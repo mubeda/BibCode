@@ -1,0 +1,525 @@
+{
+  "formatVersion": 1,
+  "routes": [
+    {
+      "name": "session",
+      "method": "GET",
+      "path": "/api/auth/session",
+      "requestContentTypes": [],
+      "payloads": [],
+      "successes": [
+        {
+          "status": 200,
+          "contentType": "application/json",
+          "schema": "Objects",
+          "fingerprint": "88537975f59cc9c7e9fee7fd668bb24c18551200d6235106226d1c47e60c0d42"
+        }
+      ],
+      "errors": [
+        {
+          "status": 500,
+          "contentType": "application/json",
+          "schema": "EnvironmentInternalError",
+          "fingerprint": "4821d8753a6797ee2fbaf94c6e52105d7d120b46b96b878cf4722faa9a20e3e0"
+        }
+      ]
+    },
+    {
+      "name": "browserSession",
+      "method": "POST",
+      "path": "/api/auth/browser-session",
+      "requestContentTypes": ["application/json"],
+      "payloads": [
+        {
+          "contentType": "application/json",
+          "schema": "Objects",
+          "fingerprint": "ce857515bdf6a6328a36c6df7692846f6fbc386271da6973f6a03df39c933e44"
+        }
+      ],
+      "successes": [
+        {
+          "status": 200,
+          "contentType": "application/json",
+          "schema": "Objects",
+          "fingerprint": "b6fb70ee066e227ddaf9d753e3c933e45ea4d552a9f42e8b6c9ff9914f69322f"
+        }
+      ],
+      "errors": [
+        {
+          "status": 401,
+          "contentType": "application/json",
+          "schema": "EnvironmentAuthInvalidError",
+          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+        },
+        {
+          "status": 500,
+          "contentType": "application/json",
+          "schema": "EnvironmentInternalError",
+          "fingerprint": "4821d8753a6797ee2fbaf94c6e52105d7d120b46b96b878cf4722faa9a20e3e0"
+        }
+      ]
+    },
+    {
+      "name": "token",
+      "method": "POST",
+      "path": "/oauth/token",
+      "requestContentTypes": ["application/x-www-form-urlencoded"],
+      "payloads": [
+        {
+          "contentType": "application/x-www-form-urlencoded",
+          "schema": "Objects",
+          "fingerprint": "746432a74986642eee5a4f4c32fbab9d666642bf3247b3f4955610e9683d4de7"
+        }
+      ],
+      "successes": [
+        {
+          "status": 200,
+          "contentType": "application/json",
+          "schema": "Objects",
+          "fingerprint": "7859bef3973de94e6918d64a1c4fc6bf22f89007f1f9315182c51c32ff972451"
+        }
+      ],
+      "errors": [
+        {
+          "status": 400,
+          "contentType": "application/json",
+          "schema": "EnvironmentRequestInvalidError",
+          "fingerprint": "7aff5e977016f31ae9353b3a4f48b817aeac19bd490db3266b3f7bb2eb8f32ac"
+        },
+        {
+          "status": 401,
+          "contentType": "application/json",
+          "schema": "EnvironmentAuthInvalidError",
+          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+        },
+        {
+          "status": 500,
+          "contentType": "application/json",
+          "schema": "EnvironmentInternalError",
+          "fingerprint": "4821d8753a6797ee2fbaf94c6e52105d7d120b46b96b878cf4722faa9a20e3e0"
+        }
+      ]
+    },
+    {
+      "name": "webSocketTicket",
+      "method": "POST",
+      "path": "/api/auth/websocket-ticket",
+      "requestContentTypes": [],
+      "payloads": [],
+      "successes": [
+        {
+          "status": 200,
+          "contentType": "application/json",
+          "schema": "Objects",
+          "fingerprint": "6071b275cecdd26a6486654e88fd9d717a46a4dac4eb903a59c10e3d3750fcd2"
+        }
+      ],
+      "errors": [
+        {
+          "status": 401,
+          "contentType": "application/json",
+          "schema": "EnvironmentAuthInvalidError",
+          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+        },
+        {
+          "status": 500,
+          "contentType": "application/json",
+          "schema": "EnvironmentInternalError",
+          "fingerprint": "4821d8753a6797ee2fbaf94c6e52105d7d120b46b96b878cf4722faa9a20e3e0"
+        }
+      ]
+    },
+    {
+      "name": "pairingCredential",
+      "method": "POST",
+      "path": "/api/auth/pairing-token",
+      "requestContentTypes": ["application/json"],
+      "payloads": [
+        {
+          "contentType": "application/json",
+          "schema": "Objects",
+          "fingerprint": "f939406bebaf0bfbca1c2f7a5b7e8f89ce375161b077434e05327d1913e1647a"
+        }
+      ],
+      "successes": [
+        {
+          "status": 200,
+          "contentType": "application/json",
+          "schema": "Objects",
+          "fingerprint": "b41ee0a5731a9b9f361faafc82bbc30eb9bbbda1430e639efc7ed15e75d62697"
+        }
+      ],
+      "errors": [
+        {
+          "status": 400,
+          "contentType": "application/json",
+          "schema": "EnvironmentRequestInvalidError",
+          "fingerprint": "7aff5e977016f31ae9353b3a4f48b817aeac19bd490db3266b3f7bb2eb8f32ac"
+        },
+        {
+          "status": 401,
+          "contentType": "application/json",
+          "schema": "EnvironmentAuthInvalidError",
+          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+        },
+        {
+          "status": 403,
+          "contentType": "application/json",
+          "schema": "EnvironmentScopeRequiredError",
+          "fingerprint": "602b9ab896e06ff4bcdac4df75d694e1c6e8e45c0a1a66df4fe21f2617c7b396"
+        },
+        {
+          "status": 500,
+          "contentType": "application/json",
+          "schema": "EnvironmentInternalError",
+          "fingerprint": "4821d8753a6797ee2fbaf94c6e52105d7d120b46b96b878cf4722faa9a20e3e0"
+        }
+      ]
+    },
+    {
+      "name": "pairingLinks",
+      "method": "GET",
+      "path": "/api/auth/pairing-links",
+      "requestContentTypes": [],
+      "payloads": [],
+      "successes": [
+        {
+          "status": 200,
+          "contentType": "application/json",
+          "schema": "Arrays",
+          "fingerprint": "2aa72d24a01882ffaa95f36773d455c279e2cd863abdbc36b82da99ace977fc2"
+        }
+      ],
+      "errors": [
+        {
+          "status": 401,
+          "contentType": "application/json",
+          "schema": "EnvironmentAuthInvalidError",
+          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+        },
+        {
+          "status": 403,
+          "contentType": "application/json",
+          "schema": "EnvironmentScopeRequiredError",
+          "fingerprint": "602b9ab896e06ff4bcdac4df75d694e1c6e8e45c0a1a66df4fe21f2617c7b396"
+        },
+        {
+          "status": 500,
+          "contentType": "application/json",
+          "schema": "EnvironmentInternalError",
+          "fingerprint": "4821d8753a6797ee2fbaf94c6e52105d7d120b46b96b878cf4722faa9a20e3e0"
+        }
+      ]
+    },
+    {
+      "name": "revokePairingLink",
+      "method": "POST",
+      "path": "/api/auth/pairing-links/revoke",
+      "requestContentTypes": ["application/json"],
+      "payloads": [
+        {
+          "contentType": "application/json",
+          "schema": "Objects",
+          "fingerprint": "f3962c1644924035c8cd2db9628c43ebd93c08ad5bdfdba4dac4d242fe9c2968"
+        }
+      ],
+      "successes": [
+        {
+          "status": 200,
+          "contentType": "application/json",
+          "schema": "Objects",
+          "fingerprint": "05d17a2888c1709c4f6b9e770d007efd2cbc584ddbe7e5a9278d99854b045a18"
+        }
+      ],
+      "errors": [
+        {
+          "status": 401,
+          "contentType": "application/json",
+          "schema": "EnvironmentAuthInvalidError",
+          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+        },
+        {
+          "status": 403,
+          "contentType": "application/json",
+          "schema": "EnvironmentScopeRequiredError",
+          "fingerprint": "602b9ab896e06ff4bcdac4df75d694e1c6e8e45c0a1a66df4fe21f2617c7b396"
+        },
+        {
+          "status": 500,
+          "contentType": "application/json",
+          "schema": "EnvironmentInternalError",
+          "fingerprint": "4821d8753a6797ee2fbaf94c6e52105d7d120b46b96b878cf4722faa9a20e3e0"
+        }
+      ]
+    },
+    {
+      "name": "clients",
+      "method": "GET",
+      "path": "/api/auth/clients",
+      "requestContentTypes": [],
+      "payloads": [],
+      "successes": [
+        {
+          "status": 200,
+          "contentType": "application/json",
+          "schema": "Arrays",
+          "fingerprint": "fc7bb04eb9ae60af7cfd7d9137090721f6a7e429cb0480ca14c70a03fed05356"
+        }
+      ],
+      "errors": [
+        {
+          "status": 401,
+          "contentType": "application/json",
+          "schema": "EnvironmentAuthInvalidError",
+          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+        },
+        {
+          "status": 403,
+          "contentType": "application/json",
+          "schema": "EnvironmentScopeRequiredError",
+          "fingerprint": "602b9ab896e06ff4bcdac4df75d694e1c6e8e45c0a1a66df4fe21f2617c7b396"
+        },
+        {
+          "status": 500,
+          "contentType": "application/json",
+          "schema": "EnvironmentInternalError",
+          "fingerprint": "4821d8753a6797ee2fbaf94c6e52105d7d120b46b96b878cf4722faa9a20e3e0"
+        }
+      ]
+    },
+    {
+      "name": "revokeClient",
+      "method": "POST",
+      "path": "/api/auth/clients/revoke",
+      "requestContentTypes": ["application/json"],
+      "payloads": [
+        {
+          "contentType": "application/json",
+          "schema": "Objects",
+          "fingerprint": "df394b76d7c613720315f6e8ebae96fcda7d7f702a15b058c4417f234b142e58"
+        }
+      ],
+      "successes": [
+        {
+          "status": 200,
+          "contentType": "application/json",
+          "schema": "Objects",
+          "fingerprint": "05d17a2888c1709c4f6b9e770d007efd2cbc584ddbe7e5a9278d99854b045a18"
+        }
+      ],
+      "errors": [
+        {
+          "status": 401,
+          "contentType": "application/json",
+          "schema": "EnvironmentAuthInvalidError",
+          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+        },
+        {
+          "status": 403,
+          "contentType": "application/json",
+          "schema": "EnvironmentOperationForbiddenError",
+          "fingerprint": "e8b11e33d2cdcac5fc486fe450a0b64ae216f125f5f8130d6b11799fdc2dfef2"
+        },
+        {
+          "status": 403,
+          "contentType": "application/json",
+          "schema": "EnvironmentScopeRequiredError",
+          "fingerprint": "602b9ab896e06ff4bcdac4df75d694e1c6e8e45c0a1a66df4fe21f2617c7b396"
+        },
+        {
+          "status": 500,
+          "contentType": "application/json",
+          "schema": "EnvironmentInternalError",
+          "fingerprint": "4821d8753a6797ee2fbaf94c6e52105d7d120b46b96b878cf4722faa9a20e3e0"
+        }
+      ]
+    },
+    {
+      "name": "revokeOtherClients",
+      "method": "POST",
+      "path": "/api/auth/clients/revoke-others",
+      "requestContentTypes": [],
+      "payloads": [],
+      "successes": [
+        {
+          "status": 200,
+          "contentType": "application/json",
+          "schema": "Objects",
+          "fingerprint": "c6fd0e86c5c33ae271e0f54dc6a41648a35cd7da45ed0a27615ad037f75b63be"
+        }
+      ],
+      "errors": [
+        {
+          "status": 401,
+          "contentType": "application/json",
+          "schema": "EnvironmentAuthInvalidError",
+          "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff"
+        },
+        {
+          "status": 403,
+          "contentType": "application/json",
+          "schema": "EnvironmentScopeRequiredError",
+          "fingerprint": "602b9ab896e06ff4bcdac4df75d694e1c6e8e45c0a1a66df4fe21f2617c7b396"
+        },
+        {
+          "status": 500,
+          "contentType": "application/json",
+          "schema": "EnvironmentInternalError",
+          "fingerprint": "4821d8753a6797ee2fbaf94c6e52105d7d120b46b96b878cf4722faa9a20e3e0"
+        }
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "schema": "EnvironmentRequestInvalidError",
+      "status": 400,
+      "contentType": "application/json",
+      "fingerprint": "7aff5e977016f31ae9353b3a4f48b817aeac19bd490db3266b3f7bb2eb8f32ac",
+      "fixture": "errors/request-invalid.json"
+    },
+    {
+      "schema": "EnvironmentAuthInvalidError",
+      "status": 401,
+      "contentType": "application/json",
+      "fingerprint": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff",
+      "fixture": "errors/auth-invalid.json"
+    },
+    {
+      "schema": "EnvironmentScopeRequiredError",
+      "status": 403,
+      "contentType": "application/json",
+      "fingerprint": "602b9ab896e06ff4bcdac4df75d694e1c6e8e45c0a1a66df4fe21f2617c7b396",
+      "fixture": "errors/scope-required.json"
+    },
+    {
+      "schema": "EnvironmentOperationForbiddenError",
+      "status": 403,
+      "contentType": "application/json",
+      "fingerprint": "e8b11e33d2cdcac5fc486fe450a0b64ae216f125f5f8130d6b11799fdc2dfef2",
+      "fixture": "errors/operation-forbidden.json"
+    },
+    {
+      "schema": "EnvironmentInternalError",
+      "status": 500,
+      "contentType": "application/json",
+      "fingerprint": "4821d8753a6797ee2fbaf94c6e52105d7d120b46b96b878cf4722faa9a20e3e0",
+      "fixture": "errors/internal.json"
+    }
+  ],
+  "scopes": {
+    "all": [
+      "orchestration:read",
+      "orchestration:operate",
+      "terminal:operate",
+      "review:write",
+      "access:read",
+      "access:write",
+      "relay:read",
+      "relay:write"
+    ],
+    "standardClient": [
+      "orchestration:read",
+      "orchestration:operate",
+      "terminal:operate",
+      "review:write",
+      "relay:read"
+    ],
+    "administrative": [
+      "orchestration:read",
+      "orchestration:operate",
+      "terminal:operate",
+      "review:write",
+      "relay:read",
+      "access:read",
+      "access:write",
+      "relay:write"
+    ]
+  },
+  "samples": {
+    "session": {
+      "success": "responses/session.json"
+    },
+    "browserSession": {
+      "request": "requests/browser-session.json",
+      "success": "responses/browser-session.json"
+    },
+    "token": {
+      "request": "requests/token-form.txt",
+      "success": "responses/token.json"
+    },
+    "webSocketTicket": {
+      "success": "responses/websocket-ticket.json"
+    },
+    "pairingCredential": {
+      "request": "requests/pairing-create.json",
+      "success": "responses/pairing-create.json"
+    },
+    "pairingLinks": {
+      "success": "responses/pairing-list.json"
+    },
+    "revokePairingLink": {
+      "request": "requests/pairing-revoke.json",
+      "success": "responses/pairing-revoke.json"
+    },
+    "clients": {
+      "success": "responses/client-list.json"
+    },
+    "revokeClient": {
+      "request": "requests/client-revoke.json",
+      "success": "responses/client-revoke.json"
+    },
+    "revokeOtherClients": {
+      "success": "responses/client-revoke-others.json"
+    }
+  },
+  "schemaFingerprints": {
+    "AuthAccessTokenResult": "cea8aabefb044f9daf941efa9e83f1d17d3817247c3e32a153f5765fca0891ad",
+    "AuthBrowserSessionRequest": "ce857515bdf6a6328a36c6df7692846f6fbc386271da6973f6a03df39c933e44",
+    "AuthBrowserSessionResult": "39abbe3526341131c33f73525739e84b4949ae9dba0abb1293359bec43dc5e90",
+    "AuthClientSession": "ca6a71208b6e873ecd4f6d1a692a9cd7cdce900cfed520e9256754dbd6339f95",
+    "AuthClientSessionList": "b06719a499829317cf7f7abbad18b2967ec04c049fc6aa47305cc36b11ae3b9b",
+    "AuthClientSessionRevokeResult": "05d17a2888c1709c4f6b9e770d007efd2cbc584ddbe7e5a9278d99854b045a18",
+    "AuthCreatePairingCredentialInput": "f939406bebaf0bfbca1c2f7a5b7e8f89ce375161b077434e05327d1913e1647a",
+    "AuthEnvironmentScope": "0075f3b8e58d5c596cb62b1fab337228db16942bc03be9685fafa11f5aa8b08d",
+    "AuthEnvironmentScopes": "c80c09a9ed11b43aa331fd500b6a7bba484dd93cfef92c7a014bb9812f3b4989",
+    "AuthOtherClientSessionsRevokeResult": "09a01af283c067546b42a825ad343e48941492ad5c319c211e5f6b75f51d4af1",
+    "AuthPairingCredentialResult": "57232db62fd57bd4c2dd35776b84fe2d264254d50ec46efd65ebe10436b4f8e0",
+    "AuthPairingLink": "5f9e80a3a34fc9371c02a0a9e4c28d1b5e6ec6dcc259e197ebac16879e033792",
+    "AuthPairingLinkList": "65474e4e4d88139c6b53fd39f8af62c7cb29db8b711adaa1ec9dd1f5bea482ee",
+    "AuthPairingLinkRevokeResult": "05d17a2888c1709c4f6b9e770d007efd2cbc584ddbe7e5a9278d99854b045a18",
+    "AuthRevokeClientSessionInput": "df394b76d7c613720315f6e8ebae96fcda7d7f702a15b058c4417f234b142e58",
+    "AuthRevokePairingLinkInput": "f3962c1644924035c8cd2db9628c43ebd93c08ad5bdfdba4dac4d242fe9c2968",
+    "AuthSessionState": "7c7433c4e7469f73ff94c1f8e9ae52ad2441eeed5fe96ecbe3bee1651b2c3a7e",
+    "AuthTokenExchangeRequest": "746432a74986642eee5a4f4c32fbab9d666642bf3247b3f4955610e9683d4de7",
+    "AuthWebSocketTicketResult": "4d4b514499bf6373a0812f5defaf5b880acb5d42ce3e057da68f5ab9c5c36a84",
+    "EnvironmentAuthInvalidError": "fb39b2fefb6cc89c7a61b6888eaf5188dcbd5f8a9192746e6edf302f321f7eff",
+    "EnvironmentInternalError": "4821d8753a6797ee2fbaf94c6e52105d7d120b46b96b878cf4722faa9a20e3e0",
+    "EnvironmentOperationForbiddenError": "e8b11e33d2cdcac5fc486fe450a0b64ae216f125f5f8130d6b11799fdc2dfef2",
+    "EnvironmentRequestInvalidError": "7aff5e977016f31ae9353b3a4f48b817aeac19bd490db3266b3f7bb2eb8f32ac",
+    "EnvironmentScopeRequiredError": "602b9ab896e06ff4bcdac4df75d694e1c6e8e45c0a1a66df4fe21f2617c7b396"
+  },
+  "fixtures": [
+    "errors/auth-invalid.json",
+    "errors/internal.json",
+    "errors/operation-forbidden.json",
+    "errors/request-invalid.json",
+    "errors/scope-required.json",
+    "requests/browser-session.json",
+    "requests/client-revoke.json",
+    "requests/pairing-create.json",
+    "requests/pairing-revoke.json",
+    "requests/token-form.txt",
+    "responses/browser-session.json",
+    "responses/client-list.json",
+    "responses/client-revoke-others.json",
+    "responses/client-revoke.json",
+    "responses/pairing-create.json",
+    "responses/pairing-list.json",
+    "responses/pairing-revoke.json",
+    "responses/session.json",
+    "responses/token.json",
+    "responses/websocket-ticket.json",
+    "scopes.json"
+  ]
+}

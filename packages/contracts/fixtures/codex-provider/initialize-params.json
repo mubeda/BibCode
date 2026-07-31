@@ -1,0 +1,10 @@
+{
+  "clientInfo": {
+    "name": "bibcode_desktop",
+    "title": "BiBCode Desktop",
+    "version": "0.1.1"
+  },
+  "capabilities": {
+    "experimentalApi": true
+  }
+}

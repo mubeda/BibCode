@@ -1,0 +1,22 @@
+{
+  "metadata": {
+    "provider": "opencode",
+    "producerVersion": "1.18.4",
+    "schemaSource": "GET /doc",
+    "capturedAt": "2026-07-24T00:00:00Z",
+    "redactions": [
+      "[redacted workspace]",
+      "[redacted command arguments]",
+      "[redacted provider failure]"
+    ]
+  },
+  "rootSessionID": "ses-root-activity",
+  "streamContext": {
+    "directory": "[redacted workspace]"
+  },
+  "verifiedChildSessionIDs": ["ses-child-direct", "ses-child-nested"],
+  "rawSseFrames": [
+    "id: oc-1184-foreign-session\nevent: message\ndata: {\"id\":\"oc-1184-foreign-session\",\"type\":\"session.updated\",\"properties\":{\"sessionID\":\"ses-foreign-workspace\",\"info\":{\"id\":\"ses-foreign-workspace\",\"parentID\":\"ses-unrelated-parent\",\"title\":\"[redacted foreign session title]\",\"directory\":\"[redacted workspace]\"}}}\n\n",
+    "id: oc-1184-foreign-text\nevent: message\ndata: {\"id\":\"oc-1184-foreign-text\",\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses-foreign-workspace\",\"part\":{\"id\":\"prt-foreign-text\",\"sessionID\":\"ses-foreign-workspace\",\"messageID\":\"msg-foreign-assistant\",\"type\":\"text\",\"text\":\"[redacted foreign commentary]\"},\"time\":1721827200500}}\n\n"
+  ]
+}

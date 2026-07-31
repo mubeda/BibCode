@@ -1,0 +1,153 @@
+{
+  "scenario": "subagent tool hooks use their own agent identity while anonymous work stays unowned",
+  "rawInputLines": [
+    {
+      "source": "hookInput",
+      "line": "{\"hook_event_name\":\"SubagentStart\",\"session_id\":\"session-root\",\"transcript_path\":\"/tmp/session-root.jsonl\",\"cwd\":\"/workspace\",\"permission_mode\":\"default\",\"agent_id\":\"agent-tools-1\",\"agent_type\":\"Bash\"}"
+    },
+    {
+      "source": "hookInput",
+      "line": "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"session-root\",\"transcript_path\":\"/tmp/session-root.jsonl\",\"cwd\":\"/workspace\",\"permission_mode\":\"default\",\"agent_id\":\"agent-tools-1\",\"agent_type\":\"Bash\",\"tool_name\":\"Bash\",\"tool_use_id\":\"tool-use-ok\",\"tool_input\":{\"command\":\"echo CLAUDE_FIXTURE_TOOL_PAYLOAD_DO_NOT_LEAK\",\"credentials\":{\"apiKey\":\"CLAUDE_FIXTURE_SECRET_DO_NOT_LEAK\"}},\"environment\":{\"TOKEN\":\"CLAUDE_FIXTURE_ENV_DO_NOT_LEAK\"},\"settings\":{\"apiKey\":\"CLAUDE_FIXTURE_SETTINGS_DO_NOT_LEAK\"}}"
+    },
+    {
+      "source": "stream",
+      "line": "{\"type\":\"system\",\"subtype\":\"hook_started\",\"hook_name\":\"activity-capture\",\"hook_event\":\"PreToolUse\",\"hook_id\":\"hook-tool-ok\",\"uuid\":\"system-hook-tool-started\",\"session_id\":\"session-root\"}"
+    },
+    {
+      "source": "stream",
+      "line": "{\"type\":\"system\",\"subtype\":\"hook_response\",\"hook_name\":\"activity-capture\",\"hook_event\":\"PreToolUse\",\"hook_id\":\"hook-tool-ok\",\"output\":\"hook accepted\",\"stdout\":\"hook accepted\",\"stderr\":\"\",\"exit_code\":0,\"outcome\":\"success\",\"uuid\":\"system-hook-tool-response\",\"session_id\":\"session-root\"}"
+    },
+    {
+      "source": "hookInput",
+      "line": "{\"hook_event_name\":\"PostToolUse\",\"session_id\":\"session-root\",\"transcript_path\":\"/tmp/session-root.jsonl\",\"cwd\":\"/workspace\",\"permission_mode\":\"default\",\"agent_id\":\"agent-tools-1\",\"agent_type\":\"Bash\",\"tool_name\":\"Bash\",\"tool_use_id\":\"tool-use-ok\",\"tool_input\":{\"command\":\"echo CLAUDE_FIXTURE_TOOL_PAYLOAD_DO_NOT_LEAK\"},\"tool_response\":{\"stdout\":\"CLAUDE_FIXTURE_SECRET_DO_NOT_LEAK\",\"stderr\":\"\",\"interrupted\":false,\"isImage\":false}}"
+    },
+    {
+      "source": "hookInput",
+      "line": "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"session-root\",\"transcript_path\":\"/tmp/session-root.jsonl\",\"cwd\":\"/workspace\",\"permission_mode\":\"default\",\"agent_id\":\"agent-tools-1\",\"agent_type\":\"Bash\",\"tool_name\":\"Read\",\"tool_use_id\":\"tool-use-failed\",\"tool_input\":{\"file_path\":\"/tmp/private-settings.json\",\"settings\":{\"token\":\"CLAUDE_FIXTURE_SETTINGS_DO_NOT_LEAK\"}}}"
+    },
+    {
+      "source": "hookInput",
+      "line": "{\"hook_event_name\":\"PostToolUseFailure\",\"session_id\":\"session-root\",\"transcript_path\":\"/tmp/session-root.jsonl\",\"cwd\":\"/workspace\",\"permission_mode\":\"default\",\"agent_id\":\"agent-tools-1\",\"agent_type\":\"Bash\",\"tool_name\":\"Read\",\"tool_use_id\":\"tool-use-failed\",\"tool_input\":{\"file_path\":\"/tmp/private-settings.json\"},\"error\":\"Read failed after permission denial\",\"credentials\":{\"token\":\"CLAUDE_FIXTURE_SECRET_DO_NOT_LEAK\"}}"
+    },
+    {
+      "source": "hookInput",
+      "line": "{\"hook_event_name\":\"PreToolUse\",\"session_id\":\"session-root\",\"transcript_path\":\"/tmp/session-root.jsonl\",\"cwd\":\"/workspace\",\"permission_mode\":\"default\",\"tool_name\":\"Bash\",\"tool_use_id\":\"tool-use-root\",\"tool_input\":{\"command\":\"echo root\"}}"
+    },
+    {
+      "source": "stream",
+      "line": "{\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"task-tools-1\",\"tool_use_id\":\"tool-task-tools-1\",\"description\":\"Run a failing delegated check\",\"uuid\":\"system-task-tools-started\",\"session_id\":\"session-root\"}"
+    },
+    {
+      "source": "stream",
+      "line": "{\"type\":\"system\",\"subtype\":\"task_notification\",\"task_id\":\"task-tools-1\",\"status\":\"failed\",\"output_file\":\"/tmp/task-tools-1.output\",\"summary\":\"Delegated check failed after timeout.\",\"uuid\":\"system-task-tools-failed\",\"session_id\":\"session-root\"}"
+    },
+    {
+      "source": "hookInput",
+      "line": "{\"hook_event_name\":\"SubagentStop\",\"session_id\":\"session-root\",\"transcript_path\":\"/tmp/session-root.jsonl\",\"cwd\":\"/workspace\",\"permission_mode\":\"default\",\"stop_hook_active\":false,\"agent_id\":\"agent-tools-1\",\"agent_type\":\"Bash\",\"agent_transcript_path\":\"/tmp/agent-tools-1.jsonl\",\"last_assistant_message\":\"Completed after handling the tool failure.\"}"
+    }
+  ],
+  "expectedMutations": [
+    {
+      "type": "upsertActor",
+      "actor": {
+        "_tag": "actor",
+        "id": "claude:agent:agent-tools-1",
+        "parentActorId": null,
+        "name": "Claude Bash",
+        "role": "Bash",
+        "providerType": "claude",
+        "status": "starting",
+        "summary": null,
+        "startedAt": "2026-07-24T12:02:00Z",
+        "updatedAt": "2026-07-24T12:02:00Z",
+        "terminalAt": null
+      }
+    },
+    {
+      "type": "upsertActor",
+      "actor": {
+        "_tag": "actor",
+        "id": "claude:agent:agent-tools-1",
+        "parentActorId": null,
+        "name": "Claude Bash",
+        "role": "Bash",
+        "providerType": "claude",
+        "status": "running",
+        "summary": null,
+        "startedAt": "2026-07-24T12:02:00Z",
+        "updatedAt": "2026-07-24T12:02:00Z",
+        "terminalAt": null
+      }
+    },
+    {
+      "type": "appendEntry",
+      "entry": {
+        "id": "claude:event:tool:session-root:agent-tools-1:tool-use-ok:started",
+        "ownerKind": "actor",
+        "ownerId": "claude:agent:agent-tools-1",
+        "kind": "command",
+        "title": "Bash started",
+        "detail": null,
+        "tone": "tool",
+        "createdAt": "2026-07-24T12:02:01Z"
+      }
+    },
+    {
+      "type": "appendEntry",
+      "entry": {
+        "id": "claude:event:tool:session-root:agent-tools-1:tool-use-ok:completed",
+        "ownerKind": "actor",
+        "ownerId": "claude:agent:agent-tools-1",
+        "kind": "command",
+        "title": "Bash completed",
+        "detail": null,
+        "tone": "success",
+        "createdAt": "2026-07-24T12:02:04Z"
+      }
+    },
+    {
+      "type": "appendEntry",
+      "entry": {
+        "id": "claude:event:tool:session-root:agent-tools-1:tool-use-failed:started",
+        "ownerKind": "actor",
+        "ownerId": "claude:agent:agent-tools-1",
+        "kind": "tool",
+        "title": "Read started",
+        "detail": null,
+        "tone": "tool",
+        "createdAt": "2026-07-24T12:02:05Z"
+      }
+    },
+    {
+      "type": "appendEntry",
+      "entry": {
+        "id": "claude:event:tool:session-root:agent-tools-1:tool-use-failed:failed",
+        "ownerKind": "actor",
+        "ownerId": "claude:agent:agent-tools-1",
+        "kind": "error",
+        "title": "Read failed",
+        "detail": "Read failed after permission denial",
+        "tone": "error",
+        "createdAt": "2026-07-24T12:02:06Z"
+      }
+    },
+    {
+      "type": "upsertActor",
+      "actor": {
+        "_tag": "actor",
+        "id": "claude:agent:agent-tools-1",
+        "parentActorId": null,
+        "name": "Claude Bash",
+        "role": "Bash",
+        "providerType": "claude",
+        "status": "completed",
+        "summary": "Completed after handling the tool failure.",
+        "startedAt": "2026-07-24T12:02:00Z",
+        "updatedAt": "2026-07-24T12:02:10Z",
+        "terminalAt": "2026-07-24T12:02:10Z"
+      }
+    }
+  ],
+  "expectedMutationInputIndexes": [0, 0, 1, 4, 5, 6, 10],
+  "noMutationInputIndexes": [2, 3, 7, 8, 9]
+}

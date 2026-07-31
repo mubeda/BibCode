@@ -1,0 +1,2774 @@
+#![cfg_attr(not(unix), allow(dead_code))]
+// Windows compiles the shared factory facade, while the Unix-socket observer
+// intentionally remains Unix-only and returns pass-through there.
+
+use std::{
+    collections::{BTreeMap, HashMap, VecDeque},
+    fmt,
+    future::Future,
+    path::{Path, PathBuf},
+    pin::Pin,
+    process::Stdio,
+    sync::{
+        Arc, LazyLock, Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
+    time::Duration,
+};
+
+#[cfg(unix)]
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{Value, json};
+use time::{OffsetDateTime, format_description::well_known::Rfc3339};
+use tokio::process::Child;
+
+use super::{
+    PreparedTerminalLaunch, PreparedTerminalObserver, ProviderTerminalObserverFactory,
+    ProviderTerminalObserverFactoryInput, TerminalAgentActivityControl,
+    TerminalAgentActivityObservation, TerminalAgentActivityObservationKind,
+    TerminalAgentActivityState, TerminalAgentActivityTransition,
+    TerminalGenerationActivityPublisher,
+    TerminalObserverGeneration, TerminalObserverWorkerContext,
+    supervisor::cleanup_owned_generation_directory,
+};
+#[cfg(unix)]
+use super::supervisor::create_owned_generation_directory;
+use crate::{
+    activity::{ActivityCapabilities, ActivityObservationState, ProviderActivityMutation},
+    process::{
+        configure_background_command,
+        supervised::{SupervisedOverflow, SupervisedRunRequest, run_supervised},
+    },
+    provider::codex::{
+        activity::{BackgroundSnapshotAuthority, CodexActivityOutput, CodexActivityTracker},
+        build_initialize_params,
+        model::{
+            CODEX_RECONCILIATION_BACKGROUND_LIMIT, CODEX_RECONCILIATION_THREAD_LIMIT,
+            ThreadBackgroundTerminalsListParams, ThreadListParams,
+            ThreadReadParams, decode_background_terminals_list_response,
+            decode_thread_list_response, decode_thread_read_response,
+            is_recoverable_thread_resume_error,
+        },
+    },
+};
+#[cfg(unix)]
+use crate::provider::codex::model::CODEX_REMOTE_MESSAGE_MAX_BYTES;
+
+const CODEX_PROBE_OUTPUT_LIMIT: usize = 128 * 1024;
+const CODEX_CAPABILITY_CACHE_CAPACITY: usize = 64;
+const CODEX_HELPER_READY_TIMEOUT: Duration = Duration::from_secs(3);
+const CODEX_HELPER_REAP_TIMEOUT: Duration = Duration::from_secs(2);
+const CODEX_HELPER_SUPERVISOR_CAPACITY: usize = 32;
+const CODEX_HELPER_SUPERVISOR_INIT_TIMEOUT: Duration = Duration::from_millis(100);
+const CODEX_PREPARATION_BUDGET: Duration = Duration::from_millis(350);
+const CODEX_CONNECT_INITIALIZE_TIMEOUT: Duration = Duration::from_secs(3);
+const CODEX_ROOT_DISCOVERY_INTERVAL: Duration = Duration::from_secs(1);
+const CODEX_ROOT_DISCOVERY_LIMIT: usize = 50;
+const CODEX_ROOT_DISCOVERY_REQUEST_TIMEOUT: Duration = Duration::from_secs(1);
+const CODEX_RESUME_MATERIALIZATION_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const CODEX_RECONCILIATION_REQUEST_TIMEOUT: Duration = Duration::from_millis(100);
+const CODEX_RECONCILIATION_PASS_TIMEOUT: Duration = Duration::from_millis(300);
+const CODEX_ACTIVITY_ENABLE_BARRIER_METHOD: &str = "account/read";
+const CODEX_ACTIVITY_RETRY_MIN: Duration = Duration::from_millis(50);
+const CODEX_ACTIVITY_RETRY_MAX: Duration = Duration::from_secs(1);
+const CODEX_ACTIVITY_REATTACH_ACK_TIMEOUT: Duration = CODEX_CONNECT_INITIALIZE_TIMEOUT
+    .saturating_add(CODEX_ROOT_DISCOVERY_INTERVAL)
+    .saturating_add(CODEX_ROOT_DISCOVERY_REQUEST_TIMEOUT)
+    .saturating_add(CODEX_RESUME_MATERIALIZATION_TIMEOUT)
+    .saturating_add(CODEX_RECONCILIATION_PASS_TIMEOUT);
+const CODEX_REMOTE_PENDING_NOTIFICATION_LIMIT: usize = 256;
+const CODEX_REMOTE_RPC_ERROR_PREFIX: &str = "Codex remote request failed: ";
+const UNIX_SOCKET_PATH_SOFT_LIMIT: usize = 100;
+
+#[derive(Clone, Eq, PartialEq)]
+pub struct CodexProbeOutput {
+    pub success: bool,
+    pub stdout: String,
+    pub stderr: String,
+}
+
+impl fmt::Debug for CodexProbeOutput {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexProbeOutput")
+            .field("success", &self.success)
+            .field("stdout_bytes", &self.stdout.len())
+            .field("stderr_bytes", &self.stderr.len())
+            .finish()
+    }
+}
+
+pub trait CodexCapabilityProbeRunner: Send + Sync {
+    fn run(
+        &self,
+        executable: &Path,
+        args: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<CodexProbeOutput, String>> + Send + '_>>;
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CodexCapabilities {
+    pub version: String,
+    pub unix_listener: bool,
+    pub websocket_listener: bool,
+    pub remote_tui: bool,
+}
+
+pub struct CachedCodexCapabilityProbe {
+    runner: Arc<dyn CodexCapabilityProbeRunner>,
+    cache: tokio::sync::Mutex<CodexCapabilityCache>,
+}
+
+impl fmt::Debug for CachedCodexCapabilityProbe {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CachedCodexCapabilityProbe")
+            .finish_non_exhaustive()
+    }
+}
+
+impl CachedCodexCapabilityProbe {
+    #[must_use]
+    pub fn new(runner: Arc<dyn CodexCapabilityProbeRunner>) -> Self {
+        Self {
+            runner,
+            cache: tokio::sync::Mutex::new(CodexCapabilityCache::default()),
+        }
+    }
+
+    pub async fn probe(&self, executable: &Path) -> Option<CodexCapabilities> {
+        let path = std::fs::canonicalize(executable).unwrap_or_else(|_| executable.to_path_buf());
+        let fingerprint = CodexExecutableFingerprint::read(&path);
+        let mut cache = self.cache.lock().await;
+        if let Some(capabilities) = fingerprint
+            .as_ref()
+            .and_then(|fingerprint| cache.get(fingerprint))
+        {
+            return Some(capabilities);
+        }
+        let capabilities = self.probe_uncached(&path).await;
+        if let (Some(fingerprint), Some(capabilities)) = (fingerprint, &capabilities) {
+            cache.insert(fingerprint, capabilities.clone());
+        }
+        capabilities
+    }
+
+    async fn probe_uncached(&self, executable: &Path) -> Option<CodexCapabilities> {
+        let version = self
+            .runner
+            .run(executable, vec!["--version".to_owned()])
+            .await
+            .ok()?;
+        let root_help = self
+            .runner
+            .run(executable, vec!["--help".to_owned()])
+            .await
+            .ok()?;
+        let app_server_help = self
+            .runner
+            .run(
+                executable,
+                vec!["app-server".to_owned(), "--help".to_owned()],
+            )
+            .await
+            .ok()?;
+        if !version.success || !root_help.success || !app_server_help.success {
+            return None;
+        }
+        let version_output = bounded_probe_text(&version.stdout, &version.stderr);
+        let root_help = bounded_probe_text(&root_help.stdout, &root_help.stderr);
+        let app_server_help = bounded_probe_text(&app_server_help.stdout, &app_server_help.stderr);
+        let version = parse_codex_version(&version_output)?;
+        Some(CodexCapabilities {
+            version,
+            unix_listener: app_server_help.contains("--listen")
+                && app_server_help.contains("unix://"),
+            websocket_listener: app_server_help.contains("--listen")
+                && app_server_help.contains("ws://"),
+            remote_tui: root_help.contains("--remote") && root_help.contains("unix://"),
+        })
+    }
+}
+
+#[derive(Debug, Default)]
+struct CodexCapabilityCache {
+    entries: HashMap<CodexExecutableFingerprint, CodexCapabilities>,
+    recency: VecDeque<CodexExecutableFingerprint>,
+}
+
+impl CodexCapabilityCache {
+    fn get(&mut self, fingerprint: &CodexExecutableFingerprint) -> Option<CodexCapabilities> {
+        let capabilities = self.entries.get(fingerprint)?.clone();
+        self.recency.retain(|cached| cached != fingerprint);
+        self.recency.push_back(fingerprint.clone());
+        Some(capabilities)
+    }
+
+    fn insert(&mut self, fingerprint: CodexExecutableFingerprint, capabilities: CodexCapabilities) {
+        self.entries
+            .retain(|cached, _| cached.path != fingerprint.path);
+        self.recency
+            .retain(|cached| cached.path != fingerprint.path);
+        while self.entries.len() >= CODEX_CAPABILITY_CACHE_CAPACITY {
+            let Some(oldest) = self.recency.pop_front() else {
+                self.entries.clear();
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+        self.entries.insert(fingerprint.clone(), capabilities);
+        self.recency.push_back(fingerprint);
+    }
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+struct CodexExecutableFingerprint {
+    path: PathBuf,
+    length: u64,
+    modified: Option<std::time::SystemTime>,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    changed_seconds: i64,
+    #[cfg(unix)]
+    changed_nanoseconds: i64,
+}
+
+impl CodexExecutableFingerprint {
+    fn read(path: &Path) -> Option<Self> {
+        let metadata = std::fs::metadata(path).ok()?;
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+        Some(Self {
+            path: path.to_path_buf(),
+            length: metadata.len(),
+            modified: metadata.modified().ok(),
+            #[cfg(unix)]
+            device: metadata.dev(),
+            #[cfg(unix)]
+            inode: metadata.ino(),
+            #[cfg(unix)]
+            changed_seconds: metadata.ctime(),
+            #[cfg(unix)]
+            changed_nanoseconds: metadata.ctime_nsec(),
+        })
+    }
+}
+
+fn bounded_probe_text(stdout: &str, stderr: &str) -> String {
+    let mut output = String::with_capacity(
+        stdout
+            .len()
+            .saturating_add(stderr.len())
+            .min(CODEX_PROBE_OUTPUT_LIMIT),
+    );
+    for value in [stdout, stderr] {
+        let remaining = CODEX_PROBE_OUTPUT_LIMIT.saturating_sub(output.len());
+        if remaining == 0 {
+            break;
+        }
+        let boundary = value
+            .char_indices()
+            .map(|(index, _)| index)
+            .take_while(|index| *index <= remaining)
+            .last()
+            .unwrap_or(0);
+        let end = if value.len() <= remaining {
+            value.len()
+        } else {
+            boundary
+        };
+        output.push_str(&value[..end]);
+        if output.len() < CODEX_PROBE_OUTPUT_LIMIT {
+            output.push('\n');
+        }
+    }
+    output
+}
+
+fn parse_codex_version(output: &str) -> Option<String> {
+    output
+        .split_whitespace()
+        .find(|part| {
+            part.chars()
+                .next()
+                .is_some_and(|first| first.is_ascii_digit())
+                && part.chars().any(|character| character == '.')
+                && part
+                    .chars()
+                    .all(|character| character.is_ascii_digit() || character == '.')
+        })
+        .map(str::to_owned)
+}
+
+#[derive(Clone)]
+pub struct CodexHelperLaunch {
+    pub executable: String,
+    pub args: Vec<String>,
+    pub cwd: PathBuf,
+    pub env: BTreeMap<String, String>,
+    pub endpoint: String,
+    pub socket_path: PathBuf,
+}
+
+impl fmt::Debug for CodexHelperLaunch {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexHelperLaunch")
+            .field("executable", &self.executable)
+            .field("arg_count", &self.args.len())
+            .field("cwd", &self.cwd)
+            .field("env_keys", &self.env.keys())
+            .field("socket_path", &self.socket_path)
+            .finish()
+    }
+}
+
+pub trait CodexHelperProcess: Send + Sync + fmt::Debug {
+    fn terminate(&self);
+}
+
+type CodexHelperStartFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Arc<dyn CodexHelperProcess>, String>> + Send + 'a>>;
+
+pub trait CodexHelperLauncher: Send + Sync + fmt::Debug {
+    fn start(&self, launch: CodexHelperLaunch) -> CodexHelperStartFuture<'_>;
+}
+
+pub trait CodexRemoteClient: Send {
+    fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>>;
+
+    fn notify(
+        &mut self,
+        method: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
+
+    fn drain_request_buffered_notifications(&mut self) -> Vec<Value>;
+
+    fn next(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<Value>, String>> + Send + '_>>;
+}
+
+type CodexRemoteConnectFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Box<dyn CodexRemoteClient>, String>> + Send + 'a>>;
+
+pub trait CodexRemoteClientFactory: Send + Sync + fmt::Debug {
+    fn connect(&self, endpoint: &str) -> CodexRemoteConnectFuture<'_>;
+}
+
+pub struct CodexTerminalObserverFactory {
+    probe: Arc<CachedCodexCapabilityProbe>,
+    helper: Arc<dyn CodexHelperLauncher>,
+    remote: Arc<dyn CodexRemoteClientFactory>,
+    reattach_timeout: Duration,
+}
+
+impl fmt::Debug for CodexTerminalObserverFactory {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexTerminalObserverFactory")
+            .field("reattach_timeout", &self.reattach_timeout)
+            .finish_non_exhaustive()
+    }
+}
+
+impl CodexTerminalObserverFactory {
+    #[must_use]
+    pub fn new(
+        probe: Arc<CachedCodexCapabilityProbe>,
+        helper: Arc<dyn CodexHelperLauncher>,
+        remote: Arc<dyn CodexRemoteClientFactory>,
+    ) -> Self {
+        Self::new_with_reattach_timeout(probe, helper, remote, CODEX_ACTIVITY_REATTACH_ACK_TIMEOUT)
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn new_with_reattach_timeout(
+        probe: Arc<CachedCodexCapabilityProbe>,
+        helper: Arc<dyn CodexHelperLauncher>,
+        remote: Arc<dyn CodexRemoteClientFactory>,
+        reattach_timeout: Duration,
+    ) -> Self {
+        Self {
+            probe,
+            helper,
+            remote,
+            reattach_timeout,
+        }
+    }
+
+    #[must_use]
+    pub fn system() -> Self {
+        Self::new(
+            Arc::new(CachedCodexCapabilityProbe::new(Arc::new(
+                SystemCodexCapabilityProbeRunner,
+            ))),
+            Arc::new(SystemCodexHelperLauncher),
+            Arc::new(SystemCodexRemoteClientFactory),
+        )
+    }
+
+    async fn prepare_inner(
+        &self,
+        input: ProviderTerminalObserverFactoryInput,
+    ) -> Option<PreparedTerminalLaunch> {
+        #[cfg(not(unix))]
+        {
+            let _ = input;
+            return None;
+        }
+        #[cfg(unix)]
+        {
+            tokio::time::timeout(CODEX_PREPARATION_BUDGET, self.prepare_unix(input))
+                .await
+                .ok()
+                .flatten()
+        }
+    }
+
+    #[cfg(unix)]
+    async fn prepare_unix(
+        &self,
+        input: ProviderTerminalObserverFactoryInput,
+    ) -> Option<PreparedTerminalLaunch> {
+        let generation_started_at = OffsetDateTime::now_utc().unix_timestamp();
+        let executable = PathBuf::from(&input.launch.executable);
+        let capabilities = self.probe.probe(&executable).await?;
+        if !capabilities.unix_listener || !capabilities.remote_tui {
+            return None;
+        }
+        let args = remote_tui_args(&input.launch.args)?;
+        let expected_cwd = effective_tui_cwd(&args, &input.launch.cwd);
+        let generation_key = input.launch.generation.id().simple().to_string();
+        let generation_dir = create_owned_generation_directory(
+            &input.runtime_dir,
+            &format!("c{}", &generation_key[..16]),
+        )
+        .ok()?;
+        let socket_path = generation_dir.join("s");
+        if socket_path.as_os_str().as_encoded_bytes().len() > UNIX_SOCKET_PATH_SOFT_LIMIT {
+            cleanup_owned_generation_directory(&input.runtime_dir, &generation_dir);
+            return None;
+        }
+        let resources = Arc::new(CodexEndpointResources::new(
+            socket_path.clone(),
+            generation_dir,
+            input.runtime_dir.clone(),
+        ));
+        let endpoint = format!("unix://{}", socket_path.to_string_lossy());
+        let helper = self
+            .helper
+            .start(CodexHelperLaunch {
+                executable: input.launch.executable.clone(),
+                args: vec![
+                    "app-server".to_owned(),
+                    "--listen".to_owned(),
+                    endpoint.clone(),
+                ],
+                cwd: input.launch.cwd.clone(),
+                env: input.launch.launch_env.clone(),
+                endpoint: endpoint.clone(),
+                socket_path,
+            })
+            .await
+            .ok()?;
+        resources.install_helper(helper);
+        let mut tui_args = args;
+        tui_args.push("--remote".to_owned());
+        tui_args.push(endpoint.clone());
+        let observer = CodexPreparedTerminalObserver {
+            inner: Arc::new(CodexObserverInner {
+                resources,
+                endpoint,
+                publisher: input.activity_publisher,
+                remote: self.remote.clone(),
+                provider_instance_id: input.launch.activity.provider_instance_id,
+                expected_cwd,
+                generation_started_at,
+                spawned: AtomicBool::new(false),
+                connection_epoch: AtomicU64::new(0),
+                activity: Arc::new(TerminalAgentActivityControl::enabled()),
+                reattach_timeout: self.reattach_timeout,
+            }),
+        };
+        Some(PreparedTerminalLaunch {
+            executable: input.launch.executable,
+            args: tui_args,
+            private_env: BTreeMap::new(),
+            observer: Box::new(observer),
+        })
+    }
+}
+
+impl ProviderTerminalObserverFactory for CodexTerminalObserverFactory {
+    fn prepare(
+        &self,
+        input: ProviderTerminalObserverFactoryInput,
+    ) -> Pin<Box<dyn Future<Output = Option<PreparedTerminalLaunch>> + Send + '_>> {
+        Box::pin(self.prepare_inner(input))
+    }
+}
+
+fn effective_tui_cwd(args: &[String], launch_cwd: &Path) -> PathBuf {
+    let configured = args.windows(2).rev().find_map(|pair| {
+        matches!(pair[0].as_str(), "-C" | "--cd").then(|| PathBuf::from(&pair[1]))
+    });
+    let configured = configured.or_else(|| {
+        args.iter().rev().find_map(|argument| {
+            argument
+                .strip_prefix("--cd=")
+                .map(PathBuf::from)
+                .or_else(|| argument.strip_prefix("-C=").map(PathBuf::from))
+        })
+    });
+    let path = configured.map_or_else(
+        || launch_cwd.to_path_buf(),
+        |configured| {
+            if configured.is_absolute() {
+                configured
+            } else {
+                launch_cwd.join(configured)
+            }
+        },
+    );
+    std::fs::canonicalize(&path).unwrap_or(path)
+}
+
+fn remote_tui_args(args: &[String]) -> Option<Vec<String>> {
+    const VALUE_FLAGS: &[&str] = &[
+        "-c",
+        "--config",
+        "--enable",
+        "--disable",
+        "-m",
+        "--model",
+        "-p",
+        "--profile",
+        "-s",
+        "--sandbox",
+        "-C",
+        "--cd",
+        "--add-dir",
+        "-a",
+        "--ask-for-approval",
+        "--local-provider",
+    ];
+    const BOOLEAN_FLAGS: &[&str] = &[
+        "--oss",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "--dangerously-bypass-hook-trust",
+        "--search",
+        "--no-alt-screen",
+        "--strict-config",
+    ];
+    let mut retained = Vec::with_capacity(args.len());
+    let mut index = 0;
+    while index < args.len() {
+        let argument = &args[index];
+        if argument == "--remote" || argument == "--remote-auth-token-env" {
+            return None;
+        }
+        if BOOLEAN_FLAGS.contains(&argument.as_str()) {
+            retained.push(argument.clone());
+            index += 1;
+            continue;
+        }
+        if VALUE_FLAGS.contains(&argument.as_str()) {
+            let value = args.get(index + 1)?;
+            if value.is_empty() {
+                return None;
+            }
+            retained.push(argument.clone());
+            retained.push(value.clone());
+            index += 2;
+            continue;
+        }
+        if VALUE_FLAGS
+            .iter()
+            .any(|flag| argument.starts_with(&format!("{flag}=")))
+        {
+            retained.push(argument.clone());
+            index += 1;
+            continue;
+        }
+        return None;
+    }
+    Some(retained)
+}
+
+#[derive(Debug)]
+struct CodexPreparedTerminalObserver {
+    inner: Arc<CodexObserverInner>,
+}
+
+impl PreparedTerminalObserver for CodexPreparedTerminalObserver {
+    fn on_spawned(
+        &self,
+        _pid: u32,
+        generation: TerminalObserverGeneration,
+        workers: TerminalObserverWorkerContext,
+    ) {
+        if self.inner.spawned.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let inner = self.inner.clone();
+        if workers
+            .spawn(async move {
+                run_codex_observer(inner, generation).await;
+            })
+            .is_err()
+        {
+            self.inner.cleanup();
+        }
+    }
+
+    fn set_agent_activity_enabled(
+        &self,
+        enabled: bool,
+        _generation: TerminalObserverGeneration,
+        _workers: TerminalObserverWorkerContext,
+    ) -> Pin<Box<dyn Future<Output = TerminalAgentActivityTransition> + Send + '_>> {
+        Box::pin(async move {
+            let mut transition = self
+                .inner
+                .activity
+                .transition_observed(enabled, self.inner.reattach_timeout)
+                .await;
+            transition.epochs.codex = self.inner.connection_epoch.load(Ordering::Acquire);
+            transition
+        })
+    }
+
+    fn agent_activity_enable_ack_timeout(&self) -> Option<Duration> {
+        Some(self.inner.reattach_timeout)
+    }
+
+    fn diagnostic_label(&self) -> &str {
+        "codex-remote-app-server"
+    }
+}
+
+struct CodexEndpointResources {
+    helper: Mutex<Option<Arc<dyn CodexHelperProcess>>>,
+    socket_path: PathBuf,
+    generation_dir: PathBuf,
+    runtime_dir: PathBuf,
+    cleaned: AtomicBool,
+}
+
+impl CodexEndpointResources {
+    fn new(socket_path: PathBuf, generation_dir: PathBuf, runtime_dir: PathBuf) -> Self {
+        Self {
+            helper: Mutex::new(None),
+            socket_path,
+            generation_dir,
+            runtime_dir,
+            cleaned: AtomicBool::new(false),
+        }
+    }
+
+    fn install_helper(&self, helper: Arc<dyn CodexHelperProcess>) {
+        *self
+            .helper
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(helper);
+    }
+
+    fn cleanup(&self) {
+        if self.cleaned.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if let Some(helper) = self
+            .helper
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            helper.terminate();
+        }
+        cleanup_owned_generation_directory(&self.runtime_dir, &self.generation_dir);
+    }
+}
+
+impl fmt::Debug for CodexEndpointResources {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexEndpointResources")
+            .field("socket_path", &self.socket_path)
+            .field("generation_dir", &self.generation_dir)
+            .field("cleaned", &self.cleaned.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for CodexEndpointResources {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+struct CodexObserverInner {
+    resources: Arc<CodexEndpointResources>,
+    endpoint: String,
+    publisher: TerminalGenerationActivityPublisher,
+    remote: Arc<dyn CodexRemoteClientFactory>,
+    provider_instance_id: String,
+    expected_cwd: PathBuf,
+    generation_started_at: i64,
+    spawned: AtomicBool,
+    connection_epoch: AtomicU64,
+    activity: Arc<TerminalAgentActivityControl>,
+    reattach_timeout: Duration,
+}
+
+impl fmt::Debug for CodexObserverInner {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CodexObserverInner")
+            .field("endpoint", &self.endpoint)
+            .field("resources", &self.resources)
+            .field("provider_instance_id", &self.provider_instance_id)
+            .field("generation_started_at", &self.generation_started_at)
+            .field("spawned", &self.spawned.load(Ordering::Acquire))
+            .finish_non_exhaustive()
+    }
+}
+
+impl CodexObserverInner {
+    fn cleanup(&self) {
+        self.resources.cleanup();
+    }
+}
+
+impl Drop for CodexObserverInner {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+enum CodexObserverWait<T> {
+    Cancelled,
+    ActivityChanged(bool),
+    Completed(T),
+}
+
+async fn run_codex_observer(
+    inner: Arc<CodexObserverInner>,
+    generation: TerminalObserverGeneration,
+) {
+    run_codex_observer_inner(&inner, &generation).await;
+    inner.cleanup();
+}
+
+async fn run_codex_observer_inner(
+    inner: &CodexObserverInner,
+    generation: &TerminalObserverGeneration,
+) {
+    let mut activity = inner.activity.subscribe();
+    let Ok(mut client) = connect_initialized_codex_client(inner).await else {
+        generation.cancelled().await;
+        return;
+    };
+    let mut epoch = 0_u64;
+    inner.connection_epoch.store(epoch, Ordering::Release);
+    let mut discovery_deadline = tokio::time::Instant::now() + CODEX_ROOT_DISCOVERY_INTERVAL;
+    let mut discovery_state = CodexRootDiscoveryState::Ready;
+    let root = loop {
+        if discovery_state == CodexRootDiscoveryState::Ready
+            && tokio::time::Instant::now() >= discovery_deadline
+        {
+            match discover_codex_tui_root(
+                &mut *client,
+                inner.generation_started_at,
+                &inner.expected_cwd,
+            )
+            .await
+            {
+                CodexRootDiscoveryOutcome::Found(root) => break root,
+                CodexRootDiscoveryOutcome::Retry => {
+                    discovery_deadline =
+                        tokio::time::Instant::now() + CODEX_ROOT_DISCOVERY_INTERVAL;
+                }
+                CodexRootDiscoveryOutcome::WaitForResponse => {
+                    discovery_state = CodexRootDiscoveryState::WaitingForResponse;
+                }
+                CodexRootDiscoveryOutcome::Stop => {
+                    discovery_state = CodexRootDiscoveryState::Disabled;
+                }
+            }
+            continue;
+        }
+        let next = if discovery_state == CodexRootDiscoveryState::Ready {
+            tokio::time::timeout_at(discovery_deadline, client.next()).await
+        } else {
+            Ok(client.next().await)
+        };
+        match next {
+            Ok(Ok(Some(envelope))) => {
+                if discovery_state == CodexRootDiscoveryState::WaitingForResponse
+                    && is_codex_json_rpc_response(&envelope)
+                {
+                    discovery_state = CodexRootDiscoveryState::Ready;
+                    discovery_deadline =
+                        tokio::time::Instant::now() + CODEX_ROOT_DISCOVERY_INTERVAL;
+                    continue;
+                }
+                if let Some(root) =
+                    tui_root_thread(&envelope, inner.generation_started_at, &inner.expected_cwd)
+                {
+                    break root;
+                }
+            }
+            Ok(Ok(None)) | Ok(Err(_)) => {
+                drop(client);
+                let Some(reconnected) = reconnect_codex_root_discovery_client(
+                    inner,
+                    generation,
+                    &mut activity,
+                    &mut epoch,
+                )
+                .await
+                else {
+                    park_codex_observer_unavailable(inner, generation, &mut activity, epoch).await;
+                    return;
+                };
+                client = reconnected;
+                discovery_state = CodexRootDiscoveryState::Ready;
+                discovery_deadline =
+                    tokio::time::Instant::now() + CODEX_ROOT_DISCOVERY_INTERVAL;
+            }
+            Err(_) => {
+                match discover_codex_tui_root(
+                    &mut *client,
+                    inner.generation_started_at,
+                    &inner.expected_cwd,
+                )
+                .await
+                {
+                    CodexRootDiscoveryOutcome::Found(root) => break root,
+                    CodexRootDiscoveryOutcome::Retry => {
+                        discovery_deadline =
+                            tokio::time::Instant::now() + CODEX_ROOT_DISCOVERY_INTERVAL;
+                    }
+                    CodexRootDiscoveryOutcome::WaitForResponse => {
+                        discovery_state = CodexRootDiscoveryState::WaitingForResponse;
+                    }
+                    CodexRootDiscoveryOutcome::Stop => {
+                        discovery_state = CodexRootDiscoveryState::Disabled;
+                    }
+                }
+            }
+        }
+    };
+
+    // Initial attachment may repair activity that happened before the observer
+    // found the TUI root. Toggle recovery never decodes this response.
+    let resume_deadline = tokio::time::Instant::now() + CODEX_RESUME_MATERIALIZATION_TIMEOUT;
+    let resumed = loop {
+        let response = tokio::select! {
+            biased;
+            _ = generation.cancelled() => return,
+            response = tokio::time::timeout_at(
+                resume_deadline,
+                client.request("thread/resume", json!({"threadId": root})),
+            ) => response,
+        };
+        let response = match response {
+            Ok(Ok(response)) => response,
+            Ok(Err(error)) if is_codex_resume_materialization_pending(&error) => {
+                let retry_at = tokio::time::Instant::now() + CODEX_ROOT_DISCOVERY_INTERVAL;
+                if retry_at >= resume_deadline {
+                    generation.cancelled().await;
+                    return;
+                }
+                tokio::select! {
+                    biased;
+                    _ = generation.cancelled() => return,
+                    _ = tokio::time::sleep_until(retry_at) => {}
+                }
+                continue;
+            }
+            Ok(Err(error)) if is_codex_resume_transport_error(&error) => {
+                let Some(reconnected) =
+                    reconnect_initialized_codex_client(inner, generation, resume_deadline).await
+                else {
+                    generation.cancelled().await;
+                    return;
+                };
+                epoch = epoch.wrapping_add(1);
+                inner.connection_epoch.store(epoch, Ordering::Release);
+                client = reconnected;
+                continue;
+            }
+            Ok(Err(_)) | Err(_) => {
+                generation.cancelled().await;
+                return;
+            }
+        };
+        let Ok(resumed) = decode_thread_read_response(response) else {
+            generation.cancelled().await;
+            return;
+        };
+        if resumed.thread.id.as_deref() != Some(&root) {
+            generation.cancelled().await;
+            return;
+        }
+        break resumed;
+    };
+
+    if !inner
+        .publisher
+        .publish_correlated(
+            "codex",
+            Some(&inner.provider_instance_id),
+            ActivityCapabilities::structured_full(false),
+        )
+        .await
+        .unwrap_or(false)
+    {
+        return;
+    }
+
+    let mut tracker = CodexActivityTracker::new(Some(&root));
+    tracker.seed_actor(&root);
+    let native_event_key_prefix = format!("codex:terminal-observation:{epoch}");
+    let started_at_ms = current_unix_millis();
+    let mut root_output = tracker.handle_notification(
+        "thread/status/changed",
+        &json!({
+            "threadId": root,
+            "status": {"type": "active", "activeFlags": []},
+        }),
+        started_at_ms,
+        0,
+    );
+    let recovered = tracker.reconcile_thread_history(&resumed.thread);
+    root_output.mutations.extend(recovered.mutations);
+    root_output.request_reconciliation |= recovered.request_reconciliation;
+    apply_activity_output(
+        inner,
+        &format!("{native_event_key_prefix}:root"),
+        root_output,
+    )
+    .await;
+    reconcile_codex_terminal(
+        inner,
+        &native_event_key_prefix,
+        &mut *client,
+        &mut tracker,
+        &root,
+        0,
+    )
+    .await;
+
+    let initial_state = *activity.borrow_and_update();
+    let mut live_state = initial_state.enabled.then_some(initial_state);
+    inner
+        .activity
+        .mark_observed(TerminalAgentActivityObservation {
+            state: initial_state,
+            epoch,
+            kind: if initial_state.enabled {
+                TerminalAgentActivityObservationKind::Live
+            } else {
+                TerminalAgentActivityObservationKind::Dormant
+            },
+        });
+    let mut receive_sequence = 1_u128;
+    if initial_state.enabled {
+        publish_codex_live_scope(inner, epoch, receive_sequence).await;
+        receive_sequence = receive_sequence.saturating_add(1);
+    }
+
+    let mut reconciliation_sequence = 1_u128;
+    let mut pending_barrier = None;
+    let mut pending_reconciliation = false;
+    let mut retry_at = None;
+    let mut retry_delay = CODEX_ACTIVITY_RETRY_MIN;
+    let mut recovering = false;
+
+    'owner: loop {
+        if recovering {
+            let recovery_deadline = tokio::time::Instant::now() + inner.reattach_timeout;
+            let recovery =
+                reconnect_attached_codex_client(inner, generation, &root, recovery_deadline);
+            tokio::pin!(recovery);
+            let outcome = tokio::select! {
+                biased;
+                _ = generation.cancelled() => CodexObserverWait::Cancelled,
+                changed = activity.changed() => {
+                    CodexObserverWait::ActivityChanged(changed.is_ok())
+                }
+                recovered = &mut recovery => CodexObserverWait::Completed(recovered),
+            };
+            match outcome {
+                CodexObserverWait::Cancelled => break,
+                CodexObserverWait::ActivityChanged(false) => break,
+                CodexObserverWait::ActivityChanged(true) => {
+                    let desired = *activity.borrow_and_update();
+                    inner
+                        .activity
+                        .mark_observed(TerminalAgentActivityObservation {
+                            state: desired,
+                            epoch,
+                            kind: TerminalAgentActivityObservationKind::Unavailable,
+                        });
+                    continue;
+                }
+                CodexObserverWait::Completed(Some(reconnected)) => {
+                    client = reconnected;
+                    tracker = CodexActivityTracker::new(Some(&root));
+                    tracker.seed_actor(&root);
+                    pending_reconciliation = false;
+                    recovering = false;
+                    retry_delay = CODEX_ACTIVITY_RETRY_MIN;
+                    let desired = *activity.borrow_and_update();
+                    if desired.enabled {
+                        pending_barrier = Some(desired);
+                    } else {
+                        inner
+                            .activity
+                            .mark_observed(TerminalAgentActivityObservation {
+                                state: desired,
+                                epoch,
+                                kind: TerminalAgentActivityObservationKind::Dormant,
+                            });
+                    }
+                    continue;
+                }
+                CodexObserverWait::Completed(None) => {
+                    let desired = inner.activity.snapshot();
+                    inner
+                        .activity
+                        .mark_observed(TerminalAgentActivityObservation {
+                            state: desired,
+                            epoch,
+                            kind: TerminalAgentActivityObservationKind::Unavailable,
+                        });
+                    let wake_at = tokio::time::Instant::now() + retry_delay;
+                    retry_delay = retry_delay.saturating_mul(2).min(CODEX_ACTIVITY_RETRY_MAX);
+                    tokio::select! {
+                        biased;
+                        _ = generation.cancelled() => break 'owner,
+                        changed = activity.changed() => {
+                            if changed.is_err() {
+                                break 'owner;
+                            }
+                            let desired = *activity.borrow_and_update();
+                            inner.activity.mark_observed(TerminalAgentActivityObservation {
+                                state: desired,
+                                epoch,
+                                kind: TerminalAgentActivityObservationKind::Unavailable,
+                            });
+                        }
+                        _ = tokio::time::sleep_until(wake_at) => {}
+                    }
+                    continue;
+                }
+            }
+        }
+
+        if let Some(desired) = pending_barrier.take() {
+            let barrier_epoch = epoch;
+            let deadline = tokio::time::Instant::now() + inner.reattach_timeout;
+            let outcome = {
+                let barrier = cross_codex_enable_barrier(&mut *client, generation, deadline);
+                tokio::pin!(barrier);
+                tokio::select! {
+                    biased;
+                    _ = generation.cancelled() => CodexObserverWait::Cancelled,
+                    changed = activity.changed() => {
+                        CodexObserverWait::ActivityChanged(changed.is_ok())
+                    }
+                    crossed = &mut barrier => CodexObserverWait::Completed(crossed),
+                }
+            };
+            match outcome {
+                CodexObserverWait::Cancelled => break,
+                CodexObserverWait::ActivityChanged(false) => break,
+                CodexObserverWait::ActivityChanged(true) => {
+                    client.drain_request_buffered_notifications();
+                    let changed = *activity.borrow_and_update();
+                    live_state = None;
+                    pending_reconciliation = false;
+                    retry_at = None;
+                    if changed.enabled {
+                        pending_barrier = Some(changed);
+                    } else {
+                        inner
+                            .activity
+                            .mark_observed(TerminalAgentActivityObservation {
+                                state: changed,
+                                epoch,
+                                kind: TerminalAgentActivityObservationKind::Dormant,
+                            });
+                    }
+                    continue;
+                }
+                CodexObserverWait::Completed(crossed)
+                    if crossed
+                        && barrier_epoch == inner.connection_epoch.load(Ordering::Acquire)
+                        && inner.activity.snapshot() == desired =>
+                {
+                    tracker = CodexActivityTracker::new(Some(&root));
+                    tracker.seed_actor(&root);
+                    pending_reconciliation = false;
+                    retry_at = None;
+                    retry_delay = CODEX_ACTIVITY_RETRY_MIN;
+                    live_state = Some(desired);
+                    inner
+                        .activity
+                        .mark_observed(TerminalAgentActivityObservation {
+                            state: desired,
+                            epoch: barrier_epoch,
+                            kind: TerminalAgentActivityObservationKind::Live,
+                        });
+                    publish_codex_live_scope(inner, barrier_epoch, receive_sequence).await;
+                    receive_sequence = receive_sequence.saturating_add(1);
+                    continue;
+                }
+                CodexObserverWait::Completed(_) => {
+                    live_state = None;
+                    pending_reconciliation = false;
+                    if barrier_epoch == inner.connection_epoch.load(Ordering::Acquire)
+                        && inner.activity.snapshot() == desired
+                    {
+                        inner
+                            .activity
+                            .mark_observed(TerminalAgentActivityObservation {
+                                state: desired,
+                                epoch: barrier_epoch,
+                                kind: TerminalAgentActivityObservationKind::Unavailable,
+                            });
+                        retry_at = Some(tokio::time::Instant::now() + retry_delay);
+                        retry_delay = retry_delay.saturating_mul(2).min(CODEX_ACTIVITY_RETRY_MAX);
+                    }
+                    continue;
+                }
+            }
+        }
+
+        if pending_reconciliation {
+            let desired = inner.activity.snapshot();
+            if live_state != Some(desired) {
+                pending_reconciliation = false;
+                continue;
+            }
+            let outcome = {
+                let native_event_key_prefix =
+                    format!("codex:terminal-observation:{epoch}");
+                let reconciliation = reconcile_codex_terminal(
+                    inner,
+                    &native_event_key_prefix,
+                    &mut *client,
+                    &mut tracker,
+                    &root,
+                    reconciliation_sequence,
+                );
+                tokio::pin!(reconciliation);
+                tokio::select! {
+                    biased;
+                    _ = generation.cancelled() => CodexObserverWait::Cancelled,
+                    changed = activity.changed() => {
+                        CodexObserverWait::ActivityChanged(changed.is_ok())
+                    }
+                    _ = &mut reconciliation => CodexObserverWait::Completed(()),
+                }
+            };
+            pending_reconciliation = false;
+            match outcome {
+                CodexObserverWait::Cancelled => break,
+                CodexObserverWait::ActivityChanged(false) => break,
+                CodexObserverWait::ActivityChanged(true) => {
+                    client.drain_request_buffered_notifications();
+                    let changed = *activity.borrow_and_update();
+                    retry_at = None;
+                    if !changed.enabled {
+                        live_state = None;
+                        pending_barrier = None;
+                        inner.activity.mark_observed(TerminalAgentActivityObservation {
+                            state: changed,
+                            epoch,
+                            kind: TerminalAgentActivityObservationKind::Dormant,
+                        });
+                    } else if live_state == Some(changed) {
+                        inner.activity.mark_observed(TerminalAgentActivityObservation {
+                            state: changed,
+                            epoch,
+                            kind: TerminalAgentActivityObservationKind::Live,
+                        });
+                    } else {
+                        live_state = None;
+                        pending_barrier = Some(changed);
+                    }
+                }
+                CodexObserverWait::Completed(()) => {
+                    reconciliation_sequence = reconciliation_sequence.saturating_add(1);
+                }
+            }
+            continue;
+        }
+
+        tokio::select! {
+            biased;
+            _ = generation.cancelled() => break,
+            changed = activity.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+                let desired = *activity.borrow_and_update();
+                retry_at = None;
+                if !desired.enabled {
+                    live_state = None;
+                    pending_barrier = None;
+                    pending_reconciliation = false;
+                    inner.activity.mark_observed(TerminalAgentActivityObservation {
+                        state: desired,
+                        epoch,
+                        kind: TerminalAgentActivityObservationKind::Dormant,
+                    });
+                } else if live_state == Some(desired) {
+                    inner.activity.mark_observed(TerminalAgentActivityObservation {
+                        state: desired,
+                        epoch,
+                        kind: TerminalAgentActivityObservationKind::Live,
+                    });
+                } else {
+                    pending_barrier = Some(desired);
+                }
+            }
+            _ = async {
+                if let Some(wake_at) = retry_at {
+                    tokio::time::sleep_until(wake_at).await;
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            } => {
+                retry_at = None;
+                let desired = inner.activity.snapshot();
+                if desired.enabled && live_state != Some(desired) {
+                    pending_barrier = Some(desired);
+                }
+            }
+            envelope = client.next() => {
+                let envelope = match envelope {
+                    Ok(Some(envelope)) => envelope,
+                    Ok(None) | Err(_) => {
+                        epoch = epoch.wrapping_add(1);
+                        inner.connection_epoch.store(epoch, Ordering::Release);
+                        live_state = None;
+                        pending_barrier = None;
+                        pending_reconciliation = false;
+                        retry_at = None;
+                        recovering = true;
+                        let desired = inner.activity.snapshot();
+                        inner.activity.mark_observed(TerminalAgentActivityObservation {
+                            state: desired,
+                            epoch,
+                            kind: TerminalAgentActivityObservationKind::Unavailable,
+                        });
+                        continue;
+                    }
+                };
+                let desired = inner.activity.snapshot();
+                if live_state != Some(desired)
+                    || epoch != inner.connection_epoch.load(Ordering::Acquire)
+                {
+                    continue;
+                }
+                let Some(admission) = inner.activity.admit() else {
+                    continue;
+                };
+                let output = tracker.handle_envelope(&envelope, receive_sequence);
+                let reconcile = output.request_reconciliation;
+                if !inner.activity.admission_is_current(&admission)
+                    || epoch != inner.connection_epoch.load(Ordering::Acquire)
+                {
+                    continue;
+                }
+                apply_activity_output(
+                    inner,
+                    &format!(
+                        "codex:terminal-observation:{epoch}:live:{receive_sequence}"
+                    ),
+                    output,
+                )
+                .await;
+                receive_sequence = receive_sequence.saturating_add(1);
+                pending_reconciliation |= reconcile
+                    && inner.activity.admission_is_current(&admission)
+                    && epoch == inner.connection_epoch.load(Ordering::Acquire);
+            }
+        }
+    }
+}
+
+async fn publish_codex_live_scope(inner: &CodexObserverInner, epoch: u64, receive_sequence: u128) {
+    let mut enabled = CodexActivityOutput::default();
+    enabled.mutations.push(ProviderActivityMutation::SetScope {
+        capabilities: ActivityCapabilities::structured_full(true),
+        observation_state: ActivityObservationState::Live,
+    });
+    apply_activity_output(
+        inner,
+        &format!("codex:terminal-observation:{epoch}:live:{receive_sequence}"),
+        enabled,
+    )
+    .await;
+}
+
+async fn cross_codex_enable_barrier(
+    client: &mut dyn CodexRemoteClient,
+    generation: &TerminalObserverGeneration,
+    deadline: tokio::time::Instant,
+) -> bool {
+    let response = tokio::select! {
+        biased;
+        _ = generation.cancelled() => return false,
+        response = tokio::time::timeout_at(
+            deadline,
+            client.request(
+                CODEX_ACTIVITY_ENABLE_BARRIER_METHOD,
+                json!({"refreshToken": false}),
+            ),
+        ) => response,
+    };
+    client.drain_request_buffered_notifications();
+    matches!(response, Ok(Ok(_)))
+}
+
+async fn reconnect_attached_codex_client(
+    inner: &CodexObserverInner,
+    generation: &TerminalObserverGeneration,
+    root: &str,
+    deadline: tokio::time::Instant,
+) -> Option<Box<dyn CodexRemoteClient>> {
+    let mut client = reconnect_initialized_codex_client(inner, generation, deadline).await?;
+    let response = tokio::select! {
+        biased;
+        _ = generation.cancelled() => return None,
+        response = tokio::time::timeout_at(
+            deadline,
+            client.request("thread/resume", json!({"threadId": root})),
+        ) => response,
+    };
+    matches!(response, Ok(Ok(_))).then_some(client)
+}
+
+async fn reconnect_codex_root_discovery_client(
+    inner: &CodexObserverInner,
+    generation: &TerminalObserverGeneration,
+    activity: &mut tokio::sync::watch::Receiver<TerminalAgentActivityState>,
+    epoch: &mut u64,
+) -> Option<Box<dyn CodexRemoteClient>> {
+    *epoch = epoch.wrapping_add(1);
+    inner.connection_epoch.store(*epoch, Ordering::Release);
+    let desired = inner.activity.snapshot();
+    inner
+        .activity
+        .mark_observed(TerminalAgentActivityObservation {
+            state: desired,
+            epoch: *epoch,
+            kind: TerminalAgentActivityObservationKind::Unavailable,
+        });
+    let reconnect = reconnect_initialized_codex_client(
+        inner,
+        generation,
+        tokio::time::Instant::now() + inner.reattach_timeout,
+    );
+    tokio::pin!(reconnect);
+    loop {
+        tokio::select! {
+            biased;
+            _ = generation.cancelled() => return None,
+            changed = activity.changed() => {
+                if changed.is_err() {
+                    return None;
+                }
+                let desired = *activity.borrow_and_update();
+                inner.activity.mark_observed(TerminalAgentActivityObservation {
+                    state: desired,
+                    epoch: *epoch,
+                    kind: TerminalAgentActivityObservationKind::Unavailable,
+                });
+            }
+            reconnected = &mut reconnect => return reconnected,
+        }
+    }
+}
+
+async fn park_codex_observer_unavailable(
+    inner: &CodexObserverInner,
+    generation: &TerminalObserverGeneration,
+    activity: &mut tokio::sync::watch::Receiver<TerminalAgentActivityState>,
+    epoch: u64,
+) {
+    loop {
+        tokio::select! {
+            biased;
+            _ = generation.cancelled() => return,
+            changed = activity.changed() => {
+                if changed.is_err() {
+                    return;
+                }
+                let desired = *activity.borrow_and_update();
+                inner.activity.mark_observed(TerminalAgentActivityObservation {
+                    state: desired,
+                    epoch,
+                    kind: TerminalAgentActivityObservationKind::Unavailable,
+                });
+            }
+        }
+    }
+}
+
+async fn connect_initialized_codex_client(
+    inner: &CodexObserverInner,
+) -> Result<Box<dyn CodexRemoteClient>, String> {
+    let mut client = inner.remote.connect(&inner.endpoint).await?;
+    client
+        .request(
+            "initialize",
+            build_initialize_params(env!("CARGO_PKG_VERSION")),
+        )
+        .await?;
+    client.notify("initialized").await?;
+    Ok(client)
+}
+
+async fn reconnect_initialized_codex_client(
+    inner: &CodexObserverInner,
+    generation: &TerminalObserverGeneration,
+    deadline: tokio::time::Instant,
+) -> Option<Box<dyn CodexRemoteClient>> {
+    loop {
+        let connected = tokio::select! {
+            biased;
+            _ = generation.cancelled() => return None,
+            connected = tokio::time::timeout_at(deadline, connect_initialized_codex_client(inner)) => connected,
+        };
+        if let Ok(Ok(client)) = connected {
+            return Some(client);
+        }
+        let retry_at = tokio::time::Instant::now() + CODEX_ROOT_DISCOVERY_INTERVAL;
+        if retry_at >= deadline {
+            return None;
+        }
+        tokio::select! {
+            biased;
+            _ = generation.cancelled() => return None,
+            _ = tokio::time::sleep_until(retry_at) => {}
+        }
+    }
+}
+
+fn tui_root_thread(
+    envelope: &Value,
+    generation_started_at: i64,
+    expected_cwd: &Path,
+) -> Option<String> {
+    let method = envelope.get("method").and_then(Value::as_str)?;
+    if method != "thread/started" {
+        return None;
+    }
+    tui_root_candidate(
+        envelope.pointer("/params/thread")?,
+        generation_started_at,
+        expected_cwd,
+    )
+}
+
+fn tui_root_candidate(
+    thread: &Value,
+    generation_started_at: i64,
+    expected_cwd: &Path,
+) -> Option<String> {
+    let thread = thread.as_object()?;
+    let created_at = thread.get("createdAt")?.as_i64()?;
+    if created_at < generation_started_at {
+        return None;
+    }
+    let thread_id = thread
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|thread_id| !thread_id.trim().is_empty())?;
+    if thread.get("sessionId").and_then(Value::as_str) != Some(thread_id)
+        || !thread.get("forkedFromId").is_some_and(Value::is_null)
+        || !thread.get("parentThreadId").is_some_and(Value::is_null)
+        || !matches!(
+            thread.get("source").and_then(Value::as_str),
+            Some("cli" | "vscode")
+        )
+        || !thread
+            .get("threadSource")
+            .is_some_and(|source| source.is_null() || source.as_str() == Some("user"))
+    {
+        return None;
+    }
+    let cwd = Path::new(thread.get("cwd")?.as_str()?);
+    let cwd = std::fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
+    (cwd == expected_cwd).then(|| thread_id.to_owned())
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum CodexRootDiscoveryState {
+    Ready,
+    WaitingForResponse,
+    Disabled,
+}
+
+enum CodexRootDiscoveryOutcome {
+    Found(String),
+    Retry,
+    WaitForResponse,
+    Stop,
+}
+
+fn is_codex_json_rpc_response(value: &Value) -> bool {
+    value.get("id").is_some()
+        && value.get("method").is_none()
+        && (value.get("result").is_some() || value.get("error").is_some())
+}
+
+fn is_codex_resume_materialization_pending(error: &str) -> bool {
+    let Some(payload) = error.strip_prefix(CODEX_REMOTE_RPC_ERROR_PREFIX) else {
+        return false;
+    };
+    let Ok(error) = serde_json::from_str::<Value>(payload) else {
+        return false;
+    };
+    if error.get("code").and_then(Value::as_i64) != Some(-32600) {
+        return false;
+    }
+    let Some(message) = error.get("message").and_then(Value::as_str) else {
+        return false;
+    };
+    is_recoverable_thread_resume_error(message)
+}
+
+fn is_codex_resume_transport_error(error: &str) -> bool {
+    !error.starts_with(CODEX_REMOTE_RPC_ERROR_PREFIX)
+}
+
+async fn discover_codex_tui_root(
+    client: &mut dyn CodexRemoteClient,
+    generation_started_at: i64,
+    expected_cwd: &Path,
+) -> CodexRootDiscoveryOutcome {
+    let response = match tokio::time::timeout(
+        CODEX_ROOT_DISCOVERY_REQUEST_TIMEOUT,
+        client.request(
+            "thread/list",
+            json!({
+                "limit": CODEX_ROOT_DISCOVERY_LIMIT,
+                "sortKey": "created_at",
+                "sortDirection": "desc",
+                "sourceKinds": ["cli", "vscode"],
+                "cwd": expected_cwd.to_string_lossy(),
+                "useStateDbOnly": true,
+            }),
+        ),
+    )
+    .await
+    {
+        Ok(Ok(response)) => response,
+        Ok(Err(error)) if error.starts_with("Codex remote request failed:") => {
+            return CodexRootDiscoveryOutcome::Retry;
+        }
+        Ok(Err(_)) => return CodexRootDiscoveryOutcome::Stop,
+        Err(_) => return CodexRootDiscoveryOutcome::WaitForResponse,
+    };
+    let Ok(decoded) = decode_thread_list_response(response.clone()) else {
+        return CodexRootDiscoveryOutcome::Stop;
+    };
+    if decoded.next_cursor.is_some() {
+        return CodexRootDiscoveryOutcome::Retry;
+    }
+    let Some(candidates) = response.get("data").and_then(Value::as_array) else {
+        return CodexRootDiscoveryOutcome::Stop;
+    };
+    let mut matching = candidates
+        .iter()
+        .take(CODEX_ROOT_DISCOVERY_LIMIT)
+        .filter_map(|thread| tui_root_candidate(thread, generation_started_at, expected_cwd));
+    let Some(root) = matching.next() else {
+        return CodexRootDiscoveryOutcome::Retry;
+    };
+    if matching.next().is_some() {
+        CodexRootDiscoveryOutcome::Retry
+    } else {
+        CodexRootDiscoveryOutcome::Found(root)
+    }
+}
+
+async fn apply_activity_output(
+    inner: &CodexObserverInner,
+    native_event_key: &str,
+    output: CodexActivityOutput,
+) {
+    if output.mutations.is_empty() {
+        return;
+    }
+    let _ = inner
+        .publisher
+        .apply(native_event_key, output.mutations, &current_timestamp())
+        .await;
+}
+
+async fn reconcile_codex_terminal(
+    inner: &CodexObserverInner,
+    native_event_key_prefix: &str,
+    client: &mut dyn CodexRemoteClient,
+    tracker: &mut CodexActivityTracker,
+    root: &str,
+    reconciliation_sequence: u128,
+) {
+    let _ = tokio::time::timeout(
+        CODEX_RECONCILIATION_PASS_TIMEOUT,
+        reconcile_codex_terminal_inner(
+            inner,
+            native_event_key_prefix,
+            client,
+            tracker,
+            root,
+            reconciliation_sequence,
+        ),
+    )
+    .await;
+}
+
+async fn bounded_codex_reconciliation_request(
+    client: &mut dyn CodexRemoteClient,
+    method: &str,
+    params: Value,
+) -> Result<Value, ()> {
+    tokio::time::timeout(
+        CODEX_RECONCILIATION_REQUEST_TIMEOUT,
+        client.request(method, params),
+    )
+    .await
+    .map_err(|_| ())?
+    .map_err(|_| ())
+}
+
+async fn reconcile_codex_terminal_inner(
+    inner: &CodexObserverInner,
+    native_event_key_prefix: &str,
+    client: &mut dyn CodexRemoteClient,
+    tracker: &mut CodexActivityTracker,
+    root: &str,
+    reconciliation_sequence: u128,
+) -> Result<(), ()> {
+    // Background processes are an independent snapshot authority. Request
+    // them first so a stalled descendant endpoint cannot starve their update.
+    let background = bounded_codex_reconciliation_request(
+        client,
+        "thread/backgroundTerminals/list",
+        serde_json::to_value(ThreadBackgroundTerminalsListParams {
+            thread_id: root,
+            limit: u16::try_from(CODEX_RECONCILIATION_BACKGROUND_LIMIT)
+                .expect("Codex background reconciliation limit fits u16"),
+            cursor: None,
+        })
+        .expect("Codex terminal background-terminal params serialize"),
+    )
+    .await
+    .and_then(|value| decode_background_terminals_list_response(value).map_err(|_| ()));
+    let background = background.ok();
+    if let Some(background) = background {
+        let output = tracker.reconcile_background_terminals(
+            &background.data,
+            &current_timestamp(),
+            BackgroundSnapshotAuthority::Complete,
+        );
+        apply_activity_output(
+            inner,
+            &format!("{native_event_key_prefix}:reconcile:{reconciliation_sequence}:background"),
+            output,
+        )
+        .await;
+    }
+
+    let list = bounded_codex_reconciliation_request(
+        client,
+        "thread/list",
+        serde_json::to_value(ThreadListParams {
+            ancestor_thread_id: root,
+            limit: u16::try_from(CODEX_RECONCILIATION_THREAD_LIMIT)
+                .expect("Codex descendant reconciliation limit fits u16"),
+            cursor: None,
+        })
+        .expect("Codex terminal thread/list params serialize"),
+    )
+    .await
+    .and_then(|value| decode_thread_list_response(value).map_err(|_| ()));
+    let list = list.ok();
+    if let Some(list) = list {
+        let descendants = tracker.reconcile_descendants(&list.data);
+        apply_activity_output(
+            inner,
+            &format!("{native_event_key_prefix}:reconcile:{reconciliation_sequence}:descendants"),
+            descendants.output,
+        )
+        .await;
+        for thread_id in descendants.threads_to_read {
+            let thread = bounded_codex_reconciliation_request(
+                client,
+                "thread/read",
+                serde_json::to_value(ThreadReadParams {
+                    thread_id: &thread_id,
+                    include_turns: true,
+                })
+                .expect("Codex terminal thread/read params serialize"),
+            )
+            .await
+            .and_then(|value| decode_thread_read_response(value).map_err(|_| ()));
+            let thread = thread
+                .ok()
+                .filter(|thread| thread.thread.id.as_deref() == Some(thread_id.as_str()));
+            if let Some(thread) = thread {
+                let output = tracker.reconcile_thread_history(&thread.thread);
+                apply_activity_output(
+                    inner,
+                    &format!(
+                        "{native_event_key_prefix}:reconcile:{reconciliation_sequence}:thread:{thread_id}"
+                    ),
+                    output,
+                )
+                .await;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn current_unix_millis() -> u64 {
+    u64::try_from(OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000).unwrap_or_default()
+}
+
+fn current_timestamp() -> String {
+    OffsetDateTime::now_utc()
+        .format(&Rfc3339)
+        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
+}
+
+#[derive(Debug)]
+struct SystemCodexCapabilityProbeRunner;
+
+impl CodexCapabilityProbeRunner for SystemCodexCapabilityProbeRunner {
+    fn run(
+        &self,
+        executable: &Path,
+        args: Vec<String>,
+    ) -> Pin<Box<dyn Future<Output = Result<CodexProbeOutput, String>> + Send + '_>> {
+        let executable = executable.to_path_buf();
+        Box::pin(async move {
+            let mut command = tokio::process::Command::new(executable);
+            command
+                .args(args)
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped());
+            let output = run_supervised(
+                SupervisedRunRequest {
+                    command,
+                    stdin: None,
+                    timeout: Duration::from_secs(3),
+                    cleanup_timeout: Duration::from_secs(2),
+                    max_output_bytes: CODEX_PROBE_OUTPUT_LIMIT,
+                    overflow: SupervisedOverflow::Truncate,
+                },
+                &tokio_util::sync::CancellationToken::new(),
+            )
+            .await
+            .map_err(|error| format!("Codex capability probe failed: {error:?}"))?;
+            Ok(CodexProbeOutput {
+                success: output.status.success(),
+                stdout: String::from_utf8_lossy(&output.stdout.bytes).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr.bytes).into_owned(),
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct SystemCodexHelperLauncher;
+
+impl CodexHelperLauncher for SystemCodexHelperLauncher {
+    fn start(&self, launch: CodexHelperLaunch) -> CodexHelperStartFuture<'_> {
+        Box::pin(async move {
+            let supervisor = SYSTEM_CODEX_HELPER_SUPERVISOR
+                .wait_ready()
+                .await
+                .ok_or_else(|| "Codex helper supervisor is unavailable".to_owned())?;
+            let permit = supervisor
+                .reserve()
+                .ok_or_else(|| "Codex helper supervisor is at capacity".to_owned())?;
+            let mut command = tokio::process::Command::new(&launch.executable);
+            configure_background_command(&mut command);
+            command
+                .args(&launch.args)
+                .current_dir(&launch.cwd)
+                .envs(&launch.env)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .kill_on_drop(true);
+            let child = command
+                .spawn()
+                .map_err(|error| format!("failed to start Codex App Server helper: {error}"))?;
+            let (process, ready) = supervisor.supervise(child, launch.socket_path, permit);
+            ready
+                .await
+                .map_err(|_| "Codex helper supervisor stopped before readiness".to_owned())??;
+            Ok(Arc::new(process) as Arc<dyn CodexHelperProcess>)
+        })
+    }
+}
+
+// Helper ownership outlives generation-scoped observer runtimes so teardown
+// cannot abort the kill-and-wait phase before the child is reaped.
+static SYSTEM_CODEX_HELPER_SUPERVISOR: LazyLock<CodexHelperSupervisorInitializer> =
+    LazyLock::new(|| {
+        CodexHelperSupervisorInitializer::start(
+            CODEX_HELPER_SUPERVISOR_CAPACITY,
+            CODEX_HELPER_SUPERVISOR_INIT_TIMEOUT,
+        )
+    });
+
+#[derive(Clone, Debug)]
+struct CodexHelperSupervisor {
+    runtime: tokio::runtime::Handle,
+    slots: Arc<tokio::sync::Semaphore>,
+}
+
+#[derive(Clone, Debug)]
+enum CodexHelperSupervisorState {
+    Initializing,
+    Ready(CodexHelperSupervisor),
+    Failed,
+}
+
+#[derive(Debug)]
+struct CodexHelperSupervisorInitializer {
+    state: tokio::sync::watch::Receiver<CodexHelperSupervisorState>,
+    timeout: Duration,
+    shutdown: tokio_util::sync::CancellationToken,
+}
+
+impl CodexHelperSupervisorInitializer {
+    fn start(capacity: usize, timeout: Duration) -> Self {
+        Self::start_with(capacity, timeout, || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .map_err(|error| error.to_string())
+        })
+    }
+
+    fn start_with<F>(capacity: usize, timeout: Duration, initialize: F) -> Self
+    where
+        F: FnOnce() -> Result<tokio::runtime::Runtime, String> + Send + 'static,
+    {
+        let (sender, receiver) =
+            tokio::sync::watch::channel(CodexHelperSupervisorState::Initializing);
+        let failure_sender = sender.clone();
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let thread_shutdown = shutdown.clone();
+        let spawned = std::thread::Builder::new()
+            .name("codex-helper-supervisor".to_owned())
+            .spawn(move || {
+                let initialized =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(initialize));
+                let runtime = match initialized {
+                    Ok(Ok(runtime)) => runtime,
+                    Ok(Err(_)) | Err(_) => {
+                        let _ = sender.send(CodexHelperSupervisorState::Failed);
+                        return;
+                    }
+                };
+                let supervisor = CodexHelperSupervisor {
+                    runtime: runtime.handle().clone(),
+                    slots: Arc::new(tokio::sync::Semaphore::new(capacity)),
+                };
+                if sender
+                    .send(CodexHelperSupervisorState::Ready(supervisor))
+                    .is_err()
+                {
+                    return;
+                }
+                runtime.block_on(thread_shutdown.cancelled());
+            });
+        if spawned.is_err() {
+            let _ = failure_sender.send(CodexHelperSupervisorState::Failed);
+        }
+        Self {
+            state: receiver,
+            timeout,
+            shutdown,
+        }
+    }
+
+    async fn wait_ready(&self) -> Option<CodexHelperSupervisor> {
+        let mut state = self.state.clone();
+        tokio::time::timeout(self.timeout, async move {
+            loop {
+                match state.borrow().clone() {
+                    CodexHelperSupervisorState::Initializing => {}
+                    CodexHelperSupervisorState::Ready(supervisor) => return Some(supervisor),
+                    CodexHelperSupervisorState::Failed => return None,
+                }
+                if state.changed().await.is_err() {
+                    return None;
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+}
+
+impl Drop for CodexHelperSupervisorInitializer {
+    fn drop(&mut self) {
+        self.shutdown.cancel();
+    }
+}
+
+impl CodexHelperSupervisor {
+    #[cfg(test)]
+    fn with_runtime(runtime: tokio::runtime::Handle, capacity: usize) -> Self {
+        Self {
+            runtime,
+            slots: Arc::new(tokio::sync::Semaphore::new(capacity)),
+        }
+    }
+
+    fn reserve(&self) -> Option<tokio::sync::OwnedSemaphorePermit> {
+        self.slots.clone().try_acquire_owned().ok()
+    }
+
+    fn supervise(
+        &self,
+        mut child: Child,
+        socket_path: PathBuf,
+        permit: tokio::sync::OwnedSemaphorePermit,
+    ) -> (
+        SystemCodexHelperProcess,
+        tokio::sync::oneshot::Receiver<Result<(), String>>,
+    ) {
+        let termination = tokio_util::sync::CancellationToken::new();
+        let child_termination = termination.clone();
+        let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
+        self.runtime.spawn(async move {
+            let _permit = permit;
+            let ready_deadline = tokio::time::Instant::now() + CODEX_HELPER_READY_TIMEOUT;
+            let readiness = loop {
+                if socket_path.exists() {
+                    break Ok(());
+                }
+                match child.try_wait() {
+                    Ok(Some(_)) => {
+                        break Err("Codex App Server helper exited before readiness".to_owned());
+                    }
+                    Err(error) => {
+                        break Err(format!(
+                            "failed to inspect Codex App Server helper: {error}"
+                        ));
+                    }
+                    Ok(None) => {}
+                }
+                if tokio::time::Instant::now() >= ready_deadline {
+                    break Err("Codex App Server helper readiness timed out".to_owned());
+                }
+                tokio::select! {
+                    biased;
+                    () = child_termination.cancelled() => {
+                        terminate_and_reap_codex_helper(child).await;
+                        return;
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(10)) => {}
+                }
+            };
+            if let Err(error) = readiness {
+                let _ = ready_sender.send(Err(error));
+                terminate_and_reap_codex_helper(child).await;
+                return;
+            }
+            if ready_sender.send(Ok(())).is_err() {
+                terminate_and_reap_codex_helper(child).await;
+                return;
+            }
+            tokio::select! {
+                biased;
+                () = child_termination.cancelled() => {
+                    terminate_and_reap_codex_helper(child).await;
+                }
+                result = child.wait() => {
+                    if let Err(error) = result {
+                        tracing::warn!(error = %error, "failed to reap Codex helper after exit");
+                    }
+                }
+            }
+        });
+        (SystemCodexHelperProcess { termination }, ready_receiver)
+    }
+}
+
+async fn terminate_and_reap_codex_helper(mut child: Child) {
+    if let Err(error) = child.start_kill() {
+        tracing::warn!(error = %error, "failed to terminate owned Codex helper");
+    }
+    if tokio::time::timeout(CODEX_HELPER_REAP_TIMEOUT, child.wait())
+        .await
+        .is_err()
+    {
+        tracing::warn!(
+            timeout_ms = CODEX_HELPER_REAP_TIMEOUT.as_millis(),
+            "Codex helper reap exceeded its bounded cleanup window; retaining ownership"
+        );
+        if let Err(error) = child.wait().await {
+            tracing::warn!(error = %error, "failed to reap owned Codex helper");
+        }
+    }
+}
+
+struct SystemCodexHelperProcess {
+    termination: tokio_util::sync::CancellationToken,
+}
+
+impl fmt::Debug for SystemCodexHelperProcess {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("SystemCodexHelperProcess")
+            .finish_non_exhaustive()
+    }
+}
+
+impl CodexHelperProcess for SystemCodexHelperProcess {
+    fn terminate(&self) {
+        self.termination.cancel();
+    }
+}
+
+impl Drop for SystemCodexHelperProcess {
+    fn drop(&mut self) {
+        self.termination.cancel();
+    }
+}
+
+#[derive(Debug)]
+struct SystemCodexRemoteClientFactory;
+
+impl CodexRemoteClientFactory for SystemCodexRemoteClientFactory {
+    fn connect(&self, endpoint: &str) -> CodexRemoteConnectFuture<'_> {
+        let endpoint = endpoint.to_owned();
+        Box::pin(async move {
+            #[cfg(unix)]
+            {
+                let Some(path) = endpoint.strip_prefix("unix://") else {
+                    return Err("unsupported Codex remote endpoint".to_owned());
+                };
+                let stream = tokio::net::UnixStream::connect(path)
+                    .await
+                    .map_err(|error| format!("failed to connect to Codex App Server: {error}"))?;
+                let config = tokio_tungstenite::tungstenite::protocol::WebSocketConfig::default()
+                    .max_message_size(Some(CODEX_REMOTE_MESSAGE_MAX_BYTES))
+                    .max_frame_size(Some(CODEX_REMOTE_MESSAGE_MAX_BYTES));
+                let (socket, _) = tokio_tungstenite::client_async_with_config(
+                    "ws://localhost/rpc",
+                    stream,
+                    Some(config),
+                )
+                .await
+                .map_err(|error| format!("Codex App Server handshake failed: {error}"))?;
+                Ok(Box::new(SystemCodexRemoteClient {
+                    socket,
+                    next_request_id: 1,
+                    pending: VecDeque::new(),
+                }) as Box<dyn CodexRemoteClient>)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = endpoint;
+                Err("Codex terminal remote transport is unsupported".to_owned())
+            }
+        })
+    }
+}
+
+#[cfg(unix)]
+struct SystemCodexRemoteClient {
+    socket: tokio_tungstenite::WebSocketStream<tokio::net::UnixStream>,
+    next_request_id: u64,
+    pending: VecDeque<Value>,
+}
+
+#[cfg(unix)]
+impl SystemCodexRemoteClient {
+    async fn read_value(&mut self) -> Result<Option<Value>, String> {
+        while let Some(message) = self.socket.next().await {
+            let message = message.map_err(|error| format!("Codex remote read failed: {error}"))?;
+            let value = match message {
+                tokio_tungstenite::tungstenite::Message::Text(text) => {
+                    if text.len() > CODEX_REMOTE_MESSAGE_MAX_BYTES {
+                        return Err("Codex remote message exceeded its fixed bound".to_owned());
+                    }
+                    serde_json::from_slice(text.as_bytes())
+                }
+                tokio_tungstenite::tungstenite::Message::Binary(bytes) => {
+                    if bytes.len() > CODEX_REMOTE_MESSAGE_MAX_BYTES {
+                        return Err("Codex remote message exceeded its fixed bound".to_owned());
+                    }
+                    serde_json::from_slice(bytes.as_ref())
+                }
+                tokio_tungstenite::tungstenite::Message::Close(_) => return Ok(None),
+                tokio_tungstenite::tungstenite::Message::Ping(_)
+                | tokio_tungstenite::tungstenite::Message::Pong(_)
+                | tokio_tungstenite::tungstenite::Message::Frame(_) => continue,
+            }
+            .map_err(|error| format!("Codex remote JSON was invalid: {error}"))?;
+            return Ok(Some(value));
+        }
+        Ok(None)
+    }
+}
+
+#[cfg(unix)]
+impl CodexRemoteClient for SystemCodexRemoteClient {
+    fn request(
+        &mut self,
+        method: &str,
+        params: Value,
+    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
+        let method = method.to_owned();
+        Box::pin(async move {
+            let id = self.next_request_id;
+            self.next_request_id = self
+                .next_request_id
+                .checked_add(1)
+                .ok_or_else(|| "Codex remote request id space was exhausted".to_owned())?;
+            self.socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"id": id, "method": method, "params": params})
+                        .to_string()
+                        .into(),
+                ))
+                .await
+                .map_err(|error| format!("Codex remote write failed: {error}"))?;
+            loop {
+                let value = self
+                    .read_value()
+                    .await?
+                    .ok_or_else(|| "Codex remote closed before response".to_owned())?;
+                if value.get("id").and_then(Value::as_u64) == Some(id) {
+                    if let Some(error) = value.get("error") {
+                        return Err(format!("Codex remote request failed: {error}"));
+                    }
+                    return Ok(value.get("result").cloned().unwrap_or(Value::Null));
+                }
+                // A timed-out request may complete after a later request has
+                // started. Its response is stale, not a future notification.
+                if value.get("id").is_some() {
+                    continue;
+                }
+                if self.pending.len() == CODEX_REMOTE_PENDING_NOTIFICATION_LIMIT {
+                    self.pending.pop_front();
+                }
+                self.pending.push_back(value);
+            }
+        })
+    }
+
+    fn notify(
+        &mut self,
+        method: &str,
+    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        let method = method.to_owned();
+        Box::pin(async move {
+            self.socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({"method": method}).to_string().into(),
+                ))
+                .await
+                .map_err(|error| format!("Codex remote write failed: {error}"))
+        })
+    }
+
+    fn drain_request_buffered_notifications(&mut self) -> Vec<Value> {
+        self.pending.drain(..).collect()
+    }
+
+    fn next(&mut self) -> Pin<Box<dyn Future<Output = Result<Option<Value>, String>> + Send + '_>> {
+        Box::pin(async move {
+            if let Some(value) = self.pending.pop_front() {
+                return Ok(Some(value));
+            }
+            self.read_value().await
+        })
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use std::os::unix::fs::PermissionsExt;
+
+    use super::*;
+
+    static SYSTEM_PROCESS_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn executable_script(root: &Path, name: &str, body: &str) -> PathBuf {
+        let path = root.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("probe script");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
+            .expect("probe script permissions");
+        path
+    }
+
+    #[test]
+    fn bounded_probe_text_includes_separators_within_the_limit() {
+        let stdout = "x".repeat(CODEX_PROBE_OUTPUT_LIMIT);
+
+        let output = bounded_probe_text(&stdout, "stderr");
+
+        assert_eq!(output.len(), CODEX_PROBE_OUTPUT_LIMIT);
+    }
+
+    #[tokio::test]
+    async fn system_probe_streams_large_output_into_fixed_bounds() {
+        let _process_guard = SYSTEM_PROCESS_TEST_LOCK.lock().await;
+        let root = tempfile::tempdir().expect("probe directory");
+        let executable = executable_script(
+            root.path(),
+            "large-probe",
+            "yes x | head -c 262144\nyes y | head -c 262144 >&2",
+        );
+
+        let output = SystemCodexCapabilityProbeRunner
+            .run(&executable, Vec::new())
+            .await
+            .expect("large probe");
+
+        assert!(output.success);
+        assert!(
+            output.stdout.len() <= CODEX_PROBE_OUTPUT_LIMIT,
+            "stdout allocation exceeded the probe bound"
+        );
+        assert!(
+            output.stderr.len() <= CODEX_PROBE_OUTPUT_LIMIT,
+            "stderr allocation exceeded the probe bound"
+        );
+    }
+
+    #[tokio::test]
+    async fn system_probe_timeout_terminates_and_reaps_the_owned_process() {
+        let _process_guard = SYSTEM_PROCESS_TEST_LOCK.lock().await;
+        let root = tempfile::tempdir().expect("probe directory");
+        let pid_path = root.path().join("probe.pid");
+        let executable = executable_script(
+            root.path(),
+            "hung-probe",
+            "printf '%s' \"$$\" > \"$1\"\nwhile :; do sleep 1; done",
+        );
+
+        let started = std::time::Instant::now();
+        let result = SystemCodexCapabilityProbeRunner
+            .run(&executable, vec![pid_path.to_string_lossy().into_owned()])
+            .await;
+
+        assert!(result.is_err(), "hung probe must fail closed");
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "hung probe exceeded its bounded timeout and cleanup window"
+        );
+        let pid = std::fs::read_to_string(&pid_path)
+            .expect("probe pid")
+            .parse::<i32>()
+            .expect("numeric probe pid");
+        assert!(
+            !process_exists(pid),
+            "timed-out probe process was not terminated and reaped"
+        );
+    }
+
+    #[tokio::test]
+    async fn system_helper_termination_waits_for_and_reaps_the_owned_child() {
+        let _process_guard = SYSTEM_PROCESS_TEST_LOCK.lock().await;
+        let root = tempfile::tempdir().expect("helper directory");
+        let pid_path = root.path().join("helper.pid");
+        let socket_path = root.path().join("helper.sock");
+        let executable = executable_script(
+            root.path(),
+            "helper",
+            "printf '%s' \"$$\" > \"$BIBCODE_HELPER_PID\"\nsocket=${3#unix://}\n: > \"$socket\"\nwhile :; do sleep 1; done",
+        );
+        let endpoint = format!("unix://{}", socket_path.to_string_lossy());
+        let helper = SystemCodexHelperLauncher
+            .start(CodexHelperLaunch {
+                executable: executable.to_string_lossy().into_owned(),
+                args: vec![
+                    "app-server".to_owned(),
+                    "--listen".to_owned(),
+                    endpoint.clone(),
+                ],
+                cwd: root.path().to_path_buf(),
+                env: BTreeMap::from([(
+                    "BIBCODE_HELPER_PID".to_owned(),
+                    pid_path.to_string_lossy().into_owned(),
+                )]),
+                endpoint,
+                socket_path,
+            })
+            .await
+            .expect("real helper launch");
+        let pid = std::fs::read_to_string(&pid_path)
+            .expect("helper pid")
+            .parse::<i32>()
+            .expect("numeric helper pid");
+
+        helper.terminate();
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while process_exists(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "helper termination did not complete its bounded kill-and-wait lifecycle"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        drop(helper);
+    }
+
+    #[tokio::test]
+    async fn cancelling_helper_start_before_readiness_still_reaps_the_child() {
+        let _process_guard = SYSTEM_PROCESS_TEST_LOCK.lock().await;
+        let root = tempfile::tempdir().expect("helper directory");
+        let pid_path = root.path().join("helper.pid");
+        let socket_path = root.path().join("never-created.sock");
+        let executable = executable_script(
+            root.path(),
+            "unready-helper",
+            "printf '%s' \"$$\" > \"$BIBCODE_HELPER_PID\"\nwhile :; do sleep 1; done",
+        );
+        let endpoint = format!("unix://{}", socket_path.to_string_lossy());
+        let launcher = SystemCodexHelperLauncher;
+
+        let mut start = launcher.start(CodexHelperLaunch {
+            executable: executable.to_string_lossy().into_owned(),
+            args: vec![
+                "app-server".to_owned(),
+                "--listen".to_owned(),
+                endpoint.clone(),
+            ],
+            cwd: root.path().to_path_buf(),
+            env: BTreeMap::from([(
+                "BIBCODE_HELPER_PID".to_owned(),
+                pid_path.to_string_lossy().into_owned(),
+            )]),
+            endpoint,
+            socket_path,
+        });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                tokio::select! {
+                    result = &mut start => {
+                        panic!("unready helper completed unexpectedly: {result:?}");
+                    }
+                    () = tokio::time::sleep(Duration::from_millis(10)) => {
+                        if pid_path.exists() {
+                            break;
+                        }
+                    }
+                }
+            }
+        })
+        .await
+        .expect("helper process started before cancellation");
+        drop(start);
+        let pid = std::fs::read_to_string(&pid_path)
+            .expect("helper pid")
+            .parse::<i32>()
+            .expect("numeric helper pid");
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while process_exists(pid) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancelled helper start did not retain ownership through reap"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn helper_supervisor_refuses_saturation_before_process_admission() {
+        let supervisor = CodexHelperSupervisor::with_runtime(tokio::runtime::Handle::current(), 1);
+        let permit = supervisor.reserve().expect("first helper slot");
+
+        assert!(
+            supervisor.reserve().is_none(),
+            "a saturated helper supervisor must refuse admission before spawning a child"
+        );
+
+        drop(permit);
+        assert!(
+            supervisor.reserve().is_some(),
+            "releasing the owned helper slot must restore bounded capacity"
+        );
+    }
+
+    #[tokio::test]
+    async fn helper_supervisor_initialization_is_bounded_and_late_failure_exits() {
+        let (exited_sender, exited_receiver) = std::sync::mpsc::sync_channel(1);
+        let initializer =
+            CodexHelperSupervisorInitializer::start_with(1, Duration::from_millis(50), move || {
+                std::thread::sleep(Duration::from_millis(150));
+                let _ = exited_sender.send(());
+                Err("delayed initialization failure".to_owned())
+            });
+        let started = std::time::Instant::now();
+
+        assert!(
+            initializer.wait_ready().await.is_none(),
+            "late helper initialization must fail open"
+        );
+        assert!(
+            started.elapsed() < CODEX_PREPARATION_BUDGET,
+            "helper initialization blocked the fixed terminal preparation budget"
+        );
+        assert!(
+            exited_receiver
+                .recv_timeout(Duration::from_millis(500))
+                .is_ok(),
+            "late failed initialization thread did not exit cleanly"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_helper_supervisor_initialization_does_not_poison_future_initializers() {
+        let failed =
+            CodexHelperSupervisorInitializer::start_with(1, Duration::from_millis(50), || {
+                Err("injected initialization failure".to_owned())
+            });
+        assert!(failed.wait_ready().await.is_none());
+
+        let ready =
+            CodexHelperSupervisorInitializer::start_with(1, Duration::from_millis(100), || {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())
+            });
+        assert!(
+            ready.wait_ready().await.is_some(),
+            "one failed initializer must not poison later initialization"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_successful_helper_initialization_is_ready_for_a_later_launch_and_reaped() {
+        struct RuntimeExitSignal(Option<tokio::sync::oneshot::Sender<()>>);
+
+        impl Drop for RuntimeExitSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
+        let (constructed_sender, mut constructed_receiver) = tokio::sync::oneshot::channel();
+        let (task_started_sender, task_started_receiver) = tokio::sync::oneshot::channel();
+        let (runtime_exited_sender, runtime_exited_receiver) = tokio::sync::oneshot::channel();
+        let initializer =
+            CodexHelperSupervisorInitializer::start_with(1, Duration::from_millis(50), move || {
+                release_receiver
+                    .recv()
+                    .map_err(|_| "late initialization release was dropped".to_owned())?;
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())?;
+                runtime.spawn(async move {
+                    let _exit_signal = RuntimeExitSignal(Some(runtime_exited_sender));
+                    let _ = task_started_sender.send(());
+                    std::future::pending::<()>().await;
+                });
+                let _ = constructed_sender.send(());
+                Ok(runtime)
+            });
+        let first_started = std::time::Instant::now();
+
+        assert!(
+            initializer.wait_ready().await.is_none(),
+            "the launch waiting on cold initialization must fail open at its fixed bound"
+        );
+        assert!(
+            first_started.elapsed() < CODEX_PREPARATION_BUDGET,
+            "cold initialization blocked the terminal preparation budget"
+        );
+        assert!(
+            constructed_receiver.try_recv().is_err(),
+            "no helper runtime may be constructed before initialization is released"
+        );
+        release_sender
+            .send(())
+            .expect("release late successful initialization");
+        tokio::time::timeout(Duration::from_millis(500), constructed_receiver)
+            .await
+            .expect("late runtime construction completed")
+            .expect("late runtime construction signal");
+
+        let supervisor = initializer
+            .wait_ready()
+            .await
+            .expect("late successful initialization must serve a later launch");
+        let permit = supervisor
+            .reserve()
+            .expect("no helper capacity is admitted before the supervisor is ready");
+        drop(permit);
+        tokio::time::timeout(Duration::from_millis(500), task_started_receiver)
+            .await
+            .expect("supervisor runtime task started")
+            .expect("supervisor runtime task start signal");
+
+        drop(supervisor);
+        drop(initializer);
+        tokio::time::timeout(Duration::from_millis(500), runtime_exited_receiver)
+            .await
+            .expect("dropping the initializer stopped its runtime thread")
+            .expect("supervisor runtime exit signal");
+    }
+
+    #[tokio::test]
+    async fn system_remote_client_uses_websocket_rpc_over_a_real_unix_socket() {
+        let root = tempfile::tempdir().expect("UDS directory");
+        let socket_path = root.path().join("app-server.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind UDS");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept UDS client");
+            let mut socket =
+                tokio_tungstenite::accept_hdr_async(stream, |request: &tokio_tungstenite::tungstenite::handshake::server::Request, response: tokio_tungstenite::tungstenite::handshake::server::Response| {
+                    assert_eq!(request.uri().path(), "/rpc");
+                    Ok(response)
+                })
+                .await
+                .expect("accept WebSocket");
+            let request = socket
+                .next()
+                .await
+                .expect("request frame")
+                .expect("request message")
+                .into_text()
+                .expect("text request");
+            let request: Value = serde_json::from_str(&request).expect("request JSON");
+            assert_eq!(request["method"], "initialize");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::json!({
+                        "id": request["id"],
+                        "result": {"accepted": true},
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .expect("response");
+            let notification = socket
+                .next()
+                .await
+                .expect("notification frame")
+                .expect("notification message")
+                .into_text()
+                .expect("text notification");
+            let notification: Value =
+                serde_json::from_str(&notification).expect("notification JSON");
+            assert_eq!(notification["method"], "initialized");
+        });
+        let endpoint = format!("unix://{}", socket_path.to_string_lossy());
+
+        let mut client = SystemCodexRemoteClientFactory
+            .connect(&endpoint)
+            .await
+            .expect("connect real UDS");
+        let response = client
+            .request("initialize", serde_json::json!({"clientInfo": {}}))
+            .await
+            .expect("initialize response");
+        assert_eq!(response, serde_json::json!({"accepted": true}));
+        client.notify("initialized").await.expect("initialized");
+        server.await.expect("UDS server");
+    }
+
+    #[tokio::test]
+    async fn system_remote_client_rejects_oversized_messages_before_json_decode() {
+        let root = tempfile::tempdir().expect("UDS directory");
+        let socket_path = root.path().join("oversized-app-server.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind UDS");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept UDS client");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept WebSocket");
+            let request = socket
+                .next()
+                .await
+                .expect("request frame")
+                .expect("request message")
+                .into_text()
+                .expect("text request");
+            let request: Value = serde_json::from_str(&request).expect("request JSON");
+            let _ = socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    serde_json::json!({
+                        "id": request["id"],
+                        "result": {
+                            "payload": "x".repeat(CODEX_REMOTE_MESSAGE_MAX_BYTES)
+                        },
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await;
+        });
+        let endpoint = format!("unix://{}", socket_path.to_string_lossy());
+        let mut client = SystemCodexRemoteClientFactory
+            .connect(&endpoint)
+            .await
+            .expect("connect real UDS");
+
+        let result = client.request("thread/read", json!({})).await;
+
+        assert!(
+            result.is_err(),
+            "oversized WebSocket messages must fail before serde allocates their JSON graph"
+        );
+        drop(client);
+        server.await.expect("UDS server");
+    }
+
+    #[tokio::test]
+    async fn system_remote_client_discards_late_responses_and_bounds_queued_notifications() {
+        let root = tempfile::tempdir().expect("UDS directory");
+        let socket_path = root.path().join("late-response-app-server.sock");
+        let listener = tokio::net::UnixListener::bind(&socket_path).expect("bind UDS");
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept UDS client");
+            let mut socket = tokio_tungstenite::accept_async(stream)
+                .await
+                .expect("accept WebSocket");
+            let request_a = socket
+                .next()
+                .await
+                .expect("request A frame")
+                .expect("request A message")
+                .into_text()
+                .expect("request A text");
+            let request_a: Value = serde_json::from_str(&request_a).expect("request A JSON");
+            let request_b = socket
+                .next()
+                .await
+                .expect("request B frame")
+                .expect("request B message")
+                .into_text()
+                .expect("request B text");
+            let request_b: Value = serde_json::from_str(&request_b).expect("request B JSON");
+
+            for sequence in 0..=CODEX_REMOTE_PENDING_NOTIFICATION_LIMIT {
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({
+                            "method": "fixture/event",
+                            "params": {"sequence": sequence},
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .expect("queued notification");
+            }
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({
+                        "id": request_a["id"],
+                        "result": {"request": "A"},
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .expect("late response A");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({
+                        "id": request_b["id"],
+                        "result": {"request": "B"},
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .expect("response B");
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Close(None))
+                .await
+                .expect("close frame");
+        });
+        let endpoint = format!("unix://{}", socket_path.to_string_lossy());
+        let mut client = SystemCodexRemoteClientFactory
+            .connect(&endpoint)
+            .await
+            .expect("connect real UDS");
+
+        assert!(
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                client.request("fixture/request-a", json!({})),
+            )
+            .await
+            .is_err(),
+            "request A must time out before its late response"
+        );
+        let response_b = client
+            .request("fixture/request-b", json!({}))
+            .await
+            .expect("request B response");
+        assert_eq!(response_b, json!({"request": "B"}));
+
+        let mut sequences = Vec::new();
+        while let Some(notification) = client.next().await.expect("queued notification") {
+            assert_eq!(notification["method"], "fixture/event");
+            sequences.push(
+                notification["params"]["sequence"]
+                    .as_u64()
+                    .expect("notification sequence"),
+            );
+        }
+        assert_eq!(
+            sequences.len(),
+            CODEX_REMOTE_PENDING_NOTIFICATION_LIMIT,
+            "notification queue must retain a fixed maximum"
+        );
+        assert_eq!(sequences.first(), Some(&1));
+        assert_eq!(
+            sequences.last(),
+            Some(
+                &u64::try_from(CODEX_REMOTE_PENDING_NOTIFICATION_LIMIT).expect("small queue limit")
+            )
+        );
+        server.await.expect("UDS server");
+    }
+
+    fn process_exists(pid: i32) -> bool {
+        // SAFETY: kill with signal 0 performs an existence/permission check
+        // without delivering a signal.
+        let result = unsafe { libc::kill(pid, 0) };
+        result == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
+    }
+}

@@ -1,0 +1,85 @@
+{
+  "scenario": "forwarded text retains task correlation without inventing actor attribution",
+  "rawInputLines": [
+    {
+      "source": "hookInput",
+      "line": "{\"hook_event_name\":\"SubagentStart\",\"session_id\":\"session-root\",\"transcript_path\":\"/tmp/session-root.jsonl\",\"cwd\":\"/workspace\",\"permission_mode\":\"default\",\"agent_id\":\"agent-forwarded-1\",\"agent_type\":\"Writer\"}"
+    },
+    {
+      "source": "stream",
+      "line": "{\"type\":\"system\",\"subtype\":\"task_started\",\"task_id\":\"task-forwarded-1\",\"tool_use_id\":\"tool-task-forwarded-1\",\"description\":\"Write the parser\",\"uuid\":\"system-task-started-1\",\"session_id\":\"session-root\"}"
+    },
+    {
+      "source": "stream",
+      "line": "{\"type\":\"assistant\",\"session_id\":\"session-child-forwarded\",\"uuid\":\"assistant-forwarded-1\",\"parent_tool_use_id\":\"tool-task-forwarded-1\",\"message\":{\"id\":\"message-forwarded-1\",\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"Investigating the parser.\"}]}}"
+    },
+    {
+      "source": "stream",
+      "line": "{\"type\":\"user\",\"session_id\":\"session-child-forwarded\",\"uuid\":\"user-forwarded-1\",\"parent_tool_use_id\":\"tool-task-forwarded-1\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"tool_result\",\"tool_use_id\":\"tool-child-1\",\"content\":\"Parser test output\"}]}}"
+    },
+    {
+      "source": "stream",
+      "line": "{\"type\":\"system\",\"subtype\":\"task_updated\",\"task_id\":\"task-forwarded-1\",\"patch\":{\"status\":\"completed\"},\"uuid\":\"system-task-updated-1\",\"session_id\":\"session-root\"}"
+    },
+    {
+      "source": "stream",
+      "line": "{\"type\":\"system\",\"subtype\":\"task_notification\",\"task_id\":\"task-forwarded-1\",\"status\":\"completed\",\"output_file\":\"/tmp/task-forwarded-1.output\",\"summary\":\"Implemented parser.\",\"uuid\":\"system-task-notification-1\",\"session_id\":\"session-root\"}"
+    },
+    {
+      "source": "hookInput",
+      "line": "{\"hook_event_name\":\"SubagentStop\",\"session_id\":\"session-root\",\"transcript_path\":\"/tmp/session-root.jsonl\",\"cwd\":\"/workspace\",\"permission_mode\":\"default\",\"agent_id\":\"agent-forwarded-1\",\"agent_type\":\"Writer\",\"stop_hook_active\":false,\"last_assistant_message\":\"Implemented parser.\",\"agent_transcript_path\":\"/tmp/agent-forwarded-1.jsonl\"}"
+    }
+  ],
+  "expectedMutations": [
+    {
+      "type": "upsertActor",
+      "actor": {
+        "_tag": "actor",
+        "id": "claude:agent:agent-forwarded-1",
+        "parentActorId": null,
+        "name": "Claude Writer",
+        "role": "Writer",
+        "providerType": "claude",
+        "status": "starting",
+        "summary": null,
+        "startedAt": "2026-07-24T12:01:00Z",
+        "updatedAt": "2026-07-24T12:01:00Z",
+        "terminalAt": null
+      }
+    },
+    {
+      "type": "upsertActor",
+      "actor": {
+        "_tag": "actor",
+        "id": "claude:agent:agent-forwarded-1",
+        "parentActorId": null,
+        "name": "Claude Writer",
+        "role": "Writer",
+        "providerType": "claude",
+        "status": "running",
+        "summary": null,
+        "startedAt": "2026-07-24T12:01:00Z",
+        "updatedAt": "2026-07-24T12:01:00Z",
+        "terminalAt": null
+      }
+    },
+    {
+      "type": "upsertActor",
+      "actor": {
+        "_tag": "actor",
+        "id": "claude:agent:agent-forwarded-1",
+        "parentActorId": null,
+        "name": "Claude Writer",
+        "role": "Writer",
+        "providerType": "claude",
+        "status": "completed",
+        "summary": "Implemented parser.",
+        "startedAt": "2026-07-24T12:01:00Z",
+        "updatedAt": "2026-07-24T12:01:06Z",
+        "terminalAt": "2026-07-24T12:01:06Z"
+      }
+    }
+  ],
+  "expectedMutationInputIndexes": [0, 0, 6],
+  "noMutationInputIndexes": [1, 2, 3, 4, 5]
+}

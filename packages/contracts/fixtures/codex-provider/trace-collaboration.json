@@ -1,0 +1,208 @@
+{
+  "scenario": "root spawn and agent state transitions",
+  "initialActorIds": [],
+  "inboundMessages": [
+    {
+      "emittedAtMs": 1784894400000,
+      "method": "item/started",
+      "params": {
+        "threadId": "root-1",
+        "turnId": "turn-1",
+        "item": {
+          "id": "item-collab-spawn",
+          "type": "collabAgentToolCall",
+          "tool": "spawnAgent",
+          "status": "inProgress",
+          "senderThreadId": "root-1",
+          "receiverThreadIds": ["child-1", "child-2"],
+          "prompt": "[redacted prompt]",
+          "model": "gpt-5.4",
+          "reasoningEffort": "medium",
+          "agentsStates": {
+            "child-1": {
+              "status": "pendingInit",
+              "message": null
+            },
+            "child-2": {
+              "status": "pendingInit",
+              "message": null
+            }
+          }
+        },
+        "startedAtMs": 1784894400000
+      }
+    },
+    {
+      "emittedAtMs": 1784894401000,
+      "method": "item/completed",
+      "params": {
+        "threadId": "root-1",
+        "turnId": "turn-1",
+        "item": {
+          "id": "item-collab-spawn",
+          "type": "collabAgentToolCall",
+          "tool": "spawnAgent",
+          "status": "completed",
+          "senderThreadId": "root-1",
+          "receiverThreadIds": ["child-1", "child-2"],
+          "prompt": "[redacted prompt]",
+          "model": "gpt-5.4",
+          "reasoningEffort": "medium",
+          "agentsStates": {
+            "child-1": {
+              "status": "running",
+              "message": null
+            },
+            "child-2": {
+              "status": "running",
+              "message": null
+            }
+          }
+        },
+        "completedAtMs": 1784894401000
+      }
+    },
+    {
+      "emittedAtMs": 1784894402000,
+      "method": "item/completed",
+      "params": {
+        "threadId": "root-1",
+        "turnId": "turn-1",
+        "item": {
+          "id": "item-collab-wait",
+          "type": "collabAgentToolCall",
+          "tool": "wait",
+          "status": "completed",
+          "senderThreadId": "root-1",
+          "receiverThreadIds": ["child-1", "child-2"],
+          "prompt": null,
+          "model": null,
+          "reasoningEffort": null,
+          "agentsStates": {
+            "child-1": {
+              "status": "completed",
+              "message": "[redacted status message]"
+            },
+            "child-2": {
+              "status": "running",
+              "message": null
+            }
+          }
+        },
+        "completedAtMs": 1784894402000
+      }
+    },
+    {
+      "emittedAtMs": 1784894403000,
+      "method": "item/started",
+      "params": {
+        "threadId": "root-1",
+        "turnId": "turn-1",
+        "item": {
+          "id": "item-sub-agent-started",
+          "type": "subAgentActivity",
+          "agentThreadId": "child-3",
+          "agentPath": "[redacted agent path]",
+          "kind": "started"
+        },
+        "startedAtMs": 1784894403000
+      }
+    },
+    {
+      "emittedAtMs": 1784894404000,
+      "method": "item/started",
+      "params": {
+        "threadId": "root-1",
+        "turnId": "turn-1",
+        "item": {
+          "id": "item-future-1",
+          "type": "futureActivityItem",
+          "payload": "[redacted unknown payload]"
+        },
+        "startedAtMs": 1784894404000
+      }
+    }
+  ],
+  "expectedMutations": [
+    {
+      "type": "upsertActor",
+      "actor": {
+        "_tag": "actor",
+        "id": "codex:thread:child-1",
+        "parentActorId": null,
+        "name": "Codex child-1",
+        "role": null,
+        "providerType": "codex",
+        "status": "starting",
+        "summary": null,
+        "startedAt": "2026-07-24T12:00:00Z",
+        "updatedAt": "2026-07-24T12:00:00Z",
+        "terminalAt": null
+      }
+    },
+    {
+      "type": "upsertActor",
+      "actor": {
+        "_tag": "actor",
+        "id": "codex:thread:child-2",
+        "parentActorId": null,
+        "name": "Codex child-2",
+        "role": null,
+        "providerType": "codex",
+        "status": "starting",
+        "summary": null,
+        "startedAt": "2026-07-24T12:00:00Z",
+        "updatedAt": "2026-07-24T12:00:00Z",
+        "terminalAt": null
+      }
+    },
+    {
+      "type": "upsertActor",
+      "actor": {
+        "_tag": "actor",
+        "id": "codex:thread:child-1",
+        "parentActorId": null,
+        "name": "Codex child-1",
+        "role": null,
+        "providerType": "codex",
+        "status": "running",
+        "summary": null,
+        "startedAt": "2026-07-24T12:00:00Z",
+        "updatedAt": "2026-07-24T12:00:01Z",
+        "terminalAt": null
+      }
+    },
+    {
+      "type": "upsertActor",
+      "actor": {
+        "_tag": "actor",
+        "id": "codex:thread:child-2",
+        "parentActorId": null,
+        "name": "Codex child-2",
+        "role": null,
+        "providerType": "codex",
+        "status": "running",
+        "summary": null,
+        "startedAt": "2026-07-24T12:00:00Z",
+        "updatedAt": "2026-07-24T12:00:01Z",
+        "terminalAt": null
+      }
+    },
+    {
+      "type": "upsertActor",
+      "actor": {
+        "_tag": "actor",
+        "id": "codex:thread:child-1",
+        "parentActorId": null,
+        "name": "Codex child-1",
+        "role": null,
+        "providerType": "codex",
+        "status": "completed",
+        "summary": "[redacted status message]",
+        "startedAt": "2026-07-24T12:00:00Z",
+        "updatedAt": "2026-07-24T12:00:02Z",
+        "terminalAt": "2026-07-24T12:00:02Z"
+      }
+    }
+  ]
+}

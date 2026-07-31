@@ -1,0 +1,53 @@
+{
+  "versionOutput": "codex-cli 0.145.0",
+  "rootHelp": "Options:\n      --remote <ADDR>\n          Accepted forms: ws://host:port, wss://host:port, unix://, or unix://PATH.\n",
+  "appServerHelp": "Options:\n      --listen <URL>\n          Supported values: stdio://, unix://, unix://PATH, ws://IP:PORT, off.\n",
+  "originalArgs": [
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--model",
+    "gpt-5.4",
+    "--config",
+    "model_reasoning_effort=\"high\""
+  ],
+  "helperArgs": ["app-server", "--listen", "$ENDPOINT"],
+  "tuiArgs": [
+    "--dangerously-bypass-approvals-and-sandbox",
+    "--model",
+    "gpt-5.4",
+    "--config",
+    "model_reasoning_effort=\"high\"",
+    "--remote",
+    "$ENDPOINT"
+  ],
+  "initializeRequest": {
+    "method": "initialize",
+    "params": {
+      "clientInfo": {
+        "name": "bibcode_desktop",
+        "title": "BiBCode Desktop",
+        "version": "$CARGO_PKG_VERSION"
+      },
+      "capabilities": {
+        "experimentalApi": true
+      }
+    }
+  },
+  "initializedNotification": {
+    "method": "initialized"
+  },
+  "rootNotification": {
+    "method": "thread/started",
+    "params": {
+      "thread": {
+        "id": "terminal-root",
+        "sessionId": "terminal-root",
+        "forkedFromId": null,
+        "parentThreadId": null,
+        "source": "vscode",
+        "threadSource": "user",
+        "cwd": "$CWD",
+        "createdAt": 2000000000
+      }
+    }
+  }
+}
