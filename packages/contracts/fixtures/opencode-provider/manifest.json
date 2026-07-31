@@ -1,0 +1,13 @@
+{
+  "fixtures": [
+    "inventory-snapshot.json",
+    "rollback.json",
+    "trace-question-resolved.json",
+    "trace-session.json",
+    "trace-child-sessions.json",
+    "trace-child-sse.json",
+    "trace-child-history.json",
+    "trace-foreign-session.json",
+    "trace-reconnect.json"
+  ]
+}

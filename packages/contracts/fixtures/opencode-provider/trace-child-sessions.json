@@ -1,0 +1,54 @@
+{
+  "metadata": {
+    "provider": "opencode",
+    "producerVersion": "1.18.4",
+    "schemaSource": "GET /doc",
+    "capturedAt": "2026-07-24T00:00:00Z",
+    "redactions": [
+      "[redacted workspace]",
+      "[redacted command arguments]",
+      "[redacted provider failure]"
+    ]
+  },
+  "rootSessionID": "ses-root-activity",
+  "childrenResponses": [
+    {
+      "method": "GET",
+      "path": "/session/ses-root-activity/children",
+      "parentSessionID": "ses-root-activity",
+      "response": [
+        {
+          "id": "ses-child-direct",
+          "parentID": "ses-root-activity",
+          "title": "[redacted child title]",
+          "directory": "[redacted workspace]",
+          "time": {
+            "created": 1721827200000
+          }
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/session/ses-child-direct/children",
+      "parentSessionID": "ses-child-direct",
+      "response": [
+        {
+          "id": "ses-child-nested",
+          "parentID": "ses-child-direct",
+          "title": "[redacted nested child title]",
+          "directory": "[redacted workspace]",
+          "time": {
+            "created": 1721827201000
+          }
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/session/ses-child-nested/children",
+      "parentSessionID": "ses-child-nested",
+      "response": []
+    }
+  ]
+}

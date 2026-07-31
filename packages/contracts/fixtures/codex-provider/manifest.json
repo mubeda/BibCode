@@ -1,0 +1,28 @@
+{
+  "activityFixtures": [
+    "trace-child-activity.json",
+    "trace-collaboration.json",
+    "trace-reconcile.json",
+    "trace-schema-downgrade.json"
+  ],
+  "fixtures": [
+    "initialize-params.json",
+    "model-discovery.json",
+    "probe-scenario.json",
+    "reconnect-scenario.json",
+    "skill-discovery.json",
+    "trace-approval-prefix.json",
+    "trace-approval.json",
+    "trace-child-activity.json",
+    "trace-collaboration.json",
+    "trace-reconcile.json",
+    "trace-schema-downgrade.json",
+    "trace-text.json",
+    "trace-tool.json",
+    "turn-start-approval.json",
+    "turn-start-default.json",
+    "turn-start-plan.json",
+    "turn-start-text.json",
+    "turn-start-tool.json"
+  ]
+}

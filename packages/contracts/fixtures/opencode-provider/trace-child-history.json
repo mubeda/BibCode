@@ -1,0 +1,88 @@
+{
+  "metadata": {
+    "provider": "opencode",
+    "producerVersion": "1.18.4",
+    "schemaSource": "GET /doc",
+    "capturedAt": "2026-07-24T00:00:00Z",
+    "redactions": [
+      "[redacted workspace]",
+      "[redacted command arguments]",
+      "[redacted provider failure]"
+    ]
+  },
+  "rootSessionID": "ses-root-activity",
+  "messageResponses": [
+    {
+      "method": "GET",
+      "path": "/session/ses-child-direct/message?limit=200",
+      "sessionID": "ses-child-direct",
+      "response": [
+        {
+          "info": {
+            "id": "msg-child-assistant",
+            "sessionID": "ses-child-direct",
+            "role": "assistant",
+            "time": {
+              "created": 1721827200000,
+              "completed": 1721827202000
+            },
+            "finish": "stop"
+          },
+          "parts": [
+            {
+              "id": "prt-child-text",
+              "sessionID": "ses-child-direct",
+              "messageID": "msg-child-assistant",
+              "type": "text",
+              "text": "[redacted child commentary]"
+            },
+            {
+              "id": "prt-child-reasoning",
+              "sessionID": "ses-child-direct",
+              "messageID": "msg-child-assistant",
+              "type": "reasoning",
+              "text": "[redacted internal reasoning]"
+            },
+            {
+              "id": "prt-child-tool",
+              "sessionID": "ses-child-direct",
+              "messageID": "msg-child-assistant",
+              "type": "tool",
+              "callID": "call-child-tool",
+              "tool": "bash",
+              "state": {
+                "status": "completed",
+                "input": {
+                  "command": "[redacted command]"
+                },
+                "output": "[redacted tool output]"
+              }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/session/ses-child-nested/message?limit=200",
+      "sessionID": "ses-child-nested",
+      "response": [
+        {
+          "info": {
+            "id": "msg-nested-assistant",
+            "sessionID": "ses-child-nested",
+            "role": "assistant",
+            "time": {
+              "created": 1721827201000
+            },
+            "error": {
+              "name": "ProviderError",
+              "message": "[redacted provider failure]"
+            }
+          },
+          "parts": []
+        }
+      ]
+    }
+  ]
+}

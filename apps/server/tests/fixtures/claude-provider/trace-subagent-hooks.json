@@ -1,0 +1,93 @@
+{
+  "scenario": "documented concurrent identity beside exact emitted hook notifications",
+  "rawInputLines": [
+    {
+      "source": "capabilityProbe",
+      "line": "{\"version\":\"2.1.218\",\"help_flags\":[\"--include-hook-events\",\"--forward-subagent-text\"]}"
+    },
+    {
+      "source": "hookInput",
+      "line": "{\"hook_event_name\":\"SubagentStart\",\"session_id\":\"session-root\",\"transcript_path\":\"/tmp/session-root.jsonl\",\"cwd\":\"/workspace\",\"permission_mode\":\"default\",\"agent_id\":\"agent-hooks-1\",\"agent_type\":\"Explore\"}"
+    },
+    {
+      "source": "stream",
+      "line": "{\"type\":\"system\",\"subtype\":\"hook_started\",\"hook_name\":\"activity-capture\",\"hook_event\":\"SubagentStart\",\"hook_id\":\"hook-start-1\",\"uuid\":\"system-hook-start-1\",\"session_id\":\"session-root\"}"
+    },
+    {
+      "source": "stream",
+      "line": "{\"type\":\"system\",\"subtype\":\"hook_response\",\"hook_name\":\"activity-capture\",\"hook_event\":\"SubagentStart\",\"hook_id\":\"hook-start-1\",\"output\":\"{}\",\"stdout\":\"\",\"stderr\":\"\",\"exit_code\":0,\"outcome\":\"success\",\"uuid\":\"system-hook-response-1\",\"session_id\":\"session-root\"}"
+    },
+    {
+      "source": "hookInput",
+      "line": "{\"hook_event_name\":\"SubagentStart\",\"session_id\":\"session-root\",\"transcript_path\":\"/tmp/session-root.jsonl\",\"cwd\":\"/workspace\",\"permission_mode\":\"default\",\"agent_id\":\"agent-hooks-2\",\"agent_type\":\"Explore\"}"
+    }
+  ],
+  "expectedMutations": [
+    {
+      "type": "upsertActor",
+      "actor": {
+        "_tag": "actor",
+        "id": "claude:agent:agent-hooks-1",
+        "parentActorId": null,
+        "name": "Claude Explore",
+        "role": "Explore",
+        "providerType": "claude",
+        "status": "starting",
+        "summary": null,
+        "startedAt": "2026-07-24T12:00:00Z",
+        "updatedAt": "2026-07-24T12:00:00Z",
+        "terminalAt": null
+      }
+    },
+    {
+      "type": "upsertActor",
+      "actor": {
+        "_tag": "actor",
+        "id": "claude:agent:agent-hooks-1",
+        "parentActorId": null,
+        "name": "Claude Explore",
+        "role": "Explore",
+        "providerType": "claude",
+        "status": "running",
+        "summary": null,
+        "startedAt": "2026-07-24T12:00:00Z",
+        "updatedAt": "2026-07-24T12:00:00Z",
+        "terminalAt": null
+      }
+    },
+    {
+      "type": "upsertActor",
+      "actor": {
+        "_tag": "actor",
+        "id": "claude:agent:agent-hooks-2",
+        "parentActorId": null,
+        "name": "Claude Explore",
+        "role": "Explore",
+        "providerType": "claude",
+        "status": "starting",
+        "summary": null,
+        "startedAt": "2026-07-24T12:00:01Z",
+        "updatedAt": "2026-07-24T12:00:01Z",
+        "terminalAt": null
+      }
+    },
+    {
+      "type": "upsertActor",
+      "actor": {
+        "_tag": "actor",
+        "id": "claude:agent:agent-hooks-2",
+        "parentActorId": null,
+        "name": "Claude Explore",
+        "role": "Explore",
+        "providerType": "claude",
+        "status": "running",
+        "summary": null,
+        "startedAt": "2026-07-24T12:00:01Z",
+        "updatedAt": "2026-07-24T12:00:01Z",
+        "terminalAt": null
+      }
+    }
+  ],
+  "expectedMutationInputIndexes": [1, 1, 4, 4],
+  "noMutationInputIndexes": [0, 2, 3]
+}

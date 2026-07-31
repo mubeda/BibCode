@@ -1,0 +1,22 @@
+{
+  "name": "@bibcode/scripts",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "check:dependency-ledger": "node check-dependency-upgrade-ledger.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vp test run"
+  },
+  "dependencies": {
+    "@bibcode/contracts": "workspace:*",
+    "@bibcode/shared": "workspace:*",
+    "@effect/platform-node": "catalog:",
+    "effect": "catalog:",
+    "smol-toml": "1.7.0",
+    "yaml": "catalog:"
+  },
+  "devDependencies": {
+    "@effect/vitest": "catalog:",
+    "vite-plus": "catalog:"
+  }
+}
