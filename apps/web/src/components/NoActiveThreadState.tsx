@@ -1,4 +1,4 @@
-import { Empty, EmptyDescription, EmptyHeader, EmptyTitle } from "./ui/empty";
+import { Empty, EmptyHeader, EmptyTitle } from "./ui/empty";
 import { SidebarInset } from "./ui/sidebar";
 import { cn } from "~/lib/utils";
 import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
@@ -24,10 +24,7 @@ export function NoActiveThreadState() {
         <Empty className="flex-1">
           <div className="w-full max-w-lg px-8 py-12">
             <EmptyHeader className="max-w-none">
-              <EmptyTitle className="text-foreground text-xl">Pick a thread to continue</EmptyTitle>
-              <EmptyDescription className="mt-2 text-sm text-muted-foreground/78">
-                Select an existing thread or create a new one to get started.
-              </EmptyDescription>
+              <EmptyTitle className="text-foreground text-xl">Let's BibCode...</EmptyTitle>
             </EmptyHeader>
           </div>
         </Empty>
