@@ -181,6 +181,8 @@ pub struct NativeServerControl {
     latest_published_provider_probe_sequence: Arc<AtomicU64>,
     #[cfg(test)]
     provider_update_refresh_attempts: Arc<AtomicU64>,
+    #[cfg(test)]
+    latest_full_provider_refresh_generation: Arc<AtomicU64>,
     settings_load_error: Option<Value>,
     #[cfg(test)]
     settings_update_barrier: Arc<RwLock<Option<Arc<Barrier>>>>,
@@ -188,6 +190,8 @@ pub struct NativeServerControl {
     next_quick_provider_probe_pause: Arc<Mutex<Option<ProviderProbePause>>>,
     #[cfg(test)]
     next_full_provider_probe_pause: Arc<Mutex<Option<ProviderProbePause>>>,
+    #[cfg(test)]
+    next_full_provider_refresh_handoff_pause: Arc<Mutex<Option<ProviderProbePause>>>,
     keybinding_rules: Arc<RwLock<Vec<Value>>>,
     keybinding_issues: Arc<RwLock<Vec<Value>>>,
     providers: Arc<RwLock<Vec<Value>>>,
@@ -270,6 +274,8 @@ impl NativeServerControl {
             latest_published_provider_probe_sequence: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
             provider_update_refresh_attempts: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            latest_full_provider_refresh_generation: Arc::new(AtomicU64::new(0)),
             settings_load_error,
             #[cfg(test)]
             settings_update_barrier: Arc::new(RwLock::new(None)),
@@ -277,6 +283,8 @@ impl NativeServerControl {
             next_quick_provider_probe_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             next_full_provider_probe_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            next_full_provider_refresh_handoff_pause: Arc::new(Mutex::new(None)),
             keybinding_rules: Arc::new(RwLock::new(loaded_keybindings.rules)),
             keybinding_issues: Arc::new(RwLock::new(loaded_keybindings.issues)),
             providers: Arc::new(RwLock::new(providers)),
@@ -444,6 +452,13 @@ impl NativeServerControl {
     async fn install_next_full_provider_probe_pause(&self) -> ProviderProbePause {
         let pause = ProviderProbePause::new();
         *self.next_full_provider_probe_pause.lock().await = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    async fn install_next_full_provider_refresh_handoff_pause(&self) -> ProviderProbePause {
+        let pause = ProviderProbePause::new();
+        *self.next_full_provider_refresh_handoff_pause.lock().await = Some(pause.clone());
         pause
     }
 
@@ -775,6 +790,19 @@ impl NativeServerControl {
         provider_inventory::probe_full(settings, instance_id, cwd, &self.provider_maintenance).await
     }
 
+    #[cfg(test)]
+    async fn pause_full_provider_refresh_handoff(&self) {
+        if let Some(pause) = self
+            .next_full_provider_refresh_handoff_pause
+            .lock()
+            .await
+            .take()
+        {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
     async fn publish_provider_snapshots_if_current(
         &self,
         refreshed: Vec<provider_inventory::ProviderProbeResult>,
@@ -880,6 +908,7 @@ impl NativeServerControl {
         }
         let control = self.clone();
         Some(tokio::spawn(async move {
+            let mut owns_refresh = true;
             'refresh: loop {
                 loop {
                     let probe_sequence = control.begin_provider_probe();
@@ -904,19 +933,38 @@ impl NativeServerControl {
                         .await
                         .is_some()
                     {
+                        #[cfg(test)]
+                        control
+                            .latest_full_provider_refresh_generation
+                            .store(generation, Ordering::Release);
                         break;
                     }
                     (generation, settings) = control.settings_snapshot().await;
                 }
+                control
+                    .full_provider_refresh_running
+                    .store(false, Ordering::Release);
+                owns_refresh = false;
                 let (latest_generation, latest_settings) = control.settings_snapshot().await;
+                #[cfg(test)]
+                control.pause_full_provider_refresh_handoff().await;
                 if latest_generation == generation && latest_settings == settings {
                     break;
                 }
+                if control
+                    .full_provider_refresh_running
+                    .swap(true, Ordering::AcqRel)
+                {
+                    break;
+                }
+                owns_refresh = true;
                 (generation, settings) = (latest_generation, latest_settings);
             }
-            control
-                .full_provider_refresh_running
-                .store(false, Ordering::Release);
+            if owns_refresh {
+                control
+                    .full_provider_refresh_running
+                    .store(false, Ordering::Release);
+            }
         }))
     }
 
@@ -2061,6 +2109,36 @@ mod tests {
 
         pause.release();
         checks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn full_refresh_handoff_covers_settings_changed_after_its_final_snapshot() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        let pause = control
+            .install_next_full_provider_refresh_handoff_pause()
+            .await;
+        let (generation, settings) = control.settings_snapshot().await;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| control.config.base_dir.clone());
+        control.spawn_full_provider_refresh(generation, settings, cwd);
+        pause.wait_until_entered().await;
+
+        control
+            .update_settings(json!({
+                "patch": { "providers": { "codex": { "enabled": false } } }
+            }))
+            .await
+            .expect("settings update succeeds");
+        let expected_generation = control.settings_generation.load(Ordering::Acquire);
+        pause.release();
+        wait_for_full_refresh_idle(&control).await;
+
+        assert_eq!(
+            control
+                .latest_full_provider_refresh_generation
+                .load(Ordering::Acquire),
+            expected_generation,
+        );
     }
 
     #[tokio::test]
