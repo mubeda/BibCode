@@ -895,6 +895,12 @@ async fn refresh_providers_returns_version_advisories_without_registry_access() 
     let missing_codex = directory.path().join("missing-codex");
     let settings = json!({
         "enableProviderUpdateChecks": false,
+        "providers": {
+            "claudeAgent": { "enabled": false },
+            "cursor": { "enabled": false },
+            "grok": { "enabled": false },
+            "opencode": { "enabled": false }
+        },
         "providerInstances": {
             "codex": {
                 "driver": "codex",
