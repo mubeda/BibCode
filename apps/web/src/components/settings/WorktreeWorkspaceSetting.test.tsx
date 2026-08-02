@@ -6,16 +6,25 @@ import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 import { EnvironmentId } from "@bibcode/contracts";
 import { DEFAULT_UNIFIED_SETTINGS, type UnifiedSettings } from "@bibcode/contracts/settings";
+import { SshConnectionTarget } from "@bibcode/client-runtime/connection";
+import type { PickHostFolderResult } from "../hostFolderPicker";
 import type { EnvironmentPresentation } from "../../state/environments";
 
 type Props = Record<string, unknown>;
+type UpdateSettings = (patch: Partial<UnifiedSettings>) => Promise<unknown>;
+type HostPicker = () => Promise<PickHostFolderResult>;
 
 const harness = vi.hoisted(() => ({
   environments: [] as EnvironmentPresentation[],
   primaryEnvironment: null as EnvironmentPresentation | null,
   settingsByEnvironment: new Map<string, UnifiedSettings>(),
   settingsListeners: new Set<() => void>(),
-  updateByEnvironment: new Map<string, ReturnType<typeof vi.fn>>(),
+  updateByEnvironment: new Map<string, UpdateSettings>(),
+  hostPicker: vi.fn<HostPicker>(async () => ({
+    _tag: "Selected" as const,
+    environmentId: EnvironmentId.make("host-one"),
+    path: "D:\\Worktrees",
+  })),
   rows: [] as Props[],
   selects: [] as Props[],
   draftInputs: [] as Props[],
@@ -27,6 +36,12 @@ const harness = vi.hoisted(() => ({
     this.settingsByEnvironment.clear();
     this.settingsListeners.clear();
     this.updateByEnvironment.clear();
+    this.hostPicker.mockReset();
+    this.hostPicker.mockResolvedValue({
+      _tag: "Selected",
+      environmentId: EnvironmentId.make("host-one"),
+      path: "D:\\Worktrees",
+    });
     this.rows.length = 0;
     this.selects.length = 0;
     this.draftInputs.length = 0;
@@ -51,15 +66,17 @@ vi.mock("../../hooks/useSettings", () => ({
       () => harness.settingsByEnvironment.get(environmentId) ?? DEFAULT_UNIFIED_SETTINGS,
     ),
   useUpdateEnvironmentSettings: (environmentId: string) => {
-    let update = harness.updateByEnvironment.get(environmentId);
-    if (!update) {
-      update = vi.fn(async (patch: Partial<UnifiedSettings>) => ({
-        _tag: "Success",
-        value: { ...DEFAULT_UNIFIED_SETTINGS, ...patch },
-      }));
-      harness.updateByEnvironment.set(environmentId, update);
-    }
-    return update;
+    return async (patch: Partial<UnifiedSettings>) => {
+      let update = harness.updateByEnvironment.get(environmentId);
+      if (!update) {
+        update = vi.fn(async (nextPatch: Partial<UnifiedSettings>) => ({
+          _tag: "Success",
+          value: { ...DEFAULT_UNIFIED_SETTINGS, ...nextPatch },
+        }));
+        harness.updateByEnvironment.set(environmentId, update);
+      }
+      return update(patch);
+    };
   },
 }));
 
@@ -121,6 +138,11 @@ vi.mock("./RemoteDirectoryPickerDialog", () => ({
   },
 }));
 
+vi.mock("../hostFolderPicker", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../hostFolderPicker")>();
+  return { ...actual, pickHostFolder: harness.hostPicker };
+});
+
 const { WorktreeWorkspaceSetting } = await import("./WorktreeWorkspaceSetting");
 
 function connectedEnvironment(id: string, label: string): EnvironmentPresentation {
@@ -129,7 +151,9 @@ function connectedEnvironment(id: string, label: string): EnvironmentPresentatio
     label,
     displayUrl: null,
     relayManaged: false,
-    entry: {} as EnvironmentPresentation["entry"],
+    entry: {
+      target: { _tag: "PrimaryConnectionTarget" },
+    } as EnvironmentPresentation["entry"],
     serverConfig: null,
     connection: { phase: "connected", error: null, traceId: null },
   };
@@ -209,6 +233,7 @@ function button(label: string): Props {
 
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+  Object.defineProperty(window, "desktopBridge", { configurable: true, value: {} });
   harness.reset();
 });
 
@@ -217,6 +242,7 @@ afterEach(async () => {
     await act(async () => setting.root.unmount());
     setting.container.remove();
   }
+  Reflect.deleteProperty(window, "desktopBridge");
 });
 
 describe("WorktreeWorkspaceSetting", () => {
@@ -273,17 +299,99 @@ describe("WorktreeWorkspaceSetting", () => {
     expect(select("Workspace host").value).toBe("host-two");
   });
 
-  it("opens the picker and routes its selection to the selected host", async () => {
-    harness.environments = [connectedEnvironment("host-one", "Local")];
+  it("uses the shared native picker for the primary desktop host", async () => {
+    const local = connectedEnvironment("host-one", "This device");
+    harness.environments = [local];
+    harness.primaryEnvironment = local;
     await renderSetting();
 
     await invoke(button("Browse"), "onClick");
-    expect(latest(harness.pickers).environmentId).toBe("host-one");
-    expect(latest(harness.pickers).open).toBe(true);
-    await invoke(latest(harness.pickers), "onSelect", "/srv/worktrees");
+    expect(harness.hostPicker).toHaveBeenCalledOnce();
+    expect(latest(harness.pickers).open).toBe(false);
     expect(harness.updateByEnvironment.get("host-one")).toHaveBeenCalledWith({
-      worktreeBaseDirectory: "/srv/worktrees",
+      worktreeBaseDirectory: "D:\\Worktrees",
     });
+  });
+
+  it("keeps the server browser for a remote host", async () => {
+    harness.environments = [
+      {
+        ...connectedEnvironment("remote", "SSH host"),
+        entry: {
+          target: new SshConnectionTarget({
+            environmentId: EnvironmentId.make("remote"),
+            label: "SSH host",
+            connectionId: "ssh:remote",
+          }),
+        } as EnvironmentPresentation["entry"],
+      },
+    ];
+    harness.primaryEnvironment = null;
+    await renderSetting();
+
+    await invoke(button("Browse"), "onClick");
+
+    expect(harness.hostPicker).not.toHaveBeenCalled();
+    expect(latest(harness.pickers).open).toBe(true);
+  });
+
+  it("leaves Workspace unchanged when native picking is cancelled", async () => {
+    const local = connectedEnvironment("host-one", "This device");
+    harness.environments = [local];
+    harness.primaryEnvironment = local;
+    harness.hostPicker.mockResolvedValueOnce({ _tag: "Cancelled" });
+    await renderSetting();
+
+    await invoke(button("Browse"), "onClick");
+
+    expect(harness.updateByEnvironment.get("host-one")).toBeUndefined();
+  });
+
+  it("shows a native picker failure without changing Workspace", async () => {
+    const local = connectedEnvironment("host-one", "This device");
+    harness.environments = [local];
+    harness.primaryEnvironment = local;
+    harness.hostPicker.mockResolvedValueOnce({
+      _tag: "Failure",
+      message: "Native folder picker failed.",
+    });
+    const setting = await renderSetting();
+
+    await invoke(button("Browse"), "onClick");
+
+    expect(setting.container.textContent).toContain("Native folder picker failed.");
+    expect(harness.updateByEnvironment.get("host-one")).toBeUndefined();
+  });
+
+  it("ignores a native selection after the selected host changes", async () => {
+    const local = connectedEnvironment("host-one", "This device");
+    const remote = connectedEnvironment("host-two", "SSH host");
+    harness.environments = [local, remote];
+    harness.primaryEnvironment = local;
+    let resolveSelection!: (result: PickHostFolderResult) => void;
+    harness.hostPicker.mockReturnValueOnce(
+      new Promise<PickHostFolderResult>((resolve) => {
+        resolveSelection = resolve;
+      }),
+    );
+    const setting = await renderSetting();
+
+    await act(async () => {
+      void (button("Browse").onClick as () => Promise<void>)();
+    });
+    await invoke(select("Workspace host"), "onValueChange", "host-two");
+    await rerender(setting);
+    await act(async () => {
+      resolveSelection({
+        _tag: "Selected",
+        environmentId: EnvironmentId.make("host-one"),
+        path: "D:\\Stale",
+      });
+      await Promise.resolve();
+    });
+
+    expect(harness.updateByEnvironment.get("host-one")).toBeUndefined();
+    expect(harness.updateByEnvironment.get("host-two")).toBeUndefined();
   });
 
   it("shows the canonical Workspace returned by the server before the settings stream catches up", async () => {
@@ -397,6 +505,6 @@ describe("WorktreeWorkspaceSetting", () => {
     expect(latest(harness.pickers).open).toBe(false);
 
     await invoke(priorPicker, "onSelect", "/stale/worktrees");
-    expect(harness.updateByEnvironment.get("host-two")).not.toHaveBeenCalled();
+    expect(harness.updateByEnvironment.get("host-two")).toBeUndefined();
   });
 });

@@ -28,7 +28,7 @@
 - Modify: `apps/web/src/components/add-project/pickAddProjectFolder.ts`
 - Modify: `apps/web/src/components/add-project/AddProjectDialog.logic.ts`
 - Modify: `apps/web/src/components/add-project/useAddProjectWorkflow.ts`
-- Test: `apps/web/src/components/add-project/pickAddProjectFolder.test.ts`
+- Delete: `apps/web/src/components/add-project/pickAddProjectFolder.test.ts` after moving its coverage to the shared-module test
 - Test: `apps/web/src/components/add-project/AddProjectDialog.logic.test.ts`
 
 **Interfaces:**
@@ -69,7 +69,7 @@ export function pickHostFolder(input: PickHostFolderInput): Promise<PickHostFold
 
 - [ ] **Step 1: Write the failing shared-module tests**
 
-Create `hostFolderPicker.test.ts` with the existing primary, WSL, cancellation, and unsupported-host cases. Include this capability assertion:
+Create `hostFolderPicker.test.ts` by moving the existing primary, WSL, cancellation, and unsupported-host cases from `pickAddProjectFolder.test.ts`, then delete the old test file so each behavior has one owner. Include this capability assertion:
 
 ```ts
 expect(
@@ -98,7 +98,7 @@ expect(
 Run:
 
 ```bash
-vp test run --project unit apps/web/src/components/hostFolderPicker.test.ts
+vp test run apps/web/src/components/hostFolderPicker.test.ts
 ```
 
 Expected: FAIL because `hostFolderPicker.ts` does not exist.
@@ -198,7 +198,7 @@ Make `shouldUseNativePicker` delegate to `canUseNativeHostFolderPicker` so Add P
 Run:
 
 ```bash
-vp test run --project unit apps/web/src/components/hostFolderPicker.test.ts apps/web/src/components/add-project/pickAddProjectFolder.test.ts apps/web/src/components/add-project/AddProjectDialog.logic.test.ts apps/web/src/components/add-project/useAddProjectWorkflow.test.tsx
+vp test run apps/web/src/components/hostFolderPicker.test.ts apps/web/src/components/add-project/AddProjectDialog.logic.test.ts apps/web/src/components/add-project/useAddProjectWorkflow.test.tsx
 ```
 
 Expected: all selected tests PASS.
@@ -206,7 +206,7 @@ Expected: all selected tests PASS.
 - [ ] **Step 5: Commit Task 1**
 
 ```bash
-git add apps/web/src/components/hostFolderPicker.ts apps/web/src/components/hostFolderPicker.test.ts apps/web/src/components/add-project/pickAddProjectFolder.ts apps/web/src/components/add-project/AddProjectDialog.logic.ts apps/web/src/components/add-project/useAddProjectWorkflow.ts apps/web/src/components/add-project/pickAddProjectFolder.test.ts apps/web/src/components/add-project/AddProjectDialog.logic.test.ts
+git add apps/web/src/components/hostFolderPicker.ts apps/web/src/components/hostFolderPicker.test.ts apps/web/src/components/add-project/pickAddProjectFolder.ts apps/web/src/components/add-project/AddProjectDialog.logic.ts apps/web/src/components/add-project/useAddProjectWorkflow.ts apps/web/src/components/add-project/pickAddProjectFolder.test.ts apps/web/src/components/add-project/AddProjectDialog.logic.test.ts docs/superpowers/plans/2026-08-02-shared-workspace-folder-picker.md
 git commit -m "refactor: share native host folder picker"
 ```
 
@@ -338,7 +338,7 @@ it("ignores a native selection after the selected host changes", async () => {
 Run:
 
 ```bash
-vp test run --project unit apps/web/src/components/settings/WorktreeWorkspaceSetting.test.tsx
+vp test run apps/web/src/components/settings/WorktreeWorkspaceSetting.test.tsx
 ```
 
 Expected: FAIL because Workspace still always opens `RemoteDirectoryPickerDialog` and never calls the shared picker.
@@ -435,7 +435,7 @@ Use a request token cleared on unmount so a stale native selection cannot save t
 Run:
 
 ```bash
-vp test run --project unit apps/web/src/components/settings/WorktreeWorkspaceSetting.test.tsx apps/web/src/components/hostFolderPicker.test.ts apps/web/src/components/add-project/pickAddProjectFolder.test.ts apps/web/src/components/add-project/useAddProjectWorkflow.test.tsx
+vp test run apps/web/src/components/settings/WorktreeWorkspaceSetting.test.tsx apps/web/src/components/hostFolderPicker.test.ts apps/web/src/components/add-project/useAddProjectWorkflow.test.tsx
 ```
 
 Expected: all selected tests PASS.

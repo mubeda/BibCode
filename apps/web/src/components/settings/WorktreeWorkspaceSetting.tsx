@@ -6,6 +6,9 @@ import {
   squashAtomCommandFailure,
 } from "@bibcode/client-runtime/state/runtime";
 
+import { desktopLocalBackendId, isDesktopLocalConnectionTarget } from "~/connection/desktopLocal";
+import { useDesktopLocalBootstraps } from "~/connection/useDesktopLocalBootstraps";
+import { readLocalApi } from "~/localApi";
 import { useEnvironmentSettings, useUpdateEnvironmentSettings } from "../../hooks/useSettings";
 import {
   type EnvironmentPresentation,
@@ -17,10 +20,17 @@ import { DraftInput } from "../ui/draft-input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { RemoteDirectoryPickerDialog } from "./RemoteDirectoryPickerDialog";
 import { SettingResetButton, SettingsRow } from "./settingsLayout";
+import {
+  canUseNativeHostFolderPicker,
+  getEnvironmentBrowsePlatform,
+  pickHostFolder,
+  readPrimaryRunningDistro,
+} from "../hostFolderPicker";
 
 export function WorktreeWorkspaceSetting() {
   const { environments } = useEnvironments();
   const primaryEnvironment = usePrimaryEnvironment();
+  const desktopLocalBootstraps = useDesktopLocalBootstraps();
   const initialEnvironmentId =
     primaryEnvironment?.environmentId ?? environments[0]?.environmentId ?? null;
   const [selectedEnvironmentId, setSelectedEnvironmentId] = useState<EnvironmentId | null>(
@@ -62,6 +72,8 @@ export function WorktreeWorkspaceSetting() {
       key={selectedEnvironment.environmentId}
       environment={selectedEnvironment}
       environments={environments}
+      primaryEnvironmentId={primaryEnvironment?.environmentId ?? null}
+      desktopLocalBootstraps={desktopLocalBootstraps}
       onSelectEnvironment={setSelectedEnvironmentId}
     />
   );
@@ -70,10 +82,14 @@ export function WorktreeWorkspaceSetting() {
 function EnvironmentWorktreeWorkspaceSetting({
   environment,
   environments,
+  primaryEnvironmentId,
+  desktopLocalBootstraps,
   onSelectEnvironment,
 }: {
   readonly environment: EnvironmentPresentation;
   readonly environments: ReadonlyArray<EnvironmentPresentation>;
+  readonly primaryEnvironmentId: EnvironmentId | null;
+  readonly desktopLocalBootstraps: ReturnType<typeof useDesktopLocalBootstraps>;
   readonly onSelectEnvironment: (environmentId: EnvironmentId) => void;
 }) {
   const settings = useEnvironmentSettings(environment.environmentId);
@@ -83,6 +99,7 @@ function EnvironmentWorktreeWorkspaceSetting({
   const [pickerOpen, setPickerOpen] = useState(false);
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const nativeRequest = useRef(0);
   const [confirmedWorkspace, setConfirmedWorkspace] = useState<{
     readonly value: string;
     readonly source: UnifiedSettings;
@@ -94,6 +111,13 @@ function EnvironmentWorktreeWorkspaceSetting({
       setConfirmedWorkspace(null);
     }
   }, [confirmedWorkspace, settings]);
+
+  useEffect(
+    () => () => {
+      nativeRequest.current += 1;
+    },
+    [],
+  );
 
   const save = useCallback(
     async (worktreeBaseDirectory: string) => {
@@ -123,6 +147,74 @@ function EnvironmentWorktreeWorkspaceSetting({
   );
 
   const configured = confirmedWorkspace?.value ?? settings.worktreeBaseDirectory;
+  const isPrimary = environment.environmentId === primaryEnvironmentId;
+  const desktopInstanceId = isDesktopLocalConnectionTarget(environment.entry.target)
+    ? (desktopLocalBootstraps.find((bootstrap) => bootstrap.httpBaseUrl === environment.displayUrl)
+        ?.id ?? null)
+    : null;
+  const nativeTarget = {
+    environmentId: environment.environmentId,
+    platform: getEnvironmentBrowsePlatform(environment.serverConfig?.environment.platform.os),
+    isPrimary,
+    desktopInstanceId,
+    nativePickerAvailable: typeof window !== "undefined" && window.desktopBridge !== undefined,
+  };
+  const wslCandidates = environments.flatMap((candidate) => {
+    const backendId = desktopLocalBackendId(candidate.entry.target);
+    if (backendId === null) return [];
+    const bootstrap = desktopLocalBootstraps.find(
+      (entry) => entry.httpBaseUrl === candidate.displayUrl,
+    );
+    return [
+      {
+        environmentId: candidate.environmentId,
+        backendId,
+        runningDistro: bootstrap?.runningDistro ?? null,
+      },
+    ];
+  });
+  const browse = async () => {
+    if (!canUseNativeHostFolderPicker(nativeTarget)) {
+      setPickerOpen(true);
+      return;
+    }
+    const api = readLocalApi();
+    if (api === undefined) {
+      setError("Folder picking is unavailable.");
+      return;
+    }
+    const request = ++nativeRequest.current;
+    const requestIsCurrent = () => nativeRequest.current === request;
+    try {
+      const result = await pickHostFolder({
+        host: nativeTarget,
+        primaryEnvironmentId,
+        initialPath: configured || "~",
+        dialogs: api.dialogs,
+        getWslState: () =>
+          typeof window === "undefined" || window.desktopBridge === undefined
+            ? Promise.resolve(null)
+            : window.desktopBridge.getWslState(),
+        primaryRunningDistro: readPrimaryRunningDistro(),
+        wslCandidates,
+      });
+      switch (result._tag) {
+        case "Cancelled":
+          return;
+        case "Failure":
+          if (requestIsCurrent()) setError(result.message);
+          return;
+        case "Selected":
+          if (result.environmentId === environment.environmentId && requestIsCurrent()) {
+            await save(result.path);
+          }
+      }
+    } catch (cause) {
+      if (requestIsCurrent()) {
+        setError(cause instanceof Error ? cause.message : "Folder picking failed.");
+      }
+    }
+  };
   return (
     <>
       <SettingsRow
@@ -185,7 +277,7 @@ function EnvironmentWorktreeWorkspaceSetting({
               type="button"
               variant="outline"
               disabled={!connected || pending}
-              onClick={() => setPickerOpen(true)}
+              onClick={() => void browse()}
             >
               Browse
             </Button>
