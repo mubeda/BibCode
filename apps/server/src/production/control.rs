@@ -114,6 +114,7 @@ struct ProviderProbePause {
 pub(crate) struct ProviderUpdateCheckTask {
     cancellation: CancellationToken,
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    refresh_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
 }
 
 impl ProviderUpdateCheckTask {
@@ -122,6 +123,15 @@ impl ProviderUpdateCheckTask {
         if let Some(task) = self.task.lock().await.take() {
             let _ = task.await;
         }
+        if let Some(task) = self.refresh_task.lock().await.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for ProviderUpdateCheckTask {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
     }
 }
 
@@ -169,6 +179,8 @@ pub struct NativeServerControl {
     agent_activity_handler: AgentActivityHandlerSlot,
     next_provider_probe_sequence: Arc<AtomicU64>,
     latest_published_provider_probe_sequence: Arc<AtomicU64>,
+    #[cfg(test)]
+    provider_update_refresh_attempts: Arc<AtomicU64>,
     settings_load_error: Option<Value>,
     #[cfg(test)]
     settings_update_barrier: Arc<RwLock<Option<Arc<Barrier>>>>,
@@ -256,6 +268,8 @@ impl NativeServerControl {
             agent_activity_handler: AgentActivityHandlerSlot::default(),
             next_provider_probe_sequence: Arc::new(AtomicU64::new(0)),
             latest_published_provider_probe_sequence: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            provider_update_refresh_attempts: Arc::new(AtomicU64::new(0)),
             settings_load_error,
             #[cfg(test)]
             settings_update_barrier: Arc::new(RwLock::new(None)),
@@ -668,29 +682,58 @@ impl NativeServerControl {
         )
     }
 
-    async fn request_full_provider_refresh(&self) {
+    async fn request_full_provider_refresh(
+        &self,
+        cancellation: CancellationToken,
+        refresh_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    ) {
+        #[cfg(test)]
+        self.provider_update_refresh_attempts
+            .fetch_add(1, Ordering::AcqRel);
         let (generation, settings) = self.settings_snapshot().await;
         let cwd = std::env::current_dir().unwrap_or_else(|_| self.config.base_dir.clone());
-        self.spawn_full_provider_refresh(generation, settings, cwd);
+        if cancellation.is_cancelled() {
+            return;
+        }
+        if let Some(task) = self.start_full_provider_refresh(
+            generation,
+            settings,
+            cwd,
+            Some(cancellation),
+        ) {
+            if let Some(previous) = refresh_task.lock().await.replace(task) {
+                let _ = previous.await;
+            }
+        }
     }
 
     pub(crate) fn start_provider_update_checks(&self) -> ProviderUpdateCheckTask {
         let cancellation = CancellationToken::new();
         let task_cancellation = cancellation.clone();
         let control = self.clone();
+        let refresh_task = Arc::new(Mutex::new(None));
+        let task_refresh = refresh_task.clone();
         let task = tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
             interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
             loop {
                 tokio::select! {
                     () = task_cancellation.cancelled() => break,
-                    _ = interval.tick() => control.request_full_provider_refresh().await,
+                    _ = interval.tick() => {
+                        if task_cancellation.is_cancelled() {
+                            break;
+                        }
+                        control
+                            .request_full_provider_refresh(task_cancellation.clone(), &task_refresh)
+                            .await;
+                    }
                 }
             }
         });
         ProviderUpdateCheckTask {
             cancellation,
             task: Mutex::new(Some(task)),
+            refresh_task,
         }
     }
 
@@ -818,43 +861,63 @@ impl NativeServerControl {
         }));
     }
 
-    fn spawn_full_provider_refresh(&self, mut generation: u64, mut settings: Value, cwd: PathBuf) {
+    fn spawn_full_provider_refresh(&self, generation: u64, settings: Value, cwd: PathBuf) {
+        let _ = self.start_full_provider_refresh(generation, settings, cwd, None);
+    }
+
+    fn start_full_provider_refresh(
+        &self,
+        mut generation: u64,
+        mut settings: Value,
+        cwd: PathBuf,
+        cancellation: Option<CancellationToken>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         if self
             .full_provider_refresh_running
             .swap(true, Ordering::AcqRel)
         {
-            return;
+            return None;
         }
         let control = self.clone();
-        tokio::spawn(async move {
-            loop {
-                let probe_sequence = control.begin_provider_probe();
-                let providers = control
-                    .probe_full_provider_snapshots(&settings, None, &cwd)
-                    .await;
-                if control
-                    .publish_provider_snapshots_if_current(
-                        providers,
-                        false,
-                        generation,
-                        &settings,
-                        probe_sequence,
-                    )
-                    .await
-                    .is_some()
-                {
+        Some(tokio::spawn(async move {
+            'refresh: loop {
+                loop {
+                    let probe_sequence = control.begin_provider_probe();
+                    let providers = if let Some(cancellation) = cancellation.as_ref() {
+                        tokio::select! {
+                            () = cancellation.cancelled() => break 'refresh,
+                            providers = control.probe_full_provider_snapshots(&settings, None, &cwd) => providers,
+                        }
+                    } else {
+                        control
+                            .probe_full_provider_snapshots(&settings, None, &cwd)
+                            .await
+                    };
+                    if control
+                        .publish_provider_snapshots_if_current(
+                            providers,
+                            false,
+                            generation,
+                            &settings,
+                            probe_sequence,
+                        )
+                        .await
+                        .is_some()
+                    {
+                        break;
+                    }
+                    (generation, settings) = control.settings_snapshot().await;
+                }
+                let (latest_generation, latest_settings) = control.settings_snapshot().await;
+                if latest_generation == generation && latest_settings == settings {
                     break;
                 }
-                (generation, settings) = control.settings_snapshot().await;
+                (generation, settings) = (latest_generation, latest_settings);
             }
             control
                 .full_provider_refresh_running
                 .store(false, Ordering::Release);
-            let (latest_generation, latest_settings) = control.settings_snapshot().await;
-            if latest_generation != generation || latest_settings != settings {
-                control.spawn_full_provider_refresh(latest_generation, latest_settings, cwd);
-            }
-        });
+        }))
     }
 
     async fn update_keybinding(&self, method: &str, payload: Value) -> Result<Value, Value> {
@@ -1838,6 +1901,36 @@ mod tests {
         NativeServerControl::new(ServerConfig::new(directory), json!({})).await
     }
 
+    async fn scheduler_control(temp: &tempfile::TempDir) -> NativeServerControl {
+        let config = ServerConfig::new(temp.path());
+        let settings_path = config.state_dir().join("settings.json");
+        let missing_binary = temp
+            .path()
+            .join("missing-provider-executable")
+            .to_string_lossy()
+            .into_owned();
+        tokio::fs::create_dir_all(config.state_dir())
+            .await
+            .expect("state directory exists");
+        tokio::fs::write(
+            settings_path,
+            serde_json::to_vec(&json!({
+                "enableProviderUpdateChecks": false,
+                "providerInstances": {
+                    "codex": { "driver": "codex", "enabled": true, "config": { "binaryPath": missing_binary } },
+                    "claude": { "driver": "claudeAgent", "enabled": true, "config": { "binaryPath": missing_binary } },
+                    "cursor": { "driver": "cursor", "enabled": true, "config": { "binaryPath": missing_binary } },
+                    "grok": { "driver": "grok", "enabled": true, "config": { "binaryPath": missing_binary } },
+                    "opencode": { "driver": "opencode", "enabled": true, "config": { "binaryPath": missing_binary } }
+                }
+            }))
+            .expect("settings JSON"),
+        )
+        .await
+        .expect("write settings");
+        NativeServerControl::new(config, json!({"policy":"test"})).await
+    }
+
     async fn wait_for_probe_after(control: &NativeServerControl, previous: u64) -> u64 {
         for _ in 0..100 {
             let current = control.next_provider_probe_sequence.load(Ordering::Acquire);
@@ -1859,14 +1952,24 @@ mod tests {
         panic!("provider check did not finish");
     }
 
+    async fn wait_for_scheduler_request_after(control: &NativeServerControl, previous: u64) {
+        for _ in 0..100 {
+            if control
+                .provider_update_refresh_attempts
+                .load(Ordering::Acquire)
+                > previous
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("provider update check did not request a refresh");
+    }
+
     #[tokio::test(start_paused = true)]
     async fn provider_update_checks_run_immediately_and_every_hour() {
         let temp = tempfile::tempdir().expect("state directory");
-        let control = NativeServerControl::new(
-            ServerConfig::new(temp.path()),
-            json!({"policy":"test"}),
-        )
-        .await;
+        let control = scheduler_control(&temp).await;
         let before = control.next_provider_probe_sequence.load(Ordering::Acquire);
         let checks = control.start_provider_update_checks();
 
@@ -1888,11 +1991,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn provider_update_check_shutdown_prevents_future_ticks() {
         let temp = tempfile::tempdir().expect("state directory");
-        let control = NativeServerControl::new(
-            ServerConfig::new(temp.path()),
-            json!({"policy":"test"}),
-        )
-        .await;
+        let control = scheduler_control(&temp).await;
         let checks = control.start_provider_update_checks();
         let before = control.next_provider_probe_sequence.load(Ordering::Acquire);
         wait_for_probe_after(&control, before).await;
@@ -1907,20 +2006,54 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn dropping_provider_update_checks_prevents_future_ticks() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        let checks = control.start_provider_update_checks();
+        let before = control.next_provider_probe_sequence.load(Ordering::Acquire);
+        wait_for_probe_after(&control, before).await;
+        wait_for_full_refresh_idle(&control).await;
+        drop(checks);
+        let stopped_at = control.next_provider_probe_sequence.load(Ordering::Acquire);
+
+        tokio::time::advance(Duration::from_secs(2 * 60 * 60)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            control.next_provider_probe_sequence.load(Ordering::Acquire),
+            stopped_at
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_update_check_shutdown_cancels_a_paused_full_refresh() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        let pause = control.install_next_full_provider_probe_pause().await;
+        let checks = control.start_provider_update_checks();
+        pause.wait_until_entered().await;
+
+        checks.shutdown().await;
+
+        assert!(
+            !control.full_provider_refresh_running.load(Ordering::Acquire),
+            "scheduled full refresh must finish before shutdown returns"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn provider_update_checks_coalesce_while_a_full_refresh_is_running() {
         let temp = tempfile::tempdir().expect("state directory");
-        let control = NativeServerControl::new(
-            ServerConfig::new(temp.path()),
-            json!({"policy":"test"}),
-        )
-        .await;
+        let control = scheduler_control(&temp).await;
         let pause = control.install_next_full_provider_probe_pause().await;
         let checks = control.start_provider_update_checks();
         pause.wait_until_entered().await;
         let running_sequence = control.next_provider_probe_sequence.load(Ordering::Acquire);
+        let requested = control
+            .provider_update_refresh_attempts
+            .load(Ordering::Acquire);
 
         tokio::time::advance(Duration::from_secs(60 * 60)).await;
-        tokio::task::yield_now().await;
+        wait_for_scheduler_request_after(&control, requested).await;
         assert_eq!(
             control.next_provider_probe_sequence.load(Ordering::Acquire),
             running_sequence,
