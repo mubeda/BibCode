@@ -24,60 +24,151 @@ mod tests {
                 "codex",
                 "codex",
                 Some("C:/Users/me/AppData/Roaming/npm/codex.cmd"),
+                None,
                 "npm install -g @openai/codex@latest",
             ),
             (
                 "codex",
                 "codex",
                 Some("C:/Users/me/.bun/bin/codex.exe"),
+                None,
                 "bun i -g @openai/codex@latest",
             ),
             (
                 "claudeAgent",
                 "claude",
                 Some("/Users/me/.local/bin/claude"),
+                None,
                 "/Users/me/.local/bin/claude update",
             ),
             (
                 "claudeAgent",
                 "claude",
                 Some("/opt/homebrew/bin/claude"),
+                None,
                 "brew upgrade claude-code",
             ),
             (
                 "opencode",
                 "opencode",
                 Some("/home/me/.opencode/bin/opencode"),
+                None,
                 "/home/me/.opencode/bin/opencode upgrade",
             ),
             (
                 "opencode",
                 "opencode",
                 Some("/home/linuxbrew/.linuxbrew/bin/opencode"),
+                None,
                 "brew upgrade anomalyco/tap/opencode",
             ),
             (
                 "codex",
                 "codex",
                 Some("/home/me/.local/share/pnpm/codex"),
+                None,
                 "pnpm add -g @openai/codex@latest",
             ),
             (
                 "codex",
                 "codex",
                 Some("/home/me/.vite-plus/bin/codex"),
+                None,
                 "vp i -g @openai/codex",
             ),
+            (
+                "codex",
+                "codex",
+                Some("/usr/local/bin/codex"),
+                Some("/usr/local/lib/node_modules/@openai/codex/bin/codex.js"),
+                "npm install -g @openai/codex@latest",
+            ),
+            (
+                "codex",
+                "codex",
+                Some("/srv/project/node_modules/.bin/codex"),
+                None,
+                "npm install -g @openai/codex@latest",
+            ),
+            (
+                "codex",
+                "codex",
+                Some("C:/npm/node_modules/@openai/codex/bin/codex.js"),
+                None,
+                "npm install -g @openai/codex@latest",
+            ),
+            (
+                "codex",
+                "codex",
+                Some("/usr/local/bin/codex"),
+                Some("/Users/me/Library/pnpm/global/5/node_modules/@openai/codex/bin/codex.js"),
+                "pnpm add -g @openai/codex@latest",
+            ),
+            (
+                "codex",
+                "codex",
+                Some("/usr/bin/codex"),
+                Some("/home/me/.local/share/pnpm/global/5/node_modules/@openai/codex/bin/codex.js"),
+                "pnpm add -g @openai/codex@latest",
+            ),
+            (
+                "codex",
+                "codex",
+                Some("/srv/tools/codex"),
+                None,
+                "npm install -g @openai/codex@latest",
+            ),
         ];
-        for (driver, binary, resolved, expected) in cases {
-            let capabilities =
-                capabilities_for_paths(driver, binary, resolved.map(Path::new), None);
+        for (driver, binary, resolved, canonical, expected) in cases {
+            let capabilities = capabilities_for_paths(
+                driver,
+                binary,
+                resolved.map(Path::new),
+                canonical.map(Path::new),
+            );
             assert_eq!(
                 capabilities
                     .update
                     .as_ref()
                     .map(|value| value.display.as_str()),
                 Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn native_installers_require_exact_paths() {
+        let cases = [
+            (
+                "claudeAgent",
+                "/srv/.local/bin/claude-wrapper",
+                None,
+            ),
+            (
+                "opencode",
+                "/srv/.opencode/bin/opencode-backup",
+                None,
+            ),
+            (
+                "claudeAgent",
+                "C:/Users/me/.local/bin/claude.exe",
+                Some("C:/Users/me/.local/bin/claude.exe update"),
+            ),
+            (
+                "opencode",
+                "C:/Users/me/.opencode/bin/opencode.exe",
+                Some("C:/Users/me/.opencode/bin/opencode.exe upgrade"),
+            ),
+        ];
+        for (driver, binary, expected) in cases {
+            let capabilities =
+                capabilities_for_paths(driver, binary, Some(Path::new(binary)), None);
+            assert_eq!(
+                capabilities
+                    .update
+                    .as_ref()
+                    .map(|value| value.display.as_str()),
+                expected
             );
         }
     }
@@ -491,7 +582,13 @@ struct ProviderMaintenanceInner {
     latest_versions: tokio::sync::Mutex<HashMap<&'static str, VersionCacheEntry>>,
     running_targets: Arc<Mutex<HashSet<String>>>,
     command_locks: Mutex<HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>>,
-    update_states: RwLock<HashMap<String, Value>>,
+    update_states: RwLock<HashMap<String, RetainedProviderUpdateState>>,
+}
+
+#[derive(Debug)]
+struct RetainedProviderUpdateState {
+    driver: String,
+    state: Value,
 }
 
 #[derive(Clone, Copy)]
@@ -572,39 +669,65 @@ impl ProviderMaintenance {
             .clone()
     }
 
-    pub(crate) fn set_update_state(&self, instance_id: &str, state: Value) {
+    pub(crate) fn set_update_state(&self, instance_id: &str, driver: &str, state: Value) {
         self.inner
             .update_states
             .write()
             .expect("provider update states lock")
-            .insert(instance_id.to_owned(), state);
+            .insert(
+                instance_id.to_owned(),
+                RetainedProviderUpdateState {
+                    driver: driver.to_owned(),
+                    state,
+                },
+            );
+    }
+
+    pub(crate) fn remove_update_state(&self, instance_id: &str) {
+        self.inner
+            .update_states
+            .write()
+            .expect("provider update states lock")
+            .remove(instance_id);
     }
 
     pub(crate) fn overlay_update_state(&self, snapshot: &mut Value) {
-        let Some(instance_id) = snapshot.get("instanceId").and_then(Value::as_str) else {
+        let Some((instance_id, driver)) = snapshot
+            .get("instanceId")
+            .and_then(Value::as_str)
+            .zip(snapshot.get("driver").and_then(Value::as_str))
+        else {
             return;
         };
-        if let Some(state) = self
+        let state = self
             .inner
             .update_states
             .read()
             .expect("provider update states lock")
             .get(instance_id)
-        {
-            snapshot["updateState"] = state.clone();
+            .filter(|retained| retained.driver == driver)
+            .map(|retained| retained.state.clone());
+        if let Some(state) = state {
+            snapshot["updateState"] = state;
+        } else if let Some(snapshot) = snapshot.as_object_mut() {
+            snapshot.remove("updateState");
         }
     }
 
-    pub(crate) fn prune_update_states<'a>(
+    pub(crate) fn prune_update_states<'a, I>(
         &self,
-        instance_ids: impl IntoIterator<Item = &'a str>,
-    ) {
-        let instance_ids = instance_ids.into_iter().collect::<HashSet<_>>();
+        identities: I,
+    ) where
+        I: IntoIterator<Item = (&'a str, &'a str)>,
+    {
+        let identities = identities.into_iter().collect::<HashSet<_>>();
         self.inner
             .update_states
             .write()
             .expect("provider update states lock")
-            .retain(|instance_id, _| instance_ids.contains(instance_id.as_str()));
+            .retain(|instance_id, retained| {
+                identities.contains(&(instance_id.as_str(), retained.driver.as_str()))
+            });
     }
 
     pub(crate) async fn capabilities(
@@ -856,11 +979,13 @@ fn resolved_or_configured_binary(
 }
 
 fn is_claude_native_path(normalized_path: &str) -> bool {
-    normalized_path.contains("/.local/bin/claude")
+    normalized_path.ends_with("/.local/bin/claude")
+        || normalized_path.ends_with("/.local/bin/claude.exe")
 }
 
 fn is_opencode_native_path(normalized_path: &str) -> bool {
-    normalized_path.contains("/.opencode/bin/opencode")
+    normalized_path.ends_with("/.opencode/bin/opencode")
+        || normalized_path.ends_with("/.opencode/bin/opencode.exe")
 }
 
 fn resolve_package_managed_capabilities(
@@ -908,6 +1033,8 @@ fn resolve_package_managed_capabilities(
     }
     if paths.iter().any(|path| {
         path.contains("/.local/share/pnpm/")
+            || path.contains("/local/share/pnpm/")
+            || path.contains("/library/pnpm/")
             || path.contains("/appdata/local/pnpm/")
             || path.contains("/appdata/roaming/pnpm/")
     }) {
@@ -921,7 +1048,9 @@ fn resolve_package_managed_capabilities(
     if paths.iter().any(|path| {
         path.contains("/appdata/roaming/npm/")
             || path.contains("/.npm-global/")
-            || path.contains("/.local/bin/")
+            || path.contains("/lib/node_modules/")
+            || path.contains("/node_modules/.bin/")
+            || path.contains("/npm/node_modules/")
     }) {
         return capabilities_with_update(
             Some(definition.package_name),
@@ -948,7 +1077,7 @@ fn resolve_package_managed_capabilities(
             "homebrew",
         );
     }
-    if !paths.is_empty() || target.binary_path.contains(['/', '\\']) {
+    if target.binary_path.contains(['/', '\\']) {
         return manual_capabilities(Some(definition.package_name));
     }
     capabilities_with_update(

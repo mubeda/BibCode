@@ -23,7 +23,7 @@ use crate::{
     production::{
         agent_activity::AgentActivitySettingsHandler,
         keybindings, local_servers, provider_inventory,
-        provider_maintenance::ProviderMaintenance,
+        provider_maintenance::{ProviderMaintenance, ProviderMaintenanceTarget},
         server_terminal::{JsonFuture, JsonStream, ProductionServerControl},
     },
     server_settings::ProviderSettingsState,
@@ -88,9 +88,7 @@ fn post_update_status(providers: &[Value], instance_id: &str) -> &'static str {
         .iter()
         .find(|provider| provider["instanceId"] == instance_id)
     {
-        Some(provider) if provider["versionAdvisory"]["status"] != "behind_latest" => {
-            "succeeded"
-        }
+        Some(provider) if provider["versionAdvisory"]["status"] == "current" => "succeeded",
         _ => "unchanged",
     }
 }
@@ -486,8 +484,28 @@ impl NativeServerControl {
         json!({ "providers": providers })
     }
 
-    async fn publish_provider_update_state(&self, instance_id: &str, state: Value) -> Vec<Value> {
-        self.provider_maintenance.set_update_state(instance_id, state);
+    async fn publish_provider_update_state(
+        &self,
+        target: &ProviderMaintenanceTarget,
+        state: Value,
+    ) -> Vec<Value> {
+        let _update_guard = self.settings_update_lock.lock().await;
+        let configured = provider_inventory::maintenance_target(
+            &*self.settings.read().await,
+            &target.driver,
+            Some(&target.instance_id),
+        )
+        .is_some();
+        if configured {
+            self.provider_maintenance.set_update_state(
+                &target.instance_id,
+                &target.driver,
+                state,
+            );
+        } else {
+            self.provider_maintenance
+                .remove_update_state(&target.instance_id);
+        }
         let mut providers = self.providers.write().await;
         for provider in providers.iter_mut() {
             self.provider_maintenance.overlay_update_state(provider);
@@ -546,7 +564,7 @@ impl NativeServerControl {
             Ok(guard) => guard,
             Err(_) => {
                 self.publish_provider_update_state(
-                    &target.instance_id,
+                    &target,
                     provider_update_state(
                         "queued",
                         None,
@@ -561,7 +579,7 @@ impl NativeServerControl {
                     () = cancellation.cancelled() => {
                         let finished_at = now_iso();
                         let providers = self.publish_provider_update_state(
-                            &target.instance_id,
+                            &target,
                             provider_update_state(
                                 "failed",
                                 None,
@@ -577,7 +595,7 @@ impl NativeServerControl {
         };
         let started_at = now_iso();
         self.publish_provider_update_state(
-            &target.instance_id,
+            &target,
             provider_update_state(
                 "running",
                 Some(&started_at),
@@ -598,7 +616,7 @@ impl NativeServerControl {
                 let finished_at = now_iso();
                 let providers = self
                     .publish_provider_update_state(
-                        &target.instance_id,
+                        &target,
                         provider_update_state(
                             "failed",
                             Some(&started_at),
@@ -620,7 +638,7 @@ impl NativeServerControl {
             );
             let providers = self
                 .publish_provider_update_state(
-                    &target.instance_id,
+                    &target,
                     provider_update_state(
                         "failed",
                         Some(&started_at),
@@ -676,7 +694,7 @@ impl NativeServerControl {
         let finished_at = now_iso();
         let providers = self
             .publish_provider_update_state(
-                &target.instance_id,
+                &target,
                 provider_update_state(
                     status,
                     Some(&started_at),
@@ -870,9 +888,7 @@ impl NativeServerControl {
         }
         if !partial {
             self.provider_maintenance.prune_update_states(
-                current
-                    .iter()
-                    .filter_map(|provider| provider.get("instanceId").and_then(Value::as_str)),
+                current.iter().filter_map(provider_snapshot_identity),
             );
         }
         for provider in current.iter_mut() {
@@ -1859,8 +1875,13 @@ mod tests {
             "instanceId": "codex",
             "versionAdvisory": { "status": "behind_latest" }
         });
+        let unknown = json!({
+            "instanceId": "codex",
+            "versionAdvisory": { "status": "unknown" }
+        });
         assert_eq!(post_update_status(&[current], "codex"), "succeeded");
         assert_eq!(post_update_status(&[behind], "codex"), "unchanged");
+        assert_eq!(post_update_status(&[unknown], "codex"), "unchanged");
         assert_eq!(post_update_status(&[], "codex"), "unchanged");
     }
 
@@ -2142,13 +2163,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stale_provider_update_verification_does_not_reinsert_removed_instance() {
+    async fn removed_provider_update_state_is_not_retained_or_reused() {
         let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("state directory");
-        let control = control_with_cursor_update_fixture(
-            write_cursor_update_fixture(directory.path()).await,
-        )
-        .await;
+        let executable = write_cursor_update_fixture(directory.path()).await;
+        let control = control_with_cursor_update_fixture(executable.clone()).await;
         let pause = control.install_next_full_provider_probe_pause().await;
         let updating = {
             let control = control.clone();
@@ -2194,10 +2213,44 @@ mod tests {
             .await
             .iter()
             .all(|provider| provider["instanceId"] != "cursor-work"));
+
+        let mut removed_snapshot = json!({
+            "instanceId": "cursor-work",
+            "driver": "cursor",
+        });
+        control
+            .provider_maintenance
+            .overlay_update_state(&mut removed_snapshot);
+        assert!(removed_snapshot.get("updateState").is_none());
+
+        control
+            .update_settings(json!({
+                "patch": {
+                    "providerInstances": {
+                        "cursor-work": {
+                            "driver": "cursor",
+                            "enabled": true,
+                            "config": { "binaryPath": executable }
+                        }
+                    }
+                }
+            }))
+            .await
+            .expect("re-add cursor provider");
+        let refreshed = control
+            .refresh_providers(&json!({ "instanceId": "cursor-work" }))
+            .await;
+        let readded = refreshed["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("re-added cursor provider");
+        assert!(readded.get("updateState").is_none());
     }
 
     #[tokio::test]
-    async fn absent_target_verification_does_not_report_succeeded_while_settings_refresh_is_paused(
+    async fn absent_target_verification_removes_update_state_while_settings_refresh_is_paused(
     ) {
         let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("state directory");
@@ -2271,7 +2324,7 @@ mod tests {
             .iter()
             .find(|provider| provider["instanceId"] == "cursor-work")
             .expect("cached cursor provider");
-        assert_eq!(provider["updateState"]["status"], "unchanged");
+        assert!(provider.get("updateState").is_none());
     }
 
     #[tokio::test]

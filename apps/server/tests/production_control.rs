@@ -939,7 +939,7 @@ async fn refresh_providers_returns_version_advisories_without_registry_access() 
 }
 
 #[tokio::test]
-async fn provider_update_executes_a_supported_cursor_command_and_publishes_success() {
+async fn provider_update_executes_a_supported_cursor_command_but_cannot_verify_version() {
     let directory = tempfile::tempdir().expect("temporary state directory");
     let executable = write_provider_fixture(&directory).await;
     let settings = json!({
@@ -976,8 +976,11 @@ async fn provider_update_executes_a_supported_cursor_command_and_publishes_succe
         .iter()
         .find(|provider| provider["instanceId"] == "cursor-work")
         .expect("updated cursor");
-    assert_eq!(provider["updateState"]["status"], "succeeded");
-    assert_eq!(provider["updateState"]["message"], "Provider updated.");
+    assert_eq!(provider["updateState"]["status"], "unchanged");
+    assert_eq!(
+        provider["updateState"]["message"],
+        "Update command completed, but BiBCode could not verify the provider version."
+    );
 }
 
 #[tokio::test]
