@@ -1272,6 +1272,7 @@ describe("ProviderSettingsPanel", () => {
     expect(h.sections.find((section) => section.title === "Providers")?.contentVariant).toBe(
       "stack",
     );
+    expect(control("button", "Add provider instance").props.hidden).toBe(true);
 
     const cardIds = h.instanceCards.map((card) => String(card.instanceId));
     // Cursor's default slot is hidden (no live cursor provider), but the
