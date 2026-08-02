@@ -12,7 +12,7 @@ use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
 #[cfg(test)]
 use tokio::sync::{Barrier, Notify};
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
@@ -174,6 +174,7 @@ pub struct NativeServerControl {
     settings_path: PathBuf,
     keybindings_path: PathBuf,
     settings: Arc<RwLock<Value>>,
+    automatic_git_fetch_interval: watch::Sender<Duration>,
     settings_update_lock: Arc<Mutex<()>>,
     settings_generation: Arc<AtomicU64>,
     agent_activity_handler: AgentActivityHandlerSlot,
@@ -251,6 +252,8 @@ impl NativeServerControl {
         };
         apply_settings_defaults(&mut settings);
         redact_sensitive_environment(&mut settings);
+        let (automatic_git_fetch_interval, _) =
+            watch::channel(automatic_git_fetch_interval(&settings));
         let loaded_keybindings = keybindings::load(&keybindings_path).await;
         let cwd = std::env::current_dir().unwrap_or_else(|_| config.base_dir.clone());
         let provider_maintenance = ProviderMaintenance::new();
@@ -267,6 +270,7 @@ impl NativeServerControl {
             settings_path,
             keybindings_path,
             settings: Arc::new(RwLock::new(settings.clone())),
+            automatic_git_fetch_interval,
             settings_update_lock: Arc::new(Mutex::new(())),
             settings_generation: Arc::new(AtomicU64::new(0)),
             agent_activity_handler: AgentActivityHandlerSlot::default(),
@@ -324,6 +328,10 @@ impl NativeServerControl {
             "observability": observability_snapshot(&self.state_directory),
             "settings": settings,
         })
+    }
+
+    pub(crate) fn automatic_git_fetch_interval_signal(&self) -> watch::Sender<Duration> {
+        self.automatic_git_fetch_interval.clone()
     }
 
     pub async fn attach_agent_activity_handler(
@@ -415,6 +423,16 @@ impl NativeServerControl {
                     .is_some()
                 });
             *commit_control.settings.write().await = next.clone();
+            let next_fetch_interval = automatic_git_fetch_interval(&next);
+            commit_control
+                .automatic_git_fetch_interval
+                .send_if_modified(|current| {
+                    if *current == next_fetch_interval {
+                        return false;
+                    }
+                    *current = next_fetch_interval;
+                    true
+                });
             commit_control.publish(json!({
                 "version": 1,
                 "type": "settingsUpdated",
@@ -1276,6 +1294,16 @@ fn validate_settings_document(settings: &Value) -> Result<(), String> {
         validate_optional_bool(terminal, "webglEnabled")?;
     }
     Ok(())
+}
+
+fn automatic_git_fetch_interval(settings: &Value) -> Duration {
+    let Some(milliseconds) = settings
+        .get("automaticGitFetchInterval")
+        .and_then(Value::as_f64)
+    else {
+        return Duration::from_secs(30);
+    };
+    Duration::try_from_secs_f64(milliseconds / 1_000.0).unwrap_or(Duration::MAX)
 }
 
 fn normalize_legacy_settings_for_validation(settings: &Value) -> Value {

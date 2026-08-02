@@ -6,11 +6,11 @@ use std::{
     time::Duration,
 };
 
-use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
 use bibcode_server::{
     CauseItem, RequestId, RpcExit, RpcRegistry, ServerConfig, ServerMessage, ServerRuntime,
 };
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::time::timeout;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
@@ -208,6 +208,109 @@ async fn vcs_status_stream_is_bounded_and_cancellable() {
             if request_id.as_str() == "7"
                 && cause == vec![CauseItem::Interrupt { fiber_id: None }]
     ));
+
+    socket.close(None).await.expect("close WebSocket");
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+}
+
+#[tokio::test]
+async fn automatic_git_fetch_setting_changes_apply_without_restart() {
+    if relaunch_with_isolated_git_config(
+        "automatic_git_fetch_setting_changes_apply_without_restart",
+    ) {
+        return;
+    }
+
+    let temp = TempDir::new().expect("temporary server directory");
+    let root = TempDir::new().expect("temporary Git fixture");
+    let remote = root.path().join("remote.git");
+    fs::create_dir(&remote).expect("bare remote directory");
+    run_git_in(&remote, &["init", "--bare", "--initial-branch=main"]);
+
+    let publisher = root.path().join("publisher");
+    fs::create_dir(&publisher).expect("publisher directory");
+    initialize_repository_in(&publisher);
+    commit_file(&publisher, "tracked.txt", "base\n", "initial");
+    let remote_url = local_file_url(&remote);
+    run_git_in(&publisher, &["remote", "add", "origin", &remote_url]);
+    run_git_in(&publisher, &["push", "-u", "origin", "main"]);
+
+    run_git_in(root.path(), &["clone", "--quiet", &remote_url, "consumer"]);
+    let consumer = root.path().join("consumer");
+    let initial_remote_ref = git_stdout_in(&consumer, &["rev-parse", "origin/main"]);
+
+    let config = test_config(&temp);
+    fs::create_dir_all(config.state_dir()).expect("server state directory");
+    fs::write(
+        config.state_dir().join("settings.json"),
+        r#"{
+            "automaticGitFetchInterval": 0,
+            "enableProviderUpdateChecks": false,
+            "providers": {
+                "codex": { "enabled": false },
+                "claudeAgent": { "enabled": false },
+                "cursor": { "enabled": false },
+                "grok": { "enabled": false },
+                "opencode": { "enabled": false }
+            }
+        }"#,
+    )
+    .expect("disabled automatic fetch settings");
+    let handle = ServerRuntime::start(config).await.expect("server starts");
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("WebSocket connects");
+
+    request(
+        &mut socket,
+        "8",
+        "subscribeVcsStatus",
+        json!({ "cwd": consumer }),
+    )
+    .await;
+    let _snapshot = next_server_message(&mut socket).await;
+    send_json(&mut socket, json!({ "_tag": "Ack", "requestId": "8" })).await;
+    tokio::time::timeout(Duration::from_secs(10), next_server_message(&mut socket))
+        .await
+        .expect("initial remote status is published");
+    send_json(&mut socket, json!({ "_tag": "Ack", "requestId": "8" })).await;
+
+    commit_file(
+        &publisher,
+        "tracked.txt",
+        "remote change\n",
+        "remote update",
+    );
+    run_git_in(&publisher, &["push"]);
+    tokio::time::sleep(Duration::from_secs(1)).await;
+
+    assert_eq!(
+        git_stdout_in(&consumer, &["rev-parse", "origin/main"]),
+        initial_remote_ref,
+        "a zero automatic fetch interval must not update the remote-tracking ref"
+    );
+
+    request(
+        &mut socket,
+        "9",
+        "server.updateSettings",
+        json!({ "patch": { "automaticGitFetchInterval": 100 } }),
+    )
+    .await;
+    let _updated_settings = success_value(&mut socket, "9").await;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(3);
+    loop {
+        if git_stdout_in(&consumer, &["rev-parse", "origin/main"]) != initial_remote_ref {
+            break;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "changing the automatic fetch interval must take effect without restarting"
+        );
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
 
     socket.close(None).await.expect("close WebSocket");
     handle.shutdown();

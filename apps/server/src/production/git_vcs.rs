@@ -7,7 +7,7 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 #[cfg(not(windows))]
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -27,7 +27,7 @@ use super::host_paths::resolve_host_directory;
 
 const STREAM_CAPACITY: usize = 8;
 const REF_REFRESH_INTERVAL: Duration = Duration::from_secs(3);
-const STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
+const LOCAL_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(30);
 
 pub const GIT_VCS_UNARY_METHODS: &[&str] = &[
     "shell.openInEditor",
@@ -71,11 +71,23 @@ impl Default for GitVcsRpcServices {
 
 impl GitVcsRpcServices {
     pub fn with_repository(repository: Arc<GitRepository>) -> Self {
+        let (automatic_remote_refresh_interval, _) = watch::channel(LOCAL_STATUS_REFRESH_INTERVAL);
+        Self::with_repository_and_automatic_fetch_interval(
+            repository,
+            automatic_remote_refresh_interval,
+        )
+    }
+
+    pub fn with_repository_and_automatic_fetch_interval(
+        repository: Arc<GitRepository>,
+        automatic_remote_refresh_interval: watch::Sender<Duration>,
+    ) -> Self {
         Self {
-            broadcaster: StatusBroadcaster::with_refresh_intervals(
+            broadcaster: StatusBroadcaster::with_automatic_remote_refresh_interval(
                 Arc::clone(&repository),
                 REF_REFRESH_INTERVAL,
-                STATUS_REFRESH_INTERVAL,
+                LOCAL_STATUS_REFRESH_INTERVAL,
+                automatic_remote_refresh_interval,
                 STREAM_CAPACITY,
             ),
             repository,
