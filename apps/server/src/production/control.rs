@@ -5,6 +5,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -12,6 +13,7 @@ use serde_json::{Value, json};
 #[cfg(test)]
 use tokio::sync::{Barrier, Notify};
 use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -106,6 +108,21 @@ fn provider_update_error(provider: &str, reason: impl Into<String>) -> Value {
 struct ProviderProbePause {
     entered: Arc<Notify>,
     release: Arc<Notify>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ProviderUpdateCheckTask {
+    cancellation: CancellationToken,
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl ProviderUpdateCheckTask {
+    pub(crate) async fn shutdown(&self) {
+        self.cancellation.cancel();
+        if let Some(task) = self.task.lock().await.take() {
+            let _ = task.await;
+        }
+    }
 }
 
 #[cfg(test)]
@@ -649,6 +666,32 @@ impl NativeServerControl {
             self.settings_generation.load(Ordering::Acquire),
             self.settings.read().await.clone(),
         )
+    }
+
+    async fn request_full_provider_refresh(&self) {
+        let (generation, settings) = self.settings_snapshot().await;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| self.config.base_dir.clone());
+        self.spawn_full_provider_refresh(generation, settings, cwd);
+    }
+
+    pub(crate) fn start_provider_update_checks(&self) -> ProviderUpdateCheckTask {
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let control = self.clone();
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    () = task_cancellation.cancelled() => break,
+                    _ = interval.tick() => control.request_full_provider_refresh().await,
+                }
+            }
+        });
+        ProviderUpdateCheckTask {
+            cancellation,
+            task: Mutex::new(Some(task)),
+        }
     }
 
     fn begin_provider_probe(&self) -> u64 {
@@ -1793,6 +1836,98 @@ mod tests {
         .await
         .expect("write settings");
         NativeServerControl::new(ServerConfig::new(directory), json!({})).await
+    }
+
+    async fn wait_for_probe_after(control: &NativeServerControl, previous: u64) -> u64 {
+        for _ in 0..100 {
+            let current = control.next_provider_probe_sequence.load(Ordering::Acquire);
+            if current > previous {
+                return current;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("provider check did not start");
+    }
+
+    async fn wait_for_full_refresh_idle(control: &NativeServerControl) {
+        for _ in 0..100 {
+            if !control.full_provider_refresh_running.load(Ordering::Acquire) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("provider check did not finish");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_update_checks_run_immediately_and_every_hour() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = NativeServerControl::new(
+            ServerConfig::new(temp.path()),
+            json!({"policy":"test"}),
+        )
+        .await;
+        let before = control.next_provider_probe_sequence.load(Ordering::Acquire);
+        let checks = control.start_provider_update_checks();
+
+        let after_startup = wait_for_probe_after(&control, before).await;
+        wait_for_full_refresh_idle(&control).await;
+
+        tokio::time::advance(Duration::from_secs(60 * 60 - 1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            control.next_provider_probe_sequence.load(Ordering::Acquire),
+            after_startup
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        wait_for_probe_after(&control, after_startup).await;
+        checks.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_update_check_shutdown_prevents_future_ticks() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = NativeServerControl::new(
+            ServerConfig::new(temp.path()),
+            json!({"policy":"test"}),
+        )
+        .await;
+        let checks = control.start_provider_update_checks();
+        let before = control.next_provider_probe_sequence.load(Ordering::Acquire);
+        wait_for_probe_after(&control, before).await;
+        checks.shutdown().await;
+        let stopped_at = control.next_provider_probe_sequence.load(Ordering::Acquire);
+        tokio::time::advance(Duration::from_secs(2 * 60 * 60)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            control.next_provider_probe_sequence.load(Ordering::Acquire),
+            stopped_at
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_update_checks_coalesce_while_a_full_refresh_is_running() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = NativeServerControl::new(
+            ServerConfig::new(temp.path()),
+            json!({"policy":"test"}),
+        )
+        .await;
+        let pause = control.install_next_full_provider_probe_pause().await;
+        let checks = control.start_provider_update_checks();
+        pause.wait_until_entered().await;
+        let running_sequence = control.next_provider_probe_sequence.load(Ordering::Acquire);
+
+        tokio::time::advance(Duration::from_secs(60 * 60)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            control.next_provider_probe_sequence.load(Ordering::Acquire),
+            running_sequence,
+        );
+
+        pause.release();
+        checks.shutdown().await;
     }
 
     #[tokio::test]

@@ -34,7 +34,7 @@ use crate::{
     production::{
         agent_activity::ProductionAgentActivity,
         connect_mcp::ConnectMcpService,
-        control::NativeServerControl,
+        control::{NativeServerControl, ProviderUpdateCheckTask},
         git_vcs::{GitVcsRpcServices, register_git_vcs_rpc},
         http_routes::{
             AssetHttpResponse, DiagnosticLogsHttpResponse, HttpRouteError, JsonOperation,
@@ -79,6 +79,7 @@ pub struct ProductionRuntime {
     terminal_services: ServerTerminalServices,
     provider_runtime: Arc<ProviderRuntimeSupervisor>,
     operational_logs: OperationalLogs,
+    provider_update_checks: ProviderUpdateCheckTask,
     orchestration_effects: OrchestrationEffects,
     diagnostic_bundle: DiagnosticBundleService,
     _resource_sampler: Arc<NativeResourceSampler>,
@@ -118,6 +119,7 @@ impl ProductionRuntime {
             )
             .await,
         );
+        let provider_update_checks = control.start_provider_update_checks();
         let activity_controller =
             AgentActivityController::new(control.agent_activity_enabled().await);
         let orchestration = OrchestrationEngine::start(
@@ -279,6 +281,7 @@ impl ProductionRuntime {
             terminal_services,
             provider_runtime,
             operational_logs,
+            provider_update_checks,
             orchestration_effects,
             diagnostic_bundle,
             _resource_sampler: resource_sampler,
@@ -378,6 +381,7 @@ impl ProductionRuntime {
     }
 
     pub async fn shutdown(&self) {
+        self.provider_update_checks.shutdown().await;
         self.orchestration_effects.shutdown().await;
         if let Err(error) = self.provider_runtime.shutdown().await {
             let error = bound_diagnostic_string(&error.to_string(), 160);
