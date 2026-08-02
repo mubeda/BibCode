@@ -594,6 +594,10 @@ impl NativeServerControl {
         let refreshed = self
             .probe_full_provider_snapshots(&settings, Some(&target.instance_id), &cwd)
             .await;
+        let verification = refreshed
+            .iter()
+            .map(|result| result.snapshot.clone())
+            .collect::<Vec<_>>();
         let (status, message) = match self
             .publish_provider_snapshots_if_current(
                 refreshed,
@@ -604,11 +608,11 @@ impl NativeServerControl {
             )
             .await
         {
-            Some(providers) => {
-                let status = post_update_status(&providers, &target.instance_id);
+            Some(_) => {
+                let status = post_update_status(&verification, &target.instance_id);
                 let message = match status {
                     "succeeded" => "Provider updated.",
-                    _ if providers.iter().any(|provider| {
+                    _ if verification.iter().any(|provider| {
                         provider["instanceId"] == target.instance_id
                             && provider["versionAdvisory"]["status"] == "behind_latest"
                     }) => {
@@ -1844,6 +1848,84 @@ mod tests {
             .await
             .iter()
             .all(|provider| provider["instanceId"] != "cursor-work"));
+    }
+
+    #[tokio::test]
+    async fn absent_target_verification_does_not_report_succeeded_while_settings_refresh_is_paused(
+    ) {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("state directory");
+        let control = control_with_cursor_update_fixture(
+            write_slow_cursor_update_fixture(directory.path()).await,
+        )
+        .await;
+        let mut events = control.config_events.subscribe();
+        let updating = {
+            let control = control.clone();
+            tokio::spawn(async move {
+                control
+                    .update_provider(
+                        &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
+                        CancellationToken::new(),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.expect("provider update event");
+                if event["type"] == "providerStatuses"
+                    && event["payload"]["providers"]
+                        .as_array()
+                        .is_some_and(|providers| providers.iter().any(|provider| {
+                            provider["instanceId"] == "cursor-work"
+                                && provider["updateState"]["status"] == "running"
+                        }))
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("running state published");
+
+        let quick_pause = control.install_next_quick_provider_probe_pause().await;
+        let settings_update = {
+            let control = control.clone();
+            tokio::spawn(async move {
+                control
+                    .update_settings(json!({
+                        "patch": {
+                            "providerInstances": {
+                                "replacement": {
+                                    "driver": "grok",
+                                    "enabled": false,
+                                    "config": {}
+                                }
+                            }
+                        }
+                    }))
+                    .await
+            })
+        };
+        quick_pause.wait_until_entered().await;
+
+        let result = updating
+            .await
+            .expect("provider update joins")
+            .expect("provider update returns snapshots");
+        quick_pause.release();
+        settings_update
+            .await
+            .expect("settings update joins")
+            .expect("settings update succeeds");
+        let provider = result["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("cached cursor provider");
+        assert_eq!(provider["updateState"]["status"], "unchanged");
     }
 
     #[tokio::test]
