@@ -945,3 +945,47 @@ async fn provider_update_rejects_an_instance_driver_mismatch() {
     assert_eq!(error["_tag"], "ServerProviderUpdateError");
     assert_eq!(error["provider"], "cursor");
 }
+
+#[tokio::test]
+async fn provider_update_rejects_malformed_instance_ids_without_publishing_update_state() {
+    let directory = tempfile::tempdir().expect("temporary state directory");
+    let executable = write_provider_fixture(&directory).await;
+    let settings = json!({
+        "enableProviderUpdateChecks": false,
+        "providerInstances": {
+            "cursor-work": {
+                "driver": "cursor",
+                "enabled": true,
+                "config": { "binaryPath": executable }
+            }
+        }
+    });
+    let settings_path = directory.path().join("userdata/settings.json");
+    tokio::fs::create_dir_all(settings_path.parent().expect("settings parent"))
+        .await
+        .expect("create settings directory");
+    tokio::fs::write(
+        settings_path,
+        serde_json::to_vec(&settings).expect("settings JSON"),
+    )
+    .await
+    .expect("write settings fixture");
+    let control = NativeServerControl::new(ServerConfig::new(directory.path()), auth_descriptor()).await;
+
+    for instance_id in [Value::Null, json!(7), json!({}), json!("not a slug")] {
+        let error = control
+            .call(
+                "server.updateProvider",
+                json!({ "provider": "cursor", "instanceId": instance_id }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("malformed instance ID must be rejected");
+        assert_eq!(error["_tag"], "ServerProviderUpdateError");
+        assert_eq!(error["provider"], "cursor");
+        assert!(error["reason"].as_str().is_some_and(|reason| reason.contains("instanceId")));
+    }
+
+    let config = call(&control, "server.getConfig", json!({})).await;
+    assert_eq!(config["providers"][0]["updateState"], Value::Null);
+}
