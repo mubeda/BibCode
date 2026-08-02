@@ -23,7 +23,9 @@ use crate::{
     production::{
         agent_activity::AgentActivitySettingsHandler,
         keybindings, local_servers, provider_inventory,
-        provider_maintenance::{ProviderMaintenance, ProviderMaintenanceTarget},
+        provider_maintenance::{
+            ProviderMaintenance, ProviderMaintenanceTarget, ProviderUpdateLifecycleToken,
+        },
         server_terminal::{JsonFuture, JsonStream, ProductionServerControl},
     },
     server_settings::ProviderSettingsState,
@@ -402,6 +404,16 @@ impl NativeServerControl {
             {
                 let _ = handler.transition(next_agent_activity, generation).await;
             }
+            commit_control
+                .provider_maintenance
+                .invalidate_update_lifecycles(|instance_id, driver| {
+                    provider_inventory::maintenance_target(
+                        &next,
+                        driver,
+                        Some(instance_id),
+                    )
+                    .is_some()
+                });
             *commit_control.settings.write().await = next.clone();
             commit_control.publish(json!({
                 "version": 1,
@@ -487,6 +499,7 @@ impl NativeServerControl {
     async fn publish_provider_update_state(
         &self,
         target: &ProviderMaintenanceTarget,
+        token: ProviderUpdateLifecycleToken,
         state: Value,
     ) -> Vec<Value> {
         let _update_guard = self.settings_update_lock.lock().await;
@@ -497,14 +510,19 @@ impl NativeServerControl {
         )
         .is_some();
         if configured {
-            self.provider_maintenance.set_update_state(
+            self.provider_maintenance.set_update_state_if_current(
                 &target.instance_id,
                 &target.driver,
+                token,
                 state,
             );
         } else {
             self.provider_maintenance
-                .remove_update_state(&target.instance_id);
+                .invalidate_update_lifecycle_if_current(
+                    &target.instance_id,
+                    &target.driver,
+                    token,
+                );
         }
         let mut providers = self.providers.write().await;
         for provider in providers.iter_mut() {
@@ -555,16 +573,32 @@ impl NativeServerControl {
                 "This provider does not expose a safe native self-update command.",
             )
         })?;
-        let _reservation = self
-            .provider_maintenance
-            .reserve_target(&target.instance_id)
-            .map_err(|reason| provider_update_error(provider, reason))?;
+        let reservation = {
+            let _update_guard = self.settings_update_lock.lock().await;
+            if provider_inventory::maintenance_target(
+                &*self.settings.read().await,
+                &target.driver,
+                Some(&target.instance_id),
+            )
+            .is_none()
+            {
+                return Err(provider_update_error(
+                    provider,
+                    "The requested provider instance does not match this provider.",
+                ));
+            }
+            self.provider_maintenance
+                .reserve_target(&target.instance_id, &target.driver)
+        }
+        .map_err(|reason| provider_update_error(provider, reason))?;
+        let update_token = reservation.token();
         let lock = self.provider_maintenance.command_lock(update.lock_key);
         let command_guard = match lock.clone().try_lock_owned() {
             Ok(guard) => guard,
             Err(_) => {
                 self.publish_provider_update_state(
                     &target,
+                    update_token,
                     provider_update_state(
                         "queued",
                         None,
@@ -580,6 +614,7 @@ impl NativeServerControl {
                         let finished_at = now_iso();
                         let providers = self.publish_provider_update_state(
                             &target,
+                            update_token,
                             provider_update_state(
                                 "failed",
                                 None,
@@ -596,6 +631,7 @@ impl NativeServerControl {
         let started_at = now_iso();
         self.publish_provider_update_state(
             &target,
+            update_token,
             provider_update_state(
                 "running",
                 Some(&started_at),
@@ -617,6 +653,7 @@ impl NativeServerControl {
                 let providers = self
                     .publish_provider_update_state(
                         &target,
+                        update_token,
                         provider_update_state(
                             "failed",
                             Some(&started_at),
@@ -639,6 +676,7 @@ impl NativeServerControl {
             let providers = self
                 .publish_provider_update_state(
                     &target,
+                    update_token,
                     provider_update_state(
                         "failed",
                         Some(&started_at),
@@ -695,6 +733,7 @@ impl NativeServerControl {
         let providers = self
             .publish_provider_update_state(
                 &target,
+                update_token,
                 provider_update_state(
                     status,
                     Some(&started_at),
@@ -2196,17 +2235,6 @@ mod tests {
             }))
             .await
             .expect("settings replace provider");
-        pause.release();
-
-        let result = updating
-            .await
-            .expect("provider update joins")
-            .expect("provider update returns snapshots");
-        assert!(result["providers"]
-            .as_array()
-            .expect("providers")
-            .iter()
-            .all(|provider| provider["instanceId"] != "cursor-work"));
         assert!(control
             .providers
             .read()
@@ -2246,6 +2274,25 @@ mod tests {
             .iter()
             .find(|provider| provider["instanceId"] == "cursor-work")
             .expect("re-added cursor provider");
+        assert!(readded.get("updateState").is_none());
+
+        pause.release();
+        let result = updating
+            .await
+            .expect("provider update joins")
+            .expect("provider update returns snapshots");
+        let readded = result["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("re-added cursor provider");
+        assert!(readded.get("updateState").is_none());
+        let providers = control.providers.read().await;
+        let readded = providers
+            .iter()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("stored re-added cursor provider");
         assert!(readded.get("updateState").is_none());
     }
 

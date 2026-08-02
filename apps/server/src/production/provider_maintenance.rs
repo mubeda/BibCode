@@ -485,14 +485,72 @@ mod tests {
     async fn rejects_a_second_update_for_the_same_instance() {
         let maintenance = ProviderMaintenance::new();
         let first = maintenance
-            .reserve_target("codex-work")
+            .reserve_target("codex-work", "codex")
             .expect("first reservation");
         assert_eq!(
-            maintenance.reserve_target("codex-work").unwrap_err(),
+            maintenance
+                .reserve_target("codex-work", "codex")
+                .unwrap_err(),
             "An update is already running for this provider."
         );
         drop(first);
-        assert!(maintenance.reserve_target("codex-work").is_ok());
+        assert!(maintenance.reserve_target("codex-work", "codex").is_ok());
+    }
+
+    #[test]
+    fn stale_update_lifecycle_cannot_overwrite_or_release_a_new_update() {
+        let maintenance = ProviderMaintenance::new();
+        let old = maintenance
+            .reserve_target("cursor-work", "cursor")
+            .expect("old reservation");
+        assert!(maintenance.set_update_state_if_current(
+            "cursor-work",
+            "cursor",
+            old.token(),
+            json!({ "status": "running", "message": "old" }),
+        ));
+        maintenance.invalidate_update_lifecycles(|instance_id, driver| {
+            instance_id == "cursor-work" && driver == "cursor"
+        });
+        assert!(maintenance.set_update_state_if_current(
+            "cursor-work",
+            "cursor",
+            old.token(),
+            json!({ "status": "running", "message": "still-current" }),
+        ));
+
+        maintenance.invalidate_update_lifecycles(|_, _| false);
+        let new = maintenance
+            .reserve_target("cursor-work", "cursor")
+            .expect("new reservation");
+        assert!(maintenance.set_update_state_if_current(
+            "cursor-work",
+            "cursor",
+            new.token(),
+            json!({ "status": "running", "message": "new" }),
+        ));
+        assert!(!maintenance.set_update_state_if_current(
+            "cursor-work",
+            "cursor",
+            old.token(),
+            json!({ "status": "failed", "message": "stale" }),
+        ));
+
+        drop(old);
+        assert_eq!(
+            maintenance
+                .reserve_target("cursor-work", "cursor")
+                .unwrap_err(),
+            "An update is already running for this provider."
+        );
+        let mut snapshot = json!({ "instanceId": "cursor-work", "driver": "cursor" });
+        maintenance.overlay_update_state(&mut snapshot);
+        assert_eq!(snapshot["updateState"]["message"], "new");
+
+        drop(new);
+        assert!(maintenance
+            .reserve_target("cursor-work", "cursor")
+            .is_ok());
     }
 
     #[tokio::test]
@@ -509,7 +567,7 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -554,18 +612,33 @@ pub(crate) struct ProviderMaintenance {
     inner: Arc<ProviderMaintenanceInner>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderUpdateLifecycleToken(u64);
+
 #[derive(Debug)]
 pub(crate) struct ProviderUpdateReservation {
     instance_id: String,
-    running_targets: Arc<Mutex<HashSet<String>>>,
+    token: ProviderUpdateLifecycleToken,
+    updates: Arc<Mutex<ProviderUpdateCoordinator>>,
 }
 
 impl Drop for ProviderUpdateReservation {
     fn drop(&mut self) {
-        self.running_targets
+        let mut updates = self
+            .updates
             .lock()
-            .expect("provider update reservations lock")
-            .remove(&self.instance_id);
+            .expect("provider update coordinator lock");
+        if let Some(lifecycle) = updates.lifecycles.get_mut(&self.instance_id)
+            && lifecycle.token == self.token
+        {
+            lifecycle.active = false;
+        }
+    }
+}
+
+impl ProviderUpdateReservation {
+    pub(crate) fn token(&self) -> ProviderUpdateLifecycleToken {
+        self.token
     }
 }
 
@@ -580,14 +653,28 @@ struct ProviderMaintenanceInner {
     client: reqwest::Client,
     registry_base_url: Url,
     latest_versions: tokio::sync::Mutex<HashMap<&'static str, VersionCacheEntry>>,
-    running_targets: Arc<Mutex<HashSet<String>>>,
+    updates: Arc<Mutex<ProviderUpdateCoordinator>>,
     command_locks: Mutex<HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>>,
-    update_states: RwLock<HashMap<String, RetainedProviderUpdateState>>,
+}
+
+#[derive(Debug, Default)]
+struct ProviderUpdateCoordinator {
+    next_token: u64,
+    lifecycles: HashMap<String, ProviderUpdateLifecycle>,
+    states: HashMap<String, RetainedProviderUpdateState>,
+}
+
+#[derive(Debug)]
+struct ProviderUpdateLifecycle {
+    driver: String,
+    token: ProviderUpdateLifecycleToken,
+    active: bool,
 }
 
 #[derive(Debug)]
 struct RetainedProviderUpdateState {
     driver: String,
+    token: ProviderUpdateLifecycleToken,
     state: Value,
 }
 
@@ -634,9 +721,8 @@ impl ProviderMaintenance {
                 client: reqwest::Client::new(),
                 registry_base_url,
                 latest_versions: tokio::sync::Mutex::new(HashMap::new()),
-                running_targets: Arc::new(Mutex::new(HashSet::new())),
+                updates: Arc::new(Mutex::new(ProviderUpdateCoordinator::default())),
                 command_locks: Mutex::new(HashMap::new()),
-                update_states: RwLock::new(HashMap::new()),
             }),
         }
     }
@@ -644,18 +730,38 @@ impl ProviderMaintenance {
     pub(crate) fn reserve_target(
         &self,
         instance_id: &str,
+        driver: &str,
     ) -> Result<ProviderUpdateReservation, &'static str> {
-        let mut running = self
+        let mut updates = self
             .inner
-            .running_targets
+            .updates
             .lock()
-            .expect("provider update reservations lock");
-        if !running.insert(instance_id.to_owned()) {
+            .expect("provider update coordinator lock");
+        if updates
+            .lifecycles
+            .get(instance_id)
+            .is_some_and(|lifecycle| lifecycle.active)
+        {
             return Err("An update is already running for this provider.");
         }
+        updates.next_token = updates
+            .next_token
+            .checked_add(1)
+            .expect("provider update lifecycle tokens exhausted");
+        let token = ProviderUpdateLifecycleToken(updates.next_token);
+        updates.lifecycles.insert(
+            instance_id.to_owned(),
+            ProviderUpdateLifecycle {
+                driver: driver.to_owned(),
+                token,
+                active: true,
+            },
+        );
+        updates.states.remove(instance_id);
         Ok(ProviderUpdateReservation {
             instance_id: instance_id.to_owned(),
-            running_targets: self.inner.running_targets.clone(),
+            token,
+            updates: self.inner.updates.clone(),
         })
     }
 
@@ -669,26 +775,87 @@ impl ProviderMaintenance {
             .clone()
     }
 
-    pub(crate) fn set_update_state(&self, instance_id: &str, driver: &str, state: Value) {
-        self.inner
-            .update_states
-            .write()
-            .expect("provider update states lock")
-            .insert(
-                instance_id.to_owned(),
-                RetainedProviderUpdateState {
-                    driver: driver.to_owned(),
-                    state,
-                },
-            );
+    pub(crate) fn set_update_state_if_current(
+        &self,
+        instance_id: &str,
+        driver: &str,
+        token: ProviderUpdateLifecycleToken,
+        state: Value,
+    ) -> bool {
+        let mut updates = self
+            .inner
+            .updates
+            .lock()
+            .expect("provider update coordinator lock");
+        if !updates.lifecycles.get(instance_id).is_some_and(|lifecycle| {
+            lifecycle.driver == driver && lifecycle.token == token
+        }) {
+            return false;
+        }
+        updates.states.insert(
+            instance_id.to_owned(),
+            RetainedProviderUpdateState {
+                driver: driver.to_owned(),
+                token,
+                state,
+            },
+        );
+        true
     }
 
-    pub(crate) fn remove_update_state(&self, instance_id: &str) {
-        self.inner
-            .update_states
-            .write()
-            .expect("provider update states lock")
-            .remove(instance_id);
+    pub(crate) fn invalidate_update_lifecycle_if_current(
+        &self,
+        instance_id: &str,
+        driver: &str,
+        token: ProviderUpdateLifecycleToken,
+    ) {
+        let mut updates = self
+            .inner
+            .updates
+            .lock()
+            .expect("provider update coordinator lock");
+        if !updates.lifecycles.get(instance_id).is_some_and(|lifecycle| {
+            lifecycle.driver == driver && lifecycle.token == token
+        }) {
+            return;
+        }
+        updates.lifecycles.remove(instance_id);
+        if updates
+            .states
+            .get(instance_id)
+            .is_some_and(|state| state.driver == driver && state.token == token)
+        {
+            updates.states.remove(instance_id);
+        }
+    }
+
+    pub(crate) fn invalidate_update_lifecycles(
+        &self,
+        mut is_configured: impl FnMut(&str, &str) -> bool,
+    ) {
+        let mut updates = self
+            .inner
+            .updates
+            .lock()
+            .expect("provider update coordinator lock");
+        let invalid = updates
+            .lifecycles
+            .iter()
+            .filter(|(instance_id, lifecycle)| {
+                !is_configured(instance_id, &lifecycle.driver)
+            })
+            .map(|(instance_id, _)| instance_id.clone())
+            .collect::<Vec<_>>();
+        for instance_id in invalid {
+            let Some(lifecycle) = updates.lifecycles.remove(&instance_id) else {
+                continue;
+            };
+            if updates.states.get(&instance_id).is_some_and(|state| {
+                state.driver == lifecycle.driver && state.token == lifecycle.token
+            }) {
+                updates.states.remove(&instance_id);
+            }
+        }
     }
 
     pub(crate) fn overlay_update_state(&self, snapshot: &mut Value) {
@@ -699,14 +866,23 @@ impl ProviderMaintenance {
         else {
             return;
         };
-        let state = self
+        let updates = self
             .inner
-            .update_states
-            .read()
-            .expect("provider update states lock")
-            .get(instance_id)
-            .filter(|retained| retained.driver == driver)
-            .map(|retained| retained.state.clone());
+            .updates
+            .lock()
+            .expect("provider update coordinator lock");
+        let state = updates.states.get(instance_id).and_then(|retained| {
+            updates
+                .lifecycles
+                .get(instance_id)
+                .filter(|lifecycle| {
+                    lifecycle.driver == driver
+                        && retained.driver == driver
+                        && lifecycle.token == retained.token
+                })
+                .map(|_| retained.state.clone())
+        });
+        drop(updates);
         if let Some(state) = state {
             snapshot["updateState"] = state;
         } else if let Some(snapshot) = snapshot.as_object_mut() {
@@ -721,13 +897,29 @@ impl ProviderMaintenance {
         I: IntoIterator<Item = (&'a str, &'a str)>,
     {
         let identities = identities.into_iter().collect::<HashSet<_>>();
-        self.inner
-            .update_states
-            .write()
-            .expect("provider update states lock")
-            .retain(|instance_id, retained| {
-                identities.contains(&(instance_id.as_str(), retained.driver.as_str()))
-            });
+        let mut updates = self
+            .inner
+            .updates
+            .lock()
+            .expect("provider update coordinator lock");
+        let invalid = updates
+            .states
+            .iter()
+            .filter(|(instance_id, retained)| {
+                !identities.contains(&(instance_id.as_str(), retained.driver.as_str()))
+                    || !updates
+                        .lifecycles
+                        .get(instance_id.as_str())
+                        .is_some_and(|lifecycle| {
+                            lifecycle.driver == retained.driver
+                                && lifecycle.token == retained.token
+                        })
+            })
+            .map(|(instance_id, _)| instance_id.clone())
+            .collect::<Vec<_>>();
+        for instance_id in invalid {
+            updates.states.remove(&instance_id);
+        }
     }
 
     pub(crate) async fn capabilities(
