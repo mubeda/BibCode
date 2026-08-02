@@ -460,8 +460,22 @@ impl NativeServerControl {
         let provider = payload
             .get("provider")
             .and_then(Value::as_str)
-            .unwrap_or("unknown");
-        let instance_id = payload.get("instanceId").and_then(Value::as_str);
+            .ok_or_else(|| provider_update_error("unknown", "provider must be a valid provider slug"))?;
+        validate_slug(provider, "provider").map_err(|reason| provider_update_error("unknown", reason))?;
+        let instance_id = match payload.get("instanceId") {
+            None => None,
+            Some(Value::String(instance_id)) => {
+                validate_slug(instance_id, "instanceId")
+                    .map_err(|reason| provider_update_error(provider, reason))?;
+                Some(instance_id.as_str())
+            }
+            Some(_) => {
+                return Err(provider_update_error(
+                    provider,
+                    "instanceId must be a valid provider slug",
+                ));
+            }
+        };
         let (_, settings) = self.settings_snapshot().await;
         let target = provider_inventory::maintenance_target(&settings, provider, instance_id)
             .ok_or_else(|| {
@@ -574,26 +588,42 @@ impl NativeServerControl {
         }
         drop(command_guard);
 
-        let (_, settings) = self.settings_snapshot().await;
+        let (generation, settings) = self.settings_snapshot().await;
         let cwd = std::env::current_dir().unwrap_or_else(|_| self.config.base_dir.clone());
+        let probe_sequence = self.begin_provider_probe();
         let refreshed = self
             .probe_full_provider_snapshots(&settings, Some(&target.instance_id), &cwd)
             .await;
-        let verification = refreshed
-            .iter()
-            .map(|result| result.snapshot.clone())
-            .collect::<Vec<_>>();
-        let status = post_update_status(&verification, &target.instance_id);
-        self.merge_provider_snapshots(refreshed, true).await;
-        let finished_at = now_iso();
-        let message = match status {
-            "succeeded" => "Provider updated.",
-            _ if verification.iter().any(|provider| {
-                provider["instanceId"] == target.instance_id
-                    && provider["versionAdvisory"]["status"] == "behind_latest"
-            }) => "Update command completed, but BiBCode still detects an outdated provider version.",
-            _ => "Update command completed, but BiBCode could not verify the provider version.",
+        let (status, message) = match self
+            .publish_provider_snapshots_if_current(
+                refreshed,
+                true,
+                generation,
+                &settings,
+                probe_sequence,
+            )
+            .await
+        {
+            Some(providers) => {
+                let status = post_update_status(&providers, &target.instance_id);
+                let message = match status {
+                    "succeeded" => "Provider updated.",
+                    _ if providers.iter().any(|provider| {
+                        provider["instanceId"] == target.instance_id
+                            && provider["versionAdvisory"]["status"] == "behind_latest"
+                    }) => {
+                        "Update command completed, but BiBCode still detects an outdated provider version."
+                    }
+                    _ => "Update command completed, but BiBCode could not verify the provider version.",
+                };
+                (status, message)
+            }
+            None => (
+                "unchanged",
+                "Update command completed, but BiBCode could not verify the provider version.",
+            ),
         };
+        let finished_at = now_iso();
         let providers = self
             .publish_provider_update_state(
                 &target.instance_id,
@@ -1637,9 +1667,12 @@ pub(crate) fn now_iso() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Mutex as StdMutex,
-        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    use std::{
+        sync::{
+            Mutex as StdMutex,
+            atomic::{AtomicBool, Ordering as AtomicOrdering},
+        },
+        time::Duration,
     };
 
     use crate::{
@@ -1671,6 +1704,201 @@ mod tests {
         assert_eq!(post_update_status(&[current], "codex"), "succeeded");
         assert_eq!(post_update_status(&[behind], "codex"), "unchanged");
         assert_eq!(post_update_status(&[], "codex"), "unchanged");
+    }
+
+    async fn write_cursor_update_fixture(directory: &Path) -> PathBuf {
+        #[cfg(windows)]
+        let (name, contents) = (
+            "cursor.cmd",
+            "@echo off\r\nif \"%1\"==\"about\" (echo {\"cliVersion\":\"9.8.7\"}& exit /b 0)\r\necho cursor updated\r\n",
+        );
+        #[cfg(not(windows))]
+        let (name, contents) = (
+            "cursor",
+            "#!/bin/sh\nif [ \"$1\" = \"about\" ]; then\n  echo '{\"cliVersion\":\"9.8.7\"}'\nelse\n  echo 'cursor updated'\nfi\n",
+        );
+        let path = directory.join(name);
+        tokio::fs::write(&path, contents)
+            .await
+            .expect("write cursor fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = tokio::fs::metadata(&path)
+                .await
+                .expect("cursor fixture metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            tokio::fs::set_permissions(&path, permissions)
+                .await
+                .expect("make cursor fixture executable");
+        }
+        path
+    }
+
+    async fn write_slow_cursor_update_fixture(directory: &Path) -> PathBuf {
+        #[cfg(windows)]
+        let (name, contents) = (
+            "slow-cursor.cmd",
+            "@echo off\r\nif \"%1\"==\"about\" (echo {\"cliVersion\":\"9.8.7\"}& exit /b 0)\r\npowershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 2\"\r\n",
+        );
+        #[cfg(not(windows))]
+        let (name, contents) = (
+            "slow-cursor",
+            "#!/bin/sh\nif [ \"$1\" = \"about\" ]; then\n  echo '{\"cliVersion\":\"9.8.7\"}'\nelse\n  sleep 2\nfi\n",
+        );
+        let path = directory.join(name);
+        tokio::fs::write(&path, contents)
+            .await
+            .expect("write slow cursor fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = tokio::fs::metadata(&path)
+                .await
+                .expect("slow cursor fixture metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            tokio::fs::set_permissions(&path, permissions)
+                .await
+                .expect("make slow cursor fixture executable");
+        }
+        path
+    }
+
+    async fn control_with_cursor_update_fixture(executable: PathBuf) -> NativeServerControl {
+        let directory = executable.parent().expect("fixture directory");
+        let settings_path = ServerConfig::new(directory).state_dir().join("settings.json");
+        tokio::fs::create_dir_all(settings_path.parent().expect("settings directory"))
+            .await
+            .expect("create settings directory");
+        tokio::fs::write(
+            &settings_path,
+            serde_json::to_vec(&json!({
+                "enableProviderUpdateChecks": false,
+                "providerInstances": {
+                    "cursor-work": {
+                        "driver": "cursor",
+                        "enabled": true,
+                        "config": { "binaryPath": executable }
+                    }
+                }
+            }))
+            .expect("settings JSON"),
+        )
+        .await
+        .expect("write settings");
+        NativeServerControl::new(ServerConfig::new(directory), json!({})).await
+    }
+
+    #[tokio::test]
+    async fn stale_provider_update_verification_does_not_reinsert_removed_instance() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("state directory");
+        let control = control_with_cursor_update_fixture(
+            write_cursor_update_fixture(directory.path()).await,
+        )
+        .await;
+        let pause = control.install_next_full_provider_probe_pause().await;
+        let updating = {
+            let control = control.clone();
+            tokio::spawn(async move {
+                control
+                    .update_provider(
+                        &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
+                        CancellationToken::new(),
+                    )
+                    .await
+            })
+        };
+        pause.wait_until_entered().await;
+
+        control
+            .update_settings(json!({
+                "patch": {
+                    "providerInstances": {
+                        "replacement": {
+                            "driver": "grok",
+                            "enabled": false,
+                            "config": {}
+                        }
+                    }
+                }
+            }))
+            .await
+            .expect("settings replace provider");
+        pause.release();
+
+        let result = updating
+            .await
+            .expect("provider update joins")
+            .expect("provider update returns snapshots");
+        assert!(result["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .all(|provider| provider["instanceId"] != "cursor-work"));
+        assert!(control
+            .providers
+            .read()
+            .await
+            .iter()
+            .all(|provider| provider["instanceId"] != "cursor-work"));
+    }
+
+    #[tokio::test]
+    async fn cancelled_provider_update_publishes_failed_state() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("state directory");
+        let control = control_with_cursor_update_fixture(
+            write_slow_cursor_update_fixture(directory.path()).await,
+        )
+        .await;
+        let mut events = control.config_events.subscribe();
+        let cancellation = CancellationToken::new();
+        let updating = {
+            let control = control.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                control
+                    .update_provider(
+                        &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
+                        cancellation,
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.expect("provider update event");
+                if event["type"] == "providerStatuses"
+                    && event["payload"]["providers"]
+                        .as_array()
+                        .is_some_and(|providers| providers.iter().any(|provider| {
+                            provider["instanceId"] == "cursor-work"
+                                && provider["updateState"]["status"] == "running"
+                        }))
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("running state published");
+        cancellation.cancel();
+
+        let result = updating
+            .await
+            .expect("provider update joins")
+            .expect("cancelled update returns snapshots");
+        let provider = result["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("cursor provider");
+        assert_eq!(provider["updateState"]["status"], "failed");
+        assert!(provider["updateState"]["finishedAt"].is_string());
     }
 
     #[derive(Clone)]
