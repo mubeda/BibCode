@@ -12,6 +12,7 @@ mod tests {
     use axum::{Json, Router, extract::State, http::StatusCode, routing::get};
     use serde_json::{Value, json};
     use tokio::net::TcpListener;
+    use tokio_util::sync::CancellationToken;
     use url::Url;
 
     use super::*;
@@ -271,17 +272,168 @@ mod tests {
 
         assert!(concurrent_requests.load(Ordering::SeqCst) >= 2);
     }
+
+    fn output_command(bytes: usize) -> ProviderUpdateCommand {
+        if cfg!(windows) {
+            ProviderUpdateCommand {
+                display: "powershell test output".to_owned(),
+                executable: "powershell.exe".to_owned(),
+                args: vec![
+                    "-NoProfile".to_owned(),
+                    "-NonInteractive".to_owned(),
+                    "-Command".to_owned(),
+                    format!("[Console]::Out.Write('x' * {bytes})"),
+                ],
+                lock_key: "test-output",
+            }
+        } else {
+            ProviderUpdateCommand {
+                display: "sh test output".to_owned(),
+                executable: "sh".to_owned(),
+                args: vec![
+                    "-c".to_owned(),
+                    format!("head -c {bytes} /dev/zero | tr '\\0' x"),
+                ],
+                lock_key: "test-output",
+            }
+        }
+    }
+
+    fn exit_command(code: i32) -> ProviderUpdateCommand {
+        if cfg!(windows) {
+            ProviderUpdateCommand {
+                display: format!("powershell exit {code}"),
+                executable: "powershell.exe".to_owned(),
+                args: vec![
+                    "-NoProfile".to_owned(),
+                    "-NonInteractive".to_owned(),
+                    "-Command".to_owned(),
+                    format!("exit {code}"),
+                ],
+                lock_key: "test-exit",
+            }
+        } else {
+            ProviderUpdateCommand {
+                display: format!("sh exit {code}"),
+                executable: "sh".to_owned(),
+                args: vec!["-c".to_owned(), format!("exit {code}")],
+                lock_key: "test-exit",
+            }
+        }
+    }
+
+    fn sleep_command() -> ProviderUpdateCommand {
+        if cfg!(windows) {
+            ProviderUpdateCommand {
+                display: "powershell sleep".to_owned(),
+                executable: "powershell.exe".to_owned(),
+                args: vec![
+                    "-NoProfile".to_owned(),
+                    "-NonInteractive".to_owned(),
+                    "-Command".to_owned(),
+                    "Start-Sleep -Seconds 2".to_owned(),
+                ],
+                lock_key: "test-sleep",
+            }
+        } else {
+            ProviderUpdateCommand {
+                display: "sleep 2".to_owned(),
+                executable: "sleep".to_owned(),
+                args: vec!["2".to_owned()],
+                lock_key: "test-sleep",
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn update_command_captures_bounded_output() {
+        let command = output_command(12_000);
+        let result = ProviderMaintenance::new()
+            .run_update_command(
+                &target("cursor", "cursor-agent"),
+                &command,
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("command result");
+        assert_eq!(result.exit_code, 0);
+        assert!(result
+            .output
+            .as_deref()
+            .is_some_and(|value| value.chars().count() <= 10_000));
+    }
+
+    #[tokio::test]
+    async fn update_command_preserves_non_zero_exit_code() {
+        let result = ProviderMaintenance::new()
+            .run_update_command(
+                &target("cursor", "cursor-agent"),
+                &exit_command(7),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("non-zero command result");
+        assert_eq!(result.exit_code, 7);
+    }
+
+    #[tokio::test]
+    async fn update_command_timeout_stops_the_child() {
+        let error = ProviderMaintenance::new()
+            .run_update_command_with_timeout(
+                &target("cursor", "cursor-agent"),
+                &sleep_command(),
+                &CancellationToken::new(),
+                Duration::from_millis(25),
+            )
+            .await
+            .expect_err("sleep command must time out");
+        assert!(error.contains("timed out"));
+    }
+
+    #[tokio::test]
+    async fn rejects_a_second_update_for_the_same_instance() {
+        let maintenance = ProviderMaintenance::new();
+        let first = maintenance
+            .reserve_target("codex-work")
+            .expect("first reservation");
+        assert_eq!(
+            maintenance.reserve_target("codex-work").unwrap_err(),
+            "An update is already running for this provider."
+        );
+        drop(first);
+        assert!(maintenance.reserve_target("codex-work").is_ok());
+    }
+
+    #[tokio::test]
+    async fn shared_package_manager_updates_queue() {
+        let maintenance = ProviderMaintenance::new();
+        let lock = maintenance.command_lock("npm-global");
+        let first = lock.clone().lock_owned().await;
+        assert!(lock.clone().try_lock_owned().is_err());
+        drop(first);
+        assert!(lock.try_lock_owned().is_ok());
+    }
 }
-use std::{collections::HashMap, ffi::OsString, path::Path, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    ffi::OsString,
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, RwLock},
+    time::Duration,
+};
 
 use serde_json::{Value, json};
 use url::Url;
 
-use super::provider_runtime::resolve_provider_executable_in_path;
+use crate::git::{OutputPolicy, ProcessRequest, ProcessRunner};
+
+use super::provider_runtime::{prepare_provider_launch, resolve_provider_executable_in_path};
 
 const CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 const REGISTRY_TIMEOUT: Duration = Duration::from_secs(4);
 const UPDATE_MESSAGE: &str = "Install the update now or review provider settings.";
+const UPDATE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
+const UPDATE_OUTPUT_LIMIT: usize = 10_000;
 
 #[derive(Clone, Debug)]
 pub(crate) struct ProviderMaintenanceTarget {
@@ -312,10 +464,34 @@ pub(crate) struct ProviderMaintenance {
 }
 
 #[derive(Debug)]
+pub(crate) struct ProviderUpdateReservation {
+    instance_id: String,
+    running_targets: Arc<Mutex<HashSet<String>>>,
+}
+
+impl Drop for ProviderUpdateReservation {
+    fn drop(&mut self) {
+        self.running_targets
+            .lock()
+            .expect("provider update reservations lock")
+            .remove(&self.instance_id);
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ProviderUpdateCommandResult {
+    pub(crate) exit_code: i32,
+    pub(crate) output: Option<String>,
+}
+
+#[derive(Debug)]
 struct ProviderMaintenanceInner {
     client: reqwest::Client,
     registry_base_url: Url,
     latest_versions: tokio::sync::Mutex<HashMap<&'static str, VersionCacheEntry>>,
+    running_targets: Arc<Mutex<HashSet<String>>>,
+    command_locks: Mutex<HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>>,
+    update_states: RwLock<HashMap<String, Value>>,
 }
 
 #[derive(Clone, Copy)]
@@ -361,8 +537,74 @@ impl ProviderMaintenance {
                 client: reqwest::Client::new(),
                 registry_base_url,
                 latest_versions: tokio::sync::Mutex::new(HashMap::new()),
+                running_targets: Arc::new(Mutex::new(HashSet::new())),
+                command_locks: Mutex::new(HashMap::new()),
+                update_states: RwLock::new(HashMap::new()),
             }),
         }
+    }
+
+    pub(crate) fn reserve_target(
+        &self,
+        instance_id: &str,
+    ) -> Result<ProviderUpdateReservation, &'static str> {
+        let mut running = self
+            .inner
+            .running_targets
+            .lock()
+            .expect("provider update reservations lock");
+        if !running.insert(instance_id.to_owned()) {
+            return Err("An update is already running for this provider.");
+        }
+        Ok(ProviderUpdateReservation {
+            instance_id: instance_id.to_owned(),
+            running_targets: self.inner.running_targets.clone(),
+        })
+    }
+
+    pub(crate) fn command_lock(&self, lock_key: &'static str) -> Arc<tokio::sync::Mutex<()>> {
+        self.inner
+            .command_locks
+            .lock()
+            .expect("provider update command locks")
+            .entry(lock_key)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
+    pub(crate) fn set_update_state(&self, instance_id: &str, state: Value) {
+        self.inner
+            .update_states
+            .write()
+            .expect("provider update states lock")
+            .insert(instance_id.to_owned(), state);
+    }
+
+    pub(crate) fn overlay_update_state(&self, snapshot: &mut Value) {
+        let Some(instance_id) = snapshot.get("instanceId").and_then(Value::as_str) else {
+            return;
+        };
+        if let Some(state) = self
+            .inner
+            .update_states
+            .read()
+            .expect("provider update states lock")
+            .get(instance_id)
+        {
+            snapshot["updateState"] = state.clone();
+        }
+    }
+
+    pub(crate) fn prune_update_states<'a>(
+        &self,
+        instance_ids: impl IntoIterator<Item = &'a str>,
+    ) {
+        let instance_ids = instance_ids.into_iter().collect::<HashSet<_>>();
+        self.inner
+            .update_states
+            .write()
+            .expect("provider update states lock")
+            .retain(|instance_id, _| instance_ids.contains(instance_id.as_str()));
     }
 
     pub(crate) async fn capabilities(
@@ -387,6 +629,64 @@ impl ProviderMaintenance {
             resolved.as_deref(),
             canonical.as_deref(),
         )
+    }
+
+    pub(crate) async fn run_update_command(
+        &self,
+        target: &ProviderMaintenanceTarget,
+        update: &ProviderUpdateCommand,
+        cancellation: &tokio_util::sync::CancellationToken,
+    ) -> Result<ProviderUpdateCommandResult, String> {
+        self.run_update_command_with_timeout(target, update, cancellation, UPDATE_TIMEOUT)
+            .await
+    }
+
+    async fn run_update_command_with_timeout(
+        &self,
+        target: &ProviderMaintenanceTarget,
+        update: &ProviderUpdateCommand,
+        cancellation: &tokio_util::sync::CancellationToken,
+        timeout: Duration,
+    ) -> Result<ProviderUpdateCommandResult, String> {
+        let search_path = target
+            .environment
+            .iter()
+            .find(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("path"))
+            .map(|(_, value)| value.clone())
+            .or_else(|| std::env::var_os("PATH"));
+        let executable = resolve_provider_executable_in_path(&update.executable, search_path.as_deref())
+            .ok_or_else(|| format!("Could not resolve update command '{}'.", update.executable))?;
+        let launch = prepare_provider_launch(&executable, &update.args)?;
+        let cwd = std::env::current_dir()
+            .map_err(|error| format!("Could not determine update working directory: {error}"))?;
+        let process_output = ProcessRunner
+            .run(
+                ProcessRequest {
+                    operation: "provider.maintenance.update".to_owned(),
+                    command: launch.program,
+                    args: launch.args,
+                    cwd: PathBuf::from(cwd),
+                    env: target.environment.clone(),
+                    stdin: None,
+                    timeout,
+                    max_output_bytes: UPDATE_OUTPUT_LIMIT,
+                    output_policy: OutputPolicy::Truncate,
+                    append_truncation_marker: true,
+                    allow_non_zero_exit: true,
+                },
+                cancellation,
+            )
+            .await
+            .map_err(|error| error.to_string())?;
+        let output = [process_output.stderr, process_output.stdout]
+            .into_iter()
+            .filter(|value| !value.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(ProviderUpdateCommandResult {
+            exit_code: process_output.exit_code,
+            output: (!output.is_empty()).then(|| output.chars().take(UPDATE_OUTPUT_LIMIT).collect()),
+        })
     }
 
     pub(crate) async fn enrich_snapshot(
