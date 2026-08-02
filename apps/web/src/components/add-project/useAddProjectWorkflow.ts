@@ -52,6 +52,7 @@ import {
   type AddProjectStep,
 } from "./AddProjectDialog.logic";
 import { createAddProjectOperations, type AddProjectCommandResult } from "./addProjectOperations";
+import { readPrimaryRunningDistro } from "../hostFolderPicker";
 import { pickAddProjectFolder, type PickAddProjectFolderResult } from "./pickAddProjectFolder";
 
 export interface AddProjectWorkflow {
@@ -538,21 +539,6 @@ function adaptAtomResult<T, E>(result: AtomCommandResult<T, E>): AddProjectComma
     _tag: "Failure",
     error: isAtomCommandInterrupted(result) ? null : squashAtomCommandFailure(result),
   };
-}
-
-function readPrimaryRunningDistro(): string | null {
-  if (typeof window === "undefined" || window.desktopBridge === undefined) {
-    return null;
-  }
-  try {
-    return (
-      window.desktopBridge
-        .getLocalEnvironmentBootstraps()
-        .find((bootstrap) => bootstrap.id === PRIMARY_LOCAL_ENVIRONMENT_ID)?.runningDistro ?? null
-    );
-  } catch {
-    return null;
-  }
 }
 
 export function useAddProjectWorkflow(input: {
