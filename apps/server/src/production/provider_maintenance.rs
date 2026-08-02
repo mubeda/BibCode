@@ -148,6 +148,43 @@ mod tests {
         )
     }
 
+    async fn delayed_npm_registry_fixture(version: &str) -> (Url, Arc<AtomicUsize>) {
+        let concurrent_requests = Arc::new(AtomicUsize::new(0));
+        let active_requests = Arc::new(AtomicUsize::new(0));
+        let state = (
+            version.to_owned(),
+            concurrent_requests.clone(),
+            active_requests,
+        );
+        let app = Router::new()
+            .route(
+                "/{*path}",
+                get(
+                    |State((version, concurrent_requests, active_requests)): State<(
+                        String,
+                        Arc<AtomicUsize>,
+                        Arc<AtomicUsize>,
+                    )>| async move {
+                        let active = active_requests.fetch_add(1, Ordering::SeqCst) + 1;
+                        concurrent_requests.fetch_max(active, Ordering::SeqCst);
+                        tokio::time::sleep(Duration::from_millis(50)).await;
+                        active_requests.fetch_sub(1, Ordering::SeqCst);
+                        Json(json!({ "version": version }))
+                    },
+                ),
+            )
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("registry listener");
+        let address = listener.local_addr().expect("registry address");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("registry server") });
+        (
+            Url::parse(&format!("http://{address}/")).expect("registry URL"),
+            concurrent_requests,
+        )
+    }
+
     #[tokio::test]
     async fn enriches_snapshot_and_caches_npm_latest_for_one_hour() {
         let (registry_url, requests) = npm_registry_fixture("9.9.9").await;
@@ -216,6 +253,23 @@ mod tests {
             .await;
         assert_eq!(snapshot["versionAdvisory"]["latestVersion"], "9.9.9");
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fetches_different_package_versions_concurrently() {
+        let (registry_url, concurrent_requests) = delayed_npm_registry_fixture("9.9.9").await;
+        let maintenance = ProviderMaintenance::with_registry_base_url(registry_url);
+        let codex_target = target("codex", "codex");
+        let claude_target = target("claudeAgent", "claude");
+        let mut codex = installed_snapshot("codex", "1.0.0");
+        let mut claude = installed_snapshot("claudeAgent", "1.0.0");
+
+        tokio::join!(
+            maintenance.enrich_snapshot(&codex_target, &mut codex, true),
+            maintenance.enrich_snapshot(&claude_target, &mut claude, true),
+        );
+
+        assert!(concurrent_requests.load(Ordering::SeqCst) >= 2);
     }
 }
 use std::{collections::HashMap, ffi::OsString, path::Path, sync::Arc, time::Duration};
@@ -371,12 +425,13 @@ impl ProviderMaintenance {
     }
 
     async fn latest_version(&self, package_name: &'static str) -> Option<String> {
-        let mut cache = self.inner.latest_versions.lock().await;
+        let cache = self.inner.latest_versions.lock().await;
         if let Some(entry) = cache.get(package_name)
             && entry.expires_at > tokio::time::Instant::now()
         {
             return entry.version.clone();
         }
+        drop(cache);
         let encoded: String =
             url::form_urlencoded::byte_serialize(package_name.as_bytes()).collect();
         let version = match self.inner.registry_base_url.join(&encoded) {
@@ -400,7 +455,7 @@ impl ProviderMaintenance {
             },
             Err(_) => None,
         };
-        cache.insert(
+        self.inner.latest_versions.lock().await.insert(
             package_name,
             VersionCacheEntry {
                 expires_at: tokio::time::Instant::now() + CACHE_TTL,

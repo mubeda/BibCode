@@ -1564,17 +1564,24 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn quick_disabled_probe_marks_rich_metadata_not_requested() {
+    async fn quick_and_full_disabled_probes_attach_unknown_advisories() {
         let settings = json!({
             "providerInstances": {
                 "codex": { "driver": "codex", "enabled": false, "config": {} }
             }
         });
         let maintenance = ProviderMaintenance::new();
-        let result = probe(&settings, Some("codex"), Path::new("."), &maintenance).await;
+        let quick = probe(&settings, Some("codex"), Path::new("."), &maintenance).await;
+        let full = probe_full(&settings, Some("codex"), Path::new("."), &maintenance).await;
 
-        assert_eq!(result[0].rich_metadata, RichMetadataOutcome::NotRequested);
-        assert!(!result[0].snapshot["models"].as_array().unwrap().is_empty());
+        for result in [quick, full] {
+            assert_eq!(result[0].rich_metadata, RichMetadataOutcome::NotRequested);
+            assert!(!result[0].snapshot["models"].as_array().unwrap().is_empty());
+            assert_eq!(result[0].snapshot["versionAdvisory"]["status"], "unknown");
+            assert!(result[0].snapshot["versionAdvisory"]["canUpdate"].is_boolean());
+            assert!(result[0].snapshot["versionAdvisory"]["currentVersion"].is_null());
+            assert!(result[0].snapshot["versionAdvisory"]["latestVersion"].is_null());
+        }
     }
 
     #[test]
