@@ -890,6 +890,28 @@ async fn provider_update_reports_the_contract_error_when_native_update_is_unavai
 }
 
 #[tokio::test]
+async fn refresh_providers_returns_version_advisories_without_registry_access() {
+    let (_directory, control) = fixture().await;
+
+    call(
+        &control,
+        "server.updateSettings",
+        json!({ "patch": { "enableProviderUpdateChecks": false } }),
+    )
+    .await;
+    let refreshed = call(&control, "server.refreshProviders", json!({})).await;
+    let codex = refreshed["providers"]
+        .as_array()
+        .expect("providers")
+        .iter()
+        .find(|provider| provider["driver"] == "codex")
+        .expect("codex provider");
+    assert!(codex["versionAdvisory"].is_object());
+    assert!(codex["versionAdvisory"]["canUpdate"].is_boolean());
+    assert!(codex["versionAdvisory"]["status"].is_string());
+}
+
+#[tokio::test]
 async fn provider_update_executes_a_supported_cursor_command_and_publishes_success() {
     let directory = tempfile::tempdir().expect("temporary state directory");
     let executable = write_provider_fixture(&directory).await;
