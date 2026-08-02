@@ -65,6 +65,42 @@ fn merge_provider_snapshot(
     next
 }
 
+fn provider_update_state(
+    status: &str,
+    started_at: Option<&str>,
+    finished_at: Option<&str>,
+    message: &str,
+    output: Option<&str>,
+) -> Value {
+    json!({
+        "status": status,
+        "startedAt": started_at,
+        "finishedAt": finished_at,
+        "message": message,
+        "output": output,
+    })
+}
+
+fn post_update_status(providers: &[Value], instance_id: &str) -> &'static str {
+    match providers
+        .iter()
+        .find(|provider| provider["instanceId"] == instance_id)
+    {
+        Some(provider) if provider["versionAdvisory"]["status"] != "behind_latest" => {
+            "succeeded"
+        }
+        _ => "unchanged",
+    }
+}
+
+fn provider_update_error(provider: &str, reason: impl Into<String>) -> Value {
+    json!({
+        "_tag": "ServerProviderUpdateError",
+        "provider": provider,
+        "reason": reason.into(),
+    })
+}
+
 #[cfg(test)]
 #[derive(Clone, Debug)]
 struct ProviderProbePause {
@@ -404,6 +440,175 @@ impl NativeServerControl {
         json!({ "providers": providers })
     }
 
+    async fn publish_provider_update_state(&self, instance_id: &str, state: Value) -> Vec<Value> {
+        self.provider_maintenance.set_update_state(instance_id, state);
+        let mut providers = self.providers.write().await;
+        for provider in providers.iter_mut() {
+            self.provider_maintenance.overlay_update_state(provider);
+        }
+        let snapshot = providers.clone();
+        drop(providers);
+        self.publish_provider_snapshots(&snapshot);
+        snapshot
+    }
+
+    async fn update_provider(
+        &self,
+        payload: &Value,
+        cancellation: CancellationToken,
+    ) -> Result<Value, Value> {
+        let provider = payload
+            .get("provider")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        let instance_id = payload.get("instanceId").and_then(Value::as_str);
+        let (_, settings) = self.settings_snapshot().await;
+        let target = provider_inventory::maintenance_target(&settings, provider, instance_id)
+            .ok_or_else(|| {
+                provider_update_error(
+                    provider,
+                    "The requested provider instance does not match this provider.",
+                )
+            })?;
+        let capabilities = self.provider_maintenance.capabilities(&target).await;
+        let update = capabilities.update.ok_or_else(|| {
+            provider_update_error(
+                provider,
+                "This provider does not expose a safe native self-update command.",
+            )
+        })?;
+        let _reservation = self
+            .provider_maintenance
+            .reserve_target(&target.instance_id)
+            .map_err(|reason| provider_update_error(provider, reason))?;
+        let lock = self.provider_maintenance.command_lock(update.lock_key);
+        let command_guard = match lock.clone().try_lock_owned() {
+            Ok(guard) => guard,
+            Err(_) => {
+                self.publish_provider_update_state(
+                    &target.instance_id,
+                    provider_update_state(
+                        "queued",
+                        None,
+                        None,
+                        "Waiting for another provider update to finish.",
+                        None,
+                    ),
+                )
+                .await;
+                tokio::select! {
+                    guard = lock.lock_owned() => guard,
+                    () = cancellation.cancelled() => {
+                        let finished_at = now_iso();
+                        let providers = self.publish_provider_update_state(
+                            &target.instance_id,
+                            provider_update_state(
+                                "failed",
+                                None,
+                                Some(&finished_at),
+                                "Provider update was cancelled.",
+                                Some("provider.maintenance.update was cancelled"),
+                            ),
+                        ).await;
+                        return Ok(json!({ "providers": providers }));
+                    }
+                }
+            }
+        };
+        let started_at = now_iso();
+        self.publish_provider_update_state(
+            &target.instance_id,
+            provider_update_state(
+                "running",
+                Some(&started_at),
+                None,
+                "Updating provider.",
+                None,
+            ),
+        )
+        .await;
+        let command_result = match self
+            .provider_maintenance
+            .run_update_command(&target, &update, &cancellation)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                drop(command_guard);
+                let finished_at = now_iso();
+                let providers = self
+                    .publish_provider_update_state(
+                        &target.instance_id,
+                        provider_update_state(
+                            "failed",
+                            Some(&started_at),
+                            Some(&finished_at),
+                            "Provider update failed.",
+                            Some(&error),
+                        ),
+                    )
+                    .await;
+                return Ok(json!({ "providers": providers }));
+            }
+        };
+        if command_result.exit_code != 0 {
+            drop(command_guard);
+            let finished_at = now_iso();
+            let message = format!(
+                "Update command exited with code {}.",
+                command_result.exit_code
+            );
+            let providers = self
+                .publish_provider_update_state(
+                    &target.instance_id,
+                    provider_update_state(
+                        "failed",
+                        Some(&started_at),
+                        Some(&finished_at),
+                        &message,
+                        command_result.output.as_deref(),
+                    ),
+                )
+                .await;
+            return Ok(json!({ "providers": providers }));
+        }
+        drop(command_guard);
+
+        let (_, settings) = self.settings_snapshot().await;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| self.config.base_dir.clone());
+        let refreshed = self
+            .probe_full_provider_snapshots(&settings, Some(&target.instance_id), &cwd)
+            .await;
+        let verification = refreshed
+            .iter()
+            .map(|result| result.snapshot.clone())
+            .collect::<Vec<_>>();
+        let status = post_update_status(&verification, &target.instance_id);
+        self.merge_provider_snapshots(refreshed, true).await;
+        let finished_at = now_iso();
+        let message = match status {
+            "succeeded" => "Provider updated.",
+            _ if verification.iter().any(|provider| {
+                provider["instanceId"] == target.instance_id
+                    && provider["versionAdvisory"]["status"] == "behind_latest"
+            }) => "Update command completed, but BiBCode still detects an outdated provider version.",
+            _ => "Update command completed, but BiBCode could not verify the provider version.",
+        };
+        let providers = self
+            .publish_provider_update_state(
+                &target.instance_id,
+                provider_update_state(
+                    status,
+                    Some(&started_at),
+                    Some(&finished_at),
+                    message,
+                    command_result.output.as_deref(),
+                ),
+            )
+            .await;
+        Ok(json!({ "providers": providers }))
+    }
+
     async fn settings_snapshot(&self) -> (u64, Value) {
         let _update_guard = self.settings_update_lock.lock().await;
         (
@@ -514,6 +719,16 @@ impl NativeServerControl {
                     merge_provider_snapshot(previous, result)
                 })
                 .collect();
+        }
+        if !partial {
+            self.provider_maintenance.prune_update_states(
+                current
+                    .iter()
+                    .filter_map(|provider| provider.get("instanceId").and_then(Value::as_str)),
+            );
+        }
+        for provider in current.iter_mut() {
+            self.provider_maintenance.overlay_update_state(provider);
         }
         current.clone()
     }
@@ -629,17 +844,7 @@ impl ProductionServerControl for NativeServerControl {
                 },
                 "server.updateSettings" => control.update_settings(payload).await,
                 "server.refreshProviders" => Ok(control.refresh_providers(&payload).await),
-                "server.updateProvider" => {
-                    let provider = payload
-                        .get("provider")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown");
-                    Err(json!({
-                        "_tag": "ServerProviderUpdateError",
-                        "provider": provider,
-                        "reason": "This provider does not expose a safe native self-update command.",
-                    }))
-                }
+                "server.updateProvider" => control.update_provider(&payload, cancellation).await,
                 "server.upsertKeybinding" | "server.removeKeybinding" => {
                     control.update_keybinding(method, payload).await
                 }
@@ -1452,6 +1657,21 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn post_update_verification_distinguishes_success_and_unchanged() {
+        let current = json!({
+            "instanceId": "codex",
+            "versionAdvisory": { "status": "current" }
+        });
+        let behind = json!({
+            "instanceId": "codex",
+            "versionAdvisory": { "status": "behind_latest" }
+        });
+        assert_eq!(post_update_status(&[current], "codex"), "succeeded");
+        assert_eq!(post_update_status(&[behind], "codex"), "unchanged");
+        assert_eq!(post_update_status(&[], "codex"), "unchanged");
+    }
 
     #[derive(Clone)]
     struct TestAgentActivityHandler {
@@ -2786,7 +3006,7 @@ mod tests {
         assert_eq!(
             call(
                 "server.updateProvider",
-                json!({"provider":"codex"}),
+                json!({"provider":"grok"}),
                 CancellationToken::new(),
             )
             .await

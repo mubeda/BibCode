@@ -888,3 +888,60 @@ async fn provider_update_reports_the_contract_error_when_native_update_is_unavai
             .is_some_and(|reason| !reason.is_empty())
     );
 }
+
+#[tokio::test]
+async fn provider_update_executes_a_supported_cursor_command_and_publishes_success() {
+    let directory = tempfile::tempdir().expect("temporary state directory");
+    let executable = write_provider_fixture(&directory).await;
+    let settings = json!({
+        "enableProviderUpdateChecks": false,
+        "providerInstances": {
+            "cursor-work": {
+                "driver": "cursor",
+                "enabled": true,
+                "config": { "binaryPath": executable }
+            }
+        }
+    });
+    let settings_path = directory.path().join("userdata/settings.json");
+    tokio::fs::create_dir_all(settings_path.parent().expect("settings parent"))
+        .await
+        .expect("create settings directory");
+    tokio::fs::write(
+        settings_path,
+        serde_json::to_vec(&settings).expect("settings JSON"),
+    )
+    .await
+    .expect("write settings fixture");
+    let control = NativeServerControl::new(ServerConfig::new(directory.path()), auth_descriptor()).await;
+
+    let result = call(
+        &control,
+        "server.updateProvider",
+        json!({ "provider": "cursor", "instanceId": "cursor-work" }),
+    )
+    .await;
+    let provider = result["providers"]
+        .as_array()
+        .expect("providers")
+        .iter()
+        .find(|provider| provider["instanceId"] == "cursor-work")
+        .expect("updated cursor");
+    assert_eq!(provider["updateState"]["status"], "succeeded");
+    assert_eq!(provider["updateState"]["message"], "Provider updated.");
+}
+
+#[tokio::test]
+async fn provider_update_rejects_an_instance_driver_mismatch() {
+    let (_directory, control) = fixture().await;
+    let error = control
+        .call(
+            "server.updateProvider",
+            json!({ "provider": "cursor", "instanceId": "codex" }),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("mismatched instance and driver must fail");
+    assert_eq!(error["_tag"], "ServerProviderUpdateError");
+    assert_eq!(error["provider"], "cursor");
+}
