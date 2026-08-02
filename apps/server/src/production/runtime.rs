@@ -267,7 +267,10 @@ impl ProductionRuntime {
         register_workspace_preview_rpc(&mut registry, workspace_preview);
         register_git_vcs_rpc(
             &mut registry,
-            GitVcsRpcServices::with_repository(git_repository),
+            GitVcsRpcServices::with_repository_and_automatic_fetch_interval(
+                git_repository,
+                control.automatic_git_fetch_interval_signal(),
+            ),
         );
         register_server_terminal_rpc(&mut registry, terminal_services.clone());
         finalize_rpc_registry(&registry, &control)?;
