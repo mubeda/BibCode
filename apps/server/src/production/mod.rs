@@ -12,6 +12,7 @@ pub mod operational_logs;
 pub mod orchestration_effects;
 pub mod orchestration_rpc;
 mod provider_inventory;
+mod provider_maintenance;
 pub mod provider_runtime;
 pub mod relay;
 pub mod runtime;

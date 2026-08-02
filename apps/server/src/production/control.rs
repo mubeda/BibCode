@@ -21,6 +21,7 @@ use crate::{
     production::{
         agent_activity::AgentActivitySettingsHandler,
         keybindings, local_servers, provider_inventory,
+        provider_maintenance::ProviderMaintenance,
         server_terminal::{JsonFuture, JsonStream, ProductionServerControl},
     },
     server_settings::ProviderSettingsState,
@@ -125,6 +126,7 @@ pub struct NativeServerControl {
     keybinding_rules: Arc<RwLock<Vec<Value>>>,
     keybinding_issues: Arc<RwLock<Vec<Value>>>,
     providers: Arc<RwLock<Vec<Value>>>,
+    provider_maintenance: ProviderMaintenance,
     full_provider_refresh_running: Arc<AtomicBool>,
     activity_protocol_registered: Arc<AtomicBool>,
     config_events: broadcast::Sender<Value>,
@@ -182,7 +184,8 @@ impl NativeServerControl {
         redact_sensitive_environment(&mut settings);
         let loaded_keybindings = keybindings::load(&keybindings_path).await;
         let cwd = std::env::current_dir().unwrap_or_else(|_| config.base_dir.clone());
-        let providers = provider_inventory::probe(&settings, None, &cwd)
+        let provider_maintenance = ProviderMaintenance::new();
+        let providers = provider_inventory::probe(&settings, None, &cwd, &provider_maintenance)
             .await
             .into_iter()
             .map(|result| result.snapshot)
@@ -210,6 +213,7 @@ impl NativeServerControl {
             keybinding_rules: Arc::new(RwLock::new(loaded_keybindings.rules)),
             keybinding_issues: Arc::new(RwLock::new(loaded_keybindings.issues)),
             providers: Arc::new(RwLock::new(providers)),
+            provider_maintenance,
             full_provider_refresh_running: Arc::new(AtomicBool::new(false)),
             activity_protocol_registered: Arc::new(AtomicBool::new(false)),
             config_events,
@@ -427,7 +431,7 @@ impl NativeServerControl {
             pause.entered.notify_one();
             pause.release.notified().await;
         }
-        provider_inventory::probe(settings, instance_id, cwd).await
+        provider_inventory::probe(settings, instance_id, cwd, &self.provider_maintenance).await
     }
 
     async fn probe_full_provider_snapshots(
@@ -443,7 +447,7 @@ impl NativeServerControl {
             pause.entered.notify_one();
             pause.release.notified().await;
         }
-        provider_inventory::probe_full(settings, instance_id, cwd).await
+        provider_inventory::probe_full(settings, instance_id, cwd, &self.provider_maintenance).await
     }
 
     async fn publish_provider_snapshots_if_current(
