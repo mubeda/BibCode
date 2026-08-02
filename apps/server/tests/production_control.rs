@@ -891,15 +891,36 @@ async fn provider_update_reports_the_contract_error_when_native_update_is_unavai
 
 #[tokio::test]
 async fn refresh_providers_returns_version_advisories_without_registry_access() {
-    let (_directory, control) = fixture().await;
+    let directory = tempfile::tempdir().expect("temporary state directory");
+    let missing_codex = directory.path().join("missing-codex");
+    let settings = json!({
+        "enableProviderUpdateChecks": false,
+        "providerInstances": {
+            "codex": {
+                "driver": "codex",
+                "enabled": true,
+                "config": { "binaryPath": missing_codex }
+            }
+        }
+    });
+    let settings_path = directory.path().join("userdata/settings.json");
+    tokio::fs::create_dir_all(settings_path.parent().expect("settings parent"))
+        .await
+        .expect("create settings directory");
+    tokio::fs::write(
+        settings_path,
+        serde_json::to_vec(&settings).expect("settings JSON"),
+    )
+    .await
+    .expect("write settings fixture");
+    let control = NativeServerControl::new(ServerConfig::new(directory.path()), auth_descriptor()).await;
 
-    call(
+    let refreshed = call(
         &control,
-        "server.updateSettings",
-        json!({ "patch": { "enableProviderUpdateChecks": false } }),
+        "server.refreshProviders",
+        json!({ "instanceId": "codex" }),
     )
     .await;
-    let refreshed = call(&control, "server.refreshProviders", json!({})).await;
     let codex = refreshed["providers"]
         .as_array()
         .expect("providers")
