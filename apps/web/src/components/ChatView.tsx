@@ -5746,6 +5746,9 @@ function ChatViewContent(props: ChatViewProps) {
           threadRef={activeThreadRef}
           surfaces={rightPanelState.surfaces}
           sessions={activePreviewState.sessions}
+          activeSurfaceId={
+            effectiveRightPanelOpen ? (rightPanelState.activeSurfaceId ?? null) : null
+          }
         />
       ) : null}
       {!isPanel && effectiveRightPanelOpen && !shouldUsePlanSidebarSheet
