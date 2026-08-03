@@ -16,18 +16,18 @@ export interface DesktopPreviewTabHostDescriptor {
 export function selectDesktopPreviewTabHosts(
   surfaces: readonly RightPanelSurface[],
   sessions: Readonly<Record<string, PreviewSessionSnapshot>>,
+  activeSurfaceId: string | null,
 ): readonly DesktopPreviewTabHostDescriptor[] {
-  return surfaces.flatMap((surface) => {
-    if (surface.kind !== "preview" || surface.resourceId === null) return [];
-    const session = sessions[surface.resourceId];
-    if (!session) return [];
-    return [
-      {
-        tabId: surface.resourceId,
-        initialUrl: session.navStatus._tag === "Idle" ? null : session.navStatus.url,
-      },
-    ];
-  });
+  const surface = surfaces.find((candidate) => candidate.id === activeSurfaceId);
+  if (surface?.kind !== "preview" || surface.resourceId === null) return [];
+  const session = sessions[surface.resourceId];
+  if (!session) return [];
+  return [
+    {
+      tabId: surface.resourceId,
+      initialUrl: session.navStatus._tag === "Idle" ? null : session.navStatus.url,
+    },
+  ];
 }
 
 export function NativePreviewTabHost(props: {
@@ -60,9 +60,17 @@ export function DesktopPreviewTabHosts(props: {
   readonly threadRef: ScopedThreadRef;
   readonly surfaces: readonly RightPanelSurface[];
   readonly sessions: Readonly<Record<string, PreviewSessionSnapshot>>;
+  readonly activeSurfaceId: string | null;
 }) {
-  const { threadRef, surfaces, sessions } = props;
-  return selectDesktopPreviewTabHosts(surfaces, sessions).map(({ tabId, initialUrl }) => (
-    <NativePreviewTabHost key={tabId} threadRef={threadRef} tabId={tabId} initialUrl={initialUrl} />
-  ));
+  const { threadRef, surfaces, sessions, activeSurfaceId } = props;
+  return selectDesktopPreviewTabHosts(surfaces, sessions, activeSurfaceId).map(
+    ({ tabId, initialUrl }) => (
+      <NativePreviewTabHost
+        key={tabId}
+        threadRef={threadRef}
+        tabId={tabId}
+        initialUrl={initialUrl}
+      />
+    ),
+  );
 }
