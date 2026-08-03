@@ -83,6 +83,7 @@ export default defineConfig({
       ".reference",
       ".repos/**",
       ".plans",
+      "docs/superpowers/**",
       ".alchemy",
       "dist",
       "node_modules",
