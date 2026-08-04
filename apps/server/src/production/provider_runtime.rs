@@ -21,7 +21,7 @@ use crate::{
         ProcessRegistration, ProcessRegistrationMetadata, RegistrationSource,
     },
     orchestration::{
-        ProviderTurnDelivery, canonical_command_digest,
+        ProviderTurnDelivery, TurnDeliveryState, canonical_command_digest,
         engine::{
             ActivityInput, OrchestrationCommand, OrchestrationEngine, ProposedPlanInput,
             SessionInput,
@@ -1106,6 +1106,26 @@ async fn deliver_orchestration_turn_with_identity(
                     detail: error.to_string(),
                 };
             }
+            if let Some(row) = frozen_delivery.as_ref() {
+                match engine
+                    .repositories()
+                    .get_provider_turn_delivery(row.command_id.clone())
+                    .await
+                {
+                    Ok(Some(current)) if current.state == TurnDeliveryState::Dismissed => {
+                        return ProviderDeliveryOutcome::Rejected {
+                            detail: "message delivery was cancelled before the provider started"
+                                .to_owned(),
+                        };
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        return ProviderDeliveryOutcome::DefinitelyNotSent {
+                            detail: error.to_string(),
+                        };
+                    }
+                }
+            }
             let retry = match frozen_delivery {
                 Some(row) => supervisor.deliver_frozen_turn(command, row).await,
                 None => supervisor.deliver_turn(command, delivery_key).await,
@@ -1360,6 +1380,7 @@ async fn launch_request_for_command(
         validate_frozen_session_identity(row, resume_cursor)?;
     }
     let options = selection_options(selection);
+    let session_options = provider_session_options(&route.provider, &options);
     Ok(ProviderLaunchRequest {
         thread_id: thread_id.clone(),
         activity_causal_revision: 0,
@@ -1378,7 +1399,7 @@ async fn launch_request_for_command(
         service_tier: selection_string_option_from(&options, "serviceTier"),
         effort: selection_effort(&options),
         agent: selection_string_option_from(&options, "agent"),
-        options,
+        options: session_options,
         resume_cursor,
         environment: route.environment,
         endpoint: (!route.binary.server_url.trim().is_empty())
@@ -1407,6 +1428,7 @@ impl ResolvedProviderRouteSettings {
     ) -> Result<String, ProviderRuntimeError> {
         let model = model_from_selection(selection);
         let options = selection_options(selection);
+        let session_options = provider_session_options(&self.provider, &options);
         let service_tier = selection_string_option_from(&options, "serviceTier");
         let effort = selection_effort(&options);
         let agent = selection_string_option_from(&options, "agent");
@@ -1420,7 +1442,7 @@ impl ResolvedProviderRouteSettings {
                 .then_some(self.binary.server_password.as_str()),
             self.codex_home.as_ref(),
             model.as_deref(),
-            &options,
+            &session_options,
             service_tier.as_deref(),
             effort.as_deref(),
             agent.as_deref(),
@@ -2678,7 +2700,7 @@ async fn reconcile_model_selection(
     operational_log: Option<&ProviderOperationalLog>,
 ) -> Result<(), ProviderRuntimeError> {
     let target_model = model_from_selection(selection);
-    let target_options = selection_options(selection);
+    let selection_options = selection_options(selection);
     let mut target_restart = None;
     let mut restore_restart = None;
     let mut rejected_update = None;
@@ -2695,102 +2717,142 @@ async fn reconcile_model_selection(
                     .to_owned(),
             });
         }
+        let target_options = provider_session_options(&entry.launch.provider, &selection_options);
+        let target_service_tier = selection_string_option_from(&selection_options, "serviceTier");
+        let target_effort = selection_effort(&selection_options);
+        let target_agent = selection_string_option_from(&selection_options, "agent");
+        let launch_only_changed = match entry.launch.provider.as_str() {
+            "claude" | "claudeAgent" => {
+                entry.launch.effort != target_effort || entry.launch.agent != target_agent
+            }
+            "opencode" => entry.launch.agent != target_agent,
+            _ => false,
+        };
         let model_changed = target_model
             .as_ref()
             .is_some_and(|model| entry.launch.model.as_ref() != Some(model));
         let options_changed = entry.launch.options != target_options;
-        if !model_changed && !options_changed {
+        if !model_changed && !options_changed && !launch_only_changed {
             return Ok(());
         }
-        let previous_model = entry.launch.model.clone();
-        let previous_options = entry.launch.options.clone();
-        let mut model_attempted = false;
-        let options_require_target_model =
-            model_changed && entry.driver.reapply_options_on_model_change();
-        let update = async {
-            if options_require_target_model {
-                model_attempted = true;
-                entry
-                    .driver
-                    .set_model(target_model.clone().expect("changed model is present"))
-                    .await?;
-            }
-            if options_changed || options_require_target_model {
-                entry.driver.set_options(target_options.clone()).await?;
-            }
-            if model_changed
-                && !model_attempted
-                && let Some(model) = target_model.clone()
-            {
-                model_attempted = true;
-                entry.driver.set_model(model).await?;
-            }
-            Ok::<(), ProviderRuntimeError>(())
-        }
-        .await;
-        if options_changed {
-            let mut log_launch = entry.launch.clone();
+        if launch_only_changed {
+            let mut launch = entry.launch.clone();
             if model_changed {
-                log_launch.model.clone_from(&target_model);
+                launch.model.clone_from(&target_model);
             }
+            launch.options = target_options;
+            launch.service_tier = target_service_tier;
+            launch.effort = target_effort;
+            launch.agent = target_agent;
+            target_restart = Some(launch);
             record_option_reconciliation(
                 operational_log,
-                &log_launch,
-                &target_options,
-                "live",
-                match &update {
-                    Ok(()) => "applied",
-                    Err(ProviderRuntimeError::UnsupportedCapability { .. }) => "restart-required",
-                    Err(_) => "failed",
-                },
+                &entry.launch,
+                &selection_options,
+                "restart",
+                "restart-required",
             );
-        }
-        match update {
-            Ok(()) => {
-                let previous_launch = entry.launch.clone();
-                if model_changed {
-                    entry.launch.model = target_model;
+            // Agent and Claude effort are process arguments, not live session options.
+            // Restart below rather than asking the driver to apply an invalid option.
+        } else {
+            let previous_model = entry.launch.model.clone();
+            let previous_options = entry.launch.options.clone();
+            let mut model_attempted = false;
+            let options_require_target_model =
+                model_changed && entry.driver.reapply_options_on_model_change();
+            let update = async {
+                if options_require_target_model {
+                    model_attempted = true;
+                    entry
+                        .driver
+                        .set_model(target_model.clone().expect("changed model is present"))
+                        .await?;
                 }
-                entry.launch.options = target_options;
-                if let Err(error) = persist_entry(&engine.repositories(), entry, "ready").await {
-                    entry.launch = previous_launch.clone();
+                if options_changed || options_require_target_model {
+                    entry.driver.set_options(target_options.clone()).await?;
+                }
+                if model_changed
+                    && !model_attempted
+                    && let Some(model) = target_model.clone()
+                {
+                    model_attempted = true;
+                    entry.driver.set_model(model).await?;
+                }
+                Ok::<(), ProviderRuntimeError>(())
+            }
+            .await;
+            if options_changed {
+                let mut log_launch = entry.launch.clone();
+                if model_changed {
+                    log_launch.model.clone_from(&target_model);
+                }
+                record_option_reconciliation(
+                    operational_log,
+                    &log_launch,
+                    &target_options,
+                    "live",
+                    match &update {
+                        Ok(()) => "applied",
+                        Err(ProviderRuntimeError::UnsupportedCapability { .. }) => {
+                            "restart-required"
+                        }
+                        Err(_) => "failed",
+                    },
+                );
+            }
+            match update {
+                Ok(()) => {
+                    let previous_launch = entry.launch.clone();
+                    if model_changed {
+                        entry.launch.model = target_model;
+                    }
+                    entry.launch.options = target_options;
+                    entry.launch.service_tier = target_service_tier;
+                    entry.launch.effort = target_effort;
+                    entry.launch.agent = target_agent;
+                    if let Err(error) = persist_entry(&engine.repositories(), entry, "ready").await {
+                        entry.launch = previous_launch.clone();
+                        if !restore_driver_configuration(
+                            entry,
+                            model_changed,
+                            previous_launch.model.clone(),
+                            options_changed || options_require_target_model,
+                            previous_launch.options.clone(),
+                        )
+                        .await
+                        {
+                            entry.configuration_healthy = false;
+                            restore_restart = Some(previous_launch);
+                        }
+                        rejected_update = Some(error);
+                    }
+                }
+                Err(ProviderRuntimeError::UnsupportedCapability { .. }) => {
+                    let mut launch = entry.launch.clone();
+                    if model_changed {
+                        launch.model = target_model;
+                    }
+                    launch.options = target_options;
+                    launch.service_tier = target_service_tier;
+                    launch.effort = target_effort;
+                    launch.agent = target_agent;
+                    target_restart = Some(launch);
+                }
+                Err(error) => {
                     if !restore_driver_configuration(
                         entry,
-                        model_changed,
-                        previous_launch.model.clone(),
+                        model_attempted,
+                        previous_model,
                         options_changed || options_require_target_model,
-                        previous_launch.options.clone(),
+                        previous_options,
                     )
                     .await
                     {
                         entry.configuration_healthy = false;
-                        restore_restart = Some(previous_launch);
+                        restore_restart = Some(entry.launch.clone());
                     }
                     rejected_update = Some(error);
                 }
-            }
-            Err(ProviderRuntimeError::UnsupportedCapability { .. }) => {
-                let mut launch = entry.launch.clone();
-                if model_changed {
-                    launch.model = target_model;
-                }
-                launch.options = target_options;
-                target_restart = Some(launch);
-            }
-            Err(error) => {
-                if !restore_driver_configuration(
-                    entry,
-                    model_attempted,
-                    previous_model,
-                    options_changed || options_require_target_model,
-                    previous_options,
-                )
-                .await
-                {
-                    entry.configuration_healthy = false;
-                    restore_restart = Some(entry.launch.clone());
-                }
-                rejected_update = Some(error);
             }
         }
     }
@@ -2996,6 +3058,24 @@ fn selection_options(selection: &Value) -> Vec<Value> {
     options
         .into_iter()
         .map(|(id, value)| json!({ "id": id, "value": value }))
+        .collect()
+}
+
+fn provider_session_options(provider: &str, options: &[Value]) -> Vec<Value> {
+    options
+        .iter()
+        .filter(|option| {
+            let id = option.get("id").and_then(Value::as_str);
+            match provider {
+                "claude" | "claudeAgent" => !matches!(
+                    id,
+                    Some("agent" | "effort" | "reasoningEffort" | "reasoning")
+                ),
+                "opencode" => id != Some("agent"),
+                _ => true,
+            }
+        })
+        .cloned()
         .collect()
 }
 
@@ -7122,7 +7202,11 @@ mod tests {
         }
     }
 
-    async fn launch_request_with_options(options: Vec<Value>) -> super::ProviderLaunchRequest {
+    async fn launch_request_for_provider_with_options(
+        provider: &str,
+        model: &str,
+        options: Vec<Value>,
+    ) -> super::ProviderLaunchRequest {
         let engine = supervisor_engine().await;
         let settings = TempDir::new().expect("provider settings directory");
         let command = serde_json::from_value(json!({
@@ -7131,8 +7215,8 @@ mod tests {
             "threadId":"t1",
             "message":{"messageId":"launch-message","role":"user","text":"launch","attachments":[]},
             "modelSelection":{
-                "instanceId":"codex",
-                "model":"gpt-5.6",
+                "instanceId":provider,
+                "model":model,
                 "options":options
             },
             "runtimeMode":"full-access",
@@ -7153,6 +7237,10 @@ mod tests {
         request
     }
 
+    async fn launch_request_with_options(options: Vec<Value>) -> super::ProviderLaunchRequest {
+        launch_request_for_provider_with_options("codex", "gpt-5.6", options).await
+    }
+
     #[tokio::test]
     async fn launch_request_preserves_canonical_options() {
         let request = launch_request_with_options(vec![
@@ -7167,6 +7255,46 @@ mod tests {
                 json!({ "id":"fastMode", "value":true }),
                 json!({ "id":"reasoningEffort", "value":"high" }),
             ]
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_launch_keeps_agent_and_effort_out_of_session_options() {
+        let request = launch_request_for_provider_with_options(
+            "claudeAgent",
+            "claude-opus-4-8",
+            vec![
+                json!({ "id":"agent", "value":"claude" }),
+                json!({ "id":"effort", "value":"high" }),
+                json!({ "id":"fastMode", "value":true }),
+            ],
+        )
+        .await;
+
+        assert_eq!(request.agent.as_deref(), Some("claude"));
+        assert_eq!(request.effort.as_deref(), Some("high"));
+        assert_eq!(
+            request.options,
+            vec![json!({ "id":"fastMode", "value":true })]
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_launch_keeps_agent_out_of_session_options() {
+        let request = launch_request_for_provider_with_options(
+            "opencode",
+            "opencode/big-pickle",
+            vec![
+                json!({ "id":"agent", "value":"build" }),
+                json!({ "id":"variant", "value":"high" }),
+            ],
+        )
+        .await;
+
+        assert_eq!(request.agent.as_deref(), Some("build"));
+        assert_eq!(
+            request.options,
+            vec![json!({ "id":"variant", "value":"high" })]
         );
     }
 

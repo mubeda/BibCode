@@ -48,6 +48,9 @@ type ComposerControlAvailability =
 
 type CommitModelOptions = (nextOptions: ProviderOptions | undefined) => void | Promise<void>;
 
+const ACTIVE_CONTROL_CLASSNAME =
+  "border-foreground/12 bg-foreground/10 text-foreground hover:border-foreground/18 hover:bg-foreground/15 hover:text-foreground dark:border-foreground/18 dark:bg-foreground/14 dark:hover:border-foreground/24 dark:hover:bg-foreground/20 [&_svg]:!text-foreground";
+
 type TraitsPersistence = {
   threadRef?: ScopedThreadRef;
   draftId?: DraftId;
@@ -500,14 +503,15 @@ export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
   );
 });
 
-function EffortLevelIcon({ level }: { level: number }) {
-  const heights = ["h-1", "h-1.5", "h-2.5", "h-3.5"];
+function EffortLevelIcon({ level, levels }: { level: number; levels: number }) {
+  const barCount = Math.max(1, levels);
   return (
     <span aria-hidden="true" className="flex h-4 items-end gap-0.5">
-      {heights.map((height, index) => (
+      {Array.from({ length: barCount }, (_, index) => (
         <span
-          key={height}
-          className={cn("w-0.5 rounded-sm", height, index < level ? "bg-current" : "bg-current/30")}
+          key={index}
+          className={cn("w-0.5 rounded-sm", index < level ? "bg-current" : "bg-current/30")}
+          style={{ height: barCount === 1 ? 14 : 4 + Math.round((10 * index) / (barCount - 1)) }}
         />
       ))}
     </span>
@@ -556,7 +560,8 @@ export const ComposerTraitControls = memo(function ComposerTraitControls({
     selectedPromptInjectedEffort ?? getDescriptorStringValue(primarySelectDescriptor) ?? "";
   const effortOptionIndex =
     primarySelectDescriptor?.options.findIndex((option) => option.id === effortValue) ?? -1;
-  const effortLevel = Math.max(1, Math.min(4, effortOptionIndex + 1));
+  const effortLevelCount = primarySelectDescriptor?.options.length ?? 1;
+  const effortLevel = Math.max(1, Math.min(effortLevelCount, effortOptionIndex + 1));
   const effortLabel =
     primarySelectDescriptor?.options.find((option) => option.id === effortValue)?.label ??
     primarySelectDescriptor?.label;
@@ -589,33 +594,30 @@ export const ComposerTraitControls = memo(function ComposerTraitControls({
         ? "Disable fast mode"
         : "Enable fast mode"
       : resolvedFastAvailability.reason;
+  const effortTooltip = isPending
+    ? "Applying reasoning effort"
+    : resolvedEffortAvailability.state === "supported"
+      ? `Reasoning effort: ${effortLabel ?? "Unknown"}`
+      : resolvedEffortAvailability.reason;
   const effortButton = (
     <Button
       type="button"
       size="sm"
-      variant={effortValue ? "default" : "ghost"}
+      variant="ghost"
       className={cn(
         "h-7 px-1.5",
         resolvedEffortAvailability.state === "supported"
-          ? effortValue
-            ? ""
-            : "text-muted-foreground/70 hover:text-foreground/80"
+          ? "text-foreground/80 hover:text-foreground"
           : "border border-input bg-background text-muted-foreground/70",
       )}
-      aria-label={
-        isPending
-          ? "Applying reasoning effort"
-          : resolvedEffortAvailability.state === "supported"
-            ? `Reasoning effort: ${effortLabel ?? "Unknown"}`
-            : resolvedEffortAvailability.reason
-      }
+      aria-label={effortTooltip}
       aria-disabled={!effortOperable}
       aria-busy={isPending}
     >
       {isPending ? (
         <LoaderCircleIcon aria-hidden="true" className="size-3.5 animate-spin" />
       ) : (
-        <EffortLevelIcon level={effortLevel} />
+        <EffortLevelIcon level={effortLevel} levels={effortLevelCount} />
       )}
     </Button>
   );
@@ -628,11 +630,13 @@ export const ComposerTraitControls = memo(function ComposerTraitControls({
             <Button
               type="button"
               size="sm"
-              variant={fastModeEnabled ? "default" : "ghost"}
+              variant="ghost"
               className={cn(
                 "h-7 gap-1 px-1.5",
                 resolvedFastAvailability.state === "supported"
-                  ? !fastModeEnabled && "text-muted-foreground/70 hover:text-foreground/80"
+                  ? fastModeEnabled
+                    ? ACTIVE_CONTROL_CLASSNAME
+                    : "text-muted-foreground/70 hover:text-foreground/80"
                   : "border border-input bg-background text-muted-foreground/70",
               )}
               aria-label={fastLabel}
@@ -661,13 +665,14 @@ export const ComposerTraitControls = memo(function ComposerTraitControls({
             </Button>
           }
         />
-        {resolvedFastAvailability.state === "supported" ? null : (
-          <TooltipPopup side="top">{resolvedFastAvailability.reason}</TooltipPopup>
-        )}
+        <TooltipPopup side="top">{fastLabel}</TooltipPopup>
       </Tooltip>
       {effortOperable ? (
         <Menu>
-          <MenuTrigger render={effortButton} />
+          <Tooltip>
+            <TooltipTrigger render={<MenuTrigger render={effortButton} />} />
+            <TooltipPopup side="top">{effortTooltip}</TooltipPopup>
+          </Tooltip>
           <MenuPopup align="start">
             <TraitsMenuContent
               provider={provider}
@@ -687,9 +692,7 @@ export const ComposerTraitControls = memo(function ComposerTraitControls({
       ) : (
         <Tooltip>
           <TooltipTrigger render={effortButton} />
-          {resolvedEffortAvailability.state === "supported" ? null : (
-            <TooltipPopup side="top">{resolvedEffortAvailability.reason}</TooltipPopup>
-          )}
+          <TooltipPopup side="top">{effortTooltip}</TooltipPopup>
         </Tooltip>
       )}
     </div>

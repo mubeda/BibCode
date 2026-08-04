@@ -32,6 +32,7 @@ import {
   createLocalDispatchSnapshot,
   deriveComposerSendState,
   deriveLockedProvider,
+  findLastCancellableDeliveryMessage,
   getStartedThreadModelChangeBlockReason,
   hasServerAcknowledgedLocalDispatch,
   readFileAsDataUrl,
@@ -944,6 +945,23 @@ describe("hasServerAcknowledgedLocalDispatch", () => {
     expect(hasServerAcknowledgedLocalDispatch({ ...common, threadError: "failed" })).toBe(true);
   });
 
+  it("acknowledges terminal delivery failure without waiting for a provider session", () => {
+    const localDispatch = createLocalDispatchSnapshot(makeThread());
+
+    expect(
+      hasServerAcknowledgedLocalDispatch({
+        localDispatch,
+        phase: "ready",
+        latestTurn: null,
+        session: null,
+        deliveryState: "failed",
+        hasPendingApproval: false,
+        hasPendingUserInput: false,
+        threadError: null,
+      }),
+    ).toBe(true);
+  });
+
   it("requires a started latest turn while running and detects either session field settling", () => {
     const localDispatch = createLocalDispatchSnapshot(
       makeThread({ latestTurn: completedTurn, session: readySession }),
@@ -979,5 +997,20 @@ describe("hasServerAcknowledgedLocalDispatch", () => {
         session: { ...readySession, updatedAt: "2026-03-29T02:00:00.000Z" },
       }),
     ).toBe(true);
+  });
+});
+
+describe("findLastCancellableDeliveryMessage", () => {
+  it("keeps the latest pending or sending delivery cancellable after reload", () => {
+    const message = (id: string, state: "delivered" | "pending" | "sending") =>
+      ({ id, delivery: { state, provider: "opencode" } }) as ChatMessage;
+
+    expect(
+      findLastCancellableDeliveryMessage([
+        message("delivered", "delivered"),
+        message("pending", "pending"),
+        message("sending", "sending"),
+      ])?.id,
+    ).toBe("sending");
   });
 });
