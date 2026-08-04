@@ -2306,7 +2306,10 @@ describe("ChatView project script handlers", () => {
       providerSessionDefaults: {
         [ProviderDriverKind.make("codex")]: {
           model: "gpt-configured",
-          options: [{ id: "reasoningEffort", value: "high" }],
+          options: [
+            { id: "reasoningEffort", value: "high" },
+            { id: "serviceTier", value: "fast" },
+          ],
         },
       },
     };
@@ -2341,10 +2344,7 @@ describe("ChatView project script handlers", () => {
         modelSelection: {
           instanceId: codexInstanceId,
           model: "gpt-configured",
-          options: [
-            { id: "reasoningEffort", value: "high" },
-            { id: "serviceTier", value: "fast" },
-          ],
+          options: [{ id: "reasoningEffort", value: "high" }],
         },
       },
     });
