@@ -6,7 +6,10 @@ import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const harness = vi.hoisted(() => ({
   api: null as null | { contextMenu: { show: ReturnType<typeof vi.fn> } },
-  refCurrent: null as null | { querySelector: ReturnType<typeof vi.fn> },
+  refCurrent: null as null | {
+    querySelector: ReturnType<typeof vi.fn>;
+    querySelectorAll: ReturnType<typeof vi.fn>;
+  },
   effects: [] as Array<() => void>,
 }));
 
@@ -29,7 +32,9 @@ vi.mock("~/components/ui/tooltip", () => ({
   TooltipPopup: ({ children }: { children: React.ReactNode }) => <span>{children}</span>,
 }));
 vi.mock("~/components/ui/scroll-area", () => ({
-  ScrollArea: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  ScrollArea: ({ children, ...props }: React.ComponentProps<"div">) => (
+    <div {...props}>{children}</div>
+  ),
 }));
 
 import { CenterPanelTabs } from "./CenterPanelTabs";
@@ -48,8 +53,20 @@ const terminal = {
   label: "Codex Terminal",
 } as const;
 
+type WheelEventStub = {
+  deltaX: number;
+  deltaY: number;
+  preventDefault: ReturnType<typeof vi.fn>;
+};
+
+type KeyboardEventStub = {
+  key: string;
+  preventDefault: ReturnType<typeof vi.fn>;
+};
+
 function props(surfaces: CenterSurface[] = [host, chat, terminal]) {
   return {
+    hostLabel: "Codex",
     surfaces,
     activeSurfaceId: chat.id,
     terminalLabelsById: new Map([["terminal-1", "Build terminal"]]),
@@ -81,13 +98,17 @@ beforeEach(() => {
 });
 
 describe("CenterPanelTabs", () => {
-  it("renders every surface title and scrolls the active tab into view", () => {
+  it("names the host from its current provider and preserves other surface labels", () => {
     const scrollIntoView = vi.fn();
-    harness.refCurrent = { querySelector: vi.fn(() => ({ scrollIntoView })) };
+    harness.refCurrent = {
+      querySelector: vi.fn(() => ({ scrollIntoView })),
+      querySelectorAll: vi.fn(),
+    };
     const input = props();
     const markup = renderToStaticMarkup(<CenterPanelTabs {...input} />);
 
-    expect(markup).toContain("Main");
+    expect(markup).toContain("Codex");
+    expect(markup).not.toContain("Main");
     expect(markup).toContain("Claude");
     expect(markup).toContain("Codex Terminal");
     expect(markup).not.toContain("Build terminal");
@@ -104,6 +125,75 @@ describe("CenterPanelTabs", () => {
 
   it("returns null for an empty surface collection", () => {
     expect(CenterPanelTabs(props([]))).toBeNull();
+  });
+
+  it("translates vertical wheel input only when the tab viewport overflows", () => {
+    const viewport = { scrollWidth: 640, clientWidth: 240, scrollLeft: 12 };
+    const activeTab = { scrollIntoView: vi.fn() };
+    const activationButtons = [
+      { focus: vi.fn(), scrollIntoView: vi.fn() },
+      { focus: vi.fn(), scrollIntoView: vi.fn() },
+      { focus: vi.fn(), scrollIntoView: vi.fn() },
+    ];
+    harness.refCurrent = {
+      querySelector: vi.fn((selector: string) =>
+        selector === '[data-slot="scroll-area-viewport"]' ? viewport : activeTab,
+      ),
+      querySelectorAll: vi.fn(() => activationButtons),
+    };
+    const input = props();
+    const tree = CenterPanelTabs(input);
+    const scrollArea = visit(tree).find(
+      (element) =>
+        (element.props as Record<string, unknown>)["data-center-panel-tab-list"] === true,
+    );
+    if (!scrollArea) throw new Error("Tab scroll area not found");
+
+    const event: WheelEventStub = { deltaX: 0, deltaY: 48, preventDefault: vi.fn() };
+    (scrollArea.props as { onWheel: (event: WheelEventStub) => void }).onWheel(event);
+
+    expect(viewport.scrollLeft).toBe(60);
+    expect(event.preventDefault).toHaveBeenCalledOnce();
+
+    viewport.clientWidth = viewport.scrollWidth;
+    (scrollArea.props as { onWheel: (event: WheelEventStub) => void }).onWheel(event);
+    expect(viewport.scrollLeft).toBe(60);
+  });
+
+  it("moves to and reveals the adjacent tab with horizontal arrow keys", () => {
+    const viewport = { scrollWidth: 640, clientWidth: 240, scrollLeft: 12 };
+    const activeTab = { scrollIntoView: vi.fn() };
+    const activationButtons = [
+      { focus: vi.fn(), scrollIntoView: vi.fn() },
+      { focus: vi.fn(), scrollIntoView: vi.fn() },
+      { focus: vi.fn(), scrollIntoView: vi.fn() },
+    ];
+    harness.refCurrent = {
+      querySelector: vi.fn((selector: string) =>
+        selector === '[data-slot="scroll-area-viewport"]' ? viewport : activeTab,
+      ),
+      querySelectorAll: vi.fn(() => activationButtons),
+    };
+    const input = props();
+    const tree = CenterPanelTabs(input);
+    const elements = visit(tree);
+    const activeButton = elements.find(
+      (element) =>
+        element.type === "button" &&
+        (element.props as Record<string, unknown>)["aria-selected"] === true,
+    );
+    if (!activeButton) throw new Error("Active tab button not found");
+
+    const event: KeyboardEventStub = { key: "ArrowRight", preventDefault: vi.fn() };
+    (activeButton.props as { onKeyDown: (event: KeyboardEventStub) => void }).onKeyDown(event);
+
+    expect(event.preventDefault).toHaveBeenCalledOnce();
+    expect(activationButtons[2]?.focus).toHaveBeenCalledOnce();
+    expect(activationButtons[2]?.scrollIntoView).toHaveBeenCalledWith({
+      block: "nearest",
+      inline: "nearest",
+    });
+    expect(input.onActivate).toHaveBeenCalledWith(terminal);
   });
 
   it("handles activation, close buttons, middle click, and context-menu actions", async () => {
@@ -145,8 +235,7 @@ describe("CenterPanelTabs", () => {
     const activate = chatElements.find(
       (element) =>
         element.type === "button" &&
-        (element.props as Record<string, unknown>).className ===
-          "flex min-w-0 flex-1 items-center gap-1.5",
+        (element.props as Record<string, unknown>)["data-center-panel-tab-activation"] === true,
     );
     if (!activate) throw new Error("Activate button not found");
     (activate.props as { onClick: () => void }).onClick();
