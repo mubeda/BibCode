@@ -5,7 +5,10 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     process::Stdio,
-    sync::{Arc, Mutex as StdMutex, OnceLock},
+    sync::{
+        Arc, Mutex as StdMutex, OnceLock,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, SystemTime},
 };
 
@@ -93,6 +96,7 @@ pub type BoxRuntimeFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 const DEFAULT_QUEUE_CAPACITY: usize = 32;
 const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 128;
+const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const ACTIVITY_ONLY_PROVIDER_EVENT_TYPE: &str = "activity.native";
 const DELIVERY_ROUTE_FINGERPRINT_FIELD: &str = "_bibcodeProviderRouteFingerprint";
 const DELIVERY_ROUTE_CWD_PENDING_FIELD: &str = "_bibcodeProviderRouteCwdPending";
@@ -316,12 +320,14 @@ pub trait ProviderDriverFactory: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct SupervisorOptions {
     pub queue_capacity: usize,
+    pub session_idle_timeout: Duration,
 }
 
 impl Default for SupervisorOptions {
     fn default() -> Self {
         Self {
             queue_capacity: DEFAULT_QUEUE_CAPACITY,
+            session_idle_timeout: DEFAULT_SESSION_IDLE_TIMEOUT,
         }
     }
 }
@@ -402,6 +408,11 @@ enum SupervisorMessage {
         thread_id: String,
         generation: u64,
     },
+    SuspendIdle {
+        thread_id: String,
+        idle_generation: Arc<AtomicU64>,
+        generation: u64,
+    },
 }
 
 struct SessionEntry {
@@ -415,6 +426,16 @@ struct SessionEntry {
     activity_compensation_key: String,
     event_task: JoinHandle<()>,
     event_cancellation: CancellationToken,
+    idle_generation: Arc<AtomicU64>,
+    terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
+    idle_timeout: Duration,
+}
+
+struct DetachedSession {
+    launch: ProviderLaunchRequest,
+    driver: Arc<dyn ProviderDriver>,
+    resume_cursor: Option<Value>,
+    runtime_payload: Option<Value>,
 }
 
 #[derive(Default)]
@@ -564,6 +585,7 @@ impl ProviderRuntimeSupervisor {
         operational_log: Option<ProviderOperationalLog>,
     ) -> Self {
         let queue_capacity = options.queue_capacity.max(1);
+        let session_idle_timeout = options.session_idle_timeout;
         let (sender, receiver) = mpsc::channel(queue_capacity);
         let (terminal_sender, terminal_receiver) = mpsc::unbounded_channel();
         let stopped = CancellationToken::new();
@@ -579,6 +601,7 @@ impl ProviderRuntimeSupervisor {
                 terminal_sender,
                 terminal_receiver,
                 queue_capacity,
+                session_idle_timeout,
                 worker_stopped,
                 operational_log,
             )
@@ -1744,6 +1767,7 @@ async fn run_supervisor(
     terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
     mut terminal_receiver: mpsc::UnboundedReceiver<SupervisorMessage>,
     deferred_capacity: usize,
+    session_idle_timeout: Duration,
     stopped: CancellationToken,
     operational_log: Option<ProviderOperationalLog>,
 ) {
@@ -1779,6 +1803,8 @@ async fn run_supervisor(
                     *request,
                     operational_log.as_ref(),
                     None,
+                    terminal_sender.clone(),
+                    session_idle_timeout,
                 )
                 .await;
                 let _ = response.send(result);
@@ -1991,6 +2017,27 @@ async fn run_supervisor(
                     deferred_configuration.remove(&thread_id);
                 }
             }
+            SupervisorMessage::SuspendIdle {
+                thread_id,
+                idle_generation,
+                generation,
+            } => {
+                let is_current = sessions.get(&thread_id).is_some_and(|entry| {
+                    Arc::ptr_eq(&entry.idle_generation, &idle_generation)
+                        && entry.idle_generation.load(Ordering::Relaxed) == generation
+                });
+                if is_current
+                    && let Err(error) = suspend_idle_session(
+                        &engine.repositories(),
+                        &activity,
+                        &mut sessions,
+                        &thread_id,
+                    )
+                    .await
+                {
+                    tracing::warn!(%error, %thread_id, "failed to suspend idle provider session");
+                }
+            }
             SupervisorMessage::Shutdown { response } => {
                 reject_all_deferred(&mut deferred_configuration, ProviderRuntimeError::Shutdown);
                 let result =
@@ -2195,6 +2242,7 @@ async fn spawn_delivery(
             Ok((row.clone(), active_provider_session_id(entry, row)?))
         })
         .transpose()?;
+    entry.idle_generation.fetch_add(1, Ordering::Relaxed);
     let driver = entry.driver.clone();
     let launch = entry.launch.clone();
     let resume_cursor = entry.resume_cursor.clone();
@@ -2401,6 +2449,8 @@ async fn launch_session(
     mut request: ProviderLaunchRequest,
     operational_log: Option<&ProviderOperationalLog>,
     inherited_activity_lifecycle: Option<SharedActivityLifecycle>,
+    terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
+    idle_timeout: Duration,
 ) -> Result<(), ProviderRuntimeError> {
     let option_application_method = if inherited_activity_lifecycle.is_some() {
         "restart"
@@ -2520,6 +2570,7 @@ async fn launch_session(
     dispatch_session_state(engine, &request, "ready", None, None).await?;
 
     let cancellation = CancellationToken::new();
+    let idle_generation = Arc::new(AtomicU64::new(0));
     let event_task = spawn_event_pump(
         engine.clone(),
         driver.clone(),
@@ -2532,6 +2583,9 @@ async fn launch_session(
         format!("supervisor:stream-ended:{activity_lifecycle_id}"),
         cancellation.clone(),
         operational_log.cloned(),
+        idle_generation.clone(),
+        terminal_sender.clone(),
+        idle_timeout,
     );
     sessions.insert(
         request.thread_id.clone(),
@@ -2546,6 +2600,9 @@ async fn launch_session(
             activity_compensation_key: format!("supervisor:cancelled-live:{activity_lifecycle_id}"),
             event_task,
             event_cancellation: cancellation,
+            idle_generation,
+            terminal_sender,
+            idle_timeout,
         },
     );
     Ok(())
@@ -2606,6 +2663,7 @@ async fn handle_command(
             interaction_mode,
             ..
         } => {
+            entry.idle_generation.fetch_add(1, Ordering::Relaxed);
             let turn_id = entry
                 .driver
                 .send(message.text, message.attachments, interaction_mode)
@@ -2953,9 +3011,13 @@ async fn restart_session(
     operational_log: Option<&ProviderOperationalLog>,
 ) -> Result<(), ProviderRuntimeError> {
     let mut inherited_activity_lifecycle = None;
+    let mut terminal_sender = None;
+    let mut idle_timeout = None;
     if let Some(entry) = sessions.get(thread_id) {
         launch.resume_cursor = entry.resume_cursor.clone();
         inherited_activity_lifecycle = Some(entry.activity_lifecycle.clone());
+        terminal_sender = Some(entry.terminal_sender.clone());
+        idle_timeout = Some(entry.idle_timeout);
         entry.driver.shutdown().await?;
     }
     if let Some(entry) = sessions.remove(thread_id) {
@@ -2990,6 +3052,12 @@ async fn restart_session(
         launch,
         operational_log,
         inherited_activity_lifecycle,
+        terminal_sender.ok_or_else(|| ProviderRuntimeError::SessionNotFound {
+            thread_id: thread_id.to_owned(),
+        })?,
+        idle_timeout.ok_or_else(|| ProviderRuntimeError::SessionNotFound {
+            thread_id: thread_id.to_owned(),
+        })?,
     )
     .await
 }
@@ -3122,6 +3190,9 @@ fn spawn_event_pump(
     stream_ended_event_key: String,
     cancellation: CancellationToken,
     operational_log: Option<ProviderOperationalLog>,
+    idle_generation: Arc<AtomicU64>,
+    terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
+    idle_timeout: Duration,
 ) -> JoinHandle<()> {
     let activity_controller = activity.agent_activity_controller();
     tokio::spawn(async move {
@@ -3232,6 +3303,8 @@ fn spawn_event_pump(
                     if event.event_type == ACTIVITY_ONLY_PROVIDER_EVENT_TYPE {
                         continue;
                     }
+                    let completed = event.event_type == "turn.completed"
+                        && event.payload.get("state").and_then(Value::as_str) != Some("failed");
                     if let Err(error) = project_provider_event(
                         &engine,
                         &launch,
@@ -3246,11 +3319,35 @@ fn spawn_event_pump(
                             return;
                         }
                         tracing::warn!(%error, "failed to project provider runtime event");
+                    } else if completed {
+                        schedule_idle_suspend(
+                            terminal_sender.clone(),
+                            launch.thread_id.clone(),
+                            idle_generation.clone(),
+                            idle_timeout,
+                        );
                     }
                 }
             }
         }
     })
+}
+
+fn schedule_idle_suspend(
+    sender: mpsc::UnboundedSender<SupervisorMessage>,
+    thread_id: String,
+    idle_generation: Arc<AtomicU64>,
+    idle_timeout: Duration,
+) {
+    let generation = idle_generation.fetch_add(1, Ordering::Relaxed) + 1;
+    tokio::spawn(async move {
+        tokio::time::sleep(idle_timeout).await;
+        let _ = sender.send(SupervisorMessage::SuspendIdle {
+            thread_id,
+            idle_generation,
+            generation,
+        });
+    });
 }
 
 async fn provider_thread_was_deleted(repositories: &Repositories, thread_id: &str) -> bool {
@@ -3550,10 +3647,52 @@ async fn stop_session(
     sessions: &mut HashMap<String, SessionEntry>,
     thread_id: &str,
 ) -> Result<(), ProviderRuntimeError> {
+    let result = match detach_session(activity, sessions, thread_id).await {
+        Ok(entry) => entry.driver.shutdown().await,
+        Err(ProviderRuntimeError::SessionNotFound { .. }) => Ok(()),
+        Err(error) => return Err(error),
+    };
+    repositories
+        .delete_provider_session_runtime(thread_id.to_owned())
+        .await
+        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
+    result
+}
+
+async fn suspend_idle_session(
+    repositories: &Repositories,
+    activity: &ActivityProjection,
+    sessions: &mut HashMap<String, SessionEntry>,
+    thread_id: &str,
+) -> Result<(), ProviderRuntimeError> {
+    let entry = detach_session(activity, sessions, thread_id).await?;
+    let result = entry.driver.shutdown().await;
+    persist_runtime(
+        repositories,
+        &entry.launch,
+        "suspended",
+        entry.resume_cursor,
+        entry.runtime_payload,
+    )
+    .await?;
+    result
+}
+
+async fn detach_session(
+    activity: &ActivityProjection,
+    sessions: &mut HashMap<String, SessionEntry>,
+    thread_id: &str,
+) -> Result<DetachedSession, ProviderRuntimeError> {
     let Some(entry) = sessions.remove(thread_id) else {
         return Err(ProviderRuntimeError::SessionNotFound {
             thread_id: thread_id.to_owned(),
         });
+    };
+    let detached = DetachedSession {
+        launch: entry.launch.clone(),
+        driver: entry.driver.clone(),
+        resume_cursor: entry.resume_cursor.clone(),
+        runtime_payload: entry.runtime_payload.clone(),
     };
     entry.event_cancellation.cancel();
     entry.event_task.abort();
@@ -3565,15 +3704,10 @@ async fn stop_session(
         &entry.launch,
         entry.activity_capable,
         &entry.activity_lifecycle,
-        entry.activity_compensation_key,
+        entry.activity_compensation_key.clone(),
     )
     .await;
-    let result = entry.driver.shutdown().await;
-    repositories
-        .delete_provider_session_runtime(thread_id.to_owned())
-        .await
-        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
-    result
+    Ok(detached)
 }
 
 async fn synchronize_activity_lifecycle(
@@ -8530,6 +8664,167 @@ done
                 turn_id: Some("unit-turn".to_owned())
             }
         );
+        supervisor.shutdown().await.unwrap();
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn completed_idle_session_is_suspended_without_losing_resume_state() {
+        let engine = supervisor_engine().await;
+        let state = Arc::new(StdMutex::new(SupervisorDriverState::default()));
+        let (events_tx, events_rx) = mpsc::channel(2);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state: state.clone(),
+                events: StdMutex::new(Some(events_rx)),
+            }),
+            super::ActivityProjection::new(crate::activity::ActivityRepository::new(
+                engine.repositories().database().clone(),
+            )),
+            super::SupervisorOptions {
+                queue_capacity: 2,
+                session_idle_timeout: std::time::Duration::from_millis(100),
+            },
+        );
+        let temp = TempDir::new().unwrap();
+        let mut request = native_launch(&temp, "codex");
+        request.thread_id = "t1".to_owned();
+        supervisor.launch(request).await.unwrap();
+
+        for (event_type, payload) in [
+            (
+                "content.delta",
+                json!({"messageId":"assistant-idle","delta":"OK"}),
+            ),
+            (
+                "turn.completed",
+                json!({"messageId":"assistant-idle","state":"completed"}),
+            ),
+        ] {
+            events_tx
+                .send(super::ProviderEvent {
+                    native_event_id: None,
+                    event_type: event_type.to_owned(),
+                    thread_id: "t1".to_owned(),
+                    turn_id: Some("unit-turn".to_owned()),
+                    request_id: None,
+                    payload,
+                    activity: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+
+        for _ in 0..100 {
+            let projected = load_snapshot(&engine.repositories())
+                .await
+                .unwrap()
+                .messages
+                .iter()
+                .any(|message| message.message_id == "assistant-idle" && !message.is_streaming);
+            if projected {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let follow_up: OrchestrationCommand = serde_json::from_value(json!({
+            "type":"thread.turn.start", "commandId":"follow-up", "threadId":"t1",
+            "message":{"messageId":"user-follow-up","role":"user","text":"next","attachments":[]},
+            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "runtimeMode":"full-access", "interactionMode":"default",
+            "createdAt":"2026-07-16T00:00:01Z"
+        }))
+        .unwrap();
+        supervisor.handle_orchestration(follow_up).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(state.lock().unwrap().shutdowns, 0);
+
+        for (event_type, payload) in [
+            (
+                "content.delta",
+                json!({"messageId":"assistant-follow-up","delta":"OK"}),
+            ),
+            (
+                "turn.completed",
+                json!({"messageId":"assistant-follow-up","state":"completed"}),
+            ),
+        ] {
+            events_tx
+                .send(super::ProviderEvent {
+                    native_event_id: None,
+                    event_type: event_type.to_owned(),
+                    thread_id: "t1".to_owned(),
+                    turn_id: Some("unit-turn-follow-up".to_owned()),
+                    request_id: None,
+                    payload,
+                    activity: Vec::new(),
+                })
+                .await
+                .unwrap();
+        }
+        for _ in 0..100 {
+            let projected = load_snapshot(&engine.repositories())
+                .await
+                .unwrap()
+                .messages
+                .iter()
+                .any(|message| {
+                    message.message_id == "assistant-follow-up" && !message.is_streaming
+                });
+            if projected {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+
+        timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                if state.lock().unwrap().shutdowns == 1 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("idle provider is suspended");
+
+        let runtime = engine
+            .repositories()
+            .get_provider_session_runtime("t1".to_owned())
+            .await
+            .unwrap()
+            .expect("resume state is retained");
+        assert_eq!(runtime.status, "suspended");
+        assert_eq!(runtime.resume_cursor, Some(json!({"threadId":"unit-session"})));
+
+        let stop: OrchestrationCommand = serde_json::from_value(json!({
+            "type":"thread.session.stop", "commandId":"stop-idle", "threadId":"t1",
+            "createdAt":"2026-07-16T00:00:02Z"
+        }))
+        .unwrap();
+        supervisor.handle_orchestration(stop).await.unwrap();
+        assert!(
+            engine
+                .repositories()
+                .get_provider_session_runtime("t1".to_owned())
+                .await
+                .unwrap()
+                .is_none(),
+            "stopping a suspended session removes its resume state"
+        );
+        assert_eq!(state.lock().unwrap().shutdowns, 1);
+
         supervisor.shutdown().await.unwrap();
         engine.shutdown().await;
     }
