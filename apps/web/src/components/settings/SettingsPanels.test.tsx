@@ -214,6 +214,9 @@ vi.mock("../chat/ProviderModelPicker", () => ({
 }));
 
 vi.mock("../chat/TraitsPicker", () => ({
+  findProviderEffortDescriptor: (descriptors: ReadonlyArray<{ id: string; type: string }>) =>
+    descriptors.find((descriptor) => descriptor.type === "select" && descriptor.id === "effort") ??
+    null,
   TraitsPicker: (props: AnyProps) => {
     h.traitsPickers.push(props);
     return <div data-testid="traits-picker" />;
@@ -1272,6 +1275,7 @@ describe("ProviderSettingsPanel", () => {
     expect(h.sections.find((section) => section.title === "Providers")?.contentVariant).toBe(
       "stack",
     );
+    expect(control("button", "Add provider instance").props.hidden).toBe(true);
 
     const cardIds = h.instanceCards.map((card) => String(card.instanceId));
     // Cursor's default slot is hidden (no live cursor provider), but the

@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     ffi::OsStr,
     future::Future,
     path::{Path, PathBuf},
@@ -21,6 +21,7 @@ use crate::{
         ProcessRegistration, ProcessRegistrationMetadata, RegistrationSource,
     },
     orchestration::{
+        ProviderTurnDelivery, canonical_command_digest,
         engine::{
             ActivityInput, OrchestrationCommand, OrchestrationEngine, ProposedPlanInput,
             SessionInput,
@@ -42,9 +43,13 @@ use crate::{
         orchestration_effects::process_compatible_path,
     },
     provider::{
-        attachments::{AttachmentMaterializer, MaterializedImage},
+        attachments::{
+            AttachmentMaterializer, MaterializedAttachment, append_file_references,
+            split_native_images_and_file_references,
+        },
         claude::{
-            ClaudeControlRequest, ClaudeProviderRuntime, Decision, RuntimeMode as ClaudeRuntimeMode,
+            ClaudeControlRequest, ClaudeProviderRuntime, Decision,
+            RuntimeMode as ClaudeRuntimeMode,
             hook_sink::{
                 CLAUDE_HOOK_TOKEN_ENV, ClaudeHookSinkHandle, claude_hook_settings,
                 start_claude_hook_sink,
@@ -61,6 +66,7 @@ use crate::{
         cursor::{
             AcpConnectionConfig as CursorConnectionConfig,
             AcpJsonRpcConnection as CursorConnection, CursorSessionOptions, CursorSessionRuntime,
+            runtime::CursorRuntimeError,
         },
         grok::{
             AcpConnectionConfig as GrokConnectionConfig, AcpJsonRpcConnection as GrokConnection,
@@ -88,6 +94,10 @@ pub type BoxRuntimeFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 const DEFAULT_QUEUE_CAPACITY: usize = 32;
 const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 128;
 const ACTIVITY_ONLY_PROVIDER_EVENT_TYPE: &str = "activity.native";
+const DELIVERY_ROUTE_FINGERPRINT_FIELD: &str = "_bibcodeProviderRouteFingerprint";
+const DELIVERY_ROUTE_CWD_PENDING_FIELD: &str = "_bibcodeProviderRouteCwdPending";
+const DELIVERY_ROUTE_FINGERPRINT_VERSION: &str = "provider-route-v4";
+const DELIVERY_ROUTE_CWD_FINGERPRINT_VERSION: &str = "provider-route-cwd-v1";
 
 /// Prevent host diagnostics settings from turning provider stderr into a high-volume event stream.
 pub(crate) fn sanitize_provider_subprocess_environment(command: &mut tokio::process::Command) {
@@ -106,6 +116,7 @@ pub struct ProviderLaunchRequest {
     pub runtime_mode: String,
     pub interaction_mode: String,
     pub model: Option<String>,
+    pub options: Vec<Value>,
     pub service_tier: Option<String>,
     pub effort: Option<String>,
     pub agent: Option<String>,
@@ -192,6 +203,35 @@ pub struct ProviderEvent {
     pub activity: Vec<ProviderActivityMutation>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderDeliveryOutcome {
+    Accepted { turn_id: Option<String> },
+    DefinitelyNotSent { detail: String },
+    Ambiguous { detail: String },
+    Rejected { detail: String },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProviderReconciliationOutcome {
+    Found,
+    Absent,
+    Unavailable { detail: String },
+}
+
+pub struct ProviderDeliveryHandle {
+    completion: oneshot::Receiver<ProviderDeliveryOutcome>,
+}
+
+impl ProviderDeliveryHandle {
+    pub async fn completion(self) -> ProviderDeliveryOutcome {
+        self.completion
+            .await
+            .unwrap_or_else(|_| ProviderDeliveryOutcome::Ambiguous {
+                detail: "provider delivery task ended without an outcome".to_owned(),
+            })
+    }
+}
+
 pub trait ProviderDriver: Send + Sync {
     fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>>;
     fn send(
@@ -200,6 +240,32 @@ pub trait ProviderDriver: Send + Sync {
         attachments: Vec<Value>,
         interaction_mode: String,
     ) -> BoxRuntimeFuture<'_, Result<Option<String>, ProviderRuntimeError>>;
+    fn deliver(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+        interaction_mode: String,
+        _delivery_key: String,
+    ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
+        Box::pin(async move {
+            match self.send(text, attachments, interaction_mode).await {
+                Ok(turn_id) => ProviderDeliveryOutcome::Accepted { turn_id },
+                Err(error) => ProviderDeliveryOutcome::Ambiguous {
+                    detail: error.to_string(),
+                },
+            }
+        })
+    }
+    fn reconcile(
+        &self,
+        _delivery_key: String,
+    ) -> BoxRuntimeFuture<'_, ProviderReconciliationOutcome> {
+        Box::pin(async {
+            ProviderReconciliationOutcome::Unavailable {
+                detail: "provider does not support exact delivery reconciliation".to_owned(),
+            }
+        })
+    }
     fn interrupt(
         &self,
         turn_id: Option<String>,
@@ -228,6 +294,13 @@ pub trait ProviderDriver: Send + Sync {
         Box::pin(async { Ok(()) })
     }
     fn set_model(&self, model: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>>;
+    fn reapply_options_on_model_change(&self) -> bool {
+        false
+    }
+    fn set_options(
+        &self,
+        options: Vec<Value>,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>>;
     fn rollback(&self, turn_count: i64) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>>;
     fn next_event(&self) -> BoxRuntimeFuture<'_, Option<ProviderEvent>>;
     fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>>;
@@ -303,6 +376,16 @@ enum SupervisorMessage {
         command: Box<OrchestrationCommand>,
         response: oneshot::Sender<Result<(), ProviderRuntimeError>>,
     },
+    Deliver {
+        command: Box<OrchestrationCommand>,
+        delivery_key: String,
+        frozen_delivery: Option<Box<ProviderTurnDelivery>>,
+        response: oneshot::Sender<Result<ProviderDeliveryHandle, ProviderRuntimeError>>,
+    },
+    Reconcile {
+        row: Box<ProviderTurnDelivery>,
+        response: oneshot::Sender<Result<ProviderReconciliationOutcome, ProviderRuntimeError>>,
+    },
     SetAgentActivityEnabled {
         enabled: bool,
         response: oneshot::Sender<Result<usize, ProviderRuntimeError>>,
@@ -310,11 +393,21 @@ enum SupervisorMessage {
     Shutdown {
         response: oneshot::Sender<Result<(), ProviderRuntimeError>>,
     },
+    DeliveryComplete {
+        thread_id: String,
+        generation: u64,
+        abnormal: bool,
+    },
+    DrainDeferred {
+        thread_id: String,
+        generation: u64,
+    },
 }
 
 struct SessionEntry {
     launch: ProviderLaunchRequest,
     driver: Arc<dyn ProviderDriver>,
+    configuration_healthy: bool,
     resume_cursor: Option<Value>,
     runtime_payload: Option<Value>,
     activity_capable: bool,
@@ -322,6 +415,42 @@ struct SessionEntry {
     activity_compensation_key: String,
     event_task: JoinHandle<()>,
     event_cancellation: CancellationToken,
+}
+
+#[derive(Default)]
+struct ThreadDeliverySequence {
+    active_generation: Option<u64>,
+    completed_generation: u64,
+}
+
+struct DeliveryTerminalGuard {
+    sender: mpsc::UnboundedSender<SupervisorMessage>,
+    thread_id: String,
+    generation: u64,
+    completed: bool,
+}
+
+impl DeliveryTerminalGuard {
+    fn complete(mut self) {
+        self.completed = true;
+        let _ = self.sender.send(SupervisorMessage::DeliveryComplete {
+            thread_id: self.thread_id.clone(),
+            generation: self.generation,
+            abnormal: false,
+        });
+    }
+}
+
+impl Drop for DeliveryTerminalGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            let _ = self.sender.send(SupervisorMessage::DeliveryComplete {
+                thread_id: self.thread_id.clone(),
+                generation: self.generation,
+                abnormal: true,
+            });
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default)]
@@ -343,8 +472,7 @@ impl RetainedActivitySections {
     fn from_counts(counts: &ActivitySummaryCounts) -> Self {
         Self {
             actors: counts.subagents.active > 0 || counts.subagents.done > 0,
-            background_work: counts.background_tasks.active > 0
-                || counts.background_tasks.done > 0,
+            background_work: counts.background_tasks.active > 0 || counts.background_tasks.done > 0,
         }
     }
 
@@ -435,15 +563,22 @@ impl ProviderRuntimeSupervisor {
         options: SupervisorOptions,
         operational_log: Option<ProviderOperationalLog>,
     ) -> Self {
-        let (sender, receiver) = mpsc::channel(options.queue_capacity.max(1));
+        let queue_capacity = options.queue_capacity.max(1);
+        let (sender, receiver) = mpsc::channel(queue_capacity);
+        let (terminal_sender, terminal_receiver) = mpsc::unbounded_channel();
         let stopped = CancellationToken::new();
         let worker_stopped = stopped.clone();
+        let worker_sender = sender.clone();
         let worker = tokio::spawn(async move {
             run_supervisor(
                 engine,
                 factory,
                 activity,
                 receiver,
+                worker_sender,
+                terminal_sender,
+                terminal_receiver,
+                queue_capacity,
                 worker_stopped,
                 operational_log,
             )
@@ -501,6 +636,72 @@ impl ProviderRuntimeSupervisor {
             response,
         })
         .await
+    }
+
+    pub async fn deliver_turn(
+        &self,
+        command: OrchestrationCommand,
+        delivery_key: String,
+    ) -> Result<ProviderDeliveryHandle, ProviderRuntimeError> {
+        if self.stopped.is_cancelled() {
+            return Err(ProviderRuntimeError::Shutdown);
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(SupervisorMessage::Deliver {
+                command: Box::new(command),
+                delivery_key,
+                frozen_delivery: None,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| ProviderRuntimeError::QueueClosed)?;
+        response_rx
+            .await
+            .map_err(|_| ProviderRuntimeError::ResponseDropped)?
+    }
+
+    async fn deliver_frozen_turn(
+        &self,
+        command: OrchestrationCommand,
+        row: ProviderTurnDelivery,
+    ) -> Result<ProviderDeliveryHandle, ProviderRuntimeError> {
+        if self.stopped.is_cancelled() {
+            return Err(ProviderRuntimeError::Shutdown);
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(SupervisorMessage::Deliver {
+                command: Box::new(command),
+                delivery_key: row.delivery_key.clone(),
+                frozen_delivery: Some(Box::new(row)),
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| ProviderRuntimeError::QueueClosed)?;
+        response_rx
+            .await
+            .map_err(|_| ProviderRuntimeError::ResponseDropped)?
+    }
+
+    pub async fn reconcile_turn(
+        &self,
+        row: ProviderTurnDelivery,
+    ) -> Result<ProviderReconciliationOutcome, ProviderRuntimeError> {
+        if self.stopped.is_cancelled() {
+            return Err(ProviderRuntimeError::Shutdown);
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(SupervisorMessage::Reconcile {
+                row: Box::new(row),
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| ProviderRuntimeError::QueueClosed)?;
+        response_rx
+            .await
+            .map_err(|_| ProviderRuntimeError::ResponseDropped)?
     }
 
     pub async fn set_agent_activity_enabled(
@@ -600,7 +801,7 @@ pub async fn route_orchestration_command(
         Err(ProviderRuntimeError::SessionNotFound { .. })
             if matches!(command, OrchestrationCommand::ThreadTurnStart { .. }) =>
         {
-            let request = launch_request_for_command(engine, settings_root, &command).await?;
+            let request = launch_request_for_command(engine, settings_root, &command, None).await?;
             supervisor.launch(request).await?;
             supervisor.handle_orchestration(command).await
         }
@@ -621,6 +822,373 @@ pub async fn route_orchestration_command(
             Err(ProviderRuntimeError::StaleSession { thread_id, action })
         }
         Err(error) => Err(error),
+    }
+}
+
+pub async fn deliver_orchestration_turn(
+    supervisor: &ProviderRuntimeSupervisor,
+    engine: &OrchestrationEngine,
+    settings_root: &PathBuf,
+    command: OrchestrationCommand,
+    delivery_key: String,
+) -> ProviderDeliveryOutcome {
+    deliver_orchestration_turn_with_identity(
+        supervisor,
+        engine,
+        settings_root,
+        command,
+        delivery_key,
+        None,
+    )
+    .await
+}
+
+pub async fn deliver_durable_orchestration_turn(
+    supervisor: &ProviderRuntimeSupervisor,
+    engine: &OrchestrationEngine,
+    settings_root: &PathBuf,
+    command: OrchestrationCommand,
+    delivery_key: String,
+) -> ProviderDeliveryOutcome {
+    let command_id = match &command {
+        OrchestrationCommand::ThreadTurnStart { command_id, .. } => command_id.clone(),
+        _ => {
+            return ProviderDeliveryOutcome::Rejected {
+                detail: "only a turn start can use durable provider delivery".to_owned(),
+            };
+        }
+    };
+    let row = match engine
+        .repositories()
+        .get_provider_turn_delivery(command_id)
+        .await
+    {
+        Ok(Some(row)) if row.delivery_key == delivery_key => row,
+        Ok(Some(_)) => {
+            return ProviderDeliveryOutcome::Rejected {
+                detail: "durable provider delivery key does not match its persisted row".to_owned(),
+            };
+        }
+        Ok(None) => {
+            return ProviderDeliveryOutcome::Rejected {
+                detail: "durable provider delivery row was not found".to_owned(),
+            };
+        }
+        Err(error) => {
+            return ProviderDeliveryOutcome::Rejected {
+                detail: error.to_string(),
+            };
+        }
+    };
+    deliver_orchestration_turn_with_identity(
+        supervisor,
+        engine,
+        settings_root,
+        command,
+        delivery_key,
+        Some(row),
+    )
+    .await
+}
+
+pub(crate) fn finalize_delivery_route_cwd(
+    payload: &mut Value,
+    cwd: Option<&Path>,
+) -> Result<bool, ProviderRuntimeError> {
+    if payload
+        .get(DELIVERY_ROUTE_CWD_PENDING_FIELD)
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        return Ok(false);
+    }
+    let cwd = cwd.ok_or_else(|| ProviderRuntimeError::Provider {
+        provider: "orchestration".to_owned(),
+        detail: "durable provider route worktree cwd is still unavailable after bootstrap"
+            .to_owned(),
+    })?;
+    let partial = payload
+        .get(DELIVERY_ROUTE_FINGERPRINT_FIELD)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ProviderRuntimeError::Provider {
+            provider: "orchestration".to_owned(),
+            detail:
+                "durable provider route fingerprint is missing while finalizing its worktree cwd"
+                    .to_owned(),
+        })?;
+    let fingerprint =
+        delivery_route_fingerprint_with_cwd(partial, &process_compatible_path(cwd.to_path_buf()))?;
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| ProviderRuntimeError::Provider {
+            provider: "orchestration".to_owned(),
+            detail: "durable turn payload must be a JSON object before its provider route can be finalized"
+                .to_owned(),
+        })?;
+    object.insert(
+        DELIVERY_ROUTE_FINGERPRINT_FIELD.to_owned(),
+        Value::String(fingerprint),
+    );
+    object.remove(DELIVERY_ROUTE_CWD_PENDING_FIELD);
+    Ok(true)
+}
+
+/// Freezes the identity of the provider launch used by a durable turn.
+///
+/// Secret values participate in the in-memory digest input, but only the digest is persisted.
+/// Resume cursors, provider session IDs, and issued MCP credentials are volatile continuation
+/// state rather than provider process destinations. A local-draft worktree path is finalized after
+/// bootstrap because it does not exist at admission time.
+pub async fn freeze_delivery_route(
+    engine: &OrchestrationEngine,
+    settings_root: &PathBuf,
+    command: &OrchestrationCommand,
+    payload: &mut Value,
+) -> Result<(), ProviderRuntimeError> {
+    let OrchestrationCommand::ThreadTurnStart {
+        thread_id,
+        model_selection,
+        bootstrap,
+        ..
+    } = command
+    else {
+        return Err(ProviderRuntimeError::Provider {
+            provider: "orchestration".to_owned(),
+            detail: "only a turn start can freeze a durable provider route".to_owned(),
+        });
+    };
+    let thread = engine
+        .repositories()
+        .get_thread(thread_id.clone())
+        .await
+        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
+    let bootstrap_selection = bootstrap
+        .as_deref()
+        .and_then(|bootstrap| bootstrap.create_thread.as_ref())
+        .map(|create| &create.model_selection);
+    let selection = model_selection
+        .as_ref()
+        .or(bootstrap_selection)
+        .or_else(|| thread.as_ref().map(|thread| &thread.model_selection))
+        .ok_or_else(|| ProviderRuntimeError::Provider {
+            provider: "orchestration".to_owned(),
+            detail: format!("turn for thread {thread_id} has no provider identity"),
+        })?;
+    let instance_id = selection
+        .get("instanceId")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("codex");
+    let route = resolve_provider_route_settings(settings_root, instance_id, None).await?;
+    let (cwd, cwd_pending) = if let Some(thread) = thread.as_ref() {
+        let project = engine
+            .repositories()
+            .get_project(thread.project_id.clone())
+            .await
+            .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
+            .ok_or_else(|| ProviderRuntimeError::Provider {
+                provider: route.provider.clone(),
+                detail: format!("project {} was not found", thread.project_id),
+            })?;
+        (
+            Some(process_compatible_path(
+                thread
+                    .worktree_path
+                    .clone()
+                    .map_or_else(|| PathBuf::from(project.workspace_root), PathBuf::from),
+            )),
+            false,
+        )
+    } else {
+        let bootstrap =
+            bootstrap
+                .as_deref()
+                .ok_or_else(|| ProviderRuntimeError::SessionNotFound {
+                    thread_id: thread_id.clone(),
+                })?;
+        let create = bootstrap.create_thread.as_ref().ok_or_else(|| {
+            ProviderRuntimeError::SessionNotFound {
+                thread_id: thread_id.clone(),
+            }
+        })?;
+        if let Some(worktree_path) = create.worktree_path.as_ref() {
+            (
+                Some(process_compatible_path(PathBuf::from(worktree_path))),
+                false,
+            )
+        } else if bootstrap.prepare_worktree.is_some() {
+            (None, true)
+        } else {
+            let project = engine
+                .repositories()
+                .get_project(create.project_id.clone())
+                .await
+                .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
+                .ok_or_else(|| ProviderRuntimeError::Provider {
+                    provider: route.provider.clone(),
+                    detail: format!("project {} was not found", create.project_id),
+                })?;
+            (
+                Some(process_compatible_path(PathBuf::from(
+                    project.workspace_root,
+                ))),
+                false,
+            )
+        }
+    };
+    let fingerprint = route.fingerprint(selection, cwd.as_deref())?;
+    let object = payload
+        .as_object_mut()
+        .ok_or_else(|| ProviderRuntimeError::Provider {
+            provider: route.provider,
+            detail:
+                "durable turn payload must be a JSON object before its provider route can be frozen"
+                    .to_owned(),
+        })?;
+    object.insert(
+        DELIVERY_ROUTE_FINGERPRINT_FIELD.to_owned(),
+        Value::String(fingerprint),
+    );
+    if cwd_pending {
+        object.insert(
+            DELIVERY_ROUTE_CWD_PENDING_FIELD.to_owned(),
+            Value::Bool(true),
+        );
+    }
+    Ok(())
+}
+
+async fn deliver_orchestration_turn_with_identity(
+    supervisor: &ProviderRuntimeSupervisor,
+    engine: &OrchestrationEngine,
+    settings_root: &PathBuf,
+    command: OrchestrationCommand,
+    delivery_key: String,
+    frozen_delivery: Option<ProviderTurnDelivery>,
+) -> ProviderDeliveryOutcome {
+    let is_frozen = frozen_delivery.is_some();
+    let first = match frozen_delivery.clone() {
+        Some(row) => supervisor.deliver_frozen_turn(command.clone(), row).await,
+        None => {
+            supervisor
+                .deliver_turn(command.clone(), delivery_key.clone())
+                .await
+        }
+    };
+    let handle = match first {
+        Ok(handle) => handle,
+        Err(ProviderRuntimeError::SessionNotFound { .. }) => {
+            let request = match launch_request_for_command(
+                engine,
+                settings_root,
+                &command,
+                frozen_delivery.as_ref(),
+            )
+            .await
+            {
+                Ok(request) => request,
+                Err(error) => {
+                    return ProviderDeliveryOutcome::Rejected {
+                        detail: error.to_string(),
+                    };
+                }
+            };
+            if let Some(row) = frozen_delivery.as_ref()
+                && let Err(error) = validate_frozen_delivery_route(row, &request)
+            {
+                return ProviderDeliveryOutcome::Rejected {
+                    detail: error.to_string(),
+                };
+            }
+            if let Err(error) = supervisor.launch(request).await {
+                return ProviderDeliveryOutcome::DefinitelyNotSent {
+                    detail: error.to_string(),
+                };
+            }
+            let retry = match frozen_delivery {
+                Some(row) => supervisor.deliver_frozen_turn(command, row).await,
+                None => supervisor.deliver_turn(command, delivery_key).await,
+            };
+            match retry {
+                Ok(handle) => handle,
+                Err(error) if is_frozen => {
+                    return ProviderDeliveryOutcome::Rejected {
+                        detail: error.to_string(),
+                    };
+                }
+                Err(error) => return delivery_enqueue_failure(error),
+            }
+        }
+        Err(error) if is_frozen => {
+            return ProviderDeliveryOutcome::Rejected {
+                detail: error.to_string(),
+            };
+        }
+        Err(error) => return delivery_enqueue_failure(error),
+    };
+    handle.completion().await
+}
+
+fn delivery_enqueue_failure(error: ProviderRuntimeError) -> ProviderDeliveryOutcome {
+    match error {
+        ProviderRuntimeError::ResponseDropped => ProviderDeliveryOutcome::Ambiguous {
+            detail: error.to_string(),
+        },
+        _ => ProviderDeliveryOutcome::DefinitelyNotSent {
+            detail: error.to_string(),
+        },
+    }
+}
+
+pub async fn reconcile_orchestration_turn(
+    supervisor: &ProviderRuntimeSupervisor,
+    engine: &OrchestrationEngine,
+    settings_root: &PathBuf,
+    row: ProviderTurnDelivery,
+) -> ProviderReconciliationOutcome {
+    match supervisor.reconcile_turn(row.clone()).await {
+        Ok(outcome) => outcome,
+        Err(ProviderRuntimeError::SessionNotFound { .. }) => {
+            let command = match serde_json::from_value::<OrchestrationCommand>(row.payload.clone())
+            {
+                Ok(command) => command,
+                Err(error) => {
+                    return ProviderReconciliationOutcome::Unavailable {
+                        detail: format!("durable turn payload is invalid: {error}"),
+                    };
+                }
+            };
+            let request =
+                match launch_request_for_command(engine, settings_root, &command, Some(&row)).await
+                {
+                    Ok(request) => request,
+                    Err(error) => {
+                        return ProviderReconciliationOutcome::Unavailable {
+                            detail: error.to_string(),
+                        };
+                    }
+                };
+            if let Err(error) = validate_frozen_delivery_route(&row, &request) {
+                return ProviderReconciliationOutcome::Unavailable {
+                    detail: error.to_string(),
+                };
+            }
+            if let Err(error) = supervisor.launch(request).await {
+                return ProviderReconciliationOutcome::Unavailable {
+                    detail: error.to_string(),
+                };
+            }
+            supervisor
+                .reconcile_turn(row)
+                .await
+                .unwrap_or_else(|error| ProviderReconciliationOutcome::Unavailable {
+                    detail: error.to_string(),
+                })
+        }
+        Err(error) => ProviderReconciliationOutcome::Unavailable {
+            detail: error.to_string(),
+        },
     }
 }
 
@@ -706,12 +1274,14 @@ async fn launch_request_for_command(
     engine: &OrchestrationEngine,
     settings_root: &PathBuf,
     command: &OrchestrationCommand,
+    frozen_delivery: Option<&ProviderTurnDelivery>,
 ) -> Result<ProviderLaunchRequest, ProviderRuntimeError> {
     let OrchestrationCommand::ThreadTurnStart {
         thread_id,
         model_selection,
         runtime_mode,
         interaction_mode,
+        bootstrap,
         ..
     } = command
     else {
@@ -736,35 +1306,171 @@ async fn launch_request_for_command(
             provider: "orchestration".to_owned(),
             detail: format!("project {} was not found", thread.project_id),
         })?;
-    let selection = model_selection.as_ref().unwrap_or(&thread.model_selection);
-    let instance_id = selection
-        .get("instanceId")
-        .and_then(Value::as_str)
-        .unwrap_or("codex")
-        .to_owned();
+    let bootstrap_selection = bootstrap
+        .as_deref()
+        .and_then(|bootstrap| bootstrap.create_thread.as_ref())
+        .map(|create| &create.model_selection);
+    let selection = model_selection
+        .as_ref()
+        .or(bootstrap_selection)
+        .unwrap_or(&thread.model_selection);
+    let instance_id = frozen_delivery.map_or_else(
+        || {
+            selection
+                .get("instanceId")
+                .and_then(Value::as_str)
+                .unwrap_or("codex")
+                .to_owned()
+        },
+        |row| row.provider_instance_id.clone(),
+    );
+    let route =
+        resolve_provider_route_settings(settings_root, &instance_id, frozen_delivery).await?;
+    let provider = route.provider.as_str();
+    let persisted = repositories
+        .get_provider_session_runtime(thread_id.clone())
+        .await
+        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
+        .filter(|runtime| {
+            runtime.provider_name == provider
+                && runtime.provider_instance_id.as_deref() == Some(instance_id.as_str())
+        });
+    let requires_resume = frozen_delivery.is_some_and(|row| row.provider_session_id.is_some());
+    if requires_resume && persisted.is_none() {
+        return Err(ProviderRuntimeError::Provider {
+            provider: provider.to_owned(),
+            detail: format!(
+                "durable turn requires resumable runtime state for provider instance {instance_id}"
+            ),
+        });
+    }
+    let resume_cursor = persisted.and_then(|runtime| runtime.resume_cursor);
+    if let Some(row) = frozen_delivery
+        && row.provider_session_id.is_some()
+    {
+        let resume_cursor =
+            resume_cursor
+                .as_ref()
+                .ok_or_else(|| ProviderRuntimeError::Provider {
+                    provider: provider.to_owned(),
+                    detail: format!(
+                        "durable turn requires a resume cursor for provider instance {instance_id}"
+                    ),
+                })?;
+        validate_frozen_session_identity(row, resume_cursor)?;
+    }
+    let options = selection_options(selection);
+    Ok(ProviderLaunchRequest {
+        thread_id: thread_id.clone(),
+        activity_causal_revision: 0,
+        provider: provider.to_owned(),
+        provider_label: route.provider_label,
+        provider_instance_id: Some(instance_id),
+        binary_path: route.binary.binary_path.clone(),
+        cwd: process_compatible_path(
+            thread
+                .worktree_path
+                .map_or_else(|| PathBuf::from(project.workspace_root), PathBuf::from),
+        ),
+        runtime_mode: runtime_mode.clone(),
+        interaction_mode: interaction_mode.clone(),
+        model: model_from_selection(selection),
+        service_tier: selection_string_option_from(&options, "serviceTier"),
+        effort: selection_effort(&options),
+        agent: selection_string_option_from(&options, "agent"),
+        options,
+        resume_cursor,
+        environment: route.environment,
+        endpoint: (!route.binary.server_url.trim().is_empty())
+            .then(|| route.binary.server_url.clone()),
+        server_password: (!route.binary.server_password.is_empty())
+            .then(|| route.binary.server_password.clone()),
+        mcp: None,
+        codex_home: route.codex_home,
+    })
+}
+
+struct ResolvedProviderRouteSettings {
+    provider: String,
+    provider_instance_id: String,
+    provider_label: String,
+    binary: ProviderBinarySettingsState,
+    environment: BTreeMap<String, String>,
+    codex_home: Option<CodexHomeLayout>,
+}
+
+impl ResolvedProviderRouteSettings {
+    fn fingerprint(
+        &self,
+        selection: &Value,
+        cwd: Option<&Path>,
+    ) -> Result<String, ProviderRuntimeError> {
+        let model = model_from_selection(selection);
+        let options = selection_options(selection);
+        let service_tier = selection_string_option_from(&options, "serviceTier");
+        let effort = selection_effort(&options);
+        let agent = selection_string_option_from(&options, "agent");
+        let partial = delivery_route_fingerprint_values(
+            &self.provider,
+            Some(&self.provider_instance_id),
+            &self.binary.binary_path,
+            &self.environment,
+            (!self.binary.server_url.trim().is_empty()).then_some(self.binary.server_url.as_str()),
+            (!self.binary.server_password.is_empty())
+                .then_some(self.binary.server_password.as_str()),
+            self.codex_home.as_ref(),
+            model.as_deref(),
+            &options,
+            service_tier.as_deref(),
+            effort.as_deref(),
+            agent.as_deref(),
+        )?;
+        cwd.map_or(Ok(partial.clone()), |cwd| {
+            delivery_route_fingerprint_with_cwd(&partial, cwd)
+        })
+    }
+}
+
+async fn resolve_provider_route_settings(
+    settings_root: &PathBuf,
+    instance_id: &str,
+    frozen_delivery: Option<&ProviderTurnDelivery>,
+) -> Result<ResolvedProviderRouteSettings, ProviderRuntimeError> {
     let settings = ProviderSettingsStore::new(settings_root)
         .get()
         .await
         .map_err(|error| ProviderRuntimeError::Provider {
-            provider: instance_id.clone(),
+            provider: instance_id.to_owned(),
             detail: error.to_string(),
         })?;
-    let instance = settings.provider_instances.get(&instance_id);
+    let instance = settings.provider_instances.get(instance_id);
+    if let Some(row) = frozen_delivery
+        && instance.is_none()
+        && instance_id != row.provider_kind
+    {
+        return Err(ProviderRuntimeError::Provider {
+            provider: row.provider_kind.clone(),
+            detail: format!(
+                "durable turn requires provider instance {}, but that exact instance is unavailable",
+                row.provider_instance_id
+            ),
+        });
+    }
     let driver = instance
         .map(|value| value.driver.as_str())
-        .unwrap_or(instance_id.as_str());
-    let provider = match driver {
-        "claudeAgent" | "claude" => "claudeAgent",
-        "codex" => "codex",
-        "cursor" => "cursor",
-        "grok" => "grok",
-        "opencode" => "opencode",
-        other => {
-            return Err(ProviderRuntimeError::UnsupportedProvider {
-                provider: other.to_owned(),
-            });
-        }
-    };
+        .unwrap_or(instance_id);
+    let provider = canonical_provider_kind(driver)?;
+    if let Some(row) = frozen_delivery
+        && provider != row.provider_kind
+    {
+        return Err(ProviderRuntimeError::Provider {
+            provider: row.provider_kind.clone(),
+            detail: format!(
+                "durable turn provider identity mismatch: instance {} now uses {}, expected {}",
+                row.provider_instance_id, provider, row.provider_kind
+            ),
+        });
+    }
     let binary = provider_binary_settings(&settings.providers, provider, instance);
     if !binary.enabled || binary.binary_path.trim().is_empty() {
         return Err(ProviderRuntimeError::UnsupportedProvider {
@@ -791,45 +1497,181 @@ async fn launch_request_for_command(
                 .unwrap_or_else(|| Path::new(".")),
         )
     });
-    let persisted = repositories
-        .get_provider_session_runtime(thread_id.clone())
-        .await
-        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
-        .filter(|runtime| {
-            runtime.provider_name == provider
-                && runtime.provider_instance_id.as_deref() == Some(instance_id.as_str())
-        });
-    Ok(ProviderLaunchRequest {
-        thread_id: thread_id.clone(),
-        activity_causal_revision: 0,
+    Ok(ResolvedProviderRouteSettings {
         provider: provider.to_owned(),
+        provider_instance_id: instance_id.to_owned(),
         provider_label: instance
             .and_then(|value| value.display_name.as_deref())
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .unwrap_or(provider)
             .to_owned(),
-        provider_instance_id: Some(instance_id),
-        binary_path: binary.binary_path.clone(),
-        cwd: process_compatible_path(
-            thread
-                .worktree_path
-                .map_or_else(|| PathBuf::from(project.workspace_root), PathBuf::from),
-        ),
-        runtime_mode: runtime_mode.clone(),
-        interaction_mode: interaction_mode.clone(),
-        model: model_from_selection(selection),
-        service_tier: selection_string_option(selection, "serviceTier"),
-        effort: selection_string_option(selection, "reasoningEffort"),
-        agent: selection_string_option(selection, "agent"),
-        resume_cursor: persisted.and_then(|runtime| runtime.resume_cursor),
+        binary,
         environment,
-        endpoint: (!binary.server_url.trim().is_empty()).then(|| binary.server_url.clone()),
-        server_password: (!binary.server_password.is_empty())
-            .then(|| binary.server_password.clone()),
-        mcp: None,
         codex_home,
     })
+}
+
+fn validate_frozen_session_identity(
+    row: &ProviderTurnDelivery,
+    resume_cursor: &Value,
+) -> Result<(), ProviderRuntimeError> {
+    let Some(expected_session_id) = row.provider_session_id.as_deref() else {
+        return Ok(());
+    };
+    let cursor_field = match row.provider_kind.as_str() {
+        "codex" => "threadId",
+        "claudeAgent" | "cursor" | "opencode" => "sessionId",
+        _ => {
+            return Err(ProviderRuntimeError::Provider {
+                provider: row.provider_kind.clone(),
+                detail: "provider does not support exact durable turn reconciliation".to_owned(),
+            });
+        }
+    };
+    let actual_session_id = resume_cursor.get(cursor_field).and_then(Value::as_str);
+    if actual_session_id == Some(expected_session_id) {
+        return Ok(());
+    }
+    Err(ProviderRuntimeError::Provider {
+        provider: row.provider_kind.clone(),
+        detail: format!(
+            "durable turn provider session mismatch: expected {expected_session_id}, found {}",
+            actual_session_id.unwrap_or("no resumable session")
+        ),
+    })
+}
+
+fn delivery_route_fingerprint(
+    request: &ProviderLaunchRequest,
+) -> Result<String, ProviderRuntimeError> {
+    let partial = delivery_route_fingerprint_values(
+        &request.provider,
+        request.provider_instance_id.as_deref(),
+        &request.binary_path,
+        &request.environment,
+        request.endpoint.as_deref(),
+        request.server_password.as_deref(),
+        request.codex_home.as_ref(),
+        request.model.as_deref(),
+        &request.options,
+        request.service_tier.as_deref(),
+        request.effort.as_deref(),
+        request.agent.as_deref(),
+    )?;
+    delivery_route_fingerprint_with_cwd(&partial, &request.cwd)
+}
+
+fn delivery_route_fingerprint_values(
+    provider: &str,
+    provider_instance_id: Option<&str>,
+    binary_path: &str,
+    environment: &BTreeMap<String, String>,
+    endpoint: Option<&str>,
+    server_password: Option<&str>,
+    codex_home: Option<&CodexHomeLayout>,
+    model: Option<&str>,
+    options: &[Value],
+    service_tier: Option<&str>,
+    effort: Option<&str>,
+    agent: Option<&str>,
+) -> Result<String, ProviderRuntimeError> {
+    let codex_home = codex_home.map(|layout| {
+        json!({
+            "sharedHomePath": layout.shared_home_path,
+            "effectiveHomePath": layout.effective_home_path,
+            "overlay": layout.is_overlay(),
+        })
+    });
+    canonical_command_digest(&json!({
+        "version": DELIVERY_ROUTE_FINGERPRINT_VERSION,
+        "provider": provider,
+        "providerInstanceId": provider_instance_id,
+        "binaryPath": binary_path,
+        "environment": environment,
+        "endpoint": endpoint,
+        "serverPassword": server_password,
+        "codexHome": codex_home,
+        "model": model,
+        "options": options,
+        "serviceTier": service_tier,
+        "effort": effort,
+        "agent": agent,
+    }))
+    .map_err(|detail| ProviderRuntimeError::Provider {
+        provider: provider.to_owned(),
+        detail: format!("failed to fingerprint durable provider route: {detail}"),
+    })
+}
+
+fn delivery_route_fingerprint_with_cwd(
+    partial: &str,
+    cwd: &Path,
+) -> Result<String, ProviderRuntimeError> {
+    canonical_command_digest(&json!({
+        "version": DELIVERY_ROUTE_CWD_FINGERPRINT_VERSION,
+        "route": partial,
+        "cwd": cwd,
+    }))
+    .map_err(|detail| ProviderRuntimeError::Provider {
+        provider: "orchestration".to_owned(),
+        detail: format!("failed to fingerprint durable provider cwd: {detail}"),
+    })
+}
+
+fn frozen_delivery_route_fingerprint(
+    row: &ProviderTurnDelivery,
+) -> Result<&str, ProviderRuntimeError> {
+    row.payload
+        .get(DELIVERY_ROUTE_FINGERPRINT_FIELD)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ProviderRuntimeError::Provider {
+            provider: row.provider_kind.clone(),
+            detail: "durable provider route fingerprint is missing; delivery is blocked because the original provider destination cannot be verified"
+                .to_owned(),
+        })
+}
+
+fn validate_frozen_delivery_route(
+    row: &ProviderTurnDelivery,
+    request: &ProviderLaunchRequest,
+) -> Result<(), ProviderRuntimeError> {
+    if row
+        .payload
+        .get(DELIVERY_ROUTE_CWD_PENDING_FIELD)
+        .and_then(Value::as_bool)
+        == Some(true)
+    {
+        return Err(ProviderRuntimeError::Provider {
+            provider: row.provider_kind.clone(),
+            detail: "durable provider route has an unresolved worktree cwd; delivery is blocked before contacting the provider"
+                .to_owned(),
+        });
+    }
+    let expected = frozen_delivery_route_fingerprint(row)?;
+    let actual = delivery_route_fingerprint(request)?;
+    if expected == actual {
+        return Ok(());
+    }
+    Err(ProviderRuntimeError::Provider {
+        provider: row.provider_kind.clone(),
+        detail: "durable provider route changed after admission; delivery is blocked before contacting the provider"
+            .to_owned(),
+    })
+}
+
+pub(crate) fn canonical_provider_kind(driver: &str) -> Result<&'static str, ProviderRuntimeError> {
+    match driver {
+        "claudeAgent" | "claude" => Ok("claudeAgent"),
+        "codex" => Ok("codex"),
+        "cursor" => Ok("cursor"),
+        "grok" => Ok("grok"),
+        "opencode" => Ok("opencode"),
+        other => Err(ProviderRuntimeError::UnsupportedProvider {
+            provider: other.to_owned(),
+        }),
+    }
 }
 
 fn provider_binary_settings(
@@ -876,11 +1718,35 @@ async fn run_supervisor(
     factory: Arc<dyn ProviderDriverFactory>,
     activity: ActivityProjection,
     mut receiver: mpsc::Receiver<SupervisorMessage>,
+    sender: mpsc::Sender<SupervisorMessage>,
+    terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
+    mut terminal_receiver: mpsc::UnboundedReceiver<SupervisorMessage>,
+    deferred_capacity: usize,
     stopped: CancellationToken,
     operational_log: Option<ProviderOperationalLog>,
 ) {
     let mut sessions = HashMap::<String, SessionEntry>::new();
-    while let Some(message) = receiver.recv().await {
+    let mut delivery_sequences = HashMap::<String, ThreadDeliverySequence>::new();
+    let mut next_delivery_generation = 0_u64;
+    let mut deferred_configuration = HashMap::<
+        String,
+        VecDeque<(
+            u64,
+            Box<OrchestrationCommand>,
+            oneshot::Sender<Result<(), ProviderRuntimeError>>,
+        )>,
+    >::new();
+    loop {
+        let message = tokio::select! {
+            message = receiver.recv() => {
+                let Some(message) = message else { break };
+                message
+            }
+            message = terminal_receiver.recv() => {
+                let Some(message) = message else { continue };
+                message
+            }
+        };
         match message {
             SupervisorMessage::Launch { request, response } => {
                 let result = launch_session(
@@ -896,6 +1762,24 @@ async fn run_supervisor(
                 let _ = response.send(result);
             }
             SupervisorMessage::Handle { command, response } => {
+                if let Some(thread_id) = delivery_ordered_command_thread(command.as_ref())
+                    && let Some(generation) = delivery_sequences
+                        .get(thread_id)
+                        .and_then(|sequence| sequence.active_generation)
+                {
+                    let queued = deferred_configuration.entry(thread_id.to_owned()).or_default();
+                    if queued.len() >= deferred_capacity {
+                        let _ = response.send(Err(ProviderRuntimeError::Provider {
+                            provider: "orchestration".to_owned(),
+                            detail: format!(
+                                "thread {thread_id} deferred provider configuration queue is full"
+                            ),
+                        }));
+                    } else {
+                        queued.push_back((generation, command, response));
+                    }
+                    continue;
+                }
                 let result = handle_command(
                     &engine,
                     &factory,
@@ -907,11 +1791,186 @@ async fn run_supervisor(
                 .await;
                 let _ = response.send(result);
             }
+            SupervisorMessage::Deliver {
+                command,
+                delivery_key,
+                frozen_delivery,
+                response,
+            } => {
+                let result = async {
+                    let thread_id = command_thread_id(command.as_ref())
+                        .ok_or_else(|| ProviderRuntimeError::Provider {
+                            provider: "orchestration".to_owned(),
+                            detail: "durable delivery command has no thread identity".to_owned(),
+                        })?
+                        .to_owned();
+                    let sequence = delivery_sequences.entry(thread_id.clone()).or_default();
+                    if sequence.active_generation.is_some()
+                        || deferred_configuration
+                            .get(&thread_id)
+                            .is_some_and(|queued| !queued.is_empty())
+                    {
+                        return Err(ProviderRuntimeError::Provider {
+                            provider: "orchestration".to_owned(),
+                            detail: format!(
+                                "thread {thread_id} already has provider work awaiting ordered completion"
+                            ),
+                        });
+                    }
+                    if let OrchestrationCommand::ThreadTurnStart {
+                        thread_id,
+                        model_selection: Some(selection),
+                        ..
+                    } = command.as_ref()
+                    {
+                        reconcile_model_selection(
+                            &engine,
+                            &factory,
+                            &activity,
+                            &mut sessions,
+                            thread_id,
+                            selection,
+                            operational_log.as_ref(),
+                        )
+                        .await?;
+                    }
+                    next_delivery_generation = next_delivery_generation.checked_add(1).ok_or_else(
+                        || ProviderRuntimeError::Provider {
+                            provider: "orchestration".to_owned(),
+                            detail: "provider delivery generation exhausted".to_owned(),
+                        },
+                    )?;
+                    let generation = next_delivery_generation;
+                    let result = spawn_delivery(
+                        &engine,
+                        &mut sessions,
+                        *command,
+                        delivery_key,
+                        frozen_delivery.as_deref(),
+                        terminal_sender.clone(),
+                        generation,
+                    )
+                    .await;
+                    if result.is_ok() {
+                        delivery_sequences
+                            .entry(thread_id)
+                            .or_default()
+                            .active_generation = Some(generation);
+                    }
+                    result
+                }
+                .await;
+                let _ = response.send(result);
+            }
+            SupervisorMessage::Reconcile { row, response } => {
+                let result = sessions
+                    .get(&row.thread_id)
+                    .map(|entry| {
+                        validate_active_delivery_identity(entry, &row)?;
+                        Ok(entry.driver.clone())
+                    })
+                    .transpose()
+                    .and_then(|driver| {
+                        driver.ok_or_else(|| ProviderRuntimeError::SessionNotFound {
+                            thread_id: row.thread_id.clone(),
+                        })
+                    });
+                match result {
+                    Ok(driver) => {
+                        tokio::spawn(async move {
+                            let outcome = driver.reconcile(row.delivery_key).await;
+                            let _ = response.send(Ok(outcome));
+                        });
+                    }
+                    Err(error) => {
+                        let _ = response.send(Err(error));
+                    }
+                }
+            }
             SupervisorMessage::SetAgentActivityEnabled { enabled, response } => {
                 let result = set_live_agent_activity_enabled(&activity, &sessions, enabled).await;
                 let _ = response.send(result);
             }
+            SupervisorMessage::DeliveryComplete {
+                thread_id,
+                generation,
+                abnormal,
+            } => {
+                let sequence = delivery_sequences.entry(thread_id.clone()).or_default();
+                if sequence.active_generation != Some(generation) {
+                    reject_deferred_generation(
+                        &mut deferred_configuration,
+                        &thread_id,
+                        generation,
+                        "stale provider delivery completion",
+                    );
+                    continue;
+                }
+                sequence.active_generation = None;
+                sequence.completed_generation = generation;
+                if abnormal {
+                    reject_deferred_generation(
+                        &mut deferred_configuration,
+                        &thread_id,
+                        generation,
+                        "provider delivery attempt ended abnormally",
+                    );
+                } else if deferred_configuration
+                    .get(&thread_id)
+                    .is_some_and(|queued| !queued.is_empty())
+                {
+                    schedule_deferred_drain(sender.clone(), thread_id, generation);
+                }
+            }
+            SupervisorMessage::DrainDeferred {
+                thread_id,
+                generation,
+            } => {
+                let ready = delivery_sequences.get(&thread_id).is_some_and(|sequence| {
+                    sequence.active_generation.is_none()
+                        && sequence.completed_generation == generation
+                });
+                if !ready {
+                    reject_deferred_generation(
+                        &mut deferred_configuration,
+                        &thread_id,
+                        generation,
+                        "stale deferred provider configuration drain",
+                    );
+                    continue;
+                }
+                let queued = deferred_configuration.get_mut(&thread_id);
+                let next = queued.and_then(VecDeque::pop_front);
+                if let Some((queued_generation, command, response)) = next {
+                    if queued_generation != generation {
+                        let _ = response.send(Err(ProviderRuntimeError::Provider {
+                            provider: "orchestration".to_owned(),
+                            detail: "deferred provider configuration generation changed".to_owned(),
+                        }));
+                    } else {
+                        let result = handle_command(
+                            &engine,
+                            &factory,
+                            &activity,
+                            &mut sessions,
+                            *command,
+                            operational_log.as_ref(),
+                        )
+                        .await;
+                        let _ = response.send(result);
+                    }
+                }
+                if deferred_configuration
+                    .get(&thread_id)
+                    .is_some_and(|queued| !queued.is_empty())
+                {
+                    schedule_deferred_drain(sender.clone(), thread_id, generation);
+                } else {
+                    deferred_configuration.remove(&thread_id);
+                }
+            }
             SupervisorMessage::Shutdown { response } => {
+                reject_all_deferred(&mut deferred_configuration, ProviderRuntimeError::Shutdown);
                 let result =
                     shutdown_sessions(&engine.repositories(), &activity, &mut sessions).await;
                 stopped.cancel();
@@ -920,8 +1979,277 @@ async fn run_supervisor(
             }
         }
     }
+    reject_all_deferred(&mut deferred_configuration, ProviderRuntimeError::Shutdown);
     let _ = shutdown_sessions(&engine.repositories(), &activity, &mut sessions).await;
     stopped.cancel();
+}
+
+fn delivery_ordered_command_thread(command: &OrchestrationCommand) -> Option<&str> {
+    match command {
+        OrchestrationCommand::ThreadTurnStart { thread_id, .. }
+        | OrchestrationCommand::ThreadRuntimeModeSet { thread_id, .. }
+        | OrchestrationCommand::ThreadInteractionModeSet { thread_id, .. }
+        | OrchestrationCommand::ThreadSessionStop { thread_id, .. }
+        | OrchestrationCommand::ThreadMetaUpdate {
+            thread_id,
+            model_selection: Some(_),
+            ..
+        } => Some(thread_id),
+        _ => None,
+    }
+}
+
+fn schedule_deferred_drain(
+    sender: mpsc::Sender<SupervisorMessage>,
+    thread_id: String,
+    generation: u64,
+) {
+    tokio::spawn(async move {
+        let _ = sender
+            .send(SupervisorMessage::DrainDeferred {
+                thread_id,
+                generation,
+            })
+            .await;
+    });
+}
+
+fn reject_deferred_generation(
+    deferred: &mut HashMap<
+        String,
+        VecDeque<(
+            u64,
+            Box<OrchestrationCommand>,
+            oneshot::Sender<Result<(), ProviderRuntimeError>>,
+        )>,
+    >,
+    thread_id: &str,
+    generation: u64,
+    detail: &str,
+) {
+    let Some(mut queued) = deferred.remove(thread_id) else {
+        return;
+    };
+    let mut retained = VecDeque::new();
+    while let Some((queued_generation, command, response)) = queued.pop_front() {
+        if queued_generation == generation {
+            let _ = response.send(Err(ProviderRuntimeError::Provider {
+                provider: "orchestration".to_owned(),
+                detail: detail.to_owned(),
+            }));
+        } else {
+            retained.push_back((queued_generation, command, response));
+        }
+    }
+    if !retained.is_empty() {
+        deferred.insert(thread_id.to_owned(), retained);
+    }
+}
+
+fn reject_all_deferred(
+    deferred: &mut HashMap<
+        String,
+        VecDeque<(
+            u64,
+            Box<OrchestrationCommand>,
+            oneshot::Sender<Result<(), ProviderRuntimeError>>,
+        )>,
+    >,
+    error: ProviderRuntimeError,
+) {
+    for (_, mut queued) in deferred.drain() {
+        while let Some((_, _, response)) = queued.pop_front() {
+            let _ = response.send(Err(match &error {
+                ProviderRuntimeError::Shutdown => ProviderRuntimeError::Shutdown,
+                _ => ProviderRuntimeError::Provider {
+                    provider: "orchestration".to_owned(),
+                    detail: error.to_string(),
+                },
+            }));
+        }
+    }
+}
+
+fn validate_active_delivery_identity(
+    entry: &SessionEntry,
+    row: &ProviderTurnDelivery,
+) -> Result<(), ProviderRuntimeError> {
+    let active_instance_id = entry
+        .launch
+        .provider_instance_id
+        .as_deref()
+        .unwrap_or(entry.launch.provider.as_str());
+    if entry.launch.provider != row.provider_kind || active_instance_id != row.provider_instance_id
+    {
+        return Err(ProviderRuntimeError::Provider {
+            provider: row.provider_kind.clone(),
+            detail: format!(
+                "active provider identity mismatch for durable turn: expected {}/{}, found {}/{}",
+                row.provider_kind,
+                row.provider_instance_id,
+                entry.launch.provider,
+                active_instance_id
+            ),
+        });
+    }
+    validate_frozen_delivery_route(row, &entry.launch)?;
+    if row.provider_session_id.is_none() {
+        return Ok(());
+    }
+    let resume_cursor =
+        entry
+            .resume_cursor
+            .as_ref()
+            .ok_or_else(|| ProviderRuntimeError::Provider {
+                provider: row.provider_kind.clone(),
+                detail: "active provider runtime has no resumable session identity".to_owned(),
+            })?;
+    validate_frozen_session_identity(row, resume_cursor)
+}
+
+fn active_provider_session_id(
+    entry: &SessionEntry,
+    row: &ProviderTurnDelivery,
+) -> Result<String, ProviderRuntimeError> {
+    let resume_cursor =
+        entry
+            .resume_cursor
+            .as_ref()
+            .ok_or_else(|| ProviderRuntimeError::Provider {
+                provider: row.provider_kind.clone(),
+                detail: "active provider runtime has no resumable session identity".to_owned(),
+            })?;
+    let cursor_field = if row.provider_kind == "codex" {
+        "threadId"
+    } else {
+        "sessionId"
+    };
+    let session_id = resume_cursor
+        .get(cursor_field)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| ProviderRuntimeError::Provider {
+            provider: row.provider_kind.clone(),
+            detail: "active provider runtime has no native session identity".to_owned(),
+        })?;
+    Ok(session_id.to_owned())
+}
+
+async fn spawn_delivery(
+    engine: &OrchestrationEngine,
+    sessions: &mut HashMap<String, SessionEntry>,
+    command: OrchestrationCommand,
+    delivery_key: String,
+    frozen_delivery: Option<&ProviderTurnDelivery>,
+    terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
+    generation: u64,
+) -> Result<ProviderDeliveryHandle, ProviderRuntimeError> {
+    let OrchestrationCommand::ThreadTurnStart {
+        thread_id,
+        message,
+        interaction_mode,
+        ..
+    } = command
+    else {
+        return Err(ProviderRuntimeError::Provider {
+            provider: "orchestration".to_owned(),
+            detail: "only a turn start can use durable provider delivery".to_owned(),
+        });
+    };
+    let entry = sessions
+        .get(&thread_id)
+        .ok_or_else(|| ProviderRuntimeError::SessionNotFound {
+            thread_id: thread_id.clone(),
+        })?;
+    if !entry.configuration_healthy {
+        return Err(ProviderRuntimeError::Provider {
+            provider: entry.launch.provider.clone(),
+            detail: "provider configuration is unavailable after failed restoration".to_owned(),
+        });
+    }
+    let frozen_session = frozen_delivery
+        .map(|row| {
+            validate_active_delivery_identity(entry, row)?;
+            Ok((row.clone(), active_provider_session_id(entry, row)?))
+        })
+        .transpose()?;
+    let driver = entry.driver.clone();
+    let launch = entry.launch.clone();
+    let resume_cursor = entry.resume_cursor.clone();
+    let runtime_payload = entry.runtime_payload.clone();
+    let repositories = engine.repositories();
+    let engine = engine.clone();
+    let (completion_tx, completion) = oneshot::channel();
+    let terminal = DeliveryTerminalGuard {
+        sender: terminal_sender,
+        thread_id,
+        generation,
+        completed: false,
+    };
+    tokio::spawn(async move {
+        let freeze_failure = if let Some((row, provider_session_id)) = frozen_session {
+            match repositories
+                .freeze_provider_turn_session(
+                    row.command_id.clone(),
+                    row.attempts,
+                    row.provider_instance_id.clone(),
+                    row.provider_kind.clone(),
+                    provider_session_id,
+                    now(),
+                )
+                .await
+            {
+                Ok(Some(_)) => None,
+                Ok(None) => Some(ProviderDeliveryOutcome::DefinitelyNotSent {
+                        detail: format!(
+                            "durable provider session freeze conflicted for {} at attempt {}",
+                            row.command_id, row.attempts
+                        ),
+                    }),
+                Err(error) => Some(ProviderDeliveryOutcome::DefinitelyNotSent {
+                        detail: format!(
+                            "durable provider session freeze failed for {}: {error}",
+                            row.command_id
+                        ),
+                    }),
+            }
+        } else {
+            None
+        };
+        let outcome = if let Some(outcome) = freeze_failure {
+            outcome
+        } else {
+            driver
+                .deliver(
+                    message.text,
+                    message.attachments,
+                    interaction_mode,
+                    delivery_key,
+                )
+                .await
+        };
+        if let ProviderDeliveryOutcome::Accepted { turn_id } = &outcome {
+            if let Err(error) = persist_runtime(
+                &repositories,
+                &launch,
+                "running",
+                resume_cursor,
+                runtime_payload,
+            )
+            .await
+            {
+                tracing::warn!(%error, "accepted provider delivery runtime state was not persisted");
+            }
+            if let Err(error) =
+                dispatch_session_state(&engine, &launch, "running", turn_id.clone(), None).await
+            {
+                tracing::warn!(%error, "accepted provider delivery session state was not projected");
+            }
+        }
+        terminal.complete();
+        let _ = completion_tx.send(outcome);
+    });
+    Ok(ProviderDeliveryHandle { completion })
 }
 
 fn provider_supports_agent_activity(provider: &str) -> bool {
@@ -1052,6 +2380,11 @@ async fn launch_session(
     operational_log: Option<&ProviderOperationalLog>,
     inherited_activity_lifecycle: Option<SharedActivityLifecycle>,
 ) -> Result<(), ProviderRuntimeError> {
+    let option_application_method = if inherited_activity_lifecycle.is_some() {
+        "restart"
+    } else {
+        "live"
+    };
     if request.provider == "grok" {
         return Err(ProviderRuntimeError::UnsupportedProvider {
             provider: "grok".to_owned(),
@@ -1106,6 +2439,30 @@ async fn launch_session(
             return Err(error);
         }
     };
+    let options_result = driver.set_options(request.options.clone()).await;
+    record_option_reconciliation(
+        operational_log,
+        &request,
+        &request.options,
+        option_application_method,
+        match &options_result {
+            Ok(()) => "applied",
+            Err(ProviderRuntimeError::UnsupportedCapability { .. }) => "restart-required",
+            Err(_) => "failed",
+        },
+    );
+    if let Err(error) = options_result {
+        let _ = driver.shutdown().await;
+        persist_runtime(
+            &engine.repositories(),
+            &request,
+            "error",
+            started.resume_cursor.clone(),
+            Some(json!({ "error": error.to_string() })),
+        )
+        .await?;
+        return Err(error);
+    }
     let activity_lifecycle_id = Uuid::new_v4();
     let activity_lifecycle = inherited_activity_lifecycle.unwrap_or_else(|| {
         Arc::new(StdMutex::new(ProviderActivityLifecycleState::new(
@@ -1159,6 +2516,7 @@ async fn launch_session(
         SessionEntry {
             launch: request,
             driver,
+            configuration_healthy: true,
             resume_cursor: started.resume_cursor,
             runtime_payload: started.runtime_payload,
             activity_capable,
@@ -1191,6 +2549,28 @@ async fn handle_command(
     if matches!(command, OrchestrationCommand::ThreadSessionStop { .. }) {
         return stop_session(&engine.repositories(), activity, sessions, &thread_id).await;
     }
+    match &command {
+        OrchestrationCommand::ThreadTurnStart {
+            model_selection: Some(selection),
+            ..
+        }
+        | OrchestrationCommand::ThreadMetaUpdate {
+            model_selection: Some(selection),
+            ..
+        } => {
+            reconcile_model_selection(
+                engine,
+                factory,
+                activity,
+                sessions,
+                &thread_id,
+                selection,
+                operational_log,
+            )
+            .await?;
+        }
+        _ => {}
+    }
     let entry =
         sessions
             .get_mut(&thread_id)
@@ -1201,16 +2581,9 @@ async fn handle_command(
     match command {
         OrchestrationCommand::ThreadTurnStart {
             message,
-            model_selection,
             interaction_mode,
             ..
         } => {
-            if let Some(model) = model_selection.as_ref().and_then(model_from_selection)
-                && entry.launch.model.as_deref() != Some(model.as_str())
-            {
-                entry.driver.set_model(model.clone()).await?;
-                entry.launch.model = Some(model);
-            }
             let turn_id = entry
                 .driver
                 .send(message.text, message.attachments, interaction_mode)
@@ -1285,38 +2658,226 @@ async fn handle_command(
             }
         }
         OrchestrationCommand::ThreadMetaUpdate {
-            model_selection: Some(selection),
+            model_selection: Some(_),
             ..
-        } => {
-            if let Some(model) = model_from_selection(&selection) {
-                match entry.driver.set_model(model.clone()).await {
-                    Ok(()) => {
-                        entry.launch.model = Some(model);
-                        persist_entry(&engine.repositories(), entry, "ready").await?;
-                    }
-                    Err(ProviderRuntimeError::UnsupportedCapability { .. }) => {
-                        let mut launch = entry.launch.clone();
-                        launch.model = Some(model);
-                        return restart_session(
-                            engine,
-                            factory,
-                            activity,
-                            sessions,
-                            &thread_id,
-                            launch,
-                            operational_log,
-                        )
-                        .await;
-                    }
-                    Err(error) => return Err(error),
-                }
-            }
-            Ok(())
-        }
+        } => Ok(()),
         OrchestrationCommand::ThreadCheckpointRevert { turn_count, .. } => {
             entry.driver.rollback(turn_count).await
         }
         _ => Ok(()),
+    }
+}
+
+async fn reconcile_model_selection(
+    engine: &OrchestrationEngine,
+    factory: &Arc<dyn ProviderDriverFactory>,
+    activity: &ActivityProjection,
+    sessions: &mut HashMap<String, SessionEntry>,
+    thread_id: &str,
+    selection: &Value,
+    operational_log: Option<&ProviderOperationalLog>,
+) -> Result<(), ProviderRuntimeError> {
+    let target_model = model_from_selection(selection);
+    let target_options = selection_options(selection);
+    let mut target_restart = None;
+    let mut restore_restart = None;
+    let mut rejected_update = None;
+    {
+        let entry = sessions
+            .get_mut(thread_id)
+            .ok_or_else(|| ProviderRuntimeError::SessionNotFound {
+                thread_id: thread_id.to_owned(),
+            })?;
+        if !entry.configuration_healthy {
+            return Err(ProviderRuntimeError::Provider {
+                provider: entry.launch.provider.clone(),
+                detail: "provider configuration is unavailable after failed restoration"
+                    .to_owned(),
+            });
+        }
+        let model_changed = target_model
+            .as_ref()
+            .is_some_and(|model| entry.launch.model.as_ref() != Some(model));
+        let options_changed = entry.launch.options != target_options;
+        if !model_changed && !options_changed {
+            return Ok(());
+        }
+        let previous_model = entry.launch.model.clone();
+        let previous_options = entry.launch.options.clone();
+        let mut model_attempted = false;
+        let options_require_target_model =
+            model_changed && entry.driver.reapply_options_on_model_change();
+        let update = async {
+            if options_require_target_model {
+                model_attempted = true;
+                entry
+                    .driver
+                    .set_model(target_model.clone().expect("changed model is present"))
+                    .await?;
+            }
+            if options_changed || options_require_target_model {
+                entry.driver.set_options(target_options.clone()).await?;
+            }
+            if model_changed
+                && !model_attempted
+                && let Some(model) = target_model.clone()
+            {
+                model_attempted = true;
+                entry.driver.set_model(model).await?;
+            }
+            Ok::<(), ProviderRuntimeError>(())
+        }
+        .await;
+        if options_changed {
+            let mut log_launch = entry.launch.clone();
+            if model_changed {
+                log_launch.model.clone_from(&target_model);
+            }
+            record_option_reconciliation(
+                operational_log,
+                &log_launch,
+                &target_options,
+                "live",
+                match &update {
+                    Ok(()) => "applied",
+                    Err(ProviderRuntimeError::UnsupportedCapability { .. }) => "restart-required",
+                    Err(_) => "failed",
+                },
+            );
+        }
+        match update {
+            Ok(()) => {
+                let previous_launch = entry.launch.clone();
+                if model_changed {
+                    entry.launch.model = target_model;
+                }
+                entry.launch.options = target_options;
+                if let Err(error) = persist_entry(&engine.repositories(), entry, "ready").await {
+                    entry.launch = previous_launch.clone();
+                    if !restore_driver_configuration(
+                        entry,
+                        model_changed,
+                        previous_launch.model.clone(),
+                        options_changed || options_require_target_model,
+                        previous_launch.options.clone(),
+                    )
+                    .await
+                    {
+                        entry.configuration_healthy = false;
+                        restore_restart = Some(previous_launch);
+                    }
+                    rejected_update = Some(error);
+                }
+            }
+            Err(ProviderRuntimeError::UnsupportedCapability { .. }) => {
+                let mut launch = entry.launch.clone();
+                if model_changed {
+                    launch.model = target_model;
+                }
+                launch.options = target_options;
+                target_restart = Some(launch);
+            }
+            Err(error) => {
+                if !restore_driver_configuration(
+                    entry,
+                    model_attempted,
+                    previous_model,
+                    options_changed || options_require_target_model,
+                    previous_options,
+                )
+                .await
+                {
+                    entry.configuration_healthy = false;
+                    restore_restart = Some(entry.launch.clone());
+                }
+                rejected_update = Some(error);
+            }
+        }
+    }
+    if let Some(launch) = target_restart {
+        restart_session(
+            engine,
+            factory,
+            activity,
+            sessions,
+            thread_id,
+            launch,
+            operational_log,
+        )
+        .await?;
+    }
+    if let Some(launch) = restore_restart {
+        restart_session(
+            engine,
+            factory,
+            activity,
+            sessions,
+            thread_id,
+            launch,
+            operational_log,
+        )
+        .await?;
+    }
+    if let Some(error) = rejected_update {
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn restore_driver_configuration(
+    entry: &SessionEntry,
+    restore_model: bool,
+    model: Option<String>,
+    restore_options: bool,
+    options: Vec<Value>,
+) -> bool {
+    let mut restored = true;
+    if restore_model {
+        restored = if let Some(model) = model {
+            entry.driver.set_model(model).await.is_ok()
+        } else {
+            false
+        };
+    }
+    if restore_options {
+        restored &= entry.driver.set_options(options).await.is_ok();
+    }
+    restored
+}
+
+fn record_option_reconciliation(
+    operational_log: Option<&ProviderOperationalLog>,
+    launch: &ProviderLaunchRequest,
+    options: &[Value],
+    application_method: &str,
+    result: &str,
+) {
+    let Some(log) = operational_log else {
+        return;
+    };
+    let accepted = matches!(result, "applied" | "restart-required");
+    let provider_instance_id = launch
+        .provider_instance_id
+        .as_deref()
+        .unwrap_or(&launch.provider);
+    for option in options {
+        let Some(option_id) = option.get("id").and_then(Value::as_str) else {
+            continue;
+        };
+        let requested_value = option.get("value").and_then(|value| match value {
+            Value::Bool(_) => Some(value),
+            Value::String(_) if accepted => Some(value),
+            _ => None,
+        });
+        let _ = log.record_option_reconciliation(
+            &launch.thread_id,
+            provider_instance_id,
+            launch.model.as_deref(),
+            if accepted { option_id } else { "unknown" },
+            requested_value,
+            application_method,
+            result,
+        );
     }
 }
 
@@ -1330,9 +2891,12 @@ async fn restart_session(
     operational_log: Option<&ProviderOperationalLog>,
 ) -> Result<(), ProviderRuntimeError> {
     let mut inherited_activity_lifecycle = None;
-    if let Some(entry) = sessions.remove(thread_id) {
+    if let Some(entry) = sessions.get(thread_id) {
         launch.resume_cursor = entry.resume_cursor.clone();
         inherited_activity_lifecycle = Some(entry.activity_lifecycle.clone());
+        entry.driver.shutdown().await?;
+    }
+    if let Some(entry) = sessions.remove(thread_id) {
         entry.event_cancellation.cancel();
         entry.event_task.abort();
         let _ = entry.event_task.await;
@@ -1350,7 +2914,6 @@ async fn restart_session(
             entry.activity_compensation_key,
         )
         .await;
-        entry.driver.shutdown().await?;
     }
     engine
         .repositories()
@@ -1404,20 +2967,53 @@ fn model_from_selection(selection: &Value) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn selection_string_option(selection: &Value, id: &str) -> Option<String> {
-    selection
+fn unsupported_option(provider: &str, option_id: &str) -> ProviderRuntimeError {
+    ProviderRuntimeError::Provider {
+        provider: provider.to_owned(),
+        detail: format!("option {option_id} is not supported by the selected model/session"),
+    }
+}
+
+fn selection_options(selection: &Value) -> Vec<Value> {
+    let mut options = BTreeMap::<String, Value>::new();
+    for option in selection
         .get("options")
         .and_then(Value::as_array)
-        .and_then(|options| {
-            options
-                .iter()
-                .find(|option| option.get("id").and_then(Value::as_str) == Some(id))
-        })
+        .into_iter()
+        .flatten()
+    {
+        let Some(id) = option.get("id").and_then(Value::as_str).map(str::trim) else {
+            continue;
+        };
+        let Some(value) = option.get("value") else {
+            continue;
+        };
+        if id.is_empty() || !(value.is_string() || value.is_boolean()) {
+            continue;
+        }
+        options.insert(id.to_owned(), value.clone());
+    }
+    options
+        .into_iter()
+        .map(|(id, value)| json!({ "id": id, "value": value }))
+        .collect()
+}
+
+fn selection_string_option_from(options: &[Value], id: &str) -> Option<String> {
+    options
+        .iter()
+        .find(|option| option.get("id").and_then(Value::as_str) == Some(id))
         .and_then(|option| option.get("value"))
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(str::to_owned)
+}
+
+fn selection_effort(options: &[Value]) -> Option<String> {
+    ["reasoningEffort", "effort", "reasoning"]
+        .into_iter()
+        .find_map(|id| selection_string_option_from(options, id))
 }
 
 fn parse_provider_command(text: &str) -> Option<(&str, &str)> {
@@ -1705,6 +3301,23 @@ async fn project_provider_event(
                     object.insert("requestId".to_owned(), Value::String(request_id));
                 } else {
                     payload = json!({ "requestId": request_id, "detail": payload });
+                }
+            }
+            if event.event_type == "mcp.status.updated" {
+                let provider_instance_id = launch
+                    .provider_instance_id
+                    .clone()
+                    .unwrap_or_else(|| launch.provider.clone());
+                if let Some(object) = payload.as_object_mut() {
+                    object.insert(
+                        "providerInstanceId".to_owned(),
+                        Value::String(provider_instance_id),
+                    );
+                } else {
+                    payload = json!({
+                        "providerInstanceId": provider_instance_id,
+                        "detail": payload,
+                    });
                 }
             }
             OrchestrationCommand::ThreadActivityAppend {
@@ -2311,8 +3924,8 @@ impl CodexDriver {
                 cwd: request.cwd.to_string_lossy().into_owned(),
                 runtime_mode: runtime_mode(&request.runtime_mode),
                 model: request.model,
-                service_tier: request.service_tier,
-                effort: request.effort,
+                service_tier: None,
+                effort: None,
                 resume_cursor,
             },
             connection,
@@ -2324,6 +3937,35 @@ impl CodexDriver {
             child: Arc::new(Mutex::new(child)),
             attachments,
         })
+    }
+
+    async fn prepare_turn_input(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+    ) -> Result<(String, Vec<Value>), ProviderRuntimeError> {
+        let text = if let Some(("goal", objective)) = parse_provider_command(&text)
+            && !objective.is_empty()
+        {
+            self.runtime
+                .set_goal(objective)
+                .await
+                .map_err(provider_error("codex"))?;
+            objective.to_owned()
+        } else {
+            text
+        };
+        let materialized = self
+            .attachments
+            .materialize(attachments)
+            .await
+            .map_err(attachment_error("codex"))?;
+        let (images, files) = split_native_images_and_file_references(materialized);
+        let text = append_file_references(text, &files).map_err(attachment_error("codex"))?;
+        Ok((
+            text,
+            images.into_iter().map(codex_image).collect::<Vec<_>>(),
+        ))
     }
 }
 
@@ -2357,30 +3999,66 @@ impl ProviderDriver for CodexDriver {
         interaction_mode: String,
     ) -> BoxRuntimeFuture<'_, Result<Option<String>, ProviderRuntimeError>> {
         Box::pin(async move {
-            let text = if let Some(("goal", objective)) = parse_provider_command(&text)
-                && !objective.is_empty()
-            {
-                self.runtime
-                    .set_goal(objective)
-                    .await
-                    .map_err(provider_error("codex"))?;
-                objective.to_owned()
-            } else {
-                text
-            };
-            let attachments: Vec<Value> = self
-                .attachments
-                .materialize(attachments)
-                .await
-                .map_err(attachment_error("codex"))?
-                .into_iter()
-                .map(codex_image)
-                .collect();
+            let (text, attachments) = self.prepare_turn_input(text, attachments).await?;
             self.runtime
-                .send_turn(Some(text), attachments, Some(interaction_mode))
+                .send_turn(Some(text), attachments, Some(interaction_mode), None)
                 .await
                 .map(|turn| Some(turn.turn_id))
                 .map_err(provider_error("codex"))
+        })
+    }
+    fn deliver(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+        interaction_mode: String,
+        delivery_key: String,
+    ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
+        Box::pin(async move {
+            let (text, attachments) = match self.prepare_turn_input(text, attachments).await {
+                Ok(input) => input,
+                Err(error) => {
+                    return ProviderDeliveryOutcome::Rejected {
+                        detail: error.to_string(),
+                    };
+                }
+            };
+            match self
+                .runtime
+                .send_turn(
+                    Some(text),
+                    attachments,
+                    Some(interaction_mode),
+                    Some(delivery_key),
+                )
+                .await
+            {
+                Ok(turn) => ProviderDeliveryOutcome::Accepted {
+                    turn_id: Some(turn.turn_id),
+                },
+                Err(crate::provider::codex::runtime::RuntimeError::MissingProviderThreadId) => {
+                    ProviderDeliveryOutcome::DefinitelyNotSent {
+                        detail: "Codex session is missing a provider thread id".to_owned(),
+                    }
+                }
+                Err(error) => ProviderDeliveryOutcome::Ambiguous {
+                    detail: error.to_string(),
+                },
+            }
+        })
+    }
+    fn reconcile(
+        &self,
+        delivery_key: String,
+    ) -> BoxRuntimeFuture<'_, ProviderReconciliationOutcome> {
+        Box::pin(async move {
+            match self.runtime.delivery_exists(&delivery_key).await {
+                Ok(true) => ProviderReconciliationOutcome::Found,
+                Ok(false) => ProviderReconciliationOutcome::Absent,
+                Err(error) => ProviderReconciliationOutcome::Unavailable {
+                    detail: error.to_string(),
+                },
+            }
         })
     }
     fn interrupt(
@@ -2432,6 +4110,50 @@ impl ProviderDriver for CodexDriver {
     }
     fn set_model(&self, _model: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         unsupported("codex", "post-start model changes")
+    }
+    fn set_options(
+        &self,
+        options: Vec<Value>,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async move {
+            let mut service_tier = None;
+            let mut effort = None;
+            for option in options {
+                let id = option.get("id").and_then(Value::as_str).ok_or_else(|| {
+                    ProviderRuntimeError::Provider {
+                        provider: "codex".to_owned(),
+                        detail: "option is missing an id".to_owned(),
+                    }
+                })?;
+                let value = option
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.trim().is_empty())
+                    .map(str::to_owned)
+                    .ok_or_else(|| ProviderRuntimeError::Provider {
+                        provider: "codex".to_owned(),
+                        detail: format!("option {id} must be a non-empty string"),
+                    })?;
+                match id {
+                    "serviceTier" => service_tier = Some(value),
+                    "reasoningEffort" => effort = Some(value),
+                    _ => {
+                        return Err(ProviderRuntimeError::Provider {
+                            provider: "codex".to_owned(),
+                            detail: format!(
+                                "option {id} is not supported by the selected model/session"
+                            ),
+                        });
+                    }
+                }
+            }
+            self.runtime
+                .validate_turn_options(service_tier.as_deref(), effort.as_deref())
+                .await
+                .map_err(provider_error("codex"))?;
+            self.runtime.set_turn_options(service_tier, effort).await;
+            Ok(())
+        })
     }
     fn rollback(&self, turn_count: i64) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
@@ -2524,6 +4246,21 @@ impl CursorDriver {
             attachments,
         })
     }
+
+    async fn prepare_turn_input(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+    ) -> Result<(String, Vec<Value>), ProviderRuntimeError> {
+        let materialized = self
+            .attachments
+            .materialize(attachments)
+            .await
+            .map_err(attachment_error("cursor"))?;
+        let (images, files) = split_native_images_and_file_references(materialized);
+        let text = append_file_references(text, &files).map_err(attachment_error("cursor"))?;
+        Ok((text, images.into_iter().map(acp_image).collect()))
+    }
 }
 
 impl ProviderDriver for CursorDriver {
@@ -2551,19 +4288,58 @@ impl ProviderDriver for CursorDriver {
         _: String,
     ) -> BoxRuntimeFuture<'_, Result<Option<String>, ProviderRuntimeError>> {
         Box::pin(async move {
-            let attachments = self
-                .attachments
-                .materialize(attachments)
-                .await
-                .map_err(attachment_error("cursor"))?
-                .into_iter()
-                .map(acp_image)
-                .collect();
+            let (text, attachments) = self.prepare_turn_input(text, attachments).await?;
             self.runtime
                 .send_turn(Some(&text), attachments)
                 .await
                 .map(Some)
                 .map_err(provider_error("cursor"))
+        })
+    }
+    fn deliver(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+        _: String,
+        _: String,
+    ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
+        Box::pin(async move {
+            let (text, attachments) = match self.prepare_turn_input(text, attachments).await {
+                Ok(input) => input,
+                Err(error) => {
+                    return ProviderDeliveryOutcome::Rejected {
+                        detail: error.to_string(),
+                    };
+                }
+            };
+            let receipt = match self
+                .runtime
+                .send_turn_with_receipt(Some(&text), attachments)
+                .await
+            {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    return ProviderDeliveryOutcome::DefinitelyNotSent {
+                        detail: error.to_string(),
+                    };
+                }
+            };
+            let turn_id = receipt.turn_id.clone();
+            match receipt.completion().await {
+                Ok(()) => ProviderDeliveryOutcome::Accepted {
+                    turn_id: Some(turn_id),
+                },
+                Err(
+                    error @ CursorRuntimeError::Protocol(
+                        crate::provider::cursor::acp::AcpProtocolError::RemoteRequest { .. },
+                    ),
+                ) => ProviderDeliveryOutcome::Rejected {
+                    detail: error.to_string(),
+                },
+                Err(error) => ProviderDeliveryOutcome::Ambiguous {
+                    detail: error.to_string(),
+                },
+            }
         })
     }
     fn interrupt(
@@ -2624,6 +4400,20 @@ impl ProviderDriver for CursorDriver {
         Box::pin(async move {
             self.runtime
                 .set_model(&model)
+                .await
+                .map_err(provider_error("cursor"))
+        })
+    }
+    fn reapply_options_on_model_change(&self) -> bool {
+        true
+    }
+    fn set_options(
+        &self,
+        options: Vec<Value>,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async move {
+            self.runtime
+                .set_options(options)
                 .await
                 .map_err(provider_error("cursor"))
         })
@@ -2741,14 +4531,14 @@ impl ProviderDriver for GrokDriver {
         _: String,
     ) -> BoxRuntimeFuture<'_, Result<Option<String>, ProviderRuntimeError>> {
         Box::pin(async move {
-            let attachments = self
+            let materialized = self
                 .attachments
                 .materialize(attachments)
                 .await
-                .map_err(attachment_error("grok"))?
-                .into_iter()
-                .map(acp_image)
-                .collect();
+                .map_err(attachment_error("grok"))?;
+            let (images, files) = split_native_images_and_file_references(materialized);
+            let text = append_file_references(text, &files).map_err(attachment_error("grok"))?;
+            let attachments = images.into_iter().map(acp_image).collect();
             self.runtime
                 .send_turn(Some(&text), attachments)
                 .await
@@ -2820,6 +4610,12 @@ impl ProviderDriver for GrokDriver {
                 .await
                 .map_err(provider_error("grok"))
         })
+    }
+    fn set_options(
+        &self,
+        options: Vec<Value>,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        reject_unsupported_options("grok", options)
     }
     fn rollback(&self, _: i64) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         unsupported("grok", "checkpoint rollback")
@@ -2931,6 +4727,20 @@ impl OpenCodeDriver {
             attachments,
         })
     }
+
+    async fn materialize_turn_attachments(
+        &self,
+        attachments: Vec<Value>,
+    ) -> Result<Vec<Value>, ProviderRuntimeError> {
+        Ok(self
+            .attachments
+            .materialize(attachments)
+            .await
+            .map_err(attachment_error("opencode"))?
+            .into_iter()
+            .map(opencode_file)
+            .collect())
+    }
 }
 
 impl ProviderDriver for OpenCodeDriver {
@@ -2955,25 +4765,82 @@ impl ProviderDriver for OpenCodeDriver {
         _: String,
     ) -> BoxRuntimeFuture<'_, Result<Option<String>, ProviderRuntimeError>> {
         Box::pin(async move {
-            let attachments: Vec<Value> = self
-                .attachments
-                .materialize(attachments)
-                .await
-                .map_err(attachment_error("opencode"))?
-                .into_iter()
-                .map(opencode_file)
-                .collect();
+            let attachments = self.materialize_turn_attachments(attachments).await?;
             let turn = if attachments.is_empty() {
                 match parse_provider_command(&text) {
                     Some((command, arguments)) => {
-                        self.runtime.send_command(command, arguments).await
+                        self.runtime.send_command(command, arguments, None).await
                     }
-                    None => self.runtime.send_turn(Some(&text), attachments).await,
+                    None => self.runtime.send_turn(Some(&text), attachments, None).await,
                 }
             } else {
-                self.runtime.send_turn(Some(&text), attachments).await
+                self.runtime.send_turn(Some(&text), attachments, None).await
             };
             turn.map(Some).map_err(provider_error("opencode"))
+        })
+    }
+    fn deliver(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+        _: String,
+        delivery_key: String,
+    ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
+        Box::pin(async move {
+            let attachments = match self.materialize_turn_attachments(attachments).await {
+                Ok(attachments) => attachments,
+                Err(error) => {
+                    return ProviderDeliveryOutcome::Rejected {
+                        detail: error.to_string(),
+                    };
+                }
+            };
+            let result = if attachments.is_empty() {
+                match parse_provider_command(&text) {
+                    Some((command, arguments)) => {
+                        self.runtime
+                            .send_command(command, arguments, Some(&delivery_key))
+                            .await
+                    }
+                    None => {
+                        self.runtime
+                            .send_turn(Some(&text), attachments, Some(&delivery_key))
+                            .await
+                    }
+                }
+            } else {
+                self.runtime
+                    .send_turn(Some(&text), attachments, Some(&delivery_key))
+                    .await
+            };
+            match result {
+                Ok(turn_id) => ProviderDeliveryOutcome::Accepted {
+                    turn_id: Some(turn_id),
+                },
+                Err(error @ crate::provider::opencode::runtime::OpenCodeRuntimeError::MissingSession)
+                | Err(error @ crate::provider::opencode::runtime::OpenCodeRuntimeError::InvalidResponse(_)) => {
+                    ProviderDeliveryOutcome::DefinitelyNotSent {
+                        detail: error.to_string(),
+                    }
+                }
+                Err(error) => ProviderDeliveryOutcome::Ambiguous {
+                    detail: error.to_string(),
+                },
+            }
+        })
+    }
+    fn reconcile(
+        &self,
+        delivery_key: String,
+    ) -> BoxRuntimeFuture<'_, ProviderReconciliationOutcome> {
+        Box::pin(async move {
+            match self.runtime.message_exists(&delivery_key).await {
+                Ok(true) => ProviderReconciliationOutcome::Found,
+                Ok(false) => ProviderReconciliationOutcome::Absent,
+                Err(error) => ProviderReconciliationOutcome::Unavailable {
+                    detail: error.to_string(),
+                },
+            }
         })
     }
     fn interrupt(
@@ -3031,6 +4898,20 @@ impl ProviderDriver for OpenCodeDriver {
                 .map_err(provider_error("opencode"))
         })
     }
+    fn reapply_options_on_model_change(&self) -> bool {
+        true
+    }
+    fn set_options(
+        &self,
+        options: Vec<Value>,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async move {
+            self.runtime
+                .set_options(options)
+                .await
+                .map_err(provider_error("opencode"))
+        })
+    }
     fn rollback(&self, count: i64) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
             let count = usize::try_from(count).map_err(|_| ProviderRuntimeError::Provider {
@@ -3074,6 +4955,59 @@ impl ProviderDriver for OpenCodeDriver {
     }
 }
 
+#[derive(Default)]
+struct ClaudeAcknowledgementState {
+    next_id: u64,
+    pending: Option<(u64, oneshot::Sender<()>)>,
+}
+
+#[derive(Clone, Default)]
+struct ClaudeAcknowledgementSlot {
+    state: Arc<StdMutex<ClaudeAcknowledgementState>>,
+}
+
+impl ClaudeAcknowledgementSlot {
+    fn register(&self, sender: oneshot::Sender<()>) -> Option<ClaudeAcknowledgementRegistration> {
+        let mut state = self.state.lock().expect("Claude acknowledgement lock");
+        if state.pending.is_some() {
+            return None;
+        }
+        state.next_id = state.next_id.wrapping_add(1);
+        let id = state.next_id;
+        state.pending = Some((id, sender));
+        Some(ClaudeAcknowledgementRegistration {
+            id,
+            state: self.state.clone(),
+        })
+    }
+
+    fn acknowledge(&self) {
+        if let Some((_, sender)) = self
+            .state
+            .lock()
+            .expect("Claude acknowledgement lock")
+            .pending
+            .take()
+        {
+            let _ = sender.send(());
+        }
+    }
+}
+
+struct ClaudeAcknowledgementRegistration {
+    id: u64,
+    state: Arc<StdMutex<ClaudeAcknowledgementState>>,
+}
+
+impl Drop for ClaudeAcknowledgementRegistration {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().expect("Claude acknowledgement lock");
+        if state.pending.as_ref().map(|(id, _)| *id) == Some(self.id) {
+            state.pending.take();
+        }
+    }
+}
+
 struct ClaudeDriver {
     provider: String,
     runtime: Arc<Mutex<ClaudeProviderRuntime>>,
@@ -3084,8 +5018,11 @@ struct ClaudeDriver {
     runtime_mode: Mutex<ClaudeRuntimeMode>,
     configured_runtime_mode: Mutex<String>,
     interaction_mode: Mutex<String>,
+    options: Vec<Value>,
+    supports_fast_mode: bool,
     sequence: Mutex<u64>,
     attachments: AttachmentMaterializer,
+    pending_acknowledgement: ClaudeAcknowledgementSlot,
     hook_sink: Option<Arc<ClaudeHookSinkHandle>>,
     output: Arc<ClaudeOutputHandle>,
 }
@@ -3432,6 +5369,7 @@ fn build_claude_launch_arguments(
         "stream-json".to_owned(),
         "--output-format".to_owned(),
         "stream-json".to_owned(),
+        "--replay-user-messages".to_owned(),
         "--include-partial-messages".to_owned(),
     ];
     if support.include_hook_events {
@@ -3460,7 +5398,7 @@ fn build_claude_launch_arguments(
     if let Some(agent) = request.agent.as_ref() {
         args.extend(["--agent".to_owned(), agent.clone()]);
     }
-    if let Some(settings) = hook_settings {
+    if let Some(settings) = claude_session_settings(request, hook_settings) {
         args.extend(["--settings".to_owned(), settings.to_string()]);
     }
     if let Some(mcp) = request.mcp.as_ref() {
@@ -3478,6 +5416,70 @@ fn build_claude_launch_arguments(
     args
 }
 
+fn claude_session_settings(
+    request: &ProviderLaunchRequest,
+    hook_settings: Option<&Value>,
+) -> Option<Value> {
+    let mut settings = hook_settings
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    if let Some(fast_mode) = selection_boolean_option(&request.options, "fastMode") {
+        settings.insert("fastMode".to_owned(), Value::Bool(fast_mode));
+    }
+    (!settings.is_empty()).then(|| Value::Object(settings))
+}
+
+fn selection_boolean_option(options: &[Value], id: &str) -> Option<bool> {
+    options
+        .iter()
+        .find(|option| option.get("id").and_then(Value::as_str) == Some(id))
+        .and_then(|option| option.get("value"))
+        .and_then(Value::as_bool)
+}
+
+fn claude_supports_fast_mode(model: Option<&str>) -> bool {
+    let Some(model) = model else {
+        return false;
+    };
+    crate::provider::claude::model::all_models(&[])
+        .into_iter()
+        .find(|candidate| candidate.get("slug").and_then(Value::as_str) == Some(model))
+        .is_some_and(|candidate| {
+            candidate["capabilities"]["optionDescriptors"]
+                .as_array()
+                .is_some_and(|descriptors| {
+                    descriptors.iter().any(|descriptor| {
+                        descriptor.get("id").and_then(Value::as_str) == Some("fastMode")
+                            && descriptor.get("type").and_then(Value::as_str) == Some("boolean")
+                    })
+                })
+        })
+}
+
+fn validate_claude_options(
+    provider: &str,
+    options: &[Value],
+    supports_fast_mode: bool,
+) -> Result<(), ProviderRuntimeError> {
+    let mut seen = HashSet::new();
+    for option in options {
+        let Some(id) = option.get("id").and_then(Value::as_str) else {
+            return Err(unsupported_option(provider, "unknown"));
+        };
+        if !seen.insert(id) || id != "fastMode" || !supports_fast_mode {
+            return Err(unsupported_option(provider, id));
+        }
+        if option.get("value").and_then(Value::as_bool).is_none() {
+            return Err(ProviderRuntimeError::Provider {
+                provider: provider.to_owned(),
+                detail: "option fastMode requires a boolean value".to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
+
 #[doc(hidden)]
 pub fn build_claude_launch_arguments_for_test(
     request: &ProviderLaunchRequest,
@@ -3485,6 +5487,16 @@ pub fn build_claude_launch_arguments_for_test(
     support: ClaudeActivitySupport,
 ) -> Vec<String> {
     build_claude_launch_arguments(request, session_id, support, None)
+}
+
+#[doc(hidden)]
+pub fn build_claude_launch_arguments_with_settings_for_test(
+    request: &ProviderLaunchRequest,
+    session_id: &str,
+    support: ClaudeActivitySupport,
+    hook_settings: Option<Value>,
+) -> Vec<String> {
+    build_claude_launch_arguments(request, session_id, support, hook_settings.as_ref())
 }
 
 #[doc(hidden)]
@@ -3562,6 +5574,8 @@ impl ClaudeDriver {
         attribution: ProcessAttributionRegistry,
         activity_enabled: bool,
     ) -> Result<Self, ProviderRuntimeError> {
+        let supports_fast_mode = claude_supports_fast_mode(request.model.as_deref());
+        validate_claude_options(&request.provider, &request.options, supports_fast_mode)?;
         let mode = claude_mode(&request.runtime_mode, &request.interaction_mode);
         let session_id = request
             .resume_cursor
@@ -3613,6 +5627,7 @@ impl ClaudeDriver {
             Some(sink) => (Some(sink.receiver), Some(Arc::new(sink.handle))),
             None => (None, None),
         };
+        let pending_acknowledgement = ClaudeAcknowledgementSlot::default();
         let output = spawn_claude_output(
             runtime.clone(),
             request.thread_id.clone(),
@@ -3621,6 +5636,7 @@ impl ClaudeDriver {
             hook_receiver,
             hook_handle.clone(),
             events_tx,
+            pending_acknowledgement.clone(),
         );
         Ok(Self {
             provider: request.provider,
@@ -3632,22 +5648,49 @@ impl ClaudeDriver {
             runtime_mode: Mutex::new(mode),
             configured_runtime_mode: Mutex::new(request.runtime_mode),
             interaction_mode: Mutex::new(request.interaction_mode),
+            options: request.options,
+            supports_fast_mode,
             sequence: Mutex::new(0),
             attachments,
+            pending_acknowledgement,
             hook_sink: hook_handle,
             output,
         })
     }
 
-    async fn write_json(&self, value: Value) -> Result<(), ProviderRuntimeError> {
+    fn encode_json_line(&self, value: Value) -> Result<Vec<u8>, ProviderRuntimeError> {
         let mut bytes = serde_json::to_vec(&value).map_err(provider_error(&self.provider))?;
         bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    async fn write_bytes(&self, bytes: &[u8]) -> Result<(), ProviderRuntimeError> {
         let mut writer = self.writer.lock().await;
         writer
-            .write_all(&bytes)
+            .write_all(bytes)
             .await
             .map_err(provider_error(&self.provider))?;
         writer.flush().await.map_err(provider_error(&self.provider))
+    }
+
+    async fn write_json(&self, value: Value) -> Result<(), ProviderRuntimeError> {
+        let bytes = self.encode_json_line(value)?;
+        self.write_bytes(&bytes).await
+    }
+
+    async fn prepare_turn_input(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+    ) -> Result<(String, Vec<Value>), ProviderRuntimeError> {
+        let materialized = self
+            .attachments
+            .materialize(attachments)
+            .await
+            .map_err(attachment_error("claude"))?;
+        let (images, files) = split_native_images_and_file_references(materialized);
+        let text = append_file_references(text, &files).map_err(attachment_error("claude"))?;
+        Ok((text, images.into_iter().map(claude_image).collect()))
     }
 
     async fn next_sequence(&self) -> u64 {
@@ -3701,14 +5744,7 @@ impl ProviderDriver for ClaudeDriver {
     ) -> BoxRuntimeFuture<'_, Result<Option<String>, ProviderRuntimeError>> {
         Box::pin(async move {
             let turn_id = Uuid::new_v4().to_string();
-            let attachments = self
-                .attachments
-                .materialize(attachments)
-                .await
-                .map_err(attachment_error("claude"))?
-                .into_iter()
-                .map(claude_image)
-                .collect();
+            let (text, attachments) = self.prepare_turn_input(text, attachments).await?;
             let content = crate::provider::attachments::prompt_parts(Some(&text), attachments);
             self.runtime
                 .lock()
@@ -3719,6 +5755,88 @@ impl ProviderDriver for ClaudeDriver {
                 });
             self.write_json(json!({"type":"user","session_id":self.session_id,"message":{"role":"user","content":content},"parent_tool_use_id":null})).await?;
             Ok(Some(turn_id))
+        })
+    }
+    fn deliver(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+        _: String,
+        _: String,
+    ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
+        Box::pin(async move {
+            let (text, attachments) = match self.prepare_turn_input(text, attachments).await {
+                Ok(input) => input,
+                Err(error) => {
+                    return ProviderDeliveryOutcome::Rejected {
+                        detail: error.to_string(),
+                    };
+                }
+            };
+            let turn_id = Uuid::new_v4().to_string();
+            let content = crate::provider::attachments::prompt_parts(Some(&text), attachments);
+            let bytes = match self.encode_json_line(json!({
+                "type":"user",
+                "session_id":self.session_id,
+                "message":{"role":"user","content":content},
+                "parent_tool_use_id":null
+            })) {
+                Ok(bytes) => bytes,
+                Err(error) => {
+                    return ProviderDeliveryOutcome::Rejected {
+                        detail: error.to_string(),
+                    };
+                }
+            };
+            if self.output.cancellation.is_cancelled() {
+                return ProviderDeliveryOutcome::DefinitelyNotSent {
+                    detail: "Claude output closed before delivery".to_owned(),
+                };
+            }
+            let (acknowledgement_tx, acknowledgement_rx) = oneshot::channel();
+            let acknowledgement_registration =
+                match self.pending_acknowledgement.register(acknowledgement_tx) {
+                    Some(registration) => registration,
+                    None => {
+                        return ProviderDeliveryOutcome::DefinitelyNotSent {
+                            detail: "Claude already has a pending delivery acknowledgement"
+                                .to_owned(),
+                        };
+                    }
+                };
+            if self.output.cancellation.is_cancelled() {
+                return ProviderDeliveryOutcome::DefinitelyNotSent {
+                    detail: "Claude output closed before delivery".to_owned(),
+                };
+            }
+            self.runtime
+                .lock()
+                .await
+                .start_turn(crate::provider::claude::TurnInput {
+                    turn_id: turn_id.clone(),
+                    input: text,
+                });
+            if let Err(error) = self.write_bytes(&bytes).await {
+                return ProviderDeliveryOutcome::Ambiguous {
+                    detail: error.to_string(),
+                };
+            }
+            let outcome = tokio::select! {
+                biased;
+                result = acknowledgement_rx => match result {
+                    Ok(()) => ProviderDeliveryOutcome::Accepted { turn_id: Some(turn_id) },
+                    Err(_) => ProviderDeliveryOutcome::Ambiguous {
+                        detail: "Claude acknowledgement waiter closed after delivery write".to_owned(),
+                    },
+                },
+                () = self.output.cancellation.cancelled() => {
+                    ProviderDeliveryOutcome::Ambiguous {
+                        detail: "Claude output closed after delivery write before acknowledgement".to_owned(),
+                    }
+                }
+            };
+            drop(acknowledgement_registration);
+            outcome
         })
     }
     fn interrupt(
@@ -3792,6 +5910,23 @@ impl ProviderDriver for ClaudeDriver {
     fn set_model(&self, _: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         unsupported("claude", "post-start model changes")
     }
+    fn set_options(
+        &self,
+        options: Vec<Value>,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        if options == self.options {
+            return Box::pin(async { Ok(()) });
+        }
+        let provider = self.provider.clone();
+        let supports_fast_mode = self.supports_fast_mode;
+        Box::pin(async move {
+            validate_claude_options(&provider, &options, supports_fast_mode)?;
+            Err(ProviderRuntimeError::UnsupportedCapability {
+                provider,
+                capability: "session-local options",
+            })
+        })
+    }
     fn rollback(&self, _: i64) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         unsupported("claude", "checkpoint rollback")
     }
@@ -3860,10 +5995,7 @@ fn spawn_claude_recovery_worker(
             let Some(recovered) = recovered else {
                 continue;
             };
-            let output = runtime
-                .lock()
-                .await
-                .handle_recovered_transcript(recovered);
+            let output = runtime.lock().await.handle_recovered_transcript(recovered);
             let native_event_id = output
                 .native_event_id
                 .and_then(|value| ProviderNativeEventId::new(value).ok());
@@ -3899,6 +6031,7 @@ fn spawn_claude_output(
     hook_receiver: Option<mpsc::Receiver<Value>>,
     hook_sink: Option<Arc<ClaudeHookSinkHandle>>,
     sender: mpsc::Sender<ProviderEvent>,
+    pending_acknowledgement: ClaudeAcknowledgementSlot,
 ) -> Arc<ClaudeOutputHandle> {
     let cancellation = CancellationToken::new();
     let (recovery_sender, recovery_receiver) =
@@ -3916,16 +6049,17 @@ fn spawn_claude_output(
     let stdout_runtime = runtime.clone();
     let stdout_recovery_sender = recovery_sender.clone();
     let stdout_cancellation = cancellation.clone();
+    let stdout_pending_acknowledgement = pending_acknowledgement.clone();
     let stdout_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         loop {
             let line = tokio::select! {
                 biased;
-                () = stdout_cancellation.cancelled() => return,
+                () = stdout_cancellation.cancelled() => break,
                 line = lines.next_line() => line,
             };
             let Ok(Some(line)) = line else {
-                return;
+                break;
             };
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
@@ -3938,12 +6072,14 @@ fn spawn_claude_output(
                 false,
                 &stdout_recovery_sender,
                 &stdout_cancellation,
+                &stdout_pending_acknowledgement,
             )
             .await
             {
-                return;
+                break;
             }
         }
+        stdout_cancellation.cancel();
     });
     let hook_task = hook_receiver.map(|mut hook_receiver| {
         let hook_runtime = runtime.clone();
@@ -3969,6 +6105,7 @@ fn spawn_claude_output(
                     true,
                     &hook_recovery_sender,
                     &hook_cancellation,
+                    &pending_acknowledgement,
                 )
                 .await
                 {
@@ -4054,6 +6191,7 @@ pub async fn claude_output_shutdown_with_open_stream_for_test() -> bool {
         None,
         None,
         sender,
+        ClaudeAcknowledgementSlot::default(),
     );
     let completed = tokio::time::timeout(Duration::from_millis(150), output.shutdown())
         .await
@@ -4067,8 +6205,7 @@ pub async fn claude_output_shutdown_with_open_stream_for_test() -> bool {
 mod claude_recovery_worker_tests {
     use super::*;
     use crate::provider::claude::{
-        ClaudeTranscriptReaderFixture,
-        transcript::ClaudeTranscriptRecoveryRequestMetadata,
+        ClaudeTranscriptReaderFixture, transcript::ClaudeTranscriptRecoveryRequestMetadata,
     };
     use std::sync::atomic::{AtomicBool, Ordering};
     use tempfile::TempDir;
@@ -4097,7 +6234,11 @@ mod claude_recovery_worker_tests {
             request: ClaudeTranscriptRecoveryRequest,
             _cancellation: CancellationToken,
         ) -> BoxRuntimeFuture<'static, Option<ClaudeRecoveredTranscript>> {
-            let started = self.started.try_lock().ok().and_then(|mut sender| sender.take());
+            let started = self
+                .started
+                .try_lock()
+                .ok()
+                .and_then(|mut sender| sender.take());
             let release = self.release.clone();
             Box::pin(async move {
                 if let Some(started) = started {
@@ -4367,7 +6508,11 @@ async fn emit_claude_value(
     authenticated_hook: bool,
     recovery_sender: &mpsc::Sender<ClaudeTranscriptRecoveryRequest>,
     cancellation: &CancellationToken,
+    pending_acknowledgement: &ClaudeAcknowledgementSlot,
 ) -> bool {
+    if !authenticated_hook && value.get("type").and_then(Value::as_str) == Some("user") {
+        pending_acknowledgement.acknowledge();
+    }
     let emitted_at_ms = u64::try_from(
         OffsetDateTime::now_utc()
             .unix_timestamp_nanos()
@@ -4486,14 +6631,14 @@ fn attachment_error(
     provider_error(provider)
 }
 
-fn codex_image(image: MaterializedImage) -> Value {
+fn codex_image(image: MaterializedAttachment) -> Value {
     json!({
         "type": "image",
         "url": format!("data:{};base64,{}", image.mime_type, image.base64_data),
     })
 }
 
-fn acp_image(image: MaterializedImage) -> Value {
+fn acp_image(image: MaterializedAttachment) -> Value {
     json!({
         "type": "image",
         "data": image.base64_data,
@@ -4501,7 +6646,7 @@ fn acp_image(image: MaterializedImage) -> Value {
     })
 }
 
-fn claude_image(image: MaterializedImage) -> Value {
+fn claude_image(image: MaterializedAttachment) -> Value {
     json!({
         "type": "image",
         "source": {
@@ -4512,7 +6657,7 @@ fn claude_image(image: MaterializedImage) -> Value {
     })
 }
 
-fn opencode_file(image: MaterializedImage) -> Value {
+fn opencode_file(image: MaterializedAttachment) -> Value {
     json!({
         "type": "file",
         "mime": image.mime_type,
@@ -4539,12 +6684,25 @@ fn acp_mcp_servers(mcp: Option<&ProviderMcpConfig>) -> Vec<Value> {
 mod attachment_adapter_tests {
     use super::*;
 
-    fn image() -> MaterializedImage {
-        MaterializedImage {
+    fn image() -> MaterializedAttachment {
+        MaterializedAttachment {
+            attachment_type: "image".to_owned(),
             name: "screen.png".to_owned(),
             mime_type: "image/png".to_owned(),
             base64_data: "aW1hZ2U=".to_owned(),
             file_url: "file:///state/attachments/image-1".to_owned(),
+            path: PathBuf::from("/state/attachments/image-1"),
+        }
+    }
+
+    fn file() -> MaterializedAttachment {
+        MaterializedAttachment {
+            attachment_type: "file".to_owned(),
+            name: "notes<&.txt".to_owned(),
+            mime_type: "text/plain".to_owned(),
+            base64_data: "bm90ZXM=".to_owned(),
+            file_url: "file:///state/attachments/notes-1".to_owned(),
+            path: PathBuf::from("/state/attachments/notes<&-1"),
         }
     }
 
@@ -4575,6 +6733,41 @@ mod attachment_adapter_tests {
             })
         );
     }
+
+    #[test]
+    fn images_stay_native_and_files_become_escaped_local_references() {
+        let (images, files) = split_native_images_and_file_references(vec![image(), file()]);
+        assert_eq!(images.len(), 1);
+        assert_eq!(files.len(), 1);
+        assert_eq!(
+            codex_image(images[0].clone()),
+            json!({ "type": "image", "url": "data:image/png;base64,aW1hZ2U=" })
+        );
+        assert_eq!(
+            acp_image(images[0].clone()),
+            json!({ "type": "image", "data": "aW1hZ2U=", "mimeType": "image/png" })
+        );
+        assert_eq!(
+            claude_image(images[0].clone()),
+            json!({
+                "type": "image",
+                "source": { "type": "base64", "media_type": "image/png", "data": "aW1hZ2U=" }
+            })
+        );
+        assert_eq!(
+            opencode_file(file()),
+            json!({
+                "type": "file",
+                "mime": "text/plain",
+                "url": "file:///state/attachments/notes-1",
+                "filename": "notes<&.txt"
+            })
+        );
+        assert_eq!(
+            append_file_references("inspect".to_owned(), &files).expect("references append"),
+            "inspect\n<attached_files>\n- notes&lt;&amp;.txt: /state/attachments/notes&lt;&amp;-1\n</attached_files>"
+        );
+    }
 }
 
 fn unsupported<T>(
@@ -4590,6 +6783,24 @@ where
             provider,
             capability,
         })
+    })
+}
+
+fn reject_unsupported_options(
+    provider: &'static str,
+    options: Vec<Value>,
+) -> BoxRuntimeFuture<'static, Result<(), ProviderRuntimeError>> {
+    Box::pin(async move {
+        let Some(option) = options.first() else {
+            return Ok(());
+        };
+        Err(unsupported_option(
+            provider,
+            option
+                .get("id")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown"),
+        ))
     })
 }
 
@@ -4633,7 +6844,7 @@ mod tests {
             AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
             ProcessSampler,
         },
-        orchestration::engine::{EngineOptions, OrchestrationCommand},
+        orchestration::engine::{EngineOptions, OrchestrationCommand, load_snapshot},
         persistence::{Database, ProviderSessionRuntime, run_migrations},
         server_settings::{
             ProviderEnvironmentVariableState, ProviderInstanceState, ProviderSettingsState,
@@ -4646,11 +6857,19 @@ mod tests {
     };
     use serde_json::{Value, json};
     use std::{
+        io,
+        pin::Pin,
         sync::{Arc, Mutex as StdMutex},
+        task::{Context, Poll},
         time::Instant,
     };
     use tempfile::TempDir;
-    use tokio::{net::TcpListener, sync::mpsc, time::timeout};
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader, DuplexStream},
+        net::TcpListener,
+        sync::mpsc,
+        time::timeout,
+    };
 
     struct CurrentDirectoryGuard {
         original: std::path::PathBuf,
@@ -4683,6 +6902,9 @@ mod tests {
         models: Vec<String>,
         rollbacks: Vec<i64>,
         shutdowns: usize,
+        send_gate: Option<Arc<tokio::sync::Notify>>,
+        reconcile_gate: Option<Arc<tokio::sync::Notify>>,
+        reconcile_started: Option<Arc<tokio::sync::Notify>>,
     }
 
     struct SupervisorDriver {
@@ -4698,7 +6920,7 @@ mod tests {
             Box::pin(async move {
                 self.state.lock().unwrap().starts += 1;
                 Ok(super::StartedSession {
-                    resume_cursor: Some(json!({"sessionId":"unit-session"})),
+                    resume_cursor: Some(json!({"threadId":"unit-session"})),
                     runtime_payload: Some(json!({"transport":"unit"})),
                     activity_capabilities: super::ActivityCapabilities::none(),
                 })
@@ -4713,8 +6935,27 @@ mod tests {
         ) -> super::BoxRuntimeFuture<'_, Result<Option<String>, super::ProviderRuntimeError>>
         {
             Box::pin(async move {
+                let gate = self.state.lock().unwrap().send_gate.clone();
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
                 self.state.lock().unwrap().sends.push(text);
                 Ok(Some("unit-turn".to_owned()))
+            })
+        }
+        fn reconcile(
+            &self,
+            _delivery_key: String,
+        ) -> super::BoxRuntimeFuture<'_, super::ProviderReconciliationOutcome> {
+            Box::pin(async move {
+                let gate = self.state.lock().unwrap().reconcile_gate.clone();
+                if let Some(started) = self.state.lock().unwrap().reconcile_started.clone() {
+                    started.notify_one();
+                }
+                if let Some(gate) = gate {
+                    gate.notified().await;
+                }
+                super::ProviderReconciliationOutcome::Found
             })
         }
 
@@ -4778,6 +7019,13 @@ mod tests {
                 self.state.lock().unwrap().models.push(model);
                 Ok(())
             })
+        }
+
+        fn set_options(
+            &self,
+            _: Vec<Value>,
+        ) -> super::BoxRuntimeFuture<'_, Result<(), super::ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
         }
 
         fn rollback(
@@ -4861,6 +7109,7 @@ mod tests {
             runtime_mode: "approval-required".to_owned(),
             interaction_mode: "default".to_owned(),
             model: Some("test-model".to_owned()),
+            options: Vec::new(),
             service_tier: None,
             effort: None,
             agent: None,
@@ -4871,6 +7120,189 @@ mod tests {
             mcp: None,
             codex_home: None,
         }
+    }
+
+    async fn launch_request_with_options(options: Vec<Value>) -> super::ProviderLaunchRequest {
+        let engine = supervisor_engine().await;
+        let settings = TempDir::new().expect("provider settings directory");
+        let command = serde_json::from_value(json!({
+            "type":"thread.turn.start",
+            "commandId":"launch-options",
+            "threadId":"t1",
+            "message":{"messageId":"launch-message","role":"user","text":"launch","attachments":[]},
+            "modelSelection":{
+                "instanceId":"codex",
+                "model":"gpt-5.6",
+                "options":options
+            },
+            "runtimeMode":"full-access",
+            "interactionMode":"default",
+            "createdAt":"2026-07-16T00:00:00Z"
+        }))
+        .expect("turn command");
+
+        let request = super::launch_request_for_command(
+            &engine,
+            &settings.path().to_path_buf(),
+            &command,
+            None,
+        )
+        .await
+        .expect("launch request");
+        engine.shutdown().await;
+        request
+    }
+
+    #[tokio::test]
+    async fn launch_request_preserves_canonical_options() {
+        let request = launch_request_with_options(vec![
+            json!({ "id":"fastMode", "value":true }),
+            json!({ "id":"reasoningEffort", "value":"high" }),
+        ])
+        .await;
+
+        assert_eq!(
+            request.options,
+            vec![
+                json!({ "id":"fastMode", "value":true }),
+                json!({ "id":"reasoningEffort", "value":"high" }),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn launch_request_derives_effort_from_provider_aliases() {
+        for option_id in ["reasoningEffort", "effort", "reasoning"] {
+            let request = launch_request_with_options(vec![json!({
+                "id":option_id,
+                "value":"high"
+            })])
+            .await;
+            assert_eq!(request.effort.as_deref(), Some("high"));
+        }
+        let request = launch_request_with_options(vec![
+            json!({ "id":"reasoning", "value":"low" }),
+            json!({ "id":"effort", "value":"medium" }),
+            json!({ "id":"reasoningEffort", "value":"high" }),
+        ])
+        .await;
+        assert_eq!(request.effort.as_deref(), Some("high"));
+    }
+
+    #[tokio::test]
+    async fn launch_request_normalizes_options_deterministically() {
+        let request = launch_request_with_options(vec![
+            json!({ "id":"zeta", "value":"first" }),
+            json!({ "id":" fastMode ", "value":false }),
+            json!({ "id":"zeta", "value":"last" }),
+            json!({ "id":"", "value":"ignored" }),
+            json!({ "id":"count", "value":1 }),
+            json!({ "id":"missing" }),
+            json!({ "value":true }),
+            json!({ "id":false, "value":"ignored" }),
+        ])
+        .await;
+
+        assert_eq!(
+            request.options,
+            vec![
+                json!({ "id":"fastMode", "value":false }),
+                json!({ "id":"zeta", "value":"last" }),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn rejected_option_logging_redacts_untrusted_ids_and_string_values() {
+        use crate::production::operational_logs::{
+            OperationalLogOptions, ProviderOperationalLog,
+        };
+
+        let temp = TempDir::new().expect("provider option log directory");
+        let path = temp.path().join("provider-options.log");
+        let log = ProviderOperationalLog::start(
+            path.clone(),
+            OperationalLogOptions {
+                max_file_bytes: 4096,
+                retained_files: 1,
+                queue_capacity: 4,
+            },
+        )
+        .await
+        .expect("provider option log starts");
+        let request = native_launch(&temp, "codex");
+
+        super::record_option_reconciliation(
+            Some(&log),
+            &request,
+            &[json!({
+                "id":"PRIVATE_OPTION_ID",
+                "value":"PRIVATE_OPTION_VALUE"
+            })],
+            "live",
+            "failed",
+        );
+        log.shutdown().await.expect("provider option log shuts down");
+
+        let contents = std::fs::read_to_string(path).expect("read provider option log");
+        assert!(!contents.contains("PRIVATE_OPTION_ID"));
+        assert!(!contents.contains("PRIVATE_OPTION_VALUE"));
+        let record: Value = serde_json::from_str(contents.trim()).expect("provider option record");
+        assert_eq!(record["optionId"], "unknown");
+        assert!(record.get("requestedValue").is_none());
+    }
+
+    #[test]
+    fn delivery_fingerprint_changes_when_options_change() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let mut standard = native_launch(&temp, "codex");
+        standard.options = vec![json!({ "id":"fastMode", "value":false })];
+        let mut fast = standard.clone();
+        fast.options = vec![json!({ "id":"fastMode", "value":true })];
+
+        assert_ne!(
+            super::delivery_route_fingerprint(&standard).expect("standard route fingerprint"),
+            super::delivery_route_fingerprint(&fast).expect("fast route fingerprint")
+        );
+    }
+
+    #[test]
+    fn claude_delivery_launch_requests_replayed_user_message_acknowledgements() {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let request = native_launch(&temp, "claudeAgent");
+
+        let arguments = super::build_claude_launch_arguments(
+            &request,
+            "claude-session",
+            super::ClaudeActivitySupport::default(),
+            None,
+        );
+
+        for required in [
+            "--print",
+            "--input-format",
+            "--output-format",
+            "--replay-user-messages",
+            "--include-partial-messages",
+            "--verbose",
+        ] {
+            assert!(
+                arguments.iter().any(|argument| argument == required),
+                "Claude launch is missing required argument {required}: {arguments:?}"
+            );
+        }
+        let replay = arguments
+            .iter()
+            .position(|argument| argument == "--replay-user-messages")
+            .expect("replay argument");
+        let verbose = arguments
+            .iter()
+            .position(|argument| argument == "--verbose")
+            .expect("verbose argument");
+        assert!(
+            replay < verbose,
+            "Claude requires --replay-user-messages before --verbose: {arguments:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -4894,14 +7326,49 @@ mod tests {
         let executable = temp.path().join(format!("{name}.cmd"));
         let source = match kind {
             "claude" => {
-                r#"process.stderr.write("fixture warning\n");
-process.stdin.resume();
+                r#"const fs = require("node:fs");
+const readline = require("node:readline");
+process.stderr.write("fixture warning\n");
+const lines = readline.createInterface({ input: process.stdin });
+lines.on("line", (line) => {
+  if (process.env.BIBCODE_TEST_REQUEST_CAPTURE) {
+    fs.appendFileSync(process.env.BIBCODE_TEST_REQUEST_CAPTURE, `${line}\n`);
+  }
+});
+"#
+            }
+            "claude-replay" => {
+                r#"const fs = require("node:fs");
+const readline = require("node:readline");
+const lines = readline.createInterface({ input: process.stdin });
+lines.on("line", (line) => {
+  fs.appendFileSync(process.env.BIBCODE_TEST_REQUEST_CAPTURE, `${line}\n`);
+  const timer = setInterval(() => {
+    if (!fs.existsSync(process.env.BIBCODE_TEST_ACK_GATE)) return;
+    clearInterval(timer);
+    process.stdout.write(`${line}\n`);
+  }, 10);
+});
+"#
+            }
+            "claude-disconnect" => {
+                r#"const fs = require("node:fs");
+const readline = require("node:readline");
+const lines = readline.createInterface({ input: process.stdin });
+lines.on("line", (line) => {
+  fs.appendFileSync(process.env.BIBCODE_TEST_REQUEST_CAPTURE, `${line}\n`);
+  process.exit(0);
+});
 "#
             }
             "codex" => {
-                r#"const readline = require("node:readline");
+                r#"const fs = require("node:fs");
+const readline = require("node:readline");
 const lines = readline.createInterface({ input: process.stdin });
 lines.on("line", (line) => {
+  if (process.env.BIBCODE_TEST_REQUEST_CAPTURE) {
+    fs.appendFileSync(process.env.BIBCODE_TEST_REQUEST_CAPTURE, `${line}\n`);
+  }
   const request = JSON.parse(line);
   let result;
   switch (request.method) {
@@ -4910,6 +7377,9 @@ lines.on("line", (line) => {
       break;
     case "thread/start":
       result = { cwd: process.cwd(), model: "gpt-5", thread: { id: "native-codex-thread" } };
+      break;
+    case "mcpServerStatus/list":
+      result = { data: [], nextCursor: null };
       break;
     case "thread/goal/set":
       result = { goal: { status: "active" } };
@@ -4934,9 +7404,13 @@ lines.on("line", (line) => {
 "#
             }
             "acp" => {
-                r#"const readline = require("node:readline");
+                r#"const fs = require("node:fs");
+const readline = require("node:readline");
 const lines = readline.createInterface({ input: process.stdin });
 lines.on("line", (line) => {
+  if (process.env.BIBCODE_TEST_REQUEST_CAPTURE) {
+    fs.appendFileSync(process.env.BIBCODE_TEST_REQUEST_CAPTURE, `${line}\n`);
+  }
   const request = JSON.parse(line);
   let result;
   switch (request.method) {
@@ -4976,6 +7450,22 @@ lines.on("line", (line) => {
       result = { configOptions: [] };
       break;
     case "session/prompt":
+      if (process.env.BIBCODE_TEST_REJECT_PROMPT) {
+        process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, error: { code: -32000, message: "prompt rejected" } })}\n`);
+        return;
+      }
+      if (process.env.BIBCODE_TEST_DISCONNECT_AFTER_PROMPT) {
+        process.exit(0);
+        return;
+      }
+      if (process.env.BIBCODE_TEST_ACK_GATE) {
+        const timer = setInterval(() => {
+          if (!fs.existsSync(process.env.BIBCODE_TEST_ACK_GATE)) return;
+          clearInterval(timer);
+          process.stdout.write(`${JSON.stringify({ jsonrpc: "2.0", id: request.id, result: { stopReason: "end_turn" } })}\n`);
+        }, 10);
+        return;
+      }
       result = { stopReason: "end_turn" };
       break;
     default:
@@ -4997,18 +7487,268 @@ lines.on("line", (line) => {
     }
 
     #[cfg(unix)]
-    const CLAUDE_FIXTURE: &str =
-        "#!/bin/sh\nprintf '%s\\n' 'fixture warning' >&2\ncat >/dev/null\n";
+    const CLAUDE_FIXTURE: &str = r#"#!/bin/sh
+printf '%s\n' 'fixture warning' >&2
+while IFS= read -r line; do
+  [ -z "$BIBCODE_TEST_REQUEST_CAPTURE" ] || printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
+done
+"#;
     #[cfg(windows)]
     const CLAUDE_FIXTURE: &str = "claude";
 
     #[cfg(unix)]
+    const CLAUDE_REPLAY_FIXTURE: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
+  while [ ! -f "$BIBCODE_TEST_ACK_GATE" ]; do sleep 0.01; done
+  printf '%s\n' "$line"
+done
+"#;
+    #[cfg(windows)]
+    const CLAUDE_REPLAY_FIXTURE: &str = "claude-replay";
+
+    #[cfg(unix)]
+    const CLAUDE_DISCONNECT_FIXTURE: &str = r#"#!/bin/sh
+IFS= read -r line
+printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
+"#;
+    #[cfg(windows)]
+    const CLAUDE_DISCONNECT_FIXTURE: &str = "claude-disconnect";
+
+    async fn claude_delivery_fixture(
+        temp: &TempDir,
+        name: &str,
+        fixture: &str,
+        capture_path: &std::path::Path,
+        acknowledgement_gate: Option<&std::path::Path>,
+    ) -> Arc<super::ClaudeDriver> {
+        let executable = executable_fixture(temp, name, fixture);
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let mut request = native_launch(temp, "claudeAgent");
+        request.binary_path = executable.to_string_lossy().into_owned();
+        request.environment.insert(
+            "BIBCODE_TEST_REQUEST_CAPTURE".to_owned(),
+            capture_path.to_string_lossy().into_owned(),
+        );
+        if let Some(gate) = acknowledgement_gate {
+            request.environment.insert(
+                "BIBCODE_TEST_ACK_GATE".to_owned(),
+                gate.to_string_lossy().into_owned(),
+            );
+        }
+        Arc::new(
+            super::ClaudeDriver::spawn(
+                request,
+                factory.attachments.clone(),
+                factory.attribution.clone(),
+                false,
+            )
+            .await
+            .expect("Claude delivery fixture should start"),
+        )
+    }
+
+    #[tokio::test]
+    async fn claude_options_acknowledge_the_exact_launch_vector_and_restart_only_fast_changes() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let temp = TempDir::new().expect("provider fixture directory");
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let fixture = executable_fixture(&temp, "claude-options", CLAUDE_FIXTURE);
+        let mut request = native_launch(&temp, "claudeAgent");
+        request.binary_path = fixture.to_string_lossy().into_owned();
+        request.model = Some("claude-opus-4-8".to_owned());
+        request.options = vec![json!({ "id": "fastMode", "value": true })];
+        let driver = super::ClaudeDriver::spawn(
+            request,
+            factory.attachments.clone(),
+            factory.attribution.clone(),
+            false,
+        )
+        .await
+        .expect("Claude driver should create");
+
+        driver
+            .set_options(vec![json!({ "id": "fastMode", "value": true })])
+            .await
+            .expect("exact launch vector is acknowledged");
+        assert!(matches!(
+            driver
+                .set_options(vec![json!({ "id": "fastMode", "value": false })])
+                .await,
+            Err(super::ProviderRuntimeError::UnsupportedCapability { .. })
+        ));
+        assert!(matches!(
+            driver
+                .set_options(vec![json!({ "id": "unknown", "value": true })])
+                .await,
+            Err(super::ProviderRuntimeError::Provider { .. })
+        ));
+        driver.shutdown().await.expect("Claude driver should shut down");
+    }
+
+    #[tokio::test]
+    async fn claude_delivery_waits_for_the_replayed_user_message_before_accepting() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let temp = TempDir::new().expect("provider fixture directory");
+        let capture_path = temp.path().join("claude-delivery.jsonl");
+        let acknowledgement_gate = temp.path().join("release-acknowledgement");
+        let driver = claude_delivery_fixture(
+            &temp,
+            "claude-delivery-replay",
+            CLAUDE_REPLAY_FIXTURE,
+            &capture_path,
+            Some(&acknowledgement_gate),
+        )
+        .await;
+        driver.start().await.expect("Claude fixture should start");
+        let delivery_driver = driver.clone();
+        let mut delivery = tokio::spawn(async move {
+            delivery_driver
+                .deliver(
+                    "hello".to_owned(),
+                    Vec::new(),
+                    "default".to_owned(),
+                    "unused-no-id-key".to_owned(),
+                )
+                .await
+        });
+        captured_request(&capture_path, |value| value["type"] == "user").await;
+
+        let premature = timeout(std::time::Duration::from_millis(100), &mut delivery).await;
+        let was_pending = premature.is_err();
+        std::fs::write(&acknowledgement_gate, b"release").expect("release acknowledgement");
+        let outcome = match premature {
+            Ok(outcome) => outcome.expect("delivery task should join"),
+            Err(_) => timeout(std::time::Duration::from_secs(2), delivery)
+                .await
+                .expect("replayed user message should acknowledge delivery")
+                .expect("delivery task should join"),
+        };
+        driver.shutdown().await.expect("Claude fixture shutdown");
+
+        assert!(
+            was_pending,
+            "writing stdin is not acceptance; delivery must wait for Claude's replay"
+        );
+        assert!(matches!(
+            outcome,
+            super::ProviderDeliveryOutcome::Accepted { turn_id: Some(_) }
+        ));
+    }
+
+    #[tokio::test]
+    async fn claude_delivery_disconnect_after_write_without_replay_is_ambiguous() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let temp = TempDir::new().expect("provider fixture directory");
+        let capture_path = temp.path().join("claude-delivery.jsonl");
+        let driver = claude_delivery_fixture(
+            &temp,
+            "claude-delivery-disconnect",
+            CLAUDE_DISCONNECT_FIXTURE,
+            &capture_path,
+            None,
+        )
+        .await;
+        driver.start().await.expect("Claude fixture should start");
+        let delivery_driver = driver.clone();
+        let delivery = tokio::spawn(async move {
+            delivery_driver
+                .deliver(
+                    "hello".to_owned(),
+                    Vec::new(),
+                    "default".to_owned(),
+                    "unused-no-id-key".to_owned(),
+                )
+                .await
+        });
+        captured_request(&capture_path, |value| value["type"] == "user").await;
+        let outcome = timeout(std::time::Duration::from_secs(2), delivery)
+            .await
+            .expect("provider disconnect should resolve delivery")
+            .expect("delivery task should join");
+        driver.shutdown().await.expect("Claude fixture shutdown");
+
+        assert!(matches!(
+            outcome,
+            super::ProviderDeliveryOutcome::Ambiguous { .. }
+        ));
+    }
+
+    #[test]
+    fn claude_delivery_cancellation_releases_the_pending_acknowledgement() {
+        let slot = super::ClaudeAcknowledgementSlot::default();
+        let (first_sender, _first_receiver) = tokio::sync::oneshot::channel();
+        let first = slot
+            .register(first_sender)
+            .expect("first delivery registers");
+        slot.acknowledge();
+        let (retry_sender, _retry_receiver) = tokio::sync::oneshot::channel();
+        let retry = slot
+            .register(retry_sender)
+            .expect("acknowledgement releases the first registration");
+
+        drop(first);
+
+        let (overlap_sender, _overlap_receiver) = tokio::sync::oneshot::channel();
+        assert!(
+            slot.register(overlap_sender).is_none(),
+            "an older delivery guard must not clear a newer acknowledgement slot"
+        );
+        drop(retry);
+        let (next_sender, _next_receiver) = tokio::sync::oneshot::channel();
+        assert!(slot.register(next_sender).is_some());
+    }
+
+    #[tokio::test]
+    async fn claude_delivery_non_user_stdout_does_not_acknowledge_the_pending_turn() {
+        // Mutation caught: acknowledging every raw stdout value instead of only a user replay.
+        let runtime = Arc::new(tokio::sync::Mutex::new(
+            crate::provider::claude::ClaudeProviderRuntime::new(
+                "claude-delivery-thread".to_owned(),
+                "claude-session".to_owned(),
+            ),
+        ));
+        let (event_sender, _event_receiver) = tokio::sync::mpsc::channel(4);
+        let (recovery_sender, _recovery_receiver) = tokio::sync::mpsc::channel(1);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let slot = super::ClaudeAcknowledgementSlot::default();
+        let (acknowledgement_sender, mut acknowledgement_receiver) =
+            tokio::sync::oneshot::channel();
+        let _registration = slot
+            .register(acknowledgement_sender)
+            .expect("delivery acknowledgement registers");
+
+        assert!(
+            super::emit_claude_value(
+                &runtime,
+                "claude-delivery-thread",
+                serde_json::json!({
+                    "type": "assistant",
+                    "message": { "role": "assistant", "content": [] }
+                }),
+                &event_sender,
+                false,
+                &recovery_sender,
+                &cancellation,
+                &slot,
+            )
+            .await
+        );
+        assert!(matches!(
+            acknowledgement_receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[cfg(unix)]
     const CODEX_FIXTURE: &str = r#"#!/bin/sh
 while IFS= read -r line; do
+  [ -z "$BIBCODE_TEST_REQUEST_CAPTURE" ] || printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
     *'"method":"initialize"'*) printf '{"id":%s,"result":{"userAgent":"fixture"}}\n' "$id" ;;
     *'"method":"thread/start"'*) printf '{"id":%s,"result":{"cwd":"/tmp","model":"gpt-5","thread":{"id":"native-codex-thread"}}}\n' "$id" ;;
+    *'"method":"mcpServerStatus/list"'*) printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$id" ;;
     *'"method":"thread/goal/set"'*) printf '{"id":%s,"result":{"goal":{"status":"active"}}}\n' "$id" ;;
     *'"method":"turn/start"'*) printf '{"id":%s,"result":{"turn":{"id":"native-codex-turn"}}}\n' "$id" ;;
     *'"method":"turn/interrupt"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
@@ -5023,6 +7763,7 @@ done
     #[cfg(unix)]
     const ACP_FIXTURE: &str = r#"#!/bin/sh
 while IFS= read -r line; do
+  [ -z "$BIBCODE_TEST_REQUEST_CAPTURE" ] || printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
     *'"method":"initialize"'*|*'"method":"authenticate"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
@@ -5030,12 +7771,510 @@ while IFS= read -r line; do
     *'"method":"session/create"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"grok-session","modes":{"currentModeId":"code","availableModes":[{"id":"code","name":"Agent"},{"id":"ask","name":"Ask"}]}}}\n' "$id" ;;
     *'"method":"session/set_config_option"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{"configOptions":[]}}\n' "$id" ;;
     *'"method":"session/set_mode"'*|*'"method":"session/set_model"'*) printf '{"jsonrpc":"2.0","id":%s,"result":{}}\n' "$id" ;;
-    *'"method":"session/prompt"'*) sleep 0.1; printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id" ;;
+    *'"method":"session/prompt"'*)
+      [ -z "$BIBCODE_TEST_REJECT_PROMPT" ] || { printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"prompt rejected"}}\n' "$id"; continue; }
+      [ -z "$BIBCODE_TEST_DISCONNECT_AFTER_PROMPT" ] || exit 0
+      while [ -n "$BIBCODE_TEST_ACK_GATE" ] && [ ! -f "$BIBCODE_TEST_ACK_GATE" ]; do sleep 0.01; done
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"stopReason":"end_turn"}}\n' "$id"
+      ;;
   esac
 done
 "#;
     #[cfg(windows)]
     const ACP_FIXTURE: &str = "acp";
+
+    async fn cursor_delivery_fixture(
+        temp: &TempDir,
+        capture_path: &std::path::Path,
+        acknowledgement_gate: Option<&std::path::Path>,
+        disconnect_after_prompt: bool,
+        reject_prompt: bool,
+    ) -> Arc<super::CursorDriver> {
+        let executable = executable_fixture(temp, "cursor-delivery", ACP_FIXTURE);
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let mut request = native_launch(temp, "cursor");
+        request.binary_path = executable.to_string_lossy().into_owned();
+        request.environment.insert(
+            "BIBCODE_TEST_REQUEST_CAPTURE".to_owned(),
+            capture_path.to_string_lossy().into_owned(),
+        );
+        if let Some(gate) = acknowledgement_gate {
+            request.environment.insert(
+                "BIBCODE_TEST_ACK_GATE".to_owned(),
+                gate.to_string_lossy().into_owned(),
+            );
+        }
+        if disconnect_after_prompt {
+            request.environment.insert(
+                "BIBCODE_TEST_DISCONNECT_AFTER_PROMPT".to_owned(),
+                "1".to_owned(),
+            );
+        }
+        if reject_prompt {
+            request
+                .environment
+                .insert("BIBCODE_TEST_REJECT_PROMPT".to_owned(), "1".to_owned());
+        }
+        Arc::new(
+            super::CursorDriver::spawn(
+                request,
+                factory.attachments.clone(),
+                factory.attribution.clone(),
+            )
+            .await
+            .expect("Cursor delivery fixture should start"),
+        )
+    }
+
+    #[tokio::test]
+    async fn cursor_delivery_missing_session_is_definitely_not_sent() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let temp = TempDir::new().expect("provider fixture directory");
+        let capture_path = temp.path().join("cursor-delivery.jsonl");
+        let driver = cursor_delivery_fixture(&temp, &capture_path, None, false, false).await;
+
+        let outcome = driver
+            .deliver(
+                "hello".to_owned(),
+                Vec::new(),
+                "default".to_owned(),
+                "unused-no-id-key".to_owned(),
+            )
+            .await;
+        driver.shutdown().await.expect("Cursor fixture shutdown");
+
+        assert!(matches!(
+            outcome,
+            super::ProviderDeliveryOutcome::DefinitelyNotSent { .. }
+        ));
+        assert!(
+            !std::fs::read_to_string(&capture_path)
+                .unwrap_or_default()
+                .contains("session/prompt"),
+            "pre-write failure must not create a prompt request"
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_delivery_waits_for_the_session_prompt_response_before_accepting() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let temp = TempDir::new().expect("provider fixture directory");
+        let capture_path = temp.path().join("cursor-delivery.jsonl");
+        let acknowledgement_gate = temp.path().join("release-response");
+        let driver = cursor_delivery_fixture(
+            &temp,
+            &capture_path,
+            Some(&acknowledgement_gate),
+            false,
+            false,
+        )
+        .await;
+        driver.start().await.expect("Cursor fixture should start");
+        let delivery_driver = driver.clone();
+        let mut delivery = tokio::spawn(async move {
+            delivery_driver
+                .deliver(
+                    "hello".to_owned(),
+                    Vec::new(),
+                    "default".to_owned(),
+                    "unused-no-id-key".to_owned(),
+                )
+                .await
+        });
+        captured_request(&capture_path, |value| value["method"] == "session/prompt").await;
+
+        let premature = timeout(std::time::Duration::from_millis(100), &mut delivery).await;
+        let was_pending = premature.is_err();
+        std::fs::write(&acknowledgement_gate, b"release").expect("release response");
+        let outcome = match premature {
+            Ok(outcome) => outcome.expect("delivery task should join"),
+            Err(_) => timeout(std::time::Duration::from_secs(2), delivery)
+                .await
+                .expect("prompt response should acknowledge delivery")
+                .expect("delivery task should join"),
+        };
+        driver.shutdown().await.expect("Cursor fixture shutdown");
+
+        assert!(
+            was_pending,
+            "writing the ACP request is not acceptance; delivery must wait for its response"
+        );
+        assert!(matches!(
+            outcome,
+            super::ProviderDeliveryOutcome::Accepted { turn_id: Some(_) }
+        ));
+    }
+
+    #[tokio::test]
+    async fn cursor_delivery_disconnect_after_write_before_response_is_ambiguous() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let temp = TempDir::new().expect("provider fixture directory");
+        let capture_path = temp.path().join("cursor-delivery.jsonl");
+        let driver = cursor_delivery_fixture(&temp, &capture_path, None, true, false).await;
+        driver.start().await.expect("Cursor fixture should start");
+        let outcome = timeout(
+            std::time::Duration::from_secs(2),
+            driver.deliver(
+                "hello".to_owned(),
+                Vec::new(),
+                "default".to_owned(),
+                "unused-no-id-key".to_owned(),
+            ),
+        )
+        .await
+        .expect("provider disconnect should resolve delivery");
+        captured_request(&capture_path, |value| value["method"] == "session/prompt").await;
+        driver.shutdown().await.expect("Cursor fixture shutdown");
+
+        assert!(matches!(
+            outcome,
+            super::ProviderDeliveryOutcome::Ambiguous { .. }
+        ));
+    }
+
+    #[tokio::test]
+    async fn cursor_delivery_remote_prompt_rejection_is_rejected() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let temp = TempDir::new().expect("provider fixture directory");
+        let capture_path = temp.path().join("cursor-delivery.jsonl");
+        let driver = cursor_delivery_fixture(&temp, &capture_path, None, false, true).await;
+        driver.start().await.expect("Cursor fixture should start");
+
+        let outcome = driver
+            .deliver(
+                "hello".to_owned(),
+                Vec::new(),
+                "default".to_owned(),
+                "unused-no-id-key".to_owned(),
+            )
+            .await;
+        captured_request(&capture_path, |value| value["method"] == "session/prompt").await;
+        driver.shutdown().await.expect("Cursor fixture shutdown");
+
+        assert!(matches!(
+            outcome,
+            super::ProviderDeliveryOutcome::Rejected { detail }
+                if detail.contains("prompt rejected")
+        ));
+    }
+
+    #[tokio::test]
+    async fn cursor_delivery_prompt_write_zero_bytes_is_definitely_not_sent() {
+        // Mutation caught: treating a proven zero-byte failure as possibly submitted prevents a
+        // safe retry.
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let (outcome, accepted_prompt_bytes, prompt_reached_peer, _) =
+            cursor_delivery_with_prompt_write_failure(PromptWriteFailure::BeforeFirstByte).await;
+
+        assert!(matches!(
+            outcome,
+            super::ProviderDeliveryOutcome::DefinitelyNotSent { .. }
+        ));
+        assert_eq!(accepted_prompt_bytes, 0);
+        assert!(!prompt_reached_peer);
+    }
+
+    #[tokio::test]
+    async fn cursor_delivery_prompt_write_partial_bytes_is_ambiguous() {
+        // Mutation caught: write_all erases a successful prefix when a later write fails, making
+        // a possibly submitted prompt look safe to retry.
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let (outcome, accepted_prompt_bytes, prompt_reached_peer, _) =
+            cursor_delivery_with_prompt_write_failure(PromptWriteFailure::AfterPrefix).await;
+
+        assert!(matches!(
+            outcome,
+            super::ProviderDeliveryOutcome::Ambiguous { .. }
+        ));
+        assert!(
+            accepted_prompt_bytes > 0,
+            "the writer accepted a prompt prefix"
+        );
+        assert!(
+            !prompt_reached_peer,
+            "the incomplete JSON line was not a prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_delivery_prompt_write_flush_failure_is_ambiguous() {
+        // Mutation caught: a flush error occurs after write_all accepted the complete prompt frame,
+        // so classifying it as definitely unsent can duplicate a provider-visible prompt.
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let (outcome, accepted_prompt_bytes, prompt_reached_peer, _) =
+            cursor_delivery_with_prompt_write_failure(PromptWriteFailure::OnFlush).await;
+
+        assert!(matches!(
+            outcome,
+            super::ProviderDeliveryOutcome::Ambiguous { .. }
+        ));
+        assert!(
+            accepted_prompt_bytes > 0,
+            "the writer accepted the prompt frame"
+        );
+        assert!(
+            prompt_reached_peer,
+            "the peer parsed the complete prompt frame"
+        );
+    }
+
+    #[tokio::test]
+    async fn cursor_delivery_prompt_write_confirmation_loss_is_ambiguous_without_a_pending_leak() {
+        // Mutation caught: dropping the writer confirmation without removing its correlation
+        // leaves a permanently pending response entry after the durable driver returns Ambiguous.
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let (outcome, accepted_prompt_bytes, prompt_reached_peer, pending_request_count) =
+            cursor_delivery_with_prompt_write_failure(PromptWriteFailure::LoseConfirmation).await;
+
+        assert!(matches!(
+            outcome,
+            super::ProviderDeliveryOutcome::Ambiguous { .. }
+        ));
+        assert_eq!(accepted_prompt_bytes, 0);
+        assert!(!prompt_reached_peer);
+        assert_eq!(
+            pending_request_count, 0,
+            "the lost receipt owns correlation cleanup"
+        );
+    }
+
+    async fn cursor_delivery_with_prompt_write_failure(
+        failure: PromptWriteFailure,
+    ) -> (super::ProviderDeliveryOutcome, usize, bool, usize) {
+        let temp = TempDir::new().expect("provider fixture directory");
+        let dummy = cursor_delivery_fixture(
+            &temp,
+            &temp.path().join("cursor-child.jsonl"),
+            None,
+            false,
+            false,
+        )
+        .await;
+        let (stdout, mut stdout_peer) = tokio::io::duplex(4096);
+        let (stdin_peer, stdin) = tokio::io::duplex(4096);
+        let (stderr, _stderr_peer) = tokio::io::duplex(4096);
+        let prompt_reached_peer = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let accepted_prompt_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (release_peer, hold_peer_open) = tokio::sync::oneshot::channel();
+        let (connection, incoming) = super::CursorConnection::spawn(
+            stdout,
+            PromptFailingWriter {
+                inner: stdin,
+                failure,
+                prompt_detected: false,
+                fail_next_prompt_write: false,
+                accepted_prompt_bytes: accepted_prompt_bytes.clone(),
+            },
+            stderr,
+            super::CursorConnectionConfig::default(),
+        );
+        let pending_connection = connection.clone();
+        let runtime = super::CursorSessionRuntime::new(
+            super::CursorSessionOptions {
+                thread_id: "cursor-writer-failure".to_owned(),
+                cwd: temp.path().to_string_lossy().into_owned(),
+                runtime_mode: "approval-required".to_owned(),
+                interaction_mode: "default".to_owned(),
+                model: "test-model".to_owned(),
+                resume_session_id: None,
+                mcp_servers: Vec::new(),
+            },
+            connection,
+            incoming,
+        );
+        let peer_prompt = prompt_reached_peer.clone();
+        let peer = tokio::spawn(async move {
+            let mut requests = BufReader::new(stdin_peer).lines();
+            while let Some(line) = requests.next_line().await.expect("ACP request read") {
+                let Ok(request) = serde_json::from_str::<Value>(&line) else {
+                    continue;
+                };
+                if request["method"] == "session/prompt" {
+                    peer_prompt.store(true, std::sync::atomic::Ordering::SeqCst);
+                    continue;
+                }
+                let result = match request["method"].as_str() {
+                    Some("initialize" | "authenticate" | "session/set_mode") => json!({}),
+                    Some("session/new") => json!({
+                        "sessionId": "cursor-session",
+                        "configOptions": [{ "id": "model", "category": "model" }],
+                        "modes": {
+                            "currentModeId": "ask",
+                            "availableModes": [
+                                { "id": "ask", "name": "Ask" },
+                                { "id": "code", "name": "Agent" }
+                            ]
+                        }
+                    }),
+                    Some("session/set_config_option") => json!({ "configOptions": [] }),
+                    Some(method) => panic!("unexpected ACP method {method}"),
+                    None => panic!("ACP request missing method"),
+                };
+                stdout_peer
+                    .write_all(
+                        format!(
+                            "{{\"jsonrpc\":\"2.0\",\"id\":{},\"result\":{result}}}\n",
+                            request["id"]
+                        )
+                        .as_bytes(),
+                    )
+                    .await
+                    .expect("ACP response write");
+            }
+            let _ = hold_peer_open.await;
+        });
+        let driver = super::CursorDriver {
+            runtime,
+            child: dummy.child.clone(),
+            attachments: dummy.attachments.clone(),
+        };
+        driver.start().await.expect("Cursor fixture should start");
+
+        let outcome = timeout(
+            std::time::Duration::from_secs(2),
+            driver.deliver(
+                "hello".to_owned(),
+                Vec::new(),
+                "default".to_owned(),
+                "unused-no-id-key".to_owned(),
+            ),
+        )
+        .await
+        .expect("writer failure should resolve delivery");
+        let pending_request_count = pending_connection.pending_request_count().await;
+        let _ = release_peer.send(());
+        timeout(std::time::Duration::from_secs(2), driver.shutdown())
+            .await
+            .expect("Cursor fixture shutdown timeout")
+            .expect("Cursor fixture shutdown");
+        timeout(std::time::Duration::from_secs(2), peer)
+            .await
+            .expect("ACP peer shutdown timeout")
+            .expect("ACP peer task");
+
+        (
+            outcome,
+            accepted_prompt_bytes.load(std::sync::atomic::Ordering::SeqCst),
+            prompt_reached_peer.load(std::sync::atomic::Ordering::SeqCst),
+            pending_request_count,
+        )
+    }
+
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum PromptWriteFailure {
+        BeforeFirstByte,
+        AfterPrefix,
+        OnFlush,
+        LoseConfirmation,
+    }
+
+    struct PromptFailingWriter {
+        inner: DuplexStream,
+        failure: PromptWriteFailure,
+        prompt_detected: bool,
+        fail_next_prompt_write: bool,
+        accepted_prompt_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl AsyncWrite for PromptFailingWriter {
+        fn poll_write(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+            bytes: &[u8],
+        ) -> Poll<io::Result<usize>> {
+            if self.fail_next_prompt_write {
+                return Poll::Ready(Err(io::Error::other(
+                    "intentional partial prompt writer failure",
+                )));
+            }
+            let starts_prompt = !self.prompt_detected
+                && bytes
+                    .windows(b"\"method\":\"session/prompt\"".len())
+                    .any(|window| window == b"\"method\":\"session/prompt\"");
+            if starts_prompt && self.failure == PromptWriteFailure::BeforeFirstByte {
+                return Poll::Ready(Err(io::Error::other(
+                    "intentional zero-byte prompt writer failure",
+                )));
+            }
+            if starts_prompt && self.failure == PromptWriteFailure::LoseConfirmation {
+                panic!("intentional prompt writer confirmation loss");
+            }
+            if starts_prompt && self.failure == PromptWriteFailure::AfterPrefix {
+                let prefix_length = bytes.len().min(16);
+                let result = Pin::new(&mut self.inner).poll_write(context, &bytes[..prefix_length]);
+                if let Poll::Ready(Ok(written)) = result {
+                    self.prompt_detected = true;
+                    self.fail_next_prompt_write = written > 0;
+                    self.accepted_prompt_bytes
+                        .fetch_add(written, std::sync::atomic::Ordering::SeqCst);
+                }
+                return result;
+            }
+            if starts_prompt {
+                self.prompt_detected = true;
+            }
+            let result = Pin::new(&mut self.inner).poll_write(context, bytes);
+            if self.prompt_detected {
+                if let Poll::Ready(Ok(written)) = result {
+                    self.accepted_prompt_bytes
+                        .fetch_add(written, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            result
+        }
+
+        fn poll_flush(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<io::Result<()>> {
+            if self.prompt_detected && self.failure == PromptWriteFailure::OnFlush {
+                return Poll::Ready(Err(io::Error::other("intentional prompt flush failure")));
+            }
+            Pin::new(&mut self.inner).poll_flush(context)
+        }
+
+        fn poll_shutdown(
+            mut self: Pin<&mut Self>,
+            context: &mut Context<'_>,
+        ) -> Poll<io::Result<()>> {
+            Pin::new(&mut self.inner).poll_shutdown(context)
+        }
+    }
+
+    async fn captured_request(path: &std::path::Path, predicate: impl Fn(&Value) -> bool) -> Value {
+        timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let captured = std::fs::read_to_string(path).unwrap_or_default();
+                if let Some(request) = captured
+                    .lines()
+                    .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                    .find(|request| predicate(request))
+                {
+                    return request;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider request capture timeout")
+    }
+
+    async fn prepared_attachment_pair(factory: &super::NativeProviderDriverFactory) -> Vec<Value> {
+        let prepared = factory
+            .attachments
+            .prepare(vec![
+                json!({
+                    "type":"image", "id":"image-1", "name":"screen.png", "mimeType":"image/png",
+                    "sizeBytes":5, "dataUrl":"data:image/png;base64,aW1hZ2U="
+                }),
+                json!({
+                    "type":"file", "id":"notes-1", "name":"notes<&.txt", "mimeType":"text/plain",
+                    "sizeBytes":5, "dataUrl":"data:text/plain;base64,bm90ZXM="
+                }),
+            ])
+            .await
+            .expect("attachment pair should prepare");
+        let attachments = prepared.attachments().to_vec();
+        prepared.commit();
+        attachments
+    }
 
     async fn live_claims(
         registry: &ProcessAttributionRegistry,
@@ -5101,6 +8340,352 @@ done
 
         supervisor.shutdown().await.unwrap();
         engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delivery_send_does_not_block_supervisor_control_messages() {
+        let engine = supervisor_engine().await;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            send_gate: Some(gate.clone()),
+            ..SupervisorDriverState::default()
+        }));
+        let (_, events) = mpsc::channel(1);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state: state.clone(),
+                events: StdMutex::new(Some(events)),
+            }),
+            super::ActivityProjection::new(crate::activity::ActivityRepository::new(
+                engine.repositories().database().clone(),
+            )),
+            super::SupervisorOptions::default(),
+        );
+        let temp = TempDir::new().unwrap();
+        let mut request = native_launch(&temp, "codex");
+        request.thread_id = "t1".to_owned();
+        supervisor.launch(request).await.unwrap();
+        let command: OrchestrationCommand = serde_json::from_value(json!({
+            "type":"thread.turn.start", "commandId":"delivery", "threadId":"t1",
+            "message":{"messageId":"message","role":"user","text":"hello","attachments":[]},
+            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "runtimeMode":"full-access", "interactionMode":"default",
+            "createdAt":"2026-07-16T00:00:00Z"
+        }))
+        .unwrap();
+
+        let handle = supervisor
+            .deliver_turn(command, "delivery-1".to_owned())
+            .await
+            .unwrap();
+        timeout(
+            std::time::Duration::from_millis(100),
+            supervisor.handle_orchestration(
+                serde_json::from_value(json!({
+                    "type":"thread.approval.respond", "commandId":"approval",
+                    "threadId":"t1", "requestId":"request-1",
+                    "decision":"accept", "createdAt":"2026-07-16T00:00:00Z"
+                }))
+                .unwrap(),
+            ),
+        )
+        .await
+        .expect("approval remains responsive")
+        .unwrap();
+        assert_eq!(state.lock().unwrap().approvals, 1);
+
+        gate.notify_one();
+        assert_eq!(
+            handle.completion().await,
+            super::ProviderDeliveryOutcome::Accepted {
+                turn_id: Some("unit-turn".to_owned())
+            }
+        );
+        supervisor.shutdown().await.unwrap();
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stale_delivery_completion_cannot_clear_the_active_attempt_generation() {
+        let engine = supervisor_engine().await;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            send_gate: Some(gate.clone()),
+            ..SupervisorDriverState::default()
+        }));
+        let (_, events) = mpsc::channel(1);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state: state.clone(),
+                events: StdMutex::new(Some(events)),
+            }),
+            super::ActivityProjection::new(crate::activity::ActivityRepository::new(
+                engine.repositories().database().clone(),
+            )),
+            super::SupervisorOptions::default(),
+        );
+        let temp = TempDir::new().unwrap();
+        let mut request = native_launch(&temp, "codex");
+        request.thread_id = "t1".to_owned();
+        request.model = Some("gpt-5".to_owned());
+        supervisor.launch(request).await.unwrap();
+        let delivery = supervisor
+            .deliver_turn(
+                serde_json::from_value(json!({
+                    "type":"thread.turn.start", "commandId":"generation-delivery",
+                    "threadId":"t1",
+                    "message":{"messageId":"generation-message","role":"user","text":"hold","attachments":[]},
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access", "interactionMode":"default",
+                    "createdAt":"2026-07-16T00:00:00Z"
+                }))
+                .unwrap(),
+                "generation-key".to_owned(),
+            )
+            .await
+            .unwrap();
+        supervisor
+            .sender
+            .send(super::SupervisorMessage::DeliveryComplete {
+                thread_id: "t1".to_owned(),
+                generation: u64::MAX,
+                abnormal: false,
+            })
+            .await
+            .unwrap();
+        let mut metadata = Box::pin(supervisor.handle_orchestration(
+            serde_json::from_value(json!({
+                "type":"thread.meta.update", "commandId":"generation-metadata",
+                "threadId":"t1",
+                "modelSelection":{
+                    "instanceId":"codex", "model":"gpt-5",
+                    "options":[{"id":"fastMode","value":true}]
+                }
+            }))
+            .unwrap(),
+        ));
+        assert!(matches!(futures_util::poll!(metadata.as_mut()), Poll::Pending));
+        supervisor
+            .handle_orchestration(
+                serde_json::from_value(json!({
+                    "type":"thread.approval.respond", "commandId":"generation-barrier",
+                    "threadId":"t1", "requestId":"generation-request",
+                    "decision":"accept", "createdAt":"2026-07-16T00:00:00Z"
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(futures_util::poll!(metadata.as_mut()), Poll::Pending));
+
+        gate.notify_one();
+        assert!(matches!(
+            delivery.completion().await,
+            super::ProviderDeliveryOutcome::Accepted { .. }
+        ));
+        metadata.await.unwrap();
+        assert_eq!(state.lock().unwrap().models, Vec::<String>::new());
+        supervisor.shutdown().await.unwrap();
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn stale_owned_delivery_cas_conflict_never_calls_the_provider() {
+        let engine = supervisor_engine().await;
+        let state = Arc::new(StdMutex::new(SupervisorDriverState::default()));
+        let (_, events) = mpsc::channel(1);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state: state.clone(),
+                events: StdMutex::new(Some(events)),
+            }),
+            super::ActivityProjection::new(crate::activity::ActivityRepository::new(
+                engine.repositories().database().clone(),
+            )),
+            super::SupervisorOptions::default(),
+        );
+        let temp = TempDir::new().unwrap();
+        let mut request = native_launch(&temp, "codex");
+        request.thread_id = "t1".to_owned();
+        request.model = Some("gpt-5".to_owned());
+        let route_fingerprint = super::delivery_route_fingerprint(&request).unwrap();
+        supervisor.launch(request).await.unwrap();
+        let command: OrchestrationCommand = serde_json::from_value(json!({
+            "type":"thread.turn.start", "commandId":"stale-cas", "threadId":"t1",
+            "message":{"messageId":"stale-message","role":"user","text":"never send","attachments":[]},
+            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "runtimeMode":"full-access", "interactionMode":"default",
+            "createdAt":"2026-07-16T00:00:00Z"
+        }))
+        .unwrap();
+        let mut payload = serde_json::to_value(&command).unwrap();
+        payload[super::DELIVERY_ROUTE_FINGERPRINT_FIELD] = Value::String(route_fingerprint);
+        let payload = serde_json::to_string(&payload).unwrap();
+        engine
+            .repositories()
+            .database()
+            .call(move |connection| {
+                connection.execute(
+                    "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status) VALUES ('stale-cas', 'thread', 't1', '2026-07-16T00:00:00Z', 0, 'accepted')",
+                    [],
+                )?;
+                connection.execute(
+                    "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at) VALUES ('stale-cas', 't1', 'stale-message', 'codex', 'codex', NULL, 'stale-key', ?, 'sending', 1, NULL, '2026-07-16T00:00:00Z', '2026-07-16T00:00:00Z')",
+                    [payload],
+                )?;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        let stale_row = engine
+            .repositories()
+            .get_provider_turn_delivery("stale-cas".to_owned())
+            .await
+            .unwrap()
+            .unwrap();
+        engine
+            .repositories()
+            .freeze_provider_turn_session(
+                "stale-cas".to_owned(),
+                1,
+                "codex".to_owned(),
+                "codex".to_owned(),
+                "different-session".to_owned(),
+                "2026-07-16T00:00:01Z".to_owned(),
+            )
+            .await
+            .unwrap()
+            .expect("authoritative row drifts after the stale task snapshot");
+
+        let outcome = supervisor
+            .deliver_frozen_turn(command, stale_row)
+            .await
+            .unwrap()
+            .completion()
+            .await;
+        assert!(matches!(
+            outcome,
+            super::ProviderDeliveryOutcome::DefinitelyNotSent { ref detail }
+                if detail.contains("session freeze conflicted")
+        ));
+        assert!(
+            state.lock().unwrap().sends.is_empty(),
+            "the post-spawn CAS conflict must make zero provider calls"
+        );
+
+        supervisor.shutdown().await.unwrap();
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delivery_reconciliation_does_not_block_supervisor_control_messages() {
+        let engine = supervisor_engine().await;
+        let gate = Arc::new(tokio::sync::Notify::new());
+        let started = Arc::new(tokio::sync::Notify::new());
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            reconcile_gate: Some(gate.clone()),
+            reconcile_started: Some(started.clone()),
+            ..SupervisorDriverState::default()
+        }));
+        let (_, events) = mpsc::channel(1);
+        let supervisor = Arc::new(super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state: state.clone(),
+                events: StdMutex::new(Some(events)),
+            }),
+            super::ActivityProjection::new(crate::activity::ActivityRepository::new(
+                engine.repositories().database().clone(),
+            )),
+            super::SupervisorOptions::default(),
+        ));
+        let temp = TempDir::new().unwrap();
+        let mut request = native_launch(&temp, "codex");
+        request.thread_id = "t1".to_owned();
+        let route_fingerprint = super::delivery_route_fingerprint(&request).unwrap();
+        supervisor.launch(request).await.unwrap();
+        let mut payload = json!({});
+        payload[super::DELIVERY_ROUTE_FINGERPRINT_FIELD] = Value::String(route_fingerprint);
+        let reconciliation = {
+            let supervisor = supervisor.clone();
+            tokio::spawn(async move {
+                supervisor
+                    .reconcile_turn(crate::orchestration::ProviderTurnDelivery {
+                        command_id: "reconcile".to_owned(),
+                        thread_id: "t1".to_owned(),
+                        message_id: "message".to_owned(),
+                        provider_instance_id: "codex".to_owned(),
+                        provider_kind: "codex".to_owned(),
+                        provider_session_id: None,
+                        delivery_key: "delivery-1".to_owned(),
+                        payload,
+                        state: crate::orchestration::TurnDeliveryState::Sending,
+                        attempts: 1,
+                        last_error: None,
+                        created_at: "2026-07-16T00:00:00Z".to_owned(),
+                        updated_at: "2026-07-16T00:00:00Z".to_owned(),
+                    })
+                    .await
+            })
+        };
+        timeout(std::time::Duration::from_secs(1), started.notified())
+            .await
+            .expect("reconciliation starts");
+        timeout(
+            std::time::Duration::from_millis(100),
+            supervisor.handle_orchestration(
+                serde_json::from_value(json!({
+                    "type":"thread.approval.respond", "commandId":"approval-reconcile",
+                    "threadId":"t1", "requestId":"request-1",
+                    "decision":"accept", "createdAt":"2026-07-16T00:00:00Z"
+                }))
+                .unwrap(),
+            ),
+        )
+        .await
+        .expect("approval remains responsive")
+        .unwrap();
+        assert_eq!(state.lock().unwrap().approvals, 1);
+
+        gate.notify_one();
+        assert_eq!(
+            reconciliation.await.unwrap().unwrap(),
+            super::ProviderReconciliationOutcome::Found
+        );
+        supervisor.shutdown().await.unwrap();
+        engine.shutdown().await;
+    }
+
+    #[test]
+    fn provider_kind_resolver_normalizes_aliases_and_rejects_unknown_drivers() {
+        assert_eq!(
+            super::canonical_provider_kind("claude").expect("claude alias"),
+            "claudeAgent"
+        );
+        assert_eq!(
+            super::canonical_provider_kind("codex").expect("codex provider"),
+            "codex"
+        );
+        assert!(matches!(
+            super::canonical_provider_kind("unknown"),
+            Err(super::ProviderRuntimeError::UnsupportedProvider { provider })
+                if provider == "unknown"
+        ));
+    }
+
+    #[test]
+    fn dropped_delivery_response_is_ambiguous_but_closed_queue_is_not_sent() {
+        assert!(matches!(
+            super::delivery_enqueue_failure(super::ProviderRuntimeError::ResponseDropped),
+            super::ProviderDeliveryOutcome::Ambiguous { .. }
+        ));
+        assert!(matches!(
+            super::delivery_enqueue_failure(super::ProviderRuntimeError::QueueClosed),
+            super::ProviderDeliveryOutcome::DefinitelyNotSent { .. }
+        ));
     }
 
     #[tokio::test]
@@ -5207,16 +8792,26 @@ done
         }))
         .unwrap();
         assert!(matches!(
-            super::launch_request_for_command(&engine, &settings_root, &missing_thread_command)
-                .await,
+            super::launch_request_for_command(
+                &engine,
+                &settings_root,
+                &missing_thread_command,
+                None
+            )
+            .await,
             Err(super::ProviderRuntimeError::SessionNotFound { .. })
         ));
         let blocked_settings_root = temp.path().join("blocked-settings");
         std::fs::write(&blocked_settings_root, "not a directory").unwrap();
         assert!(
-            super::launch_request_for_command(&engine, &blocked_settings_root, &launch_command)
-                .await
-                .is_err()
+            super::launch_request_for_command(
+                &engine,
+                &blocked_settings_root,
+                &launch_command,
+                None
+            )
+            .await
+            .is_err()
         );
         engine
             .repositories()
@@ -5234,7 +8829,7 @@ done
             .await
             .unwrap();
         let resolved_launch =
-            super::launch_request_for_command(&engine, &settings_root, &launch_command)
+            super::launch_request_for_command(&engine, &settings_root, &launch_command, None)
                 .await
                 .unwrap();
         assert_eq!(
@@ -5270,7 +8865,7 @@ done
         )
         .unwrap();
         assert_eq!(
-            super::launch_request_for_command(&engine, &settings_root, &launch_command)
+            super::launch_request_for_command(&engine, &settings_root, &launch_command, None)
                 .await
                 .unwrap()
                 .provider_label,
@@ -5292,7 +8887,7 @@ done
             .await
             .unwrap();
         assert_eq!(
-            super::launch_request_for_command(&engine, &settings_root, &launch_command)
+            super::launch_request_for_command(&engine, &settings_root, &launch_command, None)
                 .await
                 .unwrap()
                 .resume_cursor,
@@ -5381,7 +8976,20 @@ done
     async fn native_process_adapters_cover_live_codex_claude_cursor_and_grok_commands() {
         let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
-        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let attachment_root = temp.path().join("state&").join("attachments");
+        let factory = super::NativeProviderDriverFactory::new(attachment_root.clone());
+        let attachments = prepared_attachment_pair(&factory).await;
+        let capture_path = temp.path().join("provider-requests.jsonl");
+        let capture_value = capture_path.to_string_lossy().into_owned();
+        let notes_path = std::fs::canonicalize(attachment_root.join("notes-1"))
+            .expect("prepared file path should canonicalize");
+        let escaped_notes_path = notes_path
+            .to_str()
+            .expect("test path should be Unicode")
+            .replace('&', "&amp;");
+        let expected_text = format!(
+            "hello\n<attached_files>\n- notes&lt;&amp;.txt: {escaped_notes_path}\n</attached_files>"
+        );
 
         let claude_fixture = executable_fixture(&temp, "claude-fixture", CLAUDE_FIXTURE);
         let mut claude_request = native_launch(&temp, "claudeAgent");
@@ -5389,6 +8997,10 @@ done
         claude_request.model = Some("claude-sonnet".to_owned());
         claude_request.agent = Some("reviewer".to_owned());
         claude_request.resume_cursor = Some(json!({"sessionId":"claude-session"}));
+        claude_request.environment.insert(
+            "BIBCODE_TEST_REQUEST_CAPTURE".to_owned(),
+            capture_value.clone(),
+        );
         let claude = super::ClaudeDriver::spawn(
             claude_request,
             factory.attachments.clone(),
@@ -5407,10 +9019,30 @@ done
         );
         assert!(
             claude
-                .send("hello".to_owned(), Vec::new(), "default".to_owned())
+                .send(
+                    "hello".to_owned(),
+                    attachments.clone(),
+                    "default".to_owned(),
+                )
                 .await
                 .expect("Claude turn should send")
                 .is_some()
+        );
+        let claude_user = captured_request(&capture_path, |request| {
+            request["type"] == "user" && request["session_id"] == "claude-session"
+        })
+        .await;
+        assert_eq!(
+            claude_user["message"],
+            json!({
+                "role":"user",
+                "content":[
+                    {"type":"text", "text":expected_text},
+                    {"type":"image", "source":{
+                        "type":"base64", "media_type":"image/png", "data":"aW1hZ2U="
+                    }}
+                ]
+            })
         );
         claude
             .interrupt(None)
@@ -5474,6 +9106,10 @@ done
         let codex_fixture = executable_fixture(&temp, "codex-fixture", CODEX_FIXTURE);
         let mut codex_request = native_launch(&temp, "codex");
         codex_request.binary_path = codex_fixture.to_string_lossy().into_owned();
+        codex_request.environment.insert(
+            "BIBCODE_TEST_REQUEST_CAPTURE".to_owned(),
+            capture_value.clone(),
+        );
         let codex = factory
             .create(codex_request)
             .await
@@ -5500,10 +9136,23 @@ done
             .expect("Codex default interaction mode should be accepted");
         assert!(
             codex
-                .send("hello".to_owned(), Vec::new(), "default".to_owned())
+                .send(
+                    "hello".to_owned(),
+                    attachments.clone(),
+                    "default".to_owned(),
+                )
                 .await
                 .expect("Codex turn should send")
                 .is_some()
+        );
+        let codex_turn =
+            captured_request(&capture_path, |request| request["method"] == "turn/start").await;
+        assert_eq!(
+            codex_turn["params"]["input"],
+            json!([
+                {"type":"text", "text":expected_text},
+                {"type":"image", "url":"data:image/png;base64,aW1hZ2U="}
+            ])
         );
         assert!(
             codex
@@ -5539,6 +9188,10 @@ done
         for provider in ["cursor", "grok"] {
             let mut request = native_launch(&temp, provider);
             request.binary_path = acp_fixture.to_string_lossy().into_owned();
+            request.environment.insert(
+                "BIBCODE_TEST_REQUEST_CAPTURE".to_owned(),
+                capture_value.clone(),
+            );
             if provider == "grok" {
                 request
                     .environment
@@ -5565,10 +9218,32 @@ done
                     .is_empty()
             );
             let turn = driver
-                .send("hello".to_owned(), Vec::new(), "default".to_owned())
+                .send(
+                    "hello".to_owned(),
+                    attachments.clone(),
+                    "default".to_owned(),
+                )
                 .await
                 .expect("ACP turn should send")
                 .expect("ACP turn id");
+            let session_id = if provider == "cursor" {
+                "cursor-session"
+            } else {
+                "grok-session"
+            };
+            let prompt = captured_request(&capture_path, |request| {
+                request["method"] == "session/prompt"
+                    && request["params"]["sessionId"] == session_id
+            })
+            .await;
+            assert_eq!(
+                prompt["params"]["prompt"],
+                json!([
+                    {"type":"text", "text":expected_text},
+                    {"type":"image", "data":"aW1hZ2U=", "mimeType":"image/png"}
+                ]),
+                "{provider} must retain the image and reference the ordinary file"
+            );
             driver
                 .interrupt(Some(turn))
                 .await
@@ -5608,6 +9283,7 @@ done
     #[tokio::test]
     async fn native_opencode_adapter_covers_live_session_turn_and_control_commands() {
         let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let prompt_body = Arc::new(StdMutex::new(None::<Value>));
         let app = Router::new()
             .route(
                 "/session",
@@ -5616,7 +9292,16 @@ done
             .route("/event", get(|| async { "" }))
             .route(
                 "/session/{session_id}/prompt_async",
-                post(|| async { Json(json!({})) }),
+                post({
+                    let prompt_body = prompt_body.clone();
+                    move |Json(body): Json<Value>| {
+                        let prompt_body = prompt_body.clone();
+                        async move {
+                            *prompt_body.lock().unwrap() = Some(body);
+                            Json(json!({}))
+                        }
+                    }
+                }),
             )
             .route(
                 "/session/{session_id}/command",
@@ -5661,7 +9346,9 @@ done
             .await
             .expect("live endpoint should become ready");
         super::kill_child(&endpoint_child).await;
-        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let attachment_root = temp.path().join("state&").join("attachments");
+        let factory = super::NativeProviderDriverFactory::new(attachment_root.clone());
+        let attachments = prepared_attachment_pair(&factory).await;
         let mut request = native_launch(&temp, "opencode");
         request.endpoint = Some(format!("http://{address}"));
         request.server_password = Some("secret".to_owned());
@@ -5685,10 +9372,39 @@ done
             .expect("OpenCode default interaction mode should be accepted");
         assert!(
             driver
-                .send("hello".to_owned(), Vec::new(), "default".to_owned())
+                .send("hello".to_owned(), attachments, "default".to_owned())
                 .await
                 .expect("OpenCode turn should send")
                 .is_some()
+        );
+        let image_url = url::Url::from_file_path(
+            std::fs::canonicalize(attachment_root.join("image-1"))
+                .expect("prepared image path should canonicalize"),
+        )
+        .expect("prepared image should have a file URL")
+        .to_string();
+        let notes_url = url::Url::from_file_path(
+            std::fs::canonicalize(attachment_root.join("notes-1"))
+                .expect("prepared file path should canonicalize"),
+        )
+        .expect("prepared file should have a file URL")
+        .to_string();
+        assert_eq!(
+            prompt_body
+                .lock()
+                .unwrap()
+                .clone()
+                .expect("OpenCode prompt body should be captured"),
+            json!({
+                "sessionID":"native-opencode-session",
+                "parts":[
+                    {"type":"text", "text":"hello"},
+                    {"type":"file", "mime":"image/png", "url":image_url, "filename":"screen.png"},
+                    {"type":"file", "mime":"text/plain", "url":notes_url, "filename":"notes<&.txt"}
+                ],
+                "model":{"providerID":"openai", "modelID":"gpt-5"},
+                "agent":"reviewer"
+            })
         );
         assert!(
             driver
@@ -5754,37 +9470,32 @@ done
                 { "id": "serviceTier", "value": "fast" }
             ]
         });
+        let options = super::selection_options(&selection);
+        let service_tier = |selection: Value| {
+            super::selection_string_option_from(
+                &super::selection_options(&selection),
+                "serviceTier",
+            )
+        };
 
         assert_eq!(
-            super::selection_string_option(&selection, "reasoningEffort"),
+            super::selection_string_option_from(&options, "reasoningEffort"),
             Some("high".to_owned())
         );
         assert_eq!(
-            super::selection_string_option(&selection, "serviceTier"),
+            super::selection_string_option_from(&options, "serviceTier"),
             Some("fast".to_owned())
         );
         assert_eq!(
-            super::selection_string_option(
-                &json!({"options":[{"id":"serviceTier","value":"  "}]}),
-                "serviceTier"
-            ),
+            service_tier(json!({"options":[{"id":"serviceTier","value":"  "}]})),
             None
         );
         assert_eq!(
-            super::selection_string_option(
-                &json!({"options":[{"id":"serviceTier","value":42}]}),
-                "serviceTier"
-            ),
+            service_tier(json!({"options":[{"id":"serviceTier","value":42}]})),
             None
         );
-        assert_eq!(
-            super::selection_string_option(&json!({"options":[]}), "serviceTier"),
-            None
-        );
-        assert_eq!(
-            super::selection_string_option(&json!({"options":{}}), "serviceTier"),
-            None
-        );
+        assert_eq!(service_tier(json!({"options":[]})), None);
+        assert_eq!(service_tier(json!({"options":{}})), None);
     }
 
     #[test]
@@ -5861,6 +9572,51 @@ done
         ] {
             assert_eq!(super::event_activity_shape(event_type), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn mcp_status_activity_is_attributed_to_the_launched_provider_instance() {
+        let engine = supervisor_engine().await;
+        let temp = TempDir::new().expect("temporary launch directory");
+        let mut launch = native_launch(&temp, "codex");
+        launch.thread_id = "t1".to_owned();
+        launch.provider_instance_id = Some("codex-work".to_owned());
+
+        super::project_provider_event(
+            &engine,
+            &launch,
+            None,
+            None,
+            super::ProviderEvent {
+                native_event_id: None,
+                event_type: "mcp.status.updated".to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: None,
+                request_id: None,
+                payload: json!({
+                    "servers": [{ "name": "context7", "state": "connected" }]
+                }),
+                activity: Vec::new(),
+            },
+        )
+        .await
+        .expect("MCP status projects");
+
+        let snapshot = load_snapshot(&engine.repositories())
+            .await
+            .expect("load projection snapshot");
+        assert_eq!(
+            snapshot
+                .activities
+                .last()
+                .expect("MCP status activity")
+                .payload,
+            json!({
+                "servers": [{ "name": "context7", "state": "connected" }],
+                "providerInstanceId": "codex-work"
+            })
+        );
+        engine.shutdown().await;
     }
 
     #[test]

@@ -70,6 +70,14 @@ pub trait OrchestrationEffectCallbacks: Send + Sync {
 
     fn refresh_workspace<'a>(&'a self, cwd: &'a Path) -> BoxEffectFuture<'a, ()>;
 
+    fn setup_script_is_running<'a>(
+        &'a self,
+        _thread_id: &'a str,
+        _terminal_id: &'a str,
+    ) -> BoxEffectFuture<'a, bool> {
+        Box::pin(async { Ok(false) })
+    }
+
     fn launch_setup_script<'a>(&'a self, _input: SetupScriptLaunch) -> BoxEffectFuture<'a, ()> {
         Box::pin(async {
             Err(
@@ -214,25 +222,25 @@ struct ProductionBootstrapEffects {
     repositories: crate::persistence::Repositories,
     repository: Arc<GitRepository>,
     callbacks: Arc<dyn OrchestrationEffectCallbacks>,
-    cancellation: CancellationToken,
 }
 
 impl ThreadTurnBootstrapEffects for ProductionBootstrapEffects {
     fn prepare_worktree<'a>(
         &'a self,
         input: ThreadTurnStartBootstrapPrepareWorktree,
+        cancellation: &'a CancellationToken,
     ) -> BoxBootstrapFuture<'a, BootstrapWorktree> {
         Box::pin(async move {
             let cwd = PathBuf::from(&input.project_cwd);
             let remove_branch = input.branch.is_some();
             let ref_name = if input.start_from_origin == Some(true) {
-                fetch_origin_base(&cwd, &input.base_branch, &self.cancellation).await?
+                fetch_origin_base(&cwd, &input.base_branch, cancellation).await?
             } else {
                 input.base_branch.clone()
             };
             let result = self
                 .repository
-                .create_worktree(
+                .ensure_worktree(
                     CreateWorktreeInput {
                         cwd,
                         ref_name,
@@ -240,7 +248,7 @@ impl ThreadTurnBootstrapEffects for ProductionBootstrapEffects {
                         base_ref_name: None,
                         path: None,
                     },
-                    &self.cancellation,
+                    cancellation,
                 )
                 .await
                 .map_err(|error| error.to_string())?;
@@ -252,15 +260,7 @@ impl ThreadTurnBootstrapEffects for ProductionBootstrapEffects {
                 remove_branch,
             };
             if let Err(error) = self.callbacks.refresh_workspace(&path).await {
-                let cleanup =
-                    remove_bootstrap_worktree(&self.repository, &worktree, &self.cancellation)
-                        .await;
-                return Err(match cleanup {
-                    Ok(()) => format!("worktree was created but workspace refresh failed: {error}"),
-                    Err(cleanup_error) => format!(
-                        "worktree was created but workspace refresh failed: {error}; cleanup failed: {cleanup_error}"
-                    ),
-                });
+                return Err(format!("worktree workspace refresh failed: {error}"));
             }
             Ok(worktree)
         })
@@ -296,6 +296,17 @@ impl ThreadTurnBootstrapEffects for ProductionBootstrapEffects {
                 return Ok(BootstrapSetupResult::NoScript);
             };
             let terminal_id = format!("setup-{}", script.id);
+            if self
+                .callbacks
+                .setup_script_is_running(&input.thread_id, &terminal_id)
+                .await?
+            {
+                return Ok(BootstrapSetupResult::Started {
+                    script_id: script.id,
+                    script_name: script.name,
+                    terminal_id,
+                });
+            }
             let worktree_path = PathBuf::from(&input.worktree_path);
             let env = BTreeMap::from([
                 ("BIBCODE_PROJECT_ROOT".to_owned(), project.workspace_root),
@@ -323,53 +334,6 @@ impl ThreadTurnBootstrapEffects for ProductionBootstrapEffects {
             })
         })
     }
-
-    fn cleanup_thread_resources<'a>(&'a self, thread_id: &'a str) -> BoxBootstrapFuture<'a, ()> {
-        Box::pin(async move {
-            let provider_error = self.callbacks.stop_provider(thread_id).await.err();
-            let terminal_error = self.callbacks.close_terminals(thread_id).await.err();
-            match (provider_error, terminal_error) {
-                (None, None) => Ok(()),
-                (Some(provider), None) => Err(format!("provider cleanup failed: {provider}")),
-                (None, Some(terminals)) => Err(format!("terminal cleanup failed: {terminals}")),
-                (Some(provider), Some(terminals)) => Err(format!(
-                    "provider cleanup failed: {provider}; terminal cleanup failed: {terminals}"
-                )),
-            }
-        })
-    }
-
-    fn remove_worktree<'a>(&'a self, worktree: BootstrapWorktree) -> BoxBootstrapFuture<'a, ()> {
-        Box::pin(async move {
-            remove_bootstrap_worktree(&self.repository, &worktree, &self.cancellation).await
-        })
-    }
-}
-
-async fn remove_bootstrap_worktree(
-    repository: &GitRepository,
-    worktree: &BootstrapWorktree,
-    cancellation: &CancellationToken,
-) -> Result<(), String> {
-    let repository_root = PathBuf::from(&worktree.repository_root);
-    repository
-        .remove_worktree(
-            &repository_root,
-            Path::new(&worktree.path),
-            true,
-            cancellation,
-        )
-        .await
-        .map_err(|error| error.to_string())?;
-    if worktree.remove_branch {
-        run_bootstrap_git(
-            &repository_root,
-            ["branch", "-D", worktree.branch.as_str()],
-            cancellation,
-        )
-        .await?;
-    }
-    Ok(())
 }
 
 async fn fetch_origin_base(
@@ -452,7 +416,6 @@ impl OrchestrationEffects {
             repositories: engine.repositories(),
             repository,
             callbacks: callbacks.clone(),
-            cancellation: cancellation.clone(),
         }));
 
         let worker = tokio::spawn(run_worker(
@@ -1477,35 +1440,41 @@ mod tests {
             })
             .await
             .expect("empty project fixture");
+        repositories
+            .upsert_project(ProjectionProject {
+                project_id: "setup".to_owned(),
+                title: "Setup".to_owned(),
+                workspace_root: parent.path().join("setup").to_string_lossy().into_owned(),
+                default_model_selection: None,
+                scripts: json!([{
+                    "id":"install",
+                    "name":"Install",
+                    "command":"vp install",
+                    "runOnWorktreeCreate":true
+                }]),
+                created_at: "2026-07-16T00:00:02Z".to_owned(),
+                updated_at: "2026-07-16T00:00:02Z".to_owned(),
+                deleted_at: None,
+            })
+            .await
+            .expect("setup project fixture");
         let bootstrap = ProductionBootstrapEffects {
             repositories,
             repository: Arc::new(GitRepository::default()),
             callbacks: callbacks.clone(),
-            cancellation: CancellationToken::new(),
         };
+        let bootstrap_cancellation = CancellationToken::new();
         assert!(
             bootstrap
-                .prepare_worktree(ThreadTurnStartBootstrapPrepareWorktree {
-                    project_cwd: file.to_string_lossy().into_owned(),
-                    base_branch: "main".to_owned(),
-                    branch: Some("unit-invalid".to_owned()),
-                    start_from_origin: None,
-                })
-                .await
-                .is_err()
-        );
-        assert!(
-            bootstrap
-                .remove_worktree(BootstrapWorktree {
-                    repository_root: file.to_string_lossy().into_owned(),
-                    branch: "unit-invalid".to_owned(),
-                    path: parent
-                        .path()
-                        .join("missing-worktree")
-                        .to_string_lossy()
-                        .into_owned(),
-                    remove_branch: true,
-                })
+                .prepare_worktree(
+                    ThreadTurnStartBootstrapPrepareWorktree {
+                        project_cwd: file.to_string_lossy().into_owned(),
+                        base_branch: "main".to_owned(),
+                        branch: Some("unit-invalid".to_owned()),
+                        start_from_origin: None,
+                    },
+                    &bootstrap_cancellation
+                )
                 .await
                 .is_err()
         );
@@ -1562,6 +1531,18 @@ mod tests {
                 .expect("empty scripts should be a no-op"),
             BootstrapSetupResult::NoScript
         );
+        assert!(
+            bootstrap
+                .run_setup_script(BootstrapSetupInput {
+                    thread_id: "thread".to_owned(),
+                    project_id: Some("setup".to_owned()),
+                    project_cwd: None,
+                    worktree_path: parent.path().to_string_lossy().into_owned(),
+                })
+                .await
+                .expect_err("unavailable setup terminal fails")
+                .contains("unavailable")
+        );
         database
             .call(|connection| {
                 connection.execute("DROP TABLE projection_projects", [])?;
@@ -1585,12 +1566,117 @@ mod tests {
         ] {
             assert!(bootstrap.run_setup_script(input).await.is_err());
         }
-        let cleanup_error = bootstrap
-            .cleanup_thread_resources("thread")
+        assert_eq!(callbacks.0.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn setup_script_restart_reuses_the_deterministic_terminal() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+        struct SetupCallbacks {
+            running: AtomicBool,
+            launches: AtomicUsize,
+        }
+
+        impl OrchestrationEffectCallbacks for SetupCallbacks {
+            fn workspace_for_thread<'a>(
+                &'a self,
+                _: &'a str,
+            ) -> BoxEffectFuture<'a, Option<PathBuf>> {
+                Box::pin(async { Ok(None) })
+            }
+
+            fn rollback_provider<'a>(&'a self, _: &'a str, _: i64) -> BoxEffectFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn stop_provider<'a>(&'a self, _: &'a str) -> BoxEffectFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn close_terminals<'a>(&'a self, _: &'a str) -> BoxEffectFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn refresh_workspace<'a>(&'a self, _: &'a Path) -> BoxEffectFuture<'a, ()> {
+                Box::pin(async { Ok(()) })
+            }
+
+            fn setup_script_is_running<'a>(
+                &'a self,
+                _thread_id: &'a str,
+                terminal_id: &'a str,
+            ) -> BoxEffectFuture<'a, bool> {
+                assert_eq!(terminal_id, "setup-install");
+                Box::pin(async move { Ok(self.running.load(Ordering::SeqCst)) })
+            }
+
+            fn launch_setup_script<'a>(
+                &'a self,
+                input: SetupScriptLaunch,
+            ) -> BoxEffectFuture<'a, ()> {
+                assert_eq!(input.terminal_id, "setup-install");
+                Box::pin(async move {
+                    self.launches.fetch_add(1, Ordering::SeqCst);
+                    self.running.store(true, Ordering::SeqCst);
+                    Ok(())
+                })
+            }
+        }
+
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
             .await
-            .expect_err("both cleanup callbacks fail");
-        assert!(cleanup_error.contains("provider cleanup failed: provider"));
-        assert!(cleanup_error.contains("terminal cleanup failed: terminals"));
-        assert_eq!(callbacks.0.load(Ordering::Relaxed), 5);
+            .expect("migrations");
+        let repositories = Repositories::new(database);
+        repositories
+            .upsert_project(ProjectionProject {
+                project_id: "setup-project".to_owned(),
+                title: "Setup".to_owned(),
+                workspace_root: "C:/repo".to_owned(),
+                default_model_selection: None,
+                scripts: json!([{
+                    "id":"install",
+                    "name":"Install",
+                    "command":"vp install",
+                    "runOnWorktreeCreate":true
+                }]),
+                created_at: "2026-08-01T00:00:00Z".to_owned(),
+                updated_at: "2026-08-01T00:00:00Z".to_owned(),
+                deleted_at: None,
+            })
+            .await
+            .expect("project");
+        let callbacks = Arc::new(SetupCallbacks {
+            running: AtomicBool::new(false),
+            launches: AtomicUsize::new(0),
+        });
+        let bootstrap = ProductionBootstrapEffects {
+            repositories,
+            repository: Arc::new(GitRepository::default()),
+            callbacks: callbacks.clone(),
+        };
+        let input = BootstrapSetupInput {
+            thread_id: "thread".to_owned(),
+            project_id: Some("setup-project".to_owned()),
+            project_cwd: None,
+            worktree_path: "C:/repo/.worktrees/setup".to_owned(),
+        };
+
+        let first = bootstrap
+            .run_setup_script(input.clone())
+            .await
+            .expect("first launch");
+        let restarted = bootstrap
+            .run_setup_script(input)
+            .await
+            .expect("restart lookup");
+
+        assert_eq!(first, restarted);
+        assert_eq!(callbacks.launches.load(Ordering::SeqCst), 1);
     }
 }

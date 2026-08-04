@@ -1,7 +1,7 @@
 # BiBCode
 
-BiBCode is a minimal web GUI for coding agents with useful workflows inspired by Orca and
-Conductor.build (currently Codex, Claude, Cursor, and OpenCode, with more coming soon).
+BiBCode is a minimal web GUI for coding agents (currently Codex, Claude, Cursor, and OpenCode,
+with more coming soon).
 
 This project is maintained in the public [mubeda/BibCode repository](https://github.com/mubeda/BibCode).
 
@@ -16,6 +16,18 @@ This project is maintained in the public [mubeda/BibCode repository](https://git
 The React frontend is shared unchanged between browser and desktop modes. Tauri-specific behavior is
 kept behind `window.desktopBridge`. Production builds contain no Electron,
 Node.js runtime, or TypeScript server.
+
+## Origins and acknowledgements
+
+BiBCode began as a fork of [pingdotgg/t3code](https://github.com/pingdotgg/t3code). It has since
+been substantially rewritten: the original Electron and Node.js runtime was replaced by a Rust
+application server and a Tauri 2 desktop host. BiBCode is now a Rust/Tauri application and does not
+ship Electron or a production Node.js runtime.
+
+BiBCode also uses code and ideas from [stablyai/orca](https://github.com/stablyai/orca), alongside
+workflow inspiration from [Conductor](https://conductor.build/). We are deeply grateful to the
+maintainers and contributors of T3 Code and Orca. Their important open-source work made BiBCode
+possible and continues to help shape it.
 
 ## Installation
 

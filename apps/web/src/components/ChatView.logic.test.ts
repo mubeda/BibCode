@@ -9,7 +9,7 @@ import {
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import type { ChatMessage, Thread } from "../types";
-import type { ComposerImageAttachment } from "../composerDraftStore";
+import type { ComposerAttachment, ComposerImageAttachment } from "../composerDraftStore";
 import type { ActivityDetailPageData, ActivityRosterPageData } from "./activity/ActivityPanel";
 
 const atomRegistry = vi.hoisted(() => ({
@@ -27,7 +27,7 @@ import {
   buildLocalDraftThread,
   buildExpiredTerminalContextToastCopy,
   buildThreadTurnInterruptInput,
-  cloneComposerImageForRetry,
+  cloneComposerAttachmentForRetry,
   collectUserMessageBlobPreviewUrls,
   createLocalDispatchSnapshot,
   deriveComposerSendState,
@@ -347,7 +347,7 @@ describe("local draft and attachment helpers", () => {
     expect(() => revokeBlobPreviewUrl("blob:preview")).not.toThrow();
   });
 
-  it("clones retry blob URLs while preserving non-blob and failed clones", () => {
+  it("clones retry blob URLs only for images and preserves files", () => {
     const file = new File(["image"], "image.png", { type: "image/png" });
     const image: ComposerImageAttachment = {
       type: "image",
@@ -361,10 +361,10 @@ describe("local draft and attachment helpers", () => {
     const createObjectURL = vi.fn(() => "blob:retry");
     vi.stubGlobal("URL", { createObjectURL });
 
-    expect(cloneComposerImageForRetry(image)).toEqual({ ...image, previewUrl: "blob:retry" });
+    expect(cloneComposerAttachmentForRetry(image)).toEqual({ ...image, previewUrl: "blob:retry" });
     expect(createObjectURL).toHaveBeenCalledWith(file);
     expect(
-      cloneComposerImageForRetry({ ...image, previewUrl: "data:image/png;base64,eA==" }),
+      cloneComposerAttachmentForRetry({ ...image, previewUrl: "data:image/png;base64,eA==" }),
     ).toEqual({
       ...image,
       previewUrl: "data:image/png;base64,eA==",
@@ -373,10 +373,21 @@ describe("local draft and attachment helpers", () => {
     createObjectURL.mockImplementation(() => {
       throw new Error("object URLs disabled");
     });
-    expect(cloneComposerImageForRetry(image)).toBe(image);
+    expect(cloneComposerAttachmentForRetry(image)).toBe(image);
+
+    const fileAttachment: ComposerAttachment = {
+      type: "file",
+      id: "file-1",
+      name: "notes.txt",
+      mimeType: "text/plain",
+      sizeBytes: file.size,
+      file,
+    };
+    expect(cloneComposerAttachmentForRetry(fileAttachment)).toBe(fileAttachment);
+    expect(createObjectURL).toHaveBeenCalledTimes(2);
 
     vi.stubGlobal("URL", undefined);
-    expect(cloneComposerImageForRetry(image)).toBe(image);
+    expect(cloneComposerAttachmentForRetry(image)).toBe(image);
   });
 });
 
@@ -408,7 +419,7 @@ describe("readFileAsDataUrl", () => {
     );
 
     await expect(readFileAsDataUrl(file)).resolves.toBe("data:image/png;base64,aW1hZ2U=");
-    await expect(readFileAsDataUrl(file)).rejects.toThrow("Could not read image data.");
+    await expect(readFileAsDataUrl(file)).rejects.toThrow("Could not read attachment data.");
   });
 
   it("preserves reader errors and supplies a fallback error", async () => {
@@ -418,7 +429,7 @@ describe("readFileAsDataUrl", () => {
     ScriptedFileReader.outcomes.push({ error: failure }, { error: null });
 
     await expect(readFileAsDataUrl(file)).rejects.toBe(failure);
-    await expect(readFileAsDataUrl(file)).rejects.toThrow("Failed to read image.");
+    await expect(readFileAsDataUrl(file)).rejects.toThrow("Failed to read attachment.");
   });
 });
 

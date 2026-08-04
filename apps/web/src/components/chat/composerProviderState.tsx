@@ -13,13 +13,17 @@ import {
   isClaudeUltrathinkPrompt,
   resolvePromptInjectedEffort,
 } from "@bibcode/shared/model";
-import type { ReactNode } from "react";
-
 import type { DraftId } from "../../composerDraftStore";
 import { getProviderModelCapabilities } from "../../providerModels";
-import { shouldRenderTraitsControls, TraitsMenuContent, TraitsPicker } from "./TraitsPicker";
+import { ComposerTraitControls, findProviderEffortDescriptor } from "./TraitsPicker";
+import { getFastModeDescriptor } from "@bibcode/shared/providerSessionDefaults";
 
 const CODEX_PROVIDER = "codex";
+
+export type ComposerControlAvailability =
+  | { state: "supported" }
+  | { state: "unknown"; reason: string }
+  | { state: "unsupported"; reason: string };
 
 export type ComposerProviderStateInput = {
   provider: ProviderDriverKind;
@@ -47,10 +51,38 @@ type TraitsRenderInput = {
   draftId?: DraftId;
   model: string;
   models: ReadonlyArray<ServerProviderModel>;
+  providerSnapshotLoaded?: boolean;
   modelOptions: ReadonlyArray<ProviderOptionSelection> | undefined;
   prompt: string;
   onPromptChange: (prompt: string) => void;
+  onModelOptionsChange?: (
+    nextOptions: ReadonlyArray<ProviderOptionSelection> | undefined,
+  ) => void | Promise<void>;
 };
+
+function controlAvailability(input: {
+  descriptorPresent: boolean;
+  provider: ProviderDriverKind;
+  model: string;
+  models: ReadonlyArray<ServerProviderModel>;
+  providerSnapshotLoaded: boolean;
+  label: string;
+}): ComposerControlAvailability {
+  if (
+    !input.providerSnapshotLoaded ||
+    !input.models.some((candidate) => candidate.slug === input.model)
+  ) {
+    return { state: "unknown", reason: `${input.label} availability is still loading.` };
+  }
+  if (input.descriptorPresent) return { state: "supported" };
+  const providerLabel = input.provider.replace(/([a-z])([A-Z])/g, "$1 $2").replace(/[_-]+/g, " ");
+  const modelLabel =
+    input.models.find((candidate) => candidate.slug === input.model)?.name ?? input.model;
+  return {
+    state: "unsupported",
+    reason: `${input.label} is not supported by ${modelLabel} through ${providerLabel}.`,
+  };
+}
 
 export function getComposerPromptInjectionState(prompt: string): ComposerPromptInjectionState {
   return isClaudeUltrathinkPrompt(prompt) ? "ultrathink" : "none";
@@ -63,12 +95,8 @@ export function getComposerProviderState(input: ComposerProviderStateInput): Com
     provider,
     caps,
     selections: modelOptions,
-    enforceCodexServiceTier: true,
   });
-  const primarySelectDescriptor = descriptors.find(
-    (descriptor): descriptor is Extract<(typeof descriptors)[number], { type: "select" }> =>
-      descriptor.type === "select" && descriptor.id !== "serviceTier",
-  );
+  const primarySelectDescriptor = findProviderEffortDescriptor(descriptors);
   const primaryValue = getProviderOptionCurrentValue(primarySelectDescriptor ?? null);
   const rawPrimaryValue = primarySelectDescriptor
     ? getProviderOptionStringSelectionValue(modelOptions, primarySelectDescriptor.id)
@@ -94,10 +122,7 @@ export function getComposerProviderState(input: ComposerProviderStateInput): Com
   };
 }
 
-function renderTraitsControl(
-  Component: typeof TraitsMenuContent | typeof TraitsPicker,
-  input: TraitsRenderInput,
-): ReactNode {
+export function renderComposerTraitControls(input: TraitsRenderInput) {
   const {
     provider,
     instanceId,
@@ -108,26 +133,26 @@ function renderTraitsControl(
     modelOptions,
     prompt,
     onPromptChange,
+    onModelOptionsChange,
   } = input;
   const hasTarget = threadRef !== undefined || draftId !== undefined;
   const modelOptionsForRender =
     provider === CODEX_PROVIDER
       ? getComposerProviderState({ provider, model, models, modelOptions }).modelOptionsForDispatch
       : modelOptions;
-  if (
-    !hasTarget ||
-    !shouldRenderTraitsControls({
-      provider,
-      models,
-      model,
-      modelOptions: modelOptionsForRender,
-      prompt,
-    })
-  ) {
+  if (!hasTarget) {
     return null;
   }
+  const snapshotLoaded = input.providerSnapshotLoaded ?? models.length > 0;
+  const descriptors = getProviderCapabilityDescriptors({
+    provider,
+    caps: getProviderModelCapabilities(models, model, provider),
+    selections: modelOptionsForRender,
+  });
+  const fastDescriptor = getFastModeDescriptor(provider, descriptors);
+  const effortDescriptor = findProviderEffortDescriptor(descriptors);
   return (
-    <Component
+    <ComposerTraitControls
       provider={provider}
       {...(instanceId ? { instanceId } : {})}
       models={models}
@@ -135,16 +160,25 @@ function renderTraitsControl(
       {...(draftId ? { draftId } : {})}
       model={model}
       modelOptions={modelOptionsForRender}
+      fastAvailability={controlAvailability({
+        descriptorPresent: fastDescriptor !== null,
+        provider,
+        model,
+        models,
+        providerSnapshotLoaded: snapshotLoaded,
+        label: "Fast mode",
+      })}
+      effortAvailability={controlAvailability({
+        descriptorPresent: effortDescriptor !== null,
+        provider,
+        model,
+        models,
+        providerSnapshotLoaded: snapshotLoaded,
+        label: "Reasoning effort",
+      })}
       prompt={prompt}
       onPromptChange={onPromptChange}
+      {...(onModelOptionsChange ? { onModelOptionsChange } : {})}
     />
   );
-}
-
-export function renderProviderTraitsMenuContent(input: TraitsRenderInput): ReactNode {
-  return renderTraitsControl(TraitsMenuContent, input);
-}
-
-export function renderProviderTraitsPicker(input: TraitsRenderInput): ReactNode {
-  return renderTraitsControl(TraitsPicker, input);
 }

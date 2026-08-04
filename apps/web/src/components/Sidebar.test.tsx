@@ -2425,6 +2425,16 @@ staticDescribe("primary row", () => {
 });
 
 staticDescribe("new thread entry points", () => {
+  it("keeps the main-chat action invisible and uses the worktree icon", () => {
+    baseScenario();
+    const markup = render(<Sidebar />);
+
+    const mainChat = mustFindProps(byTestId("new-main-chat-button"), "new main chat button");
+    expect(mainChat["className"]).toContain("invisible");
+    expect(markup).toContain("lucide-folder-git-2");
+    expect(markup).not.toContain("lucide-square-pen");
+  });
+
   it("creates a main-branch chat for a single-member project", () => {
     baseScenario();
     render(<Sidebar />);

@@ -70,6 +70,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(36, "ActivityEventIdempotencyLedger", migration_036),
     Migration::new(37, "ActivityEntryRetentionOwners", migration_037),
     Migration::new(38, "ActivityRecordRetentionCounts", migration_038),
+    Migration::new(39, "DurableProviderTurnDelivery", migration_039),
 ];
 
 impl Migration {
@@ -1503,9 +1504,159 @@ fn migration_038(transaction: &Transaction<'_>) -> Result<()> {
     )
 }
 
+fn migration_039(transaction: &Transaction<'_>) -> Result<()> {
+    if !table_has_column(transaction, "orchestration_command_receipts", "command_id")? {
+        return Ok(());
+    }
+
+    transaction.execute_batch(
+        r#"
+        ALTER TABLE orchestration_command_receipts ADD COLUMN payload_digest TEXT;
+
+        CREATE TABLE provider_turn_outbox (
+          command_id TEXT PRIMARY KEY
+            REFERENCES orchestration_command_receipts(command_id) ON DELETE CASCADE,
+          thread_id TEXT NOT NULL,
+          message_id TEXT NOT NULL,
+          provider_instance_id TEXT NOT NULL,
+          provider_kind TEXT NOT NULL,
+          provider_session_id TEXT,
+          delivery_key TEXT NOT NULL,
+          payload_json TEXT NOT NULL,
+          state TEXT NOT NULL CHECK(state IN ('pending', 'sending', 'delivered', 'uncertain', 'dismissed', 'failed')),
+          attempts INTEGER NOT NULL DEFAULT 0,
+          last_error TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX idx_provider_turn_outbox_thread_state
+          ON provider_turn_outbox(thread_id, state, created_at, command_id);
+        CREATE UNIQUE INDEX idx_provider_turn_outbox_message
+          ON provider_turn_outbox(message_id);
+
+        CREATE TABLE orchestration_attachment_refs (
+          command_id TEXT NOT NULL
+            REFERENCES orchestration_command_receipts(command_id) ON DELETE CASCADE,
+          attachment_id TEXT NOT NULL,
+          content_digest TEXT,
+          size_bytes INTEGER NOT NULL,
+          PRIMARY KEY (command_id, attachment_id)
+        );
+        CREATE INDEX idx_orchestration_attachment_refs_attachment
+          ON orchestration_attachment_refs(attachment_id);
+
+        ALTER TABLE projection_thread_messages ADD COLUMN delivery_state TEXT;
+        ALTER TABLE projection_thread_messages ADD COLUMN delivery_provider TEXT;
+        ALTER TABLE projection_thread_messages ADD COLUMN delivery_detail TEXT;
+        "#,
+    )?;
+
+    let legacy_refs: Vec<(String, String, i64)> = {
+        let mut statement = transaction.prepare(
+            "SELECT command_id, payload_json FROM orchestration_events
+             WHERE event_type = 'thread.message-sent' AND command_id IS NOT NULL
+               AND json_extract(payload_json, '$.role') = 'user'",
+        )?;
+        let mut rows = statement.query([])?;
+        let mut refs = Vec::new();
+        while let Some(row) = rows.next()? {
+            let command_id: String = row.get(0)?;
+            let payload_json: String = row.get(1)?;
+            let payload: serde_json::Value = serde_json::from_str(&payload_json).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?;
+            let Some(attachments) = payload.get("attachments") else {
+                continue;
+            };
+            if attachments.is_null() {
+                continue;
+            }
+            let attachments = attachments.as_array().ok_or_else(|| {
+                rusqlite::Error::InvalidParameterName(
+                    "legacy thread.message-sent attachments must be an array".to_owned(),
+                )
+            })?;
+            for attachment in attachments {
+                let attachment_id = attachment.get("id").and_then(serde_json::Value::as_str).ok_or_else(|| {
+                    rusqlite::Error::InvalidParameterName(
+                        "legacy attachment is missing string id".to_owned(),
+                    )
+                })?;
+                let size_bytes = attachment.get("sizeBytes").and_then(serde_json::Value::as_i64).filter(|size| *size >= 0).ok_or_else(|| {
+                    rusqlite::Error::InvalidParameterName(
+                        "legacy attachment is missing non-negative integer sizeBytes".to_owned(),
+                    )
+                })?;
+                refs.push((command_id.clone(), attachment_id.to_owned(), size_bytes));
+            }
+        }
+        refs
+    };
+
+    for (command_id, attachment_id, size_bytes) in legacy_refs {
+        transaction.execute(
+            "INSERT OR IGNORE INTO orchestration_attachment_refs \
+             (command_id, attachment_id, content_digest, size_bytes) VALUES (?, ?, NULL, ?)",
+            rusqlite::params![command_id, attachment_id, size_bytes],
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{MIGRATIONS, Migration, migration_001, run_migrations};
+
+    fn assert_delivery_schema(connection: &rusqlite::Connection) -> rusqlite::Result<()> {
+        let columns = |table: &str| -> rusqlite::Result<Vec<(String, String, i64, Option<String>, i64)>> {
+            connection.prepare(&format!("PRAGMA table_info({table})"))?.query_map([], |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))?.collect()
+        };
+        assert_eq!(columns("orchestration_command_receipts")?.into_iter().find(|column| column.0 == "payload_digest"), Some(("payload_digest".to_owned(), "TEXT".to_owned(), 0, None, 0)));
+        for name in ["delivery_state", "delivery_provider", "delivery_detail"] {
+            assert_eq!(columns("projection_thread_messages")?.into_iter().find(|column| column.0 == name), Some((name.to_owned(), "TEXT".to_owned(), 0, None, 0)));
+        }
+        assert_eq!(
+            columns("provider_turn_outbox")?,
+            vec![
+                ("command_id".to_owned(), "TEXT".to_owned(), 0, None, 1), ("thread_id".to_owned(), "TEXT".to_owned(), 1, None, 0), ("message_id".to_owned(), "TEXT".to_owned(), 1, None, 0), ("provider_instance_id".to_owned(), "TEXT".to_owned(), 1, None, 0), ("provider_kind".to_owned(), "TEXT".to_owned(), 1, None, 0), ("provider_session_id".to_owned(), "TEXT".to_owned(), 0, None, 0), ("delivery_key".to_owned(), "TEXT".to_owned(), 1, None, 0), ("payload_json".to_owned(), "TEXT".to_owned(), 1, None, 0), ("state".to_owned(), "TEXT".to_owned(), 1, None, 0), ("attempts".to_owned(), "INTEGER".to_owned(), 1, Some("0".to_owned()), 0), ("last_error".to_owned(), "TEXT".to_owned(), 0, None, 0), ("created_at".to_owned(), "TEXT".to_owned(), 1, None, 0), ("updated_at".to_owned(), "TEXT".to_owned(), 1, None, 0),
+            ]
+        );
+        assert_eq!(columns("orchestration_attachment_refs")?, vec![("command_id".to_owned(), "TEXT".to_owned(), 1, None, 1), ("attachment_id".to_owned(), "TEXT".to_owned(), 1, None, 2), ("content_digest".to_owned(), "TEXT".to_owned(), 0, None, 0), ("size_bytes".to_owned(), "INTEGER".to_owned(), 1, None, 0)]);
+        for (table, expected_columns) in [
+            ("provider_turn_outbox", vec!["command_id", "thread_id", "message_id", "provider_instance_id", "provider_kind", "provider_session_id", "delivery_key", "payload_json", "state", "attempts", "last_error", "created_at", "updated_at"]),
+            ("orchestration_attachment_refs", vec!["command_id", "attachment_id", "content_digest", "size_bytes"]),
+        ] {
+            let columns = connection.prepare(&format!("PRAGMA table_info({table})"))?.query_map([], |row| row.get::<_, String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(columns, expected_columns);
+        }
+        for table in ["provider_turn_outbox", "orchestration_attachment_refs"] {
+            let foreign_keys = connection.prepare(&format!("PRAGMA foreign_key_list({table})"))?.query_map([], |row| Ok((row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(6)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(foreign_keys, vec![("orchestration_command_receipts".to_owned(), "command_id".to_owned(), "command_id".to_owned(), "CASCADE".to_owned())]);
+        }
+        for (index, columns, unique) in [
+            ("idx_provider_turn_outbox_thread_state", vec!["thread_id", "state", "created_at", "command_id"], 0_i64),
+            ("idx_provider_turn_outbox_message", vec!["message_id"], 1_i64),
+            ("idx_orchestration_attachment_refs_attachment", vec!["attachment_id"], 0_i64),
+        ] {
+            let index_meta = connection.query_row(&format!("SELECT name, [unique] FROM pragma_index_list('{}') WHERE name = ?", if index.starts_with("idx_orchestration") { "orchestration_attachment_refs" } else { "provider_turn_outbox" }), [index], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+            assert_eq!(index_meta, (index.to_owned(), unique));
+            let actual = connection.prepare(&format!("PRAGMA index_info({index})"))?.query_map([], |row| row.get::<_, String>(2))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(actual, columns);
+        }
+        connection.execute(
+            "INSERT OR IGNORE INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status) VALUES ('schema-invalid-command', 'thread', 'thread-1', '2026-08-01T00:00:00Z', 0, 'accepted')",
+            [],
+        )?;
+        assert!(connection.execute(
+            "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, delivery_key, payload_json, state, created_at, updated_at) VALUES ('schema-invalid-command', 'thread-1', 'schema-invalid-message', 'codex', 'codex', 'key', '{}', 'not-a-state', '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z')",
+            [],
+        ).is_err());
+        Ok(())
+    }
 
     #[test]
     fn exposes_all_ordered_migration_metadata() {
@@ -1514,13 +1665,14 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=38).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=39).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
         assert_eq!(MIGRATIONS[35].name, "ActivityEventIdempotencyLedger");
         assert_eq!(MIGRATIONS[36].name, "ActivityEntryRetentionOwners");
         assert_eq!(MIGRATIONS[37].name, "ActivityRecordRetentionCounts");
+        assert_eq!(MIGRATIONS[38].name, "DurableProviderTurnDelivery");
 
         let migration = Migration::new(99, "RuntimeFixture", migration_001);
         assert_eq!(migration.id, 99);
@@ -1610,9 +1762,9 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 22);
+        assert_eq!(second.len(), 23);
         assert_eq!(second[0].id, 17);
-        assert_eq!(second[21].id, 38);
+        assert_eq!(second[22].id, 39);
 
         let third = run_migrations(&mut connection, None)?;
         assert!(third.is_empty());
@@ -1624,8 +1776,96 @@ mod tests {
             [],
             |row| row.get::<_, u32>(0),
         )?;
-        assert_eq!(application_table_count, 22);
+        assert_eq!(application_table_count, 24);
+        assert_delivery_schema(&connection)?;
 
+        Ok(())
+    }
+
+    #[test]
+    fn migration_39_adds_delivery_storage_and_backfills_attachment_references(
+    ) -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(38))?;
+        connection.execute(
+            "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status) VALUES ('command-1', 'thread', 'thread-1', '2026-08-01T00:00:00Z', 1, 'accepted')",
+            [],
+        )?;
+        connection.execute(
+            "INSERT INTO orchestration_events (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, command_id, causation_event_id, correlation_id, actor_kind, payload_json, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params![
+                "event-1",
+                "thread",
+                "thread-1",
+                1,
+                "thread.message-sent",
+                "2026-08-01T00:00:00Z",
+                "command-1",
+                Option::<String>::None,
+                "command-1",
+                "client",
+                r#"{"threadId":"thread-1","messageId":"message-1","role":"user","text":"ship it","attachments":[{"id":"attachment-1","sizeBytes":3}]}"#,
+                "{}",
+            ],
+        )?;
+
+        run_migrations(&mut connection, None)?;
+
+        let table_exists = |table: &str| -> rusqlite::Result<bool> {
+            connection.query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?)",
+                [table],
+                |row| row.get(0),
+            )
+        };
+        let column_exists = |table: &str, column: &str| -> rusqlite::Result<bool> {
+            let mut statement = connection.prepare(&format!("PRAGMA table_info({table})"))?;
+            let columns = statement
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(columns.iter().any(|candidate| candidate == column))
+        };
+
+        for table in ["provider_turn_outbox", "orchestration_attachment_refs"] {
+            assert!(table_exists(table)?);
+        }
+        assert_delivery_schema(&connection)?;
+        assert!(column_exists("orchestration_command_receipts", "payload_digest")?);
+        for column in ["delivery_state", "delivery_provider", "delivery_detail"] {
+            assert!(column_exists("projection_thread_messages", column)?);
+        }
+        assert!(connection.execute(
+            "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, delivery_key, payload_json, state, created_at, updated_at) VALUES ('command-1', 'thread-1', 'invalid-state-message', 'codex', 'codex', 'key', '{}', 'invalid', '2026-08-01T00:00:00Z', '2026-08-01T00:00:00Z')",
+            [],
+        ).is_err());
+        let reference = connection.query_row(
+            "SELECT command_id, attachment_id, content_digest, size_bytes FROM orchestration_attachment_refs",
+            [],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, i64>(3)?)),
+        )?;
+        assert_eq!(reference, ("command-1".to_owned(), "attachment-1".to_owned(), None, 3));
+
+        Ok(())
+    }
+
+    #[test]
+    fn migration_39_rejects_malformed_legacy_attachment_references() -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(38))?;
+        connection.execute(
+            "INSERT INTO orchestration_events (event_id, aggregate_kind, stream_id, stream_version, event_type, occurred_at, command_id, causation_event_id, correlation_id, actor_kind, payload_json, metadata_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            rusqlite::params!["event-bad", "thread", "thread-1", 1, "thread.message-sent", "2026-08-01T00:00:00Z", "command-bad", Option::<String>::None, "command-bad", "client", r#"{"role":"user","attachments":[{"id":"attachment-bad"}]}"#, "{}"],
+        )?;
+
+        assert!(run_migrations(&mut connection, None).is_err());
+        assert_eq!(
+            connection.query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'provider_turn_outbox'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?,
+            0
+        );
         Ok(())
     }
 
@@ -1645,12 +1885,13 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 5);
+        assert_eq!(applied.len(), 6);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
         assert_eq!(applied[3].id, 37);
         assert_eq!(applied[4].id, 38);
+        assert_eq!(applied[5].id, 39);
         let value = connection.query_row("SELECT value FROM legacy_user_data", [], |row| {
             row.get::<_, String>(0)
         })?;

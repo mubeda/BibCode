@@ -53,7 +53,8 @@ fn cursor_helper_outputs_match_fixtures() {
         serde_json::to_value(resolve_acp_config_updates(
             &config_updates_fixture["options"],
             &config_updates_fixture["updates"],
-        ))
+        )
+        .expect("config updates"))
         .expect("updates json"),
         config_updates_fixture["expected"]
     );
@@ -86,6 +87,37 @@ fn cursor_helper_outputs_match_fixtures() {
         resolve_acp_base_model_id("gpt-5.4[reasoning=medium,context=272k]"),
         "gpt-5.4"
     );
+}
+
+#[test]
+fn cursor_config_updates_reject_stale_or_malformed_descriptors_before_rpc() {
+    let fast = json!({
+        "id": "fast",
+        "category": "model_config",
+        "type": "select",
+        "currentValue": "false",
+        "options": [{ "value": "false" }, { "value": "true" }]
+    });
+    assert!(resolve_acp_config_updates(
+        &json!([fast]),
+        &json!([{ "id": "fastMode", "value": true }]),
+    )
+    .is_ok());
+    assert!(resolve_acp_config_updates(
+        &json!([{ "id": "fast", "category": "model", "type": "select", "options": [{ "value": "true" }] }]),
+        &json!([{ "id": "fastMode", "value": true }]),
+    )
+    .is_err());
+    assert!(resolve_acp_config_updates(
+        &json!([{ "id": "context", "category": "model_config", "type": "select", "options": [{ "value": "272k" }] }]),
+        &json!([{ "id": "contextWindow", "value": "1m" }]),
+    )
+    .is_err());
+    assert!(resolve_acp_config_updates(
+        &json!([{ "id": "reasoning", "category": "thought_level", "type": "boolean", "options": [{ "value": "high" }] }]),
+        &json!([{ "id": "reasoning", "value": "high" }]),
+    )
+    .is_err());
 }
 
 #[tokio::test]
@@ -328,12 +360,12 @@ async fn cursor_runtime_applies_the_selected_model_after_session_creation() {
         }
     }));
     peer.expect_request("session/set_config_option")
-        .respond(json!({ "configOptions": [] }));
+        .respond(json!({ "configOptions": [{ "id": "model", "category": "model" }] }));
     peer.expect_request("session/set_mode")
         .expect_params(json!({ "sessionId": "cursor-model-session", "modeId": "code" }))
         .respond(json!({}));
     peer.expect_request("session/set_config_option")
-        .respond(json!({ "configOptions": [] }));
+        .respond(json!({ "configOptions": [{ "id": "model", "category": "model" }] }));
     peer.expect_request("session/set_mode")
         .expect_params(json!({ "sessionId": "cursor-model-session", "modeId": "architect" }))
         .respond(json!({}));
@@ -348,6 +380,586 @@ async fn cursor_runtime_applies_the_selected_model_after_session_creation() {
         .set_interaction_mode("plan")
         .await
         .expect("switch interaction mode");
+    peer_task.await.expect("peer");
+}
+
+#[tokio::test]
+async fn cursor_fast_mode_uses_acp_config_update() {
+    let (connection, incoming, mut peer) = scripted_peer();
+    let runtime = CursorSessionRuntime::new(
+        CursorSessionOptions {
+            thread_id: "cursor-fast-thread".to_owned(),
+            cwd: "/tmp/project".to_owned(),
+            runtime_mode: "full-access".to_owned(),
+            interaction_mode: "default".to_owned(),
+            model: "default".to_owned(),
+            resume_session_id: None,
+            mcp_servers: Vec::new(),
+        },
+        connection,
+        incoming,
+    );
+    peer.expect_request("initialize").respond(json!({}));
+    peer.expect_request("authenticate").respond(json!({}));
+    peer.expect_request("session/new").respond(json!({
+        "sessionId": "s1",
+        "configOptions": [{
+            "id": "fast",
+            "category": "model_config",
+            "type": "select",
+            "currentValue": "false",
+            "options": [{ "value": "false" }, { "value": "true" }]
+        }],
+    }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "fast", "value": "true" }))
+        .respond(json!({
+            "configOptions": [{
+                "id": "fast",
+                "category": "model_config",
+                "type": "select",
+                "currentValue": "true",
+                "options": [{ "value": "false" }, { "value": "true" }]
+            }],
+        }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "fast", "value": "false" }))
+        .respond(json!({
+            "configOptions": [{
+                "id": "fast",
+                "category": "model_config",
+                "type": "select",
+                "currentValue": "false",
+                "options": [{ "value": "false" }, { "value": "true" }]
+            }],
+        }));
+    let peer_task = tokio::spawn(peer.run());
+
+    runtime.start().await.expect("start");
+    runtime
+        .set_options(vec![json!({ "id": "fastMode", "value": true })])
+        .await
+        .expect("fast config update");
+    runtime
+        .set_options(Vec::new())
+        .await
+        .expect("omitting fast mode restores the advertised baseline");
+
+    peer_task.await.expect("peer");
+}
+
+#[tokio::test]
+async fn cursor_empty_options_compensate_if_a_baseline_reset_fails() {
+    let (connection, incoming, mut peer) = scripted_peer();
+    let runtime = CursorSessionRuntime::new(
+        CursorSessionOptions {
+            thread_id: "cursor-baseline-compensation-thread".to_owned(),
+            cwd: "/tmp/project".to_owned(),
+            runtime_mode: "full-access".to_owned(),
+            interaction_mode: "default".to_owned(),
+            model: "default".to_owned(),
+            resume_session_id: None,
+            mcp_servers: Vec::new(),
+        },
+        connection,
+        incoming,
+    );
+    let baseline = json!([
+        {
+            "id": "fast", "category": "model_config", "type": "select",
+            "currentValue": "false", "options": [{ "value": "false" }, { "value": "true" }]
+        },
+        {
+            "id": "context", "category": "model_config", "type": "select",
+            "currentValue": "272k", "options": [{ "value": "272k" }, { "value": "1m" }]
+        }
+    ]);
+    let fast_enabled = json!([
+        {
+            "id": "fast", "category": "model_config", "type": "select",
+            "currentValue": "true", "options": [{ "value": "false" }, { "value": "true" }]
+        },
+        {
+            "id": "context", "category": "model_config", "type": "select",
+            "currentValue": "272k", "options": [{ "value": "272k" }, { "value": "1m" }]
+        }
+    ]);
+    let active = json!([
+        {
+            "id": "fast", "category": "model_config", "type": "select",
+            "currentValue": "true", "options": [{ "value": "false" }, { "value": "true" }]
+        },
+        {
+            "id": "context", "category": "model_config", "type": "select",
+            "currentValue": "1m", "options": [{ "value": "272k" }, { "value": "1m" }]
+        }
+    ]);
+    let context_reset = json!([
+        {
+            "id": "fast", "category": "model_config", "type": "select",
+            "currentValue": "true", "options": [{ "value": "false" }, { "value": "true" }]
+        },
+        {
+            "id": "context", "category": "model_config", "type": "select",
+            "currentValue": "272k", "options": [{ "value": "272k" }, { "value": "1m" }]
+        }
+    ]);
+    peer.expect_request("initialize").respond(json!({}));
+    peer.expect_request("authenticate").respond(json!({}));
+    peer.expect_request("session/new")
+        .respond(json!({ "sessionId": "s1", "configOptions": baseline }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "fast", "value": "true" }))
+        .respond(json!({ "configOptions": fast_enabled }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "context", "value": "1m" }))
+        .respond(json!({ "configOptions": active.clone() }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "context", "value": "272k" }))
+        .respond(json!({ "configOptions": context_reset }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "fast", "value": "false" }))
+        .respond_error(json!({ "code": -32000, "message": "baseline reset rejected" }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "context", "value": "1m" }))
+        .respond(json!({ "configOptions": active }));
+    let peer_task = tokio::spawn(peer.run());
+
+    runtime.start().await.expect("start");
+    runtime
+        .set_options(vec![
+            json!({ "id": "fastMode", "value": true }),
+            json!({ "id": "contextWindow", "value": "1m" }),
+        ])
+        .await
+        .expect("activate non-default options");
+    assert!(runtime.set_options(Vec::new()).await.is_err());
+
+    peer_task.await.expect("peer");
+}
+
+#[tokio::test]
+async fn cursor_model_switch_uses_target_baselines_and_revalidates_active_options() {
+    let (connection, incoming, mut peer) = scripted_peer();
+    let runtime = CursorSessionRuntime::new(
+        CursorSessionOptions {
+            thread_id: "cursor-model-option-thread".to_owned(),
+            cwd: "/tmp/project".to_owned(),
+            runtime_mode: "full-access".to_owned(),
+            interaction_mode: "default".to_owned(),
+            model: "default".to_owned(),
+            resume_session_id: None,
+            mcp_servers: Vec::new(),
+        },
+        connection,
+        incoming,
+    );
+    let config_options = |model: &str, fast: Option<&str>| {
+        let mut options = vec![json!({ "id": "model", "category": "model", "currentValue": model })];
+        if let Some(fast) = fast {
+            options.push(json!({
+                "id": "fast", "category": "model_config", "type": "select",
+                "currentValue": fast, "options": [{ "value": "false" }, { "value": "true" }]
+            }));
+        }
+        options
+    };
+    let old_baseline = config_options("old", Some("false"));
+    let old_active = config_options("old", Some("true"));
+    let target_advertisement = vec![
+        json!({ "id": "model", "category": "model", "currentValue": "target" }),
+        json!({
+            "id": "fast", "category": "model_config", "type": "select",
+            "currentValue": "true",
+            "options": [
+                { "value": "false", "isDefault": true },
+                { "value": "true" }
+            ]
+        }),
+    ];
+    let target_active = target_advertisement.clone();
+    let target_reset = config_options("target", Some("false"));
+    let unsupported_target = config_options("no-fast", None);
+
+    peer.expect_request("initialize").respond(json!({}));
+    peer.expect_request("authenticate").respond(json!({}));
+    peer.expect_request("session/new")
+        .respond(json!({ "sessionId": "s1", "configOptions": old_baseline.clone() }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "fast", "value": "true" }))
+        .respond(json!({ "configOptions": old_active }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "model", "value": "target" }))
+        .respond(json!({ "configOptions": target_advertisement }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "fast", "value": "true" }))
+        .respond(json!({ "configOptions": target_active }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "fast", "value": "false" }))
+        .respond(json!({ "configOptions": target_reset }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "model", "value": "no-fast" }))
+        .respond(json!({ "configOptions": unsupported_target }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "model", "value": "old" }))
+        .respond(json!({ "configOptions": old_baseline }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "fast", "value": "true" }))
+        .respond(json!({ "configOptions": config_options("old", Some("true")) }));
+    let peer_task = tokio::spawn(peer.run());
+
+    runtime.start().await.expect("start");
+    runtime
+        .set_options(vec![json!({ "id": "fastMode", "value": true })])
+        .await
+        .expect("enable fast on old model");
+    runtime.set_model("target").await.expect("switch to compatible target");
+    runtime
+        .set_options(vec![json!({ "id": "fastMode", "value": true })])
+        .await
+        .expect("reapply fast against target capabilities");
+    runtime
+        .set_options(Vec::new())
+        .await
+        .expect("clear uses the target model baseline");
+    runtime.set_model("no-fast").await.expect("switch to target without fast");
+    assert!(runtime
+        .set_options(vec![json!({ "id": "fastMode", "value": true })])
+        .await
+        .is_err());
+    runtime.set_model("old").await.expect("restore the previous model");
+    runtime
+        .set_options(vec![json!({ "id": "fastMode", "value": true })])
+        .await
+        .expect("restore the previous active options");
+
+    peer_task.await.expect("peer");
+}
+
+#[tokio::test]
+async fn cursor_default_model_restoration_uses_the_advertised_provider_value() {
+    let (connection, incoming, mut peer) = scripted_peer();
+    let runtime = CursorSessionRuntime::new(
+        CursorSessionOptions {
+            thread_id: "cursor-default-model-restore-thread".to_owned(),
+            cwd: "/tmp/project".to_owned(),
+            runtime_mode: "full-access".to_owned(),
+            interaction_mode: "default".to_owned(),
+            model: "default".to_owned(),
+            resume_session_id: None,
+            mcp_servers: Vec::new(),
+        },
+        connection,
+        incoming,
+    );
+    let default_options = json!([
+        {
+            "id": "model", "category": "model", "type": "select",
+            "currentValue": "cursor-auto",
+            "options": [
+                { "value": "cursor-auto", "isDefault": true },
+                { "value": "target" }
+            ]
+        },
+        {
+            "id": "fast", "category": "model_config", "type": "select",
+            "currentValue": "false", "options": [{ "value": "false" }, { "value": "true" }]
+        }
+    ]);
+    let target_options = json!([
+        {
+            "id": "model", "category": "model", "type": "select",
+            "currentValue": "target",
+            "options": [
+                { "value": "cursor-auto", "isDefault": true },
+                { "value": "target" }
+            ]
+        }
+    ]);
+    let default_fast_enabled = json!([
+        {
+            "id": "model", "category": "model", "type": "select",
+            "currentValue": "cursor-auto",
+            "options": [
+                { "value": "cursor-auto", "isDefault": true },
+                { "value": "target" }
+            ]
+        },
+        {
+            "id": "fast", "category": "model_config", "type": "select",
+            "currentValue": "true", "options": [{ "value": "false" }, { "value": "true" }]
+        }
+    ]);
+    peer.expect_request("initialize").respond(json!({}));
+    peer.expect_request("authenticate").respond(json!({}));
+    peer.expect_request("session/new")
+        .respond(json!({ "sessionId": "s1", "configOptions": default_options.clone() }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "model", "value": "target" }))
+        .respond(json!({ "configOptions": target_options }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "model", "value": "cursor-auto" }))
+        .respond(json!({ "configOptions": default_options.clone() }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "fast", "value": "true" }))
+        .respond(json!({ "configOptions": default_fast_enabled }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "fast", "value": "false" }))
+        .respond(json!({ "configOptions": default_options }));
+    let peer_task = tokio::spawn(peer.run());
+
+    runtime.start().await.expect("start");
+    runtime.set_model("target").await.expect("switch to target");
+    runtime
+        .set_model("default")
+        .await
+        .expect("restore Cursor's advertised default model");
+    runtime
+        .set_options(vec![json!({ "id": "fastMode", "value": true })])
+        .await
+        .expect("restored model acknowledgement replaces current options");
+    runtime
+        .set_options(Vec::new())
+        .await
+        .expect("restored model acknowledgement replaces baseline options");
+    timeout(Duration::from_secs(1), peer_task)
+        .await
+        .expect("default restoration RPC")
+        .expect("peer");
+}
+
+#[tokio::test]
+async fn cursor_default_model_restoration_rejects_a_fabricated_default() {
+    let (connection, incoming, mut peer) = scripted_peer();
+    let runtime = CursorSessionRuntime::new(
+        CursorSessionOptions {
+            thread_id: "cursor-missing-default-model-thread".to_owned(),
+            cwd: "/tmp/project".to_owned(),
+            runtime_mode: "full-access".to_owned(),
+            interaction_mode: "default".to_owned(),
+            model: "default".to_owned(),
+            resume_session_id: None,
+            mcp_servers: Vec::new(),
+        },
+        connection,
+        incoming,
+    );
+    let initial_options = json!([{
+        "id": "model", "category": "model", "type": "select",
+        "options": [{ "value": "first-listed" }, { "value": "target" }]
+    }]);
+    let target_options = json!([{
+        "id": "model", "category": "model", "type": "select",
+        "currentValue": "target",
+        "options": [{ "value": "first-listed" }, { "value": "target" }]
+    }]);
+    peer.expect_request("initialize").respond(json!({}));
+    peer.expect_request("authenticate").respond(json!({}));
+    peer.expect_request("session/new")
+        .respond(json!({ "sessionId": "s1", "configOptions": initial_options }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "model", "value": "target" }))
+        .respond(json!({ "configOptions": target_options }));
+    peer.expect_no_request();
+    let peer_task = tokio::spawn(peer.run());
+
+    runtime.start().await.expect("start");
+    runtime.set_model("target").await.expect("switch to target");
+    assert!(runtime.set_model("default").await.is_err());
+    peer_task.await.expect("peer");
+}
+
+#[tokio::test]
+async fn cursor_option_failure_compensates_acknowledged_updates() {
+    let (connection, incoming, mut peer) = scripted_peer();
+    let runtime = CursorSessionRuntime::new(
+        CursorSessionOptions {
+            thread_id: "cursor-compensation-thread".to_owned(),
+            cwd: "/tmp/project".to_owned(),
+            runtime_mode: "full-access".to_owned(),
+            interaction_mode: "default".to_owned(),
+            model: "default".to_owned(),
+            resume_session_id: None,
+            mcp_servers: Vec::new(),
+        },
+        connection,
+        incoming,
+    );
+    let initial = json!([
+        {
+            "id": "fast",
+            "category": "model_config",
+            "type": "select",
+            "currentValue": "false",
+            "options": [{ "value": "false" }, { "value": "true" }]
+        },
+        {
+            "id": "context",
+            "category": "model_config",
+            "type": "select",
+            "currentValue": "272k",
+            "options": [{ "value": "272k" }, { "value": "1m" }]
+        }
+    ]);
+    let fast_enabled = json!([
+        {
+            "id": "fast",
+            "category": "model_config",
+            "type": "select",
+            "currentValue": "true",
+            "options": [{ "value": "false" }, { "value": "true" }]
+        },
+        {
+            "id": "context",
+            "category": "model_config",
+            "type": "select",
+            "currentValue": "272k",
+            "options": [{ "value": "272k" }, { "value": "1m" }]
+        }
+    ]);
+    peer.expect_request("initialize").respond(json!({}));
+    peer.expect_request("authenticate").respond(json!({}));
+    peer.expect_request("session/new")
+        .respond(json!({ "sessionId": "s1", "configOptions": initial }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "fast", "value": "true" }))
+        .respond(json!({ "configOptions": fast_enabled }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "context", "value": "1m" }))
+        .respond_error(json!({ "code": -32000, "message": "context rejected" }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "fast", "value": "false" }))
+        .respond(json!({ "configOptions": initial }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "fast", "value": "true" }))
+        .respond(json!({ "configOptions": fast_enabled }));
+    let peer_task = tokio::spawn(peer.run());
+
+    runtime.start().await.expect("start");
+    assert!(runtime
+        .set_options(vec![
+            json!({ "id": "fastMode", "value": true }),
+            json!({ "id": "contextWindow", "value": "1m" }),
+        ])
+        .await
+        .is_err());
+    runtime
+        .set_options(vec![json!({ "id": "fastMode", "value": true })])
+        .await
+        .expect("compensated acknowledgement must become the next local snapshot");
+
+    peer_task.await.expect("peer");
+}
+
+#[tokio::test]
+async fn cursor_malformed_config_acknowledgement_is_compensated() {
+    let (connection, incoming, mut peer) = scripted_peer();
+    let runtime = CursorSessionRuntime::new(
+        CursorSessionOptions {
+            thread_id: "cursor-malformed-ack-thread".to_owned(),
+            cwd: "/tmp/project".to_owned(),
+            runtime_mode: "full-access".to_owned(),
+            interaction_mode: "default".to_owned(),
+            model: "default".to_owned(),
+            resume_session_id: None,
+            mcp_servers: Vec::new(),
+        },
+        connection,
+        incoming,
+    );
+    let initial = json!([{
+        "id": "fast",
+        "category": "model_config",
+        "type": "select",
+        "currentValue": "false",
+        "options": [{ "value": "false" }, { "value": "true" }]
+    }]);
+    peer.expect_request("initialize").respond(json!({}));
+    peer.expect_request("authenticate").respond(json!({}));
+    peer.expect_request("session/new")
+        .respond(json!({ "sessionId": "s1", "configOptions": initial }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "fast", "value": "true" }))
+        .respond(json!({}));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "fast", "value": "false" }))
+        .respond(json!({ "configOptions": initial }));
+    let peer_task = tokio::spawn(peer.run());
+
+    runtime.start().await.expect("start");
+    assert!(runtime
+        .set_options(vec![json!({ "id": "fastMode", "value": true })])
+        .await
+        .is_err());
+    peer_task.await.expect("peer");
+}
+
+#[tokio::test]
+async fn cursor_failed_compensation_latches_configuration_uncertain() {
+    let (connection, incoming, mut peer) = scripted_peer();
+    let runtime = CursorSessionRuntime::new(
+        CursorSessionOptions {
+            thread_id: "cursor-uncertain-thread".to_owned(),
+            cwd: "/tmp/project".to_owned(),
+            runtime_mode: "full-access".to_owned(),
+            interaction_mode: "default".to_owned(),
+            model: "default".to_owned(),
+            resume_session_id: None,
+            mcp_servers: Vec::new(),
+        },
+        connection,
+        incoming,
+    );
+    let initial = json!([
+        {
+            "id": "fast", "category": "model_config", "type": "select",
+            "currentValue": "false", "options": [{ "value": "false" }, { "value": "true" }]
+        },
+        {
+            "id": "context", "category": "model_config", "type": "select",
+            "currentValue": "272k", "options": [{ "value": "272k" }, { "value": "1m" }]
+        }
+    ]);
+    let fast_enabled = json!([
+        {
+            "id": "fast", "category": "model_config", "type": "select",
+            "currentValue": "true", "options": [{ "value": "false" }, { "value": "true" }]
+        },
+        {
+            "id": "context", "category": "model_config", "type": "select",
+            "currentValue": "272k", "options": [{ "value": "272k" }, { "value": "1m" }]
+        }
+    ]);
+    peer.expect_request("initialize").respond(json!({}));
+    peer.expect_request("authenticate").respond(json!({}));
+    peer.expect_request("session/new")
+        .respond(json!({ "sessionId": "s1", "configOptions": initial }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "fast", "value": "true" }))
+        .respond(json!({ "configOptions": fast_enabled }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "context", "value": "1m" }))
+        .respond_error(json!({ "code": -32000, "message": "context rejected" }));
+    peer.expect_request("session/set_config_option")
+        .expect_params(json!({ "sessionId": "s1", "configId": "fast", "value": "false" }))
+        .respond_error(json!({ "code": -32000, "message": "rollback rejected" }));
+    peer.expect_no_request();
+    let peer_task = tokio::spawn(peer.run());
+
+    runtime.start().await.expect("start");
+    assert!(runtime
+        .set_options(vec![
+            json!({ "id": "fastMode", "value": true }),
+            json!({ "id": "contextWindow", "value": "1m" }),
+        ])
+        .await
+        .is_err());
+    assert!(runtime.set_options(Vec::new()).await.is_err());
+    assert!(runtime
+        .set_options(vec![json!({ "id": "fastMode", "value": true })])
+        .await
+        .is_err());
+    assert!(runtime.send_turn(Some("must not send"), Vec::new()).await.is_err());
     peer_task.await.expect("peer");
 }
 
@@ -1013,6 +1625,7 @@ impl ScriptedPeer {
             method: method.to_owned(),
             expected_params: None,
             response: None,
+            error: None,
             emits: Vec::new(),
             emits_after_follow_up: Vec::new(),
             expected_follow_up: None,
@@ -1020,6 +1633,10 @@ impl ScriptedPeer {
             stderr_messages: Vec::new(),
         });
         self.steps.last_mut().expect("step")
+    }
+
+    fn expect_no_request(&mut self) {
+        self.steps.push(PeerStep::ExpectNoRequest);
     }
 
     async fn run(self) {
@@ -1032,6 +1649,7 @@ impl ScriptedPeer {
                     method,
                     expected_params,
                     response,
+                    error,
                     emits,
                     emits_after_follow_up,
                     expected_follow_up,
@@ -1072,7 +1690,21 @@ impl ScriptedPeer {
                             json!({ "jsonrpc": "2.0", "id": message["id"].clone(), "result": result }),
                         )
                         .await;
+                    } else if let Some(error) = error {
+                        write_json(
+                            &mut writer,
+                            json!({ "jsonrpc": "2.0", "id": message["id"].clone(), "error": error }),
+                        )
+                        .await;
                     }
+                }
+                PeerStep::ExpectNoRequest => {
+                    assert!(
+                        timeout(Duration::from_millis(100), read_json_message(&mut reader, "unexpected request"))
+                            .await
+                            .is_err(),
+                        "Cursor sent an RPC after configuration became uncertain"
+                    );
                 }
             }
         }
@@ -1085,31 +1717,47 @@ enum PeerStep {
         method: String,
         expected_params: Option<Value>,
         response: Option<Value>,
+        error: Option<Value>,
         emits: Vec<Value>,
         emits_after_follow_up: Vec<Value>,
         expected_follow_up: Option<Value>,
         expected_notification: Option<String>,
         stderr_messages: Vec<String>,
     },
+    ExpectNoRequest,
 }
 
 impl PeerStep {
     fn expect_params(&mut self, value: Value) -> &mut Self {
         let PeerStep::ExpectRequest {
             expected_params, ..
-        } = self;
+        } = self else {
+            panic!("expected request step");
+        };
         *expected_params = Some(value);
         self
     }
 
     fn respond(&mut self, result: Value) -> &mut Self {
-        let PeerStep::ExpectRequest { response, .. } = self;
+        let PeerStep::ExpectRequest { response, .. } = self else {
+            panic!("expected request step");
+        };
         *response = Some(result);
         self
     }
 
+    fn respond_error(&mut self, error: Value) -> &mut Self {
+        let PeerStep::ExpectRequest { error: response, .. } = self else {
+            panic!("expected request step");
+        };
+        *response = Some(error);
+        self
+    }
+
     fn emit_request(&mut self, value: Value) -> &mut Self {
-        let PeerStep::ExpectRequest { emits, .. } = self;
+        let PeerStep::ExpectRequest { emits, .. } = self else {
+            panic!("expected request step");
+        };
         emits.push(value);
         self
     }
@@ -1118,7 +1766,9 @@ impl PeerStep {
         let PeerStep::ExpectRequest {
             emits_after_follow_up,
             ..
-        } = self;
+        } = self else {
+            panic!("expected request step");
+        };
         emits_after_follow_up.push(value);
         self
     }
@@ -1126,7 +1776,9 @@ impl PeerStep {
     fn expect_response(&mut self, value: Value) -> &mut Self {
         let PeerStep::ExpectRequest {
             expected_follow_up, ..
-        } = self;
+        } = self else {
+            panic!("expected request step");
+        };
         *expected_follow_up = Some(value);
         self
     }
@@ -1135,7 +1787,9 @@ impl PeerStep {
         let PeerStep::ExpectRequest {
             expected_notification,
             ..
-        } = self;
+        } = self else {
+            panic!("expected request step");
+        };
         *expected_notification = Some(method.to_owned());
         self
     }
@@ -1143,7 +1797,9 @@ impl PeerStep {
     fn emit_stderr(&mut self, message: &str) -> &mut Self {
         let PeerStep::ExpectRequest {
             stderr_messages, ..
-        } = self;
+        } = self else {
+            panic!("expected request step");
+        };
         stderr_messages.push(message.to_owned());
         self
     }

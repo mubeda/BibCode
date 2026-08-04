@@ -1,0 +1,194 @@
+import type { OrchestrationThreadActivity } from "@bibcode/contracts";
+import type { ReactNode } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { describe, expect, it, vi } from "vite-plus/test";
+
+vi.mock("../ui/popover", () => ({
+  Popover: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  PopoverTrigger: ({ render, children }: { render?: ReactNode; children?: ReactNode }) => (
+    <>{render ?? children}</>
+  ),
+  PopoverPopup: ({ children }: { children: ReactNode }) => (
+    <section role="dialog" aria-labelledby="mcp-title">
+      {children}
+    </section>
+  ),
+  PopoverTitle: ({ children }: { children: ReactNode }) => <h2 id="mcp-title">{children}</h2>,
+}));
+
+import { deriveMcpStatusSnapshot, McpStatusPopover } from "./McpStatusPopover";
+
+function activity(
+  payload: unknown,
+  overrides: Partial<OrchestrationThreadActivity> = {},
+): OrchestrationThreadActivity {
+  return {
+    id: "activity-1" as OrchestrationThreadActivity["id"],
+    tone: "info",
+    kind: "provider-event",
+    summary: "mcp.status.updated",
+    payload,
+    turnId: null,
+    createdAt: "2026-08-01T12:00:00.000Z",
+    ...overrides,
+  };
+}
+
+describe("deriveMcpStatusSnapshot", () => {
+  it("uses the newest valid snapshot for the active provider instance", () => {
+    const snapshot = deriveMcpStatusSnapshot(
+      [
+        activity({
+          providerInstanceId: "codex_work",
+          servers: [{ name: "old", state: "starting" }],
+        }),
+        activity({
+          providerInstanceId: "codex_work",
+          servers: [{ name: "new", state: "connected" }],
+        }),
+      ],
+      "codex_work",
+      true,
+    );
+
+    expect(snapshot).toEqual({
+      servers: [{ name: "new", state: "connected", detail: null }],
+    });
+  });
+
+  it("ignores newer snapshots from another provider instance", () => {
+    const snapshot = deriveMcpStatusSnapshot(
+      [
+        activity({
+          providerInstanceId: "codex_work",
+          servers: [{ name: "mine", state: "connected" }],
+        }),
+        activity({
+          providerInstanceId: "codex_personal",
+          servers: [{ name: "other", state: "error" }],
+        }),
+      ],
+      "codex_work",
+      true,
+    );
+
+    expect(snapshot).toEqual({
+      servers: [{ name: "mine", state: "connected", detail: null }],
+    });
+  });
+
+  it("returns awaiting when the active instance has not sent a valid snapshot", () => {
+    expect(
+      deriveMcpStatusSnapshot(
+        [
+          activity({
+            providerInstanceId: "codex_work",
+            servers: [{ name: "bad", state: "unknown" }],
+          }),
+        ],
+        "codex_work",
+        true,
+      ),
+    ).toEqual({ servers: [] });
+  });
+
+  it("skips a malformed newer snapshot instead of masking an older valid one", () => {
+    expect(
+      deriveMcpStatusSnapshot(
+        [
+          activity({
+            providerInstanceId: "codex_work",
+            servers: [{ name: "older", state: "connected" }],
+          }),
+          activity({
+            providerInstanceId: "codex_work",
+            servers: [
+              { name: "newer", state: "starting" },
+              { name: "bad", state: "unknown" },
+            ],
+          }),
+        ],
+        "codex_work",
+        true,
+      ),
+    ).toEqual({ servers: [{ name: "older", state: "connected", detail: null }] });
+  });
+
+  it("keeps an explicitly empty latest snapshot as valid awaiting state", () => {
+    expect(
+      deriveMcpStatusSnapshot(
+        [
+          activity({
+            providerInstanceId: "codex_work",
+            servers: [{ name: "older", state: "connected" }],
+          }),
+          activity({ providerInstanceId: "codex_work", servers: [] }),
+        ],
+        "codex_work",
+        true,
+      ),
+    ).toEqual({ servers: [] });
+  });
+
+  it("clears stale connected and starting rows when the runtime is not live", () => {
+    expect(
+      deriveMcpStatusSnapshot(
+        [
+          activity({
+            providerInstanceId: "codex_work",
+            servers: [
+              { name: "connected", state: "connected" },
+              { name: "starting", state: "starting" },
+              { name: "auth", state: "needs-auth" },
+            ],
+          }),
+        ],
+        "codex_work",
+        false,
+      ),
+    ).toEqual({
+      servers: [
+        { name: "connected", state: "disconnected", detail: null },
+        { name: "starting", state: "disconnected", detail: null },
+        { name: "auth", state: "needs-auth", detail: null },
+      ],
+    });
+  });
+});
+
+describe("McpStatusPopover", () => {
+  it("renders every MCP state with an accessible status and wrapped detail", () => {
+    const markup = renderToStaticMarkup(
+      <McpStatusPopover
+        snapshot={{
+          servers: [
+            { name: "connected", state: "connected", detail: null },
+            { name: "starting", state: "starting", detail: "Starting connection" },
+            { name: "auth", state: "needs-auth", detail: "Sign in to continue" },
+            { name: "offline", state: "disconnected", detail: null },
+            { name: "failed", state: "error", detail: "Connection failed" },
+          ],
+        }}
+      />,
+    );
+
+    expect(markup).toContain('aria-label="MCP servers"');
+    expect(markup).toContain('<section role="dialog" aria-labelledby="mcp-title">');
+    expect(markup).toContain('<h2 id="mcp-title">MCPs</h2>');
+    expect(markup).toContain("MCPs");
+    expect(markup).toContain('role="status"');
+    expect(markup).toContain("Connected");
+    expect(markup).toContain("Starting");
+    expect(markup).toContain("Needs authentication");
+    expect(markup).toContain("Disconnected");
+    expect(markup).toContain("Error");
+    expect(markup).toContain('title="connected"');
+    expect(markup).toContain("Sign in to continue");
+  });
+
+  it("shows a neutral awaiting state before the first snapshot", () => {
+    expect(renderToStaticMarkup(<McpStatusPopover snapshot={{ servers: [] }} />)).toContain(
+      "Awaiting MCP status",
+    );
+  });
+});

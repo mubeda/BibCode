@@ -465,7 +465,6 @@ export function runDevRunnerWithInput(input: DevRunnerCliInput) {
           }),
       ),
     );
-
     const { offset, source } = yield* resolveOffset({ portOffset, devInstance });
 
     const { serverOffset, webOffset } = yield* resolveModePortOffsets({
@@ -619,7 +618,10 @@ const cliRuntimeLayer = Layer.mergeAll(
 type MainLauncher = <E, A>(effect: Effect.Effect<A, E, never>) => void;
 
 export function applyDevRunnerRepoEnv(env: Readonly<Record<string, string | undefined>>): void {
-  Object.assign(process.env, env);
+  for (const [key, value] of Object.entries(env)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
 }
 
 export function runDevRunnerMain(

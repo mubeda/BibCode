@@ -1,4 +1,10 @@
-import { CheckpointRef, EnvironmentId, MessageId, TurnId } from "@bibcode/contracts";
+import {
+  CheckpointRef,
+  EnvironmentId,
+  MessageId,
+  ProviderDriverKind,
+  TurnId,
+} from "@bibcode/contracts";
 import { act, createRef, type ComponentProps, type ReactNode, type Ref } from "react";
 import type { WorkLogEntry } from "../../session-logic";
 import { renderToStaticMarkup } from "react-dom/server";
@@ -202,6 +208,8 @@ function buildProps() {
     onOpenTurnDiff: () => {},
     revertTurnCountByUserMessageId: new Map(),
     onRevertUserMessage: () => {},
+    onResolveTurnDelivery: () => {},
+    resolvingTurnDeliveryMessageId: null,
     isRevertingCheckpoint: false,
     onImageExpand: () => {},
     activeThreadEnvironmentId: ACTIVE_THREAD_ENVIRONMENT_ID,
@@ -242,6 +250,37 @@ function buildUserTimelineEntry(text: string) {
 }
 
 describe("MessagesTimeline", () => {
+  it("renders delivery uncertainty immediately below the affected user message", async () => {
+    const MessagesTimeline = await loadMessagesTimeline();
+    const entry = buildUserTimelineEntry("Send this once.");
+    const markup = renderToStaticMarkup(
+      <MessagesTimeline
+        {...buildProps()}
+        timelineEntries={[
+          {
+            ...entry,
+            message: {
+              ...entry.message,
+              delivery: {
+                state: "uncertain" as const,
+                provider: ProviderDriverKind.make("claudeAgent"),
+                detail: "connection closed before acknowledgement",
+              },
+            },
+          },
+        ]}
+      />,
+    );
+
+    expect(markup).toContain("Delivery uncertain");
+    expect(markup).toContain("Claude may have received this message");
+    expect(markup).toContain('aria-label="Retry message delivery"');
+    expect(markup).toContain('aria-label="Dismiss delivery warning"');
+    expect(markup.indexOf('data-user-message-body="true"')).toBeLessThan(
+      markup.indexOf("Delivery uncertain"),
+    );
+  });
+
   it("uses LegendList isNearEnd when deciding whether the live edge is visible", async () => {
     const {
       resolveTimelineIsAtEnd,
@@ -1464,6 +1503,38 @@ describe("MessagesTimeline minimap", () => {
 });
 
 describe("MessagesTimeline mounted interactions", () => {
+  it("scopes retry and dismiss actions to the affected message", async () => {
+    const onResolveTurnDelivery = vi.fn();
+    const entry = buildUserTimelineEntry("Send this once.");
+    const timelineEntry = {
+      ...entry,
+      message: {
+        ...entry.message,
+        delivery: {
+          state: "failed" as const,
+          provider: ProviderDriverKind.make("codex"),
+          detail: "provider rejected the request",
+        },
+      },
+    };
+    const container = await mountTimeline({
+      timelineEntries: [timelineEntry],
+      onResolveTurnDelivery,
+    });
+
+    const retry = container.querySelector<HTMLElement>('[aria-label="Retry message delivery"]');
+    const dismiss = container.querySelector<HTMLElement>('[aria-label="Dismiss delivery warning"]');
+    expect(retry).not.toBeNull();
+    expect(dismiss).not.toBeNull();
+    await click(retry!);
+    await click(dismiss!);
+
+    expect(onResolveTurnDelivery.mock.calls).toEqual([
+      [entry.message.id, "retry"],
+      [entry.message.id, "dismiss"],
+    ]);
+  });
+
   it("expands regular image attachments and reverts from their user message", async () => {
     const onImageExpand = vi.fn();
     const onRevertUserMessage = vi.fn();

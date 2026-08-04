@@ -215,7 +215,7 @@ describe("ProviderModelPicker", () => {
     expect(mounted.container.querySelector('[data-provider-icon="Codex"]')).toMatchObject({
       dataset: { showBadge: "false", iconClass: "size-4" },
     });
-    expect(mounted.container.textContent).toBe("55");
+    expect(mounted.container.textContent).toBe("5Codex · GPT-5");
     expect(captured.contentProps).toMatchObject({
       activeInstanceId: codex.instanceId,
       model: "gpt-5",
@@ -226,9 +226,34 @@ describe("ProviderModelPicker", () => {
     });
   });
 
+  it("locks duplicate provider instances to the active model and describes it fully", async () => {
+    const work = entry("codex-work", { displayName: "Codex Work", isDefault: false });
+    const workModels: ReadonlyArray<ModelEsque> = [
+      { slug: "gpt-5-work", name: "GPT-5 Work", shortName: "Work" },
+    ];
+    const mounted = await mount(
+      renderPicker({
+        lockToActiveInstance: true,
+        instanceEntries: [codex, work],
+        modelOptionsByInstance: new Map([
+          [codex.instanceId, codexModels],
+          [work.instanceId, workModels],
+        ]),
+      }),
+    );
+
+    expect(mounted.container.querySelector("[data-tooltip]")?.textContent).toBe("Codex · GPT-5");
+    await click(mounted.container, "[data-open-menu]");
+    expect(captured.contentProps).toMatchObject({
+      activeInstanceId: codex.instanceId,
+      model: "gpt-5",
+      lockToActiveInstance: true,
+    });
+  });
+
   it("falls back to the first active model and handles a missing instance", async () => {
     const mounted = await mount(renderPicker({ model: "foreign-model" }));
-    expect(mounted.container.textContent).toBe("55");
+    expect(mounted.container.textContent).toBe("5Codex · GPT-5");
 
     const missingId = ProviderInstanceId.make("missing");
     await act(async () =>

@@ -1,6 +1,7 @@
 import {
   CommandId,
   EnvironmentId,
+  MessageId,
   ORCHESTRATION_WS_METHODS,
   ProjectId,
   ThreadId,
@@ -22,6 +23,7 @@ import * as EnvironmentSupervisor from "../connection/supervisor.ts";
 import * as RpcSession from "../rpc/session.ts";
 import type { WsRpcProtocolClient } from "../rpc/protocol.ts";
 import { archiveThread, createProject, stopThreadSession } from "./commands.ts";
+import * as EnvironmentCommands from "./commands.ts";
 
 const TEST_CRYPTO_LAYER = Layer.succeed(
   Crypto.Crypto,
@@ -154,6 +156,43 @@ describe("environment commands", () => {
           type: "thread.archive",
           commandId: "archive-command",
           threadId: "thread-1",
+        },
+      ]);
+    }).pipe(Effect.provide(TEST_CRYPTO_LAYER)),
+  );
+
+  it.effect("dispatches a typed turn delivery resolution with command metadata", () =>
+    Effect.gen(function* () {
+      const dispatched: ClientOrchestrationCommand[] = [];
+      const supervisor = yield* makeSupervisor(dispatched);
+      const resolveTurnDelivery = (EnvironmentCommands as unknown as Record<string, unknown>)
+        .resolveTurnDelivery;
+
+      expect(resolveTurnDelivery).toBeTypeOf("function");
+      yield* (
+        resolveTurnDelivery as (input: {
+          commandId: CommandId;
+          threadId: ThreadId;
+          messageId: ReturnType<typeof MessageId.make>;
+          action: "retry" | "dismiss";
+          createdAt: string;
+        }) => ReturnType<typeof stopThreadSession>
+      )({
+        commandId: CommandId.make("resolve-delivery"),
+        threadId: ThreadId.make("thread-1"),
+        messageId: MessageId.make("message-1"),
+        action: "retry",
+        createdAt: "2026-08-03T00:00:00.000Z",
+      }).pipe(Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor));
+
+      expect(dispatched).toEqual([
+        {
+          type: "thread.turn-delivery.resolve",
+          commandId: "resolve-delivery",
+          threadId: "thread-1",
+          messageId: "message-1",
+          action: "retry",
+          createdAt: "2026-08-03T00:00:00.000Z",
         },
       ]);
     }).pipe(Effect.provide(TEST_CRYPTO_LAYER)),

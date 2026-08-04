@@ -1,5 +1,4 @@
-use serde::Serialize;
-use serde_json::json;
+use bibcode_server::orchestration::TurnDeliveryState;
 use bibcode_server::persistence::{
     AuthPairingLink, AuthSessionClient, CheckpointDiffBlob, CommandReceipt, Database,
     NewAuthSession, NewOrchestrationEvent, ProjectionCheckpoint, ProjectionPendingApproval,
@@ -8,6 +7,8 @@ use bibcode_server::persistence::{
     ProjectionThreadSession, ProjectionTurnById, ProviderSessionRuntime, Repositories,
     run_migrations,
 };
+use serde::Serialize;
+use serde_json::json;
 
 const T0: &str = "2026-07-10T10:00:00.000Z";
 const T1: &str = "2026-07-10T10:01:00.000Z";
@@ -125,6 +126,7 @@ fn public_repository_api_inventory_is_explicit() {
 
     let mut expected = vec![
         "append_event",
+        "claim_provider_turn",
         "clear_checkpoint_turn_conflict",
         "consume_auth_pairing_link",
         "create_auth_pairing_link",
@@ -151,6 +153,7 @@ fn public_repository_api_inventory_is_explicit() {
         "get_project",
         "get_projection_state",
         "get_provider_session_runtime",
+        "get_provider_turn_delivery",
         "get_thread",
         "get_thread_session",
         "get_turn_by_id",
@@ -165,6 +168,8 @@ fn public_repository_api_inventory_is_explicit() {
         "list_projection_states",
         "list_proposed_plans_by_thread",
         "list_provider_session_runtimes",
+        "list_provider_turn_deliveries",
+        "list_referenced_attachment_ids",
         "list_threads_by_project",
         "list_turns_by_thread",
         "max_event_sequence",
@@ -355,6 +360,7 @@ async fn command_receipt_and_checkpoint_diff_repositories_upsert_and_order() {
         result_sequence: 1,
         status: "accepted".to_owned(),
         error: None,
+        payload_digest: Some("digest-1".to_owned()),
     };
     repositories
         .upsert_command_receipt(receipt.clone())
@@ -424,6 +430,127 @@ async fn command_receipt_and_checkpoint_diff_repositories_upsert_and_order() {
     );
     assert_row_eq(&diffs[0], &early_diff);
     assert_row_eq(&diffs[1], &later_diff);
+}
+
+#[tokio::test]
+async fn provider_turn_delivery_repositories_fetch_filter_reference_and_claim() {
+    let repositories = migrated_repositories().await;
+    repositories
+        .database()
+        .call(|connection| {
+            connection.execute_batch(
+                "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status) VALUES ('command-a', 'thread', 'thread-1', '2026-08-01T00:00:00Z', 1, 'accepted'), ('command-b', 'thread', 'thread-1', '2026-08-01T00:00:01Z', 2, 'accepted'), ('command-c', 'thread', 'thread-1', '2026-08-01T00:00:02Z', 3, 'accepted');
+                 INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at) VALUES
+                   ('command-b', 'thread-1', 'message-b', 'claudeAgent', 'claudeAgent', NULL, 'key-b', '{\"text\":\"later\"}', 'uncertain', 2, 'lost', '2026-08-01T00:00:02Z', '2026-08-01T00:00:03Z'),
+                   ('command-c', 'thread-1', 'message-c', 'codex', 'codex', NULL, 'key-c', '{\"text\":\"excluded\"}', 'delivered', 1, NULL, '2026-08-01T00:00:04Z', '2026-08-01T00:00:05Z'),
+                   ('command-a', 'thread-1', 'message-a', 'codex', 'codex', NULL, 'key-a', '{\"text\":\"first\"}', 'pending', 0, NULL, '2026-08-01T00:00:00Z', '2026-08-01T00:00:01Z');
+                 INSERT INTO orchestration_attachment_refs (command_id, attachment_id, content_digest, size_bytes) VALUES ('command-a', 'attachment-z', 'digest-z', 3), ('command-b', 'attachment-a', NULL, 4);",
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("delivery fixtures insert");
+
+    let fetched = repositories
+        .get_provider_turn_delivery("command-a".to_owned())
+        .await
+        .expect("delivery fetch")
+        .expect("delivery exists");
+    assert_eq!(fetched.payload, json!({"text": "first"}));
+    assert_eq!(fetched.provider_session_id, None);
+    assert_eq!(
+        repositories
+            .list_provider_turn_deliveries(vec![TurnDeliveryState::Pending])
+            .await
+            .expect("delivery list")
+            .into_iter()
+            .map(|delivery| delivery.command_id)
+            .collect::<Vec<_>>(),
+        vec!["command-a"]
+    );
+    assert_eq!(
+        repositories
+            .list_referenced_attachment_ids()
+            .await
+            .expect("reference list"),
+        vec!["attachment-a", "attachment-z"]
+    );
+    let claimed = repositories
+        .claim_provider_turn("command-a".to_owned(), "2026-08-01T00:00:04Z".to_owned())
+        .await
+        .expect("first claim")
+        .expect("pending turn claims");
+    assert_eq!(claimed.state, TurnDeliveryState::Sending);
+    assert_eq!(claimed.attempts, 1);
+    let frozen = repositories
+        .freeze_provider_turn_session(
+            "command-a".to_owned(),
+            1,
+            "codex".to_owned(),
+            "codex".to_owned(),
+            "session-a".to_owned(),
+            "2026-08-01T00:00:05Z".to_owned(),
+        )
+        .await
+        .expect("session freeze")
+        .expect("sending turn freezes");
+    assert_eq!(frozen.provider_session_id.as_deref(), Some("session-a"));
+    assert!(
+        repositories
+            .freeze_provider_turn_session(
+                "command-a".to_owned(),
+                1,
+                "codex".to_owned(),
+                "codex".to_owned(),
+                "session-a".to_owned(),
+                "2026-08-01T00:00:06Z".to_owned(),
+            )
+            .await
+            .expect("idempotent session freeze")
+            .is_some()
+    );
+    assert!(
+        repositories
+            .freeze_provider_turn_session(
+                "command-a".to_owned(),
+                1,
+                "codex".to_owned(),
+                "codex".to_owned(),
+                "session-drift".to_owned(),
+                "2026-08-01T00:00:07Z".to_owned(),
+            )
+            .await
+            .expect("session drift is a conditional miss")
+            .is_none()
+    );
+    assert!(
+        repositories
+            .freeze_provider_turn_session(
+                "command-a".to_owned(),
+                2,
+                "codex".to_owned(),
+                "codex".to_owned(),
+                "session-a".to_owned(),
+                "2026-08-01T00:00:08Z".to_owned(),
+            )
+            .await
+            .expect("stale attempt is a conditional miss")
+            .is_none()
+    );
+    let frozen = repositories
+        .get_provider_turn_delivery("command-a".to_owned())
+        .await
+        .expect("frozen delivery fetch")
+        .expect("frozen delivery exists");
+    assert_eq!(frozen.provider_session_id.as_deref(), Some("session-a"));
+    assert_eq!(frozen.attempts, 1);
+    assert!(
+        repositories
+            .claim_provider_turn("command-a".to_owned(), "2026-08-01T00:00:05Z".to_owned())
+            .await
+            .expect("second claim")
+            .is_none()
+    );
 }
 
 #[tokio::test]
@@ -604,6 +731,9 @@ async fn conversation_projection_repositories_round_trip_order_and_delete() {
             "metadata": {"width": 800, "height": 600}
         }])),
         is_streaming: false,
+        delivery_state: Some("uncertain".to_owned()),
+        delivery_provider: Some("claudeAgent".to_owned()),
+        delivery_detail: Some("connection lost after write".to_owned()),
         created_at: T1.to_owned(),
         updated_at: T1.to_owned(),
     };

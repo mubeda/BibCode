@@ -15,6 +15,7 @@ use crate::{
         configure_supervised_background_command_wrap,
         supervised::{log_cleanup_failures, terminate_and_wait},
     },
+    production::provider_maintenance::{ProviderMaintenance, ProviderMaintenanceTarget},
     production::provider_runtime::{
         prepare_provider_launch, resolve_provider_executable,
         sanitize_provider_subprocess_environment,
@@ -114,16 +115,18 @@ pub(crate) async fn probe(
     settings: &Value,
     selected: Option<&str>,
     cwd: &Path,
+    maintenance: &ProviderMaintenance,
 ) -> Vec<ProviderProbeResult> {
-    probe_inner(settings, selected, cwd, false).await
+    probe_inner(settings, selected, cwd, false, maintenance).await
 }
 
 pub(crate) async fn probe_full(
     settings: &Value,
     selected: Option<&str>,
     cwd: &Path,
+    maintenance: &ProviderMaintenance,
 ) -> Vec<ProviderProbeResult> {
-    probe_inner(settings, selected, cwd, true).await
+    probe_inner(settings, selected, cwd, true, maintenance).await
 }
 
 async fn probe_inner(
@@ -131,12 +134,25 @@ async fn probe_inner(
     selected: Option<&str>,
     cwd: &Path,
     include_slow_capabilities: bool,
+    maintenance: &ProviderMaintenance,
 ) -> Vec<ProviderProbeResult> {
+    let checks_enabled = settings
+        .get("enableProviderUpdateChecks")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
     futures_util::future::join_all(
         definitions(settings)
             .into_iter()
             .filter(|definition| selected.is_none_or(|id| id == definition.instance_id))
-            .map(|definition| probe_one(definition, cwd, include_slow_capabilities)),
+            .map(|definition| {
+                probe_one(
+                    definition,
+                    cwd,
+                    include_slow_capabilities,
+                    checks_enabled,
+                    maintenance,
+                )
+            }),
     )
     .await
 }
@@ -338,6 +354,48 @@ fn provider_environment(instance: &Value) -> Vec<(OsString, OsString)> {
 
 async fn probe_one(
     definition: ProviderDefinition,
+    cwd: &Path,
+    include_slow_capabilities: bool,
+    checks_enabled: bool,
+    maintenance: &ProviderMaintenance,
+) -> ProviderProbeResult {
+    let target = maintenance_target_from_definition(&definition);
+    let mut result = probe_one_snapshot(&definition, cwd, include_slow_capabilities).await;
+    maintenance
+        .enrich_snapshot(&target, &mut result.snapshot, checks_enabled)
+        .await;
+    result
+}
+
+fn maintenance_target_from_definition(
+    definition: &ProviderDefinition,
+) -> ProviderMaintenanceTarget {
+    ProviderMaintenanceTarget {
+        instance_id: definition.instance_id.clone(),
+        driver: definition.driver.clone(),
+        binary_path: definition.binary_path.clone(),
+        environment: definition.environment.clone(),
+    }
+}
+
+#[allow(dead_code)] // Used by Task 2 before running a provider update command.
+pub(crate) fn maintenance_target(
+    settings: &Value,
+    provider: &str,
+    instance_id: Option<&str>,
+) -> Option<ProviderMaintenanceTarget> {
+    definitions(settings)
+        .into_iter()
+        .find(|definition| {
+            definition.driver == provider
+                && instance_id.is_none_or(|id| id == definition.instance_id)
+        })
+        .as_ref()
+        .map(maintenance_target_from_definition)
+}
+
+async fn probe_one_snapshot(
+    definition: &ProviderDefinition,
     cwd: &Path,
     include_slow_capabilities: bool,
 ) -> ProviderProbeResult {
@@ -1472,6 +1530,9 @@ fn snapshot_owned_message(
     if let Some(message) = message {
         result["message"] = json!(message);
     }
+    if definition.driver == "codex" {
+        result["supportsMcpStatus"] = json!(true);
+    }
     result
 }
 
@@ -1488,17 +1549,42 @@ mod tests {
 
     use axum::{Json, Router, routing::get};
 
+    #[test]
+    fn maintenance_target_rejects_mismatched_instance_driver_pairs() {
+        let settings = json!({
+            "providerInstances": {
+                "configured-codex": {
+                    "driver": "codex",
+                    "config": { "binaryPath": "custom-codex" }
+                }
+            }
+        });
+
+        let target = maintenance_target(&settings, "codex", Some("configured-codex"))
+            .expect("matching provider target");
+        assert_eq!(target.binary_path, "custom-codex");
+        assert!(maintenance_target(&settings, "claudeAgent", Some("configured-codex")).is_none());
+    }
+
     #[tokio::test]
-    async fn quick_disabled_probe_marks_rich_metadata_not_requested() {
+    async fn quick_and_full_disabled_probes_attach_unknown_advisories() {
         let settings = json!({
             "providerInstances": {
                 "codex": { "driver": "codex", "enabled": false, "config": {} }
             }
         });
-        let result = probe(&settings, Some("codex"), Path::new(".")).await;
+        let maintenance = ProviderMaintenance::new();
+        let quick = probe(&settings, Some("codex"), Path::new("."), &maintenance).await;
+        let full = probe_full(&settings, Some("codex"), Path::new("."), &maintenance).await;
 
-        assert_eq!(result[0].rich_metadata, RichMetadataOutcome::NotRequested);
-        assert!(!result[0].snapshot["models"].as_array().unwrap().is_empty());
+        for result in [quick, full] {
+            assert_eq!(result[0].rich_metadata, RichMetadataOutcome::NotRequested);
+            assert!(!result[0].snapshot["models"].as_array().unwrap().is_empty());
+            assert_eq!(result[0].snapshot["versionAdvisory"]["status"], "unknown");
+            assert!(result[0].snapshot["versionAdvisory"]["canUpdate"].is_boolean());
+            assert!(result[0].snapshot["versionAdvisory"]["currentVersion"].is_null());
+            assert!(result[0].snapshot["versionAdvisory"]["latestVersion"].is_null());
+        }
     }
 
     #[test]
@@ -1615,6 +1701,47 @@ mod tests {
         assert_eq!(inventory.len(), 1);
         assert_eq!(inventory[0]["name"], "refactor");
         assert_eq!(inventory[0]["invocation"], "dollar");
+    }
+
+    #[test]
+    fn only_codex_inventory_advertises_mcp_status() {
+        let definitions = definitions(&json!({
+            "providerInstances": {
+                "codex": { "driver": "codex", "enabled": true, "config": {} },
+                "claude": { "driver": "claudeAgent", "enabled": true, "config": {} }
+            }
+        }));
+        let codex = snapshot_owned_message(
+            definitions
+                .iter()
+                .find(|definition| definition.driver == "codex")
+                .expect("Codex definition"),
+            true,
+            None,
+            "ready",
+            json!({ "status": "authenticated" }),
+            Vec::new(),
+            ProviderCapabilities::default(),
+            None,
+            "2026-08-01T00:00:00.000Z".to_owned(),
+        );
+        let claude = snapshot_owned_message(
+            definitions
+                .iter()
+                .find(|definition| definition.driver == "claudeAgent")
+                .expect("Claude definition"),
+            true,
+            None,
+            "ready",
+            json!({ "status": "authenticated" }),
+            Vec::new(),
+            ProviderCapabilities::default(),
+            None,
+            "2026-08-01T00:00:00.000Z".to_owned(),
+        );
+
+        assert_eq!(codex["supportsMcpStatus"], true);
+        assert!(claude.get("supportsMcpStatus").is_none());
     }
 
     #[test]
@@ -1865,9 +1992,10 @@ mod tests {
             }
         });
 
+        let maintenance = ProviderMaintenance::new();
         let result = timeout(
             Duration::from_secs(2),
-            probe_full(&settings, None, Path::new(".")),
+            probe_full(&settings, None, Path::new("."), &maintenance),
         )
         .await;
         server.abort();

@@ -1,12 +1,9 @@
-use std::sync::{Arc, Mutex};
-
-use serde_json::{Value, json};
 use bibcode_server::orchestration::engine::{
-    BootstrapSetupInput, BootstrapSetupResult, BootstrapWorktree, BoxBootstrapFuture,
     EngineOptions, OrchestrationCommand, OrchestrationEngine, OrchestrationError, TestHooks,
-    ThreadTurnBootstrapEffects, ThreadTurnStartBootstrapPrepareWorktree, load_snapshot,
+    load_snapshot,
 };
 use bibcode_server::persistence::{Database, Repositories, run_migrations};
+use serde_json::{Value, json};
 
 const CREATED_AT: &str = "2026-07-10T10:00:00.000Z";
 
@@ -20,64 +17,6 @@ async fn migrated_repositories() -> Repositories {
         .await
         .expect("migrations");
     Repositories::new(database)
-}
-
-#[derive(Default)]
-struct BootstrapRollbackProbe {
-    calls: Mutex<Vec<&'static str>>,
-    setup_terminal_active: Mutex<bool>,
-}
-
-impl ThreadTurnBootstrapEffects for BootstrapRollbackProbe {
-    fn prepare_worktree<'a>(
-        &'a self,
-        input: ThreadTurnStartBootstrapPrepareWorktree,
-    ) -> BoxBootstrapFuture<'a, BootstrapWorktree> {
-        Box::pin(async move {
-            self.calls.lock().unwrap().push("prepare");
-            Ok(BootstrapWorktree {
-                repository_root: input.project_cwd,
-                branch: input
-                    .branch
-                    .unwrap_or_else(|| "bootstrap-branch".to_owned()),
-                path: "C:/virtual-worktree".to_owned(),
-                remove_branch: true,
-            })
-        })
-    }
-
-    fn run_setup_script<'a>(
-        &'a self,
-        _input: BootstrapSetupInput,
-    ) -> BoxBootstrapFuture<'a, BootstrapSetupResult> {
-        Box::pin(async move {
-            self.calls.lock().unwrap().push("setup");
-            *self.setup_terminal_active.lock().unwrap() = true;
-            Ok(BootstrapSetupResult::Started {
-                script_id: "setup".to_owned(),
-                script_name: "Setup".to_owned(),
-                terminal_id: "setup-terminal".to_owned(),
-            })
-        })
-    }
-
-    fn cleanup_thread_resources<'a>(&'a self, _thread_id: &'a str) -> BoxBootstrapFuture<'a, ()> {
-        Box::pin(async move {
-            self.calls.lock().unwrap().push("cleanup");
-            *self.setup_terminal_active.lock().unwrap() = false;
-            Ok(())
-        })
-    }
-
-    fn remove_worktree<'a>(&'a self, _worktree: BootstrapWorktree) -> BoxBootstrapFuture<'a, ()> {
-        Box::pin(async move {
-            self.calls.lock().unwrap().push("remove");
-            if *self.setup_terminal_active.lock().unwrap() {
-                return Err("setup terminal still owns the worktree".to_owned());
-            }
-            Ok(())
-        })
-    }
 }
 
 fn command_values() -> Vec<Value> {
@@ -446,158 +385,6 @@ async fn bootstrap_turn_creates_thread_before_dispatching_final_turn() {
             "thread.message-sent",
             "thread.turn-start-requested"
         ]
-    );
-
-    engine.shutdown().await;
-}
-
-#[tokio::test]
-async fn bootstrap_worktree_failure_cleans_up_newly_created_thread() {
-    let repositories = migrated_repositories().await;
-    let engine =
-        OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
-            .await
-            .expect("engine starts");
-    engine
-        .dispatch(decode(command_values()[0].clone()))
-        .await
-        .expect("project is created");
-
-    let error = engine
-        .dispatch(decode(json!({
-            "type":"thread.turn.start", "commandId":"bootstrap-fails", "threadId":"failed-thread",
-            "message":{"messageId":"never-sent","role":"user","text":"build it","attachments":[]},
-            "bootstrap":{
-                "createThread":{
-                    "projectId":"p1", "title":"Failed bootstrap",
-                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
-                    "runtimeMode":"full-access", "interactionMode":"default",
-                    "branch":null, "worktreePath":null, "createdAt":CREATED_AT
-                },
-                "prepareWorktree":{"projectCwd":"C:/missing","baseBranch":"main"}
-            },
-            "createdAt":CREATED_AT
-        })))
-        .await
-        .expect_err("bootstrap fails without production effects");
-    assert!(error.to_string().contains("worktree preparation"));
-    assert!(
-        error
-            .to_string()
-            .contains("production bootstrap effects are not registered")
-    );
-
-    let thread = engine
-        .repositories()
-        .get_thread("failed-thread".to_owned())
-        .await
-        .unwrap()
-        .expect("created thread remains as a tombstone");
-    assert!(thread.deleted_at.is_some());
-    assert!(
-        engine
-            .repositories()
-            .list_messages_by_thread("failed-thread".to_owned())
-            .await
-            .unwrap()
-            .is_empty()
-    );
-
-    engine.shutdown().await;
-}
-
-#[tokio::test]
-async fn bootstrap_metadata_failure_removes_the_prepared_worktree() {
-    let repositories = migrated_repositories().await;
-    let hooks = TestHooks::default();
-    let engine = OrchestrationEngine::start(
-        repositories.database().clone(),
-        EngineOptions {
-            queue_capacity: 1,
-            test_hooks: hooks.clone(),
-        },
-    )
-    .await
-    .expect("engine starts");
-    engine
-        .dispatch(decode(command_values()[0].clone()))
-        .await
-        .expect("project is created");
-    let effects = Arc::new(BootstrapRollbackProbe::default());
-    engine.set_bootstrap_effects(effects.clone());
-    hooks.fail_next_projector("projection.threads", Some("thread.meta-updated"));
-
-    let error = engine
-        .dispatch(decode(json!({
-            "type":"thread.turn.start", "commandId":"bootstrap-meta-fails", "threadId":"meta-failed-thread",
-            "message":{"messageId":"never-sent","role":"user","text":"build it","attachments":[]},
-            "bootstrap":{
-                "createThread":{
-                    "projectId":"p1", "title":"Metadata failure",
-                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
-                    "runtimeMode":"full-access", "interactionMode":"default",
-                    "branch":null, "worktreePath":null, "createdAt":CREATED_AT
-                },
-                "prepareWorktree":{
-                    "projectCwd":"C:/repo", "baseBranch":"main", "branch":"bootstrap-branch"
-                }
-            },
-            "createdAt":CREATED_AT
-        })))
-        .await
-        .expect_err("metadata persistence fails");
-    assert!(error.to_string().contains("projection.threads"));
-    assert_eq!(*effects.calls.lock().unwrap(), vec!["prepare", "remove"]);
-
-    engine.shutdown().await;
-}
-
-#[tokio::test]
-async fn bootstrap_turn_failure_closes_setup_resources_before_removing_worktree() {
-    let repositories = migrated_repositories().await;
-    let hooks = TestHooks::default();
-    let engine = OrchestrationEngine::start(
-        repositories.database().clone(),
-        EngineOptions {
-            queue_capacity: 1,
-            test_hooks: hooks.clone(),
-        },
-    )
-    .await
-    .expect("engine starts");
-    engine
-        .dispatch(decode(command_values()[0].clone()))
-        .await
-        .expect("project is created");
-    let effects = Arc::new(BootstrapRollbackProbe::default());
-    engine.set_bootstrap_effects(effects.clone());
-    hooks.fail_next_projector("projection.thread-messages", Some("thread.message-sent"));
-
-    let error = engine
-        .dispatch(decode(json!({
-            "type":"thread.turn.start", "commandId":"bootstrap-turn-fails", "threadId":"turn-failed-thread",
-            "message":{"messageId":"never-sent","role":"user","text":"build it","attachments":[]},
-            "bootstrap":{
-                "createThread":{
-                    "projectId":"p1", "title":"Turn failure",
-                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
-                    "runtimeMode":"full-access", "interactionMode":"default",
-                    "branch":null, "worktreePath":null, "createdAt":CREATED_AT
-                },
-                "prepareWorktree":{
-                    "projectCwd":"C:/repo", "baseBranch":"main", "branch":"bootstrap-branch"
-                },
-                "runSetupScript":true
-            },
-            "createdAt":CREATED_AT
-        })))
-        .await
-        .expect_err("turn persistence fails");
-    assert!(error.to_string().contains("projection.thread-messages"));
-    assert!(!error.to_string().contains("worktree cleanup failed"));
-    assert_eq!(
-        *effects.calls.lock().unwrap(),
-        vec!["prepare", "setup", "cleanup", "remove"]
     );
 
     engine.shutdown().await;

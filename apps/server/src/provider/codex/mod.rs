@@ -1,5 +1,6 @@
 pub(crate) mod activity;
 pub mod home;
+pub(crate) mod mcp_status;
 pub mod model;
 pub mod protocol;
 pub mod runtime;

@@ -258,9 +258,6 @@ vi.mock("./ComposerCommandMenu", () => ({
 vi.mock("./ComposerPendingApprovalActions", () => ({
   ComposerPendingApprovalActions: h.mk("ComposerPendingApprovalActions"),
 }));
-vi.mock("./CompactComposerControlsMenu", () => ({
-  CompactComposerControlsMenu: h.mk("CompactComposerControlsMenu"),
-}));
 vi.mock("./ComposerPrimaryActions", () => ({
   ComposerPrimaryActions: h.mk("ComposerPrimaryActions"),
 }));
@@ -283,6 +280,10 @@ vi.mock("./ComposerPreviewAnnotationCards", () => ({
   ComposerPreviewAnnotationCards: h.mk("ComposerPreviewAnnotationCards"),
 }));
 vi.mock("./ContextWindowMeter", () => ({ ContextWindowMeter: h.mk("ContextWindowMeter") }));
+vi.mock("./McpStatusPopover", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./McpStatusPopover")>()),
+  McpStatusPopover: h.mk("McpStatusPopover"),
+}));
 
 // ---------------------------------------------------------------------------
 // State hooks and heavy state modules.
@@ -307,7 +308,11 @@ vi.mock("../../state/threads", () => ({
 }));
 
 import { type ChatComposerHandle, type ChatComposerProps, ChatComposer } from "./ChatComposer";
-import { type ComposerImageAttachment, useComposerDraftStore } from "../../composerDraftStore";
+import {
+  type ComposerFileAttachment,
+  type ComposerImageAttachment,
+  useComposerDraftStore,
+} from "../../composerDraftStore";
 import {
   INLINE_TERMINAL_CONTEXT_PLACEHOLDER,
   type TerminalContextDraft,
@@ -376,6 +381,7 @@ function runAnimationFrames(): void {
 }
 
 let fileReaderShouldFail = false;
+const fileReaderDelayByName = new Map<string, number>();
 class FakeFileReader {
   result: string | null = null;
   error: Error | null = null;
@@ -384,13 +390,21 @@ class FakeFileReader {
     (this.listeners[type] ??= []).push(listener);
   }
   readAsDataURL(file: { type?: string; name?: string }): void {
-    if (fileReaderShouldFail) {
-      this.error = new Error("read failed");
-      for (const listener of this.listeners["error"] ?? []) listener();
-      return;
+    const complete = () => {
+      if (fileReaderShouldFail) {
+        this.error = new Error("read failed");
+        for (const listener of this.listeners["error"] ?? []) listener();
+        return;
+      }
+      this.result = `data:${file.type ?? "application/octet-stream"};base64,${file.name ?? ""}`;
+      for (const listener of this.listeners["load"] ?? []) listener();
+    };
+    const delay = fileReaderDelayByName.get(file.name ?? "") ?? 0;
+    if (delay > 0) {
+      setTimeout(complete, delay);
+    } else {
+      complete();
     }
-    this.result = `data:${file.type ?? "application/octet-stream"};base64,${file.name ?? ""}`;
-    for (const listener of this.listeners["load"] ?? []) listener();
   }
 }
 
@@ -621,6 +635,18 @@ function makeImage(overrides: Partial<ComposerImageAttachment> = {}): ComposerIm
   };
 }
 
+function makeFile(overrides: Partial<ComposerFileAttachment> = {}): ComposerFileAttachment {
+  return {
+    type: "file",
+    id: "file-1",
+    name: "notes.txt",
+    mimeType: "text/plain",
+    sizeBytes: 4,
+    file: new File(["note"], "notes.txt", { type: "text/plain" }),
+    ...overrides,
+  };
+}
+
 function makeTerminalContext(id: string, text = "npm test output"): TerminalContextDraft {
   return {
     id,
@@ -769,7 +795,7 @@ function renderComposer(overrides: Partial<ChatComposerProps> = {}): RenderResul
     terminalOpen: false,
     gitCwd: "/repo",
     promptRef: { current: "" },
-    composerImagesRef: { current: [] },
+    composerAttachmentsRef: { current: [] },
     composerTerminalContextsRef: { current: [] },
     composerElementContextsRef: { current: [] },
     composerRef,
@@ -885,6 +911,7 @@ beforeEach(() => {
   rafCallbacks.length = 0;
   documentStub.activeElement = null;
   fileReaderShouldFail = false;
+  fileReaderDelayByName.clear();
   resettableComposerStore.setState({ ...pristineComposerState }, true);
   Object.assign(resettableComposerStore.getInitialState(), pristineComposerState);
   vi.stubGlobal("window", windowStub);
@@ -933,6 +960,60 @@ describe("ChatComposer rendering", () => {
     const pathSearch = findCapture("useComposerPathSearch")["target"] as Record<string, unknown>;
     expect(pathSearch["cwd"]).toBeNull();
     expect(pathSearch["query"]).toBeNull();
+  });
+
+  it("shows MCP status only for the selected supported provider instance", () => {
+    const activeThreadActivities = [
+      {
+        id: "activity-mcp" as Thread["activities"][number]["id"],
+        tone: "info",
+        kind: "provider-event",
+        summary: "mcp.status.updated",
+        payload: {
+          providerInstanceId: "codex",
+          servers: [{ name: "context7", state: "connected" }],
+        },
+        turnId: null,
+        createdAt: now,
+      },
+    ] as Thread["activities"];
+
+    renderComposer({
+      providerStatuses: [{ ...codexProvider, supportsMcpStatus: true }],
+      activeThreadActivities,
+    });
+
+    expect(findCapture("McpStatusPopover")["snapshot"]).toEqual({
+      servers: [{ name: "context7", state: "connected", detail: null }],
+    });
+
+    h.captures.length = 0;
+    const personalInstanceId = ProviderInstanceId.make("codex_personal");
+    renderComposer({
+      providerStatuses: [
+        { ...codexProvider, supportsMcpStatus: true },
+        { ...codexProvider, instanceId: personalInstanceId, supportsMcpStatus: true },
+      ],
+      activeProjectDefaultModelSelection: { instanceId: personalInstanceId, model: "gpt-5.4" },
+      activeThreadActivities: [
+        ...activeThreadActivities,
+        {
+          ...activeThreadActivities[0]!,
+          id: "activity-mcp-personal" as Thread["activities"][number]["id"],
+          payload: {
+            providerInstanceId: "codex_personal",
+            servers: [{ name: "personal-server", state: "starting" }],
+          },
+        },
+      ],
+    });
+    expect(findCapture("McpStatusPopover")["snapshot"]).toEqual({
+      servers: [{ name: "personal-server", state: "starting", detail: null }],
+    });
+
+    h.captures.length = 0;
+    renderComposer({ providerStatuses: [codexProvider], activeThreadActivities });
+    expect(filterCaptures("McpStatusPopover")).toEqual([]);
   });
 
   it("locks the provider picker to the active instance after the provider is fixed", () => {
@@ -1012,7 +1093,7 @@ describe("ChatComposer rendering", () => {
 
   it("shows the disconnected placeholder", () => {
     const { markup } = renderComposer({ phase: "disconnected" });
-    expect(markup).toContain('data-placeholder="Ask for follow-up changes or attach images"');
+    expect(markup).toContain('data-placeholder="Ask for follow-up changes or attach files"');
   });
 
   it("renders the approval header, empties the editor, and swaps the footer", () => {
@@ -1031,6 +1112,12 @@ describe("ChatComposer rendering", () => {
 
     const actions = findCapture("ComposerPendingApprovalActions");
     expect(actions["isResponding"]).toBe(true);
+    expect(captureByLabel("Button", "Attach files")["disabled"]).toBe(true);
+    const picker = findHost(
+      (element) => element.type === "input" && element.props["type"] === "file",
+    ).props;
+    expect(picker["hidden"]).toBe(true);
+    expect(picker["disabled"]).toBe(true);
   });
 
   it("falls back to the generic approval placeholder without a detail", () => {
@@ -1055,6 +1142,7 @@ describe("ChatComposer rendering", () => {
     );
     // Terminal contexts are suppressed while questions are pending.
     expect(editorProps()["terminalContexts"]).toEqual([]);
+    expect(captureByLabel("Button", "Attach files")["disabled"]).toBe(true);
   });
 
   it("renders the plan follow-up banner with the extracted plan title", () => {
@@ -1080,47 +1168,103 @@ describe("ChatComposer rendering", () => {
     expect(spies.togglePlanSidebar).toHaveBeenCalledTimes(1);
   });
 
-  it("forwards runtime mode and interaction mode changes", () => {
-    const { spies } = renderComposer();
+  it("renders the folded-map Plan toggle without Build UI", () => {
+    const { markup, spies } = renderComposer();
+
+    expect(markup).not.toContain(">Build<");
+    const toggle = captureByLabel("Button", "Enable plan mode");
+    (toggle["onClick"] as () => void)();
+    expect(spies.toggleInteractionMode).toHaveBeenCalledOnce();
+
+    renderComposer({ interactionMode: "plan" });
+    const activePlan = captureByLabel("Button", "Disable plan mode");
+    expect(activePlan["aria-pressed"]).toBe(true);
+    expect(activePlan["variant"]).toBe("default");
+  });
+
+  it("keeps runtime controls icon-only at compact and regular widths", () => {
+    const { spies } = renderComposer({ runtimeMode: "auto-accept-edits" });
+
+    const runtimeTrigger = captureByLabel("SelectTrigger", "Auto-accept edits");
+    expect(runtimeTrigger["className"]).toContain("bg-primary");
+    expect(filterCaptures("SelectValue")).toHaveLength(0);
 
     const select = findCapture("Select");
     (select["onValueChange"] as (value: string) => void)("full-access");
     expect(spies.handleRuntimeModeChange).toHaveBeenCalledWith("full-access");
 
-    const toggle = captureByLabel("Button", "Default mode — click to enter plan mode");
-    (toggle["onClick"] as () => void)();
-    expect(spies.toggleInteractionMode).toHaveBeenCalledTimes(1);
-  });
-
-  it("labels the interaction toggle for plan mode and hides it when disabled", () => {
-    const { markup } = renderComposer({ interactionMode: "plan" });
-    expect(markup).toContain("Plan mode — click to return to normal build mode");
-
     const hidden = renderComposer({
       providerStatuses: [{ ...codexProvider, showInteractionModeToggle: false }],
     });
-    expect(hidden.markup).not.toContain("Default mode — click to enter plan mode");
+    expect(hidden.markup).not.toContain("Enable plan mode");
+    const unavailablePlan = findCapture("Button", (props) =>
+      String(props["aria-label"]).startsWith("Plan mode is not supported"),
+    );
+    expect(unavailablePlan["aria-disabled"]).toBe(true);
+    (unavailablePlan["onClick"] as () => void)();
+    expect(hidden.spies.toggleInteractionMode).not.toHaveBeenCalled();
   });
 
-  it("renders the compact footer controls when the footer is compact", () => {
+  it("keeps mode controls left and send actions fixed when the footer is compact", () => {
     h.stateSeeds.set(STATE.footerCompact, true);
     h.stateSeeds.set(STATE.primaryActionsCompact, true);
     const { markup, spies } = renderComposer({ planSidebarOpen: true });
 
-    expect(markup).toContain('data-mock="CompactComposerControlsMenu"');
     expect(markup).toContain('data-chat-composer-footer-compact="true"');
-    const compact = findCapture("CompactComposerControlsMenu");
-    (compact["onToggleInteractionMode"] as () => void)();
+    expect(markup).toContain('data-chat-composer-actions="right"');
+    const toggle = captureByLabel("Button", "Enable plan mode");
+    (toggle["onClick"] as () => void)();
     expect(spies.toggleInteractionMode).toHaveBeenCalledTimes(1);
 
     const primary = findCapture("ComposerPrimaryActions");
     expect(primary["compact"]).toBe(true);
   });
 
-  it("renders the context window meter when activities carry usage", () => {
-    // deriveLatestContextWindowSnapshot(): no usable activity -> no meter.
-    const { markup } = renderComposer({ activeThreadActivities: undefined });
-    expect(markup).not.toContain('data-mock="ContextWindowMeter"');
+  it("orders measured context and MCP between paperclip and primary actions", () => {
+    const activities = [
+      {
+        id: "activity-context" as Thread["activities"][number]["id"],
+        tone: "info",
+        kind: "context-window.updated",
+        summary: "context.window.updated",
+        payload: { usedTokens: 50, maxTokens: 100 },
+        turnId: null,
+        createdAt: now,
+      },
+      {
+        id: "activity-mcp" as Thread["activities"][number]["id"],
+        tone: "info",
+        kind: "provider-event",
+        summary: "mcp.status.updated",
+        payload: { providerInstanceId: "codex", servers: [] },
+        turnId: null,
+        createdAt: now,
+      },
+    ] as Thread["activities"];
+
+    renderComposer({
+      providerStatuses: [{ ...codexProvider, supportsMcpStatus: true }],
+      activeThreadActivities: activities,
+    });
+
+    expect(findCapture("ContextWindowMeter")["usage"]).toMatchObject({
+      usedTokens: 50,
+      maxTokens: 100,
+      usedPercentage: 50,
+    });
+    const attachmentIndex = h.captures.findIndex(
+      (capture) => capture.name === "Button" && capture.props["aria-label"] === "Attach files",
+    );
+    const contextIndex = h.captures.findIndex((capture) => capture.name === "ContextWindowMeter");
+    const mcpIndex = h.captures.findIndex((capture) => capture.name === "McpStatusPopover");
+    const primaryIndex = h.captures.findIndex(
+      (capture) => capture.name === "ComposerPrimaryActions",
+    );
+
+    expect(attachmentIndex).toBeGreaterThanOrEqual(0);
+    expect(attachmentIndex).toBeLessThan(contextIndex);
+    expect(contextIndex).toBeLessThan(mcpIndex);
+    expect(mcpIndex).toBeLessThan(primaryIndex);
   });
 
   it("shows the preparing worktree hint", () => {
@@ -1145,16 +1289,47 @@ describe("ChatComposer rendering", () => {
 // ---------------------------------------------------------------------------
 
 describe("ChatComposer attachments", () => {
+  it("selects mixed attachments through the paperclip picker", () => {
+    const { markup } = renderComposer();
+    const picker = captureByLabel("Button", "Attach files");
+    const input = findHost(
+      (element) => element.type === "input" && element.props["type"] === "file",
+    ).props;
+    const image = new File(["png"], "shot.png", { type: "image/png" });
+    const file = new File(["note"], "notes.txt", { type: "text/plain" });
+
+    (picker["onClick"] as () => void)();
+    (input["onChange"] as (event: unknown) => void)({
+      currentTarget: { files: [image, file], value: "picked" },
+    });
+
+    expect(draftOf(threadRef)?.attachments.map((attachment) => attachment.type)).toEqual([
+      "image",
+      "file",
+    ]);
+    expect(markup).toContain('aria-label="Attach files"');
+  });
+
+  it("renders a file chip without an image preview", () => {
+    draftStore().addAttachment(threadRef, makeFile());
+    const { markup } = renderComposer();
+
+    expect(markup).toContain("notes.txt");
+    expect(markup).toContain("4 B");
+    expect(markup).toContain('aria-label="Remove notes.txt"');
+    expect(markup).not.toContain('aria-label="Preview notes.txt"');
+  });
+
   it("renders image previews, remove buttons, and non-persisted warnings", async () => {
     const withPreview = makeImage({ id: "img-a", name: "shot.png" });
     const withoutPreview = makeImage({ id: "img-b", name: "plain.png", previewUrl: "" });
-    draftStore().addImages(threadRef, [withPreview, withoutPreview]);
+    draftStore().addAttachments(threadRef, [withPreview, withoutPreview]);
     useComposerDraftStore.setState((state) => ({
       draftsByThreadKey: {
         ...state.draftsByThreadKey,
         [threadKey]: {
           ...state.draftsByThreadKey[threadKey]!,
-          nonPersistedImageIds: ["img-a"],
+          nonPersistedAttachmentIds: ["img-a"],
         },
       },
     }));
@@ -1177,20 +1352,21 @@ describe("ChatComposer attachments", () => {
     // Remove click deletes the image from the draft store.
     const removeButton = captureByLabel("Button", "Remove shot.png");
     (removeButton["onClick"] as () => void)();
-    expect(draftOf(threadRef)?.images.map((image) => image.id)).toEqual(["img-b"]);
+    expect(draftOf(threadRef)?.attachments.map((attachment) => attachment.id)).toEqual(["img-b"]);
 
     // The persist effect staged data urls through the FileReader stub; the
     // store's verification pass then strips them again because nothing ever
     // reaches localStorage in this environment, marking images non-persisted.
     expect(draftOf(threadRef)?.persistedAttachments).toEqual([]);
-    expect(draftOf(threadRef)?.nonPersistedImageIds).toEqual(["img-b"]);
+    expect(draftOf(threadRef)?.nonPersistedAttachmentIds).toEqual(["img-b"]);
   });
 
   it("restages existing persisted attachments when reading a file fails", async () => {
     const image = makeImage({ id: "img-keep" });
-    draftStore().addImages(threadRef, [image]);
+    draftStore().addAttachments(threadRef, [image]);
     draftStore().syncPersistedAttachments(threadRef, [
       {
+        type: "image",
         id: "img-keep",
         name: image.name,
         mimeType: image.mimeType,
@@ -1206,9 +1382,31 @@ describe("ChatComposer attachments", () => {
     // The read failure falls back to the previously staged attachment; the
     // storage verification pass then reports it as non-persisted (no real
     // localStorage here), so the image survives while the staging is cleared.
-    expect(draftOf(threadRef)?.images.map((entry) => entry.id)).toEqual(["img-keep"]);
+    expect(draftOf(threadRef)?.attachments.map((entry) => entry.id)).toEqual(["img-keep"]);
     expect(draftOf(threadRef)?.persistedAttachments).toEqual([]);
-    expect(draftOf(threadRef)?.nonPersistedImageIds).toEqual(["img-keep"]);
+    expect(draftOf(threadRef)?.nonPersistedAttachmentIds).toEqual(["img-keep"]);
+  });
+
+  it("persists mixed attachments in draft order when reads resolve out of order", async () => {
+    const image = makeImage({ id: "slow-image", name: "slow.png" });
+    const file = makeFile({ id: "fast-file", name: "fast.txt" });
+    draftStore().addAttachments(threadRef, [image, file]);
+    fileReaderDelayByName.set("slow.png", 10);
+    const syncPersistedAttachments = vi.spyOn(draftStore(), "syncPersistedAttachments");
+
+    renderComposer();
+    await new Promise((resolve) => setTimeout(resolve, 20));
+
+    expect(syncPersistedAttachments).toHaveBeenCalledWith(
+      threadRef,
+      expect.arrayContaining([
+        expect.objectContaining({ name: "slow.png" }),
+        expect.objectContaining({ name: "fast.txt" }),
+      ]),
+    );
+    expect(
+      syncPersistedAttachments.mock.calls.at(-1)?.[1]?.map((attachment) => attachment.name),
+    ).toEqual(["slow.png", "fast.txt"]);
   });
 
   it("renders element contexts, review comments, and preview annotations with working removal", () => {
@@ -1250,7 +1448,7 @@ describe("ChatComposer attachments", () => {
   });
 
   it("expands the image attached to a preview annotation", () => {
-    draftStore().addImages(threadRef, [makeImage({ id: "ann-image" })]);
+    draftStore().addAttachments(threadRef, [makeImage({ id: "ann-image" })]);
     draftStore().setPreviewAnnotations(threadRef, [
       {
         id: "ann-image",
@@ -1897,8 +2095,10 @@ describe("ChatComposer paste and drag", () => {
     expect(
       (event as unknown as { preventDefault: ReturnType<typeof vi.fn> }).preventDefault,
     ).toHaveBeenCalled();
-    expect(draftOf(threadRef)?.images).toHaveLength(1);
-    expect(draftOf(threadRef)?.images[0]?.previewUrl).toContain("blob:generated-");
+    expect(draftOf(threadRef)?.attachments).toHaveLength(1);
+    expect(draftOf(threadRef)?.attachments[0]).toMatchObject({
+      previewUrl: expect.stringContaining("blob:generated-"),
+    });
     expect(spies.setThreadError).toHaveBeenCalledWith(threadId, null);
   });
 
@@ -1908,10 +2108,13 @@ describe("ChatComposer paste and drag", () => {
 
     onPaste(pasteEvent([imageFile("a.png"), imageFile("b.png")]));
 
-    expect(draftOf(threadRef)?.images.map((image) => image.name)).toEqual(["a.png", "b.png"]);
+    expect(draftOf(threadRef)?.attachments.map((attachment) => attachment.name)).toEqual([
+      "a.png",
+      "b.png",
+    ]);
   });
 
-  it("ignores pastes without image files", () => {
+  it("adds non-image files from paste", () => {
     renderComposer();
     const onPaste = editorProps()["onPaste"] as (event: unknown) => void;
 
@@ -1920,13 +2123,15 @@ describe("ChatComposer paste and drag", () => {
     const textOnly = pasteEvent([new File(["x"], "notes.txt", { type: "text/plain" })]);
     onPaste(textOnly);
 
-    expect(draftOf(threadRef)?.images ?? []).toEqual([]);
+    expect(draftOf(threadRef)?.attachments.map((attachment) => attachment.name)).toEqual([
+      "notes.txt",
+    ]);
     expect(
       (textOnly as unknown as { preventDefault: ReturnType<typeof vi.fn> }).preventDefault,
-    ).not.toHaveBeenCalled();
+    ).toHaveBeenCalled();
   });
 
-  it("rejects images while plan questions are pending", () => {
+  it("rejects attachments while plan questions are pending", () => {
     renderComposer({
       pendingUserInputs: [makePendingUserInput()],
       activePendingProgress: makePendingProgress(),
@@ -1937,9 +2142,9 @@ describe("ChatComposer paste and drag", () => {
 
     expect(h.toastAdd).toHaveBeenCalledWith({
       type: "error",
-      title: "Attach images after answering plan questions.",
+      title: "Attach files after answering plan questions.",
     });
-    expect(draftOf(threadRef)?.images ?? []).toEqual([]);
+    expect(draftOf(threadRef)?.attachments ?? []).toEqual([]);
   });
 
   it("does nothing without an active thread", () => {
@@ -1948,22 +2153,24 @@ describe("ChatComposer paste and drag", () => {
 
     onPaste(pasteEvent([imageFile()]));
 
-    expect(draftOf(threadRef)?.images ?? []).toEqual([]);
+    expect(draftOf(threadRef)?.attachments ?? []).toEqual([]);
   });
 
-  it("reports unsupported types, oversized files, and the attachment cap on drop", () => {
-    const preloaded = Array.from({ length: PROVIDER_SEND_TURN_MAX_ATTACHMENTS }, () => makeImage());
-    const { spies, props } = renderComposer({
-      composerImagesRef: { current: [] },
+  it("reports empty, oversized, and excess attachments on drop", () => {
+    const preloaded = Array.from({ length: PROVIDER_SEND_TURN_MAX_ATTACHMENTS }, (_, index) =>
+      makeImage({ id: `preloaded-${index}`, name: `preloaded-${index}.png` }),
+    );
+    const { spies } = renderComposer({
+      composerAttachmentsRef: { current: [] },
     });
     const dropHost = findHost((element) => typeof element.props["onDrop"] === "function");
     const onDrop = dropHost.props["onDrop"] as (event: unknown) => void;
 
-    // Unsupported type.
-    onDrop(dragEvent({ files: [new File(["x"], "notes.txt", { type: "text/plain" })] }));
+    // Empty file.
+    onDrop(dragEvent({ files: [new File([], "empty.txt", { type: "text/plain" })] }));
     expect(spies.setThreadError).toHaveBeenLastCalledWith(
       threadId,
-      "Unsupported file type for 'notes.txt'. Please attach image files only.",
+      "'empty.txt' is empty and cannot be attached.",
     );
 
     // Oversized image.
@@ -1976,14 +2183,61 @@ describe("ChatComposer paste and drag", () => {
     expect(String(spies.setThreadError.mock.calls.at(-1)?.[1])).toContain("exceeds the");
 
     // Attachment cap.
-    props.composerImagesRef.current = preloaded;
+    draftStore().addAttachments(threadRef, preloaded);
     onDrop(dragEvent({ files: [imageFile("over.png")] }));
     expect(spies.setThreadError).toHaveBeenLastCalledWith(
       threadId,
-      `You can attach up to ${PROVIDER_SEND_TURN_MAX_ATTACHMENTS} images per message.`,
+      "'over.png' cannot be attached: you can attach up to 8 files per message.",
     );
 
     expect(spies.focusComposer).toHaveBeenCalledTimes(3);
+  });
+
+  it("keeps the first validation error from a mixed invalid drop", () => {
+    const { spies } = renderComposer();
+    const onDrop = findHost((element) => typeof element.props["onDrop"] === "function").props[
+      "onDrop"
+    ] as (event: unknown) => void;
+    const oversized = {
+      name: "large.bin",
+      type: "application/octet-stream",
+      size: PROVIDER_SEND_TURN_MAX_IMAGE_BYTES + 1,
+    } as unknown as File;
+
+    onDrop(
+      dragEvent({
+        files: [new File([], "empty.txt", { type: "text/plain" }), oversized],
+      }),
+    );
+
+    expect(spies.setThreadError).toHaveBeenLastCalledWith(
+      threadId,
+      "'empty.txt' is empty and cannot be attached.",
+    );
+  });
+
+  it("reports the earliest rejected input across capacity and validation failures", () => {
+    draftStore().addAttachments(
+      threadRef,
+      Array.from({ length: PROVIDER_SEND_TURN_MAX_ATTACHMENTS }, (_, index) =>
+        makeImage({ id: `preloaded-${index}`, name: `preloaded-${index}.png` }),
+      ),
+    );
+    const { spies } = renderComposer();
+    const onDrop = findHost((element) => typeof element.props["onDrop"] === "function").props[
+      "onDrop"
+    ] as (event: unknown) => void;
+
+    onDrop(
+      dragEvent({
+        files: [imageFile("valid.png"), new File([], "empty.txt", { type: "text/plain" })],
+      }),
+    );
+
+    expect(spies.setThreadError).toHaveBeenLastCalledWith(
+      threadId,
+      "'valid.png' cannot be attached: you can attach up to 8 files per message.",
+    );
   });
 
   it("tracks drag enter, over, leave, and drop", () => {
@@ -2027,7 +2281,9 @@ describe("ChatComposer paste and drag", () => {
 
     const drop = dragEvent({ files: [imageFile("dropped.png")] });
     onDrop(drop);
-    expect(draftOf(threadRef)?.images.map((image) => image.name)).toEqual(["dropped.png"]);
+    expect(draftOf(threadRef)?.attachments.map((attachment) => attachment.name)).toEqual([
+      "dropped.png",
+    ]);
   });
 
   it("renders the drag-over styling when a drag is active", () => {
@@ -2257,7 +2513,7 @@ describe("ChatComposer imperative handle", () => {
     expect(context.selectedModel).toBe("gpt-5.4");
     expect(context.selectedModelSelection.instanceId).toBe(codexInstanceId);
     expect(context.reviewComments.map((comment) => comment.id)).toEqual(["rc-ctx"]);
-    expect(context.images).toEqual([]);
+    expect(context.attachments).toEqual([]);
     expect(context.selectedProviderModels.map((model) => model.slug)).toEqual(["gpt-5.4"]);
   });
 });
@@ -2525,6 +2781,7 @@ describe("ChatComposer effects", () => {
   it("clears persisted attachments when the draft has no images", async () => {
     draftStore().syncPersistedAttachments(threadRef, [
       {
+        type: "image",
         id: "stale",
         name: "stale.png",
         mimeType: "image/png",
