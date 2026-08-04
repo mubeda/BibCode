@@ -11,6 +11,7 @@ import {
 describe("hostedPairing", () => {
   afterEach(() => {
     vi.unstubAllEnvs();
+    vi.unstubAllGlobals();
   });
 
   it("reads hosted pairing host and query token parameters", () => {
@@ -78,6 +79,15 @@ describe("hostedPairing", () => {
 
     vi.stubEnv("VITE_HTTP_URL", "https://backend.example.com");
     expect(isHostedStaticApp(new URL("https://preview.example.test/"))).toBe(false);
+  });
+
+  it("does not classify a desktop bridge host as the hosted static app", () => {
+    vi.stubEnv("VITE_HOSTED_APP_URL", "http://tauri.localhost");
+    vi.stubEnv("VITE_HTTP_URL", "");
+    vi.stubEnv("VITE_WS_URL", "");
+    vi.stubGlobal("window", { desktopBridge: {} });
+
+    expect(isHostedStaticApp(new URL("http://tauri.localhost/"))).toBe(false);
   });
 
   it("detects hosted channel aliases as static apps", () => {

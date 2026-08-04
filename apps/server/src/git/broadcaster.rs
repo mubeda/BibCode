@@ -1,11 +1,15 @@
 use std::{
     collections::HashMap,
+    future::pending,
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
     time::Duration,
 };
 
-use tokio::sync::mpsc;
+use tokio::{
+    sync::{mpsc, watch},
+    time::Instant,
+};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -21,10 +25,14 @@ pub struct StatusBroadcaster {
 struct Inner {
     repository: Arc<GitRepository>,
     ref_refresh_interval: Duration,
-    status_refresh_interval: Duration,
+    local_status_refresh_interval: Duration,
+    automatic_remote_refresh_interval: watch::Sender<Duration>,
     subscriber_capacity: usize,
     state: Mutex<State>,
 }
+
+const REMOTE_FAILURE_BACKOFF_INITIAL: Duration = Duration::from_secs(30);
+const REMOTE_FAILURE_BACKOFF_MAX: Duration = Duration::from_secs(15 * 60);
 
 #[derive(Default)]
 struct State {
@@ -69,11 +77,30 @@ impl StatusBroadcaster {
         status_refresh_interval: Duration,
         subscriber_capacity: usize,
     ) -> Self {
+        let (automatic_remote_refresh_interval, _) = watch::channel(status_refresh_interval);
+        Self::with_automatic_remote_refresh_interval(
+            repository,
+            ref_refresh_interval,
+            status_refresh_interval,
+            automatic_remote_refresh_interval,
+            subscriber_capacity,
+        )
+    }
+
+    #[must_use]
+    pub fn with_automatic_remote_refresh_interval(
+        repository: Arc<GitRepository>,
+        ref_refresh_interval: Duration,
+        local_status_refresh_interval: Duration,
+        automatic_remote_refresh_interval: watch::Sender<Duration>,
+        subscriber_capacity: usize,
+    ) -> Self {
         Self {
             inner: Arc::new(Inner {
                 repository,
                 ref_refresh_interval,
-                status_refresh_interval,
+                local_status_refresh_interval,
+                automatic_remote_refresh_interval,
                 subscriber_capacity: subscriber_capacity.max(1),
                 state: Mutex::new(State::default()),
             }),
@@ -197,6 +224,39 @@ impl StatusBroadcaster {
         Ok(())
     }
 
+    async fn refresh_remote(
+        &self,
+        cwd: &Path,
+        cancellation: &CancellationToken,
+        fetch: bool,
+    ) -> Result<(), GitCommandError> {
+        let remote = if fetch {
+            self.inner
+                .repository
+                .refresh_remote_status(cwd, cancellation)
+                .await?
+        } else {
+            self.inner
+                .repository
+                .remote_status(cwd, cancellation)
+                .await?
+        };
+        let mut state = self.lock_state();
+        let Some(entry) = state.repositories.get_mut(cwd) else {
+            return Ok(());
+        };
+        if entry.remote.as_ref() != Some(&remote) {
+            entry.remote = Some(remote.clone());
+            publish(entry, VcsStatusStreamEvent::RemoteUpdated { remote });
+        }
+        if entry.subscribers.is_empty()
+            && let Some(entry) = state.repositories.remove(cwd)
+        {
+            entry.poller_cancellation.cancel();
+        }
+        Ok(())
+    }
+
     pub async fn refresh_status(
         &self,
         cwd: &Path,
@@ -236,37 +296,44 @@ impl StatusBroadcaster {
         let broadcaster = self.clone();
         tokio::spawn(async move {
             let mut ref_interval = tokio::time::interval(broadcaster.inner.ref_refresh_interval);
-            ref_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            let mut status_interval =
-                tokio::time::interval(broadcaster.inner.status_refresh_interval);
-            status_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            ref_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut local_status_interval =
+                tokio::time::interval(broadcaster.inner.local_status_refresh_interval);
+            local_status_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            let mut automatic_remote_refresh_interval = broadcaster
+                .inner
+                .automatic_remote_refresh_interval
+                .subscribe();
+            let configured_interval = *automatic_remote_refresh_interval.borrow_and_update();
+            let mut next_remote_fetch =
+                (!configured_interval.is_zero()).then(|| Instant::now() + configured_interval);
+            let mut failure_backoff = Duration::ZERO;
+            let _ = broadcaster.refresh_remote(&cwd, &cancellation, false).await;
             loop {
                 tokio::select! {
                     _ = cancellation.cancelled() => break,
-                    _ = status_interval.tick() => {
+                    _ = local_status_interval.tick() => {
                         let _ = broadcaster.refresh_local(&cwd, &cancellation).await;
-                        let result = broadcaster
-                            .inner
-                            .repository
-                            .refresh_remote_status(&cwd, &cancellation)
-                            .await;
-                        if let Ok(remote) = result {
-                            let mut state = broadcaster.lock_state();
-                            let Some(entry) = state.repositories.get_mut(&cwd) else {
-                                break;
-                            };
-                            if entry.remote.as_ref() != Some(&remote) {
-                                entry.remote = Some(remote.clone());
-                                publish(entry, VcsStatusStreamEvent::RemoteUpdated { remote });
-                            }
-                            let remove_repository = entry.subscribers.is_empty();
-                            if remove_repository {
-                                if let Some(entry) = state.repositories.remove(&cwd) {
-                                    entry.poller_cancellation.cancel();
-                                }
-                                break;
-                            }
+                    }
+                    changed = automatic_remote_refresh_interval.changed() => {
+                        if changed.is_err() {
+                            break;
                         }
+                        failure_backoff = Duration::ZERO;
+                        let interval = *automatic_remote_refresh_interval.borrow_and_update();
+                        next_remote_fetch = (!interval.is_zero())
+                            .then(|| Instant::now() + interval);
+                    }
+                    _ = wait_for_deadline(next_remote_fetch) => {
+                        if broadcaster.refresh_remote(&cwd, &cancellation, true).await.is_ok() {
+                            failure_backoff = Duration::ZERO;
+                        } else {
+                            failure_backoff = next_remote_failure_backoff(failure_backoff);
+                        }
+                        let interval = *automatic_remote_refresh_interval.borrow();
+                        next_remote_fetch = (!interval.is_zero()).then(|| {
+                            Instant::now() + interval.max(failure_backoff)
+                        });
                     }
                     _ = ref_interval.tick() => {
                         let _ = broadcaster.refresh_ref(&cwd, &cancellation).await;
@@ -294,6 +361,21 @@ impl StatusBroadcaster {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+async fn wait_for_deadline(deadline: Option<Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => pending().await,
+    }
+}
+
+fn next_remote_failure_backoff(current: Duration) -> Duration {
+    if current.is_zero() {
+        REMOTE_FAILURE_BACKOFF_INITIAL
+    } else {
+        current.saturating_mul(2).min(REMOTE_FAILURE_BACKOFF_MAX)
     }
 }
 
@@ -331,5 +413,18 @@ mod tests {
         let broadcaster =
             StatusBroadcaster::new(Arc::new(GitRepository::default()), Duration::ZERO, 0);
         assert_eq!(broadcaster.inner.subscriber_capacity, 1);
+    }
+
+    #[test]
+    fn remote_failure_backoff_is_capped() {
+        let mut backoff = Duration::ZERO;
+        assert_eq!(
+            next_remote_failure_backoff(backoff),
+            Duration::from_secs(30)
+        );
+        for _ in 0..10 {
+            backoff = next_remote_failure_backoff(backoff);
+        }
+        assert_eq!(backoff, REMOTE_FAILURE_BACKOFF_MAX);
     }
 }

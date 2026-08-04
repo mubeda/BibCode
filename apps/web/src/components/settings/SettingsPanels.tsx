@@ -1582,6 +1582,7 @@ function EnvironmentScopedProviderSettingsPanel({
               <TooltipTrigger
                 render={
                   <Button
+                    hidden
                     size="icon-xs"
                     variant="ghost"
                     className="size-5 rounded-sm p-0 text-muted-foreground hover:text-foreground"

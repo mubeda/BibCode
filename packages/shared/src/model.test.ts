@@ -31,6 +31,7 @@ import {
   trimOrNull,
   type SelectableModelOption,
 } from "./model.ts";
+import { getFastModeDescriptor, getFastModeOffValue } from "./providerSessionDefaults.ts";
 
 const CODEX = ProviderDriverKind.make("codex");
 const CLAUDE = ProviderDriverKind.make("claudeAgent");
@@ -84,176 +85,87 @@ const claudeCaps: ModelCapabilities = createModelCapabilities({
 });
 
 describe("descriptor helpers", () => {
-  it("enforces Codex service tiers across partial and empty capability snapshots only", () => {
-    const partialCaps = createModelCapabilities({
-      optionDescriptors: [
-        {
-          id: "reasoningEffort",
-          label: "Reasoning",
-          type: "select",
-          options: [
-            { id: "medium", label: "Medium", isDefault: true },
-            { id: "high", label: "High" },
-          ],
-        },
-        {
-          id: "serviceTier",
-          label: "Live tier",
-          description: "Live descriptor",
-          type: "select",
-          options: [
-            { id: "default", label: "Live Standard", isDefault: true },
-            { id: "priority", label: "Priority", description: "Priority processing" },
-          ],
-          currentValue: "default",
-        },
-      ],
-    });
-    const selections = [
-      { id: "reasoningEffort", value: "high" },
-      { id: "serviceTier", value: "fast" },
-    ] as const;
-
-    const codexDescriptors = getProviderCapabilityDescriptors({
-      provider: CODEX,
-      caps: partialCaps,
-      selections,
-    });
-    expect(codexDescriptors).toEqual([
-      expect.objectContaining({ id: "reasoningEffort", currentValue: "high" }),
-      {
-        id: "serviceTier",
-        label: "Live tier",
-        description: "Live descriptor",
-        type: "select",
-        options: [
-          { id: "default", label: "Live Standard", isDefault: true },
-          { id: "priority", label: "Priority", description: "Priority processing" },
-          { id: "fast", label: "Fast" },
-        ],
-        currentValue: "fast",
-      },
-    ]);
-
+  it("does not fabricate Codex fast mode", () => {
     expect(
       getProviderCapabilityDescriptors({
-        provider: CODEX,
-        caps: {},
-        selections: [
-          { id: "reasoningEffort", value: "xhigh" },
-          { id: "serviceTier", value: "fast" },
-        ],
+        provider: ProviderDriverKind.make("codex"),
+        caps: createModelCapabilities({ optionDescriptors: [] }),
       }),
-    ).toEqual([
-      {
-        id: "reasoningEffort",
-        label: "Reasoning",
-        type: "select",
-        options: [
-          { id: "none", label: "None" },
-          { id: "minimal", label: "Minimal" },
-          { id: "low", label: "Low" },
-          { id: "medium", label: "Medium", isDefault: true },
-          { id: "high", label: "High" },
-          { id: "xhigh", label: "Extra High" },
-          { id: "max", label: "Max" },
-          { id: "ultra", label: "Ultra" },
-        ],
-        currentValue: "xhigh",
-      },
-      {
-        id: "serviceTier",
-        label: "Service Tier",
-        type: "select",
-        options: [
-          { id: "default", label: "Standard", isDefault: true },
-          { id: "fast", label: "Fast" },
-        ],
-        currentValue: "fast",
-      },
-    ]);
+    ).toEqual([]);
+  });
 
+  it("normalizes selected Codex effort without fabricating a service tier", () => {
     expect(
       getProviderCapabilityDescriptors({
         provider: CODEX,
-        caps: createModelCapabilities({
-          optionDescriptors: [
-            {
-              id: "reasoningEffort",
-              label: "Broken effort",
-              type: "boolean",
-              currentValue: false,
-            },
-            {
-              id: "reasoningEffort",
-              label: "Duplicate effort",
-              type: "select",
-              options: [],
-            },
-          ],
-        }),
+        caps: createModelCapabilities({ optionDescriptors: [] }),
         selections: [{ id: "reasoningEffort", value: "high" }],
       }),
-    ).toEqual([
-      expect.objectContaining({
-        id: "reasoningEffort",
-        type: "select",
-        currentValue: "high",
-      }),
-      expect.objectContaining({ id: "serviceTier", type: "select" }),
-    ]);
+    ).toEqual([expect.objectContaining({ id: "reasoningEffort", currentValue: "high" })]);
+  });
 
-    const repairedMalformedValues = getProviderCapabilityDescriptors({
+  it("preserves an advertised Codex fast service tier", () => {
+    const descriptors = getProviderCapabilityDescriptors({
+      provider: ProviderDriverKind.make("codex"),
+      caps: createModelCapabilities({
+        optionDescriptors: [
+          {
+            id: "serviceTier",
+            label: "Service Tier",
+            type: "select",
+            options: [
+              { id: "default", label: "Standard", isDefault: true },
+              { id: "fast", label: "Fast" },
+            ],
+          },
+        ],
+      }),
+    });
+
+    expect(getFastModeDescriptor(CODEX, descriptors)?.id).toBe("serviceTier");
+    expect(getFastModeOffValue(CODEX, getFastModeDescriptor(CODEX, descriptors))).toBe("default");
+  });
+
+  it("uses an advertised non-default Codex tier as Fast off", () => {
+    const descriptors = getProviderCapabilityDescriptors({
       provider: CODEX,
       caps: createModelCapabilities({
         optionDescriptors: [
           {
-            id: "reasoningEffort",
-            label: "Live effort",
+            id: "serviceTier",
+            label: "Service Tier",
             type: "select",
             options: [
-              { id: "medium", label: "Medium", isDefault: true },
-              { id: "medium", label: "Duplicate Medium" },
-              { id: "high", label: "High" },
+              { id: "fast", label: "Fast" },
+              { id: "flex", label: "Flex" },
             ],
-            currentValue: "retired-effort",
           },
+        ],
+      }),
+      selections: [{ id: "serviceTier", value: "fast" }],
+    });
+    const descriptor = getFastModeDescriptor(CODEX, descriptors);
+
+    expect(descriptor?.id).toBe("serviceTier");
+    expect(getFastModeOffValue(CODEX, descriptor)).toBe("flex");
+  });
+
+  it("does not expose one-way Codex Fast metadata as a toggle", () => {
+    const descriptors = getProviderCapabilityDescriptors({
+      provider: CODEX,
+      caps: createModelCapabilities({
+        optionDescriptors: [
           {
             id: "serviceTier",
-            label: "Live tier",
+            label: "Service Tier",
             type: "select",
-            options: [],
-            currentValue: "retired-tier",
+            options: [{ id: "fast", label: "Fast" }],
           },
         ],
       }),
     });
-    expect(repairedMalformedValues).toEqual([
-      expect.objectContaining({
-        id: "reasoningEffort",
-        currentValue: "medium",
-        options: [
-          { id: "medium", label: "Medium", isDefault: true },
-          { id: "high", label: "High" },
-        ],
-      }),
-      expect.objectContaining({
-        id: "serviceTier",
-        currentValue: "default",
-        options: [
-          { id: "default", label: "Standard", isDefault: true },
-          { id: "fast", label: "Fast" },
-        ],
-      }),
-    ]);
 
-    expect(
-      getProviderCapabilityDescriptors({
-        provider: CLAUDE,
-        caps: partialCaps,
-        selections,
-      }),
-    ).toEqual(getProviderOptionDescriptors({ caps: partialCaps, selections }));
+    expect(getFastModeDescriptor(CODEX, descriptors)).toBeNull();
   });
 
   it("clones descriptor-owned arrays without mutating caller values", () => {

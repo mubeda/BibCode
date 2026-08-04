@@ -30,7 +30,7 @@ use super::{
     activity::{MAX_LINEAGE_DEPTH, OpenCodeActivityTracker, TEXT_COALESCE_MS, valid_key},
     model::{
         OpenCodeChildSessionDto, OpenCodeMessageDto, OpenCodeSessionStatusDto,
-        OpenCodeStatusMapDto, merge_assistant_text, parse_model_slug,
+        OpenCodeStatusMapDto, infer_default_variant, merge_assistant_text, parse_model_slug,
     },
     sse::OpenCodeSseDecoder,
 };
@@ -132,6 +132,7 @@ struct RuntimeInner {
     thread_id: String,
     directory: String,
     model: Mutex<Option<(String, String)>>,
+    selected_variant: Mutex<Option<String>>,
     agent: Option<String>,
     runtime_mode: Mutex<String>,
     session_id: Mutex<Option<String>>,
@@ -297,8 +298,7 @@ impl ReconciliationIdentityState {
                 .expect("matching reconciliation fingerprint has an occurrence");
         }
 
-        let occurrence =
-            next_reconciliation_causal_occurrence(&self.activity_head, &fingerprint);
+        let occurrence = next_reconciliation_causal_occurrence(&self.activity_head, &fingerprint);
         self.activity_head =
             next_activity_causal_head(&self.activity_head, b"reconciliation", &fingerprint);
         self.last_reconciliation_fingerprint = Some(fingerprint);
@@ -463,6 +463,7 @@ impl OpenCodeSessionRuntime {
                 thread_id: thread_id.to_owned(),
                 directory: directory.to_owned(),
                 model: Mutex::new(model.and_then(parse_model_slug)),
+                selected_variant: Mutex::new(None),
                 agent: agent
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
@@ -658,6 +659,7 @@ impl OpenCodeSessionRuntime {
         &self,
         text: Option<&str>,
         attachments: Vec<Value>,
+        message_id: Option<&str>,
     ) -> Result<String, OpenCodeRuntimeError> {
         let session_id = self.session_id().await?;
         let turn_id = self.begin_turn().await;
@@ -665,11 +667,17 @@ impl OpenCodeSessionRuntime {
             "sessionID": session_id,
             "parts": crate::provider::attachments::prompt_parts(text, attachments),
         });
+        if let Some(message_id) = message_id {
+            body["messageID"] = json!(message_id);
+        }
         if let Some((provider_id, model_id)) = self.inner.model.lock().await.as_ref() {
             body["model"] = json!({
                 "providerID": provider_id,
                 "modelID": model_id,
             });
+        }
+        if let Some(variant) = self.inner.selected_variant.lock().await.clone() {
+            body["variant"] = Value::String(variant);
         }
         if let Some(agent) = self.inner.agent.as_ref() {
             body["agent"] = json!(agent);
@@ -692,10 +700,53 @@ impl OpenCodeSessionRuntime {
         Ok(turn_id)
     }
 
+    pub async fn message_exists(&self, message_id: &str) -> Result<bool, OpenCodeRuntimeError> {
+        let session_id = self.session_id().await?;
+        let response = self
+            .inner
+            .client
+            .get(self.session_request_url(&session_id, &["message", message_id])?)
+            .send()
+            .await
+            .map_err(|error| OpenCodeRuntimeError::Http(error.to_string()))?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(false);
+        }
+        if !response.status().is_success() {
+            return Err(OpenCodeRuntimeError::Http(format!(
+                "message lookup returned HTTP {}",
+                response.status()
+            )));
+        }
+        let value: Value = response
+            .json()
+            .await
+            .map_err(|error| OpenCodeRuntimeError::InvalidResponse(error.to_string()))?;
+        let info = value
+            .get("info")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                OpenCodeRuntimeError::InvalidResponse(
+                    "message lookup response missing info".to_owned(),
+                )
+            })?;
+        if info.get("id").and_then(Value::as_str) != Some(message_id)
+            || info.get("sessionID").and_then(Value::as_str) != Some(session_id.as_str())
+            || info.get("role").and_then(Value::as_str) != Some("user")
+            || value.get("parts").and_then(Value::as_array).is_none()
+        {
+            return Err(OpenCodeRuntimeError::InvalidResponse(
+                "message lookup response has invalid identity or shape".to_owned(),
+            ));
+        }
+        Ok(true)
+    }
+
     pub async fn send_command(
         &self,
         command: &str,
         arguments: &str,
+        message_id: Option<&str>,
     ) -> Result<String, OpenCodeRuntimeError> {
         let session_id = self.session_id().await?;
         let command = command.trim().trim_start_matches('/');
@@ -709,11 +760,17 @@ impl OpenCodeSessionRuntime {
             "command": command,
             "arguments": arguments.trim(),
         });
+        if let Some(message_id) = message_id {
+            body["messageID"] = json!(message_id);
+        }
         if let Some(agent) = self.inner.agent.as_ref() {
             body["agent"] = json!(agent);
         }
         if let Some((provider_id, model_id)) = self.inner.model.lock().await.as_ref() {
             body["model"] = json!(format!("{provider_id}/{model_id}"));
+        }
+        if let Some(variant) = self.inner.selected_variant.lock().await.clone() {
+            body["variant"] = Value::String(variant);
         }
         let response = self
             .inner
@@ -741,6 +798,146 @@ impl OpenCodeSessionRuntime {
         })?;
         *self.inner.model.lock().await = Some(parsed);
         Ok(())
+    }
+
+    pub async fn set_variant(&self, variant: Option<String>) {
+        *self.inner.selected_variant.lock().await = variant;
+    }
+
+    pub async fn set_options(&self, options: Vec<Value>) -> Result<(), OpenCodeRuntimeError> {
+        if options.is_empty() {
+            self.set_variant(None).await;
+            return Ok(());
+        }
+
+        let mut fast_mode = None;
+        let mut requested_variant = None;
+        for option in options {
+            let id = option.get("id").and_then(Value::as_str).ok_or_else(|| {
+                OpenCodeRuntimeError::InvalidResponse("option id must be a string".to_owned())
+            })?;
+            match id {
+                "fastMode" if fast_mode.is_none() => {
+                    fast_mode = Some(option.get("value").and_then(Value::as_bool).ok_or_else(|| {
+                        OpenCodeRuntimeError::InvalidResponse(
+                            "option fastMode requires a boolean value".to_owned(),
+                        )
+                    })?);
+                }
+                "variant" if requested_variant.is_none() => {
+                    requested_variant = Some(
+                        option
+                            .get("value")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.is_empty())
+                            .map(str::to_owned)
+                            .ok_or_else(|| {
+                                OpenCodeRuntimeError::InvalidResponse(
+                                    "option variant requires a non-empty string value".to_owned(),
+                                )
+                            })?,
+                    );
+                }
+                _ => {
+                    return Err(OpenCodeRuntimeError::InvalidResponse(format!(
+                        "option {id} is not supported by the selected model/session"
+                    )));
+                }
+            }
+        }
+
+        let (provider_id, variants) = self.advertised_variants().await?;
+        let has_variant = |variant: &str| variants.iter().any(|candidate| candidate == variant);
+        let selected = match fast_mode {
+            Some(true) => {
+                if requested_variant.is_some() {
+                    return Err(OpenCodeRuntimeError::InvalidResponse(
+                        "fastMode=true conflicts with variant".to_owned(),
+                    ));
+                }
+                if !has_variant("fast") {
+                    return Err(OpenCodeRuntimeError::InvalidResponse(
+                        "option fastMode is not supported by the selected model/session".to_owned(),
+                    ));
+                }
+                Some("fast".to_owned())
+            }
+            Some(false) | None => match requested_variant {
+                Some(variant) if variant != "fast" && has_variant(&variant) => Some(variant),
+                Some(variant) => {
+                    return Err(OpenCodeRuntimeError::InvalidResponse(format!(
+                        "variant {variant} is not advertised by the selected model"
+                    )));
+                }
+                None => self
+                    .inner
+                    .selected_variant
+                    .lock()
+                    .await
+                    .as_deref()
+                    .filter(|variant| *variant != "fast" && has_variant(variant))
+                    .map(str::to_owned)
+                    .or_else(|| {
+                        let non_fast = variants
+                            .iter()
+                            .filter(|variant| variant.as_str() != "fast")
+                            .map(String::as_str)
+                            .collect::<Vec<_>>();
+                        infer_default_variant(&provider_id, &non_fast)
+                    }),
+            },
+        };
+        self.set_variant(selected).await;
+        Ok(())
+    }
+
+    async fn advertised_variants(&self) -> Result<(String, Vec<String>), OpenCodeRuntimeError> {
+        let (provider_id, model_id) = self
+            .inner
+            .model
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| {
+                OpenCodeRuntimeError::InvalidResponse(
+                    "options require a selected provider/model".to_owned(),
+                )
+            })?;
+        let response = self
+            .inner
+            .client
+            .get(self.request_url("/provider")?)
+            .send()
+            .await
+            .map_err(|error| OpenCodeRuntimeError::Http(error.to_string()))?;
+        if !response.status().is_success() {
+            return Err(OpenCodeRuntimeError::Http(format!(
+                "provider inventory returned HTTP {}",
+                response.status()
+            )));
+        }
+        let providers = response
+            .json::<Value>()
+            .await
+            .map_err(|error| OpenCodeRuntimeError::InvalidResponse(error.to_string()))?;
+        let variants = providers
+            .get("all")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|provider| provider.get("id").and_then(Value::as_str) == Some(&provider_id))
+            .and_then(|provider| provider.get("models"))
+            .and_then(Value::as_object)
+            .and_then(|models| models.get(&model_id))
+            .and_then(|model| model.get("variants"))
+            .and_then(Value::as_object)
+            .map(|variants| variants.keys().cloned().collect::<Vec<_>>())
+            .ok_or_else(|| {
+                OpenCodeRuntimeError::InvalidResponse(
+                    "selected model has no advertised variants".to_owned(),
+                )
+            })?;
+        Ok((provider_id, variants))
     }
 
     async fn begin_turn(&self) -> String {
@@ -1082,7 +1279,8 @@ impl OpenCodeSessionRuntime {
 
     #[cfg(test)]
     async fn handle_sse_event(&self, session_id: &str, event: Value) {
-        self.handle_sse_event_observed_at(session_id, event, 0).await;
+        self.handle_sse_event_observed_at(session_id, event, 0)
+            .await;
     }
 
     async fn handle_sse_event_observed_at(
@@ -1562,8 +1760,7 @@ impl OpenCodeSessionRuntime {
                     let Some(inner) = runtime.upgrade() else {
                         return;
                     };
-                    let next = OpenCodeSessionRuntime::internal(inner)
-                        .take_reconciliation_hint();
+                    let next = OpenCodeSessionRuntime::internal(inner).take_reconciliation_hint();
                     merge_one_pending_reconciliation_hint(&mut hint, next);
                     hint
                 } else if let Some(hint) = retry_hint.take() {
@@ -1586,8 +1783,8 @@ impl OpenCodeSessionRuntime {
                     let Some(inner) = runtime.upgrade() else {
                         return;
                     };
-                    let Some(mut hint) = OpenCodeSessionRuntime::internal(inner)
-                        .take_reconciliation_hint()
+                    let Some(mut hint) =
+                        OpenCodeSessionRuntime::internal(inner).take_reconciliation_hint()
                     else {
                         continue;
                     };
@@ -1865,9 +2062,8 @@ impl OpenCodeSessionRuntime {
             let url = self
                 .session_request_url(&session_id, &["message"])
                 .map_err(|_| ())?;
-            let url =
-                append_query_pair(url, "limit", &RECONCILIATION_HISTORY_LIMIT.to_string())
-                    .map_err(|_| ())?;
+            let url = append_query_pair(url, "limit", &RECONCILIATION_HISTORY_LIMIT.to_string())
+                .map_err(|_| ())?;
             let response = self
                 .fetch_reconciliation_json::<Vec<OpenCodeMessageDto>>(url)
                 .await?;
@@ -1878,10 +2074,7 @@ impl OpenCodeSessionRuntime {
                 }
                 ReconciliationApiResult::NotFound => {
                     if history_support == EndpointSupport::Unknown {
-                        match self
-                            .fetch_root_history_capability(root_session_id)
-                            .await?
-                        {
+                        match self.fetch_root_history_capability(root_session_id).await? {
                             EndpointSupport::Supported => {
                                 history_support = EndpointSupport::Supported;
                             }
@@ -1976,7 +2169,9 @@ impl OpenCodeSessionRuntime {
                 .expect("OpenCode child reconciliation DTOs serialize");
             append_bounded_mutations(
                 &mut record_mutations,
-                tracker.reconcile_children(parent_session_id, &value).mutations,
+                tracker
+                    .reconcile_children(parent_session_id, &value)
+                    .mutations,
                 RECONCILIATION_RECORD_MUTATION_LIMIT,
             );
         }
@@ -2015,7 +2210,7 @@ impl OpenCodeSessionRuntime {
                 .unwrap_or_else(|| ReconciliationHistoryCursor {
                     signature: signature.clone(),
                     ..ReconciliationHistoryCursor::default()
-            });
+                });
             while let Some(message) = messages.get(cursor.message_index) {
                 let remaining = record_limit.saturating_sub(record_mutations.len());
                 if remaining == 0 {
@@ -2077,8 +2272,8 @@ impl OpenCodeSessionRuntime {
                     .mutations,
             );
         }
-        let deferred = cursor_updates.iter().any(|(_, cursor)| cursor.is_some())
-            || tracker.has_pending_text();
+        let deferred =
+            cursor_updates.iter().any(|(_, cursor)| cursor.is_some()) || tracker.has_pending_text();
         if !deferred {
             tracker.finish_detail_baseline();
         }
@@ -2187,11 +2382,7 @@ impl OpenCodeSessionRuntime {
                 .expect("OpenCode runtime owner-state mutex poisoned");
             if !*active
                 || cancellation.is_cancelled()
-                || self
-                    .inner
-                    .activity_flush_generation
-                    .load(Ordering::SeqCst)
-                    != generation
+                || self.inner.activity_flush_generation.load(Ordering::SeqCst) != generation
             {
                 return;
             }
@@ -2405,8 +2596,7 @@ fn activity_batch_fingerprint(activity: &[ProviderActivityMutation]) -> [u8; 32]
 }
 
 fn update_serialized_fingerprint<T: Serialize>(hasher: &mut Sha256, value: &T) {
-    let encoded =
-        serde_json::to_vec(value).expect("provider activity mutation fields serialize");
+    let encoded = serde_json::to_vec(value).expect("provider activity mutation fields serialize");
     hasher.update(
         u64::try_from(encoded.len())
             .expect("serialized activity mutation length fits u64")
@@ -2637,7 +2827,9 @@ mod tests {
     use axum::{
         Json, Router,
         extract::{Path, State},
-        routing::get,
+        http::StatusCode,
+        response::IntoResponse,
+        routing::{get, post},
     };
     use serde_json::json;
     use tokio::{net::TcpListener, sync::Mutex};
@@ -2686,6 +2878,144 @@ mod tests {
             )
             .await;
         runtime
+    }
+
+    #[tokio::test]
+    async fn prompt_async_serializes_the_delivery_key_as_message_id() {
+        type Bodies = Arc<Mutex<Vec<serde_json::Value>>>;
+
+        async fn prompt(
+            State(bodies): State<Bodies>,
+            Json(body): Json<serde_json::Value>,
+        ) -> StatusCode {
+            bodies.lock().await.push(body);
+            StatusCode::NO_CONTENT
+        }
+
+        let bodies: Bodies = Arc::new(Mutex::new(Vec::new()));
+        let app = Router::new()
+            .route("/session/{session_id}/prompt_async", post(prompt))
+            .with_state(bodies.clone());
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let runtime = super::OpenCodeSessionRuntime::new(
+            &format!("http://{address}"),
+            "unit-thread",
+            "/tmp/unit",
+            None,
+        );
+        *runtime.inner.session_id.lock().await = Some("session-1".to_owned());
+
+        runtime
+            .send_turn(Some("hello"), Vec::new(), Some("delivery-1"))
+            .await
+            .expect("send turn");
+
+        assert_eq!(
+            bodies.lock().await.as_slice(),
+            [json!({
+                "sessionID": "session-1",
+                "messageID": "delivery-1",
+                "parts": [{"type": "text", "text": "hello"}]
+            })]
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn exact_message_readback_distinguishes_found_absent_and_unavailable() {
+        async fn message(
+            Path((_session_id, message_id)): Path<(String, String)>,
+        ) -> impl IntoResponse {
+            match message_id.as_str() {
+                "delivery-found" => Json(json!({
+                    "info": {
+                        "id": "delivery-found",
+                        "sessionID": "session-1",
+                        "role": "user"
+                    },
+                    "parts": []
+                }))
+                .into_response(),
+                "delivery-absent" => StatusCode::NOT_FOUND.into_response(),
+                "delivery-malformed" => Json(json!({})).into_response(),
+                "delivery-assistant" => Json(json!({
+                    "info": {
+                        "id": "delivery-assistant",
+                        "sessionID": "session-1",
+                        "role": "assistant"
+                    },
+                    "parts": []
+                }))
+                .into_response(),
+                "delivery-system" => Json(json!({
+                    "info": {
+                        "id": "delivery-system",
+                        "sessionID": "session-1",
+                        "role": "system"
+                    },
+                    "parts": []
+                }))
+                .into_response(),
+                "delivery-missing-role" => Json(json!({
+                    "info": {
+                        "id": "delivery-missing-role",
+                        "sessionID": "session-1"
+                    },
+                    "parts": []
+                }))
+                .into_response(),
+                "delivery-non-string-role" => Json(json!({
+                    "info": {
+                        "id": "delivery-non-string-role",
+                        "sessionID": "session-1",
+                        "role": 7
+                    },
+                    "parts": []
+                }))
+                .into_response(),
+                _ => StatusCode::BAD_GATEWAY.into_response(),
+            }
+        }
+
+        let app = Router::new().route("/session/{session_id}/message/{message_id}", get(message));
+        let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+        let address = listener.local_addr().expect("address");
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app).await.expect("serve");
+        });
+        let runtime = super::OpenCodeSessionRuntime::new(
+            &format!("http://{address}"),
+            "unit-thread",
+            "/tmp/unit",
+            None,
+        );
+        *runtime.inner.session_id.lock().await = Some("session-1".to_owned());
+
+        assert!(runtime.message_exists("delivery-found").await.unwrap());
+        assert!(!runtime.message_exists("delivery-absent").await.unwrap());
+        assert!(runtime.message_exists("delivery-malformed").await.is_err());
+        for message_id in [
+            "delivery-assistant",
+            "delivery-system",
+            "delivery-missing-role",
+            "delivery-non-string-role",
+        ] {
+            assert!(
+                runtime.message_exists(message_id).await.is_err(),
+                "{message_id} must not reconcile as the durable user message"
+            );
+        }
+        assert!(
+            runtime
+                .message_exists("delivery-unavailable")
+                .await
+                .is_err()
+        );
+        server.abort();
     }
 
     async fn assert_no_queued_event(runtime: &super::OpenCodeSessionRuntime) {
@@ -3008,7 +3338,9 @@ mod tests {
         let blocker_gate_acquired = gate_acquired.clone();
         let blocker_release_gate = release_gate.clone();
         let blocker = tokio::spawn(async move {
-            let inner = blocker_runtime.upgrade().expect("runtime before owner drop");
+            let inner = blocker_runtime
+                .upgrade()
+                .expect("runtime before owner drop");
             let _flush_gate = inner.activity_flush_gate.lock().await;
             blocker_gate_acquired.notify_one();
             blocker_release_gate.notified().await;
@@ -3045,10 +3377,8 @@ mod tests {
         assert!(
             matches!(
                 late_event,
-                Err(
-                    tokio::sync::mpsc::error::TryRecvError::Empty
-                        | tokio::sync::mpsc::error::TryRecvError::Disconnected
-                )
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty
+                    | tokio::sync::mpsc::error::TryRecvError::Disconnected)
             ),
             "late event after owner drop: {late_event:?}"
         );
@@ -3198,8 +3528,7 @@ mod tests {
             crate::activity::ActivityCapabilities::none(),
             crate::activity::ActivityObservationState::Live,
         );
-        let mut identity =
-            super::ReconciliationIdentityState::new("identity-thread", 7);
+        let mut identity = super::ReconciliationIdentityState::new("identity-thread", 7);
 
         let first = identity.reconciliation_occurrence(&stale);
         assert_eq!(
@@ -3365,9 +3694,7 @@ mod tests {
             }]),
         );
 
-        runtime
-            .request_reconciliation(true, Some("a"), false)
-            .await;
+        runtime.request_reconciliation(true, Some("a"), false).await;
         let first_continuation = next_activity_event(&runtime).await;
         assert_eq!(
             first_continuation

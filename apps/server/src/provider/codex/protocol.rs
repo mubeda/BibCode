@@ -25,7 +25,7 @@ pub struct ConnectionConfig {
 impl Default for ConnectionConfig {
     fn default() -> Self {
         Self {
-            max_stdout_line_bytes: 128 * 1024,
+            max_stdout_line_bytes: 8 * 1024 * 1024,
             max_stderr_line_bytes: 64 * 1024,
         }
     }
@@ -46,6 +46,9 @@ pub enum IncomingEvent {
         method: String,
         params: Value,
         emitted_at_ms: u64,
+    },
+    NotificationBarrier {
+        processed: oneshot::Sender<()>,
     },
     Request {
         correlation_id: String,
@@ -110,6 +113,39 @@ struct Inner {
 struct PendingRequest {
     method: String,
     responder: oneshot::Sender<Result<Value, ProtocolError>>,
+}
+
+struct PendingResponseRegistration {
+    inner: Arc<Inner>,
+    correlation: Option<String>,
+}
+
+impl PendingResponseRegistration {
+    async fn remove(&mut self) {
+        if self.correlation.is_none() {
+            return;
+        }
+        let mut pending = self.inner.pending.lock().await;
+        if let Some(correlation) = self.correlation.take() {
+            pending.remove(&correlation);
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.correlation = None;
+    }
+}
+
+impl Drop for PendingResponseRegistration {
+    fn drop(&mut self) {
+        let Some(correlation) = self.correlation.take() else {
+            return;
+        };
+        let inner = self.inner.clone();
+        tokio::spawn(async move {
+            inner.pending.lock().await.remove(&correlation);
+        });
+    }
 }
 
 enum WriterMessage {
@@ -253,6 +289,11 @@ impl JsonRpcConnection {
         self.request_inner(method, params, Some(cancellation)).await
     }
 
+    #[cfg(test)]
+    pub(crate) async fn pending_request_count(&self) -> usize {
+        self.inner.pending.lock().await.len()
+    }
+
     async fn request_inner(
         &self,
         method: &str,
@@ -275,13 +316,17 @@ impl JsonRpcConnection {
                 responder,
             },
         );
+        let mut registration = PendingResponseRegistration {
+            inner: self.inner.clone(),
+            correlation: Some(correlation.clone()),
+        };
         if self
             .inner
             .writer
             .send(WriterMessage::Json(payload))
             .is_err()
         {
-            self.inner.pending.lock().await.remove(&correlation);
+            registration.remove().await;
             return Err(ProtocolError::Closed {
                 reason: self.close_reason().await,
             });
@@ -294,13 +339,18 @@ impl JsonRpcConnection {
             })
         };
         let Some(cancellation) = cancellation else {
-            return receive_response.await;
+            let result = receive_response.await;
+            registration.disarm();
+            return result;
         };
         tokio::select! {
             biased;
-            result = receive_response => result,
+            result = receive_response => {
+                registration.disarm();
+                result
+            },
             () = cancellation.cancelled() => {
-                self.inner.pending.lock().await.remove(&correlation);
+                registration.remove().await;
                 Err(ProtocolError::Cancelled {
                     method: method.to_owned(),
                 })
@@ -456,6 +506,7 @@ async fn route_stdout_message(
             return Ok(());
         }
         let params = object.get("params").cloned().unwrap_or(Value::Null);
+        let processed = (method == "mcpServer/startupStatus/updated").then(oneshot::channel);
         incoming
             .send(IncomingEvent::Notification {
                 method: method.to_owned(),
@@ -468,6 +519,18 @@ async fn route_stdout_message(
             .map_err(|_| ProtocolError::Closed {
                 reason: "incoming receiver dropped".to_owned(),
             })?;
+        if let Some((processed_tx, processed_rx)) = processed {
+            incoming
+                .send(IncomingEvent::NotificationBarrier {
+                    processed: processed_tx,
+                })
+                .map_err(|_| ProtocolError::Closed {
+                    reason: "incoming receiver dropped".to_owned(),
+                })?;
+            processed_rx.await.map_err(|_| ProtocolError::Closed {
+                reason: "incoming receiver dropped before processing notification".to_owned(),
+            })?;
+        }
         return Ok(());
     }
 
@@ -777,6 +840,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn default_connection_accepts_large_codex_app_server_messages() {
+        let (stdout, mut stdout_peer) = duplex(4096);
+        let (stdin_peer, stdin) = duplex(4096);
+        let (stderr, _stderr_peer) = duplex(4096);
+        let (_connection, mut incoming) =
+            JsonRpcConnection::spawn(stdout, stdin, stderr, ConnectionConfig::default());
+        drop(stdin_peer);
+
+        let payload = json!({
+            "method": "thread/started",
+            "params": { "schema": "x".repeat(256 * 1024) },
+        });
+        stdout_peer
+            .write_all(format!("{payload}\n").as_bytes())
+            .await
+            .expect("write large Codex message");
+        stdout_peer.flush().await.expect("flush Codex message");
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), incoming.recv())
+            .await
+            .expect("large Codex message should be read")
+            .expect("large Codex message should route");
+        assert!(matches!(
+            event,
+            IncomingEvent::Notification { method, .. } if method == "thread/started"
+        ));
+    }
+
+    #[tokio::test]
     async fn inbound_routing_and_stream_bounds_cover_json_rpc_failure_contracts() {
         let (writer, _writer_rx) = mpsc::unbounded_channel();
         let inner = Arc::new(Inner {
@@ -789,17 +881,20 @@ mod tests {
         });
         let (incoming_tx, mut incoming_rx) = mpsc::unbounded_channel();
 
-        route_stdout_message(
-            json!({
-                "method":"thread/update",
-                "params":{"ready":true},
-                "emittedAtMs": 42,
-            }),
-            &inner,
-            &incoming_tx,
-        )
-        .await
-        .expect("notification should route");
+        let notification_inner = inner.clone();
+        let notification_incoming = incoming_tx.clone();
+        let notification = tokio::spawn(async move {
+            route_stdout_message(
+                json!({
+                    "method":"mcpServer/startupStatus/updated",
+                    "params":{"ready":true},
+                    "emittedAtMs": 42,
+                }),
+                &notification_inner,
+                &notification_incoming,
+            )
+            .await
+        });
         assert!(matches!(
             incoming_rx.recv().await,
             Some(IncomingEvent::Notification {
@@ -807,8 +902,20 @@ mod tests {
                 params,
                 emitted_at_ms: 42,
             })
-                if method == "thread/update" && params == json!({"ready":true})
+                if method == "mcpServer/startupStatus/updated"
+                    && params == json!({"ready":true})
         ));
+        let Some(IncomingEvent::NotificationBarrier { processed }) = incoming_rx.recv().await
+        else {
+            panic!("notification barrier should route");
+        };
+        processed
+            .send(())
+            .expect("notification should be processed");
+        notification
+            .await
+            .expect("notification routing task")
+            .expect("notification should route");
 
         route_stdout_message(
             json!({"id":"request-1","method":"approve"}),
@@ -1014,6 +1121,44 @@ mod tests {
             .notify_without_params("thread/still-open")
             .await
             .expect("late cancellation response does not close the connection");
+    }
+
+    #[tokio::test]
+    async fn dropped_request_removes_its_pending_response_waiter() {
+        let (writer, mut writer_rx) = mpsc::unbounded_channel();
+        let (connection, inner) = connection_with_writer(writer);
+        let request_connection = connection.clone();
+        let request = tokio::spawn(async move {
+            request_connection
+                .request("mcpServerStatus/list", Value::Null)
+                .await
+        });
+
+        let Some(WriterMessage::Json(request_payload)) = writer_rx.recv().await else {
+            panic!("request should write");
+        };
+        assert_eq!(inner.pending.lock().await.len(), 1);
+
+        request.abort();
+        assert!(
+            request
+                .await
+                .expect_err("request task should abort")
+                .is_cancelled()
+        );
+        tokio::task::yield_now().await;
+
+        assert!(
+            inner.pending.lock().await.is_empty(),
+            "dropped request must not leak a pending response waiter"
+        );
+        route_stdout_message(
+            json!({"id":request_payload["id"].clone(),"result":{"late":true}}),
+            &inner,
+            &mpsc::unbounded_channel().0,
+        )
+        .await
+        .expect("a late response to a dropped request is harmless");
     }
 
     #[tokio::test]

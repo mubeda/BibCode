@@ -5,10 +5,13 @@ import * as Schema from "effect/Schema";
 import {
   DEFAULT_PROVIDER_INTERACTION_MODE,
   DEFAULT_RUNTIME_MODE,
+  ChatAttachment,
+  ClientOrchestrationCommand,
   DispatchResult,
   ModelSelection,
   OrchestrationCommand,
   OrchestrationEvent,
+  OrchestrationMessage,
   OrchestrationGetFullThreadDiffInput,
   OrchestrationGetTurnDiffInput,
   OrchestrationLatestTurn,
@@ -41,6 +44,39 @@ const decodeOrchestrationProposedPlan = Schema.decodeUnknownEffect(Orchestration
 const decodeOrchestrationSession = Schema.decodeUnknownEffect(OrchestrationSession);
 const decodeDispatchResult = Schema.decodeUnknownEffect(DispatchResult);
 const encodeThreadCreatedPayload = Schema.encodeEffect(ThreadCreatedPayload);
+const decodeOrchestrationMessageSync = Schema.decodeUnknownSync(OrchestrationMessage);
+const decodeOrchestrationCommandSync = Schema.decodeUnknownSync(OrchestrationCommand);
+
+it("decodes message delivery and delivery resolution command", () => {
+  const message = decodeOrchestrationMessageSync({
+    id: "message-1",
+    role: "user",
+    text: "ship it",
+    turnId: null,
+    streaming: false,
+    delivery: {
+      state: "uncertain",
+      provider: "claudeAgent",
+      detail: "connection lost after write",
+    },
+    createdAt: "2026-08-01T00:00:00Z",
+    updatedAt: "2026-08-01T00:00:01Z",
+  });
+  assert.strictEqual(message.delivery?.state, "uncertain");
+
+  const command = decodeOrchestrationCommandSync({
+    type: "thread.turn-delivery.resolve",
+    commandId: "resolve-1",
+    threadId: "thread-1",
+    messageId: "message-1",
+    action: "retry",
+    createdAt: "2026-08-01T00:00:02Z",
+  });
+  if (command.type !== "thread.turn-delivery.resolve") {
+    assert.fail(`Expected delivery resolution command, received ${command.type}.`);
+  }
+  assert.strictEqual(command.action, "retry");
+});
 
 it.effect("decodes an authoritative project identity from project creation", () =>
   Effect.gen(function* () {
@@ -75,6 +111,161 @@ const decodeThreadCreatedPayload = Schema.decodeUnknownEffect(ThreadCreatedPaylo
 const decodeOrchestrationCommand = Schema.decodeUnknownEffect(OrchestrationCommand);
 const decodeOrchestrationEvent = Schema.decodeUnknownEffect(OrchestrationEvent);
 const decodeThreadMetaUpdatedPayload = Schema.decodeUnknownEffect(ThreadMetaUpdatedPayload);
+const decodeChatAttachment = Schema.decodeUnknownEffect(ChatAttachment);
+const decodeClientOrchestrationCommand = Schema.decodeUnknownEffect(ClientOrchestrationCommand);
+const encodeClientOrchestrationCommand = Schema.encodeEffect(ClientOrchestrationCommand);
+
+it.effect("decodes image and file chat attachments", () =>
+  Effect.gen(function* () {
+    const image = {
+      type: "image" as const,
+      id: "image-1",
+      name: "pixel.png",
+      mimeType: "image/png",
+      sizeBytes: 12,
+    };
+    const file = {
+      type: "file" as const,
+      id: "notes-1",
+      name: "notes.txt",
+      mimeType: "text/plain",
+      sizeBytes: 12,
+    };
+
+    assert.deepStrictEqual(yield* decodeChatAttachment(image), image);
+    assert.deepStrictEqual(yield* decodeChatAttachment(file), file);
+  }),
+);
+
+it.effect("round-trips uploaded attachment ids", () =>
+  Effect.gen(function* () {
+    const command = {
+      type: "thread.turn.start",
+      commandId: "cmd-upload-file",
+      threadId: "thread-upload-file",
+      message: {
+        messageId: "msg-upload-file",
+        role: "user",
+        text: "file",
+        attachments: [
+          {
+            type: "image" as const,
+            id: "image-upload-1",
+            name: "pixel.png",
+            mimeType: "image/png",
+            sizeBytes: 5,
+            dataUrl: "data:image/png;base64,aGVsbG8=",
+          },
+          {
+            type: "file" as const,
+            id: "notes-upload-1",
+            name: "notes.txt",
+            mimeType: "text/plain",
+            sizeBytes: 5,
+            dataUrl: "data:text/plain;base64,aGVsbG8=",
+          },
+        ],
+      },
+      runtimeMode: "full-access",
+      interactionMode: "default",
+      createdAt: "2026-01-01T00:00:00.000Z",
+    } as const;
+    const parsed = yield* decodeClientOrchestrationCommand(command);
+
+    if (parsed.type !== "thread.turn.start") {
+      throw new Error("Expected a thread.turn.start command.");
+    }
+    assert.deepStrictEqual(parsed.message.attachments, command.message.attachments);
+    assert.deepStrictEqual(yield* encodeClientOrchestrationCommand(parsed), command);
+  }),
+);
+
+it.effect("rejects ambiguous, invalid, oversized, and excessive attachments", () =>
+  Effect.gen(function* () {
+    const image = {
+      type: "image",
+      id: "image-1",
+      name: "pixel.png",
+      mimeType: "image/png",
+      sizeBytes: 12,
+    };
+    const file = {
+      type: "file",
+      id: "notes-1",
+      name: "notes.txt",
+      mimeType: "text/plain",
+      sizeBytes: 12,
+    };
+    const invalidInputs = [
+      { ...file, mimeType: "image/png" },
+      { ...image, mimeType: "text/plain" },
+      { ...file, sizeBytes: 10 * 1024 * 1024 + 1 },
+    ];
+
+    for (const input of invalidInputs) {
+      assert.strictEqual((yield* Effect.exit(decodeChatAttachment(input)))._tag, "Failure");
+    }
+    for (const attachment of [
+      {
+        type: "file",
+        id: "bad id",
+        name: "notes.txt",
+        mimeType: "text/plain",
+        sizeBytes: 1,
+        dataUrl: "data:text/plain;base64,eA==",
+      },
+      {
+        type: "image",
+        name: "pixel.png",
+        mimeType: "image/png",
+        sizeBytes: 1,
+        dataUrl: "data:image/png;base64,eA==",
+      },
+    ]) {
+      assert.strictEqual(
+        (yield* Effect.exit(
+          decodeClientOrchestrationCommand({
+            type: "thread.turn.start",
+            commandId: "cmd-invalid-upload-id",
+            threadId: "thread-invalid-upload-id",
+            message: {
+              messageId: "msg-invalid-upload-id",
+              role: "user",
+              text: "invalid",
+              attachments: [attachment],
+            },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            createdAt: "2026-01-01T00:00:00.000Z",
+          }),
+        ))._tag,
+        "Failure",
+      );
+    }
+    assert.strictEqual(
+      (yield* Effect.exit(
+        decodeThreadTurnStartCommand({
+          type: "thread.turn.start",
+          commandId: "cmd-attachments",
+          threadId: "thread-attachments",
+          message: {
+            messageId: "msg-attachments",
+            role: "user",
+            text: "attachments",
+            attachments: Array.from({ length: 9 }, (_, index) => ({
+              ...file,
+              id: `notes-${index}`,
+            })),
+          },
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          createdAt: "2026-01-01T00:00:00.000Z",
+        }),
+      ))._tag,
+      "Failure",
+    );
+  }),
+);
 
 it.effect("parses turn diff input when fromTurnCount <= toTurnCount", () =>
   Effect.gen(function* () {

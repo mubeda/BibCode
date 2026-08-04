@@ -15,6 +15,11 @@ const EMPTY_CAPABILITIES: ModelCapabilities = createModelCapabilities({
 });
 const DEFAULT_DRIVER_KIND = ProviderDriverKind.make("codex");
 
+export type ProviderControlAvailability =
+  | { state: "supported" }
+  | { state: "unknown"; reason: string }
+  | { state: "unsupported"; reason: string };
+
 export function formatProviderDriverKindLabel(provider: ProviderDriverKind): string {
   return provider
     .replace(/([a-z])([A-Z])/g, "$1 $2")
@@ -49,8 +54,22 @@ export function getProviderDisplayName(
 export function getProviderInteractionModeToggle(
   providers: ReadonlyArray<ServerProvider>,
   provider: ProviderDriverKind,
-): boolean {
-  return getProviderSnapshot(providers, provider)?.showInteractionModeToggle ?? true;
+  selectedInstanceId?: ProviderInstanceId,
+  hasExplicitInstanceSelection = selectedInstanceId !== undefined,
+): ProviderControlAvailability {
+  const selected = hasExplicitInstanceSelection
+    ? providers.find((candidate) => candidate.instanceId === selectedInstanceId)
+    : getProviderSnapshot(providers, provider);
+  if (!selected) {
+    return { state: "unknown", reason: "Plan mode availability is still loading." };
+  }
+  if (selected.showInteractionModeToggle === false) {
+    return {
+      state: "unsupported",
+      reason: `Plan mode is not supported by ${selected.displayName || formatProviderDriverKindLabel(provider)}.`,
+    };
+  }
+  return { state: "supported" };
 }
 
 export function isProviderEnabled(

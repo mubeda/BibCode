@@ -7,6 +7,9 @@ import {
   normalizeProjectPathForDispatch,
 } from "~/lib/projectPaths";
 
+import { canUseNativeHostFolderPicker } from "../hostFolderPicker";
+export { getEnvironmentBrowsePlatform } from "../hostFolderPicker";
+
 export type AddProjectStep = "start" | "host-path" | "clone" | "create";
 
 export interface AddProjectHostOption {
@@ -17,19 +20,6 @@ export interface AddProjectHostOption {
   readonly isPrimary: boolean;
   readonly desktopInstanceId: string | null;
   readonly nativePickerAvailable: boolean;
-}
-
-export function getEnvironmentBrowsePlatform(os: string | null | undefined): string | null {
-  if (os === "windows") {
-    return "Win32";
-  }
-  if (os === "darwin") {
-    return "MacIntel";
-  }
-  if (os === "linux") {
-    return "Linux";
-  }
-  return null;
 }
 
 export function defaultAddProjectParent(value: string | null | undefined): string {
@@ -117,5 +107,5 @@ export function joinProjectPath(parent: string, name: string, platform: string):
 }
 
 export function shouldUseNativePicker(host: AddProjectHostOption): boolean {
-  return host.nativePickerAvailable && (host.isPrimary || host.desktopInstanceId !== null);
+  return canUseNativeHostFolderPicker(host);
 }

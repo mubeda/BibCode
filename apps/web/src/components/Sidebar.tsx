@@ -4,6 +4,7 @@ import {
   ChevronRightIcon,
   CloudIcon,
   ContainerIcon,
+  FolderGit2Icon,
   FolderPlusIcon,
   Globe2Icon,
   LoaderIcon,
@@ -11,7 +12,6 @@ import {
   PinIcon,
   SearchIcon,
   SettingsIcon,
-  SquarePenIcon,
   TerminalIcon,
   TriangleAlertIcon,
 } from "lucide-react";
@@ -2798,7 +2798,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
                   type="button"
                   aria-label={`New main-branch chat in ${project.displayName}`}
                   data-testid="new-main-chat-button"
-                  className={SIDEBAR_ICON_ACTION_BUTTON_CLASS}
+                  className={cn(SIDEBAR_ICON_ACTION_BUTTON_CLASS, "invisible")}
                   onClick={handleCreateThreadClick}
                 />
               }
@@ -2819,7 +2819,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
                 />
               }
             >
-              <SquarePenIcon className="size-3.5" />
+              <FolderGit2Icon className="size-3.5" />
             </TooltipTrigger>
             <TooltipPopup side="top">New worktree</TooltipPopup>
           </Tooltip>

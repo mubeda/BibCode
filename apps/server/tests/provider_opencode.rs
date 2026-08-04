@@ -12,8 +12,8 @@ use std::{
 };
 
 use axum::{
-    body::{Body, Bytes},
     Json, Router,
+    body::{Body, Bytes},
     extract::{OriginalUri, Path, Query, State},
     http::{HeaderMap, StatusCode},
     response::{
@@ -22,11 +22,6 @@ use axum::{
     },
     routing::{delete, get, post},
 };
-use futures_util::{Stream, StreamExt, stream};
-use opencode::{
-    OpenCodeActivityFixtureAdapter, OpenCodeSessionRuntime, build_inventory_snapshot,
-    merge_assistant_text, parse_model_slug,
-};
 use bibcode_server::activity::{
     ActivityCapabilities, ActivityEntryKind, ActivityHistoryRecovery, ActivityLifecycle,
     ActivityObservationState, ActivityProjection, ActivityRecordKind, ActivityRepository,
@@ -34,6 +29,11 @@ use bibcode_server::activity::{
     ProviderActivityMutation,
 };
 use bibcode_server::persistence::{Database, run_migrations};
+use futures_util::{Stream, StreamExt, stream};
+use opencode::{
+    OpenCodeActivityFixtureAdapter, OpenCodeSessionRuntime, build_inventory_snapshot,
+    merge_assistant_text, parse_model_slug,
+};
 use serde_json::{Value, json};
 use tokio::{
     net::TcpListener,
@@ -125,7 +125,10 @@ fn activity_tracker_maps_only_verified_children_and_statuses_truthfully() {
         "id": "idle-1", "type": "session.status",
         "properties": { "sessionID": "ses-child-direct", "status": { "type": "idle" } }
     }));
-    assert!(idle.mutations.is_empty(), "idle preserves the already-waiting lifecycle");
+    assert!(
+        idle.mutations.is_empty(),
+        "idle preserves the already-waiting lifecycle"
+    );
 
     let foreign = tracker.handle_event(&json!({
         "id": "foreign-1", "type": "session.status",
@@ -175,7 +178,10 @@ fn activity_tracker_keeps_child_graph_and_activity_entries_bounded_and_idempoten
             if entry.id == "opencode:part:message:part-text:snapshot:0:10:1a989ea86150171c687b0727f218eedbb94c4665a7da9b0add1bf5de607f2bf1"
                 && entry.detail.as_deref() == Some("alpha beta")
     ));
-    assert!(tracker.handle_event(&text).mutations.is_empty(), "older cumulative text must not be replayed");
+    assert!(
+        tracker.handle_event(&text).mutations.is_empty(),
+        "older cumulative text must not be replayed"
+    );
     assert!(
         tracker.flush_text().mutations.is_empty(),
         "an older cumulative snapshot cannot enqueue a duplicate suffix"
@@ -186,12 +192,16 @@ fn activity_tracker_keeps_child_graph_and_activity_entries_bounded_and_idempoten
 
     let tool = json!({"type":"message.part.updated","properties":{"sessionID":"child","part":{"id":"tool-part","sessionID":"child","messageID":"message","type":"tool","callID":"call-1","tool":"bash","state":{"status":"completed"}}}});
     let tool_output = tracker.handle_event(&tool);
-    assert!(matches!(tool_output.mutations.as_slice(), [ProviderActivityMutation::AppendEntry(entry)] if entry.kind == ActivityEntryKind::Tool && entry.id.starts_with("opencode:part:message:tool-part:completed:")));
+    assert!(
+        matches!(tool_output.mutations.as_slice(), [ProviderActivityMutation::AppendEntry(entry)] if entry.kind == ActivityEntryKind::Tool && entry.id.starts_with("opencode:part:message:tool-part:completed:"))
+    );
     assert!(tracker.handle_history("child", &json!([{"info":{"id":"message","sessionID":"child","role":"assistant","time":{"completed":1002}},"parts":[{"id":"tool-part","sessionID":"child","messageID":"message","type":"tool","callID":"call-1","tool":"bash","state":{"status":"completed"}}]}])).mutations.len() == 1, "history supplies terminal actor once but not a duplicate tool entry");
     assert!(tracker.handle_event(&json!({"type":"session.status","properties":{"sessionID":"child","status":{"type":"busy"}}})).mutations.is_empty(), "terminal child cannot reopen");
 
     let command = tracker.handle_event(&json!({"id":"command-1","type":"command.executed","properties":{"sessionID":"nested","messageID":"message-nested","name":"review","arguments":"--quick"}}));
-    assert!(matches!(command.mutations.as_slice(), [ProviderActivityMutation::AppendEntry(entry)] if entry.kind == ActivityEntryKind::Command && entry.owner_id == "opencode:session:nested"));
+    assert!(
+        matches!(command.mutations.as_slice(), [ProviderActivityMutation::AppendEntry(entry)] if entry.kind == ActivityEntryKind::Command && entry.owner_id == "opencode:session:nested")
+    );
 
     let documented_command = tracker.handle_event_at(
         &json!({
@@ -272,7 +282,10 @@ fn activity_tracker_preserves_whitespace_deltas_and_flushes_at_the_coalesce_boun
     );
     let delta = json!({"id":"delta-1","type":"message.part.delta","properties":{"sessionID":"child","messageID":"message","partID":"part","field":"text","delta":" leading"}});
     assert!(tracker.handle_event_at(&delta, 10).mutations.is_empty());
-    assert!(tracker.handle_event_at(&delta, 20).mutations.is_empty(), "exact repeated SSE id is idempotent");
+    assert!(
+        tracker.handle_event_at(&delta, 20).mutations.is_empty(),
+        "exact repeated SSE id is idempotent"
+    );
     let boundary = tracker.handle_event_at(
         &json!({"id":"delta-2","type":"message.part.delta","properties":{"sessionID":"child","messageID":"message","partID":"part","field":"text","delta":" text"}}),
         110,
@@ -511,10 +524,7 @@ fn activity_tracker_live_parts_prefer_documented_times_and_keep_legacy_event_tim
         [ProviderActivityMutation::AppendEntry(entry)] => entry.clone(),
         other => panic!("expected one timestamped text entry, got {other:?}"),
     };
-    assert_eq!(
-        text_entry.created_at,
-        "2023-11-14T22:13:23.000000000Z"
-    );
+    assert_eq!(text_entry.created_at, "2023-11-14T22:13:23.000000000Z");
 
     let tool = json!({
         "type": "message.part.updated",
@@ -542,10 +552,7 @@ fn activity_tracker_live_parts_prefer_documented_times_and_keep_legacy_event_tim
         [ProviderActivityMutation::AppendEntry(entry)] => entry.clone(),
         other => panic!("expected one timestamped tool entry, got {other:?}"),
     };
-    assert_eq!(
-        tool_entry.created_at,
-        "2023-11-14T22:13:25.000000000Z"
-    );
+    assert_eq!(tool_entry.created_at, "2023-11-14T22:13:25.000000000Z");
 
     let legacy = json!({
         "type": "message.part.updated",
@@ -567,10 +574,7 @@ fn activity_tracker_live_parts_prefer_documented_times_and_keep_legacy_event_tim
         [ProviderActivityMutation::AppendEntry(entry)] => entry.clone(),
         other => panic!("expected one legacy-timestamp tool entry, got {other:?}"),
     };
-    assert_eq!(
-        legacy_entry.created_at,
-        "2023-11-14T22:14:00.000000000Z"
-    );
+    assert_eq!(legacy_entry.created_at, "2023-11-14T22:14:00.000000000Z");
 
     let actor_fallback = json!({
         "type": "message.part.updated",
@@ -591,10 +595,7 @@ fn activity_tracker_live_parts_prefer_documented_times_and_keep_legacy_event_tim
         [ProviderActivityMutation::AppendEntry(entry)] => entry.clone(),
         other => panic!("expected one actor-fallback tool entry, got {other:?}"),
     };
-    assert_eq!(
-        actor_entry.created_at,
-        "2023-11-14T22:13:20.000000000Z"
-    );
+    assert_eq!(actor_entry.created_at, "2023-11-14T22:13:20.000000000Z");
     assert!(tracker.handle_event(&tool).mutations.is_empty());
     assert!(tracker.handle_event(&legacy).mutations.is_empty());
     assert!(tracker.handle_event(&actor_fallback).mutations.is_empty());
@@ -1061,9 +1062,17 @@ fn activity_tracker_marks_true_live_coverage_saturation_without_snapshot_echo() 
         marker_entries[0].detail.as_deref(),
         Some("[truncated; recover from history]"),
     );
-    assert_ne!(marker_entries[0].detail.as_deref(), Some(cumulative.as_str()));
+    assert_ne!(
+        marker_entries[0].detail.as_deref(),
+        Some(cumulative.as_str())
+    );
 
-    assert!(tracker.handle_event_at(&snapshot_event, 1_700_001).mutations.is_empty());
+    assert!(
+        tracker
+            .handle_event_at(&snapshot_event, 1_700_001)
+            .mutations
+            .is_empty()
+    );
     assert!(
         tracker.flush_text().mutations.is_empty(),
         "the same authoritative snapshot identity must not produce a distinct marker",
@@ -1152,7 +1161,12 @@ fn activity_tracker_replays_evicted_delta_with_stable_identity_without_corruptin
             "delta":"x"
         }
     });
-    assert!(tracker.handle_event_at(&first_event, 10).mutations.is_empty());
+    assert!(
+        tracker
+            .handle_event_at(&first_event, 10)
+            .mutations
+            .is_empty()
+    );
     let first = tracker.flush_text();
     let first_entry = match first.mutations.as_slice() {
         [ProviderActivityMutation::AppendEntry(entry)] => entry.clone(),
@@ -1178,10 +1192,13 @@ fn activity_tracker_replays_evicted_delta_with_stable_identity_without_corruptin
         assert!(output.mutations.is_empty());
         let flushed = tracker.flush_text();
         if index == 1 {
-            second_entry_id = flushed.mutations.first().and_then(|mutation| match mutation {
-                ProviderActivityMutation::AppendEntry(entry) => Some(entry.id.clone()),
-                _ => None,
-            });
+            second_entry_id = flushed
+                .mutations
+                .first()
+                .and_then(|mutation| match mutation {
+                    ProviderActivityMutation::AppendEntry(entry) => Some(entry.id.clone()),
+                    _ => None,
+                });
         }
     }
     assert_ne!(
@@ -1190,7 +1207,12 @@ fn activity_tracker_replays_evicted_delta_with_stable_identity_without_corruptin
         "distinct identical deltas keep distinct provider identities",
     );
 
-    assert!(tracker.handle_event_at(&first_event, 10).mutations.is_empty());
+    assert!(
+        tracker
+            .handle_event_at(&first_event, 10)
+            .mutations
+            .is_empty()
+    );
     let replay = tracker.flush_text();
     assert!(matches!(
         replay.mutations.as_slice(),
@@ -1272,7 +1294,10 @@ fn activity_tracker_matches_new_delta_after_stale_replay_and_unchanged_snapshot(
         other => panic!("expected the original old delta entry, got {other:?}"),
     };
     assert!(
-        tracker.handle_event(&snapshot("base old")).mutations.is_empty()
+        tracker
+            .handle_event(&snapshot("base old"))
+            .mutations
+            .is_empty()
             && tracker.flush_text().mutations.is_empty(),
         "the first authoritative snapshot covers the original live delta",
     );
@@ -1280,10 +1305,7 @@ fn activity_tracker_matches_new_delta_after_stale_replay_and_unchanged_snapshot(
     for index in 0..2_048 {
         assert!(
             tracker
-                .handle_event_at(
-                    &delta(&format!("evict-{index}"), "eviction-part", "z"),
-                    10,
-                )
+                .handle_event_at(&delta(&format!("evict-{index}"), "eviction-part", "z"), 10,)
                 .mutations
                 .is_empty()
         );
@@ -1297,7 +1319,10 @@ fn activity_tracker_matches_new_delta_after_stale_replay_and_unchanged_snapshot(
             if entry.id == old_entry.id && entry.detail == old_entry.detail
     ));
     assert!(
-        tracker.handle_event(&snapshot("base old")).mutations.is_empty()
+        tracker
+            .handle_event(&snapshot("base old"))
+            .mutations
+            .is_empty()
             && tracker.flush_text().mutations.is_empty(),
         "an unchanged authoritative snapshot must not move the cumulative baseline",
     );
@@ -1311,7 +1336,10 @@ fn activity_tracker_matches_new_delta_after_stale_replay_and_unchanged_snapshot(
     assert_ne!(new_entry.id, old_entry.id);
     assert_eq!(new_entry.detail.as_deref(), Some(" new"));
     assert!(
-        tracker.handle_event(&snapshot("base old new")).mutations.is_empty()
+        tracker
+            .handle_event(&snapshot("base old new"))
+            .mutations
+            .is_empty()
             && tracker.flush_text().mutations.is_empty(),
         "the updated snapshot must match the newest real delta around stale replay noise",
     );
@@ -1408,7 +1436,10 @@ fn activity_tracker_matches_newest_equal_text_delta_without_collapsing_event_ide
     };
     assert_ne!(newest_entry.id, trailing_entry.id);
     assert!(
-        tracker.handle_event(&snapshot("basexxy")).mutations.is_empty()
+        tracker
+            .handle_event(&snapshot("basexxy"))
+            .mutations
+            .is_empty()
             && tracker.flush_text().mutations.is_empty(),
         "the updated snapshot must cover the newest equal-text event and its trailing delta, not stale replay noise",
     );
@@ -1418,7 +1449,10 @@ fn activity_tracker_matches_newest_equal_text_delta_without_collapsing_event_ide
 fn activity_tracker_maps_the_versioned_child_sse_fixture_after_registry_verification() {
     let sessions = activity_fixture("trace-child-sessions.json");
     let mut tracker = OpenCodeActivityFixtureAdapter::new("ses-root-activity");
-    for response in sessions["childrenResponses"].as_array().expect("child batches") {
+    for response in sessions["childrenResponses"]
+        .as_array()
+        .expect("child batches")
+    {
         tracker.reconcile_children(
             response["parentSessionID"].as_str().expect("parent"),
             &response["response"],
@@ -1484,16 +1518,24 @@ fn opencode_activity_fixture_rejects_non_recursive_or_unattributed_child_lineage
     assert_eq!(root_children[0]["parentID"], "ses-root-activity");
 
     let direct_children = children_response(responses, "ses-child-direct");
-    assert_eq!(direct_children.len(), 1, "nested discovery follows the direct child");
+    assert_eq!(
+        direct_children.len(),
+        1,
+        "nested discovery follows the direct child"
+    );
     assert_eq!(direct_children[0]["id"], "ses-child-nested");
     assert_eq!(direct_children[0]["parentID"], "ses-child-direct");
 
     let nested_children = children_response(responses, "ses-child-nested");
-    assert!(nested_children.is_empty(), "the recursive traversal terminates");
+    assert!(
+        nested_children.is_empty(),
+        "the recursive traversal terminates"
+    );
 }
 
 #[test]
-fn opencode_activity_fixture_rejects_sse_frames_that_lose_child_identity_or_treat_reasoning_as_commentary() {
+fn opencode_activity_fixture_rejects_sse_frames_that_lose_child_identity_or_treat_reasoning_as_commentary()
+ {
     let fixture = activity_fixture("trace-child-sse.json");
     assert_opencode_1184_metadata(&fixture);
     assert_eq!(fixture["rootSessionID"], "ses-root-activity");
@@ -1503,7 +1545,10 @@ fn opencode_activity_fixture_rejects_sse_frames_that_lose_child_identity_or_trea
     assert_eq!(created["type"], "session.created");
     assert_eq!(created["properties"]["sessionID"], "ses-child-direct");
     assert_eq!(created["properties"]["info"]["id"], "ses-child-direct");
-    assert_eq!(created["properties"]["info"]["parentID"], "ses-root-activity");
+    assert_eq!(
+        created["properties"]["info"]["parentID"],
+        "ses-root-activity"
+    );
 
     let statuses = frames
         .iter()
@@ -1533,7 +1578,10 @@ fn opencode_activity_fixture_rejects_sse_frames_that_lose_child_identity_or_trea
     assert_eq!(text["properties"]["sessionID"], "ses-child-direct");
     assert_eq!(text["properties"]["part"]["id"], "prt-child-text");
     assert_eq!(text["properties"]["part"]["sessionID"], "ses-child-direct");
-    assert_eq!(text["properties"]["part"]["messageID"], "msg-child-assistant");
+    assert_eq!(
+        text["properties"]["part"]["messageID"],
+        "msg-child-assistant"
+    );
     assert_eq!(text["properties"]["part"]["type"], "text");
 
     let message = sse_frame(&frames, "oc-1184-child-message");
@@ -1558,8 +1606,7 @@ fn opencode_activity_fixture_rejects_sse_frames_that_lose_child_identity_or_trea
     );
     assert_eq!(reasoning["properties"]["part"]["type"], "reasoning");
     assert_ne!(
-        reasoning["properties"]["part"]["type"],
-        "text",
+        reasoning["properties"]["part"]["type"], "text",
         "raw reasoning is not documented commentary",
     );
 
@@ -1572,9 +1619,15 @@ fn opencode_activity_fixture_rejects_sse_frames_that_lose_child_identity_or_trea
         assert_eq!(tool["properties"]["sessionID"], "ses-child-direct");
         assert_eq!(tool["properties"]["part"]["id"], "prt-child-tool");
         assert_eq!(tool["properties"]["part"]["sessionID"], "ses-child-direct");
-        assert_eq!(tool["properties"]["part"]["messageID"], "msg-child-assistant");
+        assert_eq!(
+            tool["properties"]["part"]["messageID"],
+            "msg-child-assistant"
+        );
         assert_eq!(tool["properties"]["part"]["type"], "tool");
-        assert_eq!(tool["properties"]["part"]["state"]["status"], expected_state);
+        assert_eq!(
+            tool["properties"]["part"]["state"]["status"],
+            expected_state
+        );
     }
 
     let command = sse_frame(&frames, "oc-1184-child-command");
@@ -1582,7 +1635,10 @@ fn opencode_activity_fixture_rejects_sse_frames_that_lose_child_identity_or_trea
     assert_eq!(command["properties"]["sessionID"], "ses-child-direct");
     assert_eq!(command["properties"]["messageID"], "msg-child-assistant");
     assert_eq!(command["properties"]["name"], "review");
-    assert_eq!(command["properties"]["arguments"], "[redacted command arguments]");
+    assert_eq!(
+        command["properties"]["arguments"],
+        "[redacted command arguments]"
+    );
 }
 
 #[test]
@@ -1600,7 +1656,10 @@ fn opencode_activity_fixture_rejects_history_without_terminal_evidence_or_sse_de
     assert_eq!(completed[0]["info"]["id"], "msg-child-assistant");
     assert_eq!(completed[0]["info"]["sessionID"], "ses-child-direct");
     assert_eq!(completed[0]["info"]["role"], "assistant");
-    assert_eq!(completed[0]["info"]["time"]["completed"], 1_721_827_202_000_i64);
+    assert_eq!(
+        completed[0]["info"]["time"]["completed"],
+        1_721_827_202_000_i64
+    );
     assert_eq!(completed[0]["info"]["finish"], "stop");
     assert_eq!(completed[0]["parts"][0]["id"], "prt-child-text");
     assert_eq!(completed[0]["parts"][0]["sessionID"], "ses-child-direct");
@@ -1646,7 +1705,10 @@ fn opencode_activity_fixture_rejects_root_activity_that_erases_child_terminal_ev
     let child_sse = activity_fixture("trace-child-sse.json");
     let child_frames = raw_sse_frames(&child_sse);
     let root_activity = sse_frame(&child_frames, "oc-1184-root-after-child-terminal");
-    assert_eq!(root_activity["properties"]["sessionID"], "ses-root-activity");
+    assert_eq!(
+        root_activity["properties"]["sessionID"],
+        "ses-root-activity"
+    );
     assert!(
         root_activity["properties"]["info"]["time"]["created"]
             .as_i64()
@@ -1663,7 +1725,10 @@ fn opencode_activity_fixture_rejects_foreign_workspace_events_that_claim_child_a
     let fixture = activity_fixture("trace-foreign-session.json");
     assert_opencode_1184_metadata(&fixture);
     assert_eq!(fixture["rootSessionID"], "ses-root-activity");
-    assert_eq!(fixture["verifiedChildSessionIDs"], json!(["ses-child-direct", "ses-child-nested"]));
+    assert_eq!(
+        fixture["verifiedChildSessionIDs"],
+        json!(["ses-child-direct", "ses-child-nested"])
+    );
     let stream_directory = fixture["streamContext"]["directory"]
         .as_str()
         .expect("directory-scoped event stream");
@@ -1671,8 +1736,14 @@ fn opencode_activity_fixture_rejects_foreign_workspace_events_that_claim_child_a
     let frames = raw_sse_frames(&fixture);
     let foreign_session = sse_frame(&frames, "oc-1184-foreign-session");
     assert_eq!(foreign_session["type"], "session.updated");
-    assert_eq!(foreign_session["properties"]["sessionID"], "ses-foreign-workspace");
-    assert_eq!(foreign_session["properties"]["info"]["id"], "ses-foreign-workspace");
+    assert_eq!(
+        foreign_session["properties"]["sessionID"],
+        "ses-foreign-workspace"
+    );
+    assert_eq!(
+        foreign_session["properties"]["info"]["id"],
+        "ses-foreign-workspace"
+    );
     assert_eq!(
         foreign_session["properties"]["info"]["directory"],
         stream_directory
@@ -1696,9 +1767,18 @@ fn opencode_activity_fixture_rejects_foreign_workspace_events_that_claim_child_a
     let foreign = sse_frame(&frames, "oc-1184-foreign-text");
     assert_eq!(foreign["type"], "message.part.updated");
     assert_eq!(foreign["properties"]["sessionID"], "ses-foreign-workspace");
-    assert_eq!(foreign["properties"]["part"]["sessionID"], "ses-foreign-workspace");
-    assert_eq!(foreign["properties"]["part"]["messageID"], "msg-foreign-assistant");
-    assert_eq!(foreign["properties"]["sessionID"], foreign_session["properties"]["info"]["id"]);
+    assert_eq!(
+        foreign["properties"]["part"]["sessionID"],
+        "ses-foreign-workspace"
+    );
+    assert_eq!(
+        foreign["properties"]["part"]["messageID"],
+        "msg-foreign-assistant"
+    );
+    assert_eq!(
+        foreign["properties"]["sessionID"],
+        foreign_session["properties"]["info"]["id"]
+    );
     assert_ne!(foreign["properties"]["sessionID"], fixture["rootSessionID"]);
     assert!(
         !fixture["verifiedChildSessionIDs"]
@@ -1714,7 +1794,11 @@ fn opencode_activity_fixture_rejects_reconnect_recovery_that_depends_on_sse_repl
     let fixture = activity_fixture("trace-reconnect.json");
     assert_opencode_1184_metadata(&fixture);
     let reconnect_frames = raw_sse_frames(&fixture);
-    assert_eq!(reconnect_frames.len(), 1, "reconnect has no SSE replay buffer");
+    assert_eq!(
+        reconnect_frames.len(),
+        1,
+        "reconnect has no SSE replay buffer"
+    );
     assert_eq!(reconnect_frames[0]["type"], "server.connected");
     assert_eq!(reconnect_frames[0]["id"], "oc-1184-reconnected");
 
@@ -1724,10 +1808,7 @@ fn opencode_activity_fixture_rejects_reconnect_recovery_that_depends_on_sse_repl
     assert_eq!(root_children[0]["parentID"], "ses-root-activity");
     let nested_children = children_response(snapshots, "ses-child-missed-direct");
     assert_eq!(nested_children[0]["id"], "ses-child-missed-nested");
-    assert_eq!(
-        nested_children[0]["parentID"],
-        "ses-child-missed-direct"
-    );
+    assert_eq!(nested_children[0]["parentID"], "ses-child-missed-direct");
 
     let status = snapshots
         .iter()
@@ -1744,7 +1825,10 @@ fn opencode_activity_fixture_rejects_reconnect_recovery_that_depends_on_sse_repl
     let history = message_response(snapshots, "ses-child-missed-direct");
     assert_eq!(history[0]["info"]["sessionID"], "ses-child-missed-direct");
     assert_eq!(history[0]["info"]["role"], "assistant");
-    assert_eq!(history[0]["info"]["time"]["completed"], 1_721_827_260_000_i64);
+    assert_eq!(
+        history[0]["info"]["time"]["completed"],
+        1_721_827_260_000_i64
+    );
     assert_eq!(history[0]["info"]["finish"], "stop");
 }
 
@@ -1834,9 +1918,14 @@ async fn opencode_runtime_failure_boundaries_reject_invalid_sessions_and_http_st
             .is_err()
     );
     assert!(runtime.set_model("missing-slash").await.is_err());
-    assert!(runtime.send_command("/", "").await.is_err());
-    assert!(runtime.send_turn(Some("hello"), Vec::new()).await.is_err());
-    assert!(runtime.send_command("test", "args").await.is_err());
+    assert!(runtime.send_command("/", "", None).await.is_err());
+    assert!(
+        runtime
+            .send_turn(Some("hello"), Vec::new(), None)
+            .await
+            .is_err()
+    );
+    assert!(runtime.send_command("test", "args", None).await.is_err());
     assert!(runtime.rollback_thread(1).await.is_err());
     assert!(
         runtime
@@ -1935,8 +2024,13 @@ async fn opencode_runtime_maps_transport_loss_across_every_live_operation() {
             .await
             .is_err()
     );
-    assert!(runtime.send_turn(Some("hello"), Vec::new()).await.is_err());
-    assert!(runtime.send_command("review", "src").await.is_err());
+    assert!(
+        runtime
+            .send_turn(Some("hello"), Vec::new(), None)
+            .await
+            .is_err()
+    );
+    assert!(runtime.send_command("review", "src", None).await.is_err());
     assert!(runtime.interrupt_turn().await.is_err());
     assert!(runtime.rollback_thread(1).await.is_err());
     assert!(
@@ -2028,6 +2122,7 @@ async fn opencode_runtime_matches_session_and_rollback_traces() {
         .set_model("openai/gpt-5.4")
         .await
         .expect("switch model");
+    runtime.set_variant(Some("fast".to_owned())).await;
     let send_runtime = runtime.clone();
     let send_turn = tokio::spawn(async move {
         send_runtime
@@ -2039,6 +2134,7 @@ async fn opencode_runtime_matches_session_and_rollback_traces() {
                     "url": "file:///state/attachments/image-1",
                     "filename": "screen.png"
                 })],
+                None,
             )
             .await
     });
@@ -2067,6 +2163,7 @@ async fn opencode_runtime_matches_session_and_rollback_traces() {
         Some(&json!({
             "sessionID": "session-1",
             "model": { "providerID": "openai", "modelID": "gpt-5.4" },
+            "variant": "fast",
             "parts": [
                 { "type": "text", "text": "hello" },
                 {
@@ -2146,8 +2243,9 @@ async fn opencode_runtime_dispatches_native_commands_with_agent_and_model() {
     )
     .expect("runtime");
     runtime.start().await.expect("start");
+    runtime.set_variant(Some("high".to_owned())).await;
     runtime
-        .send_command("review", "src/provider")
+        .send_command("review", "src/provider", None)
         .await
         .expect("native command");
 
@@ -2158,8 +2256,90 @@ async fn opencode_runtime_dispatches_native_commands_with_agent_and_model() {
             "arguments": "src/provider",
             "agent": "reviewer",
             "model": "openai/gpt-5.4",
+            "variant": "high",
         }))
     );
+    server.abort();
+}
+
+#[tokio::test]
+async fn opencode_options_use_exact_model_variants_and_reject_conflicts_before_prompt() {
+    let state = Arc::new(TestServerState::default());
+    let app = Router::new()
+        .route("/session", post(create_session))
+        .route("/event", get(subscribe_permission_events))
+        .route(
+            "/provider",
+            get(|| async {
+                Json(json!({
+                    "connected": ["openai"],
+                    "all": [{
+                        "id": "openai",
+                        "models": {
+                            "gpt-5": { "variants": { "fast": {}, "high": {}, "low": {} } },
+                            "other": { "variants": { "fast": {}, "medium": {} } },
+                            "fast-only": { "variants": { "fast": {} } }
+                        }
+                    }]
+                }))
+            }),
+        )
+        .route("/session/{session_id}/prompt_async", post(prompt_async))
+        .with_state(state.clone());
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address: SocketAddr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    let runtime = OpenCodeSessionRuntime::new(
+        &format!("http://{address}"),
+        "opencode-options-thread",
+        "/tmp/project",
+        Some("openai/gpt-5"),
+    );
+    runtime.start().await.expect("start");
+
+    assert!(runtime
+        .set_options(vec![json!({ "id": "madeUp", "value": true })])
+        .await
+        .is_err());
+    assert!(state.prompt_body.lock().await.is_none());
+    assert!(runtime
+        .set_options(vec![json!({ "id": "variant", "value": "medium" })])
+        .await
+        .is_err());
+    assert!(state.prompt_body.lock().await.is_none());
+
+    runtime
+        .set_options(vec![json!({ "id": "fastMode", "value": false })])
+        .await
+        .expect("false selects the advertised non-fast default");
+    assert!(runtime
+        .set_options(vec![
+            json!({ "id": "fastMode", "value": true }),
+            json!({ "id": "variant", "value": "high" }),
+        ])
+        .await
+        .is_err());
+    runtime.send_turn(Some("hello"), Vec::new(), None).await.unwrap();
+    assert_eq!(state.prompt_body.lock().await.as_ref().unwrap()["variant"], "high");
+
+    runtime.set_model("openai/other").await.unwrap();
+    runtime
+        .set_options(vec![json!({ "id": "fastMode", "value": true })])
+        .await
+        .expect("compatible target reapplies Fast");
+    runtime.send_turn(Some("fast again"), Vec::new(), None).await.unwrap();
+    assert_eq!(state.prompt_body.lock().await.as_ref().unwrap()["variant"], "fast");
+
+    runtime.set_model("openai/fast-only").await.unwrap();
+    runtime
+        .set_options(vec![json!({ "id": "fastMode", "value": false })])
+        .await
+        .expect("false does not invent a fast-only variant");
+    runtime.send_turn(Some("again"), Vec::new(), None).await.unwrap();
+    assert!(state.prompt_body.lock().await.as_ref().unwrap().get("variant").is_none());
+
     server.abort();
 }
 
@@ -2192,7 +2372,7 @@ async fn opencode_runtime_surfaces_session_errors_and_removes_the_unanswered_pro
     );
     runtime.start().await.expect("start");
     runtime
-        .send_turn(Some("hello"), vec![])
+        .send_turn(Some("hello"), vec![], None)
         .await
         .expect("send turn");
     let events = timeout(Duration::from_secs(2), runtime.collect_events(4))
@@ -2251,7 +2431,7 @@ async fn opencode_turn_ids_remain_unique_across_runtime_restarts() {
         OpenCodeSessionRuntime::new(&endpoint, "opencode-restart-thread", "/tmp/project", None);
     first.start().await.expect("first start");
     let first_turn_id = first
-        .send_turn(Some("first"), vec![])
+        .send_turn(Some("first"), vec![], None)
         .await
         .expect("first turn");
     first.stop().await.expect("first stop");
@@ -2260,7 +2440,7 @@ async fn opencode_turn_ids_remain_unique_across_runtime_restarts() {
         OpenCodeSessionRuntime::new(&endpoint, "opencode-restart-thread", "/tmp/project", None);
     second.start().await.expect("second start");
     let second_turn_id = second
-        .send_turn(Some("second"), vec![])
+        .send_turn(Some("second"), vec![], None)
         .await
         .expect("second turn");
     second.stop().await.expect("second stop");
@@ -2472,29 +2652,25 @@ async fn disabled_agent_activity_skips_reconciliation_and_resumes_authoritativel
         .await
         .insert("child-toggle".to_owned(), Vec::new());
     *state.statuses.lock().await = json!({"child-toggle": {"type": "busy"}});
-    state
-        .histories
-        .lock()
-        .await
-        .insert(
-            "child-toggle".to_owned(),
-            json!([{
-                "info": {
-                    "id": "message-disabled-history",
-                    "sessionID": "child-toggle",
-                    "role": "assistant",
-                    "time": {"created": 12}
-                },
-                "parts": [{
-                    "id": "part-disabled-history",
-                    "sessionID": "child-toggle",
-                    "messageID": "message-disabled-history",
-                    "type": "text",
-                    "text": "disabled-straddling-start",
-                    "time": {"start": 12}
-                }]
-            }]),
-        );
+    state.histories.lock().await.insert(
+        "child-toggle".to_owned(),
+        json!([{
+            "info": {
+                "id": "message-disabled-history",
+                "sessionID": "child-toggle",
+                "role": "assistant",
+                "time": {"created": 12}
+            },
+            "parts": [{
+                "id": "part-disabled-history",
+                "sessionID": "child-toggle",
+                "messageID": "message-disabled-history",
+                "type": "text",
+                "text": "disabled-straddling-start",
+                "time": {"start": 12}
+            }]
+        }]),
+    );
     let (endpoint, server) = spawn_reconciliation_server(state.clone()).await;
     let runtime =
         OpenCodeSessionRuntime::new(&endpoint, "opencode-toggle-thread", "/tmp/project", None);
@@ -2733,7 +2909,7 @@ async fn opencode_runtime_routes_root_verified_child_and_foreign_sse_without_cro
                 && actor.status.as_str() == "waiting"
     )));
     runtime
-        .send_turn(Some("root prompt"), Vec::new())
+        .send_turn(Some("root prompt"), Vec::new(), None)
         .await
         .expect("root turn");
 
@@ -3097,10 +3273,7 @@ async fn opencode_runtime_routes_root_verified_child_and_foreign_sse_without_cro
         projection
             .apply(
                 &scope.scope_id,
-                event
-                    .native_event_id
-                    .clone()
-                    .expect("live child native ID"),
+                event.native_event_id.clone().expect("live child native ID"),
                 event.activity.clone(),
                 format!("2026-07-25T12:10:{:02}Z", index + 1),
             )
@@ -3182,7 +3355,11 @@ async fn opencode_runtime_resynchronizes_after_a_malformed_sse_frame() {
     })
     .await
     .expect("valid frame after malformed SSE reaches the runtime");
-    assert!(event_types.iter().any(|event_type| event_type == "runtime.error"));
+    assert!(
+        event_types
+            .iter()
+            .any(|event_type| event_type == "runtime.error")
+    );
     assert!(
         event_types
             .iter()
@@ -3643,7 +3820,11 @@ async fn captured_timestamp_less_child_command_persists_observation_time_once() 
         .iter()
         .filter(|entry| entry.kind == ActivityEntryKind::Command)
         .collect::<Vec<_>>();
-    assert_eq!(commands.len(), 1, "the duplicate captured SSE frame is stable");
+    assert_eq!(
+        commands.len(),
+        1,
+        "the duplicate captured SSE frame is stable"
+    );
     assert!(
         !commands[0].created_at.starts_with("1970-01-01"),
         "timestamp-less live commands use production SSE observation time"
@@ -4004,7 +4185,10 @@ async fn reconciliation_transactionally_drains_pending_live_text_within_slice_bu
             .apply(&scope.scope_id, native_event_id, activity, created_at)
             .await
             .expect("replay applies");
-        assert!(deltas.is_empty(), "native replay produces no duplicate deltas");
+        assert!(
+            deltas.is_empty(),
+            "native replay produces no duplicate deltas"
+        );
     }
     let replayed_detail = projection
         .list_detail(
@@ -4518,11 +4702,7 @@ async fn reconciliation_root_plus_fifty_dirty_hints_never_drop_the_last_child() 
             .lock()
             .await
             .insert(child.clone(), Vec::new());
-        state
-            .histories
-            .lock()
-            .await
-            .insert(child, json!([]));
+        state.histories.lock().await.insert(child, json!([]));
     }
     let (endpoint, server) = spawn_reconciliation_server(state.clone()).await;
     let runtime = OpenCodeSessionRuntime::new(
@@ -5728,12 +5908,18 @@ async fn reconciliation_rejects_control_ids_and_stops_discovery_at_depth_sixteen
         parent = child;
     }
     state.children.lock().await.insert(parent, Vec::new());
-    state.children.lock().await.get_mut("root").expect("root").push(json!({
-        "id": "bad\nchild",
-        "parentID": "root",
-        "title": "Invalid",
-        "time": { "created": 30, "updated": 30 }
-    }));
+    state
+        .children
+        .lock()
+        .await
+        .get_mut("root")
+        .expect("root")
+        .push(json!({
+            "id": "bad\nchild",
+            "parentID": "root",
+            "title": "Invalid",
+            "time": { "created": 30, "updated": 30 }
+        }));
     let (endpoint, server) = spawn_reconciliation_server(state.clone()).await;
     let runtime = OpenCodeSessionRuntime::new(
         &endpoint,
@@ -5751,9 +5937,14 @@ async fn reconciliation_rejects_control_ids_and_stops_discovery_at_depth_sixteen
         mutation,
         ProviderActivityMutation::UpsertActor(actor) if actor.id.contains("depth-17")
     )));
-    assert!(!state.history_requests.lock().await.iter().any(|uri| {
-        uri.contains("bad%0Achild") || uri.contains("depth-17")
-    }));
+    assert!(
+        !state
+            .history_requests
+            .lock()
+            .await
+            .iter()
+            .any(|uri| { uri.contains("bad%0Achild") || uri.contains("depth-17") })
+    );
 
     runtime.stop().await.expect("stop");
     server.abort();
@@ -5842,7 +6033,10 @@ async fn invalid_root_identity_disables_activity_without_breaking_chat_start() {
         );
 
         assert_eq!(
-            runtime.start().await.expect("normal chat start remains available"),
+            runtime
+                .start()
+                .await
+                .expect("normal chat start remains available"),
             root_id
         );
         assert_eq!(runtime.collect_events(2).await.len(), 2);
@@ -6239,9 +6433,7 @@ struct ReconciliationEventConnectionGuard {
 
 impl Drop for ReconciliationEventConnectionGuard {
     fn drop(&mut self) {
-        self.state
-            .event_disconnects
-            .fetch_add(1, Ordering::SeqCst);
+        self.state.event_disconnects.fetch_add(1, Ordering::SeqCst);
         self.state.event_connection_closed.notify_waiters();
     }
 }
@@ -6277,11 +6469,7 @@ async fn list_reconciliation_children(
     OriginalUri(uri): OriginalUri,
     State(state): State<Arc<ReconciliationServerState>>,
 ) -> Response {
-    state
-        .children_requests
-        .lock()
-        .await
-        .push(uri.to_string());
+    state.children_requests.lock().await.push(uri.to_string());
     state.children_entered.notify_waiters();
     if state.slow_children.load(Ordering::SeqCst) {
         std::future::pending::<()>().await;
@@ -6348,10 +6536,7 @@ async fn list_reconciliation_messages(
     }
     if state.oversized_stream.load(Ordering::SeqCst) {
         let first = stream::once(async {
-            Ok::<Bytes, std::convert::Infallible>(Bytes::from(vec![
-                b'x';
-                4 * 1024 * 1024 + 1
-            ]))
+            Ok::<Bytes, std::convert::Infallible>(Bytes::from(vec![b'x'; 4 * 1024 * 1024 + 1]))
         });
         let tail = stream::pending::<Result<Bytes, std::convert::Infallible>>();
         return Response::new(Body::from_stream(first.chain(tail)));
@@ -6866,7 +7051,10 @@ fn parse_raw_sse_frame(raw: &str) -> Value {
         "one JSON payload per captured frame"
     );
     let payload: Value = serde_json::from_str(data).expect("SSE JSON payload");
-    assert_eq!(payload["id"], header_id, "top-level event ID matches SSE header");
+    assert_eq!(
+        payload["id"], header_id,
+        "top-level event ID matches SSE header"
+    );
     payload
 }
 

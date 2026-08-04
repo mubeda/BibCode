@@ -888,3 +888,156 @@ async fn provider_update_reports_the_contract_error_when_native_update_is_unavai
             .is_some_and(|reason| !reason.is_empty())
     );
 }
+
+#[tokio::test]
+async fn refresh_providers_returns_version_advisories_without_registry_access() {
+    let directory = tempfile::tempdir().expect("temporary state directory");
+    let missing_codex = directory.path().join("missing-codex");
+    let settings = json!({
+        "enableProviderUpdateChecks": false,
+        "providers": {
+            "claudeAgent": { "enabled": false },
+            "cursor": { "enabled": false },
+            "grok": { "enabled": false },
+            "opencode": { "enabled": false }
+        },
+        "providerInstances": {
+            "codex": {
+                "driver": "codex",
+                "enabled": true,
+                "config": { "binaryPath": missing_codex }
+            }
+        }
+    });
+    let settings_path = directory.path().join("userdata/settings.json");
+    tokio::fs::create_dir_all(settings_path.parent().expect("settings parent"))
+        .await
+        .expect("create settings directory");
+    tokio::fs::write(
+        settings_path,
+        serde_json::to_vec(&settings).expect("settings JSON"),
+    )
+    .await
+    .expect("write settings fixture");
+    let control = NativeServerControl::new(ServerConfig::new(directory.path()), auth_descriptor()).await;
+
+    let refreshed = call(
+        &control,
+        "server.refreshProviders",
+        json!({ "instanceId": "codex" }),
+    )
+    .await;
+    let codex = refreshed["providers"]
+        .as_array()
+        .expect("providers")
+        .iter()
+        .find(|provider| provider["driver"] == "codex")
+        .expect("codex provider");
+    assert!(codex["versionAdvisory"].is_object());
+    assert!(codex["versionAdvisory"]["canUpdate"].is_boolean());
+    assert!(codex["versionAdvisory"]["status"].is_string());
+}
+
+#[tokio::test]
+async fn provider_update_executes_a_supported_cursor_command_but_cannot_verify_version() {
+    let directory = tempfile::tempdir().expect("temporary state directory");
+    let executable = write_provider_fixture(&directory).await;
+    let settings = json!({
+        "enableProviderUpdateChecks": false,
+        "providerInstances": {
+            "cursor-work": {
+                "driver": "cursor",
+                "enabled": true,
+                "config": { "binaryPath": executable }
+            }
+        }
+    });
+    let settings_path = directory.path().join("userdata/settings.json");
+    tokio::fs::create_dir_all(settings_path.parent().expect("settings parent"))
+        .await
+        .expect("create settings directory");
+    tokio::fs::write(
+        settings_path,
+        serde_json::to_vec(&settings).expect("settings JSON"),
+    )
+    .await
+    .expect("write settings fixture");
+    let control = NativeServerControl::new(ServerConfig::new(directory.path()), auth_descriptor()).await;
+
+    let result = call(
+        &control,
+        "server.updateProvider",
+        json!({ "provider": "cursor", "instanceId": "cursor-work" }),
+    )
+    .await;
+    let provider = result["providers"]
+        .as_array()
+        .expect("providers")
+        .iter()
+        .find(|provider| provider["instanceId"] == "cursor-work")
+        .expect("updated cursor");
+    assert_eq!(provider["updateState"]["status"], "unchanged");
+    assert_eq!(
+        provider["updateState"]["message"],
+        "Update command completed, but BiBCode could not verify the provider version."
+    );
+}
+
+#[tokio::test]
+async fn provider_update_rejects_an_instance_driver_mismatch() {
+    let (_directory, control) = fixture().await;
+    let error = control
+        .call(
+            "server.updateProvider",
+            json!({ "provider": "cursor", "instanceId": "codex" }),
+            CancellationToken::new(),
+        )
+        .await
+        .expect_err("mismatched instance and driver must fail");
+    assert_eq!(error["_tag"], "ServerProviderUpdateError");
+    assert_eq!(error["provider"], "cursor");
+}
+
+#[tokio::test]
+async fn provider_update_rejects_malformed_instance_ids_without_publishing_update_state() {
+    let directory = tempfile::tempdir().expect("temporary state directory");
+    let executable = write_provider_fixture(&directory).await;
+    let settings = json!({
+        "enableProviderUpdateChecks": false,
+        "providerInstances": {
+            "cursor-work": {
+                "driver": "cursor",
+                "enabled": true,
+                "config": { "binaryPath": executable }
+            }
+        }
+    });
+    let settings_path = directory.path().join("userdata/settings.json");
+    tokio::fs::create_dir_all(settings_path.parent().expect("settings parent"))
+        .await
+        .expect("create settings directory");
+    tokio::fs::write(
+        settings_path,
+        serde_json::to_vec(&settings).expect("settings JSON"),
+    )
+    .await
+    .expect("write settings fixture");
+    let control = NativeServerControl::new(ServerConfig::new(directory.path()), auth_descriptor()).await;
+
+    for instance_id in [Value::Null, json!(7), json!({}), json!("not a slug")] {
+        let error = control
+            .call(
+                "server.updateProvider",
+                json!({ "provider": "cursor", "instanceId": instance_id }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect_err("malformed instance ID must be rejected");
+        assert_eq!(error["_tag"], "ServerProviderUpdateError");
+        assert_eq!(error["provider"], "cursor");
+        assert!(error["reason"].as_str().is_some_and(|reason| reason.contains("instanceId")));
+    }
+
+    let config = call(&control, "server.getConfig", json!({})).await;
+    assert_eq!(config["providers"][0]["updateState"], Value::Null);
+}

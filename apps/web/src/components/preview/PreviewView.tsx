@@ -80,7 +80,7 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
   const isMountedRef = useRef(true);
   const previewState = useThreadPreviewState(threadRef);
   const addPreviewAnnotation = useComposerDraftStore((store) => store.addPreviewAnnotation);
-  const addImage = useComposerDraftStore((store) => store.addImage);
+  const addAttachment = useComposerDraftStore((store) => store.addAttachment);
   const environment = useEnvironment(threadRef.environmentId);
   const environmentHttpBaseUrl = useEnvironmentHttpBaseUrl(threadRef.environmentId);
   const open = useAtomCommand(previewEnvironment.open);
@@ -534,7 +534,7 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
         addPreviewAnnotation(threadRef, annotation);
         const screenshotFile = await previewAnnotationScreenshotFile(annotation);
         if (screenshotFile && annotation.screenshot) {
-          addImage(threadRef, {
+          addAttachment(threadRef, {
             type: "image",
             id: annotation.id,
             name: screenshotFile.name,
@@ -567,7 +567,7 @@ export function PreviewView({ threadRef, tabId: requestedTabId, configuredUrls, 
         }
       }
     })();
-  }, [addImage, addPreviewAnnotation, tabId, threadRef]);
+  }, [addAttachment, addPreviewAnnotation, tabId, threadRef]);
 
   // If the active tab changes mid-pick (close, thread switch, hot restart),
   // tell main to tear down the in-flight session AND reset our local toggle

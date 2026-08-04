@@ -138,6 +138,35 @@ impl ProviderOperationalLog {
             .is_some_and(|record| self.writer.try_write(record))
     }
 
+    #[must_use]
+    pub fn record_option_reconciliation(
+        &self,
+        thread_id: &str,
+        provider_instance_id: &str,
+        model: Option<&str>,
+        option_id: &str,
+        requested_value: Option<&Value>,
+        application_method: &str,
+        result: &str,
+    ) -> bool {
+        let mut record = serde_json::json!({
+            "timestamp": timestamp(),
+            "eventType": "option.reconciliation",
+            "threadId": thread_id,
+            "providerInstanceId": provider_instance_id,
+            "optionId": option_id,
+            "applicationMethod": application_method,
+            "result": result,
+        });
+        if let Some(model) = model {
+            record["model"] = Value::String(model.to_owned());
+        }
+        if let Some(requested_value) = requested_value {
+            record["requestedValue"] = requested_value.clone();
+        }
+        self.writer.try_write(record)
+    }
+
     pub async fn shutdown(&self) -> Result<(), String> {
         self.writer.shutdown().await
     }
@@ -754,6 +783,45 @@ mod tests {
         ] {
             assert!(!contents.contains(private_value));
         }
+    }
+
+    #[tokio::test]
+    async fn option_reconciliation_records_only_explicit_safe_fields() {
+        let temp = TempDir::new().expect("temporary log directory");
+        let path = temp.path().join("provider-options.log");
+        let log = ProviderOperationalLog::start(
+            path.clone(),
+            OperationalLogOptions {
+                max_file_bytes: 4096,
+                retained_files: 1,
+                queue_capacity: 4,
+            },
+        )
+        .await
+        .expect("provider log starts");
+
+        assert!(log.record_option_reconciliation(
+            "thread-1",
+            "codex-work",
+            Some("gpt-5.6"),
+            "fastMode",
+            Some(&json!(true)),
+            "live",
+            "applied",
+        ));
+        log.shutdown().await.expect("provider log shuts down");
+
+        let contents = std::fs::read_to_string(path).expect("read provider log");
+        let record: Value = serde_json::from_str(contents.trim()).expect("provider option record");
+        assert_eq!(record["eventType"], "option.reconciliation");
+        assert_eq!(record["threadId"], "thread-1");
+        assert_eq!(record["providerInstanceId"], "codex-work");
+        assert_eq!(record["model"], "gpt-5.6");
+        assert_eq!(record["optionId"], "fastMode");
+        assert_eq!(record["requestedValue"], true);
+        assert_eq!(record["applicationMethod"], "live");
+        assert_eq!(record["result"], "applied");
+        assert_eq!(record.as_object().expect("record object").len(), 9);
     }
 
     #[tokio::test]

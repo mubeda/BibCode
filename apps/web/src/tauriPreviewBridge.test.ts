@@ -177,6 +177,112 @@ const commandCases: readonly CommandCase[] = [
 ];
 
 describe("tauriPreviewBridge", () => {
+  it("reuses one native host across logical browser tabs", async () => {
+    const { bridge, invoke } = makeBridge();
+
+    await bridge.createTab("logical-a");
+    await bridge.closeTab("logical-a");
+    await bridge.createTab("logical-b");
+    await bridge.navigate("logical-b", "https://b.test/");
+
+    expect(
+      invoke.mock.calls.filter(([command]) => command === "desktop_preview_create_tab"),
+    ).toEqual([["desktop_preview_create_tab", { tabId: "logical-a" }]]);
+    expect(invoke.mock.calls.some(([command]) => command === "desktop_preview_close_tab")).toBe(
+      false,
+    );
+    expect(invoke).toHaveBeenLastCalledWith("desktop_preview_navigate", {
+      tabId: "logical-a",
+      url: "https://b.test/",
+    });
+  });
+
+  it("reports reused native host state under the active logical tab", async () => {
+    const { bridge, emit } = makeBridge();
+    const received: Array<readonly [string, DesktopPreviewTabState]> = [];
+    bridge.onStateChange((tabId, state) => received.push([tabId, state]));
+    await bridge.createTab("logical-a");
+    await bridge.closeTab("logical-a");
+    await bridge.createTab("logical-b");
+
+    emit("preview://state", statePayload("logical-a", 1, "https://b.test/"));
+
+    expect(received).toEqual([
+      [
+        "logical-b",
+        { ...statePayload("logical-a", 1, "https://b.test/").state, tabId: "logical-b" },
+      ],
+    ]);
+  });
+
+  it("hides and repositions the native host while switching logical tabs", async () => {
+    const { bridge, invoke } = makeBridge();
+    const firstBounds = { x: 1, y: 2, width: 300, height: 200 };
+    const secondBounds = { x: 5, y: 6, width: 400, height: 250 };
+    await bridge.createTab("logical-a");
+    await bridge.setBounds("logical-a", firstBounds, true);
+    await bridge.closeTab("logical-a");
+    await bridge.setBounds("logical-b", secondBounds, true);
+    await bridge.createTab("logical-b");
+
+    expect(
+      invoke.mock.calls.filter(([command]) => command === "desktop_preview_set_bounds"),
+    ).toEqual([
+      ["desktop_preview_set_bounds", { tabId: "logical-a", bounds: firstBounds, visible: true }],
+      ["desktop_preview_set_bounds", { tabId: "logical-a", bounds: firstBounds, visible: false }],
+      ["desktop_preview_set_bounds", { tabId: "logical-a", bounds: secondBounds, visible: true }],
+    ]);
+  });
+
+  it("routes active logical tab commands through the reused native host", async () => {
+    const { bridge, invoke } = makeBridge();
+    await bridge.createTab("logical-a");
+    await bridge.closeTab("logical-a");
+    await bridge.createTab("logical-b");
+    invoke.mockClear();
+
+    await bridge.goBack("logical-b");
+    await bridge.goForward("logical-b");
+    await bridge.refresh("logical-b");
+    await bridge.hardReload("logical-b");
+    await bridge.zoomIn("logical-b");
+    await bridge.openDevTools("logical-b");
+    await bridge.captureScreenshot("logical-b");
+
+    expect(invoke.mock.calls).toEqual([
+      ["desktop_preview_go_back", { tabId: "logical-a" }],
+      ["desktop_preview_go_forward", { tabId: "logical-a" }],
+      ["desktop_preview_refresh", { tabId: "logical-a" }],
+      ["desktop_preview_hard_reload", { tabId: "logical-a" }],
+      ["desktop_preview_set_zoom", { tabId: "logical-a", factor: 1.1 }],
+      ["desktop_preview_open_devtools", { tabId: "logical-a" }],
+      ["desktop_preview_capture_screenshot", { tabId: "logical-a" }],
+    ]);
+  });
+
+  it("does not reset native zoom while activating a reused logical tab", async () => {
+    const { bridge, invoke } = makeBridge();
+    await bridge.createTab("logical-a");
+    await bridge.zoomIn("logical-a");
+    await bridge.closeTab("logical-a");
+    await bridge.createTab("logical-b");
+
+    expect(invoke.mock.calls.filter(([command]) => command === "desktop_preview_set_zoom")).toEqual(
+      [["desktop_preview_set_zoom", { tabId: "logical-a", factor: 1.1 }]],
+    );
+  });
+
+  it("attributes reused native host screenshots to the active logical tab", async () => {
+    const { bridge } = makeBridge();
+    await bridge.createTab("logical-a");
+    await bridge.closeTab("logical-a");
+    await bridge.createTab("logical-b");
+
+    const artifact = await bridge.captureScreenshot("logical-b");
+
+    expect(artifact).toEqual({ ...screenshotArtifact, tabId: "logical-b" });
+  });
+
   it("reports image clipboard unsupported while retaining its rejecting stub", async () => {
     const { bridge } = makeBridge();
 

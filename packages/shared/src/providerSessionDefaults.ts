@@ -68,7 +68,6 @@ interface NormalizedProviderOptions {
 const FAST_MODE_OPTION_ID = "fastMode";
 const SERVICE_TIER_OPTION_ID = "serviceTier";
 const FAST_SERVICE_TIER_VALUE = "fast";
-const DEFAULT_SERVICE_TIER_VALUE = "default";
 const CODEX_DRIVER_KIND = ProviderDriverKind.make("codex");
 const CLAUDE_DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
 const DEFAULT_EFFORT_BY_PROVIDER: Partial<Record<ProviderDriverKind, string>> = {
@@ -167,7 +166,7 @@ function findEffortDescriptor(
   return null;
 }
 
-function getFastModeDescriptor(
+export function getFastModeDescriptor(
   driver: ProviderDriverKind,
   descriptors: ReadonlyArray<ProviderOptionDescriptor>,
 ): ProviderOptionDescriptor | null {
@@ -186,9 +185,38 @@ function getFastModeDescriptor(
       (descriptor) =>
         descriptor.id === SERVICE_TIER_OPTION_ID &&
         descriptor.type === "select" &&
-        descriptor.options.some((option) => option.id === FAST_SERVICE_TIER_VALUE),
+        descriptor.options.some((option) => option.id === FAST_SERVICE_TIER_VALUE) &&
+        getFastModeOffValue(driver, descriptor) !== null,
     ) ?? null
   );
+}
+
+export function getFastModeOffValue(
+  driver: ProviderDriverKind,
+  descriptor: ProviderOptionDescriptor | null | undefined,
+): string | boolean | null {
+  if (descriptor?.id === FAST_MODE_OPTION_ID && descriptor.type === "boolean") {
+    return false;
+  }
+  if (
+    driver !== CODEX_DRIVER_KIND ||
+    descriptor?.id !== SERVICE_TIER_OPTION_ID ||
+    descriptor.type !== "select"
+  ) {
+    return null;
+  }
+
+  const nonFastOptions = descriptor.options.filter(
+    (option) => option.id !== FAST_SERVICE_TIER_VALUE,
+  );
+  const currentValue = getProviderOptionCurrentValue(descriptor);
+  if (
+    typeof currentValue === "string" &&
+    nonFastOptions.some((option) => option.id === currentValue)
+  ) {
+    return currentValue;
+  }
+  return nonFastOptions.find((option) => option.isDefault)?.id ?? nonFastOptions[0]?.id ?? null;
 }
 
 function normalizeProviderOptions(
@@ -211,7 +239,6 @@ function normalizeProviderOptions(
     caps: model.capabilities ?? {},
     selections,
     preservePromptInjectedSelections: true,
-    enforceCodexServiceTier: true,
   });
   const effortDescriptor = findEffortDescriptor(descriptors);
   const effortValue = getProviderOptionCurrentValue(effortDescriptor);
@@ -413,11 +440,15 @@ export function updateProviderSessionDefault(input: {
       });
       normalizedOptions = normalizeUpdatedSelections(selections);
     } else if (fastModeDescriptor?.type === "select") {
-      selections = replaceSelection(selections, {
-        id: fastModeDescriptor.id,
-        value: input.change.value ? FAST_SERVICE_TIER_VALUE : DEFAULT_SERVICE_TIER_VALUE,
-      });
-      normalizedOptions = normalizeUpdatedSelections(selections);
+      const offValue = getFastModeOffValue(input.driver, fastModeDescriptor);
+      const value = input.change.value ? FAST_SERVICE_TIER_VALUE : offValue;
+      if (typeof value === "string") {
+        selections = replaceSelection(selections, {
+          id: fastModeDescriptor.id,
+          value,
+        });
+        normalizedOptions = normalizeUpdatedSelections(selections);
+      }
     }
   }
 

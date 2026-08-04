@@ -8,6 +8,7 @@ interface DesktopTabLease {
 }
 
 const leases = new Map<string, DesktopTabLease>();
+let nativeOperationTail: Promise<void> | undefined;
 
 export interface AcquiredDesktopTab {
   readonly ready: Promise<void>;
@@ -15,13 +16,45 @@ export interface AcquiredDesktopTab {
   readonly release: () => void;
 }
 
-function createTab(tabId: string, lease: DesktopTabLease): void {
-  let ready: Promise<void>;
+function enqueueNativeOperation(operation: () => Promise<void>): Promise<void> {
+  let result: Promise<void>;
   try {
-    ready = previewBridge?.createTab(tabId) ?? Promise.resolve();
+    result = nativeOperationTail === undefined ? operation() : nativeOperationTail.then(operation);
   } catch (error) {
-    ready = Promise.reject(error);
+    result = Promise.reject(error);
   }
+  const clearTail = () => {
+    if (nativeOperationTail === tail) nativeOperationTail = undefined;
+  };
+  const tail = result.then(clearTail, clearTail);
+  nativeOperationTail = tail;
+  return result;
+}
+
+async function closeTab(tabId: string, lease: DesktopTabLease): Promise<void> {
+  try {
+    await lease.ready;
+  } catch {
+    // A rejected creation has no native child to preserve.
+  }
+  await previewBridge?.closeTab(tabId);
+}
+
+function createTab(tabId: string, lease: DesktopTabLease): void {
+  const inactive: Array<readonly [string, DesktopTabLease]> = [];
+  for (const [inactiveTabId, inactiveLease] of leases) {
+    if (inactiveTabId === tabId || inactiveLease.references > 0) continue;
+    if (inactiveLease.closeTimer !== null) window.clearTimeout(inactiveLease.closeTimer);
+    inactiveLease.closeTimer = null;
+    leases.delete(inactiveTabId);
+    inactive.push([inactiveTabId, inactiveLease]);
+  }
+  const ready = enqueueNativeOperation(async () => {
+    for (const [inactiveTabId, inactiveLease] of inactive) {
+      await closeTab(inactiveTabId, inactiveLease);
+    }
+    await previewBridge?.createTab(tabId);
+  });
   lease.ready = ready;
   lease.createFailed = false;
   void ready.then(undefined, () => {
@@ -67,12 +100,7 @@ export function acquireDesktopTab(tabId: string): AcquiredDesktopTab {
         const latest = leases.get(tabId);
         if (latest !== current || latest.references > 0) return;
         leases.delete(tabId);
-        try {
-          void previewBridge?.closeTab(tabId).catch(() => undefined);
-        } catch {
-          // The tab is already absent from the registry, so a later acquire
-          // can create a fresh lifecycle instead of inheriting this failure.
-        }
+        void enqueueNativeOperation(() => closeTab(tabId, latest)).catch(() => undefined);
       }, 0);
     },
   };

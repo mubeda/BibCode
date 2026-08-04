@@ -5,13 +5,15 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use serde_json::{Value, json};
 #[cfg(test)]
 use tokio::sync::{Barrier, Notify};
-use tokio::sync::{Mutex, RwLock, broadcast, mpsc};
+use tokio::sync::{Mutex, RwLock, broadcast, mpsc, watch};
+use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -21,6 +23,9 @@ use crate::{
     production::{
         agent_activity::AgentActivitySettingsHandler,
         keybindings, local_servers, provider_inventory,
+        provider_maintenance::{
+            ProviderMaintenance, ProviderMaintenanceTarget, ProviderUpdateLifecycleToken,
+        },
         server_terminal::{JsonFuture, JsonStream, ProductionServerControl},
     },
     server_settings::ProviderSettingsState,
@@ -64,11 +69,70 @@ fn merge_provider_snapshot(
     next
 }
 
+fn provider_update_state(
+    status: &str,
+    started_at: Option<&str>,
+    finished_at: Option<&str>,
+    message: &str,
+    output: Option<&str>,
+) -> Value {
+    json!({
+        "status": status,
+        "startedAt": started_at,
+        "finishedAt": finished_at,
+        "message": message,
+        "output": output,
+    })
+}
+
+fn post_update_status(providers: &[Value], instance_id: &str) -> &'static str {
+    match providers
+        .iter()
+        .find(|provider| provider["instanceId"] == instance_id)
+    {
+        Some(provider) if provider["versionAdvisory"]["status"] == "current" => "succeeded",
+        _ => "unchanged",
+    }
+}
+
+fn provider_update_error(provider: &str, reason: impl Into<String>) -> Value {
+    json!({
+        "_tag": "ServerProviderUpdateError",
+        "provider": provider,
+        "reason": reason.into(),
+    })
+}
+
 #[cfg(test)]
 #[derive(Clone, Debug)]
 struct ProviderProbePause {
     entered: Arc<Notify>,
     release: Arc<Notify>,
+}
+
+#[derive(Debug)]
+pub(crate) struct ProviderUpdateCheckTask {
+    cancellation: CancellationToken,
+    task: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    refresh_task: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+}
+
+impl ProviderUpdateCheckTask {
+    pub(crate) async fn shutdown(&self) {
+        self.cancellation.cancel();
+        if let Some(task) = self.task.lock().await.take() {
+            let _ = task.await;
+        }
+        if let Some(task) = self.refresh_task.lock().await.take() {
+            let _ = task.await;
+        }
+    }
+}
+
+impl Drop for ProviderUpdateCheckTask {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+    }
 }
 
 #[cfg(test)]
@@ -110,11 +174,16 @@ pub struct NativeServerControl {
     settings_path: PathBuf,
     keybindings_path: PathBuf,
     settings: Arc<RwLock<Value>>,
+    automatic_git_fetch_interval: watch::Sender<Duration>,
     settings_update_lock: Arc<Mutex<()>>,
     settings_generation: Arc<AtomicU64>,
     agent_activity_handler: AgentActivityHandlerSlot,
     next_provider_probe_sequence: Arc<AtomicU64>,
     latest_published_provider_probe_sequence: Arc<AtomicU64>,
+    #[cfg(test)]
+    provider_update_refresh_attempts: Arc<AtomicU64>,
+    #[cfg(test)]
+    latest_full_provider_refresh_generation: Arc<AtomicU64>,
     settings_load_error: Option<Value>,
     #[cfg(test)]
     settings_update_barrier: Arc<RwLock<Option<Arc<Barrier>>>>,
@@ -122,9 +191,12 @@ pub struct NativeServerControl {
     next_quick_provider_probe_pause: Arc<Mutex<Option<ProviderProbePause>>>,
     #[cfg(test)]
     next_full_provider_probe_pause: Arc<Mutex<Option<ProviderProbePause>>>,
+    #[cfg(test)]
+    next_full_provider_refresh_handoff_pause: Arc<Mutex<Option<ProviderProbePause>>>,
     keybinding_rules: Arc<RwLock<Vec<Value>>>,
     keybinding_issues: Arc<RwLock<Vec<Value>>>,
     providers: Arc<RwLock<Vec<Value>>>,
+    provider_maintenance: ProviderMaintenance,
     full_provider_refresh_running: Arc<AtomicBool>,
     activity_protocol_registered: Arc<AtomicBool>,
     config_events: broadcast::Sender<Value>,
@@ -180,9 +252,12 @@ impl NativeServerControl {
         };
         apply_settings_defaults(&mut settings);
         redact_sensitive_environment(&mut settings);
+        let (automatic_git_fetch_interval, _) =
+            watch::channel(automatic_git_fetch_interval(&settings));
         let loaded_keybindings = keybindings::load(&keybindings_path).await;
         let cwd = std::env::current_dir().unwrap_or_else(|_| config.base_dir.clone());
-        let providers = provider_inventory::probe(&settings, None, &cwd)
+        let provider_maintenance = ProviderMaintenance::new();
+        let providers = provider_inventory::probe(&settings, None, &cwd, &provider_maintenance)
             .await
             .into_iter()
             .map(|result| result.snapshot)
@@ -195,11 +270,16 @@ impl NativeServerControl {
             settings_path,
             keybindings_path,
             settings: Arc::new(RwLock::new(settings.clone())),
+            automatic_git_fetch_interval,
             settings_update_lock: Arc::new(Mutex::new(())),
             settings_generation: Arc::new(AtomicU64::new(0)),
             agent_activity_handler: AgentActivityHandlerSlot::default(),
             next_provider_probe_sequence: Arc::new(AtomicU64::new(0)),
             latest_published_provider_probe_sequence: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            provider_update_refresh_attempts: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            latest_full_provider_refresh_generation: Arc::new(AtomicU64::new(0)),
             settings_load_error,
             #[cfg(test)]
             settings_update_barrier: Arc::new(RwLock::new(None)),
@@ -207,9 +287,12 @@ impl NativeServerControl {
             next_quick_provider_probe_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             next_full_provider_probe_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            next_full_provider_refresh_handoff_pause: Arc::new(Mutex::new(None)),
             keybinding_rules: Arc::new(RwLock::new(loaded_keybindings.rules)),
             keybinding_issues: Arc::new(RwLock::new(loaded_keybindings.issues)),
             providers: Arc::new(RwLock::new(providers)),
+            provider_maintenance,
             full_provider_refresh_running: Arc::new(AtomicBool::new(false)),
             activity_protocol_registered: Arc::new(AtomicBool::new(false)),
             config_events,
@@ -245,6 +328,10 @@ impl NativeServerControl {
             "observability": observability_snapshot(&self.state_directory),
             "settings": settings,
         })
+    }
+
+    pub(crate) fn automatic_git_fetch_interval_signal(&self) -> watch::Sender<Duration> {
+        self.automatic_git_fetch_interval.clone()
     }
 
     pub async fn attach_agent_activity_handler(
@@ -325,7 +412,27 @@ impl NativeServerControl {
             {
                 let _ = handler.transition(next_agent_activity, generation).await;
             }
+            commit_control
+                .provider_maintenance
+                .invalidate_update_lifecycles(|instance_id, driver| {
+                    provider_inventory::maintenance_target(
+                        &next,
+                        driver,
+                        Some(instance_id),
+                    )
+                    .is_some()
+                });
             *commit_control.settings.write().await = next.clone();
+            let next_fetch_interval = automatic_git_fetch_interval(&next);
+            commit_control
+                .automatic_git_fetch_interval
+                .send_if_modified(|current| {
+                    if *current == next_fetch_interval {
+                        return false;
+                    }
+                    *current = next_fetch_interval;
+                    true
+                });
             commit_control.publish(json!({
                 "version": 1,
                 "type": "settingsUpdated",
@@ -376,6 +483,13 @@ impl NativeServerControl {
         pause
     }
 
+    #[cfg(test)]
+    async fn install_next_full_provider_refresh_handoff_pause(&self) -> ProviderProbePause {
+        let pause = ProviderProbePause::new();
+        *self.next_full_provider_refresh_handoff_pause.lock().await = Some(pause.clone());
+        pause
+    }
+
     async fn refresh_providers(&self, payload: &Value) -> Value {
         let instance_id = payload.get("instanceId").and_then(Value::as_str);
         let (generation, settings) = self.settings_snapshot().await;
@@ -400,12 +514,317 @@ impl NativeServerControl {
         json!({ "providers": providers })
     }
 
+    async fn publish_provider_update_state(
+        &self,
+        target: &ProviderMaintenanceTarget,
+        token: ProviderUpdateLifecycleToken,
+        state: Value,
+    ) -> Vec<Value> {
+        let _update_guard = self.settings_update_lock.lock().await;
+        let configured = provider_inventory::maintenance_target(
+            &*self.settings.read().await,
+            &target.driver,
+            Some(&target.instance_id),
+        )
+        .is_some();
+        if configured {
+            self.provider_maintenance.set_update_state_if_current(
+                &target.instance_id,
+                &target.driver,
+                token,
+                state,
+            );
+        } else {
+            self.provider_maintenance
+                .invalidate_update_lifecycle_if_current(
+                    &target.instance_id,
+                    &target.driver,
+                    token,
+                );
+        }
+        let mut providers = self.providers.write().await;
+        for provider in providers.iter_mut() {
+            self.provider_maintenance.overlay_update_state(provider);
+        }
+        let snapshot = providers.clone();
+        drop(providers);
+        self.publish_provider_snapshots(&snapshot);
+        snapshot
+    }
+
+    async fn update_provider(
+        &self,
+        payload: &Value,
+        cancellation: CancellationToken,
+    ) -> Result<Value, Value> {
+        let provider = payload
+            .get("provider")
+            .and_then(Value::as_str)
+            .ok_or_else(|| provider_update_error("unknown", "provider must be a valid provider slug"))?;
+        validate_slug(provider, "provider").map_err(|reason| provider_update_error("unknown", reason))?;
+        let instance_id = match payload.get("instanceId") {
+            None => None,
+            Some(Value::String(instance_id)) => {
+                validate_slug(instance_id, "instanceId")
+                    .map_err(|reason| provider_update_error(provider, reason))?;
+                Some(instance_id.as_str())
+            }
+            Some(_) => {
+                return Err(provider_update_error(
+                    provider,
+                    "instanceId must be a valid provider slug",
+                ));
+            }
+        };
+        let (_, settings) = self.settings_snapshot().await;
+        let target = provider_inventory::maintenance_target(&settings, provider, instance_id)
+            .ok_or_else(|| {
+                provider_update_error(
+                    provider,
+                    "The requested provider instance does not match this provider.",
+                )
+            })?;
+        let capabilities = self.provider_maintenance.capabilities(&target).await;
+        let update = capabilities.update.ok_or_else(|| {
+            provider_update_error(
+                provider,
+                "This provider does not expose a safe native self-update command.",
+            )
+        })?;
+        let reservation = {
+            let _update_guard = self.settings_update_lock.lock().await;
+            if provider_inventory::maintenance_target(
+                &*self.settings.read().await,
+                &target.driver,
+                Some(&target.instance_id),
+            )
+            .is_none()
+            {
+                return Err(provider_update_error(
+                    provider,
+                    "The requested provider instance does not match this provider.",
+                ));
+            }
+            self.provider_maintenance
+                .reserve_target(&target.instance_id, &target.driver)
+        }
+        .map_err(|reason| provider_update_error(provider, reason))?;
+        let update_token = reservation.token();
+        let lock = self.provider_maintenance.command_lock(update.lock_key);
+        let command_guard = match lock.clone().try_lock_owned() {
+            Ok(guard) => guard,
+            Err(_) => {
+                self.publish_provider_update_state(
+                    &target,
+                    update_token,
+                    provider_update_state(
+                        "queued",
+                        None,
+                        None,
+                        "Waiting for another provider update to finish.",
+                        None,
+                    ),
+                )
+                .await;
+                tokio::select! {
+                    guard = lock.lock_owned() => guard,
+                    () = cancellation.cancelled() => {
+                        let finished_at = now_iso();
+                        let providers = self.publish_provider_update_state(
+                            &target,
+                            update_token,
+                            provider_update_state(
+                                "failed",
+                                None,
+                                Some(&finished_at),
+                                "Provider update was cancelled.",
+                                Some("provider.maintenance.update was cancelled"),
+                            ),
+                        ).await;
+                        return Ok(json!({ "providers": providers }));
+                    }
+                }
+            }
+        };
+        let started_at = now_iso();
+        self.publish_provider_update_state(
+            &target,
+            update_token,
+            provider_update_state(
+                "running",
+                Some(&started_at),
+                None,
+                "Updating provider.",
+                None,
+            ),
+        )
+        .await;
+        let command_result = match self
+            .provider_maintenance
+            .run_update_command(&target, &update, &cancellation)
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                drop(command_guard);
+                let finished_at = now_iso();
+                let providers = self
+                    .publish_provider_update_state(
+                        &target,
+                        update_token,
+                        provider_update_state(
+                            "failed",
+                            Some(&started_at),
+                            Some(&finished_at),
+                            "Provider update failed.",
+                            Some(&error),
+                        ),
+                    )
+                    .await;
+                return Ok(json!({ "providers": providers }));
+            }
+        };
+        if command_result.exit_code != 0 {
+            drop(command_guard);
+            let finished_at = now_iso();
+            let message = format!(
+                "Update command exited with code {}.",
+                command_result.exit_code
+            );
+            let providers = self
+                .publish_provider_update_state(
+                    &target,
+                    update_token,
+                    provider_update_state(
+                        "failed",
+                        Some(&started_at),
+                        Some(&finished_at),
+                        &message,
+                        command_result.output.as_deref(),
+                    ),
+                )
+                .await;
+            return Ok(json!({ "providers": providers }));
+        }
+        drop(command_guard);
+
+        let (generation, settings) = self.settings_snapshot().await;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| self.config.base_dir.clone());
+        let probe_sequence = self.begin_provider_probe();
+        let refreshed = self
+            .probe_full_provider_snapshots(&settings, Some(&target.instance_id), &cwd)
+            .await;
+        let verification = refreshed
+            .iter()
+            .map(|result| result.snapshot.clone())
+            .collect::<Vec<_>>();
+        let (status, message) = match self
+            .publish_provider_snapshots_if_current(
+                refreshed,
+                true,
+                generation,
+                &settings,
+                probe_sequence,
+            )
+            .await
+        {
+            Some(_) => {
+                let status = post_update_status(&verification, &target.instance_id);
+                let message = match status {
+                    "succeeded" => "Provider updated.",
+                    _ if verification.iter().any(|provider| {
+                        provider["instanceId"] == target.instance_id
+                            && provider["versionAdvisory"]["status"] == "behind_latest"
+                    }) => {
+                        "Update command completed, but BiBCode still detects an outdated provider version."
+                    }
+                    _ => "Update command completed, but BiBCode could not verify the provider version.",
+                };
+                (status, message)
+            }
+            None => (
+                "unchanged",
+                "Update command completed, but BiBCode could not verify the provider version.",
+            ),
+        };
+        let finished_at = now_iso();
+        let providers = self
+            .publish_provider_update_state(
+                &target,
+                update_token,
+                provider_update_state(
+                    status,
+                    Some(&started_at),
+                    Some(&finished_at),
+                    message,
+                    command_result.output.as_deref(),
+                ),
+            )
+            .await;
+        Ok(json!({ "providers": providers }))
+    }
+
     async fn settings_snapshot(&self) -> (u64, Value) {
         let _update_guard = self.settings_update_lock.lock().await;
         (
             self.settings_generation.load(Ordering::Acquire),
             self.settings.read().await.clone(),
         )
+    }
+
+    async fn request_full_provider_refresh(
+        &self,
+        cancellation: CancellationToken,
+        refresh_task: &Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+    ) {
+        #[cfg(test)]
+        self.provider_update_refresh_attempts
+            .fetch_add(1, Ordering::AcqRel);
+        let (generation, settings) = self.settings_snapshot().await;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| self.config.base_dir.clone());
+        if cancellation.is_cancelled() {
+            return;
+        }
+        if let Some(task) = self.start_full_provider_refresh(
+            generation,
+            settings,
+            cwd,
+            Some(cancellation),
+        ) {
+            if let Some(previous) = refresh_task.lock().await.replace(task) {
+                let _ = previous.await;
+            }
+        }
+    }
+
+    pub(crate) fn start_provider_update_checks(&self) -> ProviderUpdateCheckTask {
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let control = self.clone();
+        let refresh_task = Arc::new(Mutex::new(None));
+        let task_refresh = refresh_task.clone();
+        let task = tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(60 * 60));
+            interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    () = task_cancellation.cancelled() => break,
+                    _ = interval.tick() => {
+                        if task_cancellation.is_cancelled() {
+                            break;
+                        }
+                        control
+                            .request_full_provider_refresh(task_cancellation.clone(), &task_refresh)
+                            .await;
+                    }
+                }
+            }
+        });
+        ProviderUpdateCheckTask {
+            cancellation,
+            task: Mutex::new(Some(task)),
+            refresh_task,
+        }
     }
 
     fn begin_provider_probe(&self) -> u64 {
@@ -427,7 +846,7 @@ impl NativeServerControl {
             pause.entered.notify_one();
             pause.release.notified().await;
         }
-        provider_inventory::probe(settings, instance_id, cwd).await
+        provider_inventory::probe(settings, instance_id, cwd, &self.provider_maintenance).await
     }
 
     async fn probe_full_provider_snapshots(
@@ -443,7 +862,20 @@ impl NativeServerControl {
             pause.entered.notify_one();
             pause.release.notified().await;
         }
-        provider_inventory::probe_full(settings, instance_id, cwd).await
+        provider_inventory::probe_full(settings, instance_id, cwd, &self.provider_maintenance).await
+    }
+
+    #[cfg(test)]
+    async fn pause_full_provider_refresh_handoff(&self) {
+        if let Some(pause) = self
+            .next_full_provider_refresh_handoff_pause
+            .lock()
+            .await
+            .take()
+        {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
     }
 
     async fn publish_provider_snapshots_if_current(
@@ -511,6 +943,14 @@ impl NativeServerControl {
                 })
                 .collect();
         }
+        if !partial {
+            self.provider_maintenance.prune_update_states(
+                current.iter().filter_map(provider_snapshot_identity),
+            );
+        }
+        for provider in current.iter_mut() {
+            self.provider_maintenance.overlay_update_state(provider);
+        }
         current.clone()
     }
 
@@ -522,43 +962,83 @@ impl NativeServerControl {
         }));
     }
 
-    fn spawn_full_provider_refresh(&self, mut generation: u64, mut settings: Value, cwd: PathBuf) {
+    fn spawn_full_provider_refresh(&self, generation: u64, settings: Value, cwd: PathBuf) {
+        let _ = self.start_full_provider_refresh(generation, settings, cwd, None);
+    }
+
+    fn start_full_provider_refresh(
+        &self,
+        mut generation: u64,
+        mut settings: Value,
+        cwd: PathBuf,
+        cancellation: Option<CancellationToken>,
+    ) -> Option<tokio::task::JoinHandle<()>> {
         if self
             .full_provider_refresh_running
             .swap(true, Ordering::AcqRel)
         {
-            return;
+            return None;
         }
         let control = self.clone();
-        tokio::spawn(async move {
-            loop {
-                let probe_sequence = control.begin_provider_probe();
-                let providers = control
-                    .probe_full_provider_snapshots(&settings, None, &cwd)
-                    .await;
+        Some(tokio::spawn(async move {
+            let mut owns_refresh = true;
+            'refresh: loop {
+                loop {
+                    let probe_sequence = control.begin_provider_probe();
+                    let providers = if let Some(cancellation) = cancellation.as_ref() {
+                        tokio::select! {
+                            () = cancellation.cancelled() => break 'refresh,
+                            providers = control.probe_full_provider_snapshots(&settings, None, &cwd) => providers,
+                        }
+                    } else {
+                        control
+                            .probe_full_provider_snapshots(&settings, None, &cwd)
+                            .await
+                    };
+                    if control
+                        .publish_provider_snapshots_if_current(
+                            providers,
+                            false,
+                            generation,
+                            &settings,
+                            probe_sequence,
+                        )
+                        .await
+                        .is_some()
+                    {
+                        #[cfg(test)]
+                        control
+                            .latest_full_provider_refresh_generation
+                            .store(generation, Ordering::Release);
+                        break;
+                    }
+                    (generation, settings) = control.settings_snapshot().await;
+                }
+                control
+                    .full_provider_refresh_running
+                    .store(false, Ordering::Release);
+                owns_refresh = false;
+                let (latest_generation, latest_settings) = control.settings_snapshot().await;
+                #[cfg(test)]
+                control.pause_full_provider_refresh_handoff().await;
+                if latest_generation == generation && latest_settings == settings {
+                    break;
+                }
                 if control
-                    .publish_provider_snapshots_if_current(
-                        providers,
-                        false,
-                        generation,
-                        &settings,
-                        probe_sequence,
-                    )
-                    .await
-                    .is_some()
+                    .full_provider_refresh_running
+                    .swap(true, Ordering::AcqRel)
                 {
                     break;
                 }
-                (generation, settings) = control.settings_snapshot().await;
+                owns_refresh = true;
+                (generation, settings) = (latest_generation, latest_settings);
             }
-            control
-                .full_provider_refresh_running
-                .store(false, Ordering::Release);
-            let (latest_generation, latest_settings) = control.settings_snapshot().await;
-            if latest_generation != generation || latest_settings != settings {
-                control.spawn_full_provider_refresh(latest_generation, latest_settings, cwd);
+            if owns_refresh {
+                control
+                    .full_provider_refresh_running
+                    .store(false, Ordering::Release);
             }
-        });
+        }))
     }
 
     async fn update_keybinding(&self, method: &str, payload: Value) -> Result<Value, Value> {
@@ -625,17 +1105,7 @@ impl ProductionServerControl for NativeServerControl {
                 },
                 "server.updateSettings" => control.update_settings(payload).await,
                 "server.refreshProviders" => Ok(control.refresh_providers(&payload).await),
-                "server.updateProvider" => {
-                    let provider = payload
-                        .get("provider")
-                        .and_then(Value::as_str)
-                        .unwrap_or("unknown");
-                    Err(json!({
-                        "_tag": "ServerProviderUpdateError",
-                        "provider": provider,
-                        "reason": "This provider does not expose a safe native self-update command.",
-                    }))
-                }
+                "server.updateProvider" => control.update_provider(&payload, cancellation).await,
                 "server.upsertKeybinding" | "server.removeKeybinding" => {
                     control.update_keybinding(method, payload).await
                 }
@@ -824,6 +1294,16 @@ fn validate_settings_document(settings: &Value) -> Result<(), String> {
         validate_optional_bool(terminal, "webglEnabled")?;
     }
     Ok(())
+}
+
+fn automatic_git_fetch_interval(settings: &Value) -> Duration {
+    let Some(milliseconds) = settings
+        .get("automaticGitFetchInterval")
+        .and_then(Value::as_f64)
+    else {
+        return Duration::from_secs(30);
+    };
+    Duration::try_from_secs_f64(milliseconds / 1_000.0).unwrap_or(Duration::MAX)
 }
 
 fn normalize_legacy_settings_for_validation(settings: &Value) -> Value {
@@ -1428,9 +1908,12 @@ pub(crate) fn now_iso() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Mutex as StdMutex,
-        atomic::{AtomicBool, Ordering as AtomicOrdering},
+    use std::{
+        sync::{
+            Mutex as StdMutex,
+            atomic::{AtomicBool, Ordering as AtomicOrdering},
+        },
+        time::Duration,
     };
 
     use crate::{
@@ -1448,6 +1931,531 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn post_update_verification_distinguishes_success_and_unchanged() {
+        let current = json!({
+            "instanceId": "codex",
+            "versionAdvisory": { "status": "current" }
+        });
+        let behind = json!({
+            "instanceId": "codex",
+            "versionAdvisory": { "status": "behind_latest" }
+        });
+        let unknown = json!({
+            "instanceId": "codex",
+            "versionAdvisory": { "status": "unknown" }
+        });
+        assert_eq!(post_update_status(&[current], "codex"), "succeeded");
+        assert_eq!(post_update_status(&[behind], "codex"), "unchanged");
+        assert_eq!(post_update_status(&[unknown], "codex"), "unchanged");
+        assert_eq!(post_update_status(&[], "codex"), "unchanged");
+    }
+
+    async fn write_cursor_update_fixture(directory: &Path) -> PathBuf {
+        #[cfg(windows)]
+        let (name, contents) = (
+            "cursor.cmd",
+            "@echo off\r\nif \"%1\"==\"about\" (echo {\"cliVersion\":\"9.8.7\"}& exit /b 0)\r\necho cursor updated\r\n",
+        );
+        #[cfg(not(windows))]
+        let (name, contents) = (
+            "cursor",
+            "#!/bin/sh\nif [ \"$1\" = \"about\" ]; then\n  echo '{\"cliVersion\":\"9.8.7\"}'\nelse\n  echo 'cursor updated'\nfi\n",
+        );
+        let path = directory.join(name);
+        tokio::fs::write(&path, contents)
+            .await
+            .expect("write cursor fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = tokio::fs::metadata(&path)
+                .await
+                .expect("cursor fixture metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            tokio::fs::set_permissions(&path, permissions)
+                .await
+                .expect("make cursor fixture executable");
+        }
+        path
+    }
+
+    async fn write_slow_cursor_update_fixture(directory: &Path) -> PathBuf {
+        #[cfg(windows)]
+        let (name, contents) = (
+            "slow-cursor.cmd",
+            "@echo off\r\nif \"%1\"==\"about\" (echo {\"cliVersion\":\"9.8.7\"}& exit /b 0)\r\npowershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 2\"\r\n",
+        );
+        #[cfg(not(windows))]
+        let (name, contents) = (
+            "slow-cursor",
+            "#!/bin/sh\nif [ \"$1\" = \"about\" ]; then\n  echo '{\"cliVersion\":\"9.8.7\"}'\nelse\n  sleep 2\nfi\n",
+        );
+        let path = directory.join(name);
+        tokio::fs::write(&path, contents)
+            .await
+            .expect("write slow cursor fixture");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let mut permissions = tokio::fs::metadata(&path)
+                .await
+                .expect("slow cursor fixture metadata")
+                .permissions();
+            permissions.set_mode(0o755);
+            tokio::fs::set_permissions(&path, permissions)
+                .await
+                .expect("make slow cursor fixture executable");
+        }
+        path
+    }
+
+    async fn control_with_cursor_update_fixture(executable: PathBuf) -> NativeServerControl {
+        let directory = executable.parent().expect("fixture directory");
+        let settings_path = ServerConfig::new(directory).state_dir().join("settings.json");
+        tokio::fs::create_dir_all(settings_path.parent().expect("settings directory"))
+            .await
+            .expect("create settings directory");
+        tokio::fs::write(
+            &settings_path,
+            serde_json::to_vec(&json!({
+                "enableProviderUpdateChecks": false,
+                "providerInstances": {
+                    "cursor-work": {
+                        "driver": "cursor",
+                        "enabled": true,
+                        "config": { "binaryPath": executable }
+                    }
+                }
+            }))
+            .expect("settings JSON"),
+        )
+        .await
+        .expect("write settings");
+        NativeServerControl::new(ServerConfig::new(directory), json!({})).await
+    }
+
+    async fn scheduler_control(temp: &tempfile::TempDir) -> NativeServerControl {
+        let config = ServerConfig::new(temp.path());
+        let settings_path = config.state_dir().join("settings.json");
+        let missing_binary = temp
+            .path()
+            .join("missing-provider-executable")
+            .to_string_lossy()
+            .into_owned();
+        tokio::fs::create_dir_all(config.state_dir())
+            .await
+            .expect("state directory exists");
+        tokio::fs::write(
+            settings_path,
+            serde_json::to_vec(&json!({
+                "enableProviderUpdateChecks": false,
+                "providerInstances": {
+                    "codex": { "driver": "codex", "enabled": true, "config": { "binaryPath": missing_binary } },
+                    "claude": { "driver": "claudeAgent", "enabled": true, "config": { "binaryPath": missing_binary } },
+                    "cursor": { "driver": "cursor", "enabled": true, "config": { "binaryPath": missing_binary } },
+                    "grok": { "driver": "grok", "enabled": true, "config": { "binaryPath": missing_binary } },
+                    "opencode": { "driver": "opencode", "enabled": true, "config": { "binaryPath": missing_binary } }
+                }
+            }))
+            .expect("settings JSON"),
+        )
+        .await
+        .expect("write settings");
+        NativeServerControl::new(config, json!({"policy":"test"})).await
+    }
+
+    async fn wait_for_probe_after(control: &NativeServerControl, previous: u64) -> u64 {
+        for _ in 0..100 {
+            let current = control.next_provider_probe_sequence.load(Ordering::Acquire);
+            if current > previous {
+                return current;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("provider check did not start");
+    }
+
+    async fn wait_for_full_refresh_idle(control: &NativeServerControl) {
+        for _ in 0..100 {
+            if !control.full_provider_refresh_running.load(Ordering::Acquire) {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("provider check did not finish");
+    }
+
+    async fn wait_for_scheduler_request_after(control: &NativeServerControl, previous: u64) {
+        for _ in 0..100 {
+            if control
+                .provider_update_refresh_attempts
+                .load(Ordering::Acquire)
+                > previous
+            {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+        panic!("provider update check did not request a refresh");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_update_checks_run_immediately_and_every_hour() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        let before = control.next_provider_probe_sequence.load(Ordering::Acquire);
+        let checks = control.start_provider_update_checks();
+
+        let after_startup = wait_for_probe_after(&control, before).await;
+        wait_for_full_refresh_idle(&control).await;
+
+        tokio::time::advance(Duration::from_secs(60 * 60 - 1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            control.next_provider_probe_sequence.load(Ordering::Acquire),
+            after_startup
+        );
+
+        tokio::time::advance(Duration::from_secs(1)).await;
+        wait_for_probe_after(&control, after_startup).await;
+        checks.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_update_check_shutdown_prevents_future_ticks() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        let checks = control.start_provider_update_checks();
+        let before = control.next_provider_probe_sequence.load(Ordering::Acquire);
+        wait_for_probe_after(&control, before).await;
+        checks.shutdown().await;
+        let stopped_at = control.next_provider_probe_sequence.load(Ordering::Acquire);
+        tokio::time::advance(Duration::from_secs(2 * 60 * 60)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            control.next_provider_probe_sequence.load(Ordering::Acquire),
+            stopped_at
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn dropping_provider_update_checks_prevents_future_ticks() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        let checks = control.start_provider_update_checks();
+        let before = control.next_provider_probe_sequence.load(Ordering::Acquire);
+        wait_for_probe_after(&control, before).await;
+        wait_for_full_refresh_idle(&control).await;
+        drop(checks);
+        let stopped_at = control.next_provider_probe_sequence.load(Ordering::Acquire);
+
+        tokio::time::advance(Duration::from_secs(2 * 60 * 60)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            control.next_provider_probe_sequence.load(Ordering::Acquire),
+            stopped_at
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_update_check_shutdown_cancels_a_paused_full_refresh() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        let pause = control.install_next_full_provider_probe_pause().await;
+        let checks = control.start_provider_update_checks();
+        pause.wait_until_entered().await;
+
+        checks.shutdown().await;
+
+        assert!(
+            !control.full_provider_refresh_running.load(Ordering::Acquire),
+            "scheduled full refresh must finish before shutdown returns"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn provider_update_checks_coalesce_while_a_full_refresh_is_running() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        let pause = control.install_next_full_provider_probe_pause().await;
+        let checks = control.start_provider_update_checks();
+        pause.wait_until_entered().await;
+        let running_sequence = control.next_provider_probe_sequence.load(Ordering::Acquire);
+        let requested = control
+            .provider_update_refresh_attempts
+            .load(Ordering::Acquire);
+
+        tokio::time::advance(Duration::from_secs(60 * 60)).await;
+        wait_for_scheduler_request_after(&control, requested).await;
+        assert_eq!(
+            control.next_provider_probe_sequence.load(Ordering::Acquire),
+            running_sequence,
+        );
+
+        pause.release();
+        checks.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn full_refresh_handoff_covers_settings_changed_after_its_final_snapshot() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let control = scheduler_control(&temp).await;
+        let pause = control
+            .install_next_full_provider_refresh_handoff_pause()
+            .await;
+        let (generation, settings) = control.settings_snapshot().await;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| control.config.base_dir.clone());
+        control.spawn_full_provider_refresh(generation, settings, cwd);
+        pause.wait_until_entered().await;
+
+        control
+            .update_settings(json!({
+                "patch": { "providers": { "codex": { "enabled": false } } }
+            }))
+            .await
+            .expect("settings update succeeds");
+        let expected_generation = control.settings_generation.load(Ordering::Acquire);
+        pause.release();
+        wait_for_full_refresh_idle(&control).await;
+
+        assert_eq!(
+            control
+                .latest_full_provider_refresh_generation
+                .load(Ordering::Acquire),
+            expected_generation,
+        );
+    }
+
+    #[tokio::test]
+    async fn removed_provider_update_state_is_not_retained_or_reused() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("state directory");
+        let executable = write_cursor_update_fixture(directory.path()).await;
+        let control = control_with_cursor_update_fixture(executable.clone()).await;
+        let pause = control.install_next_full_provider_probe_pause().await;
+        let updating = {
+            let control = control.clone();
+            tokio::spawn(async move {
+                control
+                    .update_provider(
+                        &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
+                        CancellationToken::new(),
+                    )
+                    .await
+            })
+        };
+        pause.wait_until_entered().await;
+
+        control
+            .update_settings(json!({
+                "patch": {
+                    "providerInstances": {
+                        "replacement": {
+                            "driver": "grok",
+                            "enabled": false,
+                            "config": {}
+                        }
+                    }
+                }
+            }))
+            .await
+            .expect("settings replace provider");
+        assert!(control
+            .providers
+            .read()
+            .await
+            .iter()
+            .all(|provider| provider["instanceId"] != "cursor-work"));
+
+        let mut removed_snapshot = json!({
+            "instanceId": "cursor-work",
+            "driver": "cursor",
+        });
+        control
+            .provider_maintenance
+            .overlay_update_state(&mut removed_snapshot);
+        assert!(removed_snapshot.get("updateState").is_none());
+
+        control
+            .update_settings(json!({
+                "patch": {
+                    "providerInstances": {
+                        "cursor-work": {
+                            "driver": "cursor",
+                            "enabled": true,
+                            "config": { "binaryPath": executable }
+                        }
+                    }
+                }
+            }))
+            .await
+            .expect("re-add cursor provider");
+        let refreshed = control
+            .refresh_providers(&json!({ "instanceId": "cursor-work" }))
+            .await;
+        let readded = refreshed["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("re-added cursor provider");
+        assert!(readded.get("updateState").is_none());
+
+        pause.release();
+        let result = updating
+            .await
+            .expect("provider update joins")
+            .expect("provider update returns snapshots");
+        let readded = result["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("re-added cursor provider");
+        assert!(readded.get("updateState").is_none());
+        let providers = control.providers.read().await;
+        let readded = providers
+            .iter()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("stored re-added cursor provider");
+        assert!(readded.get("updateState").is_none());
+    }
+
+    #[tokio::test]
+    async fn absent_target_verification_removes_update_state_while_settings_refresh_is_paused(
+    ) {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("state directory");
+        let control = control_with_cursor_update_fixture(
+            write_slow_cursor_update_fixture(directory.path()).await,
+        )
+        .await;
+        let mut events = control.config_events.subscribe();
+        let updating = {
+            let control = control.clone();
+            tokio::spawn(async move {
+                control
+                    .update_provider(
+                        &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
+                        CancellationToken::new(),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.expect("provider update event");
+                if event["type"] == "providerStatuses"
+                    && event["payload"]["providers"]
+                        .as_array()
+                        .is_some_and(|providers| providers.iter().any(|provider| {
+                            provider["instanceId"] == "cursor-work"
+                                && provider["updateState"]["status"] == "running"
+                        }))
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("running state published");
+
+        let quick_pause = control.install_next_quick_provider_probe_pause().await;
+        let settings_update = {
+            let control = control.clone();
+            tokio::spawn(async move {
+                control
+                    .update_settings(json!({
+                        "patch": {
+                            "providerInstances": {
+                                "replacement": {
+                                    "driver": "grok",
+                                    "enabled": false,
+                                    "config": {}
+                                }
+                            }
+                        }
+                    }))
+                    .await
+            })
+        };
+        quick_pause.wait_until_entered().await;
+
+        let result = updating
+            .await
+            .expect("provider update joins")
+            .expect("provider update returns snapshots");
+        quick_pause.release();
+        settings_update
+            .await
+            .expect("settings update joins")
+            .expect("settings update succeeds");
+        let provider = result["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("cached cursor provider");
+        assert!(provider.get("updateState").is_none());
+    }
+
+    #[tokio::test]
+    async fn cancelled_provider_update_publishes_failed_state() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("state directory");
+        let control = control_with_cursor_update_fixture(
+            write_slow_cursor_update_fixture(directory.path()).await,
+        )
+        .await;
+        let mut events = control.config_events.subscribe();
+        let cancellation = CancellationToken::new();
+        let updating = {
+            let control = control.clone();
+            let cancellation = cancellation.clone();
+            tokio::spawn(async move {
+                control
+                    .update_provider(
+                        &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
+                        cancellation,
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.expect("provider update event");
+                if event["type"] == "providerStatuses"
+                    && event["payload"]["providers"]
+                        .as_array()
+                        .is_some_and(|providers| providers.iter().any(|provider| {
+                            provider["instanceId"] == "cursor-work"
+                                && provider["updateState"]["status"] == "running"
+                        }))
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("running state published");
+        cancellation.cancel();
+
+        let result = updating
+            .await
+            .expect("provider update joins")
+            .expect("cancelled update returns snapshots");
+        let provider = result["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("cursor provider");
+        assert_eq!(provider["updateState"]["status"], "failed");
+        assert!(provider["updateState"]["finishedAt"].is_string());
+    }
 
     #[derive(Clone)]
     struct TestAgentActivityHandler {
@@ -2782,7 +3790,7 @@ mod tests {
         assert_eq!(
             call(
                 "server.updateProvider",
-                json!({"provider":"codex"}),
+                json!({"provider":"grok"}),
                 CancellationToken::new(),
             )
             .await

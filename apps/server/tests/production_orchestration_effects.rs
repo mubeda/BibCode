@@ -7,19 +7,18 @@ use std::{
     time::Duration,
 };
 
-use orchestration_effects::{
-    BoxEffectFuture, EffectsOptions, OrchestrationEffectCallbacks, OrchestrationEffects,
-    SetupScriptLaunch, normalize_project_workspace_root,
-};
-use serde_json::json;
 use bibcode_server::{
     git::{BoxWorktreeBaseDirectoryFuture, GitRepository, WorktreeBaseDirectoryProvider},
     orchestration::engine::{EngineOptions, OrchestrationCommand, OrchestrationEngine},
     persistence::{Database, run_migrations},
     production::host_paths::process_compatible_path,
 };
+use orchestration_effects::{
+    BoxEffectFuture, EffectsOptions, OrchestrationEffectCallbacks, OrchestrationEffects,
+    SetupScriptLaunch, normalize_project_workspace_root,
+};
+use serde_json::json;
 use tempfile::TempDir;
-use tokio_util::sync::CancellationToken;
 
 const NOW: &str = "2026-07-10T10:00:00.000Z";
 
@@ -84,6 +83,21 @@ impl OrchestrationEffectCallbacks for CallbackState {
                 return Err(error);
             }
             Ok(())
+        })
+    }
+
+    fn setup_script_is_running<'a>(
+        &'a self,
+        thread_id: &'a str,
+        terminal_id: &'a str,
+    ) -> BoxEffectFuture<'a, bool> {
+        Box::pin(async move {
+            Ok(self
+                .setup_scripts
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|launch| launch.thread_id == thread_id && launch.terminal_id == terminal_id))
         })
     }
 
@@ -228,7 +242,7 @@ async fn normalizes_and_optionally_creates_project_workspace_roots() {
 }
 
 #[tokio::test]
-async fn bootstrap_uses_the_injected_worktree_workspace() {
+async fn bootstrap_admission_does_not_use_the_injected_workspace_before_delivery() {
     let source = initialize_repository();
     let workspace = tempfile::tempdir().expect("worktree workspace");
     let canonical_workspace = process_compatible_path(
@@ -283,27 +297,18 @@ async fn bootstrap_uses_the_injected_worktree_workspace() {
         .await
         .expect("thread query")
         .expect("thread");
+    assert!(thread.worktree_path.is_none());
     assert!(
-        Path::new(thread.worktree_path.as_deref().expect("worktree path"))
-            .starts_with(&canonical_workspace)
+        !git(source.path(), &["worktree", "list", "--porcelain"])
+            .replace('\\', "/")
+            .contains(canonical_workspace.to_string_lossy().as_ref())
     );
-
-    let created_path = PathBuf::from(thread.worktree_path.expect("worktree path"));
     effects.shutdown().await;
-    repository
-        .remove_worktree(
-            source.path(),
-            &created_path,
-            true,
-            &CancellationToken::new(),
-        )
-        .await
-        .expect("remove configured worktree");
     engine.shutdown().await;
 }
 
 #[tokio::test]
-async fn bootstrap_creates_worktree_updates_thread_runs_setup_then_dispatches_turn() {
+async fn bootstrap_admission_persists_turn_without_running_prerequisites() {
     let repository = initialize_repository();
     let engine = engine(repository.path()).await;
     dispatch(
@@ -356,17 +361,12 @@ async fn bootstrap_creates_worktree_updates_thread_runs_setup_then_dispatches_tu
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(thread.branch.as_deref(), Some("bibcode/bootstrap-test"));
-    let worktree_path = PathBuf::from(thread.worktree_path.expect("worktree path"));
-    assert!(worktree_path.is_dir());
+    assert!(thread.branch.is_none());
+    assert!(thread.worktree_path.is_none());
 
     {
         let setup_scripts = callbacks.setup_scripts.lock().unwrap();
-        assert_eq!(setup_scripts.len(), 1);
-        assert_eq!(setup_scripts[0].thread_id, "worktree-thread");
-        assert_eq!(setup_scripts[0].script_id, "setup");
-        assert_eq!(setup_scripts[0].command, "vp install");
-        assert_eq!(setup_scripts[0].cwd, worktree_path);
+        assert!(setup_scripts.is_empty());
     }
 
     let events = engine.read_events(0).await.unwrap();
@@ -379,9 +379,6 @@ async fn bootstrap_creates_worktree_updates_thread_runs_setup_then_dispatches_tu
         thread_events,
         vec![
             "thread.created",
-            "thread.meta-updated",
-            "thread.activity-appended",
-            "thread.activity-appended",
             "thread.message-sent",
             "thread.turn-start-requested"
         ]
@@ -389,19 +386,10 @@ async fn bootstrap_creates_worktree_updates_thread_runs_setup_then_dispatches_tu
 
     effects.shutdown().await;
     engine.shutdown().await;
-    git(
-        repository.path(),
-        &[
-            "worktree",
-            "remove",
-            "--force",
-            worktree_path.to_string_lossy().as_ref(),
-        ],
-    );
 }
 
 #[tokio::test]
-async fn bootstrap_setup_launch_failure_rolls_back_worktree_branch_and_thread() {
+async fn bootstrap_admission_does_not_run_failing_setup_before_delivery() {
     let repository = initialize_repository();
     let engine = engine(repository.path()).await;
     dispatch(
@@ -445,29 +433,20 @@ async fn bootstrap_setup_launch_failure_rolls_back_worktree_branch_and_thread() 
         "createdAt":NOW
     }))
     .unwrap();
-    let error = engine
+    engine
         .dispatch(command)
         .await
-        .expect_err("setup launch failure aborts bootstrap");
-    assert!(error.to_string().contains("setup script launch"));
-    assert!(error.to_string().contains("terminal start failed"));
+        .expect("bootstrap is admitted");
 
     let events = engine.read_events(0).await.unwrap();
-    assert!(!events.iter().any(|event| {
+    assert!(events.iter().any(|event| {
         event.event.aggregate_id == "setup-failure"
             && event.event.event_type == "thread.turn-start-requested"
     }));
-    let failure = events
-        .iter()
-        .find(|event| {
-            event.event.aggregate_id == "setup-failure"
-                && event.event.payload["activity"]["kind"] == "setup-script.failed"
-        })
-        .expect("setup failure activity");
-    assert_eq!(
-        failure.event.payload["activity"]["payload"]["detail"],
-        "terminal start failed"
-    );
+    assert!(!events.iter().any(|event| {
+        event.event.aggregate_id == "setup-failure"
+            && event.event.payload["activity"]["kind"] == "setup-script.failed"
+    }));
 
     let thread = engine
         .repositories()
@@ -475,23 +454,22 @@ async fn bootstrap_setup_launch_failure_rolls_back_worktree_branch_and_thread() 
         .await
         .unwrap()
         .unwrap();
-    assert!(thread.deleted_at.is_some());
+    assert!(thread.deleted_at.is_none());
     let worktrees = git(repository.path(), &["worktree", "list", "--porcelain"]);
     assert!(!worktrees.contains("bibcode/setup-failure-test"));
-    assert!(!git_succeeds(
-        repository.path(),
-        &[
-            "show-ref",
-            "--verify",
-            "refs/heads/bibcode/setup-failure-test"
-        ]
-    ));
+    assert!(
+        git(
+            repository.path(),
+            &["branch", "--list", "bibcode/setup-failure-test"]
+        )
+        .is_empty()
+    );
     effects.shutdown().await;
     engine.shutdown().await;
 }
 
 #[tokio::test]
-async fn bootstrap_workspace_refresh_failure_removes_the_just_created_worktree() {
+async fn bootstrap_admission_does_not_refresh_workspace_before_delivery() {
     let repository = initialize_repository();
     let engine = engine(repository.path()).await;
     let callbacks = Arc::new(CallbackState::default());
@@ -523,35 +501,33 @@ async fn bootstrap_workspace_refresh_failure_removes_the_just_created_worktree()
     }))
     .unwrap();
 
-    let error = engine
+    engine
         .dispatch(command)
         .await
-        .expect_err("refresh failure aborts bootstrap");
-    assert!(error.to_string().contains("index refresh failed"));
+        .expect("bootstrap is admitted");
     let worktrees = git(repository.path(), &["worktree", "list", "--porcelain"]);
     assert!(!worktrees.contains("bibcode/refresh-failure-test"));
-    assert!(!git_succeeds(
-        repository.path(),
-        &[
-            "show-ref",
-            "--verify",
-            "refs/heads/bibcode/refresh-failure-test"
-        ]
-    ));
+    assert!(
+        git(
+            repository.path(),
+            &["branch", "--list", "bibcode/refresh-failure-test"]
+        )
+        .is_empty()
+    );
     let thread = engine
         .repositories()
         .get_thread("refresh-failure".to_owned())
         .await
         .unwrap()
         .unwrap();
-    assert!(thread.deleted_at.is_some());
+    assert!(thread.deleted_at.is_none());
 
     effects.shutdown().await;
     engine.shutdown().await;
 }
 
 #[tokio::test]
-async fn bootstrap_git_failures_include_bounded_actionable_stderr() {
+async fn bootstrap_admission_does_not_fetch_origin_before_delivery() {
     let repository = initialize_repository();
     let engine = engine(repository.path()).await;
     let effects = OrchestrationEffects::start(
@@ -581,17 +557,27 @@ async fn bootstrap_git_failures_include_bounded_actionable_stderr() {
     }))
     .unwrap();
 
-    let error = engine
+    engine
         .dispatch(command)
         .await
-        .expect_err("missing origin aborts bootstrap");
-    let message = error.to_string();
+        .expect("bootstrap is admitted");
     assert!(
-        message.contains("bootstrap.git.fetch exited with code"),
-        "{message}"
+        engine
+            .repositories()
+            .get_thread("fetch-failure".to_owned())
+            .await
+            .expect("thread")
+            .expect("persisted thread")
+            .deleted_at
+            .is_none()
     );
-    assert!(message.contains("fatal:"), "{message}");
-    assert!(message.to_ascii_lowercase().contains("origin"), "{message}");
+    assert!(
+        git(
+            repository.path(),
+            &["branch", "--list", "bibcode/fetch-failure-test"]
+        )
+        .is_empty()
+    );
 
     effects.shutdown().await;
     engine.shutdown().await;

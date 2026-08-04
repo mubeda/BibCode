@@ -84,7 +84,7 @@
   "inventorySummary": {
     "javascriptDirect": 79,
     "javascriptLedger": 78,
-    "rustRegistry": 77,
+    "rustRegistry": 78,
     "rustPath": 1,
     "actions": 9,
     "toolchains": 9
@@ -1651,6 +1651,17 @@
       "source": "https://crates.io/crates/security-framework",
       "cohort": "rust-current",
       "platforms": ["macos"],
+      "status": "current"
+    },
+    {
+      "key": "rust:workspace:semver",
+      "name": "semver",
+      "current": "1",
+      "target": "1",
+      "channel": "stable",
+      "source": "https://crates.io/crates/semver",
+      "cohort": "rust-current",
+      "platforms": ["linux", "macos", "windows"],
       "status": "current"
     },
     {

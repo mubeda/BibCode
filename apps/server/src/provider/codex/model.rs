@@ -2,8 +2,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
 const DEFAULT_MODEL: &str = "gpt-5.4";
-const DEFAULT_SERVICE_TIER_ID: &str = "default";
-const FAST_SERVICE_TIER_ID: &str = "fast";
 
 const BIBCODE_BROWSER_TOOL_INSTRUCTIONS: &str = r#"
 
@@ -461,6 +459,62 @@ pub(crate) fn decode_thread_read_response(mut value: Value) -> Result<ThreadRead
     serde_json::from_value(value).map_err(|error| error.to_string())
 }
 
+pub(crate) fn delivery_key_exists(
+    value: &Value,
+    thread_id: &str,
+    delivery_key: &str,
+) -> Result<bool, String> {
+    ensure_bounded_remote_value(value)?;
+    let thread = value
+        .get("thread")
+        .and_then(Value::as_object)
+        .ok_or_else(|| "thread/read response missing thread".to_owned())?;
+    if thread.get("id").and_then(Value::as_str) != Some(thread_id) {
+        return Err("thread/read response has the wrong thread.id".to_owned());
+    }
+    let turns = thread
+        .get("turns")
+        .and_then(Value::as_array)
+        .ok_or_else(|| "thread/read response missing complete thread.turns".to_owned())?;
+    for turn in turns {
+        let turn = turn
+            .as_object()
+            .ok_or_else(|| "thread/read response contains an invalid turn".to_owned())?;
+        if turn.get("id").and_then(Value::as_str).is_none() {
+            return Err("thread/read response turn is missing id".to_owned());
+        }
+        let items = turn
+            .get("items")
+            .and_then(Value::as_array)
+            .ok_or_else(|| "thread/read response turn is missing items".to_owned())?;
+        for item in items {
+            let item = item
+                .as_object()
+                .ok_or_else(|| "thread/read response contains an invalid item".to_owned())?;
+            let item_type = item
+                .get("type")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "thread/read response item is missing type".to_owned())?;
+            if item_type != "userMessage" {
+                continue;
+            }
+            if item.get("id").and_then(Value::as_str).is_none()
+                || item.get("content").and_then(Value::as_array).is_none()
+            {
+                return Err("thread/read response contains an incomplete userMessage".to_owned());
+            }
+            match item.get("clientId") {
+                Some(Value::String(client_id)) if client_id == delivery_key => return Ok(true),
+                Some(Value::String(_) | Value::Null) | None => {}
+                Some(_) => {
+                    return Err("thread/read response userMessage.clientId is invalid".to_owned());
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
 pub(crate) fn decode_background_terminals_list_response(
     mut value: Value,
 ) -> Result<ThreadBackgroundTerminalsListResponse, String> {
@@ -476,6 +530,8 @@ pub(crate) fn decode_background_terminals_list_response(
 pub struct BuildTurnStartInput {
     pub thread_id: String,
     pub runtime_mode: CodexRuntimeMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_user_message_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -527,6 +583,10 @@ pub fn build_turn_start_params(input: &BuildTurnStartInput) -> Value {
         "sandboxPolicy": sandbox_policy,
         "input": turn_input,
     });
+
+    if let Some(client_user_message_id) = input.client_user_message_id.as_ref() {
+        payload["clientUserMessageId"] = json!(client_user_message_id);
+    }
 
     if let Some(model) = input.model.as_ref().map(|value| resolve_turn_model(value)) {
         payload["model"] = json!(model);
@@ -634,7 +694,7 @@ pub fn parse_model_list_response(
 pub fn fallback_models(
     configured_model: Option<&str>,
     configured_effort: Option<&str>,
-    configured_service_tier: Option<&str>,
+    _configured_service_tier: Option<&str>,
     custom_models: &[String],
 ) -> Vec<Value> {
     const EFFORTS: [&str; 8] = [
@@ -648,11 +708,6 @@ pub fn fallback_models(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .unwrap_or("medium");
-    let selected_service_tier = if configured_service_tier == Some("fast") {
-        "fast"
-    } else {
-        "default"
-    };
     let mut efforts = EFFORTS.into_iter().collect::<Vec<_>>();
     if !efforts.contains(&selected_effort) {
         efforts.push(selected_effort);
@@ -682,24 +737,6 @@ pub fn fallback_models(
                     "type": "select",
                     "options": effort_options,
                     "currentValue": selected_effort,
-                },
-                {
-                    "id": "serviceTier",
-                    "label": "Service Tier",
-                    "type": "select",
-                    "options": [
-                        {
-                            "id": "default",
-                            "label": "Standard",
-                            "isDefault": selected_service_tier == "default"
-                        },
-                        {
-                            "id": "fast",
-                            "label": "Fast",
-                            "isDefault": selected_service_tier == "fast"
-                        }
-                    ],
-                    "currentValue": selected_service_tier,
                 }
             ]
         }
@@ -850,55 +887,22 @@ fn map_model_capabilities(model: &Value) -> Value {
         })
         .collect::<Vec<_>>();
 
-    let mut service_tiers = model
+    let service_tiers = model
         .get("serviceTiers")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
-    if service_tiers.is_empty() {
-        service_tiers = model
-            .get("additionalSpeedTiers")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default()
-            .into_iter()
-            .filter_map(|tier| {
-                tier.as_str().map(|id| {
-                    json!({
-                        "id": id,
-                        "name": if id == FAST_SERVICE_TIER_ID { "Fast" } else { id },
-                        "description": "",
-                    })
-                })
-            })
-            .collect();
-    }
 
     let mut seen_service_tiers = std::collections::HashSet::new();
-    service_tiers.retain(|tier| {
-        tier.get("id")
-            .and_then(Value::as_str)
-            .filter(|id| !id.is_empty())
-            .is_some_and(|id| seen_service_tiers.insert(id.to_owned()))
-    });
-    if !seen_service_tiers.contains(DEFAULT_SERVICE_TIER_ID) {
-        service_tiers.insert(
-            0,
-            json!({
-                "id": DEFAULT_SERVICE_TIER_ID,
-                "name": "Standard",
-                "description": "",
-            }),
-        );
-        seen_service_tiers.insert(DEFAULT_SERVICE_TIER_ID.to_owned());
-    }
-    if !seen_service_tiers.contains(FAST_SERVICE_TIER_ID) {
-        service_tiers.push(json!({
-            "id": FAST_SERVICE_TIER_ID,
-            "name": "Fast",
-            "description": "",
-        }));
-    }
+    let service_tiers = service_tiers
+        .iter()
+        .filter(|tier| {
+            tier.get("id")
+                .and_then(Value::as_str)
+                .filter(|id| !id.is_empty())
+                .is_some_and(|id| seen_service_tiers.insert(id.to_owned()))
+        })
+        .collect::<Vec<_>>();
 
     let default_service_tier = model
         .get("defaultServiceTier")
@@ -907,8 +911,7 @@ fn map_model_capabilities(model: &Value) -> Value {
             service_tiers
                 .iter()
                 .any(|tier| tier.get("id").and_then(Value::as_str) == Some(*default_id))
-        })
-        .unwrap_or(DEFAULT_SERVICE_TIER_ID);
+        });
 
     let mut option_descriptors = Vec::new();
     if !reasoning_options.is_empty() {
@@ -933,7 +936,7 @@ fn map_model_capabilities(model: &Value) -> Value {
                 "id": id,
                 "label": name,
                 "description": if description.is_empty() { Value::Null } else { json!(description) },
-                "isDefault": default_service_tier == id,
+                "isDefault": default_service_tier == Some(id),
             })
         })
         .map(|value| {
@@ -947,13 +950,18 @@ fn map_model_capabilities(model: &Value) -> Value {
             Value::Object(object)
         })
         .collect::<Vec<_>>();
-    option_descriptors.push(json!({
-        "id": "serviceTier",
-        "label": "Service Tier",
-        "type": "select",
-        "options": options,
-        "currentValue": default_service_tier,
-    }));
+    if !options.is_empty() {
+        let mut descriptor = json!({
+            "id": "serviceTier",
+            "label": "Service Tier",
+            "type": "select",
+            "options": options,
+        });
+        if let Some(default_service_tier) = default_service_tier {
+            descriptor["currentValue"] = json!(default_service_tier);
+        }
+        option_descriptors.push(descriptor);
+    }
 
     json!({
         "optionDescriptors": option_descriptors,
@@ -1134,7 +1142,7 @@ mod tests {
     }
 
     #[test]
-    fn fallback_models_expose_codex_effort_and_fast_service_tiers() {
+    fn fallback_models_do_not_advertise_unverified_fast() {
         let models = fallback_models(Some("gpt-private"), Some("max"), Some("fast"), &[]);
         let model = &models[0];
         let descriptors = model["capabilities"]["optionDescriptors"]
@@ -1144,11 +1152,6 @@ mod tests {
             .iter()
             .find(|descriptor| descriptor["id"] == "reasoningEffort")
             .expect("reasoning effort descriptor");
-        let service_tier = descriptors
-            .iter()
-            .find(|descriptor| descriptor["id"] == "serviceTier")
-            .expect("service tier descriptor");
-
         assert_eq!(model["slug"], "gpt-private");
         assert!(
             effort["options"]
@@ -1157,9 +1160,11 @@ mod tests {
                 .iter()
                 .any(|option| { option["id"] == "max" && option["isDefault"] == true })
         );
-        assert_eq!(service_tier["options"][0]["id"], "default");
-        assert_eq!(service_tier["options"][1]["id"], "fast");
-        assert_eq!(service_tier["currentValue"], "fast");
+        assert!(
+            descriptors
+                .iter()
+                .all(|descriptor| descriptor["id"] != "serviceTier")
+        );
     }
 
     #[test]
@@ -1183,74 +1188,51 @@ mod tests {
     }
 
     #[test]
-    fn live_models_always_expose_unique_standard_and_fast_service_tiers() {
+    fn live_model_without_service_tiers_does_not_advertise_fast() {
+        let models = parse_model_list_response(
+            &json!({ "data": [{ "model": "gpt-5.6", "serviceTiers": [] }]}),
+            &[],
+        )
+        .expect("live model should parse");
+        let descriptors = models[0].capabilities["optionDescriptors"]
+            .as_array()
+            .expect("live option descriptors");
+
+        assert!(
+            descriptors
+                .iter()
+                .all(|descriptor| descriptor["id"] != "serviceTier")
+        );
+    }
+
+    #[test]
+    fn live_model_preserves_only_advertised_service_tiers() {
         let models = parse_model_list_response(
             &json!({
-                "data":[
-                    {
-                        "model":"gpt-no-tiers",
-                        "supportedReasoningEfforts":[{"reasoningEffort":"high"}]
-                    },
-                    {
-                        "model":"gpt-partial-tiers",
-                        "serviceTiers":[
-                            {
-                                "id":"default",
-                                "name":"Live Standard",
-                                "description":"Ordinary latency"
-                            },
-                            {
-                                "id":"priority",
-                                "name":"Priority",
-                                "description":"Priority processing"
-                            },
-                            {"id":"default","name":"Duplicate Standard"},
-                            {"id":"priority","name":"Duplicate Priority"}
-                        ],
-                        "defaultServiceTier":"priority"
-                    }
-                ]
+                "data": [{
+                    "model": "gpt-5.6",
+                    "serviceTiers": [{ "id": "default", "name": "Standard" }]
+                }]
             }),
             &[],
         )
-        .expect("live models should parse");
-
-        let no_tiers = models[0].capabilities["optionDescriptors"]
+        .expect("live model should parse");
+        let service_tier = models[0].capabilities["optionDescriptors"]
             .as_array()
-            .unwrap()
+            .expect("live option descriptors")
             .iter()
             .find(|descriptor| descriptor["id"] == "serviceTier")
-            .expect("Codex service tier invariant");
-        let no_tier_options = no_tiers["options"].as_array().unwrap();
+            .expect("advertised service tier descriptor");
+
         assert_eq!(
-            no_tier_options
+            service_tier["options"]
+                .as_array()
+                .expect("service tier options")
                 .iter()
                 .filter_map(|option| option["id"].as_str())
                 .collect::<Vec<_>>(),
-            vec!["default", "fast"]
+            vec!["default"]
         );
-        assert_eq!(no_tiers["currentValue"], "default");
-
-        let partial = models[1].capabilities["optionDescriptors"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|descriptor| descriptor["id"] == "serviceTier")
-            .expect("Codex service tier invariant");
-        let partial_options = partial["options"].as_array().unwrap();
-        let ids = partial_options
-            .iter()
-            .filter_map(|option| option["id"].as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(ids, vec!["default", "priority", "fast"]);
-        assert_eq!(ids.iter().filter(|id| **id == "default").count(), 1);
-        assert_eq!(ids.iter().filter(|id| **id == "fast").count(), 1);
-        assert_eq!(partial_options[0]["label"], "Live Standard");
-        assert_eq!(partial_options[0]["description"], "Ordinary latency");
-        assert_eq!(partial_options[1]["label"], "Priority");
-        assert_eq!(partial_options[1]["description"], "Priority processing");
-        assert_eq!(partial_options[1]["isDefault"], true);
-        assert_eq!(partial["currentValue"], "priority");
     }
 
     #[test]
@@ -1303,6 +1285,7 @@ mod tests {
         let turn = build_turn_start_params(&BuildTurnStartInput {
             thread_id: "thread".to_owned(),
             runtime_mode: CodexRuntimeMode::ApprovalRequired,
+            client_user_message_id: None,
             prompt: Some(String::new()),
             attachments: Vec::new(),
             model: None,
@@ -1313,6 +1296,64 @@ mod tests {
         assert_eq!(
             turn["collaborationMode"]["settings"]["model"],
             DEFAULT_MODEL
+        );
+    }
+
+    #[test]
+    fn turn_start_serializes_the_delivery_key_as_client_user_message_id() {
+        let input: BuildTurnStartInput = serde_json::from_value(json!({
+            "threadId": "provider-thread-1",
+            "runtimeMode": "full-access",
+            "prompt": "hello",
+            "clientUserMessageId": "delivery-1"
+        }))
+        .expect("turn input");
+
+        assert_eq!(
+            build_turn_start_params(&input)["clientUserMessageId"],
+            "delivery-1"
+        );
+    }
+
+    #[test]
+    fn delivery_readback_requires_a_complete_exact_client_id_match() {
+        let found = json!({
+            "thread": {
+                "id": "provider-thread-1",
+                "turns": [{
+                    "id": "turn-1",
+                    "items": [{
+                        "type": "userMessage",
+                        "id": "user-1",
+                        "clientId": "delivery-1",
+                        "content": [{"type": "text", "text": "hello"}]
+                    }]
+                }]
+            }
+        });
+        let absent = json!({
+            "thread": {
+                "id": "provider-thread-1",
+                "turns": [{"id": "turn-1", "items": []}]
+            }
+        });
+
+        assert_eq!(
+            delivery_key_exists(&found, "provider-thread-1", "delivery-1"),
+            Ok(true)
+        );
+        assert_eq!(
+            delivery_key_exists(&absent, "provider-thread-1", "delivery-1"),
+            Ok(false)
+        );
+        assert!(delivery_key_exists(&json!({}), "provider-thread-1", "delivery-1").is_err());
+        assert!(
+            delivery_key_exists(
+                &json!({"thread":{"id":"provider-thread-1","turns":[{}]}}),
+                "provider-thread-1",
+                "delivery-1"
+            )
+            .is_err()
         );
     }
 }

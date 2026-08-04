@@ -2,7 +2,10 @@ use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
     pin::Pin,
-    sync::{Arc, Mutex as StdMutex},
+    sync::{
+        Arc, Mutex as StdMutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -10,7 +13,6 @@ use rusqlite::{OptionalExtension, Row, Transaction, params};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
 use thiserror::Error;
-use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     sync::{broadcast, mpsc, oneshot},
     task::JoinHandle,
@@ -19,6 +21,7 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::checkpointing;
+use crate::orchestration::delivery::{CommandAdmission, TurnDeliveryState, TurnDeliveryTransition};
 use crate::persistence::{
     CheckpointDiffBlob, CommandReceipt, Database, NewOrchestrationEvent, OrchestrationEvent,
     PersistenceError, ProjectionPendingApproval, ProjectionProject, ProjectionState,
@@ -39,16 +42,6 @@ const PROJECTOR_NAMES: [&str; 9] = [
     "projection.threads",
 ];
 const HISTORICAL_PROJECT_ROOT_INSPECTION_TIMEOUT: Duration = Duration::from_millis(250);
-
-fn server_command_id(scope: &str) -> String {
-    format!("server:{scope}:{}", Uuid::new_v4())
-}
-
-fn now_iso() -> String {
-    OffsetDateTime::now_utc()
-        .format(&Rfc3339)
-        .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
-}
 
 #[derive(Clone, Debug, Default)]
 pub enum OptionalNullable<T> {
@@ -87,6 +80,13 @@ impl<T: Serialize> Serialize for OptionalNullable<T> {
 
 fn optional_nullable_is_missing<T>(value: &OptionalNullable<T>) -> bool {
     value.is_missing()
+}
+
+#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TurnDeliveryResolutionAction {
+    Retry,
+    Dismiss,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -220,16 +220,13 @@ pub trait ThreadTurnBootstrapEffects: Send + Sync {
     fn prepare_worktree<'a>(
         &'a self,
         input: ThreadTurnStartBootstrapPrepareWorktree,
+        cancellation: &'a CancellationToken,
     ) -> BoxBootstrapFuture<'a, BootstrapWorktree>;
 
     fn run_setup_script<'a>(
         &'a self,
         input: BootstrapSetupInput,
     ) -> BoxBootstrapFuture<'a, BootstrapSetupResult>;
-
-    fn cleanup_thread_resources<'a>(&'a self, thread_id: &'a str) -> BoxBootstrapFuture<'a, ()>;
-
-    fn remove_worktree<'a>(&'a self, worktree: BootstrapWorktree) -> BoxBootstrapFuture<'a, ()>;
 }
 
 pub type BoxProjectCommandFuture<'a, T> =
@@ -447,6 +444,18 @@ pub enum OrchestrationCommand {
         #[serde(rename = "createdAt")]
         created_at: String,
     },
+    #[serde(rename = "thread.turn-delivery.resolve")]
+    ThreadTurnDeliveryResolve {
+        #[serde(rename = "commandId")]
+        command_id: String,
+        #[serde(rename = "threadId")]
+        thread_id: String,
+        #[serde(rename = "messageId")]
+        message_id: String,
+        action: TurnDeliveryResolutionAction,
+        #[serde(rename = "createdAt")]
+        created_at: String,
+    },
     #[serde(rename = "thread.approval.respond")]
     ThreadApprovalRespond {
         #[serde(rename = "commandId")]
@@ -609,6 +618,25 @@ pub struct EngineOptions {
 #[derive(Clone, Debug, Default)]
 pub struct TestHooks {
     fail_next_projector: Arc<StdMutex<Option<FailProjectorOnce>>>,
+    pause_after_admission_commit: Arc<StdMutex<Option<AdmissionCommitPause>>>,
+    fail_delivery_transitions: Arc<AtomicUsize>,
+    delivery_transition_attempts: Arc<AtomicUsize>,
+}
+
+#[derive(Clone, Debug)]
+pub struct AdmissionCommitPause {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+impl AdmissionCommitPause {
+    pub async fn wait_until_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    pub fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -623,6 +651,61 @@ impl TestHooks {
             projector: projector.into(),
             event_type: event_type.map(str::to_owned),
         });
+    }
+
+    pub fn pause_after_next_admission_commit(&self) -> AdmissionCommitPause {
+        let pause = AdmissionCommitPause {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        *self
+            .pause_after_admission_commit
+            .lock()
+            .expect("admission pause mutex") = Some(pause.clone());
+        pause
+    }
+
+    pub fn fail_next_delivery_transitions(&self, count: usize) {
+        self.fail_delivery_transitions
+            .store(count, Ordering::SeqCst);
+    }
+
+    pub fn delivery_transition_attempts(&self) -> usize {
+        self.delivery_transition_attempts.load(Ordering::SeqCst)
+    }
+
+    fn maybe_fail_delivery_transition(&self) -> Result<(), OrchestrationError> {
+        self.delivery_transition_attempts
+            .fetch_add(1, Ordering::SeqCst);
+        if self
+            .fail_delivery_transitions
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                if remaining > 0 {
+                    Some(remaining - 1)
+                } else {
+                    None
+                }
+            })
+            .is_ok()
+        {
+            return Err(OrchestrationError::InjectedProjectorFailure {
+                projector: "provider.turn-delivery-transition".to_owned(),
+                event_type: "thread.turn-delivery-updated".to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn maybe_pause_after_admission_commit(&self) {
+        let pause = self
+            .pause_after_admission_commit
+            .lock()
+            .expect("admission pause mutex")
+            .take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
     }
 
     fn maybe_fail(&self, projector: &str, event_type: &str) -> Result<(), OrchestrationError> {
@@ -657,6 +740,8 @@ pub enum OrchestrationError {
     },
     #[error("command previously rejected ({command_id}): {detail}")]
     PreviouslyRejected { command_id: String, detail: String },
+    #[error("command payload conflicts with the accepted command ({command_id})")]
+    CommandConflict { command_id: String },
     #[error("orchestration worker has already shut down")]
     WorkerClosed,
     #[error("orchestration worker cancelled")]
@@ -706,16 +791,27 @@ fn canonical_default_thread_id(model: &CommandModel, project_id: &str) -> Option
     })
 }
 
-#[derive(Debug)]
 struct CommandEnvelope {
     command: OrchestrationCommand,
+    admission: Option<CommandAdmission>,
     response: oneshot::Sender<Result<DispatchResult, OrchestrationError>>,
+    on_commit: Option<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+struct DeliveryTransitionEnvelope {
+    transition: TurnDeliveryTransition,
+    response: oneshot::Sender<Result<bool, OrchestrationError>>,
+}
+
+enum WorkerEnvelope {
+    Command(CommandEnvelope),
+    DeliveryTransition(DeliveryTransitionEnvelope),
 }
 
 #[derive(Clone)]
 pub struct OrchestrationEngine {
     repositories: Repositories,
-    sender: mpsc::Sender<CommandEnvelope>,
+    sender: mpsc::Sender<WorkerEnvelope>,
     events: broadcast::Sender<OrchestrationEvent>,
     shutdown: CancellationToken,
     worker: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
@@ -760,31 +856,63 @@ impl OrchestrationEngine {
         &self,
         command: OrchestrationCommand,
     ) -> Result<DispatchResult, OrchestrationError> {
-        if matches!(
-            command,
-            OrchestrationCommand::ThreadTurnStart {
-                bootstrap: Some(_),
-                ..
-            }
-        ) {
-            return self.dispatch_bootstrap_turn(command).await;
-        }
-        self.dispatch_plain(command).await
+        self.dispatch_inner(command, None, None).await
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn dispatch_with_commit(
+        &self,
+        command: OrchestrationCommand,
+        on_commit: impl FnOnce() + Send + 'static,
+    ) -> Result<DispatchResult, OrchestrationError> {
+        self.dispatch_inner(command, None, Some(Box::new(on_commit)))
+            .await
+    }
+
+    pub(crate) async fn dispatch_with_admission(
+        &self,
+        command: OrchestrationCommand,
+        admission: CommandAdmission,
+        on_commit: impl FnOnce() + Send + 'static,
+    ) -> Result<DispatchResult, OrchestrationError> {
+        self.dispatch_inner(command, Some(admission), Some(Box::new(on_commit)))
+            .await
+    }
+
+    async fn dispatch_inner(
+        &self,
+        command: OrchestrationCommand,
+        admission: Option<CommandAdmission>,
+        on_commit: Option<Box<dyn FnOnce() + Send + 'static>>,
+    ) -> Result<DispatchResult, OrchestrationError> {
+        self.dispatch_plain_with_commit(command, admission, on_commit)
+            .await
     }
 
     async fn dispatch_plain(
         &self,
         command: OrchestrationCommand,
     ) -> Result<DispatchResult, OrchestrationError> {
+        self.dispatch_plain_with_commit(command, None, None).await
+    }
+
+    async fn dispatch_plain_with_commit(
+        &self,
+        command: OrchestrationCommand,
+        admission: Option<CommandAdmission>,
+        on_commit: Option<Box<dyn FnOnce() + Send + 'static>>,
+    ) -> Result<DispatchResult, OrchestrationError> {
         if self.shutdown.is_cancelled() {
             return Err(OrchestrationError::Cancelled);
         }
         let (response_tx, response_rx) = oneshot::channel();
         self.sender
-            .send(CommandEnvelope {
+            .send(WorkerEnvelope::Command(CommandEnvelope {
                 command,
+                admission,
                 response: response_tx,
-            })
+                on_commit,
+            }))
             .await
             .map_err(|_| OrchestrationError::WorkerClosed)?;
         response_rx
@@ -792,150 +920,7 @@ impl OrchestrationEngine {
             .map_err(|_| OrchestrationError::ResponseDropped)?
     }
 
-    async fn dispatch_bootstrap_turn(
-        &self,
-        command: OrchestrationCommand,
-    ) -> Result<DispatchResult, OrchestrationError> {
-        let OrchestrationCommand::ThreadTurnStart {
-            command_id,
-            thread_id,
-            message,
-            model_selection,
-            title_seed,
-            runtime_mode,
-            interaction_mode,
-            bootstrap: Some(bootstrap),
-            source_proposed_plan,
-            created_at,
-        } = command
-        else {
-            return self.dispatch_plain(command).await;
-        };
-
-        let ThreadTurnStartBootstrap {
-            create_thread,
-            prepare_worktree,
-            run_setup_script,
-        } = *bootstrap;
-
-        let mut created_thread = false;
-        let target_project_id = create_thread
-            .as_ref()
-            .map(|create| create.project_id.clone());
-        let target_project_cwd = prepare_worktree
-            .as_ref()
-            .map(|prepare| prepare.project_cwd.clone());
-        let mut target_worktree_path = create_thread
-            .as_ref()
-            .and_then(|create| create.worktree_path.clone());
-        let mut prepared_worktree = None;
-        let mut setup_started = false;
-        if let Some(create) = create_thread {
-            self.dispatch_plain(OrchestrationCommand::ThreadCreate {
-                command_id: server_command_id("bootstrap-thread-create"),
-                thread_id: thread_id.clone(),
-                project_id: create.project_id,
-                title: create.title,
-                kind: None,
-                model_selection: create.model_selection,
-                runtime_mode: create.runtime_mode,
-                interaction_mode: create.interaction_mode,
-                branch: create.branch,
-                worktree_path: create.worktree_path,
-                created_at: create.created_at,
-            })
-            .await?;
-            created_thread = true;
-        }
-
-        let result = async {
-            if let Some(prepare) = prepare_worktree {
-                let effects =
-                    self.bootstrap_effects()
-                        .ok_or_else(|| OrchestrationError::Bootstrap {
-                            stage: "worktree preparation",
-                            detail: "production bootstrap effects are not registered".to_owned(),
-                        })?;
-                let worktree = effects.prepare_worktree(prepare).await.map_err(|detail| {
-                    OrchestrationError::Bootstrap {
-                        stage: "worktree preparation",
-                        detail,
-                    }
-                })?;
-                target_worktree_path = Some(worktree.path.clone());
-                prepared_worktree = Some(worktree.clone());
-                self.dispatch_plain(OrchestrationCommand::ThreadMetaUpdate {
-                    command_id: server_command_id("bootstrap-thread-meta-update"),
-                    thread_id: thread_id.clone(),
-                    title: None,
-                    model_selection: None,
-                    branch: OptionalNullable::Present(Some(worktree.branch.clone())),
-                    worktree_path: OptionalNullable::Present(Some(worktree.path.clone())),
-                })
-                .await?;
-            }
-
-            if run_setup_script == Some(true)
-                && let Some(worktree_path) = target_worktree_path
-            {
-                setup_started = self
-                    .run_bootstrap_setup(
-                        &thread_id,
-                        target_project_id,
-                        target_project_cwd,
-                        worktree_path,
-                    )
-                    .await?;
-            }
-
-            self.dispatch_plain(OrchestrationCommand::ThreadTurnStart {
-                command_id,
-                thread_id: thread_id.clone(),
-                message,
-                model_selection,
-                title_seed,
-                runtime_mode,
-                interaction_mode,
-                bootstrap: None,
-                source_proposed_plan,
-                created_at,
-            })
-            .await
-        }
-        .await;
-        if let Err(mut error) = result {
-            if setup_started
-                && let Some(effects) = self.bootstrap_effects()
-                && let Err(cleanup_error) = effects.cleanup_thread_resources(&thread_id).await
-            {
-                error = OrchestrationError::Bootstrap {
-                    stage: "rollback",
-                    detail: format!("{error}; thread resource cleanup failed: {cleanup_error}"),
-                };
-            }
-            if let Some(worktree) = prepared_worktree
-                && let Some(effects) = self.bootstrap_effects()
-                && let Err(cleanup_error) = effects.remove_worktree(worktree).await
-            {
-                error = OrchestrationError::Bootstrap {
-                    stage: "rollback",
-                    detail: format!("{error}; worktree cleanup failed: {cleanup_error}"),
-                };
-            }
-            if created_thread {
-                let _ = self
-                    .dispatch_plain(OrchestrationCommand::ThreadDelete {
-                        command_id: server_command_id("bootstrap-thread-delete"),
-                        thread_id,
-                    })
-                    .await;
-            }
-            return Err(error);
-        }
-        result
-    }
-
-    fn bootstrap_effects(&self) -> Option<Arc<dyn ThreadTurnBootstrapEffects>> {
+    pub(crate) fn bootstrap_effects(&self) -> Option<Arc<dyn ThreadTurnBootstrapEffects>> {
         self.bootstrap_effects
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -956,14 +941,15 @@ impl OrchestrationEngine {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(effects);
     }
 
-    async fn run_bootstrap_setup(
+    pub(crate) async fn run_bootstrap_setup(
         &self,
+        bootstrap_command_id: &str,
         thread_id: &str,
         project_id: Option<String>,
         project_cwd: Option<String>,
         worktree_path: String,
+        created_at: String,
     ) -> Result<bool, OrchestrationError> {
-        let requested_at = now_iso();
         let result = match self.bootstrap_effects() {
             Some(effects) => {
                 effects
@@ -989,11 +975,12 @@ impl OrchestrationEngine {
                     (
                         "setup-script.requested",
                         "Starting setup script",
-                        requested_at,
+                        created_at.clone(),
                     ),
-                    ("setup-script.started", "Setup script started", now_iso()),
+                    ("setup-script.started", "Setup script started", created_at),
                 ] {
                     self.append_bootstrap_activity(
+                        bootstrap_command_id,
                         thread_id,
                         "info",
                         kind,
@@ -1001,20 +988,21 @@ impl OrchestrationEngine {
                         payload.clone(),
                         created_at,
                     )
-                    .await;
+                    .await?;
                 }
                 Ok(true)
             }
             Err(detail) => {
                 self.append_bootstrap_activity(
+                    bootstrap_command_id,
                     thread_id,
                     "error",
                     "setup-script.failed",
                     "Setup script failed to start",
                     json!({"detail":detail,"worktreePath":worktree_path}),
-                    requested_at,
+                    created_at,
                 )
-                .await;
+                .await?;
                 Err(OrchestrationError::Bootstrap {
                     stage: "setup script launch",
                     detail,
@@ -1025,30 +1013,31 @@ impl OrchestrationEngine {
 
     async fn append_bootstrap_activity(
         &self,
+        bootstrap_command_id: &str,
         thread_id: &str,
         tone: &str,
         kind: &str,
         summary: &str,
         payload: Value,
         created_at: String,
-    ) {
-        let _ = self
-            .dispatch_plain(OrchestrationCommand::ThreadActivityAppend {
-                command_id: server_command_id(kind),
-                thread_id: thread_id.to_owned(),
-                activity: ActivityInput {
-                    id: Uuid::new_v4().to_string(),
-                    tone: tone.to_owned(),
-                    kind: kind.to_owned(),
-                    summary: summary.to_owned(),
-                    payload,
-                    turn_id: None,
-                    sequence: None,
-                    created_at: created_at.clone(),
-                },
-                created_at,
-            })
-            .await;
+    ) -> Result<(), OrchestrationError> {
+        self.dispatch_plain(OrchestrationCommand::ThreadActivityAppend {
+            command_id: format!("server:bootstrap:{bootstrap_command_id}:activity:{kind}"),
+            thread_id: thread_id.to_owned(),
+            activity: ActivityInput {
+                id: format!("bootstrap:{bootstrap_command_id}:{kind}"),
+                tone: tone.to_owned(),
+                kind: kind.to_owned(),
+                summary: summary.to_owned(),
+                payload,
+                turn_id: None,
+                sequence: None,
+                created_at: created_at.clone(),
+            },
+            created_at,
+        })
+        .await?;
+        Ok(())
     }
 
     pub fn subscribe_events(&self) -> broadcast::Receiver<OrchestrationEvent> {
@@ -1068,6 +1057,28 @@ impl OrchestrationEngine {
         self.repositories.clone()
     }
 
+    pub(crate) async fn transition_turn_delivery(
+        &self,
+        transition: TurnDeliveryTransition,
+    ) -> Result<bool, OrchestrationError> {
+        if self.shutdown.is_cancelled() {
+            return Err(OrchestrationError::Cancelled);
+        }
+        let (response, receive) = oneshot::channel();
+        self.sender
+            .send(WorkerEnvelope::DeliveryTransition(
+                DeliveryTransitionEnvelope {
+                    transition,
+                    response,
+                },
+            ))
+            .await
+            .map_err(|_| OrchestrationError::WorkerClosed)?;
+        receive
+            .await
+            .map_err(|_| OrchestrationError::ResponseDropped)?
+    }
+
     pub async fn shutdown(&self) {
         self.shutdown.cancel();
         if let Some(worker) = self.worker.lock().await.take() {
@@ -1079,7 +1090,7 @@ impl OrchestrationEngine {
 fn spawn_worker(
     repositories: Repositories,
     mut model: CommandModel,
-    mut receiver: mpsc::Receiver<CommandEnvelope>,
+    mut receiver: mpsc::Receiver<WorkerEnvelope>,
     events: broadcast::Sender<OrchestrationEvent>,
     shutdown: CancellationToken,
     hooks: TestHooks,
@@ -1093,20 +1104,38 @@ fn spawn_worker(
                     let Some(envelope) = envelope else {
                         break;
                     };
-                    let effects = project_command_effects
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .clone();
-                    let result = process_envelope(
-                        &repositories,
-                        &mut model,
-                        &events,
-                        &hooks,
-                        effects.as_deref(),
-                        envelope.command,
-                    )
-                    .await;
-                    let _ = envelope.response.send(result);
+                    match envelope {
+                        WorkerEnvelope::Command(CommandEnvelope { command, admission, response, on_commit }) => {
+                            let has_admission = admission.is_some();
+                            let effects = project_command_effects
+                                .lock()
+                                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                                .clone();
+                            let result = process_envelope(
+                                &repositories,
+                                &mut model,
+                                &events,
+                                &hooks,
+                                effects.as_deref(),
+                                command,
+                                admission,
+                            )
+                            .await;
+                            if result.as_ref().is_ok_and(|outcome| outcome.accepted_new)
+                                && let Some(on_commit) = on_commit
+                            {
+                                on_commit();
+                                if has_admission {
+                                    hooks.maybe_pause_after_admission_commit().await;
+                                }
+                            }
+                            let _ = response.send(result.map(|outcome| outcome.result));
+                        }
+                        WorkerEnvelope::DeliveryTransition(DeliveryTransitionEnvelope { transition, response }) => {
+                            let result = persist_turn_delivery_transition(&repositories, &events, &hooks, transition).await;
+                            let _ = response.send(result);
+                        }
+                    }
                 }
             }
         }
@@ -1120,7 +1149,8 @@ async fn process_envelope(
     hooks: &TestHooks,
     project_command_effects: Option<&dyn ProjectCommandEffects>,
     mut command: OrchestrationCommand,
-) -> Result<DispatchResult, OrchestrationError> {
+    admission: Option<CommandAdmission>,
+) -> Result<ProcessEnvelopeOutcome, OrchestrationError> {
     let command_id = command.command_id().to_owned();
     let requested_project_id = match &command {
         OrchestrationCommand::ProjectCreate { project_id, .. } => Some(project_id.clone()),
@@ -1131,6 +1161,11 @@ async fn process_envelope(
         .await
         .map_err(wrap_persistence)?
     {
+        if let Some(admission) = &admission
+            && receipt.payload_digest.as_deref() != Some(admission.payload_digest.as_str())
+        {
+            return Err(OrchestrationError::CommandConflict { command_id });
+        }
         if receipt.status == "accepted" {
             let project_id = requested_project_id.as_ref().map(|requested_id| {
                 if receipt.aggregate_kind == "project" {
@@ -1139,12 +1174,15 @@ async fn process_envelope(
                     requested_id.clone()
                 }
             });
-            return Ok(DispatchResult {
-                sequence: receipt.result_sequence,
-                thread_id: project_id
-                    .as_deref()
-                    .and_then(|project_id| canonical_default_thread_id(model, project_id)),
-                project_id,
+            return Ok(ProcessEnvelopeOutcome {
+                result: DispatchResult {
+                    sequence: receipt.result_sequence,
+                    thread_id: project_id
+                        .as_deref()
+                        .and_then(|project_id| canonical_default_thread_id(model, project_id)),
+                    project_id,
+                },
+                accepted_new: false,
             });
         }
         return Err(OrchestrationError::PreviouslyRejected {
@@ -1158,6 +1196,62 @@ async fn process_envelope(
         Some(value) => value.to_owned(),
         None => current_timestamp(repositories.database()).await?,
     };
+
+    if let OrchestrationCommand::ThreadTurnDeliveryResolve {
+        command_id,
+        thread_id,
+        message_id,
+        action,
+        ..
+    } = &command
+    {
+        let payload_digest = admission
+            .as_ref()
+            .map(|admission| admission.payload_digest.clone());
+        let committed = persist_turn_delivery_resolution(
+            repositories,
+            events,
+            hooks,
+            command_id.clone(),
+            thread_id.clone(),
+            message_id.clone(),
+            *action,
+            occurred_at.clone(),
+            payload_digest.clone(),
+        )
+        .await?;
+        if let Some(saved) = committed {
+            return Ok(ProcessEnvelopeOutcome {
+                result: DispatchResult {
+                    sequence: saved.sequence,
+                    thread_id: None,
+                    project_id: None,
+                },
+                accepted_new: true,
+            });
+        }
+
+        let detail = format!(
+            "Message '{message_id}' does not have uncertain or failed delivery on thread '{thread_id}'."
+        );
+        repositories
+            .upsert_command_receipt(CommandReceipt {
+                command_id: command_id.clone(),
+                aggregate_kind: "thread".to_owned(),
+                aggregate_id: thread_id.clone(),
+                accepted_at: occurred_at,
+                result_sequence: current_max_sequence(repositories).await.unwrap_or(0),
+                status: "rejected".to_owned(),
+                error: Some(detail.clone()),
+                payload_digest,
+            })
+            .await
+            .map_err(wrap_persistence)?;
+        return Err(OrchestrationError::Invariant {
+            command_type: command.command_type().to_owned(),
+            detail,
+        });
+    }
 
     canonicalize_project_command(model, &mut command, project_command_effects).await?;
     let project_create_identity = match &command {
@@ -1179,25 +1273,31 @@ async fn process_envelope(
             let sequence = current_max_sequence(repositories).await?;
             repositories
                 .upsert_command_receipt(CommandReceipt {
-                    command_id,
+                    command_id: command_id.clone(),
                     aggregate_kind: "project".to_owned(),
                     aggregate_id: existing_project_id.clone(),
                     accepted_at: occurred_at,
                     result_sequence: sequence,
                     status: "accepted".to_owned(),
                     error: None,
+                    payload_digest: admission
+                        .as_ref()
+                        .map(|admission| admission.payload_digest.clone()),
                 })
                 .await
                 .map_err(wrap_persistence)?;
-            return Ok(DispatchResult {
-                sequence,
-                thread_id: canonical_default_thread_id(model, &existing_project_id),
-                project_id: Some(existing_project_id),
+            return Ok(ProcessEnvelopeOutcome {
+                result: DispatchResult {
+                    sequence,
+                    thread_id: canonical_default_thread_id(model, &existing_project_id),
+                    project_id: Some(existing_project_id),
+                },
+                accepted_new: true,
             });
         }
     }
 
-    let planned = match plan_command(repositories, model, &command, &occurred_at).await {
+    let mut planned = match plan_command(repositories, model, &command, &occurred_at).await {
         Ok(planned) => planned,
         Err(error) => {
             let aggregate = command.aggregate_ref();
@@ -1210,12 +1310,37 @@ async fn process_envelope(
                     result_sequence: current_max_sequence(repositories).await.unwrap_or(0),
                     status: "rejected".to_owned(),
                     error: Some(error.to_string()),
+                    payload_digest: admission
+                        .as_ref()
+                        .map(|admission| admission.payload_digest.clone()),
                 })
                 .await
                 .map_err(wrap_persistence)?;
             return Err(error);
         }
     };
+
+    if let Some(turn) = admission
+        .as_ref()
+        .and_then(|value| value.provider_turn.as_ref())
+    {
+        planned.push(make_event(
+            "thread.turn-delivery-updated",
+            "thread",
+            &turn.thread_id,
+            &turn.created_at,
+            &turn.command_id,
+            json!({}),
+            json!({
+                "threadId": turn.thread_id,
+                "messageId": turn.message_id,
+                "state": "pending",
+                "provider": turn.provider_kind,
+                "detail": null,
+                "updatedAt": turn.created_at,
+            }),
+        ));
+    }
 
     prepare_project_create(&command, project_command_effects).await?;
     let aggregate = command.aggregate_ref();
@@ -1226,6 +1351,7 @@ async fn process_envelope(
         &command_id,
         aggregate.0,
         aggregate.1,
+        admission,
     )
     .await?;
     apply_to_model(model, &committed);
@@ -1240,13 +1366,21 @@ async fn process_envelope(
             detail: "Command produced no events.".to_owned(),
         })?;
     let project_id = project_create_identity.map(|(project_id, _)| project_id);
-    Ok(DispatchResult {
-        sequence: last_sequence,
-        thread_id: project_id
-            .as_deref()
-            .and_then(|project_id| canonical_default_thread_id(model, project_id)),
-        project_id,
+    Ok(ProcessEnvelopeOutcome {
+        result: DispatchResult {
+            sequence: last_sequence,
+            thread_id: project_id
+                .as_deref()
+                .and_then(|project_id| canonical_default_thread_id(model, project_id)),
+            project_id,
+        },
+        accepted_new: true,
     })
+}
+
+struct ProcessEnvelopeOutcome {
+    result: DispatchResult,
+    accepted_new: bool,
 }
 
 async fn canonicalize_project_command(
@@ -1707,11 +1841,63 @@ async fn plan_command(
             message,
             model_selection,
             title_seed,
+            bootstrap,
             source_proposed_plan,
             created_at,
             ..
         } => {
-            let thread = require_thread(model, command, thread_id)?;
+            let (thread, created) = match model.threads.get(thread_id) {
+                Some(thread) if thread.deleted_at.is_none() => (thread.clone(), None),
+                Some(_) => {
+                    return invariant(command, format!("Thread '{thread_id}' is deleted."));
+                }
+                None => {
+                    let Some(create) = bootstrap
+                        .as_deref()
+                        .and_then(|bootstrap| bootstrap.create_thread.as_ref())
+                    else {
+                        return invariant(
+                            command,
+                            format!(
+                                "Thread '{thread_id}' does not exist for command '{}'.",
+                                command.command_type()
+                            ),
+                        );
+                    };
+                    require_project(model, command, &create.project_id)?;
+                    let event = make_event(
+                        "thread.created",
+                        "thread",
+                        thread_id,
+                        &create.created_at,
+                        command_id,
+                        metadata.clone(),
+                        json!({
+                            "threadId":thread_id,
+                            "projectId":create.project_id,
+                            "title":create.title,
+                            "modelSelection":create.model_selection,
+                            "runtimeMode":create.runtime_mode,
+                            "interactionMode":create.interaction_mode,
+                            "branch":create.branch,
+                            "worktreePath":create.worktree_path,
+                            "createdAt":create.created_at,
+                            "updatedAt":create.created_at,
+                        }),
+                    );
+                    (
+                        ThreadState {
+                            project_id: create.project_id.clone(),
+                            kind: "workspace".to_owned(),
+                            runtime_mode: create.runtime_mode.clone(),
+                            interaction_mode: create.interaction_mode.clone(),
+                            archived_at: None,
+                            deleted_at: None,
+                        },
+                        Some(event),
+                    )
+                }
+            };
             if let Some(source) = source_proposed_plan {
                 let source_thread_id = required_command_string(command, source, "threadId")?;
                 let source_plan_id = required_command_string(command, source, "planId")?;
@@ -1770,7 +1956,7 @@ async fn plan_command(
                 payload,
             );
             start.causation_event_id = Some(user.event_id.clone());
-            Ok(vec![user, start])
+            Ok(created.into_iter().chain([user, start]).collect())
         }
         OrchestrationCommand::ThreadTurnInterrupt {
             command_id,
@@ -1788,6 +1974,10 @@ async fn plan_command(
             "turnId",
             turn_id.as_ref().map(|v| json!(v)),
             model,
+        ),
+        OrchestrationCommand::ThreadTurnDeliveryResolve { .. } => invariant(
+            command,
+            "Delivery resolution must be persisted through its atomic transition path.".to_owned(),
         ),
         OrchestrationCommand::ThreadApprovalRespond {
             command_id,
@@ -2105,6 +2295,7 @@ async fn persist_command(
     command_id: &str,
     aggregate_kind: &str,
     aggregate_id: &str,
+    admission: Option<CommandAdmission>,
 ) -> Result<VecDeque<OrchestrationEvent>, OrchestrationError> {
     let repositories = repositories.clone();
     let hooks = hooks.clone();
@@ -2142,21 +2333,241 @@ async fn persist_command(
             upsert_command_receipt_tx(
                 &transaction,
                 CommandReceipt {
-                    command_id,
+                    command_id: command_id.clone(),
                     aggregate_kind,
                     aggregate_id,
                     accepted_at: last_saved.event.occurred_at.clone(),
                     result_sequence: last_saved.sequence,
                     status: "accepted".to_owned(),
                     error: None,
+                    payload_digest: admission.as_ref().map(|value| value.payload_digest.clone()),
                 },
             )?;
+            if let Some(admission) = admission {
+                for reference in admission.attachment_refs {
+                    transaction.execute(
+                        "INSERT INTO orchestration_attachment_refs (command_id, attachment_id, content_digest, size_bytes) VALUES (?, ?, ?, ?)",
+                        params![command_id, reference.attachment_id, reference.content_digest, reference.size_bytes],
+                    )?;
+                }
+                if let Some(turn) = admission.provider_turn {
+                    transaction.execute(
+                        "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, NULL, ?, ?)",
+                        params![turn.command_id, turn.thread_id, turn.message_id, turn.provider_instance_id, turn.provider_kind, turn.provider_session_id, turn.delivery_key, json_string(&turn.payload)?, turn.created_at, turn.created_at],
+                    )?;
+                }
+            }
             transaction.commit()?;
             Ok(committed)
         })
         .await
         .map_err(wrap_persistence)?;
     Ok(committed)
+}
+
+async fn persist_turn_delivery_transition(
+    repositories: &Repositories,
+    events: &broadcast::Sender<OrchestrationEvent>,
+    hooks: &TestHooks,
+    transition: TurnDeliveryTransition,
+) -> Result<bool, OrchestrationError> {
+    hooks.maybe_fail_delivery_transition()?;
+    let database = repositories.database().clone();
+    let hooks = hooks.clone();
+    let committed = database
+        .call(move |connection| {
+            let transaction = connection.transaction()?;
+            let current = transaction
+                .query_row(
+                    "SELECT thread_id, message_id, provider_kind, state, attempts FROM provider_turn_outbox WHERE command_id = ?",
+                    [&transition.command_id],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, i64>(4)?)),
+                )
+                .optional()?;
+            let Some((thread_id, message_id, provider, state, attempts)) = current else {
+                return Ok(None);
+            };
+            if attempts != transition.expected_attempt
+                || !transition
+                    .expected_states
+                    .iter()
+                    .any(|expected| turn_delivery_state_name(*expected) == state)
+            {
+                return Ok(None);
+            }
+            let next_state = turn_delivery_state_name(transition.next_state);
+            let updated = transaction.execute(
+                "UPDATE provider_turn_outbox SET state = ?, last_error = ?, updated_at = ? WHERE command_id = ? AND state = ? AND attempts = ?",
+                params![next_state, transition.detail, transition.updated_at, transition.command_id, state, transition.expected_attempt],
+            )?;
+            if updated == 0 {
+                return Ok(None);
+            }
+            let planned = make_event(
+                "thread.turn-delivery-updated",
+                "thread",
+                &thread_id,
+                &transition.updated_at,
+                &format!("server:turn-delivery:{}", transition.command_id),
+                json!({}),
+                json!({
+                    "threadId": thread_id,
+                    "messageId": message_id,
+                    "state": next_state,
+                    "provider": provider,
+                    "detail": transition.detail,
+                    "updatedAt": transition.updated_at,
+                }),
+            );
+            let saved = append_event_tx(&transaction, planned)?;
+            for projector in PROJECTOR_NAMES {
+                hooks
+                    .maybe_fail(projector, &saved.event.event_type)
+                    .map_err(projector_failure_to_persistence)?;
+                apply_projector_tx(&transaction, projector, &saved)?;
+                upsert_projection_state_tx(
+                    &transaction,
+                    projector,
+                    saved.sequence,
+                    &saved.event.occurred_at,
+                )?;
+            }
+            rebuild_thread_derived_fields_tx(&transaction, &saved.event.aggregate_id)?;
+            transaction.commit()?;
+            Ok(Some(saved))
+        })
+        .await
+        .map_err(wrap_persistence)?;
+    if let Some(event) = committed {
+        let _ = events.send(event);
+        Ok(true)
+    } else {
+        Ok(false)
+    }
+}
+
+async fn persist_turn_delivery_resolution(
+    repositories: &Repositories,
+    events: &broadcast::Sender<OrchestrationEvent>,
+    hooks: &TestHooks,
+    resolution_command_id: String,
+    thread_id: String,
+    message_id: String,
+    action: TurnDeliveryResolutionAction,
+    updated_at: String,
+    payload_digest: Option<String>,
+) -> Result<Option<OrchestrationEvent>, OrchestrationError> {
+    let database = repositories.database().clone();
+    let hooks = hooks.clone();
+    let committed = database
+        .call(move |connection| {
+            let transaction = connection.transaction()?;
+            let current = transaction
+                .query_row(
+                    "SELECT command_id, provider_kind, state, last_error FROM provider_turn_outbox WHERE thread_id = ? AND message_id = ?",
+                    params![thread_id, message_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, Option<String>>(3)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let Some((delivery_command_id, provider, state, last_error)) = current else {
+                return Ok(None);
+            };
+            if state != "uncertain" && state != "failed" {
+                return Ok(None);
+            }
+
+            let (next_state, detail, updated) = match action {
+                TurnDeliveryResolutionAction::Retry => (
+                    "pending",
+                    None,
+                    transaction.execute(
+                        "UPDATE provider_turn_outbox SET state = 'pending', attempts = 0, last_error = NULL, updated_at = ? WHERE command_id = ? AND state IN ('uncertain', 'failed')",
+                        params![updated_at, delivery_command_id],
+                    )?,
+                ),
+                TurnDeliveryResolutionAction::Dismiss => (
+                    "dismissed",
+                    last_error,
+                    transaction.execute(
+                        "UPDATE provider_turn_outbox SET state = 'dismissed', updated_at = ? WHERE command_id = ? AND state IN ('uncertain', 'failed')",
+                        params![updated_at, delivery_command_id],
+                    )?,
+                ),
+            };
+            if updated == 0 {
+                return Ok(None);
+            }
+
+            let planned = make_event(
+                "thread.turn-delivery-updated",
+                "thread",
+                &thread_id,
+                &updated_at,
+                &resolution_command_id,
+                json!({"deliveryCommandId":delivery_command_id}),
+                json!({
+                    "threadId": thread_id,
+                    "messageId": message_id,
+                    "state": next_state,
+                    "provider": provider,
+                    "detail": detail,
+                    "updatedAt": updated_at,
+                }),
+            );
+            let saved = append_event_tx(&transaction, planned)?;
+            for projector in PROJECTOR_NAMES {
+                hooks
+                    .maybe_fail(projector, &saved.event.event_type)
+                    .map_err(projector_failure_to_persistence)?;
+                apply_projector_tx(&transaction, projector, &saved)?;
+                upsert_projection_state_tx(
+                    &transaction,
+                    projector,
+                    saved.sequence,
+                    &saved.event.occurred_at,
+                )?;
+            }
+            rebuild_thread_derived_fields_tx(&transaction, &thread_id)?;
+            upsert_command_receipt_tx(
+                &transaction,
+                CommandReceipt {
+                    command_id: resolution_command_id,
+                    aggregate_kind: "thread".to_owned(),
+                    aggregate_id: thread_id,
+                    accepted_at: updated_at,
+                    result_sequence: saved.sequence,
+                    status: "accepted".to_owned(),
+                    error: None,
+                    payload_digest,
+                },
+            )?;
+            transaction.commit()?;
+            Ok(Some(saved))
+        })
+        .await
+        .map_err(wrap_persistence)?;
+    if let Some(event) = &committed {
+        let _ = events.send(event.clone());
+    }
+    Ok(committed)
+}
+
+fn turn_delivery_state_name(state: TurnDeliveryState) -> &'static str {
+    match state {
+        TurnDeliveryState::Pending => "pending",
+        TurnDeliveryState::Sending => "sending",
+        TurnDeliveryState::Delivered => "delivered",
+        TurnDeliveryState::Uncertain => "uncertain",
+        TurnDeliveryState::Dismissed => "dismissed",
+        TurnDeliveryState::Failed => "failed",
+    }
 }
 
 fn apply_to_model(model: &mut CommandModel, events: &VecDeque<OrchestrationEvent>) {
@@ -2579,6 +2990,21 @@ fn apply_messages_projector_tx(
         transaction.execute(
             "DELETE FROM projection_thread_messages WHERE thread_id = ? AND turn_id IN (SELECT json_extract(payload_json, '$.turnId') FROM orchestration_events WHERE event_type = 'thread.turn-diff-completed' AND stream_id = ? AND CAST(json_extract(payload_json, '$.checkpointTurnCount') AS INTEGER) > ?)",
             params![required_str(&event.event.payload, "threadId")?, required_str(&event.event.payload, "threadId")?, required_i64(&event.event.payload, "turnCount")?],
+        )?;
+        return Ok(());
+    }
+    if event.event.event_type == "thread.turn-delivery-updated" {
+        let payload = &event.event.payload;
+        transaction.execute(
+            "UPDATE projection_thread_messages SET delivery_state = ?, delivery_provider = ?, delivery_detail = ?, updated_at = ? WHERE message_id = ? AND thread_id = ?",
+            params![
+                required_str(payload, "state")?,
+                required_str(payload, "provider")?,
+                optional_string(payload.get("detail")),
+                required_str(payload, "updatedAt")?,
+                required_str(payload, "messageId")?,
+                required_str(payload, "threadId")?,
+            ],
         )?;
         return Ok(());
     }
@@ -3156,11 +3582,11 @@ fn upsert_command_receipt_tx(
     receipt: CommandReceipt,
 ) -> Result<(), PersistenceError> {
     transaction.execute(
-        "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error) \
-         VALUES (?, ?, ?, ?, ?, ?, ?) \
+        "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
          ON CONFLICT (command_id) DO UPDATE SET \
            aggregate_kind = excluded.aggregate_kind, aggregate_id = excluded.aggregate_id, accepted_at = excluded.accepted_at, \
-           result_sequence = excluded.result_sequence, status = excluded.status, error = excluded.error",
+           result_sequence = excluded.result_sequence, status = excluded.status, error = excluded.error, payload_digest = excluded.payload_digest",
         params![
             receipt.command_id,
             receipt.aggregate_kind,
@@ -3168,7 +3594,8 @@ fn upsert_command_receipt_tx(
             receipt.accepted_at,
             receipt.result_sequence,
             receipt.status,
-            receipt.error
+            receipt.error,
+            receipt.payload_digest
         ],
     )?;
     Ok(())
@@ -3323,6 +3750,7 @@ impl OrchestrationCommand {
             Self::ThreadInteractionModeSet { .. } => "thread.interaction-mode.set",
             Self::ThreadTurnStart { .. } => "thread.turn.start",
             Self::ThreadTurnInterrupt { .. } => "thread.turn.interrupt",
+            Self::ThreadTurnDeliveryResolve { .. } => "thread.turn-delivery.resolve",
             Self::ThreadApprovalRespond { .. } => "thread.approval.respond",
             Self::ThreadUserInputRespond { .. } => "thread.user-input.respond",
             Self::ThreadCheckpointRevert { .. } => "thread.checkpoint.revert",
@@ -3351,6 +3779,7 @@ impl OrchestrationCommand {
             | Self::ThreadInteractionModeSet { command_id, .. }
             | Self::ThreadTurnStart { command_id, .. }
             | Self::ThreadTurnInterrupt { command_id, .. }
+            | Self::ThreadTurnDeliveryResolve { command_id, .. }
             | Self::ThreadApprovalRespond { command_id, .. }
             | Self::ThreadUserInputRespond { command_id, .. }
             | Self::ThreadCheckpointRevert { command_id, .. }
@@ -3379,6 +3808,7 @@ impl OrchestrationCommand {
             | Self::ThreadInteractionModeSet { created_at, .. }
             | Self::ThreadTurnStart { created_at, .. }
             | Self::ThreadTurnInterrupt { created_at, .. }
+            | Self::ThreadTurnDeliveryResolve { created_at, .. }
             | Self::ThreadApprovalRespond { created_at, .. }
             | Self::ThreadUserInputRespond { created_at, .. }
             | Self::ThreadCheckpointRevert { created_at, .. }
@@ -3408,6 +3838,7 @@ impl OrchestrationCommand {
             | Self::ThreadInteractionModeSet { thread_id, .. }
             | Self::ThreadTurnStart { thread_id, .. }
             | Self::ThreadTurnInterrupt { thread_id, .. }
+            | Self::ThreadTurnDeliveryResolve { thread_id, .. }
             | Self::ThreadApprovalRespond { thread_id, .. }
             | Self::ThreadUserInputRespond { thread_id, .. }
             | Self::ThreadCheckpointRevert { thread_id, .. }
@@ -3537,7 +3968,6 @@ pub async fn load_snapshot(repositories: &Repositories) -> Result<Snapshot, Orch
     let diffs = list_diffs(repositories.database()).await?;
     threads.sort_by(|left, right| left.thread_id.cmp(&right.thread_id));
     messages.sort_by(|left, right| left.message_id.cmp(&right.message_id));
-    activities.sort_by(|left, right| left.activity_id.cmp(&right.activity_id));
     sessions.sort_by(|left, right| left.thread_id.cmp(&right.thread_id));
     approvals.sort_by(|left, right| left.request_id.cmp(&right.request_id));
     proposed_plans.sort_by(|left, right| left.plan_id.cmp(&right.plan_id));
@@ -3572,7 +4002,7 @@ async fn list_receipts(database: &Database) -> Result<Vec<CommandReceipt>, Orche
         .clone()
         .call(|connection| {
             let mut statement = connection.prepare(
-                "SELECT command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error \
+                "SELECT command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest \
                  FROM orchestration_command_receipts ORDER BY accepted_at ASC, command_id ASC",
             )?;
             statement
@@ -3585,6 +4015,7 @@ async fn list_receipts(database: &Database) -> Result<Vec<CommandReceipt>, Orche
                         result_sequence: row.get(4)?,
                         status: row.get(5)?,
                         error: row.get(6)?,
+                        payload_digest: row.get(7)?,
                     })
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()
@@ -3620,9 +4051,1048 @@ async fn list_diffs(database: &Database) -> Result<Vec<CheckpointDiffBlob>, Orch
 
 #[cfg(test)]
 mod tests {
+    use crate::orchestration::{
+        AttachmentReference, CommandAdmission, NewProviderTurnDelivery, TurnDeliveryState,
+        TurnDeliveryTransition, canonical_command_digest,
+    };
     use crate::persistence::run_migrations;
 
     use super::*;
+
+    struct DropFlag(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    fn project_create_command(command_id: &str, project_id: &str) -> OrchestrationCommand {
+        serde_json::from_value(json!({
+            "type":"project.create", "commandId":command_id, "projectId":project_id,
+            "title":"Project", "workspaceRoot":"C:/repo", "defaultModelSelection":null,
+            "createdAt":"2026-08-01T00:00:00Z"
+        }))
+        .expect("project command")
+    }
+
+    async fn delivery_engine(hooks: TestHooks) -> (OrchestrationEngine, String) {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let engine = OrchestrationEngine::start(
+            database,
+            EngineOptions {
+                test_hooks: hooks,
+                ..EngineOptions::default()
+            },
+        )
+        .await
+        .expect("engine");
+        engine
+            .dispatch(project_create_command(
+                "delivery-project",
+                "delivery-project",
+            ))
+            .await
+            .expect("project");
+        let thread_id = engine
+            .repositories()
+            .list_threads_by_project("delivery-project".to_owned())
+            .await
+            .expect("threads")
+            .into_iter()
+            .find(|thread| thread.kind == "default")
+            .expect("default thread")
+            .thread_id;
+        (engine, thread_id)
+    }
+
+    fn delivery_turn_for_message(
+        command_id: &str,
+        thread_id: &str,
+        message_id: &str,
+        text: &str,
+        created_at: &str,
+    ) -> OrchestrationCommand {
+        serde_json::from_value(json!({
+            "type":"thread.turn.start", "commandId":command_id, "threadId":thread_id,
+            "message":{"messageId":message_id,"role":"user","text":text,"attachments":[{
+                "type":"file","id":"notes-1","name":"notes.txt","mimeType":"text/plain","sizeBytes":5
+            }]},
+            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "createdAt":created_at
+        }))
+        .expect("turn command")
+    }
+
+    fn delivery_turn(command_id: &str, thread_id: &str, text: &str) -> OrchestrationCommand {
+        delivery_turn_for_message(
+            command_id,
+            thread_id,
+            "delivery-message",
+            text,
+            "2026-08-01T00:00:01Z",
+        )
+    }
+
+    fn delivery_admission_for_message(
+        command: &OrchestrationCommand,
+        thread_id: &str,
+        message_id: &str,
+        created_at: &str,
+    ) -> CommandAdmission {
+        CommandAdmission {
+            payload_digest: canonical_command_digest(command).expect("digest"),
+            attachment_refs: vec![AttachmentReference {
+                attachment_id: "notes-1".to_owned(),
+                content_digest: Some("digest-1".to_owned()),
+                size_bytes: 5,
+            }],
+            provider_turn: Some(NewProviderTurnDelivery {
+                command_id: command.command_id().to_owned(),
+                thread_id: thread_id.to_owned(),
+                message_id: message_id.to_owned(),
+                provider_instance_id: "codex".to_owned(),
+                provider_kind: "codex".to_owned(),
+                provider_session_id: None,
+                delivery_key: "delivery-key".to_owned(),
+                payload: serde_json::to_value(command).expect("payload"),
+                created_at: created_at.to_owned(),
+            }),
+        }
+    }
+
+    fn delivery_admission(command: &OrchestrationCommand, thread_id: &str) -> CommandAdmission {
+        delivery_admission_for_message(
+            command,
+            thread_id,
+            "delivery-message",
+            "2026-08-01T00:00:01Z",
+        )
+    }
+
+    fn delivery_resolution(
+        command_id: &str,
+        thread_id: &str,
+        message_id: &str,
+        action: &str,
+        created_at: &str,
+    ) -> OrchestrationCommand {
+        serde_json::from_value(json!({
+            "type":"thread.turn-delivery.resolve",
+            "commandId":command_id,
+            "threadId":thread_id,
+            "messageId":message_id,
+            "action":action,
+            "createdAt":created_at,
+        }))
+        .expect("delivery resolution command")
+    }
+
+    async fn admit_delivery(
+        engine: &OrchestrationEngine,
+        command_id: &str,
+        thread_id: &str,
+        message_id: &str,
+        created_at: &str,
+    ) {
+        let command = delivery_turn_for_message(
+            command_id,
+            thread_id,
+            message_id,
+            command_id,
+            created_at,
+        );
+        engine
+            .dispatch_with_admission(
+                command.clone(),
+                delivery_admission_for_message(&command, thread_id, message_id, created_at),
+                || {},
+            )
+            .await
+            .expect("admit delivery");
+    }
+
+    #[tokio::test]
+    async fn delivery_replay_owns_commit_once_and_conflicts_on_digest_mismatch() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let (engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        let command = delivery_turn("delivery-command", &thread_id, "first");
+        let admission = delivery_admission(&command, &thread_id);
+        let commits = Arc::new(AtomicUsize::new(0));
+        let first_commits = commits.clone();
+        let first = engine
+            .dispatch_with_admission(command.clone(), admission.clone(), move || {
+                first_commits.fetch_add(1, Ordering::SeqCst);
+            })
+            .await
+            .expect("first accepted");
+        let replay_commits = commits.clone();
+        let same_replay = engine
+            .dispatch_with_admission(command, admission, move || {
+                replay_commits.fetch_add(1, Ordering::SeqCst);
+            })
+            .await
+            .expect("same replay");
+        let different_command = delivery_turn("delivery-command", &thread_id, "different");
+        let different = engine
+            .dispatch_with_admission(
+                different_command.clone(),
+                delivery_admission(&different_command, &thread_id),
+                || {},
+            )
+            .await;
+
+        assert_eq!(same_replay.sequence, first.sequence);
+        assert_eq!(commits.load(Ordering::SeqCst), 1);
+        assert!(matches!(
+            different,
+            Err(OrchestrationError::CommandConflict { .. })
+        ));
+        assert_eq!(
+            engine
+                .repositories()
+                .list_provider_turn_deliveries(vec![TurnDeliveryState::Pending])
+                .await
+                .expect("pending deliveries")
+                .len(),
+            1
+        );
+        assert_eq!(
+            engine
+                .repositories()
+                .list_referenced_attachment_ids()
+                .await
+                .expect("attachment refs"),
+            vec!["notes-1".to_owned()]
+        );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delivery_projector_failure_rolls_back_receipt_events_outbox_and_references() {
+        let hooks = TestHooks::default();
+        let (engine, thread_id) = delivery_engine(hooks.clone()).await;
+        let before = engine.read_events(0).await.expect("events before").len();
+        hooks.fail_next_projector("projection.thread-messages", Some("thread.message-sent"));
+        let command = delivery_turn("delivery-rollback", &thread_id, "rollback");
+        let result = engine
+            .dispatch_with_admission(
+                command.clone(),
+                delivery_admission(&command, &thread_id),
+                || {},
+            )
+            .await;
+        assert!(matches!(
+            result,
+            Err(OrchestrationError::InjectedProjectorFailure { .. })
+        ));
+        assert_eq!(
+            engine.read_events(0).await.expect("events after").len(),
+            before
+        );
+        assert!(
+            engine
+                .repositories()
+                .get_command_receipt("delivery-rollback".to_owned())
+                .await
+                .expect("receipt")
+                .is_none()
+        );
+        assert!(
+            engine
+                .repositories()
+                .get_provider_turn_delivery("delivery-rollback".to_owned())
+                .await
+                .expect("outbox")
+                .is_none()
+        );
+        assert!(
+            engine
+                .repositories()
+                .list_referenced_attachment_ids()
+                .await
+                .expect("refs")
+                .is_empty()
+        );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delivery_transition_is_attempt_conditioned_and_projects_once() {
+        let (engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        let command = delivery_turn("delivery-transition", &thread_id, "transition");
+        engine
+            .dispatch_with_admission(
+                command.clone(),
+                delivery_admission(&command, &thread_id),
+                || {},
+            )
+            .await
+            .expect("admitted");
+        let claimed = engine
+            .repositories()
+            .claim_provider_turn(
+                "delivery-transition".to_owned(),
+                "2026-08-01T00:00:02Z".to_owned(),
+            )
+            .await
+            .expect("claim")
+            .expect("claimed");
+        let before = engine.read_events(0).await.expect("before").len();
+        let transition = TurnDeliveryTransition {
+            command_id: claimed.command_id,
+            expected_states: vec![TurnDeliveryState::Sending],
+            expected_attempt: claimed.attempts,
+            next_state: TurnDeliveryState::Delivered,
+            detail: None,
+            updated_at: "2026-08-01T00:00:03Z".to_owned(),
+        };
+        assert!(
+            engine
+                .transition_turn_delivery(transition.clone())
+                .await
+                .expect("transition")
+        );
+        assert!(
+            !engine
+                .transition_turn_delivery(transition)
+                .await
+                .expect("stale transition")
+        );
+        assert_eq!(
+            engine.read_events(0).await.expect("after").len(),
+            before + 1
+        );
+        let message = engine
+            .repositories()
+            .get_message("delivery-message".to_owned())
+            .await
+            .expect("message")
+            .expect("message");
+        assert_eq!(message.delivery_state.as_deref(), Some("delivered"));
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delivery_resolution_retry_resets_and_replays_once() {
+        let (engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        admit_delivery(
+            &engine,
+            "delivery-retry-first",
+            &thread_id,
+            "delivery-retry-message",
+            "2026-08-01T00:00:01Z",
+        )
+        .await;
+        let claimed = engine
+            .repositories()
+            .claim_provider_turn(
+                "delivery-retry-first".to_owned(),
+                "2026-08-01T00:00:02Z".to_owned(),
+            )
+            .await
+            .expect("claim")
+            .expect("claimed");
+        assert!(
+            engine
+                .transition_turn_delivery(TurnDeliveryTransition {
+                    command_id: claimed.command_id,
+                    expected_states: vec![TurnDeliveryState::Sending],
+                    expected_attempt: 1,
+                    next_state: TurnDeliveryState::Uncertain,
+                    detail: Some("connection closed before acknowledgement".to_owned()),
+                    updated_at: "2026-08-01T00:00:03Z".to_owned(),
+                })
+                .await
+                .expect("mark uncertain")
+        );
+        admit_delivery(
+            &engine,
+            "delivery-retry-later",
+            &thread_id,
+            "delivery-retry-later-message",
+            "2026-08-01T00:00:04Z",
+        )
+        .await;
+
+        let before = engine.read_events(0).await.expect("events before").len();
+        let resolution = delivery_resolution(
+            "delivery-retry-resolution",
+            &thread_id,
+            "delivery-retry-message",
+            "retry",
+            "2026-08-01T00:00:05Z",
+        );
+        let first = engine
+            .dispatch(resolution.clone())
+            .await
+            .expect("retry resolution");
+        let replay = engine.dispatch(resolution).await.expect("retry replay");
+
+        assert_eq!(replay.sequence, first.sequence);
+        assert_eq!(
+            engine.read_events(0).await.expect("events after").len(),
+            before + 1
+        );
+        let row = engine
+            .repositories()
+            .get_provider_turn_delivery("delivery-retry-first".to_owned())
+            .await
+            .expect("delivery")
+            .expect("retry row");
+        assert_eq!(row.state, TurnDeliveryState::Pending);
+        assert_eq!(row.attempts, 0);
+        assert_eq!(row.last_error, None);
+        let pending = engine
+            .repositories()
+            .list_provider_turn_deliveries(vec![TurnDeliveryState::Pending])
+            .await
+            .expect("pending rows");
+        assert_eq!(
+            pending
+                .iter()
+                .map(|row| row.command_id.as_str())
+                .collect::<Vec<_>>(),
+            ["delivery-retry-first", "delivery-retry-later"]
+        );
+        let message = engine
+            .repositories()
+            .get_message("delivery-retry-message".to_owned())
+            .await
+            .expect("message")
+            .expect("retry message");
+        assert_eq!(message.delivery_state.as_deref(), Some("pending"));
+        assert_eq!(message.delivery_detail, None);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delivery_resolution_dismiss_retains_detail_and_unblocks_later_row() {
+        let (engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        admit_delivery(
+            &engine,
+            "delivery-dismiss-first",
+            &thread_id,
+            "delivery-dismiss-message",
+            "2026-08-01T00:00:01Z",
+        )
+        .await;
+        assert!(
+            engine
+                .transition_turn_delivery(TurnDeliveryTransition {
+                    command_id: "delivery-dismiss-first".to_owned(),
+                    expected_states: vec![TurnDeliveryState::Pending],
+                    expected_attempt: 0,
+                    next_state: TurnDeliveryState::Failed,
+                    detail: Some("provider rejected the request".to_owned()),
+                    updated_at: "2026-08-01T00:00:02Z".to_owned(),
+                })
+                .await
+                .expect("mark failed")
+        );
+        admit_delivery(
+            &engine,
+            "delivery-dismiss-later",
+            &thread_id,
+            "delivery-dismiss-later-message",
+            "2026-08-01T00:00:03Z",
+        )
+        .await;
+
+        let before = engine.read_events(0).await.expect("events before").len();
+        let resolution = delivery_resolution(
+            "delivery-dismiss-resolution",
+            &thread_id,
+            "delivery-dismiss-message",
+            "dismiss",
+            "2026-08-01T00:00:04Z",
+        );
+        let first = engine
+            .dispatch(resolution.clone())
+            .await
+            .expect("dismiss resolution");
+        let replay = engine.dispatch(resolution).await.expect("dismiss replay");
+
+        assert_eq!(replay.sequence, first.sequence);
+        assert_eq!(
+            engine.read_events(0).await.expect("events after").len(),
+            before + 1
+        );
+        let dismissed = engine
+            .repositories()
+            .get_provider_turn_delivery("delivery-dismiss-first".to_owned())
+            .await
+            .expect("delivery")
+            .expect("dismissed row");
+        assert_eq!(dismissed.state, TurnDeliveryState::Dismissed);
+        assert_eq!(
+            dismissed.last_error.as_deref(),
+            Some("provider rejected the request")
+        );
+        let active = engine
+            .repositories()
+            .list_provider_turn_deliveries(vec![
+                TurnDeliveryState::Pending,
+                TurnDeliveryState::Sending,
+                TurnDeliveryState::Uncertain,
+                TurnDeliveryState::Failed,
+            ])
+            .await
+            .expect("active rows");
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].command_id, "delivery-dismiss-later");
+        let message = engine
+            .repositories()
+            .get_message("delivery-dismiss-message".to_owned())
+            .await
+            .expect("message")
+            .expect("dismissed message");
+        assert_eq!(message.delivery_state.as_deref(), Some("dismissed"));
+        assert_eq!(
+            message.delivery_detail.as_deref(),
+            Some("provider rejected the request")
+        );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delivery_resolution_projector_failure_rolls_back_transition_and_receipt() {
+        let hooks = TestHooks::default();
+        let (engine, thread_id) = delivery_engine(hooks.clone()).await;
+        admit_delivery(
+            &engine,
+            "delivery-resolution-rollback",
+            &thread_id,
+            "delivery-resolution-rollback-message",
+            "2026-08-01T00:00:01Z",
+        )
+        .await;
+        assert!(
+            engine
+                .transition_turn_delivery(TurnDeliveryTransition {
+                    command_id: "delivery-resolution-rollback".to_owned(),
+                    expected_states: vec![TurnDeliveryState::Pending],
+                    expected_attempt: 0,
+                    next_state: TurnDeliveryState::Uncertain,
+                    detail: Some("unknown provider outcome".to_owned()),
+                    updated_at: "2026-08-01T00:00:02Z".to_owned(),
+                })
+                .await
+                .expect("mark uncertain")
+        );
+        hooks.fail_next_projector(
+            "projection.thread-messages",
+            Some("thread.turn-delivery-updated"),
+        );
+        let before = engine.read_events(0).await.expect("events before").len();
+        let result = engine
+            .dispatch(delivery_resolution(
+                "delivery-resolution-rollback-command",
+                &thread_id,
+                "delivery-resolution-rollback-message",
+                "retry",
+                "2026-08-01T00:00:03Z",
+            ))
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(OrchestrationError::InjectedProjectorFailure { .. })
+        ));
+        assert_eq!(engine.read_events(0).await.expect("events after").len(), before);
+        assert!(
+            engine
+                .repositories()
+                .get_command_receipt("delivery-resolution-rollback-command".to_owned())
+                .await
+                .expect("receipt")
+                .is_none()
+        );
+        let row = engine
+            .repositories()
+            .get_provider_turn_delivery("delivery-resolution-rollback".to_owned())
+            .await
+            .expect("delivery")
+            .expect("rollback row");
+        assert_eq!(row.state, TurnDeliveryState::Uncertain);
+        assert_eq!(row.last_error.as_deref(), Some("unknown provider outcome"));
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn delivery_rejected_replay_matches_digest_and_conflicts_on_change() {
+        let (engine, _) = delivery_engine(TestHooks::default()).await;
+        let rejected = delivery_turn("delivery-rejected", "missing-thread", "same");
+        let admission = delivery_admission(&rejected, "missing-thread");
+        assert!(matches!(
+            engine
+                .dispatch_with_admission(rejected.clone(), admission.clone(), || {})
+                .await,
+            Err(OrchestrationError::Invariant { .. })
+        ));
+        assert!(matches!(
+            engine
+                .dispatch_with_admission(rejected, admission, || {})
+                .await,
+            Err(OrchestrationError::PreviouslyRejected { .. })
+        ));
+        let changed = delivery_turn("delivery-rejected", "missing-thread", "changed");
+        assert!(matches!(
+            engine
+                .dispatch_with_admission(
+                    changed.clone(),
+                    delivery_admission(&changed, "missing-thread"),
+                    || {},
+                )
+                .await,
+            Err(OrchestrationError::CommandConflict { .. })
+        ));
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn dispatch_commit_ownership_crosses_only_the_engine_admission_boundary() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let observer = database
+            .enable_queue_backpressure_observation_for_integration_test()
+            .expect("database observer");
+        let engine = OrchestrationEngine::start(
+            database.clone(),
+            EngineOptions {
+                queue_capacity: 1,
+                ..EngineOptions::default()
+            },
+        )
+        .await
+        .expect("engine");
+
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let blocker_database = database.clone();
+        let blocker = tokio::spawn(async move {
+            blocker_database
+                .call(move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().expect("release database blocker");
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("database blocker entered");
+
+        let admitted_dropped = Arc::new(AtomicBool::new(false));
+        let admitted_committed = Arc::new(AtomicBool::new(false));
+        let admitted_probe = DropFlag(admitted_dropped.clone());
+        let admitted_commit = admitted_committed.clone();
+        let admitted_engine = engine.clone();
+        let admitted = tokio::spawn(async move {
+            admitted_engine
+                .dispatch_with_commit(
+                    project_create_command("admitted", "project-admitted"),
+                    move || {
+                        admitted_commit.store(true, Ordering::SeqCst);
+                        drop(admitted_probe);
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if database
+                    .queue_backpressure_snapshot_for_integration_test()
+                    .reserved_or_queued_jobs
+                    == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("admitted command reaches persistence");
+
+        let queued_engine = engine.clone();
+        let queued = tokio::spawn(async move {
+            queued_engine
+                .dispatch(project_create_command("queued", "project-queued"))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while engine.sender.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("engine queue fills");
+
+        let pending_dropped = Arc::new(AtomicBool::new(false));
+        let pending_committed = Arc::new(AtomicBool::new(false));
+        let pending_probe = DropFlag(pending_dropped.clone());
+        let pending_commit = pending_committed.clone();
+        let pending_engine = engine.clone();
+        let pending = tokio::spawn(async move {
+            pending_engine
+                .dispatch_with_commit(
+                    project_create_command("not-admitted", "project-not-admitted"),
+                    move || {
+                        pending_commit.store(true, Ordering::SeqCst);
+                        drop(pending_probe);
+                    },
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        pending.abort();
+        let _ = pending.await;
+        assert!(pending_dropped.load(Ordering::SeqCst));
+        assert!(!pending_committed.load(Ordering::SeqCst));
+
+        admitted.abort();
+        let _ = admitted.await;
+        assert!(
+            !admitted_dropped.load(Ordering::SeqCst),
+            "the worker owns an admitted command's commit guard"
+        );
+        release_tx.send(()).expect("release database");
+        blocker.await.expect("blocker task").expect("blocker call");
+        queued.await.expect("queued task").expect("queued command");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !admitted_committed.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("admitted command commits");
+        assert!(admitted_dropped.load(Ordering::SeqCst));
+        assert!(
+            engine
+                .read_events(0)
+                .await
+                .expect("events")
+                .iter()
+                .all(|event| event.event.command_id.as_deref() != Some("not-admitted"))
+        );
+
+        drop(observer);
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bootstrap_delivery_commits_thread_turn_receipt_and_outbox_before_effects() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct BootstrapEffectProbe(Arc<AtomicUsize>);
+
+        impl ThreadTurnBootstrapEffects for BootstrapEffectProbe {
+            fn prepare_worktree<'a>(
+                &'a self,
+                input: ThreadTurnStartBootstrapPrepareWorktree,
+                _cancellation: &'a CancellationToken,
+            ) -> BoxBootstrapFuture<'a, BootstrapWorktree> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    Ok(BootstrapWorktree {
+                        repository_root: input.project_cwd.clone(),
+                        branch: "bibcode/bootstrap".to_owned(),
+                        path: format!("{}/bootstrap", input.project_cwd),
+                        remove_branch: true,
+                    })
+                })
+            }
+
+            fn run_setup_script<'a>(
+                &'a self,
+                _input: BootstrapSetupInput,
+            ) -> BoxBootstrapFuture<'a, BootstrapSetupResult> {
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async { Ok(BootstrapSetupResult::NoScript) })
+            }
+        }
+
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let hooks = TestHooks::default();
+        let engine = OrchestrationEngine::start(
+            database,
+            EngineOptions {
+                test_hooks: hooks.clone(),
+                ..EngineOptions::default()
+            },
+        )
+        .await
+        .expect("engine");
+        engine
+            .dispatch(project_create_command(
+                "bootstrap-project",
+                "bootstrap-project",
+            ))
+            .await
+            .expect("project");
+
+        let effects = Arc::new(AtomicUsize::new(0));
+        engine.set_bootstrap_effects(Arc::new(BootstrapEffectProbe(effects.clone())));
+        let command = serde_json::from_value::<OrchestrationCommand>(json!({
+            "type":"thread.turn.start",
+            "commandId":"bootstrap-delivery",
+            "threadId":"bootstrap-thread",
+            "message":{"messageId":"bootstrap-message","role":"user","text":"build","attachments":[]},
+            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "bootstrap":{
+                "createThread":{
+                    "projectId":"bootstrap-project",
+                    "title":"Bootstrap",
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access",
+                    "interactionMode":"default",
+                    "branch":null,
+                    "worktreePath":null,
+                    "createdAt":"2026-08-01T00:00:01Z"
+                },
+                "prepareWorktree":{
+                    "projectCwd":"C:/repo",
+                    "baseBranch":"main",
+                    "branch":"bibcode/bootstrap"
+                },
+                "runSetupScript":true
+            },
+            "createdAt":"2026-08-01T00:00:01Z"
+        }))
+        .expect("bootstrap turn");
+        let admission = CommandAdmission {
+            payload_digest: canonical_command_digest(&command).expect("digest"),
+            attachment_refs: vec![],
+            provider_turn: Some(NewProviderTurnDelivery {
+                command_id: "bootstrap-delivery".to_owned(),
+                thread_id: "bootstrap-thread".to_owned(),
+                message_id: "bootstrap-message".to_owned(),
+                provider_instance_id: "codex".to_owned(),
+                provider_kind: "codex".to_owned(),
+                provider_session_id: None,
+                delivery_key: "bootstrap-key".to_owned(),
+                payload: serde_json::to_value(&command).expect("payload"),
+                created_at: "2026-08-01T00:00:01Z".to_owned(),
+            }),
+        };
+        let pause = hooks.pause_after_next_admission_commit();
+        let dispatch_engine = engine.clone();
+        let dispatch = tokio::spawn(async move {
+            dispatch_engine
+                .dispatch_with_admission(command, admission, || {})
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), pause.wait_until_entered())
+            .await
+            .expect("bootstrap admission commits");
+        dispatch.abort();
+        let _ = dispatch.await;
+
+        assert_eq!(effects.load(Ordering::SeqCst), 0);
+        let event_types = engine
+            .read_events(0)
+            .await
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.event.aggregate_id == "bootstrap-thread")
+            .map(|event| event.event.event_type)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_types,
+            [
+                "thread.created",
+                "thread.message-sent",
+                "thread.turn-start-requested",
+                "thread.turn-delivery-updated",
+            ]
+        );
+        assert!(
+            engine
+                .repositories()
+                .get_command_receipt("bootstrap-delivery".to_owned())
+                .await
+                .expect("receipt")
+                .is_some()
+        );
+        assert_eq!(
+            engine
+                .repositories()
+                .get_provider_turn_delivery("bootstrap-delivery".to_owned())
+                .await
+                .expect("outbox")
+                .expect("delivery")
+                .state,
+            TurnDeliveryState::Pending
+        );
+        pause.release();
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bootstrap_delivery_cancellation_before_enqueue_creates_nothing() {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let observer = database
+            .enable_queue_backpressure_observation_for_integration_test()
+            .expect("database observer");
+        let engine = OrchestrationEngine::start(
+            database.clone(),
+            EngineOptions {
+                queue_capacity: 1,
+                ..EngineOptions::default()
+            },
+        )
+        .await
+        .expect("engine");
+        engine
+            .dispatch(project_create_command(
+                "bootstrap-project",
+                "bootstrap-project",
+            ))
+            .await
+            .expect("project");
+
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let blocker_database = database.clone();
+        let blocker = tokio::spawn(async move {
+            blocker_database
+                .call(move |_| {
+                    let _ = entered_tx.send(());
+                    release_rx.recv().expect("release database blocker");
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("database blocker entered");
+        let admitted_engine = engine.clone();
+        let admitted = tokio::spawn(async move {
+            admitted_engine
+                .dispatch(project_create_command("queue-admitted", "queue-admitted"))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while database
+                .queue_backpressure_snapshot_for_integration_test()
+                .reserved_or_queued_jobs
+                != 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("admitted command reaches persistence");
+        let queued_engine = engine.clone();
+        let queued = tokio::spawn(async move {
+            queued_engine
+                .dispatch(project_create_command("queue-filled", "queue-filled"))
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while engine.sender.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("engine queue fills");
+
+        let command = serde_json::from_value::<OrchestrationCommand>(json!({
+            "type":"thread.turn.start", "commandId":"bootstrap-not-enqueued",
+            "threadId":"bootstrap-not-enqueued",
+            "message":{"messageId":"bootstrap-message","role":"user","text":"build","attachments":[]},
+            "bootstrap":{"createThread":{
+                "projectId":"bootstrap-project", "title":"Bootstrap",
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access", "interactionMode":"default",
+                "branch":null, "worktreePath":null, "createdAt":"2026-08-01T00:00:01Z"
+            }},
+            "createdAt":"2026-08-01T00:00:01Z"
+        }))
+        .expect("bootstrap command");
+        let admission = CommandAdmission {
+            payload_digest: canonical_command_digest(&command).expect("digest"),
+            attachment_refs: vec![],
+            provider_turn: Some(NewProviderTurnDelivery {
+                command_id: "bootstrap-not-enqueued".to_owned(),
+                thread_id: "bootstrap-not-enqueued".to_owned(),
+                message_id: "bootstrap-message".to_owned(),
+                provider_instance_id: "codex".to_owned(),
+                provider_kind: "codex".to_owned(),
+                provider_session_id: None,
+                delivery_key: "bootstrap-not-enqueued-key".to_owned(),
+                payload: serde_json::to_value(&command).expect("payload"),
+                created_at: "2026-08-01T00:00:01Z".to_owned(),
+            }),
+        };
+        let pending_engine = engine.clone();
+        let pending = tokio::spawn(async move {
+            pending_engine
+                .dispatch_with_admission(command, admission, || {})
+                .await
+        });
+        tokio::task::yield_now().await;
+        pending.abort();
+        let _ = pending.await;
+
+        release_tx.send(()).expect("release database");
+        blocker.await.expect("blocker").expect("database call");
+        admitted.await.expect("admitted").expect("admitted result");
+        queued.await.expect("queued").expect("queued result");
+        assert!(
+            engine
+                .repositories()
+                .get_thread("bootstrap-not-enqueued".to_owned())
+                .await
+                .expect("thread lookup")
+                .is_none()
+        );
+        assert!(
+            engine
+                .repositories()
+                .get_command_receipt("bootstrap-not-enqueued".to_owned())
+                .await
+                .expect("receipt lookup")
+                .is_none()
+        );
+        assert!(
+            engine
+                .repositories()
+                .get_provider_turn_delivery("bootstrap-not-enqueued".to_owned())
+                .await
+                .expect("outbox lookup")
+                .is_none()
+        );
+
+        drop(observer);
+        engine.shutdown().await;
+    }
 
     struct NoopBootstrapEffects;
 
@@ -3630,6 +5100,7 @@ mod tests {
         fn prepare_worktree<'a>(
             &'a self,
             input: ThreadTurnStartBootstrapPrepareWorktree,
+            _cancellation: &'a CancellationToken,
         ) -> BoxBootstrapFuture<'a, BootstrapWorktree> {
             Box::pin(async move {
                 Ok(BootstrapWorktree {
@@ -3646,20 +5117,6 @@ mod tests {
             _input: BootstrapSetupInput,
         ) -> BoxBootstrapFuture<'a, BootstrapSetupResult> {
             Box::pin(async { Ok(BootstrapSetupResult::NoScript) })
-        }
-
-        fn cleanup_thread_resources<'a>(
-            &'a self,
-            _thread_id: &'a str,
-        ) -> BoxBootstrapFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
-        }
-
-        fn remove_worktree<'a>(
-            &'a self,
-            _worktree: BootstrapWorktree,
-        ) -> BoxBootstrapFuture<'a, ()> {
-            Box::pin(async { Ok(()) })
         }
     }
 
@@ -4067,7 +5524,7 @@ mod tests {
             .await
             .expect("project retry succeeds");
 
-        let bootstrap_error = engine
+        engine
             .dispatch(command(json!({
                 "type":"thread.turn.start",
                 "commandId":"bootstrap-turn",
@@ -4092,14 +5549,7 @@ mod tests {
                 "createdAt":CREATED_AT
             })))
             .await
-            .expect_err("missing bootstrap effects fail closed");
-        assert!(matches!(
-            bootstrap_error,
-            OrchestrationError::Bootstrap {
-                stage: "worktree preparation",
-                ..
-            }
-        ));
+            .expect("bootstrap admission does not run effects");
 
         let commands = [
             json!({"type":"project.meta.update","commandId":"project-meta","projectId":"p1","title":"Renamed","workspaceRoot":"C:/repo-renamed","defaultModelSelection":{"instanceId":"codex","model":"gpt-5"}}),
@@ -4156,6 +5606,7 @@ mod tests {
                 result_sequence: 0,
                 status: "rejected".to_owned(),
                 error: None,
+                payload_digest: None,
             })
             .await
             .expect("receipt fixture inserts");
@@ -4249,13 +5700,17 @@ mod tests {
         assert!(required_i64(&json!({}), "value").is_err());
 
         let effects = Arc::new(NoopBootstrapEffects);
+        let bootstrap_cancellation = CancellationToken::new();
         let worktree = effects
-            .prepare_worktree(ThreadTurnStartBootstrapPrepareWorktree {
-                project_cwd: "C:/repo".to_owned(),
-                base_branch: "main".to_owned(),
-                branch: None,
-                start_from_origin: None,
-            })
+            .prepare_worktree(
+                ThreadTurnStartBootstrapPrepareWorktree {
+                    project_cwd: "C:/repo".to_owned(),
+                    base_branch: "main".to_owned(),
+                    branch: None,
+                    start_from_origin: None,
+                },
+                &bootstrap_cancellation,
+            )
             .await
             .expect("noop worktree");
         assert_eq!(
@@ -4269,15 +5724,6 @@ mod tests {
                 .await,
             Ok(BootstrapSetupResult::NoScript)
         );
-        effects
-            .cleanup_thread_resources("t1")
-            .await
-            .expect("noop cleanup");
-        effects
-            .remove_worktree(worktree)
-            .await
-            .expect("noop worktree cleanup");
-
         let poisoned_effects = engine.bootstrap_effects.clone();
         let panic_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let _guard = poisoned_effects.lock().expect("mutex initially healthy");

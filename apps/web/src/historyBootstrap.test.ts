@@ -133,8 +133,45 @@ describe("buildBootstrapInput", () => {
       1_500,
     );
 
-    expect(result.text).toContain("Attached image");
+    expect(result.text).toContain("Attached Image:");
     expect(result.text).toContain("screenshot.png");
+  });
+
+  it("summarizes mixed attachments from the first attachment type", () => {
+    const result = buildBootstrapInput(
+      [
+        {
+          id: messageId("u-file"),
+          role: "user",
+          text: "",
+          attachments: [
+            {
+              type: "file",
+              id: "file-1",
+              name: "notes.txt",
+              mimeType: "text/plain",
+              sizeBytes: 12,
+            },
+            {
+              type: "image",
+              id: "image-1",
+              name: "shot.png",
+              mimeType: "image/png",
+              sizeBytes: 12,
+            },
+          ],
+          createdAt: "2026-02-09T00:00:00.000Z",
+          turnId: null,
+          updatedAt: "2026-02-09T00:00:00.000Z",
+          streaming: false,
+        },
+      ],
+      "Continue",
+      1_500,
+    );
+
+    expect(result.text).toContain("File: notes.txt");
+    expect(result.text).toContain("shot.png");
   });
 
   it("summarizes text plus multiple images and caps the attachment name list", () => {
@@ -163,7 +200,7 @@ describe("buildBootstrapInput", () => {
     );
 
     expect(result.text).toContain(
-      "Please inspect these.\n[Attached images: one.png, two.png, three.png (+1 more)]",
+      "Please inspect these.\n[Attached Image: one.png, two.png, three.png (+1 more)]",
     );
   });
 
