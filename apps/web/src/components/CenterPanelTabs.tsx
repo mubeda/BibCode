@@ -1,7 +1,14 @@
 import type { ContextMenuItem } from "@bibcode/contracts";
 import { getTerminalLabel } from "@bibcode/shared/terminalLabels";
 import { Bot, MessageSquare, TerminalSquare, X } from "lucide-react";
-import { type MouseEvent as ReactMouseEvent, useCallback, useEffect, useRef } from "react";
+import {
+  type KeyboardEvent as ReactKeyboardEvent,
+  type MouseEvent as ReactMouseEvent,
+  type WheelEvent as ReactWheelEvent,
+  useCallback,
+  useEffect,
+  useRef,
+} from "react";
 
 import type { CenterSurface } from "~/centerPanelStore";
 import { cn } from "~/lib/utils";
@@ -10,6 +17,7 @@ import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { ScrollArea } from "~/components/ui/scroll-area";
 
 interface CenterPanelTabsProps {
+  hostLabel: string;
   surfaces: readonly CenterSurface[];
   activeSurfaceId: string | null;
   terminalLabelsById?: ReadonlyMap<string, string>;
@@ -24,11 +32,12 @@ type TabContextMenuAction = "close" | "close-others" | "close-to-right" | "close
 
 function centerSurfaceTitle(
   surface: CenterSurface,
+  hostLabel: string,
   terminalLabelsById: ReadonlyMap<string, string> | undefined,
 ): string {
   switch (surface.kind) {
     case "chat-host":
-      return "Main";
+      return hostLabel;
     case "chat":
       return surface.providerLabel ?? "Chat";
     case "terminal":
@@ -53,6 +62,37 @@ function CenterSurfaceIcon({ surface }: { surface: CenterSurface }) {
 
 export function CenterPanelTabs(props: CenterPanelTabsProps) {
   const tabListRef = useRef<HTMLDivElement>(null);
+
+  const handleWheel = useCallback((event: ReactWheelEvent<HTMLDivElement>) => {
+    const viewport = tabListRef.current?.querySelector<HTMLElement>(
+      '[data-slot="scroll-area-viewport"]',
+    );
+    if (!viewport || viewport.scrollWidth <= viewport.clientWidth) return;
+    if (event.deltaY === 0 || Math.abs(event.deltaX) >= Math.abs(event.deltaY)) return;
+
+    viewport.scrollLeft += event.deltaY;
+    event.preventDefault();
+  }, []);
+
+  const handleTabKeyDown = useCallback(
+    (event: ReactKeyboardEvent<HTMLButtonElement>, surfaceIndex: number) => {
+      if (event.key !== "ArrowLeft" && event.key !== "ArrowRight") return;
+      const direction = event.key === "ArrowRight" ? 1 : -1;
+      const nextIndex = surfaceIndex + direction;
+      const nextSurface = props.surfaces[nextIndex];
+      if (!nextSurface) return;
+
+      event.preventDefault();
+      const activationButtons = tabListRef.current?.querySelectorAll<HTMLButtonElement>(
+        "[data-center-panel-tab-activation]",
+      );
+      const nextButton = activationButtons?.[nextIndex];
+      nextButton?.focus();
+      nextButton?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      props.onActivate(nextSurface);
+    },
+    [props],
+  );
 
   const handleTabContextMenu = useCallback(
     async (event: ReactMouseEvent, surface: CenterSurface) => {
@@ -121,20 +161,25 @@ export function CenterPanelTabs(props: CenterPanelTabsProps) {
 
   return (
     <div
-      className="flex h-9 shrink-0 items-center gap-1 border-b border-border/60 px-2"
+      className="relative flex min-w-0 flex-1 self-stretch items-center overflow-hidden"
       data-center-panel-tabbar
     >
       <ScrollArea
         ref={tabListRef}
         hideScrollbars
         scrollFade
-        className="min-w-0 flex-1 rounded-none"
+        className="min-w-0 flex-1 self-stretch rounded-none"
         data-center-panel-tab-list
+        onWheel={handleWheel}
       >
-        <div className="flex h-full w-max min-w-full items-center gap-1">
-          {props.surfaces.map((surface) => {
+        <div
+          className="flex h-full w-max min-w-full items-center gap-1 px-2"
+          role="tablist"
+          aria-label="Workspace panels"
+        >
+          {props.surfaces.map((surface, surfaceIndex) => {
             const active = surface.id === props.activeSurfaceId;
-            const title = centerSurfaceTitle(surface, props.terminalLabelsById);
+            const title = centerSurfaceTitle(surface, props.hostLabel, props.terminalLabelsById);
             return (
               <div
                 key={surface.id}
@@ -154,8 +199,12 @@ export function CenterPanelTabs(props: CenterPanelTabsProps) {
                     render={
                       <button
                         type="button"
-                        className="flex min-w-0 flex-1 items-center gap-1.5"
+                        role="tab"
+                        aria-selected={active}
+                        data-center-panel-tab-activation
+                        className="flex min-w-0 flex-1 items-center gap-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
                         onClick={() => props.onActivate(surface)}
+                        onKeyDown={(event) => handleTabKeyDown(event, surfaceIndex)}
                       >
                         <CenterSurfaceIcon surface={surface} />
                         <span className="truncate">{title}</span>
@@ -166,7 +215,7 @@ export function CenterPanelTabs(props: CenterPanelTabsProps) {
                 </Tooltip>
                 <button
                   type="button"
-                  className="flex size-4 shrink-0 items-center justify-center rounded opacity-0 hover:bg-muted focus:opacity-100 group-hover:opacity-100"
+                  className="flex size-4 shrink-0 items-center justify-center rounded opacity-0 hover:bg-muted focus:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70 group-hover:opacity-100"
                   aria-label={`Close ${title}`}
                   onClick={() => props.onCloseSurface(surface)}
                 >
