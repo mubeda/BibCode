@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make every packaged T4Code terminal render Powerline and Nerd Font glyphs by default while offering device-local bundled, system, and custom font choices.
+**Goal:** Make every packaged BiBCode terminal render Powerline and Nerd Font glyphs by default while offering device-local bundled, system, and custom font choices.
 
 **Architecture:** Extend client-only settings with a recoverable terminal font preference, bundle the official monospaced Nerd Fonts symbols face alongside the existing JetBrains Mono web font, and resolve every preference through one font-stack utility. Settings updates mutate the existing xterm instance after the symbols face loads, preserving the backend session and scrollback.
 
@@ -13,7 +13,7 @@
 - Follow red–green–refactor for every behavior change.
 - Keep the font preference in `ClientSettings`; do not add it to `ServerSettings`, Rust settings, RPC contracts, or remote-environment state.
 - Do not touch the pre-existing unstaged change in `apps/desktop/src-tauri/src/bridge.rs`.
-- Use the family name `T4Code Symbols Nerd Font Mono` for the bundled symbols asset.
+- Use the family name `BiBCode Symbols Nerd Font Mono` for the bundled symbols asset.
 - Pin Nerd Fonts release `v3.4.0`.
 - Pin archive SHA-256 `7f8c090da3b0eaa7108646bf34cbbb6ed13d5358a72460522108b06c7ecd716a`.
 - Pin source TTF SHA-256 `f0f624d9b474bea1662cf7e862d44aebe1ae1f6c7f9cb7a0ca5d0e5ac9561c60`.
@@ -346,13 +346,13 @@ import {
 describe("resolveTerminalFontFamily", () => {
   it("uses bundled JetBrains Mono with the Nerd symbols fallback by default", () => {
     expect(resolveTerminalFontFamily({ mode: "bundled" })).toBe(
-      '"JetBrains Mono", "T4Code Symbols Nerd Font Mono", monospace',
+      '"JetBrains Mono", "BiBCode Symbols Nerd Font Mono", monospace',
     );
   });
 
   it("uses the system monospace generic before the bundled symbols", () => {
     expect(resolveTerminalFontFamily({ mode: "system" })).toBe(
-      'ui-monospace, "T4Code Symbols Nerd Font Mono", monospace',
+      'ui-monospace, "BiBCode Symbols Nerd Font Mono", monospace',
     );
   });
 
@@ -363,7 +363,7 @@ describe("resolveTerminalFontFamily", () => {
         family: 'Operator "Mono" \\ Local',
       }),
     ).toBe(
-      '"Operator \\"Mono\\" \\\\ Local", "T4Code Symbols Nerd Font Mono", "JetBrains Mono", monospace',
+      '"Operator \\"Mono\\" \\\\ Local", "BiBCode Symbols Nerd Font Mono", "JetBrains Mono", monospace',
     );
   });
 
@@ -444,7 +444,7 @@ import {
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
 
-export const TERMINAL_NERD_SYMBOLS_FONT_FAMILY = "T4Code Symbols Nerd Font Mono";
+export const TERMINAL_NERD_SYMBOLS_FONT_FAMILY = "BiBCode Symbols Nerd Font Mono";
 export const TERMINAL_FONT_GLYPH_PROBE = "\ue0b0\uf115\u{f0001}";
 
 interface TerminalFontFaceSet {
@@ -646,7 +646,7 @@ Insert this block after `@import "tailwindcss";` in `apps/web/src/index.css`:
 
 ```css
 @font-face {
-  font-family: "T4Code Symbols Nerd Font Mono";
+  font-family: "BiBCode Symbols Nerd Font Mono";
   src: url("./assets/fonts/nerd-fonts-symbols/SymbolsNerdFontMono-Regular.woff2")
     format("woff2");
   font-style: normal;
@@ -820,7 +820,7 @@ Add the option metadata near the other Settings constants:
 
 ```ts
 const TERMINAL_FONT_OPTIONS = [
-  { value: "bundled", label: "T4Code Nerd Font (bundled)" },
+  { value: "bundled", label: "BiBCode Nerd Font (bundled)" },
   { value: "system", label: "System monospace" },
   { value: "custom", label: "Custom font family" },
 ] as const satisfies ReadonlyArray<{
@@ -856,7 +856,7 @@ Insert this row first inside `<SettingsSection title="Terminal">`:
   status={
     settings.terminalFontPreference.mode === "custom" &&
     isCustomTerminalFontAvailable(settings.terminalFontPreference.family) === false
-      ? "This font is not available on this device. T4Code will use its bundled fallbacks."
+      ? "This font is not available on this device. BiBCode will use its bundled fallbacks."
       : null
   }
   resetAction={
@@ -890,7 +890,7 @@ Insert this row first inside `<SettingsSection title="Terminal">`:
         <SelectValue>
           {TERMINAL_FONT_OPTIONS.find(
             (option) => option.value === settings.terminalFontPreference.mode,
-          )?.label ?? "T4Code Nerd Font (bundled)"}
+          )?.label ?? "BiBCode Nerd Font (bundled)"}
         </SelectValue>
       </SelectTrigger>
       <SelectPopup align="end" alignItemWithTrigger={false}>
@@ -1076,7 +1076,7 @@ it.each([false, true])(
     const terminal = view.fakeTerminal;
     expect(terminal).not.toBeNull();
     expect(terminal!.options.fontFamily).toBe(
-      '"JetBrains Mono", "T4Code Symbols Nerd Font Mono", monospace',
+      '"JetBrains Mono", "BiBCode Symbols Nerd Font Mono", monospace',
     );
     xtermState.fitAddons.at(-1)!.fit.mockImplementation(() => {
       terminal!.cols += 1;
@@ -1092,7 +1092,7 @@ it.each([false, true])(
     expect(terminal!.dispose).not.toHaveBeenCalled();
     expect(view.detachRendererSpy).not.toHaveBeenCalled();
     expect(terminal!.options.fontFamily).toBe(
-      '"Maple Mono", "T4Code Symbols Nerd Font Mono", "JetBrains Mono", monospace',
+      '"Maple Mono", "BiBCode Symbols Nerd Font Mono", "JetBrains Mono", monospace',
     );
     expect(terminal!.clearTextureAtlas).toHaveBeenCalled();
     expect(terminal!.refresh).toHaveBeenCalledWith(0, terminal!.rows - 1);
@@ -1288,7 +1288,7 @@ if (!artifactDirectory || !projectPath) {
   throw new Error("The packaged desktop UI fixture environment was not prepared.");
 }
 
-const bundledLabel = "T4Code Nerd Font (bundled)";
+const bundledLabel = "BiBCode Nerd Font (bundled)";
 const fontGlyphProbe = "\ue0b0 \uf115 \u{f0001}";
 const terminalGlyphProbe = "\ue0b0 \uf115";
 
@@ -1338,15 +1338,15 @@ describe("packaged terminal font support", () => {
 
     const fontProbe = await browser.executeAsync((probe, done) => {
       void document.fonts
-        .load('12px "T4Code Symbols Nerd Font Mono"', probe)
+        .load('12px "BiBCode Symbols Nerd Font Mono"', probe)
         .then(() => {
           done({
             loaded: document.fonts.check(
-              '12px "T4Code Symbols Nerd Font Mono"',
+              '12px "BiBCode Symbols Nerd Font Mono"',
               probe,
             ),
             familyRegistered: [...document.fonts].some(
-              (face) => face.family === "T4Code Symbols Nerd Font Mono",
+              (face) => face.family === "BiBCode Symbols Nerd Font Mono",
             ),
           });
         })
@@ -1420,7 +1420,7 @@ Run:
 pnpm run test:ui:desktop:build
 ```
 
-Expected: the packaged T4Code macOS application is produced and includes the
+Expected: the packaged BiBCode macOS application is produced and includes the
 hashed WOFF2 asset.
 
 - [ ] **Step 5: Run the terminal font packaged UI test on macOS**

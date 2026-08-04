@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Rename repository-internal TypeScript, Rust, package, lint-plugin, file, and build identities from T4Code/t4code to BiBCode/bibcode while leaving persisted and externally consumed compatibility identifiers for the runtime migration plan.
+**Goal:** Rename repository-internal TypeScript, Rust, package, lint-plugin, file, and build identities from the retired identity to BiBCode/bibcode while leaving persisted and externally consumed compatibility identifiers for the runtime migration plan.
 
 **Architecture:** Rename dependency-graph roots before consumers: workspace packages and lint plugin, then Cargo packages/crates/binaries, then source symbols/files, then CI/build selectors. Regenerate lockfiles and compile the whole graph before changing runtime storage, environment, or protocol identifiers.
 
@@ -33,9 +33,9 @@
 - Modify: `packages/contracts/package.json`
 - Modify: `packages/shared/package.json`
 - Modify: `scripts/package.json`
-- Modify: every project-owned TypeScript/JavaScript import containing `@bibcode/`
+- Modify: every project-owned TypeScript/JavaScript import containing the retired package scope
 - Modify: `vite.config.shared.ts`
-- Modify: `tsconfig*.json` files containing the old package scope
+- Modify: `tsconfig*.json` files containing the retired package scope
 - Modify: `pnpm-lock.yaml`
 
 **Interfaces:**
@@ -62,22 +62,13 @@ vp test scripts/toolchain-contract.test.ts
 
 - [ ] **Step 3: Rename package manifests, imports, and filters atomically**
 
-Apply the exact mechanical mapping across project-owned text:
-
-```text
-@bibcode/monorepo       -> @bibcode/monorepo
-@bibcode/desktop        -> @bibcode/desktop
-@bibcode/marketing      -> @bibcode/marketing
-@bibcode/web            -> @bibcode/web
-@bibcode/scripts        -> @bibcode/scripts
-@bibcode/contracts      -> @bibcode/contracts
-@bibcode/shared         -> @bibcode/shared
-@bibcode/client-runtime -> @bibcode/client-runtime
-```
+Replace the retired workspace scope with `@bibcode/` while preserving each
+package suffix (`monorepo`, `desktop`, `marketing`, `web`, `scripts`,
+`contracts`, `shared`, and `client-runtime`).
 
 Change imports, dependencies, Vite aliases, workspace filters, test fixtures,
 and CI filters together. Do not alter runtime string values merely because they
-contain lowercase `t4code`.
+contain the retired runtime prefix.
 
 - [ ] **Step 4: Refresh the lockfile and verify package resolution**
 
@@ -93,10 +84,8 @@ package names.
 
 - [ ] **Step 5: Review checkpoint without staging or committing**
 
-```powershell
-rg -n --hidden --glob '!.repos/**' --glob '!node_modules/**' --glob '!target/**' '@bibcode/' .
-git diff --check
-```
+Audit project-owned text for the retired workspace scope, excluding vendored
+repositories, dependencies, and build output, then run `git diff --check`.
 
 Expected: no old workspace-scope imports outside the ignored design history.
 
@@ -104,11 +93,11 @@ Expected: no old workspace-scope imports outside the ignored design history.
 
 **Files:**
 
-- Rename directory: `oxlint-plugin-bibcode` -> `oxlint-plugin-bibcode`
+- Rename the retired lint-plugin directory to `oxlint-plugin-bibcode`.
 - Modify: `pnpm-workspace.yaml`
 - Modify: `package.json`
 - Modify: `vite.config.shared.ts`
-- Modify: every source suppression/config containing `t4code/<rule>`
+- Modify: every source suppression/config containing the retired rule namespace
 - Modify: plugin production/tests/config files under `oxlint-plugin-bibcode`
 - Modify: `pnpm-lock.yaml`
 
@@ -134,8 +123,9 @@ vp test oxlint-plugin-bibcode scripts/coverage-config.test.ts
 
 Move the directory once, update the workspace glob/filter, package name,
 registration key, test paths, rule documentation, and all project-owned
-`oxlint-disable` comments from `t4code/` to `bibcode/`. Do not create a second
-plugin or compatibility wrapper because the plugin is private to this repo.
+`oxlint-disable` comments from the retired namespace to `bibcode/`. Do not
+create a second plugin or compatibility wrapper because the plugin is private
+to this repo.
 
 - [ ] **Step 4: Refresh resolution and verify GREEN**
 
@@ -147,10 +137,8 @@ vp lint --report-unused-disable-directives
 
 - [ ] **Step 5: Review checkpoint without staging or committing**
 
-```powershell
-git ls-files --cached --others --exclude-standard | Select-String -Pattern 'oxlint-plugin-bibcode'
-rg -n --hidden --glob '!.repos/**' --glob '!node_modules/**' --glob '!target/**' 't4code/' .
-```
+Audit tracked and untracked project-owned paths for the retired plugin basename,
+then audit project-owned text for the retired rule namespace.
 
 Expected: no project-owned old plugin path or rule namespace.
 
@@ -162,10 +150,10 @@ Expected: no project-owned old plugin path or rule namespace.
 - Modify: `apps/server/Cargo.toml`
 - Modify: `apps/server/package.json`
 - Modify: `apps/server/src/main.rs`
-- Modify: project-owned Rust references to `bibcode_server`
+- Modify: project-owned Rust references to the retired server crate
 - Modify: `apps/desktop/src-tauri/Cargo.toml`
 - Modify: `apps/desktop/src-tauri/src/main.rs`
-- Modify: project-owned Rust references to `bibcode_desktop_lib`
+- Modify: project-owned Rust references to the retired desktop library crate
 - Modify: `tools/updater-verifier/Cargo.toml`
 - Modify: `tools/updater-verifier/src/main.rs`
 - Modify: fixture `Cargo.toml`/`Cargo.lock` files under `apps/server/tests/fixtures`
@@ -197,20 +185,15 @@ cargo metadata --locked --no-deps
 
 - [ ] **Step 3: Rename Cargo package, crate, and binary identities**
 
-Apply these exact mappings throughout project-owned Rust and build scripts:
-
-```text
-bibcode-server           -> bibcode-server
-bibcode_server           -> bibcode_server
-bibcode-desktop          -> bibcode-desktop
-bibcode_desktop_lib      -> bibcode_desktop_lib
-bibcode-updater-verifier -> bibcode-updater-verifier
---bin bibcode            -> --bin bibcode
-```
+Rename the retired server, desktop, updater-verifier, library-crate, and binary
+identities to `bibcode-server`, `bibcode-desktop`,
+`bibcode-updater-verifier`, `bibcode_server`, `bibcode_desktop_lib`, and
+`bibcode` respectively.
 
 Update package scripts, Cargo workspace dependency keys, CI `cargo -p`
 selectors, binary discovery code, diagnostics process labels, and fixtures.
-Do not yet rename `.t4code`, protocol routes, env variables, or persisted keys.
+Do not yet rename the retired filesystem path, protocol routes, environment
+variables, or persisted keys.
 
 - [ ] **Step 4: Refresh Cargo locks and verify GREEN**
 
@@ -224,9 +207,8 @@ vp test scripts/rust-workspace.test.ts
 
 - [ ] **Step 5: Review checkpoint without staging or committing**
 
-```powershell
-rg -n --hidden --glob '!.repos/**' --glob '!target/**' '(bibcode-server|bibcode_server|bibcode-desktop|bibcode_desktop_lib|bibcode-updater-verifier|--bin bibcode)' Cargo.toml Cargo.lock apps tools scripts .github
-```
+Audit Cargo manifests, locks, applications, tools, scripts, and workflows for
+the retired Rust/build identities.
 
 Expected: no old build identity except runtime compatibility examples explicitly
 deferred to the next plan.
@@ -235,10 +217,10 @@ deferred to the next plan.
 
 **Files:**
 
-- Rename: `apps/web/src/components/clerk/BiBCodeConnectSidebarSignIn.tsx` -> `apps/web/src/components/clerk/BiBCodeConnectSidebarSignIn.tsx`
-- Rename: `apps/web/src/components/clerk/useBiBCodeConnectAuthPrompt.tsx` -> `apps/web/src/components/clerk/useBiBCodeConnectAuthPrompt.tsx`
-- Rename: `docs/cloud/bibcode-connect-clerk.md` -> `docs/cloud/bibcode-connect-clerk.md`
-- Rename: `docs/cloud/bibcode-connect-auth-flow.html` -> `docs/cloud/bibcode-connect-auth-flow.html`
+- Rename the retired connect sidebar component to `apps/web/src/components/clerk/BiBCodeConnectSidebarSignIn.tsx`.
+- Rename the retired connect auth hook to `apps/web/src/components/clerk/useBiBCodeConnectAuthPrompt.tsx`.
+- Rename the retired Clerk guide to `docs/cloud/bibcode-connect-clerk.md`.
+- Rename the retired auth-flow guide to `docs/cloud/bibcode-connect-auth-flow.html`.
 - Modify: `packages/shared/src/composerTrigger.ts`
 - Modify: `apps/web/src/composer-logic.ts`
 - Modify: `apps/web/src/components/ChatView.tsx`
@@ -253,17 +235,10 @@ deferred to the next plan.
 
 - [ ] **Step 1: Change symbol-level tests and imports**
 
-Use the direct mapping:
-
-```text
-BiBCodeConnect...                 -> BiBCodeConnect...
-useBiBCodeConnectAuthPrompt       -> useBiBCodeConnectAuthPrompt
-ComposerBiBCodeAction             -> ComposerBiBCodeAction
-BiBCodeActionItem                 -> BiBCodeActionItem
-buildBiBCodeActionItems           -> buildBiBCodeActionItems
-parseStandaloneComposerBiBCodeAction -> parseStandaloneComposerBiBCodeAction
-executeBiBCodeAction              -> executeBiBCodeAction
-```
+Change tests and imports from the retired connect/composer symbols to
+`BiBCodeConnect...`, `useBiBCodeConnectAuthPrompt`, `ComposerBiBCodeAction`,
+`BiBCodeActionItem`, `buildBiBCodeActionItems`,
+`parseStandaloneComposerBiBCodeAction`, and `executeBiBCodeAction`.
 
 - [ ] **Step 2: Run focused tests and verify RED/compile failure**
 
@@ -274,9 +249,9 @@ vp test apps/web/src/composer-logic.test.ts apps/web/src/components/chat/compose
 - [ ] **Step 3: Rename files, exports, imports, and callers atomically**
 
 Use one move per file and update every CodeGraph caller. Keep serialized
-composer trigger values in the same atomic change: `"bibcode-action"` becomes
-`"bibcode-action"`. This discriminant is transient composer UI state, so it
-does not need a persistence compatibility alias.
+composer trigger values in the same atomic change, setting the canonical
+discriminant to `"bibcode-action"`. This discriminant is transient composer UI
+state, so it does not need a persistence compatibility alias.
 
 - [ ] **Step 4: Verify focused behavior and typecheck**
 
@@ -287,9 +262,7 @@ vp run --filter @bibcode/web typecheck
 
 - [ ] **Step 5: Review checkpoint without staging or committing**
 
-```powershell
-git ls-files --cached --others --exclude-standard | Select-String -Pattern 'T4Code|bibcode-connect'
-```
+Audit tracked and untracked paths for retired connect/composer names.
 
 Expected: only runtime/persistence compatibility values scheduled for the next
 plan and deliberate historical design records remain.
@@ -345,7 +318,8 @@ git diff --check -- .github package.json scripts
 
 **Files:**
 
-- Modify: `scripts/t4code-identity.test.ts` only if its embedded source-name allow rules need updating; the filename itself remains until the final runtime plan.
+- Modify the identity guard script only if its embedded source-name allow rules
+  need updating; its retired filename remains until the final runtime plan.
 
 **Interfaces:**
 
@@ -354,9 +328,9 @@ git diff --check -- .github package.json scripts
 
 - [ ] **Step 1: Run exhaustive source/build scans**
 
-```powershell
-rg -n --hidden --glob '!.git/**' --glob '!.repos/**' --glob '!node_modules/**' --glob '!target/**' --glob '!.codegraph/**' '(@bibcode/|bibcode-server|bibcode_server|bibcode-desktop|bibcode_desktop_lib|bibcode-updater-verifier|oxlint-plugin-bibcode|BiBCodeConnect|ComposerT4Code|T4CodeAction)' .
-```
+Run a repository-wide, self-hiding audit for every retired package, Rust,
+plugin, connect, and composer identity, excluding VCS metadata, vendored
+repositories, dependencies, build outputs, and CodeGraph data.
 
 Expected: no match outside ignored design/plan history and runtime compatibility
 tests that explicitly model an old client.

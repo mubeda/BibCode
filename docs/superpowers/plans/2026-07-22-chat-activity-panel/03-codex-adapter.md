@@ -346,6 +346,6 @@ cargo test -p bibcode-server --test activity_rpc -- --nocapture
   - spawn at least two subagents, including one nested child;
   - confirm Active/Done counts and parent relation;
   - open a child and inspect commentary/tool/command entries;
-  - reload T4Code and confirm bounded history recovery;
+  - reload BiBCode and confirm bounded history recovery;
   - stop the provider connection briefly and confirm stale/reconnect behavior; and
   - confirm the root transcript contains no duplicate child commentary.

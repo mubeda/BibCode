@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Follow `/Users/admin/.codex/worktrees/44f9/t4code/AGENTS.md`.
+- Follow `/Users/admin/.codex/worktrees/44f9/bibcode/AGENTS.md`.
 - Do not add process or RPC dependencies to `centerPanelStore` or `useCenterPanelActions`.
 - Preserve the existing optimistic-close behavior used by right-panel terminals.
 - Preserve the existing chat-panel deletion behavior by delegating surface mutations to `useCenterPanelActions`.
@@ -444,8 +444,8 @@ Expected: the packaged macOS test application builds successfully.
 
 - [ ] **Step 2: Establish a clean baseline**
 
-Launch the packaged app, open the existing T4Code task for
-`/Users/admin/.codex/worktrees/44f9/t4code`, and record:
+Launch the packaged app, open the existing BiBCode task for
+`/Users/admin/.codex/worktrees/44f9/bibcode`, and record:
 
 - the terminal count shown in the app;
 - the absence of a provider CLI child process for the terminal about to be launched.
@@ -458,7 +458,7 @@ Open the toolbar action menu and choose **Codex Terminal**. Verify:
 - the provider process command is
   `codex --dangerously-bypass-approvals-and-sandbox`;
 - the process current working directory is
-  `/Users/admin/.codex/worktrees/44f9/t4code`;
+  `/Users/admin/.codex/worktrees/44f9/bibcode`;
 - the terminal count increases by one.
 
 - [ ] **Step 4: Close the provider terminal tab and poll for lifecycle completion**

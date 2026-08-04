@@ -15,8 +15,6 @@ const DESKTOP_BOOTSTRAP: &str = "desktop-bootstrap-fixture";
 const TOKEN_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 const BOOTSTRAP_TOKEN_TYPE: &str = "urn:bibcode:params:oauth:token-type:environment-bootstrap";
-const LEGACY_BOOTSTRAP_TOKEN_TYPE: &str =
-    "urn:t4code:params:oauth:token-type:environment-bootstrap";
 
 #[test]
 fn language_neutral_auth_fixtures_match_the_rust_http_inventory() {
@@ -125,19 +123,6 @@ async fn desktop_bootstrap_creates_cookie_and_bearer_sessions() {
     .await;
     assert_eq!(authenticated["authenticated"], true);
 
-    let legacy_cookie = cookie.replacen("bibcode_session_", "t4code_session_", 1);
-    let legacy_authenticated = get_json(
-        client
-            .get(http_url(&handle, "/api/auth/session"))
-            .header(header::COOKIE, legacy_cookie)
-            .send()
-            .await
-            .expect("legacy cookie session request"),
-        StatusCode::OK,
-    )
-    .await;
-    assert_eq!(legacy_authenticated["authenticated"], true);
-
     let access = exchange_token(&client, &handle, DESKTOP_BOOTSTRAP, None).await;
     assert_eq!(access["token_type"], "Bearer");
     assert_eq!(access["issued_token_type"], ACCESS_TOKEN_TYPE);
@@ -147,19 +132,6 @@ async fn desktop_bootstrap_creates_cookie_and_bearer_sessions() {
             .as_str()
             .is_some_and(|scope| scope.contains("access:write"))
     );
-
-    let legacy_exchange = client
-        .post(http_url(&handle, "/oauth/token"))
-        .form(&[
-            ("grant_type", TOKEN_GRANT_TYPE),
-            ("subject_token", DESKTOP_BOOTSTRAP),
-            ("subject_token_type", LEGACY_BOOTSTRAP_TOKEN_TYPE),
-            ("requested_token_type", ACCESS_TOKEN_TYPE),
-        ])
-        .send()
-        .await
-        .expect("legacy token exchange request");
-    assert_eq!(legacy_exchange.status(), StatusCode::OK);
 
     shutdown(handle).await;
 }

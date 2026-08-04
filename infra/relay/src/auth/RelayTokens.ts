@@ -1,5 +1,4 @@
 import {
-  LegacyRelayWebClientId,
   RelayDpopAccessTokenScope,
   RelayEnvironmentConnectScope,
   RelayEnvironmentStatusScope,
@@ -63,7 +62,6 @@ const allowedScopesByClientId: Record<
   ReadonlySet<RelayDpopAccessTokenScope>
 > = {
   [RelayWebClientId]: new Set([RelayEnvironmentConnectScope, RelayEnvironmentStatusScope]),
-  [LegacyRelayWebClientId]: new Set([RelayEnvironmentConnectScope, RelayEnvironmentStatusScope]),
 };
 
 function resolveDpopAccessTokenScopes(input: {

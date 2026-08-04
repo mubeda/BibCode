@@ -13,7 +13,7 @@ use uuid::Uuid;
 use super::{
     model::{
         ACCESS_TOKEN_TYPE, BOOTSTRAP_TOKEN_TYPE, BrowserSessionRequest, BrowserSessionResult,
-        ClientMetadata, CreatePairingRequest, LEGACY_BOOTSTRAP_TOKEN_TYPE, RevokeClientRequest,
+        ClientMetadata, CreatePairingRequest, RevokeClientRequest,
         RevokePairingRequest, SCOPE_ACCESS_READ, SCOPE_ACCESS_WRITE, TOKEN_GRANT_TYPE,
         TokenExchangeRequest, WebSocketTicketResult,
     },
@@ -127,10 +127,7 @@ async fn token_inner(
     payload: TokenExchangeRequest,
 ) -> Result<Response, AuthError> {
     if payload.grant_type != TOKEN_GRANT_TYPE
-        || !matches!(
-            payload.subject_token_type.as_str(),
-            BOOTSTRAP_TOKEN_TYPE | LEGACY_BOOTSTRAP_TOKEN_TYPE
-        )
+        || payload.subject_token_type != BOOTSTRAP_TOKEN_TYPE
         || payload.requested_token_type != ACCESS_TOKEN_TYPE
         || payload.subject_token.trim().is_empty()
     {
@@ -386,7 +383,6 @@ async fn authenticate_request_for_method(
         .and_then(|value| value.to_str().ok())
         .and_then(|cookies| {
             cookie_value(cookies, auth.cookie_name())
-                .or_else(|| cookie_value(cookies, &auth.legacy_cookie_name()))
         });
     let authorization = headers
         .get(header::AUTHORIZATION)

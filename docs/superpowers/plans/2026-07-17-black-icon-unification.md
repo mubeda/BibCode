@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Remove every blue T4Code product icon and make the existing black-background, white-`T4` artwork the only icon used by development, nightly, production, web, desktop, and installers.
+**Goal:** Remove every blue BiBCode product icon and make the existing black-background, white-`T4` artwork the only icon used by development, nightly, production, web, desktop, and installers.
 
 **Architecture:** `assets/prod` becomes the only authoritative icon family. Release-channel inputs remain compatible, but the shared brand resolver maps every channel to the same production web assets; Vite public files are verified black copies, and Tauri references production PNG/ICO/ICNS files directly.
 
@@ -11,7 +11,7 @@
 ## Global Constraints
 
 - Use the existing unbadged black-background, white-`T4` artwork without redesigning it.
-- Delete all blue T4Code product-icon outputs and source material under `assets/dev`, `assets/nightly`, `apps/desktop/resources`, and the blue contents currently stored in `apps/web/public`.
+- Delete all blue BiBCode product-icon outputs and source material under `assets/dev`, `assets/nightly`, `apps/desktop/resources`, and the blue contents currently stored in `apps/web/public`.
 - Keep development and nightly channel names and release behavior.
 - Keep generic web public filenames required by browser metadata and the splash/boot UI.
 - Do not modify third-party icons, file-type icons, screenshots, diagnostics, application names, bundle identifiers, or release metadata.
@@ -244,7 +244,7 @@ does not exist, and `apps/desktop/resources` still exists.
 Run:
 
 ```bash
-icon_root=$(mktemp -d /tmp/t4code-black-icon.XXXXXX)
+icon_root=$(mktemp -d /tmp/bibcode-black-icon.XXXXXX)
 iconset="$icon_root/t4-black-macos.iconset"
 mkdir -p "$iconset"
 sips -z 16 16 assets/prod/black-macos-1024.png --out "$iconset/icon_16x16.png"
@@ -471,7 +471,7 @@ Expected: the Tauri app and DMG build exits 0.
 Run:
 
 ```bash
-audit_dir=$(mktemp -d /tmp/t4code-black-icon-audit.XXXXXX)
+audit_dir=$(mktemp -d /tmp/bibcode-black-icon-audit.XXXXXX)
 mkdir -p "$audit_dir/thumbs"
 for source in \
   assets/prod/black-macos-1024.png \

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build a reliable, current-chat-scoped activity dock and right-panel inspector for subagents and provider-managed background tasks, with structured-chat support for Codex, Claude, and OpenCode and handshake-gated observation for T4Code-owned provider terminals.
+**Goal:** Build a reliable, current-chat-scoped activity dock and right-panel inspector for subagents and provider-managed background tasks, with structured-chat support for Codex, Claude, and OpenCode and handshake-gated observation for BiBCode-owned provider terminals.
 
 **Architecture:** Provider adapters emit native-identity-preserving mutations into a server-owned activity projection. The projection persists a bounded journal and materialized records, exposes a snapshot-plus-ordered-delta RPC, and feeds a provider-neutral client reducer. React renders one floating dock and one Activity right-panel surface; terminal observation is a separately negotiated capability attached to structured terminal launch metadata.
 
@@ -25,7 +25,7 @@ structured-chat implementation.
 
 ## Global Constraints
 
-- Follow `/Users/admin/.codex/worktrees/b4f1/t4code/AGENTS.md`.
+- Follow `/Users/admin/.codex/worktrees/b4f1/bibcode/AGENTS.md`.
 - Before modifying Effect schemas or Effect Streams, read `.repos/effect-smol/LLMS.md` completely and use vendored Effect source examples.
 - Do not edit or import from `.repos/`.
 - Keep `packages/contracts` schema-only. Put runtime reducers in `packages/client-runtime` or `packages/shared` with explicit subpath exports.

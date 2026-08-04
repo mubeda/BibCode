@@ -6,7 +6,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Remove native mobile app support and mobile-only relay/device infrastructure from T4Code.
+**Goal:** Remove native mobile app support and mobile-only relay/device infrastructure from BiBCode.
 
 **Architecture:** Keep the web, desktop, server, relay, and shared client runtime. Remove Expo/React Native app code, mobile-only package manager entries, mobile CI, mobile APNS/live-activity relay endpoints, and web settings/profile UI that lists mobile clients.
 

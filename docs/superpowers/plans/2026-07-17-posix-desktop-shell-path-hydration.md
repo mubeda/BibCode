@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make packaged macOS and Linux T4Code desktop builds discover and launch executables from the user's interactive login-shell PATH.
+**Goal:** Make packaged macOS and Linux BiBCode desktop builds discover and launch executables from the user's interactive login-shell PATH.
 
 **Architecture:** A new Rust desktop startup module will synchronously capture the login-shell PATH with bounded output and a five-second timeout, merge it ahead of the inherited GUI PATH, and install it before Tauri starts. Provider executable resolution remains centralized in the Rust server, with a new pure search-path helper so behavior can be tested without mutating global environment state.
 
@@ -14,7 +14,7 @@
 - Keep Windows behavior unchanged.
 - Do not hardcode Homebrew, npm, pnpm, Cargo, or provider-specific installation directories.
 - Do not modify persisted provider binary paths.
-- Hydration must fail open and never prevent T4Code from starting.
+- Hydration must fail open and never prevent BiBCode from starting.
 - The shell probe timeout is five seconds.
 - Timed-out children must be killed and reaped, and stdout-reader threads must be joined.
 - Never log PATH contents, captured shell output, or other environment contents.
@@ -704,17 +704,17 @@ Run:
 ./node_modules/.bin/vp run dist:desktop:dmg:arm64
 ```
 
-Expected: a new `T4Code (Alpha)_0.2.2_aarch64.dmg` under
+Expected: a new `BiBCode (Alpha)_0.2.2_aarch64.dmg` under
 `release/desktop/mac-arm64/`.
 
 - [ ] **Step 3: Replace the installed app safely**
 
-Quit `T4Code (Alpha)`, mount the new DMG, preserve the current application as
-`/Applications/T4Code (Alpha).app.pre-path-hydration`, copy the new app with
+Quit `BiBCode (Alpha)`, mount the new DMG, preserve the current application as
+`/Applications/BiBCode (Alpha).app.pre-path-hydration`, copy the new app with
 `ditto`, unmount the DMG, and launch it through Launch Services with:
 
 ```bash
-open -a "T4Code (Alpha)"
+open -a "BiBCode (Alpha)"
 ```
 
 If installation fails, restore the preserved application before continuing.

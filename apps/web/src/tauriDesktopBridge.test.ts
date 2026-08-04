@@ -635,7 +635,7 @@ describe("tauriDesktopBridge", () => {
   });
 
   it("uses browser fallbacks when optional native capabilities reject", async () => {
-    const storage = new Map<string, string>([["t4code.connectionCatalog", "legacy-catalog"]]);
+    const storage = new Map<string, string>([["bibcode.connectionCatalog", "browser-catalog"]]);
     const localStorage = {
       getItem: vi.fn((key: string) => storage.get(key) ?? null),
       setItem: vi.fn((key: string, value: string) => storage.set(key, value)),
@@ -653,7 +653,7 @@ describe("tauriDesktopBridge", () => {
     await expect(bridge.getClientSettings()).resolves.toBeNull();
     await expect(bridge.setClientSettings(DEFAULT_CLIENT_SETTINGS)).resolves.toBeUndefined();
     await expect(bridge.getClientSettings()).resolves.toEqual(DEFAULT_CLIENT_SETTINGS);
-    await expect(bridge.getConnectionCatalog!()).resolves.toBe("legacy-catalog");
+    await expect(bridge.getConnectionCatalog!()).resolves.toBe("browser-catalog");
     await expect(bridge.setConnectionCatalog!("browser-catalog")).resolves.toBe(true);
     await expect(bridge.clearConnectionCatalog!()).resolves.toBeUndefined();
     await expect(bridge.discoverSshHosts()).resolves.toEqual([]);
@@ -707,7 +707,7 @@ describe("tauriDesktopBridge", () => {
     );
     expect(localStorage.setItem).toHaveBeenCalledWith(
       "bibcode.connectionCatalog",
-      "legacy-catalog",
+      "browser-catalog",
     );
     expect(localStorage.setItem).toHaveBeenCalledWith(
       "bibcode.connectionCatalog",

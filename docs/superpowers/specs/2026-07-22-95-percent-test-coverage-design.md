@@ -55,7 +55,7 @@ The TypeScript sweep is divided into these ownership cohorts:
 5. Shared runtime utilities.
 6. Relay infrastructure, including worker and HTTP boundaries.
 7. Repository scripts and build/configuration entrypoints.
-8. The T4Code Oxlint plugin.
+8. The BiBCode Oxlint plugin.
 
 Every cohort below 95% receives focused tests. Work within a cohort proceeds from deterministic pure logic through error and state-transition paths, then reaches framework and platform adapters.
 

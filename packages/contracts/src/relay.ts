@@ -15,7 +15,6 @@ export const RelayManagedEndpointProviderKind = Schema.Literals([
   "manual",
   "cloudflare_tunnel",
   "bibcode_relay",
-  "t4code_relay",
 ]);
 export type RelayManagedEndpointProviderKind = typeof RelayManagedEndpointProviderKind.Type;
 
@@ -406,8 +405,7 @@ export const RelayDpopTokenExchangeGrantType =
 export const RelayJwtSubjectTokenType = "urn:ietf:params:oauth:token-type:jwt" as const;
 export const RelayAccessTokenType = "urn:ietf:params:oauth:token-type:access_token" as const;
 export const RelayWebClientId = "bibcode-web" as const;
-export const LegacyRelayWebClientId = "t4code-web" as const;
-export const RelayPublicClientId = Schema.Literals([RelayWebClientId, LegacyRelayWebClientId]);
+export const RelayPublicClientId = Schema.Literal(RelayWebClientId);
 export type RelayPublicClientId = typeof RelayPublicClientId.Type;
 
 export const RelayDpopAccessTokenRequest = Schema.Struct({

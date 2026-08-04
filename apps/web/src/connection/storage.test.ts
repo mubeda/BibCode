@@ -190,15 +190,14 @@ type OpenMode = "success" | "error" | "undefined";
 
 function installFakeIndexedDb(
   options: { open?: OpenMode; fault?: FaultMode } = {},
-): FakeDatabaseHandle & { readonly legacyStores: FakeDatabaseHandle["stores"] } {
+): FakeDatabaseHandle {
   const handle = makeFakeDatabase(options.fault ?? "none");
-  const legacyHandle = makeFakeDatabase(options.fault ?? "none");
   const openMode = options.open ?? "success";
   if (openMode === "undefined") {
     vi.stubGlobal("indexedDB", undefined);
   } else {
     vi.stubGlobal("indexedDB", {
-      open: (name: string, _version: number) => {
+      open: (_name: string, _version: number) => {
         const request = new FakeRequest();
         queueMicrotask(() => {
           if (openMode === "error") {
@@ -206,7 +205,7 @@ function installFakeIndexedDb(
             request.fire("error");
             return;
           }
-          request.result = name === "t4code:connection-runtime" ? legacyHandle.db : handle.db;
+          request.result = handle.db;
           request.fire("upgradeneeded");
           request.fire("success");
         });
@@ -220,7 +219,7 @@ function installFakeIndexedDb(
     }),
   });
   vi.stubGlobal("window", {});
-  return { ...handle, legacyStores: legacyHandle.stores };
+  return handle;
 }
 
 // ── Domain fixtures ──────────────────────────────────────────────────
@@ -284,7 +283,7 @@ const remoteToken = new TokenStore.RemoteDpopAccessToken({
   endpoint: {
     httpBaseUrl: "https://relay.example/",
     wsBaseUrl: "wss://relay.example/",
-    providerKind: "t4code_relay",
+    providerKind: "bibcode_relay",
   },
   accessToken: "remote-access-token",
   expiresAtEpochMs: 1_000,
@@ -529,19 +528,6 @@ describe("makeCatalogBackend (IndexedDB)", () => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe("connectionStorageLayer", () => {
-  it.effect("copies the legacy T4Code catalog into canonical BiBCode storage", () => {
-    const handle = installFakeIndexedDb();
-    const encoded = encodeCatalog(emptyCatalog);
-    handle.legacyStores.set("catalog", new Map([["document", encoded]]));
-
-    return Effect.gen(function* () {
-      const targetStore = yield* ConnectionTargetStore;
-      expect(yield* targetStore.list).toEqual([]);
-      expect(handle.stores.get("catalog")?.get("document")).toBe(encoded);
-      expect(handle.legacyStores.get("catalog")?.get("document")).toBe(encoded);
-    }).pipe(Effect.provide(connectionStorageLayer));
-  });
-
   it.effect("registers, reads, updates, and removes catalog-backed stores", () => {
     installFakeIndexedDb();
     return Effect.gen(function* () {

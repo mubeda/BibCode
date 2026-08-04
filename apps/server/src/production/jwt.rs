@@ -254,8 +254,7 @@ impl PersistentJwtCodec {
         }
 
         let header: JoseHeader = decode_json_segment(encoded_header, "header")?;
-        let legacy_typ = typ.replacen("bibcode", "t4code", 1);
-        if header.alg != "EdDSA" || (header.typ != typ && header.typ != legacy_typ) {
+        if header.alg != "EdDSA" || header.typ != typ {
             return Err(jwt(
                 "JWT protected header does not match EdDSA and the required typ",
             ));
@@ -420,10 +419,8 @@ fn validate_cloud_claims(
         exp: claims.exp,
     };
     validate_registered_claims(&registered)?;
-    let legacy_issuer = issuer.replacen("bibcode", "t4code", 1);
-    let legacy_audience = audience.replacen("bibcode", "t4code", 1);
-    if (claims.iss != issuer && claims.iss != legacy_issuer)
-        || (claims.aud != audience && claims.aud != legacy_audience)
+    if claims.iss != issuer
+        || claims.aud != audience
         || claims.environment_id.trim().is_empty()
         || claims.nonce.trim().is_empty()
         || claims.scope.is_empty()

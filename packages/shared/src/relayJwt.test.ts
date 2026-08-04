@@ -129,28 +129,6 @@ describe("relayJwt", () => {
     expect(normalizeRelayIssuer("///")).toBe("");
   });
 
-  it.effect("accepts legacy T4Code relay identity values during migration", () =>
-    Effect.gen(function* () {
-      const keyPair = yield* getPrimaryKeyPair;
-      const token = yield* signRelayJwt({
-        privateKey: keyPair.privatePem,
-        typ: "t4code-test+jwt",
-        payload: claims({ iss: "t4code-env:legacy", aud: "t4code-env:target" }),
-      });
-
-      expect(
-        yield* verifyRelayJwt({
-          publicKey: keyPair.publicPem,
-          token,
-          typ: "bibcode-test+jwt",
-          issuer: "bibcode-env:legacy",
-          audience: "bibcode-env:target",
-          nowEpochSeconds: NOW,
-        }),
-      ).toMatchObject({ iss: "t4code-env:legacy", aud: "t4code-env:target" });
-    }),
-  );
-
   it.effect("preserves signing context without exposing private key material", () =>
     Effect.gen(function* () {
       const privateKey = "PRIVATE_KEY_SECRET_VALUE";

@@ -84,7 +84,7 @@ then provide a generic wrapper:
 
 ```rust
 pub const WINDOWS_PTY_TRAMPOLINE_ARG: &str =
-    "--t4code-internal-windows-pty-trampoline";
+    "--bibcode-internal-windows-pty-trampoline";
 
 pub(crate) fn wrap_windows_pty_launch(
     target: PreparedLaunch,
@@ -278,7 +278,7 @@ async fn assert_terminal_kills_descendant(
     let process = PortablePtyBackend
         .spawn_with_windows_pty_trampoline(
             &input,
-            Path::new(env!("CARGO_BIN_EXE_t4code")),
+            Path::new(env!("CARGO_BIN_EXE_bibcode")),
         )
         .unwrap();
     wait_for_file(&child_pid_file).await;
@@ -321,7 +321,7 @@ Windows-job, and PTY modules, then run:
 
 ```toml
 [package]
-name = "t4code-windows-module-check"
+name = "bibcode-windows-module-check"
 version = "0.0.0"
 edition = "2024"
 

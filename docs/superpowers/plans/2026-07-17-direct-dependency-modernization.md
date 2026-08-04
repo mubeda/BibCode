@@ -8,7 +8,7 @@
 
 **Goal:** Upgrade every direct dependency, toolchain, and GitHub Action to the
 newest appropriate release while keeping all tests green and proving packaged
-T4Code compatibility on Windows, macOS, and Linux.
+BiBCode compatibility on Windows, macOS, and Linux.
 
 **Architecture:** First synchronize the isolated execution branch with the
 latest remote `main` and prove the resulting baseline with the complete test
@@ -480,7 +480,7 @@ The smoke specs must:
 11. close cleanly with no orphan server process.
 
 Use test-owned temporary state directories and bounded fixture providers. Never
-use the developer's real T4Code state or authenticated provider sessions.
+use the developer's real BiBCode state or authenticated provider sessions.
 
 **Step 5: Add a manual/reusable three-OS UI workflow**
 

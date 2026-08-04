@@ -3,24 +3,24 @@
 ## Goal
 
 Make Resource Manager explain who consumed the reported CPU and memory without hiding the total
-resource footprint of the selected T4Code environment.
+resource footprint of the selected BiBCode environment.
 
 The compact headline remains the combined monitored total. Every expanded view separates that
 total into:
 
-- **T4Code Core**: the native T4Code host/server plus local UI/WebView processes that the desktop
+- **BiBCode Core**: the native BiBCode host/server plus local UI/WebView processes that the desktop
   host can associate reliably.
 - **External Tooling**: AI provider CLIs, terminals, helpers, and other processes launched or
-  supervised by T4Code.
+  supervised by BiBCode.
 
-The design prevents high provider usage from being presented as if it were T4Code's own usage,
+The design prevents high provider usage from being presented as if it were BiBCode's own usage,
 while keeping the full operational cost visible.
 
 ## Current Problem
 
 The native diagnostics sampler reads the server process and all of its descendants. Both the live
 snapshot and history sum that tree into one number. The status bar and Resource Manager describe
-the result as T4Code usage even though provider CLIs, terminal commands, Git, SSH, relay, and other
+the result as BiBCode usage even though provider CLIs, terminal commands, Git, SSH, relay, and other
 tools may dominate it.
 
 The current model also has several internal inconsistencies:
@@ -29,8 +29,8 @@ The current model also has several internal inconsistencies:
 - live CPU and memory tooltips describe child-only totals even though the server root is included;
 - the compact process list is CPU-oriented even when memory is the resource under investigation;
 - UI/WebView processes outside the server tree are explicitly excluded, so the displayed value is
-  neither a pure T4Code number nor a complete local-application number; and
-- ownership is inferred from ancestry and command text rather than recorded when T4Code launches
+  neither a pure BiBCode number nor a complete local-application number; and
+- ownership is inferred from ancestry and command text rather than recorded when BiBCode launches
   the process.
 
 ## Chosen Approach
@@ -64,7 +64,7 @@ This design changes:
 This design does not:
 
 - add process resource limits or automatic termination;
-- attribute resource usage to a specific T4Code thread or session;
+- attribute resource usage to a specific BiBCode thread or session;
 - estimate memory for processes the operating system cannot identify reliably;
 - sum processes from different machines;
 - include unrelated machine-wide processes; or
@@ -79,7 +79,7 @@ The existing `environmentId` is the host-scope identity at the client boundary.
 
 Local UI usage is included in the selected environment only when the desktop UI and native server
 run on the same machine. When the selected environment is remote, its Core card describes that
-remote T4Code server.
+remote BiBCode server.
 
 The desktop client also queries its always-present local environment when a remote environment is
 selected. It renders the local environment's Core value separately as **This device**, including
@@ -89,12 +89,12 @@ measure.
 
 ### Attribution scope
 
-- `core`: T4Code-owned native host/server or reliably associated UI processes.
+- `core`: BiBCode-owned native host/server or reliably associated UI processes.
 - `external`: a provider, terminal, helper, or fallback server descendant.
 
 ### Attribution kind
 
-- `server`: the native T4Code server or combined Tauri host/server root.
+- `server`: the native BiBCode server or combined Tauri host/server root.
 - `ui`: a UI/WebView process claimed by the local desktop adapter.
 - `provider`: a registered AI provider root or its descendants.
 - `terminal`: a registered managed terminal root or its descendants.
@@ -176,7 +176,7 @@ rewrite.
 #### Desktop UI
 
 The desktop host owns a `DesktopUiProcessObserver` platform boundary. It reports only process
-identities that the platform implementation can associate with the running T4Code desktop
+identities that the platform implementation can associate with the running BiBCode desktop
 instance. Those identities register as scope `core`, kind `ui`.
 
 The observer reports one of:
@@ -186,10 +186,10 @@ The observer reports one of:
   actionable failure; or
 - `unavailable`: the platform cannot provide reliable association or the observation failed before
   any UI process could be identified; or
-- `notApplicable`: this is a headless server runtime with no co-located T4Code UI.
+- `notApplicable`: this is a headless server runtime with no co-located BiBCode UI.
 
 The observer never guesses from a generic executable name such as `WebContent`, browser, or
-renderer. If a platform cannot distinguish T4Code UI processes from unrelated applications, UI
+renderer. If a platform cannot distinguish BiBCode UI processes from unrelated applications, UI
 coverage is `unavailable`.
 
 Desktop UI observation follows the same demand signal and sampling interval as process diagnostics.
@@ -356,7 +356,7 @@ RPC wire fixtures and typed failure fixtures are regenerated in the same change.
 The status-bar memory number remains the current Combined value for the selected environment. This
 preserves visibility of the complete monitored footprint.
 
-The accessible label and tooltip call it **combined monitored resources**, not T4Code-only
+The accessible label and tooltip call it **combined monitored resources**, not BiBCode-only
 resources. A warning indicator appears when the latest snapshot is stale, failed, or has partial
 UI coverage.
 
@@ -365,7 +365,7 @@ UI coverage.
 The popover uses the approved parallel-card hierarchy:
 
 1. Combined memory, CPU, and process count as the headline.
-2. Equal-width **T4Code Core** and **External Tooling** cards.
+2. Equal-width **BiBCode Core** and **External Tooling** cards.
 3. **Highest consumers**, ranked by current RSS memory.
 
 Each consumer row shows:
@@ -543,7 +543,7 @@ interprets old combined totals as Core usage.
 ## Acceptance Criteria
 
 - The compact headline still reports the Combined monitored total for the selected host.
-- Expanded views always show separate T4Code Core and External Tooling totals.
+- Expanded views always show separate BiBCode Core and External Tooling totals.
 - Current Combined CPU, RSS, and process counts reconcile exactly with Core plus External.
 - Provider and terminal roots use launcher-supplied labels; their descendants inherit ownership.
 - An unregistered descendant remains visible as External fallback.

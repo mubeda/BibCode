@@ -1044,8 +1044,7 @@ fn bitbucket_credentials() -> Option<BitbucketCredentials> {
 }
 
 fn environment_value(name: &str) -> Option<String> {
-    let legacy_name = name.replacen("BIBCODE_", "T4CODE_", 1);
-    crate::environment_identity::bibcode_env_string(name, &legacy_name)
+    crate::environment_identity::bibcode_env_string(name)
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
 }

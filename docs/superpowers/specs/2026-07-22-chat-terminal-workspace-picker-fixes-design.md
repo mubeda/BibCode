@@ -10,7 +10,7 @@ terminal, or filesystem mutation paths:
 
 1. A normal click on any HTTP(S) link rendered in AI chat opens the internal
    Browser.
-2. A newly launched Codex Terminal receives the active T4Code foreground and
+2. A newly launched Codex Terminal receives the active BiBCode foreground and
    background colors early enough for Codex's startup palette probe, so its
    composer matches Light and Dark themes.
 3. The remote **Select Workspace folder** dialog can create a folder in the
@@ -29,7 +29,7 @@ restart.
 - Same-document fragments keep their existing in-chat navigation behavior.
 - The existing context menu remains the escape hatch for opening a link in the
   system browser.
-- Folder creation targets the selected T4Code host and the directory currently
+- Folder creation targets the selected BiBCode host and the directory currently
   displayed by the picker.
 - Successful folder creation navigates into the new folder so the existing
   **Select folder** action can immediately choose it.
@@ -45,7 +45,7 @@ restart.
 `ChatMarkdown` already owns the required internal-browser command through
 `openUrlInPreview`. The right-click action calls it, but ordinary external link
 anchors use `target="_blank"` and their click handler only special-cases `#fragment`
-navigation. A Tauri webview does not reliably turn that target into the T4Code
+navigation. A Tauri webview does not reliably turn that target into the BiBCode
 Browser surface, so the visible link can appear inert.
 
 The fix belongs in the existing markdown link renderer. No new browser API or
@@ -53,7 +53,7 @@ desktop shell call is required.
 
 ### Codex terminal palette
 
-T4Code already passes reserved `BIBCODE_OSC_*` launch values and the Rust PTY layer
+BiBCode already passes reserved `BIBCODE_OSC_*` launch values and the Rust PTY layer
 answers OSC 10/11/12 queries synchronously. Two gaps remain:
 
 1. The frontend derives those launch values from `document.documentElement` inside
@@ -122,7 +122,7 @@ policy and make behavior depend on failure timing.
 
 The launch environment is memoized with `resolvedTheme` as an explicit dependency.
 The thread runtime environment continues to win ordinary user keys, but reserved
-T4Code color keys are owned by T4Code and cannot be overridden accidentally.
+BiBCode color keys are owned by BiBCode and cannot be overridden accidentally.
 Keeping xterm and OSC values behind the same resolved-theme input prevents the two
 representations from drifting.
 
@@ -198,7 +198,7 @@ path traversal, and symlink boundaries. No optimistic folder row is inserted.
 
 ## Error Handling and Reliability
 
-- Browser-open failures do not silently redirect outside T4Code.
+- Browser-open failures do not silently redirect outside BiBCode.
 - A failed OSC response write is non-fatal and leaves Codex on its conservative
   fallback, matching current PTY behavior; the regression tests make the normal
   path deterministic.

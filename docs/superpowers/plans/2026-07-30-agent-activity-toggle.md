@@ -1551,7 +1551,7 @@ env -u BIBCODE_CLAUDE_KEYCHAIN_ACCESS pnpm exec tauri build --debug
 ```
 
 Expected: a debug application bundle is created under
-`target/debug/bundle/macos/T4Code (Alpha).app`.
+`target/debug/bundle/macos/BiBCode (Alpha).app`.
 
 - [ ] **Step 6: Verify the enabled state with Computer Use**
 

@@ -78,29 +78,6 @@ describe("loadRepoEnv", () => {
     });
   });
 
-  it("prefers BiBCode variables and accepts pre-rebrand variables", () => {
-    expect(
-      resolvePublicConfig({
-        BIBCODE_RELAY_URL: "https://new.example.test",
-        T4CODE_RELAY_URL: "https://old.example.test",
-      }).relayUrl,
-    ).toBe("https://new.example.test");
-    expect(resolvePublicConfig({ T4CODE_RELAY_URL: "https://old.example.test" }).relayUrl).toBe(
-      "https://old.example.test",
-    );
-  });
-
-  it("projects legacy public runtime inputs to canonical variables without removing them", () => {
-    const env = loadRepoEnv({
-      baseEnv: { T4CODE_HOME: "C:/legacy-home", T4CODE_PORT: "4773" },
-      repoRoot: makeTemporaryDirectory(),
-    });
-
-    expect(env.BIBCODE_HOME).toBe("C:/legacy-home");
-    expect(env.BIBCODE_PORT).toBe("4773");
-    expect(env.T4CODE_HOME).toBe("C:/legacy-home");
-  });
-
   it("trims values, skips empty aliases, and preserves unrelated environment entries", () => {
     expect(
       loadRepoEnv({

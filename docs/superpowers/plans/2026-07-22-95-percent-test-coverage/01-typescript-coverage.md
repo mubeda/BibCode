@@ -66,7 +66,7 @@ import { fetchLatestRelease, RELEASES_URL, type Release } from "./releases";
 const release: Release = {
   tag_name: "v1.2.3",
   html_url: "https://github.com/mubeda/BibCode/releases/tag/v1.2.3",
-  assets: [{ name: "T4Code.dmg", browser_download_url: "https://example.test/T4Code.dmg" }],
+  assets: [{ name: "BiBCode.dmg", browser_download_url: "https://example.test/BiBCode.dmg" }],
 };
 
 describe("fetchLatestRelease", () => {
@@ -83,7 +83,7 @@ describe("fetchLatestRelease", () => {
   afterEach(() => vi.unstubAllGlobals());
 
   it("returns the cached release without fetching", async () => {
-    values.set("t4code-latest-release", JSON.stringify(release));
+    values.set("bibcode-latest-release", JSON.stringify(release));
     const fetch = vi.fn();
     vi.stubGlobal("fetch", fetch);
     await expect(fetchLatestRelease()).resolves.toEqual(release);
@@ -93,14 +93,14 @@ describe("fetchLatestRelease", () => {
   it("fetches and caches a release with assets", async () => {
     vi.stubGlobal("fetch", vi.fn(async () => ({ json: async () => release })));
     await expect(fetchLatestRelease()).resolves.toEqual(release);
-    expect(JSON.parse(values.get("t4code-latest-release")!)).toEqual(release);
+    expect(JSON.parse(values.get("bibcode-latest-release")!)).toEqual(release);
   });
 
   it("does not cache an API payload without assets", async () => {
     const payload = { tag_name: "v1.2.3" };
     vi.stubGlobal("fetch", vi.fn(async () => ({ json: async () => payload })));
     await expect(fetchLatestRelease()).resolves.toEqual(payload);
-    expect(values.has("t4code-latest-release")).toBe(false);
+    expect(values.has("bibcode-latest-release")).toBe(false);
   });
 
   it("exposes the repository releases URL", () => {
@@ -130,10 +130,10 @@ const projectedRoutes = config.routes?.map((route) => ({
   cookie: "headers" in route ? route.headers?.["Set-Cookie"] : undefined,
 }));
 expect(projectedRoutes).toEqual([
-  { src: "/__t4code/channel", dest: undefined, status: 302, location: "/", cookie: "t4code_web_channel=nightly; Path=/; Max-Age=31536000; HttpOnly; Secure; SameSite=Lax" },
-  { src: "/__t4code/channel", dest: undefined, status: 302, location: "/", cookie: "t4code_web_channel=latest; Path=/; Max-Age=31536000; HttpOnly; Secure; SameSite=Lax" },
-  { src: "/(.*)", dest: "https://nightly.app.t4code.codes/$1", status: undefined, location: undefined, cookie: undefined },
-  { src: "/(.*)", dest: "https://latest.app.t4code.codes/$1", status: undefined, location: undefined, cookie: undefined },
+  { src: "/__bibcode/channel", dest: undefined, status: 302, location: "/", cookie: "bibcode_web_channel=nightly; Path=/; Max-Age=31536000; HttpOnly; Secure; SameSite=Lax" },
+  { src: "/__bibcode/channel", dest: undefined, status: 302, location: "/", cookie: "bibcode_web_channel=latest; Path=/; Max-Age=31536000; HttpOnly; Secure; SameSite=Lax" },
+  { src: "/(.*)", dest: "https://nightly.app.bibcode.codes/$1", status: undefined, location: undefined, cookie: undefined },
+  { src: "/(.*)", dest: "https://latest.app.bibcode.codes/$1", status: undefined, location: undefined, cookie: undefined },
 ]);
 ```
 

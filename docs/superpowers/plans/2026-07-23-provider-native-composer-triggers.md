@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make the chat composer use `:` for T4Code actions and each provider's normalized native `/`, `$`, and `@` capabilities, while preserving polished file and agent chips whose source text is provider-native.
+**Goal:** Make the chat composer use `:` for BiBCode actions and each provider's normalized native `/`, `$`, and `@` capabilities, while preserving polished file and agent chips whose source text is provider-native.
 
 **Architecture:** Normalize invocation metadata at the server boundary, derive a provider-neutral capability profile in a pure web module, and make shared trigger/reference utilities the canonical source for detection and serialization. Keep `ChatComposer` responsible for editor state and local action execution, while the Lexical editor maps native source tokens to visual nodes. Canonicalize legacy Markdown file links only at draft reconstruction and the provider send boundary.
 
@@ -421,7 +421,7 @@ Rules:
 
 - [ ] **Step 7: Generalize slash search**
 
-Change the search helper to accept provider command and slash-skill items only. Preserve exact-name-first and fuzzy matching. Remove T4Code actions and agents from its input type.
+Change the search helper to accept provider command and slash-skill items only. Preserve exact-name-first and fuzzy matching. Remove BiBCode actions and agents from its input type.
 
 - [ ] **Step 8: Run capability and trigger suites**
 
@@ -458,7 +458,7 @@ git commit -m "feat: gate composer triggers by provider capabilities"
 Test every trigger independently:
 
 ```ts
-it("keeps T4Code actions isolated under colon", () => {
+it("keeps BiBCode actions isolated under colon", () => {
   expect(buildComposerCommandItems(inputFor(":"))).toMatchObject([
     { type: "bibcode-action", group: "bibcode", action: "model", replacement: null },
     { type: "bibcode-action", group: "bibcode", action: "plan", replacement: null },
@@ -517,7 +517,7 @@ export type ComposerCommandItem =
 export type ComposerCommandGroupId = "bibcode" | "commands" | "skills" | "files" | "agents";
 ```
 
-Every selectable provider item includes its exact `replacement`; T4Code actions use `replacement: null`. File replacement must call `serializeComposerReference(path)`. Agent replacement is `@${agent.name} `.
+Every selectable provider item includes its exact `replacement`; BiBCode actions use `replacement: null`. File replacement must call `serializeComposerReference(path)`. Agent replacement is `@${agent.name} `.
 
 Return:
 
@@ -535,7 +535,7 @@ Delete item type ownership from `ComposerCommandMenu.tsx`; import it from `compo
 
 ```ts
 const GROUPS = [
-  ["t4code", "T4Code"],
+  ["bibcode", "BiBCode"],
   ["commands", "Commands"],
   ["skills", "Skills"],
   ["files", "Files"],
@@ -543,7 +543,7 @@ const GROUPS = [
 ] as const;
 ```
 
-Use the existing file glyph, skill glyph, and bot glyph. T4Code actions retain the bot/internal-action glyph. Remove `groupSlashCommandSections`.
+Use the existing file glyph, skill glyph, and bot glyph. BiBCode actions retain the bot/internal-action glyph. Remove `groupSlashCommandSections`.
 
 - [ ] **Step 5: Teach highlight resolution about exact agent matches**
 
@@ -561,7 +561,7 @@ Run:
 vp test run --project unit apps/web/src/components/chat/composerCommandItems.test.ts apps/web/src/components/chat/ComposerCommandMenu.test.tsx apps/web/src/components/chat/composerMenuHighlight.test.ts
 ```
 
-Expected: all pass with group labels `T4Code`, `Commands`, `Skills`, `Files`, and `Agents`.
+Expected: all pass with group labels `BiBCode`, `Commands`, `Skills`, `Files`, and `Agents`.
 
 - [ ] **Step 7: Commit the menu extraction**
 
@@ -731,7 +731,7 @@ git commit -m "feat: render native file and agent references as chips"
 Replace old expectations with the native contract:
 
 ```ts
-it("lists only T4Code actions for colon", () => {
+it("lists only BiBCode actions for colon", () => {
   const menu = renderMenuFor(":");
   expect(menu.items.map((item) => item.label)).toEqual([":model", ":plan", ":default"]);
 });
@@ -783,12 +783,12 @@ Keep `useComposerPathSearch` in `ChatComposer`, active only for `provider-refere
 
 Delete:
 
-- hard-coded slash T4Code items;
+- hard-coded slash BiBCode items;
 - direct skill filtering;
 - direct provider-agent instruction construction;
 - provider-native insertion branching inside selection.
 
-- [ ] **Step 5: Centralize T4Code action execution**
+- [ ] **Step 5: Centralize BiBCode action execution**
 
 Create one callback:
 
@@ -839,7 +839,7 @@ Do not change the prompt text during provider capability refresh or session hydr
 Use provider-neutral copy that advertises internal actions without promising unsupported provider keys:
 
 ```text
-Ask anything, @ files, : T4Code actions, or a provider-native command
+Ask anything, @ files, : BiBCode actions, or a provider-native command
 ```
 
 Avoid dynamically listing unavailable sigils in a way that causes layout churn.
@@ -1075,7 +1075,7 @@ switch the provider of an existing chat through the composer model picker.
 
 1. open the provider's dedicated chat panel and assert its model picker lists
    only models for that provider, including before the first send;
-2. type `:` and assert only T4Code actions;
+2. type `:` and assert only BiBCode actions;
 3. choose and verify a local action clears;
 4. type `/` and assert the expected Commands and Skills groups;
 5. type `$` and assert the dollar skill or no menu;
@@ -1227,7 +1227,7 @@ if (!globalThis.sky) {
 }
 ```
 
-List apps, select the locally built T4Code application, and get a fresh app state before each interaction sequence.
+List apps, select the locally built BiBCode application, and get a fresh app state before each interaction sequence.
 
 - [ ] **Step 8: Validate all trigger profiles with Computer Use**
 
@@ -1282,7 +1282,7 @@ chips restore while their source text remains native.
 
 Save screenshots and accessibility state for:
 
-- T4Code action menu;
+- BiBCode action menu;
 - provider slash Commands/Skills groups;
 - file/agent reference groups;
 - restored OpenCode file/agent chips and Codex skill chip;
@@ -1321,7 +1321,7 @@ temporary homes, or generated state.
 
 ## Completion Checklist
 
-- [ ] `:` is the only trigger for T4Code-owned actions.
+- [ ] `:` is the only trigger for BiBCode-owned actions.
 - [ ] `/` shows only native provider commands and slash-invoked skills.
 - [ ] `$` shows only enabled dollar-invoked skills.
 - [ ] `@` shows workspace files and only natively mentionable agents.

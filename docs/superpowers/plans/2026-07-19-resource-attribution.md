@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Keep the Resource Manager headline as the combined monitored footprint while making every expanded view clearly and accurately separate T4Code Core from launched External Tooling.
+**Goal:** Keep the Resource Manager headline as the combined monitored footprint while making every expanded view clearly and accurately separate BiBCode Core from launched External Tooling.
 
 **Architecture:** Extend native samples with stable process identity, join them to a bounded launcher-owned provenance registry, and run a pure nearest-ancestor attributor before any current or historical aggregation. A single demand-driven sampler becomes the source for both diagnostics RPCs. The contracts switch atomically to split totals, and the web UI renders parallel Core/External cards without ever merging local desktop usage into a selected remote host.
 
@@ -925,7 +925,7 @@ type ResourceUsagePresentation = {
 
 - [ ] Update `ResourceUsageSegment.tsx`:
   1. Combined memory, CPU, and process count headline.
-  2. Equal-width **T4Code Core** and **External Tooling** cards.
+  2. Equal-width **BiBCode Core** and **External Tooling** cards.
   3. **Highest consumers** mixed list with scope tag, label, bounded command, memory, and CPU.
   4. Optional **This device** Core row visually outside selected-host totals.
 
@@ -1062,7 +1062,7 @@ git commit -m "feat(web): add attributed resource diagnostics"
 ### Step 1: Document the operational meaning
 
 - [ ] Update `docs/operations/observability.md` with:
-  - Combined, T4Code Core, and External Tooling definitions;
+  - Combined, BiBCode Core, and External Tooling definitions;
   - host-scoped remote/local behavior;
   - UI coverage statuses;
   - launcher registration plus fallback semantics;
@@ -1123,7 +1123,7 @@ Expected: both exit successfully. These are mandatory repository completion gate
 
 ```bash
 vp run build:desktop
-vp run measure:desktop-runtime -- --label resource-attribution-macos --command target/release/bibcode-desktop --ready-url http://127.0.0.1:3773/.well-known/t4code/environment --window-title "T4Code (Alpha)" --idle-ms 30000
+vp run measure:desktop-runtime -- --label resource-attribution-macos --command target/release/bibcode-desktop --ready-url http://127.0.0.1:3773/.well-known/bibcode/environment --window-title "BiBCode (Alpha)" --idle-ms 30000
 ```
 
 - [ ] With the packaged app:

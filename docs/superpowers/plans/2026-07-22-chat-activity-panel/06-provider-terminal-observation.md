@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Show the same activity dock and inspector for T4Code-launched Codex, Claude, and OpenCode terminal sessions after a reliable native-session handshake.
+**Goal:** Show the same activity dock and inspector for BiBCode-launched Codex, Claude, and OpenCode terminal sessions after a reliable native-session handshake.
 
 **Architecture:** Provider-terminal actions carry a bounded, declarative observation hint. The server validates the provider instance and uses an injected terminal-launch observer to prepare a private control topology before the PTY starts. A generation-scoped observer projects native activity into a terminal activity scope and tears down with the PTY. The original terminal always remains usable when observer setup or handshake fails.
 
@@ -357,7 +357,7 @@ git commit -m "feat(terminal): observe Codex remote sessions"
 Cover:
 
 - feature probe confirms interactive settings overlay and HTTP hook support;
-- an isolated mode-0600 settings file adds T4Code `SubagentStart`, `SubagentStop`, `PreToolUse`, `PostToolUse`, and failure hooks;
+- an isolated mode-0600 settings file adds BiBCode `SubagentStart`, `SubagentStop`, `PreToolUse`, `PostToolUse`, and failure hooks;
 - the generated overlay composes with normal user/project/local settings and does not replace existing hooks;
 - hook URL binds loopback only and contains no bearer token in logs;
 - each POST requires a per-launch bearer token, correct correlation value, JSON content type, and body <= 1 MiB;
@@ -540,7 +540,7 @@ Cover:
 
 On production runtime construction, ask `ActivityProjection` to mark unresolved active terminal scopes interrupted. Do not mark normal web-chat scopes interrupted; their provider runtimes own separate reconnect rules.
 
-Clean only artifacts carrying a validated T4Code ownership marker and residing under the configured application-private runtime directory.
+Clean only artifacts carrying a validated BiBCode ownership marker and residing under the configured application-private runtime directory.
 
 - [ ] **Step 3: Run full terminal regressions and commit**
 

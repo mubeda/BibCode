@@ -103,27 +103,15 @@ export function resolvePublicConfig(...sources: readonly Environment[]): BiBCode
     clerkPublishableKey: firstNonEmpty(
       sources,
       "BIBCODE_CLERK_PUBLISHABLE_KEY",
-      "T4CODE_CLERK_PUBLISHABLE_KEY",
       "VITE_CLERK_PUBLISHABLE_KEY",
     ),
     clerkJwtTemplate: firstNonEmpty(
       sources,
       "BIBCODE_CLERK_JWT_TEMPLATE",
-      "T4CODE_CLERK_JWT_TEMPLATE",
       "VITE_CLERK_JWT_TEMPLATE",
     ),
-    clerkCliOAuthClientId: firstNonEmpty(
-      sources,
-      "BIBCODE_CLERK_CLI_OAUTH_CLIENT_ID",
-      "T4CODE_CLERK_CLI_OAUTH_CLIENT_ID",
-    ),
-    relayUrl: firstNonEmpty(
-      sources,
-      "BIBCODE_RELAY_URL",
-      "T4CODE_RELAY_URL",
-      "VITE_BIBCODE_RELAY_URL",
-      "VITE_T4CODE_RELAY_URL",
-    ),
+    clerkCliOAuthClientId: firstNonEmpty(sources, "BIBCODE_CLERK_CLI_OAUTH_CLIENT_ID"),
+    relayUrl: firstNonEmpty(sources, "BIBCODE_RELAY_URL", "VITE_BIBCODE_RELAY_URL"),
   };
 }
 

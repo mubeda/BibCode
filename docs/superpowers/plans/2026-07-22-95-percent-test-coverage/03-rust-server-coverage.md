@@ -49,8 +49,8 @@ Use the existing `git` helper and configure identity locally:
 fn initialize_repository() -> tempfile::TempDir {
     let directory = tempfile::tempdir().expect("temporary repository");
     git(directory.path(), &["init", "--initial-branch=main"]);
-    git(directory.path(), &["config", "user.name", "T4Code Test"]);
-    git(directory.path(), &["config", "user.email", "test@t4code.invalid"]);
+    git(directory.path(), &["config", "user.name", "BiBCode Test"]);
+    git(directory.path(), &["config", "user.email", "test@bibcode.invalid"]);
     std::fs::write(directory.path().join("README.md"), "initial\n").expect("seed file");
     git(directory.path(), &["add", "README.md"]);
     git(directory.path(), &["commit", "-m", "initial"]);

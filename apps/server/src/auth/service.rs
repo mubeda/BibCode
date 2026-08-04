@@ -241,11 +241,6 @@ impl AuthService {
     }
 
     #[must_use]
-    pub fn legacy_cookie_name(&self) -> String {
-        self.cookie_name().replacen("bibcode", "t4code", 1)
-    }
-
-    #[must_use]
     pub(crate) fn subscribe_access(&self) -> broadcast::Receiver<AuthAccessEvent> {
         self.access_events.subscribe()
     }

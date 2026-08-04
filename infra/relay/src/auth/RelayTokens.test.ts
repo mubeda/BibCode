@@ -164,18 +164,6 @@ describe("RelayTokens", () => {
     }).pipe(Effect.provide(layer)),
   );
 
-  it.effect("accepts the legacy web client id during migration", () =>
-    Effect.gen(function* () {
-      const relayTokens = yield* RelayTokens.RelayTokens;
-      expect(
-        relayTokens.resolveDpopAccessTokenScopes({
-          clientId: "t4code-web",
-          scope: "environment:connect",
-        }),
-      ).toEqual(["environment:connect"]);
-    }).pipe(Effect.provide(layer)),
-  );
-
   it.effect("rejects signed DPoP tokens whose scope is outside the relay policy", () =>
     Effect.gen(function* () {
       const relayTokens = yield* RelayTokens.RelayTokens;

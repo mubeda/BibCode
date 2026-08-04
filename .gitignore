@@ -24,7 +24,6 @@ build/
 .logs/
 release/
 release-mock/
-.t4code
 .bibcode
 .idea/
 apps/web/.playwright

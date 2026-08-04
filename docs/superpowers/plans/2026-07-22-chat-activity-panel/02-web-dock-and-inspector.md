@@ -147,7 +147,7 @@ Cover:
 - corrupt persisted input returns defaults; and
 - only the boolean preference is persisted.
 
-Use storage key `t4code:activity-dock-state:v1` and the existing
+Use storage key `bibcode:activity-dock-state:v1` and the existing
 `scopedProjectKey(scopeProjectRef(environmentId, projectId))` helper as the
 workspace-equivalent key.
 

@@ -1,11 +1,11 @@
-# Canonical T4Code Identity Implementation Plan
+# Canonical BiBCode Identity Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > `superpowers:subagent-driven-development` (recommended) or
 > `superpowers:executing-plans` to implement this plan task-by-task. Steps use
 > checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make T4Code the only active identity across the repository and built products.
+**Goal:** Make BiBCode the only active identity across the repository and built products.
 
 **Architecture:** Perform a hard coordinated rename of package, Rust, runtime,
 protocol, persistence, build, and documentation surfaces. Regenerate dependency
@@ -15,8 +15,8 @@ metadata after source renames and enforce the result with a repository guard.
 
 ## Global Constraints
 
-- Canonical product name is `T4Code`; canonical slug and CLI are `t4code`.
-- Canonical npm scope is `@t4code`; canonical environment prefix is `BIBCODE_`.
+- Canonical product name is `BiBCode`; canonical slug and CLI are `bibcode`.
+- Canonical npm scope is `@bibcode`; canonical environment prefix is `BIBCODE_`.
 - Do not preserve aliases using the removed identity.
 - Do not edit vendored repositories under `.repos`.
 - Generated lockfiles must be regenerated rather than hand-maintained.
@@ -28,7 +28,7 @@ metadata after source renames and enforce the result with a repository guard.
 
 **Files:**
 
-- Create: `scripts/t4code-identity.test.ts`
+- Create: `scripts/bibcode-identity.test.ts`
 - Modify: `scripts/package.json`
 
 **Interfaces:**
@@ -37,7 +37,7 @@ metadata after source renames and enforce the result with a repository guard.
   excluding `.git`, `.repos`, `node_modules`, `target`, and generated binaries.
 
 - [x] Write a failing test that reports every removed identity occurrence and path.
-- [x] Run `vp test scripts/t4code-identity.test.ts` and verify it fails.
+- [x] Run `vp test scripts/bibcode-identity.test.ts` and verify it fails.
 - [x] Keep the test active through the rename until it returns zero findings.
 
 ### Task 2: Rename Workspace And Rust Identities
@@ -51,7 +51,7 @@ metadata after source renames and enforce the result with a repository guard.
 
 **Interfaces:**
 
-- Produces `@bibcode/*`, `bibcode-server`, `bibcode-desktop`, and `t4code` CLI names.
+- Produces `@bibcode/*`, `bibcode-server`, `bibcode-desktop`, and `bibcode` CLI names.
 
 - [x] Rename directories and manifests.
 - [x] Replace workspace imports, filters, crate paths, binary names, and process assertions.
@@ -67,8 +67,8 @@ metadata after source renames and enforce the result with a repository guard.
 
 **Interfaces:**
 
-- Produces `BIBCODE_*`, `VITE_BIBCODE_*`, `t4code:` storage keys,
-  `/.well-known/t4code/environment`, and `/__t4code/channel`.
+- Produces `BIBCODE_*`, `VITE_BIBCODE_*`, `bibcode:` storage keys,
+  `/.well-known/bibcode/environment`, and `/__bibcode/channel`.
 
 - [x] Rename runtime constants, routes, marker strings, schemas, telemetry, and persisted keys.
 - [x] Update language-neutral fixtures and contract parity tests.
@@ -83,7 +83,7 @@ metadata after source renames and enforce the result with a repository guard.
 
 **Interfaces:**
 
-- Produces T4Code-only build commands, artifact names, environment configuration,
+- Produces BiBCode-only build commands, artifact names, environment configuration,
   release metadata, examples, and documentation.
 
 - [x] Rename all tooling and workflow inputs/outputs.

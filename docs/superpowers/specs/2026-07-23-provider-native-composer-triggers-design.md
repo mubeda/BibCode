@@ -5,12 +5,12 @@
 ## Goal
 
 Make the AI chat composer follow the selected provider's native conventions for
-commands, skills, agents, and files while giving T4Code-owned actions a
+commands, skills, agents, and files while giving BiBCode-owned actions a
 separate, unambiguous trigger.
 
 The completed interaction uses:
 
-- `:` for T4Code actions;
+- `:` for BiBCode actions;
 - `/` for provider-native slash commands and slash-invoked skills;
 - `$` for provider-native dollar-invoked skills;
 - `@` for native file references and, only where supported, native agent
@@ -24,7 +24,7 @@ syntax remain separate concerns.
 
 The current composer has a fixed trigger model:
 
-- `/` mixes T4Code actions, provider commands, and provider agents;
+- `/` mixes BiBCode actions, provider commands, and provider agents;
 - `$` lists every discovered skill, even when the provider invokes that skill
   with `/` or prose;
 - `@` searches only workspace files and folders; and
@@ -33,7 +33,7 @@ The current composer has a fixed trigger model:
 
 This creates several inconsistencies:
 
-1. T4Code actions occupy the same namespace as provider commands.
+1. BiBCode actions occupy the same namespace as provider commands.
 2. Agents appear in the slash menu even when the selected provider has no
    inline agent syntax.
 3. Skills are discovered through one fixed trigger and translated only after
@@ -67,7 +67,7 @@ truth because these tools change frequently.
 
 ## Design Principles
 
-1. **Trigger ownership is explicit.** T4Code and providers never compete for the
+1. **Trigger ownership is explicit.** BiBCode and providers never compete for the
    same menu item.
 2. **Provider-native behavior wins.** The UI does not invent agent or skill
    invocation syntax.
@@ -86,7 +86,7 @@ truth because these tools change frequently.
 
 | Key | Owner                          | Available items                                           | Selection result                           |
 | --- | ------------------------------ | --------------------------------------------------------- | ------------------------------------------ |
-| `:` | T4Code                         | Local actions such as `:model`, `:plan`, and `:default`   | Execute locally and remove the action text |
+| `:` | BiBCode                         | Local actions such as `:model`, `:plan`, and `:default`   | Execute locally and remove the action text |
 | `/` | Selected provider              | Provider commands and skills whose invocation is `slash`  | Insert `/name`                             |
 | `$` | Selected provider              | Skills whose invocation is `dollar`                       | Insert `$name`                             |
 | `@` | Provider and workspace context | Workspace files plus agents whose invocation is `mention` | Insert `@path` or `@agent`                 |
@@ -133,7 +133,7 @@ The provider inventory must not encode web-specific menu groupings. It reports
 semantic capability and invocation data only.
 
 Provider commands already present in `slashCommands` retain their `/` syntax,
-including driver-supported commands such as `/goal`. T4Code-local actions are
+including driver-supported commands such as `/goal`. BiBCode-local actions are
 the actions executed entirely by the web client, currently model and
 interaction-mode changes.
 
@@ -148,7 +148,7 @@ Shared composer logic gains a provider-neutral capability profile:
 Trigger detection accepts this profile instead of assuming that every sigil is
 active. It returns independent trigger kinds for:
 
-- T4Code action;
+- BiBCode action;
 - provider slash item;
 - provider dollar skill; and
 - provider reference.
@@ -170,12 +170,12 @@ Capability interpretation and menu-item construction move out of
 6. returns the native insertion text for each item.
 
 `ChatComposer` remains responsible for current editor state, invoking workspace
-path search, applying the selected replacement, and executing T4Code-local
+path search, applying the selected replacement, and executing BiBCode-local
 actions.
 
 `ComposerCommandMenu` renders semantic groups:
 
-- T4Code;
+- BiBCode;
 - Commands;
 - Skills;
 - Files; and
@@ -205,9 +205,9 @@ exact agent name wins, matching the provider's native mention semantics.
 
 ## Interaction Semantics
 
-### T4Code actions
+### BiBCode actions
 
-Typing `:` at the start of a line opens a T4Code-only menu. The initial actions
+Typing `:` at the start of a line opens a BiBCode-only menu. The initial actions
 are:
 
 - `:model` — open the response-model picker;
@@ -395,7 +395,7 @@ The acceptance workflow is:
    - the profile is opened in its own provider-locked chat panel;
    - the model picker lists only models for that panel's provider, including
      before the first message is sent;
-   - the `:` menu contains only T4Code actions;
+   - the `:` menu contains only BiBCode actions;
    - each local action executes and clears correctly;
    - `/` contains only native commands and slash skills;
    - `$` contains only dollar skills or opens no menu when unsupported;
@@ -419,7 +419,7 @@ Use workflow passes.
 
 ## Non-Goals
 
-- Inventing a universal T4Code agent invocation syntax.
+- Inventing a universal BiBCode agent invocation syntax.
 - Adding new provider commands, skills, or agents.
 - Replacing provider mode or model controls with composer triggers.
 - Switching a chat panel's provider from the model picker.
@@ -429,7 +429,7 @@ Use workflow passes.
 
 ## Completion Criteria
 
-- `:` is the only T4Code action trigger.
+- `:` is the only BiBCode action trigger.
 - Provider commands, skills, and agents appear only under their native trigger.
 - The client derives menus from normalized capabilities without provider-name
   conditionals.

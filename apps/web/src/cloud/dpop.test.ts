@@ -36,22 +36,17 @@ function installFakeIndexedDb(
   options: {
     readonly fault?: IndexedDbFault;
     readonly initial?: BrowserDpopKey;
-    readonly legacyInitial?: BrowserDpopKey;
     readonly existingStore?: boolean;
   } = {},
 ) {
   const values = new Map<IDBValidKey, unknown>();
-  const legacyValues = new Map<IDBValidKey, unknown>();
   if (options.initial) {
     values.set("relay-dpop-proof-key", options.initial);
-  }
-  if (options.legacyInitial) {
-    legacyValues.set("relay-dpop-proof-key", options.legacyInitial);
   }
   const hasStore = new Map<string, boolean>();
   let closed = false;
   const databaseFor = (name: string) => {
-    const databaseValues = name === "t4code:cloud-auth" ? legacyValues : values;
+    const databaseValues = values;
     return {
       objectStoreNames: {
         contains: () => hasStore.get(name) ?? options.existingStore ?? false,
@@ -178,16 +173,6 @@ describe("browser DPoP proofs", () => {
       installFakeIndexedDb({ initial: proofKey, existingStore: true });
 
       expect(yield* readStoredBrowserDpopKey()).toEqual(proofKey);
-    }),
-  );
-
-  it.effect("copies a legacy T4Code proof key into canonical BiBCode storage", () =>
-    Effect.gen(function* () {
-      const proofKey = yield* generateBrowserDpopKey;
-      const storage = installFakeIndexedDb({ legacyInitial: proofKey, existingStore: true });
-
-      expect(yield* readStoredBrowserDpopKey()).toEqual(proofKey);
-      expect(storage.values.get("relay-dpop-proof-key")).toEqual(proofKey);
     }),
   );
 

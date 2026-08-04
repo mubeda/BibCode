@@ -67,7 +67,6 @@ const CLAUDE_HOOK_REQUEST_CAPACITY: usize = 32;
 const CLAUDE_HOOK_BODY_TIMEOUT: Duration = Duration::from_secs(2);
 const CLAUDE_HOOK_RESPONSE_TIMEOUT: Duration = Duration::from_secs(2);
 const CLAUDE_HOOK_CORRELATION_HEADER: &str = "X-BiBCode-Launch-Correlation";
-const LEGACY_CLAUDE_HOOK_CORRELATION_HEADER: &str = "X-T4Code-Launch-Correlation";
 const CLAUDE_HOOK_PATH_LIMIT: usize = 4 * 1024;
 const CLAUDE_HOOK_TEXT_LIMIT: usize = 16 * 1024;
 const CLAUDE_HOOK_OBJECT_LIMIT: usize = 64 * 1024;
@@ -1313,7 +1312,6 @@ fn authorized(headers: &HeaderMap, expected_token: &str, expected_correlation: &
     };
     let Some(correlation) = headers
         .get(CLAUDE_HOOK_CORRELATION_HEADER)
-        .or_else(|| headers.get(LEGACY_CLAUDE_HOOK_CORRELATION_HEADER))
         .and_then(|value| value.to_str().ok())
     else {
         return false;
@@ -1774,7 +1772,6 @@ mod tests {
     fn hook_authorization_accepts_canonical_and_legacy_correlation_headers() {
         for header_name in [
             CLAUDE_HOOK_CORRELATION_HEADER,
-            LEGACY_CLAUDE_HOOK_CORRELATION_HEADER,
         ] {
             let mut headers = HeaderMap::new();
             headers.insert("authorization", "Bearer token".parse().unwrap());

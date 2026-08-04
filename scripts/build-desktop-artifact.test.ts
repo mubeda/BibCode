@@ -204,26 +204,6 @@ it.layer(NodeServices.layer)("build-desktop-artifact", (it) => {
     }),
   );
 
-  it.effect("accepts pre-rebrand Tauri build environment defaults", () =>
-    Effect.gen(function* () {
-      const path = yield* Path.Path;
-      const plan = yield* resolveTauriBuildPlan(
-        {},
-        {
-          T4CODE_TAURI_DESKTOP_PLATFORM: "linux",
-          T4CODE_TAURI_DESKTOP_TARGET: "deb",
-          T4CODE_TAURI_DESKTOP_ARCH: "arm64",
-        },
-        { platform: "linux", arch: "x64" },
-        path.resolve("X:/repo"),
-      );
-
-      assert.equal(plan.platform, "linux");
-      assert.equal(plan.target, "deb");
-      assert.equal(plan.arch, "arm64");
-    }),
-  );
-
   it.effect("rejects cross-platform builds unless explicitly allowed", () =>
     Effect.gen(function* () {
       const path = yield* Path.Path;

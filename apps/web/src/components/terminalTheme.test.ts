@@ -59,23 +59,23 @@ describe("terminal theme launch values", () => {
     expect(
       mergeTerminalSpawnEnv({
         commandEnv: {
-          t4code_osc_foreground: "command-lowercase",
-          T4Code_Osc_Cursor: "command-mixed-case",
-          t4code_windows_console_theme: "command-lowercase",
+          bibcode_osc_foreground: "command-lowercase",
+          BiBCode_Osc_Cursor: "command-mixed-case",
+          bibcode_windows_console_theme: "command-lowercase",
         },
         runtimeEnv: {
-          t4code_osc_background: "runtime-lowercase",
-          T4Code_Windows_Console_Theme: "runtime-mixed-case",
+          bibcode_osc_background: "runtime-lowercase",
+          BiBCode_Windows_Console_Theme: "runtime-mixed-case",
         },
         resolvedTheme: "light",
         windowsConsoleTheme: true,
       }),
     ).toEqual({
-      t4code_osc_foreground: "command-lowercase",
-      T4Code_Osc_Cursor: "command-mixed-case",
-      t4code_windows_console_theme: "command-lowercase",
-      t4code_osc_background: "runtime-lowercase",
-      T4Code_Windows_Console_Theme: "runtime-mixed-case",
+      bibcode_osc_foreground: "command-lowercase",
+      BiBCode_Osc_Cursor: "command-mixed-case",
+      bibcode_windows_console_theme: "command-lowercase",
+      bibcode_osc_background: "runtime-lowercase",
+      BiBCode_Windows_Console_Theme: "runtime-mixed-case",
       BIBCODE_OSC_BACKGROUND: "255,255,255",
       BIBCODE_OSC_FOREGROUND: "28,33,41",
       BIBCODE_OSC_CURSOR: "38,56,78",

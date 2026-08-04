@@ -1197,7 +1197,7 @@ BIBCODE_AUTO_BOOTSTRAP_PROJECT_FROM_CWD=1 \
 vp run dev:desktop
 ```
 
-Expected: the Tauri app named `T4Code (Alpha)` opens from the current worktree and the dev server reports ready. Keep this terminal running during QA.
+Expected: the Tauri app named `BiBCode (Alpha)` opens from the current worktree and the dev server reports ready. Keep this terminal running during QA.
 
 - [ ] **Step 4: Verify stable provider panels with Computer Use**
 
@@ -1234,7 +1234,7 @@ In the same app:
 2. Switch to the next Codex model. Confirm a still-valid effort remains selected; otherwise confirm the declared default/first valid effort is selected without a blank value.
 3. Repeat for every Claude model and every advertised Claude effort. Confirm Claude Fast by default appears only for models whose descriptor supports it.
 4. Close Settings, reopen it, and confirm the last selections.
-5. Quit `T4Code (Alpha)` normally, stop the dev command, restart it with the exact Step 3 environment, reopen Settings, and confirm model, effort, and fast values survived the application restart.
+5. Quit `BiBCode (Alpha)` normally, stop the dev command, restart it with the exact Step 3 environment, reopen Settings, and confirm model, effort, and fast values survived the application restart.
 
 Expected: no blank effort, no disappearing Codex fast toggle, and all saved defaults persist.
 

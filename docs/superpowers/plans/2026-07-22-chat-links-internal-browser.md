@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make every normal HTTP(S) link activation in AI chat open T4Code's internal Browser while preserving fragment, file-link, non-HTTP, and context-menu behavior.
+**Goal:** Make every normal HTTP(S) link activation in AI chat open BiBCode's internal Browser while preserving fragment, file-link, non-HTTP, and context-menu behavior.
 
 **Architecture:** Keep link routing inside `ChatMarkdown`, which already owns `openUrlInPreview` and the native context menu. Add a small pure HTTP(S) classifier, cover it through behavior tests, and route only those anchors through the existing preview command.
 

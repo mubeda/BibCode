@@ -6,7 +6,7 @@
 
 ## Context
 
-T4Code currently has two overlapping Add Project implementations:
+BiBCode currently has two overlapping Add Project implementations:
 
 - `AddProjectDialog` combines an embedded filesystem browser, nested-repository
   scanning and selection, clone controls, and project creation on one screen.
@@ -21,12 +21,12 @@ focused steps. The supplied Orca screenshots show:
 2. A dedicated Clone from URL step.
 3. A dedicated Create a new project step.
 
-T4Code will adopt this interaction model and remove its current Add Project UI.
+BiBCode will adopt this interaction model and remove its current Add Project UI.
 
 ## Goals
 
 - Make the Orca-style dialog the only Add Project UI.
-- Support every currently connected T4Code environment through a Host selector.
+- Support every currently connected BiBCode environment through a Host selector.
 - Use the native folder picker when the selected local or WSL environment can
   be routed safely.
 - Use a focused host-path entry step for remote environments and browser-only
@@ -78,7 +78,7 @@ an Enter key hint. Enter activates it.
 For the primary local environment and safely mapped desktop-local WSL
 environments, Browse folder opens the existing native directory picker. WSL
 picker routing continues to use the desktop pool instance identifier and strict
-UNC-to-Linux path mapping already used by T4Code.
+UNC-to-Linux path mapping already used by BiBCode.
 
 For a remote environment, or when no native desktop picker is available, Browse
 folder opens a host-path step. The step contains:
@@ -89,7 +89,7 @@ folder opens a host-path step. The step contains:
 - An editable absolute or home-relative host path
 - A full-width **Open project** action
 
-The selected folder is always registered as one project. T4Code does not scan
+The selected folder is always registered as one project. BiBCode does not scan
 its children or offer nested imports in this UI.
 
 ### Clone From URL
@@ -116,7 +116,7 @@ The create step contains:
 
 - Back
 - Title: **Create a new project**
-- Description: "Name it and T4Code will create a real project with sensible
+- Description: "Name it and BiBCode will create a real project with sensible
   defaults."
 - Project name input
 - A collapsed summary card reading **Git repository in \<parent\>**

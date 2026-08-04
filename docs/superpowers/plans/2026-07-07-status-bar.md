@@ -7,7 +7,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Build the approved T4Code-focused Orca-style status bar with Claude/Codex usage, refresh, and a resource manager backed by existing process diagnostics.
+**Goal:** Build the approved BiBCode-focused Orca-style status bar with Claude/Codex usage, refresh, and a resource manager backed by existing process diagnostics.
 
 **Architecture:** Add schema-only provider usage contracts, a server-side provider usage service exposed through WebSocket RPC, and focused React status-bar components mounted in the authenticated app shell. Reuse existing diagnostics and terminal metadata for Resource Manager instead of duplicating process monitoring.
 

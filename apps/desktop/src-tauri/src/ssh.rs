@@ -53,11 +53,7 @@ exit 1
 const REMOTE_LAUNCH_SCRIPT: &str = r#"set -eu
 STATE_KEY="$1"
 STATE_DIR="$HOME/.bibcode-ssh-launch/$STATE_KEY"
-LEGACY_STATE_DIR="$HOME/.t4code/ssh-launch/$STATE_KEY"
 SERVER_HOME="$HOME/.bibcode"
-if ! command -v bibcode >/dev/null 2>&1 && command -v t4code >/dev/null 2>&1; then
-  SERVER_HOME="$HOME/.t4code"
-fi
 PORT_FILE="$STATE_DIR/port"
 PID_FILE="$STATE_DIR/pid"
 MANAGED_FILE="$STATE_DIR/managed"
@@ -68,9 +64,6 @@ cat >"$RUNNER_FILE" <<'SH'
 #!/bin/sh
 if command -v bibcode >/dev/null 2>&1; then
   exec bibcode "$@"
-fi
-if command -v t4code >/dev/null 2>&1; then
-  exec t4code "$@"
 fi
 printf 'Remote host is missing the native BiBCode CLI. Install the Rust bibcode binary before connecting.\n' >&2
 exit 1
@@ -84,13 +77,9 @@ wait_ready() {
     if command -v curl >/dev/null 2>&1; then
       curl --fail --silent --show-error --max-time 1 \
         "http://127.0.0.1:$port/.well-known/bibcode/environment" >/dev/null 2>&1 && return 0
-      curl --fail --silent --show-error --max-time 1 \
-        "http://127.0.0.1:$port/.well-known/t4code/environment" >/dev/null 2>&1 && return 0
     elif command -v wget >/dev/null 2>&1; then
       wget --quiet --timeout=1 --output-document=/dev/null \
         "http://127.0.0.1:$port/.well-known/bibcode/environment" >/dev/null 2>&1 && return 0
-      wget --quiet --timeout=1 --output-document=/dev/null \
-        "http://127.0.0.1:$port/.well-known/t4code/environment" >/dev/null 2>&1 && return 0
     else
       printf 'Remote host requires curl or wget for readiness checks.\n' >&2
       return 1
@@ -127,15 +116,6 @@ pick_port() {
   done
   return 1
 }
-if [ ! -e "$MANAGED_FILE" ] && [ -d "$LEGACY_STATE_DIR" ]; then
-  LEGACY_PID="$(cat "$LEGACY_STATE_DIR/pid" 2>/dev/null || true)"
-  LEGACY_PORT="$(cat "$LEGACY_STATE_DIR/port" 2>/dev/null || true)"
-  LEGACY_MANAGED="$(cat "$LEGACY_STATE_DIR/managed" 2>/dev/null || true)"
-  if [ "$LEGACY_MANAGED" = "managed" ] && [ -n "$LEGACY_PID" ] && [ -n "$LEGACY_PORT" ] && kill -0 "$LEGACY_PID" 2>/dev/null && wait_ready "$LEGACY_PORT" "@@REMOTE_REUSE_READY_TIMEOUT_MS@@"; then
-    printf '{"remotePort":%s,"serverKind":"managed"}\n' "$LEGACY_PORT"
-    exit 0
-  fi
-fi
 REMOTE_PID="$(cat "$PID_FILE" 2>/dev/null || true)"
 REMOTE_PORT="$(cat "$PORT_FILE" 2>/dev/null || true)"
 REMOTE_MANAGED="$(cat "$MANAGED_FILE" 2>/dev/null || true)"
@@ -166,10 +146,6 @@ printf '{"remotePort":%s,"serverKind":"managed"}\n' "$REMOTE_PORT"
 const REMOTE_STOP_SCRIPT: &str = r#"set -eu
 STATE_KEY="$1"
 STATE_DIR="$HOME/.bibcode-ssh-launch/$STATE_KEY"
-LEGACY_STATE_DIR="$HOME/.t4code/ssh-launch/$STATE_KEY"
-if [ ! -e "$STATE_DIR/managed" ] && [ -e "$LEGACY_STATE_DIR/managed" ]; then
-  STATE_DIR="$LEGACY_STATE_DIR"
-fi
 PID_FILE="$STATE_DIR/pid"
 PORT_FILE="$STATE_DIR/port"
 MANAGED_FILE="$STATE_DIR/managed"
@@ -920,7 +896,7 @@ async fn issue_remote_pairing_token(
     args.extend([
         "sh".to_string(),
         "-lc".to_string(),
-        "if command -v bibcode >/dev/null 2>&1; then bibcode auth pairing create --base-dir \"$HOME/.bibcode\" --json; else t4code auth pairing create --base-dir \"$HOME/.t4code\" --json; fi".to_string(),
+        "bibcode auth pairing create --base-dir \"$HOME/.bibcode\" --json".to_string(),
     ]);
     let mut command = Command::new(ssh_command());
     configure_background_command(&mut command);
@@ -2216,7 +2192,7 @@ mod tests {
     }
 
     #[test]
-    fn remote_launch_prefers_the_native_bibcode_runtime_with_legacy_fallback() {
+    fn remote_launch_requires_the_native_bibcode_runtime() {
         for forbidden in [
             "node -",
             "command -v node",
@@ -2230,7 +2206,6 @@ mod tests {
             );
         }
         assert!(REMOTE_LAUNCH_SCRIPT.contains("command -v bibcode"));
-        assert!(REMOTE_LAUNCH_SCRIPT.contains("command -v t4code"));
         assert!(REMOTE_LAUNCH_SCRIPT.contains("native BiBCode CLI"));
     }
 

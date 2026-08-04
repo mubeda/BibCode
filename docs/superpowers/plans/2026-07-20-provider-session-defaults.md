@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Follow `/Users/admin/.codex/worktrees/6f54/t4code/AGENTS.md`.
+- Follow `/Users/admin/.codex/worktrees/6f54/bibcode/AGENTS.md`.
 - Before modifying Effect-based schemas, read `.repos/effect-smol/LLMS.md` completely and use the vendored Effect source for API examples.
 - Do not edit anything under `.repos/`.
 - Preserve provider/instance routing. The resolver selects only model/options after a target instance is known.
@@ -922,7 +922,7 @@ BIBCODE_DEV_INSTANCE=provider-session-defaults vp run dev:desktop
 
 Keep the process running in a PTY and poll it in intervals shorter than 60 seconds while it builds.
 
-- [ ] Use macOS computer control—not browser-only inspection—to open the resulting **T4Code (Alpha)** window and perform this exact walkthrough:
+- [ ] Use macOS computer control—not browser-only inspection—to open the resulting **BiBCode (Alpha)** window and perform this exact walkthrough:
 
   1. Open **Settings → Providers**.
   2. Confirm each provider is an independent rounded panel with visible spacing.
@@ -934,7 +934,7 @@ Keep the process running in a PTY and poll it in intervals shorter than 60 secon
   8. Create a disposable normal chat and confirm its composer selection matches.
   9. Create a disposable center Chat panel and confirm it starts with the same model/options.
   10. Open that provider’s AI terminal panel and inspect the visible structured launch/session behavior; confirm supported CLI defaults are applied and unsupported flags are absent.
-  11. Quit T4Code completely, relaunch the same development instance, and confirm the saved defaults remain.
+  11. Quit BiBCode completely, relaunch the same development instance, and confirm the saved defaults remain.
   12. Create another disposable chat and confirm the persisted defaults apply after relaunch.
   13. Choose a model without effort or fast support and confirm unsupported controls disappear and the new chat omits them.
 

@@ -3,7 +3,7 @@
 ## Goal
 
 Restore trusted desktop update checks after the Electron-to-Tauri migration.
-T4Code will discover stable GitHub Releases on Windows x64, Linux x64, macOS
+BiBCode will discover stable GitHub Releases on Windows x64, Linux x64, macOS
 x64, and macOS arm64. It will check shortly after startup and every two hours,
 notify when an update is available, and wait for the user to download and
 install it.
@@ -71,7 +71,7 @@ in chat, command output, source control, or repository files.
 - Store its passphrase separately in
   `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`.
 - Write the requested recoverable private-key backup to
-  `C:\Users\mauro\Downloads\t4code-updater.key`.
+  `C:\Users\mauro\Downloads\bibcode-updater.key`.
 - Refuse to overwrite an existing key backup at that path.
 - The user must preserve the passphrase separately from the key backup.
 
@@ -133,7 +133,7 @@ names have been verified. Only then will CI publish the draft. Because GitHub's
 `latest` endpoint excludes drafts, clients continue seeing the previous complete
 stable release during publication.
 
-Nightly releases may continue to exist as GitHub prereleases, but T4Code will
+Nightly releases may continue to exist as GitHub prereleases, but BiBCode will
 not select or expose them. They do not update `latest.json` and are never
 returned by the configured endpoint.
 

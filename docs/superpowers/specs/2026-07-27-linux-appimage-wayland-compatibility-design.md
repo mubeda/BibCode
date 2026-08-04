@@ -2,7 +2,7 @@
 
 ## Goal
 
-Every T4Code Linux AppImage must start reliably on distributions whose Mesa and Wayland stacks
+Every BiBCode Linux AppImage must start reliably on distributions whose Mesa and Wayland stacks
 are newer than the Ubuntu runner used to build the artifact. The fix must apply to local,
 release, updater-signed, and packaged UI AppImage builds without disabling GPU acceleration or
 changing runtime behavior on macOS and Windows.
@@ -25,7 +25,7 @@ Two controlled experiments isolated this boundary:
 1. `WEBKIT_DISABLE_DMABUF_RENDERER=1` and `WEBKIT_DISABLE_COMPOSITING_MODE=1` did not prevent the
    abort.
 2. Preloading the host `libwayland-client.so.0`, or removing only the bundled copy from an
-   extracted AppImage, kept `WebKitWebProcess` alive and rendered the complete T4Code UI.
+   extracted AppImage, kept `WebKitWebProcess` alive and rendered the complete BiBCode UI.
 
 This matches the current upstream Tauri report
 [tauri-apps/tauri#15665](https://github.com/tauri-apps/tauri/issues/15665), which documents the
@@ -36,7 +36,7 @@ same failure mode for AppImages built on older Ubuntu runners and executed with 
 Patch the AppImage packaging stage before linuxdeploy creates the final image.
 
 Tauri 2.11 does not expose an AppImage library exclusion option. It does, however, reuse a GTK
-linuxdeploy plugin from its tools cache. T4Code will opt into Tauri's project-local tools cache
+linuxdeploy plugin from its tools cache. BiBCode will opt into Tauri's project-local tools cache
 and prepare a repository-controlled wrapper at `target/.tauri/linuxdeploy-plugin-gtk.sh`.
 
 The wrapper will:
@@ -72,7 +72,7 @@ already-signed artifact.
 - Downloads are hash-verified before publication.
 - Temporary writes are renamed into place so an interrupted preparation cannot leave a trusted
   partial plugin.
-- The upstream plugin and T4Code wrapper are executable.
+- The upstream plugin and BiBCode wrapper are executable.
 
 The script will expose a small injectable preparation function for focused tests while its CLI
 entry point uses the real filesystem, network, hashing, and platform.
@@ -165,10 +165,10 @@ signing flow. Mutating the AppDir before image creation preserves the existing r
 
 ## Acceptance Criteria
 
-- A T4Code AppImage contains no bundled `libwayland-client.so*`.
+- A BiBCode AppImage contains no bundled `libwayland-client.so*`.
 - The corrected artifact starts on the reported CachyOS Wayland/Intel environment without
   `LD_PRELOAD` or WebKit renderer overrides.
-- `WebKitWebProcess` remains alive and the T4Code UI renders.
+- `WebKitWebProcess` remains alive and the BiBCode UI renders.
 - Release builds sign the already-corrected AppImage through the existing Tauri updater path.
 - macOS and Windows build behavior is unchanged.
 - No global Tauri cache or host library is modified.

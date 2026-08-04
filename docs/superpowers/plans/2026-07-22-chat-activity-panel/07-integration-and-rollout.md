@@ -300,7 +300,7 @@ Use Mermaid only for the cross-layer data flow where it materially clarifies own
 
 - [ ] **Step 2: Update provider docs**
 
-Codex and Claude docs list required/version-gated switches and how T4Code falls back. `providers.md` includes OpenCode and explicitly states Cursor/Grok terminal activity is unsupported in v1.
+Codex and Claude docs list required/version-gated switches and how BiBCode falls back. `providers.md` includes OpenCode and explicitly states Cursor/Grok terminal activity is unsupported in v1.
 
 Do not promise exact provider CLI versions indefinitely. Describe feature detection and link to the fixture/conformance tests.
 
@@ -420,7 +420,7 @@ For Codex, Claude, and OpenCode structured chats:
 
 For each supported provider terminal:
 
-- start through T4Code's provider-terminal action;
+- start through BiBCode's provider-terminal action;
 - wait for handshake before expecting a dock;
 - spawn/inspect child activity;
 - restart and verify generation separation; and
@@ -444,7 +444,7 @@ The feature is complete only when:
 
 - activity protocol v1 negotiates additively;
 - supported structured chats satisfy provider conformance;
-- supported T4Code-owned terminals handshake before showing activity;
+- supported BiBCode-owned terminals handshake before showing activity;
 - unsupported/empty/failed scopes show no misleading dock;
 - the UI is inspect-only, responsive, keyboard accessible, and bounded;
 - reconnect/restart/late-event invariants pass;

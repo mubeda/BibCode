@@ -15,7 +15,7 @@
 - Never rewrite provider ANSI output as a theme workaround.
 - Never restart a running Codex process without an explicit user action.
 - Cursor, Claude, shell, and other terminals retain current live xterm theme updates.
-- Runtime environment keys win ordinary provider defaults; reserved `BIBCODE_OSC_*` keys remain T4Code-owned.
+- Runtime environment keys win ordinary provider defaults; reserved `BIBCODE_OSC_*` keys remain BiBCode-owned.
 - Preserve PTY output, history, resize, cleanup, and supervision behavior.
 - Use TDD and run the Windows integration test on the current Windows host.
 - `vp check` and `vp run typecheck` must pass before completion.
@@ -381,7 +381,7 @@ let osc_responder = {
 let (output_ready, output_ready_rx) = std::sync::mpsc::sync_channel(0);
 let output_sender = output.clone();
 thread::Builder::new()
-    .name(format!("t4code-pty-output-{pid}"))
+    .name(format!("bibcode-pty-output-{pid}"))
     .spawn(move || {
         let _ = output_ready.send(());
         read_output(&mut reader, &output_sender, osc_responder);
@@ -724,9 +724,9 @@ Expected: both commands exit 0.
 
 - [ ] **Step 4: Perform the Windows desktop smoke check**
 
-1. Set T4Code to Light theme before opening a Codex Terminal.
+1. Set BiBCode to Light theme before opening a Codex Terminal.
 2. Open a new Codex Terminal and verify the composer background is light, not black.
-3. Switch T4Code to Dark and verify the running terminal remains entirely light with the restart notice rather than becoming mixed.
+3. Switch BiBCode to Dark and verify the running terminal remains entirely light with the restart notice rather than becoming mixed.
 4. Activate **Restart to apply** and verify the restarted Codex Terminal is entirely dark.
 5. Repeat Dark → Light.
 6. Open Claude and Cursor terminals and verify they retain live xterm theme updates.

@@ -8,7 +8,7 @@ Keep the bottom of Settings → Diagnostics clear of the persistent status bar a
 
 The Diagnostics page receives enough bottom padding for its final content and focus ring to scroll fully above the status bar at desktop and compact viewport sizes.
 
-A final “Diagnostic logs” section contains a primary `Download logs` button and concise copy explaining that the archive contains redacted server and frontend diagnostics. While a download is being prepared, the button is disabled and shows progress. A successful request starts a browser download named `t4code-diagnostics-<UTC timestamp>.zip`. A failure leaves the page usable and displays an error toast with an actionable message.
+A final “Diagnostic logs” section contains a primary `Download logs` button and concise copy explaining that the archive contains redacted server and frontend diagnostics. While a download is being prepared, the button is disabled and shows progress. A successful request starts a browser download named `bibcode-diagnostics-<UTC timestamp>.zip`. A failure leaves the page usable and displays an error toast with an actionable message.
 
 The same interaction works in the browser-hosted application and the Tauri webview. It downloads logs from the environment represented by the Diagnostics page rather than reading local desktop paths directly.
 
@@ -45,7 +45,7 @@ The body is limited to 512 KiB before decoding. Server log input is limited to t
 A successful response uses:
 
 - `Content-Type: application/zip`;
-- `Content-Disposition: attachment; filename="t4code-diagnostics-<UTC timestamp>.zip"`;
+- `Content-Disposition: attachment; filename="bibcode-diagnostics-<UTC timestamp>.zip"`;
 - `Cache-Control: no-store`; and
 - `X-Content-Type-Options: nosniff`.
 
@@ -76,7 +76,7 @@ Automated coverage includes:
 - the Diagnostics panel renders the final section, disables the button during work, reports failure, and includes bottom clearance; and
 - existing Diagnostics refresh, process-control, trace, and open-folder behaviors remain intact.
 
-Visual verification uses the running browser-hosted React application with isolated T4Code state. Capture before and after screenshots at a desktop viewport and a compact viewport, with the page scrolled to the bottom so status-bar clearance and the new download section are visible. Inspect the browser console, failed requests, and the downloaded ZIP contents after the interaction.
+Visual verification uses the running browser-hosted React application with isolated BiBCode state. Capture before and after screenshots at a desktop viewport and a compact viewport, with the page scrolled to the bottom so status-bar clearance and the new download section are visible. Inspect the browser console, failed requests, and the downloaded ZIP contents after the interaction.
 
 ## Out of Scope
 
