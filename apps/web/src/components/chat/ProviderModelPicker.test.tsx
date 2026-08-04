@@ -56,10 +56,12 @@ vi.mock("../ui/popover", () => ({
   PopoverTrigger: ({
     render,
     children,
+    ...props
   }: {
     render: ReactElement<Record<string, unknown>>;
     children?: ReactNode;
-  }) => cloneElement(render, {}, children),
+    [key: string]: unknown;
+  }) => cloneElement(render, props, children),
   PopoverPopup: ({ children }: { children?: ReactNode }) => <div>{children}</div>,
 }));
 
@@ -72,7 +74,7 @@ vi.mock("../ui/tooltip", () => ({
   }: {
     render: ReactElement<Record<string, unknown>>;
     children?: ReactNode;
-  }) => cloneElement(render, {}, children),
+  }) => cloneElement(render, { "data-tooltip-trigger": true }, children),
 }));
 
 vi.mock("~/lib/utils", () => ({
@@ -212,6 +214,7 @@ describe("ProviderModelPicker", () => {
   it("renders the active instance and selected model", async () => {
     const mounted = await mount(renderPicker());
 
+    expect(mounted.container.querySelector("button[data-tooltip-trigger]")).not.toBeNull();
     expect(mounted.container.querySelector('[data-provider-icon="Codex"]')).toMatchObject({
       dataset: { showBadge: "false", iconClass: "size-4" },
     });

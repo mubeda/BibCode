@@ -245,6 +245,7 @@ import {
   collectUserMessageBlobPreviewUrls,
   createLocalDispatchSnapshot,
   deriveComposerSendState,
+  findLastCancellableDeliveryMessage,
   hasServerAcknowledgedLocalDispatch,
   getStartedThreadModelChangeBlockReason,
   LAST_INVOKED_SCRIPT_BY_PROJECT_KEY,
@@ -762,6 +763,21 @@ function useLocalDispatchState(input: {
     setLocalDispatch(null);
   }, []);
 
+  const localDispatchDeliveryState = (() => {
+    if (
+      !localDispatch ||
+      !input.activeThread ||
+      localDispatch.threadId !== input.activeThread.id ||
+      !localDispatch.messageId
+    ) {
+      return null;
+    }
+    const messageId = localDispatch.messageId;
+    return (
+      input.activeThread.messages.find((message) => message.id === messageId)?.delivery?.state ??
+      null
+    );
+  })();
   const serverAcknowledgedLocalDispatch = useMemo(
     () =>
       hasServerAcknowledgedLocalDispatch({
@@ -772,6 +788,7 @@ function useLocalDispatchState(input: {
         hasPendingApproval: input.activePendingApproval !== null,
         hasPendingUserInput: input.activePendingUserInput !== null,
         threadError: input.threadError,
+        deliveryState: localDispatchDeliveryState,
       }),
     [
       input.activeLatestTurn,
@@ -780,12 +797,16 @@ function useLocalDispatchState(input: {
       input.activeThread?.session,
       input.phase,
       input.threadError,
+      localDispatchDeliveryState,
       localDispatch,
     ],
   );
   const activeLocalDispatch = serverAcknowledgedLocalDispatch ? null : localDispatch;
+  const cancellableDelivery = input.activeThread
+    ? findLastCancellableDeliveryMessage(input.activeThread.messages)
+    : null;
   const beginLocalDispatch = useCallback(
-    (options?: { preparingWorktree?: boolean }) => {
+    (options?: { preparingWorktree?: boolean; threadId?: ThreadId; messageId?: MessageId }) => {
       const preparingWorktree = Boolean(options?.preparingWorktree);
       setLocalDispatch((current) => {
         const active = serverAcknowledgedLocalDispatch ? null : current;
@@ -804,8 +825,11 @@ function useLocalDispatchState(input: {
     beginLocalDispatch,
     resetLocalDispatch,
     localDispatchStartedAt: activeLocalDispatch?.startedAt ?? null,
+    cancellableDeliveryThreadId: cancellableDelivery ? (input.activeThread?.id ?? null) : null,
+    cancellableDeliveryMessageId: cancellableDelivery?.id ?? null,
+    canCancelPendingSend: cancellableDelivery !== null,
     isPreparingWorktree: activeLocalDispatch?.preparingWorktree ?? false,
-    isSendBusy: activeLocalDispatch !== null,
+    isSendBusy: activeLocalDispatch !== null || cancellableDelivery !== null,
   };
 }
 
@@ -2392,6 +2416,9 @@ function ChatViewContent(props: ChatViewProps) {
     beginLocalDispatch,
     resetLocalDispatch,
     localDispatchStartedAt,
+    cancellableDeliveryThreadId,
+    cancellableDeliveryMessageId,
+    canCancelPendingSend,
     isPreparingWorktree,
     isSendBusy,
   } = useLocalDispatchState({
@@ -4772,8 +4799,13 @@ function ChatViewContent(props: ChatViewProps) {
       return;
     }
 
+    const messageIdForSend = newMessageId();
     sendInFlightRef.current = true;
-    beginLocalDispatch({ preparingWorktree: Boolean(baseBranchForWorktree) });
+    beginLocalDispatch({
+      preparingWorktree: Boolean(baseBranchForWorktree),
+      threadId: threadIdForSend,
+      messageId: messageIdForSend,
+    });
 
     const composerAttachmentsSnapshot = [...composerAttachments];
     const composerTerminalContextsSnapshot = [...sendableComposerTerminalContexts];
@@ -4792,7 +4824,6 @@ function ChatViewContent(props: ChatViewProps) {
       messageTextWithPreviewAnnotations,
       composerReviewCommentsSnapshot,
     );
-    const messageIdForSend = newMessageId();
     const messageCreatedAt = new Date().toISOString();
     const outgoingMessageText = formatOutgoingPrompt({
       provider: ctxSelectedProvider,
@@ -4961,7 +4992,11 @@ function ChatViewContent(props: ChatViewProps) {
                 : {}),
             }
           : undefined;
-      beginLocalDispatch({ preparingWorktree: false });
+      beginLocalDispatch({
+        preparingWorktree: false,
+        threadId: threadIdForSend,
+        messageId: messageIdForSend,
+      });
       const legacyDraftFallback = fallbackDraftResolution?.fallback ?? null;
       const warningKey = routeThreadKey;
       if (
@@ -5055,6 +5090,26 @@ function ChatViewContent(props: ChatViewProps) {
   };
 
   const onInterrupt = async () => {
+    if (phase !== "running" && cancellableDeliveryThreadId && cancellableDeliveryMessageId) {
+      const result = await resolveTurnDelivery({
+        environmentId,
+        input: {
+          threadId: cancellableDeliveryThreadId,
+          messageId: cancellableDeliveryMessageId,
+          action: "dismiss",
+        },
+      });
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        const error = squashAtomCommandFailure(result);
+        setThreadError(
+          cancellableDeliveryThreadId,
+          error instanceof Error ? error.message : "Failed to cancel message delivery.",
+        );
+      } else {
+        resetLocalDispatch();
+      }
+      return;
+    }
     if (!activeThread) return;
     const result = await interruptThreadTurn({
       environmentId,
@@ -5295,7 +5350,11 @@ function ChatViewContent(props: ChatViewProps) {
       });
 
       sendInFlightRef.current = true;
-      beginLocalDispatch({ preparingWorktree: false });
+      beginLocalDispatch({
+        preparingWorktree: false,
+        threadId: threadIdForSend,
+        messageId: messageIdForSend,
+      });
       setThreadError(threadIdForSend, null);
 
       // Position this sent row once LegendList has measured the anchored tail.
@@ -5444,6 +5503,7 @@ function ChatViewContent(props: ChatViewProps) {
 
     const createdAt = new Date().toISOString();
     const nextThreadId = newThreadId();
+    const nextMessageId = newMessageId();
     const planMarkdown = activeProposedPlan.planMarkdown;
     const implementationPrompt = buildPlanImplementationPrompt(planMarkdown);
     const outgoingImplementationPrompt = formatOutgoingPrompt({
@@ -5457,7 +5517,11 @@ function ChatViewContent(props: ChatViewProps) {
     const nextThreadModelSelection: ModelSelection = ctxSelectedModelSelection;
 
     sendInFlightRef.current = true;
-    beginLocalDispatch({ preparingWorktree: false });
+    beginLocalDispatch({
+      preparingWorktree: false,
+      threadId: nextThreadId,
+      messageId: nextMessageId,
+    });
     const finish = () => {
       sendInFlightRef.current = false;
       resetLocalDispatch();
@@ -5486,7 +5550,7 @@ function ChatViewContent(props: ChatViewProps) {
         input: {
           threadId: nextThreadId,
           message: {
-            messageId: newMessageId(),
+            messageId: nextMessageId,
             role: "user",
             text: outgoingImplementationPrompt,
             attachments: [],
@@ -6011,6 +6075,7 @@ function ChatViewContent(props: ChatViewProps) {
                       phase={phase}
                       isConnecting={isConnecting}
                       isSendBusy={isSendBusy}
+                      canCancelPendingSend={canCancelPendingSend}
                       isPreparingWorktree={isPreparingWorktree}
                       environmentUnavailable={activeEnvironmentUnavailableState}
                       activePendingApproval={activePendingApproval}

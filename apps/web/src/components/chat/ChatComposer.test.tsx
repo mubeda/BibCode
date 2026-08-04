@@ -1164,6 +1164,10 @@ describe("ChatComposer rendering", () => {
     expect(markup).toContain("Plan");
 
     const toggle = captureByLabel("Button", "Hide plan sidebar");
+    expect(toggle["variant"]).toBe("ghost");
+    expect(toggle["className"]).toContain("bg-foreground/10");
+    expect(toggle["className"]).toContain("dark:bg-foreground/14");
+    expect(toggle["className"]).toContain("text-foreground");
     (toggle["onClick"] as () => void)();
     expect(spies.togglePlanSidebar).toHaveBeenCalledTimes(1);
   });
@@ -1179,14 +1183,19 @@ describe("ChatComposer rendering", () => {
     renderComposer({ interactionMode: "plan" });
     const activePlan = captureByLabel("Button", "Disable plan mode");
     expect(activePlan["aria-pressed"]).toBe(true);
-    expect(activePlan["variant"]).toBe("default");
+    expect(activePlan["variant"]).toBe("ghost");
+    expect(activePlan["className"]).toContain("bg-foreground/10");
+    expect(activePlan["className"]).toContain("dark:bg-foreground/14");
+    expect(activePlan["className"]).toContain("text-foreground");
   });
 
   it("keeps runtime controls icon-only at compact and regular widths", () => {
     const { spies } = renderComposer({ runtimeMode: "auto-accept-edits" });
 
     const runtimeTrigger = captureByLabel("SelectTrigger", "Auto-accept edits");
-    expect(runtimeTrigger["className"]).toContain("bg-primary");
+    expect(runtimeTrigger["className"]).not.toContain("bg-primary");
+    expect(runtimeTrigger["className"]).not.toContain("bg-foreground/");
+    expect(runtimeTrigger["className"]).toContain("text-foreground/80");
     expect(filterCaptures("SelectValue")).toHaveLength(0);
 
     const select = findCapture("Select");

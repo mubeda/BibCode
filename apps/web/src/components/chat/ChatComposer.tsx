@@ -159,6 +159,8 @@ const runtimeModeConfig: Record<
 };
 
 const runtimeModeOptions = Object.keys(runtimeModeConfig) as RuntimeMode[];
+const ACTIVE_CONTROL_CLASSNAME =
+  "border-foreground/12 bg-foreground/10 text-foreground hover:border-foreground/18 hover:bg-foreground/15 hover:text-foreground dark:border-foreground/18 dark:bg-foreground/14 dark:hover:border-foreground/24 dark:hover:bg-foreground/20 [&_svg]:!text-foreground";
 const COMPOSER_FLOATING_LAYER_SELECTOR = [
   '[data-slot="popover-popup"]',
   '[data-slot="menu-popup"]',
@@ -242,12 +244,12 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
       <TooltipTrigger
         render={
           <Button
-            variant={props.interactionMode === "plan" ? "default" : "ghost"}
+            variant="ghost"
             className={cn(
               "shrink-0 px-2",
               props.interactionModeAvailability.state === "supported"
                 ? props.interactionMode === "plan"
-                  ? ""
+                  ? ACTIVE_CONTROL_CLASSNAME
                   : "text-muted-foreground/70 hover:text-foreground/80"
                 : "border border-input bg-background text-muted-foreground/70",
             )}
@@ -291,7 +293,7 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
               <SelectTrigger
                 variant="ghost"
                 size="sm"
-                className="shrink-0 border-primary bg-primary px-2 text-primary-foreground [&_[data-slot=select-icon]]:hidden [&_svg]:text-primary-foreground"
+                className="shrink-0 px-2 text-foreground/80 hover:text-foreground [&_[data-slot=select-icon]]:hidden [&_svg]:text-foreground/80"
                 aria-label={runtimeModeOption.label}
               />
             }
@@ -330,10 +332,12 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
             <TooltipTrigger
               render={
                 <Button
-                  variant={props.planSidebarOpen ? "default" : "ghost"}
+                  variant="ghost"
                   className={cn(
                     "shrink-0 whitespace-nowrap px-2 sm:px-3",
-                    !props.planSidebarOpen && "text-muted-foreground/70 hover:text-foreground/80",
+                    props.planSidebarOpen
+                      ? ACTIVE_CONTROL_CLASSNAME
+                      : "text-muted-foreground/70 hover:text-foreground/80",
                   )}
                   size="sm"
                   type="button"
@@ -369,6 +373,7 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
     isComplete: boolean;
   } | null;
   isRunning: boolean;
+  canCancelPendingSend: boolean;
   showPlanFollowUpPrompt: boolean;
   promptHasText: boolean;
   isSendBusy: boolean;
@@ -415,6 +420,7 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
         compact={props.compact}
         pendingAction={props.pendingAction}
         isRunning={props.isRunning}
+        canCancelPendingSend={props.canCancelPendingSend}
         showPlanFollowUpPrompt={props.showPlanFollowUpPrompt}
         promptHasText={props.promptHasText}
         isSendBusy={props.isSendBusy}
@@ -495,6 +501,7 @@ export interface ChatComposerProps {
   phase: SessionPhase;
   isConnecting: boolean;
   isSendBusy: boolean;
+  canCancelPendingSend?: boolean;
   isPreparingWorktree: boolean;
   environmentUnavailable: {
     readonly label: string;
@@ -605,6 +612,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     phase,
     isConnecting,
     isSendBusy,
+    canCancelPendingSend = false,
     isPreparingWorktree,
     environmentUnavailable,
     activePendingApproval,
@@ -2770,6 +2778,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   activeThreadProviderDisplayName={activeThreadProviderDisplayName}
                   pendingAction={pendingPrimaryAction}
                   isRunning={phase === "running"}
+                  canCancelPendingSend={canCancelPendingSend}
                   showPlanFollowUpPrompt={pendingUserInputs.length === 0 && showPlanFollowUpPrompt}
                   promptHasText={prompt.trim().length > 0}
                   isSendBusy={isSendBusy}

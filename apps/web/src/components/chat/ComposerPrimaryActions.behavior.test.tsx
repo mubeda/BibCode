@@ -5,6 +5,7 @@ import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 const harness = vi.hoisted(() => ({
   buttons: [] as Array<Record<string, unknown>>,
   menuItems: [] as Array<Record<string, unknown>>,
+  tooltipTriggers: [] as Array<ReactElement<Record<string, unknown>>>,
 }));
 
 vi.mock("react", async (importOriginal) => ({
@@ -33,6 +34,16 @@ vi.mock("../ui/menu", () => ({
 }));
 vi.mock("../ui/spinner", () => ({
   Spinner: () => <span data-spinner />,
+}));
+vi.mock("../ui/tooltip", () => ({
+  Tooltip: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  TooltipTrigger: ({ render }: { render: ReactElement<Record<string, unknown>> }) => {
+    harness.tooltipTriggers.push(render);
+    return render;
+  },
+  TooltipPopup: ({ children }: { children: React.ReactNode }) => (
+    <span data-tooltip>{children}</span>
+  ),
 }));
 
 import { ComposerPrimaryActions } from "./ComposerPrimaryActions";
@@ -70,6 +81,7 @@ function invoke(props: Record<string, unknown>, key: string, ...args: unknown[])
 beforeEach(() => {
   harness.buttons.length = 0;
   harness.menuItems.length = 0;
+  harness.tooltipTriggers.length = 0;
   vi.mocked(defaults.onPreviousPendingQuestion).mockReset();
   vi.mocked(defaults.onInterrupt).mockReset();
   vi.mocked(defaults.onImplementPlanInNewThread).mockReset();
@@ -159,16 +171,28 @@ describe("ComposerPrimaryActions", () => {
   });
 
   it("interrupts a running response and preserves composer focus", () => {
-    const { tree, markup } = renderActions({
+    const { markup } = renderActions({
       isRunning: true,
       preserveComposerFocusOnPointerDown: true,
     });
     expect(markup).toContain("Stop generation");
-    const props = tree.props as Record<string, unknown>;
+    const props = harness.tooltipTriggers[0]!.props;
     const preventDefault = vi.fn();
     invoke(props, "onPointerDown", { preventDefault });
     invoke(props, "onClick");
     expect(preventDefault).toHaveBeenCalledOnce();
+    expect(defaults.onInterrupt).toHaveBeenCalledOnce();
+    expect(markup).toContain('<span data-tooltip="true">Stop generation</span>');
+  });
+
+  it("offers cancellation while an admitted message is still sending", () => {
+    const { markup } = renderActions({
+      isSendBusy: true,
+      canCancelPendingSend: true,
+    });
+
+    expect(markup).toContain("Stop generation");
+    invoke(harness.tooltipTriggers[0]!.props, "onClick");
     expect(defaults.onInterrupt).toHaveBeenCalledOnce();
   });
 
@@ -223,21 +247,20 @@ describe("ComposerPrimaryActions", () => {
       { hasSendableContent: false, expected: "Send message" },
     ];
     for (const value of cases) {
-      const { tree, markup } = renderActions(value);
-      expect((tree.props as Record<string, unknown>)["aria-label"]).toBe(value.expected);
+      const { markup } = renderActions(value);
+      expect(markup).toContain(`aria-label="${value.expected}"`);
       const busy = value.isConnecting || value.isSendBusy;
       expect(markup.includes("data-spinner")).toBe(Boolean(busy));
+      expect(markup).toContain(`<span data-tooltip="true">${value.expected}</span>`);
     }
 
     expect(
-      (
-        renderActions({
-          isEnvironmentUnavailable: true,
-          isConnecting: true,
-          isPreparingWorktree: true,
-          isSendBusy: true,
-        }).tree.props as Record<string, unknown>
-      )["aria-label"],
-    ).toBe("Environment disconnected");
+      renderActions({
+        isEnvironmentUnavailable: true,
+        isConnecting: true,
+        isPreparingWorktree: true,
+        isSendBusy: true,
+      }).markup,
+    ).toContain('aria-label="Environment disconnected"');
   });
 });

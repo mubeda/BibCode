@@ -15,7 +15,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     orchestration::{
         CommandAdmission, NewProviderTurnDelivery, OrchestrationCommand, OrchestrationEngine,
-        OrchestrationError, canonical_command_digest, load_snapshot,
+        OrchestrationError, canonical_command_digest, engine::TurnDeliveryResolutionAction,
+        load_snapshot,
     },
     persistence::{OrchestrationEvent, ProjectionThread},
     provider::attachments::{
@@ -27,8 +28,8 @@ use crate::{
 
 use super::orchestration_effects::install_project_command_effects;
 use super::provider_runtime::{
-    ProviderRuntimeSupervisor, canonical_provider_kind, freeze_delivery_route,
-    route_orchestration_command,
+    ProviderRuntimeError, ProviderRuntimeSupervisor, canonical_provider_kind,
+    freeze_delivery_route, route_orchestration_command,
 };
 use super::turn_delivery::TurnDeliveryService;
 
@@ -145,6 +146,16 @@ async fn dispatch_prepared_command(
     payload_digest: String,
     request_tag: String,
 ) -> RpcResult {
+    let delivery_cancellation = match &command {
+        OrchestrationCommand::ThreadTurnDeliveryResolve {
+            command_id,
+            thread_id,
+            action: TurnDeliveryResolutionAction::Dismiss,
+            created_at,
+            ..
+        } => Some((command_id.clone(), thread_id.clone(), created_at.clone())),
+        _ => None,
+    };
     let is_delivery_resolution = matches!(
         command,
         OrchestrationCommand::ThreadTurnDeliveryResolve { .. }
@@ -219,17 +230,32 @@ async fn dispatch_prepared_command(
     if let Some(provider) = provider
         && accepted_new.load(Ordering::Acquire)
         && should_route
-        && !is_delivery_resolution
-        && !route_before_admission
     {
-        route_orchestration_command(
-            &provider.provider,
-            &dispatch,
-            &provider.settings_root,
-            command,
-        )
-        .await
-        .map_err(provider_command_error)?;
+        if let Some((command_id, thread_id, created_at)) = delivery_cancellation {
+            let result = provider
+                .provider
+                .handle_orchestration(OrchestrationCommand::ThreadTurnInterrupt {
+                    command_id: format!("{command_id}:provider-interrupt"),
+                    thread_id,
+                    turn_id: None,
+                    created_at,
+                })
+                .await;
+            if let Err(error) = result
+                && !matches!(error, ProviderRuntimeError::SessionNotFound { .. })
+            {
+                tracing::warn!(%error, "provider interrupt failed after cancelling message delivery");
+            }
+        } else if !is_delivery_resolution && !route_before_admission {
+            route_orchestration_command(
+                &provider.provider,
+                &dispatch,
+                &provider.settings_root,
+                command,
+            )
+            .await
+            .map_err(provider_command_error)?;
+        }
     }
     serde_json::to_value(result).map_err(|error| invalid_request(&request_tag, error.to_string()))
 }

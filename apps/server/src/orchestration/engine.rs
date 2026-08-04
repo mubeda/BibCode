@@ -1232,7 +1232,7 @@ async fn process_envelope(
         }
 
         let detail = format!(
-            "Message '{message_id}' does not have uncertain or failed delivery on thread '{thread_id}'."
+            "Message '{message_id}' does not have a cancellable, uncertain, or failed delivery on thread '{thread_id}'."
         );
         repositories
             .upsert_command_receipt(CommandReceipt {
@@ -2479,7 +2479,13 @@ async fn persist_turn_delivery_resolution(
             let Some((delivery_command_id, provider, state, last_error)) = current else {
                 return Ok(None);
             };
-            if state != "uncertain" && state != "failed" {
+            let resolvable = match action {
+                TurnDeliveryResolutionAction::Retry => state == "uncertain" || state == "failed",
+                TurnDeliveryResolutionAction::Dismiss => {
+                    matches!(state.as_str(), "pending" | "sending" | "uncertain" | "failed")
+                }
+            };
+            if !resolvable {
                 return Ok(None);
             }
 
@@ -2496,7 +2502,7 @@ async fn persist_turn_delivery_resolution(
                     "dismissed",
                     last_error,
                     transaction.execute(
-                        "UPDATE provider_turn_outbox SET state = 'dismissed', updated_at = ? WHERE command_id = ? AND state IN ('uncertain', 'failed')",
+                        "UPDATE provider_turn_outbox SET state = 'dismissed', updated_at = ? WHERE command_id = ? AND state IN ('pending', 'sending', 'uncertain', 'failed')",
                         params![updated_at, delivery_command_id],
                     )?,
                 ),
@@ -4294,10 +4300,7 @@ mod tests {
             result,
             Err(OrchestrationError::InjectedProjectorFailure { .. })
         ));
-        assert_eq!(
-            engine.read_events(0).await.expect("events after").len(),
-            before
-        );
+        assert_eq!(engine.read_events(0).await.expect("events after").len(), before);
         assert!(
             engine
                 .repositories()
@@ -4564,6 +4567,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delivery_resolution_dismiss_cancels_pending_and_sending_messages() {
+        for initial_state in [TurnDeliveryState::Pending, TurnDeliveryState::Sending] {
+            let (engine, thread_id) = delivery_engine(TestHooks::default()).await;
+            admit_delivery(
+                &engine,
+                "delivery-cancel",
+                &thread_id,
+                "delivery-cancel-message",
+                "2026-08-01T00:00:01Z",
+            )
+            .await;
+            if initial_state == TurnDeliveryState::Sending {
+                engine
+                    .repositories()
+                    .claim_provider_turn(
+                        "delivery-cancel".to_owned(),
+                        "2026-08-01T00:00:02Z".to_owned(),
+                    )
+                    .await
+                    .expect("claim cancellation fixture")
+                    .expect("claimed cancellation fixture");
+            }
+
+            engine
+                .dispatch(delivery_resolution(
+                    "delivery-cancel-resolution",
+                    &thread_id,
+                    "delivery-cancel-message",
+                    "dismiss",
+                    "2026-08-01T00:00:03Z",
+                ))
+                .await
+                .expect("cancel admitted delivery");
+
+            let delivery = engine
+                .repositories()
+                .get_provider_turn_delivery("delivery-cancel".to_owned())
+                .await
+                .expect("cancelled delivery")
+                .expect("cancelled delivery row");
+            assert_eq!(delivery.state, TurnDeliveryState::Dismissed);
+            engine.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
     async fn delivery_resolution_projector_failure_rolls_back_transition_and_receipt() {
         let hooks = TestHooks::default();
         let (engine, thread_id) = delivery_engine(hooks.clone()).await;
@@ -4607,7 +4656,10 @@ mod tests {
             result,
             Err(OrchestrationError::InjectedProjectorFailure { .. })
         ));
-        assert_eq!(engine.read_events(0).await.expect("events after").len(), before);
+        assert_eq!(
+            engine.read_events(0).await.expect("events after").len(),
+            before
+        );
         assert!(
             engine
                 .repositories()

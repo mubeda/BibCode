@@ -10,6 +10,7 @@ import {
 import { act, type ReactElement, useEffect, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
+import { TooltipProvider } from "../ui/tooltip";
 
 const testState = vi.hoisted(() => ({
   setProviderModelOptions: vi.fn(),
@@ -590,11 +591,14 @@ describe("TraitsPicker", () => {
       'button[aria-label="Reasoning effort: High"]',
     );
     expect(fastButton?.getAttribute("aria-pressed")).toBe("true");
-    expect(fastButton?.className).toContain("bg-primary");
-    expect(fastButton?.className).toContain("text-primary-foreground");
+    expect(fastButton?.className).not.toContain("bg-primary");
+    expect(fastButton?.className).toContain("bg-foreground/10");
+    expect(fastButton?.className).toContain("dark:bg-foreground/14");
+    expect(fastButton?.className).toContain("text-foreground");
     expect(effortButton).not.toBeNull();
-    expect(effortButton?.className).toContain("bg-primary");
-    expect(effortButton?.className).toContain("text-primary-foreground");
+    expect(effortButton?.getAttribute("aria-pressed")).toBeNull();
+    expect(effortButton?.className).not.toContain("bg-primary");
+    expect(effortButton?.className).toContain("text-foreground/80");
     expect(document.body.textContent).not.toContain("High");
     expect(document.body.textContent).not.toContain("Agent");
     expect(document.body.textContent).not.toContain("reviewer");
@@ -610,6 +614,54 @@ describe("TraitsPicker", () => {
     expect(onModelOptionsChange).toHaveBeenCalledWith(
       expect.arrayContaining([expect.objectContaining({ id: "fastMode", value: false })]),
     );
+  });
+
+  it("renders one reasoning bar per provider effort level", async () => {
+    const claudeEffort = selectDescriptor("effort", "Effort", [
+      { id: "low", label: "Low" },
+      { id: "medium", label: "Medium" },
+      { id: "high", label: "High" },
+      { id: "extra-high", label: "Extra High" },
+      { id: "max", label: "Max" },
+    ]);
+    const codexEffort = selectDescriptor("reasoningEffort", "Reasoning", [
+      { id: "low", label: "Low" },
+      { id: "medium", label: "Medium" },
+      { id: "high", label: "High" },
+      { id: "xhigh", label: "Extra High" },
+    ]);
+
+    await mount(
+      <div>
+        <ComposerTraitControls
+          provider={CLAUDE}
+          models={modelsWith([claudeEffort])}
+          model={MODEL}
+          prompt=""
+          modelOptions={selections(["effort", "max"])}
+          onPromptChange={vi.fn()}
+          onModelOptionsChange={vi.fn()}
+        />
+        <ComposerTraitControls
+          provider={CODEX}
+          models={modelsWith([codexEffort])}
+          model={MODEL}
+          prompt=""
+          modelOptions={selections(["reasoningEffort", "xhigh"])}
+          onPromptChange={vi.fn()}
+          onModelOptionsChange={vi.fn()}
+        />
+      </div>,
+    );
+
+    const claudeBars = document
+      .querySelector<HTMLButtonElement>('button[aria-label="Reasoning effort: Max"]')
+      ?.querySelector('[aria-hidden="true"]')?.children;
+    const codexBars = document
+      .querySelector<HTMLButtonElement>('button[aria-label="Reasoning effort: Extra High"]')
+      ?.querySelector('[aria-hidden="true"]')?.children;
+    expect(claudeBars).toHaveLength(5);
+    expect(codexBars).toHaveLength(4);
   });
 
   it("keeps unavailable Fast and effort focusable with their reason", async () => {
@@ -694,6 +746,47 @@ describe("TraitsPicker", () => {
     expect(onModelOptionsChange).toHaveBeenCalledWith(
       expect.arrayContaining([expect.objectContaining({ id: "serviceTier", value: "default" })]),
     );
+  });
+
+  it("shows tooltips for supported Fast and reasoning controls", async () => {
+    await mount(
+      <TooltipProvider delay={0}>
+        <ComposerTraitControls
+          provider={CLAUDE}
+          models={modelsWith([effort, booleanDescriptor("fastMode", "Fast Mode")])}
+          model={MODEL}
+          prompt=""
+          modelOptions={selections(["effort", "high"], ["fastMode", false])}
+          onPromptChange={vi.fn()}
+          onModelOptionsChange={vi.fn()}
+        />
+      </TooltipProvider>,
+    );
+
+    const fast = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Enable fast mode"]',
+    )!;
+    await act(async () => {
+      fast.focus();
+      await Promise.resolve();
+    });
+    expect(document.body.querySelector('[data-slot="tooltip-popup"]')?.textContent).toContain(
+      "Enable fast mode",
+    );
+
+    fast.blur();
+    const effortControl = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Reasoning effort: High"]',
+    )!;
+    await act(async () => {
+      effortControl.focus();
+      await Promise.resolve();
+    });
+    expect(
+      [...document.body.querySelectorAll('[data-slot="tooltip-popup"]')].some((popup) =>
+        popup.textContent?.includes("Reasoning effort: High"),
+      ),
+    ).toBe(true);
   });
 
   it("turns Codex Fast off with the advertised non-default tier", async () => {

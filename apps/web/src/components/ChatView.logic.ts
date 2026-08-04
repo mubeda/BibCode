@@ -2,6 +2,7 @@ import {
   ACTIVITY_PAGE_MAX_LENGTH,
   type ActivityScopeRef,
   type EnvironmentId,
+  type MessageId,
   isProviderDriverKind,
   ProjectId,
   type ModelSelection,
@@ -510,6 +511,8 @@ export async function waitForStartedServerThread(
 export interface LocalDispatchSnapshot {
   startedAt: string;
   preparingWorktree: boolean;
+  threadId: ThreadId | null;
+  messageId: MessageId | null;
   latestTurnTurnId: TurnId | null;
   latestTurnRequestedAt: string | null;
   latestTurnStartedAt: string | null;
@@ -518,15 +521,27 @@ export interface LocalDispatchSnapshot {
   sessionUpdatedAt: string | null;
 }
 
+export function findLastCancellableDeliveryMessage(
+  messages: ReadonlyArray<ChatMessage>,
+): ChatMessage | null {
+  return (
+    messages.findLast(
+      (message) => message.delivery?.state === "pending" || message.delivery?.state === "sending",
+    ) ?? null
+  );
+}
+
 export function createLocalDispatchSnapshot(
   activeThread: Thread | undefined,
-  options?: { preparingWorktree?: boolean },
+  options?: { preparingWorktree?: boolean; threadId?: ThreadId; messageId?: MessageId },
 ): LocalDispatchSnapshot {
   const latestTurn = activeThread?.latestTurn ?? null;
   const session = activeThread?.session ?? null;
   return {
     startedAt: new Date().toISOString(),
     preparingWorktree: Boolean(options?.preparingWorktree),
+    threadId: options?.threadId ?? activeThread?.id ?? null,
+    messageId: options?.messageId ?? null,
     latestTurnTurnId: latestTurn?.turnId ?? null,
     latestTurnRequestedAt: latestTurn?.requestedAt ?? null,
     latestTurnStartedAt: latestTurn?.startedAt ?? null,
@@ -544,11 +559,19 @@ export function hasServerAcknowledgedLocalDispatch(input: {
   hasPendingApproval: boolean;
   hasPendingUserInput: boolean;
   threadError: string | null | undefined;
+  deliveryState?: NonNullable<ChatMessage["delivery"]>["state"] | null;
 }): boolean {
   if (!input.localDispatch) {
     return false;
   }
   if (input.hasPendingApproval || input.hasPendingUserInput || Boolean(input.threadError)) {
+    return true;
+  }
+  if (
+    input.deliveryState === "failed" ||
+    input.deliveryState === "uncertain" ||
+    input.deliveryState === "dismissed"
+  ) {
     return true;
   }
 
