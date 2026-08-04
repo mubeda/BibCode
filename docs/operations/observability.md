@@ -102,10 +102,11 @@ included in Core:
 - `unavailable`: the adapter could not associate any UI process reliably; and
 - `notApplicable`: the runtime is headless and has no co-located BiBCode UI.
 
-The initial desktop observer reports `unavailable` and states that local UI
-usage is not included. It does not estimate UI usage or claim generic
-`WebContent`, browser, renderer, or executable-name matches. Core still includes
-the native server in this state.
+On Windows, the desktop observer associates WebView2 roots only when they are
+current BiBCode descendants carrying WebView2's embedded-browser marker and the
+running desktop executable name. Their helper descendants inherit Core UI
+ownership. Unsupported platforms report `unavailable`; the observer never
+claims generic browser or renderer executable-name matches.
 
 Production provider and terminal launchers register their root PID, scope,
 kind, and bounded label. The schema reserves the `helper` kind, but no

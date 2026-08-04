@@ -1,3 +1,14 @@
+use bibcode_server::diagnostics::{
+    DesktopUiProcessObserver, UnavailableDesktopUiProcessObserver,
+};
+#[cfg(windows)]
+use bibcode_server::diagnostics::WebView2DesktopUiProcessObserver;
+use bibcode_server::process::{configure_background_command, configure_background_std_command};
+use bibcode_server::{
+    DESKTOP_SHUTDOWN_PATH as SERVER_BACKEND_SHUTDOWN_PATH,
+    DESKTOP_SHUTDOWN_TOKEN_HEADER as SERVER_BACKEND_SHUTDOWN_TOKEN_HEADER, ServerConfig,
+    ServerRuntime,
+};
 use serde_json::{Value, json};
 use std::{
     collections::BTreeMap,
@@ -11,13 +22,6 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
     time::{Duration, Instant},
-};
-use bibcode_server::diagnostics::UnavailableDesktopUiProcessObserver;
-use bibcode_server::process::{configure_background_command, configure_background_std_command};
-use bibcode_server::{
-    DESKTOP_SHUTDOWN_PATH as SERVER_BACKEND_SHUTDOWN_PATH,
-    DESKTOP_SHUTDOWN_TOKEN_HEADER as SERVER_BACKEND_SHUTDOWN_TOKEN_HEADER, ServerConfig,
-    ServerRuntime,
 };
 use tauri::{AppHandle, Emitter, Runtime};
 use tokio::{
@@ -1083,7 +1087,7 @@ async fn start_managed_backend(
             let server_config = server_config_for_launch(base_dir.clone(), &plan.config);
             let handle = ServerRuntime::start_with_ui_process_observer(
                 server_config,
-                Arc::new(UnavailableDesktopUiProcessObserver),
+                desktop_ui_process_observer(),
             )
             .await
             .map_err(|error| format!("Could not start in-process desktop backend: {error}"))?;
@@ -1146,6 +1150,18 @@ async fn start_managed_backend(
             ))
         }
     }
+}
+
+fn desktop_ui_process_observer() -> Arc<dyn DesktopUiProcessObserver> {
+    #[cfg(windows)]
+    if let Some(executable_name) = std::env::current_exe().ok().and_then(|path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+    }) {
+        return Arc::new(WebView2DesktopUiProcessObserver::new(executable_name));
+    }
+
+    Arc::new(UnavailableDesktopUiProcessObserver)
 }
 
 fn server_config_for_launch(base_dir: PathBuf, config: &BackendRunConfig) -> ServerConfig {
