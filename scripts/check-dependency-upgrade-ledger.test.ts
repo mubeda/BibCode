@@ -267,6 +267,22 @@ describe("dependency upgrade ledger discovery", () => {
     );
   });
 
+  it("ignores dependencies from local Git worktrees", () => {
+    const root = createRepositoryFixture();
+    const worktreeDirectory = NodePath.join(root, ".worktrees/example");
+    NodeFS.mkdirSync(worktreeDirectory, { recursive: true });
+    NodeFS.writeFileSync(
+      NodePath.join(worktreeDirectory, "package.json"),
+      JSON.stringify({ dependencies: { "worktree-only-dependency": "1.0.0" } }),
+    );
+
+    const inventory = discoverDependencyInventory(root);
+
+    expect(inventory.entries.some((entry) => entry.name === "worktree-only-dependency")).toBe(
+      false,
+    );
+  });
+
   it("discovers registry crates, fixture-only crates, and the local path crate", () => {
     const root = createRepositoryFixture();
     const inventory = discoverDependencyInventory(root);

@@ -5,7 +5,6 @@ import { Popover as PopoverPrimitive } from "@base-ui/react/popover";
 import { cn } from "~/lib/utils";
 
 const PopoverCreateHandle = PopoverPrimitive.createHandle;
-
 const Popover = PopoverPrimitive.Root;
 
 function PopoverTrigger({ className, children, ...props }: PopoverPrimitive.Trigger.Props) {
@@ -37,7 +36,7 @@ function PopoverPopup({
   anchor?: PopoverPrimitive.Positioner.Props["anchor"];
 }) {
   return (
-    <PopoverPrimitive.Portal>
+    <PopoverPrimitive.Portal keepMounted>
       <PopoverPrimitive.Positioner
         align={align}
         alignOffset={alignOffset}
@@ -57,18 +56,16 @@ function PopoverPopup({
           data-slot="popover-popup"
           {...props}
         >
-          <PopoverPrimitive.Viewport
+          <div
             className={cn(
-              "relative size-full max-h-(--available-height) overflow-clip px-(--viewport-inline-padding) py-4 [--viewport-inline-padding:--spacing(4)] has-data-[slot=calendar]:p-2 data-instant:transition-none **:data-current:data-ending-style:opacity-0 **:data-current:data-starting-style:opacity-0 **:data-previous:data-ending-style:opacity-0 **:data-previous:data-starting-style:opacity-0 **:data-current:w-[calc(var(--popup-width)-2*var(--viewport-inline-padding)-2px)] **:data-previous:w-[calc(var(--popup-width)-2*var(--viewport-inline-padding)-2px)] **:data-current:opacity-100 **:data-previous:opacity-100 **:data-current:transition-opacity **:data-previous:transition-opacity",
-              tooltipStyle
-                ? "py-1 [--viewport-inline-padding:--spacing(2)]"
-                : "not-data-transitioning:overflow-y-auto",
+              "relative size-full max-h-(--available-height) overflow-clip px-(--viewport-inline-padding) py-4 [--viewport-inline-padding:--spacing(4)] has-data-[slot=calendar]:p-2",
+              tooltipStyle ? "py-1 [--viewport-inline-padding:--spacing(2)]" : "overflow-y-auto",
               viewportClassName,
             )}
             data-slot="popover-viewport"
           >
             {children}
-          </PopoverPrimitive.Viewport>
+          </div>
         </PopoverPrimitive.Popup>
       </PopoverPrimitive.Positioner>
     </PopoverPrimitive.Portal>

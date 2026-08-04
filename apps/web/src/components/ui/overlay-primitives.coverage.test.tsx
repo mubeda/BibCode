@@ -313,7 +313,7 @@ describe("menu, popover, and select wrappers", () => {
   });
 
   it("renders popover tooltip and viewport variants", () => {
-    render(
+    const markup = render(
       <Popover open>
         <PopoverTrigger>Open</PopoverTrigger>
         <PopoverPopup viewportClassName="viewport">Default</PopoverPopup>
@@ -334,7 +334,8 @@ describe("menu, popover, and select wrappers", () => {
     );
 
     expect(propsFor("Positioner")).toHaveLength(2);
-    expect(propsFor("Viewport")[1]?.className).toContain("tooltip-viewport");
+    expect(propsFor("Portal").every((props) => props.keepMounted === true)).toBe(true);
+    expect(markup).toContain("tooltip-viewport");
     expect(propsFor("Popup")[1]?.className).toContain("w-fit");
   });
 
