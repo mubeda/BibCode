@@ -60,7 +60,7 @@ const h = vi.hoisted(() => {
     stopRecordingResult: { path: "/rec.webm" } as unknown,
     stopRecordingRejects: false,
     addPreviewAnnotationCalls: [] as unknown[],
-    addImageCalls: [] as unknown[],
+    addAttachmentCalls: [] as unknown[],
     screenshotFile: null as unknown,
     // bus subscriptions
     previewActionSubscribers: [] as Array<(action: string) => void>,
@@ -115,7 +115,7 @@ vi.mock("~/composerDraftStore", () => ({
   useComposerDraftStore: (selector: (store: Record<string, unknown>) => unknown) =>
     selector({
       addPreviewAnnotation: (...args: unknown[]) => h.addPreviewAnnotationCalls.push(args),
-      addImage: (...args: unknown[]) => h.addImageCalls.push(args),
+      addAttachment: (...args: unknown[]) => h.addAttachmentCalls.push(args),
     }),
 }));
 
@@ -543,7 +543,7 @@ beforeEach(() => {
   h.stopRecordingResult = { path: "/rec.webm" };
   h.stopRecordingRejects = false;
   h.addPreviewAnnotationCalls.length = 0;
-  h.addImageCalls.length = 0;
+  h.addAttachmentCalls.length = 0;
   h.screenshotFile = null;
   h.previewActionSubscribers.length = 0;
   h.viewportChangeSubscriptions.length = 0;
@@ -1147,7 +1147,7 @@ describe("handlePickElement", () => {
 
     expect(bridgeMethodCalls("pickElement")).toHaveLength(1);
     expect(h.addPreviewAnnotationCalls).toHaveLength(1);
-    expect(h.addImageCalls).toHaveLength(1);
+    expect(h.addAttachmentCalls).toHaveLength(1);
     // pickActive was toggled on then off.
     expect(h.setStateCalls.some((c) => c.applied === true)).toBe(true);
     expect(h.setStateCalls.some((c) => c.applied === false)).toBe(true);

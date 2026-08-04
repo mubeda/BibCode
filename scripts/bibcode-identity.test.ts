@@ -84,9 +84,11 @@ const compatibilityFiles = new Set([
   "packages/shared/src/environmentIdentity.ts",
   "packages/shared/src/relayJwt.test.ts",
   "packages/shared/src/relayJwt.ts",
+  "README.md",
   "scripts/build-desktop-artifact.test.ts",
   "scripts/lib/public-config.test.ts",
   "scripts/lib/public-config.ts",
+  "docs/superpowers/specs/2026-08-01-provider-maintenance-rust-design.md",
 ]);
 
 function projectFiles(): string[] {

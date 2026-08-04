@@ -71,6 +71,7 @@ const h = vi.hoisted(() => {
     runningTerminalIds: [] as string[],
     queryDataByKey: new Map<string, unknown>(),
     assetUrls: [] as string[],
+    assetResources: [] as unknown[],
     previewSupported: false,
     previewState: {} as Record<string, unknown>,
     settings: {} as Record<string, unknown>,
@@ -159,6 +160,7 @@ vi.mock("../state/threads", () => ({
     setInteractionMode: { key: "thread.setInteractionMode" },
     startTurn: { key: "thread.startTurn" },
     interruptTurn: { key: "thread.interruptTurn" },
+    resolveDelivery: { key: "thread.resolveDelivery" },
     respondToApproval: { key: "thread.respondToApproval" },
     respondToUserInput: { key: "thread.respondToUserInput" },
     revertCheckpoint: { key: "thread.revertCheckpoint" },
@@ -251,7 +253,10 @@ vi.mock("../hooks/useSettings", () => ({
 }));
 
 vi.mock("../assets/assetUrls", () => ({
-  useAssetUrls: () => h.assetUrls,
+  useAssetUrls: (_environmentId: unknown, resources: unknown[]) => {
+    h.assetResources = resources;
+    return h.assetUrls;
+  },
 }));
 
 vi.mock("../previewStateStore", () => ({
@@ -857,7 +862,7 @@ function composerHandle(overrides: Partial<ChatComposerHandle> = {}): ChatCompos
     addTerminalContext: () => undefined,
     getSendContext: () => ({
       prompt: "",
-      images: [],
+      attachments: [],
       terminalContexts: [],
       elementContexts: [],
       previewAnnotations: [],
@@ -950,7 +955,7 @@ function seedOwnedComposerContexts(
 ): void {
   const store = useComposerDraftStore.getState();
   store.setPrompt(threadRef, actionText);
-  store.addImages(threadRef, [contexts.image]);
+  store.addAttachments(threadRef, [contexts.image]);
   store.setTerminalContexts(threadRef, [contexts.terminalContext]);
   store.setElementContexts(threadRef, [contexts.elementContext]);
   store.setPreviewAnnotations(threadRef, [contexts.previewAnnotation]);
@@ -962,7 +967,7 @@ function sendContextWithOwnedComposerContexts(
 ): ReturnType<ChatComposerHandle["getSendContext"]> {
   return {
     ...composerHandle().getSendContext(),
-    images: [contexts.image],
+    attachments: [contexts.image],
     terminalContexts: [contexts.terminalContext],
     elementContexts: [contexts.elementContext],
     previewAnnotations: [contexts.previewAnnotation],
@@ -1229,6 +1234,7 @@ beforeEach(() => {
   h.runningTerminalIds = [];
   h.queryDataByKey.clear();
   h.assetUrls = [];
+  h.assetResources = [];
   h.previewSupported = false;
   h.previewState = {
     snapshot: null,
@@ -1287,6 +1293,46 @@ beforeEach(() => {
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+});
+
+describe("ChatView attachment assets", () => {
+  it("requests server asset URLs only for image attachments", () => {
+    seedConnectedServerThread(
+      makeThread({
+        messages: [
+          {
+            id: MessageId.make("image-message"),
+            role: "user",
+            text: "",
+            attachments: [
+              {
+                type: "image",
+                id: "image-attachment",
+                name: "shot.png",
+                mimeType: "image/png",
+                sizeBytes: 1,
+              },
+              {
+                type: "file",
+                id: "file-attachment",
+                name: "notes.txt",
+                mimeType: "text/plain",
+                sizeBytes: 1,
+              },
+            ],
+            turnId: null,
+            createdAt: now,
+            updatedAt: now,
+            streaming: false,
+          },
+        ],
+      }),
+    );
+
+    renderServerRoute();
+
+    expect(h.assetResources).toEqual([{ _tag: "attachment", attachmentId: "image-attachment" }]);
+  });
 });
 
 describe("ChatView center panel variant", () => {
@@ -3363,7 +3409,7 @@ describe("ChatView send flows", () => {
 
       const store = useComposerDraftStore.getState();
       store.setPrompt(threadRef, actionText);
-      store.addImages(threadRef, [image]);
+      store.addAttachments(threadRef, [image]);
       store.setTerminalContexts(threadRef, [terminalContext]);
       store.setElementContexts(threadRef, [elementContext]);
       store.setPreviewAnnotations(threadRef, [previewAnnotation]);
@@ -3374,7 +3420,7 @@ describe("ChatView send flows", () => {
         resetCursorState,
         getSendContext: () => ({
           ...composerHandle().getSendContext(),
-          images: [image],
+          attachments: [image],
           terminalContexts: [terminalContext],
           elementContexts: [elementContext],
           previewAnnotations: [previewAnnotation],
@@ -3391,7 +3437,7 @@ describe("ChatView send flows", () => {
       expect(revokeObjectUrl).toHaveBeenCalledWith("blob:colon-action");
       expect(useComposerDraftStore.getState().getComposerDraft(threadRef)).toMatchObject({
         prompt: "",
-        images: [],
+        attachments: [],
         terminalContexts: [],
         elementContexts: [],
         previewAnnotations: [],
@@ -3558,7 +3604,7 @@ describe("ChatView send flows", () => {
     const { promptRef } = installComposerHandle({
       getSendContext: () => ({
         ...composerHandle().getSendContext(),
-        images: [image],
+        attachments: [image],
       }),
     });
     promptRef.current = "";
@@ -3576,6 +3622,44 @@ describe("ChatView send flows", () => {
     };
     expect(input.input.titleSeed).toBe("Image: shot.png");
     expect(input.input.message.attachments[0]!.dataUrl).toBe("data:image/png;base64,ZmFrZQ==");
+  });
+
+  it("sends file attachments with their id and a file title seed", async () => {
+    class FakeFileReader {
+      result = "data:text/plain;base64,bm90ZQ==";
+      addEventListener(type: string, handler: () => void) {
+        if (type === "load") handler();
+      }
+      readAsDataURL(_file: unknown) {}
+    }
+    vi.stubGlobal("FileReader", FakeFileReader);
+
+    seedConnectedServerThread();
+    renderServerRoute();
+    const file = {
+      type: "file" as const,
+      id: "file-1" as ChatAttachmentId,
+      name: "notes.txt",
+      mimeType: "text/plain",
+      sizeBytes: 4,
+      file: new File(["note"], "notes.txt", { type: "text/plain" }),
+    };
+    const { promptRef } = installComposerHandle({
+      getSendContext: () => ({
+        ...composerHandle().getSendContext(),
+        attachments: [file],
+      }),
+    });
+    promptRef.current = "";
+
+    await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
+
+    expect(commandCallsFor("thread.startTurn")[0]?.input).toMatchObject({
+      input: {
+        titleSeed: "File: notes.txt",
+        message: { attachments: [{ type: "file", id: "file-1" }] },
+      },
+    });
   });
 
   it("uses terminal and element context labels as attachment-only title seeds", async () => {
@@ -3720,7 +3804,7 @@ describe("ChatView send flows", () => {
       expect(revokeObjectUrl).toHaveBeenCalledWith(contexts.image.previewUrl);
       const clearedDraft = useComposerDraftStore.getState().getComposerDraft(threadRef);
       expect(clearedDraft?.prompt ?? "").toBe("");
-      expect(clearedDraft?.images ?? []).toEqual([]);
+      expect(clearedDraft?.attachments ?? []).toEqual([]);
       expect(clearedDraft?.terminalContexts ?? []).toEqual([]);
       expect(clearedDraft?.elementContexts ?? []).toEqual([]);
       expect(clearedDraft?.previewAnnotations ?? []).toEqual([]);
@@ -3751,7 +3835,7 @@ describe("ChatView send flows", () => {
     expect(revokeObjectUrl).toHaveBeenCalledWith(contexts.image.previewUrl);
     expect(useComposerDraftStore.getState().getComposerDraft(threadRef)).toMatchObject({
       prompt: "",
-      images: [],
+      attachments: [],
       terminalContexts: [],
       elementContexts: [],
       previewAnnotations: [],
@@ -4173,6 +4257,107 @@ describe("ChatView pending user input", () => {
         "Failed to submit user input.",
       ]),
     );
+  });
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// Turn delivery resolution
+// ─────────────────────────────────────────────────────────────────────
+
+describe("ChatView turn delivery resolution", () => {
+  const deliveryMessageId = MessageId.make("message-delivery-1");
+
+  function seedUncertainDelivery() {
+    seedConnectedServerThread(
+      makeThread({
+        messages: [
+          {
+            id: deliveryMessageId,
+            role: "user",
+            text: "send once",
+            turnId: null,
+            createdAt: now,
+            updatedAt: now,
+            streaming: false,
+            delivery: {
+              state: "uncertain",
+              provider: ProviderDriverKind.make("claudeAgent"),
+              detail: "connection closed before acknowledgement",
+            },
+          },
+        ],
+      }),
+    );
+  }
+
+  it("confirms an uncertain retry before dispatching the message-scoped action", async () => {
+    seedUncertainDelivery();
+    const confirms: string[] = [];
+    h.localApi = {
+      dialogs: {
+        confirm: (message: string) => {
+          confirms.push(message);
+          return Promise.resolve(true);
+        },
+      },
+    };
+    renderServerRoute();
+
+    const callback = capturedProps("messagesTimeline")["onResolveTurnDelivery"];
+    expect(callback).toBeTypeOf("function");
+    await (callback as (messageId: MessageId, action: "retry" | "dismiss") => Promise<void>)(
+      deliveryMessageId,
+      "retry",
+    );
+
+    expect(confirms).toHaveLength(1);
+    expect(confirms[0]).toContain("Claude may receive a duplicate");
+    expect(commandCallsFor("thread.resolveDelivery")).toEqual([
+      {
+        key: "thread.resolveDelivery",
+        input: {
+          environmentId,
+          input: { threadId, messageId: deliveryMessageId, action: "retry" },
+        },
+      },
+    ]);
+  });
+
+  it("dismisses without duplicate confirmation and marks only the matching command pending", async () => {
+    seedUncertainDelivery();
+    const confirm = vi.fn(() => Promise.resolve(true));
+    h.localApi = { dialogs: { confirm } };
+    renderServerRoute();
+
+    const callback = capturedProps("messagesTimeline")["onResolveTurnDelivery"];
+    expect(callback).toBeTypeOf("function");
+    await (callback as (messageId: MessageId, action: "retry" | "dismiss") => Promise<void>)(
+      deliveryMessageId,
+      "dismiss",
+    );
+
+    expect(confirm).not.toHaveBeenCalled();
+    expect(commandCallsFor("thread.resolveDelivery")[0]?.input).toEqual({
+      environmentId,
+      input: { threadId, messageId: deliveryMessageId, action: "dismiss" },
+    });
+    expect(h.setStateCalls.some((call) => call.applied === deliveryMessageId)).toBe(true);
+    expect(h.setStateCalls.at(-1)?.applied).toBeNull();
+  });
+
+  it("does not retry uncertain delivery when duplicate confirmation is declined", async () => {
+    seedUncertainDelivery();
+    h.localApi = { dialogs: { confirm: () => Promise.resolve(false) } };
+    renderServerRoute();
+
+    const callback = capturedProps("messagesTimeline")["onResolveTurnDelivery"];
+    expect(callback).toBeTypeOf("function");
+    await (callback as (messageId: MessageId, action: "retry" | "dismiss") => Promise<void>)(
+      deliveryMessageId,
+      "retry",
+    );
+
+    expect(commandCallsFor("thread.resolveDelivery")).toHaveLength(0);
   });
 });
 

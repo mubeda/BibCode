@@ -8,6 +8,7 @@ use sha2::Sha256;
 use thiserror::Error;
 
 use crate::project::ProjectFaviconResolver;
+use crate::provider::attachments::AttachmentMaterializer;
 use crate::workspace::{WorkspaceError, paths};
 
 pub const ASSET_ROUTE_PREFIX: &str = "/api/assets";
@@ -72,7 +73,7 @@ pub enum AssetError {
 #[derive(Clone)]
 pub struct AssetAccess {
     secret: Vec<u8>,
-    attachments_dir: PathBuf,
+    attachments: AttachmentMaterializer,
     ttl: Duration,
     favicon_resolver: ProjectFaviconResolver,
 }
@@ -85,7 +86,7 @@ impl AssetAccess {
     pub fn with_ttl(secret: Vec<u8>, attachments_dir: PathBuf, ttl: Duration) -> Self {
         Self {
             secret,
-            attachments_dir,
+            attachments: AttachmentMaterializer::new(attachments_dir),
             ttl,
             favicon_resolver: ProjectFaviconResolver,
         }
@@ -129,14 +130,14 @@ impl AssetAccess {
                 (claims, file_name(&file))
             }
             AssetResource::Attachment { attachment_id } => {
-                let file = self.attachments_dir.join(&attachment_id);
-                let metadata = tokio::fs::metadata(&file).await.ok();
-                if !metadata.is_some_and(|metadata| metadata.is_file()) {
-                    return Err(AssetError::NotFound(attachment_id));
-                }
+                let file = self
+                    .attachments
+                    .resolve_existing_file(&attachment_id)
+                    .await
+                    .map_err(|_| AssetError::NotFound(attachment_id.clone()))?;
                 (
                     Claims::Attachment {
-                        path: file.clone(),
+                        attachment_id,
                         expires_at,
                     },
                     file_name(&file),
@@ -196,9 +197,15 @@ impl AssetAccess {
                     .ok()
                     .map(|(path, _)| ResolvedAsset::File(path))
             }
-            Claims::Attachment { path, .. } => {
-                let metadata = tokio::fs::metadata(&path).await.ok()?;
-                metadata.is_file().then_some(ResolvedAsset::File(path))
+            Claims::Attachment { attachment_id, .. } => {
+                if requested_path != attachment_id {
+                    return None;
+                }
+                self.attachments
+                    .resolve_existing_file(&attachment_id)
+                    .await
+                    .ok()
+                    .map(ResolvedAsset::File)
             }
             Claims::ProjectFavicon { root, relative, .. } => match relative {
                 Some(relative) => canonical_workspace_file(&root, &relative)
@@ -250,7 +257,7 @@ enum Claims {
         expires_at: u64,
     },
     Attachment {
-        path: PathBuf,
+        attachment_id: String,
         expires_at: u64,
     },
     ProjectFavicon {
@@ -474,5 +481,65 @@ mod tests {
         for token in ["", "missing-dot", "bad.%%%", "%%%.bad"] {
             assert_eq!(access.resolve(token, "style.css").await, None);
         }
+    }
+
+    #[tokio::test]
+    async fn attachment_urls_reject_untrusted_ids_and_linked_leaves() {
+        let state = tempfile::tempdir().unwrap();
+        let attachments = state.path().join("attachments");
+        tokio::fs::create_dir(&attachments).await.unwrap();
+        tokio::fs::write(state.path().join("state.sqlite"), b"database secret")
+            .await
+            .unwrap();
+        let absolute = state.path().join("absolute-secret");
+        tokio::fs::write(&absolute, b"absolute secret")
+            .await
+            .unwrap();
+        let overlong = "a".repeat(129);
+        tokio::fs::write(attachments.join(&overlong), b"long id secret")
+            .await
+            .unwrap();
+        let access = AssetAccess::new(vec![6; 32], attachments.clone());
+
+        for attachment_id in [
+            "../state.sqlite".to_owned(),
+            absolute.to_string_lossy().into_owned(),
+            "NUL".to_owned(),
+            overlong,
+        ] {
+            assert!(
+                access
+                    .issue(AssetIssueRequest {
+                        resource: AssetResource::Attachment { attachment_id },
+                        workspace_root: None,
+                    })
+                    .await
+                    .is_err(),
+                "an untrusted attachment id must never receive a signed URL"
+            );
+        }
+
+        let outside = state.path().join("linked-secret");
+        #[cfg(unix)]
+        tokio::fs::write(&outside, b"linked secret").await.unwrap();
+        #[cfg(windows)]
+        tokio::fs::create_dir(&outside).await.unwrap();
+        let linked = attachments.join("linked");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+        #[cfg(windows)]
+        junction::create(&outside, &linked).expect("attachment leaf junction");
+        assert!(
+            access
+                .issue(AssetIssueRequest {
+                    resource: AssetResource::Attachment {
+                        attachment_id: "linked".to_owned(),
+                    },
+                    workspace_root: None,
+                })
+                .await
+                .is_err(),
+            "a linked attachment leaf must never receive a signed URL"
+        );
     }
 }

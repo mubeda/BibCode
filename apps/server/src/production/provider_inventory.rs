@@ -1530,6 +1530,9 @@ fn snapshot_owned_message(
     if let Some(message) = message {
         result["message"] = json!(message);
     }
+    if definition.driver == "codex" {
+        result["supportsMcpStatus"] = json!(true);
+    }
     result
 }
 
@@ -1698,6 +1701,47 @@ mod tests {
         assert_eq!(inventory.len(), 1);
         assert_eq!(inventory[0]["name"], "refactor");
         assert_eq!(inventory[0]["invocation"], "dollar");
+    }
+
+    #[test]
+    fn only_codex_inventory_advertises_mcp_status() {
+        let definitions = definitions(&json!({
+            "providerInstances": {
+                "codex": { "driver": "codex", "enabled": true, "config": {} },
+                "claude": { "driver": "claudeAgent", "enabled": true, "config": {} }
+            }
+        }));
+        let codex = snapshot_owned_message(
+            definitions
+                .iter()
+                .find(|definition| definition.driver == "codex")
+                .expect("Codex definition"),
+            true,
+            None,
+            "ready",
+            json!({ "status": "authenticated" }),
+            Vec::new(),
+            ProviderCapabilities::default(),
+            None,
+            "2026-08-01T00:00:00.000Z".to_owned(),
+        );
+        let claude = snapshot_owned_message(
+            definitions
+                .iter()
+                .find(|definition| definition.driver == "claudeAgent")
+                .expect("Claude definition"),
+            true,
+            None,
+            "ready",
+            json!({ "status": "authenticated" }),
+            Vec::new(),
+            ProviderCapabilities::default(),
+            None,
+            "2026-08-01T00:00:00.000Z".to_owned(),
+        );
+
+        assert_eq!(codex["supportsMcpStatus"], true);
+        assert!(claude.get("supportsMcpStatus").is_none());
     }
 
     #[test]

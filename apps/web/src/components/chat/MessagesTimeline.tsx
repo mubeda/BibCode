@@ -31,7 +31,7 @@ import {
   workEntryIndicatesToolSuccess,
   workLogEntryIsToolLike,
 } from "../../session-logic";
-import { type TurnDiffSummary } from "../../types";
+import { type TurnDeliveryResolutionAction, type TurnDiffSummary } from "../../types";
 import { summarizeTurnDiffStats } from "../../lib/turnDiffTree";
 import {
   getRenderablePatch,
@@ -46,6 +46,7 @@ import {
   ChevronRightIcon,
   CircleAlertIcon,
   EyeIcon,
+  FileIcon,
   GlobeIcon,
   HammerIcon,
   MessageCircleIcon,
@@ -65,6 +66,7 @@ import { ProposedPlanCard } from "./ProposedPlanCard";
 import { ChangedFilesTree } from "./ChangedFilesTree";
 import { DiffStatLabel, hasNonZeroStat } from "./DiffStatLabel";
 import { MessageCopyButton } from "./MessageCopyButton";
+import { TurnDeliveryNotice } from "./TurnDeliveryNotice";
 import {
   computeStableMessagesTimelineRows,
   deriveMessagesTimelineRows,
@@ -98,6 +100,7 @@ import { cn } from "~/lib/utils";
 import { useUiStateStore } from "~/uiStateStore";
 import { type TimestampFormat } from "@bibcode/contracts/settings";
 import { formatChatTimestampTooltip, formatShortTimestamp } from "../../timestampFormat";
+import { formatMemoryBytes as formatBytes } from "../status-bar/statusBarFormat";
 
 import {
   buildInlineTerminalContextText,
@@ -130,6 +133,8 @@ interface TimelineRowSharedState {
   skills: ReadonlyArray<Pick<ServerProviderSkill, "name" | "displayName">>;
   activeThreadEnvironmentId: EnvironmentId;
   onRevertUserMessage: (messageId: MessageId) => void;
+  onResolveTurnDelivery: (messageId: MessageId, action: TurnDeliveryResolutionAction) => void;
+  resolvingTurnDeliveryMessageId: MessageId | null;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
   onToggleTurnFold: (turnId: TurnId) => void;
@@ -165,6 +170,8 @@ interface MessagesTimelineProps {
   onOpenTurnDiff: (turnId: TurnId, filePath?: string) => void;
   revertTurnCountByUserMessageId: Map<MessageId, number>;
   onRevertUserMessage: (messageId: MessageId) => void;
+  onResolveTurnDelivery: (messageId: MessageId, action: TurnDeliveryResolutionAction) => void;
+  resolvingTurnDeliveryMessageId: MessageId | null;
   isRevertingCheckpoint: boolean;
   onImageExpand: (preview: ExpandedImagePreview) => void;
   activeThreadEnvironmentId: EnvironmentId;
@@ -198,6 +205,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
   onOpenTurnDiff,
   revertTurnCountByUserMessageId,
   onRevertUserMessage,
+  onResolveTurnDelivery,
+  resolvingTurnDeliveryMessageId,
   isRevertingCheckpoint,
   onImageExpand,
   activeThreadEnvironmentId,
@@ -417,6 +426,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       skills,
       activeThreadEnvironmentId,
       onRevertUserMessage,
+      onResolveTurnDelivery,
+      resolvingTurnDeliveryMessageId,
       onImageExpand,
       onOpenTurnDiff,
       onToggleTurnFold,
@@ -431,6 +442,8 @@ export const MessagesTimeline = memo(function MessagesTimeline({
       skills,
       activeThreadEnvironmentId,
       onRevertUserMessage,
+      onResolveTurnDelivery,
+      resolvingTurnDeliveryMessageId,
       onImageExpand,
       onOpenTurnDiff,
       onToggleTurnFold,
@@ -844,8 +857,23 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
     ...displayedUserMessage.elementContexts,
     ...elementContextState.contexts,
   ];
-  const previewImages = userImages.filter((image) => image.name.startsWith("preview-annotation-"));
-  const regularImages = userImages.filter((image) => !image.name.startsWith("preview-annotation-"));
+  const previewImages = userImages.filter(
+    (
+      attachment,
+    ): attachment is Extract<
+      NonNullable<TimelineMessage["attachments"]>[number],
+      { type: "image" }
+    > => attachment.type === "image" && attachment.name.startsWith("preview-annotation-"),
+  );
+  const regularImages = userImages.filter(
+    (
+      attachment,
+    ): attachment is Extract<
+      NonNullable<TimelineMessage["attachments"]>[number],
+      { type: "image" }
+    > => attachment.type === "image" && !attachment.name.startsWith("preview-annotation-"),
+  );
+  const regularFiles = userImages.filter((attachment) => attachment.type === "file");
   const canRevertAgentWork = typeof row.revertTurnCount === "number";
 
   return (
@@ -853,7 +881,7 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
       <div className="relative max-w-[80%] rounded-2xl border border-border bg-secondary p-3">
         {regularImages.length > 0 && (
           <div className="mb-2 grid max-w-[420px] grid-cols-2 gap-2">
-            {regularImages.map((image: NonNullable<TimelineMessage["attachments"]>[number]) => (
+            {regularImages.map((image) => (
               <div
                 key={image.id}
                 className="overflow-hidden rounded-lg border border-border/80 bg-background/70"
@@ -884,6 +912,22 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
             ))}
           </div>
         )}
+        {regularFiles.length > 0 && (
+          <div className="mb-2 flex flex-wrap gap-2">
+            {regularFiles.map((file) => (
+              <div
+                key={file.id}
+                className="flex min-w-44 items-center gap-2 rounded-lg border border-border/80 bg-background/70 px-2 py-1.5"
+              >
+                <FileIcon className="size-4 shrink-0 text-muted-foreground" />
+                <span className="min-w-0 truncate text-xs">{file.name}</span>
+                <span className="shrink-0 text-[10px] text-muted-foreground">
+                  {formatBytes(file.sizeBytes)}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
         {previewAnnotations.map((annotation, index) => (
           <UserMessagePreviewAnnotationCard
             key={annotation.id}
@@ -908,6 +952,14 @@ function UserTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "message" 
           markdownCwd={ctx.markdownCwd}
         />
       </div>
+      {row.message.delivery ? (
+        <TurnDeliveryNotice
+          delivery={row.message.delivery}
+          disabled={ctx.resolvingTurnDeliveryMessageId === row.message.id}
+          onRetry={() => ctx.onResolveTurnDelivery(row.message.id, "retry")}
+          onDismiss={() => ctx.onResolveTurnDelivery(row.message.id, "dismiss")}
+        />
+      ) : null}
       <div className="flex w-full max-w-[80%] items-center justify-end pe-1 text-xs tabular-nums opacity-0 transition-opacity duration-200 focus-within:opacity-100 group-hover:opacity-100">
         <div className="flex shrink-0 items-center gap-2">
           <Tooltip>
@@ -1322,7 +1374,7 @@ const UserMessageElementContextChip = memo(function UserMessageElementContextChi
 
 function UserMessagePreviewAnnotationCard(props: {
   annotation: ParsedPreviewAnnotation;
-  image: NonNullable<TimelineMessage["attachments"]>[number] | null;
+  image: Extract<NonNullable<TimelineMessage["attachments"]>[number], { type: "image" }> | null;
 }) {
   const ctx = use(TimelineRowCtx);
   return (

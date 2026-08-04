@@ -78,6 +78,14 @@ describe("ContextWindowMeter", () => {
     expect(render({ totalProcessedTokens: null })).not.toContain("Total processed");
   });
 
+  it("renders only measured context fields", () => {
+    const markup = render({ totalProcessedTokens: 12_500 });
+
+    expect(markup).not.toContain("Free space");
+    expect(markup).not.toContain("MCP tools");
+    expect(markup).not.toContain("Memory files");
+  });
+
   it("explains automatic compaction with provider and fallback names", () => {
     expect(render({ compactsAutomatically: true }, "Codex")).toContain(
       "Codex automatically compacts",

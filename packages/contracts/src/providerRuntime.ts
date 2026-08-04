@@ -539,8 +539,24 @@ const AccountRateLimitsUpdatedPayload = Schema.Struct({
 });
 export type AccountRateLimitsUpdatedPayload = typeof AccountRateLimitsUpdatedPayload.Type;
 
-const McpStatusUpdatedPayload = Schema.Struct({
-  status: Schema.Unknown,
+export const McpServerConnectionState = Schema.Literals([
+  "connected",
+  "starting",
+  "needs-auth",
+  "disconnected",
+  "error",
+]);
+export type McpServerConnectionState = typeof McpServerConnectionState.Type;
+
+export const McpServerStatus = Schema.Struct({
+  name: TrimmedNonEmptyStringSchema,
+  state: McpServerConnectionState,
+  detail: Schema.optional(TrimmedNonEmptyStringSchema),
+});
+export type McpServerStatus = typeof McpServerStatus.Type;
+
+export const McpStatusUpdatedPayload = Schema.Struct({
+  servers: Schema.Array(McpServerStatus),
 });
 export type McpStatusUpdatedPayload = typeof McpStatusUpdatedPayload.Type;
 

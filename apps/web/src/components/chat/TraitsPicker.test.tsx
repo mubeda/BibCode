@@ -7,12 +7,13 @@ import {
   type ProviderOptionSelection,
   type ServerProviderModel,
 } from "@bibcode/contracts";
-import { act, type ReactElement, useState } from "react";
+import { act, type ReactElement, useEffect, useState } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterAll, afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const testState = vi.hoisted(() => ({
   setProviderModelOptions: vi.fn(),
+  addToast: vi.fn(),
 }));
 
 vi.mock("../../composerDraftStore", () => ({
@@ -20,7 +21,17 @@ vi.mock("../../composerDraftStore", () => ({
     selector({ setProviderModelOptions: testState.setProviderModelOptions }),
 }));
 
-import { shouldRenderTraitsControls, TraitsPicker } from "./TraitsPicker";
+vi.mock("../ui/toast", () => ({
+  toastManager: { add: testState.addToast },
+}));
+
+import {
+  ComposerTraitControls,
+  type ProviderOptionUpdater,
+  shouldRenderTraitsControls,
+  TraitsPicker,
+  useProviderOptionUpdater,
+} from "./TraitsPicker";
 
 const MODEL = "test-model";
 const CODEX = ProviderDriverKind.make("codex");
@@ -93,6 +104,71 @@ function NoPersistenceHarness() {
   );
 }
 
+function FastCommitHarness({
+  onCommit,
+}: {
+  onCommit: (nextOptions: ReadonlyArray<ProviderOptionSelection> | undefined) => Promise<void>;
+}) {
+  const [modelOptions, setModelOptions] = useState<ReadonlyArray<ProviderOptionSelection>>([
+    { id: "fastMode", value: false },
+  ]);
+  return (
+    <ComposerTraitControls
+      provider={CLAUDE}
+      models={modelsWith([booleanDescriptor("fastMode", "Fast Mode")])}
+      model={MODEL}
+      prompt=""
+      modelOptions={modelOptions}
+      onPromptChange={vi.fn()}
+      onModelOptionsChange={async (nextOptions) => {
+        await onCommit(nextOptions);
+        setModelOptions(nextOptions ?? []);
+      }}
+    />
+  );
+}
+
+function FastAndEffortCommitHarness({
+  onCommit,
+}: {
+  onCommit: (nextOptions: ReadonlyArray<ProviderOptionSelection> | undefined) => Promise<void>;
+}) {
+  const [modelOptions, setModelOptions] = useState<ReadonlyArray<ProviderOptionSelection>>([
+    { id: "fastMode", value: false },
+    { id: "effort", value: "low" },
+  ]);
+  return (
+    <ComposerTraitControls
+      provider={CLAUDE}
+      models={modelsWith([effort, booleanDescriptor("fastMode", "Fast Mode")])}
+      model={MODEL}
+      prompt=""
+      modelOptions={modelOptions}
+      onPromptChange={vi.fn()}
+      onModelOptionsChange={async (nextOptions) => {
+        await onCommit(nextOptions);
+        setModelOptions(nextOptions ?? []);
+      }}
+    />
+  );
+}
+
+function DirectUpdaterHarness({
+  onCommit,
+  onReady,
+}: {
+  onCommit: (nextOptions: ReadonlyArray<ProviderOptionSelection> | undefined) => Promise<void>;
+  onReady: (updater: ProviderOptionUpdater) => void;
+}) {
+  const updater = useProviderOptionUpdater(CLAUDE, undefined, MODEL, {
+    onModelOptionsChange: onCommit,
+  });
+  useEffect(() => {
+    onReady(updater);
+  }, [onReady, updater]);
+  return null;
+}
+
 async function mount(element: ReactElement): Promise<MountedTree> {
   const container = document.createElement("div");
   document.body.append(container);
@@ -148,6 +224,7 @@ beforeEach(() => {
     value: () => [],
   });
   testState.setProviderModelOptions.mockReset();
+  testState.addToast.mockReset();
 });
 
 afterEach(async () => {
@@ -173,6 +250,248 @@ afterAll(() => {
 });
 
 describe("TraitsPicker", () => {
+  it("keeps Fast unchanged and blocks duplicate commits until the acknowledged update succeeds", async () => {
+    let acknowledge!: () => void;
+    const acknowledgement = new Promise<void>((resolve) => {
+      acknowledge = resolve;
+    });
+    const onCommit = vi.fn(() => acknowledgement);
+    await mount(<FastCommitHarness onCommit={onCommit} />);
+
+    const fastButton = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Enable fast mode"]',
+    )!;
+    await click(fastButton);
+
+    expect(onCommit).toHaveBeenCalledTimes(1);
+    expect(fastButton.disabled).toBe(false);
+    expect(fastButton.getAttribute("aria-disabled")).toBe("true");
+    expect(document.querySelector('button[aria-label="Applying fast mode"]')).not.toBeNull();
+    expect(fastButton.getAttribute("aria-pressed")).toBe("false");
+
+    await click(fastButton);
+    expect(onCommit).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      acknowledge();
+      await acknowledgement;
+    });
+
+    expect(
+      document
+        .querySelector<HTMLButtonElement>('button[aria-label="Disable fast mode"]')
+        ?.getAttribute("aria-pressed"),
+    ).toBe("true");
+  });
+
+  it("resets pending controls when the provider model identity changes", async () => {
+    let acknowledge!: () => void;
+    const acknowledgement = new Promise<void>((resolve) => {
+      acknowledge = resolve;
+    });
+    const oldCommit = vi.fn(() => acknowledgement);
+    const newCommit = vi.fn().mockResolvedValue(undefined);
+    const mounted = await mount(
+      <ComposerTraitControls
+        provider={CLAUDE}
+        instanceId={ProviderInstanceId.make("claude-work")}
+        models={modelsWith([booleanDescriptor("fastMode", "Fast Mode")])}
+        model={MODEL}
+        prompt=""
+        modelOptions={selections(["fastMode", false])}
+        onPromptChange={vi.fn()}
+        onModelOptionsChange={oldCommit}
+      />,
+    );
+
+    await click(
+      document.querySelector<HTMLButtonElement>('button[aria-label="Enable fast mode"]')!,
+    );
+    expect(document.querySelector('button[aria-label="Applying fast mode"]')).not.toBeNull();
+
+    await act(async () => {
+      mounted.root.render(
+        <ComposerTraitControls
+          provider={ProviderDriverKind.make("opencode")}
+          instanceId={ProviderInstanceId.make("opencode-work")}
+          models={[
+            {
+              slug: "other-model",
+              name: "Other Model",
+              isCustom: false,
+              capabilities: { optionDescriptors: [booleanDescriptor("fastMode", "Fast Mode")] },
+            },
+          ]}
+          model="other-model"
+          prompt=""
+          modelOptions={selections(["fastMode", false])}
+          onPromptChange={vi.fn()}
+          onModelOptionsChange={newCommit}
+        />,
+      );
+    });
+
+    const nextFast = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Enable fast mode"]',
+    )!;
+    expect(nextFast.getAttribute("aria-busy")).toBe("false");
+    expect(nextFast.getAttribute("aria-disabled")).toBe("false");
+    await click(nextFast);
+    expect(newCommit).toHaveBeenCalledOnce();
+
+    await act(async () => {
+      acknowledge();
+      await acknowledgement;
+    });
+    expect(newCommit).toHaveBeenCalledOnce();
+  });
+
+  it("serializes Fast and effort commits from the latest acknowledged selection", async () => {
+    let acknowledgeFast!: () => void;
+    const fastAcknowledgement = new Promise<void>((resolve) => {
+      acknowledgeFast = resolve;
+    });
+    const onCommit = vi
+      .fn<(nextOptions: ReadonlyArray<ProviderOptionSelection> | undefined) => Promise<void>>()
+      .mockImplementationOnce(() => fastAcknowledgement)
+      .mockResolvedValue(undefined);
+    await mount(<FastAndEffortCommitHarness onCommit={onCommit} />);
+
+    await click(
+      document.querySelector<HTMLButtonElement>('button[aria-label="Enable fast mode"]')!,
+    );
+
+    const effortButton = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Applying reasoning effort"]',
+    )!;
+    expect(effortButton.disabled).toBe(false);
+    expect(effortButton.getAttribute("aria-disabled")).toBe("true");
+    expect(effortButton.getAttribute("aria-busy")).toBe("true");
+    await click(effortButton);
+    expect(onCommit).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      acknowledgeFast();
+      await fastAcknowledgement;
+    });
+
+    await click(
+      document.querySelector<HTMLButtonElement>('button[aria-label="Reasoning effort: Low"]')!,
+    );
+    await click(radioItem("High"));
+
+    expect(onCommit).toHaveBeenCalledTimes(2);
+    expect(onCommit).toHaveBeenLastCalledWith(
+      expect.arrayContaining([
+        { id: "fastMode", value: true },
+        { id: "effort", value: "high" },
+      ]),
+    );
+  });
+
+  it("rejects a programmatic alternate descriptor while another option commit is pending", async () => {
+    let acknowledgeFast!: () => void;
+    const fastAcknowledgement = new Promise<void>((resolve) => {
+      acknowledgeFast = resolve;
+    });
+    const onCommit = vi
+      .fn<(nextOptions: ReadonlyArray<ProviderOptionSelection> | undefined) => Promise<void>>()
+      .mockImplementationOnce(() => fastAcknowledgement)
+      .mockResolvedValue(undefined);
+    let updater: ProviderOptionUpdater | null = null;
+    const descriptors: ProviderOptionDescriptor[] = [
+      { ...booleanDescriptor("fastMode", "Fast Mode"), currentValue: false },
+      { ...effort, currentValue: "low" },
+    ];
+    await mount(<DirectUpdaterHarness onCommit={onCommit} onReady={(next) => (updater = next)} />);
+
+    let firstCommit!: Promise<void>;
+    await act(async () => {
+      firstCommit = updater!.updateDescriptor(descriptors, "fastMode", true);
+      await Promise.resolve();
+    });
+    await act(async () => {
+      await updater!.updateDescriptor(descriptors, "effort", "high");
+    });
+
+    expect(onCommit).toHaveBeenCalledTimes(1);
+
+    await act(async () => {
+      acknowledgeFast();
+      await firstCommit;
+    });
+    await act(async () => {
+      await updater!.updateDescriptor(
+        [
+          { ...booleanDescriptor("fastMode", "Fast Mode"), currentValue: true },
+          { ...effort, currentValue: "low" },
+        ],
+        "effort",
+        "high",
+      );
+    });
+
+    expect(onCommit).toHaveBeenCalledTimes(2);
+    expect(onCommit).toHaveBeenLastCalledWith([
+      { id: "fastMode", value: true },
+      { id: "effort", value: "high" },
+    ]);
+  });
+
+  it("keeps Fast unchanged and reports a normalized failure when the acknowledged update rejects", async () => {
+    const onModelOptionsChange = vi.fn().mockRejectedValue(new Error("provider rejected Fast"));
+    await mount(
+      <ComposerTraitControls
+        provider={CLAUDE}
+        models={modelsWith([booleanDescriptor("fastMode", "Fast Mode")])}
+        model={MODEL}
+        prompt=""
+        modelOptions={selections(["fastMode", false])}
+        onPromptChange={vi.fn()}
+        onModelOptionsChange={onModelOptionsChange}
+      />,
+    );
+
+    await click(
+      document.querySelector<HTMLButtonElement>('button[aria-label="Enable fast mode"]')!,
+    );
+
+    expect(onModelOptionsChange).toHaveBeenCalledTimes(1);
+    expect(
+      document
+        .querySelector<HTMLButtonElement>('button[aria-label="Enable fast mode"]')
+        ?.getAttribute("aria-pressed"),
+    ).toBe("false");
+    expect(testState.addToast).toHaveBeenCalledWith(
+      expect.objectContaining({ description: "provider rejected Fast" }),
+    );
+  });
+
+  it("writes draft option changes locally without waiting for a server commit", async () => {
+    await mount(
+      <ComposerTraitControls
+        provider={CLAUDE}
+        models={modelsWith([booleanDescriptor("fastMode", "Fast Mode")])}
+        model={MODEL}
+        prompt=""
+        modelOptions={selections(["fastMode", false])}
+        onPromptChange={vi.fn()}
+        draftId={"draft-fast" as never}
+      />,
+    );
+
+    await click(
+      document.querySelector<HTMLButtonElement>('button[aria-label="Enable fast mode"]')!,
+    );
+
+    expect(testState.setProviderModelOptions).toHaveBeenCalledWith(
+      "draft-fast",
+      CLAUDE,
+      expect.arrayContaining([expect.objectContaining({ id: "fastMode", value: true })]),
+      expect.objectContaining({ model: MODEL, persistSticky: true }),
+    );
+  });
+
   it("reports and renders controls only for models with option descriptors", async () => {
     expect(
       shouldRenderTraitsControls({
@@ -244,7 +563,259 @@ describe("TraitsPicker", () => {
     );
   });
 
-  it("shows configured Codex Fast through partial and empty capability snapshots", async () => {
+  it("renders dedicated Fast and effort controls without exposing agent selection", async () => {
+    const onModelOptionsChange = vi.fn();
+    await mount(
+      <ComposerTraitControls
+        provider={CLAUDE}
+        models={modelsWith([
+          effort,
+          booleanDescriptor("fastMode", "Fast Mode"),
+          selectDescriptor("agent", "Agent", [
+            { id: "reviewer", label: "reviewer", isDefault: true },
+          ]),
+        ])}
+        model={MODEL}
+        prompt=""
+        modelOptions={selections(["effort", "high"], ["fastMode", true], ["agent", "reviewer"])}
+        onPromptChange={vi.fn()}
+        onModelOptionsChange={onModelOptionsChange}
+      />,
+    );
+
+    const fastButton = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Disable fast mode"]',
+    );
+    const effortButton = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Reasoning effort: High"]',
+    );
+    expect(fastButton?.getAttribute("aria-pressed")).toBe("true");
+    expect(fastButton?.className).toContain("bg-primary");
+    expect(fastButton?.className).toContain("text-primary-foreground");
+    expect(effortButton).not.toBeNull();
+    expect(effortButton?.className).toContain("bg-primary");
+    expect(effortButton?.className).toContain("text-primary-foreground");
+    expect(document.body.textContent).not.toContain("High");
+    expect(document.body.textContent).not.toContain("Agent");
+    expect(document.body.textContent).not.toContain("reviewer");
+
+    await click(effortButton!);
+    expect(radioItem("Ultrathink")).not.toBeNull();
+    await click(radioItem("Low"));
+    expect(onModelOptionsChange).toHaveBeenCalledWith(
+      expect.arrayContaining([expect.objectContaining({ id: "effort", value: "low" })]),
+    );
+
+    await click(fastButton!);
+    expect(onModelOptionsChange).toHaveBeenCalledWith(
+      expect.arrayContaining([expect.objectContaining({ id: "fastMode", value: false })]),
+    );
+  });
+
+  it("keeps unavailable Fast and effort focusable with their reason", async () => {
+    const reason = "Fast mode is not supported by Test Model through OpenCode.";
+    await mount(
+      <ComposerTraitControls
+        provider={CLAUDE}
+        models={modelsWith([])}
+        model={MODEL}
+        prompt=""
+        onPromptChange={vi.fn()}
+        fastAvailability={{ state: "unsupported", reason }}
+        effortAvailability={{
+          state: "unknown",
+          reason: "Reasoning effort availability is still loading.",
+        }}
+      />,
+    );
+
+    const fast = document.querySelector<HTMLButtonElement>(`button[aria-label="${reason}"]`)!;
+    const effortControl = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Reasoning effort availability is still loading."]',
+    )!;
+    expect(fast.disabled).toBe(false);
+    expect(fast.getAttribute("aria-disabled")).toBe("true");
+    fast.focus();
+    expect(document.activeElement).toBe(fast);
+    expect(effortControl.getAttribute("aria-disabled")).toBe("true");
+  });
+
+  it("uses Codex service tier for the dedicated Fast toggle", async () => {
+    const onModelOptionsChange = vi.fn();
+    const models = modelsWith([
+      selectDescriptor("reasoningEffort", "Reasoning", [
+        { id: "medium", label: "Medium", isDefault: true },
+      ]),
+      selectDescriptor("serviceTier", "Service Tier", [
+        { id: "default", label: "Standard", isDefault: true },
+        { id: "fast", label: "Fast" },
+      ]),
+    ]);
+    const mounted = await mount(
+      <ComposerTraitControls
+        provider={CODEX}
+        models={models}
+        model={MODEL}
+        prompt=""
+        modelOptions={selections(["reasoningEffort", "medium"], ["serviceTier", "default"])}
+        onPromptChange={vi.fn()}
+        onModelOptionsChange={onModelOptionsChange}
+      />,
+    );
+
+    const disabledFastButton = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Enable fast mode"]',
+    );
+    expect(disabledFastButton?.getAttribute("aria-pressed")).toBe("false");
+    await click(disabledFastButton!);
+    expect(onModelOptionsChange).toHaveBeenCalledWith(
+      expect.arrayContaining([expect.objectContaining({ id: "serviceTier", value: "fast" })]),
+    );
+
+    await act(async () =>
+      mounted.root.render(
+        <ComposerTraitControls
+          provider={CODEX}
+          models={models}
+          model={MODEL}
+          prompt=""
+          modelOptions={selections(["reasoningEffort", "medium"], ["serviceTier", "fast"])}
+          onPromptChange={vi.fn()}
+          onModelOptionsChange={onModelOptionsChange}
+        />,
+      ),
+    );
+
+    const enabledFastButton = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Disable fast mode"]',
+    );
+    expect(enabledFastButton?.getAttribute("aria-pressed")).toBe("true");
+    await click(enabledFastButton!);
+    expect(onModelOptionsChange).toHaveBeenCalledWith(
+      expect.arrayContaining([expect.objectContaining({ id: "serviceTier", value: "default" })]),
+    );
+  });
+
+  it("turns Codex Fast off with the advertised non-default tier", async () => {
+    const onModelOptionsChange = vi.fn();
+    await mount(
+      <ComposerTraitControls
+        provider={CODEX}
+        models={modelsWith([
+          selectDescriptor("serviceTier", "Service Tier", [
+            { id: "fast", label: "Fast" },
+            { id: "flex", label: "Flex" },
+          ]),
+        ])}
+        model={MODEL}
+        prompt=""
+        modelOptions={selections(["serviceTier", "fast"])}
+        onPromptChange={vi.fn()}
+        onModelOptionsChange={onModelOptionsChange}
+      />,
+    );
+
+    await click(
+      document.querySelector<HTMLButtonElement>('button[aria-label="Disable fast mode"]')!,
+    );
+    expect(onModelOptionsChange).toHaveBeenCalledWith([{ id: "serviceTier", value: "flex" }]);
+  });
+
+  it("keeps one-way Codex Fast visible but disabled", async () => {
+    const onModelOptionsChange = vi.fn();
+    await mount(
+      <ComposerTraitControls
+        provider={CODEX}
+        models={modelsWith([
+          selectDescriptor("serviceTier", "Service Tier", [{ id: "fast", label: "Fast" }]),
+        ])}
+        model={MODEL}
+        prompt=""
+        modelOptions={selections(["serviceTier", "fast"])}
+        onPromptChange={vi.fn()}
+        onModelOptionsChange={onModelOptionsChange}
+      />,
+    );
+
+    const fast = buttonContaining("Fast");
+    expect(fast.getAttribute("aria-disabled")).toBe("true");
+    await click(fast);
+    expect(onModelOptionsChange).not.toHaveBeenCalled();
+  });
+
+  it("does not render composer effort controls for unrelated select descriptors", async () => {
+    await mount(
+      <ComposerTraitControls
+        provider={CLAUDE}
+        models={modelsWith([
+          selectDescriptor("temperature", "Temperature", [
+            { id: "warm", label: "Warm", isDefault: true },
+          ]),
+        ])}
+        model={MODEL}
+        prompt=""
+        onPromptChange={vi.fn()}
+        onModelOptionsChange={vi.fn()}
+      />,
+    );
+
+    expect(document.querySelector('button[aria-label^="Reasoning effort:"]')).toBeNull();
+  });
+
+  it("replaces composer controls when the provider instance and model change", async () => {
+    const mounted = await mount(
+      <ComposerTraitControls
+        provider={CLAUDE}
+        instanceId={ProviderInstanceId.make("first")}
+        models={modelsWith([effort, booleanDescriptor("fastMode", "Fast Mode")])}
+        model={MODEL}
+        prompt=""
+        modelOptions={selections(["effort", "high"], ["fastMode", true])}
+        onPromptChange={vi.fn()}
+        onModelOptionsChange={vi.fn()}
+      />,
+    );
+
+    await act(async () =>
+      mounted.root.render(
+        <ComposerTraitControls
+          provider={CLAUDE}
+          instanceId={ProviderInstanceId.make("second")}
+          models={[
+            {
+              slug: "other-model",
+              name: "Other Model",
+              isCustom: false,
+              capabilities: {
+                optionDescriptors: [
+                  selectDescriptor("effort", "Effort", [
+                    { id: "low", label: "Low", isDefault: true },
+                  ]),
+                  booleanDescriptor("fastMode", "Fast Mode"),
+                  selectDescriptor("agent", "Agent", [
+                    { id: "reviewer", label: "reviewer", isDefault: true },
+                  ]),
+                ],
+              },
+            },
+          ]}
+          model="other-model"
+          prompt=""
+          modelOptions={selections(["effort", "low"], ["fastMode", false], ["agent", "reviewer"])}
+          onPromptChange={vi.fn()}
+          onModelOptionsChange={vi.fn()}
+        />,
+      ),
+    );
+
+    expect(document.querySelector('button[aria-label="Disable fast mode"]')).toBeNull();
+    expect(document.querySelector('button[aria-label="Enable fast mode"]')).not.toBeNull();
+    expect(document.querySelector('button[aria-label="Reasoning effort: Low"]')).not.toBeNull();
+    expect(document.body.textContent).not.toContain("High");
+    expect(document.body.textContent).not.toContain("reviewer");
+  });
+
+  it("does not fabricate Codex Fast through partial and empty capability snapshots", async () => {
     const partialModels = modelsWith([
       selectDescriptor("reasoningEffort", "Reasoning", [
         { id: "medium", label: "Medium", isDefault: true },
@@ -263,7 +834,7 @@ describe("TraitsPicker", () => {
         prompt: "",
         modelOptions: selections(["serviceTier", "fast"]),
       }),
-    ).toBe(true);
+    ).toBe(false);
 
     await mount(
       <TraitsPicker
@@ -278,10 +849,10 @@ describe("TraitsPicker", () => {
     );
 
     const trigger = buttonContaining("High");
-    expect(trigger.textContent).toContain("Fast");
+    expect(trigger.textContent).not.toContain("Fast");
     await click(trigger);
     expect(radioItem("Standard")).toBeDefined();
-    expect(radioItem("Fast")).toBeDefined();
+    expect(document.body.textContent).not.toContain("Fast");
   });
 
   it("injects ultrathink into an empty prompt from the rendered option", async () => {

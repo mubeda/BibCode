@@ -527,6 +527,43 @@ describe("ModelPickerContent", () => {
     },
   );
 
+  it("keeps duplicate provider instances out of a locked composer picker", () => {
+    const personalEntry = entry({
+      instanceId: "codex-personal",
+      displayName: "Codex Personal",
+      isDefault: false,
+    });
+    const onInstanceModelChange = vi.fn();
+    const markup = render(
+      buildProps({
+        activeInstanceId: id("codex"),
+        model: "gpt-5-primary",
+        lockToActiveInstance: true,
+        instanceEntries: [codexEntry, personalEntry],
+        modelOptionsByInstance: new Map([
+          [id("codex"), [{ slug: "gpt-5-primary", name: "GPT-5 Primary" }]],
+          [id("codex-personal"), [{ slug: "gpt-5-personal", name: "GPT-5 Personal" }]],
+        ]),
+        onInstanceModelChange,
+      }),
+    );
+
+    expect(markup).not.toContain('data-testid="sidebar"');
+    expect(markup).not.toContain("Codex Personal");
+    expect(markup).not.toContain("GPT-5 Personal");
+    expect(captured.combobox[0]?.items).toEqual(["codex:gpt-5-primary"]);
+    expect(renderedRowKeys()).toEqual(["codex:gpt-5-primary"]);
+
+    captured.input[0]?.onChange({ target: { value: "gpt-5" } });
+    rerender();
+    expect(renderedRowKeys()).toEqual(["codex:gpt-5-primary"]);
+
+    captured.combobox[0]?.onValueChange("codex-personal:gpt-5-personal");
+    captured.combobox[0]?.onValueChange("codex:gpt-5-primary");
+    expect(onInstanceModelChange).toHaveBeenCalledWith("codex", "gpt-5-primary");
+    expect(onInstanceModelChange.mock.calls.map(([instanceId]) => instanceId)).toEqual(["codex"]);
+  });
+
   it("follows active instance changes while the mounted picker is locked", () => {
     render(buildProps({ lockToActiveInstance: true }));
     expect(renderedRowKeys()).toEqual(["codex:gpt-5", "codex:gpt-5-codex"]);

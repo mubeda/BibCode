@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -9,7 +10,7 @@ use std::{
 use axum::http::StatusCode;
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::process::Command;
+use tokio::{io::AsyncReadExt, process::Command};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -45,15 +46,17 @@ use crate::{
             BoxEffectFuture, EffectsOptions, OrchestrationEffectCallbacks, OrchestrationEffects,
             SetupScriptLaunch, process_compatible_path,
         },
-        orchestration_rpc::register_orchestration_rpc_with_provider,
+        orchestration_rpc::register_orchestration_rpc_with_delivery,
         provider_runtime::{
             NativeProviderDriverFactory, ProviderRuntimeSupervisor, SupervisorOptions,
             reconcile_abandoned_provider_sessions,
         },
         relay::relay_client_service,
         server_terminal::{ServerTerminalServices, register_server_terminal_rpc},
+        turn_delivery::TurnDeliveryService,
         workspace_preview::{WorkspacePreviewRpcServices, register_workspace_preview_rpc},
     },
+    provider::attachments::{AttachmentMaterializer, MAX_ATTACHMENT_BYTES},
     provider_terminal::{
         ClaudeTerminalObserverFactory, CodexTerminalObserverFactory,
         OpenCodeTerminalObserverFactory, ProviderSettingsInventoryAuthority,
@@ -78,6 +81,7 @@ pub struct ProductionRuntime {
     asset_access: AssetAccess,
     terminal_services: ServerTerminalServices,
     provider_runtime: Arc<ProviderRuntimeSupervisor>,
+    turn_delivery: Arc<TurnDeliveryService>,
     operational_logs: OperationalLogs,
     provider_update_checks: ProviderUpdateCheckTask,
     orchestration_effects: OrchestrationEffects,
@@ -143,6 +147,16 @@ impl ProductionRuntime {
         reconcile_abandoned_provider_sessions(&orchestration)
             .await
             .map_err(|error| error.to_string())?;
+        let referenced_attachment_ids = repositories
+            .list_referenced_attachment_ids()
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .collect::<HashSet<_>>();
+        AttachmentMaterializer::new(state_paths.attachments_dir.clone())
+            .reconcile_startup(&referenced_attachment_ids)
+            .await
+            .map_err(|error| error.to_string())?;
         let process_attribution = ProcessAttributionRegistry::new();
         let provider_settings = ProviderSettingsStore::new(&state_paths.state_dir);
         let provider_terminal_preparer = ProviderTerminalActivitySupervisor::new_with_authority(
@@ -154,8 +168,7 @@ impl ProductionRuntime {
             production_provider_terminal_observer_factories(),
         )
         .map(|supervisor| {
-            Arc::new(supervisor)
-                as Arc<dyn crate::provider_terminal::TerminalLaunchPreparer>
+            Arc::new(supervisor) as Arc<dyn crate::provider_terminal::TerminalLaunchPreparer>
         })
         .map_err(|_| {
             tracing::warn!("optional provider terminal observation is unavailable");
@@ -195,7 +208,7 @@ impl ProductionRuntime {
             SupervisorOptions::default(),
             operational_logs.provider(),
         ));
-        let asset_access = AssetAccess::new(asset_secret, config.state_dir().join("attachments"));
+        let asset_access = AssetAccess::new(asset_secret, state_paths.attachments_dir.clone());
         let workspace = WorkspaceRpc::with_dependencies(
             WorkspaceService::default(),
             WorkspaceRpcDependencies {
@@ -250,6 +263,11 @@ impl ProductionRuntime {
         )
         .await
         .map_err(|error| error.to_string())?;
+        let turn_delivery = Arc::new(TurnDeliveryService::start(
+            orchestration.clone(),
+            provider_runtime.clone(),
+            config.state_dir(),
+        ));
 
         let mut registry = RpcRegistry::with_trace_diagnostics(trace_diagnostics.clone());
         crate::auth::register_rpc_handlers(&mut registry, auth);
@@ -258,11 +276,12 @@ impl ProductionRuntime {
             activity_projection.clone(),
             activity_controller.clone(),
         );
-        register_orchestration_rpc_with_provider(
+        register_orchestration_rpc_with_delivery(
             &mut registry,
             orchestration.clone(),
             provider_runtime.clone(),
             config.state_dir(),
+            turn_delivery.clone(),
         );
         register_workspace_preview_rpc(&mut registry, workspace_preview);
         register_git_vcs_rpc(
@@ -283,6 +302,7 @@ impl ProductionRuntime {
             asset_access,
             terminal_services,
             provider_runtime,
+            turn_delivery,
             operational_logs,
             provider_update_checks,
             orchestration_effects,
@@ -311,6 +331,11 @@ impl ProductionRuntime {
                     payload.ok_or_else(|| bad_request("Request body is required."))?,
                 )
                 .map_err(bad_request)?;
+                if matches!(command, OrchestrationCommand::ThreadTurnStart { .. }) {
+                    return Err(bad_request(
+                        "thread.turn.start requires the durable orchestration RPC ingress",
+                    ));
+                }
                 let result =
                     self.orchestration
                         .dispatch(command)
@@ -349,7 +374,22 @@ impl ProductionRuntime {
             })?;
         match resolved {
             ResolvedAsset::File(file) => {
-                let bytes = tokio::fs::read(&file).await.map_err(internal_error)?;
+                let file_handle = tokio::fs::File::open(&file).await.map_err(internal_error)?;
+                let mut bytes = Vec::with_capacity(MAX_ATTACHMENT_BYTES.min(4096));
+                file_handle
+                    .take((MAX_ATTACHMENT_BYTES + 1) as u64)
+                    .read_to_end(&mut bytes)
+                    .await
+                    .map_err(internal_error)?;
+                if bytes.len() > MAX_ATTACHMENT_BYTES {
+                    return Err(HttpRouteError::new(
+                        StatusCode::PAYLOAD_TOO_LARGE,
+                        json!({
+                            "_tag": "AssetTooLargeError",
+                            "message": "Asset exceeds the 10 MiB response limit."
+                        }),
+                    ));
+                }
                 let content_type = mime_guess::from_path(&file)
                     .first_or_octet_stream()
                     .essence_str()
@@ -385,6 +425,7 @@ impl ProductionRuntime {
 
     pub async fn shutdown(&self) {
         self.provider_update_checks.shutdown().await;
+        self.turn_delivery.shutdown().await;
         self.orchestration_effects.shutdown().await;
         if let Err(error) = self.provider_runtime.shutdown().await {
             let error = bound_diagnostic_string(&error.to_string(), 160);
@@ -480,6 +521,14 @@ impl OrchestrationEffectCallbacks for RuntimeEffectCallbacks {
             self.workspace.refresh_index(cwd).await;
             Ok(())
         })
+    }
+
+    fn setup_script_is_running<'a>(
+        &'a self,
+        thread_id: &'a str,
+        terminal_id: &'a str,
+    ) -> BoxEffectFuture<'a, bool> {
+        Box::pin(async move { Ok(self.terminals.terminal_exists(thread_id, terminal_id).await) })
     }
 
     fn launch_setup_script<'a>(&'a self, input: SetupScriptLaunch) -> BoxEffectFuture<'a, ()> {
@@ -841,6 +890,82 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn http_turn_start_cannot_bypass_durable_admission() {
+        let state = TempDir::new().expect("state");
+        let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let runtime = ProductionRuntime::start(
+            &config,
+            database,
+            AuthService::new(&config, vec![7_u8; 32]),
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("runtime");
+        let workspace_root = state.path().join("http-project");
+        std::fs::create_dir(&workspace_root).expect("workspace");
+        runtime
+            .orchestration
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"project.create","commandId":"http-project","projectId":"http-project",
+                    "title":"Project","workspaceRoot":workspace_root,"defaultModelSelection":null,
+                    "createdAt":"2026-08-01T00:00:00Z"
+                }))
+                .expect("project command"),
+            )
+            .await
+            .expect("project");
+        let thread_id = load_snapshot(&runtime.orchestration.repositories())
+            .await
+            .expect("snapshot")
+            .threads
+            .into_iter()
+            .find(|thread| thread.kind == "default")
+            .expect("default thread")
+            .thread_id;
+
+        let result = runtime.json(
+            JsonOperation::OrchestrationDispatch,
+            Some(json!({
+                "type":"thread.turn.start","commandId":"http-turn","threadId":thread_id,
+                "message":{"messageId":"http-message","role":"user","text":"hello","attachments":[]},
+                "createdAt":"2026-08-01T00:00:01Z"
+            })),
+            route_context(),
+        ).await;
+
+        assert!(result.is_err());
+        assert!(
+            runtime
+                .orchestration
+                .repositories()
+                .get_command_receipt("http-turn".to_owned())
+                .await
+                .expect("receipt")
+                .is_none()
+        );
+        assert!(
+            runtime
+                .orchestration
+                .repositories()
+                .get_provider_turn_delivery("http-turn".to_owned())
+                .await
+                .expect("delivery")
+                .is_none()
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn startup_interrupts_only_unresolved_terminal_activity() {
         let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let state = TempDir::new().expect("temporary state directory");
@@ -853,8 +978,7 @@ mod tests {
             })
             .await
             .expect("migrations");
-        let projection =
-            ActivityProjection::new(ActivityRepository::new(database.clone()));
+        let projection = ActivityProjection::new(ActivityRepository::new(database.clone()));
         let terminal_scope = ActivityScopeSeed::terminal(
             "terminal:restart-active",
             "generation-restart-active",
@@ -1262,7 +1386,7 @@ mod tests {
             "invalid asset token should fail",
         );
 
-        let attachment_id = "runtime-test.png";
+        let attachment_id = "runtime-test-image";
         let attachment_path = config.state_dir().join("attachments").join(attachment_id);
         tokio::fs::create_dir_all(attachment_path.parent().expect("attachment parent"))
             .await
@@ -1288,8 +1412,36 @@ mod tests {
             .asset(asset_token.to_string(), asset_path.to_string())
             .await
             .expect("attachment asset should resolve");
-        assert_eq!(asset.content_type, "image/png");
+        assert_eq!(asset.content_type, "application/octet-stream");
         assert_eq!(asset.bytes, b"png-bytes");
+
+        let oversized_id = "runtime-oversized";
+        let oversized_path = config.state_dir().join("attachments").join(oversized_id);
+        let oversized_file = std::fs::File::create(&oversized_path).expect("oversized attachment");
+        oversized_file
+            .set_len((10 * 1024 * 1024 + 1) as u64)
+            .expect("oversized attachment length");
+        let issued = runtime
+            .asset_access
+            .issue(AssetIssueRequest {
+                resource: AssetResource::Attachment {
+                    attachment_id: oversized_id.to_owned(),
+                },
+                workspace_root: None,
+            })
+            .await
+            .expect("oversized attachment may receive a capability");
+        let mut asset_parts = issued.relative_url.rsplitn(2, '/');
+        let asset_path = asset_parts.next().expect("asset filename");
+        let asset_token = asset_parts.next().expect("asset token path");
+        let asset_token = asset_token.rsplit('/').next().expect("asset token");
+        assert!(
+            runtime
+                .asset(asset_token.to_owned(), asset_path.to_owned())
+                .await
+                .is_err(),
+            "the HTTP boundary must not return an oversized attachment body"
+        );
 
         let favicon_root = state.path().join("favicon-project");
         tokio::fs::create_dir_all(&favicon_root)

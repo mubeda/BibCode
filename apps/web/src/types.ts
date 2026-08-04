@@ -1,4 +1,5 @@
 import type {
+  ChatFileAttachment as ContractChatFileAttachment,
   ChatImageAttachment as ContractChatImageAttachment,
   OrchestrationCheckpointFile,
   OrchestrationCheckpointSummary,
@@ -9,6 +10,8 @@ import type {
   ProjectScript as ContractProjectScript,
   ProviderInteractionMode,
   RuntimeMode,
+  TurnDelivery as ContractTurnDelivery,
+  TurnDeliveryResolutionAction as ContractTurnDeliveryResolutionAction,
 } from "@bibcode/contracts";
 import type {
   EnvironmentProject,
@@ -24,6 +27,8 @@ export const DEFAULT_THREAD_TERMINAL_HEIGHT = 280;
 export const DEFAULT_THREAD_TERMINAL_ID = "term-1";
 export const MAX_TERMINALS_PER_GROUP = 4;
 export type ProjectScript = ContractProjectScript;
+export type TurnDelivery = ContractTurnDelivery;
+export type TurnDeliveryResolutionAction = ContractTurnDeliveryResolutionAction;
 
 export interface ThreadTerminalGroup {
   id: string;
@@ -35,7 +40,9 @@ export interface ChatImageAttachment extends ContractChatImageAttachment {
   readonly previewUrl?: string;
 }
 
-export type ChatAttachment = ChatImageAttachment;
+export type ChatFileAttachment = ContractChatFileAttachment;
+
+export type ChatAttachment = ChatImageAttachment | ChatFileAttachment;
 
 export interface ChatMessage extends Omit<OrchestrationMessage, "attachments"> {
   readonly attachments?: ReadonlyArray<ChatAttachment> | undefined;

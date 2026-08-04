@@ -5,10 +5,17 @@
 //! not normalize or regenerate them while reading an existing database.
 
 use std::cmp::min;
+#[cfg(test)]
+use std::sync::{
+    Arc, Mutex as StdMutex,
+    atomic::{AtomicBool, AtomicUsize, Ordering},
+};
 
 use rusqlite::{OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+
+use crate::orchestration::{ProviderTurnDelivery, TurnDeliveryState};
 
 use super::{Database, PersistenceError, Result};
 
@@ -17,11 +24,44 @@ pub type Timestamp = String;
 #[derive(Clone, Debug)]
 pub struct Repositories {
     database: Database,
+    #[cfg(test)]
+    delivery_test_hooks: Arc<DeliveryRepositoryTestHooks>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default)]
+struct DeliveryRepositoryTestHooks {
+    fail_reads: AtomicBool,
+    claim_calls: AtomicUsize,
+    pause_after_next_read: StdMutex<Option<ProviderTurnReadPause>>,
+    pause_after_next_claim: StdMutex<Option<ProviderTurnReadPause>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct ProviderTurnReadPause {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+impl ProviderTurnReadPause {
+    pub(crate) async fn wait_until_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
 }
 
 impl Repositories {
-    pub const fn new(database: Database) -> Self {
-        Self { database }
+    pub fn new(database: Database) -> Self {
+        Self {
+            database,
+            #[cfg(test)]
+            delivery_test_hooks: Arc::new(DeliveryRepositoryTestHooks::default()),
+        }
     }
 
     pub fn database(&self) -> &Database {
@@ -106,13 +146,13 @@ impl Repositories {
         self.database.call(move |connection| {
             connection.execute(
                 "INSERT INTO orchestration_command_receipts ( \
-                   command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error \
-                 ) VALUES (?, ?, ?, ?, ?, ?, ?) \
+                   command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest \
+                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT (command_id) DO UPDATE SET \
                    aggregate_kind = excluded.aggregate_kind, aggregate_id = excluded.aggregate_id, \
                    accepted_at = excluded.accepted_at, result_sequence = excluded.result_sequence, \
-                   status = excluded.status, error = excluded.error",
-                params![row.command_id, row.aggregate_kind, row.aggregate_id, row.accepted_at, row.result_sequence, row.status, row.error],
+                   status = excluded.status, error = excluded.error, payload_digest = excluded.payload_digest",
+                params![row.command_id, row.aggregate_kind, row.aggregate_id, row.accepted_at, row.result_sequence, row.status, row.error, row.payload_digest],
             )?;
             Ok(())
         }).await
@@ -120,7 +160,7 @@ impl Repositories {
 
     pub async fn get_command_receipt(&self, command_id: String) -> Result<Option<CommandReceipt>> {
         self.database.call(move |connection| connection.query_row(
-            "SELECT command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error \
+            "SELECT command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest \
              FROM orchestration_command_receipts WHERE command_id = ?",
             [command_id], decode_command_receipt).optional().map_err(Into::into)).await
     }
@@ -276,15 +316,218 @@ impl Repositories {
         self.database.call(move |connection| {
             let attachments = row.attachments.as_ref().map(encode_json).transpose()?;
             connection.execute(
-                "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, created_at, updated_at) \
-                 VALUES (?, ?, ?, ?, ?, COALESCE(?, (SELECT attachments_json FROM projection_thread_messages WHERE message_id = ?)), ?, ?, ?) \
+                "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, COALESCE(?, (SELECT attachments_json FROM projection_thread_messages WHERE message_id = ?)), ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT (message_id) DO UPDATE SET \
                    thread_id=excluded.thread_id, turn_id=excluded.turn_id, role=excluded.role, text=excluded.text, \
                    attachments_json=COALESCE(excluded.attachments_json, projection_thread_messages.attachments_json), \
-                   is_streaming=excluded.is_streaming, created_at=excluded.created_at, updated_at=excluded.updated_at",
-                params![row.message_id,row.thread_id,row.turn_id,row.role,row.text,attachments,row.message_id,i64::from(row.is_streaming),row.created_at,row.updated_at],
+                   is_streaming=excluded.is_streaming, delivery_state=excluded.delivery_state, delivery_provider=excluded.delivery_provider, delivery_detail=excluded.delivery_detail, created_at=excluded.created_at, updated_at=excluded.updated_at",
+                params![row.message_id,row.thread_id,row.turn_id,row.role,row.text,attachments,row.message_id,i64::from(row.is_streaming),row.delivery_state,row.delivery_provider,row.delivery_detail,row.created_at,row.updated_at],
             )?; Ok(())
         }).await
+    }
+
+    pub async fn get_provider_turn_delivery(
+        &self,
+        command_id: String,
+    ) -> Result<Option<ProviderTurnDelivery>> {
+        self.database
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        &(PROVIDER_TURN_DELIVERY_SELECT.to_owned() + " WHERE command_id = ?"),
+                        [command_id],
+                        decode_provider_turn_delivery,
+                    )
+                    .optional()
+                    .map_err(Into::into)
+            })
+            .await
+    }
+
+    pub async fn list_provider_turn_deliveries(
+        &self,
+        states: Vec<TurnDeliveryState>,
+    ) -> Result<Vec<ProviderTurnDelivery>> {
+        #[cfg(test)]
+        if self.delivery_test_hooks.fail_reads.load(Ordering::SeqCst) {
+            return Err(PersistenceError::WorkerUnavailable);
+        }
+        if states.is_empty() {
+            return Ok(Vec::new());
+        }
+        #[cfg(test)]
+        let pause_after_read = states.contains(&TurnDeliveryState::Pending);
+        let result = self
+            .database
+            .call(move |connection| {
+                let values = states
+                    .iter()
+                    .map(|state| state.as_str())
+                    .collect::<Vec<_>>();
+                let placeholders = std::iter::repeat_n("?", values.len())
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                collect(
+                    connection,
+                    &(PROVIDER_TURN_DELIVERY_SELECT.to_owned()
+                        + " WHERE state IN ("
+                        + &placeholders
+                        + ") ORDER BY created_at ASC, command_id ASC"),
+                    rusqlite::params_from_iter(values),
+                    decode_provider_turn_delivery,
+                )
+            })
+            .await;
+        #[cfg(test)]
+        if pause_after_read {
+            let pause = self
+                .delivery_test_hooks
+                .pause_after_next_read
+                .lock()
+                .expect("provider turn read pause mutex")
+                .take();
+            if let Some(pause) = pause {
+                pause.entered.notify_one();
+                pause.release.notified().await;
+            }
+        }
+        result
+    }
+
+    pub async fn list_referenced_attachment_ids(&self) -> Result<Vec<String>> {
+        self.database.call(|connection| collect(connection, "SELECT DISTINCT attachment_id FROM orchestration_attachment_refs ORDER BY attachment_id ASC", [], |row| row.get(0))).await
+    }
+
+    pub async fn claim_provider_turn(
+        &self,
+        command_id: String,
+        updated_at: String,
+    ) -> Result<Option<ProviderTurnDelivery>> {
+        #[cfg(test)]
+        self.delivery_test_hooks
+            .claim_calls
+            .fetch_add(1, Ordering::SeqCst);
+        let result = self.database.call(move |connection| connection.query_row(
+            "UPDATE provider_turn_outbox SET state = 'sending', attempts = attempts + 1, updated_at = ? WHERE command_id = ? AND state = 'pending' RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at",
+            params![updated_at, command_id], decode_provider_turn_delivery).optional().map_err(Into::into)).await;
+        #[cfg(test)]
+        if result.as_ref().is_ok_and(Option::is_some) {
+            let pause = self
+                .delivery_test_hooks
+                .pause_after_next_claim
+                .lock()
+                .expect("provider turn claim pause mutex")
+                .take();
+            if let Some(pause) = pause {
+                pause.entered.notify_one();
+                pause.release.notified().await;
+            }
+        }
+        result
+    }
+
+    pub async fn freeze_provider_turn_session(
+        &self,
+        command_id: String,
+        expected_attempt: i64,
+        provider_instance_id: String,
+        provider_kind: String,
+        provider_session_id: String,
+        updated_at: String,
+    ) -> Result<Option<ProviderTurnDelivery>> {
+        self.database
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "UPDATE provider_turn_outbox SET provider_session_id = ?, updated_at = ? \
+                         WHERE command_id = ? AND state = 'sending' AND attempts = ? \
+                           AND provider_instance_id = ? AND provider_kind = ? \
+                           AND (provider_session_id IS NULL OR provider_session_id = ?) \
+                         RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at",
+                        params![
+                            provider_session_id,
+                            updated_at,
+                            command_id,
+                            expected_attempt,
+                            provider_instance_id,
+                            provider_kind,
+                            provider_session_id,
+                        ],
+                        decode_provider_turn_delivery,
+                    )
+                    .optional()
+                    .map_err(Into::into)
+            })
+            .await
+    }
+
+    pub async fn replace_pending_provider_turn_payload(
+        &self,
+        command_id: String,
+        expected_attempt: i64,
+        payload: Value,
+        updated_at: String,
+    ) -> Result<Option<ProviderTurnDelivery>> {
+        self.database
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "UPDATE provider_turn_outbox SET payload_json = ?, updated_at = ? \
+                         WHERE command_id = ? AND state = 'pending' AND attempts = ? \
+                         RETURNING command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at",
+                        params![
+                            encode_json(&payload)?,
+                            updated_at,
+                            command_id,
+                            expected_attempt,
+                        ],
+                        decode_provider_turn_delivery,
+                    )
+                    .optional()
+                    .map_err(Into::into)
+            })
+            .await
+    }
+
+    #[cfg(test)]
+    pub(crate) fn fail_provider_turn_reads_for_test(&self, fail: bool) {
+        self.delivery_test_hooks
+            .fail_reads
+            .store(fail, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn provider_turn_claims_for_test(&self) -> usize {
+        self.delivery_test_hooks.claim_calls.load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_after_next_provider_turn_read_for_test(&self) -> ProviderTurnReadPause {
+        let pause = ProviderTurnReadPause {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        *self
+            .delivery_test_hooks
+            .pause_after_next_read
+            .lock()
+            .expect("provider turn read pause mutex") = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_after_next_provider_turn_claim_for_test(&self) -> ProviderTurnReadPause {
+        let pause = ProviderTurnReadPause {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        *self
+            .delivery_test_hooks
+            .pause_after_next_claim
+            .lock()
+            .expect("provider turn claim pause mutex") = Some(pause.clone());
+        pause
     }
 
     pub async fn get_message(&self, message_id: String) -> Result<Option<ProjectionThreadMessage>> {
@@ -690,6 +933,7 @@ pub struct CommandReceipt {
     pub result_sequence: i64,
     pub status: String,
     pub error: Option<String>,
+    pub payload_digest: Option<String>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CheckpointDiffBlob {
@@ -752,6 +996,9 @@ pub struct ProjectionThreadMessage {
     pub text: String,
     pub attachments: Option<Value>,
     pub is_streaming: bool,
+    pub delivery_state: Option<String>,
+    pub delivery_provider: Option<String>,
+    pub delivery_detail: Option<String>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
 }
@@ -905,7 +1152,8 @@ pub struct AuthSession {
 }
 
 const THREAD_SELECT: &str = "SELECT thread_id, project_id, title, kind, model_selection_json, runtime_mode, interaction_mode, branch, worktree_path, latest_turn_id, created_at, updated_at, archived_at, latest_user_message_at, pending_approval_count, pending_user_input_count, has_actionable_proposed_plan, deleted_at FROM projection_threads";
-const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, created_at, updated_at FROM projection_thread_messages";
+const MESSAGE_SELECT: &str = "SELECT message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, delivery_state, delivery_provider, delivery_detail, created_at, updated_at FROM projection_thread_messages";
+const PROVIDER_TURN_DELIVERY_SELECT: &str = "SELECT command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at FROM provider_turn_outbox";
 const TURN_SELECT: &str = "SELECT thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json FROM projection_turns";
 const TURN_UPSERT_SQL: &str = "INSERT INTO projection_turns (thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (thread_id, turn_id) DO UPDATE SET pending_message_id=excluded.pending_message_id, source_proposed_plan_thread_id=excluded.source_proposed_plan_thread_id, source_proposed_plan_id=excluded.source_proposed_plan_id, assistant_message_id=excluded.assistant_message_id, state=excluded.state, requested_at=excluded.requested_at, started_at=excluded.started_at, completed_at=excluded.completed_at, checkpoint_turn_count=excluded.checkpoint_turn_count, checkpoint_ref=excluded.checkpoint_ref, checkpoint_status=excluded.checkpoint_status, checkpoint_files_json=excluded.checkpoint_files_json";
 const PAIRING_SELECT: &str = "SELECT id, credential, method, scopes, subject, label, proof_key_thumbprint, created_at, expires_at, consumed_at, revoked_at FROM auth_pairing_links";
@@ -984,6 +1232,7 @@ fn decode_command_receipt(row: &Row<'_>) -> rusqlite::Result<CommandReceipt> {
         result_sequence: row.get(4)?,
         status: row.get(5)?,
         error: row.get(6)?,
+        payload_digest: row.get(7)?,
     })
 }
 fn decode_checkpoint_diff_blob(row: &Row<'_>) -> rusqlite::Result<CheckpointDiffBlob> {
@@ -1051,9 +1300,58 @@ fn decode_message(row: &Row<'_>) -> rusqlite::Result<ProjectionThreadMessage> {
         text: row.get(4)?,
         attachments: decode_optional_json(row.get(5)?, "attachments_json")?,
         is_streaming: row.get::<_, i64>(6)? == 1,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        delivery_state: row.get(7)?,
+        delivery_provider: row.get(8)?,
+        delivery_detail: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
+}
+
+fn decode_provider_turn_delivery(row: &Row<'_>) -> rusqlite::Result<ProviderTurnDelivery> {
+    let state = match row.get::<_, String>(8)?.as_str() {
+        "pending" => TurnDeliveryState::Pending,
+        "sending" => TurnDeliveryState::Sending,
+        "delivered" => TurnDeliveryState::Delivered,
+        "uncertain" => TurnDeliveryState::Uncertain,
+        "dismissed" => TurnDeliveryState::Dismissed,
+        "failed" => TurnDeliveryState::Failed,
+        state => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                8,
+                rusqlite::types::Type::Text,
+                format!("unknown turn delivery state: {state}").into(),
+            ));
+        }
+    };
+    Ok(ProviderTurnDelivery {
+        command_id: row.get(0)?,
+        thread_id: row.get(1)?,
+        message_id: row.get(2)?,
+        provider_instance_id: row.get(3)?,
+        provider_kind: row.get(4)?,
+        provider_session_id: row.get(5)?,
+        delivery_key: row.get(6)?,
+        payload: decode_json(row.get(7)?, "payload_json")?,
+        state,
+        attempts: row.get(9)?,
+        last_error: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
+    })
+}
+
+impl TurnDeliveryState {
+    fn as_str(&self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Sending => "sending",
+            Self::Delivered => "delivered",
+            Self::Uncertain => "uncertain",
+            Self::Dismissed => "dismissed",
+            Self::Failed => "failed",
+        }
+    }
 }
 fn decode_activity(row: &Row<'_>) -> rusqlite::Result<ProjectionThreadActivity> {
     Ok(ProjectionThreadActivity {

@@ -1,3 +1,5 @@
+// @effect-diagnostics nodeBuiltinImport:off - The CLI entrypoint regression runs in a child Node process.
+import * as NodeChildProcess from "node:child_process";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import * as NodeOS from "node:os";
 import * as NetService from "@bibcode/shared/Net";
@@ -780,4 +782,39 @@ it("applies repository environment only for the direct CLI entrypoint", () => {
   );
   assert.equal(launched.length, 1);
   assert.deepStrictEqual(applied, [{ TEST: "1" }]);
+});
+
+it("does not stringify unset repository configuration", () => {
+  const keys = ["BIBCODE_PORT", "BIBCODE_PORT_OFFSET"] as const;
+  const previous = Object.fromEntries(keys.map((key) => [key, process.env[key]]));
+  try {
+    for (const key of keys) delete process.env[key];
+    applyDevRunnerRepoEnv({ BIBCODE_PORT: undefined, BIBCODE_PORT_OFFSET: undefined });
+    for (const key of keys) assert.equal(process.env[key], undefined);
+  } finally {
+    for (const key of keys) {
+      if (previous[key] === undefined) delete process.env[key];
+      else process.env[key] = previous[key];
+    }
+  }
+});
+
+it("runs a dry dev CLI without a configured server port", () => {
+  const env = { ...process.env };
+  delete env.BIBCODE_PORT;
+  delete env.T4CODE_PORT;
+  delete env.PORT;
+
+  const result = NodeChildProcess.spawnSync(
+    process.execPath,
+    ["scripts/dev-runner.ts", "dev", "--dry-run"],
+    {
+      cwd: new URL("..", import.meta.url),
+      encoding: "utf8",
+      env,
+    },
+  );
+
+  assert.equal(result.status, 0, result.stderr);
+  assert.include(result.stdout, "source=default ports");
 });

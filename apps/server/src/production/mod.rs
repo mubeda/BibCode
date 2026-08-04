@@ -17,5 +17,6 @@ pub mod provider_runtime;
 pub mod relay;
 pub mod runtime;
 pub mod server_terminal;
+pub mod turn_delivery;
 pub mod workspace_preview;
 pub mod worktree_workspace;

@@ -181,4 +181,52 @@ describe("ProviderRuntimeEvent", () => {
     expect(parsed.payload.usage.maxTokens).toBe(200000);
     expect(parsed.payload.usage.usedTokens).toBe(31251);
   });
+
+  it("decodes complete normalized MCP server status snapshots", () => {
+    const parsed = decodeRuntimeEvent({
+      type: "mcp.status.updated",
+      eventId: "event-mcp-status-1",
+      provider: "codex",
+      createdAt: "2026-02-28T00:00:05.000Z",
+      threadId: "thread-1",
+      payload: {
+        servers: [
+          { name: "context7", state: "connected" },
+          { name: "atlassian", state: "needs-auth", detail: "OAuth required" },
+        ],
+      },
+    });
+
+    expect(parsed.type).toBe("mcp.status.updated");
+    if (parsed.type !== "mcp.status.updated") {
+      throw new Error("expected mcp.status.updated");
+    }
+    expect(parsed.payload.servers).toEqual([
+      { name: "context7", state: "connected" },
+      { name: "atlassian", state: "needs-auth", detail: "OAuth required" },
+    ]);
+  });
+
+  it("rejects invalid normalized MCP server statuses", () => {
+    const event = {
+      type: "mcp.status.updated",
+      eventId: "event-mcp-status-invalid",
+      provider: "codex",
+      createdAt: "2026-02-28T00:00:05.000Z",
+      threadId: "thread-1",
+    };
+
+    expect(() =>
+      decodeRuntimeEvent({
+        ...event,
+        payload: { servers: [{ name: "context7", state: "unknown" }] },
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeRuntimeEvent({
+        ...event,
+        payload: { servers: [{ name: "   ", state: "connected" }] },
+      }),
+    ).toThrow();
+  });
 });

@@ -27,8 +27,8 @@ use crate::{
     process::{Platform, ProcessCleanupReport, ShellCandidate, resolve_shell_candidates},
     provider_terminal::{
         PreparedTerminalObserver, TerminalAgentActivityTransition, TerminalLaunchPreparation,
-        TerminalLaunchPreparationInput, TerminalLaunchPreparer,
-        TerminalObserverCancellationReason, TerminalObserverGeneration,
+        TerminalLaunchPreparationInput, TerminalLaunchPreparer, TerminalObserverCancellationReason,
+        TerminalObserverGeneration,
     },
 };
 
@@ -395,10 +395,7 @@ impl PreparedObserverHandle {
             .await;
     }
 
-    async fn set_agent_activity_enabled(
-        &self,
-        enabled: bool,
-    ) -> TerminalAgentActivityTransition {
+    async fn set_agent_activity_enabled(&self, enabled: bool) -> TerminalAgentActivityTransition {
         if self.inner.generation.cancellation_reason().is_some() {
             return TerminalAgentActivityTransition::default();
         }
@@ -443,18 +440,17 @@ struct ObserverCallbackIsolation {
 impl Default for ObserverCallbackIsolation {
     fn default() -> Self {
         Self {
-            slots: Arc::new(tokio::sync::Semaphore::new(
-                MAX_ISOLATED_OBSERVER_CALLBACKS,
-            )),
+            slots: Arc::new(tokio::sync::Semaphore::new(MAX_ISOLATED_OBSERVER_CALLBACKS)),
         }
     }
 }
 
-static GLOBAL_OBSERVER_CALLBACK_SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> = LazyLock::new(|| {
-    Arc::new(tokio::sync::Semaphore::new(
-        MAX_GLOBAL_ISOLATED_OBSERVER_CALLBACKS,
-    ))
-});
+static GLOBAL_OBSERVER_CALLBACK_SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| {
+        Arc::new(tokio::sync::Semaphore::new(
+            MAX_GLOBAL_ISOLATED_OBSERVER_CALLBACKS,
+        ))
+    });
 
 enum IsolatedCallbackResult<T> {
     Completed(T),
@@ -551,7 +547,10 @@ where
     {
         Ok(Ok(permit)) => permit,
         Ok(Err(_)) => {
-            tracing::warn!(callback, "global provider terminal observer isolation is closed");
+            tracing::warn!(
+                callback,
+                "global provider terminal observer isolation is closed"
+            );
             return None;
         }
         Err(_) => {
@@ -758,12 +757,9 @@ impl SessionGeneration {
             .output_started
             .load(std::sync::atomic::Ordering::Acquire)
         {
-            if tokio::time::timeout(
-                OUTPUT_DRAIN_TIMEOUT,
-                self.output_completed.cancelled(),
-            )
-            .await
-            .is_err()
+            if tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, self.output_completed.cancelled())
+                .await
+                .is_err()
             {
                 tracing::warn!(
                     timeout_ms = OUTPUT_DRAIN_TIMEOUT.as_millis(),
@@ -813,10 +809,7 @@ impl SessionGenerationRegistry {
         {
             return generation;
         }
-        let generation = Arc::new(SessionGeneration::new(
-            key,
-            self.observer_runtime.clone(),
-        ));
+        let generation = Arc::new(SessionGeneration::new(key, self.observer_runtime.clone()));
         current.insert(key.clone(), Arc::downgrade(&generation));
         generation
     }
@@ -836,10 +829,7 @@ impl SessionGenerationRegistry {
         let mut current = self.current.lock().expect("terminal generations lock");
         current.retain(|_, generation| generation.strong_count() > 0);
         let displaced = current.remove(key).and_then(|value| value.upgrade());
-        let generation = Arc::new(SessionGeneration::new(
-            key,
-            self.observer_runtime.clone(),
-        ));
+        let generation = Arc::new(SessionGeneration::new(key, self.observer_runtime.clone()));
         current.insert(key.clone(), Arc::downgrade(&generation));
         (displaced, generation)
     }
@@ -1118,6 +1108,22 @@ impl TerminalManager {
         &self,
         input: TerminalOpenInput,
     ) -> Result<TerminalSessionSnapshot, TerminalError> {
+        self.open_inner(input, None).await
+    }
+
+    pub(crate) async fn open_with_initial_input(
+        &self,
+        input: TerminalOpenInput,
+        initial_input: String,
+    ) -> Result<TerminalSessionSnapshot, TerminalError> {
+        self.open_inner(input, Some(initial_input)).await
+    }
+
+    async fn open_inner(
+        &self,
+        input: TerminalOpenInput,
+        initial_input: Option<String>,
+    ) -> Result<TerminalSessionSnapshot, TerminalError> {
         let key = (input.thread_id.clone(), input.terminal_id.clone());
         let generation = {
             let _lifecycle = self.inner.lifecycle.lock().await;
@@ -1126,7 +1132,7 @@ impl TerminalManager {
             }
             self.inner.generations.current(&key)
         };
-        self.start(input, false, generation).await
+        self.start(input, false, generation, initial_input).await
     }
 
     pub async fn restart(
@@ -1186,7 +1192,7 @@ impl TerminalManager {
             )
             .await;
         log_terminal_cleanup("restart", &closed.report);
-        match self.start_inner(input, true, generation).await {
+        match self.start_inner(input, true, generation, None).await {
             Ok(snapshot) => Ok(snapshot),
             Err(error) => {
                 self.publish_closed_sessions(&closed.notifications);
@@ -1200,13 +1206,15 @@ impl TerminalManager {
         input: TerminalOpenInput,
         restarted: bool,
         generation: Arc<SessionGeneration>,
+        initial_input: Option<String>,
     ) -> Result<TerminalSessionSnapshot, TerminalError> {
         let key = (input.thread_id.clone(), input.terminal_id.clone());
         let operation = self.inner.operations.for_key(&key);
         let _operation = operation.lock_owned().await;
         let startup = generation.startup.clone();
         let _startup = startup.lock().await;
-        self.start_inner(input, restarted, generation).await
+        self.start_inner(input, restarted, generation, initial_input)
+            .await
     }
 
     async fn start_inner(
@@ -1214,6 +1222,7 @@ impl TerminalManager {
         input: TerminalOpenInput,
         restarted: bool,
         generation: Arc<SessionGeneration>,
+        initial_input: Option<String>,
     ) -> Result<TerminalSessionSnapshot, TerminalError> {
         if generation.is_invalidated() {
             return Err(invalidated_creation_error(&input));
@@ -1474,6 +1483,9 @@ impl TerminalManager {
                 .cancel_observer(TerminalObserverCancellationReason::GenerationInvalidated)
                 .await;
             return Err(invalidated_creation_error(&input));
+        }
+        if let Some(initial_input) = initial_input {
+            process.write(&initial_input).map_err(TerminalError::Io)?;
         }
         let label = input
             .command
@@ -1914,6 +1926,7 @@ impl TerminalManager {
                     },
                     false,
                     request_generation.clone(),
+                    None,
                 )
                 .await?;
                 self.inner
@@ -2542,7 +2555,8 @@ mod tests {
             _pid: u32,
             _generation: TerminalObserverGeneration,
             _workers: TerminalObserverWorkerContext,
-        ) {}
+        ) {
+        }
 
         fn diagnostic_label(&self) -> &str {
             "registry-observer"
@@ -2552,8 +2566,7 @@ mod tests {
     #[tokio::test]
     async fn hardening_restart_replacement_cancels_exact_displaced_generation_before_invalidation()
     {
-        let registry =
-            SessionGenerationRegistry::new(tokio::runtime::Handle::try_current().ok());
+        let registry = SessionGenerationRegistry::new(tokio::runtime::Handle::try_current().ok());
         let key = ("thread-race".to_owned(), "terminal-race".to_owned());
         let first = registry.current(&key);
         first.invalidate().await;
@@ -2738,6 +2751,7 @@ mod tests {
         tree_exit_supported: std::sync::atomic::AtomicBool,
         tree_exited: std::sync::atomic::AtomicBool,
         kill_error: std::sync::Mutex<Option<String>>,
+        writes: std::sync::Mutex<Vec<String>>,
     }
 
     impl HistoryTestPty {
@@ -2755,6 +2769,7 @@ mod tests {
                 tree_exit_supported: std::sync::atomic::AtomicBool::new(false),
                 tree_exited: std::sync::atomic::AtomicBool::new(true),
                 kill_error: std::sync::Mutex::new(None),
+                writes: std::sync::Mutex::new(Vec::new()),
             }
         }
 
@@ -2771,6 +2786,10 @@ mod tests {
 
         fn is_killed(&self) -> bool {
             self.killed.load(std::sync::atomic::Ordering::Acquire)
+        }
+
+        fn writes(&self) -> Vec<String> {
+            self.writes.lock().expect("writes lock").clone()
         }
 
         fn exit(&self, exit_code: i32) {
@@ -2816,7 +2835,11 @@ mod tests {
             self.process_identity
         }
 
-        fn write(&self, _data: &str) -> Result<(), String> {
+        fn write(&self, data: &str) -> Result<(), String> {
+            self.writes
+                .lock()
+                .expect("writes lock")
+                .push(data.to_owned());
             Ok(())
         }
 
@@ -2908,6 +2931,31 @@ mod tests {
             processes.push(process.clone());
             Ok(process)
         }
+    }
+
+    #[tokio::test]
+    async fn open_with_initial_input_submits_setup_before_publishing_the_terminal() {
+        let root = tempfile::tempdir().expect("terminal root");
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(backend.clone(), TerminalManagerOptions::default());
+
+        manager
+            .open_with_initial_input(
+                TerminalOpenInput::new(
+                    "thread",
+                    "setup-install",
+                    root.path().to_path_buf(),
+                    120,
+                    30,
+                ),
+                "vp install\r".to_owned(),
+            )
+            .await
+            .expect("terminal opens only after setup input is submitted");
+
+        assert_eq!(backend.latest().writes(), ["vp install\r"]);
+        assert_eq!(manager.subscribe_metadata().await.initial.len(), 1);
+        manager.shutdown().await;
     }
 
     #[derive(Debug)]
@@ -4062,9 +4110,10 @@ mod tests {
         let mut events = manager.subscribe_events();
         let mut metadata_events = metadata.events;
 
-        input
-            .env
-            .insert("BIBCODE_WINDOWS_CONSOLE_THEME".to_owned(), "dark".to_owned());
+        input.env.insert(
+            "BIBCODE_WINDOWS_CONSOLE_THEME".to_owned(),
+            "dark".to_owned(),
+        );
         let restarted = manager.restart(input).await.unwrap();
         assert_eq!(restarted.console_theme, Some(TerminalConsoleTheme::Dark));
         assert!(matches!(

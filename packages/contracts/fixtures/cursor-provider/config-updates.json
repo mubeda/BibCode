@@ -2,15 +2,21 @@
   "options": [
     {
       "category": "thought_level",
-      "id": "reasoning"
+      "id": "reasoning",
+      "type": "select",
+      "options": [{ "value": "extra-high" }]
     },
     {
       "category": "model_config",
-      "id": "context"
+      "id": "context",
+      "type": "select",
+      "options": [{ "value": "1m" }]
     },
     {
       "category": "model_config",
-      "id": "fast"
+      "id": "fast",
+      "type": "select",
+      "options": [{ "value": "false" }, { "value": "true" }]
     }
   ],
   "updates": [

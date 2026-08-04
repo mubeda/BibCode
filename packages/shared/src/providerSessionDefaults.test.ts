@@ -305,7 +305,7 @@ describe("getProviderSessionDefaultControls", () => {
     expect(controls.effort).toBe("medium");
   });
 
-  it("adds the Codex service-tier invariant to rich live model metadata", () => {
+  it("does not infer Codex Fast from rich metadata that omits service tiers", () => {
     const controls = getProviderSessionDefaultControls({
       driver: CODEX,
       models: [model("gpt-rich", [reasoningEffortDescriptor, contextWindowDescriptor])],
@@ -325,11 +325,11 @@ describe("getProviderSessionDefaultControls", () => {
       "xhigh",
     ]);
     expect(controls.effort).toBe("xhigh");
-    expect(controls.fastModeSupported).toBe(true);
-    expect(controls.fastMode).toBe(true);
+    expect(controls.fastModeSupported).toBe(false);
+    expect(controls.fastMode).toBeNull();
   });
 
-  it("augments a partial live Codex service tier while preserving explicit off", () => {
+  it("does not infer Codex Fast from a partial live service tier", () => {
     const controls = getProviderSessionDefaultControls({
       driver: CODEX,
       models: [
@@ -349,8 +349,8 @@ describe("getProviderSessionDefaultControls", () => {
     });
 
     expect(controls.effort).toBe("high");
-    expect(controls.fastModeSupported).toBe(true);
-    expect(controls.fastMode).toBe(false);
+    expect(controls.fastModeSupported).toBe(false);
+    expect(controls.fastMode).toBeNull();
   });
 
   it("accepts a configured Claude prompt-injected effort", () => {
@@ -366,7 +366,7 @@ describe("getProviderSessionDefaultControls", () => {
     expect(controls.effort).toBe("ultrathink");
   });
 
-  it("keeps Codex effort and fast mode available during an empty discovery snapshot", () => {
+  it("keeps Codex effort but not unverified Fast during an empty discovery snapshot", () => {
     const configuredDefault: ProviderSessionDefault = {
       model: "private-model",
       options: [
@@ -384,8 +384,8 @@ describe("getProviderSessionDefaultControls", () => {
     expect(controls.effortDescriptor?.id).toBe("reasoningEffort");
     expect(controls.effortDescriptor?.options.map(({ id }) => id)).toContain("xhigh");
     expect(controls.effort).toBe("xhigh");
-    expect(controls.fastModeSupported).toBe(true);
-    expect(controls.fastMode).toBe(true);
+    expect(controls.fastModeSupported).toBe(false);
+    expect(controls.fastMode).toBeNull();
   });
 
   it.each([
@@ -426,7 +426,7 @@ describe("getProviderSessionDefaultControls", () => {
         capabilities: null,
       } satisfies ServerProviderModel,
     },
-  ])("keeps Codex invariants through $name", ({ model: selectedModel }) => {
+  ])("does not infer Codex Fast through $name", ({ model: selectedModel }) => {
     const configuredDefault: ProviderSessionDefault = {
       model: selectedModel.slug,
       options: [
@@ -449,16 +449,13 @@ describe("getProviderSessionDefaultControls", () => {
 
     expect(controls.effortDescriptor?.id).toBe("reasoningEffort");
     expect(controls.effort).toBe("xhigh");
-    expect(controls.fastModeSupported).toBe(true);
-    expect(controls.fastMode).toBe(true);
+    expect(controls.fastModeSupported).toBe(false);
+    expect(controls.fastMode).toBeNull();
     expect(resolution.modelSelection.options).toEqual(
-      expect.arrayContaining([
-        { id: "reasoningEffort", value: "xhigh" },
-        { id: "serviceTier", value: "fast" },
-      ]),
+      expect.arrayContaining([{ id: "reasoningEffort", value: "xhigh" }]),
     );
     expect(resolution.effort).toBe("xhigh");
-    expect(resolution.fastMode).toBe(true);
+    expect(resolution.fastMode).toBeNull();
   });
 
   it("keeps Claude effort available during an empty discovery snapshot", () => {
@@ -760,7 +757,7 @@ describe("resolveProviderSessionDefault", () => {
     expect(result.fastMode).toBe(true);
   });
 
-  it("resolves the Codex service-tier invariant from rich metadata that omits it", () => {
+  it("omits unverified Fast from rich Codex metadata", () => {
     const result = resolveProviderSessionDefault({
       driver: CODEX,
       instanceId: CODEX_ID,
@@ -777,12 +774,11 @@ describe("resolveProviderSessionDefault", () => {
     expect(result.modelSelection.options).toEqual([
       { id: "reasoningEffort", value: "high" },
       { id: "contextWindow", value: "200k" },
-      { id: "serviceTier", value: "fast" },
     ]);
-    expect(result.fastMode).toBe(true);
+    expect(result.fastMode).toBeNull();
   });
 
-  it("resolves configured Fast through a partial live Codex service tier", () => {
+  it("normalizes configured Fast to an advertised partial Codex service tier", () => {
     const result = resolveProviderSessionDefault({
       driver: CODEX,
       instanceId: CODEX_ID,
@@ -804,13 +800,13 @@ describe("resolveProviderSessionDefault", () => {
 
     expect(result.modelSelection.options).toEqual([
       { id: "reasoningEffort", value: "high" },
-      { id: "serviceTier", value: "fast" },
+      { id: "serviceTier", value: "default" },
       { id: "contextWindow", value: "200k" },
     ]);
-    expect(result.fastMode).toBe(true);
+    expect(result.fastMode).toBeNull();
   });
 
-  it("normalizes an incompatible live Codex service tier without replacing other descriptors", () => {
+  it("does not treat an incompatible Codex service tier as Fast", () => {
     const result = resolveProviderSessionDefault({
       driver: CODEX,
       instanceId: CODEX_ID,
@@ -837,10 +833,10 @@ describe("resolveProviderSessionDefault", () => {
 
     expect(result.modelSelection.options).toEqual([
       { id: "reasoningEffort", value: "high" },
-      { id: "serviceTier", value: "fast" },
+      { id: "serviceTier", value: false },
       { id: "contextWindow", value: "200k" },
     ]);
-    expect(result.fastMode).toBe(true);
+    expect(result.fastMode).toBeNull();
   });
 
   it("resolves a configured Claude prompt-injected effort into the native selection", () => {
@@ -882,7 +878,7 @@ describe("resolveProviderSessionDefault", () => {
     expect(codex.fastMode).toBe(false);
   });
 
-  it("resolves offline Codex defaults into new-session native options", () => {
+  it("does not resolve offline Codex Fast into new-session options", () => {
     const result = resolveProviderSessionDefault({
       driver: CODEX,
       instanceId: CODEX_ID,
@@ -899,13 +895,10 @@ describe("resolveProviderSessionDefault", () => {
     expect(result.modelSelection).toEqual({
       instanceId: CODEX_ID,
       model: DEFAULT_MODEL_BY_PROVIDER[CODEX],
-      options: [
-        { id: "reasoningEffort", value: "xhigh" },
-        { id: "serviceTier", value: "fast" },
-      ],
+      options: [{ id: "reasoningEffort", value: "xhigh" }],
     });
     expect(result.effort).toBe("xhigh");
-    expect(result.fastMode).toBe(true);
+    expect(result.fastMode).toBeNull();
   });
 });
 
@@ -939,7 +932,7 @@ describe("updateProviderSessionDefault", () => {
     });
   });
 
-  it("persists Codex fast mode when rich live metadata omits serviceTier", () => {
+  it("does not persist Codex Fast when rich live metadata omits serviceTier", () => {
     expect(
       updateProviderSessionDefault({
         driver: CODEX,
@@ -952,14 +945,11 @@ describe("updateProviderSessionDefault", () => {
       }),
     ).toEqual({
       model: "gpt-rich",
-      options: [
-        { id: "reasoningEffort", value: "high" },
-        { id: "serviceTier", value: "fast" },
-      ],
+      options: [{ id: "reasoningEffort", value: "high" }],
     });
   });
 
-  it("persists Fast through a partial live Codex service tier", () => {
+  it("does not persist Fast through a partial live Codex service tier", () => {
     expect(
       updateProviderSessionDefault({
         driver: CODEX,
@@ -981,10 +971,7 @@ describe("updateProviderSessionDefault", () => {
       }),
     ).toEqual({
       model: "gpt-rich",
-      options: [
-        { id: "reasoningEffort", value: "high" },
-        { id: "serviceTier", value: "fast" },
-      ],
+      options: [{ id: "reasoningEffort", value: "high" }],
     });
   });
 
@@ -1046,7 +1033,34 @@ describe("updateProviderSessionDefault", () => {
     });
   });
 
-  it("persists Codex fast and effort changes without a live descriptor", () => {
+  it("persists the advertised Codex Fast-off tier without inventing default", () => {
+    const flexTier: ProviderOptionDescriptor = {
+      id: "serviceTier",
+      label: "Service Tier",
+      type: "select",
+      options: [
+        { id: "fast", label: "Fast" },
+        { id: "flex", label: "Flex" },
+      ],
+    };
+
+    expect(
+      updateProviderSessionDefault({
+        driver: CODEX,
+        models: [model("gpt-flex", [flexTier])],
+        current: {
+          model: "gpt-flex",
+          options: [{ id: "serviceTier", value: "fast" }],
+        },
+        change: { type: "fastMode", value: false },
+      }),
+    ).toEqual({
+      model: "gpt-flex",
+      options: [{ id: "serviceTier", value: "flex" }],
+    });
+  });
+
+  it("does not persist Codex Fast without a live descriptor", () => {
     const current: ProviderSessionDefault = {
       model: "gpt-offline",
       options: [
@@ -1064,10 +1078,7 @@ describe("updateProviderSessionDefault", () => {
       }),
     ).toEqual({
       model: "gpt-offline",
-      options: [
-        { id: "reasoningEffort", value: "high" },
-        { id: "serviceTier", value: "fast" },
-      ],
+      options: [{ id: "reasoningEffort", value: "high" }],
     });
   });
 
@@ -1087,10 +1098,7 @@ describe("updateProviderSessionDefault", () => {
       }),
     ).toEqual({
       model: "gpt-offline",
-      options: [
-        { id: "reasoningEffort", value: "xhigh" },
-        { id: "serviceTier", value: "default" },
-      ],
+      options: [{ id: "reasoningEffort", value: "xhigh" }],
     });
   });
 
@@ -1110,10 +1118,7 @@ describe("updateProviderSessionDefault", () => {
       }),
     ).toEqual({
       model: "gpt-offline",
-      options: [
-        { id: "reasoningEffort", value: "xhigh" },
-        { id: "serviceTier", value: "fast" },
-      ],
+      options: [{ id: "reasoningEffort", value: "xhigh" }],
     });
   });
 
@@ -1164,10 +1169,7 @@ describe("updateProviderSessionDefault", () => {
     });
     expect(incompatible).toEqual({
       model: "reasoning-lite",
-      options: [
-        { id: "reasoningEffort", value: "medium" },
-        { id: "serviceTier", value: "fast" },
-      ],
+      options: [{ id: "reasoningEffort", value: "medium" }],
     });
   });
 
