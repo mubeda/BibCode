@@ -802,7 +802,6 @@ it("does not stringify unset repository configuration", () => {
 it("runs a dry dev CLI without a configured server port", () => {
   const env = { ...process.env };
   delete env.BIBCODE_PORT;
-  delete env.T4CODE_PORT;
   delete env.PORT;
 
   const result = NodeChildProcess.spawnSync(
