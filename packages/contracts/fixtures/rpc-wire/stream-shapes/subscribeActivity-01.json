@@ -1,0 +1,33 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "kind": "delta",
+      "delta": {
+        "scopeId": "thread:thread-1",
+        "previousRevision": 3,
+        "revision": 4,
+        "changes": [
+          {
+            "kind": "actor-upserted",
+            "actor": {
+              "_tag": "actor",
+              "id": "actor:child-1",
+              "name": "Explore provider events",
+              "status": "running",
+              "summary": "Reading App Server schemas",
+              "startedAt": "2026-07-22T12:00:00Z",
+              "updatedAt": "2026-07-22T12:00:01Z",
+              "terminalAt": null,
+              "parentActorId": null,
+              "role": "explorer",
+              "providerType": "worker"
+            }
+          }
+        ],
+        "updatedAt": "2026-07-22T12:00:02Z"
+      }
+    }
+  ]
+}

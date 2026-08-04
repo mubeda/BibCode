@@ -1,0 +1,135 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "version": 1,
+      "type": "providerStatuses",
+      "payload": {
+        "providers": [
+          {
+            "instanceId": "c-_no-_",
+            "driver": "L",
+            "displayName": "T-\\E6i^RH.",
+            "showInteractionModeToggle": false,
+            "enabled": false,
+            "installed": false,
+            "version": ".f7,mc%_2\"",
+            "status": "error",
+            "auth": {
+              "status": "authenticated",
+              "type": "qw!46n",
+              "label": "+P/zDTE:r|"
+            },
+            "checkedAt": "m]?\\7uw",
+            "availability": "unavailable",
+            "models": [
+              {
+                "slug": "TKN>BLw[C\\]",
+                "name": "K!'G",
+                "subProvider": "[H[zz[7m\"kT6",
+                "isCustom": true,
+                "capabilities": null
+              }
+            ],
+            "slashCommands": [
+              {
+                "name": "h26gL",
+                "description": "VF",
+                "input": {
+                  "hint": "Kv"
+                }
+              }
+            ],
+            "skills": [
+              {
+                "name": "xjzL",
+                "path": ":lrw7)",
+                "enabled": true,
+                "displayName": "X*t5^:",
+                "shortDescription": "\\"
+              },
+              {
+                "name": "OcX8~5uTvV#{",
+                "path": "]wD5~ a@/d",
+                "scope": ".#IT0P|)",
+                "enabled": true,
+                "displayName": "VHb48)'{2P",
+                "shortDescription": "4iM",
+                "invocation": "slash"
+              },
+              {
+                "name": "[<",
+                "description": "?",
+                "path": "4[L5M]K%$!C",
+                "scope": "W",
+                "enabled": false,
+                "displayName": "*z]"
+              },
+              {
+                "name": "QQTZj",
+                "path": "nUKW,D>U",
+                "scope": "VM|Hkkk(",
+                "enabled": false,
+                "displayName": "@Z%I",
+                "shortDescription": "#Y",
+                "invocation": "dollar"
+              },
+              {
+                "name": "kk@D/{MR9",
+                "path": "\"Gv|OV61(3?",
+                "scope": "Q1%}fYHtS;b8",
+                "enabled": false,
+                "invocation": "prompt"
+              },
+              {
+                "name": "blF1kY.phvp^",
+                "description": "R5->v",
+                "path": ")Id(",
+                "scope": "|\"",
+                "enabled": true,
+                "displayName": "LU`swK9LM,Fc",
+                "shortDescription": "{",
+                "invocation": "prompt"
+              }
+            ],
+            "agents": [
+              {
+                "name": "`M=1GPe"
+              },
+              {
+                "name": "xVje.n",
+                "model": "G.9X"
+              },
+              {
+                "name": "N",
+                "model": "8",
+                "invocation": "mention"
+              },
+              {
+                "name": "jPFJ",
+                "description": "qgL3hcw?^/v"
+              }
+            ],
+            "versionAdvisory": {
+              "status": "unknown",
+              "currentVersion": null,
+              "latestVersion": "O*Q\\dH4",
+              "updateCommand": null,
+              "canUpdate": false,
+              "checkedAt": null,
+              "message": null
+            },
+            "updateState": {
+              "status": "unchanged",
+              "startedAt": null,
+              "finishedAt": null,
+              "message": null,
+              "output": "6c3TG`1"
+            }
+          }
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,44 @@
+{
+  "scenario": "unsupported recovery schema downgrades without failing the turn",
+  "initialActorIds": [],
+  "inboundMessages": [
+    {
+      "id": "recovery-list-1",
+      "error": {
+        "code": -32601,
+        "message": "Method not found: thread/list",
+        "data": null
+      }
+    },
+    {
+      "emittedAtMs": 1784894581000,
+      "method": "turn/completed",
+      "params": {
+        "threadId": "root-1",
+        "turn": {
+          "id": "turn-1",
+          "items": [],
+          "itemsView": "full",
+          "status": "completed",
+          "error": null,
+          "startedAt": 1784894580,
+          "completedAt": 1784894581,
+          "durationMs": 1000
+        }
+      }
+    }
+  ],
+  "expectedMutations": [
+    {
+      "type": "setScope",
+      "capabilities": {
+        "actors": true,
+        "attributedActivity": true,
+        "backgroundWork": false,
+        "historyRecovery": "none",
+        "terminalObservation": false
+      },
+      "observationState": "live"
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "name": "@bibcode/monorepo",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "prepare": "effect-tsgo patch",
+    "dev": "node scripts/dev-runner.ts dev",
+    "dev:server": "node scripts/dev-runner.ts dev:server",
+    "dev:web": "node scripts/dev-runner.ts dev:web",
+    "dev:marketing": "vp run --filter @bibcode/marketing dev",
+    "dev:desktop": "vp run --filter @bibcode/desktop dev",
+    "start": "vp run --filter bibcode start",
+    "start:desktop": "vp run --filter @bibcode/desktop dev",
+    "start:marketing": "vp run --filter @bibcode/marketing preview",
+    "start:mock-update-server": "node scripts/mock-update-server.ts",
+    "build": "vp run --filter './apps/*' --filter './packages/*' --filter './oxlint-plugin-bibcode' --filter './scripts' build",
+    "build:marketing": "vp run --filter @bibcode/marketing build",
+    "build:desktop": "vp run --filter @bibcode/desktop build",
+    "typecheck": "vp run -r --concurrency-limit 2 typecheck",
+    "tc": "vp run -r --concurrency-limit 2 typecheck",
+    "lint": "vp lint --report-unused-disable-directives",
+    "test": "vp run -r test",
+    "test:coverage": "vp run test:coverage:ts && vp run test:coverage:rust",
+    "test:coverage:ts": "vp test --coverage",
+    "test:coverage:rust": "node scripts/check-rust-coverage.ts",
+    "check:dependency-ledger": "node scripts/check-dependency-upgrade-ledger.ts",
+    "test:desktop": "vp run --filter @bibcode/desktop test",
+    "test:ui:desktop": "vp run --filter @bibcode/desktop test:ui",
+    "test:ui:desktop:build": "vp run --filter @bibcode/desktop test:ui:build",
+    "fmt": "vp fmt",
+    "fmt:check": "vp fmt --check",
+    "build:contracts": "vp run --filter @bibcode/contracts build",
+    "dist:desktop:artifact": "node scripts/build-desktop-artifact.ts",
+    "dist:desktop:dmg": "node scripts/build-desktop-artifact.ts --platform mac --target dmg",
+    "dist:desktop:dmg:arm64": "node scripts/build-desktop-artifact.ts --platform mac --target dmg --arch arm64",
+    "dist:desktop:dmg:x64": "node scripts/build-desktop-artifact.ts --platform mac --target dmg --arch x64",
+    "dist:desktop:linux": "node scripts/build-desktop-artifact.ts --platform linux --target AppImage --arch x64",
+    "dist:desktop:win": "node scripts/build-desktop-artifact.ts --platform win --target nsis",
+    "dist:desktop:win:arm64": "node scripts/build-desktop-artifact.ts --platform win --target nsis --arch arm64",
+    "dist:desktop:win:x64": "node scripts/build-desktop-artifact.ts --platform win --target nsis --arch x64",
+    "release:smoke": "node scripts/release-smoke.ts",
+    "measure:desktop-runtime": "node scripts/measure-desktop-runtime.ts",
+    "clean": "rm -rf node_modules apps/*/node_modules packages/*/node_modules apps/*/dist packages/*/dist target apps/*/src-tauri/target packages/*/target .vite-plus apps/*/.vite-plus packages/*/.vite-plus",
+    "sync:repos": "node scripts/sync-reference-repos.ts"
+  },
+  "devDependencies": {
+    "@effect/tsgo": "catalog:",
+    "@oxlint/plugins": "^1.74.0",
+    "@types/node": "catalog:",
+    "@vitest/coverage-v8": "4.1.10",
+    "typescript": "catalog:",
+    "vite-plus": "catalog:"
+  },
+  "engines": {
+    "node": "26.5.0"
+  },
+  "packageManager": "pnpm@11.15.0",
+  "msw": {
+    "workerDirectory": [
+      "apps/web/public"
+    ]
+  }
+}

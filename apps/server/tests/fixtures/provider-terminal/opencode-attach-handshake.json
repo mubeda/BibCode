@@ -1,0 +1,63 @@
+{
+  "versionOutput": "1.18.4",
+  "serveHelp": "opencode serve\n  --port\n  --hostname\n  --print-logs\n  --log-level",
+  "attachHelp": "opencode attach <url>\n  --dir\n  --session\n  --continue\n  --fork",
+  "originalArgs": ["--model", "anthropic/claude-sonnet-4-5"],
+  "originalConfig": {
+    "theme": "system",
+    "experimental": {
+      "batch_tool": true
+    }
+  },
+  "endpoint": "http://127.0.0.1:43127",
+  "rootSession": {
+    "id": "root-tui-session",
+    "title": "TUI session",
+    "directory": "$CWD",
+    "time": {
+      "created": 1844674407370955
+    }
+  },
+  "childSession": {
+    "id": "child-session",
+    "parentID": "root-tui-session",
+    "title": "Inspect repository",
+    "time": {
+      "created": 1844674407370955
+    }
+  },
+  "childStatus": {
+    "type": "busy"
+  },
+  "childMessages": [
+    {
+      "info": {
+        "id": "assistant-message",
+        "sessionID": "child-session",
+        "role": "assistant",
+        "time": {
+          "created": 1844674407370955
+        }
+      },
+      "parts": [
+        {
+          "id": "tool-part",
+          "sessionID": "child-session",
+          "messageID": "assistant-message",
+          "type": "tool",
+          "tool": "bash",
+          "callID": "call-1",
+          "state": {
+            "status": "running",
+            "input": {
+              "command": "vp check"
+            },
+            "time": {
+              "start": 1844674407370955
+            }
+          }
+        }
+      ]
+    }
+  ]
+}

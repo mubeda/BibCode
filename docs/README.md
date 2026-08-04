@@ -1,0 +1,16 @@
+# Documentation
+
+- [Getting started](./getting-started/quick-start.md)
+- [Workspace UI](./user/workspace-ui.md)
+- [Architecture](./architecture/overview.md)
+- [Activity observation](./architecture/activity-observation.md)
+- [Provider architecture](./architecture/providers.md)
+- [Desktop performance baseline](./architecture/desktop-performance-baseline.md)
+- [BiBCode Connect](./cloud/bibcode-connect-clerk.md)
+- [Integrations](./integrations/source-control-providers.md)
+- [Operations](./operations/ci.md)
+- [Release process](./operations/release.md)
+- [Codex provider](./providers/codex.md)
+- [Claude provider](./providers/claude.md)
+- [Reference](./reference/encyclopedia.md)
+- [User guides](./user/keybindings.md)

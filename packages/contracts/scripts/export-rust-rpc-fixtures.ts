@@ -1,0 +1,702 @@
+// @effect-diagnostics nodeBuiltinImport:off
+import * as NodeChildProcess from "node:child_process";
+import * as NodeCrypto from "node:crypto";
+import * as NodeFSP from "node:fs/promises";
+import * as NodePath from "node:path";
+
+import * as DateTime from "effect/DateTime";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
+import type * as SchemaAST from "effect/SchemaAST";
+import type * as RpcMessage from "effect/unstable/rpc/RpcMessage";
+import * as RpcSerialization from "effect/unstable/rpc/RpcSerialization";
+import * as FastCheck from "fast-check";
+
+import { OrchestrationEvent, ORCHESTRATION_WS_METHODS } from "../src/orchestration.ts";
+import { WS_METHODS, WsRpcGroup } from "../src/rpc.ts";
+import {
+  ServerProcessDiagnosticsResult,
+  ServerProcessResourceHistoryResult,
+  ServerSignalProcessInput,
+} from "../src/server.ts";
+import { DEFAULT_SERVER_SETTINGS } from "../src/settings.ts";
+import { TerminalOpenInput } from "../src/terminal.ts";
+
+const StreamSchemaTypeId = "~effect/rpc/RpcSchema/StreamSchema";
+const requestId = "900719925474099312345";
+const compileUnknownEncoder = (
+  codec: Schema.Codec<unknown, unknown, never, never>,
+): ((value: unknown) => unknown) => Schema.encodeUnknownSync(codec);
+
+const request = {
+  _tag: "Request",
+  id: requestId,
+  tag: "server.getConfig",
+  payload: {},
+  headers: [
+    ["authorization", "Bearer fixture"],
+    ["x-bibcode-fixture", "rpc-wire"],
+  ],
+  traceId: "0123456789abcdef0123456789abcdef",
+  spanId: "0123456789abcdef",
+  sampled: true,
+} satisfies RpcMessage.RequestEncoded;
+
+const fixtures = {
+  ack: {
+    _tag: "Ack",
+    requestId,
+  } satisfies RpcMessage.AckEncoded,
+  chunk: {
+    _tag: "Chunk",
+    requestId,
+    values: [
+      { _tag: "First", value: 1 },
+      { _tag: "Second", value: "two" },
+    ],
+  } satisfies RpcMessage.ResponseChunkEncoded,
+  "client-protocol-error": {
+    _tag: "ClientProtocolError",
+    error: {
+      _tag: "RpcClientError",
+      reason: {
+        _tag: "RpcClientDefect",
+        message: "fixture protocol error",
+        cause: "fixture cause",
+      },
+    },
+  },
+  defect: {
+    _tag: "Defect",
+    defect: "fixture connection defect",
+  } satisfies RpcMessage.ResponseDefectEncoded,
+  eof: { _tag: "Eof" } satisfies RpcMessage.Eof,
+  "exit-defect": {
+    _tag: "Exit",
+    requestId,
+    exit: {
+      _tag: "Failure",
+      cause: [{ _tag: "Die", defect: "fixture request defect" }],
+    },
+  } satisfies RpcMessage.ResponseExitEncoded,
+  "exit-failure": {
+    _tag: "Exit",
+    requestId,
+    exit: {
+      _tag: "Failure",
+      cause: [{ _tag: "Fail", error: { _tag: "FixtureError", message: "typed failure" } }],
+    },
+  } satisfies RpcMessage.ResponseExitEncoded,
+  "exit-interrupt": {
+    _tag: "Exit",
+    requestId,
+    exit: {
+      _tag: "Failure",
+      cause: [{ _tag: "Interrupt", fiberId: undefined }],
+    },
+  } satisfies RpcMessage.ResponseExitEncoded,
+  "exit-stream-success": {
+    _tag: "Exit",
+    requestId,
+    exit: { _tag: "Success", value: null },
+  } satisfies RpcMessage.ResponseExitEncoded,
+  "exit-success": {
+    _tag: "Exit",
+    requestId,
+    exit: { _tag: "Success", value: { ready: true } },
+  } satisfies RpcMessage.ResponseExitEncoded,
+  interrupt: {
+    _tag: "Interrupt",
+    requestId,
+  } satisfies RpcMessage.InterruptEncoded,
+  ping: { _tag: "Ping" } satisfies RpcMessage.Ping,
+  pong: { _tag: "Pong" } satisfies RpcMessage.Pong,
+  request,
+} as const;
+
+const methods = [...WsRpcGroup.requests.values()]
+  .map((rpc) => ({
+    name: rpc._tag,
+    mode:
+      StreamSchemaTypeId in (rpc.successSchema as object)
+        ? ("stream" as const)
+        : ("unary" as const),
+  }))
+  .toSorted((left, right) => left.name.localeCompare(right.name));
+const activeNames = new Set<string>(methods.map(({ name }) => name));
+const knownNames = new Set([
+  ...Object.values(WS_METHODS),
+  ...Object.values(ORCHESTRATION_WS_METHODS),
+]);
+const staleMethodIdentifiers = [...knownNames].filter((name) => !activeNames.has(name)).toSorted();
+
+interface UnionLikeAst {
+  readonly _tag: string;
+  readonly types?: ReadonlyArray<SchemaAST.AST>;
+}
+
+const countSchemaShapes = (ast: UnionLikeAst): number => {
+  if (ast._tag !== "Union") return 1;
+  if (ast.types === undefined) {
+    throw new Error("Union schema AST did not expose its member types.");
+  }
+  return ast.types.length;
+};
+
+const topLevelStreamShapeCount = [...WsRpcGroup.requests.values()]
+  .filter((rpc) => StreamSchemaTypeId in (rpc.successSchema as object))
+  .reduce((count, rpc) => {
+    const streamSchema = rpc.successSchema as unknown as {
+      readonly success: { readonly ast: UnionLikeAst };
+    };
+    return count + countSchemaShapes(streamSchema.success.ast);
+  }, 0);
+const orchestrationEventShapeCount = countSchemaShapes(OrchestrationEvent.ast);
+
+const schemaMembers = (ast: SchemaAST.AST): ReadonlyArray<SchemaAST.AST> =>
+  ast._tag === "Union" ? ast.types : [ast];
+
+const fixtureServerConfig = {
+  environment: {
+    environmentId: "fixture",
+    label: "Fixture",
+    platform: { os: "windows", arch: "x64" },
+    serverVersion: "0.1.1",
+    capabilities: { repositoryIdentity: true },
+  },
+  auth: {
+    policy: "loopback-browser",
+    bootstrapMethods: ["one-time-token"],
+    sessionMethods: ["browser-session-cookie", "bearer-access-token"],
+    sessionCookieName: "bibcode_session",
+  },
+  cwd: "C:\\fixture",
+  keybindingsConfigPath: "C:\\fixture\\keybindings.json",
+  keybindings: [],
+  issues: [],
+  providers: [],
+  availableEditors: [],
+  observability: {
+    logsDirectoryPath: "C:\\fixture\\logs",
+    localTracingEnabled: false,
+    otlpTracesEnabled: false,
+    otlpMetricsEnabled: false,
+  },
+  settings: DEFAULT_SERVER_SETTINGS,
+} as const;
+const fixtureDate = Option.getOrThrow(DateTime.make(1_767_225_600_000));
+const fixtureProcessAttribution = {
+  processKey: "42:100",
+  scope: "external",
+  kind: "provider",
+  label: "Codex",
+  confidence: "exact",
+} as const;
+const fixtureProcessTotals = {
+  combined: { cpuPercent: 3, rssBytes: 30, processCount: 2 },
+  core: { cpuPercent: 1, rssBytes: 10, processCount: 1 },
+  external: { cpuPercent: 2, rssBytes: 20, processCount: 1 },
+} as const;
+const fixtureProcessDiagnostics = {
+  serverPid: 1,
+  readAt: fixtureDate,
+  totals: fixtureProcessTotals,
+  uiCoverage: { status: "notApplicable", message: Option.none<string>() },
+  processes: [
+    {
+      pid: 42,
+      ppid: 1,
+      pgid: Option.none<number>(),
+      status: "Run",
+      cpuPercent: 2,
+      rssBytes: 20,
+      elapsed: "00:00:01",
+      command: "codex",
+      depth: 0,
+      childPids: [],
+      ...fixtureProcessAttribution,
+    },
+  ],
+  error: Option.none<{ readonly message: string }>(),
+} as const;
+const fixtureProcessHistory = {
+  readAt: fixtureDate,
+  windowMs: 60_000,
+  bucketMs: 1_000,
+  sampleIntervalMs: 500,
+  retainedSampleCount: 2,
+  cpuSecondsApprox: { combined: 1.5, core: 1, external: 0.5 },
+  uiCoverage: { status: "partial", message: Option.some("UI coverage is partial.") },
+  buckets: [
+    {
+      startedAt: fixtureDate,
+      endedAt: fixtureDate,
+      cpuPercent: {
+        average: { combined: 3, core: 1, external: 2 },
+        peak: { combined: 6, core: 2, external: 4 },
+      },
+      rssBytes: {
+        average: { combined: 30, core: 10, external: 20 },
+        peak: { combined: 60, core: 20, external: 40 },
+      },
+      maxProcessCount: { combined: 2, core: 1, external: 1 },
+    },
+  ],
+  processes: [
+    {
+      pid: 42,
+      ppid: 1,
+      command: "codex",
+      depth: 0,
+      ...fixtureProcessAttribution,
+      firstSeenAt: fixtureDate,
+      lastSeenAt: fixtureDate,
+      currentCpuPercent: 2,
+      avgCpuPercent: 2,
+      maxCpuPercent: 4,
+      cpuSecondsApprox: 0.5,
+      currentRssBytes: 20,
+      maxRssBytes: 40,
+      sampleCount: 2,
+    },
+  ],
+  error: Option.none<{
+    readonly failureTag:
+      | "ProcessDiagnosticsQueryTimeoutError"
+      | "ProcessDiagnosticsQueryFailedError"
+      | "ProcessDiagnosticsServerProcessSignalError"
+      | "ProcessDiagnosticsNotDescendantError"
+      | "ProcessDiagnosticsSignalFailedError";
+    readonly message: string;
+  }>(),
+} as const;
+const fixtureSignalProcessInput = {
+  pid: 42,
+  processKey: "42:100",
+  signal: "SIGINT",
+} as const;
+const fixturePairingLink = {
+  id: "fixture-pairing-link",
+  credential: "23456789ABCD",
+  scopes: ["orchestration:read"],
+  subject: "fixture",
+  createdAt: fixtureDate,
+  expiresAt: fixtureDate,
+} as const;
+const fixtureClientSession = {
+  sessionId: "00000000-0000-4000-8000-000000000001",
+  subject: "fixture",
+  scopes: ["orchestration:read"],
+  method: "bearer-access-token",
+  client: { deviceType: "desktop" },
+  issuedAt: fixtureDate,
+  expiresAt: fixtureDate,
+  lastConnectedAt: null,
+  connected: false,
+  current: false,
+} as const;
+const fixtureActivityActor = {
+  _tag: "actor",
+  id: "actor:child-1",
+  parentActorId: null,
+  name: "Explore provider events",
+  role: "explorer",
+  providerType: "worker",
+  status: "running",
+  summary: "Reading App Server schemas",
+  startedAt: "2026-07-22T12:00:00Z",
+  updatedAt: "2026-07-22T12:00:01Z",
+  terminalAt: null,
+} as const;
+const fixtureActivitySnapshot = {
+  protocolVersion: 1,
+  scopeId: "thread:thread-1",
+  scope: { _tag: "thread", threadId: "thread-1" },
+  revision: 3,
+  provider: "codex",
+  providerInstanceId: "codex",
+  capabilities: {
+    actors: true,
+    attributedActivity: true,
+    backgroundWork: true,
+    historyRecovery: "full",
+    terminalObservation: false,
+  },
+  observationState: "live",
+  sections: {
+    subagents: { state: "live", message: null, retryable: false },
+    backgroundTasks: { state: "live", message: null, retryable: false },
+  },
+  counts: {
+    subagents: { active: 1, done: 0 },
+    backgroundTasks: { active: 0, done: 0 },
+  },
+  actors: [fixtureActivityActor],
+  workItems: [],
+  actorsHasMore: false,
+  workItemsHasMore: false,
+  updatedAt: "2026-07-22T12:00:01Z",
+} as const;
+
+const manualStreamSamples = new Map<string, unknown>([
+  ["subscribeActivity:0", { kind: "snapshot", snapshot: fixtureActivitySnapshot }],
+  [
+    "subscribeActivity:1",
+    {
+      kind: "delta",
+      delta: {
+        scopeId: fixtureActivitySnapshot.scopeId,
+        previousRevision: 3,
+        revision: 4,
+        changes: [{ kind: "actor-upserted", actor: fixtureActivityActor }],
+        updatedAt: "2026-07-22T12:00:02Z",
+      },
+    },
+  ],
+  ["subscribeServerConfig:0", { version: 1, type: "snapshot", config: fixtureServerConfig }],
+  [
+    "subscribeServerConfig:1",
+    {
+      version: 1,
+      type: "keybindingsUpdated",
+      payload: { keybindings: [], issues: [] },
+    },
+  ],
+  [
+    "subscribeServerConfig:3",
+    {
+      version: 1,
+      type: "settingsUpdated",
+      payload: { settings: DEFAULT_SERVER_SETTINGS },
+    },
+  ],
+  [
+    "subscribeAuthAccess:0",
+    {
+      version: 1,
+      revision: 1,
+      type: "snapshot",
+      payload: { pairingLinks: [], clientSessions: [] },
+    },
+  ],
+  [
+    "subscribeAuthAccess:1",
+    {
+      version: 1,
+      revision: 2,
+      type: "pairingLinkUpserted",
+      payload: fixturePairingLink,
+    },
+  ],
+  [
+    "subscribeAuthAccess:2",
+    {
+      version: 1,
+      revision: 3,
+      type: "pairingLinkRemoved",
+      payload: { id: fixturePairingLink.id },
+    },
+  ],
+  [
+    "subscribeAuthAccess:3",
+    {
+      version: 1,
+      revision: 4,
+      type: "clientUpserted",
+      payload: fixtureClientSession,
+    },
+  ],
+  [
+    "subscribeAuthAccess:4",
+    {
+      version: 1,
+      revision: 5,
+      type: "clientRemoved",
+      payload: { sessionId: fixtureClientSession.sessionId },
+    },
+  ],
+]);
+
+const stringSeed = (value: string): number => {
+  let seed = 0x811c9dc5;
+  for (const character of value) {
+    seed ^= character.codePointAt(0) ?? 0;
+    seed = Math.imul(seed, 0x01000193);
+  }
+  return seed | 0;
+};
+
+const encodeSchemaSample = (
+  ast: SchemaAST.AST,
+  fixtureKey: string,
+  manualValue?: unknown,
+): unknown => {
+  const codec = Schema.make(ast) as Schema.Codec<unknown, unknown, never, never>;
+  const encode = compileUnknownEncoder(codec);
+  const encodeAndValidate = (value: unknown): unknown => {
+    const encoded = encode(value);
+    const jsonRoundTrip = JSON.parse(
+      JSON.stringify(encoded, (_key, item: unknown) => {
+        if (typeof item === "number" && !Number.isFinite(item)) return 0;
+        if (typeof item === "string" && /^-?\d{5,}-\d{2}-\d{2}T/.test(item)) {
+          return "2026-01-01T00:00:00.000Z";
+        }
+        return item;
+      }),
+    ) as unknown;
+    return jsonRoundTrip;
+  };
+  if (manualValue !== undefined) {
+    return encodeAndValidate(manualValue);
+  }
+  const arbitrary = Schema.toArbitrary(codec);
+  let lastError: unknown;
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    const [sample] = FastCheck.sample(arbitrary, {
+      numRuns: 1,
+      seed: stringSeed(`${fixtureKey}:${attempt}`),
+    });
+    try {
+      return encodeAndValidate(sample);
+    } catch (error) {
+      lastError = error;
+    }
+  }
+  throw new Error(`Could not generate schema fixture ${fixtureKey}.`, { cause: lastError });
+};
+
+const jsonParser = RpcSerialization.json.makeUnsafe();
+const serializeWireFixture = (message: unknown): unknown => {
+  const encoded = jsonParser.encode(message);
+  if (typeof encoded !== "string") {
+    throw new Error("JSON RPC serializer did not produce a string.");
+  }
+  return JSON.parse(encoded) as unknown;
+};
+
+const stripEffectOptionIds = (value: unknown): unknown =>
+  JSON.parse(
+    JSON.stringify(value, (key, item: unknown) => {
+      if (key === "_id" && item === "Option") return undefined;
+      return item;
+    }),
+  ) as unknown;
+
+const dynamicFixtures = new Map<string, unknown>();
+dynamicFixtures.set(
+  "contract-shapes/server__getProcessDiagnostics-success.json",
+  stripEffectOptionIds(
+    serializeWireFixture({
+      _tag: "Exit",
+      requestId,
+      exit: {
+        _tag: "Success",
+        value: compileUnknownEncoder(ServerProcessDiagnosticsResult)(fixtureProcessDiagnostics),
+      },
+    } satisfies RpcMessage.ResponseExitEncoded),
+  ),
+);
+dynamicFixtures.set(
+  "contract-shapes/server__getProcessResourceHistory-success.json",
+  stripEffectOptionIds(
+    serializeWireFixture({
+      _tag: "Exit",
+      requestId,
+      exit: {
+        _tag: "Success",
+        value: compileUnknownEncoder(ServerProcessResourceHistoryResult)(fixtureProcessHistory),
+      },
+    } satisfies RpcMessage.ResponseExitEncoded),
+  ),
+);
+dynamicFixtures.set(
+  "contract-shapes/server__signalProcess-request.json",
+  serializeWireFixture({
+    _tag: "Request",
+    id: requestId,
+    tag: "server.signalProcess",
+    payload: compileUnknownEncoder(ServerSignalProcessInput)(fixtureSignalProcessInput),
+    headers: [],
+  } satisfies RpcMessage.RequestEncoded),
+);
+dynamicFixtures.set(
+  "contract-shapes/terminal__open-provider-activity-request.json",
+  serializeWireFixture({
+    _tag: "Request",
+    id: requestId,
+    tag: "terminal.open",
+    payload: compileUnknownEncoder(TerminalOpenInput)({
+      threadId: "thread-1",
+      terminalId: "term-1",
+      cwd: "C:/repo",
+      env: {
+        COMMAND_ONLY: "command",
+        RUNTIME_ONLY: "runtime",
+        SHARED: "runtime",
+      },
+      command: {
+        executable: "codex",
+        args: ["--model", "gpt-5"],
+        env: {
+          COMMAND_ONLY: "command",
+          SHARED: "command",
+        },
+        activity: {
+          driverKind: "codex",
+          providerInstanceId: "codex_personal",
+        },
+      },
+    }),
+    headers: [],
+  } satisfies RpcMessage.RequestEncoded),
+);
+dynamicFixtures.set(
+  "contract-shapes/terminal__open-without-provider-activity-request.json",
+  serializeWireFixture({
+    _tag: "Request",
+    id: requestId,
+    tag: "terminal.open",
+    payload: compileUnknownEncoder(TerminalOpenInput)({
+      threadId: "thread-1",
+      terminalId: "term-2",
+      cwd: "C:/repo",
+      command: {
+        executable: "codex",
+        args: [],
+      },
+    }),
+    headers: [],
+  } satisfies RpcMessage.RequestEncoded),
+);
+const schemaFingerprints: Record<string, string> = {};
+const streamShapeFixtures: Array<string> = [];
+const typedFailureFixtures: Array<string> = [];
+for (const rpc of [...WsRpcGroup.requests.values()].toSorted((left, right) =>
+  left._tag.localeCompare(right._tag),
+)) {
+  const safeMethodName = rpc._tag.replaceAll(".", "__");
+  if (StreamSchemaTypeId in (rpc.successSchema as object)) {
+    const streamSchema = rpc.successSchema as unknown as {
+      readonly success: { readonly ast: SchemaAST.AST };
+    };
+    for (const [index, member] of schemaMembers(streamSchema.success.ast).entries()) {
+      const fixtureKey = `${rpc._tag}:${index}`;
+      const relativePath = `stream-shapes/${safeMethodName}-${String(index).padStart(2, "0")}.json`;
+      const value = encodeSchemaSample(member, fixtureKey, manualStreamSamples.get(fixtureKey));
+      dynamicFixtures.set(
+        relativePath,
+        serializeWireFixture({
+          _tag: "Chunk",
+          requestId,
+          values: [value],
+        } satisfies RpcMessage.ResponseChunkEncoded),
+      );
+      schemaFingerprints[relativePath] = NodeCrypto.createHash("sha256")
+        .update(JSON.stringify(member))
+        .digest("hex");
+      streamShapeFixtures.push(relativePath);
+    }
+  }
+
+  for (const [index, member] of schemaMembers(rpc.errorSchema.ast).entries()) {
+    if (member._tag === "Never") continue;
+    const fixtureKey = `${rpc._tag}:error:${index}`;
+    const relativePath = `typed-failures/${safeMethodName}-${String(index).padStart(2, "0")}.json`;
+    let error: unknown;
+    try {
+      error = encodeSchemaSample(member, fixtureKey);
+    } catch (cause) {
+      if (cause instanceof Error && cause.message.includes("Unsupported AST Never")) {
+        continue;
+      }
+      throw cause;
+    }
+    dynamicFixtures.set(
+      relativePath,
+      serializeWireFixture({
+        _tag: "Exit",
+        requestId,
+        exit: {
+          _tag: "Failure",
+          cause: [{ _tag: "Fail", error }],
+        },
+      } satisfies RpcMessage.ResponseExitEncoded),
+    );
+    schemaFingerprints[relativePath] = NodeCrypto.createHash("sha256")
+      .update(JSON.stringify(member))
+      .digest("hex");
+    typedFailureFixtures.push(relativePath);
+  }
+}
+
+if (methods.length !== 85) {
+  throw new Error(`Expected 85 active RPC methods, found ${methods.length}.`);
+}
+const streamMethodCount = methods.filter(({ mode }) => mode === "stream").length;
+if (streamMethodCount !== 15) {
+  throw new Error(`Expected 15 streaming RPC methods, found ${streamMethodCount}.`);
+}
+if (topLevelStreamShapeCount !== 56) {
+  throw new Error(
+    `Expected 56 top-level streaming item shapes, found ${topLevelStreamShapeCount}.`,
+  );
+}
+if (streamShapeFixtures.length !== topLevelStreamShapeCount) {
+  throw new Error(
+    `Exported ${streamShapeFixtures.length} stream shape fixtures, expected ${topLevelStreamShapeCount}.`,
+  );
+}
+if (typedFailureFixtures.length !== 131) {
+  throw new Error(`Expected 131 typed failure fixtures, found ${typedFailureFixtures.length}.`);
+}
+if (orchestrationEventShapeCount !== 23) {
+  throw new Error(`Expected 23 orchestration event shapes, found ${orchestrationEventShapeCount}.`);
+}
+const expectedStale = ["projects.add", "projects.list", "projects.remove"];
+if (JSON.stringify(staleMethodIdentifiers) !== JSON.stringify(expectedStale)) {
+  throw new Error(`Unexpected stale RPC identifiers: ${staleMethodIdentifiers.join(", ")}`);
+}
+
+const outputDirectory = NodePath.resolve(import.meta.dirname, "../fixtures/rpc-wire");
+await NodeFSP.rm(outputDirectory, { force: true, recursive: true });
+await NodeFSP.mkdir(outputDirectory, { recursive: true });
+for (const [name, fixture] of Object.entries(fixtures)) {
+  const outputPath = NodePath.join(outputDirectory, `${name}.json`);
+  await NodeFSP.writeFile(outputPath, `${JSON.stringify(fixture, null, 2)}\n`);
+}
+for (const [relativePath, fixture] of dynamicFixtures) {
+  const outputPath = NodePath.join(outputDirectory, relativePath);
+  await NodeFSP.mkdir(NodePath.dirname(outputPath), { recursive: true });
+  await NodeFSP.writeFile(outputPath, `${JSON.stringify(fixture, null, 2)}\n`);
+}
+const manifestPath = NodePath.join(outputDirectory, "manifest.json");
+await NodeFSP.writeFile(
+  manifestPath,
+  `${JSON.stringify(
+    {
+      protocolVersion: "effect-4.0.0-beta.78",
+      methods,
+      streamMethodCount,
+      expectedTopLevelStreamShapes: topLevelStreamShapeCount,
+      expectedOrchestrationEventShapes: orchestrationEventShapeCount,
+      streamShapeFixtures,
+      typedFailureFixtures,
+      schemaFingerprints,
+      staleMethodIdentifiers,
+      fixtures: [
+        ...Object.keys(fixtures).map((name) => `${name}.json`),
+        ...dynamicFixtures.keys(),
+      ].toSorted(),
+    },
+    null,
+    2,
+  )}\n`,
+);
+
+const formatResult = NodeChildProcess.spawnSync("vp", ["fmt", "--write", outputDirectory], {
+  cwd: NodePath.resolve(import.meta.dirname, "../../.."),
+  stdio: "inherit",
+});
+if (formatResult.status !== 0) {
+  throw new Error(`Failed to format RPC fixtures (exit ${formatResult.status ?? "unknown"}).`);
+}

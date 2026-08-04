@@ -1,0 +1,24 @@
+pub(crate) mod activity;
+pub mod canonical;
+pub(crate) mod hook_sink;
+pub mod model;
+pub mod protocol;
+pub mod runtime;
+pub(crate) mod transcript;
+
+#[doc(hidden)]
+pub use activity::{
+    ClaudeActivityFixtureAdapter, ClaudeActivityInputSource, ClaudeActivityOutput,
+    ClaudeActivityStateCounts,
+};
+#[doc(hidden)]
+pub use transcript::{ClaudeTranscriptFixtureAdapter, ClaudeTranscriptFixtureOutput};
+#[doc(hidden)]
+pub use transcript::{ClaudeTranscriptReadFixtureOutput, ClaudeTranscriptReaderFixture};
+pub use canonical::{CanonicalEvent, CanonicalEventTrace};
+pub use protocol::{AssistantMessage, ClaudeMessage};
+pub use runtime::{
+    ClaudeControlRequest, ClaudePermissionMode, ClaudeProviderRuntime, Decision, LaunchRequest,
+    LaunchRequestInput, PermissionRequestInput, ReconnectSnapshot, ResolvedUserInput, RuntimeMode,
+    TurnInput, UserInputRequestInput,
+};

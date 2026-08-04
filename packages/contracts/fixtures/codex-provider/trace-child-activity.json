@@ -1,0 +1,155 @@
+{
+  "scenario": "child commentary and completed work",
+  "initialActorIds": ["codex:thread:child-1"],
+  "inboundMessages": [
+    {
+      "emittedAtMs": 1784894460000,
+      "method": "item/agentMessage/delta",
+      "params": {
+        "threadId": "child-1",
+        "turnId": "child-turn-1",
+        "itemId": "child-message-1",
+        "delta": "[redacted commentary]"
+      }
+    },
+    {
+      "emittedAtMs": 1784894460000,
+      "method": "item/completed",
+      "params": {
+        "threadId": "child-1",
+        "turnId": "child-turn-1",
+        "item": {
+          "id": "child-message-1",
+          "type": "agentMessage",
+          "text": "[redacted commentary]"
+        },
+        "completedAtMs": 1784894460000
+      }
+    },
+    {
+      "emittedAtMs": 1784894460000,
+      "method": "item/started",
+      "params": {
+        "threadId": "child-1",
+        "turnId": "child-turn-1",
+        "item": {
+          "id": "child-tool-1",
+          "type": "dynamicToolCall",
+          "namespace": "workspace",
+          "tool": "inspect",
+          "arguments": {
+            "path": "[redacted path]"
+          },
+          "status": "inProgress",
+          "contentItems": null,
+          "success": null,
+          "durationMs": null
+        },
+        "startedAtMs": 1784894460000
+      }
+    },
+    {
+      "emittedAtMs": 1784894461000,
+      "method": "item/completed",
+      "params": {
+        "threadId": "child-1",
+        "turnId": "child-turn-1",
+        "item": {
+          "id": "child-tool-1",
+          "type": "dynamicToolCall",
+          "namespace": "workspace",
+          "tool": "inspect",
+          "arguments": {
+            "path": "[redacted path]"
+          },
+          "status": "completed",
+          "contentItems": [],
+          "success": true,
+          "durationMs": 1000
+        },
+        "completedAtMs": 1784894461000
+      }
+    },
+    {
+      "emittedAtMs": 1784894462000,
+      "method": "item/completed",
+      "params": {
+        "threadId": "child-1",
+        "turnId": "child-turn-1",
+        "item": {
+          "id": "child-command-1",
+          "type": "commandExecution",
+          "command": "[redacted command]",
+          "cwd": "[redacted path]",
+          "processId": null,
+          "source": "agent",
+          "status": "completed",
+          "commandActions": [
+            {
+              "type": "unknown",
+              "command": "[redacted command]"
+            }
+          ],
+          "aggregatedOutput": "[redacted command output]",
+          "exitCode": 0,
+          "durationMs": 1000
+        },
+        "completedAtMs": 1784894462000
+      }
+    }
+  ],
+  "expectedMutations": [
+    {
+      "type": "appendEntry",
+      "entry": {
+        "id": "codex:event:commentary:4c9fe1e9943bf015237f3c34cf5d683b1de6a1cea00d44ddde25aff29e0c900e-c2200580d9ac8e8f636d634c17fdcdc4dfa057c83ad628c9beed86bd7b3d8d40",
+        "ownerKind": "actor",
+        "ownerId": "codex:thread:child-1",
+        "kind": "commentary",
+        "title": "Commentary",
+        "detail": "[redacted commentary]",
+        "tone": "info",
+        "createdAt": "2026-07-24T12:01:00Z"
+      }
+    },
+    {
+      "type": "appendEntry",
+      "entry": {
+        "id": "codex:event:item-started:child-1:child-turn-1:child-tool-1:running",
+        "ownerKind": "actor",
+        "ownerId": "codex:thread:child-1",
+        "kind": "tool",
+        "title": "inspect started",
+        "detail": "[redacted tool detail]",
+        "tone": "tool",
+        "createdAt": "2026-07-24T12:01:00Z"
+      }
+    },
+    {
+      "type": "appendEntry",
+      "entry": {
+        "id": "codex:event:item-completed:child-1:child-turn-1:child-tool-1:completed",
+        "ownerKind": "actor",
+        "ownerId": "codex:thread:child-1",
+        "kind": "tool",
+        "title": "inspect completed",
+        "detail": "[redacted tool result]",
+        "tone": "success",
+        "createdAt": "2026-07-24T12:01:01Z"
+      }
+    },
+    {
+      "type": "appendEntry",
+      "entry": {
+        "id": "codex:event:item-completed:child-1:child-turn-1:child-command-1:completed",
+        "ownerKind": "actor",
+        "ownerId": "codex:thread:child-1",
+        "kind": "command",
+        "title": "Command completed",
+        "detail": "[redacted command output]",
+        "tone": "success",
+        "createdAt": "2026-07-24T12:01:02Z"
+      }
+    }
+  ]
+}
