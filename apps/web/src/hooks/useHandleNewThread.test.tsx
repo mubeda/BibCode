@@ -676,10 +676,7 @@ describe("useNewThreadHandler", () => {
     expect(createdDraftModelSelection()).toEqual({
       instanceId: codexWorkInstanceId,
       model: "built-in-second",
-      options: [
-        { id: "reasoningEffort", value: "high" },
-        { id: "serviceTier", value: "default" },
-      ],
+      options: [{ id: "reasoningEffort", value: "high" }],
     });
     expect(
       testState.serverConfigs.get(environmentId)?.settings.providerSessionDefaults[codexDriver],

@@ -258,7 +258,7 @@ describe("ProviderSessionDefaultsControls", () => {
     expect(entries("Switch")[0]?.["aria-label"]).toBe("Fast by default");
   });
 
-  it("renders Codex Fast by default when rich metadata omits serviceTier", () => {
+  it("disables Codex Fast when rich metadata omits serviceTier", () => {
     const markup = render(
       baseProps({
         models: [
@@ -288,7 +288,8 @@ describe("ProviderSessionDefaultsControls", () => {
     expect(markup).toContain("Fast by default");
     expect(entries("Switch")[0]).toMatchObject({
       "aria-label": "Fast by default",
-      checked: true,
+      checked: false,
+      disabled: true,
     });
   });
 
@@ -431,7 +432,7 @@ describe("ProviderSessionDefaultsControls", () => {
     expect(fastControl.disabled).toBe(true);
   });
 
-  it("keeps Codex controls mounted with their values when discovery becomes empty", async () => {
+  it("keeps Codex controls mounted and disables unverified Fast during empty discovery", async () => {
     const mounted = await mount(baseProps({ models: stableCodexModels, value: stableCodexValue }));
     const modelControl = controlElement(mounted, "Default model");
     const effortControl = controlElement(mounted, "Default effort");
@@ -447,7 +448,8 @@ describe("ProviderSessionDefaultsControls", () => {
     expect(fastControl.isConnected).toBe(true);
     expect(modelControl.textContent).toBe("GPT Rich");
     expect(effortControl.textContent).toBe("high");
-    expect(fastControl.getAttribute("aria-checked")).toBe("true");
+    expect(fastControl.getAttribute("aria-checked")).toBe("false");
+    expect(fastControl.disabled).toBe(true);
   });
 
   it("keeps Codex controls mounted while provider interactivity changes", async () => {

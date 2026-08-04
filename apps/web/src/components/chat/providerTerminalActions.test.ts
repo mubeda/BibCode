@@ -134,8 +134,6 @@ describe("resolveProviderTerminalAction", () => {
           "gpt-5.4",
           "--config",
           'model_reasoning_effort="high"',
-          "--config",
-          'service_tier="fast"',
         ],
         label: "Codex Terminal",
         activity: {
@@ -232,7 +230,7 @@ describe("resolveProviderTerminalAction", () => {
     },
   );
 
-  it("builds Codex terminal arguments from saved defaults during empty discovery", () => {
+  it("omits unverified Codex Fast arguments during empty discovery", () => {
     const settings = {
       ...DEFAULT_SERVER_SETTINGS,
       providerSessionDefaults: {
@@ -254,12 +252,10 @@ describe("resolveProviderTerminalAction", () => {
       DEFAULT_MODEL_BY_PROVIDER[CODEX_DRIVER],
       "--config",
       'model_reasoning_effort="xhigh"',
-      "--config",
-      'service_tier="fast"',
     ]);
   });
 
-  it("builds Codex Fast arguments through a partial live serviceTier descriptor", () => {
+  it("omits Codex Fast arguments through a partial live serviceTier descriptor", () => {
     const settings = {
       ...DEFAULT_SERVER_SETTINGS,
       providerSessionDefaults: {
@@ -283,8 +279,6 @@ describe("resolveProviderTerminalAction", () => {
       "gpt-5.6-sol",
       "--config",
       'model_reasoning_effort="medium"',
-      "--config",
-      'service_tier="fast"',
     ]);
   });
 
@@ -408,8 +402,6 @@ describe("resolveProviderTerminalAction", () => {
       "--model",
       "gpt-5.4",
       "--config",
-      'model_reasoning_effort="medium"',
-      "--config",
       'service_tier="default"',
     ]);
   });
@@ -454,7 +446,7 @@ describe("resolveProviderTerminalAction", () => {
     ).toEqual(["--permission-mode", "bypassPermissions", "--model", "grok-4"]);
   });
 
-  it("preserves Codex effort and service-tier invariants after a model fallback", () => {
+  it("preserves the verified Codex effort after a model fallback", () => {
     const settings = {
       ...DEFAULT_SERVER_SETTINGS,
       providerSessionDefaults: {
@@ -478,8 +470,6 @@ describe("resolveProviderTerminalAction", () => {
       "gpt-5.4-mini",
       "--config",
       'model_reasoning_effort="high"',
-      "--config",
-      'service_tier="fast"',
     ]);
     expect(action).toMatchObject({
       fallback: {

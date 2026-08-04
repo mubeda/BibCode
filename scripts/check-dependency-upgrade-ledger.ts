@@ -90,6 +90,7 @@ export const DEPENDENCY_AUDIT_IGNORED_DIRECTORIES: ReadonlySet<string> = new Set
   ".git",
   ".repos",
   ".superpowers",
+  ".worktrees",
   ".vite-plus",
   "dist",
   "node_modules",

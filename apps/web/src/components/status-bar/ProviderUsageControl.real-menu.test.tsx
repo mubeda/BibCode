@@ -90,11 +90,21 @@ async function pressTab(from: HTMLElement, to: HTMLElement, shiftKey = false): P
 }
 
 function detailButton(label: string): HTMLButtonElement {
-  const button = Array.from(document.querySelectorAll<HTMLButtonElement>("button")).find(
-    (candidate) => candidate.textContent?.trim() === label,
-  );
+  const button = Array.from(
+    openProviderDetail()?.querySelectorAll<HTMLButtonElement>("button") ?? [],
+  ).find((candidate) => candidate.textContent?.trim() === label);
   if (button === undefined) throw new Error(`${label} button was not rendered.`);
   return button;
+}
+
+function openProviderDetail(): HTMLElement | null {
+  return (
+    Array.from(
+      document.querySelectorAll<HTMLElement>('[data-testid="provider-usage-detail"]'),
+    ).find(
+      (detail) => !detail.closest('[data-slot="popover-positioner"]')?.hasAttribute("hidden"),
+    ) ?? null
+  );
 }
 
 async function activateNativeButtonByKeyboard(target: HTMLButtonElement): Promise<void> {
@@ -163,30 +173,24 @@ describe("ProviderUsageControl with Base UI Popover", () => {
 
     claudeTrigger.focus();
     await activateNativeButtonByKeyboard(claudeTrigger);
-    expect(document.querySelector('[data-testid="provider-usage-detail"]')?.textContent).toContain(
-      "Claude",
-    );
+    expect(openProviderDetail()?.textContent).toContain("Claude");
     expect(document.querySelector('[data-testid="provider-usage-roster"]')).toBeNull();
     expect(document.querySelector('[aria-label="Back to provider usage"]')).toBeNull();
 
-    const claudePopup = document.querySelector<HTMLElement>(
-      '[data-testid="provider-usage-detail"]',
-    );
+    const claudePopup = openProviderDetail();
     if (claudePopup === null) throw new Error("Claude detail was not rendered.");
     const claudeSettings = detailButton("Provider settings");
     await pressTab(claudeTrigger, claudeSettings);
     expect(document.activeElement).toBe(claudeSettings);
-    expect(document.querySelector('[data-testid="provider-usage-detail"]')).not.toBeNull();
+    expect(openProviderDetail()).not.toBeNull();
     await pressKey(claudeSettings, "Escape");
-    expect(document.querySelector('[data-testid="provider-usage-detail"]')).toBeNull();
+    expect(openProviderDetail()).toBeNull();
     expect(document.activeElement).toBe(claudeTrigger);
 
     codexTrigger.focus();
     await activateNativeButtonByKeyboard(codexTrigger);
-    expect(document.querySelector('[data-testid="provider-usage-detail"]')?.textContent).toContain(
-      "Codex",
-    );
-    const codexPopup = document.querySelector<HTMLElement>('[data-testid="provider-usage-detail"]');
+    expect(openProviderDetail()?.textContent).toContain("Codex");
+    const codexPopup = openProviderDetail();
     if (codexPopup === null) throw new Error("Codex detail was not rendered.");
     const resetNow = detailButton("Reset now");
     const codexSettings = detailButton("Provider settings");
@@ -196,9 +200,9 @@ describe("ProviderUsageControl with Base UI Popover", () => {
     expect(document.activeElement).toBe(codexSettings);
     await pressTab(codexSettings, resetNow, true);
     expect(document.activeElement).toBe(resetNow);
-    expect(document.querySelector('[data-testid="provider-usage-detail"]')).not.toBeNull();
+    expect(openProviderDetail()).not.toBeNull();
     await pressKey(resetNow, "Escape");
-    expect(document.querySelector('[data-testid="provider-usage-detail"]')).toBeNull();
+    expect(openProviderDetail()).toBeNull();
     expect(document.activeElement).toBe(codexTrigger);
   });
 });

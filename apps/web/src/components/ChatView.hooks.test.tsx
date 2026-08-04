@@ -2306,10 +2306,7 @@ describe("ChatView project script handlers", () => {
       providerSessionDefaults: {
         [ProviderDriverKind.make("codex")]: {
           model: "gpt-configured",
-          options: [
-            { id: "reasoningEffort", value: "high" },
-            { id: "serviceTier", value: "fast" },
-          ],
+          options: [{ id: "reasoningEffort", value: "high" }],
         },
       },
     };
@@ -2412,7 +2409,7 @@ describe("ChatView project script handlers", () => {
     });
   });
 
-  it("creates a Codex chat panel with saved effort and fast mode during empty discovery", async () => {
+  it("creates a Codex chat panel with saved effort but not unverified Fast during empty discovery", async () => {
     seedEnvironment(makeEnvironmentPresentation());
     seedProject(makeProject({ defaultModelSelection: null }));
     seedServerThread(makeThread());
@@ -2447,10 +2444,7 @@ describe("ChatView project script handlers", () => {
         modelSelection: {
           instanceId: codexInstanceId,
           model: DEFAULT_MODEL_BY_PROVIDER[ProviderDriverKind.make("codex")],
-          options: [
-            { id: "reasoningEffort", value: "high" },
-            { id: "serviceTier", value: "fast" },
-          ],
+          options: [{ id: "reasoningEffort", value: "high" }],
         },
       },
     });
@@ -2956,10 +2950,6 @@ describe("ChatView send flows", () => {
       expect(resolvedSelection).toEqual({
         instanceId: codexInstanceId,
         model: "gpt-5.4",
-        options: [
-          { id: "reasoningEffort", value: "medium" },
-          { id: "serviceTier", value: "default" },
-        ],
       });
       const promptRef = installComposerModelSelection(resolvedSelection, "medium");
       const onSend = capturedProps("chatComposer")["onSend"] as () => Promise<void>;
@@ -3015,7 +3005,7 @@ describe("ChatView send flows", () => {
     expect(input.input.bootstrap?.createThread?.modelSelection).toBe(storedSelection);
   });
 
-  it("dispatches Codex High and Fast on first send through partial live tier metadata", async () => {
+  it("normalizes Codex Fast to the advertised tier on first send through partial metadata", async () => {
     const partialCodexModel: ServerProvider["models"][number] = {
       slug: "gpt-5.5",
       name: "GPT-5.5",
@@ -3086,11 +3076,19 @@ describe("ChatView send flows", () => {
 
     await (capturedProps("chatComposer")["onSend"] as () => Promise<void>)();
 
+    const normalizedSelection: ModelSelection = {
+      instanceId: codexInstanceId,
+      model: partialCodexModel.slug,
+      options: [
+        { id: "reasoningEffort", value: "high" },
+        { id: "serviceTier", value: "default" },
+      ],
+    };
     expect(commandCallsFor("thread.startTurn")).toHaveLength(1);
     expect(commandCallsFor("thread.startTurn")[0]?.input).toMatchObject({
       input: {
-        modelSelection: seededSelection,
-        bootstrap: { createThread: { modelSelection: seededSelection } },
+        modelSelection: normalizedSelection,
+        bootstrap: { createThread: { modelSelection: normalizedSelection } },
       },
     });
   });
