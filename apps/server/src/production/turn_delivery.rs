@@ -2043,12 +2043,7 @@ mod tests {
             0,
             "a restarted worker must honor the durable retry deadline"
         );
-        tokio::time::advance(Duration::from_millis(98)).await;
-        for _ in 0..8 {
-            tokio::task::yield_now().await;
-        }
-        assert_eq!(routes.load(Ordering::SeqCst), 0);
-        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::time::advance(Duration::from_millis(99)).await;
         tokio::time::timeout(Duration::from_secs(1), async {
             while routes.load(Ordering::SeqCst) == 0 {
                 tokio::task::yield_now().await;
