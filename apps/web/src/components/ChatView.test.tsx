@@ -388,10 +388,10 @@ vi.mock("./chat/MessagesTimeline", () => ({
   },
 }));
 
-vi.mock("./chat/ChatHeader", () => ({
-  ChatHeader: (props: Record<string, unknown>) => {
-    h.captured["chatHeader"] = props;
-    return <div data-mock="chat-header">{String(props["activeThreadTitle"] ?? "")}</div>;
+vi.mock("./chat/ChatHeaderActions", () => ({
+  ChatHeaderActions: (props: Record<string, unknown>) => {
+    h.captured["chatHeaderActions"] = props;
+    return <div data-mock="chat-header-actions" />;
   },
 }));
 
@@ -2194,7 +2194,7 @@ describe("ChatView", () => {
         expect(
           capturedProps<{ allowAddSurfaces?: boolean }>("rightPanelTabs").allowAddSurfaces,
         ).toBe(false);
-        expect(h.captured["chatHeader"]).toBeUndefined();
+        expect(h.captured["chatHeaderActions"]).toBeUndefined();
         expect(h.captured["panelLayoutControls"]).toBeUndefined();
       } finally {
         await act(async () => root.unmount());
@@ -2448,7 +2448,9 @@ describe("ChatView", () => {
         expect(
           capturedProps<{ rightPanelOpen: boolean }>("panelLayoutControls").rightPanelOpen,
         ).toBe(false);
-        expect(capturedProps<{ rightPanelOpen: boolean }>("chatHeader").rightPanelOpen).toBe(false);
+        expect(capturedProps<{ rightPanelOpen: boolean }>("chatHeaderActions").rightPanelOpen).toBe(
+          false,
+        );
 
         await openSubagents(container);
         await vi.waitFor(() => {
@@ -2480,7 +2482,9 @@ describe("ChatView", () => {
         expect(
           capturedProps<{ rightPanelOpen: boolean }>("panelLayoutControls").rightPanelOpen,
         ).toBe(true);
-        expect(capturedProps<{ rightPanelOpen: boolean }>("chatHeader").rightPanelOpen).toBe(true);
+        expect(capturedProps<{ rightPanelOpen: boolean }>("chatHeaderActions").rightPanelOpen).toBe(
+          true,
+        );
       } finally {
         await act(async () => root.unmount());
         container.remove();
@@ -2610,12 +2614,22 @@ describe("ChatView", () => {
 
       const markup = renderServerRoute();
 
-      expect(markup).toContain('data-mock="chat-header"');
-      expect(markup).toContain("Demo Thread");
+      expect(markup).toContain('data-mock="center-panel-tabs"');
+      expect(markup).toContain('data-mock="chat-header-actions"');
+      expect(markup).toContain('aria-label="Demo Thread workspace"');
+      expect(markup.indexOf('data-mock="center-panel-tabs"')).toBeLessThan(
+        markup.indexOf('data-mock="chat-header-actions"'),
+      );
       expect(markup).toContain('data-mock="messages-timeline"');
       expect(markup).toContain('data-mock="chat-composer"');
       expect(markup).not.toContain('data-mock="branch-toolbar"');
       expect(markup).not.toContain('data-mock="no-active-thread"');
+
+      const tabs = capturedProps<Record<string, unknown>>("centerPanelTabs");
+      expect(tabs["hostLabel"]).toBe("Codex");
+      expect(capturedProps<Record<string, unknown>>("chatHeaderActions")).not.toHaveProperty(
+        "activeThreadTitle",
+      );
 
       const composer = capturedProps<Record<string, unknown>>("chatComposer");
       expect(composer["isServerThread"]).toBe(true);
@@ -2629,7 +2643,7 @@ describe("ChatView", () => {
       expect(activeThread.session).toBeNull();
       expect(activeThread.latestTurn).toBeNull();
 
-      const header = capturedProps<Record<string, unknown>>("chatHeader");
+      const header = capturedProps<Record<string, unknown>>("chatHeaderActions");
       expect(header["activeThreadId"]).toBe(threadId);
       expect(header["activeProjectName"]).toBe("Demo Project");
       expect(header["canCreatePanel"]).toBe(true);
@@ -2643,6 +2657,95 @@ describe("ChatView", () => {
         "composerBannerStack",
       );
       expect(bannerStack.items).toEqual([]);
+    });
+
+    it("uses the selected provider display name for the host tab", () => {
+      const namedProvider: ServerProvider = {
+        ...codexProvider,
+        displayName: "Codex Personal",
+      };
+      seedEnvironment(
+        makeEnvironmentPresentation({
+          serverConfig: { providers: [namedProvider], environment: { label: "Local" } },
+        }),
+      );
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+
+      renderServerRoute();
+
+      expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe(
+        "Codex Personal",
+      );
+    });
+
+    it("falls back to the selected provider kind when its status is missing", () => {
+      seedEnvironment(
+        makeEnvironmentPresentation({
+          serverConfig: { providers: [], environment: { label: "Local" } },
+        }),
+      );
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+
+      renderServerRoute();
+
+      expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe("Codex");
+    });
+
+    it("updates the host tab label when the selected provider changes", () => {
+      const claudeInstanceId = ProviderInstanceId.make("claude");
+      const claudeProvider: ServerProvider = {
+        ...codexProvider,
+        instanceId: claudeInstanceId,
+        driver: ProviderDriverKind.make("claude"),
+        displayName: "Claude",
+      };
+      seedEnvironment(
+        makeEnvironmentPresentation({
+          serverConfig: {
+            providers: [codexProvider, claudeProvider],
+            environment: { label: "Local" },
+          },
+        }),
+      );
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+
+      renderServerRoute();
+      expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe("Codex");
+      const initialSurfaces =
+        useCenterPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)]?.surfaces;
+
+      useComposerDraftStore.getState().setModelSelection(threadRef, {
+        instanceId: claudeInstanceId,
+        model: "claude-sonnet",
+      });
+      publishSeededStoreState(useComposerDraftStore);
+      renderServerRoute();
+
+      expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe("Claude");
+      expect(
+        useCenterPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)]?.surfaces,
+      ).toEqual(initialSurfaces);
+    });
+
+    it("keeps header actions aligned when every center surface is closed", () => {
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      useCenterPanelStore.getState().closeAllSurfaces(threadRef);
+      publishSeededStoreState(useCenterPanelStore);
+
+      const markup = renderServerRoute();
+
+      expect(markup).toContain('data-mock="chat-header-actions"');
+      expect(markup).not.toContain('data-mock="center-panel-tabs"');
+      expect(markup).toContain("data-center-panel-empty-spacer");
     });
 
     it("keeps ordinary chat and terminal launches available after activity is downgraded", async () => {
@@ -2665,7 +2768,7 @@ describe("ChatView", () => {
       const header = capturedProps<{
         onCreateChatPanel: (entry: ProviderInstanceEntry) => void;
         onOpenTerminalPanel: () => void;
-      }>("chatHeader");
+      }>("chatHeaderActions");
 
       header.onCreateChatPanel({
         instanceId: codexInstanceId,
@@ -2826,7 +2929,7 @@ describe("ChatView", () => {
       expect(activeThread.id).toBe(threadId);
       expect(activeThread.session).toBeNull();
 
-      const header = capturedProps<Record<string, unknown>>("chatHeader");
+      const header = capturedProps<Record<string, unknown>>("chatHeaderActions");
       expect(header["draftId"]).toBe(draftId);
       expect(header["canCreatePanel"]).toBe(false);
     });

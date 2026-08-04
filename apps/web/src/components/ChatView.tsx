@@ -228,7 +228,7 @@ import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
 import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { PullRequestThreadDialog } from "./PullRequestThreadDialog";
 import { MessagesTimeline } from "./chat/MessagesTimeline";
-import { ChatHeader } from "./chat/ChatHeader";
+import { ChatHeaderActions } from "./chat/ChatHeaderActions";
 import { type ProviderTerminalAction } from "./chat/providerTerminalActions";
 import { PanelLayoutControls, RightPanelMaximizeControl } from "./chat/PanelLayoutControls";
 import { type ExpandedImagePreview } from "./chat/ExpandedImagePreview";
@@ -2763,6 +2763,8 @@ function ChatViewContent(props: ChatViewProps) {
     const defaultInstanceId = defaultInstanceIdForDriver(selectedProvider);
     return providerStatuses.find((status) => status.instanceId === defaultInstanceId) ?? null;
   }, [activeProviderInstanceId, providerStatuses, selectedProvider]);
+  const centerHostLabel =
+    activeProviderStatus?.displayName?.trim() || formatProviderDriverKindLabel(selectedProvider);
   const activeProjectCwd = activeProject?.workspaceRoot ?? null;
   const activeThreadWorktreePath = activeThread?.worktreePath ?? null;
   const activeWorkspaceRoot = activeThreadWorktreePath ?? activeProjectCwd ?? undefined;
@@ -5912,6 +5914,7 @@ function ChatViewContent(props: ChatViewProps) {
         {!isPanel && (
           <header
             data-chat-header
+            aria-label={`${activeThread.title} workspace`}
             className={cn(
               "border-b border-border transition-[padding-left] duration-200 ease-linear motion-reduce:transition-none",
               "workspace-topbar pl-[calc(env(safe-area-inset-left)+0.75rem)] pr-[calc(env(safe-area-inset-right)+0.75rem)] sm:pl-[calc(env(safe-area-inset-left)+1.25rem)] sm:pr-[calc(env(safe-area-inset-right)+1.25rem)]",
@@ -5919,11 +5922,26 @@ function ChatViewContent(props: ChatViewProps) {
             )}
           >
             {!effectiveRightPanelOpen ? panelLayoutControls : null}
-            <ChatHeader
+            {activeThreadRef && centerPanelState.surfaces.length > 0 ? (
+              <CenterPanelTabs
+                hostLabel={centerHostLabel}
+                surfaces={centerPanelState.surfaces}
+                activeSurfaceId={centerPanelState.activeSurfaceId}
+                onActivate={(surface) =>
+                  centerPanelActions.activateSurface(activeThreadRef, surface.id)
+                }
+                onCloseSurface={closeCenterPanelSurface}
+                onCloseOtherSurfaces={closeOtherCenterPanelSurfaces}
+                onCloseSurfacesToRight={closeCenterPanelSurfacesToRight}
+                onCloseAllSurfaces={closeAllCenterPanelSurfaces}
+              />
+            ) : (
+              <div className="min-w-0 flex-1" aria-hidden="true" data-center-panel-empty-spacer />
+            )}
+            <ChatHeaderActions
               activeThreadEnvironmentId={activeThread.environmentId}
               activeThreadId={activeThread.id}
               {...(routeKind === "draft" && draftId ? { draftId } : {})}
-              activeThreadTitle={activeThread.title}
               activeProjectName={activeProject?.title}
               openInCwd={gitCwd}
               activeProjectScripts={activeProject?.scripts}
@@ -5946,21 +5964,6 @@ function ChatViewContent(props: ChatViewProps) {
               onDeleteProjectScript={deleteProjectScript}
             />
           </header>
-        )}
-
-        {/* Center multipanel tab strip */}
-        {!isPanel && activeThreadRef && centerPanelState.surfaces.length > 0 && (
-          <CenterPanelTabs
-            surfaces={centerPanelState.surfaces}
-            activeSurfaceId={centerPanelState.activeSurfaceId}
-            onActivate={(surface) =>
-              centerPanelActions.activateSurface(activeThreadRef, surface.id)
-            }
-            onCloseSurface={closeCenterPanelSurface}
-            onCloseOtherSurfaces={closeOtherCenterPanelSurfaces}
-            onCloseSurfacesToRight={closeCenterPanelSurfacesToRight}
-            onCloseAllSurfaces={closeAllCenterPanelSurfaces}
-          />
         )}
         {/* Error banner */}
         {!centerHostHidden ? (
