@@ -142,6 +142,10 @@ it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
       ]) {
         assert.equal(yield* fs.exists(path.join(repoRoot, iconPath)), true, iconPath);
       }
+      const linuxIcon = yield* fs.readFile(
+        path.join(repoRoot, "assets/prod/black-universal-1024.png"),
+      );
+      assert.equal(linuxIcon[25], 6, "Linux desktop icon must use the RGBA PNG color type");
       assert.equal(yield* fs.exists(path.join(repoRoot, "apps/desktop/resources")), false);
     }),
   );
