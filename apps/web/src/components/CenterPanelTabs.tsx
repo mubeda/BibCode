@@ -83,13 +83,17 @@ export function CenterPanelTabs(props: CenterPanelTabsProps) {
       if (!nextSurface) return;
 
       event.preventDefault();
-      const activationButtons = tabListRef.current?.querySelectorAll<HTMLButtonElement>(
-        "[data-center-panel-tab-activation]",
-      );
-      const nextButton = activationButtons?.[nextIndex];
-      nextButton?.focus();
-      nextButton?.scrollIntoView({ block: "nearest", inline: "nearest" });
       props.onActivate(nextSurface);
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => {
+          const activationButtons = tabListRef.current?.querySelectorAll<HTMLButtonElement>(
+            "[data-center-panel-tab-activation]",
+          );
+          const nextButton = activationButtons?.[nextIndex];
+          nextButton?.focus();
+          nextButton?.scrollIntoView({ block: "nearest", inline: "nearest" });
+        });
+      });
     },
     [props],
   );

@@ -11,6 +11,7 @@ const harness = vi.hoisted(() => ({
     querySelectorAll: ReturnType<typeof vi.fn>;
   },
   effects: [] as Array<() => void>,
+  animationFrames: [] as FrameRequestCallback[],
 }));
 
 vi.mock("react", async (importOriginal) => {
@@ -95,6 +96,11 @@ beforeEach(() => {
   harness.api = null;
   harness.refCurrent = null;
   harness.effects.length = 0;
+  harness.animationFrames.length = 0;
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+    harness.animationFrames.push(callback);
+    return harness.animationFrames.length;
+  });
 });
 
 describe("CenterPanelTabs", () => {
@@ -188,12 +194,60 @@ describe("CenterPanelTabs", () => {
     (activeButton.props as { onKeyDown: (event: KeyboardEventStub) => void }).onKeyDown(event);
 
     expect(event.preventDefault).toHaveBeenCalledOnce();
+    expect(input.onActivate).toHaveBeenCalledWith(terminal);
+    expect(activationButtons[2]?.focus).not.toHaveBeenCalled();
+    expect(harness.animationFrames).toHaveLength(1);
+    const firstFrame = harness.animationFrames.splice(0);
+    for (const callback of firstFrame) callback(0);
+    expect(activationButtons[2]?.focus).not.toHaveBeenCalled();
+    expect(harness.animationFrames).toHaveLength(1);
+    const secondFrame = harness.animationFrames.splice(0);
+    for (const callback of secondFrame) callback(16);
     expect(activationButtons[2]?.focus).toHaveBeenCalledOnce();
     expect(activationButtons[2]?.scrollIntoView).toHaveBeenCalledWith({
       block: "nearest",
       inline: "nearest",
     });
-    expect(input.onActivate).toHaveBeenCalledWith(terminal);
+  });
+
+  it("restores adjacent-tab focus after activation rerenders the active chat", () => {
+    let focusedElement = "chat";
+    const activationButtons = [
+      { focus: () => (focusedElement = "host"), scrollIntoView: vi.fn() },
+      { focus: () => (focusedElement = "chat"), scrollIntoView: vi.fn() },
+      { focus: () => (focusedElement = "terminal"), scrollIntoView: vi.fn() },
+    ];
+    harness.refCurrent = {
+      querySelector: vi.fn(() => ({ scrollIntoView: vi.fn() })),
+      querySelectorAll: vi.fn(() => activationButtons),
+    };
+    const input = props();
+    input.onActivate.mockImplementation(() => {
+      focusedElement = "composer";
+    });
+    const tree = CenterPanelTabs(input);
+    const activeButton = visit(tree).find(
+      (element) =>
+        element.type === "button" &&
+        (element.props as Record<string, unknown>)["aria-selected"] === true,
+    );
+    if (!activeButton) throw new Error("Active tab button not found");
+
+    const event: KeyboardEventStub = { key: "ArrowRight", preventDefault: vi.fn() };
+    (activeButton.props as { onKeyDown: (event: KeyboardEventStub) => void }).onKeyDown(event);
+
+    expect(focusedElement).toBe("composer");
+    expect(harness.animationFrames).toHaveLength(1);
+    requestAnimationFrame(() => {
+      focusedElement = "composer";
+    });
+    const firstFrame = harness.animationFrames.splice(0);
+    for (const callback of firstFrame) callback(0);
+    expect(focusedElement).toBe("composer");
+    expect(harness.animationFrames).toHaveLength(1);
+    const secondFrame = harness.animationFrames.splice(0);
+    for (const callback of secondFrame) callback(16);
+    expect(focusedElement).toBe("terminal");
   });
 
   it("handles activation, close buttons, middle click, and context-menu actions", async () => {
