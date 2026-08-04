@@ -212,7 +212,7 @@ Verification after implementation:
 
 - Claude usage fetching can be credential-source sensitive. The first pass should surface honest unavailable/error states and leave complex account/PTY fallback for a separate change.
 - Codex rate-limit JSON-RPC behavior can change. Keep the mapper isolated and well-tested.
-- Process diagnostics are descendants of the T4 server process, not the entire desktop shell. The UI must label this correctly so users do not interpret it as total machine memory.
+- Process diagnostics are descendants of the BiBCode server process, not the entire desktop shell. The UI must label this correctly so users do not interpret it as total machine memory.
 - Large process tables can churn. Keep detailed resource queries popover-open only.
 
 ## Follow-Ups

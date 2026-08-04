@@ -18,7 +18,7 @@
 - Keep `packages/contracts` schema-only.
 - Do not edit vendored `.repos/` content.
 - Use TDD: every production behavior gets a failing test first.
-- Resource metrics are T4 server process descendants, not whole-machine totals; UI copy must say that.
+- Resource metrics are BiBCode server process descendants, not whole-machine totals; UI copy must say that.
 - Run `vp test`, fix failures caused by this change, then run `vp check` and `vp run typecheck`.
 - Verify the running UI with Playwright/Chrome after implementation.
 

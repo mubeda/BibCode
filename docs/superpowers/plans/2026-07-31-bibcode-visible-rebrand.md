@@ -288,13 +288,13 @@ are listed.
 
 Update every match that identifies the product. Preserve lower-case commands,
 environment variables, paths, package names, protocol examples, and explicit
-third-party provenance until the internal plans. Change visible `T4 Connect`
-to `BiBCode Connect`. Update screenshot alt text and installer/release examples
+third-party provenance until the internal plans. Use `BiBCode Connect` for the
+visible connection label. Update screenshot alt text and installer/release examples
 to the names from Task 3.
 
 - [ ] **Step 3: Repeat the audit and inspect every remaining line**
 
-Run the Step 1 audit. Expected: no product-facing match; any unrelated T4
+Run the Step 1 audit. Expected: no product-facing match; any unrelated legacy
 technical term must be manually confirmed and recorded in the review notes.
 
 - [ ] **Step 4: Verify documentation links and formatting**
@@ -476,7 +476,7 @@ git diff --check -- assets apps/web/public apps/marketing/public scripts/lib/bra
 **Interfaces:**
 
 - Consumes: the rebranded packaged app and E2E fixture.
-- Produces: two current BiBCode product screenshots with no T3/T4 identity.
+- Produces: two current BiBCode product screenshots with no predecessor identity.
 
 - [ ] **Step 1: Add reproducible marketing captures to the existing E2E spec**
 
