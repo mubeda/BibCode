@@ -1658,7 +1658,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_inventory_uses_saved_defaults_before_live_discovery() {
+    fn codex_inventory_keeps_effort_but_not_unverified_fast_before_live_discovery() {
         let definitions = definitions(&json!({
             "providerInstances": {
                 "codex": { "driver": "codex", "enabled": true, "config": {} }
@@ -1681,8 +1681,11 @@ mod tests {
             "xhigh"
         );
         assert_eq!(
-            models[0]["capabilities"]["optionDescriptors"][1]["currentValue"],
-            "fast"
+            models[0]["capabilities"]["optionDescriptors"]
+                .as_array()
+                .expect("fallback option descriptors")
+                .len(),
+            1
         );
     }
 
@@ -1745,7 +1748,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_inventory_uses_legacy_object_saved_defaults_before_live_discovery() {
+    fn codex_inventory_keeps_legacy_effort_but_not_unverified_fast_before_live_discovery() {
         let definitions = definitions(&json!({
             "providerInstances": {
                 "codex": { "driver": "codex", "enabled": true, "config": {} }
@@ -1768,8 +1771,11 @@ mod tests {
             "xhigh"
         );
         assert_eq!(
-            models[0]["capabilities"]["optionDescriptors"][1]["currentValue"],
-            "fast"
+            models[0]["capabilities"]["optionDescriptors"]
+                .as_array()
+                .expect("fallback option descriptors")
+                .len(),
+            1
         );
     }
 
