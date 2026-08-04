@@ -20,6 +20,7 @@ import {
 import {
   getFastModeDescriptor,
   getFastModeOffValue,
+  getFastModeOnValue,
 } from "@bibcode/shared/providerSessionDefaults";
 import { memo, useCallback, useEffect, useRef, useState } from "react";
 import type { VariantProps } from "class-variance-authority";
@@ -239,7 +240,8 @@ function getSelectedTraits(
   const fastModeEnabled =
     fastModeDescriptor?.type === "boolean"
       ? fastModeDescriptor.currentValue === true
-      : getDescriptorStringValue(fastModeDescriptor ?? null) === "fast";
+      : getDescriptorStringValue(fastModeDescriptor ?? null) ===
+        getFastModeOnValue(provider, fastModeDescriptor);
   const contextWindow = getDescriptorStringValue(contextWindowDescriptor);
   const selectedAgent = getDescriptorStringValue(agentDescriptor);
   const selectedAgentLabel = agentDescriptor
@@ -580,11 +582,13 @@ export const ComposerTraitControls = memo(function ComposerTraitControls({
           reason: "Reasoning effort is not supported by the selected model.",
         });
   const fastOffValue = getFastModeOffValue(provider, fastModeDescriptor);
+  const fastOnValue = getFastModeOnValue(provider, fastModeDescriptor);
   const fastOperable =
     resolvedFastAvailability.state === "supported" &&
     !isPending &&
     fastModeDescriptor &&
-    fastOffValue !== null;
+    fastOffValue !== null &&
+    fastOnValue !== null;
   const effortOperable =
     resolvedEffortAvailability.state === "supported" && !isPending && primarySelectDescriptor;
   const fastLabel = isPending
@@ -652,7 +656,7 @@ export const ComposerTraitControls = memo(function ComposerTraitControls({
                     ? !fastModeEnabled
                     : fastModeEnabled
                       ? fastOffValue
-                      : "fast",
+                      : fastOnValue,
                 );
               }}
             >

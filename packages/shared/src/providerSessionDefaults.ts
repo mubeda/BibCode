@@ -67,7 +67,7 @@ interface NormalizedProviderOptions {
 
 const FAST_MODE_OPTION_ID = "fastMode";
 const SERVICE_TIER_OPTION_ID = "serviceTier";
-const FAST_SERVICE_TIER_VALUE = "fast";
+const FAST_SERVICE_TIER_VALUES = ["priority", "fast"] as const;
 const CODEX_DRIVER_KIND = ProviderDriverKind.make("codex");
 const CLAUDE_DRIVER_KIND = ProviderDriverKind.make("claudeAgent");
 const DEFAULT_EFFORT_BY_PROVIDER: Partial<Record<ProviderDriverKind, string>> = {
@@ -185,8 +185,30 @@ export function getFastModeDescriptor(
       (descriptor) =>
         descriptor.id === SERVICE_TIER_OPTION_ID &&
         descriptor.type === "select" &&
-        descriptor.options.some((option) => option.id === FAST_SERVICE_TIER_VALUE) &&
+        getFastModeOnValue(driver, descriptor) !== null &&
         getFastModeOffValue(driver, descriptor) !== null,
+    ) ?? null
+  );
+}
+
+export function getFastModeOnValue(
+  driver: ProviderDriverKind,
+  descriptor: ProviderOptionDescriptor | null | undefined,
+): string | boolean | null {
+  if (descriptor?.id === FAST_MODE_OPTION_ID && descriptor.type === "boolean") {
+    return true;
+  }
+  if (
+    driver !== CODEX_DRIVER_KIND ||
+    descriptor?.id !== SERVICE_TIER_OPTION_ID ||
+    descriptor.type !== "select"
+  ) {
+    return null;
+  }
+
+  return (
+    FAST_SERVICE_TIER_VALUES.find((value) =>
+      descriptor.options.some((option) => option.id === value),
     ) ?? null
   );
 }
@@ -207,7 +229,7 @@ export function getFastModeOffValue(
   }
 
   const nonFastOptions = descriptor.options.filter(
-    (option) => option.id !== FAST_SERVICE_TIER_VALUE,
+    (option) => !FAST_SERVICE_TIER_VALUES.some((value) => option.id === value),
   );
   const currentValue = getProviderOptionCurrentValue(descriptor);
   if (
@@ -244,6 +266,7 @@ function normalizeProviderOptions(
   const effortValue = getProviderOptionCurrentValue(effortDescriptor);
   const fastModeDescriptor = getFastModeDescriptor(driver, descriptors);
   const fastModeValue = getProviderOptionCurrentValue(fastModeDescriptor);
+  const fastModeOnValue = getFastModeOnValue(driver, fastModeDescriptor);
 
   return {
     descriptors,
@@ -256,7 +279,7 @@ function normalizeProviderOptions(
           ? fastModeValue
           : null
         : fastModeDescriptor?.type === "select"
-          ? fastModeValue === FAST_SERVICE_TIER_VALUE
+          ? fastModeValue === fastModeOnValue
           : null,
   };
 }
@@ -441,7 +464,9 @@ export function updateProviderSessionDefault(input: {
       normalizedOptions = normalizeUpdatedSelections(selections);
     } else if (fastModeDescriptor?.type === "select") {
       const offValue = getFastModeOffValue(input.driver, fastModeDescriptor);
-      const value = input.change.value ? FAST_SERVICE_TIER_VALUE : offValue;
+      const value = input.change.value
+        ? getFastModeOnValue(input.driver, fastModeDescriptor)
+        : offValue;
       if (typeof value === "string") {
         selections = replaceSelection(selections, {
           id: fastModeDescriptor.id,
