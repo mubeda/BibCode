@@ -8565,7 +8565,7 @@ async fn missing_runtime_accepts_durable_thread_settings_for_the_next_turn() {
 }
 
 #[tokio::test]
-async fn missing_runtime_rejects_ephemeral_commands_as_stale_session_actions() {
+async fn missing_runtime_rejects_ephemeral_actions_and_stops_idempotently() {
     let engine = engine().await;
     let state = Arc::new(StdMutex::new(DriverState::default()));
     let factory = Arc::new(FakeFactory {
@@ -8583,7 +8583,6 @@ async fn missing_runtime_rejects_ephemeral_commands_as_stale_session_actions() {
         json!({"type":"thread.turn.interrupt","commandId":"interrupt","threadId":"t1","turnId":"turn-1","createdAt":NOW}),
         json!({"type":"thread.approval.respond","commandId":"approve","threadId":"t1","requestId":"r1","decision":"accept","createdAt":NOW}),
         json!({"type":"thread.user-input.respond","commandId":"answer","threadId":"t1","requestId":"r2","answers":{"q":"a"},"createdAt":NOW}),
-        json!({"type":"thread.session.stop","commandId":"stop","threadId":"t1","createdAt":NOW}),
     ];
 
     for value in commands {
@@ -8608,6 +8607,14 @@ async fn missing_runtime_rejects_ephemeral_commands_as_stale_session_actions() {
         ));
         assert!(message.contains("start a new turn"), "{message}");
     }
+
+    let stop = serde_json::from_value(json!({
+        "type":"thread.session.stop", "commandId":"stop", "threadId":"t1", "createdAt":NOW
+    }))
+    .unwrap();
+    route_orchestration_command(&supervisor, &engine, &settings.path().to_path_buf(), stop)
+        .await
+        .expect("stopping a missing runtime is idempotent");
 
     supervisor.shutdown().await.unwrap();
 }
