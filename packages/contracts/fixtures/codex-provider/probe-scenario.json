@@ -123,17 +123,14 @@
               "options": [
                 {
                   "id": "default",
-                  "label": "Standard"
+                  "label": "Standard",
+                  "isDefault": false
                 },
                 {
                   "id": "priority",
                   "label": "Priority",
                   "description": "Priority capacity",
                   "isDefault": true
-                },
-                {
-                  "id": "fast",
-                  "label": "Fast"
                 }
               ],
               "currentValue": "priority"
@@ -175,17 +172,14 @@
               "options": [
                 {
                   "id": "default",
-                  "label": "Standard"
+                  "label": "Standard",
+                  "isDefault": false
                 },
                 {
                   "id": "priority",
                   "label": "Priority",
                   "description": "Priority capacity",
                   "isDefault": true
-                },
-                {
-                  "id": "fast",
-                  "label": "Fast"
                 }
               ],
               "currentValue": "priority"
