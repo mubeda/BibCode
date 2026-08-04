@@ -31,7 +31,7 @@ pub use registry::{
 pub use resource_sampler::{
     AttributedProcessSnapshot, DesktopUiObservation, DesktopUiProcessObserver,
     NativeResourceSampler, NotApplicableUiProcessObserver, ResourceSampler, UiCoverage,
-    UiCoverageStatus, UnavailableDesktopUiProcessObserver,
+    UiCoverageStatus, UnavailableDesktopUiProcessObserver, WebView2DesktopUiProcessObserver,
 };
 pub use trace::TraceDiagnosticsStore;
 pub(crate) use trace::redact_sensitive_text;

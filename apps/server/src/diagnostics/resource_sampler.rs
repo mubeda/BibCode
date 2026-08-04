@@ -51,14 +51,22 @@ pub struct DesktopUiObservation {
 }
 
 pub trait DesktopUiProcessObserver: std::fmt::Debug + Send + Sync + 'static {
-    fn observe(&self) -> Pin<Box<dyn Future<Output = DesktopUiObservation> + Send + '_>>;
+    fn observe(
+        &self,
+        rows: Arc<[ProcessRow]>,
+        server_identity: ProcessIdentity,
+    ) -> Pin<Box<dyn Future<Output = DesktopUiObservation> + Send + '_>>;
 }
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct UnavailableDesktopUiProcessObserver;
 
 impl DesktopUiProcessObserver for UnavailableDesktopUiProcessObserver {
-    fn observe(&self) -> Pin<Box<dyn Future<Output = DesktopUiObservation> + Send + '_>> {
+    fn observe(
+        &self,
+        _rows: Arc<[ProcessRow]>,
+        _server_identity: ProcessIdentity,
+    ) -> Pin<Box<dyn Future<Output = DesktopUiObservation> + Send + '_>> {
         Box::pin(async {
             DesktopUiObservation {
                 identities: Vec::new(),
@@ -72,7 +80,11 @@ impl DesktopUiProcessObserver for UnavailableDesktopUiProcessObserver {
 pub struct NotApplicableUiProcessObserver;
 
 impl DesktopUiProcessObserver for NotApplicableUiProcessObserver {
-    fn observe(&self) -> Pin<Box<dyn Future<Output = DesktopUiObservation> + Send + '_>> {
+    fn observe(
+        &self,
+        _rows: Arc<[ProcessRow]>,
+        _server_identity: ProcessIdentity,
+    ) -> Pin<Box<dyn Future<Output = DesktopUiObservation> + Send + '_>> {
         Box::pin(async {
             DesktopUiObservation {
                 identities: Vec::new(),
@@ -83,6 +95,74 @@ impl DesktopUiProcessObserver for NotApplicableUiProcessObserver {
             }
         })
     }
+}
+
+#[derive(Clone, Debug)]
+pub struct WebView2DesktopUiProcessObserver {
+    host_executable_argument: String,
+}
+
+impl WebView2DesktopUiProcessObserver {
+    #[must_use]
+    pub fn new(host_executable_name: impl AsRef<str>) -> Self {
+        Self {
+            host_executable_argument: format!(
+                "--webview-exe-name={}",
+                host_executable_name.as_ref()
+            ),
+        }
+    }
+}
+
+impl DesktopUiProcessObserver for WebView2DesktopUiProcessObserver {
+    fn observe(
+        &self,
+        rows: Arc<[ProcessRow]>,
+        server_identity: ProcessIdentity,
+    ) -> Pin<Box<dyn Future<Output = DesktopUiObservation> + Send + '_>> {
+        Box::pin(async move {
+            let identities = rows
+                .iter()
+                .filter(|row| {
+                    has_current_server_ancestry(
+                        &rows,
+                        server_identity,
+                        ProcessIdentity {
+                            pid: row.pid,
+                            started_at: row.started_at,
+                        },
+                    ) && webview2_command_matches_host(&row.command, &self.host_executable_argument)
+                })
+                .map(|row| ProcessIdentity {
+                    pid: row.pid,
+                    started_at: row.started_at,
+                })
+                .collect::<Vec<_>>();
+            let coverage = if identities.is_empty() {
+                unavailable_coverage(UI_UNAVAILABLE_MESSAGE)
+            } else {
+                UiCoverage {
+                    status: UiCoverageStatus::Available,
+                    message: None,
+                }
+            };
+
+            DesktopUiObservation {
+                identities,
+                coverage,
+            }
+        })
+    }
+}
+
+fn webview2_command_matches_host(command: &str, host_executable_argument: &str) -> bool {
+    let mut has_embedded_webview = false;
+    let mut has_matching_host = false;
+    for argument in command.split_ascii_whitespace() {
+        has_embedded_webview |= argument.eq_ignore_ascii_case("--embedded-browser-webview=1");
+        has_matching_host |= argument.eq_ignore_ascii_case(host_executable_argument);
+    }
+    has_embedded_webview && has_matching_host
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -164,10 +244,12 @@ impl NativeResourceSampler {
         signal: ProcessSignal,
     ) -> Result<(), SignalError> {
         let sample_started_at = Instant::now();
-        let observation = observe_ui_processes(self.ui_observer.clone());
-        let rows = self.native.collect_rows();
-        let (observation, rows) = tokio::join!(observation, rows);
-        let rows = rows.map_err(|error| SignalError::Read(error.to_string()))?;
+        let rows: Arc<[ProcessRow]> = self
+            .native
+            .collect_rows()
+            .await
+            .map_err(|error| SignalError::Read(error.to_string()))?
+            .into();
         let server_identity = rows
             .iter()
             .find(|row| row.pid == std::process::id())
@@ -178,6 +260,8 @@ impl NativeResourceSampler {
             .ok_or_else(|| {
                 SignalError::Read("current server process is absent from native rows".to_owned())
             })?;
+        let observation =
+            observe_ui_processes(self.ui_observer.clone(), rows.clone(), server_identity).await;
         let mut claims = self.registry.bind_and_snapshot(&rows, sample_started_at);
         append_ui_claims(&mut claims, &rows, &observation.identities);
         let attribution =
@@ -212,10 +296,7 @@ impl ResourceSampler for NativeResourceSampler {
     {
         Box::pin(async move {
             let sample_started_at = Instant::now();
-            let observation = observe_ui_processes(self.ui_observer.clone());
-            let rows = self.native.collect_rows();
-            let (observation, rows) = tokio::join!(observation, rows);
-            let rows = rows?;
+            let rows: Arc<[ProcessRow]> = self.native.collect_rows().await?.into();
             let server_identity = rows
                 .iter()
                 .find(|row| row.pid == std::process::id())
@@ -228,6 +309,8 @@ impl ResourceSampler for NativeResourceSampler {
                         "current server process is absent from native rows".into(),
                     )
                 })?;
+            let observation =
+                observe_ui_processes(self.ui_observer.clone(), rows.clone(), server_identity).await;
             let mut claims = self.registry.bind_and_snapshot(&rows, sample_started_at);
             append_ui_claims(&mut claims, &rows, &observation.identities);
             let attribution = ResourceAttributor::attribute(
@@ -240,7 +323,7 @@ impl ResourceSampler for NativeResourceSampler {
             Ok(AttributedProcessSnapshot {
                 sampled_at_ms: OffsetDateTime::now_utc().unix_timestamp_nanos() / 1_000_000,
                 server_identity,
-                native_rows: rows.into(),
+                native_rows: rows,
                 processes: attribution.processes,
                 totals: attribution.totals,
                 ui_coverage: attribution.ui_coverage,
@@ -249,8 +332,12 @@ impl ResourceSampler for NativeResourceSampler {
     }
 }
 
-async fn observe_ui_processes(observer: Arc<dyn DesktopUiProcessObserver>) -> DesktopUiObservation {
-    let mut task = tokio::spawn(async move { observer.observe().await });
+async fn observe_ui_processes(
+    observer: Arc<dyn DesktopUiProcessObserver>,
+    rows: Arc<[ProcessRow]>,
+    server_identity: ProcessIdentity,
+) -> DesktopUiObservation {
+    let mut task = tokio::spawn(async move { observer.observe(rows, server_identity).await });
     let observation = match tokio::time::timeout(UI_OBSERVATION_TIMEOUT, &mut task).await {
         Ok(Ok(observation)) => observation,
         Ok(Err(_)) => DesktopUiObservation {
@@ -374,6 +461,7 @@ mod tests {
     use super::{
         DesktopUiObservation, DesktopUiProcessObserver, NativeProcessRowSource,
         NativeResourceSampler, ResourceSampler, UiCoverage, UiCoverageStatus,
+        WebView2DesktopUiProcessObserver,
     };
     use crate::diagnostics::{
         AttributionConfidence, AttributionKind, AttributionScope, ProcessAttributionRegistry,
@@ -458,7 +546,11 @@ mod tests {
     }
 
     impl DesktopUiProcessObserver for FakeDesktopUiProcessObserver {
-        fn observe(&self) -> Pin<Box<dyn Future<Output = DesktopUiObservation> + Send + '_>> {
+        fn observe(
+            &self,
+            _rows: Arc<[ProcessRow]>,
+            _server_identity: ProcessIdentity,
+        ) -> Pin<Box<dyn Future<Output = DesktopUiObservation> + Send + '_>> {
             Box::pin(async move {
                 match &self.observation {
                     FakeObservation::Return(observation) => observation.clone(),
@@ -476,6 +568,48 @@ mod tests {
                 }
             })
         }
+    }
+
+    #[tokio::test]
+    async fn webview2_observer_attributes_only_this_desktop_process_tree_as_core_ui() {
+        let server_pid = std::process::id();
+        let webview_pid = server_pid + 1;
+        let renderer_pid = server_pid + 2;
+        let unrelated_pid = server_pid + 3;
+        let mut webview = row(webview_pid, server_pid, 200);
+        webview.command = "msedgewebview2.exe --embedded-browser-webview=1 --webview-exe-name=BiBCode-Desktop.EXE".to_owned();
+        let mut unrelated = row(unrelated_pid, 1, 400);
+        unrelated.command = "msedgewebview2.exe --embedded-browser-webview=1 --webview-exe-name=bibcode-desktop.exe".to_owned();
+        let native = Arc::new(FakeNativeProcessRowSource::new(vec![
+            row(server_pid, 1, 100),
+            webview,
+            row(renderer_pid, webview_pid, 300),
+            unrelated,
+        ]));
+        let sampler = NativeResourceSampler::with_native_process_source(
+            native,
+            ProcessAttributionRegistry::new(),
+            Arc::new(WebView2DesktopUiProcessObserver::new("bibcode-desktop.exe")),
+        );
+
+        let snapshot = sampler.sample().await.expect("sample should succeed");
+
+        assert_eq!(snapshot.ui_coverage.status, UiCoverageStatus::Available);
+        for pid in [webview_pid, renderer_pid] {
+            let process = snapshot
+                .processes
+                .iter()
+                .find(|process| process.identity.pid == pid)
+                .expect("BiBCode WebView2 process");
+            assert_eq!(process.scope, AttributionScope::Core);
+            assert_eq!(process.kind, AttributionKind::Ui);
+        }
+        assert!(
+            snapshot
+                .processes
+                .iter()
+                .all(|process| process.identity.pid != unrelated_pid)
+        );
     }
 
     fn row(pid: u32, ppid: u32, started_at: u64) -> ProcessRow {

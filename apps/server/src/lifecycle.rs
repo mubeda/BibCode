@@ -470,8 +470,13 @@ mod tests {
 
     #[tokio::test]
     async fn default_ui_observers_match_the_server_runtime_mode() {
+        let rows = Arc::<[crate::diagnostics::ProcessRow]>::from([]);
+        let server_identity = crate::diagnostics::ProcessIdentity {
+            pid: std::process::id(),
+            started_at: 1,
+        };
         let web = default_ui_process_observer(crate::config::ServerMode::Web)
-            .observe()
+            .observe(rows.clone(), server_identity)
             .await;
         assert_eq!(
             web.coverage.status,
@@ -480,7 +485,7 @@ mod tests {
         assert!(web.coverage.message.is_none());
 
         let desktop = default_ui_process_observer(crate::config::ServerMode::Desktop)
-            .observe()
+            .observe(rows, server_identity)
             .await;
         assert_eq!(
             desktop.coverage.status,
