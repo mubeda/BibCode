@@ -1,0 +1,49 @@
+{
+  "scenario": "unsupported activity flags preserve the base Claude launch",
+  "rawInputLines": [
+    {
+      "source": "capabilityProbe",
+      "line": "{\"version\":\"1.0.0\",\"help_flags\":[\"--print\",\"--input-format\",\"--output-format\",\"--include-partial-messages\",\"--verbose\"]}"
+    },
+    {
+      "source": "baseLaunch",
+      "line": "{\"functional\":true,\"arguments\":[\"--print\",\"--input-format\",\"stream-json\",\"--output-format\",\"stream-json\",\"--include-partial-messages\",\"--verbose\"]}"
+    }
+  ],
+  "expectedMutations": [
+    {
+      "type": "setScope",
+      "capabilities": {
+        "actors": false,
+        "attributedActivity": false,
+        "backgroundWork": false,
+        "historyRecovery": "none",
+        "terminalObservation": false
+      },
+      "observationState": "live"
+    }
+  ],
+  "expectedMutationInputIndexes": [0],
+  "noMutationInputIndexes": [1],
+  "expectedLaunch": {
+    "activityFlagsSupported": false,
+    "baseLaunchFunctional": true,
+    "requiredBaseArguments": [
+      "--print",
+      "--input-format",
+      "stream-json",
+      "--output-format",
+      "stream-json",
+      "--include-partial-messages",
+      "--verbose"
+    ],
+    "omittedActivityArguments": ["--include-hook-events", "--forward-subagent-text"],
+    "activityCapabilities": {
+      "actors": false,
+      "attributedActivity": false,
+      "backgroundWork": false,
+      "historyRecovery": "none",
+      "terminalObservation": false
+    }
+  }
+}

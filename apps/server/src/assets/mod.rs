@@ -1,0 +1,545 @@
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use base64::Engine;
+use hmac::{Hmac, KeyInit as _, Mac};
+use serde::{Deserialize, Serialize};
+use sha2::Sha256;
+use thiserror::Error;
+
+use crate::project::ProjectFaviconResolver;
+use crate::provider::attachments::AttachmentMaterializer;
+use crate::workspace::{WorkspaceError, paths};
+
+pub const ASSET_ROUTE_PREFIX: &str = "/api/assets";
+
+const PREVIEW_ENTRY_EXTENSIONS: &[&str] = &["htm", "html", "pdf"];
+const IMAGE_EXTENSIONS: &[&str] = &["avif", "gif", "ico", "jpeg", "jpg", "png", "svg", "webp"];
+const PREVIEW_SIBLING_EXTENSIONS: &[&str] = &[
+    "htm", "html", "pdf", "avif", "gif", "ico", "jpeg", "jpg", "png", "svg", "webp", "css", "js",
+    "mjs", "otf", "ttf", "woff", "woff2",
+];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "_tag", rename_all = "kebab-case")]
+pub enum AssetResource {
+    WorkspaceFile {
+        #[serde(rename = "threadId")]
+        thread_id: String,
+        path: String,
+    },
+    Attachment {
+        #[serde(rename = "attachmentId")]
+        attachment_id: String,
+    },
+    ProjectFavicon {
+        cwd: String,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct AssetIssueRequest {
+    pub resource: AssetResource,
+    pub workspace_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IssuedAssetUrl {
+    pub relative_url: String,
+    pub expires_at: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ResolvedAsset {
+    File(PathBuf),
+    ProjectFaviconFallback,
+}
+
+#[derive(Debug, Error)]
+pub enum AssetError {
+    #[error("a workspace root is required for workspace asset access")]
+    WorkspaceContextRequired,
+    #[error("workspace asset is not an allowed preview type: {0}")]
+    UnsupportedPreviewType(String),
+    #[error("asset was not found: {0}")]
+    NotFound(String),
+    #[error(transparent)]
+    Workspace(#[from] WorkspaceError),
+    #[error("asset token encoding failed: {0}")]
+    Encoding(#[from] serde_json::Error),
+}
+
+#[derive(Clone)]
+pub struct AssetAccess {
+    secret: Vec<u8>,
+    attachments: AttachmentMaterializer,
+    ttl: Duration,
+    favicon_resolver: ProjectFaviconResolver,
+}
+
+impl AssetAccess {
+    pub fn new(secret: Vec<u8>, attachments_dir: PathBuf) -> Self {
+        Self::with_ttl(secret, attachments_dir, Duration::from_secs(60 * 60))
+    }
+
+    pub fn with_ttl(secret: Vec<u8>, attachments_dir: PathBuf, ttl: Duration) -> Self {
+        Self {
+            secret,
+            attachments: AttachmentMaterializer::new(attachments_dir),
+            ttl,
+            favicon_resolver: ProjectFaviconResolver,
+        }
+    }
+
+    pub async fn issue(&self, request: AssetIssueRequest) -> Result<IssuedAssetUrl, AssetError> {
+        let expires_at = now_millis().saturating_add(duration_millis(self.ttl));
+        let (claims, filename) = match request.resource {
+            AssetResource::WorkspaceFile { path, .. } => {
+                let root = request
+                    .workspace_root
+                    .ok_or(AssetError::WorkspaceContextRequired)?;
+                let root = paths::normalize_root(&root, false).await?;
+                let (file, relative) = canonical_workspace_file(&root, &path).await?;
+                let metadata = tokio::fs::metadata(&file)
+                    .await
+                    .map_err(|error| WorkspaceError::operation("stat", &file, error))?;
+                if !metadata.is_file() {
+                    return Err(AssetError::NotFound(path));
+                }
+                let extension = extension(&relative);
+                let claims = if IMAGE_EXTENSIONS.contains(&extension.as_str()) {
+                    Claims::WorkspaceExact {
+                        root,
+                        relative,
+                        expires_at,
+                    }
+                } else if PREVIEW_ENTRY_EXTENSIONS.contains(&extension.as_str()) {
+                    let base = Path::new(&relative)
+                        .parent()
+                        .filter(|parent| !parent.as_os_str().is_empty())
+                        .map_or_else(|| ".".to_owned(), paths::to_posix);
+                    Claims::WorkspaceSiblings {
+                        root,
+                        base,
+                        expires_at,
+                    }
+                } else {
+                    return Err(AssetError::UnsupportedPreviewType(path));
+                };
+                (claims, file_name(&file))
+            }
+            AssetResource::Attachment { attachment_id } => {
+                let file = self
+                    .attachments
+                    .resolve_existing_file(&attachment_id)
+                    .await
+                    .map_err(|_| AssetError::NotFound(attachment_id.clone()))?;
+                (
+                    Claims::Attachment {
+                        attachment_id,
+                        expires_at,
+                    },
+                    file_name(&file),
+                )
+            }
+            AssetResource::ProjectFavicon { cwd } => {
+                let root = paths::normalize_root(Path::new(&cwd), false).await?;
+                let path = self.favicon_resolver.resolve_path(&root).await?;
+                let relative = path
+                    .as_ref()
+                    .and_then(|path| path.strip_prefix(&root).ok())
+                    .map(paths::to_posix);
+                let filename = path
+                    .as_ref()
+                    .map_or_else(|| "favicon.svg".to_owned(), |path| file_name(path));
+                (
+                    Claims::ProjectFavicon {
+                        root,
+                        relative,
+                        expires_at,
+                    },
+                    filename,
+                )
+            }
+        };
+        let token = self.sign(&claims)?;
+        Ok(IssuedAssetUrl {
+            relative_url: format!("{ASSET_ROUTE_PREFIX}/{token}/{}", percent_encode(&filename)),
+            expires_at,
+        })
+    }
+
+    pub async fn resolve(&self, token: &str, requested_path: &str) -> Option<ResolvedAsset> {
+        let claims = self.verify(token)?;
+        if claims.expires_at() <= now_millis() {
+            return None;
+        }
+        match claims {
+            Claims::WorkspaceExact { root, relative, .. } => {
+                if requested_path != Path::new(&relative).file_name()?.to_str()? {
+                    return None;
+                }
+                canonical_workspace_file(&root, &relative)
+                    .await
+                    .ok()
+                    .map(|(path, _)| ResolvedAsset::File(path))
+            }
+            Claims::WorkspaceSiblings { root, base, .. } => {
+                let requested = safe_preview_relative(requested_path)?;
+                let joined = if base == "." {
+                    requested
+                } else {
+                    format!("{base}/{requested}")
+                };
+                canonical_workspace_file(&root, &joined)
+                    .await
+                    .ok()
+                    .map(|(path, _)| ResolvedAsset::File(path))
+            }
+            Claims::Attachment { attachment_id, .. } => {
+                if requested_path != attachment_id {
+                    return None;
+                }
+                self.attachments
+                    .resolve_existing_file(&attachment_id)
+                    .await
+                    .ok()
+                    .map(ResolvedAsset::File)
+            }
+            Claims::ProjectFavicon { root, relative, .. } => match relative {
+                Some(relative) => canonical_workspace_file(&root, &relative)
+                    .await
+                    .ok()
+                    .map(|(path, _)| ResolvedAsset::File(path)),
+                None => Some(ResolvedAsset::ProjectFaviconFallback),
+            },
+        }
+    }
+
+    fn sign(&self, claims: &Claims) -> Result<String, AssetError> {
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims)?);
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret)
+            .expect("HMAC accepts arbitrary key lengths");
+        mac.update(payload.as_bytes());
+        let signature =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(mac.finalize().into_bytes());
+        Ok(format!("{payload}.{signature}"))
+    }
+
+    fn verify(&self, token: &str) -> Option<Claims> {
+        let (payload, signature) = token.split_once('.')?;
+        let signature = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(signature)
+            .ok()?;
+        let mut mac = Hmac::<Sha256>::new_from_slice(&self.secret).ok()?;
+        mac.update(payload.as_bytes());
+        mac.verify_slice(&signature).ok()?;
+        let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(payload)
+            .ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case")]
+enum Claims {
+    WorkspaceSiblings {
+        root: PathBuf,
+        base: String,
+        expires_at: u64,
+    },
+    WorkspaceExact {
+        root: PathBuf,
+        relative: String,
+        expires_at: u64,
+    },
+    Attachment {
+        attachment_id: String,
+        expires_at: u64,
+    },
+    ProjectFavicon {
+        root: PathBuf,
+        relative: Option<String>,
+        expires_at: u64,
+    },
+}
+
+impl Claims {
+    fn expires_at(&self) -> u64 {
+        match self {
+            Self::WorkspaceSiblings { expires_at, .. }
+            | Self::WorkspaceExact { expires_at, .. }
+            | Self::Attachment { expires_at, .. }
+            | Self::ProjectFavicon { expires_at, .. } => *expires_at,
+        }
+    }
+}
+
+async fn canonical_workspace_file(
+    root: &Path,
+    input: &str,
+) -> Result<(PathBuf, String), AssetError> {
+    let root = paths::normalize_root(root, false).await?;
+    let target = Path::new(input);
+    let (target, relative) = if target.is_absolute() {
+        let (_, canonical) = paths::canonical_existing_within(&root, target).await?;
+        let relative =
+            canonical
+                .strip_prefix(&root)
+                .map_err(|_| WorkspaceError::ResolvedPathOutsideRoot {
+                    root: root.clone(),
+                    resolved_path: canonical.clone(),
+                })?;
+        let relative = paths::to_posix(relative);
+        (canonical, relative)
+    } else {
+        let (target, relative) = paths::resolve_relative(&root, input)?;
+        let (_, canonical) = paths::canonical_existing_within(&root, &target).await?;
+        (canonical, relative)
+    };
+    Ok((target, relative))
+}
+
+fn safe_preview_relative(requested: &str) -> Option<String> {
+    let path = Path::new(requested);
+    if requested.is_empty() || requested.contains('\0') || path.is_absolute() {
+        return None;
+    }
+    let mut segments = Vec::new();
+    for component in path.components() {
+        let std::path::Component::Normal(segment) = component else {
+            return None;
+        };
+        let segment = segment.to_str()?;
+        if segment.starts_with('.') {
+            return None;
+        }
+        segments.push(segment);
+    }
+    let normalized = segments.join("/");
+    PREVIEW_SIBLING_EXTENSIONS
+        .contains(&extension(&normalized).as_str())
+        .then_some(normalized)
+}
+
+fn extension(path: &str) -> String {
+    Path::new(path)
+        .extension()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+}
+
+fn file_name(path: &Path) -> String {
+    path.file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("asset")
+        .to_owned()
+}
+
+fn percent_encode(value: &str) -> String {
+    url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
+}
+
+fn now_millis() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().try_into().unwrap_or(u64::MAX)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn token_from(url: &IssuedAssetUrl) -> &str {
+        url.relative_url.split('/').nth(3).unwrap()
+    }
+
+    #[tokio::test]
+    async fn asset_capabilities_cover_file_type_path_and_token_edges() {
+        let root = tempfile::tempdir().unwrap();
+        let attachments = tempfile::tempdir().unwrap();
+        let access = AssetAccess::new(vec![5; 32], attachments.path().to_path_buf());
+
+        tokio::fs::create_dir(root.path().join("directory.png"))
+            .await
+            .unwrap();
+        assert!(matches!(
+            access
+                .issue(AssetIssueRequest {
+                    resource: AssetResource::WorkspaceFile {
+                        thread_id: "thread-1".to_owned(),
+                        path: "directory.png".to_owned(),
+                    },
+                    workspace_root: Some(root.path().to_path_buf()),
+                })
+                .await,
+            Err(AssetError::NotFound(_))
+        ));
+
+        tokio::fs::write(root.path().join("notes.txt"), b"notes")
+            .await
+            .unwrap();
+        assert!(matches!(
+            access
+                .issue(AssetIssueRequest {
+                    resource: AssetResource::WorkspaceFile {
+                        thread_id: "thread-1".to_owned(),
+                        path: "notes.txt".to_owned(),
+                    },
+                    workspace_root: Some(root.path().to_path_buf()),
+                })
+                .await,
+            Err(AssetError::UnsupportedPreviewType(_))
+        ));
+        assert!(matches!(
+            access
+                .issue(AssetIssueRequest {
+                    resource: AssetResource::Attachment {
+                        attachment_id: "missing.png".to_owned(),
+                    },
+                    workspace_root: None,
+                })
+                .await,
+            Err(AssetError::NotFound(_))
+        ));
+
+        tokio::fs::write(root.path().join("index.html"), b"<html></html>")
+            .await
+            .unwrap();
+        tokio::fs::write(root.path().join("style.css"), b"body{}")
+            .await
+            .unwrap();
+        let html = access
+            .issue(AssetIssueRequest {
+                resource: AssetResource::WorkspaceFile {
+                    thread_id: "thread-1".to_owned(),
+                    path: "index.html".to_owned(),
+                },
+                workspace_root: Some(root.path().to_path_buf()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            access.resolve(token_from(&html), "style.css").await,
+            Some(ResolvedAsset::File(_))
+        ));
+
+        let absolute_path = root.path().join("absolute.png");
+        tokio::fs::write(&absolute_path, b"png").await.unwrap();
+        let absolute = access
+            .issue(AssetIssueRequest {
+                resource: AssetResource::WorkspaceFile {
+                    thread_id: "thread-1".to_owned(),
+                    path: absolute_path.to_string_lossy().into_owned(),
+                },
+                workspace_root: Some(root.path().to_path_buf()),
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            access.resolve(token_from(&absolute), "absolute.png").await,
+            Some(ResolvedAsset::File(_))
+        ));
+
+        tokio::fs::write(root.path().join("favicon.svg"), b"<svg/>")
+            .await
+            .unwrap();
+        let favicon = access
+            .issue(AssetIssueRequest {
+                resource: AssetResource::ProjectFavicon {
+                    cwd: root.path().to_string_lossy().into_owned(),
+                },
+                workspace_root: None,
+            })
+            .await
+            .unwrap();
+        assert!(matches!(
+            access.resolve(token_from(&favicon), "favicon.svg").await,
+            Some(ResolvedAsset::File(_))
+        ));
+
+        for requested in [
+            "",
+            "bad\0name.css",
+            "/absolute.css",
+            "../escape.css",
+            ".env",
+        ] {
+            assert_eq!(access.resolve(token_from(&html), requested).await, None);
+        }
+        for token in ["", "missing-dot", "bad.%%%", "%%%.bad"] {
+            assert_eq!(access.resolve(token, "style.css").await, None);
+        }
+    }
+
+    #[tokio::test]
+    async fn attachment_urls_reject_untrusted_ids_and_linked_leaves() {
+        let state = tempfile::tempdir().unwrap();
+        let attachments = state.path().join("attachments");
+        tokio::fs::create_dir(&attachments).await.unwrap();
+        tokio::fs::write(state.path().join("state.sqlite"), b"database secret")
+            .await
+            .unwrap();
+        let absolute = state.path().join("absolute-secret");
+        tokio::fs::write(&absolute, b"absolute secret")
+            .await
+            .unwrap();
+        let overlong = "a".repeat(129);
+        tokio::fs::write(attachments.join(&overlong), b"long id secret")
+            .await
+            .unwrap();
+        let access = AssetAccess::new(vec![6; 32], attachments.clone());
+
+        for attachment_id in [
+            "../state.sqlite".to_owned(),
+            absolute.to_string_lossy().into_owned(),
+            "NUL".to_owned(),
+            overlong,
+        ] {
+            assert!(
+                access
+                    .issue(AssetIssueRequest {
+                        resource: AssetResource::Attachment { attachment_id },
+                        workspace_root: None,
+                    })
+                    .await
+                    .is_err(),
+                "an untrusted attachment id must never receive a signed URL"
+            );
+        }
+
+        let outside = state.path().join("linked-secret");
+        #[cfg(unix)]
+        tokio::fs::write(&outside, b"linked secret").await.unwrap();
+        #[cfg(windows)]
+        tokio::fs::create_dir(&outside).await.unwrap();
+        let linked = attachments.join("linked");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&outside, &linked).unwrap();
+        #[cfg(windows)]
+        junction::create(&outside, &linked).expect("attachment leaf junction");
+        assert!(
+            access
+                .issue(AssetIssueRequest {
+                    resource: AssetResource::Attachment {
+                        attachment_id: "linked".to_owned(),
+                    },
+                    workspace_root: None,
+                })
+                .await
+                .is_err(),
+            "a linked attachment leaf must never receive a signed URL"
+        );
+    }
+}

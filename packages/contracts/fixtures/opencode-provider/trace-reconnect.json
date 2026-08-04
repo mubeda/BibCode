@@ -1,0 +1,88 @@
+{
+  "metadata": {
+    "provider": "opencode",
+    "producerVersion": "1.18.4",
+    "schemaSource": "GET /doc",
+    "capturedAt": "2026-07-24T00:00:00Z",
+    "redactions": [
+      "[redacted workspace]",
+      "[redacted command arguments]",
+      "[redacted provider failure]"
+    ]
+  },
+  "rootSessionID": "ses-root-activity",
+  "rawSseFrames": [
+    "id: oc-1184-reconnected\nevent: message\ndata: {\"id\":\"oc-1184-reconnected\",\"type\":\"server.connected\",\"properties\":{}}\n\n"
+  ],
+  "restSnapshots": [
+    {
+      "method": "GET",
+      "path": "/session/ses-root-activity/children",
+      "parentSessionID": "ses-root-activity",
+      "response": [
+        {
+          "id": "ses-child-missed-direct",
+          "parentID": "ses-root-activity",
+          "title": "[redacted missed child title]",
+          "directory": "[redacted workspace]"
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/session/ses-child-missed-direct/children",
+      "parentSessionID": "ses-child-missed-direct",
+      "response": [
+        {
+          "id": "ses-child-missed-nested",
+          "parentID": "ses-child-missed-direct",
+          "title": "[redacted missed nested child title]",
+          "directory": "[redacted workspace]"
+        }
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/session/ses-child-missed-nested/children",
+      "parentSessionID": "ses-child-missed-nested",
+      "response": []
+    },
+    {
+      "method": "GET",
+      "path": "/session/status",
+      "response": {
+        "ses-child-missed-direct": {
+          "type": "idle"
+        }
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/session/ses-child-missed-direct/message?limit=200",
+      "sessionID": "ses-child-missed-direct",
+      "response": [
+        {
+          "info": {
+            "id": "msg-child-missed-direct",
+            "sessionID": "ses-child-missed-direct",
+            "role": "assistant",
+            "time": {
+              "created": 1721827250000,
+              "completed": 1721827260000
+            },
+            "finish": "stop"
+          },
+          "parts": [
+            {
+              "id": "prt-child-missed-direct-text",
+              "sessionID": "ses-child-missed-direct",
+              "messageID": "msg-child-missed-direct",
+              "type": "text",
+              "text": "[redacted recovered commentary]"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

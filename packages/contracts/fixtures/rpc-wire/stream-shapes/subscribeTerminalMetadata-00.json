@@ -1,0 +1,92 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "type": "snapshot",
+      "terminals": [
+        {
+          "threadId": "T.WEUib.",
+          "terminalId": "4Y=Q4",
+          "cwd": "LQs=cFsiF1|0",
+          "worktreePath": null,
+          "status": "error",
+          "pid": null,
+          "exitCode": null,
+          "exitSignal": null,
+          "consoleTheme": "light",
+          "hasRunningSubprocess": true,
+          "label": "z",
+          "updatedAt": "s'(QI&:Qa"
+        },
+        {
+          "threadId": "itid;",
+          "terminalId": "I\"",
+          "cwd": "/P>a",
+          "worktreePath": null,
+          "status": "running",
+          "pid": null,
+          "exitCode": null,
+          "exitSignal": null,
+          "hasRunningSubprocess": true,
+          "label": "L,",
+          "updatedAt": "lN"
+        },
+        {
+          "threadId": "NxFM8Octx",
+          "terminalId": "}*V",
+          "cwd": "kcVr{W&~}c",
+          "worktreePath": null,
+          "status": "starting",
+          "pid": null,
+          "exitCode": null,
+          "exitSignal": -1361953400,
+          "hasRunningSubprocess": false,
+          "label": "B",
+          "updatedAt": "g6- .)&="
+        },
+        {
+          "threadId": "y17Z`Yf",
+          "terminalId": "9Gn}cP<",
+          "cwd": "2&u",
+          "worktreePath": null,
+          "status": "running",
+          "pid": null,
+          "exitCode": 1494537112,
+          "exitSignal": -645431119,
+          "consoleTheme": "dark",
+          "hasRunningSubprocess": false,
+          "label": "wv:+E[",
+          "updatedAt": ""
+        },
+        {
+          "threadId": "]+rRx;d",
+          "terminalId": "'D1-.d",
+          "cwd": "|H",
+          "worktreePath": null,
+          "status": "error",
+          "pid": 1134587220,
+          "exitCode": null,
+          "exitSignal": -1499695271,
+          "hasRunningSubprocess": true,
+          "label": "X]wrKI`z",
+          "updatedAt": ""
+        },
+        {
+          "threadId": "jb9U#AU:o",
+          "terminalId": "\"",
+          "cwd": "_RyCC",
+          "worktreePath": "u2,k",
+          "status": "error",
+          "pid": 857361239,
+          "exitCode": 1223399879,
+          "exitSignal": 932963937,
+          "consoleTheme": "light",
+          "hasRunningSubprocess": false,
+          "label": "+I_u~ct,",
+          "updatedAt": "3w^"
+        }
+      ]
+    }
+  ]
+}

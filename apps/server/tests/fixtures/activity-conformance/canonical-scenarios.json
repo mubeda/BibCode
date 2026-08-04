@@ -1,0 +1,234 @@
+[
+  {
+    "name": "direct-child-lifecycle",
+    "group": "lifecycle",
+    "revisionSemantics": {
+      "initialRevision": 0,
+      "finalRevision": "initialPlusEffectiveMutationBatches",
+      "effectiveMutationBatchesOnly": true,
+      "duplicateOrRejectedEventsAdvance": false,
+      "assertionStage": "repository-checkpoint-3"
+    },
+    "phases": ["start", "running", "waiting", "completed"],
+    "allowedLifecycle": ["starting", "running", "waiting", "completed"],
+    "expected": {
+      "actors": [
+        {
+          "alias": "direct-child",
+          "parentAlias": null,
+          "status": "completed"
+        }
+      ],
+      "workItems": [],
+      "entries": [],
+      "counts": {
+        "active": 0,
+        "done": 1
+      },
+      "requiredLifecycle": ["running", "completed"],
+      "observedLifecycle": {
+        "codex": ["starting", "running", "waiting", "completed"],
+        "claude": ["starting", "running", "completed"],
+        "opencode": ["waiting", "running", "waiting", "completed"]
+      }
+    },
+    "details": null
+  },
+  {
+    "name": "nested-child-parent",
+    "group": "graph",
+    "revisionSemantics": {
+      "initialRevision": 0,
+      "finalRevision": "initialPlusEffectiveMutationBatches",
+      "effectiveMutationBatchesOnly": true,
+      "duplicateOrRejectedEventsAdvance": false,
+      "assertionStage": "repository-checkpoint-3"
+    },
+    "details": {
+      "actors": [
+        { "alias": "parent", "parentAlias": null },
+        { "alias": "nested-child", "parentAlias": "parent" }
+      ],
+      "statusByProvider": {
+        "codex": "running",
+        "claude": "running",
+        "opencode": "waiting"
+      }
+    }
+  },
+  {
+    "name": "terminal-state-truthfulness",
+    "group": "state-truthfulness",
+    "revisionSemantics": {
+      "initialRevision": 0,
+      "finalRevision": "initialPlusEffectiveMutationBatches",
+      "effectiveMutationBatchesOnly": true,
+      "duplicateOrRejectedEventsAdvance": false,
+      "assertionStage": "repository-checkpoint-3"
+    },
+    "details": {
+      "states": ["failed", "cancelled", "interrupted", "unknown"],
+      "expectedByProvider": {
+        "codex": {
+          "failed": "failed",
+          "cancelled": "cancelled",
+          "interrupted": "interrupted",
+          "unknown": "unknown"
+        },
+        "claude": {
+          "failed": null,
+          "cancelled": null,
+          "interrupted": null,
+          "unknown": null
+        },
+        "opencode": {
+          "failed": "failed",
+          "cancelled": "cancelled",
+          "interrupted": null,
+          "unknown": null
+        }
+      }
+    }
+  },
+  {
+    "name": "entry-kind-capabilities",
+    "group": "entries",
+    "revisionSemantics": {
+      "initialRevision": 0,
+      "finalRevision": "initialPlusEffectiveMutationBatches",
+      "effectiveMutationBatchesOnly": true,
+      "duplicateOrRejectedEventsAdvance": false,
+      "assertionStage": "repository-checkpoint-3"
+    },
+    "details": {
+      "canonicalKinds": ["commentary", "tool", "command", "result", "error", "state", "completion"],
+      "expectedByProvider": {
+        "codex": {
+          "supported": ["commentary", "tool", "command", "error", "state"],
+          "unsupported": ["result", "completion"]
+        },
+        "claude": {
+          "supported": ["commentary", "tool", "command", "error"],
+          "unsupported": ["result", "state", "completion"]
+        },
+        "opencode": {
+          "supported": ["commentary", "tool", "command", "error"],
+          "unsupported": ["result", "state", "completion"]
+        }
+      }
+    }
+  },
+  {
+    "name": "duplicate-and-late-terminal",
+    "group": "monotonicity",
+    "revisionSemantics": {
+      "initialRevision": 0,
+      "finalRevision": "initialPlusEffectiveMutationBatches",
+      "effectiveMutationBatchesOnly": true,
+      "duplicateOrRejectedEventsAdvance": false,
+      "assertionStage": "repository-checkpoint-3"
+    },
+    "details": {
+      "expectedByProvider": {
+        "codex": {
+          "duplicateSuppressed": true,
+          "lateProgressSuppressed": true
+        },
+        "claude": {
+          "duplicateSuppressed": true,
+          "lateProgressSuppressed": true
+        },
+        "opencode": {
+          "duplicateSuppressed": true,
+          "lateProgressSuppressed": true
+        }
+      }
+    }
+  },
+  {
+    "name": "authoritative-history-repair",
+    "group": "recovery",
+    "revisionSemantics": {
+      "initialRevision": 0,
+      "finalRevision": "initialPlusEffectiveMutationBatches",
+      "effectiveMutationBatchesOnly": true,
+      "duplicateOrRejectedEventsAdvance": false,
+      "assertionStage": "repository-checkpoint-3"
+    },
+    "details": {
+      "expectedByProvider": {
+        "codex": {
+          "actorStatusRepairSupported": true,
+          "historyRecovery": "full",
+          "finalStatus": "completed",
+          "recoveredEntryKinds": []
+        },
+        "claude": {
+          "actorStatusRepairSupported": false,
+          "historyRecovery": "bounded",
+          "finalStatus": null,
+          "recoveredEntryKinds": ["commentary", "tool"]
+        },
+        "opencode": {
+          "actorStatusRepairSupported": true,
+          "historyRecovery": "full",
+          "finalStatus": "completed",
+          "recoveredEntryKinds": []
+        }
+      }
+    }
+  },
+  {
+    "name": "malformed-and-oversized-native-input",
+    "group": "native-input-bounds",
+    "revisionSemantics": {
+      "initialRevision": 0,
+      "finalRevision": "initialPlusEffectiveMutationBatches",
+      "effectiveMutationBatchesOnly": true,
+      "duplicateOrRejectedEventsAdvance": false,
+      "assertionStage": "repository-checkpoint-3"
+    },
+    "details": {
+      "expectedByProvider": {
+        "codex": {
+          "validControlEmitted": true,
+          "malformedRejected": true,
+          "oversizedIdentity": "boundedNormalized",
+          "oversizedDisplayFieldsBounded": true
+        },
+        "claude": {
+          "validControlEmitted": true,
+          "malformedRejected": true,
+          "oversizedIdentity": "boundedNormalized",
+          "oversizedDisplayFieldsBounded": true
+        },
+        "opencode": {
+          "validControlEmitted": true,
+          "malformedRejected": true,
+          "oversizedIdentity": "rejected",
+          "oversizedDisplayFieldsBounded": true
+        }
+      }
+    }
+  },
+  {
+    "name": "recovery-loss-interrupts-active",
+    "group": "recovery-loss",
+    "revisionSemantics": {
+      "initialRevision": 0,
+      "finalRevision": "initialPlusEffectiveMutationBatches",
+      "effectiveMutationBatchesOnly": true,
+      "duplicateOrRejectedEventsAdvance": false,
+      "assertionStage": "repository-checkpoint-3"
+    },
+    "details": {
+      "expectedInterruptedRecords": 2,
+      "actorStatus": "interrupted",
+      "workItemStatus": "interrupted",
+      "counts": {
+        "subagents": { "active": 0, "done": 1 },
+        "backgroundTasks": { "active": 0, "done": 1 }
+      }
+    }
+  }
+]

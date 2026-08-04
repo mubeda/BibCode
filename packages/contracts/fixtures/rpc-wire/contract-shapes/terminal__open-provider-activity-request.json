@@ -1,0 +1,28 @@
+{
+  "_tag": "Request",
+  "id": "900719925474099312345",
+  "tag": "terminal.open",
+  "payload": {
+    "threadId": "thread-1",
+    "terminalId": "term-1",
+    "cwd": "C:/repo",
+    "env": {
+      "COMMAND_ONLY": "command",
+      "RUNTIME_ONLY": "runtime",
+      "SHARED": "runtime"
+    },
+    "command": {
+      "executable": "codex",
+      "args": ["--model", "gpt-5"],
+      "env": {
+        "COMMAND_ONLY": "command",
+        "SHARED": "command"
+      },
+      "activity": {
+        "driverKind": "codex",
+        "providerInstanceId": "codex_personal"
+      }
+    }
+  },
+  "headers": []
+}

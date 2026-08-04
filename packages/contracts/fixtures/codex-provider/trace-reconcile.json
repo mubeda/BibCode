@@ -1,0 +1,153 @@
+{
+  "scenario": "descendant reconciliation adds only missed children",
+  "initialActorIds": ["codex:thread:child-live"],
+  "inboundMessages": [
+    {
+      "id": "recovery-list-1",
+      "result": {
+        "data": [
+          {
+            "id": "child-live",
+            "extra": null,
+            "sessionId": "session-tree-1",
+            "forkedFromId": null,
+            "parentThreadId": "root-1",
+            "preview": "[redacted preview]",
+            "ephemeral": false,
+            "historyMode": "paginated",
+            "modelProvider": "openai",
+            "createdAt": 1784894400,
+            "updatedAt": 1784894520,
+            "recencyAt": 1784894520,
+            "status": {
+              "type": "active",
+              "activeFlags": []
+            },
+            "path": "[redacted path]",
+            "cwd": "[redacted path]",
+            "cliVersion": "0.145.0",
+            "source": {
+              "subAgent": {
+                "thread_spawn": {
+                  "parent_thread_id": "root-1",
+                  "depth": 1,
+                  "agent_path": "[redacted path]",
+                  "agent_nickname": "live",
+                  "agent_role": "worker"
+                }
+              }
+            },
+            "canAcceptDirectInput": true,
+            "threadSource": null,
+            "agentNickname": "live",
+            "agentRole": "worker",
+            "gitInfo": null,
+            "name": null,
+            "turns": []
+          },
+          {
+            "id": "child-missed",
+            "extra": null,
+            "sessionId": "session-tree-1",
+            "forkedFromId": null,
+            "parentThreadId": "root-1",
+            "preview": "[redacted preview]",
+            "ephemeral": false,
+            "historyMode": "paginated",
+            "modelProvider": "openai",
+            "createdAt": 1784894400,
+            "updatedAt": 1784894520,
+            "recencyAt": 1784894520,
+            "status": {
+              "type": "idle"
+            },
+            "path": "[redacted path]",
+            "cwd": "[redacted path]",
+            "cliVersion": "0.145.0",
+            "source": {
+              "subAgent": {
+                "thread_spawn": {
+                  "parent_thread_id": "root-1",
+                  "depth": 1,
+                  "agent_path": "[redacted path]",
+                  "agent_nickname": "missed",
+                  "agent_role": "reviewer"
+                }
+              }
+            },
+            "canAcceptDirectInput": true,
+            "threadSource": null,
+            "agentNickname": "missed",
+            "agentRole": "reviewer",
+            "gitInfo": null,
+            "name": null,
+            "turns": []
+          }
+        ],
+        "nextCursor": null,
+        "backwardsCursor": "recovery-backwards-1"
+      }
+    },
+    {
+      "id": "recovery-read-child-missed",
+      "result": {
+        "thread": {
+          "id": "child-missed",
+          "extra": null,
+          "sessionId": "session-tree-1",
+          "forkedFromId": null,
+          "parentThreadId": "root-1",
+          "preview": "[redacted preview]",
+          "ephemeral": false,
+          "historyMode": "paginated",
+          "modelProvider": "openai",
+          "createdAt": 1784894400,
+          "updatedAt": 1784894520,
+          "recencyAt": 1784894520,
+          "status": {
+            "type": "idle"
+          },
+          "path": "[redacted path]",
+          "cwd": "[redacted path]",
+          "cliVersion": "0.145.0",
+          "source": {
+            "subAgent": {
+              "thread_spawn": {
+                "parent_thread_id": "root-1",
+                "depth": 1,
+                "agent_path": "[redacted path]",
+                "agent_nickname": "missed",
+                "agent_role": "reviewer"
+              }
+            }
+          },
+          "canAcceptDirectInput": true,
+          "threadSource": null,
+          "agentNickname": "missed",
+          "agentRole": "reviewer",
+          "gitInfo": null,
+          "name": null,
+          "turns": []
+        }
+      }
+    }
+  ],
+  "expectedMutations": [
+    {
+      "type": "upsertActor",
+      "actor": {
+        "_tag": "actor",
+        "id": "codex:thread:child-missed",
+        "parentActorId": null,
+        "name": "missed",
+        "role": "reviewer",
+        "providerType": "codex",
+        "status": "waiting",
+        "summary": null,
+        "startedAt": "2026-07-24T12:00:00Z",
+        "updatedAt": "2026-07-24T12:02:00Z",
+        "terminalAt": null
+      }
+    }
+  ]
+}

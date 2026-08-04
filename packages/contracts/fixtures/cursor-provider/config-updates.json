@@ -1,0 +1,50 @@
+{
+  "options": [
+    {
+      "category": "thought_level",
+      "id": "reasoning",
+      "type": "select",
+      "options": [{ "value": "extra-high" }]
+    },
+    {
+      "category": "model_config",
+      "id": "context",
+      "type": "select",
+      "options": [{ "value": "1m" }]
+    },
+    {
+      "category": "model_config",
+      "id": "fast",
+      "type": "select",
+      "options": [{ "value": "false" }, { "value": "true" }]
+    }
+  ],
+  "updates": [
+    {
+      "id": "reasoning",
+      "value": "xhigh"
+    },
+    {
+      "id": "fastMode",
+      "value": true
+    },
+    {
+      "id": "contextWindow",
+      "value": "1m"
+    }
+  ],
+  "expected": [
+    {
+      "configId": "reasoning",
+      "value": "extra-high"
+    },
+    {
+      "configId": "fast",
+      "value": "true"
+    },
+    {
+      "configId": "context",
+      "value": "1m"
+    }
+  ]
+}

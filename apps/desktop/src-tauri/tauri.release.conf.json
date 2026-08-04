@@ -1,0 +1,15 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "bundle": {
+    "createUpdaterArtifacts": true
+  },
+  "plugins": {
+    "updater": {
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEIwMDI1RURFNEUwMEU5MjEKUldRaDZRQk8zbDRDc09KRk91S0xkbEtTWkpXRGdIUnhEK2psbkEyRHY1QWVwZ2IrRDNCZU10VS8K",
+      "endpoints": ["https://github.com/mubeda/BibCode/releases/latest/download/latest.json"],
+      "windows": {
+        "installMode": "passive"
+      }
+    }
+  }
+}

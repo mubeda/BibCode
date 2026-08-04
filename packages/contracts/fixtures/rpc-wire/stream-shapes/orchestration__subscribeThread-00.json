@@ -1,0 +1,464 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "kind": "snapshot",
+      "snapshot": {
+        "snapshotSequence": 21,
+        "thread": {
+          "id": "2=r",
+          "projectId": "glue",
+          "title": "[",
+          "modelSelection": {
+            "instanceId": "d-",
+            "model": "]Yn?ndD",
+            "options": [
+              {
+                "id": "xMm(x",
+                "value": "-"
+              },
+              {
+                "id": "'ih3g'r",
+                "value": ".KHK#+1"
+              },
+              {
+                "id": "<GNQ_8Je my.",
+                "value": true
+              },
+              {
+                "id": "@F}J#Qo",
+                "value": true
+              },
+              {
+                "id": "7rXEIF0q",
+                "value": false
+              },
+              {
+                "id": "\"}%v%)K5",
+                "value": true
+              },
+              {
+                "id": "}X+",
+                "value": true
+              },
+              {
+                "id": "XeVf6<6*vx[",
+                "value": "b\"COu s>ja"
+              },
+              {
+                "id": "rtT7jh",
+                "value": "r1:IBJB"
+              },
+              {
+                "id": "b",
+                "value": "(5-_Wi"
+              }
+            ]
+          },
+          "runtimeMode": "auto-accept-edits",
+          "interactionMode": "plan",
+          "branch": null,
+          "worktreePath": "\"pr",
+          "latestTurn": null,
+          "createdAt": "",
+          "updatedAt": "wYe<Z|='",
+          "archivedAt": "_",
+          "deletedAt": null,
+          "messages": [
+            {
+              "id": ";'#Q+y,",
+              "role": "assistant",
+              "text": "Gb",
+              "turnId": null,
+              "streaming": false,
+              "createdAt": "MuGEnq!Kw,",
+              "updatedAt": "Loc"
+            },
+            {
+              "id": "?2>^-",
+              "role": "assistant",
+              "text": "\"S|f!I",
+              "attachments": [
+                {
+                  "type": "image",
+                  "id": "5_6-_-84",
+                  "name": "%Y&",
+                  "mimeType": "image/xn#&!/",
+                  "sizeBytes": 507872
+                },
+                {
+                  "type": "image",
+                  "id": "0",
+                  "name": "call",
+                  "mimeType": "image/S&",
+                  "sizeBytes": 7432261
+                },
+                {
+                  "type": "file",
+                  "id": "69-3-2--me_-",
+                  "name": "u&&$_x## i",
+                  "mimeType": "x7",
+                  "sizeBytes": 10485739
+                },
+                {
+                  "type": "file",
+                  "id": "o9_",
+                  "name": "K%a",
+                  "mimeType": ";//Y",
+                  "sizeBytes": 6311500
+                }
+              ],
+              "turnId": null,
+              "streaming": false,
+              "createdAt": "#,",
+              "updatedAt": "=F0;1"
+            },
+            {
+              "id": "f",
+              "role": "user",
+              "text": "",
+              "attachments": [
+                {
+                  "type": "image",
+                  "id": "lengths",
+                  "name": "%,",
+                  "mimeType": "image/}OYl'",
+                  "sizeBytes": 16
+                },
+                {
+                  "type": "image",
+                  "id": "l",
+                  "name": "CO$ja",
+                  "mimeType": "image/B",
+                  "sizeBytes": 382745
+                }
+              ],
+              "turnId": null,
+              "streaming": true,
+              "delivery": {
+                "state": "delivered",
+                "provider": "E",
+                "detail": "${g{.;"
+              },
+              "createdAt": "D(t*TxY",
+              "updatedAt": ""
+            },
+            {
+              "id": "OhQ;muZ",
+              "role": "assistant",
+              "text": "",
+              "turnId": null,
+              "streaming": false,
+              "delivery": {
+                "state": "uncertain",
+                "provider": "d__X--__ho9",
+                "detail": "g%GYU>-y)/"
+              },
+              "createdAt": "D9p!vp5",
+              "updatedAt": ""
+            },
+            {
+              "id": "~P$",
+              "role": "user",
+              "text": "\"$v",
+              "turnId": ".Bo",
+              "streaming": true,
+              "createdAt": "k$BG",
+              "updatedAt": "\\Yz$a|&"
+            },
+            {
+              "id": "bKCpdm}U{",
+              "role": "assistant",
+              "text": "-\"'O92",
+              "turnId": null,
+              "streaming": false,
+              "createdAt": "ARRF*{",
+              "updatedAt": "co"
+            },
+            {
+              "id": "<uT9gld",
+              "role": "user",
+              "text": "\"",
+              "turnId": "n!",
+              "streaming": true,
+              "createdAt": "",
+              "updatedAt": "dJP"
+            },
+            {
+              "id": "Ixc&",
+              "role": "assistant",
+              "text": "Z%HQ",
+              "turnId": null,
+              "streaming": false,
+              "createdAt": "key",
+              "updatedAt": "a{[/kp{"
+            }
+          ],
+          "proposedPlans": [
+            {
+              "id": "OSV3Wi'",
+              "turnId": null,
+              "planMarkdown": "N?1",
+              "implementedAt": null,
+              "implementationThreadId": null,
+              "createdAt": "}:aF9=b`",
+              "updatedAt": "}m{$T3So.F"
+            },
+            {
+              "id": "rq5ywc@Q$P|[",
+              "turnId": "F",
+              "planMarkdown": "jBDP",
+              "implementedAt": "!",
+              "implementationThreadId": null,
+              "createdAt": "(f",
+              "updatedAt": "=>k"
+            },
+            {
+              "id": "7`?",
+              "turnId": "1\"%4,9gI",
+              "planMarkdown": "u{MDo[++L6\"t",
+              "implementedAt": null,
+              "implementationThreadId": null,
+              "createdAt": "NA=S9s",
+              "updatedAt": "+Awu?g)-"
+            }
+          ],
+          "activities": [
+            {
+              "id": "p4+up[~\"!@:e",
+              "tone": "tool",
+              "kind": "._ULzC\\,OU",
+              "summary": "D",
+              "payload": [
+                "p*/f4",
+                -7.461222982012043e-158,
+                "AkS",
+                -8760998807847217,
+                "?&2;$",
+                {
+                  "": null,
+                  "w)/(]Y!\"h": "zdz&R",
+                  "T": "xyXZH*+:c("
+                },
+                null,
+                "383>)e0",
+                [null, null, false, false, -7.323659212286421e206, ""],
+                -3702676801462983
+              ],
+              "turnId": "q.K}pra#?T",
+              "createdAt": "=U.A_"
+            },
+            {
+              "id": "zE0",
+              "tone": "approval",
+              "kind": "XLQ",
+              "summary": "h-{Jo\\n",
+              "payload": {
+                "Y": ")7KImKHf",
+                "Q": {
+                  "e": "E#t0",
+                  "}G/ZYt%kYf": "9/ilE4%",
+                  "pqpms3FgCQ": "W uA7",
+                  "'O9/A PV": false,
+                  "^D&&CWk[,s": false
+                },
+                "ql6}": 2.408192027369311e-24,
+                "0l": true
+              },
+              "turnId": null,
+              "createdAt": "~6"
+            },
+            {
+              "id": "{-}s$98",
+              "tone": "tool",
+              "kind": "RY,x!gRj",
+              "summary": "|WyK&0k&R=+@",
+              "payload": {
+                "BI?TOq$|`": "(}u{C=ZyHb",
+                "vQ": -8882635824887630,
+                ".;AiB,": -5700035173827943,
+                ".:o,}oO": 1.0743323759548662e-11,
+                "y": -3.42706064683208e237,
+                "": 6267239866232749,
+                "k*Q=": -7807269522082229,
+                "Et4C": "5c",
+                ">N rF*]": 6300297842109449,
+                "g|12[olq#": -4765332599638054
+              },
+              "turnId": "u [",
+              "sequence": 89794459,
+              "createdAt": "Bl-u.hG`"
+            },
+            {
+              "id": "\\S",
+              "tone": "error",
+              "kind": ".mpa9",
+              "summary": ";#C\"%?^\"J<",
+              "payload": {
+                "'4yZ7B6ivm": "%",
+                "l<": -795011711024324,
+                "YX\"": {
+                  ",$D~##q": false,
+                  "": "J1",
+                  "UkK": -292333134922979,
+                  "'_CG": -1.3806939723618846e-92,
+                  "AWBkl^/0i": 363449091821725,
+                  "{?Ed": -7516064009161519,
+                  "^%": false
+                },
+                "|q#j`z#bxb": false,
+                "2@c2+6J{": {
+                  "=": -5998302720520312,
+                  "[)lUQd(": null,
+                  "%niw}[)IbB": false,
+                  " Gw]]@$}52": 256501839782173,
+                  "E": 2.858077299034765e-101,
+                  "dF,": true
+                }
+              },
+              "turnId": "@2^Lw454ub\\*",
+              "createdAt": "Y@_IHl%Ex"
+            },
+            {
+              "id": "ZfOVBZu{",
+              "tone": "error",
+              "kind": "$ |XtQ",
+              "summary": "mt]-0",
+              "payload": {},
+              "turnId": "jw'I-",
+              "sequence": 1311806185,
+              "createdAt": "\\yIm;)CD"
+            },
+            {
+              "id": "U\\\"+K!",
+              "tone": "error",
+              "kind": "iB:8:9_VGn",
+              "summary": "R<]EL'",
+              "payload": [
+                8.540844773448045e-79,
+                -1.0645325428092308e79,
+                "",
+                [null, "&y{$8", "&7#R", "wWgBmj&v", "uhB|$M-zE", true],
+                true,
+                -1.3527444894707953e-53
+              ],
+              "turnId": null,
+              "createdAt": "}]vXA"
+            }
+          ],
+          "checkpoints": [
+            {
+              "turnId": "N&",
+              "checkpointTurnCount": 4,
+              "checkpointRef": "bind",
+              "status": "error",
+              "files": [
+                {
+                  "path": "os'08Z8",
+                  "kind": "r",
+                  "additions": 100725268,
+                  "deletions": 1335384272
+                },
+                {
+                  "path": "}o H$dI:\\",
+                  "kind": ")I,-b|'",
+                  "additions": 1254665872,
+                  "deletions": 1748828898
+                },
+                {
+                  "path": "_P8l",
+                  "kind": "t:",
+                  "additions": 1331725152,
+                  "deletions": 1924523618
+                },
+                {
+                  "path": "[=:",
+                  "kind": "fsOg",
+                  "additions": 1808317409,
+                  "deletions": 309401913
+                },
+                {
+                  "path": "WOi~$k@4NEz",
+                  "kind": "`/V>>(vSX.",
+                  "additions": 185435826,
+                  "deletions": 210509393
+                },
+                {
+                  "path": "\\KY",
+                  "kind": "V]$M~;rC @J",
+                  "additions": 1091310579,
+                  "deletions": 1803823240
+                },
+                {
+                  "path": "E:5EW",
+                  "kind": "@WFv!_l",
+                  "additions": 397334720,
+                  "deletions": 1385972969
+                }
+              ],
+              "assistantMessageId": "&",
+              "completedAt": ""
+            },
+            {
+              "turnId": "Jg1",
+              "checkpointTurnCount": 2147483647,
+              "checkpointRef": "}",
+              "status": "missing",
+              "files": [
+                {
+                  "path": "f=F:",
+                  "kind": "/",
+                  "additions": 1576943651,
+                  "deletions": 1704407303
+                },
+                {
+                  "path": "~]RdNk({<",
+                  "kind": "&ttotot}",
+                  "additions": 11,
+                  "deletions": 859477693
+                },
+                {
+                  "path": "FJ!tOec;",
+                  "kind": "8}",
+                  "additions": 26,
+                  "deletions": 22
+                },
+                {
+                  "path": "Mngth1",
+                  "kind": "x\"(#",
+                  "additions": 294236650,
+                  "deletions": 1987272104
+                },
+                {
+                  "path": "slD$",
+                  "kind": "{[_prodtoS",
+                  "additions": 17,
+                  "deletions": 14
+                },
+                {
+                  "path": "len",
+                  "kind": "< `g)wN(1E",
+                  "additions": 25,
+                  "deletions": 18
+                }
+              ],
+              "assistantMessageId": "XSDagdB7s[2",
+              "completedAt": "px\\w36X("
+            }
+          ],
+          "session": {
+            "threadId": "IRe(7sdLju0",
+            "status": "running",
+            "providerName": "4\"W1o5jMt.}",
+            "providerInstanceId": "bg4_Yi-v",
+            "runtimeMode": "auto-accept-edits",
+            "activeTurnId": "ALx&J55Z-'yG",
+            "lastError": "e",
+            "updatedAt": "{<V}n1"
+          }
+        }
+      }
+    }
+  ]
+}

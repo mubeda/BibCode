@@ -1,0 +1,28 @@
+{
+  "metadata": {
+    "provider": "opencode",
+    "producerVersion": "1.18.4",
+    "schemaSource": "GET /doc",
+    "capturedAt": "2026-07-24T00:00:00Z",
+    "redactions": [
+      "[redacted workspace]",
+      "[redacted command arguments]",
+      "[redacted provider failure]"
+    ]
+  },
+  "rootSessionID": "ses-root-activity",
+  "rawSseFrames": [
+    "id: oc-1184-child-created\nevent: message\ndata: {\"id\":\"oc-1184-child-created\",\"type\":\"session.created\",\"properties\":{\"sessionID\":\"ses-child-direct\",\"info\":{\"id\":\"ses-child-direct\",\"parentID\":\"ses-root-activity\",\"title\":\"[redacted child title]\",\"directory\":\"[redacted workspace]\"}}}\n\n",
+    "id: oc-1184-child-busy\nevent: message\ndata: {\"id\":\"oc-1184-child-busy\",\"type\":\"session.status\",\"properties\":{\"sessionID\":\"ses-child-direct\",\"status\":{\"type\":\"busy\"}}}\n\n",
+    "id: oc-1184-child-retry\nevent: message\ndata: {\"id\":\"oc-1184-child-retry\",\"type\":\"session.status\",\"properties\":{\"sessionID\":\"ses-child-direct\",\"status\":{\"type\":\"retry\",\"attempt\":2,\"message\":\"[redacted retry message]\",\"next\":1721827202000,\"action\":\"[redacted retry action]\"}}}\n\n",
+    "id: oc-1184-child-idle\nevent: message\ndata: {\"id\":\"oc-1184-child-idle\",\"type\":\"session.status\",\"properties\":{\"sessionID\":\"ses-child-direct\",\"status\":{\"type\":\"idle\"}}}\n\n",
+    "id: oc-1184-child-message\nevent: message\ndata: {\"id\":\"oc-1184-child-message\",\"type\":\"message.updated\",\"properties\":{\"sessionID\":\"ses-child-direct\",\"info\":{\"id\":\"msg-child-assistant\",\"sessionID\":\"ses-child-direct\",\"role\":\"assistant\",\"time\":{\"created\":1721827200000}}}}\n\n",
+    "id: oc-1184-child-text\nevent: message\ndata: {\"id\":\"oc-1184-child-text\",\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses-child-direct\",\"part\":{\"id\":\"prt-child-text\",\"sessionID\":\"ses-child-direct\",\"messageID\":\"msg-child-assistant\",\"type\":\"text\",\"text\":\"[redacted child commentary]\"},\"time\":1721827200100}}\n\n",
+    "id: oc-1184-child-reasoning\nevent: message\ndata: {\"id\":\"oc-1184-child-reasoning\",\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses-child-direct\",\"part\":{\"id\":\"prt-child-reasoning\",\"sessionID\":\"ses-child-direct\",\"messageID\":\"msg-child-assistant\",\"type\":\"reasoning\",\"text\":\"[redacted internal reasoning]\"},\"time\":1721827200150}}\n\n",
+    "id: oc-1184-child-tool-pending\nevent: message\ndata: {\"id\":\"oc-1184-child-tool-pending\",\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses-child-direct\",\"part\":{\"id\":\"prt-child-tool\",\"sessionID\":\"ses-child-direct\",\"messageID\":\"msg-child-assistant\",\"type\":\"tool\",\"callID\":\"call-child-tool\",\"tool\":\"bash\",\"state\":{\"status\":\"pending\",\"input\":{}}},\"time\":1721827200200}}\n\n",
+    "id: oc-1184-child-tool-running\nevent: message\ndata: {\"id\":\"oc-1184-child-tool-running\",\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses-child-direct\",\"part\":{\"id\":\"prt-child-tool\",\"sessionID\":\"ses-child-direct\",\"messageID\":\"msg-child-assistant\",\"type\":\"tool\",\"callID\":\"call-child-tool\",\"tool\":\"bash\",\"state\":{\"status\":\"running\",\"input\":{\"command\":\"[redacted command]\"}}},\"time\":1721827200300}}\n\n",
+    "id: oc-1184-child-tool-completed\nevent: message\ndata: {\"id\":\"oc-1184-child-tool-completed\",\"type\":\"message.part.updated\",\"properties\":{\"sessionID\":\"ses-child-direct\",\"part\":{\"id\":\"prt-child-tool\",\"sessionID\":\"ses-child-direct\",\"messageID\":\"msg-child-assistant\",\"type\":\"tool\",\"callID\":\"call-child-tool\",\"tool\":\"bash\",\"state\":{\"status\":\"completed\",\"input\":{\"command\":\"[redacted command]\"},\"output\":\"[redacted tool output]\"}},\"time\":1721827200400}}\n\n",
+    "id: oc-1184-child-command\nevent: message\ndata: {\"id\":\"oc-1184-child-command\",\"type\":\"command.executed\",\"properties\":{\"name\":\"review\",\"sessionID\":\"ses-child-direct\",\"arguments\":\"[redacted command arguments]\",\"messageID\":\"msg-child-assistant\"}}\n\n",
+    "id: oc-1184-root-after-child-terminal\nevent: message\ndata: {\"id\":\"oc-1184-root-after-child-terminal\",\"type\":\"message.updated\",\"properties\":{\"sessionID\":\"ses-root-activity\",\"info\":{\"id\":\"msg-root-after-child-terminal\",\"sessionID\":\"ses-root-activity\",\"role\":\"assistant\",\"time\":{\"created\":1721827203000}}}}\n\n"
+  ]
+}

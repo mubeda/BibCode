@@ -1,0 +1,69 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "kind": "snapshot",
+      "snapshot": {
+        "protocolVersion": 1,
+        "scopeId": "thread:thread-1",
+        "scope": {
+          "_tag": "thread",
+          "threadId": "thread-1"
+        },
+        "revision": 3,
+        "provider": "codex",
+        "providerInstanceId": "codex",
+        "capabilities": {
+          "actors": true,
+          "attributedActivity": true,
+          "backgroundWork": true,
+          "historyRecovery": "full",
+          "terminalObservation": false
+        },
+        "observationState": "live",
+        "sections": {
+          "subagents": {
+            "state": "live",
+            "message": null,
+            "retryable": false
+          },
+          "backgroundTasks": {
+            "state": "live",
+            "message": null,
+            "retryable": false
+          }
+        },
+        "counts": {
+          "subagents": {
+            "active": 1,
+            "done": 0
+          },
+          "backgroundTasks": {
+            "active": 0,
+            "done": 0
+          }
+        },
+        "actors": [
+          {
+            "_tag": "actor",
+            "id": "actor:child-1",
+            "name": "Explore provider events",
+            "status": "running",
+            "summary": "Reading App Server schemas",
+            "startedAt": "2026-07-22T12:00:00Z",
+            "updatedAt": "2026-07-22T12:00:01Z",
+            "terminalAt": null,
+            "parentActorId": null,
+            "role": "explorer",
+            "providerType": "worker"
+          }
+        ],
+        "workItems": [],
+        "actorsHasMore": false,
+        "workItemsHasMore": false,
+        "updatedAt": "2026-07-22T12:00:01Z"
+      }
+    }
+  ]
+}

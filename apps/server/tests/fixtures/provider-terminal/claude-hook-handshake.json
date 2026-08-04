@@ -1,0 +1,20 @@
+{
+  "versionOutput": "2.1.220 (Claude Code)",
+  "rootHelp": "Usage: claude [options]\n  --settings <file-or-json>  Path to a settings JSON file or a JSON string to load additional settings from\n  --setting-sources <sources>  Comma-separated list of setting sources to load (user, project, local)",
+  "originalArgs": ["--model", "sonnet", "--permission-mode", "plan"],
+  "expectedHookEvents": [
+    "SubagentStart",
+    "SubagentStop",
+    "PreToolUse",
+    "PostToolUse",
+    "PostToolUseFailure"
+  ],
+  "rootHook": {
+    "hook_event_name": "SubagentStart",
+    "session_id": "claude-root-session",
+    "agent_id": "claude-agent-1",
+    "agent_type": "Explore",
+    "transcript_path": "/private/claude-root-session.jsonl",
+    "cwd": "/workspace"
+  }
+}
