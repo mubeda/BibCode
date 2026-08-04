@@ -2,7 +2,7 @@
 
 ## Goal
 
-Stop T4Code from creating nightly releases automatically while retaining the
+Stop BiBCode from creating nightly releases automatically while retaining the
 ability for a maintainer to create a nightly release explicitly from GitHub
 Actions.
 

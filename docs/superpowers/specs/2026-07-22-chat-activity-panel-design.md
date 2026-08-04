@@ -6,9 +6,9 @@
 
 ## Summary
 
-Add a compact, top-right activity dock to T4Code AI chat surfaces. The dock
+Add a compact, top-right activity dock to BiBCode AI chat surfaces. The dock
 summarizes subagents and provider-managed background tasks for the current chat.
-It expands into a small anchored summary and opens T4Code's existing right-panel
+It expands into a small anchored summary and opens BiBCode's existing right-panel
 system for a roster or an individual activity timeline.
 
 The feature is backed by a canonical server-side activity graph. Provider
@@ -17,7 +17,7 @@ shared actors, work items, and activity entries. The web application renders
 only capabilities and records the provider can prove. It never infers a
 subagent roster from generic tool calls.
 
-T4Code-owned provider terminals may use the same experience when the CLI can be
+BiBCode-owned provider terminals may use the same experience when the CLI can be
 started against an observable provider harness and a startup handshake proves
 that the observer and TUI share one session. The first release targets Codex,
 Claude, and OpenCode terminals. Cursor and Grok terminal tabs do not show an
@@ -31,7 +31,7 @@ the workspace or expose stop, steer, resume, terminate, or send-input controls.
 
 The latest Codex application makes concurrent work legible through a compact
 Subagents summary, an Active/Done roster, and an individual agent view showing
-commentary and commands. T4Code currently flattens the provider event stream
+commentary and commands. BiBCode currently flattens the provider event stream
 into the conversation work log. It has no durable representation of:
 
 - parent/child agent relationships;
@@ -52,7 +52,7 @@ guessing, fragile reconnect behavior, and inconsistent terminal support.
 ## Research Conclusion
 
 Subagent observability is a property of the **agent harness**, not the language
-model. A model name alone cannot promise a roster. T4Code must negotiate and
+model. A model name alone cannot promise a roster. BiBCode must negotiate and
 test the provider adapter's observable capabilities for the exact installed CLI
 or SDK version.
 
@@ -63,7 +63,7 @@ The researched harnesses fall into three groups:
 2. **Attributed hook and transcript APIs:** Claude exposes subagent lifecycle
    hooks, agent attribution, and transcript helpers.
 3. **Foreground event streams without stable child lineage:** the Cursor and
-   Grok integrations available to T4Code through CLI/ACP can expose text and
+   Grok integrations available to BiBCode through CLI/ACP can expose text and
    tool progress, but not enough stable lineage to build a truthful roster.
 
 The provider matrix in this design describes harness capability, not a blanket
@@ -80,8 +80,8 @@ capability when negotiation or its health handshake fails.
   hiding provider-specific detail.
 - Reconstruct a correct view after reconnects, restarts, duplicate events, and
   late events whenever the harness retains authoritative history.
-- Support observable T4Code-owned Codex, Claude, and OpenCode provider terminals.
-- Preserve T4Code's performance and reliability under high event volume.
+- Support observable BiBCode-owned Codex, Claude, and OpenCode provider terminals.
+- Preserve BiBCode's performance and reliability under high event volume.
 - Make unsupported behavior absent rather than misleading.
 
 ## Non-goals
@@ -91,7 +91,7 @@ capability when negotiation or its health handshake fails.
 - Controls that mutate agents or processes, including stop, steer, resume,
   terminate, retry, or send input.
 - Inferring child agents from tool names, prompt text, icons, or command output.
-- Observing arbitrary terminals that T4Code did not launch with an activity
+- Observing arbitrary terminals that BiBCode did not launch with an activity
   observer.
 - Replacing the normal conversation work log.
 - Standardizing providers' internal prompts, roles, reasoning, or orchestration
@@ -116,7 +116,7 @@ capability when negotiation or its health handshake fails.
 
 ### Activity scope
 
-One observable root chat or one T4Code-owned provider-terminal session. A chat
+One observable root chat or one BiBCode-owned provider-terminal session. A chat
 scope includes descendants spawned by that root but excludes siblings,
 ancestors, and independent sessions in the same workspace.
 
@@ -224,7 +224,7 @@ the last known timestamp.
   the existing right-panel column.
 - Between approximately 800 and 1200 CSS pixels, the dock reduces to
   icon-and-count presentation.
-- Below T4Code's existing 980-pixel right-panel breakpoint, roster and detail
+- Below BiBCode's existing 980-pixel right-panel breakpoint, roster and detail
   use the existing sheet behavior.
 - The dock is anchored within the chat/terminal content boundary and never
   covers the composer, terminal toolbar, or native window controls.
@@ -425,11 +425,11 @@ formerly active records become `interrupted`. They do not become `completed`.
 
 ### Provider terminals
 
-Only provider terminals created through T4Code's provider-terminal action are
+Only provider terminals created through BiBCode's provider-terminal action are
 eligible. Their normalized events use a bounded server-side observation journal
 associated with the center-terminal ID and native provider session ID.
 
-If the T4Code server restarts and cannot reattach to the same live harness, the
+If the BiBCode server restarts and cannot reattach to the same live harness, the
 existing journal remains inspectable and active records become `interrupted`.
 Starting a new CLI process creates a new activity scope even if it uses the same
 center-panel tab.
@@ -438,7 +438,7 @@ center-panel tab.
 
 ### Fidelity matrix
 
-| Harness | Structured chat | T4Code-owned terminal | Primary signals |
+| Harness | Structured chat | BiBCode-owned terminal | Primary signals |
 | --- | --- | --- | --- |
 | Codex App Server | Full when experimental API negotiation succeeds | Full after shared-session handshake | descendant threads, collaboration items, status, history, background terminals |
 | Claude Agent SDK/CLI | Full after hook-event adapter upgrade | Full after hook/registry handshake | SubagentStart/Stop, `agent_id`, tool hooks, transcript helpers |
@@ -463,11 +463,11 @@ The Codex adapter initializes with the experimental API capability and maps:
 - provider-native IDs into stable canonical identities.
 
 The inspected Codex 0.145.0 schema also exposes collaboration calls with sender
-and receiver thread IDs, agent states, tool kind, and lifecycle status. T4Code
+and receiver thread IDs, agent states, tool kind, and lifecycle status. BiBCode
 must generate or validate bindings against the installed App Server version
 rather than copying one release's experimental schema permanently.
 
-For a T4Code-owned Codex terminal, T4Code starts a dedicated local App Server
+For a BiBCode-owned Codex terminal, BiBCode starts a dedicated local App Server
 control endpoint, attaches the observer, and launches the Codex TUI with
 `--remote` against that same endpoint. The installed CLI accepts WebSocket and
 Unix-socket endpoints; the Unix-socket control transport is preferred because
@@ -491,10 +491,10 @@ events and subagent text attribution. The adapter maps:
 The installed Claude CLI exposes `--include-hook-events`,
 `--forward-subagent-text`, background-agent commands, session IDs, and settings
 injection. The adapter must feature-detect these switches and validate incoming
-hook shapes because the surface is versioned independently of T4Code.
+hook shapes because the surface is versioned independently of BiBCode.
 
-For a T4Code-owned interactive Claude terminal, the launcher installs a
-T4Code-managed additional hook sink through an isolated settings overlay and a
+For a BiBCode-owned interactive Claude terminal, the launcher installs a
+BiBCode-managed additional hook sink through an isolated settings overlay and a
 per-launch correlation token. It must preserve the user's normal Claude
 configuration and hooks. The observer reconciles against Claude's background
 agent registry/transcript helpers where available. No dock appears until the
@@ -515,7 +515,7 @@ It combines:
 - session messages for detail and recovery; and
 - server SSE for live deltas.
 
-For a T4Code-owned OpenCode terminal, T4Code starts one loopback server with a
+For a BiBCode-owned OpenCode terminal, BiBCode starts one loopback server with a
 per-launch credential, connects the observer, and launches the TUI with
 `opencode attach` to that exact endpoint. The endpoint is not exposed on a
 non-loopback interface by default. The dock appears only after the attached TUI
@@ -523,7 +523,7 @@ and observer report the same native session.
 
 ### Cursor and Grok
 
-The existing Cursor and Grok T4Code integrations use event streams/ACP that can
+The existing Cursor and Grok BiBCode integrations use event streams/ACP that can
 represent foreground messages and tool calls but do not currently provide the
 stable child identity, parent edge, attributed history, and lifecycle required
 for a roster.
@@ -755,7 +755,7 @@ Use `vp test` for built-in Vite+ suites and `vp run test` only when a package's
    events, late events, panel close/reopen, and client reconnect.
 5. Codex, Claude, and OpenCode structured integrations pass their adapter
    fidelity suites.
-6. T4Code-owned terminals show the dock only after a reliable shared-session
+6. BiBCode-owned terminals show the dock only after a reliable shared-session
    handshake; Cursor and Grok terminals show none in v1.
 7. The feature remains inspect-only and current-chat scoped.
 8. High event volume is paginated, bounded, and batched without loading full

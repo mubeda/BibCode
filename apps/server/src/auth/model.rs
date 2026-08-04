@@ -42,8 +42,6 @@ pub const ADMINISTRATIVE_SCOPES: &[&str] = &[
 pub const TOKEN_GRANT_TYPE: &str = "urn:ietf:params:oauth:grant-type:token-exchange";
 pub const ACCESS_TOKEN_TYPE: &str = "urn:ietf:params:oauth:token-type:access_token";
 pub const BOOTSTRAP_TOKEN_TYPE: &str = "urn:bibcode:params:oauth:token-type:environment-bootstrap";
-pub const LEGACY_BOOTSTRAP_TOKEN_TYPE: &str =
-    "urn:t4code:params:oauth:token-type:environment-bootstrap";
 
 #[derive(Clone, Debug, Serialize)]
 #[serde(rename_all = "camelCase")]

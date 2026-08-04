@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make BiBCode the canonical runtime identity for environment variables, persisted state, filesystem paths, network/auth protocols, hosted configuration, Tauri identity, and diagnostics while preserving deliberate read compatibility for existing T4Code installations and automation.
+**Goal:** Make BiBCode the canonical runtime identity for environment variables, persisted state, filesystem paths, network/auth protocols, hosted configuration, Tauri identity, and diagnostics while preserving deliberate read compatibility for installations and automation that use the retired identity.
 
 **Architecture:** Introduce minimal new-name-first fallback helpers at each persistence boundary. New clients write BiBCode identifiers; readers accept and migrate legacy values without deleting them. Protocol servers temporarily accept both routes/types while every repository-owned client emits only BiBCode values.
 
@@ -166,18 +166,18 @@ Use `std::fs`/`tokio::fs` already present. Create a uniquely owned sibling such
 as `.bibcode-migration-<uuid>.stage`, recursively copy files/directories without
 following symlinks outside the legacy root, then rename it to `.bibcode` only
 when the destination is still absent. On error, remove only the verified owned
-staging path; never move or delete `.t4code`.
+staging path; never move or delete the legacy data tree.
 
 - [ ] **Step 4: Route all default path owners through the helper**
 
 Canonicalize:
 
 ```text
-~/.t4code                 -> ~/.bibcode
-.bibcode-worktrees         -> .bibcode-worktrees
-.bibcode-provider-*        -> .bibcode-provider-*
-t4code-diagnostics-*      -> bibcode-diagnostics-*
-t4code-ssh-* / run-t4code -> bibcode-ssh-* / run-bibcode
+retired home directory        -> ~/.bibcode
+retired worktree directory    -> .bibcode-worktrees
+retired provider directories  -> .bibcode-provider-*
+retired diagnostics prefix    -> bibcode-diagnostics-*
+retired SSH/runner prefixes   -> bibcode-ssh-* / run-bibcode
 ```
 
 Desktop, server, dev runner, and SSH launch scripts must resolve the same
@@ -197,8 +197,8 @@ vp test scripts/dev-runner.test.ts
 
 - [ ] **Step 6: Review without staging or committing**
 
-Inspect every `.t4code` match. Only the migration source constant/tests/docs and
-the final allowlist may remain.
+Audit the retired filesystem-path variants. Only the migration source
+constant/tests/docs and the final allowlist may remain.
 
 ### Task 3: Browser LocalStorage and IndexedDB Migration
 
@@ -236,11 +236,9 @@ the final allowlist may remain.
 
 - [ ] **Step 1: Write local-storage migration tests**
 
-```ts
-expect(migrateStorageValue(storage, "bibcode:theme", ["t4code:theme"])).toBe("dark");
-expect(storage.getItem("bibcode:theme")).toBe("dark");
-expect(storage.getItem("t4code:theme")).toBe("dark");
-```
+Using a fixture-defined retired theme key, assert that migration returns its
+value, writes the canonical `bibcode:theme` key, and leaves the retired key
+untouched.
 
 Also assert that an existing canonical value wins and is not overwritten.
 
@@ -279,8 +277,10 @@ version arrays readable but write only the canonical BiBCode state key.
 
 - [ ] **Step 5: Migrate the two IndexedDB databases**
 
-For `t4code:connection-runtime` and `t4code:cloud-auth`, open the canonical
-BiBCode database first. If it does not exist but the legacy database does, copy
+For the retired connection-runtime and cloud-auth database names, open the
+canonical `bibcode:connection-runtime` and `bibcode:cloud-auth` databases first.
+If a canonical database does not exist but the corresponding legacy database
+does, copy
 each known object store and record in a single upgrade/migration flow, close
 both databases, and then reopen the canonical database. Do not delete the old
 database. Add fake-IndexedDB tests for precedence, copy success, empty legacy,
@@ -297,7 +297,7 @@ untouched.
 
 - [ ] **Step 7: Review without staging or committing**
 
-Inspect every `t4code:` and `t4code.` match; only fallback constants/tests and
+Audit the retired browser-persistence prefix; only fallback constants/tests and
 the final allowlist may remain.
 
 ### Task 4: HTTP, IPC, Auth, Relay, and Serialized Protocol Compatibility
@@ -329,7 +329,8 @@ the final allowlist may remain.
 **Interfaces:**
 
 - Produces: canonical `bibcode` routes, headers, URNs, JWT `typ`/issuer/audience values, cookie/client IDs, and serialized action discriminants.
-- Compatibility: servers/decoders accept the exact legacy `t4code` value while repository clients/encoders emit only the canonical value.
+- Compatibility: servers/decoders accept the exact retired value while
+  repository clients/encoders emit only the canonical `bibcode` value.
 
 - [ ] **Step 1: Change contract tests to canonical emissions plus legacy acceptance**
 
@@ -365,14 +366,14 @@ business logic.
 Canonicalize at least:
 
 ```text
-/.well-known/t4code/*       -> /.well-known/bibcode/*
+retired well-known routes    -> /.well-known/bibcode/*
 /api/bibcode-connect/*       -> /api/bibcode-connect/*
-x-t4code-*                  -> x-bibcode-*
-urn:t4code:*                -> urn:bibcode:*
-t4code-env:* / t4code-*-jwt -> bibcode-env:* / bibcode-*-jwt
-t4code_session              -> bibcode_session
-t4code-web                  -> bibcode-web
-t4code://app                -> bibcode://app
+retired header prefix        -> x-bibcode-*
+retired URN namespace        -> urn:bibcode:*
+retired env/JWT types        -> bibcode-env:* / bibcode-*-jwt
+retired session cookie       -> bibcode_session
+retired web client ID        -> bibcode-web
+retired application URI      -> bibcode://app
 ```
 
 - [ ] **Step 4: Regenerate fixtures and verify cross-language compatibility**
@@ -429,7 +430,7 @@ bibcoderelay
 ```
 
 Add a test that missing hosted-domain configuration fails at deploy/config
-resolution rather than silently routing to an old T4Code domain.
+resolution rather than silently routing to a retired branded domain.
 
 - [ ] **Step 2: Run focused tests and verify RED**
 
@@ -443,7 +444,8 @@ cargo test --locked -p bibcode-desktop window -- --test-threads=1
 Read router host/latest/nightly origins from required `BIBCODE_*` deployment
 configuration. In browser runtime, derive same-origin links from
 `window.location.origin` unless an injected BiBCode hosted-app URL is present.
-Remove `app.t4code.codes` references; do not substitute an unowned domain.
+Remove references to the retired hosted-app domain; do not substitute an
+unowned domain.
 
 - [ ] **Step 4: Change the Tauri identifier and verify built metadata**
 
@@ -467,9 +469,9 @@ corepack pnpm --filter @bibcode/marketing build
 
 - [ ] **Step 6: Review without staging or committing**
 
-```powershell
-rg -n --hidden --glob '!.repos/**' --glob '!node_modules/**' --glob '!target/**' '(t4code\.codes|com\.t4code|bibcode-relay|t4coderelay)' .
-```
+Audit project-owned text for retired hosted-domain, Tauri-identifier, and relay
+resource names while confirming the canonical `bibcode-relay` and `bibcoderelay`
+names remain where required.
 
 Expected: only explicit migration/legacy test documentation and the final
 allowlist.
@@ -478,7 +480,8 @@ allowlist.
 
 **Files:**
 
-- Rename: `scripts/t4code-identity.test.ts` -> `scripts/bibcode-identity.test.ts`
+- Rename the identity guard from its retired filename to
+  `scripts/bibcode-identity.test.ts`.
 - Modify: root test discovery/config only if the renamed test is explicitly referenced
 - Modify: migration documentation containing permitted legacy values
 
@@ -609,10 +612,10 @@ Expected: every command exits 0.
 
 - [ ] **Step 2: Run exhaustive path and text scans**
 
-```powershell
-rg -n --pcre2 --hidden --glob '!.git/**' --glob '!.repos/**' --glob '!node_modules/**' --glob '!target/**' --glob '!.codegraph/**' '(T4Code|T4[ ]+Code|(?<![A-Za-z0-9_])T4(?![A-Za-z0-9_])|t4code|BIBCODE_)' .
-git ls-files --cached --others --exclude-standard | Select-String -Pattern '(?i)t4([ _-]?code)?'
-```
+Run self-hiding repository-wide content and path audits for every retired
+product-name, standalone-mark, lowercase identity, and environment-prefix
+variant. Exclude VCS metadata, vendored repositories, dependencies, build
+outputs, and CodeGraph data.
 
 Every result must correspond exactly to the tested allowlist. There must be no
 old-brand filename outside ignored design history and no old name in an image.

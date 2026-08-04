@@ -778,7 +778,6 @@ fn route_inventory_covers_every_current_http_method_and_path() {
 fn expected_routes() -> Vec<(&'static str, &'static str)> {
     vec![
         ("GET", "/.well-known/bibcode/environment"),
-        ("GET", "/.well-known/t4code/environment"),
         ("GET", "/api/auth/session"),
         ("POST", "/api/auth/browser-session"),
         ("POST", "/oauth/token"),
@@ -802,7 +801,6 @@ fn expected_routes() -> Vec<(&'static str, &'static str)> {
         ("POST", "/api/diagnostics/logs.zip"),
         ("GET", "/api/assets/*"),
         ("POST", "/.well-known/bibcode/desktop/shutdown"),
-        ("POST", "/.well-known/t4code/desktop/shutdown"),
         ("POST", "/mcp"),
         ("DELETE", "/mcp"),
         ("GET", "*"),

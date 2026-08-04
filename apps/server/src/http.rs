@@ -33,8 +33,6 @@ use crate::{
 pub const ENVIRONMENT_DESCRIPTOR_PATH: &str = "/.well-known/bibcode/environment";
 pub const DESKTOP_SHUTDOWN_PATH: &str = "/.well-known/bibcode/desktop/shutdown";
 pub const DESKTOP_SHUTDOWN_TOKEN_HEADER: &str = "x-bibcode-desktop-bootstrap-token";
-const LEGACY_ENVIRONMENT_DESCRIPTOR_PATH: &str = "/.well-known/t4code/environment";
-const LEGACY_DESKTOP_SHUTDOWN_PATH: &str = "/.well-known/t4code/desktop/shutdown";
 
 const CONTENT_SECURITY_POLICY_VALUE: &str = "default-src 'self'; connect-src 'self' http: https: ws: wss:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'; script-src 'self'; font-src 'self' data:; object-src 'none'; base-uri 'self'; frame-ancestors 'none'";
 const IMMUTABLE_CACHE_CONTROL: &str = "public, max-age=31536000, immutable";
@@ -72,7 +70,6 @@ const fn route(method: RouteMethod, path: &'static str) -> RouteSpec {
 
 pub const ROUTE_INVENTORY: &[RouteSpec] = &[
     route(RouteMethod::Get, ENVIRONMENT_DESCRIPTOR_PATH),
-    route(RouteMethod::Get, LEGACY_ENVIRONMENT_DESCRIPTOR_PATH),
     route(RouteMethod::Get, "/api/auth/session"),
     route(RouteMethod::Post, "/api/auth/browser-session"),
     route(RouteMethod::Post, "/oauth/token"),
@@ -96,7 +93,6 @@ pub const ROUTE_INVENTORY: &[RouteSpec] = &[
     route(RouteMethod::Post, "/api/diagnostics/logs.zip"),
     route(RouteMethod::Get, "/api/assets/*"),
     route(RouteMethod::Post, DESKTOP_SHUTDOWN_PATH),
-    route(RouteMethod::Post, LEGACY_DESKTOP_SHUTDOWN_PATH),
     route(RouteMethod::Post, "/mcp"),
     route(RouteMethod::Delete, "/mcp"),
     route(RouteMethod::Get, "*"),
@@ -122,12 +118,7 @@ pub(crate) fn build_router(state: AppState) -> Router {
     let router = http_routes::add_routes(auth::add_routes(Router::<AppState>::new()));
     router
         .route(ENVIRONMENT_DESCRIPTOR_PATH, get(environment_descriptor))
-        .route(
-            LEGACY_ENVIRONMENT_DESCRIPTOR_PATH,
-            get(environment_descriptor),
-        )
         .route(DESKTOP_SHUTDOWN_PATH, post(desktop_shutdown))
-        .route(LEGACY_DESKTOP_SHUTDOWN_PATH, post(desktop_shutdown))
         .route("/ws", get(websocket))
         .fallback(static_or_dev)
         .layer(cors)
@@ -155,8 +146,6 @@ fn cors_layer(config: &ServerConfig) -> CorsLayer {
     for origin in [
         "bibcode://app",
         "bibcode-dev://app",
-        "t4code://app",
-        "t4code-dev://app",
     ] {
         if let Ok(origin) = origin.parse() {
             origins.push(origin);

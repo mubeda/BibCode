@@ -258,7 +258,7 @@ Cursor builds one parameterized model argument, for example:
 The builder starts from the base model ID, adds only supported resolved
 parameters, and produces one argument without shell quoting or interpolation.
 
-Claude's internal T4Code session may still receive a supported `fastMode`
+Claude's internal BiBCode session may still receive a supported `fastMode`
 selection through the provider protocol. The AI terminal action omits fast mode
 because the installed Claude CLI exposes no startup flag for it. The same rule
 applies to Grok fast mode and unsupported OpenCode traits.
@@ -370,7 +370,7 @@ open, displays the structured spawn failure, and does not fall back to a shell.
 
 ## macOS Desktop Verification
 
-After automated verification passes, launch the current T4Code macOS
+After automated verification passes, launch the current BiBCode macOS
 application through its normal desktop UI and perform this walkthrough:
 
 1. Open **Settings → Providers** and confirm providers render as separate
@@ -386,7 +386,7 @@ application through its normal desktop UI and perform this walkthrough:
 6. Create a center Chat panel and verify it starts with the same full selection.
 7. Open the provider's AI terminal action and verify supported CLI defaults are
    present in the structured launch command and unsupported ones are absent.
-8. Quit T4Code completely, reopen it, and confirm the provider defaults remain.
+8. Quit BiBCode completely, reopen it, and confirm the provider defaults remain.
 9. Create another new chat after relaunch and verify it uses the persisted
    values.
 10. Change to a model that lacks effort or fast mode and confirm the unsupported

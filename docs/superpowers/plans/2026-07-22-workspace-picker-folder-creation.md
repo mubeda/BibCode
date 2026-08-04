@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Let users create a directory on the selected T4Code host from the **Select Workspace folder** dialog, enter it, and select it.
+**Goal:** Let users create a directory on the selected BiBCode host from the **Select Workspace folder** dialog, enter it, and select it.
 
 **Architecture:** Reuse the existing `projectEnvironment.createEntry` command and server-side `WorkspaceService::create_entry` validation. Add one shared host-path join helper for Windows, UNC, and POSIX paths, then add an inline name editor to the existing remote picker; successful creation changes the browse target so the normal filesystem browse query canonicalizes the new location.
 
@@ -50,8 +50,8 @@ import { joinHostPath } from "./path";
 
 describe("joinHostPath", () => {
   it("joins Windows drive paths with Windows separators", () => {
-    expect(joinHostPath("X:\\Workspaces\\t4code", "new-folder")).toBe(
-      "X:\\Workspaces\\t4code\\new-folder",
+    expect(joinHostPath("X:\\Workspaces\\bibcode", "new-folder")).toBe(
+      "X:\\Workspaces\\bibcode\\new-folder",
     );
     expect(joinHostPath("X:\\", "new-folder")).toBe("X:\\new-folder");
     expect(joinHostPath("X:\\", "")).toBe("X:\\");
@@ -474,7 +474,7 @@ Expected: both commands exit 0.
 5. Repeat with a duplicate name and verify the picker stays open with a useful error.
 6. Repeat against a remote/WSL host and verify creation occurs on that host, not locally.
 
-Expected: the new folder is created only on the selected T4Code host and is immediately selectable.
+Expected: the new folder is created only on the selected BiBCode host and is immediately selectable.
 
 - [ ] **Step 5: Confirm repository cleanliness**
 

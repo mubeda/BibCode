@@ -1,4 +1,4 @@
-# T4Code Status Bar Design
+# BiBCode Status Bar Design
 
 > Status: historical design record. The shipped UI remains relevant, but the
 > server paths and TypeScript backend details below describe the pre-Rust
@@ -16,7 +16,7 @@ Orca's status bar is a bottom application bar that combines provider usage, refr
 - Optional status items for SSH hosts, ports, update state, pet overlay, and floating terminal controls.
 - Status bar visibility and per-item display settings.
 
-T4Code already has useful foundations:
+BiBCode already has useful foundations:
 
 - `server.getProcessDiagnostics`, `server.getProcessResourceHistory`, and `server.signalProcess` in contracts and server handlers.
 - The Diagnostics Settings panel already consumes process/resource data and renders process tables/charts.
@@ -25,11 +25,11 @@ T4Code already has useful foundations:
 
 ## Scope
 
-Implement a T4Code-focused first version of the Orca-style status bar:
+Implement a BiBCode-focused first version of the Orca-style status bar:
 
 - Bottom status bar mounted in the authenticated app shell.
 - Claude and Codex usage/rate-limit segments with Orca-like compact bars, refresh state, error/unavailable states, and detail popovers.
-- Resource Manager segment with current native T4Code process-tree memory and CPU,
+- Resource Manager segment with current native BiBCode process-tree memory and CPU,
   terminal session count, top process list, history chart, and kill actions using
   existing diagnostics endpoints. The final in-process Rust architecture
   includes the Tauri/server root and supervised descendants; browser/WebView
@@ -50,7 +50,7 @@ The design keeps extension points for those items so they can be added without r
 
 ## User Experience
 
-The status bar sits at the bottom of the main app, below the current page content. It uses the existing T4Code UI primitives (`Tooltip`, `Popover`, `Button`, menu primitives, and icons from `lucide-react`) and a restrained 24px-high layout.
+The status bar sits at the bottom of the main app, below the current page content. It uses the existing BiBCode UI primitives (`Tooltip`, `Popover`, `Button`, menu primitives, and icons from `lucide-react`) and a restrained 24px-high layout.
 
 Left side:
 
@@ -131,7 +131,7 @@ Server implementation:
   - stale threshold: 30 minutes
   - single-flight fetches per provider
 - Fetch Codex via the local Codex app-server JSON-RPC when possible:
-  - invoke Codex with the same runtime home/environment conventions used by T4Code's Codex driver where practical.
+  - invoke Codex with the same runtime home/environment conventions used by BiBCode's Codex driver where practical.
   - call `account/rateLimits/read`.
   - normalize `primary` as session and `secondary` as weekly.
 - Fetch Claude by checking OAuth usage credentials when available, with a minimal first-pass fallback:

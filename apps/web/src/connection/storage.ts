@@ -32,7 +32,6 @@ import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 
 const DATABASE_NAME = "bibcode:connection-runtime";
-const LEGACY_DATABASE_NAME = "t4code:connection-runtime";
 const DATABASE_VERSION = 2;
 const CATALOG_STORE_NAME = "catalog";
 const SHELL_STORE_NAME = "shell";
@@ -130,21 +129,6 @@ function readDatabaseValue(database: IDBDatabase, storeName: string, key: IDBVal
   }).pipe(Effect.withSpan("web.connectionStorage.readDatabaseValue"));
 }
 
-function readMigratedDatabaseValue(
-  database: IDBDatabase,
-  legacyDatabase: IDBDatabase | undefined,
-  storeName: string,
-  key: IDBValidKey,
-) {
-  return Effect.gen(function* () {
-    const current = yield* readDatabaseValue(database, storeName, key);
-    if (current !== undefined || legacyDatabase === undefined) return current;
-    const legacy = yield* readDatabaseValue(legacyDatabase, storeName, key);
-    if (legacy !== undefined) yield* writeDatabaseValue(database, storeName, key, legacy);
-    return legacy;
-  });
-}
-
 function writeDatabaseValue(
   database: IDBDatabase,
   storeName: string,
@@ -232,10 +216,7 @@ export interface CatalogBackend {
   readonly quarantine?: (raw: string) => Effect.Effect<void, ConnectionTransientError>;
 }
 
-export function makeCatalogBackend(
-  database: IDBDatabase,
-  legacyDatabase?: IDBDatabase,
-): CatalogBackend {
+export function makeCatalogBackend(database: IDBDatabase): CatalogBackend {
   const bridge = window.desktopBridge;
   if (bridge?.getConnectionCatalog !== undefined && bridge.setConnectionCatalog !== undefined) {
     return {
@@ -263,7 +244,7 @@ export function makeCatalogBackend(
   }
 
   return {
-    read: readMigratedDatabaseValue(database, legacyDatabase, CATALOG_STORE_NAME, CATALOG_KEY).pipe(
+    read: readDatabaseValue(database, CATALOG_STORE_NAME, CATALOG_KEY).pipe(
       Effect.map((value) => (typeof value === "string" ? value : null)),
     ),
     write: (raw) => writeDatabaseValue(database, CATALOG_STORE_NAME, CATALOG_KEY, raw),
@@ -346,11 +327,7 @@ export const connectionStorageLayer = Layer.effectContext(
     const database = yield* Effect.acquireRelease(openDatabase(), (database) =>
       Effect.sync(() => database.close()),
     );
-    const legacyDatabase = yield* Effect.acquireRelease(
-      openDatabase(LEGACY_DATABASE_NAME),
-      (value) => Effect.sync(() => value.close()),
-    );
-    const catalog = yield* makeCatalogStore(makeCatalogBackend(database, legacyDatabase));
+    const catalog = yield* makeCatalogStore(makeCatalogBackend(database));
 
     const targetStore = ConnectionTargetStore.of({
       list: catalog.read.pipe(
@@ -449,7 +426,7 @@ export const connectionStorageLayer = Layer.effectContext(
     });
     const cacheStore = EnvironmentCacheStore.of({
       loadShell: (environmentId) =>
-        readMigratedDatabaseValue(database, legacyDatabase, SHELL_STORE_NAME, environmentId).pipe(
+        readDatabaseValue(database, SHELL_STORE_NAME, environmentId).pipe(
           Effect.flatMap((raw) => {
             if (typeof raw !== "string") {
               return Effect.succeed(Option.none());
@@ -485,9 +462,8 @@ export const connectionStorageLayer = Layer.effectContext(
           ),
         ),
       loadThread: (environmentId, threadId) =>
-        readMigratedDatabaseValue(
+        readDatabaseValue(
           database,
-          legacyDatabase,
           THREAD_STORE_NAME,
           threadCacheKey(environmentId, threadId),
         ).pipe(
@@ -532,22 +508,21 @@ export const connectionStorageLayer = Layer.effectContext(
           ),
         ),
       removeThread: (environmentId, threadId) =>
-        Effect.all(
-          [database, legacyDatabase].map((value) =>
-            removeDatabaseValue(value, THREAD_STORE_NAME, threadCacheKey(environmentId, threadId)),
-          ),
-          { concurrency: "unbounded", discard: true },
+        removeDatabaseValue(
+          database,
+          THREAD_STORE_NAME,
+          threadCacheKey(environmentId, threadId),
         ).pipe(Effect.mapError((cause) => persistenceError("remove-thread", cause))),
       clear: (environmentId) =>
         Effect.all(
-          [database, legacyDatabase].flatMap((value) => [
-            removeDatabaseValue(value, SHELL_STORE_NAME, environmentId),
+          [
+            removeDatabaseValue(database, SHELL_STORE_NAME, environmentId),
             removeDatabaseValuesInRange(
-              value,
+              database,
               THREAD_STORE_NAME,
               IDBKeyRange.bound(`${environmentId}:`, `${environmentId}:\uffff`),
             ),
-          ]),
+          ],
           { concurrency: "unbounded", discard: true },
         ).pipe(Effect.mapError((cause) => persistenceError("clear-environment", cause))),
     });

@@ -41,8 +41,6 @@ const MANAGED_GENERATION_SLOT_COUNT: usize = 64;
 const OWNERSHIP_MARKER_NAME: &str = ".bibcode-provider-terminal-owner";
 #[cfg(unix)]
 const OWNERSHIP_MARKER_CONTENT: &[u8] = b"bibcode-provider-terminal-v1\n";
-#[cfg(unix)]
-const LEGACY_OWNERSHIP_MARKER_CONTENT: &[u8] = b"t4code-provider-terminal-v1\n";
 
 #[cfg(unix)]
 static MANAGED_GENERATION_SLOT_OPERATION_LOCK: Mutex<()> = Mutex::new(());
@@ -936,7 +934,7 @@ fn has_valid_ownership_marker_at(generation: &std::fs::File) -> bool {
         .take(65)
         .read_to_end(&mut content)
         .is_ok()
-        && (content == OWNERSHIP_MARKER_CONTENT || content == LEGACY_OWNERSHIP_MARKER_CONTENT)
+        && content == OWNERSHIP_MARKER_CONTENT
 }
 
 #[cfg(unix)]

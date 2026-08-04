@@ -2,7 +2,7 @@
 
 ## Goal
 
-Rebrand the project and application from T4Code to **BiBCode**. User-facing
+Rebrand the project and application from the retired identity to **BiBCode**. User-facing
 application names use `BiBCode`; icon artwork uses the compact mark `BiB`.
 
 The work is intentionally staged. The visible product rebrand is completed and
@@ -36,8 +36,7 @@ must be explicit prose rather than an accidental brand leftover.
 
 - Canonical application name: `BiBCode`.
 - Canonical icon text: `BiB`.
-- `T4Code`, `T4 Code`, `T4Code Alpha`, `T4 Code Alpha`, and
-  `T4Code (Alpha)` become `BiBCode` when they identify the product.
+- Retired product-name variants become `BiBCode` when they identify the product.
 - A standalone product mark `T4` becomes `BiBCode` in prose or `BiB` in icon
   artwork, according to context.
 - Alpha/nightly channel labels remain only when they describe an actual release
@@ -123,8 +122,8 @@ Only after this gate passes does Phase 2 begin.
 
 ## Phase 2: Internal Identifier Migration
 
-Phase 2 migrates code-level identity from `t4code`/`T4CODE` to
-`bibcode`/`BIBCODE`, including:
+Phase 2 migrates code-level identity from the retired lowercase and uppercase
+prefixes to `bibcode`/`BIBCODE`, including:
 
 - workspace package names and `@bibcode/*` imports;
 - Rust workspace packages, crates, module references, and binary names;
@@ -146,8 +145,8 @@ New code writes and advertises BiBCode identifiers. Legacy identifiers remain
 readable where removing them would break an existing installation or external
 automation:
 
-- accept `BIBCODE_*` environment variables as fallback aliases, with `BIBCODE_*`
-  taking precedence;
+- accept environment variables under the retired prefix as fallback aliases,
+  with `BIBCODE_*` taking precedence;
 - discover legacy config/data paths and migrate or reuse their contents without
   destructive moves;
 - read old persisted storage keys and write the canonical BiBCode key on the

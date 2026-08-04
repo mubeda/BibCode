@@ -2,7 +2,7 @@
 
 ## Goal
 
-Packaged T4Code desktop builds on macOS and Linux must discover and launch the
+Packaged BiBCode desktop builds on macOS and Linux must discover and launch the
 same command-line tools that the user can run from their interactive login
 shell. This fixes provider discovery for Codex, Claude, Cursor Agent, OpenCode,
 and other PATH-based executables when the desktop application inherits a
@@ -13,7 +13,7 @@ Windows behavior remains unchanged.
 ## Root Cause
 
 GUI-launched macOS applications commonly inherit a launchd PATH containing
-only `/usr/bin:/bin:/usr/sbin:/sbin`. T4Code starts its Rust server in-process,
+only `/usr/bin:/bin:/usr/sbin:/sbin`. BiBCode starts its Rust server in-process,
 and provider executable resolution reads that process PATH directly. The
 desktop startup path does not currently load the user's login-shell
 environment, so executables installed under Homebrew or user-local directories
@@ -45,7 +45,7 @@ The module will:
 
 The hydration child and its stdout-reader thread must both finish before the
 process environment is updated. This preserves the Rust 2024 safety invariant
-that process environment mutation occurs while T4Code startup is still
+that process environment mutation occurs while BiBCode startup is still
 single-threaded. The unsafe environment update will be isolated in one
 documented function.
 
@@ -57,7 +57,7 @@ On Windows the hydration entry point is a no-op.
 
 ## Shell Probe Reliability
 
-The probe is best-effort and must not prevent T4Code from opening.
+The probe is best-effort and must not prevent BiBCode from opening.
 
 - The probe has a five-second deadline.
 - stdin and stderr are discarded so interactive startup scripts cannot wait
@@ -128,7 +128,7 @@ Required automated verification:
 After automated verification passes:
 
 1. Build a fresh arm64 macOS DMG from the fixed source.
-2. Install or replace the local `T4Code (Alpha).app`.
+2. Install or replace the local `BiBCode (Alpha).app`.
 3. Launch it through the normal macOS GUI path, not from an environment-rich
    development shell.
 4. Confirm the running process no longer has only the launchd-minimal PATH.

@@ -38,9 +38,9 @@ Each plan ends with a shippable increment. Ship 01 alone and users get a working
 
 Every task's requirements implicitly include this section. Values are copied verbatim from the codebase.
 
-- **Monorepo tooling is `vite-plus` (`vp`), not npm/vitest directly.** In this environment **pnpm is invoked as `corepack pnpm`** (pnpm is not on PATH; corepack activates the pinned `pnpm@10.24.0`). A benign `WARN Unsupported engine` (node 24.12 vs wanted 24.13) prints on every command — ignore it. Commands (run from repo root `X:\Workspaces\Orca\t4code\source-control`):
+- **Monorepo tooling is `vite-plus` (`vp`), not npm/vitest directly.** In this environment **pnpm is invoked as `corepack pnpm`** (pnpm is not on PATH; corepack activates the pinned `pnpm@10.24.0`). A benign `WARN Unsupported engine` (node 24.12 vs wanted 24.13) prints on every command — ignore it. Commands (run from repo root `X:\Workspaces\Orca\bibcode\source-control`):
   - **Paths are package-relative when run via `--filter <pkg> exec`** (`vp` runs inside the package dir): use `src/foo.test.ts`, **not** `apps/web/src/foo.test.ts`.
-  - **Package names/filters:** web = `@bibcode/web`; **server = `t4code`** (NOT `@bibcode/server`); contracts = `@bibcode/contracts`; client-runtime = `@bibcode/client-runtime`; shared = `@bibcode/shared`. (Verify a package name with `corepack pnpm ls -r --depth -1` if unsure.)
+  - **Package names/filters:** web = `@bibcode/web`; **server = `bibcode`** (NOT `@bibcode/server`); contracts = `@bibcode/contracts`; client-runtime = `@bibcode/client-runtime`; shared = `@bibcode/shared`. (Verify a package name with `corepack pnpm ls -r --depth -1` if unsure.)
   - Typecheck one package: `corepack pnpm --filter @bibcode/web exec tsgo --noEmit` (web) / `corepack pnpm --filter bibcode exec tsgo --noEmit` (server — uses `tsgo`, not `tsc`).
   - Test one file — web: `corepack pnpm --filter @bibcode/web exec vp test run --project unit src/rightPanelStore.test.ts`. Server: `corepack pnpm --filter bibcode exec vp test run src/vcs/GitVcsDriverCore.test.ts` (server has NO `--project` flag; server git tests spawn real `git` and take ~40s).
   - Lint: `corepack pnpm lint` (oxlint via `vp lint`). Format: `corepack pnpm fmt` (check with `corepack pnpm fmt:check`).
@@ -74,7 +74,7 @@ These names are fixed once here so tasks written independently stay consistent.
 
 - Component: **`apps/web/src/components/SourceControlPanel.tsx`**, default export **`SourceControlPanel`**, props `{ mode: DiffPanelMode; threadRef: ScopedThreadRef; gitCwd: string | null }`.
 - Logic module: **`apps/web/src/components/SourceControlPanel.logic.ts`** (+ `.logic.test.ts`).
-- Draft store: **`apps/web/src/sourceControlPanelStore.ts`** (zustand+persist, `name: "t4code:source-control-panel-state:v1"`), holding per-thread commit-message draft and the excluded-file set. Selector **`selectThreadSourceControlDraft`**.
+- Draft store: **`apps/web/src/sourceControlPanelStore.ts`** (zustand+persist, `name: "bibcode:source-control-panel-state:v1"`), holding per-thread commit-message draft and the excluded-file set. Selector **`selectThreadSourceControlDraft`**.
 - Reuses verbatim: `vcsEnvironment.status(...)`, `useGitStackedAction(scope)`, `useVcsPullAction`, `useVcsInitAction`, `useSourceControlActionRunning`, `getSourceControlPresentation`, and the pure helpers in `GitActionsControl.logic.ts` (`buildMenuItems`, `resolveQuickAction`, `buildGitActionProgressStages`, `resolveThreadBranchUpdate`, etc.).
 - File-row click → open the Diff surface: `useRightPanelStore.getState().open(threadRef, "diff")` then `useDiffPanelStore.getState().selectGitScope(threadRef, "unstaged")`.
 

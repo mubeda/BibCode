@@ -2,7 +2,7 @@
 
 > **Supersedes:** Task 2 of `2026-07-22-codex-terminal-theme.md` and the abandoned OSC startup-response design. Native ConPTY tests proved that Codex's OSC query is consumed by the console host and attempted PTY-input replies are discarded.
 
-**Goal:** Make Codex render with the resolved T4Code palette on Windows by ensuring its built-in console-attribute fallback observes the correct ConPTY defaults.
+**Goal:** Make Codex render with the resolved BiBCode palette on Windows by ensuring its built-in console-attribute fallback observes the correct ConPTY defaults.
 
 **Architecture:** The web marks only Codex launches with `BIBCODE_WINDOWS_CONSOLE_THEME=light|dark`. The server retains this reserved marker in `PtySpawnInput`, removes it and the existing reserved OSC palette values from the real child environment, and, on Windows only, opens the PTY and runs a fixed `/d /c color F0` or `color 0F` initializer on the slave through the absolute system `cmd.exe` resolved by `GetSystemDirectoryW`. After that initializer exits successfully, the server launches the original prepared Codex command unchanged on the same slave. No wrapper remains around Codex, no trusted setup executable is resolved through `PATH`, and no user-controlled command, argument, working directory, or environment value is interpolated into the initializer.
 

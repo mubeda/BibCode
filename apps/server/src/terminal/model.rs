@@ -3,7 +3,6 @@ use std::{collections::BTreeMap, path::PathBuf};
 use serde::{Deserialize, Deserializer, Serialize};
 
 pub(crate) const WINDOWS_CONSOLE_THEME_ENV: &str = "BIBCODE_WINDOWS_CONSOLE_THEME";
-pub(crate) const LEGACY_WINDOWS_CONSOLE_THEME_ENV: &str = "T4CODE_WINDOWS_CONSOLE_THEME";
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -15,8 +14,7 @@ pub enum TerminalConsoleTheme {
 pub(crate) fn terminal_console_theme_from_env(
     env: &BTreeMap<String, String>,
 ) -> Option<TerminalConsoleTheme> {
-    let value = environment_value(env, WINDOWS_CONSOLE_THEME_ENV)
-        .or_else(|| environment_value(env, LEGACY_WINDOWS_CONSOLE_THEME_ENV));
+    let value = environment_value(env, WINDOWS_CONSOLE_THEME_ENV);
     match value.map(String::as_str) {
         Some("light") => Some(TerminalConsoleTheme::Light),
         Some("dark") => Some(TerminalConsoleTheme::Dark),

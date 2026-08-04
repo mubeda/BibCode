@@ -23,14 +23,13 @@ use crate::process::{
     Platform, launch_executable_extensions, locate_executable, wrap_launch_program,
     wrap_windows_batch_command,
 };
-use crate::terminal::model::{LEGACY_WINDOWS_CONSOLE_THEME_ENV, WINDOWS_CONSOLE_THEME_ENV};
+use crate::terminal::model::WINDOWS_CONSOLE_THEME_ENV;
 #[cfg(any(windows, test))]
 use crate::terminal::model::{
     TerminalConsoleTheme as WindowsConsoleTheme,
     terminal_console_theme_from_env as windows_console_theme_from_env,
 };
 use crate::terminal::osc::{
-    LEGACY_OSC_BACKGROUND_ENV, LEGACY_OSC_CURSOR_ENV, LEGACY_OSC_FOREGROUND_ENV,
     OSC_BACKGROUND_ENV, OSC_CURSOR_ENV, OSC_FOREGROUND_ENV, OscColorResponder, colors_from_env,
     is_reserved_osc_env_key,
 };
@@ -556,19 +555,14 @@ fn is_reserved_pty_env_key_on(platform: Platform, key: &str) -> bool {
     if platform == Platform::Windows {
         return [
             WINDOWS_CONSOLE_THEME_ENV,
-            LEGACY_WINDOWS_CONSOLE_THEME_ENV,
             OSC_BACKGROUND_ENV,
             OSC_FOREGROUND_ENV,
             OSC_CURSOR_ENV,
-            LEGACY_OSC_BACKGROUND_ENV,
-            LEGACY_OSC_FOREGROUND_ENV,
-            LEGACY_OSC_CURSOR_ENV,
         ]
             .into_iter()
             .any(|reserved| key.eq_ignore_ascii_case(reserved));
     }
     key == WINDOWS_CONSOLE_THEME_ENV
-        || key == LEGACY_WINDOWS_CONSOLE_THEME_ENV
         || is_reserved_osc_env_key(key)
 }
 
@@ -1772,7 +1766,7 @@ mod tests {
     }
 
     #[test]
-    fn windows_prepared_command_strips_mixed_case_reserved_environment() {
+    fn windows_prepared_command_strips_mixed_case_bibcode_environment() {
         let directory = tempfile::tempdir().unwrap();
         let executable = directory.path().join("provider.exe");
         std::fs::write(&executable, b"fixture").unwrap();
@@ -1783,11 +1777,11 @@ mod tests {
             cols: 80,
             rows: 24,
             env: BTreeMap::from([
-                ("t4code_osc_foreground".to_owned(), "reserved".to_owned()),
-                ("T4Code_Osc_Background".to_owned(), "reserved".to_owned()),
-                ("t4code_osc_cursor".to_owned(), "reserved".to_owned()),
+                ("bibcode_osc_foreground".to_owned(), "reserved".to_owned()),
+                ("BiBCode_Osc_Background".to_owned(), "reserved".to_owned()),
+                ("bibcode_osc_cursor".to_owned(), "reserved".to_owned()),
                 (
-                    "T4Code_Windows_Console_Theme".to_owned(),
+                    "BiBCode_Windows_Console_Theme".to_owned(),
                     "light".to_owned(),
                 ),
                 ("ORDINARY".to_owned(), "value".to_owned()),
@@ -1795,10 +1789,10 @@ mod tests {
         };
 
         let command = build_pty_command_on(Platform::Windows, &input).unwrap();
-        assert_eq!(command.get_env("t4code_osc_foreground"), None);
-        assert_eq!(command.get_env("T4Code_Osc_Background"), None);
-        assert_eq!(command.get_env("t4code_osc_cursor"), None);
-        assert_eq!(command.get_env("T4Code_Windows_Console_Theme"), None);
+        assert_eq!(command.get_env("bibcode_osc_foreground"), None);
+        assert_eq!(command.get_env("BiBCode_Osc_Background"), None);
+        assert_eq!(command.get_env("bibcode_osc_cursor"), None);
+        assert_eq!(command.get_env("BiBCode_Windows_Console_Theme"), None);
         assert_eq!(command.get_env("ORDINARY"), Some(OsStr::new("value")));
     }
 
@@ -1819,13 +1813,6 @@ mod tests {
                 "value={value:?}"
             );
         }
-        assert_eq!(
-            windows_console_theme_from_env(&BTreeMap::from([(
-                "t4code_windows_console_theme".to_owned(),
-                "light".to_owned(),
-            )])),
-            Some(WindowsConsoleTheme::Light)
-        );
         assert_eq!(windows_console_theme_from_env(&BTreeMap::new()), None);
     }
 

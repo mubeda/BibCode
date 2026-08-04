@@ -9,7 +9,7 @@
 Add an **Agent activity for this environment** toggle to **Settings → Agents**.
 The setting controls the floating agent/background-task toolbar and the
 activity-specific backend work that supplies it. It is persisted independently
-by each T4Code environment and defaults to enabled so existing installations
+by each BiBCode environment and defaults to enabled so existing installations
 retain their current behavior.
 
 Disabling the feature immediately hides the chat and AI-terminal activity UI,

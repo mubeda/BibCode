@@ -14,7 +14,7 @@ to chat as context chips.
 
 ## Background — what exists today
 
-T4Code (Tauri 2.11.5 + React 19 renderer + Rust Axum server) already contains ~90%
+BiBCode (Tauri 2.11.5 + React 19 renderer + Rust Axum server) already contains ~90%
 of this feature, dormant:
 
 - Right-panel Browser surface, tabs, and picker (`apps/web/src/components/RightPanelTabs.tsx`,
@@ -71,7 +71,7 @@ WebContents APIs.
    URL/artifact routing — implemented in phases.
 2. **Design mode is in scope** (element selection/annotation → chat context).
 3. **Consumers:** chat-panel providers and terminal CLI agents both drive the
-   browser. Both are served by the one existing mechanism: the per-thread `t4code`
+   browser. Both are served by the one existing mechanism: the per-thread `bibcode`
    MCP server injected into every provider CLI.
 4. **Security posture:** AI browsing is unrestricted; preview webviews use an
    isolated data profile, never the user's personal browser state.
@@ -127,7 +127,7 @@ Only the last three hops are new.
   (objc2), WebView2 `CapturePreview`, `webkit_web_view_get_snapshot`. PNG → base64,
   matching the existing screenshot artifact contract.
 - One shared, isolated data profile for all preview webviews (successor of the old
-  `persist:t4code-preview` partition): cookies/storage persist across tabs and
+  `persist:bibcode-preview` partition): cookies/storage persist across tabs and
   restarts but never touch the user's personal browser state. Finer-grained
   profiles are a possible later addition.
 - The automation agent bundle is embedded via `include_str!` and registered as an

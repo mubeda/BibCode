@@ -395,7 +395,7 @@ let request = tokio::spawn(
     reqwest::Client::new()
         .post(&endpoint)
         .bearer_auth(&token)
-        .header("X-T4Code-Launch-Correlation", &correlation)
+        .header("X-BiBCode-Launch-Correlation", &correlation)
         .header("content-type", "application/json")
         .body(body)
         .send(),

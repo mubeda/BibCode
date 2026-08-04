@@ -2,8 +2,6 @@ import * as Schema from "effect/Schema";
 import * as Record from "effect/Record";
 import { useCallback, useMemo, useSyncExternalStore } from "react";
 
-import { legacyStorageKey } from "../lib/storage";
-
 export class LocalStorageOperationError extends Schema.TaggedErrorClass<LocalStorageOperationError>()(
   "LocalStorageOperationError",
   {
@@ -36,13 +34,7 @@ const isomorphicLocalStorage: Storage =
 
 const read = (key: string) => {
   try {
-    const current = isomorphicLocalStorage.getItem(key);
-    if (current !== null) return current;
-    const legacyKey = legacyStorageKey(key);
-    if (legacyKey === null) return null;
-    const legacy = isomorphicLocalStorage.getItem(legacyKey);
-    if (legacy !== null) isomorphicLocalStorage.setItem(key, legacy);
-    return legacy;
+    return isomorphicLocalStorage.getItem(key);
   } catch (cause) {
     throw new LocalStorageOperationError({ operation: "read", storageKey: key, cause });
   }
@@ -81,8 +73,6 @@ export const setLocalStorageItem = <T, E>(key: string, value: T, schema: Schema.
 export const removeLocalStorageItem = (key: string) => {
   try {
     isomorphicLocalStorage.removeItem(key);
-    const legacyKey = legacyStorageKey(key);
-    if (legacyKey !== null) isomorphicLocalStorage.removeItem(legacyKey);
   } catch (cause) {
     throw new LocalStorageOperationError({ operation: "remove", storageKey: key, cause });
   }

@@ -2,20 +2,20 @@
 
 ## Summary
 
-T4Code currently ships two product-icon families:
+BiBCode currently ships two product-icon families:
 
 - the desired black background with solid white `T4` lettering in `assets/prod`;
 - blue blueprint variants used by development, nightly, the checked-in web public
   assets, and the desktop resources consumed by Tauri.
 
-All T4Code surfaces must use the same unbadged black-and-white icon. Development
+All BiBCode surfaces must use the same unbadged black-and-white icon. Development
 and nightly builds will retain their existing channel names and release behavior,
 but they will no longer have channel-specific icon artwork.
 
 ## Goals
 
-- Use the existing black-and-white T4Code artwork everywhere.
-- Remove every blue T4Code product-icon image and its obsolete source material
+- Use the existing black-and-white BiBCode artwork everywhere.
+- Remove every blue BiBCode product-icon image and its obsolete source material
   from the repository.
 - Make the production asset directory the single canonical icon source.
 - Update web, desktop, and installer references so no build can select a blue
@@ -49,7 +49,7 @@ available even though their contents become black production artwork.
 
 ## Canonical Asset Model
 
-`assets/prod` is the only authoritative location for T4Code product icons.
+`assets/prod` is the only authoritative location for BiBCode product icons.
 It contains:
 
 - the macOS source PNG;

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace every user-visible T4/T4Code identity with BiBCode and every application icon mark with BiB, without changing compatibility-sensitive runtime identifiers.
+**Goal:** Replace every user-visible retired identity with BiBCode and every application icon mark with BiB, without changing compatibility-sensitive runtime identifiers.
 
 **Architecture:** Change the canonical desktop/web branding roots first, then update dependent UI, release, installer, documentation, and image surfaces. Generate every icon format from the existing SVG master through Sharp and the installed Tauri CLI, and finish with text plus visual audits.
 
@@ -13,7 +13,9 @@
 - Canonical application name: `BiBCode`.
 - Canonical icon text: `BiB`.
 - Preserve the existing black background, white heavy type, and compact rounded-square icon style.
-- Keep `@bibcode/*`, Rust crate/binary names, `BIBCODE_*`, `.t4code`, storage keys, protocol values, and Tauri identifier unchanged in this plan unless the value is a user-facing release artifact name.
+- Keep `@bibcode/*`, Rust crate/binary names, `BIBCODE_*`, the retired
+  filesystem path, storage keys, protocol values, and Tauri identifier unchanged
+  in this plan unless the value is a user-facing release artifact name.
 - Do not modify `.repos`, dependency directories, build output, caches, or CodeGraph data.
 - Do not stage, commit, push, release, or publish anything.
 
@@ -63,7 +65,7 @@ vp test apps/web/src/branding.test.ts apps/web/src/tauriDesktopBridge.test.ts
 cargo test -j 2 -p bibcode-desktop config::tests -- --test-threads=1
 ```
 
-Expected: failures containing the current `T4Code` values.
+Expected: failures containing the pre-rebrand display values.
 
 - [ ] **Step 3: Change the canonical branding roots**
 
@@ -84,7 +86,8 @@ Set both TypeScript and Rust `APP_BASE_NAME` values to `BiBCode`. In Rust,
 derive `displayName` with the same stable/dev/nightly rule. Change Tauri
 `productName` and the main-window title to `BiBCode`, and change package/Cargo
 descriptions and authorship text that presents the old product brand. Keep
-`com.t4code.desktop`, package names, crate names, and build filters unchanged.
+the pre-rebrand Tauri identifier, package names, crate names, and build filters
+unchanged.
 
 - [ ] **Step 4: Run the focused tests and verify GREEN**
 
@@ -149,7 +152,7 @@ expect(markup).toContain('alt="BiBCode"');
 
 Use `BiBCode Connect` for the visible cloud-connect feature and `BiBCode
 JetBrainsMono Nerd Font Mono` for the bundled font-family display name. Do not
-rename TypeScript symbols or files containing `T4Code` yet.
+rename TypeScript symbols or files containing the retired brand yet.
 
 - [ ] **Step 2: Run affected web tests and verify RED**
 
@@ -157,19 +160,20 @@ rename TypeScript symbols or files containing `T4Code` yet.
 vp test apps/web/src/components/desktopUpdate.logic.test.ts apps/web/src/components/SidebarBrand.test.tsx apps/web/src/components/chat/ComposerCommandMenu.test.tsx apps/web/src/components/chat/ChatComposer.test.tsx apps/web/src/components/settings/DiagnosticsSettings.test.tsx apps/web/src/components/settings/ResourceDiagnosticsSections.test.tsx apps/web/src/components/status-bar/AppStatusBar.test.tsx apps/web/src/versionSkew.test.ts
 ```
 
-Expected: assertions still receive T4Code-branded strings.
+Expected: assertions still receive pre-rebrand strings.
 
 - [ ] **Step 3: Replace visible copy without renaming compatibility identifiers**
 
-Apply this context mapping across the listed production and adjacent test files:
+Apply these context-aware replacements across the listed production and
+adjacent test files:
 
 ```text
-T4Code / T4 Code          -> BiBCode
-T4Code Core               -> BiBCode Core
-T4Code Server             -> BiBCode Server
-T4Code UI                 -> BiBCode UI
-T4Code Connect / T4 Connect -> BiBCode Connect
-T4Code JetBrainsMono...   -> BiBCode JetBrainsMono...
+retired product name       -> BiBCode
+retired core label         -> BiBCode Core
+retired server label       -> BiBCode Server
+retired UI label           -> BiBCode UI
+retired connect label      -> BiBCode Connect
+retired font-family label  -> BiBCode JetBrainsMono...
 ```
 
 Keep lower-case imports, storage keys, data attributes, environment variables,
@@ -240,7 +244,7 @@ const publishedArtifact = updaterBundleDir
   : stagedArtifacts.find(({ source }) => source === path.join(bundleDir, artifact))!.target;
 ```
 
-Remove stale comments and URLs naming upstream T4Code deployment domains; do
+Remove stale comments and URLs naming retired upstream deployment domains; do
 not invent a replacement domain. Keep the updater repository argument as
 `${{ github.repository }}` and the committed endpoint on `mubeda/BibCode`.
 
@@ -268,13 +272,14 @@ git diff --check -- .github scripts
 **Interfaces:**
 
 - Consumes: approved brand mapping and the new release/installer names.
-- Produces: project-owned prose and metadata with no user-visible T4/T4Code identity.
+- Produces: project-owned prose and metadata with no user-visible retired identity.
 
 - [ ] **Step 1: Capture the failing documentation audit**
 
-```powershell
-rg -n --pcre2 --hidden --glob '!.git/**' --glob '!.repos/**' --glob '!node_modules/**' --glob '!target/**' --glob '!.codegraph/**' --glob '*.md' --glob '*.html' --glob '*.json' --glob '*.yaml' --glob '*.yml' '(T4Code|T4[ ]+Code|(?<![A-Za-z0-9_])T4(?![A-Za-z0-9_]))' .
-```
+Run a project-owned text audit for every retired visible product-name and mark
+variant, excluding VCS metadata, vendored repositories, dependencies, build
+outputs, and CodeGraph data. Keep the audit pattern self-hiding so the command
+does not match its own definition.
 
 Expected: the current README, docs, metadata, and historical measurement files
 are listed.
@@ -289,7 +294,7 @@ to the names from Task 3.
 
 - [ ] **Step 3: Repeat the audit and inspect every remaining line**
 
-Run the Step 1 command. Expected: no product-facing match; any unrelated T4
+Run the Step 1 audit. Expected: no product-facing match; any unrelated T4
 technical term must be manually confirmed and recorded in the review notes.
 
 - [ ] **Step 4: Verify documentation links and formatting**
@@ -522,7 +527,7 @@ Update alt text to describe BiBCode.
 
 Use `view_image` on both WebP files. Check the title/sidebar/icon, visible
 workspace/project labels, terminal content, file paths, and tool-call text for
-every T3/T4/T4Code leftover. Recapture rather than paint over any bad content.
+every retired-brand leftover. Recapture rather than paint over any bad content.
 
 - [ ] **Step 5: Edit the four retained diagnostics artifacts**
 
@@ -531,8 +536,8 @@ four exact source paths and this constrained instruction:
 
 ```text
 Preserve the screenshot pixel dimensions, layout, colors, controls, spacing,
-and all non-brand text. Replace visible “T4Code” with “BiBCode” and visible
-“t4code” process labels with “bibcode”. Make no other changes.
+and all non-brand text. Replace visible retired product and process labels with
+their `BiBCode` and `bibcode` equivalents. Make no other changes.
 ```
 
 Inspect all four edited files again at original detail. Reject and retry any
@@ -549,24 +554,17 @@ git diff --check -- apps/desktop/e2e/specs/main-window.e2e.ts apps/marketing/pub
 
 **Files:**
 
-- Modify: `scripts/t4code-identity.test.ts`
+- Modify the identity guard script under its then-current retired filename.
 
 **Interfaces:**
 
 - Consumes: all Phase 1 changes.
-- Produces: an automated guard against standalone visible `T4`, `T4 Code`, and `T4Code` while allowing embedded compatibility identifiers until later plans.
+- Produces: an automated guard against standalone visible legacy product labels while allowing embedded compatibility identifiers until later plans.
 
 - [ ] **Step 1: Add self-hiding visible-brand patterns**
 
-Construct patterns in pieces so the guard does not match its own source:
-
-```ts
-const removedVisibleIdentityPatterns = [
-  new RegExp(["T", "4", "Code"].join("")),
-  new RegExp(["T", "4", "\\s+Code"].join("")),
-  new RegExp(["(?<![A-Za-z0-9_])T", "4", "(?![A-Za-z0-9_])"].join("")),
-];
-```
+Define self-hiding patterns for every retired visible product-name and standalone
+mark variant. The guard must not match its own source.
 
 Scan project-owned text and paths, excluding `.repos`, dependencies, outputs,
 CodeGraph, the guard itself, and ignored design/plan documents. Embedded source
@@ -575,9 +573,7 @@ identity plan.
 
 - [ ] **Step 2: Run the guard and remove every accidental visible match**
 
-```powershell
-vp test scripts/t4code-identity.test.ts
-```
+Run the identity guard test at its then-current retired path.
 
 Expected: PASS with no allowlist for product-facing strings.
 
@@ -596,12 +592,10 @@ Expected: every command exits 0.
 
 - [ ] **Step 4: Perform the final Phase 1 path/text/image audit**
 
-```powershell
-rg -n --pcre2 --hidden --glob '!.git/**' --glob '!.repos/**' --glob '!node_modules/**' --glob '!target/**' --glob '!.codegraph/**' '(T4Code|T4[ ]+Code|(?<![A-Za-z0-9_])T4(?![A-Za-z0-9_]))' .
-git ls-files --cached --others --exclude-standard | Select-String -Pattern '(?i)t4([ _-]?code)?'
-git status --short
-git diff --check
-```
+Run the self-hiding retired-identity content audit and the equivalent tracked and
+untracked path audit, excluding VCS metadata, vendored repositories, dependencies,
+build outputs, and CodeGraph data. Then run `git status --short` and
+`git diff --check`.
 
 Inspect every result. Only compatibility-sensitive lowercase/internal paths and
 embedded source identifiers scheduled for later plans may remain. Re-open all

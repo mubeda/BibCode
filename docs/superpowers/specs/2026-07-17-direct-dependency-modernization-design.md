@@ -2,7 +2,7 @@
 
 ## Goal
 
-Bring every direct T4Code dependency, development toolchain, and GitHub Action
+Bring every direct BiBCode dependency, development toolchain, and GitHub Action
 to its newest appropriate release while preserving reliable behavior on
 Windows, macOS, and Linux.
 

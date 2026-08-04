@@ -12,7 +12,6 @@ pub mod diagnostics;
 mod environment_identity;
 pub mod git;
 mod http;
-pub mod identity_paths;
 mod lifecycle;
 pub mod logging;
 pub mod mcp;

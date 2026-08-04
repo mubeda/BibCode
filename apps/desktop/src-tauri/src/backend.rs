@@ -1786,7 +1786,7 @@ fn resolve_wsl_secondary_launch_plan<R: Runtime>(
 fn default_launch_plans<R: Runtime>(app: &AppHandle<R>) -> Result<Vec<BackendLaunchPlan>, String> {
     let base_dir = desktop_base_dir(app)?;
     let log_path = primary_backend_log_path(app)?;
-    let port = crate::config::bibcode_env_var("BIBCODE_PORT", "T4CODE_PORT")
+    let port = crate::config::bibcode_env_var("BIBCODE_PORT")
         .and_then(|value| value.into_string().ok())
         .and_then(|value| value.parse::<u16>().ok())
         .or_else(select_desktop_backend_port)
@@ -1855,7 +1855,7 @@ fn wsl_server_binary_candidates() -> Result<Vec<PathBuf>, String> {
         candidates.push(path);
     }
     if let Some(path) =
-        crate::config::bibcode_env_var(WSL_SERVER_BINARY_ENV, "T4CODE_WSL_SERVER_BINARY")
+        crate::config::bibcode_env_var(WSL_SERVER_BINARY_ENV)
         && !path.is_empty()
     {
         candidates.push(PathBuf::from(path));

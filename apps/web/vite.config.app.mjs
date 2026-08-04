@@ -33,9 +33,7 @@ const configuredHostedAppUrl = (() => {
   }
   return undefined;
 })();
-const sourcemapEnv = (process.env.BIBCODE_WEB_SOURCEMAP ?? process.env.T4CODE_WEB_SOURCEMAP)
-  ?.trim()
-  .toLowerCase();
+const sourcemapEnv = process.env.BIBCODE_WEB_SOURCEMAP?.trim().toLowerCase();
 
 const buildSourcemap =
   sourcemapEnv === "hidden" ? "hidden" : sourcemapEnv === "1" || sourcemapEnv === "true";

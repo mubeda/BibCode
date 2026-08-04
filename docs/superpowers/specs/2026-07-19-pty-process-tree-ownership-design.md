@@ -21,7 +21,7 @@ trampoline. First resolve and prepare the real target command exactly as today:
 native executables remain direct, `.ps1` becomes profile-free non-interactive
 PowerShell, and `.cmd`/`.bat` remains a structured standard-library batch launch.
 
-Then wrap that prepared program and argv in the T4Code trampoline for every
+Then wrap that prepared program and argv in the BiBCode trampoline for every
 Windows PTY launch. The trampoline opens the existing per-launch ready and
 authorization events, signals ready, and waits. The parent attaches the
 trampoline root to a kill-on-close Windows job before signaling authorization.

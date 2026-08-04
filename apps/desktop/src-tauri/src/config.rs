@@ -8,19 +8,8 @@ use tauri::{AppHandle, Manager, Runtime};
 
 const APP_BASE_NAME: &str = "BiBCode";
 
-fn environment_value_with(
-    canonical_name: &str,
-    legacy_name: &str,
-    read: impl Fn(&str) -> Option<std::ffi::OsString>,
-) -> Option<std::ffi::OsString> {
-    read(canonical_name).or_else(|| read(legacy_name))
-}
-
-pub(crate) fn bibcode_env_var(
-    canonical_name: &str,
-    legacy_name: &str,
-) -> Option<std::ffi::OsString> {
-    environment_value_with(canonical_name, legacy_name, |name| std::env::var_os(name))
+pub(crate) fn bibcode_env_var(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name)
 }
 
 fn config_error(context: &str, error: impl std::fmt::Display) -> String {
@@ -133,25 +122,13 @@ pub fn resolve_pick_folder_default_path<R: Runtime>(
 
 pub(crate) fn base_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
     if let Some(value) = std::env::var_os("BIBCODE_HOME").filter(|value| !value.is_empty()) {
-        return migrate_identity_base_dir(PathBuf::from(value));
-    }
-    if let Some(value) = std::env::var_os("T4CODE_HOME").filter(|value| !value.is_empty()) {
         return Ok(PathBuf::from(value));
     }
     let home = app
         .path()
         .home_dir()
         .map_err(|error| config_error("Could not resolve the home directory", error))?;
-    migrate_identity_base_dir(home.join(".bibcode"))
-}
-
-fn migrate_identity_base_dir(path: PathBuf) -> Result<PathBuf, String> {
-    if path.file_name().is_some_and(|name| name == ".bibcode") {
-        let legacy_path = path.with_file_name(".t4code");
-        return bibcode_server::identity_paths::resolve_bibcode_directory(&path, &legacy_path)
-            .map_err(|error| config_error("Could not migrate BiBCode data", error));
-    }
-    Ok(path)
+    Ok(home.join(".bibcode"))
 }
 
 pub fn state_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
@@ -235,20 +212,6 @@ pub fn write_json_file(path: &Path, value: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn canonical_environment_values_precede_legacy_values() {
-        let values = std::collections::BTreeMap::from([
-            ("BIBCODE_HOME", std::ffi::OsString::from("new")),
-            ("T4CODE_HOME", std::ffi::OsString::from("old")),
-        ]);
-        assert_eq!(
-            environment_value_with("BIBCODE_HOME", "T4CODE_HOME", |name| {
-                values.get(name).cloned()
-            }),
-            Some(std::ffi::OsString::from("new"))
-        );
-    }
 
     #[test]
     fn detects_nightly_versions() {

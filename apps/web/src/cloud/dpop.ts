@@ -22,7 +22,6 @@ export class BrowserDpopError extends Data.TaggedError("BrowserDpopError")<{
 }> {}
 
 const DPOP_DATABASE_NAME = "bibcode:cloud-auth";
-const LEGACY_DPOP_DATABASE_NAME = "t4code:cloud-auth";
 const DPOP_DATABASE_VERSION = 1;
 const DPOP_KEY_STORE_NAME = "keys";
 const DPOP_KEY_ID = "relay-dpop-proof-key";
@@ -107,13 +106,7 @@ function writeStoredBrowserDpopKeyTo(
 
 export function readStoredBrowserDpopKey(): Effect.Effect<BrowserDpopKey | null, BrowserDpopError> {
   if (typeof indexedDB === "undefined") return Effect.succeed(null);
-  return Effect.gen(function* () {
-    const current = yield* readStoredBrowserDpopKeyFrom(DPOP_DATABASE_NAME);
-    if (current !== null) return current;
-    const legacy = yield* readStoredBrowserDpopKeyFrom(LEGACY_DPOP_DATABASE_NAME);
-    if (legacy !== null) yield* writeStoredBrowserDpopKeyTo(DPOP_DATABASE_NAME, legacy);
-    return legacy;
-  });
+  return readStoredBrowserDpopKeyFrom(DPOP_DATABASE_NAME);
 }
 
 export function writeStoredBrowserDpopKey(

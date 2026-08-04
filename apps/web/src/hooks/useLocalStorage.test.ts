@@ -32,14 +32,14 @@ afterEach(() => {
 });
 
 describe("local storage errors", () => {
-  it("copies legacy T4Code values to canonical BiBCode keys", async () => {
+  it("reads BiBCode values", async () => {
     const storage = createStorage();
-    storage.setItem("t4code:theme", JSON.stringify("dark"));
+    storage.setItem("bibcode:theme", JSON.stringify("dark"));
     const { getLocalStorageItem } = await loadWithStorage(storage);
 
     expect(getLocalStorageItem("bibcode:theme", Schema.String)).toBe("dark");
     expect(storage.getItem("bibcode:theme")).toBe(JSON.stringify("dark"));
-    expect(storage.getItem("t4code:theme")).toBe(JSON.stringify("dark"));
+    expect(storage.getItem("bibcode:theme")).toBe(JSON.stringify("dark"));
   });
 
   it("preserves read failure context", async () => {

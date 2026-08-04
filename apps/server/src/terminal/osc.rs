@@ -87,9 +87,6 @@ impl OscColors {
 pub const OSC_BACKGROUND_ENV: &str = "BIBCODE_OSC_BACKGROUND";
 pub const OSC_FOREGROUND_ENV: &str = "BIBCODE_OSC_FOREGROUND";
 pub const OSC_CURSOR_ENV: &str = "BIBCODE_OSC_CURSOR";
-pub(crate) const LEGACY_OSC_BACKGROUND_ENV: &str = "T4CODE_OSC_BACKGROUND";
-pub(crate) const LEGACY_OSC_FOREGROUND_ENV: &str = "T4CODE_OSC_FOREGROUND";
-pub(crate) const LEGACY_OSC_CURSOR_ENV: &str = "T4CODE_OSC_CURSOR";
 
 /// Whether `key` is one of the exact reserved OSC color env keys.
 pub fn is_reserved_osc_env_key(key: &str) -> bool {
@@ -98,9 +95,6 @@ pub fn is_reserved_osc_env_key(key: &str) -> bool {
         OSC_BACKGROUND_ENV
             | OSC_FOREGROUND_ENV
             | OSC_CURSOR_ENV
-            | LEGACY_OSC_BACKGROUND_ENV
-            | LEGACY_OSC_FOREGROUND_ENV
-            | LEGACY_OSC_CURSOR_ENV
     )
 }
 
@@ -108,26 +102,23 @@ pub fn is_reserved_osc_env_key(key: &str) -> bool {
 /// values are ignored, leaving that color unanswered.
 pub fn colors_from_env(env: &std::collections::BTreeMap<String, String>) -> OscColors {
     OscColors {
-        foreground: environment_value(env, OSC_FOREGROUND_ENV, LEGACY_OSC_FOREGROUND_ENV)
+        foreground: environment_value(env, OSC_FOREGROUND_ENV)
             .and_then(|value| parse_rgb_triplet(value)),
-        background: environment_value(env, OSC_BACKGROUND_ENV, LEGACY_OSC_BACKGROUND_ENV)
+        background: environment_value(env, OSC_BACKGROUND_ENV)
             .and_then(|value| parse_rgb_triplet(value)),
-        cursor: environment_value(env, OSC_CURSOR_ENV, LEGACY_OSC_CURSOR_ENV)
+        cursor: environment_value(env, OSC_CURSOR_ENV)
             .and_then(|value| parse_rgb_triplet(value)),
     }
 }
 
 fn environment_value<'a>(
     env: &'a std::collections::BTreeMap<String, String>,
-    canonical_name: &str,
-    legacy_name: &str,
+    name: &str,
 ) -> Option<&'a String> {
-    [canonical_name, legacy_name].into_iter().find_map(|name| {
-        env.get(name).or_else(|| {
-            env.iter()
-                .find(|(key, _)| key.eq_ignore_ascii_case(name))
-                .map(|(_, value)| value)
-        })
+    env.get(name).or_else(|| {
+        env.iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case(name))
+            .map(|(_, value)| value)
     })
 }
 
@@ -482,24 +473,6 @@ mod tests {
         assert_eq!(parse_rgb_triplet("1,2"), None);
         assert_eq!(parse_rgb_triplet("1,2,3,4"), None);
         assert_eq!(parse_rgb_triplet("x,y,z"), None);
-    }
-
-    #[test]
-    fn reads_legacy_osc_environment_colors() {
-        let env = std::collections::BTreeMap::from([
-            ("T4CODE_OSC_FOREGROUND".to_owned(), "1,2,3".to_owned()),
-            ("T4CODE_OSC_BACKGROUND".to_owned(), "4,5,6".to_owned()),
-            ("T4CODE_OSC_CURSOR".to_owned(), "7,8,9".to_owned()),
-        ]);
-
-        assert_eq!(
-            colors_from_env(&env),
-            OscColors {
-                foreground: Some([1, 2, 3]),
-                background: Some([4, 5, 6]),
-                cursor: Some([7, 8, 9]),
-            }
-        );
     }
 
     #[test]

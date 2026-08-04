@@ -4,13 +4,6 @@ import { normalizeProjectPathForComparison } from "./lib/projectPaths";
 
 export const PERSISTED_STATE_KEY = "bibcode:ui-state:v1";
 const LEGACY_PERSISTED_STATE_KEYS = [
-  "t4code:ui-state:v1",
-  "t4code:renderer-state:v8",
-  "t4code:renderer-state:v7",
-  "t4code:renderer-state:v6",
-  "t4code:renderer-state:v5",
-  "t4code:renderer-state:v4",
-  "t4code:renderer-state:v3",
   "codething:renderer-state:v4",
   "codething:renderer-state:v3",
   "codething:renderer-state:v2",

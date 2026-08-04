@@ -30,7 +30,6 @@ import { invokeTauriCommand, type TauriCommandMock } from "./tauriInvokeRouting"
 import { createTauriPreviewBridge } from "./tauriPreviewBridge";
 
 const CONNECTION_CATALOG_STORAGE_KEY = "bibcode.connectionCatalog";
-const LEGACY_CONNECTION_CATALOG_STORAGE_KEY = "t4code.connectionCatalog";
 const BACKEND_READY_EVENT = "desktop:backend-ready";
 const MENU_ACTION_EVENT = "desktop:menu-action";
 const NIGHTLY_VERSION_PATTERN = /-nightly\.\d{8}\.\d+$/;
@@ -257,11 +256,7 @@ function getLocalEnvironmentBearerToken(): Promise<string> {
 
 function readLocalStorageConnectionCatalog(): string | null {
   try {
-    const current = localStorage.getItem(CONNECTION_CATALOG_STORAGE_KEY);
-    if (current !== null) return current;
-    const legacy = localStorage.getItem(LEGACY_CONNECTION_CATALOG_STORAGE_KEY);
-    if (legacy !== null) localStorage.setItem(CONNECTION_CATALOG_STORAGE_KEY, legacy);
-    return legacy;
+    return localStorage.getItem(CONNECTION_CATALOG_STORAGE_KEY);
   } catch {
     return null;
   }
@@ -279,7 +274,6 @@ function writeLocalStorageConnectionCatalog(catalog: string): boolean {
 function clearLocalStorageConnectionCatalog(): void {
   try {
     localStorage.removeItem(CONNECTION_CATALOG_STORAGE_KEY);
-    localStorage.removeItem(LEGACY_CONNECTION_CATALOG_STORAGE_KEY);
   } catch {}
 }
 

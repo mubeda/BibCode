@@ -162,7 +162,7 @@ activation and that terminal CSS does not leave the active cursor hidden.
 
 ## Reliable PowerShell Prediction Disablement
 
-Managed `pwsh.exe` and `powershell.exe` candidates use an invisible post-profile bootstrap. T4Code
+Managed `pwsh.exe` and `powershell.exe` candidates use an invisible post-profile bootstrap. BiBCode
 does not send `Set-PSReadLineOption` as terminal input, so the bootstrap command is neither rendered
 as user input nor added to interactive command history.
 
@@ -176,7 +176,7 @@ if ($command -and $command.Parameters.ContainsKey('PredictionSource')) {
 ```
 
 PowerShell loads the user profile before executing the startup command. This ordering ensures a
-profile cannot re-enable prediction before T4Code applies the managed setting. Resolving the command
+profile cannot re-enable prediction before BiBCode applies the managed setting. Resolving the command
 also loads PSReadLine when it is available.
 
 If `Set-PSReadLineOption` or its `PredictionSource` parameter is unavailable, the bootstrap is a
@@ -222,7 +222,7 @@ to load the addon for each currently visible viewport without restarting the she
 history.
 
 Initialization failure or WebGL context loss disposes the addon and falls back to the standard
-renderer. T4Code records one diagnostic event for the fallback but does not repeatedly retry within
+renderer. BiBCode records one diagnostic event for the fallback but does not repeatedly retry within
 the same viewport lifetime. The persisted preference remains unchanged, allowing a later renderer
 or application restart to try again.
 

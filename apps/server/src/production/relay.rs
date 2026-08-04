@@ -99,7 +99,6 @@ impl RelayClientOptions {
         Self::new(base_dir, native_platform(), native_arch())
             .with_optional_executable_override(crate::environment_identity::bibcode_env_var(
                 CLOUDFLARED_PATH_ENV_NAME,
-                "T4CODE_CLOUDFLARED_PATH",
             ))
     }
 

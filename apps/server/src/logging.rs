@@ -173,7 +173,7 @@ pub enum LoggingError {
 }
 
 pub fn initialize(log_path: &Path) -> Result<Init, LoggingError> {
-    let filter = crate::environment_identity::bibcode_env_string("BIBCODE_LOG", "T4CODE_LOG")
+    let filter = crate::environment_identity::bibcode_env_string("BIBCODE_LOG")
         .and_then(|value| EnvFilter::try_new(value).ok())
         .or_else(|| EnvFilter::try_from_default_env().ok())
         .unwrap_or_else(|| EnvFilter::new("info"));

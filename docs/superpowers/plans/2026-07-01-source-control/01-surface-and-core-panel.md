@@ -270,7 +270,7 @@ export const useSourceControlPanelStore = create<SourceControlPanelStoreState>()
         }),
     }),
     {
-      name: "t4code:source-control-panel-state:v1",
+      name: "bibcode:source-control-panel-state:v1",
       version: 1,
       storage: createJSONStorage(() =>
         resolveStorage(typeof window !== "undefined" ? window.localStorage : undefined),
@@ -1137,7 +1137,7 @@ In `SURFACE_DISABLED_REASONS` (lines 53-57), add a `sourceControl` entry:
 
 ```ts
 const SURFACE_DISABLED_REASONS = {
-  browser: "Browser previews are only available in the T4Code desktop app.",
+  browser: "Browser previews are only available in the BiBCode desktop app.",
   files: "Files are only available when a project is open.",
   diff: "Diff is only available for server threads in Git repositories.",
   sourceControl: "Source control is only available for server threads in Git repositories.",

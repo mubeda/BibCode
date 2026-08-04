@@ -514,10 +514,7 @@ async fn fetch_claude_usage(
     let store_selection = select_claude_credential_stores(
         credentials_path.is_some(),
         uses_default_config,
-        crate::environment_identity::bibcode_env_var(
-            CLAUDE_KEYCHAIN_ACCESS_ENV,
-            "T4CODE_CLAUDE_KEYCHAIN_ACCESS",
-        )
+        crate::environment_identity::bibcode_env_var(CLAUDE_KEYCHAIN_ACCESS_ENV)
         .as_deref(),
     );
     #[cfg(target_os = "macos")]

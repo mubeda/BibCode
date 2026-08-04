@@ -84,18 +84,15 @@ export function verifyRelayJwt(input: {
   return Effect.tryPromise({
     try: async () => {
       const key = await importSPKI(normalizePem(input.publicKey), "EdDSA");
-      const legacyTyp = input.typ.replace("bibcode", "t4code");
       const actualTyp = decodeProtectedHeader(input.token).typ;
-      if (actualTyp !== input.typ && actualTyp !== legacyTyp) {
+      if (actualTyp !== input.typ) {
         throw new Error("JWT protected header has an unsupported typ.");
       }
-      const legacyIssuer = input.issuer.replace("bibcode", "t4code");
-      const legacyAudience = input.audience.replace("bibcode", "t4code");
       const verified = await jwtVerify(input.token, key, {
         algorithms: ["EdDSA"],
         typ: actualTyp,
-        issuer: [...new Set([input.issuer, legacyIssuer])],
-        audience: [...new Set([input.audience, legacyAudience])],
+        issuer: input.issuer,
+        audience: input.audience,
         maxTokenAge: input.maxTokenAge ?? "5 minutes",
         clockTolerance: 60,
         currentDate: DateTime.toDate(DateTime.makeUnsafe(input.nowEpochSeconds * 1_000)),

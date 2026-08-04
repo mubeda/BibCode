@@ -60,7 +60,7 @@ Effect RPC-compatible JSON over WebSocket, operating-system WebView.
 ## Current State And Remaining Validation
 
 The production migration is implemented. `apps/server` is the canonical
-Rust/Axum/Tokio server and native `t4code` CLI, while `apps/desktop` is the Tauri 2
+Rust/Axum/Tokio server and native `bibcode` CLI, while `apps/desktop` is the Tauri 2
 host that starts the same server library in-process. The TypeScript server,
 Electron host, Node sidecar staging, native Node modules, and obsolete helper
 packages have been removed. React/Vite remains the shared browser and desktop
@@ -136,10 +136,10 @@ release-validation work; they do not require another architecture migration.
 
 - Produces `bibcode_server::ServerRuntime::start(ServerConfig)` and
   `ServerHandle::{local_addr, shutdown, join}`.
-- Produces a `t4code` Rust binary using the same `serve`, `--host`, `--port`,
+- Produces a `bibcode` Rust binary using the same `serve`, `--host`, `--port`,
   `--base-dir`, and desktop bootstrap inputs as the current CLI.
 
-- [ ] Write failing router tests for `/.well-known/t4code/environment`, desktop
+- [ ] Write failing router tests for `/.well-known/bibcode/environment`, desktop
       shutdown token validation, static-file traversal rejection, graceful
       shutdown, and binding port `0`.
 - [ ] Implement a Tokio/Axum runtime with explicit cancellation and owned task
@@ -481,7 +481,7 @@ release-validation work; they do not require another architecture migration.
       launch that binary inside WSL instead of resolving or invoking WSL Node.
 - [x] Replace SSH remote launch scripts with Rust-binary discovery,
       installation/version validation, readiness, and shutdown; remote launch must
-      never invoke `node`, `npm`, `npx`, or a JavaScript `t4code` package.
+      never invoke `node`, `npm`, `npx`, or a JavaScript `bibcode` package.
 - [x] Verify desktop startup, settings-driven restart, WSL, SSH, and exit.
 
 ### Task 15: Optimize And Harden The React/WebView Boundary
@@ -527,7 +527,7 @@ release-validation work; they do not require another architecture migration.
 
 **Interfaces:**
 
-- `t4code` resolves to the Rust binary. Desktop links the same Rust library.
+- `bibcode` resolves to the Rust binary. Desktop links the same Rust library.
 - No compatibility sidecar or hidden Node fallback remains.
 
 - [x] Add a repository scan that rejects active Electron, Node runtime,
@@ -579,7 +579,7 @@ documents and explicit compatibility fixtures may be allowlisted by exact path.
 rg -n -i "electron|electron-builder|@clerk/electron|desktop-tauri" package.json pnpm-workspace.yaml .github apps packages scripts
 rg -n "resources/node|server-node_modules|prepare-tauri-node-runtime|dist/bin\.mjs" apps/desktop Cargo.toml package.json .github scripts
 rg -n '"start": "node dist/bin\.mjs"|node --watch src/bin\.ts|apps/server/src/.+\.ts|effect-acp|effect-codex-app-server|node-pty|ffi-rs|@ff-labs/fff-node' package.json pnpm-workspace.yaml pnpm-lock.yaml .github apps packages scripts
-rg -n 'node|npm|npx|t4code@latest' apps/desktop/src-tauri/src/ssh.rs apps/desktop/src-tauri/src/backend.rs packages/ssh 2>$null
+rg -n 'node|npm|npx|bibcode@latest' apps/desktop/src-tauri/src/ssh.rs apps/desktop/src-tauri/src/backend.rs packages/ssh 2>$null
 ```
 
 Installer inspection must also prove there is no `node`, `node.exe`,

@@ -949,7 +949,7 @@ pub fn create_tab(app: &AppHandle, tab_id: &str) -> Result<(), String> {
     // Isolated persistent profile, never the app/session default.
     #[cfg(target_os = "macos")]
     {
-        builder = builder.data_store_identifier(*b"t4codepreview001");
+        builder = builder.data_store_identifier(*b"bibcodepreview001");
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -1052,7 +1052,7 @@ pub fn close_tab(app: &AppHandle, tab_id: &str) -> Result<(), String> {
 Notes for the implementer:
 - `humantime` — add `humantime = "2"` to desktop `[dependencies]` (or use the crate the codebase already stamps timestamps with — grep `updated_at`/`created_at` in `apps/desktop/src-tauri/src` first and reuse that; if nothing exists, `humantime` is the lightest).
 - If `app.get_window("main")` compiles on 2.11.5 (it does with `unstable`), drop the `get_webview_window` fallback line.
-- `data_store_identifier` takes `[u8; 16]` — the literal above is exactly 16 bytes (`t4codepreview001`).
+- `data_store_identifier` takes `[u8; 16]` — the literal above is exactly 16 bytes (`bibcodepreview001`).
 
 - [x] **Step 2: Write `commands.rs`**
 
