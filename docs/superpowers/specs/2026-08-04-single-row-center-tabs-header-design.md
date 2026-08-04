@@ -127,6 +127,7 @@ Overflow handlers perform no state mutation beyond scrolling. They must tolerate
 - Changing the host label rerenders the provider name without mutating surface state.
 - Activating a hidden tab scrolls it into view.
 - Vertical wheel input advances an overflowing horizontal rail and does nothing when the rail is not overflowing.
+- Horizontal arrow keys move focus through the tab order and reveal the newly focused tab.
 - Click, close, middle-click, and context-menu behavior remain covered.
 - `ChatHeaderActions` renders all applicable actions without rendering the thread title.
 
@@ -140,7 +141,7 @@ Overflow handlers perform no state mutation beyond scrolling. They must tolerate
 
 ### Visual verification
 
-Verify the desktop app at wide and constrained workspace widths with enough AI and terminal panels to overflow. Confirm that:
+After implementation and automated checks, use the Codex `computer-use:computer-use` skill against the running BiBCode desktop app. Verify the UI at wide and constrained workspace widths with enough AI and terminal panels to overflow. Confirm that every accepted design change is present:
 
 1. The thread title is absent from the top bar.
 2. Tabs and actions share one row.
@@ -148,8 +149,12 @@ Verify the desktop app at wide and constrained workspace widths with enough AI a
 4. Hidden tabs are reachable and the active tab reveals itself.
 5. Tabs never overlap or displace the existing action and layout controls.
 6. Long provider and terminal names truncate cleanly and expose their full labels.
+7. Switching the host chat's provider updates the first tab label.
+8. Click activation, overflow navigation, close controls, and the pinned action controls remain operable.
 
-Run the focused web tests for the changed components, followed by `vp check` and `vp run typecheck`.
+Capture fresh accessibility state and screenshots during this verification. Treat any missing accepted change, visual overlap, unreachable tab, or broken interaction as a failed verification that must be fixed before completion.
+
+Run the focused web tests for the changed components, followed by `vp check` and `vp run typecheck`, before the Computer Use verification.
 
 ## Acceptance Criteria
 
@@ -162,3 +167,4 @@ Run the focused web tests for the changed components, followed by `vp check` and
 - Existing top-bar actions remain fixed, visible, and operable without tab overlap.
 - Existing center-panel interactions continue to work.
 - Focused tests, `vp check`, and `vp run typecheck` pass.
+- Codex Computer Use verification confirms every accepted layout, naming, overflow, and interaction change in the running desktop UI.
