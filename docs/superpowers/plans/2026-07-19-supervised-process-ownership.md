@@ -305,7 +305,7 @@ CommandBuilder::job_list(&[std::os::windows::io::RawHandle])
 - portable-pty builds an attribute list with both
   `PROC_THREAD_ATTRIBUTE_PSEUDOCONSOLE` and
   `PROC_THREAD_ATTRIBUTE_JOB_LIST`.
-- T4 creates a configured kill-on-close Job before `spawn_command`, passes its
+- BiBCode creates a configured kill-on-close Job before `spawn_command`, passes its
   handle, and owns it in `PortablePtyProcess`.
 
 - [x] **Step 1: Add target-gated at-creation tests**

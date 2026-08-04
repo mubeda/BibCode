@@ -4,7 +4,7 @@
 
 BiBCode currently ships two product-icon families:
 
-- the desired black background with solid white `T4` lettering in `assets/prod`;
+- the desired black background with solid white `BiB` lettering in `assets/prod`;
 - blue blueprint variants used by development, nightly, the checked-in web public
   assets, and the desktop resources consumed by Tauri.
 

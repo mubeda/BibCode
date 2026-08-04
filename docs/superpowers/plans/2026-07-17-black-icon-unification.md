@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Remove every blue BiBCode product icon and make the existing black-background, white-`T4` artwork the only icon used by development, nightly, production, web, desktop, and installers.
+**Goal:** Remove every blue BiBCode product icon and make the existing black-background, white-`BiB` artwork the only icon used by development, nightly, production, web, desktop, and installers.
 
 **Architecture:** `assets/prod` becomes the only authoritative icon family. Release-channel inputs remain compatible, but the shared brand resolver maps every channel to the same production web assets; Vite public files are verified black copies, and Tauri references production PNG/ICO/ICNS files directly.
 
@@ -10,7 +10,7 @@
 
 ## Global Constraints
 
-- Use the existing unbadged black-background, white-`T4` artwork without redesigning it.
+- Use the existing unbadged black-background, white-`BiB` artwork without redesigning it.
 - Delete all blue BiBCode product-icon outputs and source material under `assets/dev`, `assets/nightly`, `apps/desktop/resources`, and the blue contents currently stored in `apps/web/public`.
 - Keep development and nightly channel names and release behavior.
 - Keep generic web public filenames required by browser metadata and the splash/boot UI.
@@ -490,7 +490,7 @@ montage "$audit_dir"/thumbs/*.png -tile 3x -geometry +14+14 \
 printf '%s\n' "$audit_dir/contact-sheet.png"
 ```
 
-Expected: every tile shows a black background with white `T4`; inspect the
+Expected: every tile shows a black background with white `BiB`; inspect the
 generated file with the local image viewer.
 
 - [ ] **Step 5: Re-run the focused suite and inspect final scope**

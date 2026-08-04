@@ -26,7 +26,7 @@ The audit excludes:
 - `.git`, dependency directories, build output, caches, and generated indexes;
 - `.repos`, whose contents are vendored reference repositories and are not
   owned by this project; and
-- unrelated technical uses of `T4` that do not identify this application.
+- unrelated technical uses of the retired short mark that do not identify this application.
 
 Historical upstream identity is not retained in product-facing screenshots,
 copy, or artwork. If a historical reference is necessary for provenance, it
@@ -37,7 +37,7 @@ must be explicit prose rather than an accidental brand leftover.
 - Canonical application name: `BiBCode`.
 - Canonical icon text: `BiB`.
 - Retired product-name variants become `BiBCode` when they identify the product.
-- A standalone product mark `T4` becomes `BiBCode` in prose or `BiB` in icon
+- A standalone retired product mark becomes `BiBCode` in prose or `BiB` in icon
   artwork, according to context.
 - Alpha/nightly channel labels remain only when they describe an actual release
   channel; they are not part of the application name.
@@ -86,7 +86,7 @@ keys unchanged.
 ### Images and Icons
 
 `assets/prod/logo.svg` is the editable master for the monochrome icon. Its mark
-will be changed from `T4` to `BiB`, then the existing asset path will be used to
+will use `BiB`, then the existing asset path will be used to
 regenerate or deterministically derive:
 
 - universal and macOS PNG masters;
@@ -98,7 +98,7 @@ Brand-bearing asset filenames will use `bibcode` instead of `t4` when the
 filename itself is part of packaging or project identity. References and tests
 will change atomically with those renames.
 
-Marketing screenshots currently contain older T3/T4 identity. They will be
+Marketing screenshots currently contain older predecessor identity. They will be
 recaptured from the rebranded application where practical instead of having
 text painted over. Any raster asset that cannot be regenerated will be edited
 only after visual inspection, preserving its dimensions and purpose.
