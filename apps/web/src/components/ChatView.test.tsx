@@ -2253,6 +2253,34 @@ describe("ChatView", () => {
       ]);
     });
 
+    it("does not show the hidden host error over a sibling chat panel", () => {
+      const siblingThreadId = ThreadId.make("thread-sibling-without-host-error");
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(
+        makeThread({
+          session: {
+            threadId,
+            status: "error",
+            providerName: "codex",
+            providerInstanceId: codexInstanceId,
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: "hidden host disconnected",
+            updatedAt: now,
+          },
+        }),
+      );
+      seedServerThread(makeThread({ id: siblingThreadId, title: "Visible sibling" }));
+      seedGitStatus(true);
+      useCenterPanelStore.getState().openChatPanel(threadRef, siblingThreadId, "Codex");
+      publishSeededStoreState(useCenterPanelStore);
+
+      const markup = renderServerRoute();
+
+      expect(markup).not.toContain("hidden host disconnected");
+    });
+
     it("hands the inspector between host and sibling chat without duplicate shells or targets", async () => {
       const siblingThreadId = ThreadId.make("thread-sibling-switch");
       const siblingThreadRef = scopeThreadRef(environmentId, siblingThreadId);

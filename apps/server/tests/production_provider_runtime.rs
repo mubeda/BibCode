@@ -7157,7 +7157,10 @@ async fn bounded_deferred_configuration_rejects_overflow_without_blocking_other_
             events: StdMutex::new(VecDeque::from([events_rx_a, events_rx_b])),
         }),
         activity_projection(&engine),
-        SupervisorOptions { queue_capacity: 2 },
+        SupervisorOptions {
+            queue_capacity: 2,
+            ..SupervisorOptions::default()
+        },
     ));
     supervisor.launch(launch()).await.unwrap();
     let mut launch_b = launch();
@@ -8260,6 +8263,40 @@ async fn restart_reconciles_abandoned_ready_provider_sessions() {
     assert_eq!(
         runtime.resume_cursor,
         Some(json!({"threadId":"provider-thread-ready"}))
+    );
+}
+
+#[tokio::test]
+async fn restart_ignores_intentionally_suspended_provider_sessions() {
+    let engine = engine().await;
+    project_session(&engine, "t1", "ready").await;
+    engine
+        .repositories()
+        .upsert_provider_session_runtime(persisted_runtime("t1", "suspended", NOW))
+        .await
+        .unwrap();
+
+    reconcile_abandoned_provider_sessions(&engine)
+        .await
+        .unwrap();
+
+    let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
+    let session = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.thread_id == "t1")
+        .unwrap();
+    assert_eq!(session.status, "ready");
+    assert_eq!(session.last_error, None);
+    assert_eq!(
+        engine
+            .repositories()
+            .get_provider_session_runtime("t1".to_owned())
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        "suspended"
     );
 }
 

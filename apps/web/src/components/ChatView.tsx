@@ -5963,11 +5963,15 @@ function ChatViewContent(props: ChatViewProps) {
           />
         )}
         {/* Error banner */}
-        <ProviderStatusBanner status={activeProviderStatus} />
-        <ThreadErrorBanner
-          error={threadError}
-          onDismiss={() => setThreadError(activeThread.id, null)}
-        />
+        {!centerHostHidden ? (
+          <>
+            <ProviderStatusBanner status={activeProviderStatus} />
+            <ThreadErrorBanner
+              error={threadError}
+              onDismiss={() => setThreadError(activeThread.id, null)}
+            />
+          </>
+        ) : null}
         {/* Main content area with optional plan sidebar. Kept MOUNTED (css-hidden)
             while a center panel tab is active so the host transcript's scroll and
             composer state survive tab switches. */}
