@@ -5,8 +5,6 @@ use std::{
     time::Duration,
 };
 
-use serde::{Deserialize, de::DeserializeOwned};
-use serde_json::{Value, json};
 use bibcode_server::activity::{
     ActivityActorSummary, ActivityCapabilities, ActivityEntry, ActivityLifecycle,
     ActivityObservationState, ActivityRecordKind, ActivityRepository, ActivityScopeSeed,
@@ -21,6 +19,8 @@ use bibcode_server::provider::codex::{
     is_recoverable_thread_resume_error, parse_model_list_response, parse_skills_list_response,
     probe_provider,
 };
+use serde::{Deserialize, de::DeserializeOwned};
+use serde_json::{Value, json};
 
 #[test]
 fn missing_codex_rollout_is_a_recoverable_resume_failure() {
@@ -34,6 +34,7 @@ fn automatic_codex_model_resolves_to_the_supported_default() {
     let payload = build_turn_start_params(&BuildTurnStartInput {
         thread_id: "provider-thread-1".to_owned(),
         runtime_mode: CodexRuntimeMode::FullAccess,
+        client_user_message_id: None,
         prompt: Some("hello".to_owned()),
         attachments: vec![],
         model: Some("auto".to_owned()),
@@ -598,10 +599,8 @@ fn codex_activity_rejects_foreign_collaboration_and_root_receivers() {
         "startedAtMs": 1784894401000_u64
     });
 
-    let foreign_output =
-        tracker.handle_notification("item/started", &foreign, 1784894400000);
-    let root_output =
-        tracker.handle_notification("item/started", &root_receiver, 1784894401000);
+    let foreign_output = tracker.handle_notification("item/started", &foreign, 1784894400000);
+    let root_output = tracker.handle_notification("item/started", &root_receiver, 1784894401000);
 
     assert!(foreign_output.mutations.is_empty());
     assert!(matches!(
@@ -767,8 +766,7 @@ fn codex_activity_preserves_established_non_authoritative_parents() {
         }
     });
 
-    let output =
-        tracker.handle_notification("item/completed", &sibling_update, 1_002);
+    let output = tracker.handle_notification("item/completed", &sibling_update, 1_002);
 
     assert!(matches!(
         output.mutations.as_slice(),
@@ -857,8 +855,7 @@ fn codex_activity_prefers_complete_reasoning_summary_without_exposing_raw_reason
         },
         "completedAtMs": 1784894401000_u64
     });
-    let completed_output =
-        tracker.handle_notification("item/completed", &completed, 1784894401000);
+    let completed_output = tracker.handle_notification("item/completed", &completed, 1784894401000);
     let completed_entry = completed_output
         .mutations
         .iter()
@@ -1023,7 +1020,10 @@ fn codex_activity_reopens_terminal_child_only_for_native_active_or_resume() {
     assert_eq!(actor.status, ActivityLifecycle::Completed);
     assert!(actor.started_at <= actor.updated_at);
     assert_eq!(actor.updated_at, actor.started_at);
-    assert_eq!(actor.terminal_at.as_deref(), Some(actor.updated_at.as_str()));
+    assert_eq!(
+        actor.terminal_at.as_deref(),
+        Some(actor.updated_at.as_str())
+    );
     assert!(
         actor
             .terminal_at
@@ -1265,23 +1265,20 @@ fn reopen_without_valid_provider_timestamp(
 
 #[test]
 fn tagged_active_without_provider_timestamp_cannot_reopen_epoch_terminal_actor() {
-    assert!(
-        reopen_without_valid_provider_timestamp(ReopenPath::TaggedActive, None).is_empty()
-    );
+    assert!(reopen_without_valid_provider_timestamp(ReopenPath::TaggedActive, None).is_empty());
 }
 
 #[test]
 fn tagged_active_with_out_of_range_provider_timestamp_cannot_reopen_epoch_terminal_actor() {
     assert!(
-        reopen_without_valid_provider_timestamp(ReopenPath::TaggedActive, Some(u64::MAX)).is_empty()
+        reopen_without_valid_provider_timestamp(ReopenPath::TaggedActive, Some(u64::MAX))
+            .is_empty()
     );
 }
 
 #[test]
 fn resume_without_provider_timestamp_cannot_reopen_epoch_terminal_actor() {
-    assert!(
-        reopen_without_valid_provider_timestamp(ReopenPath::ResumeAgent, None).is_empty()
-    );
+    assert!(reopen_without_valid_provider_timestamp(ReopenPath::ResumeAgent, None).is_empty());
 }
 
 #[test]
@@ -1293,15 +1290,14 @@ fn resume_with_out_of_range_provider_timestamp_cannot_reopen_epoch_terminal_acto
 
 #[test]
 fn active_recovery_without_provider_timestamp_cannot_reopen_epoch_terminal_actor() {
-    assert!(
-        reopen_without_valid_provider_timestamp(ReopenPath::RecoveryList, None).is_empty()
-    );
+    assert!(reopen_without_valid_provider_timestamp(ReopenPath::RecoveryList, None).is_empty());
 }
 
 #[test]
 fn active_recovery_with_out_of_range_provider_timestamp_cannot_reopen_epoch_terminal_actor() {
     assert!(
-        reopen_without_valid_provider_timestamp(ReopenPath::RecoveryList, Some(u64::MAX)).is_empty()
+        reopen_without_valid_provider_timestamp(ReopenPath::RecoveryList, Some(u64::MAX))
+            .is_empty()
     );
 }
 
@@ -1457,10 +1453,8 @@ fn codex_activity_event_keys_are_unambiguous_for_adversarial_delimiters() {
         "startedAtMs": 1784894400000_u64
     });
 
-    let first_output =
-        first_tracker.handle_notification("item/started", &first, 1784894400000);
-    let second_output =
-        second_tracker.handle_notification("item/started", &second, 1784894400000);
+    let first_output = first_tracker.handle_notification("item/started", &first, 1784894400000);
+    let second_output = second_tracker.handle_notification("item/started", &second, 1784894400000);
     let first_id = first_output
         .mutations
         .iter()
@@ -2242,10 +2236,7 @@ fn validate_codex_activity_scenario(name: &str, fixture: &CodexActivityFixture) 
                         .item
                 })
                 .collect::<Vec<_>>();
-            assert!(matches!(
-                item_kinds[0],
-                ThreadItemDto::Unknown
-            ));
+            assert!(matches!(item_kinds[0], ThreadItemDto::Unknown));
             assert!(matches!(
                 item_kinds[1],
                 ThreadItemDto::DynamicToolCall { .. }
@@ -2393,7 +2384,10 @@ fn provider_activity_mutation_to_value(
             "capabilities": capabilities,
             "observationState": observation_state,
         }),
-        bibcode_server::activity::ProviderActivityMutation::SetSectionHealth { section, health } => {
+        bibcode_server::activity::ProviderActivityMutation::SetSectionHealth {
+            section,
+            health,
+        } => {
             json!({
                 "type": "setSectionHealth",
                 "section": section,
@@ -2461,6 +2455,7 @@ async fn helper_outputs_match_canonical_codex_fixtures() {
         build_turn_start_params(&BuildTurnStartInput {
             thread_id: "provider-thread-1".to_owned(),
             runtime_mode: CodexRuntimeMode::AutoAcceptEdits,
+            client_user_message_id: None,
             prompt: Some("Implement it".to_owned()),
             attachments: vec![json!({
                 "type": "image",
@@ -2479,6 +2474,7 @@ async fn helper_outputs_match_canonical_codex_fixtures() {
         build_turn_start_params(&BuildTurnStartInput {
             thread_id: "provider-thread-1".to_owned(),
             runtime_mode: CodexRuntimeMode::FullAccess,
+            client_user_message_id: None,
             prompt: Some("Make a plan".to_owned()),
             attachments: vec![],
             model: Some("gpt-5.3-codex".to_owned()),
@@ -2730,9 +2726,10 @@ async fn session_runtime_matches_text_tool_and_approval_traces() {
     let peer_task = tokio::spawn(peer.run());
 
     runtime.start().await.expect("runtime starts");
-    let startup_events = runtime.collect_events(2).await;
+    let startup_events = runtime.collect_events(3).await;
     assert_eq!(startup_events[0].event_type, "session.connecting");
-    assert_eq!(startup_events[1].event_type, "session.ready");
+    assert_eq!(startup_events[1].event_type, "mcp.status.updated");
+    assert_eq!(startup_events[2].event_type, "session.ready");
 
     runtime
         .set_goal("Finish the provider parity work")
@@ -2740,21 +2737,21 @@ async fn session_runtime_matches_text_tool_and_approval_traces() {
         .expect("goal is set through app-server");
 
     runtime
-        .send_turn(Some("Small text turn".to_owned()), vec![], None)
+        .send_turn(Some("Small text turn".to_owned()), vec![], None, None)
         .await
         .expect("text turn");
     let text_events = runtime.collect_events(4).await;
     assert_eq!(text_events, stable_fixture("trace-text.json"));
 
     runtime
-        .send_turn(Some("Run a tool".to_owned()), vec![], None)
+        .send_turn(Some("Run a tool".to_owned()), vec![], None, None)
         .await
         .expect("tool turn");
     let tool_events = runtime.collect_events(5).await;
     assert_eq!(tool_events, stable_fixture("trace-tool.json"));
 
     runtime
-        .send_turn(Some("Needs approval".to_owned()), vec![], None)
+        .send_turn(Some("Needs approval".to_owned()), vec![], None, None)
         .await
         .expect("approval turn");
     let mut approval_events = runtime.collect_events(2).await;
@@ -2911,9 +2908,9 @@ async fn activity_runtime_routes_live_children_without_changing_root_events() {
 
     let peer_task = tokio::spawn(peer.run());
     runtime.start().await.expect("runtime starts");
-    runtime.collect_events(2).await;
+    runtime.collect_events(3).await;
     runtime
-        .send_turn(Some("Small text turn".to_owned()), vec![], None)
+        .send_turn(Some("Small text turn".to_owned()), vec![], None, None)
         .await
         .expect("turn starts");
     let events = timeout(Duration::from_secs(2), async {
@@ -3193,7 +3190,7 @@ async fn disabled_agent_activity_pauses_tracking_and_resumes_with_authoritative_
     let peer_task = tokio::spawn(peer.run());
 
     runtime.start().await.expect("runtime starts");
-    runtime.collect_events(2).await;
+    runtime.collect_events(3).await;
     incoming_tx
         .send(IncomingEvent::Notification {
             method: "thread/started".to_owned(),
@@ -3273,11 +3270,13 @@ async fn disabled_agent_activity_pauses_tracking_and_resumes_with_authoritative_
         })
         .expect("post-baseline reconciliation hint");
     let after_baseline = next_codex_event_matching(&runtime, |event| {
-        event.activity.iter().any(|mutation| matches!(
-            mutation,
-            ProviderActivityMutation::AppendEntry(entry)
-                if entry.detail.as_deref() == Some("after-baseline-detail")
-        ))
+        event.activity.iter().any(|mutation| {
+            matches!(
+                mutation,
+                ProviderActivityMutation::AppendEntry(entry)
+                    if entry.detail.as_deref() == Some("after-baseline-detail")
+            )
+        })
     })
     .await;
     assert!(after_baseline.activity.iter().any(|mutation| matches!(
@@ -3320,7 +3319,7 @@ async fn reconciliation_first_root_notification_requests_exact_descendant_scope(
         let mut reader = BufReader::new(peer.stdin);
         let mut writer = peer.stdout;
 
-        let initialize = read_json_message(&mut reader).await;
+        let initialize = read_scripted_message(&mut reader, &mut writer).await;
         assert_eq!(initialize["method"], "initialize");
         write_json(
             &mut writer,
@@ -3328,10 +3327,10 @@ async fn reconciliation_first_root_notification_requests_exact_descendant_scope(
         )
         .await;
         assert_eq!(
-            read_json_message(&mut reader).await["method"],
+            read_scripted_message(&mut reader, &mut writer).await["method"],
             "initialized"
         );
-        let start = read_json_message(&mut reader).await;
+        let start = read_scripted_message(&mut reader, &mut writer).await;
         assert_eq!(start["method"], "thread/start");
         write_json(
             &mut writer,
@@ -3346,10 +3345,10 @@ async fn reconciliation_first_root_notification_requests_exact_descendant_scope(
         )
         .await;
 
-        let reconciliation = read_json_message(&mut reader).await;
+        let reconciliation = read_scripted_message(&mut reader, &mut writer).await;
         let _ = request_tx.send(reconciliation);
 
-        let shutdown = read_json_message(&mut reader).await;
+        let shutdown = read_scripted_message(&mut reader, &mut writer).await;
         assert_eq!(shutdown["method"], "shutdown");
         write_json(
             &mut writer,
@@ -3359,7 +3358,7 @@ async fn reconciliation_first_root_notification_requests_exact_descendant_scope(
     });
 
     runtime.start().await.expect("runtime starts");
-    runtime.collect_events(2).await;
+    runtime.collect_events(3).await;
     incoming_tx
         .send(IncomingEvent::Notification {
             method: "thread/started".to_owned(),
@@ -3413,7 +3412,7 @@ async fn sub_agent_activity_debounces_follow_up_reconciliation_and_repairs_neste
         let mut writer = peer.stdout;
         let mut thread_list_count = 0_u8;
         loop {
-            let message = read_json_message(&mut reader).await;
+            let message = read_scripted_message(&mut reader, &mut writer).await;
             let Some(method) = message.get("method").and_then(Value::as_str) else {
                 continue;
             };
@@ -3646,7 +3645,7 @@ async fn root_turn_completion_dedupes_recovery_and_recovers_eventual_nested_desc
         let mut thread_list_count = 0_u8;
         let mut direct_read_count = 0_u8;
         loop {
-            let message = read_json_message(&mut reader).await;
+            let message = read_scripted_message(&mut reader, &mut writer).await;
             let Some(method) = message.get("method").and_then(Value::as_str) else {
                 continue;
             };
@@ -3972,7 +3971,7 @@ async fn reconciliation_bursty_collaboration_hints_coalesce_into_one_debounced_p
         let mut reader = BufReader::new(peer.stdin);
         let mut writer = peer.stdout;
         loop {
-            let message = read_json_message(&mut reader).await;
+            let message = read_scripted_message(&mut reader, &mut writer).await;
             let Some(method) = message.get("method").and_then(Value::as_str) else {
                 continue;
             };
@@ -4371,32 +4370,47 @@ async fn reconciliation_background_method_downgrade_isolated_and_warned_once() {
             .as_str()
             .is_some_and(|message| message.contains("thread/backgroundTerminals/list"))
     );
-    assert!(first_reconciliation.activity.iter().any(|mutation| matches!(
-        mutation,
-        ProviderActivityMutation::SetScope {
-            capabilities,
-            observation_state: ActivityObservationState::Live,
-        } if capabilities.actors
-            && capabilities.attributed_activity
-            && !capabilities.background_work
-            && capabilities.history_recovery
-                == bibcode_server::activity::ActivityHistoryRecovery::Bounded
-    )));
-    assert!(first_reconciliation.activity.iter().any(|mutation| matches!(
-        mutation,
-        ProviderActivityMutation::SetSectionHealth {
-            section: ActivitySection::BackgroundTasks,
-            health,
-        } if health.state == ActivitySectionObservationState::Error
-            && !health.retryable
-    )));
-    assert!(!first_reconciliation.activity.iter().any(|mutation| matches!(
-        mutation,
-        ProviderActivityMutation::SetSectionHealth {
-            section: ActivitySection::Subagents,
-            ..
-        }
-    )));
+    assert!(
+        first_reconciliation
+            .activity
+            .iter()
+            .any(|mutation| matches!(
+                mutation,
+                ProviderActivityMutation::SetScope {
+                    capabilities,
+                    observation_state: ActivityObservationState::Live,
+                } if capabilities.actors
+                    && capabilities.attributed_activity
+                    && !capabilities.background_work
+                    && capabilities.history_recovery
+                        == bibcode_server::activity::ActivityHistoryRecovery::Bounded
+            ))
+    );
+    assert!(
+        first_reconciliation
+            .activity
+            .iter()
+            .any(|mutation| matches!(
+                mutation,
+                ProviderActivityMutation::SetSectionHealth {
+                    section: ActivitySection::BackgroundTasks,
+                    health,
+                } if health.state == ActivitySectionObservationState::Error
+                    && !health.retryable
+            ))
+    );
+    assert!(
+        !first_reconciliation
+            .activity
+            .iter()
+            .any(|mutation| matches!(
+                mutation,
+                ProviderActivityMutation::SetSectionHealth {
+                    section: ActivitySection::Subagents,
+                    ..
+                }
+            ))
+    );
 
     incoming_tx
         .send(IncomingEvent::Notification {
@@ -4421,11 +4435,16 @@ async fn reconciliation_background_method_downgrade_isolated_and_warned_once() {
         event.native_event_id.as_deref() == Some("codex:reconciliation:1")
     })
     .await;
-    assert!(second_reconciliation.activity.iter().any(|mutation| matches!(
-        mutation,
-        ProviderActivityMutation::SetScope { capabilities, .. }
-            if !capabilities.background_work
-    )));
+    assert!(
+        second_reconciliation
+            .activity
+            .iter()
+            .any(|mutation| matches!(
+                mutation,
+                ProviderActivityMutation::SetScope { capabilities, .. }
+                    if !capabilities.background_work
+            ))
+    );
     assert!(
         timeout(Duration::from_millis(150), runtime.next_event())
             .await
@@ -4714,25 +4733,40 @@ async fn reconciliation_wrong_thread_read_does_not_prove_support_or_apply_histor
     })
     .await;
 
-    assert!(first_reconciliation.activity.iter().any(|mutation| matches!(
-        mutation,
-        ProviderActivityMutation::SetScope {
-            capabilities,
-            observation_state: ActivityObservationState::Live,
-        } if capabilities.history_recovery
-            == bibcode_server::activity::ActivityHistoryRecovery::Bounded
-    )));
-    assert!(!first_reconciliation.activity.iter().any(|mutation| matches!(
-        mutation,
-        ProviderActivityMutation::SetScope { capabilities, .. }
-            if capabilities.history_recovery
-                == bibcode_server::activity::ActivityHistoryRecovery::Full
-    )));
-    assert!(!first_reconciliation.activity.iter().any(|mutation| matches!(
-        mutation,
-        ProviderActivityMutation::AppendEntry(entry)
-            if entry.detail.as_deref() == Some("Wrong thread history")
-    )));
+    assert!(
+        first_reconciliation
+            .activity
+            .iter()
+            .any(|mutation| matches!(
+                mutation,
+                ProviderActivityMutation::SetScope {
+                    capabilities,
+                    observation_state: ActivityObservationState::Live,
+                } if capabilities.history_recovery
+                    == bibcode_server::activity::ActivityHistoryRecovery::Bounded
+            ))
+    );
+    assert!(
+        !first_reconciliation
+            .activity
+            .iter()
+            .any(|mutation| matches!(
+                mutation,
+                ProviderActivityMutation::SetScope { capabilities, .. }
+                    if capabilities.history_recovery
+                        == bibcode_server::activity::ActivityHistoryRecovery::Full
+            ))
+    );
+    assert!(
+        !first_reconciliation
+            .activity
+            .iter()
+            .any(|mutation| matches!(
+                mutation,
+                ProviderActivityMutation::AppendEntry(entry)
+                    if entry.detail.as_deref() == Some("Wrong thread history")
+            ))
+    );
 
     incoming_tx
         .send(IncomingEvent::Notification {
@@ -4758,24 +4792,39 @@ async fn reconciliation_wrong_thread_read_does_not_prove_support_or_apply_histor
     })
     .await;
 
-    assert!(second_reconciliation.activity.iter().any(|mutation| matches!(
-        mutation,
-        ProviderActivityMutation::SetScope {
-            capabilities,
-            observation_state: ActivityObservationState::Live,
-        } if capabilities.history_recovery
-            == bibcode_server::activity::ActivityHistoryRecovery::Full
-    )));
-    assert!(second_reconciliation.activity.iter().any(|mutation| matches!(
-        mutation,
-        ProviderActivityMutation::AppendEntry(entry)
-            if entry.detail.as_deref() == Some("Correct thread history")
-    )));
-    assert!(!second_reconciliation.activity.iter().any(|mutation| matches!(
-        mutation,
-        ProviderActivityMutation::AppendEntry(entry)
-            if entry.detail.as_deref() == Some("Wrong thread history")
-    )));
+    assert!(
+        second_reconciliation
+            .activity
+            .iter()
+            .any(|mutation| matches!(
+                mutation,
+                ProviderActivityMutation::SetScope {
+                    capabilities,
+                    observation_state: ActivityObservationState::Live,
+                } if capabilities.history_recovery
+                    == bibcode_server::activity::ActivityHistoryRecovery::Full
+            ))
+    );
+    assert!(
+        second_reconciliation
+            .activity
+            .iter()
+            .any(|mutation| matches!(
+                mutation,
+                ProviderActivityMutation::AppendEntry(entry)
+                    if entry.detail.as_deref() == Some("Correct thread history")
+            ))
+    );
+    assert!(
+        !second_reconciliation
+            .activity
+            .iter()
+            .any(|mutation| matches!(
+                mutation,
+                ProviderActivityMutation::AppendEntry(entry)
+                    if entry.detail.as_deref() == Some("Wrong thread history")
+            ))
+    );
 
     runtime.shutdown().await.expect("runtime shuts down");
     peer_task.await.expect("peer task");
@@ -4880,20 +4929,30 @@ async fn reconciliation_read_schema_incompatibility_degrades_history_to_bounded(
             .as_str()
             .is_some_and(|message| message.contains("thread/read"))
     );
-    assert!(first_reconciliation.activity.iter().any(|mutation| matches!(
-        mutation,
-        ProviderActivityMutation::SetScope {
-            capabilities,
-            observation_state: ActivityObservationState::Live,
-        } if capabilities.background_work
-            && capabilities.history_recovery
-                == bibcode_server::activity::ActivityHistoryRecovery::Bounded
-    )));
-    assert!(first_reconciliation.activity.iter().any(|mutation| matches!(
-        mutation,
-        ProviderActivityMutation::UpsertActor(actor)
-            if actor.id == "codex:thread:child-schema"
-    )));
+    assert!(
+        first_reconciliation
+            .activity
+            .iter()
+            .any(|mutation| matches!(
+                mutation,
+                ProviderActivityMutation::SetScope {
+                    capabilities,
+                    observation_state: ActivityObservationState::Live,
+                } if capabilities.background_work
+                    && capabilities.history_recovery
+                        == bibcode_server::activity::ActivityHistoryRecovery::Bounded
+            ))
+    );
+    assert!(
+        first_reconciliation
+            .activity
+            .iter()
+            .any(|mutation| matches!(
+                mutation,
+                ProviderActivityMutation::UpsertActor(actor)
+                    if actor.id == "codex:thread:child-schema"
+            ))
+    );
 
     incoming_tx
         .send(IncomingEvent::Notification {
@@ -4918,12 +4977,17 @@ async fn reconciliation_read_schema_incompatibility_degrades_history_to_bounded(
         event.native_event_id.as_deref() == Some("codex:reconciliation:1")
     })
     .await;
-    assert!(second_reconciliation.activity.iter().any(|mutation| matches!(
-        mutation,
-        ProviderActivityMutation::SetScope { capabilities, .. }
-            if capabilities.history_recovery
-                == bibcode_server::activity::ActivityHistoryRecovery::Bounded
-    )));
+    assert!(
+        second_reconciliation
+            .activity
+            .iter()
+            .any(|mutation| matches!(
+                mutation,
+                ProviderActivityMutation::SetScope { capabilities, .. }
+                    if capabilities.history_recovery
+                        == bibcode_server::activity::ActivityHistoryRecovery::Bounded
+            ))
+    );
     assert!(
         timeout(Duration::from_millis(150), runtime.next_event())
             .await
@@ -5021,17 +5085,22 @@ async fn reconciliation_list_method_not_found_degrades_history_to_none_only() {
             .as_str()
             .is_some_and(|message| message.contains("thread/list"))
     );
-    assert!(first_reconciliation.activity.iter().any(|mutation| matches!(
-        mutation,
-        ProviderActivityMutation::SetScope {
-            capabilities,
-            observation_state: ActivityObservationState::Live,
-        } if capabilities.actors
-            && capabilities.attributed_activity
-            && capabilities.background_work
-            && capabilities.history_recovery
-                == bibcode_server::activity::ActivityHistoryRecovery::None
-    )));
+    assert!(
+        first_reconciliation
+            .activity
+            .iter()
+            .any(|mutation| matches!(
+                mutation,
+                ProviderActivityMutation::SetScope {
+                    capabilities,
+                    observation_state: ActivityObservationState::Live,
+                } if capabilities.actors
+                    && capabilities.attributed_activity
+                    && capabilities.background_work
+                    && capabilities.history_recovery
+                        == bibcode_server::activity::ActivityHistoryRecovery::None
+            ))
+    );
 
     incoming_tx
         .send(IncomingEvent::Notification {
@@ -5056,12 +5125,17 @@ async fn reconciliation_list_method_not_found_degrades_history_to_none_only() {
         event.native_event_id.as_deref() == Some("codex:reconciliation:1")
     })
     .await;
-    assert!(second_reconciliation.activity.iter().any(|mutation| matches!(
-        mutation,
-        ProviderActivityMutation::SetScope { capabilities, .. }
-            if capabilities.history_recovery
-                == bibcode_server::activity::ActivityHistoryRecovery::None
-    )));
+    assert!(
+        second_reconciliation
+            .activity
+            .iter()
+            .any(|mutation| matches!(
+                mutation,
+                ProviderActivityMutation::SetScope { capabilities, .. }
+                    if capabilities.history_recovery
+                        == bibcode_server::activity::ActivityHistoryRecovery::None
+            ))
+    );
     assert!(
         timeout(Duration::from_millis(150), runtime.next_event())
             .await
@@ -5095,17 +5169,17 @@ async fn reconciliation_reconnect_cancels_old_pass_and_runs_one_immediate_repair
     let old_peer_task = tokio::spawn(async move {
         let mut reader = BufReader::new(peer_a.stdin);
         let mut writer = peer_a.stdout;
-        let initialize = read_json_message(&mut reader).await;
+        let initialize = read_scripted_message(&mut reader, &mut writer).await;
         write_json(
             &mut writer,
             json!({"id": initialize["id"].clone(), "result": {}}),
         )
         .await;
         assert_eq!(
-            read_json_message(&mut reader).await["method"],
+            read_scripted_message(&mut reader, &mut writer).await["method"],
             "initialized"
         );
-        let start = read_json_message(&mut reader).await;
+        let start = read_scripted_message(&mut reader, &mut writer).await;
         write_json(
             &mut writer,
             json!({
@@ -5118,7 +5192,7 @@ async fn reconciliation_reconnect_cancels_old_pass_and_runs_one_immediate_repair
             }),
         )
         .await;
-        let list = read_json_message(&mut reader).await;
+        let list = read_scripted_message(&mut reader, &mut writer).await;
         let _ = old_list_tx.send(list);
         std::future::pending::<()>().await;
     });
@@ -5228,17 +5302,17 @@ async fn reconciliation_transport_loss_marks_stale_and_preserves_capabilities_un
     let old_peer_task = tokio::spawn(async move {
         let mut reader = BufReader::new(peer_a.stdin);
         let mut writer = peer_a.stdout;
-        let initialize = read_json_message(&mut reader).await;
+        let initialize = read_scripted_message(&mut reader, &mut writer).await;
         write_json(
             &mut writer,
             json!({"id": initialize["id"].clone(), "result": {}}),
         )
         .await;
         assert_eq!(
-            read_json_message(&mut reader).await["method"],
+            read_scripted_message(&mut reader, &mut writer).await["method"],
             "initialized"
         );
-        let start = read_json_message(&mut reader).await;
+        let start = read_scripted_message(&mut reader, &mut writer).await;
         write_json(
             &mut writer,
             json!({
@@ -5251,7 +5325,7 @@ async fn reconciliation_transport_loss_marks_stale_and_preserves_capabilities_un
             }),
         )
         .await;
-        let first_list = read_json_message(&mut reader).await;
+        let first_list = read_scripted_message(&mut reader, &mut writer).await;
         assert_eq!(first_list["method"], "thread/list");
         write_json(
             &mut writer,
@@ -5265,11 +5339,8 @@ async fn reconciliation_transport_loss_marks_stale_and_preserves_capabilities_un
             }),
         )
         .await;
-        let background = read_json_message(&mut reader).await;
-        assert_eq!(
-            background["method"],
-            "thread/backgroundTerminals/list"
-        );
+        let background = read_scripted_message(&mut reader, &mut writer).await;
+        assert_eq!(background["method"], "thread/backgroundTerminals/list");
         write_json(
             &mut writer,
             json!({
@@ -5278,7 +5349,7 @@ async fn reconciliation_transport_loss_marks_stale_and_preserves_capabilities_un
             }),
         )
         .await;
-        let retry_list = read_json_message(&mut reader).await;
+        let retry_list = read_scripted_message(&mut reader, &mut writer).await;
         assert_eq!(retry_list["method"], "thread/list");
         drop(writer);
     });
@@ -5296,13 +5367,18 @@ async fn reconciliation_transport_loss_marks_stale_and_preserves_capabilities_un
         event.native_event_id.as_deref() == Some("codex:reconciliation:0")
     })
     .await;
-    assert!(initial_reconciliation.activity.iter().any(|mutation| matches!(
-        mutation,
-        ProviderActivityMutation::SetScope { capabilities, .. }
-            if capabilities.background_work
-                && capabilities.history_recovery
-                    == bibcode_server::activity::ActivityHistoryRecovery::Bounded
-    )));
+    assert!(
+        initial_reconciliation
+            .activity
+            .iter()
+            .any(|mutation| matches!(
+                mutation,
+                ProviderActivityMutation::SetScope { capabilities, .. }
+                    if capabilities.background_work
+                        && capabilities.history_recovery
+                            == bibcode_server::activity::ActivityHistoryRecovery::Bounded
+            ))
+    );
 
     incoming_tx_a
         .send(IncomingEvent::Notification {
@@ -5408,8 +5484,7 @@ async fn reconciliation_transport_loss_marks_stale_and_preserves_capabilities_un
 }
 
 #[tokio::test]
-async fn reconciliation_bounds_final_batch_and_retains_newest_multi_child_history()
- {
+async fn reconciliation_bounds_final_batch_and_retains_newest_multi_child_history() {
     let (connection, _protocol_incoming, mut peer) = scripted_peer();
     let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
     let runtime = CodexSessionRuntime::new(
@@ -5598,14 +5673,16 @@ async fn reconciliation_bounds_final_batch_and_retains_newest_multi_child_histor
         .iter()
         .position(|mutation| matches!(mutation, ProviderActivityMutation::AppendEntry(_)))
         .expect("retained history");
-    assert!(reconciliation.activity[..first_entry_index]
-        .iter()
-        .any(|mutation| matches!(
-            mutation,
-            ProviderActivityMutation::UpsertActor(actor)
-                if actor.id == "codex:thread:budget-child-0"
-                    && actor.status == ActivityLifecycle::Completed
-        )));
+    assert!(
+        reconciliation.activity[..first_entry_index]
+            .iter()
+            .any(|mutation| matches!(
+                mutation,
+                ProviderActivityMutation::UpsertActor(actor)
+                    if actor.id == "codex:thread:budget-child-0"
+                        && actor.status == ActivityLifecycle::Completed
+            ))
+    );
     let entries = reconciliation
         .activity
         .iter()
@@ -5626,7 +5703,9 @@ async fn reconciliation_bounds_final_batch_and_retains_newest_multi_child_histor
         "the oldest turn beyond the 20-turn read budget is ignored"
     );
     assert!(
-        entries.windows(2).all(|pair| pair[0].created_at <= pair[1].created_at),
+        entries
+            .windows(2)
+            .all(|pair| pair[0].created_at <= pair[1].created_at),
         "the newest retained entries must still be emitted chronologically"
     );
     assert!(entries.iter().any(|entry| {
@@ -5729,7 +5808,7 @@ async fn reconciliation_page_ceiling_keeps_omitted_background_work_running() {
         let mut reader = BufReader::new(peer.stdin);
         let mut writer = peer.stdout;
         loop {
-            let request = read_json_message(&mut reader).await;
+            let request = read_scripted_message(&mut reader, &mut writer).await;
             let method = request["method"].as_str().expect("request method");
             if request.get("id").is_none() {
                 assert_eq!(method, "initialized");
@@ -5956,7 +6035,7 @@ async fn assert_partial_background_pages_preserve_running_work(
         let mut writer = peer.stdout;
         let mut background_request_count = 0_usize;
         loop {
-            let request = read_json_message(&mut reader).await;
+            let request = read_scripted_message(&mut reader, &mut writer).await;
             let method = request["method"].as_str().expect("request method");
             if request.get("id").is_none() {
                 assert_eq!(method, "initialized");
@@ -6161,7 +6240,7 @@ async fn reconciliation_invalid_rows_do_not_consume_accepted_record_budgets() {
         let mut reader = BufReader::new(peer.stdin);
         let mut writer = peer.stdout;
         loop {
-            let request = read_json_message(&mut reader).await;
+            let request = read_scripted_message(&mut reader, &mut writer).await;
             let method = request["method"].as_str().expect("request method");
             if request.get("id").is_none() {
                 assert_eq!(method, "initialized");
@@ -6467,7 +6546,16 @@ async fn activity_runtime_reconnect_and_shutdown_drop_stale_incoming_work() {
         }));
     let peer_a_task = tokio::spawn(peer_a.run());
     runtime.start().await.expect("initial runtime start");
-    runtime.collect_events(2).await;
+    let startup_events = runtime.collect_events(4).await;
+    assert_eq!(
+        startup_events.last().map(|event| event.event_type.as_str()),
+        Some("session.ready")
+    );
+    assert!(
+        startup_events
+            .iter()
+            .any(|event| event.event_type == "mcp.status.updated")
+    );
     peer_a_task.await.expect("initial peer");
 
     old_incoming_tx
@@ -6498,7 +6586,8 @@ async fn activity_runtime_reconnect_and_shutdown_drop_stale_incoming_work() {
         .expect("initial activity");
     assert_eq!(
         initial_activity.native_event_id.as_deref(),
-        Some("codex:activity:0")
+        Some("codex:activity:0"),
+        "unexpected event after startup: {initial_activity:?}"
     );
 
     let (connection_b, _protocol_incoming_b, mut peer_b) = scripted_peer();
@@ -6986,7 +7075,7 @@ async fn codex_runtime_covers_auto_edit_resume_requests_and_stream_edges() {
 
     assert!(
         runtime
-            .send_turn(Some("invalid turn".to_owned()), Vec::new(), None)
+            .send_turn(Some("invalid turn".to_owned()), Vec::new(), None, None)
             .await
             .expect_err("missing turn ids must fail")
             .to_string()
@@ -6994,7 +7083,7 @@ async fn codex_runtime_covers_auto_edit_resume_requests_and_stream_edges() {
     );
 
     runtime
-        .send_turn(Some("file approval".to_owned()), Vec::new(), None)
+        .send_turn(Some("file approval".to_owned()), Vec::new(), None, None)
         .await
         .expect("file turn");
     let file_request = next_codex_event_matching(&runtime, |event| {
@@ -7018,7 +7107,7 @@ async fn codex_runtime_covers_auto_edit_resume_requests_and_stream_edges() {
     assert_eq!(failed.payload["error"]["message"], "provider failed");
 
     runtime
-        .send_turn(Some("user input".to_owned()), Vec::new(), None)
+        .send_turn(Some("user input".to_owned()), Vec::new(), None, None)
         .await
         .expect("input turn");
     let input_request = next_codex_event_matching(&runtime, |event| {
@@ -7049,7 +7138,12 @@ async fn codex_runtime_covers_auto_edit_resume_requests_and_stream_edges() {
     assert_eq!(resolved.payload["answers"]["many"], json!(["a", "b"]));
 
     runtime
-        .send_turn(Some("generic cancellation".to_owned()), Vec::new(), None)
+        .send_turn(
+            Some("generic cancellation".to_owned()),
+            Vec::new(),
+            None,
+            None,
+        )
         .await
         .expect("generic cancellation turn");
     next_codex_event_matching(&runtime, |event| {
@@ -7062,7 +7156,7 @@ async fn codex_runtime_covers_auto_edit_resume_requests_and_stream_edges() {
         .expect("generic cancellation");
 
     runtime
-        .send_turn(Some("unknown request".to_owned()), Vec::new(), None)
+        .send_turn(Some("unknown request".to_owned()), Vec::new(), None, None)
         .await
         .expect("unknown request turn");
     next_codex_event_matching(&runtime, |event| {
@@ -7071,7 +7165,7 @@ async fn codex_runtime_covers_auto_edit_resume_requests_and_stream_edges() {
     .await;
 
     runtime
-        .send_turn(Some("interrupt".to_owned()), Vec::new(), None)
+        .send_turn(Some("interrupt".to_owned()), Vec::new(), None, None)
         .await
         .expect("interrupt turn");
     runtime
@@ -7130,7 +7224,7 @@ async fn codex_runtime_and_probe_reject_invalid_provider_payloads() {
     );
     assert!(
         missing_runtime
-            .send_turn(Some("before start".to_owned()), Vec::new(), None)
+            .send_turn(Some("before start".to_owned()), Vec::new(), None, None)
             .await
             .expect_err("turns require a provider thread")
             .to_string()
@@ -7215,6 +7309,7 @@ fn codex_edge_turn_params(provider_thread_id: &str, prompt: &str) -> Value {
     build_turn_start_params(&BuildTurnStartInput {
         thread_id: provider_thread_id.to_owned(),
         runtime_mode: CodexRuntimeMode::AutoAcceptEdits,
+        client_user_message_id: None,
         prompt: Some(prompt.to_owned()),
         attachments: Vec::new(),
         model: None,
@@ -7335,7 +7430,7 @@ impl ScriptedPeer {
                     expected_follow_up_response,
                     stderr_messages,
                 } => {
-                    let message = read_json_message(&mut reader).await;
+                    let message = read_scripted_message(&mut reader, &mut writer).await;
                     assert_eq!(message["method"], method);
                     assert_eq!(message["params"], params);
                     if let Some(request_seen) = request_seen {
@@ -7374,23 +7469,44 @@ impl ScriptedPeer {
                         if requires_response
                             && let Some(expected_response) = expected_follow_up_response.take()
                         {
-                            let follow_up = read_json_message(&mut reader).await;
+                            let follow_up = read_scripted_message(&mut reader, &mut writer).await;
                             assert_eq!(follow_up, expected_response);
                         }
                     }
                     if let Some(expected_response) = expected_follow_up_response {
-                        let follow_up = read_json_message(&mut reader).await;
+                        let follow_up = read_scripted_message(&mut reader, &mut writer).await;
                         assert_eq!(follow_up, expected_response);
                     }
                 }
                 PeerStep::ExpectNotification { method } => {
-                    let message = read_json_message(&mut reader).await;
+                    let message = read_scripted_message(&mut reader, &mut writer).await;
                     assert_eq!(message["method"], method);
                     assert!(message.get("id").is_none());
                 }
             }
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+async fn read_scripted_message<R, W>(reader: &mut BufReader<R>, writer: &mut W) -> Value
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    loop {
+        let message = read_json_message(reader).await;
+        if message["method"] != "mcpServerStatus/list" {
+            return message;
+        }
+        write_json(
+            writer,
+            json!({
+                "id": message["id"].clone(),
+                "result": { "data": [], "nextCursor": null },
+            }),
+        )
+        .await;
     }
 }
 

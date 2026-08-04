@@ -16,11 +16,16 @@
         "metadata": {
           "providerTurnId": "to"
         },
-        "type": "thread.interaction-mode-set",
+        "type": "project.created",
         "payload": {
-          "threadId": "Um9$Tt2_E",
-          "interactionMode": "default",
-          "updatedAt": "|("
+          "projectId": "Um9$Tt2_E",
+          "title": "k",
+          "workspaceRoot": "s<db0e<~",
+          "repositoryIdentity": null,
+          "defaultModelSelection": null,
+          "scripts": [],
+          "createdAt": "$",
+          "updatedAt": "ke"
         }
       }
     }

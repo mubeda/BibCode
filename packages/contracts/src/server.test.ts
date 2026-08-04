@@ -61,6 +61,13 @@ describe("ServerProvider", () => {
     expect(parsed.updateState).toBeUndefined();
   });
 
+  it("keeps old snapshots compatible and decodes Codex MCP-status capability", () => {
+    expect(decodeServerProvider(baseProviderSnapshot).supportsMcpStatus).toBeUndefined();
+    expect(
+      decodeServerProvider({ ...baseProviderSnapshot, supportsMcpStatus: true }).supportsMcpStatus,
+    ).toBe(true);
+  });
+
   it("defaults one-click update support when decoding older advisory snapshots", () => {
     const parsed = decodeServerProvider({
       instanceId: "codex",

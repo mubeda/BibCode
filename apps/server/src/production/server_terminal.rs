@@ -117,6 +117,15 @@ impl ServerTerminalServices {
         let _ = self.terminal.close(thread_id, None).await;
     }
 
+    pub async fn terminal_exists(&self, thread_id: &str, terminal_id: &str) -> bool {
+        self.terminal
+            .subscribe_metadata()
+            .await
+            .initial
+            .iter()
+            .any(|terminal| terminal.thread_id == thread_id && terminal.terminal_id == terminal_id)
+    }
+
     pub async fn launch_setup_script(&self, input: SetupScriptLaunch) -> Result<(), String> {
         let mut terminal_input = TerminalOpenInput::new(
             input.thread_id.clone(),
@@ -128,24 +137,9 @@ impl ServerTerminalServices {
         terminal_input.worktree_path = Some(input.worktree_path);
         terminal_input.env = input.env;
         self.terminal
-            .open(terminal_input)
+            .open_with_initial_input(terminal_input, format!("{}\r", input.command))
             .await
             .map_err(|error| error.to_string())?;
-        if let Err(error) = self
-            .terminal
-            .write(
-                &input.thread_id,
-                &input.terminal_id,
-                &format!("{}\r", input.command),
-            )
-            .await
-        {
-            let _ = self
-                .terminal
-                .close(&input.thread_id, Some(&input.terminal_id))
-                .await;
-            return Err(error.to_string());
-        }
         Ok(())
     }
 }
@@ -560,9 +554,8 @@ fn is_provider_terminal_activity_slug(value: &str) -> bool {
     characters
         .next()
         .is_some_and(|character| character.is_ascii_alphabetic())
-        && characters.all(|character| {
-            character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
-        })
+        && characters
+            .all(|character| character.is_ascii_alphanumeric() || matches!(character, '-' | '_'))
 }
 
 fn validate_terminal_launch_command(
@@ -600,16 +593,12 @@ fn validate_terminal_launch_command(
     }
     if let Some(activity) = command.activity.as_mut() {
         activity.driver_kind = trim_ecmascript(&activity.driver_kind).to_owned();
-        if activity.driver_kind.encode_utf16().count()
-            > PROVIDER_TERMINAL_ACTIVITY_SLUG_MAX_LENGTH
+        if activity.driver_kind.encode_utf16().count() > PROVIDER_TERMINAL_ACTIVITY_SLUG_MAX_LENGTH
             || !is_provider_terminal_activity_slug(&activity.driver_kind)
         {
-            return Err(invalid_request(
-                "command activity driver kind is invalid",
-            ));
+            return Err(invalid_request("command activity driver kind is invalid"));
         }
-        activity.provider_instance_id =
-            trim_ecmascript(&activity.provider_instance_id).to_owned();
+        activity.provider_instance_id = trim_ecmascript(&activity.provider_instance_id).to_owned();
         if activity.provider_instance_id.encode_utf16().count()
             > PROVIDER_TERMINAL_ACTIVITY_SLUG_MAX_LENGTH
             || !is_provider_terminal_activity_slug(&activity.provider_instance_id)

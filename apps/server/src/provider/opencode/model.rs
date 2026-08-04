@@ -257,6 +257,18 @@ pub fn merge_assistant_text(previous: Option<&str>, next: &str) -> (String, Stri
 
 fn model_capabilities(provider_id: &str, model: &Value, agents: &Value) -> Value {
     let mut descriptors = Vec::new();
+    let supports_fast = model
+        .get("variants")
+        .and_then(Value::as_object)
+        .is_some_and(|variants| variants.contains_key("fast"));
+    if supports_fast {
+        descriptors.push(json!({
+            "id": "fastMode",
+            "label": "Fast",
+            "type": "boolean",
+            "currentValue": false,
+        }));
+    }
     let (variant_options, default_variant) = variant_options(provider_id, model.get("variants"));
     if !variant_options.is_empty() {
         let mut descriptor = json!({
@@ -345,10 +357,14 @@ fn variant_options(provider_id: &str, variants: Option<&Value>) -> (Vec<Value>, 
     let Some(variants) = variants.and_then(Value::as_object) else {
         return (Vec::new(), None);
     };
-    let variant_ids = variants.keys().map(String::as_str).collect::<Vec<_>>();
+    let variant_ids = variants
+        .keys()
+        .map(String::as_str)
+        .filter(|variant| *variant != "fast")
+        .collect::<Vec<_>>();
     let default_variant = infer_default_variant(provider_id, &variant_ids);
     let mut options = Vec::with_capacity(variant_ids.len());
-    for key in variants.keys() {
+    for key in variants.keys().filter(|key| key.as_str() != "fast") {
         let mut option = json!({
             "id": key,
             "label": title_case_slug(key),
@@ -361,7 +377,7 @@ fn variant_options(provider_id: &str, variants: Option<&Value>) -> (Vec<Value>, 
     (options, default_variant)
 }
 
-fn infer_default_variant(provider_id: &str, variants: &[&str]) -> Option<String> {
+pub(crate) fn infer_default_variant(provider_id: &str, variants: &[&str]) -> Option<String> {
     if variants.len() == 1 {
         return Some(variants[0].to_owned());
     }
@@ -495,13 +511,18 @@ mod tests {
                 Some("medium"),
             ),
             ("custom", json!({ "turbo": {} }), Some("turbo")),
-            ("custom", json!({ "fast": {}, "slow": {} }), None),
+            ("custom", json!({ "fast": {}, "slow": {} }), Some("slow")),
         ];
 
         for (provider_id, variants, expected_default) in cases {
             let capabilities =
                 model_capabilities(provider_id, &json!({ "variants": variants }), &json!([]));
-            let descriptor = &capabilities["optionDescriptors"][0];
+            let descriptor = capabilities["optionDescriptors"]
+                .as_array()
+                .expect("option descriptors")
+                .iter()
+                .find(|descriptor| descriptor["id"] == "variant")
+                .expect("variant descriptor");
             let actual_default = descriptor["options"]
                 .as_array()
                 .and_then(|options| {
@@ -520,6 +541,55 @@ mod tests {
                 actual_default, expected_default,
                 "unexpected default variant for {provider_id}"
             );
+            if capabilities["optionDescriptors"]
+                .as_array()
+                .is_some_and(|descriptors| {
+                    descriptors
+                        .iter()
+                        .any(|descriptor| descriptor["id"] == "fastMode")
+                })
+            {
+                assert_eq!(
+                    descriptor["options"]
+                        .as_array()
+                        .expect("variant options")
+                        .iter()
+                        .filter_map(|option| option["id"].as_str())
+                        .collect::<Vec<_>>(),
+                    vec!["slow"]
+                );
+            }
         }
+    }
+
+    #[test]
+    fn fast_variant_is_exposed_as_canonical_fast_mode() {
+        let capabilities = model_capabilities(
+            "custom",
+            &json!({ "variants": { "default": {}, "fast": {}, "max": {} } }),
+            &json!([]),
+        );
+        let descriptors = capabilities["optionDescriptors"]
+            .as_array()
+            .expect("option descriptors");
+        let fast_mode = descriptors
+            .iter()
+            .find(|descriptor| descriptor["id"] == "fastMode")
+            .expect("fast mode descriptor");
+        let variant = descriptors
+            .iter()
+            .find(|descriptor| descriptor["id"] == "variant")
+            .expect("variant descriptor");
+
+        assert_eq!(fast_mode["currentValue"], false);
+        assert_eq!(
+            variant["options"]
+                .as_array()
+                .expect("variant options")
+                .iter()
+                .filter_map(|option| option["id"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["default", "max"]
+        );
     }
 }

@@ -5,33 +5,27 @@ use bibcode_server::production::provider_runtime;
 
 use std::{
     collections::VecDeque,
+    convert::Infallible,
     future::Future,
     io,
     path::{Path, PathBuf},
     pin::Pin,
     process::Command,
     sync::{Arc, Mutex as StdMutex},
+    task::Poll,
     time::{Duration, Instant},
 };
 
 use axum::{
     Json, Router,
-    response::sse::{Event, Sse},
+    extract::Path as AxumPath,
+    http::StatusCode,
+    response::{
+        IntoResponse,
+        sse::{Event, Sse},
+    },
     routing::{get, post},
 };
-use futures_util::{SinkExt, StreamExt, stream};
-use provider_runtime::{
-    BoxRuntimeFuture, ClaudeActivitySupport, NativeProviderDriverFactory, ProviderDriver,
-    ProviderDriverFactory, ProviderEvent, ProviderLaunchRequest, ProviderMcpConfig,
-    ProviderNativeEventId, ProviderRuntimeError, ProviderRuntimeSupervisor, StartedSession,
-    SupervisorOptions, build_claude_launch_arguments_for_test,
-    claude_activity_probe_cache_len_for_test, claude_activity_probe_cache_paths_for_test,
-    claude_output_shutdown_with_open_stream_for_test, probe_claude_activity_support_for_test,
-    probe_claude_activity_support_with_resolution_delay_for_test,
-    reconcile_abandoned_provider_sessions, reset_claude_activity_probe_cache_for_test,
-    route_orchestration_command, seed_claude_activity_probe_cache_for_test,
-};
-use serde_json::{Value, json};
 use bibcode_server::{
     RequestId, RpcExit, RpcRegistry, ServerConfig, ServerMessage, ServerRuntime,
     activity::{
@@ -44,8 +38,9 @@ use bibcode_server::{
     diagnostics::{NativeProcessSampler, ProcessAttributionRegistry, ProcessRow, ProcessSampler},
     git::GitRepository,
     orchestration::{
+        ProviderTurnDelivery, TurnDeliveryState,
         engine::{
-            EngineOptions, OrchestrationCommand, OrchestrationEngine, SessionInput,
+            EngineOptions, OrchestrationCommand, OrchestrationEngine, SessionInput, TestHooks,
             ThreadMessageInput,
         },
         load_snapshot,
@@ -56,18 +51,35 @@ use bibcode_server::{
             self, BoxEffectFuture, EffectsOptions, OrchestrationEffectCallbacks,
             OrchestrationEffects,
         },
-        orchestration_rpc::register_orchestration_rpc_with_provider,
+        orchestration_rpc::register_orchestration_rpc_with_delivery,
+        turn_delivery::TurnDeliveryService,
     },
-    provider::claude::ClaudeTranscriptReaderFixture,
+    provider::{claude::ClaudeTranscriptReaderFixture, codex::resolve_codex_home_layout},
 };
+use futures_util::{SinkExt, StreamExt, stream};
+use provider_runtime::{
+    BoxRuntimeFuture, ClaudeActivitySupport, NativeProviderDriverFactory, ProviderDeliveryOutcome,
+    ProviderDriver, ProviderDriverFactory, ProviderEvent, ProviderLaunchRequest, ProviderMcpConfig,
+    ProviderNativeEventId, ProviderReconciliationOutcome, ProviderRuntimeError,
+    ProviderRuntimeSupervisor, StartedSession, SupervisorOptions,
+    build_claude_launch_arguments_for_test, build_claude_launch_arguments_with_settings_for_test,
+    claude_activity_probe_cache_len_for_test,
+    claude_activity_probe_cache_paths_for_test, claude_output_shutdown_with_open_stream_for_test,
+    deliver_durable_orchestration_turn, deliver_orchestration_turn, freeze_delivery_route,
+    probe_claude_activity_support_for_test,
+    probe_claude_activity_support_with_resolution_delay_for_test,
+    reconcile_abandoned_provider_sessions, reconcile_orchestration_turn,
+    reset_claude_activity_probe_cache_for_test, route_orchestration_command,
+    seed_claude_activity_probe_cache_for_test,
+};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::time::timeout;
 use tokio::{net::TcpListener, sync::mpsc};
 use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message};
 
 const NOW: &str = "2026-07-10T10:00:00.000Z";
-static CLAUDE_ACTIVITY_PROBE_TEST_LOCK: tokio::sync::Mutex<()> =
-    tokio::sync::Mutex::const_new(());
+static CLAUDE_ACTIVITY_PROBE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 const WINDOWS_CLAUDE_FIXTURE: &str = r#"
 [Console]::Out.WriteLine("ignored non-json output")
@@ -83,6 +95,7 @@ while ($null -ne ($line = [Console]::In.ReadLine())) {
   switch ([string]$request.method) {
     "initialize" { $response = '{"id":' + $id + ',"result":{"userAgent":"fixture"}}' }
     "thread/start" { $response = '{"id":' + $id + ',"result":{"cwd":"C:\\tmp","model":"gpt-5","thread":{"id":"native-codex-thread"}}}' }
+    "mcpServerStatus/list" { $response = '{"id":' + $id + ',"result":{"data":[],"nextCursor":null}}' }
     "thread/goal/set" { $response = '{"id":' + $id + ',"result":{"goal":{"status":"active"}}}' }
     "turn/start" { $response = '{"id":' + $id + ',"result":{"turn":{"id":"native-codex-turn"}}}' }
     "turn/interrupt" { $response = '{"id":' + $id + ',"result":{}}' }
@@ -192,6 +205,18 @@ struct DriverState {
     start_results: VecDeque<Result<StartedSession, ProviderRuntimeError>>,
     starts: usize,
     sends: Vec<String>,
+    sent_attachments: Vec<Vec<Value>>,
+    delivery_outcomes: VecDeque<ProviderDeliveryOutcome>,
+    delivery_entered: Option<Arc<tokio::sync::Notify>>,
+    delivery_release: Option<Arc<tokio::sync::Semaphore>>,
+    delivery_preflight_entered: Option<Arc<tokio::sync::Notify>>,
+    delivery_preflight_release: Option<Arc<tokio::sync::Semaphore>>,
+    delivery_panics: usize,
+    delivery_started: Vec<String>,
+    operation_order: Vec<&'static str>,
+    delivery_routes: Vec<(String, Option<String>, String)>,
+    delivery_active: usize,
+    delivery_max_active: usize,
     interrupts: Vec<Option<String>>,
     approvals: Vec<(String, String)>,
     answers: Vec<(String, Value)>,
@@ -200,7 +225,10 @@ struct DriverState {
     interaction_modes: Vec<String>,
     set_interaction_mode_results: VecDeque<Result<(), ProviderRuntimeError>>,
     models: Vec<String>,
+    reapply_options_on_model_change: bool,
     set_model_results: VecDeque<Result<(), ProviderRuntimeError>>,
+    option_updates: Vec<Vec<Value>>,
+    set_options_results: VecDeque<Result<(), ProviderRuntimeError>>,
     rollbacks: Vec<i64>,
     rollback_observations: Vec<(i64, Option<String>)>,
     rollback_workspace: Option<PathBuf>,
@@ -208,10 +236,13 @@ struct DriverState {
     agent_activity_transitions: Vec<bool>,
     agent_activity_results: VecDeque<Result<(), ProviderRuntimeError>>,
     shutdowns: usize,
+    shutdown_results: VecDeque<Result<(), ProviderRuntimeError>>,
     stream_ended: Option<Arc<tokio::sync::Notify>>,
 }
 
 struct FakeDriver {
+    provider: String,
+    provider_instance_id: Option<String>,
     state: Arc<StdMutex<DriverState>>,
     events: tokio::sync::Mutex<mpsc::Receiver<ProviderEvent>>,
 }
@@ -224,16 +255,30 @@ fn started_session(session_id: &str) -> StartedSession {
     }
 }
 
+fn started_session_for_provider(provider: &str, session_id: &str) -> StartedSession {
+    StartedSession {
+        resume_cursor: Some(if provider == "codex" {
+            json!({ "threadId": session_id })
+        } else {
+            json!({ "sessionId": session_id })
+        }),
+        runtime_payload: Some(json!({ "transport": "native" })),
+        activity_capabilities: ActivityCapabilities::none(),
+    }
+}
+
 impl ProviderDriver for FakeDriver {
     fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>> {
         Box::pin(async move {
             {
                 let mut state = self.state.lock().unwrap();
                 state.starts += 1;
-                state
-                    .start_results
-                    .pop_front()
-                    .unwrap_or_else(|| Ok(started_session("provider-session-1")))
+                state.start_results.pop_front().unwrap_or_else(|| {
+                    Ok(started_session_for_provider(
+                        &self.provider,
+                        "provider-session-1",
+                    ))
+                })
             }
         })
     }
@@ -241,12 +286,89 @@ impl ProviderDriver for FakeDriver {
     fn send(
         &self,
         text: String,
-        _attachments: Vec<Value>,
+        attachments: Vec<Value>,
         _interaction_mode: String,
     ) -> BoxRuntimeFuture<'_, Result<Option<String>, ProviderRuntimeError>> {
         Box::pin(async move {
-            self.state.lock().unwrap().sends.push(text);
+            let mut state = self.state.lock().unwrap();
+            state.sends.push(text);
+            state.sent_attachments.push(attachments);
             Ok(Some("provider-turn-1".to_owned()))
+        })
+    }
+
+    fn deliver(
+        &self,
+        text: String,
+        attachments: Vec<Value>,
+        interaction_mode: String,
+        _delivery_key: String,
+    ) -> BoxRuntimeFuture<'_, ProviderDeliveryOutcome> {
+        Box::pin(async move {
+            let (preflight_entered, preflight_release) = {
+                let state = self.state.lock().unwrap();
+                (
+                    state.delivery_preflight_entered.clone(),
+                    state.delivery_preflight_release.clone(),
+                )
+            };
+            if let Some(entered) = preflight_entered {
+                entered.notify_one();
+            }
+            if let Some(release) = preflight_release {
+                release
+                    .acquire()
+                    .await
+                    .expect("delivery preflight release")
+                    .forget();
+            }
+            let should_panic = {
+                let mut state = self.state.lock().unwrap();
+                if state.delivery_panics > 0 {
+                    state.delivery_panics -= 1;
+                    true
+                } else {
+                    false
+                }
+            };
+            if should_panic {
+                panic!("injected delivery panic");
+            }
+            let (entered, release) = {
+                let mut state = self.state.lock().unwrap();
+                state.operation_order.push("delivery");
+                state.delivery_started.push(text.clone());
+                state.delivery_routes.push((
+                    self.provider.clone(),
+                    self.provider_instance_id.clone(),
+                    text.clone(),
+                ));
+                state.delivery_active += 1;
+                state.delivery_max_active = state.delivery_max_active.max(state.delivery_active);
+                (
+                    state.delivery_entered.clone(),
+                    state.delivery_release.clone(),
+                )
+            };
+            if let Some(entered) = entered {
+                entered.notify_one();
+            }
+            if let Some(release) = release {
+                release.acquire().await.expect("delivery release").forget();
+            }
+            let configured = self.state.lock().unwrap().delivery_outcomes.pop_front();
+            let outcome = if let Some(outcome) = configured {
+                outcome
+            } else {
+                match self.send(text, attachments, interaction_mode).await {
+                    Ok(turn_id) => ProviderDeliveryOutcome::Accepted { turn_id },
+                    Err(error) => ProviderDeliveryOutcome::Ambiguous {
+                        detail: error.to_string(),
+                    },
+                }
+            };
+            self.state.lock().unwrap().delivery_active -= 1;
+            outcome
         })
     }
 
@@ -294,6 +416,7 @@ impl ProviderDriver for FakeDriver {
         Box::pin(async move {
             {
                 let mut state = self.state.lock().unwrap();
+                state.operation_order.push("runtime");
                 state.modes.push(mode);
                 state.set_mode_results.pop_front().unwrap_or(Ok(()))
             }
@@ -307,6 +430,7 @@ impl ProviderDriver for FakeDriver {
         Box::pin(async move {
             {
                 let mut state = self.state.lock().unwrap();
+                state.operation_order.push("interaction");
                 state.interaction_modes.push(mode);
                 state
                     .set_interaction_mode_results
@@ -323,6 +447,22 @@ impl ProviderDriver for FakeDriver {
                 state.models.push(model);
                 state.set_model_results.pop_front().unwrap_or(Ok(()))
             }
+        })
+    }
+
+    fn reapply_options_on_model_change(&self) -> bool {
+        self.state.lock().unwrap().reapply_options_on_model_change
+    }
+
+    fn set_options(
+        &self,
+        options: Vec<Value>,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async move {
+            let mut state = self.state.lock().unwrap();
+            state.operation_order.push("options");
+            state.option_updates.push(options);
+            state.set_options_results.pop_front().unwrap_or(Ok(()))
         })
     }
 
@@ -381,8 +521,9 @@ impl ProviderDriver for FakeDriver {
 
     fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
-            self.state.lock().unwrap().shutdowns += 1;
-            Ok(())
+            let mut state = self.state.lock().unwrap();
+            state.shutdowns += 1;
+            state.shutdown_results.pop_front().unwrap_or(Ok(()))
         })
     }
 }
@@ -404,6 +545,8 @@ impl ProviderDriverFactory for LaunchRaceFactory {
         request: ProviderLaunchRequest,
     ) -> BoxRuntimeFuture<'_, Result<Arc<dyn ProviderDriver>, ProviderRuntimeError>> {
         Box::pin(async move {
+            let provider = request.provider.clone();
+            let provider_instance_id = request.provider_instance_id.clone();
             self.state.lock().unwrap().launches.push(request);
             self.controller.disable().await;
             let events = self
@@ -413,6 +556,8 @@ impl ProviderDriverFactory for LaunchRaceFactory {
                 .pop_front()
                 .expect("event receiver");
             Ok(Arc::new(FakeDriver {
+                provider,
+                provider_instance_id,
                 state: self.state.clone(),
                 events: tokio::sync::Mutex::new(events),
             }) as Arc<dyn ProviderDriver>)
@@ -426,6 +571,8 @@ impl ProviderDriverFactory for FakeFactory {
         request: ProviderLaunchRequest,
     ) -> BoxRuntimeFuture<'_, Result<Arc<dyn ProviderDriver>, ProviderRuntimeError>> {
         Box::pin(async move {
+            let provider = request.provider.clone();
+            let provider_instance_id = request.provider_instance_id.clone();
             self.state.lock().unwrap().launches.push(request);
             let events = self
                 .events
@@ -434,9 +581,83 @@ impl ProviderDriverFactory for FakeFactory {
                 .pop_front()
                 .expect("event receiver");
             Ok(Arc::new(FakeDriver {
+                provider,
+                provider_instance_id,
                 state: self.state.clone(),
                 events: tokio::sync::Mutex::new(events),
             }) as Arc<dyn ProviderDriver>)
+        })
+    }
+}
+
+#[tokio::test]
+async fn fake_delivery_release_retains_bulk_permissions_before_waiters_arm() {
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let state = Arc::new(StdMutex::new(DriverState {
+        delivery_release: Some(release.clone()),
+        ..DriverState::default()
+    }));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let driver = Arc::new(FakeDriver {
+        provider: "codex".to_owned(),
+        provider_instance_id: Some("codex".to_owned()),
+        state,
+        events: tokio::sync::Mutex::new(events_rx),
+    });
+    release.add_permits(2);
+    let mut deliveries = Vec::new();
+    for text in ["first", "second"] {
+        let driver = driver.clone();
+        deliveries.push(tokio::spawn(async move {
+            driver
+                .deliver(
+                    text.to_owned(),
+                    Vec::new(),
+                    "default".to_owned(),
+                    format!("key-{text}"),
+                )
+                .await
+        }));
+    }
+    timeout(Duration::from_millis(100), async {
+        for delivery in deliveries {
+            assert!(matches!(
+                delivery.await.expect("delivery task"),
+                ProviderDeliveryOutcome::Accepted { .. }
+            ));
+        }
+    })
+    .await
+    .expect("bulk release permissions must survive before waiter registration");
+}
+
+struct NativeFixtureFactory {
+    inner: NativeProviderDriverFactory,
+    binary_path: Option<PathBuf>,
+    endpoint: Option<String>,
+    cwd: Option<PathBuf>,
+    environment: Vec<(String, String)>,
+    launches: Arc<StdMutex<Vec<ProviderLaunchRequest>>>,
+}
+
+impl ProviderDriverFactory for NativeFixtureFactory {
+    fn create(
+        &self,
+        mut request: ProviderLaunchRequest,
+    ) -> BoxRuntimeFuture<'_, Result<Arc<dyn ProviderDriver>, ProviderRuntimeError>> {
+        Box::pin(async move {
+            self.launches.lock().unwrap().push(request.clone());
+            if let Some(binary_path) = self.binary_path.as_ref() {
+                request.binary_path = binary_path.to_string_lossy().into_owned();
+            }
+            request.endpoint.clone_from(&self.endpoint);
+            if let Some(cwd) = self.cwd.as_ref() {
+                request.cwd = cwd.clone();
+            }
+            for (key, value) in &self.environment {
+                request.environment.insert(key.clone(), value.clone());
+            }
+            self.inner.create(request).await
         })
     }
 }
@@ -446,6 +667,12 @@ async fn engine() -> OrchestrationEngine {
 }
 
 async fn engine_and_database() -> (OrchestrationEngine, Database) {
+    engine_and_database_with_options(EngineOptions::default()).await
+}
+
+async fn engine_and_database_with_options(
+    options: EngineOptions,
+) -> (OrchestrationEngine, Database) {
     let database = Database::open_in_memory().await.unwrap();
     database
         .call(|connection| {
@@ -454,7 +681,7 @@ async fn engine_and_database() -> (OrchestrationEngine, Database) {
         })
         .await
         .unwrap();
-    let engine = OrchestrationEngine::start(database.clone(), EngineOptions::default())
+    let engine = OrchestrationEngine::start(database.clone(), options)
         .await
         .unwrap();
     engine
@@ -503,6 +730,7 @@ fn launch() -> ProviderLaunchRequest {
         runtime_mode: "full-access".to_owned(),
         interaction_mode: "default".to_owned(),
         model: Some("gpt-5".to_owned()),
+        options: Vec::new(),
         service_tier: None,
         effort: None,
         agent: None,
@@ -511,8 +739,324 @@ fn launch() -> ProviderLaunchRequest {
         endpoint: None,
         server_password: None,
         mcp: None,
-        codex_home: None,
+        codex_home: Some(resolve_codex_home_layout(
+            None,
+            None,
+            dirs::home_dir()
+                .as_deref()
+                .unwrap_or_else(|| Path::new(".")),
+        )),
     }
+}
+
+fn durable_turn_command(command_id: &str, text: &str) -> OrchestrationCommand {
+    durable_turn_command_for(command_id, text, "codex", "gpt-5")
+}
+
+fn durable_turn_command_for(
+    command_id: &str,
+    text: &str,
+    provider_instance_id: &str,
+    model: &str,
+) -> OrchestrationCommand {
+    serde_json::from_value(json!({
+        "type":"thread.turn.start", "commandId":command_id, "threadId":"t1",
+        "message":{
+            "messageId":format!("message-{command_id}"), "role":"user", "text":text,
+            "attachments":[]
+        },
+        "modelSelection":{"instanceId":provider_instance_id,"model":model},
+        "runtimeMode":"full-access", "interactionMode":"default", "createdAt":NOW
+    }))
+    .expect("durable turn command")
+}
+
+fn delivery_row(provider_kind: &str, delivery_key: &str) -> ProviderTurnDelivery {
+    let command_id = format!("reconcile-{delivery_key}");
+    ProviderTurnDelivery {
+        command_id: command_id.clone(),
+        thread_id: "t1".to_owned(),
+        message_id: format!("message-{delivery_key}"),
+        provider_instance_id: provider_kind.to_owned(),
+        provider_kind: provider_kind.to_owned(),
+        provider_session_id: None,
+        delivery_key: delivery_key.to_owned(),
+        payload: serde_json::to_value(durable_turn_command_for(
+            &command_id,
+            "recover",
+            provider_kind,
+            if provider_kind == "opencode" {
+                "openai/gpt-5"
+            } else {
+                "gpt-5"
+            },
+        ))
+        .expect("delivery payload"),
+        state: TurnDeliveryState::Sending,
+        attempts: 1,
+        last_error: None,
+        created_at: NOW.to_owned(),
+        updated_at: NOW.to_owned(),
+    }
+}
+
+async fn seed_sending_delivery(database: &Database, row: ProviderTurnDelivery) {
+    database
+        .call(move |connection| {
+            connection.execute(
+                "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest) VALUES (?, 'thread', ?, ?, 0, 'accepted', NULL, 'durable-restart-digest')",
+                rusqlite::params![&row.command_id, &row.thread_id, &row.created_at],
+            )?;
+            connection.execute(
+                "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'sending', ?, NULL, ?, ?)",
+                rusqlite::params![
+                    row.command_id,
+                    row.thread_id,
+                    row.message_id,
+                    row.provider_instance_id,
+                    row.provider_kind,
+                    row.provider_session_id,
+                    row.delivery_key,
+                    row.payload.to_string(),
+                    row.attempts,
+                    row.created_at,
+                    row.updated_at,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("seed accepted provider turn before durable state transition");
+}
+
+async fn seed_pending_delivery(database: &Database, mut row: ProviderTurnDelivery) {
+    row.state = TurnDeliveryState::Pending;
+    row.attempts = 0;
+    database
+        .call(move |connection| {
+            connection.execute(
+                "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest) VALUES (?, 'thread', ?, ?, 0, 'accepted', NULL, 'durable-live-retry-digest')",
+                rusqlite::params![&row.command_id, &row.thread_id, &row.created_at],
+            )?;
+            connection.execute(
+                "INSERT INTO provider_turn_outbox (command_id, thread_id, message_id, provider_instance_id, provider_kind, provider_session_id, delivery_key, payload_json, state, attempts, last_error, created_at, updated_at) VALUES (?, ?, ?, ?, ?, NULL, ?, ?, 'pending', 0, NULL, ?, ?)",
+                rusqlite::params![
+                    row.command_id,
+                    row.thread_id,
+                    row.message_id,
+                    row.provider_instance_id,
+                    row.provider_kind,
+                    row.delivery_key,
+                    row.payload.to_string(),
+                    row.created_at,
+                    row.updated_at,
+                ],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("seed pending provider turn");
+}
+
+fn write_route_settings(
+    settings: &TempDir,
+    binary_path: &str,
+    endpoint: &str,
+    environment_value: &str,
+) {
+    std::fs::write(
+        settings.path().join("settings.json"),
+        serde_json::to_vec(&json!({
+            "providerInstances": {
+                "route-cursor": {
+                    "driver": "cursor",
+                    "enabled": true,
+                    "config": {
+                        "binaryPath": binary_path,
+                        "apiEndpoint": endpoint
+                    },
+                    "environment": [{
+                        "name": "ROUTE_ENV",
+                        "value": environment_value,
+                        "valueRedacted": false
+                    }]
+                }
+            }
+        }))
+        .expect("route settings json"),
+    )
+    .expect("write route settings");
+}
+
+fn write_live_retry_settings(settings: &TempDir, provider: &str, instance_id: &str) {
+    let instance = match provider {
+        "claudeAgent" => json!({
+            "driver": "claudeAgent",
+            "enabled": true,
+            "config": {"binaryPath": "claude-route"}
+        }),
+        "cursor" => json!({
+            "driver": "cursor",
+            "enabled": true,
+            "config": {
+                "binaryPath": "cursor-route",
+                "apiEndpoint": "https://cursor-route.invalid"
+            }
+        }),
+        _ => unreachable!(),
+    };
+    let mut instances = serde_json::Map::new();
+    instances.insert(instance_id.to_owned(), instance);
+    std::fs::write(
+        settings.path().join("settings.json"),
+        serde_json::to_vec(&json!({"providerInstances": instances})).expect("retry settings json"),
+    )
+    .expect("write retry settings");
+}
+
+async fn freeze_row_route(
+    engine: &OrchestrationEngine,
+    settings: &TempDir,
+    row: &mut ProviderTurnDelivery,
+) -> OrchestrationCommand {
+    let command = serde_json::from_value::<OrchestrationCommand>(row.payload.clone())
+        .expect("durable route command");
+    freeze_delivery_route(
+        engine,
+        &settings.path().to_path_buf(),
+        &command,
+        &mut row.payload,
+    )
+    .await
+    .expect("freeze configured provider route");
+    command
+}
+
+async fn admit_and_freeze_sending_delivery(
+    engine: &OrchestrationEngine,
+    settings: &TempDir,
+    provider_kind: &str,
+    provider_instance_id: &str,
+    provider_session_id: &str,
+    delivery_key: &str,
+) -> (ProviderTurnDelivery, Arc<ProviderRuntimeSupervisor>) {
+    let delivery_entered = Arc::new(tokio::sync::Notify::new());
+    let state = Arc::new(StdMutex::new(DriverState {
+        start_results: VecDeque::from([Ok(StartedSession {
+            resume_cursor: Some(if provider_kind == "codex" {
+                json!({"threadId":provider_session_id})
+            } else {
+                json!({"sessionId":provider_session_id})
+            }),
+            runtime_payload: None,
+            activity_capabilities: ActivityCapabilities::none(),
+        })]),
+        delivery_entered: Some(delivery_entered.clone()),
+        delivery_release: Some(Arc::new(tokio::sync::Semaphore::new(0))),
+        ..DriverState::default()
+    }));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(engine),
+        SupervisorOptions::default(),
+    ));
+    let delivery = Arc::new(TurnDeliveryService::start(
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+    ));
+    let mut registry = RpcRegistry::empty();
+    register_orchestration_rpc_with_delivery(
+        &mut registry,
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+        delivery.clone(),
+    );
+    let runtime = ServerRuntime::start_with_registry(test_config(settings), registry)
+        .await
+        .expect("admission runtime");
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", runtime.local_addr()))
+        .await
+        .expect("admission websocket");
+    let command_id = format!("reconcile-{delivery_key}");
+    rpc_request(
+        &mut socket,
+        "806",
+        serde_json::to_value(durable_turn_command_for(
+            &command_id,
+            "recover",
+            provider_instance_id,
+            if provider_kind == "opencode" {
+                "openai/gpt-5"
+            } else {
+                "gpt-5"
+            },
+        ))
+        .expect("organic durable command"),
+    )
+    .await;
+    rpc_response(&mut socket, "806")
+        .await
+        .expect("organic turn admission");
+    timeout(Duration::from_secs(10), delivery_entered.notified())
+        .await
+        .expect("initial provider delivery entered");
+    let row = engine
+        .repositories()
+        .get_provider_turn_delivery(command_id.clone())
+        .await
+        .expect("organic delivery row")
+        .expect("organic outbox row");
+    assert_eq!(row.state, TurnDeliveryState::Sending);
+    assert_eq!(row.attempts, 1);
+    assert_eq!(row.provider_instance_id, provider_instance_id);
+    assert_eq!(row.provider_kind, provider_kind);
+    assert_eq!(
+        row.provider_session_id.as_deref(),
+        Some(provider_session_id),
+        "native session identity is durable before the first provider send"
+    );
+
+    socket.close(None).await.expect("admission websocket close");
+    runtime.shutdown();
+    runtime.join().await.expect("admission runtime shutdown");
+    delivery.shutdown().await;
+    let row = engine
+        .repositories()
+        .get_provider_turn_delivery(command_id)
+        .await
+        .expect("organic restart row")
+        .expect("organic outbox row survives");
+    assert_eq!(row.state, TurnDeliveryState::Sending);
+    assert_eq!(
+        row.provider_session_id.as_deref(),
+        Some(provider_session_id)
+    );
+    (row, supervisor)
+}
+
+async fn captured_json_request(path: &Path, predicate: impl Fn(&Value) -> bool) -> Value {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let content = std::fs::read_to_string(path).unwrap_or_default();
+            if let Some(request) = content
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .find(|request| predicate(request))
+            {
+                return request;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("captured provider request")
 }
 
 fn image_attachment(temp: &TempDir) -> Value {
@@ -748,6 +1292,2464 @@ where
     }
 }
 
+async fn assert_codex_restart_reconciliation(
+    mode: &'static str,
+    expected: ProviderReconciliationOutcome,
+    should_resend: bool,
+) {
+    const UNIX_FIXTURE: &str = r#"#!/bin/sh
+read_count=0
+while IFS= read -r line; do
+  [ -z "$BIBCODE_CAPTURE" ] || printf '%s\n' "$line" >> "$BIBCODE_CAPTURE"
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{"id":%s,"result":{"userAgent":"fixture"}}\n' "$id" ;;
+    *'"method":"thread/resume"'*|*'"method":"thread/start"'*) printf '{"id":%s,"result":{"cwd":"/tmp","model":"gpt-5","thread":{"id":"native-codex-thread"}}}\n' "$id" ;;
+    *'"method":"mcpServerStatus/list"'*) printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$id" ;;
+    *'"method":"turn/start"'*) printf '{"id":%s,"result":{"turn":{"id":"native-codex-turn"}}}\n' "$id" ;;
+    *'"method":"thread/read"'*)
+      if [ "$BIBCODE_READBACK_MODE" = found ]; then
+        printf '{"id":%s,"result":{"thread":{"id":"native-codex-thread","turns":[{"id":"native-codex-turn","items":[{"id":"native-user","type":"userMessage","clientId":"%s","content":[]}]}]}}}\n' "$id" "$BIBCODE_EXPECTED_DELIVERY_KEY"
+      elif [ "$BIBCODE_READBACK_MODE" = absent ]; then
+        printf '{"id":%s,"result":{"thread":{"id":"native-codex-thread","turns":[]}}}\n' "$id"
+      else
+        printf '{"id":%s,"result":{}}\n' "$id"
+      fi ;;
+    *'"method":"shutdown"'*) printf '{"id":%s,"result":null}\n' "$id" ;;
+  esac
+done
+"#;
+    const WINDOWS_FIXTURE: &str = r#"
+$readCount = 0
+while ($null -ne ($line = [Console]::In.ReadLine())) {
+  if ($env:BIBCODE_CAPTURE) { Add-Content -LiteralPath $env:BIBCODE_CAPTURE -Value $line }
+  try { $request = $line | ConvertFrom-Json } catch { continue }
+  $id = [string]$request.id
+  $response = $null
+  switch ([string]$request.method) {
+    "initialize" { $response = '{"id":' + $id + ',"result":{"userAgent":"fixture"}}' }
+    "thread/resume" { $response = '{"id":' + $id + ',"result":{"cwd":"C:\\tmp","model":"gpt-5","thread":{"id":"native-codex-thread"}}}' }
+    "thread/start" { $response = '{"id":' + $id + ',"result":{"cwd":"C:\\tmp","model":"gpt-5","thread":{"id":"native-codex-thread"}}}' }
+    "mcpServerStatus/list" { $response = '{"id":' + $id + ',"result":{"data":[],"nextCursor":null}}' }
+    "turn/start" { $response = '{"id":' + $id + ',"result":{"turn":{"id":"native-codex-turn"}}}' }
+    "thread/read" {
+      if ($env:BIBCODE_READBACK_MODE -eq "found") {
+        $response = '{"id":' + $id + ',"result":{"thread":{"id":"native-codex-thread","turns":[{"id":"native-codex-turn","items":[{"id":"native-user","type":"userMessage","clientId":"' + $env:BIBCODE_EXPECTED_DELIVERY_KEY + '","content":[]}]}]}}}'
+      } elseif ($env:BIBCODE_READBACK_MODE -eq "absent") {
+        $response = '{"id":' + $id + ',"result":{"thread":{"id":"native-codex-thread","turns":[]}}}'
+      } else {
+        $response = '{"id":' + $id + ',"result":{}}'
+      }
+    }
+    "shutdown" { $response = '{"id":' + $id + ',"result":null}' }
+  }
+  if ($null -ne $response) { [Console]::Out.WriteLine($response); [Console]::Out.Flush() }
+}
+"#;
+
+    let (engine, _) = engine_and_database().await;
+    let temp = TempDir::new().expect("Codex fixture directory");
+    let fixture = executable_fixture(
+        &temp,
+        "durable-codex-fixture",
+        UNIX_FIXTURE,
+        WINDOWS_FIXTURE,
+    );
+    let capture = temp.path().join("codex-requests.jsonl");
+    let launches = Arc::new(StdMutex::new(Vec::new()));
+    let settings = TempDir::new().expect("settings");
+    std::fs::write(
+        settings.path().join("settings.json"),
+        serde_json::to_vec(&json!({
+            "providerInstances": {
+                "frozen-codex": {
+                    "driver": "codex",
+                    "enabled": true,
+                    "config": {"binaryPath": "frozen-codex-binary"}
+                }
+            }
+        }))
+        .expect("settings json"),
+    )
+    .expect("write settings");
+    let (row, original_supervisor) = admit_and_freeze_sending_delivery(
+        &engine,
+        &settings,
+        "codex",
+        "frozen-codex",
+        "native-codex-thread",
+        "stable-codex-key",
+    )
+    .await;
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(NativeFixtureFactory {
+            inner: NativeProviderDriverFactory::new(temp.path().join("attachments")),
+            binary_path: Some(fixture),
+            endpoint: None,
+            cwd: Some(temp.path().to_path_buf()),
+            environment: vec![
+                (
+                    "BIBCODE_CAPTURE".to_owned(),
+                    capture.to_string_lossy().into_owned(),
+                ),
+                ("BIBCODE_READBACK_MODE".to_owned(), mode.to_owned()),
+                (
+                    "BIBCODE_EXPECTED_DELIVERY_KEY".to_owned(),
+                    row.delivery_key.clone(),
+                ),
+            ],
+            launches: launches.clone(),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    ));
+
+    let delivery = if mode == "unavailable" {
+        let outcome = reconcile_orchestration_turn(
+            &supervisor,
+            &engine,
+            &settings.path().to_path_buf(),
+            row.clone(),
+        )
+        .await;
+        assert_eq!(outcome, expected);
+        None
+    } else {
+        let delivery = TurnDeliveryService::start(
+            engine.clone(),
+            supervisor.clone(),
+            settings.path().to_path_buf(),
+        );
+        let completed = timeout(Duration::from_secs(10), async {
+            loop {
+                let persisted = engine
+                    .repositories()
+                    .get_provider_turn_delivery(row.command_id.clone())
+                    .await
+                    .expect("delivery row")
+                    .expect("persisted delivery");
+                if persisted.state == TurnDeliveryState::Delivered {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await;
+        if completed.is_err() {
+            let persisted = engine
+                .repositories()
+                .get_provider_turn_delivery(row.command_id.clone())
+                .await
+                .expect("delivery row")
+                .expect("persisted delivery");
+            panic!(
+                "durable dispatcher did not complete Codex {mode} recovery: state={:?}, error={:?}",
+                persisted.state, persisted.last_error
+            );
+        }
+        Some(delivery)
+    };
+    assert_eq!(
+        launches.lock().unwrap()[0].resume_cursor,
+        Some(json!({"threadId":"native-codex-thread"}))
+    );
+    assert_eq!(
+        launches.lock().unwrap()[0].provider_instance_id.as_deref(),
+        Some("frozen-codex")
+    );
+    if mode == "found" {
+        let invalid: OrchestrationCommand = serde_json::from_value(json!({
+            "type":"thread.turn.start", "commandId":"codex-rejected", "threadId":"t1",
+            "message":{
+                "messageId":"message-rejected", "role":"user", "text":"invalid",
+                "attachments":[{
+                    "type":"file", "id":"missing-file", "name":"missing.txt",
+                    "mimeType":"text/plain", "sizeBytes":1
+                }]
+            },
+            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "runtimeMode":"full-access", "interactionMode":"default", "createdAt":NOW
+        }))
+        .expect("invalid materialization command remains schema-valid");
+        assert!(matches!(
+            deliver_orchestration_turn(
+                &supervisor,
+                &engine,
+                &settings.path().to_path_buf(),
+                invalid,
+                "rejected-key".to_owned(),
+            )
+            .await,
+            ProviderDeliveryOutcome::Rejected { .. }
+        ));
+    }
+    let sends_before = std::fs::read_to_string(&capture)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|request| request["method"] == "turn/start")
+        .count();
+    assert_eq!(
+        sends_before,
+        usize::from(should_resend),
+        "Found prevents resend; Absent permits one resend"
+    );
+    if should_resend {
+        let request =
+            captured_json_request(&capture, |request| request["method"] == "turn/start").await;
+        assert_eq!(request["params"]["clientUserMessageId"], row.delivery_key);
+    }
+
+    if let Some(delivery) = delivery {
+        delivery.shutdown().await;
+    }
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    original_supervisor
+        .shutdown()
+        .await
+        .expect("original supervisor shutdown");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn durable_codex_restart_reconciliation_uses_real_adapter_and_exact_key() {
+    assert_codex_restart_reconciliation("found", ProviderReconciliationOutcome::Found, false).await;
+    assert_codex_restart_reconciliation("absent", ProviderReconciliationOutcome::Absent, true)
+        .await;
+    assert_codex_restart_reconciliation(
+        "unavailable",
+        ProviderReconciliationOutcome::Unavailable {
+            detail: "Invalid Codex payload: thread/read response missing thread".to_owned(),
+        },
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn claude_and_cursor_retry_definitely_not_sent_on_the_same_frozen_live_session() {
+    for (provider_kind, instance_id, binary_path, endpoint) in [
+        ("claudeAgent", "route-claude", "claude-route", None),
+        (
+            "cursor",
+            "route-cursor",
+            "cursor-route",
+            Some("https://cursor-route.invalid"),
+        ),
+    ] {
+        let (engine, database) = engine_and_database().await;
+        let settings = TempDir::new().expect("settings");
+        write_live_retry_settings(&settings, provider_kind, instance_id);
+        let command_id = format!("live-retry-{provider_kind}");
+        let mut row = delivery_row(provider_kind, &format!("live-retry-key-{provider_kind}"));
+        row.command_id = command_id.clone();
+        row.message_id = format!("message-{command_id}");
+        row.provider_instance_id = instance_id.to_owned();
+        row.payload = serde_json::to_value(durable_turn_command_for(
+            &command_id,
+            "retry safely",
+            instance_id,
+            "provider-model",
+        ))
+        .expect("retry route payload");
+        let _command = freeze_row_route(&engine, &settings, &mut row).await;
+        seed_pending_delivery(&database, row.clone()).await;
+        let state = Arc::new(StdMutex::new(DriverState {
+            start_results: VecDeque::from([Ok(started_session("same-live-session"))]),
+            delivery_outcomes: VecDeque::from([
+                ProviderDeliveryOutcome::DefinitelyNotSent {
+                    detail: "dns lookup failed before request write".to_owned(),
+                },
+                ProviderDeliveryOutcome::Accepted {
+                    turn_id: Some("accepted-on-second-attempt".to_owned()),
+                },
+            ]),
+            ..DriverState::default()
+        }));
+        let (_events_tx, events_rx) = mpsc::channel(1);
+        let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(FakeFactory {
+                state: state.clone(),
+                events: StdMutex::new(VecDeque::from([events_rx])),
+            }),
+            activity_projection(&engine),
+            SupervisorOptions::default(),
+        ));
+        let mut active_launch = launch();
+        active_launch.provider = provider_kind.to_owned();
+        active_launch.provider_label = provider_kind.to_owned();
+        active_launch.provider_instance_id = Some(instance_id.to_owned());
+        active_launch.binary_path = binary_path.to_owned();
+        active_launch.endpoint = endpoint.map(str::to_owned);
+        active_launch.model = Some("provider-model".to_owned());
+        active_launch.codex_home = None;
+        supervisor
+            .launch(active_launch)
+            .await
+            .expect("same live provider session");
+        let service = TurnDeliveryService::start(
+            engine.clone(),
+            supervisor.clone(),
+            settings.path().to_path_buf(),
+        );
+
+        let delivery = timeout(Duration::from_secs(5), async {
+            loop {
+                let delivery = engine
+                    .repositories()
+                    .get_provider_turn_delivery(command_id.clone())
+                    .await
+                    .expect("retry row")
+                    .expect("durable delivery");
+                if delivery.state == TurnDeliveryState::Delivered
+                    || delivery.state == TurnDeliveryState::Failed
+                {
+                    break delivery;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("live retry reaches a terminal state");
+        assert_eq!(
+            delivery.state,
+            TurnDeliveryState::Delivered,
+            "{provider_kind}: {:?}",
+            delivery.last_error
+        );
+        assert_eq!(delivery.attempts, 2, "{provider_kind}");
+        assert_eq!(
+            delivery.provider_session_id.as_deref(),
+            Some("same-live-session"),
+            "{provider_kind} must retain the exact first-attempt session"
+        );
+        assert_eq!(
+            state.lock().unwrap().delivery_started,
+            vec!["retry safely", "retry safely"],
+            "{provider_kind} should make exactly two live attempts"
+        );
+
+        service.shutdown().await;
+        supervisor.shutdown().await.expect("supervisor shutdown");
+        engine.shutdown().await;
+    }
+}
+
+#[tokio::test]
+async fn durable_delivery_blocks_binary_endpoint_and_environment_route_drift_before_launch() {
+    for drift in ["binary", "endpoint", "environment"] {
+        let (engine, database) = engine_and_database().await;
+        let settings = TempDir::new().expect("settings");
+        write_route_settings(&settings, "cursor-a", "https://route-a.invalid", "env-a");
+        let command_id = format!("route-drift-{drift}");
+        let mut row = delivery_row("cursor", &format!("route-key-{drift}"));
+        row.command_id = command_id.clone();
+        row.message_id = format!("message-{command_id}");
+        row.provider_instance_id = "route-cursor".to_owned();
+        row.payload = serde_json::to_value(durable_turn_command_for(
+            &command_id,
+            "must not send",
+            "route-cursor",
+            "cursor-model",
+        ))
+        .expect("route payload");
+        let command = freeze_row_route(&engine, &settings, &mut row).await;
+        assert!(
+            !row.payload.to_string().contains("env-a"),
+            "environment values participate in the digest but are never persisted"
+        );
+        seed_sending_delivery(&database, row.clone()).await;
+
+        let (binary, endpoint, environment) = match drift {
+            "binary" => ("cursor-b", "https://route-a.invalid", "env-a"),
+            "endpoint" => ("cursor-a", "https://route-b.invalid", "env-a"),
+            "environment" => ("cursor-a", "https://route-a.invalid", "env-b"),
+            _ => unreachable!(),
+        };
+        write_route_settings(&settings, binary, endpoint, environment);
+        let state = Arc::new(StdMutex::new(DriverState::default()));
+        let supervisor = ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(FakeFactory {
+                state: state.clone(),
+                events: StdMutex::new(VecDeque::new()),
+            }),
+            activity_projection(&engine),
+            SupervisorOptions::default(),
+        );
+
+        let outcome = deliver_durable_orchestration_turn(
+            &supervisor,
+            &engine,
+            &settings.path().to_path_buf(),
+            command,
+            row.delivery_key,
+        )
+        .await;
+        assert!(matches!(
+            outcome,
+            ProviderDeliveryOutcome::Rejected { ref detail }
+                if detail.contains("route changed after admission")
+        ));
+        let snapshot = state.lock().unwrap();
+        assert!(
+            snapshot.launches.is_empty(),
+            "{drift} drift launched a provider"
+        );
+        assert!(
+            snapshot.delivery_started.is_empty(),
+            "{drift} drift called the provider"
+        );
+        drop(snapshot);
+        supervisor.shutdown().await.expect("supervisor shutdown");
+        engine.shutdown().await;
+    }
+}
+
+async fn assert_durable_replay_rejects_inherited_selection_drift(
+    case: &str,
+    admitted_selection: Value,
+    changed_selection: Value,
+) {
+    let (engine, database) = engine_and_database().await;
+    let settings = TempDir::new().expect("settings");
+    engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.meta.update", "commandId":format!("admit-{case}-selection"),
+                "threadId":"t1", "modelSelection":admitted_selection
+            }))
+            .expect("admitted selection update"),
+        )
+        .await
+        .expect("set admitted selection");
+    let command_id = format!("inherited-{case}-route-drift");
+    let mut row = delivery_row("codex", &format!("inherited-{case}-route-key"));
+    row.command_id = command_id.clone();
+    row.message_id = format!("message-{command_id}");
+    row.payload = json!({
+        "type":"thread.turn.start", "commandId":command_id, "threadId":"t1",
+        "message":{
+            "messageId":row.message_id, "role":"user", "text":"keep the admitted selection",
+            "attachments":[]
+        },
+        "runtimeMode":"full-access", "interactionMode":"default", "createdAt":NOW
+    });
+    let command = freeze_row_route(&engine, &settings, &mut row).await;
+    assert!(row.payload["_bibcodeProviderRouteFingerprint"].is_string());
+    seed_sending_delivery(&database, row.clone()).await;
+    engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.meta.update", "commandId":format!("change-{case}-selection"),
+                "threadId":"t1", "modelSelection":changed_selection
+            }))
+            .expect("changed selection update"),
+        )
+        .await
+        .expect("change inherited selection after admission");
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::new()),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+
+    let outcome = deliver_durable_orchestration_turn(
+        &supervisor,
+        &engine,
+        &settings.path().to_path_buf(),
+        command,
+        row.delivery_key,
+    )
+    .await;
+
+    assert!(matches!(
+        outcome,
+        ProviderDeliveryOutcome::Rejected { ref detail }
+            if detail.contains("route changed after admission")
+    ));
+    let snapshot = state.lock().unwrap();
+    assert!(snapshot.launches.is_empty());
+    assert!(snapshot.delivery_started.is_empty());
+    drop(snapshot);
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn durable_delivery_blocks_inherited_model_selection_drift_before_relaunch() {
+    assert_durable_replay_rejects_inherited_selection_drift(
+        "model",
+        json!({"instanceId":"codex","model":"gpt-5"}),
+        json!({"instanceId":"codex","model":"gpt-5.1"}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn durable_replay_rejects_changed_canonical_option_before_relaunch() {
+    assert_durable_replay_rejects_inherited_selection_drift(
+        "canonical-option",
+        json!({
+            "instanceId":"codex", "model":"gpt-5",
+            "options":[{"id":"fastMode","value":false}]
+        }),
+        json!({
+            "instanceId":"codex", "model":"gpt-5",
+            "options":[{"id":"fastMode","value":true}]
+        }),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn durable_delivery_blocks_project_cwd_drift_before_relaunch() {
+    let (engine, database) = engine_and_database().await;
+    let settings = TempDir::new().expect("settings");
+    let mut row = delivery_row("codex", "project-cwd-route-key");
+    row.payload = serde_json::to_value(durable_turn_command(
+        &row.command_id,
+        "keep the admitted working directory",
+    ))
+    .expect("cwd route payload");
+    let command = freeze_row_route(&engine, &settings, &mut row).await;
+    seed_sending_delivery(&database, row.clone()).await;
+    engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"project.meta.update", "commandId":"change-project-cwd",
+                "projectId":"p1", "workspaceRoot":"C:/different-repo"
+            }))
+            .expect("project update"),
+        )
+        .await
+        .expect("change project cwd after admission");
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+
+    let outcome = deliver_durable_orchestration_turn(
+        &supervisor,
+        &engine,
+        &settings.path().to_path_buf(),
+        command,
+        row.delivery_key,
+    )
+    .await;
+
+    assert!(matches!(
+        outcome,
+        ProviderDeliveryOutcome::Rejected { ref detail }
+            if detail.contains("route changed after admission")
+    ));
+    assert!(state.lock().unwrap().launches.is_empty());
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn reconciliation_rejects_sending_local_draft_with_unresolved_cwd_without_launch() {
+    let (engine, database) = engine_and_database().await;
+    let settings = TempDir::new().expect("settings");
+    let command_id = "local-draft-route";
+    let thread_id = "local-draft-route-thread";
+    let mut row = delivery_row("codex", "local-draft-route-key");
+    row.command_id = command_id.to_owned();
+    row.thread_id = thread_id.to_owned();
+    row.message_id = format!("message-{command_id}");
+    row.payload = json!({
+        "type":"thread.turn.start", "commandId":command_id, "threadId":thread_id,
+        "message":{
+            "messageId":row.message_id, "role":"user", "text":"use the prepared worktree",
+            "attachments":[]
+        },
+        "runtimeMode":"full-access", "interactionMode":"default",
+        "bootstrap":{
+            "createThread":{
+                "projectId":"p1", "title":"Local draft",
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access", "interactionMode":"default",
+                "branch":"codex/local-draft", "worktreePath":null, "createdAt":NOW
+            },
+            "prepareWorktree":{"projectCwd":"C:/repo","baseBranch":"main"}
+        },
+        "createdAt":NOW
+    });
+    let _command = freeze_row_route(&engine, &settings, &mut row).await;
+    let admission_payload = row.payload.clone();
+    engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.create", "commandId":"create-local-draft-route-thread",
+                "threadId":thread_id, "projectId":"p1", "title":"Local draft",
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access", "interactionMode":"default",
+                "branch":"codex/local-draft", "worktreePath":null, "createdAt":NOW
+            }))
+            .expect("local draft create"),
+        )
+        .await
+        .expect("create local draft thread");
+    engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.meta.update", "commandId":"resolve-local-draft-worktree",
+                "threadId":thread_id, "branch":"codex/local-draft",
+                "worktreePath":"C:/repo/.worktrees/local-draft"
+            }))
+            .expect("local draft worktree update"),
+        )
+        .await
+        .expect("persist resolved worktree");
+    seed_sending_delivery(&database, row.clone()).await;
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+
+    let outcome = reconcile_orchestration_turn(
+        &supervisor,
+        &engine,
+        &settings.path().to_path_buf(),
+        row.clone(),
+    )
+    .await;
+
+    assert!(matches!(
+        outcome,
+        ProviderReconciliationOutcome::Unavailable { ref detail }
+            if detail.contains("unresolved worktree cwd")
+    ));
+    assert!(
+        state.lock().unwrap().launches.is_empty(),
+        "restart reconciliation must not contact a provider for an unresolved cwd"
+    );
+    let persisted = engine
+        .repositories()
+        .get_provider_turn_delivery(command_id.to_owned())
+        .await
+        .expect("read unresolved route")
+        .expect("delivery row");
+    assert_eq!(
+        persisted.payload, admission_payload,
+        "reconciliation must not finalize an already-Sending row"
+    );
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn unchanged_frozen_route_relaunches_and_legacy_missing_route_fails_closed() {
+    let (engine, database) = engine_and_database().await;
+    let settings = TempDir::new().expect("settings");
+    write_route_settings(&settings, "cursor-a", "https://route-a.invalid", "env-a");
+    let mut row = delivery_row("cursor", "unchanged-route-key");
+    row.provider_instance_id = "route-cursor".to_owned();
+    row.payload = serde_json::to_value(durable_turn_command_for(
+        &row.command_id,
+        "safe restart",
+        "route-cursor",
+        "cursor-model",
+    ))
+    .expect("route payload");
+    let command = freeze_row_route(&engine, &settings, &mut row).await;
+    seed_sending_delivery(&database, row.clone()).await;
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+
+    let outcome = deliver_durable_orchestration_turn(
+        &supervisor,
+        &engine,
+        &settings.path().to_path_buf(),
+        command,
+        row.delivery_key.clone(),
+    )
+    .await;
+    assert!(matches!(outcome, ProviderDeliveryOutcome::Accepted { .. }));
+    assert_eq!(state.lock().unwrap().launches.len(), 1);
+
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
+
+    let (engine, database) = engine_and_database().await;
+    let settings = TempDir::new().expect("legacy settings");
+    write_route_settings(&settings, "cursor-a", "https://route-a.invalid", "env-a");
+    let mut legacy = delivery_row("cursor", "legacy-route-key");
+    legacy.provider_instance_id = "route-cursor".to_owned();
+    legacy.payload = serde_json::to_value(durable_turn_command_for(
+        &legacy.command_id,
+        "legacy must not send",
+        "route-cursor",
+        "cursor-model",
+    ))
+    .expect("legacy payload");
+    let legacy_command = serde_json::from_value(legacy.payload.clone()).expect("legacy command");
+    seed_sending_delivery(&database, legacy.clone()).await;
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::new()),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    let outcome = deliver_durable_orchestration_turn(
+        &supervisor,
+        &engine,
+        &settings.path().to_path_buf(),
+        legacy_command,
+        legacy.delivery_key,
+    )
+    .await;
+    assert!(matches!(
+        outcome,
+        ProviderDeliveryOutcome::Rejected { ref detail }
+            if detail.contains("route fingerprint is missing")
+    ));
+    assert!(state.lock().unwrap().launches.is_empty());
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn active_delivery_uses_its_frozen_launch_route_not_current_settings() {
+    let (engine, database) = engine_and_database().await;
+    let settings = TempDir::new().expect("settings");
+    write_route_settings(&settings, "cursor-a", "https://route-a.invalid", "env-a");
+    let mut row = delivery_row("cursor", "active-frozen-route-key");
+    row.provider_instance_id = "route-cursor".to_owned();
+    row.payload = serde_json::to_value(durable_turn_command_for(
+        &row.command_id,
+        "use active route",
+        "route-cursor",
+        "cursor-model",
+    ))
+    .expect("active route payload");
+    let command = freeze_row_route(&engine, &settings, &mut row).await;
+    seed_sending_delivery(&database, row.clone()).await;
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    let mut active_launch = launch();
+    active_launch.provider = "cursor".to_owned();
+    active_launch.provider_label = "cursor".to_owned();
+    active_launch.provider_instance_id = Some("route-cursor".to_owned());
+    active_launch.binary_path = "cursor-a".to_owned();
+    active_launch.endpoint = Some("https://route-a.invalid".to_owned());
+    active_launch.model = Some("cursor-model".to_owned());
+    active_launch.codex_home = None;
+    active_launch
+        .environment
+        .insert("ROUTE_ENV".to_owned(), "env-a".to_owned());
+    supervisor
+        .launch(active_launch)
+        .await
+        .expect("active provider route A");
+    write_route_settings(&settings, "cursor-b", "https://route-b.invalid", "env-b");
+
+    let outcome = deliver_durable_orchestration_turn(
+        &supervisor,
+        &engine,
+        &settings.path().to_path_buf(),
+        command,
+        row.delivery_key,
+    )
+    .await;
+    assert!(matches!(outcome, ProviderDeliveryOutcome::Accepted { .. }));
+    let snapshot = state.lock().unwrap();
+    assert_eq!(
+        snapshot.launches.len(),
+        1,
+        "current settings cannot relaunch over active A"
+    );
+    assert_eq!(snapshot.delivery_started, vec!["use active route"]);
+    drop(snapshot);
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn restart_reconciliation_launches_the_frozen_provider_identity() {
+    let engine = engine().await;
+    engine
+        .repositories()
+        .upsert_provider_session_runtime(ProviderSessionRuntime {
+            thread_id: "t1".to_owned(),
+            provider_name: "codex".to_owned(),
+            provider_instance_id: Some("frozen-codex".to_owned()),
+            adapter_key: "codex-app-server".to_owned(),
+            runtime_mode: "full-access".to_owned(),
+            status: "sending".to_owned(),
+            last_seen_at: NOW.to_owned(),
+            resume_cursor: Some(json!({"threadId":"frozen-provider-session"})),
+            runtime_payload: None,
+        })
+        .await
+        .expect("persisted frozen runtime");
+    let settings = TempDir::new().expect("settings");
+    std::fs::write(
+        settings.path().join("settings.json"),
+        serde_json::to_vec(&json!({
+            "providerInstances": {
+                "frozen-codex": {
+                    "driver": "codex",
+                    "enabled": true,
+                    "config": {"binaryPath": "frozen-codex-binary"}
+                }
+            }
+        }))
+        .expect("settings json"),
+    )
+    .expect("write settings");
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    let mut row = delivery_row("codex", "frozen-identity-key");
+    row.provider_instance_id = "frozen-codex".to_owned();
+    row.provider_session_id = Some("frozen-provider-session".to_owned());
+    row.payload = json!({
+        "type":"thread.turn.start",
+        "commandId":"frozen-identity-command",
+        "threadId":"t1",
+        "message":{
+            "messageId":"frozen-identity-message",
+            "role":"user",
+            "text":"recover with frozen identity",
+            "attachments":[]
+        },
+        "modelSelection":{"instanceId":"frozen-codex","model":"gpt-5"},
+        "runtimeMode":"full-access",
+        "interactionMode":"default",
+        "createdAt":NOW
+    });
+    let frozen_command = serde_json::from_value::<OrchestrationCommand>(row.payload.clone())
+        .expect("frozen identity command");
+    freeze_delivery_route(
+        &engine,
+        &settings.path().to_path_buf(),
+        &frozen_command,
+        &mut row.payload,
+    )
+    .await
+    .expect("freeze restart route");
+
+    let _outcome =
+        reconcile_orchestration_turn(&supervisor, &engine, &settings.path().to_path_buf(), row)
+            .await;
+    let launches = state.lock().unwrap().launches.clone();
+    assert_eq!(launches.len(), 1);
+    assert_eq!(
+        launches[0].provider_instance_id.as_deref(),
+        Some("frozen-codex")
+    );
+    assert_eq!(launches[0].provider, "codex");
+    assert_eq!(launches[0].binary_path, "frozen-codex-binary");
+    assert_eq!(
+        launches[0].resume_cursor,
+        Some(json!({"threadId":"frozen-provider-session"}))
+    );
+
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn restart_reconciliation_rejects_missing_or_mismatched_frozen_instances_without_lookup() {
+    let engine = engine().await;
+    engine
+        .repositories()
+        .upsert_provider_session_runtime(ProviderSessionRuntime {
+            thread_id: "t1".to_owned(),
+            provider_name: "codex".to_owned(),
+            provider_instance_id: Some("frozen-codex".to_owned()),
+            adapter_key: "codex-app-server".to_owned(),
+            runtime_mode: "full-access".to_owned(),
+            status: "sending".to_owned(),
+            last_seen_at: NOW.to_owned(),
+            resume_cursor: Some(json!({"threadId":"frozen-provider-session"})),
+            runtime_payload: None,
+        })
+        .await
+        .expect("persisted frozen runtime");
+    let settings = TempDir::new().expect("settings");
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::new()),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    let mut row = delivery_row("codex", "missing-frozen-key");
+    row.provider_instance_id = "frozen-codex".to_owned();
+    row.provider_session_id = Some("frozen-provider-session".to_owned());
+
+    let missing = reconcile_orchestration_turn(
+        &supervisor,
+        &engine,
+        &settings.path().to_path_buf(),
+        row.clone(),
+    )
+    .await;
+    assert!(matches!(
+        missing,
+        ProviderReconciliationOutcome::Unavailable { ref detail }
+            if detail.contains("exact instance is unavailable")
+    ));
+    assert!(state.lock().unwrap().launches.is_empty());
+
+    std::fs::write(
+        settings.path().join("settings.json"),
+        serde_json::to_vec(&json!({
+            "providerInstances": {
+                "frozen-codex": {
+                    "driver": "opencode",
+                    "enabled": true,
+                    "config": {"binaryPath": "wrong-driver"}
+                }
+            }
+        }))
+        .expect("settings json"),
+    )
+    .expect("write mismatched settings");
+    let mismatch =
+        reconcile_orchestration_turn(&supervisor, &engine, &settings.path().to_path_buf(), row)
+            .await;
+    assert!(matches!(
+        mismatch,
+        ProviderReconciliationOutcome::Unavailable { ref detail }
+            if detail.contains("provider identity mismatch")
+    ));
+    assert!(state.lock().unwrap().launches.is_empty());
+
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn reconciliation_rejects_an_active_session_with_the_wrong_frozen_identity() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    supervisor
+        .launch(launch())
+        .await
+        .expect("live Codex session");
+    let mut row = delivery_row("codex", "wrong-active-identity-key");
+    row.provider_instance_id = "other-codex".to_owned();
+
+    let settings = TempDir::new().expect("settings");
+    let outcome =
+        reconcile_orchestration_turn(&supervisor, &engine, &settings.path().to_path_buf(), row)
+            .await;
+    assert!(matches!(
+        outcome,
+        ProviderReconciliationOutcome::Unavailable { ref detail }
+            if detail.contains("active provider identity mismatch")
+    ));
+    let state_snapshot = state.lock().unwrap();
+    assert_eq!(
+        state_snapshot.launches.len(),
+        1,
+        "no replacement lookup launch"
+    );
+    assert!(
+        state_snapshot.sends.is_empty(),
+        "reconciliation never sends"
+    );
+    drop(state_snapshot);
+
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn durable_delivery_rejects_an_active_session_with_the_wrong_frozen_identity() {
+    let (engine, database) = engine_and_database().await;
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    supervisor
+        .launch(launch())
+        .await
+        .expect("live Codex session");
+    let mut row = delivery_row("codex", "wrong-active-delivery-key");
+    row.provider_instance_id = "other-codex".to_owned();
+    let command = serde_json::from_value(row.payload.clone()).expect("durable command");
+    seed_sending_delivery(&database, row.clone()).await;
+
+    let settings = TempDir::new().expect("settings");
+    let outcome = deliver_durable_orchestration_turn(
+        &supervisor,
+        &engine,
+        &settings.path().to_path_buf(),
+        command,
+        row.delivery_key,
+    )
+    .await;
+    assert!(matches!(
+        outcome,
+        ProviderDeliveryOutcome::Rejected { ref detail }
+            if detail.contains("active provider identity mismatch")
+    ));
+    assert!(state.lock().unwrap().sends.is_empty());
+
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
+}
+
+async fn assert_opencode_restart_reconciliation(
+    mode: &'static str,
+    expected: ProviderReconciliationOutcome,
+    should_resend: bool,
+) {
+    let prompt_bodies = Arc::new(StdMutex::new(Vec::<Value>::new()));
+    let app = Router::new()
+        .route(
+            "/session/{session_id}",
+            get(|| async { Json(json!({"id":"native-opencode-session"})) }),
+        )
+        .route(
+            "/event",
+            get(|| async { Sse::new(stream::pending::<Result<Event, Infallible>>()) }),
+        )
+        .route(
+            "/session/{session_id}/prompt_async",
+            post({
+                let prompt_bodies = prompt_bodies.clone();
+                move |Json(body): Json<Value>| {
+                    let prompt_bodies = prompt_bodies.clone();
+                    async move {
+                        prompt_bodies.lock().unwrap().push(body);
+                        StatusCode::NO_CONTENT
+                    }
+                }
+            }),
+        )
+        .route(
+            "/session/{session_id}/message",
+            get(|| async { Json(json!({"data":[]})) }),
+        )
+        .route(
+            "/session/{session_id}/message/{message_id}",
+            get(
+                move |AxumPath((session_id, message_id)): AxumPath<(String, String)>| async move {
+                    match mode {
+                        "found" => (
+                            StatusCode::OK,
+                            Json(json!({
+                                "info":{
+                                    "id":message_id,
+                                    "sessionID":session_id,
+                                    "role":"user"
+                                },
+                                "parts":[]
+                            })),
+                        )
+                            .into_response(),
+                        "absent" => StatusCode::NOT_FOUND.into_response(),
+                        _ => (StatusCode::OK, Json(json!({}))).into_response(),
+                    }
+                },
+            ),
+        );
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("OpenCode fixture bind");
+    let endpoint = format!("http://{}", listener.local_addr().expect("fixture address"));
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app)
+            .await
+            .expect("OpenCode fixture serve");
+    });
+    let (engine, _) = engine_and_database().await;
+    let temp = TempDir::new().expect("OpenCode fixture directory");
+    let launches = Arc::new(StdMutex::new(Vec::new()));
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(NativeFixtureFactory {
+            inner: NativeProviderDriverFactory::new(temp.path().join("attachments")),
+            binary_path: None,
+            endpoint: Some(endpoint.clone()),
+            cwd: Some(temp.path().to_path_buf()),
+            environment: Vec::new(),
+            launches: launches.clone(),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    ));
+    let settings = TempDir::new().expect("settings");
+    std::fs::write(
+        settings.path().join("settings.json"),
+        serde_json::to_vec(&json!({
+            "providerInstances": {
+                "frozen-opencode": {
+                    "driver": "opencode",
+                    "enabled": true,
+                    "config": {"binaryPath": "frozen-opencode-binary", "serverUrl": endpoint}
+                }
+            }
+        }))
+        .expect("settings json"),
+    )
+    .expect("write settings");
+    let (row, original_supervisor) = admit_and_freeze_sending_delivery(
+        &engine,
+        &settings,
+        "opencode",
+        "frozen-opencode",
+        "native-opencode-session",
+        "stable-opencode-key",
+    )
+    .await;
+
+    let delivery = if mode == "unavailable" {
+        let outcome = reconcile_orchestration_turn(
+            &supervisor,
+            &engine,
+            &settings.path().to_path_buf(),
+            row.clone(),
+        )
+        .await;
+        assert_eq!(outcome, expected);
+        None
+    } else {
+        let delivery = TurnDeliveryService::start(
+            engine.clone(),
+            supervisor.clone(),
+            settings.path().to_path_buf(),
+        );
+        timeout(Duration::from_secs(10), async {
+            loop {
+                let persisted = engine
+                    .repositories()
+                    .get_provider_turn_delivery(row.command_id.clone())
+                    .await
+                    .expect("delivery row")
+                    .expect("persisted delivery");
+                if persisted.state == TurnDeliveryState::Delivered {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("durable dispatcher completes OpenCode recovery");
+        Some(delivery)
+    };
+    assert_eq!(
+        launches.lock().unwrap()[0].resume_cursor,
+        Some(json!({"sessionId":"native-opencode-session"}))
+    );
+    assert_eq!(
+        launches.lock().unwrap()[0].provider_instance_id.as_deref(),
+        Some("frozen-opencode")
+    );
+    assert_eq!(
+        prompt_bodies.lock().unwrap().len(),
+        usize::from(should_resend),
+        "Found prevents resend; Absent permits one resend"
+    );
+
+    if should_resend {
+        assert_eq!(
+            prompt_bodies.lock().unwrap()[0]["messageID"],
+            row.delivery_key
+        );
+    }
+
+    if let Some(delivery) = delivery {
+        delivery.shutdown().await;
+    }
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    original_supervisor
+        .shutdown()
+        .await
+        .expect("original supervisor shutdown");
+    engine.shutdown().await;
+    server.abort();
+}
+
+#[tokio::test]
+async fn durable_opencode_restart_reconciliation_uses_real_adapter_and_exact_key() {
+    assert_opencode_restart_reconciliation("found", ProviderReconciliationOutcome::Found, false)
+        .await;
+    assert_opencode_restart_reconciliation("absent", ProviderReconciliationOutcome::Absent, true)
+        .await;
+    assert_opencode_restart_reconciliation(
+        "unavailable",
+        ProviderReconciliationOutcome::Unavailable {
+            detail: "OpenCode response was invalid: message lookup response missing info"
+                .to_owned(),
+        },
+        false,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn durable_delivery_classifies_launch_failure_as_definitely_not_sent() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState {
+        start_results: VecDeque::from([Err(ProviderRuntimeError::Spawn {
+            provider: "codex".to_owned(),
+            detail: "fixture launch failed".to_owned(),
+        })]),
+        ..DriverState::default()
+    }));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    let settings = TempDir::new().expect("settings");
+
+    let outcome = deliver_orchestration_turn(
+        &supervisor,
+        &engine,
+        &settings.path().to_path_buf(),
+        durable_turn_command("launch-failure", "hello"),
+        "launch-failure-key".to_owned(),
+    )
+    .await;
+    assert!(matches!(
+        outcome,
+        ProviderDeliveryOutcome::DefinitelyNotSent { detail }
+            if detail.contains("fixture launch failed")
+    ));
+    let state = state.lock().unwrap();
+    assert_eq!(state.starts, 1);
+    assert!(state.sends.is_empty());
+    assert_eq!(state.launches[0].thread_id, "t1");
+    assert_eq!(state.launches[0].provider, "codex");
+    drop(state);
+
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn admitted_turn_freezes_native_session_before_provider_delivery_begins() {
+    let (engine, _) = engine_and_database().await;
+    let delivery_entered = Arc::new(tokio::sync::Notify::new());
+    let delivery_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let state = Arc::new(StdMutex::new(DriverState {
+        start_results: VecDeque::from([Ok(StartedSession {
+            resume_cursor: Some(json!({"threadId":"native-admitted-session"})),
+            runtime_payload: None,
+            activity_capabilities: ActivityCapabilities::none(),
+        })]),
+        delivery_entered: Some(delivery_entered.clone()),
+        delivery_release: Some(delivery_release.clone()),
+        ..DriverState::default()
+    }));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    ));
+    supervisor.launch(launch()).await.expect("provider launch");
+
+    let settings = TempDir::new().expect("settings");
+    let delivery = Arc::new(TurnDeliveryService::start(
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+    ));
+    let mut registry = RpcRegistry::empty();
+    register_orchestration_rpc_with_delivery(
+        &mut registry,
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+        delivery.clone(),
+    );
+    let handle = ServerRuntime::start_with_registry(test_config(&settings), registry)
+        .await
+        .expect("server runtime");
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("websocket");
+    rpc_request(
+        &mut socket,
+        "805",
+        serde_json::to_value(durable_turn_command("freeze-before-delivery", "hello"))
+            .expect("turn command json"),
+    )
+    .await;
+    rpc_response(&mut socket, "805")
+        .await
+        .expect("turn admission response");
+    let admitted = engine
+        .repositories()
+        .get_provider_turn_delivery("freeze-before-delivery".to_owned())
+        .await
+        .expect("admitted row")
+        .expect("outbox row");
+    if admitted.state == TurnDeliveryState::Pending {
+        assert_eq!(admitted.provider_session_id, None);
+    }
+
+    timeout(Duration::from_secs(10), delivery_entered.notified())
+        .await
+        .expect("provider delivery entered");
+    let frozen = engine
+        .repositories()
+        .get_provider_turn_delivery("freeze-before-delivery".to_owned())
+        .await
+        .expect("frozen row")
+        .expect("outbox row");
+    assert_eq!(frozen.state, TurnDeliveryState::Sending);
+    assert_eq!(frozen.attempts, 1);
+    assert_eq!(
+        frozen.provider_session_id.as_deref(),
+        Some("native-admitted-session"),
+        "the native identity must be durable before driver.deliver is entered"
+    );
+
+    delivery_release.add_permits(1);
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let row = engine
+                .repositories()
+                .get_provider_turn_delivery("freeze-before-delivery".to_owned())
+                .await
+                .expect("delivery row")
+                .expect("outbox row");
+            if row.state == TurnDeliveryState::Delivered {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("admitted turn completes");
+    assert_eq!(state.lock().unwrap().sends, vec!["hello"]);
+
+    socket.close(None).await.expect("websocket close");
+    handle.shutdown();
+    handle.join().await.expect("server shutdown");
+    delivery.shutdown().await;
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn durable_delivery_preserves_post_admission_transport_as_ambiguous() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState {
+        delivery_outcomes: VecDeque::from([ProviderDeliveryOutcome::Ambiguous {
+            detail: "connection closed after request write".to_owned(),
+        }]),
+        ..DriverState::default()
+    }));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    supervisor.launch(launch()).await.expect("provider launch");
+    let settings = TempDir::new().expect("settings");
+
+    let outcome = deliver_orchestration_turn(
+        &supervisor,
+        &engine,
+        &settings.path().to_path_buf(),
+        durable_turn_command("ambiguous", "hello"),
+        "ambiguous-key".to_owned(),
+    )
+    .await;
+    assert_eq!(
+        outcome,
+        ProviderDeliveryOutcome::Ambiguous {
+            detail: "connection closed after request write".to_owned()
+        }
+    );
+    assert!(state.lock().unwrap().sends.is_empty());
+
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn registered_dispatch_rpc_prepares_attachments_before_persistence_and_provider_routing() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (_events_tx, events_rx) = mpsc::channel(8);
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    ));
+    supervisor.launch(launch()).await.unwrap();
+
+    let settings = TempDir::new().unwrap();
+    let mut registry = RpcRegistry::empty();
+    let delivery = Arc::new(TurnDeliveryService::start(
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+    ));
+    register_orchestration_rpc_with_delivery(
+        &mut registry,
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+        delivery.clone(),
+    );
+    let handle = ServerRuntime::start_with_registry(test_config(&settings), registry)
+        .await
+        .unwrap();
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .unwrap();
+
+    rpc_request(
+        &mut socket,
+        "801",
+        json!({
+            "type":"thread.turn.start", "commandId":"rpc-upload", "threadId":"t1",
+            "message":{
+                "messageId":"message-upload", "role":"user", "text":"review", "attachments":[{
+                    "type":"file", "id":"notes-1", "name":"notes.txt", "mimeType":"text/plain",
+                    "sizeBytes":5, "dataUrl":"data:text/plain;base64,bm90ZXM="
+                }]
+            },
+            "createdAt":NOW
+        }),
+    )
+    .await;
+    rpc_response(&mut socket, "801")
+        .await
+        .expect("registered attachment RPC succeeds");
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let row = engine
+                .repositories()
+                .get_provider_turn_delivery("rpc-upload".to_owned())
+                .await
+                .expect("delivery row")
+                .expect("outbox row");
+            if row.state == TurnDeliveryState::Delivered {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("attachment delivery completes");
+
+    let safe_attachments = json!([{
+        "type":"file", "id":"notes-1", "name":"notes.txt", "mimeType":"text/plain", "sizeBytes":5
+    }]);
+    let events = engine.read_events(0).await.unwrap();
+    let message_event = events
+        .iter()
+        .find(|event| {
+            event.event.command_id.as_deref() == Some("rpc-upload")
+                && event.event.event_type == "thread.message-sent"
+        })
+        .expect("message event persists");
+    assert_eq!(message_event.event.payload["attachments"], safe_attachments);
+    assert!(
+        message_event.event.payload["attachments"][0]
+            .get("dataUrl")
+            .is_none()
+    );
+    assert_eq!(
+        state.lock().unwrap().sent_attachments,
+        [safe_attachments.as_array().unwrap().clone()]
+    );
+    assert_eq!(
+        std::fs::read(settings.path().join("attachments/notes-1")).unwrap(),
+        b"notes"
+    );
+    let attachment_root = settings.path().join("attachments");
+    let parked_attachment_root = settings.path().join("attachments-parked");
+    std::fs::rename(&attachment_root, &parked_attachment_root).unwrap();
+    std::fs::write(&attachment_root, b"not a directory").unwrap();
+    let sends_before_replay = state.lock().unwrap().sends.len();
+    rpc_request(
+        &mut socket,
+        "805",
+        json!({
+            "type":"thread.turn.start", "commandId":"rpc-upload", "threadId":"t1",
+            "message":{
+                "messageId":"message-upload", "role":"user", "text":"review", "attachments":[{
+                    "type":"file", "id":"notes-1", "name":"notes.txt", "mimeType":"text/plain",
+                    "sizeBytes":5, "dataUrl":"data:text/plain;base64,bm90ZXM="
+                }]
+            },
+            "createdAt":NOW
+        }),
+    )
+    .await;
+    rpc_response(&mut socket, "805")
+        .await
+        .expect("registered replay bypasses attachment materialization");
+    assert_eq!(
+        state.lock().unwrap().sends.len(),
+        sends_before_replay,
+        "a replay cannot enqueue or route a second provider turn"
+    );
+    std::fs::remove_file(&attachment_root).unwrap();
+    std::fs::rename(&parked_attachment_root, &attachment_root).unwrap();
+    let sends_before_failure = state.lock().unwrap().sends.len();
+
+    rpc_request(
+        &mut socket,
+        "802",
+        json!({
+            "type":"thread.turn.start", "commandId":"rpc-upload-invalid", "threadId":"t1",
+            "message":{
+                "messageId":"message-upload-invalid", "role":"user", "text":"review", "attachments":[{
+                    "type":"file", "id":"notes-2", "name":"notes.txt", "mimeType":"text/plain",
+                    "sizeBytes":5, "dataUrl":"data:text/plain,notes"
+                }]
+            },
+            "createdAt":NOW
+        }),
+    )
+    .await;
+    let cause = rpc_response(&mut socket, "802")
+        .await
+        .expect_err("malformed upload fails through the registered RPC");
+    assert_eq!(cause[0]["_tag"], "Fail");
+    assert_eq!(cause[0]["error"]["_tag"], "InvalidRequest");
+    assert_eq!(cause[0]["error"]["method"], "orchestration.dispatchCommand");
+    assert!(
+        cause[0]["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("base64"))
+    );
+    let events = engine.read_events(0).await.unwrap();
+    assert!(
+        events
+            .iter()
+            .all(|event| event.event.command_id.as_deref() != Some("rpc-upload-invalid")),
+        "a rejected command id cannot persist any event"
+    );
+    assert_eq!(state.lock().unwrap().sends.len(), sends_before_failure);
+
+    rpc_request(
+        &mut socket,
+        "803",
+        json!({
+            "type":"thread.turn.start", "commandId":"rpc-upload-missing-thread", "threadId":"missing-thread",
+            "message":{
+                "messageId":"message-upload-missing-thread", "role":"user", "text":"review", "attachments":[{
+                    "type":"file", "id":"missing-thread-upload", "name":"notes.txt", "mimeType":"text/plain",
+                    "sizeBytes":5, "dataUrl":"data:text/plain;base64,bm90ZXM="
+                }]
+            },
+            "createdAt":NOW
+        }),
+    )
+    .await;
+    rpc_response(&mut socket, "803")
+        .await
+        .expect_err("a nonexistent thread rejects after attachment preparation");
+    assert!(
+        !settings
+            .path()
+            .join("attachments/missing-thread-upload")
+            .exists(),
+        "dispatch rejection rolls back the prepared final"
+    );
+    assert!(
+        engine
+            .read_events(0)
+            .await
+            .unwrap()
+            .iter()
+            .all(|event| event.event.command_id.as_deref() != Some("rpc-upload-missing-thread")),
+        "dispatch rejection cannot persist an event"
+    );
+
+    socket.close(None).await.unwrap();
+    handle.shutdown();
+    handle.join().await.unwrap();
+    delivery.shutdown().await;
+    supervisor.shutdown().await.unwrap();
+    engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn registered_durable_rpc_wakes_delivery_before_a_cancelled_response_returns() {
+    let hooks = TestHooks::default();
+    let pause = hooks.pause_after_next_admission_commit();
+    let (engine, _) = engine_and_database_with_options(EngineOptions {
+        test_hooks: hooks,
+        ..EngineOptions::default()
+    })
+    .await;
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (_events_tx, events_rx) = mpsc::channel(8);
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    ));
+    supervisor.launch(launch()).await.unwrap();
+    let settings = TempDir::new().unwrap();
+    let delivery = Arc::new(TurnDeliveryService::start(
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+    ));
+    let mut registry = RpcRegistry::empty();
+    register_orchestration_rpc_with_delivery(
+        &mut registry,
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+        delivery.clone(),
+    );
+    let handle = ServerRuntime::start_with_registry(test_config(&settings), registry)
+        .await
+        .unwrap();
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .unwrap();
+
+    rpc_request(
+        &mut socket,
+        "804",
+        json!({
+            "type":"thread.turn.start", "commandId":"rpc-cancel-after-commit", "threadId":"t1",
+            "message":{"messageId":"message-cancel", "role":"user", "text":"wake", "attachments":[]},
+            "createdAt":NOW
+        }),
+    )
+    .await;
+    timeout(Duration::from_secs(10), pause.wait_until_entered())
+        .await
+        .expect("engine pauses after the durable commit callback");
+    drop(socket);
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if state
+                .lock()
+                .unwrap()
+                .sends
+                .iter()
+                .any(|message| message == "wake")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("commit callback wakes delivery before the cancelled RPC can return");
+    assert_eq!(
+        engine
+            .repositories()
+            .get_provider_turn_delivery("rpc-cancel-after-commit".to_owned())
+            .await
+            .expect("delivery row")
+            .expect("durable delivery")
+            .state,
+        bibcode_server::orchestration::TurnDeliveryState::Sending,
+        "provider routing started while the engine response remained paused"
+    );
+
+    pause.release();
+    handle.shutdown();
+    handle.join().await.unwrap();
+    delivery.shutdown().await;
+    supervisor.shutdown().await.unwrap();
+    engine.shutdown().await;
+}
+
+async fn add_delivery_thread(engine: &OrchestrationEngine, thread_id: &str) {
+    add_delivery_thread_for(engine, thread_id, "codex", "gpt-5").await;
+}
+
+async fn add_delivery_thread_for(
+    engine: &OrchestrationEngine,
+    thread_id: &str,
+    provider: &str,
+    model: &str,
+) {
+    engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.create", "commandId":format!("create-{thread_id}"),
+                "threadId":thread_id, "projectId":"p1", "title":thread_id,
+                "modelSelection":{"instanceId":provider,"model":model},
+                "runtimeMode":"full-access", "interactionMode":"default",
+                "branch":null, "worktreePath":null, "createdAt":NOW
+            }))
+            .expect("thread command"),
+        )
+        .await
+        .expect("delivery thread");
+}
+
+fn launch_for_thread(thread_id: &str) -> ProviderLaunchRequest {
+    ProviderLaunchRequest {
+        thread_id: thread_id.to_owned(),
+        ..launch()
+    }
+}
+
+fn launch_for_provider(thread_id: &str, provider: &str, model: &str) -> ProviderLaunchRequest {
+    let mut request = launch();
+    request.thread_id = thread_id.to_owned();
+    request.provider = provider.to_owned();
+    request.provider_label = provider.to_owned();
+    request.provider_instance_id = Some(provider.to_owned());
+    request.binary_path = match provider {
+        "claudeAgent" => "claude",
+        "cursor" => "cursor-agent",
+        other => other,
+    }
+    .to_owned();
+    request.model = Some(model.to_owned());
+    if provider != "codex" {
+        request.codex_home = None;
+    }
+    request
+}
+
+fn rpc_turn(thread_id: &str, command_id: &str, text: &str) -> Value {
+    json!({
+        "type":"thread.turn.start", "commandId":command_id, "threadId":thread_id,
+        "message":{
+            "messageId":format!("message-{command_id}"), "role":"user", "text":text,
+            "attachments":[]
+        },
+        "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+        "runtimeMode":"full-access", "interactionMode":"default", "createdAt":NOW
+    })
+}
+
+async fn wait_for_delivery_state_for_command(
+    engine: &OrchestrationEngine,
+    command_id: &str,
+    expected: TurnDeliveryState,
+) {
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let row = engine
+                .repositories()
+                .get_provider_turn_delivery(command_id.to_owned())
+                .await
+                .expect("delivery query")
+                .expect("delivery row");
+            if row.state == expected {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("{command_id} did not reach {expected:?}"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn delivery_service_orders_each_thread_without_blocking_another_thread() {
+    let hooks = TestHooks::default();
+    let (engine, database) = engine_and_database_with_options(EngineOptions {
+        test_hooks: hooks.clone(),
+        ..EngineOptions::default()
+    })
+    .await;
+    database
+        .call(|connection| {
+            connection.execute_batch(
+                "CREATE TRIGGER test_block_order_a1_terminal
+                 BEFORE UPDATE OF state ON provider_turn_outbox
+                 WHEN OLD.command_id = 'order-a1'
+                   AND OLD.state = 'sending'
+                   AND NEW.state = 'delivered'
+                 BEGIN
+                   SELECT RAISE(ABORT, 'test holds order-a1 nonterminal');
+                 END;
+
+                 CREATE TABLE test_delivery_order_observations (
+                   a2_claimed_while_a1_nonterminal INTEGER NOT NULL
+                 );
+                 CREATE TRIGGER test_observe_order_a2_claim
+                 AFTER UPDATE OF state ON provider_turn_outbox
+                 WHEN OLD.command_id = 'order-a2'
+                   AND OLD.state = 'pending'
+                   AND NEW.state = 'sending'
+                 BEGIN
+                   INSERT INTO test_delivery_order_observations
+                     (a2_claimed_while_a1_nonterminal)
+                   SELECT 1
+                   WHERE EXISTS (
+                     SELECT 1
+                     FROM provider_turn_outbox
+                     WHERE command_id = 'order-a1'
+                       AND state NOT IN ('delivered', 'dismissed')
+                   );
+                 END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("install A1 terminal transition gate");
+    add_delivery_thread(&engine, "t2").await;
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let state = Arc::new(StdMutex::new(DriverState {
+        delivery_release: Some(release.clone()),
+        ..DriverState::default()
+    }));
+    let mut receivers = VecDeque::new();
+    for _ in 0..2 {
+        let (_events_tx, events_rx) = mpsc::channel(1);
+        receivers.push_back(events_rx);
+    }
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(receivers),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    ));
+    for thread_id in ["t1", "t2"] {
+        supervisor
+            .launch(launch_for_thread(thread_id))
+            .await
+            .expect("provider launch");
+    }
+    let settings = TempDir::new().expect("settings");
+    let delivery = Arc::new(TurnDeliveryService::start(
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+    ));
+    let mut registry = RpcRegistry::empty();
+    register_orchestration_rpc_with_delivery(
+        &mut registry,
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+        delivery.clone(),
+    );
+    let runtime = ServerRuntime::start_with_registry(test_config(&settings), registry)
+        .await
+        .expect("delivery runtime");
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", runtime.local_addr()))
+        .await
+        .expect("delivery websocket");
+    for (request_id, thread_id, command_id, text) in [
+        ("901", "t1", "order-a1", "A1"),
+        ("902", "t1", "order-a2", "A2"),
+        ("903", "t2", "order-b1", "B1"),
+    ] {
+        rpc_request(
+            &mut socket,
+            request_id,
+            rpc_turn(thread_id, command_id, text),
+        )
+        .await;
+        rpc_response(&mut socket, request_id)
+            .await
+            .expect("turn admission");
+    }
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let snapshot = state.lock().unwrap().delivery_started.clone();
+            if snapshot.contains(&"A1".to_owned()) && snapshot.contains(&"B1".to_owned()) {
+                assert!(!snapshot.contains(&"A2".to_owned()));
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("A1 and B1 start concurrently");
+
+    release.add_permits(2);
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let transition_attempts = hooks.delivery_transition_attempts();
+            if transition_attempts >= 4 {
+                let a1 = engine
+                    .repositories()
+                    .get_provider_turn_delivery("order-a1".to_owned())
+                    .await
+                    .expect("A1 blocked delivery query")
+                    .expect("A1 blocked delivery row");
+                let b1 = engine
+                    .repositories()
+                    .get_provider_turn_delivery("order-b1".to_owned())
+                    .await
+                    .expect("B1 delivery query")
+                    .expect("B1 delivery row");
+                if a1.state == TurnDeliveryState::Sending
+                    && matches!(
+                        b1.state,
+                        TurnDeliveryState::Delivered | TurnDeliveryState::Dismissed
+                    )
+                {
+                    assert!(
+                        !state
+                            .lock()
+                            .unwrap()
+                            .delivery_started
+                            .contains(&"A2".to_owned()),
+                        "A2 entered while A1's terminal transition was retryable"
+                    );
+                    break;
+                }
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("B1 settles while A1 retries its blocked terminal transition");
+
+    database
+        .call(|connection| {
+            connection.execute_batch("DROP TRIGGER test_block_order_a1_terminal;")?;
+            Ok(())
+        })
+        .await
+        .expect("release A1 terminal transition gate");
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if state
+                .lock()
+                .unwrap()
+                .delivery_started
+                .contains(&"A2".to_owned())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("A2 starts after A1 settles");
+    let (a1_state, early_a2_claims) = database
+        .call(|connection| {
+            let a1_state = connection.query_row(
+                "SELECT state FROM provider_turn_outbox WHERE command_id = 'order-a1'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?;
+            let early_a2_claims = connection.query_row(
+                "SELECT COUNT(*) FROM test_delivery_order_observations",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?;
+            connection.execute_batch(
+                "DROP TRIGGER test_observe_order_a2_claim;
+                 DROP TABLE test_delivery_order_observations;",
+            )?;
+            Ok((a1_state, early_a2_claims))
+        })
+        .await
+        .expect("read persisted delivery-order observation");
+    assert_eq!(
+        early_a2_claims, 0,
+        "A2 was claimed while A1 was still nonterminal"
+    );
+    assert!(
+        matches!(a1_state.as_str(), "delivered" | "dismissed"),
+        "A2 entered while A1 was still {a1_state}"
+    );
+    release.add_permits(1);
+
+    socket.close(None).await.expect("websocket close");
+    runtime.shutdown();
+    runtime.join().await.expect("runtime shutdown");
+    delivery.shutdown().await;
+    supervisor.shutdown().await.expect("provider shutdown");
+    engine.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn delivery_service_never_exceeds_its_configured_four_thread_semaphore() {
+    let engine = engine().await;
+    for thread_id in [
+        "capacity-thread-2",
+        "capacity-thread-3",
+        "capacity-thread-4",
+        "capacity-thread-5",
+    ] {
+        add_delivery_thread(&engine, thread_id).await;
+    }
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let state = Arc::new(StdMutex::new(DriverState {
+        delivery_release: Some(release.clone()),
+        ..DriverState::default()
+    }));
+    let mut receivers = VecDeque::new();
+    for _ in 0..5 {
+        let (_events_tx, events_rx) = mpsc::channel(1);
+        receivers.push_back(events_rx);
+    }
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(receivers),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    ));
+    for thread_id in [
+        "t1",
+        "capacity-thread-2",
+        "capacity-thread-3",
+        "capacity-thread-4",
+        "capacity-thread-5",
+    ] {
+        supervisor
+            .launch(launch_for_thread(thread_id))
+            .await
+            .expect("provider launch");
+    }
+    let settings = TempDir::new().expect("settings");
+    let delivery = Arc::new(TurnDeliveryService::start(
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+    ));
+    let mut registry = RpcRegistry::empty();
+    register_orchestration_rpc_with_delivery(
+        &mut registry,
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+        delivery.clone(),
+    );
+    let runtime = ServerRuntime::start_with_registry(test_config(&settings), registry)
+        .await
+        .expect("delivery runtime");
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", runtime.local_addr()))
+        .await
+        .expect("delivery websocket");
+    for (index, thread_id) in [
+        "t1",
+        "capacity-thread-2",
+        "capacity-thread-3",
+        "capacity-thread-4",
+        "capacity-thread-5",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let request_id = (920 + index).to_string();
+        let command_id = format!("capacity-{index}");
+        let text = format!("capacity-{index}");
+        rpc_request(
+            &mut socket,
+            &request_id,
+            rpc_turn(thread_id, &command_id, &text),
+        )
+        .await;
+        rpc_response(&mut socket, &request_id)
+            .await
+            .expect("turn admission");
+    }
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let state = state.lock().unwrap();
+            if state.delivery_active == 4 {
+                assert_eq!(state.delivery_started.len(), 4);
+                assert_eq!(state.delivery_max_active, 4);
+                break;
+            }
+            drop(state);
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("four deliveries fill the semaphore");
+    release.add_permits(4);
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if state.lock().unwrap().delivery_started.len() == 5 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("fifth delivery starts after a permit returns");
+    release.add_permits(1);
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if state.lock().unwrap().delivery_active == 0 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("all deliveries finish");
+    assert_eq!(state.lock().unwrap().delivery_max_active, 4);
+
+    socket.close(None).await.expect("websocket close");
+    runtime.shutdown();
+    runtime.join().await.expect("runtime shutdown");
+    delivery.shutdown().await;
+    supervisor.shutdown().await.expect("provider shutdown");
+    engine.shutdown().await;
+}
+
+fn mixed_attachment_rpc_turn(
+    thread_id: &str,
+    command_id: &str,
+    provider: &str,
+    model: &str,
+) -> Value {
+    json!({
+        "type":"thread.turn.start", "commandId":command_id, "threadId":thread_id,
+        "message":{
+            "messageId":format!("message-{command_id}"), "role":"user",
+            "text":format!("send-{provider}"),
+            "attachments":[
+                {
+                    "type":"file", "id":format!("{provider}-file"), "name":"notes.txt",
+                    "mimeType":"text/plain", "sizeBytes":5,
+                    "dataUrl":"data:text/plain;base64,bm90ZXM="
+                },
+                {
+                    "type":"image", "id":format!("{provider}-image"), "name":"screen.png",
+                    "mimeType":"image/png", "sizeBytes":5,
+                    "dataUrl":"data:image/png;base64,aW1hZ2U="
+                }
+            ]
+        },
+        "modelSelection":{"instanceId":provider,"model":model},
+        "runtimeMode":"full-access", "interactionMode":"default", "createdAt":NOW
+    })
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 6)]
+async fn registered_dispatch_rpc_proves_one_mixed_attachment_delivery_for_every_provider() {
+    let hooks = TestHooks::default();
+    let (engine, _) = engine_and_database_with_options(EngineOptions {
+        test_hooks: hooks.clone(),
+        ..EngineOptions::default()
+    })
+    .await;
+    let providers = [
+        ("t1", "rpc-mixed-codex", "codex", "gpt-5"),
+        (
+            "mixed-claude",
+            "rpc-mixed-claude",
+            "claudeAgent",
+            "claude-sonnet-4-5",
+        ),
+        (
+            "mixed-opencode",
+            "rpc-mixed-opencode",
+            "opencode",
+            "openai/gpt-5",
+        ),
+        (
+            "mixed-cursor",
+            "rpc-mixed-cursor",
+            "cursor",
+            "cursor-default",
+        ),
+    ];
+    for (thread_id, _, provider, model) in providers.iter().skip(1).copied() {
+        add_delivery_thread_for(&engine, thread_id, provider, model).await;
+    }
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let mut receivers = VecDeque::new();
+    for _ in 0..providers.len() {
+        let (_events_tx, events_rx) = mpsc::channel(1);
+        receivers.push_back(events_rx);
+    }
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(receivers),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    ));
+    for (thread_id, _, provider, model) in providers {
+        supervisor
+            .launch(launch_for_provider(thread_id, provider, model))
+            .await
+            .expect("provider launch");
+    }
+    let settings = TempDir::new().expect("settings");
+    std::fs::write(
+        settings.path().join("settings.json"),
+        serde_json::to_vec(&json!({
+            "providerInstances": {
+                "cursor": {
+                    "driver": "cursor",
+                    "enabled": true,
+                    "config": {"binaryPath": "cursor-agent"}
+                }
+            }
+        }))
+        .expect("mixed provider settings"),
+    )
+    .expect("write mixed provider settings");
+    let delivery = Arc::new(TurnDeliveryService::start(
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+    ));
+    let mut registry = RpcRegistry::empty();
+    register_orchestration_rpc_with_delivery(
+        &mut registry,
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+        delivery.clone(),
+    );
+    let runtime = ServerRuntime::start_with_registry(test_config(&settings), registry)
+        .await
+        .expect("delivery runtime");
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", runtime.local_addr()))
+        .await
+        .expect("delivery websocket");
+
+    let replay_payload = mixed_attachment_rpc_turn("t1", "rpc-mixed-codex", "codex", "gpt-5");
+    for (index, (thread_id, command_id, provider, model)) in
+        providers.into_iter().take(3).enumerate()
+    {
+        let request_id = (950 + index).to_string();
+        rpc_request(
+            &mut socket,
+            &request_id,
+            mixed_attachment_rpc_turn(thread_id, command_id, provider, model),
+        )
+        .await;
+        rpc_response(&mut socket, &request_id)
+            .await
+            .expect("mixed attachment admission");
+        wait_for_delivery_state_for_command(&engine, command_id, TurnDeliveryState::Delivered)
+            .await;
+    }
+
+    let cancellation_pause = hooks.pause_after_next_admission_commit();
+    rpc_request(
+        &mut socket,
+        "953",
+        mixed_attachment_rpc_turn(
+            "mixed-cursor",
+            "rpc-mixed-cursor",
+            "cursor",
+            "cursor-default",
+        ),
+    )
+    .await;
+    timeout(
+        Duration::from_secs(10),
+        cancellation_pause.wait_until_entered(),
+    )
+    .await
+    .expect("cursor command commits before cancellation");
+    drop(socket);
+    timeout(Duration::from_secs(10), async {
+        loop {
+            if state
+                .lock()
+                .unwrap()
+                .sends
+                .contains(&"send-cursor".to_owned())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("cancelled caller cannot cancel committed provider delivery");
+    cancellation_pause.release();
+    wait_for_delivery_state_for_command(&engine, "rpc-mixed-cursor", TurnDeliveryState::Delivered)
+        .await;
+
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", runtime.local_addr()))
+        .await
+        .expect("replay websocket");
+    rpc_request(&mut socket, "954", replay_payload).await;
+    rpc_response(&mut socket, "954")
+        .await
+        .expect("identical command replay");
+
+    let snapshot = state.lock().unwrap();
+    assert_eq!(snapshot.sends.len(), 4);
+    assert_eq!(
+        snapshot.delivery_routes,
+        vec![
+            (
+                "codex".to_owned(),
+                Some("codex".to_owned()),
+                "send-codex".to_owned(),
+            ),
+            (
+                "claudeAgent".to_owned(),
+                Some("claudeAgent".to_owned()),
+                "send-claudeAgent".to_owned(),
+            ),
+            (
+                "opencode".to_owned(),
+                Some("opencode".to_owned()),
+                "send-opencode".to_owned(),
+            ),
+            (
+                "cursor".to_owned(),
+                Some("cursor".to_owned()),
+                "send-cursor".to_owned(),
+            ),
+        ],
+        "each command must reach the selected provider driver instance"
+    );
+    for provider in ["codex", "claudeAgent", "opencode", "cursor"] {
+        assert_eq!(
+            snapshot
+                .sends
+                .iter()
+                .filter(|text| text.as_str() == format!("send-{provider}"))
+                .count(),
+            1,
+            "{provider} receives one provider submission"
+        );
+    }
+    assert_eq!(snapshot.sent_attachments.len(), 4);
+    assert!(snapshot.sent_attachments.iter().all(|attachments| {
+        attachments.len() == 2
+            && attachments
+                .iter()
+                .all(|attachment| attachment.get("dataUrl").is_none())
+    }));
+    drop(snapshot);
+    let outbox_rows = engine
+        .repositories()
+        .database()
+        .call(|connection| {
+            Ok(connection.query_row(
+                "SELECT COUNT(*) FROM provider_turn_outbox WHERE command_id IN ('rpc-mixed-codex', 'rpc-mixed-claude', 'rpc-mixed-opencode', 'rpc-mixed-cursor')",
+                [],
+                |row| row.get::<_, i64>(0),
+            )?)
+        })
+        .await
+        .expect("outbox count");
+    assert_eq!(outbox_rows, 4);
+    for (_, command_id, provider, _) in providers {
+        let row = engine
+            .repositories()
+            .get_provider_turn_delivery(command_id.to_owned())
+            .await
+            .expect("delivery row")
+            .expect("one outbox row");
+        assert_eq!(row.provider_kind, provider);
+        assert_eq!(row.state, TurnDeliveryState::Delivered);
+    }
+
+    socket.close(None).await.expect("websocket close");
+    runtime.shutdown();
+    runtime.join().await.expect("runtime shutdown");
+    delivery.shutdown().await;
+    supervisor.shutdown().await.expect("provider shutdown");
+    engine.shutdown().await;
+}
+
 #[tokio::test]
 async fn routes_orchestration_commands_and_persists_resume_state() {
     let engine = engine().await;
@@ -797,7 +3799,7 @@ async fn routes_orchestration_commands_and_persists_resume_state() {
         .unwrap();
     assert_eq!(
         persisted.resume_cursor,
-        Some(json!({ "sessionId": "provider-session-1" }))
+        Some(json!({ "threadId": "provider-session-1" }))
     );
     assert_eq!(persisted.status, "ready");
     {
@@ -1061,6 +4063,183 @@ async fn activity_only_provider_events_project_graph_mutations_without_root_payl
     assert!(root.proposed_plans.is_empty());
 
     supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn mcp_complete_snapshots_project_in_order_for_the_selected_provider_instance() {
+    let (engine, database) = engine_and_database().await;
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (events_tx, events_rx) = mpsc::channel(4);
+    let factory = Arc::new(FakeFactory {
+        state,
+        events: StdMutex::new(VecDeque::from([events_rx])),
+    });
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        factory,
+        ActivityProjection::new(ActivityRepository::new(database)),
+        SupervisorOptions::default(),
+    );
+    let mut request = launch();
+    request.provider_instance_id = Some("codex-work".to_owned());
+    supervisor.launch(request).await.unwrap();
+
+    for event in [
+        ProviderEvent {
+            native_event_id: None,
+            event_type: "provider.note".to_owned(),
+            thread_id: "t1".to_owned(),
+            turn_id: None,
+            request_id: None,
+            payload: json!({ "providerInstanceId": "source-owned" }),
+            activity: Vec::new(),
+        },
+        ProviderEvent {
+            native_event_id: None,
+            event_type: "mcp.status.updated".to_owned(),
+            thread_id: "t1".to_owned(),
+            turn_id: None,
+            request_id: None,
+            payload: json!({
+                "servers": [{ "name": "old-only", "state": "connected" }]
+            }),
+            activity: Vec::new(),
+        },
+        ProviderEvent {
+            native_event_id: None,
+            event_type: "mcp.status.updated".to_owned(),
+            thread_id: "t1".to_owned(),
+            turn_id: None,
+            request_id: None,
+            payload: json!({
+                "servers": [
+                    { "name": "new-a", "state": "error", "detail": "failed" },
+                    { "name": "new-b", "state": "connected" }
+                ]
+            }),
+            activity: Vec::new(),
+        },
+    ] {
+        events_tx.send(event).await.unwrap();
+    }
+
+    let snapshot = timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
+            if snapshot
+                .activities
+                .iter()
+                .filter(|activity| activity.summary == "mcp.status.updated")
+                .count()
+                == 2
+            {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("both MCP snapshots project");
+    let ordinary = snapshot
+        .activities
+        .iter()
+        .find(|activity| activity.summary == "provider.note")
+        .expect("ordinary provider activity");
+    assert_eq!(
+        ordinary.payload,
+        json!({ "providerInstanceId": "source-owned" })
+    );
+    let mcp_payloads = snapshot
+        .activities
+        .iter()
+        .filter(|activity| activity.summary == "mcp.status.updated")
+        .map(|activity| activity.payload.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        mcp_payloads,
+        vec![
+            json!({
+                "servers": [{ "name": "old-only", "state": "connected" }],
+                "providerInstanceId": "codex-work"
+            }),
+            json!({
+                "servers": [
+                    { "name": "new-a", "state": "error", "detail": "failed" },
+                    { "name": "new-b", "state": "connected" }
+                ],
+                "providerInstanceId": "codex-work"
+            }),
+        ]
+    );
+    assert_eq!(
+        mcp_payloads.last().expect("latest MCP snapshot")["servers"],
+        json!([
+            { "name": "new-a", "state": "error", "detail": "failed" },
+            { "name": "new-b", "state": "connected" }
+        ])
+    );
+
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn load_snapshot_preserves_activity_sequence_when_ids_sort_in_reverse() {
+    let (engine, _) = engine_and_database().await;
+
+    for (command_id, activity_id, summary) in [
+        ("append-old", "z-old-activity", "old"),
+        ("append-new", "a-new-activity", "new"),
+    ] {
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "thread.activity.append",
+                    "commandId": command_id,
+                    "threadId": "t1",
+                    "activity": {
+                        "id": activity_id,
+                        "tone": "neutral",
+                        "kind": "ordering.regression",
+                        "summary": summary,
+                        "payload": { "summary": summary },
+                        "createdAt": NOW
+                    },
+                    "createdAt": NOW
+                }))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+    }
+
+    let activities = load_snapshot(&engine.repositories())
+        .await
+        .unwrap()
+        .activities
+        .into_iter()
+        .filter(|activity| activity.kind == "ordering.regression")
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        activities
+            .iter()
+            .map(|activity| activity.summary.as_str())
+            .collect::<Vec<_>>(),
+        ["old", "new"]
+    );
+    assert_eq!(
+        activities
+            .iter()
+            .map(|activity| activity.payload["summary"].as_str())
+            .collect::<Vec<_>>(),
+        [Some("old"), Some("new")]
+    );
+    assert!(
+        activities[0].sequence < activities[1].sequence,
+        "event sequence must remain the snapshot order"
+    );
+
+    engine.shutdown().await;
 }
 
 #[tokio::test]
@@ -1364,12 +4543,8 @@ async fn launch_rechecks_activity_state_after_factory_creation_before_start() {
         events: StdMutex::new(VecDeque::from([events_rx])),
         controller: controller.clone(),
     });
-    let supervisor = ProviderRuntimeSupervisor::start(
-        engine,
-        factory,
-        activity,
-        SupervisorOptions::default(),
-    );
+    let supervisor =
+        ProviderRuntimeSupervisor::start(engine, factory, activity, SupervisorOptions::default());
 
     supervisor.launch(launch()).await.expect("launch");
     let state = state.lock().unwrap();
@@ -2000,8 +5175,7 @@ async fn capable_relaunch_revives_stale_scope_before_accepting_activity() {
             if snapshot.observation_state == ActivityObservationState::Live
                 && snapshot.capabilities == ActivityCapabilities::structured_full(false)
                 && snapshot.sections.subagents.state == ActivitySectionObservationState::Live
-                && snapshot.sections.background_tasks.state
-                    == ActivitySectionObservationState::Live
+                && snapshot.sections.background_tasks.state == ActivitySectionObservationState::Live
                 && snapshot
                     .actors
                     .iter()
@@ -2158,12 +5332,7 @@ async fn assert_capability_downgrade_preserves_history(history: RetainedActivity
     match history {
         RetainedActivityHistory::Actor => {
             assert_eq!(snapshot.counts.subagents.active, 1);
-            assert!(
-                snapshot
-                    .actors
-                    .iter()
-                    .any(|actor| actor.id == record_id)
-            );
+            assert!(snapshot.actors.iter().any(|actor| actor.id == record_id));
             assert_eq!(
                 snapshot.sections.subagents.state,
                 ActivitySectionObservationState::Stale
@@ -2946,6 +6115,1522 @@ async fn unsupported_live_capabilities_restart_the_runtime_with_updated_launch_s
 }
 
 #[tokio::test]
+async fn metadata_update_applies_options_to_the_live_session() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let factory = Arc::new(FakeFactory {
+        state: state.clone(),
+        events: StdMutex::new(VecDeque::from([events_rx])),
+    });
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        factory,
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+
+    supervisor.launch(launch()).await.unwrap();
+    state.lock().unwrap().option_updates.clear();
+    supervisor
+        .handle_orchestration(
+            serde_json::from_value(json!({
+                "type":"thread.meta.update",
+                "commandId":"enable-fast",
+                "threadId":"t1",
+                "modelSelection":{
+                    "instanceId":"codex",
+                    "model":"gpt-5",
+                    "options":[{"id":"fastMode","value":true}]
+                }
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        state.lock().unwrap().option_updates,
+        vec![vec![json!({ "id":"fastMode", "value":true })]]
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn unsupported_live_option_update_restarts_with_the_new_options() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState {
+        start_results: VecDeque::from([
+            Ok(started_session("provider-session-1")),
+            Ok(started_session("provider-session-2")),
+        ]),
+        set_options_results: VecDeque::from([
+            Ok(()),
+            Err(ProviderRuntimeError::UnsupportedCapability {
+                provider: "codex".to_owned(),
+                capability: "live option update",
+            }),
+            Ok(()),
+        ]),
+        ..DriverState::default()
+    }));
+    let (_events_tx1, events_rx1) = mpsc::channel(1);
+    let (_events_tx2, events_rx2) = mpsc::channel(1);
+    let factory = Arc::new(FakeFactory {
+        state: state.clone(),
+        events: StdMutex::new(VecDeque::from([events_rx1, events_rx2])),
+    });
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        factory,
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+
+    supervisor.launch(launch()).await.unwrap();
+    supervisor
+        .handle_orchestration(
+            serde_json::from_value(json!({
+                "type":"thread.meta.update",
+                "commandId":"restart-fast",
+                "threadId":"t1",
+                "modelSelection":{
+                    "instanceId":"codex",
+                    "model":"gpt-5",
+                    "options":[{"id":"fastMode","value":true}]
+                }
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let state = state.lock().unwrap();
+    assert_eq!(
+        state.launches.last().unwrap().options,
+        vec![json!({ "id":"fastMode", "value":true })]
+    );
+    assert_eq!(state.starts, 2);
+    drop(state);
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_restart_shutdown_preserves_the_existing_live_session() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState {
+        set_options_results: VecDeque::from([
+            Ok(()),
+            Err(ProviderRuntimeError::UnsupportedCapability {
+                provider: "codex".to_owned(),
+                capability: "live option update",
+            }),
+        ]),
+        shutdown_results: VecDeque::from([
+            Err(ProviderRuntimeError::Provider {
+                provider: "codex".to_owned(),
+                detail: "injected shutdown failure".to_owned(),
+            }),
+            Ok(()),
+        ]),
+        ..DriverState::default()
+    }));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    supervisor.launch(launch()).await.unwrap();
+
+    let error = supervisor
+        .handle_orchestration(
+            serde_json::from_value(json!({
+                "type":"thread.meta.update", "commandId":"restart-shutdown-fails",
+                "threadId":"t1",
+                "modelSelection":{
+                    "instanceId":"codex", "model":"gpt-5",
+                    "options":[{"id":"fastMode","value":true}]
+                }
+            }))
+            .unwrap(),
+        )
+        .await
+        .expect_err("failed old-driver shutdown rejects restart");
+    assert!(matches!(error, ProviderRuntimeError::Provider { ref detail, .. } if detail.contains("shutdown failure")));
+
+    supervisor
+        .handle_orchestration(
+            serde_json::from_value(json!({
+                "type":"thread.approval.respond", "commandId":"approval-after-shutdown-failure",
+                "threadId":"t1", "requestId":"request-1", "decision":"accept",
+                "createdAt":NOW
+            }))
+            .unwrap(),
+        )
+        .await
+        .expect("the old session remains addressable");
+    let runtime = engine
+        .repositories()
+        .get_provider_session_runtime("t1".to_owned())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(runtime.status, "ready");
+    {
+        let state = state.lock().unwrap();
+        assert_eq!(state.starts, 1);
+        assert_eq!(state.launches.len(), 1);
+        assert_eq!(state.approvals, [("request-1".to_owned(), "accept".to_owned())]);
+        assert_eq!(state.shutdowns, 1);
+    }
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn rejected_unknown_option_keeps_the_existing_session() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState {
+        set_options_results: VecDeque::from([
+            Ok(()),
+            Err(ProviderRuntimeError::Provider {
+                provider: "codex".to_owned(),
+                detail: "option madeUpMode is not supported by the selected model/session"
+                    .to_owned(),
+            }),
+        ]),
+        ..DriverState::default()
+    }));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let factory = Arc::new(FakeFactory {
+        state: state.clone(),
+        events: StdMutex::new(VecDeque::from([events_rx])),
+    });
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        factory,
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+
+    supervisor.launch(launch()).await.unwrap();
+    let error = supervisor
+        .handle_orchestration(
+            serde_json::from_value(json!({
+                "type":"thread.meta.update",
+                "commandId":"reject-made-up",
+                "threadId":"t1",
+                "modelSelection":{
+                    "instanceId":"codex",
+                    "model":"gpt-5",
+                    "options":[{"id":"madeUpMode","value":true}]
+                }
+            }))
+            .unwrap(),
+        )
+        .await
+        .expect_err("unknown option must be rejected");
+
+    assert!(matches!(error, ProviderRuntimeError::Provider { .. }));
+    let runtime = engine
+        .repositories()
+        .get_provider_session_runtime("t1".to_owned())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        runtime.resume_cursor,
+        Some(json!({"threadId":"provider-session-1"}))
+    );
+    let state = state.lock().unwrap();
+    assert_eq!(state.starts, 1);
+    assert_eq!(state.shutdowns, 0);
+    assert_eq!(state.launches.len(), 1);
+    drop(state);
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn rejected_metadata_rpc_does_not_persist_selection_or_receipt() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState {
+        set_options_results: VecDeque::from([
+            Ok(()),
+            Err(ProviderRuntimeError::Provider {
+                provider: "codex".to_owned(),
+                detail: "option madeUpMode is not supported by the selected model/session"
+                    .to_owned(),
+            }),
+        ]),
+        ..DriverState::default()
+    }));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state,
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    ));
+    supervisor.launch(launch()).await.unwrap();
+
+    let settings = TempDir::new().unwrap();
+    let delivery = Arc::new(TurnDeliveryService::start(
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+    ));
+    let mut registry = RpcRegistry::empty();
+    register_orchestration_rpc_with_delivery(
+        &mut registry,
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+        delivery.clone(),
+    );
+    let handle = ServerRuntime::start_with_registry(test_config(&settings), registry)
+        .await
+        .unwrap();
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .unwrap();
+
+    rpc_request(
+        &mut socket,
+        "901",
+        json!({
+            "type":"thread.meta.update",
+            "commandId":"reject-made-up-rpc",
+            "threadId":"t1",
+            "modelSelection":{
+                "instanceId":"codex",
+                "model":"gpt-5",
+                "options":[{"id":"madeUpMode","value":true}]
+            }
+        }),
+    )
+    .await;
+    rpc_response(&mut socket, "901")
+        .await
+        .expect_err("rejected live option must reject the metadata RPC");
+
+    let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
+    let thread = snapshot
+        .threads
+        .iter()
+        .find(|thread| thread.thread_id == "t1")
+        .expect("thread remains present");
+    assert_eq!(
+        thread.model_selection,
+        json!({"instanceId":"codex","model":"gpt-5"})
+    );
+    assert!(
+        engine
+            .repositories()
+            .get_command_receipt("reject-made-up-rpc".to_owned())
+            .await
+            .unwrap()
+            .is_none(),
+        "a rejected live selection must not have an accepted receipt"
+    );
+
+    socket.close(None).await.unwrap();
+    handle.shutdown();
+    handle.join().await.unwrap();
+    delivery.shutdown().await;
+    supervisor.shutdown().await.unwrap();
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn rejected_options_do_not_mutate_the_model_before_a_turn() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState {
+        set_options_results: VecDeque::from([
+            Ok(()),
+            Err(ProviderRuntimeError::Provider {
+                provider: "codex".to_owned(),
+                detail: "option madeUpMode is not supported by the selected model/session"
+                    .to_owned(),
+            }),
+        ]),
+        ..DriverState::default()
+    }));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    supervisor.launch(launch()).await.unwrap();
+
+    let command = serde_json::from_value(json!({
+        "type":"thread.turn.start",
+        "commandId":"reject-model-and-options",
+        "threadId":"t1",
+        "message":{
+            "messageId":"reject-model-and-options-message",
+            "role":"user",
+            "text":"must not send",
+            "attachments":[]
+        },
+        "modelSelection":{
+            "instanceId":"codex",
+            "model":"gpt-5.1",
+            "options":[{"id":"madeUpMode","value":true}]
+        },
+        "runtimeMode":"full-access",
+        "interactionMode":"default",
+        "createdAt":NOW
+    }))
+    .unwrap();
+    assert!(supervisor.handle_orchestration(command).await.is_err());
+
+    let state = state.lock().unwrap();
+    assert!(state.models.is_empty(), "model update must wait for option validation");
+    assert!(state.sends.is_empty());
+    assert_eq!(state.starts, 1);
+    assert_eq!(state.shutdowns, 0);
+    assert_eq!(state.launches[0].model.as_deref(), Some("gpt-5"));
+    drop(state);
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn model_only_option_revalidation_restores_the_previous_open_code_launch() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState {
+        reapply_options_on_model_change: true,
+        set_options_results: VecDeque::from([
+            Ok(()),
+            Err(ProviderRuntimeError::Provider {
+                provider: "opencode".to_owned(),
+                detail: "option fastMode is not supported by the selected model/session".to_owned(),
+            }),
+            Ok(()),
+        ]),
+        ..DriverState::default()
+    }));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    let mut request = launch();
+    request.provider = "opencode".to_owned();
+    request.model = Some("openai/fast-model".to_owned());
+    request.options = vec![json!({ "id": "fastMode", "value": true })];
+    supervisor.launch(request).await.unwrap();
+
+    let command = serde_json::from_value(json!({
+        "type":"thread.turn.start",
+        "commandId":"reject-model-only-fast-variant",
+        "threadId":"t1",
+        "message":{
+            "messageId":"reject-model-only-fast-variant-message",
+            "role":"user",
+            "text":"must not send",
+            "attachments":[]
+        },
+        "modelSelection":{
+            "instanceId":"opencode",
+            "model":"openai/no-fast-model",
+            "options":[{"id":"fastMode","value":true}]
+        },
+        "runtimeMode":"full-access",
+        "interactionMode":"default",
+        "createdAt":NOW
+    }))
+    .unwrap();
+    assert!(supervisor.handle_orchestration(command).await.is_err());
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.models, ["openai/no-fast-model", "openai/fast-model"]);
+    assert_eq!(
+        state.option_updates,
+        [
+            vec![json!({"id":"fastMode","value":true})],
+            vec![json!({"id":"fastMode","value":true})],
+            vec![json!({"id":"fastMode","value":true})],
+        ]
+    );
+    assert!(state.sends.is_empty());
+    assert_eq!(state.starts, 1);
+    assert_eq!(state.shutdowns, 0);
+    assert_eq!(state.launches[0].model.as_deref(), Some("openai/fast-model"));
+    drop(state);
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_model_update_rolls_back_options_without_restarting_or_sending() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState {
+        set_model_results: VecDeque::from([
+            Err(ProviderRuntimeError::Provider {
+                provider: "codex".to_owned(),
+                detail: "live model update failed".to_owned(),
+            }),
+            Ok(()),
+        ]),
+        ..DriverState::default()
+    }));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    supervisor.launch(launch()).await.unwrap();
+    state.lock().unwrap().option_updates.clear();
+
+    let command = serde_json::from_value(json!({
+        "type":"thread.turn.start",
+        "commandId":"failed-model-after-options",
+        "threadId":"t1",
+        "message":{
+            "messageId":"failed-model-after-options-message",
+            "role":"user",
+            "text":"must not send",
+            "attachments":[]
+        },
+        "modelSelection":{
+            "instanceId":"codex",
+            "model":"gpt-5.1",
+            "options":[{"id":"fastMode","value":true}]
+        },
+        "runtimeMode":"full-access",
+        "interactionMode":"default",
+        "createdAt":NOW
+    }))
+    .unwrap();
+    assert!(supervisor.handle_orchestration(command).await.is_err());
+
+    let state = state.lock().unwrap();
+    assert_eq!(state.models, ["gpt-5.1", "gpt-5"]);
+    assert_eq!(
+        state.option_updates,
+        [
+            vec![json!({"id":"fastMode","value":true})],
+            Vec::<Value>::new(),
+        ]
+    );
+    assert!(state.sends.is_empty());
+    assert_eq!(state.starts, 1);
+    assert_eq!(state.shutdowns, 0);
+    assert_eq!(state.launches[0].model.as_deref(), Some("gpt-5"));
+    drop(state);
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn persistence_failure_restores_acknowledged_model_and_options_before_next_turn() {
+    let (engine, database) = engine_and_database().await;
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    supervisor.launch(launch()).await.unwrap();
+    state.lock().unwrap().option_updates.clear();
+    database
+        .call(|connection| {
+            connection.execute_batch(
+                "CREATE TRIGGER fail_live_configuration_persistence
+                 BEFORE UPDATE ON provider_session_runtime
+                 WHEN OLD.thread_id = 't1' AND OLD.status = 'ready' AND NEW.status = 'ready'
+                 BEGIN
+                   SELECT RAISE(FAIL, 'injected live configuration persistence failure');
+                 END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let rejected = serde_json::from_value(json!({
+        "type":"thread.turn.start",
+        "commandId":"persist-failed-configuration",
+        "threadId":"t1",
+        "message":{
+            "messageId":"persist-failed-configuration-message",
+            "role":"user", "text":"must not send", "attachments":[]
+        },
+        "modelSelection":{
+            "instanceId":"codex", "model":"gpt-5.1",
+            "options":[{"id":"fastMode","value":true}]
+        },
+        "runtimeMode":"full-access", "interactionMode":"default", "createdAt":NOW
+    }))
+    .unwrap();
+    assert!(matches!(
+        supervisor.handle_orchestration(rejected).await,
+        Err(ProviderRuntimeError::Persistence(_))
+    ));
+    {
+        let state = state.lock().unwrap();
+        assert_eq!(state.models, ["gpt-5.1", "gpt-5"]);
+        assert_eq!(
+            state.option_updates,
+            [
+                vec![json!({"id":"fastMode","value":true})],
+                Vec::<Value>::new(),
+            ]
+        );
+        assert!(state.sends.is_empty());
+        assert_eq!(state.starts, 1);
+    }
+
+    database
+        .call(|connection| {
+            connection.execute_batch("DROP TRIGGER fail_live_configuration_persistence;")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    supervisor
+        .handle_orchestration(serde_json::from_value(json!({
+            "type":"thread.turn.start", "commandId":"turn-after-persist-failure",
+            "threadId":"t1",
+            "message":{"messageId":"turn-after-persist-failure-message","role":"user","text":"safe old selection","attachments":[]},
+            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "runtimeMode":"full-access", "interactionMode":"default", "createdAt":NOW
+        })).unwrap())
+        .await
+        .unwrap();
+    let state = state.lock().unwrap();
+    assert_eq!(state.models, ["gpt-5.1", "gpt-5"]);
+    assert_eq!(state.sends, ["safe old selection"]);
+    drop(state);
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cursor_persistence_failure_restores_default_model_and_options_before_prompt() {
+    let (engine, database) = engine_and_database().await;
+    let active_options = vec![json!({ "id": "fastMode", "value": true })];
+    let state = Arc::new(StdMutex::new(DriverState {
+        reapply_options_on_model_change: true,
+        ..DriverState::default()
+    }));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    let mut request = launch();
+    request.provider = "cursor".to_owned();
+    request.provider_instance_id = Some("cursor".to_owned());
+    request.model = Some("default".to_owned());
+    request.options = active_options.clone();
+    supervisor.launch(request).await.unwrap();
+    state.lock().unwrap().option_updates.clear();
+    database
+        .call(|connection| {
+            connection.execute_batch(
+                "CREATE TRIGGER fail_cursor_default_restore_persistence
+                 BEFORE UPDATE ON provider_session_runtime
+                 WHEN OLD.thread_id = 't1' AND OLD.status = 'ready' AND NEW.status = 'ready'
+                 BEGIN
+                   SELECT RAISE(FAIL, 'injected Cursor configuration persistence failure');
+                 END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let rejected = serde_json::from_value(json!({
+        "type":"thread.turn.start", "commandId":"cursor-default-restore-persistence",
+        "threadId":"t1",
+        "message":{
+            "messageId":"cursor-default-restore-persistence-message",
+            "role":"user", "text":"must not send", "attachments":[]
+        },
+        "modelSelection":{
+            "instanceId":"cursor", "model":"target",
+            "options":[{"id":"fastMode","value":true}]
+        },
+        "runtimeMode":"full-access", "interactionMode":"default", "createdAt":NOW
+    }))
+    .unwrap();
+    assert!(matches!(
+        supervisor.handle_orchestration(rejected).await,
+        Err(ProviderRuntimeError::Persistence(_))
+    ));
+    {
+        let state = state.lock().unwrap();
+        assert_eq!(state.models, ["target", "default"]);
+        assert_eq!(
+            state.option_updates,
+            [active_options.clone(), active_options.clone()]
+        );
+        assert!(state.sends.is_empty());
+        assert_eq!(state.launches[0].model.as_deref(), Some("default"));
+    }
+
+    database
+        .call(|connection| {
+            connection.execute_batch("DROP TRIGGER fail_cursor_default_restore_persistence;")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    supervisor
+        .handle_orchestration(
+            serde_json::from_value(json!({
+                "type":"thread.turn.start", "commandId":"cursor-turn-after-default-restore",
+                "threadId":"t1",
+                "message":{
+                    "messageId":"cursor-turn-after-default-restore-message",
+                    "role":"user", "text":"safe default selection", "attachments":[]
+                },
+                "modelSelection":{
+                    "instanceId":"cursor", "model":"default",
+                    "options":[{"id":"fastMode","value":true}]
+                },
+                "runtimeMode":"full-access", "interactionMode":"default", "createdAt":NOW
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(state.lock().unwrap().sends, ["safe default selection"]);
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_default_model_persistence_restoration_blocks_delivery_when_restart_cannot_shutdown() {
+    let (engine, database) = engine_and_database().await;
+    let state = Arc::new(StdMutex::new(DriverState {
+        reapply_options_on_model_change: true,
+        set_model_results: VecDeque::from([
+            Ok(()),
+            Err(ProviderRuntimeError::Provider {
+                provider: "codex".to_owned(),
+                detail: "injected model restoration failure".to_owned(),
+            }),
+        ]),
+        shutdown_results: VecDeque::from([
+            Err(ProviderRuntimeError::Provider {
+                provider: "codex".to_owned(),
+                detail: "injected restoration shutdown failure".to_owned(),
+            }),
+            Ok(()),
+        ]),
+        ..DriverState::default()
+    }));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    let mut request = launch();
+    request.provider = "cursor".to_owned();
+    request.provider_instance_id = Some("cursor".to_owned());
+    request.model = Some("default".to_owned());
+    request.options = vec![json!({ "id": "fastMode", "value": true })];
+    supervisor.launch(request).await.unwrap();
+    database
+        .call(|connection| {
+            connection.execute_batch(
+                "CREATE TRIGGER fail_unrestorable_configuration_persistence
+                 BEFORE UPDATE ON provider_session_runtime
+                 WHEN OLD.thread_id = 't1' AND OLD.status = 'ready' AND NEW.status = 'ready'
+                 BEGIN
+                   SELECT RAISE(FAIL, 'injected unrestorable configuration persistence failure');
+                 END;",
+            )?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+    let error = supervisor
+        .handle_orchestration(serde_json::from_value(json!({
+            "type":"thread.meta.update", "commandId":"unrestorable-configuration",
+            "threadId":"t1",
+            "modelSelection":{
+                "instanceId":"cursor", "model":"target",
+                "options":[{"id":"fastMode","value":true}]
+            }
+        })).unwrap())
+        .await
+        .expect_err("failed restoration and restart must be surfaced");
+    assert!(matches!(error, ProviderRuntimeError::Provider { ref detail, .. } if detail.contains("shutdown failure")));
+
+    database
+        .call(|connection| {
+            connection.execute_batch("DROP TRIGGER fail_unrestorable_configuration_persistence;")?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+    let unsafe_turn = serde_json::from_value(json!({
+        "type":"thread.turn.start", "commandId":"blocked-after-restore-failure",
+        "threadId":"t1",
+        "message":{"messageId":"blocked-after-restore-failure-message","role":"user","text":"never send","attachments":[]},
+        "modelSelection":{
+            "instanceId":"cursor", "model":"default",
+            "options":[{"id":"fastMode","value":true}]
+        },
+        "runtimeMode":"full-access", "interactionMode":"default", "createdAt":NOW
+    })).unwrap();
+    assert!(matches!(
+        supervisor.handle_orchestration(unsafe_turn).await,
+        Err(ProviderRuntimeError::Provider { ref detail, .. })
+            if detail.contains("configuration is unavailable")
+    ));
+    let state = state.lock().unwrap();
+    assert_eq!(state.models, ["target", "default"]);
+    assert!(state.sends.is_empty());
+    drop(state);
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn admitted_durable_delivery_precedes_following_metadata_reconciliation() {
+    let engine = engine().await;
+    engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.create", "commandId":"thread-b", "threadId":"t2",
+                "projectId":"p1", "title":"Thread B",
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access", "branch":null, "worktreePath":null,
+                "createdAt":NOW
+            }))
+            .unwrap(),
+        )
+        .await
+        .unwrap();
+    let preflight_entered = Arc::new(tokio::sync::Notify::new());
+    let preflight_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let state = Arc::new(StdMutex::new(DriverState {
+        delivery_preflight_entered: Some(preflight_entered.clone()),
+        delivery_preflight_release: Some(preflight_release.clone()),
+        ..DriverState::default()
+    }));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let (_events_tx_b, events_rx_b) = mpsc::channel(1);
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx, events_rx_b])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    ));
+    supervisor.launch(launch()).await.unwrap();
+    let mut launch_b = launch();
+    launch_b.thread_id = "t2".to_owned();
+    supervisor.launch(launch_b).await.unwrap();
+    state.lock().unwrap().operation_order.clear();
+
+    let delivery = supervisor
+        .deliver_turn(
+            durable_turn_command("ordered-durable-turn", "deliver first"),
+            "ordered-durable-key".to_owned(),
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(1), preflight_entered.notified())
+        .await
+        .expect("delivery reaches provider preflight");
+
+    let mut metadata = Box::pin(supervisor.handle_orchestration(
+        serde_json::from_value(json!({
+            "type":"thread.meta.update",
+            "commandId":"metadata-after-admission",
+            "threadId":"t1",
+            "modelSelection":{
+                "instanceId":"codex",
+                "model":"gpt-5",
+                "options":[{"id":"fastMode","value":true}]
+            }
+        }))
+        .unwrap(),
+    ));
+    assert!(
+        matches!(futures_util::poll!(metadata.as_mut()), Poll::Pending),
+        "following metadata must wait for admitted delivery"
+    );
+    timeout(
+        Duration::from_millis(100),
+        supervisor.handle_orchestration(
+            serde_json::from_value(json!({
+                "type":"thread.approval.respond", "commandId":"thread-b-approval",
+                "threadId":"t2", "requestId":"request-b", "decision":"accept",
+                "createdAt":NOW
+            }))
+            .unwrap(),
+        ),
+    )
+    .await
+    .expect("thread B must not wait behind thread A delivery ordering")
+    .unwrap();
+
+    preflight_release.add_permits(1);
+    assert!(matches!(
+        delivery.completion().await,
+        ProviderDeliveryOutcome::Accepted { .. }
+    ));
+    metadata.await.unwrap();
+    assert_eq!(state.lock().unwrap().approvals, [("request-b".to_owned(), "accept".to_owned())]);
+    assert_eq!(state.lock().unwrap().operation_order, ["delivery", "options"]);
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn panicked_delivery_completes_deferred_configuration_with_an_error() {
+    let engine = engine().await;
+    let preflight_entered = Arc::new(tokio::sync::Notify::new());
+    let preflight_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let state = Arc::new(StdMutex::new(DriverState {
+        delivery_preflight_entered: Some(preflight_entered.clone()),
+        delivery_preflight_release: Some(preflight_release.clone()),
+        delivery_panics: 1,
+        ..DriverState::default()
+    }));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state,
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    ));
+    supervisor.launch(launch()).await.unwrap();
+    let delivery = supervisor
+        .deliver_turn(
+            durable_turn_command("panicked-delivery", "panic before admission"),
+            "panicked-delivery-key".to_owned(),
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(1), preflight_entered.notified())
+        .await
+        .expect("delivery reaches provider preflight");
+
+    let mut metadata = Box::pin(supervisor.handle_orchestration(
+        serde_json::from_value(json!({
+            "type":"thread.meta.update", "commandId":"metadata-after-panic",
+            "threadId":"t1",
+            "modelSelection":{
+                "instanceId":"codex", "model":"gpt-5",
+                "options":[{"id":"fastMode","value":true}]
+            }
+        }))
+        .unwrap(),
+    ));
+    assert!(matches!(futures_util::poll!(metadata.as_mut()), Poll::Pending));
+    preflight_release.add_permits(1);
+    assert!(matches!(
+        delivery.completion().await,
+        ProviderDeliveryOutcome::Ambiguous { .. }
+    ));
+    let error = timeout(Duration::from_secs(1), metadata)
+        .await
+        .expect("deferred metadata must never strand")
+        .expect_err("abnormal delivery completion rejects deferred metadata");
+    assert!(matches!(error, ProviderRuntimeError::Provider { ref detail, .. } if detail.contains("ended abnormally")));
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn supervisor_shutdown_completes_deferred_configuration_with_shutdown() {
+    let engine = engine().await;
+    let preflight_entered = Arc::new(tokio::sync::Notify::new());
+    let preflight_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let state = Arc::new(StdMutex::new(DriverState {
+        delivery_preflight_entered: Some(preflight_entered.clone()),
+        delivery_preflight_release: Some(preflight_release.clone()),
+        ..DriverState::default()
+    }));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state,
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    ));
+    supervisor.launch(launch()).await.unwrap();
+    let delivery = supervisor
+        .deliver_turn(
+            durable_turn_command("shutdown-delivery", "shutdown while paused"),
+            "shutdown-delivery-key".to_owned(),
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(1), preflight_entered.notified())
+        .await
+        .expect("delivery reaches provider preflight");
+    let mut metadata = Box::pin(supervisor.handle_orchestration(
+        serde_json::from_value(json!({
+            "type":"thread.meta.update", "commandId":"metadata-before-shutdown",
+            "threadId":"t1",
+            "modelSelection":{
+                "instanceId":"codex", "model":"gpt-5",
+                "options":[{"id":"fastMode","value":true}]
+            }
+        }))
+        .unwrap(),
+    ));
+    assert!(matches!(futures_util::poll!(metadata.as_mut()), Poll::Pending));
+    supervisor.shutdown().await.unwrap();
+    assert!(matches!(metadata.await, Err(ProviderRuntimeError::Shutdown)));
+
+    preflight_release.add_permits(1);
+    assert!(matches!(
+        delivery.completion().await,
+        ProviderDeliveryOutcome::Accepted { .. }
+    ));
+}
+
+#[tokio::test]
+async fn bounded_deferred_configuration_rejects_overflow_without_blocking_other_threads() {
+    let engine = engine().await;
+    engine
+        .dispatch(serde_json::from_value(json!({
+            "type":"thread.create", "commandId":"bounded-thread-b", "threadId":"t2",
+            "projectId":"p1", "title":"Thread B",
+            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "runtimeMode":"full-access", "branch":null, "worktreePath":null,
+            "createdAt":NOW
+        })).unwrap())
+        .await
+        .unwrap();
+    let preflight_entered = Arc::new(tokio::sync::Notify::new());
+    let preflight_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let state = Arc::new(StdMutex::new(DriverState {
+        delivery_preflight_entered: Some(preflight_entered.clone()),
+        delivery_preflight_release: Some(preflight_release.clone()),
+        ..DriverState::default()
+    }));
+    let (_events_tx_a, events_rx_a) = mpsc::channel(1);
+    let (_events_tx_b, events_rx_b) = mpsc::channel(1);
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(VecDeque::from([events_rx_a, events_rx_b])),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions { queue_capacity: 2 },
+    ));
+    supervisor.launch(launch()).await.unwrap();
+    let mut launch_b = launch();
+    launch_b.thread_id = "t2".to_owned();
+    supervisor.launch(launch_b).await.unwrap();
+    state.lock().unwrap().operation_order.clear();
+
+    let delivery = supervisor
+        .deliver_turn(
+            durable_turn_command("bounded-delivery", "bounded delivery"),
+            "bounded-delivery-key".to_owned(),
+        )
+        .await
+        .unwrap();
+    timeout(Duration::from_secs(1), preflight_entered.notified())
+        .await
+        .expect("delivery reaches provider preflight");
+
+    let mut queued = Vec::new();
+    for (index, value) in [true, false].into_iter().enumerate() {
+        let mut request = Box::pin(supervisor.handle_orchestration(
+            serde_json::from_value(json!({
+                "type":"thread.meta.update", "commandId":format!("bounded-metadata-{index}"),
+                "threadId":"t1",
+                "modelSelection":{
+                    "instanceId":"codex", "model":"gpt-5",
+                    "options":[{"id":"fastMode","value":value}]
+                }
+            }))
+            .unwrap(),
+        ));
+        assert!(matches!(futures_util::poll!(request.as_mut()), Poll::Pending));
+        supervisor
+            .handle_orchestration(serde_json::from_value(json!({
+                "type":"thread.approval.respond", "commandId":format!("bounded-barrier-{index}"),
+                "threadId":"t2", "requestId":format!("barrier-{index}"),
+                "decision":"accept", "createdAt":NOW
+            })).unwrap())
+            .await
+            .expect("thread B response proves the preceding A request was received");
+        queued.push(request);
+    }
+
+    let overflow = supervisor
+        .handle_orchestration(serde_json::from_value(json!({
+            "type":"thread.meta.update", "commandId":"bounded-metadata-overflow",
+            "threadId":"t1",
+            "modelSelection":{
+                "instanceId":"codex", "model":"gpt-5",
+                "options":[{"id":"fastMode","value":true}]
+            }
+        })).unwrap())
+        .await
+        .expect_err("per-thread deferred work must be bounded");
+    assert!(matches!(overflow, ProviderRuntimeError::Provider { ref detail, .. } if detail.contains("queue is full")));
+    supervisor
+        .handle_orchestration(serde_json::from_value(json!({
+            "type":"thread.approval.respond", "commandId":"bounded-thread-b-progress",
+            "threadId":"t2", "requestId":"thread-b-progress",
+            "decision":"accept", "createdAt":NOW
+        })).unwrap())
+        .await
+        .expect("thread B remains responsive with thread A queue full");
+
+    preflight_release.add_permits(1);
+    assert!(matches!(
+        delivery.completion().await,
+        ProviderDeliveryOutcome::Accepted { .. }
+    ));
+    for request in queued {
+        request.await.unwrap();
+    }
+    assert_eq!(
+        state.lock().unwrap().operation_order,
+        ["delivery", "options", "options"]
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn runtime_and_interaction_restarts_wait_for_same_thread_durable_delivery() {
+    let engine = engine().await;
+    engine
+        .dispatch(serde_json::from_value(json!({
+            "type":"thread.create", "commandId":"restart-order-thread-b", "threadId":"t2",
+            "projectId":"p1", "title":"Thread B",
+            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "runtimeMode":"full-access", "branch":null, "worktreePath":null,
+            "createdAt":NOW
+        })).unwrap())
+        .await
+        .unwrap();
+    let preflight_entered = Arc::new(tokio::sync::Notify::new());
+    let preflight_release = Arc::new(tokio::sync::Semaphore::new(0));
+    let state = Arc::new(StdMutex::new(DriverState {
+        delivery_preflight_entered: Some(preflight_entered.clone()),
+        delivery_preflight_release: Some(preflight_release.clone()),
+        set_mode_results: VecDeque::from([Err(ProviderRuntimeError::UnsupportedCapability {
+            provider: "codex".to_owned(),
+            capability: "runtime mode update",
+        })]),
+        set_interaction_mode_results: VecDeque::from([Err(
+            ProviderRuntimeError::UnsupportedCapability {
+                provider: "codex".to_owned(),
+                capability: "interaction mode update",
+            },
+        )]),
+        ..DriverState::default()
+    }));
+    let mut event_receivers = VecDeque::new();
+    let mut event_senders = Vec::new();
+    for _ in 0..4 {
+        let (sender, receiver) = mpsc::channel(1);
+        event_senders.push(sender);
+        event_receivers.push_back(receiver);
+    }
+    let supervisor = Arc::new(ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(FakeFactory {
+            state: state.clone(),
+            events: StdMutex::new(event_receivers),
+        }),
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    ));
+    supervisor.launch(launch()).await.unwrap();
+    let mut launch_b = launch();
+    launch_b.thread_id = "t2".to_owned();
+    supervisor.launch(launch_b).await.unwrap();
+    state.lock().unwrap().operation_order.clear();
+
+    for (index, command) in [
+        json!({
+            "type":"thread.runtime-mode.set", "commandId":"runtime-during-delivery",
+            "threadId":"t1", "runtimeMode":"approval-required", "createdAt":NOW
+        }),
+        json!({
+            "type":"thread.interaction-mode.set", "commandId":"interaction-during-delivery",
+            "threadId":"t1", "interactionMode":"plan", "createdAt":NOW
+        }),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let entered = preflight_entered.notified();
+        let delivery = supervisor
+            .deliver_turn(
+                durable_turn_command(&format!("restart-order-delivery-{index}"), "deliver first"),
+                format!("restart-order-key-{index}"),
+            )
+            .await
+            .unwrap();
+        timeout(Duration::from_secs(1), entered)
+            .await
+            .expect("delivery reaches provider preflight");
+        let mut configuration = Box::pin(
+            supervisor.handle_orchestration(serde_json::from_value(command).unwrap()),
+        );
+        assert!(matches!(
+            futures_util::poll!(configuration.as_mut()),
+            Poll::Pending
+        ));
+        supervisor
+            .handle_orchestration(serde_json::from_value(json!({
+                "type":"thread.approval.respond", "commandId":format!("restart-order-barrier-{index}"),
+                "threadId":"t2", "requestId":format!("restart-order-barrier-{index}"),
+                "decision":"accept", "createdAt":NOW
+            })).unwrap())
+            .await
+            .expect("thread B proves configuration was deferred without blocking the supervisor");
+        preflight_release.add_permits(1);
+        assert!(matches!(
+            delivery.completion().await,
+            ProviderDeliveryOutcome::Accepted { .. }
+        ));
+        configuration.await.unwrap();
+        let expected = if index == 0 {
+            ["delivery", "runtime", "options"]
+        } else {
+            ["delivery", "interaction", "options"]
+        };
+        assert_eq!(state.lock().unwrap().operation_order, expected);
+        state.lock().unwrap().operation_order.clear();
+    }
+    {
+        let state = state.lock().unwrap();
+        assert_eq!(state.starts, 4);
+        assert_eq!(state.shutdowns, 2);
+    }
+    drop(event_senders);
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_non_durable_option_reconciliation_does_not_send_the_prompt() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState {
+        set_options_results: VecDeque::from([
+            Ok(()),
+            Err(ProviderRuntimeError::Provider {
+                provider: "codex".to_owned(),
+                detail: "live option update failed".to_owned(),
+            }),
+        ]),
+        ..DriverState::default()
+    }));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let factory = Arc::new(FakeFactory {
+        state: state.clone(),
+        events: StdMutex::new(VecDeque::from([events_rx])),
+    });
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        factory,
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+
+    supervisor.launch(launch()).await.unwrap();
+    let command = serde_json::from_value(json!({
+        "type":"thread.turn.start",
+        "commandId":"failed-live-option-turn",
+        "threadId":"t1",
+        "message":{
+            "messageId":"failed-live-option-message",
+            "role":"user",
+            "text":"do work",
+            "attachments":[]
+        },
+        "modelSelection":{
+            "instanceId":"codex",
+            "model":"gpt-5",
+            "options":[{"id":"fastMode","value":true}]
+        },
+        "runtimeMode":"full-access",
+        "interactionMode":"default",
+        "createdAt":NOW
+    }))
+    .unwrap();
+
+    assert!(supervisor.handle_orchestration(command).await.is_err());
+    assert!(state.lock().unwrap().sends.is_empty());
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn initial_launch_rejects_unknown_options_before_delivery() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState {
+        set_options_results: VecDeque::from([Err(ProviderRuntimeError::Provider {
+            provider: "codex".to_owned(),
+            detail: "option madeUpMode is not supported by the selected model/session".to_owned(),
+        })]),
+        ..DriverState::default()
+    }));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let factory = Arc::new(FakeFactory {
+        state: state.clone(),
+        events: StdMutex::new(VecDeque::from([events_rx])),
+    });
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        factory,
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    let mut request = launch();
+    request.options = vec![json!({"id":"madeUpMode","value":true})];
+
+    let error = supervisor
+        .launch(request)
+        .await
+        .expect_err("unknown initial option must fail launch");
+
+    assert!(matches!(error, ProviderRuntimeError::Provider { .. }));
+    let state = state.lock().unwrap();
+    assert_eq!(state.starts, 1);
+    assert_eq!(state.shutdowns, 1);
+    assert!(state.sends.is_empty());
+    assert_eq!(
+        state.option_updates,
+        vec![vec![json!({"id":"madeUpMode","value":true})]]
+    );
+    drop(state);
+    let runtime = engine
+        .repositories()
+        .get_provider_session_runtime("t1".to_owned())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(runtime.status, "error");
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_durable_option_reconciliation_does_not_start_delivery() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState {
+        set_options_results: VecDeque::from([
+            Ok(()),
+            Err(ProviderRuntimeError::Provider {
+                provider: "codex".to_owned(),
+                detail: "live option update failed".to_owned(),
+            }),
+        ]),
+        ..DriverState::default()
+    }));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let factory = Arc::new(FakeFactory {
+        state: state.clone(),
+        events: StdMutex::new(VecDeque::from([events_rx])),
+    });
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        factory,
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+
+    supervisor.launch(launch()).await.unwrap();
+    let command = serde_json::from_value(json!({
+        "type":"thread.turn.start",
+        "commandId":"failed-durable-option-turn",
+        "threadId":"t1",
+        "message":{
+            "messageId":"failed-durable-option-message",
+            "role":"user",
+            "text":"do durable work",
+            "attachments":[]
+        },
+        "modelSelection":{
+            "instanceId":"codex",
+            "model":"gpt-5",
+            "options":[{"id":"fastMode","value":true}]
+        },
+        "runtimeMode":"full-access",
+        "interactionMode":"default",
+        "createdAt":NOW
+    }))
+    .unwrap();
+
+    assert!(
+        supervisor
+            .deliver_turn(command, "durable-option-key".to_owned())
+            .await
+            .is_err()
+    );
+    assert!(state.lock().unwrap().delivery_started.is_empty());
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn durable_delivery_applies_options_before_starting_the_attempt() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let factory = Arc::new(FakeFactory {
+        state: state.clone(),
+        events: StdMutex::new(VecDeque::from([events_rx])),
+    });
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        factory,
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+
+    supervisor.launch(launch()).await.unwrap();
+    state.lock().unwrap().option_updates.clear();
+    let command = serde_json::from_value(json!({
+        "type":"thread.turn.start",
+        "commandId":"durable-option-turn",
+        "threadId":"t1",
+        "message":{
+            "messageId":"durable-option-message",
+            "role":"user",
+            "text":"do durable work",
+            "attachments":[]
+        },
+        "modelSelection":{
+            "instanceId":"codex",
+            "model":"gpt-5",
+            "options":[{"id":"fastMode","value":true}]
+        },
+        "runtimeMode":"full-access",
+        "interactionMode":"default",
+        "createdAt":NOW
+    }))
+    .unwrap();
+
+    let outcome = supervisor
+        .deliver_turn(command, "durable-option-key".to_owned())
+        .await
+        .unwrap()
+        .completion()
+        .await;
+
+    assert!(matches!(outcome, ProviderDeliveryOutcome::Accepted { .. }));
+    let state = state.lock().unwrap();
+    assert_eq!(
+        state.option_updates,
+        vec![vec![json!({"id":"fastMode","value":true})]]
+    );
+    assert_eq!(state.delivery_started, ["do durable work"]);
+    drop(state);
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_option_restart_does_not_send_the_prompt() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState {
+        start_results: VecDeque::from([
+            Ok(started_session("provider-session-1")),
+            Err(ProviderRuntimeError::Provider {
+                provider: "codex".to_owned(),
+                detail: "restart failed".to_owned(),
+            }),
+        ]),
+        set_options_results: VecDeque::from([
+            Ok(()),
+            Err(ProviderRuntimeError::UnsupportedCapability {
+                provider: "codex".to_owned(),
+                capability: "live option update",
+            }),
+        ]),
+        ..DriverState::default()
+    }));
+    let (_events_tx1, events_rx1) = mpsc::channel(1);
+    let (_events_tx2, events_rx2) = mpsc::channel(1);
+    let factory = Arc::new(FakeFactory {
+        state: state.clone(),
+        events: StdMutex::new(VecDeque::from([events_rx1, events_rx2])),
+    });
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        factory,
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+
+    supervisor.launch(launch()).await.unwrap();
+    let command = serde_json::from_value(json!({
+        "type":"thread.turn.start",
+        "commandId":"failed-option-restart-turn",
+        "threadId":"t1",
+        "message":{
+            "messageId":"failed-option-restart-message",
+            "role":"user",
+            "text":"do work",
+            "attachments":[]
+        },
+        "modelSelection":{
+            "instanceId":"codex",
+            "model":"gpt-5",
+            "options":[{"id":"fastMode","value":true}]
+        },
+        "runtimeMode":"full-access",
+        "interactionMode":"default",
+        "createdAt":NOW
+    }))
+    .unwrap();
+
+    assert!(supervisor.handle_orchestration(command).await.is_err());
+    let state = state.lock().unwrap();
+    assert!(state.sends.is_empty());
+    assert_eq!(state.starts, 2);
+    assert_eq!(state.shutdowns, 2);
+    drop(state);
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn interaction_mode_provider_failure_preserves_the_live_launch_state() {
     let engine = engine().await;
     let state = Arc::new(StdMutex::new(DriverState {
@@ -3247,11 +7932,17 @@ async fn checkpoint_rpc_rolls_back_once_after_restore_with_the_computed_delta() 
     .unwrap();
     let settings = TempDir::new().unwrap();
     let mut registry = RpcRegistry::empty();
-    register_orchestration_rpc_with_provider(
+    let delivery = Arc::new(TurnDeliveryService::start(
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+    ));
+    register_orchestration_rpc_with_delivery(
         &mut registry,
         engine.clone(),
         supervisor.clone(),
         settings.path().to_path_buf(),
+        delivery.clone(),
     );
     let handle = ServerRuntime::start_with_registry(test_config(&settings), registry)
         .await
@@ -3308,6 +7999,7 @@ async fn checkpoint_rpc_rolls_back_once_after_restore_with_the_computed_delta() 
     socket.close(None).await.unwrap();
     handle.shutdown();
     handle.join().await.unwrap();
+    delivery.shutdown().await;
     supervisor.shutdown().await.unwrap();
     engine.shutdown().await;
 }
@@ -3356,11 +8048,17 @@ async fn checkpoint_rpc_reports_effect_failure_without_a_direct_or_second_rollba
     .unwrap();
     let settings = TempDir::new().unwrap();
     let mut registry = RpcRegistry::empty();
-    register_orchestration_rpc_with_provider(
+    let delivery = Arc::new(TurnDeliveryService::start(
+        engine.clone(),
+        supervisor.clone(),
+        settings.path().to_path_buf(),
+    ));
+    register_orchestration_rpc_with_delivery(
         &mut registry,
         engine.clone(),
         supervisor.clone(),
         settings.path().to_path_buf(),
+        delivery.clone(),
     );
     let handle = ServerRuntime::start_with_registry(test_config(&settings), registry)
         .await
@@ -3424,6 +8122,7 @@ async fn checkpoint_rpc_reports_effect_failure_without_a_direct_or_second_rollba
     socket.close(None).await.unwrap();
     handle.shutdown();
     handle.join().await.unwrap();
+    delivery.shutdown().await;
     supervisor.shutdown().await.unwrap();
     engine.shutdown().await;
 }
@@ -4265,11 +8964,12 @@ async fn native_factory_routes_every_supported_provider_to_its_native_adapter() 
 async fn supervisor_reaps_a_naturally_exited_native_provider_without_an_explicit_stop() {
     let engine = engine().await;
     let temp = TempDir::new().unwrap();
+    let exit_file = temp.path().join("allow-natural-exit");
     let executable = executable_fixture(
         &temp,
         "naturally-exiting-claude",
-        "#!/bin/sh\nsleep 1\n",
-        "Start-Sleep -Seconds 1\n",
+        "#!/bin/sh\nwhile [ ! -f \"$BIBCODE_EXIT_FILE\" ]; do sleep 0.05; done\n",
+        "while (-not (Test-Path -LiteralPath $env:BIBCODE_EXIT_FILE)) { Start-Sleep -Milliseconds 50 }\n",
     );
     let registry = ProcessAttributionRegistry::new();
     let factory = Arc::new(NativeProviderDriverFactory::with_process_attribution(
@@ -4287,6 +8987,10 @@ async fn supervisor_reaps_a_naturally_exited_native_provider_without_an_explicit
     request.provider_label = "Naturally Exiting Claude".to_owned();
     request.binary_path = executable.to_string_lossy().into_owned();
     request.cwd = temp.path().to_path_buf();
+    request.environment.insert(
+        "BIBCODE_EXIT_FILE".to_owned(),
+        exit_file.to_string_lossy().into_owned(),
+    );
 
     supervisor.launch(request).await.unwrap();
     let rows = NativeProcessSampler::default().sample().await.unwrap();
@@ -4299,6 +9003,7 @@ async fn supervisor_reaps_a_naturally_exited_native_provider_without_an_explicit
         .into_iter()
         .find(|row| row.pid == claim.identity.pid && row.started_at == claim.identity.started_at)
         .expect("bound provider process row");
+    std::fs::write(&exit_file, b"exit").expect("release provider for natural exit");
 
     timeout(Duration::from_secs(3), async {
         loop {
@@ -4880,20 +9585,27 @@ fn claude_launch_arguments_preserve_controls_and_gate_activity_flags() {
             transcript_recovery: false,
         },
     );
-    assert_eq!(
-        &supported[..9],
-        [
-            "--print",
-            "--input-format",
-            "stream-json",
-            "--output-format",
-            "stream-json",
-            "--include-partial-messages",
-            "--include-hook-events",
-            "--forward-subagent-text",
-            "--verbose",
-        ]
-    );
+    for required in [
+        "--print",
+        "--input-format",
+        "--output-format",
+        "--replay-user-messages",
+        "--include-partial-messages",
+        "--include-hook-events",
+        "--forward-subagent-text",
+        "--verbose",
+    ] {
+        assert!(supported.iter().any(|argument| argument == required));
+    }
+    let replay = supported
+        .iter()
+        .position(|argument| argument == "--replay-user-messages")
+        .expect("replay argument");
+    let verbose = supported
+        .iter()
+        .position(|argument| argument == "--verbose")
+        .expect("verbose argument");
+    assert!(replay < verbose);
     assert_eq!(
         supported
             .iter()
@@ -4938,6 +9650,29 @@ fn claude_launch_arguments_preserve_controls_and_gate_activity_flags() {
             .windows(2)
             .any(|window| window == ["--effort", "high"])
     );
+}
+
+#[test]
+fn claude_fast_mode_is_merged_into_session_settings() {
+    let mut request = launch();
+    request.provider = "claudeAgent".to_owned();
+    request.options = vec![json!({ "id": "fastMode", "value": true })];
+
+    let arguments = build_claude_launch_arguments_with_settings_for_test(
+        &request,
+        "claude-session",
+        ClaudeActivitySupport::default(),
+        Some(json!({ "hooks": {} })),
+    );
+    let settings = arguments
+        .windows(2)
+        .find(|pair| pair[0] == "--settings")
+        .map(|pair| serde_json::from_str::<Value>(&pair[1]).expect("settings JSON"))
+        .expect("session settings argument");
+
+    assert_eq!(settings["fastMode"], true);
+    assert!(settings.get("hooks").is_some());
+    assert!(!arguments.iter().any(|argument| argument.contains("settings.json")));
 }
 
 #[cfg(unix)]
@@ -5773,8 +10508,7 @@ async fn native_opencode_driver_supports_session_turn_and_control_commands() {
         })
         .await
         .unwrap();
-    let activity_projection =
-        ActivityProjection::new(ActivityRepository::new(activity_database));
+    let activity_projection = ActivityProjection::new(ActivityRepository::new(activity_database));
     let activity_scope = ActivityScopeSeed::thread(
         "thread:native-opencode-driver",
         "native-opencode-driver",
@@ -5949,6 +10683,7 @@ while IFS= read -r line; do
   case "$line" in
     *'"method":"initialize"'*) printf '{"id":%s,"result":{"userAgent":"fixture"}}\n' "$id" ;;
     *'"method":"thread/start"'*) printf '{"id":%s,"result":{"cwd":"/tmp","model":"gpt-5","thread":{"id":"native-codex-thread"}}}\n' "$id" ;;
+    *'"method":"mcpServerStatus/list"'*) printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$id" ;;
     *'"method":"thread/goal/set"'*) printf '{"id":%s,"result":{"goal":{"status":"active"}}}\n' "$id" ;;
     *'"method":"turn/start"'*) printf '{"id":%s,"result":{"turn":{"id":"native-codex-turn"}}}\n{"method":"item/started","emittedAtMs":1001,"params":{"threadId":"native-codex-thread","turnId":"native-codex-turn","item":{"id":"spawn-1","type":"collabAgentToolCall","tool":"spawnAgent","status":"inProgress","senderThreadId":"native-codex-thread","receiverThreadIds":["native-child"],"agentsStates":{"native-child":{"status":"running","message":null}}},"startedAtMs":1001}}\n' "$id" ;;
     *'"method":"turn/interrupt"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;

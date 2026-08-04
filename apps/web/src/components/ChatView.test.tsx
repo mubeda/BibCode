@@ -34,6 +34,7 @@ import {
   type ActivitySnapshot,
   EnvironmentId,
   MessageId,
+  type ModelSelection,
   ProjectId,
   ProviderDriverKind,
   ProviderInstanceId,
@@ -124,6 +125,7 @@ vi.mock("../state/threads", () => ({
     setInteractionMode: { key: "thread.setInteractionMode" },
     startTurn: { key: "thread.startTurn" },
     interruptTurn: { key: "thread.interruptTurn" },
+    resolveDelivery: { key: "thread.resolveDelivery" },
     respondToApproval: { key: "thread.respondToApproval" },
     respondToUserInput: { key: "thread.respondToUserInput" },
     revertCheckpoint: { key: "thread.revertCheckpoint" },
@@ -3086,7 +3088,7 @@ describe("ChatView handlers (captured from mocked children)", () => {
       resetCursorState: () => undefined,
       addTerminalContext: () => undefined,
       getSendContext: () => ({
-        images: [],
+        attachments: [],
         terminalContexts: [],
         elementContexts: [],
         previewAnnotations: [],
@@ -3104,6 +3106,15 @@ describe("ChatView handlers (captured from mocked children)", () => {
   function commandCallsFor(key: string): Array<{ key: string; input: unknown }> {
     return h.commandCalls.filter((call) => call.key === key);
   }
+
+  it("provides message-scoped delivery resolution state to the timeline", () => {
+    seedConnectedServerThread();
+    renderServerRoute();
+
+    const timeline = capturedProps<Record<string, unknown>>("messagesTimeline");
+    expect(timeline["onResolveTurnDelivery"]).toBeTypeOf("function");
+    expect(timeline["resolvingTurnDeliveryMessageId"]).toBeNull();
+  });
 
   it("onInterrupt targets the running turn of the active session", async () => {
     const runningTurnId = TurnId.make("turn-running");
@@ -3153,6 +3164,28 @@ describe("ChatView handlers (captured from mocked children)", () => {
         input: { environmentId, input: { threadId, requestId, decision: "approve" } },
       },
     ]);
+  });
+
+  it("commits composer options through thread metadata before they become local state", async () => {
+    seedConnectedServerThread();
+    renderServerRoute();
+
+    const composer = capturedProps<Record<string, unknown>>("chatComposer");
+    const onCommitModelSelection = composer["onCommitModelSelection"] as (
+      selection: ModelSelection,
+    ) => Promise<void>;
+    const selection: ModelSelection = {
+      instanceId: codexInstanceId,
+      model: "gpt-5.4",
+      options: [{ id: "fastMode", value: true }],
+    };
+
+    await onCommitModelSelection(selection);
+
+    expect(commandCallsFor("thread.updateMetadata")).toContainEqual({
+      key: "thread.updateMetadata",
+      input: { environmentId, input: { threadId, modelSelection: selection } },
+    });
   });
 
   it("onRespondToApproval interrupts the active turn when cancellation is requested", async () => {

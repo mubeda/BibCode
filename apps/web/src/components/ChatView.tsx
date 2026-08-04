@@ -23,6 +23,7 @@ import {
   OrchestrationThreadActivity,
   ProviderInteractionMode,
   ProviderDriverKind,
+  PROVIDER_DISPLAY_NAMES,
   RuntimeMode,
   TerminalOpenInput,
 } from "@bibcode/contracts";
@@ -115,6 +116,7 @@ import {
   type ChatMessage,
   type SessionPhase,
   type Thread,
+  type TurnDeliveryResolutionAction,
   type TurnDiffSummary,
 } from "../types";
 import { useTheme } from "../hooks/useTheme";
@@ -123,6 +125,7 @@ import { isCommandPaletteOpen } from "../commandPaletteContext";
 import { buildTemporaryWorktreeBranchName } from "@bibcode/shared/git";
 import { useMediaQuery } from "../hooks/useMediaQuery";
 import { resolveProviderSessionSelectionForInstance } from "../providerSessionSelection";
+import { formatProviderDriverKindLabel } from "../providerModels";
 import {
   ACTIVITY_DOCK_COMPACT_MEDIA_QUERY,
   RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY,
@@ -186,7 +189,7 @@ import {
 } from "../logicalProject";
 import { buildDraftThreadRouteParams } from "../threadRoutes";
 import {
-  type ComposerImageAttachment,
+  type ComposerAttachment,
   type DraftThreadEnvMode,
   useComposerDraftStore,
   type DraftId,
@@ -249,7 +252,7 @@ import {
   type KeyedActivityPage,
   type LocalDispatchSnapshot,
   PullRequestDialogState,
-  cloneComposerImageForRetry,
+  cloneComposerAttachmentForRetry,
   deriveLockedProvider,
   readFileAsDataUrl,
   reconcileBoundedActivityPages,
@@ -290,8 +293,8 @@ import type { FileEditingSession } from "./files/fileEditingSession";
 import { FileEditingSessionRegistry } from "./files/fileEditingSessionRegistry";
 import { ProjectFilesPreloader } from "./files/ProjectFilesPreloader";
 
-const IMAGE_ONLY_BOOTSTRAP_PROMPT =
-  "[User attached one or more images without additional text. Respond using the conversation context and the attached image(s).]";
+const ATTACHMENT_ONLY_BOOTSTRAP_PROMPT =
+  "[User attached one or more files without additional text. Respond using the conversation context and the attachments.]";
 const EMPTY_ACTIVITIES: OrchestrationThreadActivity[] = [];
 const EMPTY_PROVIDERS: ServerProvider[] = [];
 const EMPTY_PROVIDER_SKILLS: ServerProvider["skills"] = [];
@@ -1409,6 +1412,19 @@ function ChatViewContent(props: ChatViewProps) {
   const updateThreadMetadata = useAtomCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
   });
+  const commitComposerModelSelection = useCallback(
+    async (selection: ModelSelection) => {
+      if (routeKind !== "server") return;
+      const result = await updateThreadMetadata({
+        environmentId,
+        input: { threadId, modelSelection: selection },
+      });
+      if (result._tag === "Failure") {
+        throw squashAtomCommandFailure(result);
+      }
+    },
+    [environmentId, routeKind, threadId, updateThreadMetadata],
+  );
   const setThreadRuntimeMode = useAtomCommand(threadEnvironment.setRuntimeMode, {
     reportFailure: false,
   });
@@ -1417,6 +1433,9 @@ function ChatViewContent(props: ChatViewProps) {
   });
   const startThreadTurn = useAtomCommand(threadEnvironment.startTurn, { reportFailure: false });
   const interruptThreadTurn = useAtomCommand(threadEnvironment.interruptTurn, {
+    reportFailure: false,
+  });
+  const resolveTurnDelivery = useAtomCommand(threadEnvironment.resolveDelivery, {
     reportFailure: false,
   });
   const respondToThreadApproval = useAtomCommand(threadEnvironment.respondToApproval, {
@@ -1464,7 +1483,7 @@ function ChatViewContent(props: ChatViewProps) {
     (store) => store.getComposerDraft(composerDraftTarget)?.activeProvider ?? null,
   );
   const setComposerDraftPrompt = useComposerDraftStore((store) => store.setPrompt);
-  const addComposerDraftImages = useComposerDraftStore((store) => store.addImages);
+  const addComposerDraftAttachments = useComposerDraftStore((store) => store.addAttachments);
   const setComposerDraftTerminalContexts = useComposerDraftStore(
     (store) => store.setTerminalContexts,
   );
@@ -1500,7 +1519,7 @@ function ChatViewContent(props: ChatViewProps) {
         : null,
   );
   const promptRef = useRef("");
-  const composerImagesRef = useRef<ComposerImageAttachment[]>([]);
+  const composerAttachmentsRef = useRef<ComposerAttachment[]>([]);
   const composerTerminalContextsRef = useRef<TerminalContextDraft[]>([]);
   const composerElementContextsRef = useRef<ElementContextDraft[]>([]);
   const localComposerRef = useRef<ChatComposerHandle | null>(null);
@@ -2210,6 +2229,8 @@ function ChatViewContent(props: ChatViewProps) {
   const [dismissedVersionMismatchKey, setDismissedVersionMismatchKey] = useState<string | null>(
     null,
   );
+  const [resolvingTurnDeliveryMessageId, setResolvingTurnDeliveryMessageId] =
+    useState<MessageId | null>(null);
   const versionMismatchDismissed =
     versionMismatchDismissKey === dismissedVersionMismatchKey ||
     isVersionMismatchDismissed(versionMismatchDismissKey);
@@ -2448,10 +2469,11 @@ function ChatViewContent(props: ChatViewProps) {
     });
   }, []);
   const serverMessages = activeThread?.messages;
-  const serverAttachmentIds = useMemo(() => {
+  const serverImageAttachmentIds = useMemo(() => {
     const attachmentIds = new Set<string>();
     for (const message of serverMessages ?? []) {
       for (const attachment of message.attachments ?? []) {
+        if (attachment.type !== "image") continue;
         attachmentIds.add(attachment.id);
       }
     }
@@ -2459,22 +2481,22 @@ function ChatViewContent(props: ChatViewProps) {
   }, [serverMessages]);
   const serverAttachmentResources = useMemo(
     () =>
-      serverAttachmentIds.map((attachmentId) => ({
+      serverImageAttachmentIds.map((attachmentId) => ({
         _tag: "attachment" as const,
         attachmentId,
       })),
-    [serverAttachmentIds],
+    [serverImageAttachmentIds],
   );
   const serverAttachmentUrls = useAssetUrls(environmentId, serverAttachmentResources);
   const serverAttachmentUrlById = useMemo(
     () =>
       new Map(
-        serverAttachmentIds.flatMap((attachmentId, index) => {
+        serverImageAttachmentIds.flatMap((attachmentId, index) => {
           const url = serverAttachmentUrls[index];
           return url ? [[attachmentId, url] as const] : [];
         }),
       ),
-    [serverAttachmentIds, serverAttachmentUrls],
+    [serverImageAttachmentIds, serverAttachmentUrls],
   );
   const displayServerMessages = useMemo<ReadonlyArray<ChatMessage>>(() => {
     if (!serverMessages) return [];
@@ -2485,6 +2507,7 @@ function ChatViewContent(props: ChatViewProps) {
       return {
         ...message,
         attachments: message.attachments.map((attachment) => {
+          if (attachment.type !== "image") return attachment;
           const previewUrl = serverAttachmentUrlById.get(attachment.id);
           return previewUrl ? { ...attachment, previewUrl } : attachment;
         }),
@@ -4605,6 +4628,52 @@ function ChatViewContent(props: ChatViewProps) {
     ],
   );
 
+  const onResolveTurnDelivery = useCallback(
+    async (messageId: MessageId, action: TurnDeliveryResolutionAction) => {
+      if (!activeThread || resolvingTurnDeliveryMessageId === messageId) return;
+      const delivery = activeThread.messages.find((message) => message.id === messageId)?.delivery;
+      if (!delivery || (delivery.state !== "uncertain" && delivery.state !== "failed")) return;
+
+      if (action === "retry" && delivery.state === "uncertain") {
+        const localApi = readLocalApi();
+        if (!localApi) return;
+        const provider =
+          PROVIDER_DISPLAY_NAMES[delivery.provider] ??
+          formatProviderDriverKindLabel(delivery.provider);
+        const confirmed = await localApi.dialogs.confirm(
+          [
+            "Retry this message?",
+            `${provider} may receive a duplicate if it received the original message.`,
+            "Only retry if sending the message twice is safe.",
+          ].join("\n"),
+        );
+        if (!confirmed) return;
+      }
+
+      setResolvingTurnDeliveryMessageId(messageId);
+      setThreadError(activeThread.id, null);
+      const result = await resolveTurnDelivery({
+        environmentId,
+        input: { threadId: activeThread.id, messageId, action },
+      });
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        const error = squashAtomCommandFailure(result);
+        setThreadError(
+          activeThread.id,
+          error instanceof Error ? error.message : "Failed to resolve message delivery.",
+        );
+      }
+      setResolvingTurnDeliveryMessageId((current) => (current === messageId ? null : current));
+    },
+    [
+      activeThread,
+      environmentId,
+      resolveTurnDelivery,
+      resolvingTurnDeliveryMessageId,
+      setThreadError,
+    ],
+  );
+
   const onSend = async (e?: { preventDefault: () => void }) => {
     e?.preventDefault();
     if (
@@ -4622,7 +4691,7 @@ function ChatViewContent(props: ChatViewProps) {
     const sendCtx = composerRef.current?.getSendContext();
     if (!sendCtx) return;
     const {
-      images: composerImages,
+      attachments: composerAttachments,
       terminalContexts: composerTerminalContexts,
       elementContexts: composerElementContexts,
       previewAnnotations: composerPreviewAnnotations,
@@ -4641,7 +4710,7 @@ function ChatViewContent(props: ChatViewProps) {
       hasSendableContent,
     } = deriveComposerSendState({
       prompt: promptForSend,
-      imageCount: composerImages.length,
+      imageCount: composerAttachments.length,
       terminalContexts: composerTerminalContexts,
       elementContextCount:
         composerElementContexts.length +
@@ -4706,7 +4775,7 @@ function ChatViewContent(props: ChatViewProps) {
     sendInFlightRef.current = true;
     beginLocalDispatch({ preparingWorktree: Boolean(baseBranchForWorktree) });
 
-    const composerImagesSnapshot = [...composerImages];
+    const composerAttachmentsSnapshot = [...composerAttachments];
     const composerTerminalContextsSnapshot = [...sendableComposerTerminalContexts];
     const composerElementContextsSnapshot = [...composerElementContexts];
     const composerPreviewAnnotationsSnapshot = [...composerPreviewAnnotations];
@@ -4730,25 +4799,36 @@ function ChatViewContent(props: ChatViewProps) {
       model: ctxSelectedModel,
       models: ctxSelectedProviderModels,
       effort: ctxSelectedPromptEffort,
-      text: messageTextForSend || IMAGE_ONLY_BOOTSTRAP_PROMPT,
+      text: messageTextForSend || ATTACHMENT_ONLY_BOOTSTRAP_PROMPT,
     });
     const turnAttachmentsPromise = Promise.all(
-      composerImagesSnapshot.map(async (image) => ({
-        type: "image" as const,
-        name: image.name,
-        mimeType: image.mimeType,
-        sizeBytes: image.sizeBytes,
-        dataUrl: await readFileAsDataUrl(image.file),
+      composerAttachmentsSnapshot.map(async (attachment) => ({
+        type: attachment.type,
+        id: attachment.id,
+        name: attachment.name,
+        mimeType: attachment.mimeType,
+        sizeBytes: attachment.sizeBytes,
+        dataUrl: await readFileAsDataUrl(attachment.file),
       })),
     );
-    const optimisticAttachments = composerImagesSnapshot.map((image) => ({
-      type: "image" as const,
-      id: image.id,
-      name: image.name,
-      mimeType: image.mimeType,
-      sizeBytes: image.sizeBytes,
-      previewUrl: image.previewUrl,
-    }));
+    const optimisticAttachments = composerAttachmentsSnapshot.map((attachment) =>
+      attachment.type === "image"
+        ? {
+            type: "image" as const,
+            id: attachment.id,
+            name: attachment.name,
+            mimeType: attachment.mimeType,
+            sizeBytes: attachment.sizeBytes,
+            previewUrl: attachment.previewUrl,
+          }
+        : {
+            type: "file" as const,
+            id: attachment.id,
+            name: attachment.name,
+            mimeType: attachment.mimeType,
+            sizeBytes: attachment.sizeBytes,
+          },
+    );
     // Sending always returns to the live edge. The new row becomes the
     // anchored end-space target so it lands near the top while the response
     // streams into the reserved space below it.
@@ -4794,17 +4874,17 @@ function ChatViewContent(props: ChatViewProps) {
     clearComposerDraftContent(composerDraftTarget);
     composerRef.current?.resetCursorState();
 
-    let firstComposerImageName: string | null = null;
-    if (composerImagesSnapshot.length > 0) {
-      const firstComposerImage = composerImagesSnapshot[0];
-      if (firstComposerImage) {
-        firstComposerImageName = firstComposerImage.name;
+    let firstComposerAttachment: ComposerAttachment | null = null;
+    if (composerAttachmentsSnapshot.length > 0) {
+      const firstAttachment = composerAttachmentsSnapshot[0];
+      if (firstAttachment) {
+        firstComposerAttachment = firstAttachment;
       }
     }
     let titleSeed = trimmed;
     if (!titleSeed) {
-      if (firstComposerImageName) {
-        titleSeed = `Image: ${firstComposerImageName}`;
+      if (firstComposerAttachment) {
+        titleSeed = `${firstComposerAttachment.type === "image" ? "Image" : "File"}: ${firstComposerAttachment.name}`;
       } else if (composerTerminalContextsSnapshot.length > 0) {
         titleSeed = formatTerminalContextLabel(composerTerminalContextsSnapshot[0]!);
       } else if (composerElementContextsSnapshot.length > 0) {
@@ -4925,7 +5005,7 @@ function ChatViewContent(props: ChatViewProps) {
     if (failure !== null) {
       if (
         promptRef.current.length === 0 &&
-        composerImagesRef.current.length === 0 &&
+        composerAttachmentsRef.current.length === 0 &&
         composerTerminalContextsRef.current.length === 0 &&
         composerElementContextsRef.current.length === 0 &&
         (useComposerDraftStore.getState().getComposerDraft(composerDraftTarget)?.previewAnnotations
@@ -4942,12 +5022,14 @@ function ChatViewContent(props: ChatViewProps) {
           return next.length === existing.length ? existing : next;
         });
         promptRef.current = promptForSend;
-        const retryComposerImages = composerImagesSnapshot.map(cloneComposerImageForRetry);
-        composerImagesRef.current = retryComposerImages;
+        const retryComposerAttachments = composerAttachmentsSnapshot.map(
+          cloneComposerAttachmentForRetry,
+        );
+        composerAttachmentsRef.current = retryComposerAttachments;
         composerTerminalContextsRef.current = composerTerminalContextsSnapshot;
         composerElementContextsRef.current = composerElementContextsSnapshot;
         setComposerDraftPrompt(composerDraftTarget, promptForSend);
-        addComposerDraftImages(composerDraftTarget, retryComposerImages);
+        addComposerDraftAttachments(composerDraftTarget, retryComposerAttachments);
         setComposerDraftTerminalContexts(composerDraftTarget, composerTerminalContextsSnapshot);
         setComposerDraftElementContexts(composerDraftTarget, composerElementContextsSnapshot);
         setComposerDraftPreviewAnnotations(composerDraftTarget, composerPreviewAnnotationsSnapshot);
@@ -5859,6 +5941,8 @@ function ChatViewContent(props: ChatViewProps) {
                 onOpenTurnDiff={onOpenTurnDiff}
                 revertTurnCountByUserMessageId={revertTurnCountByUserMessageId}
                 onRevertUserMessage={onRevertUserMessage}
+                onResolveTurnDelivery={onResolveTurnDelivery}
+                resolvingTurnDeliveryMessageId={resolvingTurnDeliveryMessageId}
                 isRevertingCheckpoint={isRevertingCheckpoint}
                 onImageExpand={onExpandTimelineImage}
                 markdownCwd={gitCwd ?? undefined}
@@ -5950,6 +6034,9 @@ function ChatViewContent(props: ChatViewProps) {
                       providerStatuses={providerStatuses as ServerProvider[]}
                       activeProjectDefaultModelSelection={activeProject?.defaultModelSelection}
                       activeThreadModelSelection={activeThread?.modelSelection}
+                      {...(routeKind === "server"
+                        ? { onCommitModelSelection: commitComposerModelSelection }
+                        : {})}
                       activeThreadActivities={activeThread?.activities}
                       resolvedTheme={resolvedTheme}
                       settings={settings}
@@ -5957,7 +6044,7 @@ function ChatViewContent(props: ChatViewProps) {
                       terminalOpen={Boolean(terminalUiState.terminalOpen)}
                       gitCwd={gitCwd}
                       promptRef={promptRef}
-                      composerImagesRef={composerImagesRef}
+                      composerAttachmentsRef={composerAttachmentsRef}
                       composerTerminalContextsRef={composerTerminalContextsRef}
                       composerElementContextsRef={composerElementContextsRef}
                       onSend={onSend}

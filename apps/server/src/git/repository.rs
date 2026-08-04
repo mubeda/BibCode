@@ -930,6 +930,30 @@ impl GitRepository {
         })
     }
 
+    pub async fn ensure_worktree(
+        &self,
+        input: CreateWorktreeInput,
+        cancellation: &CancellationToken,
+    ) -> Result<VcsCreateWorktreeResult, GitCommandError> {
+        let target_ref = input
+            .new_ref_name
+            .as_deref()
+            .unwrap_or(input.ref_name.as_str());
+        if let Some(path) = self
+            .worktree_map(&input.cwd, cancellation)
+            .await?
+            .get(target_ref)
+        {
+            return Ok(VcsCreateWorktreeResult {
+                worktree: VcsWorktree {
+                    path: path.clone(),
+                    ref_name: target_ref.to_owned(),
+                },
+            });
+        }
+        self.create_worktree(input, cancellation).await
+    }
+
     async fn create_suffixed_worktree_from_occupied_branch(
         &self,
         cwd: &Path,
@@ -2097,7 +2121,9 @@ mod worktree_ownership_tests {
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
-    use super::{GitRepository, OwnedWorktreePath, display_path, parse_branch_headers};
+    use super::{
+        CreateWorktreeInput, GitRepository, OwnedWorktreePath, display_path, parse_branch_headers,
+    };
 
     #[test]
     fn branch_headers_require_an_actual_upstream_comparison() {
@@ -2139,6 +2165,35 @@ mod worktree_ownership_tests {
         git(repo.path(), &["add", "README.md"]);
         git(repo.path(), &["commit", "-m", "initial"]);
         repo
+    }
+
+    #[tokio::test]
+    async fn ensure_worktree_reuses_the_canonical_path_for_an_existing_branch() {
+        let repo = repository();
+        let parent = tempfile::tempdir().expect("worktree parent");
+        let path = parent.path().join("feature");
+        let input = CreateWorktreeInput {
+            cwd: repo.path().to_path_buf(),
+            ref_name: "main".to_owned(),
+            new_ref_name: Some("feature".to_owned()),
+            base_ref_name: None,
+            path: Some(path),
+        };
+        let repository = GitRepository::default();
+        let created = repository
+            .create_worktree(input.clone(), &CancellationToken::new())
+            .await
+            .expect("create worktree");
+        let ensured = repository
+            .ensure_worktree(input, &CancellationToken::new())
+            .await
+            .expect("ensure existing worktree");
+
+        assert_eq!(ensured.worktree.path, created.worktree.path);
+        assert_eq!(ensured.worktree.ref_name, "feature");
+        let worktrees = git(repo.path(), &["worktree", "list", "--porcelain"]);
+        assert_eq!(worktrees.matches("branch refs/heads/feature").count(), 1);
+        assert!(!worktrees.contains("refs/heads/feature-2"));
     }
 
     #[tokio::test]

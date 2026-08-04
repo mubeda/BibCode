@@ -216,52 +216,272 @@ pub fn build_capabilities_from_config_options(options: &Value) -> Value {
     json!({ "optionDescriptors": descriptors })
 }
 
-pub fn resolve_acp_config_updates(options: &Value, updates: &Value) -> Vec<Value> {
+pub fn resolve_acp_config_updates(options: &Value, updates: &Value) -> Result<Vec<Value>, String> {
     let Some(options) = options.as_array() else {
-        return Vec::new();
+        return Err("Cursor session did not advertise config options".to_owned());
     };
     let Some(updates) = updates.as_array() else {
-        return Vec::new();
+        return Err("Cursor option updates must be an array".to_owned());
     };
-    let has_model_option_effort = options.iter().any(|option| {
-        option.get("category").and_then(Value::as_str) == Some("model_option")
-            && option.get("id").and_then(Value::as_str) == Some("effort")
-    });
     let mut resolved = Vec::new();
     for update in updates {
-        match update.get("id").and_then(Value::as_str) {
+        let (config_id, value) = match update.get("id").and_then(Value::as_str) {
             Some("reasoning") => {
-                let config_id = if has_model_option_effort {
-                    "effort"
+                let (config_id, descriptor) = if let Some(descriptor) = options.iter().find(|option| {
+                    option.get("category").and_then(Value::as_str) == Some("model_option")
+                        && option.get("id").and_then(Value::as_str) == Some("effort")
+                }) {
+                    ("effort", descriptor)
                 } else {
-                    "reasoning"
+                    (
+                        "reasoning",
+                        expected_config_option(options, "reasoning", "thought_level")?,
+                    )
                 };
+                ensure_select_config_option(descriptor, config_id)?;
                 let value = match update.get("value") {
                     Some(Value::String(value)) if value == "xhigh" => json!("extra-high"),
-                    Some(value) => value.clone(),
-                    None => continue,
+                    Some(Value::String(value)) => json!(value),
+                    None => return Err("Cursor reasoning option is missing a value".to_owned()),
+                    _ => return Err("Cursor reasoning option must be a string".to_owned()),
                 };
-                resolved.push(json!({ "configId": config_id, "value": value }));
+                ensure_advertised_value(descriptor, &value, config_id)?;
+                (config_id, value)
             }
             Some("contextWindow") => {
-                if let Some(value) = update.get("value") {
-                    resolved.push(json!({ "configId": "context", "value": value }));
-                }
+                let descriptor = expected_config_option(options, "context", "model_config")?;
+                ensure_select_config_option(descriptor, "context")?;
+                let value = update
+                    .get("value")
+                    .and_then(Value::as_str)
+                    .map(|value| json!(value))
+                    .ok_or_else(|| "Cursor context window option is missing a value".to_owned())?;
+                ensure_advertised_value(descriptor, &value, "context")?;
+                ("context", value)
             }
             Some("fastMode") => {
-                if let Some(value) = update.get("value").and_then(Value::as_bool) {
-                    resolved.push(json!({ "configId": "fast", "value": value.to_string() }));
-                }
+                let descriptor = expected_config_option(options, "fast", "model_config")?;
+                ensure_select_config_option(descriptor, "fast")?;
+                let value = update
+                    .get("value")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| "Cursor fast mode must be boolean".to_owned())?;
+                let value = json!(value.to_string());
+                ensure_advertised_value(descriptor, &value, "fast")?;
+                ("fast", value)
             }
             Some("thinking") => {
-                if let Some(value) = update.get("value") {
-                    resolved.push(json!({ "configId": "thinking", "value": value }));
-                }
+                let descriptor = expected_config_option(options, "thinking", "model_config")?;
+                ensure_select_config_option(descriptor, "thinking")?;
+                let value = update
+                    .get("value")
+                    .and_then(Value::as_bool)
+                    .map(|value| json!(value.to_string()))
+                    .ok_or_else(|| "Cursor thinking option is missing a value".to_owned())?;
+                ensure_advertised_value(descriptor, &value, "thinking")?;
+                ("thinking", value)
             }
-            _ => {}
+            Some(id) => return Err(format!("Cursor does not support option {id}")),
+            None => return Err("Cursor option is missing an id".to_owned()),
+        };
+        resolved.push(json!({ "configId": config_id, "value": value }));
+    }
+    Ok(resolved)
+}
+
+pub fn resolve_acp_config_updates_with_baseline(
+    options: &Value,
+    baseline: &Value,
+    updates: &Value,
+) -> Result<Vec<Value>, String> {
+    let mut resolved = resolve_acp_config_updates(options, updates)?;
+    let requested_config_ids = resolved
+        .iter()
+        .filter_map(|update| {
+            update
+                .get("configId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<Vec<_>>();
+    let baseline = baseline
+        .as_array()
+        .ok_or_else(|| "Cursor session did not advertise baseline config options".to_owned())?;
+
+    for (config_id, category) in supported_baseline_config_options(baseline) {
+        if requested_config_ids.iter().any(|requested| requested == config_id) {
+            continue;
+        }
+        let descriptor = expected_config_option(baseline, config_id, category)?;
+        ensure_select_config_option(descriptor, config_id)?;
+        let baseline_value = acp_config_option_baseline_value(baseline, config_id)?;
+        ensure_advertised_value(descriptor, &baseline_value, config_id)?;
+        let current_value = acp_config_option_current_value(options, config_id)?;
+        if current_value != baseline_value {
+            resolved.push(json!({ "configId": config_id, "value": baseline_value }));
         }
     }
-    resolved
+
+    Ok(resolved)
+}
+
+pub fn resolve_acp_default_model_config(options: &Value) -> Result<(String, Value), String> {
+    let options = options
+        .as_array()
+        .ok_or_else(|| "Cursor session did not advertise config options".to_owned())?;
+    let descriptor = options
+        .iter()
+        .find(|option| option.get("category").and_then(Value::as_str) == Some("model"))
+        .ok_or_else(|| "Cursor session did not advertise a model config option".to_owned())?;
+    let config_id = descriptor
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| "Cursor model config option is missing an id".to_owned())?;
+    let value = descriptor
+        .get("options")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|option| option.get("isDefault") == Some(&Value::Bool(true)))
+        .and_then(advertised_option_value)
+        .filter(|value| !value.is_null())
+        .or_else(|| {
+            descriptor
+                .get("currentValue")
+                .filter(|value| !value.is_null())
+                .cloned()
+        })
+        .ok_or_else(|| {
+            format!("Cursor model config option {config_id} has no advertised default or current value")
+        })?;
+    Ok((config_id, value))
+}
+
+pub fn acp_config_option_current_value(options: &Value, config_id: &str) -> Result<Value, String> {
+    let options = options
+        .as_array()
+        .ok_or_else(|| "Cursor session did not advertise config options".to_owned())?;
+    let descriptor = options
+        .iter()
+        .find(|option| option.get("id").and_then(Value::as_str) == Some(config_id))
+        .ok_or_else(|| format!("Cursor session did not advertise config option {config_id}"))?;
+    descriptor
+        .get("currentValue")
+        .filter(|value| !value.is_null())
+        .cloned()
+        .or_else(|| {
+            descriptor
+                .get("options")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .find(|option| option.get("isDefault") == Some(&Value::Bool(true)))
+                .and_then(advertised_option_value)
+        })
+        .ok_or_else(|| format!("Cursor config option {config_id} has no current or default value"))
+}
+
+fn supported_baseline_config_options(options: &[Value]) -> Vec<(&'static str, &'static str)> {
+    let mut supported = Vec::new();
+    if options.iter().any(|option| {
+        option.get("id").and_then(Value::as_str) == Some("effort")
+            && option.get("category").and_then(Value::as_str) == Some("model_option")
+    }) {
+        supported.push(("effort", "model_option"));
+    } else if options.iter().any(|option| {
+        option.get("id").and_then(Value::as_str) == Some("reasoning")
+            && option.get("category").and_then(Value::as_str) == Some("thought_level")
+    }) {
+        supported.push(("reasoning", "thought_level"));
+    }
+    for config_id in ["context", "fast", "thinking"] {
+        if options.iter().any(|option| {
+            option.get("id").and_then(Value::as_str) == Some(config_id)
+                && option.get("category").and_then(Value::as_str) == Some("model_config")
+        }) {
+            supported.push((config_id, "model_config"));
+        }
+    }
+    supported
+}
+
+fn acp_config_option_baseline_value(options: &[Value], config_id: &str) -> Result<Value, String> {
+    let descriptor = options
+        .iter()
+        .find(|option| option.get("id").and_then(Value::as_str) == Some(config_id))
+        .ok_or_else(|| format!("Cursor session did not advertise config option {config_id}"))?;
+    descriptor
+        .get("options")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .find(|option| option.get("isDefault") == Some(&Value::Bool(true)))
+        .and_then(advertised_option_value)
+        .or_else(|| {
+            descriptor
+                .get("currentValue")
+                .filter(|value| !value.is_null())
+                .cloned()
+        })
+        .ok_or_else(|| format!("Cursor config option {config_id} has no advertised default or current value"))
+}
+
+fn expected_config_option<'a>(
+    options: &'a [Value],
+    config_id: &str,
+    category: &str,
+) -> Result<&'a Value, String> {
+    let descriptor = options
+        .iter()
+        .find(|option| option.get("id").and_then(Value::as_str) == Some(config_id))
+        .ok_or_else(|| format!("Cursor session did not advertise config option {config_id}"))?;
+    if descriptor.get("category").and_then(Value::as_str) != Some(category) {
+        return Err(format!("Cursor config option {config_id} has an unsupported category"));
+    }
+    Ok(descriptor)
+}
+
+fn ensure_select_config_option(descriptor: &Value, config_id: &str) -> Result<(), String> {
+    if descriptor.get("type").and_then(Value::as_str) != Some("select") {
+        return Err(format!("Cursor config option {config_id} has an unsupported type"));
+    }
+    if advertised_values(descriptor).is_empty() {
+        return Err(format!("Cursor config option {config_id} has no advertised values"));
+    }
+    Ok(())
+}
+
+fn ensure_advertised_value(
+    descriptor: &Value,
+    value: &Value,
+    config_id: &str,
+) -> Result<(), String> {
+    if advertised_values(descriptor).iter().any(|candidate| candidate == value) {
+        Ok(())
+    } else {
+        Err(format!("Cursor config option {config_id} does not advertise the requested value"))
+    }
+}
+
+fn advertised_values(descriptor: &Value) -> Vec<Value> {
+    descriptor
+        .get("options")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|option| {
+            advertised_option_value(option)
+        })
+        .collect()
+}
+
+fn advertised_option_value(option: &Value) -> Option<Value> {
+    option
+        .get("value")
+        .or_else(|| option.get("id"))
+        .cloned()
+        .or_else(|| option.is_string().then(|| option.clone()))
 }
 
 pub fn discover_models_from_list_available_models(

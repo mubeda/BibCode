@@ -214,6 +214,9 @@ vi.mock("../chat/ProviderModelPicker", () => ({
 }));
 
 vi.mock("../chat/TraitsPicker", () => ({
+  findProviderEffortDescriptor: (descriptors: ReadonlyArray<{ id: string; type: string }>) =>
+    descriptors.find((descriptor) => descriptor.type === "select" && descriptor.id === "effort") ??
+    null,
   TraitsPicker: (props: AnyProps) => {
     h.traitsPickers.push(props);
     return <div data-testid="traits-picker" />;

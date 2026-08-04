@@ -5,13 +5,11 @@ import {
   type ProviderOptionSelection,
   type ServerProviderModel,
 } from "@bibcode/contracts";
-import { isValidElement } from "react";
 import { DraftId } from "../../composerDraftStore";
 import {
   getComposerPromptInjectionState,
   getComposerProviderState,
-  renderProviderTraitsMenuContent,
-  renderProviderTraitsPicker,
+  renderComposerTraitControls,
 } from "./composerProviderState";
 
 // Everything in composerProviderState is now data-driven by the model's
@@ -113,7 +111,7 @@ describe("getComposerProviderState", () => {
     });
   });
 
-  it("keeps Codex Fast selected when live service tier metadata is partial", () => {
+  it("normalizes Codex Fast to an advertised partial service tier", () => {
     const state = getComposerProviderState({
       provider: CODEX,
       model: MODEL,
@@ -130,11 +128,11 @@ describe("getComposerProviderState", () => {
     expect(state).toEqual({
       provider: CODEX,
       promptEffort: "high",
-      modelOptionsForDispatch: selections(["reasoningEffort", "high"], ["serviceTier", "fast"]),
+      modelOptionsForDispatch: selections(["reasoningEffort", "high"], ["serviceTier", "default"]),
     });
   });
 
-  it("supplies the Codex effort invariant when live metadata only has service tier", () => {
+  it("does not infer Codex options from an empty capability snapshot", () => {
     const state = getComposerProviderState({
       provider: CODEX,
       model: MODEL,
@@ -144,12 +142,12 @@ describe("getComposerProviderState", () => {
 
     expect(state).toEqual({
       provider: CODEX,
-      promptEffort: "medium",
-      modelOptionsForDispatch: selections(["reasoningEffort", "medium"], ["serviceTier", "fast"]),
+      promptEffort: null,
+      modelOptionsForDispatch: undefined,
     });
   });
 
-  it("preserves configured Codex effort and Fast through empty model capabilities", () => {
+  it("preserves configured Codex effort but not unverified Fast", () => {
     const state = getComposerProviderState({
       provider: CODEX,
       model: MODEL,
@@ -160,11 +158,11 @@ describe("getComposerProviderState", () => {
     expect(state).toEqual({
       provider: CODEX,
       promptEffort: "xhigh",
-      modelOptionsForDispatch: selections(["reasoningEffort", "xhigh"], ["serviceTier", "fast"]),
+      modelOptionsForDispatch: selections(["reasoningEffort", "xhigh"]),
     });
   });
 
-  it("supplies Codex dispatch defaults when capabilities and saved options are absent", () => {
+  it("does not supply Codex dispatch defaults when capabilities are absent", () => {
     const state = getComposerProviderState({
       provider: CODEX,
       model: MODEL,
@@ -174,11 +172,8 @@ describe("getComposerProviderState", () => {
 
     expect(state).toEqual({
       provider: CODEX,
-      promptEffort: "medium",
-      modelOptionsForDispatch: selections(
-        ["reasoningEffort", "medium"],
-        ["serviceTier", "default"],
-      ),
+      promptEffort: null,
+      modelOptionsForDispatch: undefined,
     });
   });
 
@@ -238,7 +233,37 @@ describe("getComposerProviderState", () => {
     });
   });
 
-  it("derives promptEffort from the first select descriptor and preserves all others for dispatch", () => {
+  it("does not treat unrelated select descriptors as prompt effort", () => {
+    const state = getComposerProviderState({
+      provider: PROVIDER,
+      model: MODEL,
+      models: modelWith([
+        selectDescriptor("temperature", [{ id: "warm", label: "Warm", isDefault: true }]),
+      ]),
+      modelOptions: undefined,
+    });
+
+    expect(state.promptEffort).toBeNull();
+  });
+
+  it("selects canonical effort when unrelated selects appear first", () => {
+    const state = getComposerProviderState({
+      provider: PROVIDER,
+      model: MODEL,
+      models: modelWith([
+        selectDescriptor("temperature", [{ id: "warm", label: "Warm", isDefault: true }]),
+        selectDescriptor("effort", [
+          { id: "low", label: "Low" },
+          { id: "high", label: "High", isDefault: true },
+        ]),
+      ]),
+      modelOptions: selections(["temperature", "warm"], ["effort", "low"]),
+    });
+
+    expect(state.promptEffort).toBe("low");
+  });
+
+  it("derives promptEffort from the canonical effort descriptor and preserves all others for dispatch", () => {
     const state = getComposerProviderState({
       provider: PROVIDER,
       model: MODEL,
@@ -339,12 +364,57 @@ describe("provider traits render guards", () => {
       onPromptChange: () => {},
     };
 
-    expect(renderProviderTraitsPicker(args)).toBeNull();
-    expect(renderProviderTraitsMenuContent(args)).toBeNull();
+    expect(renderComposerTraitControls(args)).toBeNull();
   });
 
-  it("exposes Codex default effort and service tiers without live capabilities", () => {
-    const picker = renderProviderTraitsPicker({
+  it("does not render agent selection in the composer", () => {
+    expect(
+      renderComposerTraitControls({
+        provider: PROVIDER,
+        draftId: DraftId.make("agent-only"),
+        model: MODEL,
+        models: modelWith([
+          selectDescriptor("agent", [{ id: "reviewer", label: "Reviewer", isDefault: true }]),
+        ]),
+        modelOptions: undefined,
+        prompt: "",
+        onPromptChange: () => {},
+      }),
+    ).not.toBeNull();
+  });
+
+  it("keeps unavailable controls visible with truthful unsupported and unknown states", () => {
+    const unsupported = renderComposerTraitControls({
+      provider: PROVIDER,
+      draftId: DraftId.make("unsupported"),
+      model: MODEL,
+      models: modelWith([]),
+      providerSnapshotLoaded: true,
+      modelOptions: undefined,
+      prompt: "",
+      onPromptChange: () => {},
+    });
+    const unknown = renderComposerTraitControls({
+      provider: PROVIDER,
+      draftId: DraftId.make("unknown"),
+      model: MODEL,
+      models: [],
+      providerSnapshotLoaded: false,
+      modelOptions: undefined,
+      prompt: "",
+      onPromptChange: () => {},
+    });
+
+    expect(unsupported?.props.fastAvailability).toMatchObject({ state: "unsupported" });
+    expect(unsupported?.props.effortAvailability).toMatchObject({ state: "unsupported" });
+    expect(unknown?.props.fastAvailability).toEqual({
+      state: "unknown",
+      reason: "Fast mode availability is still loading.",
+    });
+  });
+
+  it("does not expose Codex controls without live capabilities", () => {
+    const picker = renderComposerTraitControls({
       provider: CODEX,
       draftId: DraftId.make("codex-empty-capabilities"),
       model: MODEL,
@@ -354,10 +424,6 @@ describe("provider traits render guards", () => {
       onPromptChange: () => {},
     });
 
-    expect(isValidElement(picker)).toBe(true);
-    if (!isValidElement<{ modelOptions?: ReadonlyArray<ProviderOptionSelection> }>(picker)) return;
-    expect(picker.props.modelOptions).toEqual(
-      selections(["reasoningEffort", "medium"], ["serviceTier", "default"]),
-    );
+    expect(picker).not.toBeNull();
   });
 });

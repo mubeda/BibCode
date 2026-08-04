@@ -40,6 +40,7 @@ export type SetThreadRuntimeModeInput = CommandInput<"thread.runtime-mode.set">;
 export type SetThreadInteractionModeInput = CommandInput<"thread.interaction-mode.set">;
 export type StartThreadTurnInput = CommandInput<"thread.turn.start">;
 export type InterruptThreadTurnInput = CommandInput<"thread.turn.interrupt">;
+export type ResolveTurnDeliveryInput = CommandInput<"thread.turn-delivery.resolve">;
 export type RespondToThreadApprovalInput = CommandInput<"thread.approval.respond">;
 export type RespondToThreadUserInputInput = CommandInput<"thread.user-input.respond">;
 export type RevertThreadCheckpointInput = CommandInput<"thread.checkpoint.revert">;
@@ -205,6 +206,18 @@ export const interruptThreadTurn: (input: InterruptThreadTurnInput) => CommandEf
   return yield* dispatch({
     ...input,
     type: "thread.turn.interrupt",
+    commandId: metadata.commandId,
+    createdAt: metadata.createdAt,
+  });
+});
+
+export const resolveTurnDelivery: (input: ResolveTurnDeliveryInput) => CommandEffect = Effect.fn(
+  "EnvironmentCommands.resolveTurnDelivery",
+)(function* (input) {
+  const metadata = yield* timestampedCommandMetadata(input);
+  return yield* dispatch({
+    ...input,
+    type: "thread.turn-delivery.resolve",
     commandId: metadata.commandId,
     createdAt: metadata.createdAt,
   });

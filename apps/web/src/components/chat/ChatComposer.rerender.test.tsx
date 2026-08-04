@@ -102,9 +102,6 @@ vi.mock("./ProviderModelPicker", () => ({
 vi.mock("./ComposerPendingApprovalActions", () => ({
   ComposerPendingApprovalActions: passthrough(),
 }));
-vi.mock("./CompactComposerControlsMenu", () => ({
-  CompactComposerControlsMenu: passthrough(),
-}));
 vi.mock("./ComposerPrimaryActions", () => ({
   ComposerPrimaryActions: passthrough(),
 }));
@@ -210,6 +207,12 @@ const unsupportedProvider: ServerProvider = {
   agents: [],
 };
 
+const planDisabledCodexProvider: ServerProvider = {
+  ...supportedProvider,
+  instanceId: ProviderInstanceId.make("codex-work"),
+  showInteractionModeToggle: false,
+};
+
 function makeThread(): Thread {
   return {
     id: threadId,
@@ -287,7 +290,7 @@ function makeProps(
     terminalOpen: false,
     gitCwd: "/repo",
     promptRef,
-    composerImagesRef: { current: [] },
+    composerAttachmentsRef: { current: [] },
     composerTerminalContextsRef: { current: [] },
     composerElementContextsRef: { current: [] },
     composerRef,
@@ -418,5 +421,28 @@ describe("ChatComposer provider selection rerenders", () => {
       selectedProvider: ProviderDriverKind.make("claudeAgent"),
       selectedModelSelection: { instanceId: claudeInstanceId },
     });
+  });
+
+  it("recomputes Plan availability when switching between instances of one driver", async () => {
+    const composerRef = React.createRef<ChatComposerHandle>();
+    const promptRef = { current: prompt };
+    const statuses = [supportedProvider, planDisabledCodexProvider];
+
+    await act(async () => {
+      root.render(
+        <ChatComposer {...makeProps(statuses, composerRef, promptRef, supportedProvider)} />,
+      );
+    });
+    expect(container.textContent).not.toContain("Plan mode is not supported");
+
+    await act(async () => {
+      root.render(
+        <ChatComposer
+          {...makeProps(statuses, composerRef, promptRef, planDisabledCodexProvider)}
+        />,
+      );
+    });
+
+    expect(container.textContent).toContain("Plan mode is not supported");
   });
 });

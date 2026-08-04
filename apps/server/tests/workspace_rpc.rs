@@ -904,6 +904,53 @@ async fn workspace_rpc_routes_asset_urls_through_workspace_context_resolution() 
 }
 
 #[tokio::test]
+async fn assets_create_url_never_signs_an_untrusted_attachment_id() {
+    let state = TempDir::new().expect("state");
+    let attachments = state.path().join("attachments");
+    tokio::fs::create_dir(&attachments)
+        .await
+        .expect("attachments");
+    write(state.path(), "state.sqlite", b"database secret").await;
+    let absolute = state.path().join("absolute-secret");
+    tokio::fs::write(&absolute, b"absolute secret")
+        .await
+        .unwrap();
+    let overlong = "a".repeat(129);
+    tokio::fs::write(attachments.join(&overlong), b"long id secret")
+        .await
+        .unwrap();
+    let rpc = WorkspaceRpc::with_dependencies(
+        WorkspaceService::default(),
+        WorkspaceRpcDependencies {
+            asset_access: Some(AssetAccess::new(vec![8; 32], attachments)),
+            asset_context_resolver: None,
+            review_service: None,
+        },
+    );
+
+    for attachment_id in [
+        "../state.sqlite".to_owned(),
+        absolute.to_string_lossy().into_owned(),
+        "CON".to_owned(),
+        overlong,
+    ] {
+        let error = rpc
+            .handle(
+                "assets.createUrl",
+                json!({
+                    "resource": {
+                        "_tag": "attachment",
+                        "attachmentId": attachment_id
+                    }
+                }),
+            )
+            .await
+            .expect_err("untrusted attachment ids never receive signed URLs");
+        assert_eq!(error["_tag"], "AssetAttachmentNotFoundError");
+    }
+}
+
+#[tokio::test]
 async fn signed_assets_are_exact_or_confined_to_safe_preview_siblings() {
     let root = TempDir::new().expect("root");
     write(root.path(), "preview/report.html", b"<html></html>").await;
