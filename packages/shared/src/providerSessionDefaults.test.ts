@@ -547,6 +547,37 @@ describe("Codex-only serviceTier fast-mode binding", () => {
       }),
     ).toEqual({ model: "partial-tiered-model" });
   });
+
+  it("binds Codex Fast to the advertised priority service tier", () => {
+    const priorityTier: ProviderOptionDescriptor = {
+      id: "serviceTier",
+      label: "Service Tier",
+      type: "select",
+      options: [
+        { id: "default", label: "Standard", isDefault: true },
+        { id: "priority", label: "Fast" },
+      ],
+      currentValue: "default",
+    };
+    const priorityModels = [model("gpt-5.6-sol", [priorityTier])];
+
+    expect(
+      getProviderSessionDefaultControls({
+        driver: CODEX,
+        models: priorityModels,
+      }),
+    ).toMatchObject({ fastModeSupported: true, fastMode: false });
+    expect(
+      updateProviderSessionDefault({
+        driver: CODEX,
+        models: priorityModels,
+        change: { type: "fastMode", value: true },
+      }),
+    ).toEqual({
+      model: "gpt-5.6-sol",
+      options: [{ id: "serviceTier", value: "priority" }],
+    });
+  });
 });
 
 describe("resolveProviderSessionDefault", () => {

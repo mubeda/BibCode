@@ -923,9 +923,20 @@ fn map_model_capabilities(model: &Value) -> Value {
             "currentValue": default_reasoning_effort,
         }));
     }
-    let options = service_tiers
-        .iter()
-        .map(|tier| {
+    let effective_default_service_tier = default_service_tier.unwrap_or("default");
+    let mut options = Vec::new();
+    if !service_tiers.is_empty()
+        && !service_tiers
+            .iter()
+            .any(|tier| tier.get("id").and_then(Value::as_str) == Some("default"))
+    {
+        options.push(json!({
+            "id": "default",
+            "label": "Standard",
+            "isDefault": effective_default_service_tier == "default",
+        }));
+    }
+    options.extend(service_tiers.iter().map(|tier| {
             let id = tier.get("id").and_then(Value::as_str).unwrap_or_default();
             let name = tier.get("name").and_then(Value::as_str).unwrap_or(id);
             let description = tier
@@ -936,7 +947,7 @@ fn map_model_capabilities(model: &Value) -> Value {
                 "id": id,
                 "label": name,
                 "description": if description.is_empty() { Value::Null } else { json!(description) },
-                "isDefault": default_service_tier == Some(id),
+                "isDefault": effective_default_service_tier == id,
             })
         })
         .map(|value| {
@@ -948,19 +959,15 @@ fn map_model_capabilities(model: &Value) -> Value {
                 object.remove("isDefault");
             }
             Value::Object(object)
-        })
-        .collect::<Vec<_>>();
+        }));
     if !options.is_empty() {
-        let mut descriptor = json!({
+        option_descriptors.push(json!({
             "id": "serviceTier",
             "label": "Service Tier",
             "type": "select",
             "options": options,
-        });
-        if let Some(default_service_tier) = default_service_tier {
-            descriptor["currentValue"] = json!(default_service_tier);
-        }
-        option_descriptors.push(descriptor);
+            "currentValue": effective_default_service_tier,
+        }));
     }
 
     json!({
@@ -1202,6 +1209,39 @@ mod tests {
             descriptors
                 .iter()
                 .all(|descriptor| descriptor["id"] != "serviceTier")
+        );
+    }
+
+    #[test]
+    fn live_priority_service_tier_includes_the_standard_off_value() {
+        let models = parse_model_list_response(
+            &json!({
+                "data": [{
+                    "model": "gpt-5.6-sol",
+                    "additionalSpeedTiers": ["fast"],
+                    "serviceTiers": [{ "id": "priority", "name": "Fast" }],
+                    "defaultServiceTier": null
+                }]
+            }),
+            &[],
+        )
+        .expect("live model should parse");
+        let service_tier = models[0].capabilities["optionDescriptors"]
+            .as_array()
+            .expect("live option descriptors")
+            .iter()
+            .find(|descriptor| descriptor["id"] == "serviceTier")
+            .expect("advertised service tier descriptor");
+
+        assert_eq!(service_tier["currentValue"], "default");
+        assert_eq!(
+            service_tier["options"]
+                .as_array()
+                .expect("service tier options")
+                .iter()
+                .filter_map(|option| option["id"].as_str())
+                .collect::<Vec<_>>(),
+            vec!["default", "priority"]
         );
     }
 

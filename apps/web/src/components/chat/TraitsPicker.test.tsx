@@ -692,7 +692,7 @@ describe("TraitsPicker", () => {
     expect(effortControl.getAttribute("aria-disabled")).toBe("true");
   });
 
-  it("uses Codex service tier for the dedicated Fast toggle", async () => {
+  it("uses Codex priority service tier for the dedicated Fast toggle", async () => {
     const onModelOptionsChange = vi.fn();
     const models = modelsWith([
       selectDescriptor("reasoningEffort", "Reasoning", [
@@ -700,7 +700,7 @@ describe("TraitsPicker", () => {
       ]),
       selectDescriptor("serviceTier", "Service Tier", [
         { id: "default", label: "Standard", isDefault: true },
-        { id: "fast", label: "Fast" },
+        { id: "priority", label: "Fast" },
       ]),
     ]);
     const mounted = await mount(
@@ -721,7 +721,7 @@ describe("TraitsPicker", () => {
     expect(disabledFastButton?.getAttribute("aria-pressed")).toBe("false");
     await click(disabledFastButton!);
     expect(onModelOptionsChange).toHaveBeenCalledWith(
-      expect.arrayContaining([expect.objectContaining({ id: "serviceTier", value: "fast" })]),
+      expect.arrayContaining([expect.objectContaining({ id: "serviceTier", value: "priority" })]),
     );
 
     await act(async () =>
@@ -731,7 +731,7 @@ describe("TraitsPicker", () => {
           models={models}
           model={MODEL}
           prompt=""
-          modelOptions={selections(["reasoningEffort", "medium"], ["serviceTier", "fast"])}
+          modelOptions={selections(["reasoningEffort", "medium"], ["serviceTier", "priority"])}
           onPromptChange={vi.fn()}
           onModelOptionsChange={onModelOptionsChange}
         />,
