@@ -900,9 +900,10 @@ async fn orchestration_lifecycle_and_query_rpcs_round_trip_real_state() {
             }),
         )
         .await;
-        dispatch_command(
+        rpc_request(
             &mut socket,
             "4",
+            "orchestration.dispatchCommand",
             json!({
                 "type": "thread.turn.start",
                 "commandId": "start-thread-1",
@@ -920,6 +921,12 @@ async fn orchestration_lifecycle_and_query_rpcs_round_trip_real_state() {
             }),
         )
         .await;
+        let turn_without_delivery = expect_failure(&mut socket, "4").await;
+        assert_invalid_request(
+            &turn_without_delivery,
+            "orchestration.dispatchCommand",
+            "requires durable provider delivery",
+        );
         dispatch_command(
             &mut socket,
             "5",
