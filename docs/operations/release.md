@@ -193,6 +193,13 @@ Build the native artifact for the current operating system:
 vp run build:desktop
 ```
 
+On macOS 26, verify Finder's rendered application icon from the generated app
+bundle before publishing the DMG:
+
+```powershell
+swift scripts/check-macos-app-icon.swift target/aarch64-apple-darwin/release/bundle/macos/BiBCode.app
+```
+
 Build a specific release target:
 
 ```powershell
