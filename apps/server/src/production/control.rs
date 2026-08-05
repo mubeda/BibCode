@@ -189,6 +189,8 @@ pub struct NativeServerControl {
     #[cfg(test)]
     settings_update_barrier: Arc<RwLock<Option<Arc<Barrier>>>>,
     #[cfg(test)]
+    next_settings_persisted_pause: Arc<Mutex<Option<ProviderProbePause>>>,
+    #[cfg(test)]
     next_quick_provider_probe_pause: Arc<Mutex<Option<ProviderProbePause>>>,
     #[cfg(test)]
     next_full_provider_probe_pause: Arc<Mutex<Option<ProviderProbePause>>>,
@@ -284,6 +286,8 @@ impl NativeServerControl {
             settings_load_error,
             #[cfg(test)]
             settings_update_barrier: Arc::new(RwLock::new(None)),
+            #[cfg(test)]
+            next_settings_persisted_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             next_quick_provider_probe_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -390,18 +394,37 @@ impl NativeServerControl {
         apply_settings_defaults(&mut next);
         validate_settings_document(&next)
             .map_err(|cause| settings_error(&self.settings_path, "normalize", &cause))?;
-        persist_sensitive_environment(&self.state_directory, &mut next)
-            .await
-            .map_err(|message| settings_error(&self.settings_path, "write-secret", &message))?;
-        write_json_atomically(&self.settings_path, &next)
-            .await
-            .map_err(|error| {
-                settings_error(&self.settings_path, "write-file", &error.to_string())
-            })?;
-        redact_sensitive_environment(&mut next);
-        let generation = self.settings_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let commit_control = self.clone();
         let commit = tokio::spawn(async move {
+            persist_sensitive_environment(&commit_control.state_directory, &mut next)
+                .await
+                .map_err(|message| {
+                    settings_error(&commit_control.settings_path, "write-secret", &message)
+                })?;
+            write_json_atomically(&commit_control.settings_path, &next)
+                .await
+                .map_err(|error| {
+                    settings_error(
+                        &commit_control.settings_path,
+                        "write-file",
+                        &error.to_string(),
+                    )
+                })?;
+            #[cfg(test)]
+            if let Some(pause) = commit_control
+                .next_settings_persisted_pause
+                .lock()
+                .await
+                .take()
+            {
+                pause.entered.notify_one();
+                pause.release.notified().await;
+            }
+            redact_sensitive_environment(&mut next);
+            let generation = commit_control
+                .settings_generation
+                .fetch_add(1, Ordering::AcqRel)
+                + 1;
             if let Some(handler) = commit_control
                 .agent_activity_handler
                 .handler
@@ -443,15 +466,15 @@ impl NativeServerControl {
                 "payload": { "settings": next.clone() },
             }));
             drop(update_guard);
-            next
+            Ok::<(Value, u64), Value>((next, generation))
         });
-        let next = commit.await.map_err(|_| {
+        let (next, generation) = commit.await.map_err(|_| {
             settings_error(
                 &self.settings_path,
                 "commit",
                 "persisted settings commit task stopped unexpectedly",
             )
-        })?;
+        })??;
 
         let cwd = std::env::current_dir().unwrap_or_else(|_| self.config.base_dir.clone());
         let probe_sequence = self.begin_provider_probe();
@@ -471,6 +494,13 @@ impl NativeServerControl {
     #[cfg(test)]
     async fn install_settings_update_barrier(&self, parties: usize) {
         *self.settings_update_barrier.write().await = Some(Arc::new(Barrier::new(parties)));
+    }
+
+    #[cfg(test)]
+    async fn install_next_settings_persisted_pause(&self) -> ProviderProbePause {
+        let pause = ProviderProbePause::new();
+        *self.next_settings_persisted_pause.lock().await = Some(pause.clone());
+        pause
     }
 
     #[cfg(test)]
@@ -1933,6 +1963,7 @@ mod tests {
     };
 
     use crate::{
+        activity::AgentActivityController,
         production::{
             agent_activity::{
                 AgentActivitySettingsHandler, AgentActivityTransitionReport,
@@ -2498,6 +2529,47 @@ mod tests {
     }
 
     #[derive(Clone)]
+    struct ControllerAgentActivityHandler {
+        chat: AgentActivityController,
+        terminal: AgentActivityController,
+        calls: Arc<StdMutex<Vec<(AgentActivitySource, bool, u64)>>>,
+    }
+
+    impl AgentActivitySettingsHandler for ControllerAgentActivityHandler {
+        fn transition(
+            &self,
+            source: AgentActivitySource,
+            enabled: bool,
+            settings_generation: u64,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = AgentActivityTransitionReport> + Send + '_>,
+        > {
+            Box::pin(async move {
+                self.calls.lock().expect("handler calls").push((
+                    source,
+                    enabled,
+                    settings_generation,
+                ));
+                let controller = match source {
+                    AgentActivitySource::Chat => &self.chat,
+                    AgentActivitySource::Terminal => &self.terminal,
+                };
+                let state = if enabled {
+                    controller.enable()
+                } else {
+                    controller.disable().await.state
+                };
+                AgentActivityTransitionReport {
+                    enabled: state.enabled,
+                    settings_generation,
+                    observation_generation: state.generation,
+                    ..AgentActivityTransitionReport::default()
+                }
+            })
+        }
+    }
+
+    #[derive(Clone)]
     struct BlockingAgentActivityHandler {
         calls: Arc<StdMutex<Vec<(AgentActivitySource, bool, u64)>>>,
         first_transition_entered: Arc<Notify>,
@@ -2894,6 +2966,79 @@ mod tests {
                 .await
         );
         assert_eq!(control.settings_generation.load(Ordering::Acquire), 1);
+    }
+
+    #[tokio::test]
+    async fn agent_activity_persisted_settings_converge_after_cancellation_before_commit_task_setup()
+    {
+        let temp = tempfile::tempdir().expect("control root");
+        let config = ServerConfig::new(temp.path());
+        let settings_path = config.state_dir().join("settings.json");
+        let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
+        let chat = AgentActivityController::new(true);
+        let terminal = AgentActivityController::new(false);
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        control
+            .attach_agent_activity_handler(Arc::new(ControllerAgentActivityHandler {
+                chat: chat.clone(),
+                terminal: terminal.clone(),
+                calls: calls.clone(),
+            }))
+            .await;
+        let mut events = control.config_events.subscribe();
+        let persisted = control.install_next_settings_persisted_pause().await;
+        let update = {
+            let control = control.clone();
+            tokio::spawn(async move {
+                control
+                    .update_settings(json!({"patch":{"enableChatAgentActivity":false}}))
+                    .await
+            })
+        };
+
+        persisted.wait_until_entered().await;
+        let disk_during_pause: Value = serde_json::from_slice(
+            &tokio::fs::read(&settings_path)
+                .await
+                .expect("persisted settings"),
+        )
+        .expect("valid persisted settings");
+        assert_eq!(disk_during_pause["enableChatAgentActivity"], false);
+        assert_eq!(control.settings.read().await["enableChatAgentActivity"], true);
+        assert!(chat.snapshot().enabled);
+        assert!(!terminal.snapshot().enabled);
+        assert!(calls.lock().expect("handler calls").is_empty());
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        update.abort();
+        assert!(update.await.expect_err("caller cancelled").is_cancelled());
+        persisted.release();
+
+        let event = tokio::time::timeout(Duration::from_secs(2), events.recv())
+            .await
+            .expect("detached commit publishes after caller cancellation")
+            .expect("settings event");
+        assert_eq!(
+            event["payload"]["settings"]["enableChatAgentActivity"],
+            false
+        );
+        assert_eq!(control.settings.read().await["enableChatAgentActivity"], false);
+        assert!(!chat.snapshot().enabled);
+        assert!(!terminal.snapshot().enabled);
+        assert_eq!(
+            *calls.lock().expect("handler calls"),
+            vec![(AgentActivitySource::Chat, false, 1)]
+        );
+        let disk_after_commit: Value = serde_json::from_slice(
+            &tokio::fs::read(settings_path)
+                .await
+                .expect("committed settings"),
+        )
+        .expect("valid committed settings");
+        assert_eq!(disk_after_commit["enableChatAgentActivity"], false);
     }
 
     #[test]

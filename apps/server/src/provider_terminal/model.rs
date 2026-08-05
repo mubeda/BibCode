@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::{
     activity::{
         ActivityCapabilities, ActivityDelta, ActivityProjection, ActivityResult,
-        ActivityScopeSeed, ProviderActivityMutation,
+        ActivityScopeSeed, AgentActivityAdmission, ProviderActivityMutation,
     },
     terminal::ProviderTerminalActivityLaunch,
 };
@@ -897,6 +897,7 @@ pub trait TerminalLaunchPreparer: Send + Sync {
 pub enum TerminalLaunchPreparation {
     PassThrough,
     Prepared(PreparedTerminalLaunch),
+    Admitted(PreparedTerminalLaunch, AgentActivityAdmission),
 }
 
 impl fmt::Debug for TerminalLaunchPreparation {
@@ -904,6 +905,9 @@ impl fmt::Debug for TerminalLaunchPreparation {
         match self {
             Self::PassThrough => formatter.write_str("PassThrough"),
             Self::Prepared(prepared) => formatter.debug_tuple("Prepared").field(prepared).finish(),
+            Self::Admitted(prepared, _) => {
+                formatter.debug_tuple("Admitted").field(prepared).finish()
+            }
         }
     }
 }
