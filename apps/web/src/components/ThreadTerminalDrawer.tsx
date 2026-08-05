@@ -696,9 +696,9 @@ export function TerminalViewport({
   const [webglTerminalEpoch, setWebglTerminalEpoch] = useState(0);
   const [documentVisible, setDocumentVisible] = useState(isDocumentVisible);
   const shouldRender = visible && isDocumentVisible() && documentVisible;
-  const enableAgentActivity = useEnvironmentSettings(
+  const enableTerminalAgentActivity = useEnvironmentSettings(
     environmentId,
-    (settings) => settings.enableAgentActivity,
+    (settings) => settings.enableTerminalAgentActivity,
   );
   const webglEnabled = usePrimarySettings((settings) => settings.terminal.webglEnabled);
   const terminalFontPreference = usePrimarySettings((settings) => settings.terminalFontPreference);
@@ -1705,7 +1705,7 @@ export function TerminalViewport({
         className="h-full w-full overflow-hidden"
         data-terminal-xterm-mount={terminalId}
       />
-      {enableAgentActivity && shouldRender && command?.activity !== undefined ? (
+      {enableTerminalAgentActivity && shouldRender && command?.activity !== undefined ? (
         <div
           className="pointer-events-none absolute inset-x-0 top-7 bottom-0 z-10"
           data-provider-terminal-activity-host={terminalId}

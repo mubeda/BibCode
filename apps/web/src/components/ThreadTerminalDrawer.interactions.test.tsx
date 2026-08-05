@@ -395,7 +395,7 @@ const testState = vi.hoisted(() => ({
   activityStateTargets: [] as unknown[],
   activityState: null as unknown,
   activityListeners: new Set<() => void>(),
-  enableAgentActivityByEnvironment: new Map<string, boolean>(),
+  enableTerminalAgentActivityByEnvironment: new Map<string, boolean>(),
   settingsListeners: new Set<() => void>(),
 }));
 
@@ -448,17 +448,17 @@ vi.mock("../state/terminalSessions", () => ({
 vi.mock("../hooks/useSettings", () => ({
   useEnvironmentSettings: (
     environmentId: string,
-    selector: (settings: { enableAgentActivity: boolean }) => unknown,
+    selector: (settings: { enableTerminalAgentActivity: boolean }) => unknown,
   ) => {
-    const enableAgentActivity = useSyncExternalStore(
+    const enableTerminalAgentActivity = useSyncExternalStore(
       (listener) => {
         testState.settingsListeners.add(listener);
         return () => testState.settingsListeners.delete(listener);
       },
-      () => testState.enableAgentActivityByEnvironment.get(environmentId) ?? true,
-      () => testState.enableAgentActivityByEnvironment.get(environmentId) ?? true,
+      () => testState.enableTerminalAgentActivityByEnvironment.get(environmentId) ?? false,
+      () => testState.enableTerminalAgentActivityByEnvironment.get(environmentId) ?? false,
     );
-    return selector({ enableAgentActivity });
+    return selector({ enableTerminalAgentActivity });
   },
   usePrimarySettings: (
     selector: (settings: {
@@ -573,11 +573,11 @@ async function click(element: HTMLElement): Promise<void> {
   await act(async () => element.click());
 }
 
-async function publishAgentActivitySetting(
+async function publishTerminalAgentActivitySetting(
   environmentId: EnvironmentId,
   enabled: boolean,
 ): Promise<void> {
-  testState.enableAgentActivityByEnvironment.set(environmentId, enabled);
+  testState.enableTerminalAgentActivityByEnvironment.set(environmentId, enabled);
   await act(async () => {
     for (const listener of testState.settingsListeners) listener();
     await Promise.resolve();
@@ -1078,7 +1078,7 @@ beforeEach(() => {
     recentEntries: new Map(),
   };
   testState.activityListeners.clear();
-  testState.enableAgentActivityByEnvironment.clear();
+  testState.enableTerminalAgentActivityByEnvironment.clear();
   testState.settingsListeners.clear();
   testState.writeCommand.mockReset().mockResolvedValue(AsyncResult.success(undefined));
   testState.resizeCommand.mockReset().mockResolvedValue(AsyncResult.success(undefined));
@@ -1248,6 +1248,7 @@ describe("TerminalViewport provider activity mount", () => {
   });
 
   it("mounts a correlated provider dock in the exact terminal viewport", async () => {
+    await publishTerminalAgentActivitySetting(ENVIRONMENT_ID, true);
     await publishActivitySnapshot(activitySnapshot("terminal-codex"));
 
     const mounted = await mount(
@@ -1277,6 +1278,7 @@ describe("TerminalViewport provider activity mount", () => {
   });
 
   it("does not mount duplicate live announcements for hidden provider panes", async () => {
+    await publishTerminalAgentActivitySetting(ENVIRONMENT_ID, true);
     await publishActivitySnapshot(activitySnapshot("terminal-visible"));
 
     const mounted = await mount(
@@ -1315,6 +1317,7 @@ describe("TerminalViewport provider activity mount", () => {
   });
 
   it("keeps restart journals scoped to the terminal and rejects another terminal snapshot", async () => {
+    await publishTerminalAgentActivitySetting(ENVIRONMENT_ID, true);
     const props = viewportProps({
       terminalId: "terminal-pinned",
       command: observedCommand(),
@@ -1348,6 +1351,8 @@ describe("TerminalViewport provider activity mount", () => {
     const secondThreadRef = scopeThreadRef(secondEnvironmentId, secondThreadId);
     const firstTerminalId = "terminal-activity-first";
     const secondTerminalId = "terminal-activity-second";
+    await publishTerminalAgentActivitySetting(firstEnvironmentId, true);
+    await publishTerminalAgentActivitySetting(secondEnvironmentId, true);
     const mounted = await mount(
       <>
         <ThreadTerminalDrawer
@@ -1393,7 +1398,7 @@ describe("TerminalViewport provider activity mount", () => {
       ),
     ).not.toBeNull();
 
-    await publishAgentActivitySetting(firstEnvironmentId, false);
+    await publishTerminalAgentActivitySetting(firstEnvironmentId, false);
 
     expect(
       mounted.container.querySelector(
@@ -1412,7 +1417,7 @@ describe("TerminalViewport provider activity mount", () => {
       mounted.container.querySelector(`[data-terminal-xterm-mount="${secondTerminalId}"]`),
     ).toBe(secondTerminal);
 
-    await publishAgentActivitySetting(firstEnvironmentId, true);
+    await publishTerminalAgentActivitySetting(firstEnvironmentId, true);
 
     expect(
       mounted.container.querySelector(

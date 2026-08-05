@@ -260,6 +260,7 @@ import {
   reconcileMountedTerminalThreadIds,
   resolveActivityPageLoadAction,
   resolveCenterPanelLaunchContext,
+  isAgentActivityScopeEnabled,
   resolveActivityScope,
   resolveSendEnvMode,
   revokeBlobPreviewUrl,
@@ -1488,7 +1489,8 @@ function ChatViewContent(props: ChatViewProps) {
     routeKind === "server" ? store.threadLastVisitedAtById[routeThreadKey] : undefined,
   );
   const settings = useEnvironmentSettings(environmentId);
-  const enableAgentActivity = settings.enableAgentActivity;
+  const enableChatAgentActivity = settings.enableChatAgentActivity;
+  const enableTerminalAgentActivity = settings.enableTerminalAgentActivity;
   const setStickyComposerModelSelection = useComposerDraftStore(
     (store) => store.setStickyModelSelection,
   );
@@ -1867,27 +1869,41 @@ function ChatViewContent(props: ChatViewProps) {
     () => resolveActivityScope(activeThreadRef, activeActivitySurface?.scope ?? { _tag: "thread" }),
     [activeActivitySurface?.scope, activeThreadRef],
   );
+  const activityScopeEnabled =
+    activityScope !== null &&
+    isAgentActivityScopeEnabled(activityScope, {
+      enableChatAgentActivity,
+      enableTerminalAgentActivity,
+    });
   const activityStateTarget = useMemo<ActivityStateTarget | null>(
     () =>
-      enableAgentActivity &&
+      activityScopeEnabled &&
       activeThreadRef !== null &&
       activityScope !== null &&
       (isPanel || !siblingChatOwnsCenter)
         ? { environmentId: activeThreadRef.environmentId, input: activityScope }
         : null,
-    [activeThreadRef, activityScope, enableAgentActivity, isPanel, siblingChatOwnsCenter],
+    [activeThreadRef, activityScope, activityScopeEnabled, isPanel, siblingChatOwnsCenter],
   );
   useEffect(() => {
-    if (enableAgentActivity || activeThreadRef === null) return;
+    if (activeThreadRef === null) return;
     const threadState = selectThreadRightPanelState(
       useRightPanelStore.getState().byThreadKey,
       activeThreadRef,
     );
     const activitySurface = threadState.surfaces.find((surface) => surface.kind === "activity");
-    if (activitySurface) {
+    if (activitySurface === undefined) return;
+    const persistedScope = resolveActivityScope(activeThreadRef, activitySurface.scope);
+    if (
+      persistedScope !== null &&
+      !isAgentActivityScopeEnabled(persistedScope, {
+        enableChatAgentActivity,
+        enableTerminalAgentActivity,
+      })
+    ) {
       useRightPanelStore.getState().closeSurface(activeThreadRef, activitySurface.id);
     }
-  }, [activeThreadRef, enableAgentActivity]);
+  }, [activeThreadRef, enableChatAgentActivity, enableTerminalAgentActivity]);
   const panelActivitySurfaceOpen =
     isPanel &&
     rightPanelState.isOpen &&
