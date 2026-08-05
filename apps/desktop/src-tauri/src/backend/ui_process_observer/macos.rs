@@ -599,19 +599,13 @@ included, but local UI/WebView usage could not be associated reliably."
         );
     }
 
-    #[test]
-    fn macos_ui_collection_failures_preserve_validated_rows_as_partial() {
-        // Mutation caught: replacing rather than extending collection issues loses the
-        // deterministic earliest collection boundary after candidate validation.
+    fn assert_collection_issue_preserves_validated_row(
+        issue: MacosObservationIssue,
+        expected_message: &str,
+    ) {
         let rows = vec![server_row(), web_content_row(501, 2_001)];
         let mut collection = collection(&[(501, WebKitProcessRole::WebContent)]);
-        collection.issues = [
-            MacosObservationIssue::WebviewDispatch,
-            MacosObservationIssue::PrivateSelector,
-            MacosObservationIssue::WebviewDeadline,
-        ]
-        .into_iter()
-        .collect();
+        collection.issues.insert(issue);
         let coalitions = [(SERVER_PID, Ok(HOST_COALITION)), (501, Ok(HOST_COALITION))]
             .into_iter()
             .collect();
@@ -628,7 +622,37 @@ included, but local UI/WebView usage could not be associated reliably."
         assert_eq!(observation.coverage.status, UiCoverageStatus::Partial);
         assert_eq!(
             observation.coverage.message.as_deref(),
-            Some("WebView process discovery could not run on the main thread.")
+            Some(expected_message)
+        );
+    }
+
+    #[test]
+    fn macos_ui_collection_dispatch_failure_preserves_validated_rows_as_partial() {
+        // Mutation caught: deleting dispatch issue preservation or mapping it to another
+        // collection boundary loses the exact dispatch message while retaining a valid peer.
+        assert_collection_issue_preserves_validated_row(
+            MacosObservationIssue::WebviewDispatch,
+            "WebView process discovery could not run on the main thread.",
+        );
+    }
+
+    #[test]
+    fn macos_ui_collection_deadline_failure_preserves_validated_rows_as_partial() {
+        // Mutation caught: deleting deadline issue preservation or letting dispatch shadow
+        // deadline handling loses the exact deadline message while retaining a valid peer.
+        assert_collection_issue_preserves_validated_row(
+            MacosObservationIssue::WebviewDeadline,
+            "WebView process discovery exceeded its deadline.",
+        );
+    }
+
+    #[test]
+    fn macos_ui_collection_private_selector_failure_preserves_validated_rows_as_partial() {
+        // Mutation caught: deleting private-selector issue preservation or mapping it to a
+        // generic collection failure loses its exact message while retaining a valid peer.
+        assert_collection_issue_preserves_validated_row(
+            MacosObservationIssue::PrivateSelector,
+            "WebView process identifiers were unavailable from WebKit.",
         );
     }
 
