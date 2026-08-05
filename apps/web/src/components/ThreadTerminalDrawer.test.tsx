@@ -9,7 +9,9 @@ import {
 import { scopeThreadRef } from "@bibcode/client-runtime/environment";
 import { type ComponentProps, type ReactElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
-import { describe, expect, it, vi } from "vite-plus/test";
+import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
+
+const settingsState = vi.hoisted(() => ({ enableTerminalAgentActivity: false }));
 
 // ── Module mocks ────────────────────────────────────────────────────────────
 // The drawer's `TerminalViewport` child wires xterm + Effect atom state at
@@ -43,8 +45,8 @@ vi.mock("../editorPreferences", () => ({
 vi.mock("../hooks/useSettings", () => ({
   useEnvironmentSettings: (
     _environmentId: string,
-    selector: (settings: { enableAgentActivity: boolean }) => unknown,
-  ) => selector({ enableAgentActivity: true }),
+    selector: (settings: { enableTerminalAgentActivity: boolean }) => unknown,
+  ) => selector(settingsState),
   usePrimarySettings: (
     selector: (settings: {
       terminal: { webglEnabled: boolean };
@@ -119,6 +121,10 @@ const TEST_THREAD_ID = ThreadId.make("thread-terminal-drawer");
 const TEST_THREAD_REF = scopeThreadRef(TEST_ENVIRONMENT_ID, TEST_THREAD_ID);
 const TEST_PROJECT_ID = ProjectId.make("project-terminal-drawer");
 const EMPTY_KEYBINDINGS: ResolvedKeybindingsConfig = [];
+
+beforeEach(() => {
+  settingsState.enableTerminalAgentActivity = false;
+});
 
 type DrawerProps = ComponentProps<typeof ThreadTerminalDrawer>;
 type ViewportProps = ComponentProps<typeof TerminalViewport>;
@@ -311,6 +317,7 @@ describe("TerminalViewport", () => {
   });
 
   it("mounts an eligible activity dock after the xterm mount inside the viewport boundary", () => {
+    settingsState.enableTerminalAgentActivity = true;
     const markup = renderToStaticMarkup(
       <TerminalViewport
         {...viewportProps({
@@ -332,7 +339,23 @@ describe("TerminalViewport", () => {
     );
   });
 
+  it("keeps provider terminal activity off by default without removing the xterm mount", () => {
+    const markup = renderToStaticMarkup(
+      <TerminalViewport
+        {...viewportProps({
+          terminalId: "terminal-default-off",
+          command: observedCommand(),
+          visible: true,
+        })}
+      />,
+    );
+
+    expect(markup).toContain('data-terminal-xterm-mount="terminal-default-off"');
+    expect(markup).not.toContain('data-provider-terminal-activity-host="terminal-default-off"');
+  });
+
   it("does not mount an activity host for an ordinary terminal or a hidden pane", () => {
+    settingsState.enableTerminalAgentActivity = true;
     const ordinaryMarkup = renderToStaticMarkup(<TerminalViewport {...viewportProps()} />);
     const hiddenProviderMarkup = renderToStaticMarkup(
       <TerminalViewport
@@ -351,6 +374,7 @@ describe("TerminalViewport", () => {
 
 describe("ThreadTerminalDrawer provider activity isolation", () => {
   it("binds each visible split terminal to its own eligible activity host", () => {
+    settingsState.enableTerminalAgentActivity = true;
     const markup = renderToStaticMarkup(
       <ThreadTerminalDrawer
         {...drawerProps({

@@ -34,6 +34,18 @@ type ActivitySurfaceScope =
   | { readonly _tag: "thread" }
   | { readonly _tag: "terminal"; readonly terminalId: string };
 
+export function isAgentActivityScopeEnabled(
+  scope: ActivityScopeRef,
+  settings: {
+    readonly enableChatAgentActivity: boolean;
+    readonly enableTerminalAgentActivity: boolean;
+  },
+): boolean {
+  return scope._tag === "terminal"
+    ? settings.enableTerminalAgentActivity
+    : settings.enableChatAgentActivity;
+}
+
 export function resolveActivityScope(
   activeThreadRef: ScopedThreadRef | null,
   surfaceScope: ActivitySurfaceScope,
