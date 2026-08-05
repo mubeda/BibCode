@@ -1,5 +1,6 @@
 import type { ContextMenuItem } from "@bibcode/contracts";
 import { getTerminalLabel } from "@bibcode/shared/terminalLabels";
+import { useSortable } from "@dnd-kit/sortable";
 import {
   Bot,
   ChevronLeftIcon,
@@ -19,7 +20,8 @@ import {
   useState,
 } from "react";
 
-import type { CenterSurface } from "~/centerPanelStore";
+import type { CenterPanelSplitDirection } from "~/centerPanelLayout";
+import type { CenterPanelKind, CenterSurface } from "~/centerPanelStore";
 import { cn } from "~/lib/utils";
 import { readLocalApi } from "~/localApi";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
@@ -30,20 +32,37 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "~/components/ui/menu";
+import type { CenterPanelTabDragData } from "./centerPanelDnd";
 
 interface CenterPanelTabsProps {
+  groupId: string;
   hostLabel: string;
   surfaces: readonly CenterSurface[];
   activeSurfaceId: string | null;
   terminalLabelsById?: ReadonlyMap<string, string>;
-  onActivate: (surface: CenterSurface) => void;
-  onCloseSurface: (surface: CenterSurface) => void;
-  onCloseOtherSurfaces: (surface: CenterSurface) => void;
-  onCloseSurfacesToRight: (surface: CenterSurface) => void;
-  onCloseAllSurfaces: () => void;
+  canMoveToSplit: (direction: CenterPanelSplitDirection) => boolean;
+  dragInProgress: boolean;
+  onActivate: (groupId: string, surface: CenterSurface) => void;
+  onCloseSurface: (groupId: string, surface: CenterSurface) => void;
+  onCloseOtherSurfaces: (groupId: string, surface: CenterSurface) => void;
+  onCloseSurfacesToRight: (groupId: string, surface: CenterSurface) => void;
+  onCloseAllSurfaces: (groupId: string) => void;
+  onMoveToSplit: (
+    groupId: string,
+    surface: CenterSurface,
+    direction: CenterPanelSplitDirection,
+  ) => void;
 }
 
-type TabContextMenuAction = "close" | "close-others" | "close-to-right" | "close-all";
+type TabContextMenuAction =
+  | "move-to-split"
+  | `move-to-split:${CenterPanelSplitDirection}`
+  | "close"
+  | "close-others"
+  | "close-to-right"
+  | "close-all";
+
+const SPLIT_DIRECTIONS = ["left", "right", "up", "down"] as const;
 
 function centerSurfaceTitle(
   surface: CenterSurface,
@@ -64,8 +83,8 @@ function centerSurfaceTitle(
   }
 }
 
-function CenterSurfaceIcon({ surface }: { surface: CenterSurface }) {
-  switch (surface.kind) {
+export function CenterSurfaceIcon({ kind }: { kind: CenterPanelKind }) {
+  switch (kind) {
     case "chat-host":
       return <MessageSquare className="size-3.5 shrink-0" />;
     case "chat":
@@ -73,6 +92,99 @@ function CenterSurfaceIcon({ surface }: { surface: CenterSurface }) {
     case "terminal":
       return <TerminalSquare className="size-3.5 shrink-0" />;
   }
+}
+
+interface SortableCenterTabProps {
+  readonly groupId: string;
+  readonly surface: CenterSurface;
+  readonly title: string;
+  readonly active: boolean;
+  readonly surfaceIndex: number;
+  readonly dragInProgress: boolean;
+  readonly onActivate: (surface: CenterSurface) => void;
+  readonly onClose: (surface: CenterSurface) => void;
+  readonly onMouseDown: (event: ReactMouseEvent) => void;
+  readonly onAuxClick: (event: ReactMouseEvent, surface: CenterSurface) => void;
+  readonly onContextMenu: (event: ReactMouseEvent, surface: CenterSurface) => void;
+  readonly onKeyDown: (event: ReactKeyboardEvent<HTMLButtonElement>, surfaceIndex: number) => void;
+}
+
+function SortableCenterTab({
+  groupId,
+  surface,
+  title,
+  active,
+  surfaceIndex,
+  dragInProgress,
+  onActivate,
+  onClose,
+  onMouseDown,
+  onAuxClick,
+  onContextMenu,
+  onKeyDown,
+}: SortableCenterTabProps) {
+  const sortable = useSortable({
+    id: surface.id,
+    data: {
+      type: "center-panel-tab",
+      surfaceId: surface.id,
+      groupId,
+      surfaceKind: surface.kind,
+      title,
+    } satisfies CenterPanelTabDragData,
+  });
+
+  return (
+    <div
+      ref={sortable.setNodeRef}
+      data-center-panel-tab-id={surface.id}
+      data-center-panel-group-id={groupId}
+      data-active-tab={active}
+      data-dragging={sortable.isDragging}
+      onMouseDown={onMouseDown}
+      onAuxClick={(event) => onAuxClick(event, surface)}
+      onContextMenu={(event) => onContextMenu(event, surface)}
+      className={cn(
+        "group flex h-7 min-w-25 max-w-44 shrink-0 items-center gap-1.5 rounded-md px-2 text-sm",
+        active
+          ? "bg-accent text-foreground"
+          : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
+        sortable.isDragging && "opacity-40",
+      )}
+    >
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <button
+              ref={sortable.setActivatorNodeRef}
+              {...sortable.attributes}
+              {...sortable.listeners}
+              type="button"
+              role="tab"
+              aria-selected={active}
+              data-center-panel-tab-activation
+              className="flex min-w-0 flex-1 items-center gap-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
+              onClick={() => !dragInProgress && onActivate(surface)}
+              onKeyDown={(event) => onKeyDown(event, surfaceIndex)}
+            >
+              <CenterSurfaceIcon kind={surface.kind} />
+              <span className="truncate">{title}</span>
+            </button>
+          }
+        />
+        <TooltipPopup>{title}</TooltipPopup>
+      </Tooltip>
+      <button
+        type="button"
+        className="flex size-4 shrink-0 items-center justify-center rounded opacity-0 hover:bg-muted focus:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70 group-hover:opacity-100"
+        aria-label={`Close ${title}`}
+        onPointerDown={(event) => event.stopPropagation()}
+        onClick={() => onClose(surface)}
+      >
+        <X className="size-3" />
+      </button>
+    </div>
+  );
 }
 
 export function CenterPanelTabs(props: CenterPanelTabsProps) {
@@ -111,7 +223,7 @@ export function CenterPanelTabs(props: CenterPanelTabsProps) {
 
   const activateFromAllTabs = useCallback(
     (surface: CenterSurface, surfaceIndex: number) => {
-      props.onActivate(surface);
+      props.onActivate(props.groupId, surface);
       requestAnimationFrame(() => {
         const activationButtons = tabListRef.current?.querySelectorAll<HTMLButtonElement>(
           "[data-center-panel-tab-activation]",
@@ -131,7 +243,7 @@ export function CenterPanelTabs(props: CenterPanelTabsProps) {
       if (!nextSurface) return;
 
       event.preventDefault();
-      props.onActivate(nextSurface);
+      props.onActivate(props.groupId, nextSurface);
       requestAnimationFrame(() => {
         requestAnimationFrame(() => {
           const activationButtons = tabListRef.current?.querySelectorAll<HTMLButtonElement>(
@@ -158,6 +270,16 @@ export function CenterPanelTabs(props: CenterPanelTabsProps) {
       if (surfaceIndex < 0) return;
 
       const items: ContextMenuItem<TabContextMenuAction>[] = [
+        {
+          id: "move-to-split",
+          label: "Move Tab to Split",
+          disabled: !SPLIT_DIRECTIONS.some(props.canMoveToSplit),
+          children: SPLIT_DIRECTIONS.map((direction) => ({
+            id: `move-to-split:${direction}`,
+            label: direction[0]!.toUpperCase() + direction.slice(1),
+            disabled: !props.canMoveToSplit(direction),
+          })),
+        },
         { id: "close", label: "Close" },
         { id: "close-others", label: "Close others", disabled: props.surfaces.length <= 1 },
         {
@@ -170,18 +292,29 @@ export function CenterPanelTabs(props: CenterPanelTabsProps) {
 
       const action = await api.contextMenu.show(items, { x: event.clientX, y: event.clientY });
       switch (action) {
+        case "move-to-split:left":
+        case "move-to-split:right":
+        case "move-to-split:up":
+        case "move-to-split:down":
+          props.onMoveToSplit(
+            props.groupId,
+            surface,
+            action.slice("move-to-split:".length) as CenterPanelSplitDirection,
+          );
+          break;
         case "close":
-          props.onCloseSurface(surface);
+          props.onCloseSurface(props.groupId, surface);
           break;
         case "close-others":
-          props.onCloseOtherSurfaces(surface);
+          props.onCloseOtherSurfaces(props.groupId, surface);
           break;
         case "close-to-right":
-          props.onCloseSurfacesToRight(surface);
+          props.onCloseSurfacesToRight(props.groupId, surface);
           break;
         case "close-all":
-          props.onCloseAllSurfaces();
+          props.onCloseAllSurfaces(props.groupId);
           break;
+        case "move-to-split":
         case null:
           break;
       }
@@ -199,7 +332,7 @@ export function CenterPanelTabs(props: CenterPanelTabsProps) {
       if (event.button !== 1) return;
       event.preventDefault();
       event.stopPropagation();
-      props.onCloseSurface(surface);
+      props.onCloseSurface(props.groupId, surface);
     },
     [props],
   );
@@ -231,7 +364,17 @@ export function CenterPanelTabs(props: CenterPanelTabsProps) {
     };
   }, [getTabViewport, props.surfaces.length]);
 
-  if (props.surfaces.length === 0) return null;
+  if (props.surfaces.length === 0) {
+    return (
+      <div
+        className="flex min-w-0 flex-1 items-center gap-2 self-stretch px-2"
+        data-center-panel-tabbar
+      >
+        <div role="tablist" aria-label="Workspace panels" />
+        <span className="truncate text-sm text-muted-foreground">No chat panels open</span>
+      </div>
+    );
+  }
 
   return (
     <div
@@ -257,47 +400,21 @@ export function CenterPanelTabs(props: CenterPanelTabsProps) {
             const active = surface.id === props.activeSurfaceId;
             const title = centerSurfaceTitle(surface, props.hostLabel, props.terminalLabelsById);
             return (
-              <div
+              <SortableCenterTab
                 key={surface.id}
-                data-active-tab={active}
+                groupId={props.groupId}
+                surface={surface}
+                title={title}
+                active={active}
+                surfaceIndex={surfaceIndex}
+                dragInProgress={props.dragInProgress}
+                onActivate={(entry) => props.onActivate(props.groupId, entry)}
+                onClose={(entry) => props.onCloseSurface(props.groupId, entry)}
                 onMouseDown={handleTabMouseDown}
-                onAuxClick={(event) => handleTabAuxClick(event, surface)}
-                onContextMenu={(event) => void handleTabContextMenu(event, surface)}
-                className={cn(
-                  "group flex h-7 min-w-25 max-w-44 shrink-0 items-center gap-1.5 rounded-md px-2 text-sm",
-                  active
-                    ? "bg-accent text-foreground"
-                    : "text-muted-foreground hover:bg-accent/60 hover:text-foreground",
-                )}
-              >
-                <Tooltip>
-                  <TooltipTrigger
-                    render={
-                      <button
-                        type="button"
-                        role="tab"
-                        aria-selected={active}
-                        data-center-panel-tab-activation
-                        className="flex min-w-0 flex-1 items-center gap-1.5 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70"
-                        onClick={() => props.onActivate(surface)}
-                        onKeyDown={(event) => handleTabKeyDown(event, surfaceIndex)}
-                      >
-                        <CenterSurfaceIcon surface={surface} />
-                        <span className="truncate">{title}</span>
-                      </button>
-                    }
-                  />
-                  <TooltipPopup>{title}</TooltipPopup>
-                </Tooltip>
-                <button
-                  type="button"
-                  className="flex size-4 shrink-0 items-center justify-center rounded opacity-0 hover:bg-muted focus:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70 group-hover:opacity-100"
-                  aria-label={`Close ${title}`}
-                  onClick={() => props.onCloseSurface(surface)}
-                >
-                  <X className="size-3" />
-                </button>
-              </div>
+                onAuxClick={handleTabAuxClick}
+                onContextMenu={(event, entry) => void handleTabContextMenu(event, entry)}
+                onKeyDown={handleTabKeyDown}
+              />
             );
           })}
         </div>
@@ -342,7 +459,7 @@ export function CenterPanelTabs(props: CenterPanelTabsProps) {
                   aria-current={surface.id === props.activeSurfaceId ? "page" : undefined}
                   onClick={() => activateFromAllTabs(surface, surfaceIndex)}
                 >
-                  <CenterSurfaceIcon surface={surface} />
+                  <CenterSurfaceIcon kind={surface.kind} />
                   <span className="truncate">{title}</span>
                 </DropdownMenuItem>
               );

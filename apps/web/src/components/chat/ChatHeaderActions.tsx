@@ -32,7 +32,7 @@ interface ChatHeaderActionsProps {
   preferredScriptId: string | null;
   keybindings: ResolvedKeybindingsConfig;
   availableEditors: ReadonlyArray<EditorId>;
-  rightPanelOpen: boolean;
+  reserveTitlebarControls: boolean;
   gitCwd: string | null;
   providerStatuses: ReadonlyArray<ServerProvider>;
   settings: Pick<ServerSettings, "providerInstances" | "providers" | "providerSessionDefaults">;
@@ -71,7 +71,7 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
   preferredScriptId,
   keybindings,
   availableEditors,
-  rightPanelOpen,
+  reserveTitlebarControls,
   gitCwd,
   providerStatuses,
   settings,
@@ -98,7 +98,7 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
       data-chat-header-actions
       className={cn(
         "@container/header-actions relative z-10 flex shrink-0 items-center justify-end gap-2 bg-background @3xl/header-actions:gap-3",
-        rightPanelOpen ? "pr-0" : "pr-16",
+        reserveTitlebarControls ? "pr-16" : "pr-0",
       )}
     >
       <ChatHeaderPanelMenu

@@ -34,9 +34,9 @@ const noop = () => undefined;
  * `<ThreadTerminalDrawer mode="panel">` (see research-ui.md §4). This resolves
  * cwd/worktree/runtimeEnv from the host thread's project — the same derivation
  * as ChatView's PersistentThreadTerminalPanel, which is kept private to that
- * file to avoid a ChatView↔CenterTerminalPanel import cycle. Splits/groups are
- * out of scope for v1, so a single-terminal group is synthesized and those
- * unsupported controls are omitted.
+ * file to avoid a ChatView↔CenterTerminalPanel import cycle. This component
+ * owns one center terminal surface. Center workspace grouping is external;
+ * terminal-process split controls remain intentionally omitted.
  */
 export function CenterTerminalPanel({
   threadRef,

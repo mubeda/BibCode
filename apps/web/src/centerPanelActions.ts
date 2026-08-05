@@ -28,8 +28,6 @@ import { useCallback } from "react";
 
 import { stackedThreadToast, toastManager } from "~/components/ui/toast";
 import {
-  HOST_SURFACE_ID,
-  selectThreadCenterPanelState,
   useCenterPanelStore,
   type CenterSurface,
   type OpenTerminalPanelOptions,
@@ -58,14 +56,23 @@ export interface CenterPanelActions {
     existingTerminalIds: ReadonlyArray<string>,
     options?: OpenTerminalPanelOptions,
   ) => string;
-  activateSurface: (hostRef: ScopedThreadRef, surfaceId: string) => void;
-  closeSurface: (hostRef: ScopedThreadRef, surface: CenterSurface) => void;
-  closeOtherSurfaces: (hostRef: ScopedThreadRef, surface: CenterSurface) => void;
-  closeSurfacesToRight: (hostRef: ScopedThreadRef, surface: CenterSurface) => void;
-  closeAllSurfaces: (hostRef: ScopedThreadRef) => void;
+  activateSurface: (hostRef: ScopedThreadRef, groupId: string, surfaceId: string) => void;
+  closeSurface: (hostRef: ScopedThreadRef, groupId: string, surface: CenterSurface) => void;
+  closeOtherSurfaces: (hostRef: ScopedThreadRef, groupId: string, surface: CenterSurface) => void;
+  closeSurfacesToRight: (hostRef: ScopedThreadRef, groupId: string, surface: CenterSurface) => void;
+  closeAllSurfaces: (hostRef: ScopedThreadRef, groupId: string) => void;
 }
 
-export function useCenterPanelActions(): CenterPanelActions {
+export interface CenterPanelActionsOptions {
+  readonly onCloseTerminal: (
+    hostRef: ScopedThreadRef,
+    surface: Extract<CenterSurface, { kind: "terminal" }>,
+  ) => void;
+}
+
+export function useCenterPanelActions({
+  onCloseTerminal,
+}: CenterPanelActionsOptions): CenterPanelActions {
   const createThread = useAtomCommand(threadEnvironment.create, { reportFailure: false });
   const deleteThread = useAtomCommand(threadEnvironment.delete, { reportFailure: false });
 
@@ -143,58 +150,61 @@ export function useCenterPanelActions(): CenterPanelActions {
     [],
   );
 
-  const activateSurface = useCallback((hostRef: ScopedThreadRef, surfaceId: string) => {
-    useCenterPanelStore.getState().activateSurface(hostRef, surfaceId);
-  }, []);
+  const cleanupRemoved = useCallback(
+    (hostRef: ScopedThreadRef, removed: readonly CenterSurface[]) => {
+      for (const surface of removed) {
+        if (surface.kind === "chat") {
+          deletePanelThread(hostRef.environmentId, surface.threadId);
+        } else if (surface.kind === "terminal") {
+          onCloseTerminal(hostRef, surface);
+        }
+      }
+    },
+    [deletePanelThread, onCloseTerminal],
+  );
+
+  const activateSurface = useCallback(
+    (hostRef: ScopedThreadRef, groupId: string, surfaceId: string) => {
+      useCenterPanelStore.getState().activateSurface(hostRef, groupId, surfaceId);
+    },
+    [],
+  );
 
   const closeSurface = useCallback(
-    (hostRef: ScopedThreadRef, surface: CenterSurface) => {
-      useCenterPanelStore.getState().closeSurface(hostRef, surface.id);
-      if (surface.kind === "chat") deletePanelThread(hostRef.environmentId, surface.threadId);
+    (hostRef: ScopedThreadRef, groupId: string, surface: CenterSurface) => {
+      cleanupRemoved(
+        hostRef,
+        useCenterPanelStore.getState().closeSurface(hostRef, groupId, surface.id),
+      );
     },
-    [deletePanelThread],
+    [cleanupRemoved],
   );
 
   const closeOtherSurfaces = useCallback(
-    (hostRef: ScopedThreadRef, surface: CenterSurface) => {
-      const store = useCenterPanelStore.getState();
-      const current = selectThreadCenterPanelState(store.byThreadKey, hostRef);
-      const keptIds = new Set<string>([HOST_SURFACE_ID, surface.id]);
-      for (const entry of current.surfaces) {
-        if (!keptIds.has(entry.id) && entry.kind === "chat") {
-          deletePanelThread(hostRef.environmentId, entry.threadId);
-        }
-      }
-      store.closeOtherSurfaces(hostRef, surface.id);
+    (hostRef: ScopedThreadRef, groupId: string, surface: CenterSurface) => {
+      cleanupRemoved(
+        hostRef,
+        useCenterPanelStore.getState().closeOtherSurfaces(hostRef, groupId, surface.id),
+      );
     },
-    [deletePanelThread],
+    [cleanupRemoved],
   );
 
   const closeSurfacesToRight = useCallback(
-    (hostRef: ScopedThreadRef, surface: CenterSurface) => {
-      const store = useCenterPanelStore.getState();
-      const current = selectThreadCenterPanelState(store.byThreadKey, hostRef);
-      const index = current.surfaces.findIndex((entry) => entry.id === surface.id);
-      if (index >= 0) {
-        for (const entry of current.surfaces.slice(index + 1)) {
-          if (entry.kind === "chat") deletePanelThread(hostRef.environmentId, entry.threadId);
-        }
-      }
-      store.closeSurfacesToRight(hostRef, surface.id);
+    (hostRef: ScopedThreadRef, groupId: string, surface: CenterSurface) => {
+      cleanupRemoved(
+        hostRef,
+        useCenterPanelStore.getState().closeSurfacesToRight(hostRef, groupId, surface.id),
+      );
     },
-    [deletePanelThread],
+    [cleanupRemoved],
   );
 
   const closeAllSurfaces = useCallback(
-    (hostRef: ScopedThreadRef) => {
-      const store = useCenterPanelStore.getState();
-      const current = selectThreadCenterPanelState(store.byThreadKey, hostRef);
-      for (const entry of current.surfaces) {
-        if (entry.kind === "chat") deletePanelThread(hostRef.environmentId, entry.threadId);
-      }
-      store.closeAllSurfaces(hostRef);
+    (hostRef: ScopedThreadRef, groupId: string) => {
+      cleanupRemoved(hostRef, useCenterPanelStore.getState().closeAllSurfaces(hostRef, groupId));
     },
-    [deletePanelThread],
+    [cleanupRemoved],
   );
 
   return {

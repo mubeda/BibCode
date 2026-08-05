@@ -5,13 +5,17 @@ import {
   ProviderInstanceId,
   ThreadId,
 } from "@bibcode/contracts";
-import { beforeEach, describe, expect, it } from "vite-plus/test";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
+import { CENTER_PANEL_ROOT_GROUP_ID } from "./centerPanelLayout";
 import {
   HOST_SURFACE_ID,
   migratePersistedCenterPanelState,
   selectActiveCenterSurface,
+  selectFocusedCenterPanelGroup,
+  selectFocusedCenterSurface,
   selectThreadCenterPanelState,
+  selectVisibleCenterSurfaces,
   useCenterPanelStore,
 } from "./centerPanelStore";
 
@@ -22,37 +26,55 @@ const PANEL_B = ThreadId.make("panel-b");
 const store = () => useCenterPanelStore.getState();
 const stateOf = (ref = HOST) => selectThreadCenterPanelState(store().byThreadKey, ref);
 const surfaceIds = (ref = HOST) => stateOf(ref).surfaces.map((surface) => surface.id);
+const rootGroup = () => stateOf().groups.find((group) => group.id === CENTER_PANEL_ROOT_GROUP_ID)!;
 
 describe("centerPanelStore", () => {
   beforeEach(() => useCenterPanelStore.setState({ byThreadKey: {} }));
+  afterEach(() => vi.restoreAllMocks());
 
   describe("default / host surface", () => {
-    it("returns a host-only state for an unknown thread", () => {
+    it("returns a root host group for an unknown thread", () => {
       expect(stateOf()).toEqual({
-        activeSurfaceId: HOST_SURFACE_ID,
         surfaces: [{ id: HOST_SURFACE_ID, kind: "chat-host" }],
+        groups: [
+          {
+            id: CENTER_PANEL_ROOT_GROUP_ID,
+            surfaceIds: [HOST_SURFACE_ID],
+            activeSurfaceId: HOST_SURFACE_ID,
+          },
+        ],
+        layout: { type: "leaf", groupId: CENTER_PANEL_ROOT_GROUP_ID },
+        focusedGroupId: CENTER_PANEL_ROOT_GROUP_ID,
       });
     });
 
-    it("selectActiveCenterSurface falls back to the host surface", () => {
+    it("selects the focused host surface by default", () => {
       expect(selectActiveCenterSurface(store().byThreadKey, HOST)).toEqual({
+        id: HOST_SURFACE_ID,
+        kind: "chat-host",
+      });
+      expect(selectFocusedCenterSurface(stateOf())).toEqual({
         id: HOST_SURFACE_ID,
         kind: "chat-host",
       });
     });
 
-    it("does not persist a host-only entry", () => {
-      // Activating the already-active host surface must not create a map entry.
-      store().activateSurface(HOST, HOST_SURFACE_ID);
+    it("does not persist an unchanged implicit host state", () => {
+      store().activateSurface(HOST, CENTER_PANEL_ROOT_GROUP_ID, HOST_SURFACE_ID);
       expect(store().byThreadKey).toEqual({});
     });
   });
 
-  describe("openChatPanel", () => {
-    it("appends a chat surface after the host and activates it", () => {
+  describe("creation and activation", () => {
+    it("opens chat and terminal surfaces in the focused group", () => {
       store().openChatPanel(HOST, PANEL_A, "Claude");
-      expect(surfaceIds()).toEqual([HOST_SURFACE_ID, `chat:${PANEL_A}`]);
-      expect(stateOf().activeSurfaceId).toBe(`chat:${PANEL_A}`);
+      store().openTerminalPanel(HOST, "term-1");
+
+      expect(surfaceIds()).toEqual([HOST_SURFACE_ID, `chat:${PANEL_A}`, "terminal:term-1"]);
+      expect(rootGroup()).toMatchObject({
+        surfaceIds: [HOST_SURFACE_ID, `chat:${PANEL_A}`, "terminal:term-1"],
+        activeSurfaceId: "terminal:term-1",
+      });
       expect(stateOf().surfaces[1]).toEqual({
         id: `chat:${PANEL_A}`,
         kind: "chat",
@@ -61,42 +83,16 @@ describe("centerPanelStore", () => {
       });
     });
 
-    it("keeps the host surface at index 0", () => {
-      store().openChatPanel(HOST, PANEL_A);
-      store().openTerminalPanel(HOST, "term-1");
-      expect(surfaceIds()[0]).toBe(HOST_SURFACE_ID);
-    });
-
-    it("is idempotent by surface id and re-activates the existing surface", () => {
+    it("re-activates existing surfaces without duplication", () => {
       store().openChatPanel(HOST, PANEL_A);
       store().openChatPanel(HOST, PANEL_B);
       store().openChatPanel(HOST, PANEL_A);
+
       expect(surfaceIds()).toEqual([HOST_SURFACE_ID, `chat:${PANEL_A}`, `chat:${PANEL_B}`]);
-      expect(stateOf().activeSurfaceId).toBe(`chat:${PANEL_A}`);
+      expect(rootGroup().activeSurfaceId).toBe(`chat:${PANEL_A}`);
     });
 
-    it("omits providerLabel when not supplied", () => {
-      store().openChatPanel(HOST, PANEL_A);
-      expect(stateOf().surfaces[1]).toEqual({
-        id: `chat:${PANEL_A}`,
-        kind: "chat",
-        threadId: PANEL_A,
-      });
-    });
-  });
-
-  describe("openTerminalPanel", () => {
-    it("appends a terminal surface and activates it", () => {
-      store().openTerminalPanel(HOST, "term-1");
-      expect(surfaceIds()).toEqual([HOST_SURFACE_ID, "terminal:term-1"]);
-      expect(stateOf().surfaces[1]).toEqual({
-        id: "terminal:term-1",
-        kind: "terminal",
-        terminalId: "term-1",
-      });
-    });
-
-    it("persists provider label and structured command", () => {
+    it("persists terminal launch metadata", () => {
       const command = {
         executable: "/opt/codex",
         args: ["--dangerously-bypass-approvals-and-sandbox"],
@@ -106,415 +102,231 @@ describe("centerPanelStore", () => {
           providerInstanceId: ProviderInstanceId.make("codex_personal"),
         },
       };
-      store().openTerminalPanel(HOST, "term-1", {
-        label: "Codex Terminal",
-        command,
-      });
-      expect(stateOf().surfaces[1]).toEqual({
-        id: "terminal:term-1",
-        kind: "terminal",
-        terminalId: "term-1",
-        label: "Codex Terminal",
-        command,
-      });
+      store().openTerminalPanel(HOST, "term-1", { label: "Codex Terminal", command });
+      expect(stateOf().surfaces[1]).toMatchObject({ label: "Codex Terminal", command });
     });
-  });
 
-  describe("replaceMainWithTerminal", () => {
-    it("replaces Main with one active provider terminal", () => {
+    it("replaces Main with one terminal-only root group", () => {
       const ref = scopeThreadRef(
         EnvironmentId.make("environment-1"),
         ThreadId.make("default-thread"),
       );
-      const claudeCommand = { executable: "claude", args: [] };
       const terminalId = store().replaceMainWithTerminal(ref, ["term-1"], {
         label: "Claude Terminal",
-        command: claudeCommand,
+        command: { executable: "claude", args: [] },
       });
 
       expect(terminalId).toBe("term-2");
-      expect(selectThreadCenterPanelState(store().byThreadKey, ref)).toEqual({
-        activeSurfaceId: "terminal:term-2",
-        surfaces: [
+      expect(selectThreadCenterPanelState(store().byThreadKey, ref)).toMatchObject({
+        surfaces: [{ id: "terminal:term-2", kind: "terminal", terminalId: "term-2" }],
+        groups: [
           {
-            id: "terminal:term-2",
-            kind: "terminal",
-            terminalId: "term-2",
-            label: "Claude Terminal",
-            command: claudeCommand,
+            id: CENTER_PANEL_ROOT_GROUP_ID,
+            surfaceIds: ["terminal:term-2"],
+            activeSurfaceId: "terminal:term-2",
           },
         ],
       });
     });
   });
 
-  describe("activateSurface", () => {
-    it("activates an existing surface", () => {
+  describe("group mutations", () => {
+    it("uses the focused group for creation after a split", () => {
       store().openChatPanel(HOST, PANEL_A);
-      store().openTerminalPanel(HOST, "term-1");
-      store().activateSurface(HOST, `chat:${PANEL_A}`);
-      expect(stateOf().activeSurfaceId).toBe(`chat:${PANEL_A}`);
-    });
+      vi.spyOn(crypto, "randomUUID").mockReturnValue("00000000-0000-4000-8000-000000000002");
+      const groupRight = "center-group:00000000-0000-4000-8000-000000000002";
 
-    it("ignores an unknown surface id", () => {
-      store().openChatPanel(HOST, PANEL_A);
-      store().activateSurface(HOST, "terminal:nope");
-      expect(stateOf().activeSurfaceId).toBe(`chat:${PANEL_A}`);
-    });
-  });
-
-  describe("closeSurface", () => {
-    it("closes the host surface and falls back to the next surface", () => {
-      store().openChatPanel(HOST, PANEL_A);
-      store().activateSurface(HOST, HOST_SURFACE_ID);
-      store().closeSurface(HOST, HOST_SURFACE_ID);
-      expect(surfaceIds()).toEqual([`chat:${PANEL_A}`]);
-      expect(stateOf().activeSurfaceId).toBe(`chat:${PANEL_A}`);
-    });
-
-    it("stores an explicit empty state when the only host surface closes", () => {
-      store().closeSurface(HOST, HOST_SURFACE_ID);
-      expect(surfaceIds()).toEqual([]);
-      expect(stateOf().activeSurfaceId).toBeNull();
-      expect(store().byThreadKey).toEqual({
-        "environment-1:host-1": { surfaces: [], activeSurfaceId: null },
-      });
-    });
-
-    it("removes a non-host surface and keeps the active selection when it was elsewhere", () => {
-      store().openChatPanel(HOST, PANEL_A);
-      store().openTerminalPanel(HOST, "term-1");
-      store().activateSurface(HOST, `chat:${PANEL_A}`);
-      store().closeSurface(HOST, "terminal:term-1");
-      expect(surfaceIds()).toEqual([HOST_SURFACE_ID, `chat:${PANEL_A}`]);
-      expect(stateOf().activeSurfaceId).toBe(`chat:${PANEL_A}`);
-    });
-
-    it("falls back to the neighbor when closing the active surface", () => {
-      store().openChatPanel(HOST, PANEL_A);
-      store().openTerminalPanel(HOST, "term-1");
-      // active is terminal (last opened); closing it falls back to chat:PANEL_A.
-      store().closeSurface(HOST, "terminal:term-1");
-      expect(surfaceIds()).toEqual([HOST_SURFACE_ID, `chat:${PANEL_A}`]);
-      expect(stateOf().activeSurfaceId).toBe(`chat:${PANEL_A}`);
-    });
-
-    it("falls back to the host when closing the only non-host surface", () => {
-      store().openChatPanel(HOST, PANEL_A);
-      store().closeSurface(HOST, `chat:${PANEL_A}`);
-      // Host-only again → entry pruned from the map.
-      expect(store().byThreadKey).toEqual({});
-      expect(stateOf().activeSurfaceId).toBe(HOST_SURFACE_ID);
-    });
-
-    it("ignores unknown surfaces without creating thread state", () => {
-      store().closeSurface(HOST, "chat:missing");
-      expect(store().byThreadKey).toEqual({});
-    });
-  });
-
-  describe("closeOtherSurfaces (host survives)", () => {
-    it("keeps the host and the target surface", () => {
-      store().openChatPanel(HOST, PANEL_A);
-      store().openChatPanel(HOST, PANEL_B);
-      store().openTerminalPanel(HOST, "term-1");
-      store().closeOtherSurfaces(HOST, `chat:${PANEL_A}`);
-      expect(surfaceIds()).toEqual([HOST_SURFACE_ID, `chat:${PANEL_A}`]);
-      expect(stateOf().activeSurfaceId).toBe(`chat:${PANEL_A}`);
-    });
-
-    it("collapses to the host when the host is the target", () => {
-      store().openChatPanel(HOST, PANEL_A);
-      store().openChatPanel(HOST, PANEL_B);
-      store().closeOtherSurfaces(HOST, HOST_SURFACE_ID);
-      expect(store().byThreadKey).toEqual({});
-      expect(surfaceIds()).toEqual([HOST_SURFACE_ID]);
-    });
-
-    it("ignores an unknown target", () => {
-      store().openChatPanel(HOST, PANEL_A);
-      const before = store().byThreadKey;
-      store().closeOtherSurfaces(HOST, "terminal:missing");
-      expect(store().byThreadKey).toBe(before);
-    });
-  });
-
-  describe("closeSurfacesToRight (host survives)", () => {
-    it("drops surfaces after the target", () => {
-      store().openChatPanel(HOST, PANEL_A);
-      store().openChatPanel(HOST, PANEL_B);
-      store().openTerminalPanel(HOST, "term-1");
-      store().closeSurfacesToRight(HOST, `chat:${PANEL_A}`);
-      expect(surfaceIds()).toEqual([HOST_SURFACE_ID, `chat:${PANEL_A}`]);
-    });
-
-    it("collapses to the host when closing to the right of the host", () => {
-      store().openChatPanel(HOST, PANEL_A);
-      store().openChatPanel(HOST, PANEL_B);
-      store().closeSurfacesToRight(HOST, HOST_SURFACE_ID);
-      expect(surfaceIds()).toEqual([HOST_SURFACE_ID]);
-    });
-
-    it("reselects the target when the active surface was dropped", () => {
-      store().openChatPanel(HOST, PANEL_A);
-      store().openChatPanel(HOST, PANEL_B);
-      // active is PANEL_B; closing to the right of PANEL_A drops PANEL_B.
-      store().closeSurfacesToRight(HOST, `chat:${PANEL_A}`);
-      expect(stateOf().activeSurfaceId).toBe(`chat:${PANEL_A}`);
-    });
-
-    it("keeps an active surface inside the retained range and ignores edge targets", () => {
-      store().openChatPanel(HOST, PANEL_A);
-      store().openChatPanel(HOST, PANEL_B);
-      store().activateSurface(HOST, HOST_SURFACE_ID);
-      store().closeSurfacesToRight(HOST, `chat:${PANEL_A}`);
-      expect(stateOf().activeSurfaceId).toBe(HOST_SURFACE_ID);
-
-      const before = store().byThreadKey;
-      store().closeSurfacesToRight(HOST, `chat:${PANEL_A}`);
-      store().closeSurfacesToRight(HOST, "chat:missing");
-      expect(store().byThreadKey).toBe(before);
-    });
-  });
-
-  describe("closeAllSurfaces", () => {
-    it("closes every surface and keeps an explicit empty state", () => {
-      store().openChatPanel(HOST, PANEL_A);
-      store().openTerminalPanel(HOST, "term-1");
-      store().closeAllSurfaces(HOST);
-      expect(surfaceIds()).toEqual([]);
-      expect(stateOf().activeSurfaceId).toBeNull();
-      expect(store().byThreadKey).toEqual({
-        "environment-1:host-1": { surfaces: [], activeSurfaceId: null },
-      });
-    });
-
-    it("keeps an already empty state stable", () => {
-      store().closeAllSurfaces(HOST);
-      const before = store().byThreadKey;
-      store().closeAllSurfaces(HOST);
-      expect(store().byThreadKey).toBe(before);
-    });
-  });
-
-  describe("removeThread", () => {
-    it("clears the stored entry for the thread", () => {
-      store().openChatPanel(HOST, PANEL_A);
-      store().removeThread(HOST);
-      expect(store().byThreadKey).toEqual({});
-    });
-
-    it("keeps state stable when the thread has no stored entry", () => {
-      const before = store();
-      store().removeThread(HOST);
-      expect(store()).toBe(before);
-    });
-  });
-
-  describe("migratePersistedCenterPanelState", () => {
-    it("returns an empty map for junk input", () => {
-      expect(migratePersistedCenterPanelState(null)).toEqual({ byThreadKey: {} });
-      expect(migratePersistedCenterPanelState(42)).toEqual({ byThreadKey: {} });
-      expect(migratePersistedCenterPanelState({})).toEqual({ byThreadKey: {} });
-    });
-
-    it("preserves a host-closed state while dropping invalid surfaces", () => {
-      const migrated = migratePersistedCenterPanelState({
-        byThreadKey: {
-          "environment-1:host-1": {
-            activeSurfaceId: `chat:${PANEL_A}`,
-            surfaces: [
-              { id: `chat:${PANEL_A}`, kind: "chat", threadId: PANEL_A },
-              { id: "chat:bad", kind: "chat" }, // missing threadId → dropped
-              { id: "terminal:term-1", kind: "terminal", terminalId: "term-1" },
-            ],
-          },
-        },
-      });
-      const state = migrated.byThreadKey["environment-1:host-1"];
-      expect(state?.surfaces.map((surface) => surface.id)).toEqual([
-        `chat:${PANEL_A}`,
-        "terminal:term-1",
-      ]);
-      expect(state?.activeSurfaceId).toBe(`chat:${PANEL_A}`);
-    });
-
-    it("preserves an explicitly empty v1 state", () => {
       expect(
-        migratePersistedCenterPanelState({
-          byThreadKey: {
-            "environment-1:host-1": {
-              activeSurfaceId: null,
-              surfaces: [],
-            },
-          },
+        store().dropSurface(HOST, `chat:${PANEL_A}`, {
+          groupId: CENTER_PANEL_ROOT_GROUP_ID,
+          splitDirection: "right",
         }),
-      ).toEqual({
-        byThreadKey: {
-          "environment-1:host-1": {
-            activeSurfaceId: null,
-            surfaces: [],
-          },
-        },
-      });
+      ).toBe(true);
+      expect(stateOf().groups.some((group) => group.id === groupRight)).toBe(true);
+
+      store().focusGroup(HOST, groupRight);
+      store().openTerminalPanel(HOST, "term-2");
+      expect(stateOf().groups.find((group) => group.id === groupRight)?.surfaceIds).toContain(
+        "terminal:term-2",
+      );
     });
 
-    it("preserves an ordinary v1 state where the host is present", () => {
-      const migrated = migratePersistedCenterPanelState({
-        byThreadKey: {
-          "environment-1:host-1": {
-            activeSurfaceId: `chat:${PANEL_A}`,
-            surfaces: [
-              { id: HOST_SURFACE_ID, kind: "chat-host" },
-              { id: `chat:${PANEL_A}`, kind: "chat", threadId: PANEL_A },
-            ],
-          },
-        },
-      });
+    it("keeps invalid or no-op drops atomic", () => {
+      store().openChatPanel(HOST, PANEL_A);
+      const before = store().byThreadKey;
+      expect(
+        store().dropSurface(HOST, "chat:missing", { groupId: CENTER_PANEL_ROOT_GROUP_ID }),
+      ).toBe(false);
+      expect(store().byThreadKey).toBe(before);
 
-      expect(migrated.byThreadKey["environment-1:host-1"]).toEqual({
-        activeSurfaceId: `chat:${PANEL_A}`,
-        surfaces: [
-          { id: HOST_SURFACE_ID, kind: "chat-host" },
-          { id: `chat:${PANEL_A}`, kind: "chat", threadId: PANEL_A },
-        ],
-      });
+      expect(
+        store().dropSurface(HOST, `chat:${PANEL_A}`, {
+          groupId: CENTER_PANEL_ROOT_GROUP_ID,
+          index: 1,
+        }),
+      ).toBe(false);
+      expect(store().byThreadKey).toBe(before);
     });
 
-    it("dedupes a persisted host copy and repairs a dangling active id", () => {
-      const migrated = migratePersistedCenterPanelState({
-        byThreadKey: {
-          "environment-1:host-1": {
-            activeSurfaceId: "chat:gone",
-            surfaces: [
-              { id: HOST_SURFACE_ID, kind: "chat-host" },
-              { id: HOST_SURFACE_ID, kind: "chat-host" },
-              { id: `chat:${PANEL_A}`, kind: "chat", threadId: PANEL_A },
-            ],
-          },
-        },
+    it("merges a group without changing the surface descriptor order", () => {
+      const groupRight = createRightGroup();
+      const allIdsBeforeMerge = surfaceIds();
+
+      expect(store().mergeGroup(HOST, groupRight)).toBe(true);
+      expect(surfaceIds()).toEqual(allIdsBeforeMerge);
+      expect(stateOf().groups).toHaveLength(1);
+    });
+
+    it("updates only the addressed split ratio", () => {
+      createRightGroup();
+      store().focusGroup(HOST, CENTER_PANEL_ROOT_GROUP_ID);
+      store().openTerminalPanel(HOST, "term-1");
+      vi.spyOn(crypto, "randomUUID").mockReturnValue("00000000-0000-4000-8000-000000000003");
+      expect(
+        store().dropSurface(HOST, "terminal:term-1", {
+          groupId: CENTER_PANEL_ROOT_GROUP_ID,
+          splitDirection: "down",
+        }),
+      ).toBe(true);
+
+      const before = stateOf();
+      if (before.layout.type !== "split" || before.layout.first.type !== "split") {
+        throw new Error("expected a nested split layout");
+      }
+      store().setSplitRatio(HOST, ["first"], 0.3);
+      expect(stateOf().layout).toEqual({
+        ...before.layout,
+        first: { ...before.layout.first, ratio: 0.3 },
       });
-      const state = migrated.byThreadKey["environment-1:host-1"];
-      expect(state?.surfaces.map((surface) => surface.id)).toEqual([
-        HOST_SURFACE_ID,
+      expect(stateOf().groups).toEqual(before.groups);
+    });
+  });
+
+  describe("group-local closes and returned removals", () => {
+    it("closes only surfaces to the right in the specified group and returns them", () => {
+      const groupRight = createRightGroup();
+      store().focusGroup(HOST, groupRight);
+      store().openTerminalPanel(HOST, "term-2");
+      const rootIdsBefore = rootGroup().surfaceIds;
+
+      const removed = store().closeSurfacesToRight(HOST, groupRight, `chat:${PANEL_A}`);
+      expect(removed.map((surface) => surface.id)).toEqual(["terminal:term-2"]);
+      expect(rootGroup().surfaceIds).toEqual(rootIdsBefore);
+    });
+
+    it("keeps the host only when closing others within its group", () => {
+      store().openChatPanel(HOST, PANEL_A);
+      const removed = store().closeOtherSurfaces(
+        HOST,
+        CENTER_PANEL_ROOT_GROUP_ID,
         `chat:${PANEL_A}`,
+      );
+
+      expect(removed.map((surface) => surface.id)).toEqual([]);
+      expect(rootGroup().surfaceIds).toEqual([HOST_SURFACE_ID, `chat:${PANEL_A}`]);
+    });
+
+    it("returns no removals and preserves identity for invalid group-local closes", () => {
+      const before = store().byThreadKey;
+      expect(store().closeSurface(HOST, "missing", HOST_SURFACE_ID)).toEqual([]);
+      expect(store().closeAllSurfaces(HOST, "missing")).toEqual([]);
+      expect(store().byThreadKey).toBe(before);
+    });
+
+    it("persists an explicit empty root group after closing all surfaces", () => {
+      const removed = store().closeAllSurfaces(HOST, CENTER_PANEL_ROOT_GROUP_ID);
+      expect(removed.map((surface) => surface.id)).toEqual([HOST_SURFACE_ID]);
+      expect(store().byThreadKey).toEqual({
+        "environment-1:host-1": {
+          surfaces: [],
+          groups: [{ id: CENTER_PANEL_ROOT_GROUP_ID, surfaceIds: [], activeSurfaceId: null }],
+          layout: { type: "leaf", groupId: CENTER_PANEL_ROOT_GROUP_ID },
+          focusedGroupId: CENTER_PANEL_ROOT_GROUP_ID,
+        },
+      });
+    });
+  });
+
+  describe("selectors", () => {
+    it("exposes focused and visible surfaces", () => {
+      const groupRight = createRightGroup();
+      store().focusGroup(HOST, groupRight);
+      store().openTerminalPanel(HOST, "term-2");
+
+      expect(selectFocusedCenterPanelGroup(stateOf()).id).toBe(groupRight);
+      expect(selectFocusedCenterSurface(stateOf())?.id).toBe("terminal:term-2");
+      expect(selectVisibleCenterSurfaces(stateOf())).toEqual([
+        {
+          groupId: CENTER_PANEL_ROOT_GROUP_ID,
+          surface: { id: HOST_SURFACE_ID, kind: "chat-host" },
+          focused: false,
+        },
+        {
+          groupId: groupRight,
+          surface: { id: "terminal:term-2", kind: "terminal", terminalId: "term-2" },
+          focused: true,
+        },
       ]);
-      expect(state?.activeSurfaceId).toBe(HOST_SURFACE_ID);
+      expect(selectVisibleCenterSurfaces(stateOf())).not.toContainEqual({
+        groupId: groupRight,
+        surface: { id: `chat:${PANEL_A}`, kind: "chat", threadId: PANEL_A },
+        focused: true,
+      });
     });
+  });
 
-    it("drops host-only entries", () => {
+  describe("migration", () => {
+    it("migrates the flat v2 state into one root group", () => {
       const migrated = migratePersistedCenterPanelState({
         byThreadKey: {
           "environment-1:host-1": {
-            activeSurfaceId: HOST_SURFACE_ID,
-            surfaces: [{ id: HOST_SURFACE_ID, kind: "chat-host" }],
-          },
-        },
-      });
-      expect(migrated.byThreadKey).toEqual({});
-    });
-
-    it("sanitizes duplicate, malformed, and partially typed persisted surfaces", () => {
-      const migrated = migratePersistedCenterPanelState({
-        byThreadKey: {
-          malformed: null,
-          "environment-1:host-1": {
-            activeSurfaceId: 42,
-            surfaces: [
-              null,
-              { id: `chat:${PANEL_A}`, kind: "chat", threadId: PANEL_A, providerLabel: 42 },
-              { id: `chat:${PANEL_A}`, kind: "chat", threadId: PANEL_A },
-              { id: "terminal:missing", kind: "terminal" },
-              { id: "unknown", kind: "unknown" },
-            ],
-          },
-          "environment-1:host-2": { activeSurfaceId: null, surfaces: "not-an-array" },
-        },
-      });
-
-      expect(migrated.byThreadKey["environment-1:host-1"]).toEqual({
-        activeSurfaceId: `chat:${PANEL_A}`,
-        surfaces: [{ id: `chat:${PANEL_A}`, kind: "chat", threadId: PANEL_A }],
-      });
-      expect(migrated.byThreadKey.malformed).toBeUndefined();
-      expect(migrated.byThreadKey["environment-1:host-2"]).toBeUndefined();
-    });
-
-    it("preserves bounded launch metadata, removes malformed hints, and drops malformed commands", () => {
-      const migrated = migratePersistedCenterPanelState({
-        byThreadKey: {
-          valid: {
-            activeSurfaceId: "terminal:term-1",
             surfaces: [
               { id: HOST_SURFACE_ID, kind: "chat-host" },
-              {
-                kind: "terminal",
-                terminalId: "term-1",
-                label: " Codex Terminal ",
-                command: {
-                  executable: " /opt/codex ",
-                  args: ["--dangerously-bypass-approvals-and-sandbox"],
-                  label: " Codex Terminal ",
-                  activity: {
-                    driverKind: "codex",
-                    providerInstanceId: "codex_personal",
-                  },
-                },
-              },
+              { kind: "terminal", terminalId: "term-1" },
             ],
+            activeSurfaceId: "terminal:term-1",
           },
-          malformedHint: {
-            activeSurfaceId: "terminal:term-hint",
-            surfaces: [
-              {
-                kind: "terminal",
-                terminalId: "term-hint",
-                command: {
-                  executable: "/opt/codex",
-                  args: ["--model", "gpt-5.4"],
-                  activity: {
-                    driverKind: "codex",
-                    providerInstanceId: "codex_personal",
-                    token: "must-not-persist",
-                  },
-                },
-              },
-            ],
+        },
+      });
+      expect(migrated.byThreadKey["environment-1:host-1"]).toMatchObject({
+        groups: [
+          {
+            id: CENTER_PANEL_ROOT_GROUP_ID,
+            surfaceIds: [HOST_SURFACE_ID, "terminal:term-1"],
+            activeSurfaceId: "terminal:term-1",
           },
+        ],
+        layout: { type: "leaf", groupId: CENTER_PANEL_ROOT_GROUP_ID },
+        focusedGroupId: CENTER_PANEL_ROOT_GROUP_ID,
+      });
+    });
+
+    it("preserves host-closed, explicit-empty, and sanitized terminal states", () => {
+      const migrated = migratePersistedCenterPanelState({
+        byThreadKey: {
+          closed: {
+            activeSurfaceId: "terminal:term-1",
+            surfaces: [{ kind: "terminal", terminalId: "term-1", label: " Terminal " }],
+          },
+          empty: { activeSurfaceId: null, surfaces: [] },
           invalid: {
             activeSurfaceId: "terminal:term-2",
             surfaces: [
               { id: HOST_SURFACE_ID, kind: "chat-host" },
-              {
-                kind: "terminal",
-                terminalId: "term-2",
-                command: { executable: " ", args: [] },
-              },
+              { kind: "terminal", terminalId: "term-2", command: { executable: " ", args: [] } },
             ],
           },
         },
       });
 
-      expect(migrated.byThreadKey.valid?.surfaces[1]).toMatchObject({
-        label: "Codex Terminal",
-        command: {
-          executable: "/opt/codex",
-          args: ["--dangerously-bypass-approvals-and-sandbox"],
-          label: "Codex Terminal",
-          activity: {
-            driverKind: "codex",
-            providerInstanceId: "codex_personal",
-          },
-        },
+      expect(migrated.byThreadKey.closed).toMatchObject({
+        surfaces: [
+          { id: "terminal:term-1", kind: "terminal", terminalId: "term-1", label: "Terminal" },
+        ],
       });
-      expect(migrated.byThreadKey.malformedHint?.surfaces[0]).toEqual({
-        id: "terminal:term-hint",
-        kind: "terminal",
-        terminalId: "term-hint",
-        command: {
-          executable: "/opt/codex",
-          args: ["--model", "gpt-5.4"],
-        },
+      expect(migrated.byThreadKey.empty).toMatchObject({
+        surfaces: [],
+        groups: [{ id: CENTER_PANEL_ROOT_GROUP_ID, surfaceIds: [], activeSurfaceId: null }],
       });
       expect(migrated.byThreadKey.invalid?.surfaces[1]).toEqual({
         id: "terminal:term-2",
@@ -523,47 +335,49 @@ describe("centerPanelStore", () => {
       });
     });
 
-    it("hydrates a provider terminal without restoring Main", () => {
-      const threadKey = "environment-1:default-thread";
-      const providerTerminalSurface = {
-        id: "terminal:term-1" as const,
-        kind: "terminal" as const,
-        terminalId: "term-1",
-        label: "Claude Terminal",
-        command: { executable: "claude", args: [] },
-      };
-      const persisted = {
+    it("drops only the exact implicit host default", () => {
+      const migrated = migratePersistedCenterPanelState({
         byThreadKey: {
-          [threadKey]: {
-            activeSurfaceId: providerTerminalSurface.id,
-            surfaces: [providerTerminalSurface],
+          implicit: {
+            activeSurfaceId: HOST_SURFACE_ID,
+            surfaces: [{ id: HOST_SURFACE_ID, kind: "chat-host" }],
+          },
+          explicit: {
+            surfaces: [{ id: HOST_SURFACE_ID, kind: "chat-host" }],
+            groups: [
+              { id: "other", surfaceIds: [HOST_SURFACE_ID], activeSurfaceId: HOST_SURFACE_ID },
+            ],
+            layout: { type: "leaf", groupId: "other" },
+            focusedGroupId: "other",
           },
         },
-      };
-
-      const migrated = migratePersistedCenterPanelState(persisted);
-      expect(migrated.byThreadKey[threadKey]).toEqual({
-        activeSurfaceId: "terminal:term-1",
-        surfaces: [providerTerminalSurface],
       });
-      expect(migrated.byThreadKey[threadKey]?.surfaces).not.toContainEqual({
-        id: HOST_SURFACE_ID,
-        kind: "chat-host",
-      });
+      expect(migrated.byThreadKey.implicit).toBeUndefined();
+      expect(migrated.byThreadKey.explicit).toBeDefined();
     });
+  });
 
-    it("returns null when an active surface id has no matching surface", () => {
-      expect(
-        selectActiveCenterSurface(
-          {
-            "environment-1:host-1": {
-              activeSurfaceId: "missing",
-              surfaces: [],
-            },
-          },
-          HOST,
-        ),
-      ).toBeNull();
+  describe("thread cleanup", () => {
+    it("removes a stored thread and preserves absent state identity", () => {
+      store().openChatPanel(HOST, PANEL_A);
+      store().removeThread(HOST);
+      expect(store().byThreadKey).toEqual({});
+      const before = store();
+      store().removeThread(HOST);
+      expect(store()).toBe(before);
     });
   });
 });
+
+function createRightGroup(): string {
+  store().openChatPanel(HOST, PANEL_A);
+  vi.spyOn(crypto, "randomUUID").mockReturnValue("00000000-0000-4000-8000-000000000002");
+  const groupRight = "center-group:00000000-0000-4000-8000-000000000002";
+  expect(
+    store().dropSurface(HOST, `chat:${PANEL_A}`, {
+      groupId: CENTER_PANEL_ROOT_GROUP_ID,
+      splitDirection: "right",
+    }),
+  ).toBe(true);
+  return groupRight;
+}
