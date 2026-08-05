@@ -1,15 +1,24 @@
 use std::{
     collections::{BTreeSet, HashMap, HashSet},
     ffi::OsStr,
+    fmt::{self, Debug, Formatter},
+    future::Future,
     mem::size_of,
     os::raw::c_int,
     path::Path,
+    pin::Pin,
     ptr::from_mut,
+    sync::Arc,
+    time::Duration,
 };
 
 use bibcode_server::diagnostics::{
-    DesktopUiObservation, ProcessIdentity, ProcessRow, UiCoverage, UiCoverageStatus,
+    DesktopUiObservation, DesktopUiProcessObserver, ProcessIdentity, ProcessRow, UiCoverage,
+    UiCoverageStatus,
 };
+use objc2::{msg_send, runtime::NSObjectProtocol, sel};
+use objc2_web_kit::WKWebView;
+use tauri::{AppHandle, Manager, Runtime};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum WebKitProcessRole {
@@ -31,6 +40,7 @@ struct CoalitionIds {
 }
 
 const PROC_PIDCOALITIONINFO: c_int = 20;
+const WEBVIEW_PID_COLLECTION_TIMEOUT: Duration = Duration::from_millis(175);
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]
@@ -87,6 +97,172 @@ enum MacosObservationIssue {
 struct WebKitPidCollection {
     candidates: Vec<WebKitProcessCandidate>,
     issues: BTreeSet<MacosObservationIssue>,
+}
+
+#[derive(Debug, Default)]
+struct WebViewPidResult {
+    candidates: Vec<WebKitProcessCandidate>,
+    missing_selectors: usize,
+}
+
+fn reduce_webview_results(
+    expected_callbacks: usize,
+    dispatch_failures: usize,
+    timed_out: bool,
+    results: Vec<WebViewPidResult>,
+) -> WebKitPidCollection {
+    let completed_callbacks = results.len();
+    let mut collection = WebKitPidCollection::default();
+
+    if dispatch_failures > 0 {
+        collection
+            .issues
+            .insert(MacosObservationIssue::WebviewDispatch);
+    }
+    if timed_out && completed_callbacks < expected_callbacks {
+        collection
+            .issues
+            .insert(MacosObservationIssue::WebviewDeadline);
+    }
+
+    for result in results {
+        if result.missing_selectors > 0 {
+            collection
+                .issues
+                .insert(MacosObservationIssue::PrivateSelector);
+        }
+        collection.candidates.extend(
+            result
+                .candidates
+                .into_iter()
+                .filter(|candidate| candidate.pid > 0),
+        );
+    }
+
+    collection
+}
+
+fn push_candidate(result: &mut WebViewPidResult, pid: libc::pid_t, role: WebKitProcessRole) {
+    if let Ok(pid) = u32::try_from(pid) {
+        if pid > 0 {
+            result.candidates.push(WebKitProcessCandidate { pid, role });
+        }
+    }
+}
+
+fn read_webview_pids(wk: &WKWebView) -> WebViewPidResult {
+    let mut result = WebViewPidResult::default();
+
+    if wk.respondsToSelector(sel!(_webProcessIdentifier)) {
+        // SAFETY: the runtime capability check proves the private pid_t getter is
+        // implemented by this WKWebView instance.
+        let pid: libc::pid_t = unsafe { msg_send![wk, _webProcessIdentifier] };
+        push_candidate(&mut result, pid, WebKitProcessRole::WebContent);
+    } else {
+        result.missing_selectors += 1;
+    }
+
+    if wk.respondsToSelector(sel!(_provisionalWebProcessIdentifier)) {
+        // SAFETY: the runtime capability check proves the private pid_t getter is
+        // implemented by this WKWebView instance.
+        let pid: libc::pid_t = unsafe { msg_send![wk, _provisionalWebProcessIdentifier] };
+        push_candidate(&mut result, pid, WebKitProcessRole::WebContent);
+    } else {
+        result.missing_selectors += 1;
+    }
+
+    if wk.respondsToSelector(sel!(_gpuProcessIdentifier)) {
+        // SAFETY: the runtime capability check proves the private pid_t getter is
+        // implemented by this WKWebView instance.
+        let pid: libc::pid_t = unsafe { msg_send![wk, _gpuProcessIdentifier] };
+        push_candidate(&mut result, pid, WebKitProcessRole::Gpu);
+    } else {
+        result.missing_selectors += 1;
+    }
+
+    // SAFETY: generated public getters retain their returned Objective-C
+    // objects for the duration of these local values.
+    let data_store = unsafe { wk.configuration().websiteDataStore() };
+    if data_store.respondsToSelector(sel!(_networkProcessIdentifier)) {
+        // SAFETY: the runtime capability check proves the private pid_t getter is
+        // implemented by this WKWebsiteDataStore instance.
+        let pid: libc::pid_t = unsafe { msg_send![&data_store, _networkProcessIdentifier] };
+        push_candidate(&mut result, pid, WebKitProcessRole::Networking);
+    } else {
+        result.missing_selectors += 1;
+    }
+
+    result
+}
+
+async fn collect_webview_pids<R: Runtime>(app: &AppHandle<R>) -> WebKitPidCollection {
+    let webviews = app.webviews();
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    let mut expected_callbacks = 0;
+    let mut dispatch_failures = 0;
+
+    for webview in webviews.into_values() {
+        let sender = sender.clone();
+        let dispatch = webview.with_webview(move |platform| {
+            // SAFETY: on macOS Tauri provides its live WKWebView and executes this
+            // closure on the main/UI thread.
+            let wk: &WKWebView = unsafe { &*platform.inner().cast() };
+            let _ = sender.send(read_webview_pids(wk));
+        });
+        if dispatch.is_ok() {
+            expected_callbacks += 1;
+        } else {
+            dispatch_failures += 1;
+        }
+    }
+    drop(sender);
+
+    let deadline = tokio::time::Instant::now() + WEBVIEW_PID_COLLECTION_TIMEOUT;
+    let mut results = Vec::with_capacity(expected_callbacks);
+    let mut timed_out = false;
+    while results.len() < expected_callbacks {
+        match tokio::time::timeout_at(deadline, receiver.recv()).await {
+            Ok(Some(result)) => results.push(result),
+            Ok(None) => break,
+            Err(_) => {
+                timed_out = true;
+                break;
+            }
+        }
+    }
+
+    reduce_webview_results(expected_callbacks, dispatch_failures, timed_out, results)
+}
+
+pub(super) struct MacosDesktopUiProcessObserver<R: Runtime> {
+    app: AppHandle<R>,
+}
+
+impl<R: Runtime> MacosDesktopUiProcessObserver<R> {
+    pub(super) fn new(app: AppHandle<R>) -> Self {
+        Self { app }
+    }
+}
+
+impl<R: Runtime> Debug for MacosDesktopUiProcessObserver<R> {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("MacosDesktopUiProcessObserver")
+            .finish_non_exhaustive()
+    }
+}
+
+impl<R: Runtime> DesktopUiProcessObserver for MacosDesktopUiProcessObserver<R> {
+    fn observe(
+        &self,
+        rows: Arc<[ProcessRow]>,
+        server_identity: ProcessIdentity,
+    ) -> Pin<Box<dyn Future<Output = DesktopUiObservation> + Send + '_>> {
+        Box::pin(async move {
+            let collection = collect_webview_pids(&self.app).await;
+            build_observation_with(&rows, server_identity, collection, coalition_ids)
+        })
+    }
 }
 
 const UI_UNAVAILABLE_MESSAGE: &str =
@@ -260,8 +436,9 @@ mod tests {
     use bibcode_server::diagnostics::{ProcessIdentity, ProcessRow, UiCoverageStatus};
 
     use super::{
-        build_observation_with, coalition_ids, CoalitionIds, MacosObservationIssue,
-        WebKitPidCollection, WebKitProcessCandidate, WebKitProcessRole,
+        CoalitionIds, MacosObservationIssue, WebKitPidCollection, WebKitProcessCandidate,
+        WebKitProcessRole, WebViewPidResult, build_observation_with, coalition_ids,
+        reduce_webview_results,
     };
 
     const SERVER_PID: u32 = 410;
@@ -360,6 +537,147 @@ XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebC
         build_observation_with(rows, server_identity(), collection, |pid| {
             coalitions.get(&pid).copied().unwrap_or(Err(()))
         })
+    }
+
+    #[test]
+    fn macos_ui_collection_retains_candidates_from_every_webview() {
+        // Mutation caught: replacing rather than extending the candidate vector loses the
+        // first WebView's WebContent process when a later WebView reports its GPU process.
+        let collection = reduce_webview_results(
+            2,
+            0,
+            false,
+            vec![
+                WebViewPidResult {
+                    candidates: vec![WebKitProcessCandidate {
+                        pid: 501,
+                        role: WebKitProcessRole::WebContent,
+                    }],
+                    missing_selectors: 0,
+                },
+                WebViewPidResult {
+                    candidates: vec![WebKitProcessCandidate {
+                        pid: 503,
+                        role: WebKitProcessRole::Gpu,
+                    }],
+                    missing_selectors: 0,
+                },
+            ],
+        );
+
+        assert_eq!(
+            collection.candidates,
+            vec![
+                WebKitProcessCandidate {
+                    pid: 501,
+                    role: WebKitProcessRole::WebContent,
+                },
+                WebKitProcessCandidate {
+                    pid: 503,
+                    role: WebKitProcessRole::Gpu,
+                },
+            ]
+        );
+        assert!(collection.issues.is_empty());
+    }
+
+    #[test]
+    fn macos_ui_collection_records_dispatch_failures() {
+        // Mutation caught: ignoring an immediate with_webview failure incorrectly reports
+        // complete collection coverage from the callbacks that did dispatch.
+        let collection = reduce_webview_results(1, 1, false, vec![WebViewPidResult::default()]);
+
+        assert_eq!(
+            collection.issues,
+            [MacosObservationIssue::WebviewDispatch]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn macos_ui_collection_records_an_incomplete_timed_out_fanout() {
+        // Mutation caught: checking only the timeout flag or only callback count misses a
+        // scheduled callback that did not return before the deadline.
+        let collection = reduce_webview_results(2, 0, true, vec![WebViewPidResult::default()]);
+
+        assert_eq!(
+            collection.issues,
+            [MacosObservationIssue::WebviewDeadline]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn macos_ui_collection_records_any_missing_private_selector() {
+        // Mutation caught: treating selector capability loss as healthy because another
+        // selector produced a candidate suppresses the WebKit capability boundary.
+        let collection = reduce_webview_results(
+            1,
+            0,
+            false,
+            vec![WebViewPidResult {
+                candidates: vec![WebKitProcessCandidate {
+                    pid: 501,
+                    role: WebKitProcessRole::WebContent,
+                }],
+                missing_selectors: 1,
+            }],
+        );
+
+        assert_eq!(
+            collection.issues,
+            [MacosObservationIssue::PrivateSelector]
+                .into_iter()
+                .collect()
+        );
+    }
+
+    #[test]
+    fn macos_ui_collection_without_callbacks_or_candidates_is_unavailable() {
+        // Mutation caught: deriving availability from an issue-free collection rather than
+        // from validated identities reports healthy coverage when no WebView exists.
+        let rows = vec![server_row()];
+        let coalitions = [(SERVER_PID, Ok(HOST_COALITION))].into_iter().collect();
+        let collection = reduce_webview_results(0, 0, false, Vec::new());
+
+        let observation = observe(&rows, collection, coalitions);
+
+        assert!(observation.identities.is_empty());
+        assert_eq!(observation.coverage.status, UiCoverageStatus::Unavailable);
+    }
+
+    #[test]
+    fn macos_ui_collection_drops_zero_pids_before_validation() {
+        // Mutation caught: forwarding WebKit's no-process sentinel into validation retains
+        // a candidate that was never a live process identifier.
+        let collection = reduce_webview_results(
+            1,
+            0,
+            false,
+            vec![WebViewPidResult {
+                candidates: vec![
+                    WebKitProcessCandidate {
+                        pid: 0,
+                        role: WebKitProcessRole::WebContent,
+                    },
+                    WebKitProcessCandidate {
+                        pid: 503,
+                        role: WebKitProcessRole::Gpu,
+                    },
+                ],
+                missing_selectors: 0,
+            }],
+        );
+
+        assert_eq!(
+            collection.candidates,
+            vec![WebKitProcessCandidate {
+                pid: 503,
+                role: WebKitProcessRole::Gpu,
+            }]
+        );
     }
 
     #[test]
