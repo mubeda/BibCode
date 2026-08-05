@@ -18,6 +18,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     ServerConfig,
+    activity::AgentActivitySource,
     diagnostics::TraceDiagnosticsStore,
     persistence::{read_json, write_bytes_atomically, write_json_atomically},
     production::{
@@ -412,7 +413,9 @@ impl NativeServerControl {
                     .await
                     .clone()
             {
-                let _ = handler.transition(next_agent_activity, generation).await;
+                let _ = handler
+                    .transition(AgentActivitySource::Chat, next_agent_activity, generation)
+                    .await;
             }
             commit_control
                 .provider_maintenance
@@ -2465,22 +2468,24 @@ mod tests {
 
     #[derive(Clone)]
     struct TestAgentActivityHandler {
-        calls: Arc<StdMutex<Vec<(bool, u64)>>>,
+        calls: Arc<StdMutex<Vec<(AgentActivitySource, bool, u64)>>>,
     }
 
     impl AgentActivitySettingsHandler for TestAgentActivityHandler {
         fn transition(
             &self,
+            source: AgentActivitySource,
             enabled: bool,
             settings_generation: u64,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = AgentActivityTransitionReport> + Send + '_>,
         > {
             Box::pin(async move {
-                self.calls
-                    .lock()
-                    .expect("handler calls")
-                    .push((enabled, settings_generation));
+                self.calls.lock().expect("handler calls").push((
+                    source,
+                    enabled,
+                    settings_generation,
+                ));
                 AgentActivityTransitionReport {
                     enabled,
                     settings_generation,
@@ -2506,7 +2511,10 @@ mod tests {
     }
 
     impl AgentActivityTransitionRuntime for UnifiedTestRuntime {
-        fn finalize_disabled_activity(&self) -> BoxAgentActivityFuture<'_, Result<usize, ()>> {
+        fn finalize_disabled_activity(
+            &self,
+            _source: AgentActivitySource,
+        ) -> BoxAgentActivityFuture<'_, Result<usize, ()>> {
             Box::pin(async { Ok(0) })
         }
 
@@ -2537,22 +2545,24 @@ mod tests {
     struct UnifiedTestHandler {
         coordinator: AgentActivityCoordinator,
         runtime: UnifiedTestRuntime,
-        calls: Arc<StdMutex<Vec<(bool, u64)>>>,
+        calls: Arc<StdMutex<Vec<(AgentActivitySource, bool, u64)>>>,
     }
 
     impl AgentActivitySettingsHandler for UnifiedTestHandler {
         fn transition(
             &self,
+            source: AgentActivitySource,
             enabled: bool,
             settings_generation: u64,
         ) -> std::pin::Pin<
             Box<dyn std::future::Future<Output = AgentActivityTransitionReport> + Send + '_>,
         > {
             Box::pin(async move {
-                self.calls
-                    .lock()
-                    .expect("handler calls")
-                    .push((enabled, settings_generation));
+                self.calls.lock().expect("handler calls").push((
+                    source,
+                    enabled,
+                    settings_generation,
+                ));
                 self.coordinator
                     .transition(&self.runtime, enabled, settings_generation)
                     .await
@@ -2753,6 +2763,7 @@ mod tests {
         let runtime = UnifiedTestRuntime::new(true);
         let trace = TraceDiagnosticsStore::new(temp.path().join("activity.trace.ndjson"));
         let coordinator = AgentActivityCoordinator::new(
+            AgentActivitySource::Chat,
             AgentActivityController::new(true),
             trace,
             "cancellation-test".to_owned(),
