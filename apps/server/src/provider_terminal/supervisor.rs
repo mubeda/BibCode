@@ -417,9 +417,10 @@ impl ProviderTerminalActivitySupervisor {
         &self,
         input: TerminalLaunchPreparationInput,
     ) -> TerminalLaunchPreparation {
-        let Some(activity_admission) = self.activity_controller.admit() else {
+        let activity_state = self.activity_controller.snapshot();
+        if !activity_state.enabled {
             return TerminalLaunchPreparation::PassThrough;
-        };
+        }
         let observer_generation = input.generation.clone();
         let inventory = match self.authority.current().await {
             Ok(inventory) => inventory,
@@ -481,7 +482,10 @@ impl ProviderTerminalActivitySupervisor {
                 prepared
             }
         };
-        if !activity_admission.is_current() {
+        let activity_admission = self.activity_controller.admit().filter(|admission| {
+            self.activity_controller.snapshot() == activity_state && admission.is_current()
+        });
+        let Some(activity_admission) = activity_admission else {
             drop(preparation);
             observer_generation
                 .request_cancellation(TerminalObserverCancellationReason::PreparationRejected);
@@ -492,7 +496,7 @@ impl ProviderTerminalActivitySupervisor {
                 )
                 .await;
             return TerminalLaunchPreparation::PassThrough;
-        }
+        };
         TerminalLaunchPreparation::Admitted(preparation, activity_admission)
     }
 }

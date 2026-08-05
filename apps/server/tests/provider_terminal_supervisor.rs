@@ -16,13 +16,19 @@ use axum::body::Bytes;
 use futures_util::StreamExt;
 use serde_json::Value;
 use bibcode_server::{
+    ServerConfig,
     activity::{
         ActivityCapabilities, ActivityHistoryRecovery, ActivityLifecycle, ActivityProjection,
         ActivityRecordKind, ActivityRepository, ActivityScopeRef, AgentActivityController,
-        AgentActivityDisableReport,
+        AgentActivityDisableReport, AgentActivitySource,
     },
     diagnostics::ProcessAttributionRegistry,
     persistence::{Database, run_migrations},
+    production::{
+        agent_activity::{AgentActivitySettingsHandler, AgentActivityTransitionReport},
+        control::NativeServerControl,
+        server_terminal::ProductionServerControl,
+    },
     provider_terminal::{
         CachedClaudeCapabilityProbe, CachedCodexCapabilityProbe, CachedOpenCodeCapabilityProbe,
         ClaudeAdditiveHookAttestor, ClaudeCapabilities, ClaudeCapabilityProbeRunner,
@@ -51,6 +57,7 @@ use bibcode_server::{
     },
 };
 use tokio::sync::{broadcast, oneshot, watch};
+use tokio_util::sync::CancellationToken;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -662,6 +669,136 @@ impl PreparedTerminalObserver for RacingPreparedObserver {
 
     fn diagnostic_label(&self) -> &str {
         "racing-prepared-observer"
+    }
+}
+
+#[derive(Debug)]
+struct HungProviderFactory {
+    entered: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+    returned: Arc<tokio::sync::Semaphore>,
+    dropped: Arc<tokio::sync::Semaphore>,
+    live_observers: Arc<AtomicUsize>,
+}
+
+impl ProviderTerminalObserverFactory for HungProviderFactory {
+    fn prepare(
+        &self,
+        input: ProviderTerminalObserverFactoryInput,
+    ) -> Pin<Box<dyn Future<Output = Option<PreparedTerminalLaunch>> + Send + '_>> {
+        Box::pin(async move {
+            self.entered.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .expect("hung factory release")
+                .forget();
+            self.live_observers.fetch_add(1, Ordering::AcqRel);
+            self.returned.add_permits(1);
+            Some(PreparedTerminalLaunch {
+                executable: input.launch.executable,
+                args: input.launch.args,
+                private_env: BTreeMap::from([(
+                    "BIBCODE_HUNG_FACTORY_OBSERVER".to_owned(),
+                    "installed".to_owned(),
+                )]),
+                observer: Box::new(HungPreparedObserver {
+                    dropped: self.dropped.clone(),
+                    live_observers: self.live_observers.clone(),
+                }),
+            })
+        })
+    }
+}
+
+#[derive(Debug)]
+struct HungPreparedObserver {
+    dropped: Arc<tokio::sync::Semaphore>,
+    live_observers: Arc<AtomicUsize>,
+}
+
+impl Drop for HungPreparedObserver {
+    fn drop(&mut self) {
+        self.live_observers.fetch_sub(1, Ordering::AcqRel);
+        self.dropped.add_permits(1);
+    }
+}
+
+impl PreparedTerminalObserver for HungPreparedObserver {
+    fn on_spawned(
+        &self,
+        _pid: u32,
+        _generation: TerminalObserverGeneration,
+        _workers: TerminalObserverWorkerContext,
+    ) {
+    }
+
+    fn diagnostic_label(&self) -> &str {
+        "hung-prepared-observer"
+    }
+}
+
+struct HungFactoryReleaseGuard {
+    release: Arc<tokio::sync::Semaphore>,
+    released: bool,
+}
+
+impl HungFactoryReleaseGuard {
+    fn new(release: Arc<tokio::sync::Semaphore>) -> Self {
+        Self {
+            release,
+            released: false,
+        }
+    }
+
+    fn release(&mut self) {
+        if !self.released {
+            self.released = true;
+            self.release.add_permits(1);
+        }
+    }
+}
+
+impl Drop for HungFactoryReleaseGuard {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
+#[derive(Clone)]
+struct TerminalSettingsTransitionHandler {
+    controller: AgentActivityController,
+    manager: TerminalManager,
+}
+
+impl AgentActivitySettingsHandler for TerminalSettingsTransitionHandler {
+    fn transition(
+        &self,
+        source: AgentActivitySource,
+        enabled: bool,
+        settings_generation: u64,
+    ) -> Pin<Box<dyn Future<Output = AgentActivityTransitionReport> + Send + '_>> {
+        Box::pin(async move {
+            assert_eq!(source, AgentActivitySource::Terminal);
+            let state = if enabled {
+                self.controller.enable()
+            } else {
+                self.controller.disable().await.state
+            };
+            let terminal = self.manager.set_agent_activity_enabled(enabled).await;
+            AgentActivityTransitionReport {
+                enabled: state.enabled,
+                settings_generation,
+                observation_generation: state.generation,
+                stopped_observers: terminal.stopped,
+                dormant_observers: terminal.dormant,
+                resumed_observers: terminal.resumed,
+                failed_observers: terminal.failed,
+                unavailable_observers: terminal.unavailable,
+                terminal_observation_epochs: terminal.epochs,
+                ..AgentActivityTransitionReport::default()
+            }
+        })
     }
 }
 
@@ -8145,6 +8282,242 @@ async fn agent_activity_toggle_disable_after_final_check_rejects_late_observer_i
         .await
         .expect("pass-through PTY remains writable");
     assert!(!backend.latest().killed.load(Ordering::Acquire));
+    manager.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_activity_hung_factory_does_not_block_terminal_disable_or_later_settings_updates() {
+    let fixture = tempfile::tempdir().expect("fixture root");
+    let configured = fixture.path().join("configured-codex");
+    std::fs::write(&configured, b"configured").expect("configured binary");
+    let control = NativeServerControl::new(
+        ServerConfig::new(fixture.path()),
+        serde_json::json!({"policy":"test"}),
+    )
+    .await;
+    control
+        .call(
+            "server.updateSettings",
+            serde_json::json!({"patch":{"enableTerminalAgentActivity":true}}),
+            CancellationToken::new(),
+        )
+        .await
+        .expect("enable Terminal activity before attaching runtime handler");
+    let stream_cancellation = CancellationToken::new();
+    let mut config_events = control.subscribe(
+        "subscribeServerConfig",
+        stream_cancellation.clone(),
+    );
+    let snapshot = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        config_events.recv(),
+    )
+    .await
+    .expect("config snapshot timeout")
+    .expect("config stream remains open")
+    .expect("config snapshot succeeds");
+    assert_eq!(snapshot[0]["type"], "snapshot");
+
+    let mut settings = ProviderSettingsState::default();
+    settings.providers.codex.binary_path = configured.to_string_lossy().into_owned();
+    let controller = AgentActivityController::new(true);
+    let database = Database::open_in_memory().await.expect("database");
+    database
+        .call(|connection| {
+            run_migrations(connection, None)?;
+            Ok(())
+        })
+        .await
+        .expect("migrations");
+    let projection = ActivityProjection::with_controller(
+        ActivityRepository::new(database),
+        controller.clone(),
+    );
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let returned = Arc::new(tokio::sync::Semaphore::new(0));
+    let dropped = Arc::new(tokio::sync::Semaphore::new(0));
+    let live_observers = Arc::new(AtomicUsize::new(0));
+    let factory = Arc::new(HungProviderFactory {
+        entered: entered.clone(),
+        release: release.clone(),
+        returned: returned.clone(),
+        dropped: dropped.clone(),
+        live_observers: live_observers.clone(),
+    });
+    let mut release_guard = HungFactoryReleaseGuard::new(release);
+    let supervisor = ProviderTerminalActivitySupervisor::new_with_authority(
+        Arc::new(CountingInventoryAuthority {
+            calls: AtomicUsize::new(0),
+            inventory: ProviderTerminalInventory::from_settings(&settings),
+        }),
+        controller.clone(),
+        projection,
+        ProcessAttributionRegistry::new(),
+        fixture.path().join("runtime"),
+        ProviderTerminalObserverFactories {
+            codex: Some(factory),
+            ..ProviderTerminalObserverFactories::default()
+        },
+    )
+    .expect("supervisor");
+    let backend = Arc::new(RecordingBackend::new(Arc::new(Mutex::new(Vec::new()))));
+    let manager = TerminalManager::new(
+        backend.clone(),
+        TerminalManagerOptions {
+            launch_preparer: Some(Arc::new(supervisor)),
+            ..TerminalManagerOptions::default()
+        },
+    );
+    control
+        .attach_agent_activity_handler(Arc::new(TerminalSettingsTransitionHandler {
+            controller: controller.clone(),
+            manager: manager.clone(),
+        }))
+        .await;
+
+    let mut input = TerminalOpenInput::new(
+        "thread-hung-factory",
+        "terminal-hung-factory",
+        fixture.path().to_path_buf(),
+        80,
+        24,
+    );
+    input.command = Some(TerminalLaunchCommand {
+        executable: configured.to_string_lossy().into_owned(),
+        args: vec!["--help".to_owned()],
+        label: Some("Codex".to_owned()),
+        activity: Some(ProviderTerminalActivityLaunch {
+            driver_kind: "codex".to_owned(),
+            provider_instance_id: "codex".to_owned(),
+        }),
+    });
+    let opening = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.open(input).await }
+    });
+    entered
+        .acquire()
+        .await
+        .expect("provider factory entered")
+        .forget();
+    tokio::time::timeout(std::time::Duration::from_secs(2), opening)
+        .await
+        .expect("manager preparation timeout")
+        .expect("open task")
+        .expect("original PTY launches after preparation timeout");
+    assert_eq!(backend.spawns()[0].executable, configured.to_string_lossy());
+    assert!(
+        !backend.spawns()[0]
+            .env
+            .contains_key("BIBCODE_HUNG_FACTORY_OBSERVER")
+    );
+
+    let mut disabling_update = tokio::spawn({
+        let control = control.clone();
+        async move {
+            control
+                .call(
+                    "server.updateSettings",
+                    serde_json::json!({"patch":{"enableTerminalAgentActivity":false}}),
+                    CancellationToken::new(),
+                )
+                .await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while controller.snapshot().enabled {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Terminal activity gate closes");
+    let disabled = match tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        &mut disabling_update,
+    )
+    .await
+    {
+        Ok(result) => result
+            .expect("disable settings task")
+            .expect("disable settings update"),
+        Err(_) => {
+            release_guard.release();
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                &mut disabling_update,
+            )
+            .await;
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                dropped.acquire(),
+            )
+            .await;
+            panic!("Terminal settings publication waited for the hung provider factory");
+        }
+    };
+    assert_eq!(disabled["enableTerminalAgentActivity"], false);
+    let settings_event = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let events = config_events
+                .recv()
+                .await
+                .expect("config stream remains open")
+                .expect("config event succeeds");
+            if let Some(event) = events
+                .into_iter()
+                .find(|event| event["type"] == "settingsUpdated")
+            {
+                break event;
+            }
+        }
+    })
+    .await
+    .expect("disabled settings publication");
+    assert_eq!(
+        settings_event["payload"]["settings"]["enableTerminalAgentActivity"],
+        false
+    );
+
+    let later = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        control.call(
+            "server.updateSettings",
+            serde_json::json!({"patch":{"terminalDefaultShell":"/bin/test-shell"}}),
+            CancellationToken::new(),
+        ),
+    )
+    .await
+    .expect("later settings update is not blocked")
+    .expect("later settings update succeeds");
+    assert_eq!(later["terminalDefaultShell"], "/bin/test-shell");
+
+    release_guard.release();
+    returned
+        .acquire()
+        .await
+        .expect("hung factory returns after release")
+        .forget();
+    tokio::time::timeout(std::time::Duration::from_secs(2), dropped.acquire())
+        .await
+        .expect("late prepared observer is dropped")
+        .expect("observer drop semaphore")
+        .forget();
+    assert_eq!(live_observers.load(Ordering::Acquire), 0);
+    assert_eq!(
+        manager.agent_activity_restart_descriptor_count_for_integration_test(),
+        0
+    );
+    manager
+        .write(
+            "thread-hung-factory",
+            "terminal-hung-factory",
+            "still alive\n",
+        )
+        .await
+        .expect("fallback PTY remains writable");
+    assert!(!backend.latest().killed.load(Ordering::Acquire));
+    stream_cancellation.cancel();
     manager.shutdown().await;
 }
 
