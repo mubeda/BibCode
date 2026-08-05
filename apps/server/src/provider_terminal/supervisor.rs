@@ -727,8 +727,11 @@ fn open_name_still_references_directory(
     }
     // SAFETY: successful `fstatat` initialized `named_metadata`.
     let named_metadata = unsafe { named_metadata.assume_init() };
+    // `dev_t` is narrower than `u64` on macOS but already `u64` on Linux.
+    #[allow(clippy::unnecessary_cast)]
+    let same_device = open_metadata.dev() == named_metadata.st_dev as u64;
     named_metadata.st_mode & libc::S_IFMT == libc::S_IFDIR
-        && open_metadata.dev() == named_metadata.st_dev as u64
+        && same_device
         && open_metadata.ino() == named_metadata.st_ino
 }
 
