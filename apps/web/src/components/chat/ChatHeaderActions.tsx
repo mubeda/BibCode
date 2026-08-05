@@ -97,7 +97,7 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
     <div
       data-chat-header-actions
       className={cn(
-        "@container/header-actions flex shrink-0 items-center justify-end gap-2 @3xl/header-actions:gap-3",
+        "@container/header-actions relative z-10 flex shrink-0 items-center justify-end gap-2 bg-background @3xl/header-actions:gap-3",
         rightPanelOpen ? "pr-0" : "pr-16",
       )}
     >

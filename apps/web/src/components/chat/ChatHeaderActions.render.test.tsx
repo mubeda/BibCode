@@ -82,6 +82,8 @@ describe("ChatHeaderActions rendering", () => {
     const markup = renderToStaticMarkup(<ChatHeaderActions {...props()} />);
 
     expect(markup).toContain("data-chat-header-actions");
+    expect(markup).toContain("relative z-10");
+    expect(markup).toContain("bg-background");
     expect(markup).not.toContain("Thread title");
     expect(markup).toContain("pr-16");
   });

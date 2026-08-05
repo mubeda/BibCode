@@ -1,6 +1,14 @@
 import type { ContextMenuItem } from "@bibcode/contracts";
 import { getTerminalLabel } from "@bibcode/shared/terminalLabels";
-import { Bot, MessageSquare, TerminalSquare, X } from "lucide-react";
+import {
+  Bot,
+  ChevronLeftIcon,
+  ChevronRightIcon,
+  MessageSquare,
+  Rows3Icon,
+  TerminalSquare,
+  X,
+} from "lucide-react";
 import {
   type KeyboardEvent as ReactKeyboardEvent,
   type MouseEvent as ReactMouseEvent,
@@ -8,6 +16,7 @@ import {
   useCallback,
   useEffect,
   useRef,
+  useState,
 } from "react";
 
 import type { CenterSurface } from "~/centerPanelStore";
@@ -15,6 +24,12 @@ import { cn } from "~/lib/utils";
 import { readLocalApi } from "~/localApi";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import { ScrollArea } from "~/components/ui/scroll-area";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuTrigger,
+} from "~/components/ui/menu";
 
 interface CenterPanelTabsProps {
   hostLabel: string;
@@ -62,17 +77,50 @@ function CenterSurfaceIcon({ surface }: { surface: CenterSurface }) {
 
 export function CenterPanelTabs(props: CenterPanelTabsProps) {
   const tabListRef = useRef<HTMLDivElement>(null);
+  const [hasOverflow, setHasOverflow] = useState(false);
 
-  const handleWheel = useCallback((event: ReactWheelEvent<HTMLDivElement>) => {
-    const viewport = tabListRef.current?.querySelector<HTMLElement>(
-      '[data-slot="scroll-area-viewport"]',
-    );
-    if (!viewport || viewport.scrollWidth <= viewport.clientWidth) return;
-    if (event.deltaY === 0 || Math.abs(event.deltaX) >= Math.abs(event.deltaY)) return;
+  const getTabViewport = useCallback(
+    () =>
+      tabListRef.current?.querySelector<HTMLElement>('[data-slot="scroll-area-viewport"]') ?? null,
+    [],
+  );
 
-    viewport.scrollLeft += event.deltaY;
-    event.preventDefault();
-  }, []);
+  const handleWheel = useCallback(
+    (event: ReactWheelEvent<HTMLDivElement>) => {
+      const viewport = getTabViewport();
+      if (!viewport || viewport.scrollWidth <= viewport.clientWidth) return;
+      if (event.deltaY === 0 || Math.abs(event.deltaX) >= Math.abs(event.deltaY)) return;
+
+      viewport.scrollLeft += event.deltaY;
+      event.preventDefault();
+    },
+    [getTabViewport],
+  );
+
+  const scrollTabPage = useCallback(
+    (direction: -1 | 1) => {
+      const viewport = getTabViewport();
+      if (!viewport) return;
+      viewport.scrollBy({
+        left: direction * Math.round(viewport.clientWidth * 0.9),
+        behavior: "smooth",
+      });
+    },
+    [getTabViewport],
+  );
+
+  const activateFromAllTabs = useCallback(
+    (surface: CenterSurface, surfaceIndex: number) => {
+      props.onActivate(surface);
+      requestAnimationFrame(() => {
+        const activationButtons = tabListRef.current?.querySelectorAll<HTMLButtonElement>(
+          "[data-center-panel-tab-activation]",
+        );
+        activationButtons?.[surfaceIndex]?.scrollIntoView({ block: "nearest", inline: "nearest" });
+      });
+    },
+    [props],
+  );
 
   const handleTabKeyDown = useCallback(
     (event: ReactKeyboardEvent<HTMLButtonElement>, surfaceIndex: number) => {
@@ -161,15 +209,37 @@ export function CenterPanelTabs(props: CenterPanelTabsProps) {
     activeTab?.scrollIntoView({ block: "nearest", inline: "nearest" });
   }, [props.activeSurfaceId]);
 
+  useEffect(() => {
+    const boundary = tabListRef.current;
+    const viewport = getTabViewport();
+    if (!boundary || !viewport) return;
+
+    const syncOverflow = () => {
+      setHasOverflow(viewport.scrollWidth > boundary.clientWidth + 1);
+    };
+    syncOverflow();
+    viewport.addEventListener?.("scroll", syncOverflow, { passive: true });
+    const resizeObserver =
+      typeof ResizeObserver === "undefined" ? null : new ResizeObserver(syncOverflow);
+    resizeObserver?.observe(boundary);
+    resizeObserver?.observe(viewport);
+    return () => {
+      viewport.removeEventListener?.("scroll", syncOverflow);
+      resizeObserver?.disconnect();
+    };
+  }, [getTabViewport, props.surfaces.length]);
+
   if (props.surfaces.length === 0) return null;
 
   return (
     <div
-      className="relative flex min-w-0 flex-1 self-stretch items-center overflow-hidden"
+      ref={tabListRef}
+      className="group/tabbar relative isolate flex min-w-0 flex-1 self-stretch items-center overflow-hidden"
       data-center-panel-tabbar
+      data-center-panel-overflow-boundary
+      data-overflow={hasOverflow}
     >
       <ScrollArea
-        ref={tabListRef}
         hideScrollbars
         scrollFade
         className="min-w-0 flex-1 self-stretch rounded-none"
@@ -230,6 +300,54 @@ export function CenterPanelTabs(props: CenterPanelTabsProps) {
           })}
         </div>
       </ScrollArea>
+      <div
+        className="relative z-10 hidden shrink-0 items-center gap-0.5 border-l border-border/60 bg-background pl-1 group-data-[overflow=true]/tabbar:flex"
+        data-center-panel-overflow-navigator
+      >
+        <button
+          type="button"
+          aria-label="Previous tabs"
+          title="Previous tabs"
+          className="flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
+          onClick={() => scrollTabPage(-1)}
+        >
+          <ChevronLeftIcon className="size-3.5" />
+        </button>
+        <button
+          type="button"
+          aria-label="Next tabs"
+          title="Next tabs"
+          className="flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
+          onClick={() => scrollTabPage(1)}
+        >
+          <ChevronRightIcon className="size-3.5" />
+        </button>
+        <DropdownMenu>
+          <DropdownMenuTrigger
+            aria-label="All tabs"
+            title="All tabs"
+            className="flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
+          >
+            <Rows3Icon className="size-3.5" />
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end" className="max-h-80 w-64 overflow-y-auto">
+            {props.surfaces.map((surface, surfaceIndex) => {
+              const title = centerSurfaceTitle(surface, props.hostLabel, props.terminalLabelsById);
+              return (
+                <DropdownMenuItem
+                  key={surface.id}
+                  data-center-panel-all-tab-id={surface.id}
+                  aria-current={surface.id === props.activeSurfaceId ? "page" : undefined}
+                  onClick={() => activateFromAllTabs(surface, surfaceIndex)}
+                >
+                  <CenterSurfaceIcon surface={surface} />
+                  <span className="truncate">{title}</span>
+                </DropdownMenuItem>
+              );
+            })}
+          </DropdownMenuContent>
+        </DropdownMenu>
+      </div>
     </div>
   );
 }

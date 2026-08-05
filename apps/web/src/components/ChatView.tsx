@@ -2748,10 +2748,11 @@ function ChatViewContent(props: ChatViewProps) {
   const selectedProviderInstanceId =
     providerStatuses.find((status) => status.instanceId === selectedProviderByThreadId)
       ?.instanceId ?? null;
+  const boundProviderInstanceId =
+    activeThread?.session?.providerInstanceId ?? activeThread?.modelSelection.instanceId ?? null;
   const activeProviderInstanceId =
-    selectedProviderInstanceId ??
-    activeThread?.session?.providerInstanceId ??
-    activeThread?.modelSelection.instanceId ??
+    (lockedProvider === null ? selectedProviderInstanceId : null) ??
+    boundProviderInstanceId ??
     activeProject?.defaultModelSelection?.instanceId ??
     null;
   const activeProviderStatus = useMemo(() => {
@@ -5922,47 +5923,52 @@ function ChatViewContent(props: ChatViewProps) {
             )}
           >
             {!effectiveRightPanelOpen ? panelLayoutControls : null}
-            {activeThreadRef && centerPanelState.surfaces.length > 0 ? (
-              <CenterPanelTabs
-                hostLabel={centerHostLabel}
-                surfaces={centerPanelState.surfaces}
-                activeSurfaceId={centerPanelState.activeSurfaceId}
-                onActivate={(surface) =>
-                  centerPanelActions.activateSurface(activeThreadRef, surface.id)
+            <div
+              className="isolate flex min-w-0 flex-1 self-stretch items-center overflow-hidden"
+              data-center-panel-header-row
+            >
+              {activeThreadRef && centerPanelState.surfaces.length > 0 ? (
+                <CenterPanelTabs
+                  hostLabel={centerHostLabel}
+                  surfaces={centerPanelState.surfaces}
+                  activeSurfaceId={centerPanelState.activeSurfaceId}
+                  onActivate={(surface) =>
+                    centerPanelActions.activateSurface(activeThreadRef, surface.id)
+                  }
+                  onCloseSurface={closeCenterPanelSurface}
+                  onCloseOtherSurfaces={closeOtherCenterPanelSurfaces}
+                  onCloseSurfacesToRight={closeCenterPanelSurfacesToRight}
+                  onCloseAllSurfaces={closeAllCenterPanelSurfaces}
+                />
+              ) : (
+                <div className="min-w-0 flex-1" aria-hidden="true" data-center-panel-empty-spacer />
+              )}
+              <ChatHeaderActions
+                activeThreadEnvironmentId={activeThread.environmentId}
+                activeThreadId={activeThread.id}
+                {...(routeKind === "draft" && draftId ? { draftId } : {})}
+                activeProjectName={activeProject?.title}
+                openInCwd={gitCwd}
+                activeProjectScripts={activeProject?.scripts}
+                preferredScriptId={
+                  activeProject ? (lastInvokedScriptByProjectId[activeProject.id] ?? null) : null
                 }
-                onCloseSurface={closeCenterPanelSurface}
-                onCloseOtherSurfaces={closeOtherCenterPanelSurfaces}
-                onCloseSurfacesToRight={closeCenterPanelSurfacesToRight}
-                onCloseAllSurfaces={closeAllCenterPanelSurfaces}
+                keybindings={keybindings}
+                availableEditors={availableEditors}
+                rightPanelOpen={effectiveRightPanelOpen}
+                gitCwd={gitCwd}
+                providerStatuses={providerStatuses as ServerProvider[]}
+                settings={settings}
+                canCreatePanel={centerPanelLaunchContext !== null}
+                onCreateChatPanel={handleCreateChatPanel}
+                onOpenTerminalPanel={handleOpenTerminalPanel}
+                onOpenProviderTerminalPanel={handleOpenProviderTerminalPanel}
+                onRunProjectScript={runProjectScript}
+                onAddProjectScript={saveProjectScript}
+                onUpdateProjectScript={updateProjectScript}
+                onDeleteProjectScript={deleteProjectScript}
               />
-            ) : (
-              <div className="min-w-0 flex-1" aria-hidden="true" data-center-panel-empty-spacer />
-            )}
-            <ChatHeaderActions
-              activeThreadEnvironmentId={activeThread.environmentId}
-              activeThreadId={activeThread.id}
-              {...(routeKind === "draft" && draftId ? { draftId } : {})}
-              activeProjectName={activeProject?.title}
-              openInCwd={gitCwd}
-              activeProjectScripts={activeProject?.scripts}
-              preferredScriptId={
-                activeProject ? (lastInvokedScriptByProjectId[activeProject.id] ?? null) : null
-              }
-              keybindings={keybindings}
-              availableEditors={availableEditors}
-              rightPanelOpen={effectiveRightPanelOpen}
-              gitCwd={gitCwd}
-              providerStatuses={providerStatuses as ServerProvider[]}
-              settings={settings}
-              canCreatePanel={centerPanelLaunchContext !== null}
-              onCreateChatPanel={handleCreateChatPanel}
-              onOpenTerminalPanel={handleOpenTerminalPanel}
-              onOpenProviderTerminalPanel={handleOpenProviderTerminalPanel}
-              onRunProjectScript={runProjectScript}
-              onAddProjectScript={saveProjectScript}
-              onUpdateProjectScript={updateProjectScript}
-              onDeleteProjectScript={deleteProjectScript}
-            />
+            </div>
           </header>
         )}
         {/* Error banner */}

@@ -12,14 +12,20 @@
 
 - Keep the `CenterSurface` union and center-panel persistence schema unchanged.
 - No center tab may display `Main`.
-- The host tab uses the current provider instance `displayName`, falling back to the selected provider driver label.
+- Before start, the host tab uses the selected provider instance `displayName`; after start, the session/model-bound provider wins over any stale composer selection.
 - Added AI tabs keep their existing provider-label fallback; terminal tabs keep their existing terminal-label chain.
-- The tab rail scrolls horizontally and never wraps, overlaps, moves, or shrinks the existing action and layout controls.
+- The tab rail has a strict clipped boundary before opaque fixed actions, never wraps or overlaps controls, and exposes overflow-only Previous, Next, and All tabs navigation.
 - Preserve click activation, close buttons, middle-click close, context-menu close commands, host close behavior, and mounted transcript state.
 - Do not redesign the panel menu, project scripts, Open picker, Git synchronization, or panel-layout controls.
 - Do not add dependencies or a production Node runtime.
 - Use test-driven development for every behavior change.
 - Completion requires focused tests, `vp check`, `vp run typecheck`, and Codex `computer-use:computer-use` verification of every accepted change in the running desktop UI.
+
+### Approved acceptance clarification (2026-08-04)
+
+- Provider selection is mutable only before a chat starts. Once started, the provider/model family is locked; another provider is created as a separate chat tab.
+- A started host must derive its label from the bound session/model provider even if composer draft state contains a stale selection. Its picker must expose no cross-provider model choices.
+- The rail must reserve a strict paint-clipped boundary before fixed controls. Wheel-only discovery is insufficient: an overflow-only navigator provides Previous/Next page controls and an All tabs menu for direct activation and reveal.
 
 ---
 
@@ -641,7 +647,7 @@ Inside the existing `!isPanel` header, keep the current classes, `panelLayoutCon
 
 Delete the former standalone `CenterPanelTabs` block below the header and remove the old `activeThreadTitle` prop.
 
-- [ ] **Step 6: Verify provider changes update the host label on rerender**
+- [ ] **Step 6: Verify pre-start selection and post-start provider binding**
 
 Add a ChatView test with Codex and Claude snapshots. Render once with the Codex selection, update the composer selection, publish the store, and render again:
 
@@ -678,6 +684,8 @@ expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).t
 ```
 
 The seeded server thread has no messages and no provider session, so `deriveLockedProvider` leaves it unlocked and the composer selection is the active provider source. Also assert the center-panel surface array is unchanged across the two renders.
+
+Add a second RED regression with a started Codex session and a stale composer-selected Claude model. The host label must remain `Codex`. In implementation, when `deriveLockedProvider` is non-null, resolve `activeProviderInstanceId` from `session.providerInstanceId` and then `thread.modelSelection.instanceId`; only unlocked/pre-start threads may prioritize composer selection.
 
 - [ ] **Step 7: Add and verify the empty-surface layout case**
 
@@ -811,23 +819,24 @@ At the normal window width, use fresh app state before every interaction and ver
 
 Fetch a new accessibility state after every action. Emit a screenshot showing the approved one-row wide layout.
 
-- [ ] **Step 8: Verify constrained-width overflow and pinned actions**
+- [ ] **Step 8: Verify constrained-width overflow, explicit navigation, and pinned actions**
 
 Use `sky.drag` on the BiBCode window edge to reduce the workspace width until tabs overflow. Then:
 
 1. Confirm the action cluster retains full hit targets and never overlaps tabs.
-2. Scroll the tab rail horizontally with Computer Use; activate a previously hidden tab and confirm it scrolls into view.
-3. Confirm long provider and terminal labels truncate without increasing header height; focus or hover them and confirm the full label remains available.
-4. Toggle the terminal drawer and right panel to prove the reserved title-bar controls stay reachable in both open and closed states.
-5. Emit a constrained-width screenshot and the corresponding accessibility text.
+2. Confirm Previous tabs, Next tabs, and All tabs appear only while overflowing and remain inside the rail boundary before fixed actions.
+3. Use a page button and the All tabs menu to activate a previously hidden final tab and confirm it scrolls into view; also verify wheel/trackpad scrolling.
+4. Confirm long provider and terminal labels truncate without increasing header height; focus or hover them and confirm the full label remains available.
+5. Toggle the terminal drawer and right panel to prove the reserved title-bar controls stay reachable in both open and closed states.
+6. Emit a constrained-width screenshot and the corresponding accessibility text.
 
 Expected: tabs alone clip/scroll; actions remain stationary and operable; there is no second tab row or wrapped tab.
 
-- [ ] **Step 9: Verify the host label follows provider selection**
+- [ ] **Step 9: Verify the started host stays bound to its provider**
 
-Activate the host chat. Through the existing provider/model picker, switch from the current provider to another configured provider such as Claude, then fetch fresh UI state.
+Activate the started host chat and open its provider/model picker. Search for another configured provider such as Claude, then fetch fresh UI state. Do not attempt to switch the started host.
 
-Expected: the first tab label changes to the newly selected provider immediately, the center-panel surface order is unchanged, and no `Main` or thread-title label appears. Switch back if needed and emit before/after screenshots.
+Expected: no cross-provider models are offered, the bound host label does not change, and no `Main` or thread-title label appears. Claude and other providers remain available only as separately created chat tabs. Emit picker and tab evidence.
 
 - [ ] **Step 10: Fix every visual discrepancy test-first and repeat verification**
 
@@ -866,9 +875,9 @@ If verification changed no files, do not create an empty commit. Expected final 
 
 - [ ] The chat workspace has one top bar, not stacked title and tab rows.
 - [ ] The visible thread-title box is absent while the header retains an accessible workspace label.
-- [ ] The host tab shows and follows the current provider name; no tab says `Main`.
+- [ ] The host tab follows selectable provider state before start and stays on its bound provider after start; no tab says `Main`.
 - [ ] Added AI and terminal tabs retain truthful labels and full-label tooltips.
-- [ ] Multiple tabs are reachable by pointer, wheel/trackpad, active reveal, and horizontal arrow keys.
+- [ ] Multiple tabs are reachable by pointer, wheel/trackpad, active reveal, horizontal arrow keys, Previous/Next page controls, and All tabs direct jump.
 - [ ] Tabs never overlap, wrap, move, or shrink the pinned action and layout controls.
 - [ ] Existing activate, close, middle-click, and context-menu behavior still works.
 - [ ] Empty center-surface state keeps the fixed actions available.
