@@ -818,8 +818,12 @@ describe("AgentsSettingsPanel", () => {
     expect(markup).toContain("Chat agent activity");
     expect(markup).toContain("AI Terminal agent activity");
     expect(markup.match(/Experimental/g)).toHaveLength(2);
-    expect(markup).toContain("Show live agent and background-task activity in the Chat panel.");
-    expect(markup).toContain("Show live agent and background-task activity in AI Terminals.");
+    expect(markup).toContain(
+      "Show live agent and background-task activity in the Chat panel. Disabling this stops Chat activity monitoring and collection.",
+    );
+    expect(markup).toContain(
+      "Show live agent and background-task activity in AI Terminals. Disabling this stops AI Terminal activity monitoring and collection.",
+    );
   });
 
   it("uses independent defaults", () => {
