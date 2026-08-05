@@ -277,6 +277,9 @@ function makeProps(
     runtimeMode: "approval-required",
     interactionMode: "default",
     lockedProvider: null,
+    providerBindingInstanceId: selectedProviderStatus.instanceId,
+    lockProviderPickerToActiveInstance: false,
+    providerBindingConflictReason: null,
     providerStatuses,
     activeProjectDefaultModelSelection: {
       instanceId: selectedProviderStatus.instanceId,

@@ -1,5 +1,12 @@
 import { CpuIcon, MemoryStickIcon, TerminalIcon, TriangleAlertIcon } from "lucide-react";
+import { useEffect, useRef } from "react";
 
+import {
+  acquireBrowserSurfaceOcclusion,
+  type BrowserSurfaceOcclusionLease,
+} from "~/browser/browserSurfaceStore";
+import { isDesktopHost } from "~/env";
+import { isMacPlatform } from "~/lib/utils";
 import { Popover, PopoverContent, PopoverTrigger } from "../ui/popover";
 import {
   buildResourceSummaryViewModel,
@@ -50,6 +57,31 @@ export function ResourceUsageSegment({
   terminalCount: number;
   iconOnly: boolean;
 }) {
+  const previewOcclusionRef = useRef<BrowserSurfaceOcclusionLease | null>(null);
+  const handleOpenChange = (open: boolean) => {
+    if (
+      open &&
+      previewOcclusionRef.current === null &&
+      isDesktopHost &&
+      typeof navigator !== "undefined" &&
+      isMacPlatform(navigator.platform)
+    ) {
+      previewOcclusionRef.current = acquireBrowserSurfaceOcclusion();
+      return;
+    }
+    if (!open) {
+      previewOcclusionRef.current?.release();
+      previewOcclusionRef.current = null;
+    }
+  };
+  useEffect(
+    () => () => {
+      previewOcclusionRef.current?.release();
+      previewOcclusionRef.current = null;
+    },
+    [],
+  );
+
   const presentation = buildResourceSummaryViewModel({
     selected: diagnostics,
     local: localDiagnostics,
@@ -74,7 +106,7 @@ export function ResourceUsageSegment({
   }${selectedWarningTitle}`;
 
   return (
-    <Popover>
+    <Popover onOpenChange={handleOpenChange}>
       <PopoverTrigger
         className="inline-flex h-5 items-center gap-1.5 rounded px-1 text-[11px] text-muted-foreground hover:bg-accent hover:text-foreground"
         aria-label={accessibleLabel}

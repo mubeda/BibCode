@@ -125,7 +125,7 @@ import { isCommandPaletteOpen } from "../commandPaletteContext";
 import { buildTemporaryWorktreeBranchName } from "@bibcode/shared/git";
 import { useMediaQuery } from "../hooks/useMediaQuery";
 import { resolveProviderSessionSelectionForInstance } from "../providerSessionSelection";
-import { formatProviderDriverKindLabel } from "../providerModels";
+import { formatProviderDriverKindLabel, formatProviderSlugLabel } from "../providerModels";
 import {
   ACTIVITY_DOCK_COMPACT_MEDIA_QUERY,
   RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY,
@@ -181,6 +181,7 @@ import { newDraftId, newMessageId, newThreadId } from "~/lib/utils";
 import { getProviderModelCapabilities, resolveSelectableProvider } from "../providerModels";
 import { useEnvironmentSettings } from "../hooks/useSettings";
 import { resolveAppModelSelectionForInstance } from "../modelSelection";
+import { resolveThreadProviderBinding } from "../threadProviderBinding";
 import { getTerminalFocusOwner } from "../lib/terminalFocus";
 import { DesktopPreviewTabHosts } from "../browser/DesktopPreviewTabHosts";
 import {
@@ -228,7 +229,7 @@ import { ChatComposer, type ChatComposerHandle } from "./chat/ChatComposer";
 import { ExpandedImageDialog } from "./chat/ExpandedImageDialog";
 import { PullRequestThreadDialog } from "./PullRequestThreadDialog";
 import { MessagesTimeline } from "./chat/MessagesTimeline";
-import { ChatHeader } from "./chat/ChatHeader";
+import { ChatHeaderActions } from "./chat/ChatHeaderActions";
 import { type ProviderTerminalAction } from "./chat/providerTerminalActions";
 import { PanelLayoutControls, RightPanelMaximizeControl } from "./chat/PanelLayoutControls";
 import { type ExpandedImagePreview } from "./chat/ExpandedImagePreview";
@@ -254,7 +255,6 @@ import {
   type LocalDispatchSnapshot,
   PullRequestDialogState,
   cloneComposerAttachmentForRetry,
-  deriveLockedProvider,
   readFileAsDataUrl,
   reconcileBoundedActivityPages,
   reconcileMountedTerminalThreadIds,
@@ -2270,20 +2270,19 @@ function ChatViewContent(props: ChatViewProps) {
   ]);
 
   const selectedProviderByThreadId = composerActiveProvider ?? null;
-  const threadProvider =
-    activeThread?.modelSelection.instanceId ??
-    activeProject?.defaultModelSelection?.instanceId ??
-    null;
-  const lockedProvider = deriveLockedProvider({
-    thread: activeThread,
-    selectedProvider: selectedProviderByThreadId,
-    threadProvider,
-  });
   // Once a thread selects an environment, never substitute the primary
   // environment's config while the selected environment is still loading.
   const serverConfig = activeThread
     ? (activeEnvironment?.serverConfig ?? null)
     : (primaryEnvironment?.serverConfig ?? null);
+  const providerStatuses = serverConfig?.providers ?? EMPTY_PROVIDERS;
+  const providerBinding = resolveThreadProviderBinding({
+    thread: activeThread,
+    projectDefaultModelSelection: activeProject?.defaultModelSelection,
+    selectedProviderInstanceId: selectedProviderByThreadId,
+    providers: providerStatuses,
+  });
+  const providerBindingConflictReason = providerBinding.conflict?.reason ?? null;
   const versionMismatch = resolveServerConfigVersionMismatch(serverConfig);
   const versionMismatchDismissKey =
     versionMismatch && activeThread
@@ -2342,6 +2341,15 @@ function ChatViewContent(props: ChatViewProps) {
         ),
       });
     }
+    if (providerBinding.conflict) {
+      items.push({
+        id: `provider-binding-conflict:${providerBinding.conflict.instanceId}`,
+        variant: "warning",
+        icon: <TriangleAlertIcon />,
+        title: "Provider session conflict",
+        description: providerBinding.conflict.reason,
+      });
+    }
     if (showVersionMismatchBanner && versionMismatch && versionMismatchDismissKey) {
       items.push({
         id: `version-mismatch:${versionMismatchDismissKey}`,
@@ -2366,17 +2374,20 @@ function ChatViewContent(props: ChatViewProps) {
     activeEnvironmentUnavailableState,
     handleReconnectActiveEnvironment,
     navigate,
+    providerBinding.conflict,
     showVersionMismatchBanner,
     versionMismatch,
     versionMismatchDismissKey,
     versionMismatchServerLabel,
   ]);
-  const providerStatuses = serverConfig?.providers ?? EMPTY_PROVIDERS;
+  const { lockedProvider, lockedProviderInstanceId } = providerBinding;
+  const lockProviderPickerToActiveInstance = isPanel || lockedProviderInstanceId !== null;
   const unlockedSelectedProvider = resolveSelectableProvider(
     providerStatuses,
-    selectedProviderByThreadId ?? threadProvider ?? ProviderDriverKind.make("codex"),
+    providerBinding.instanceId,
   );
-  const selectedProvider: ProviderDriverKind = lockedProvider ?? unlockedSelectedProvider;
+  const selectedProvider: ProviderDriverKind =
+    lockedProvider ?? providerBinding.driver ?? unlockedSelectedProvider;
   const phase = derivePhase(activeThread?.session ?? null);
   const threadActivities = activeThread?.activities ?? EMPTY_ACTIVITIES;
   const workLogEntries = useMemo(() => deriveWorkLogEntries(threadActivities), [threadActivities]);
@@ -2780,28 +2791,12 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const availableEditors = useAtomValue(primaryServerAvailableEditorsAtom);
-  // Prefer an instance-id match so a custom Codex instance (e.g.
-  // `codex_personal`) surfaces its own status/message in the banner rather
-  // than the default Codex's. Falls back to first-match-by-kind when no
-  // saved instance id is available or the instance no longer exists.
-  const selectedProviderInstanceId =
-    providerStatuses.find((status) => status.instanceId === selectedProviderByThreadId)
-      ?.instanceId ?? null;
-  const activeProviderInstanceId =
-    selectedProviderInstanceId ??
-    activeThread?.session?.providerInstanceId ??
-    activeThread?.modelSelection.instanceId ??
-    activeProject?.defaultModelSelection?.instanceId ??
-    null;
-  const activeProviderStatus = useMemo(() => {
-    if (activeProviderInstanceId) {
-      return (
-        providerStatuses.find((status) => status.instanceId === activeProviderInstanceId) ?? null
-      );
-    }
-    const defaultInstanceId = defaultInstanceIdForDriver(selectedProvider);
-    return providerStatuses.find((status) => status.instanceId === defaultInstanceId) ?? null;
-  }, [activeProviderInstanceId, providerStatuses, selectedProvider]);
+  const activeProviderStatus = providerBinding.status;
+  const centerHostLabel =
+    activeProviderStatus?.displayName?.trim() ||
+    (lockedProviderInstanceId
+      ? formatProviderSlugLabel(lockedProviderInstanceId)
+      : formatProviderDriverKindLabel(providerBinding.driver ?? selectedProvider));
   const activeProjectCwd = activeProject?.workspaceRoot ?? null;
   const activeThreadWorktreePath = activeThread?.worktreePath ?? null;
   const activeWorkspaceRoot = activeThreadWorktreePath ?? activeProjectCwd ?? undefined;
@@ -4747,6 +4742,7 @@ function ChatViewContent(props: ChatViewProps) {
       isSendBusy ||
       isConnecting ||
       activeEnvironmentUnavailable ||
+      providerBinding.conflict !== null ||
       sendInFlightRef.current
     )
       return;
@@ -5699,6 +5695,14 @@ function ChatViewContent(props: ChatViewProps) {
   const onProviderModelSelect = useCallback(
     (instanceId: ProviderInstanceId, model: string) => {
       if (!activeThread) return;
+      if (providerBinding.conflict !== null) {
+        scheduleComposerFocus();
+        return;
+      }
+      if (lockedProviderInstanceId && instanceId !== lockedProviderInstanceId) {
+        scheduleComposerFocus();
+        return;
+      }
       // Look up the configured instance so model normalization and custom
       // model lookup stay scoped to that exact instance. Unknown instance ids
       // are rejected by returning early; the server remains authoritative too.
@@ -5765,10 +5769,12 @@ function ChatViewContent(props: ChatViewProps) {
     [
       activeThread,
       lockedProvider,
+      lockedProviderInstanceId,
       scheduleComposerFocus,
       setComposerDraftModelSelection,
       setStickyComposerModelSelection,
       providerStatuses,
+      providerBinding.conflict,
       settings,
     ],
   );
@@ -5951,6 +5957,7 @@ function ChatViewContent(props: ChatViewProps) {
         {!isPanel && (
           <header
             data-chat-header
+            aria-label={`${activeThread.title} workspace`}
             className={cn(
               "border-b border-border transition-[padding-left] duration-200 ease-linear motion-reduce:transition-none",
               "workspace-topbar pl-[calc(env(safe-area-inset-left)+0.75rem)] pr-[calc(env(safe-area-inset-right)+0.75rem)] sm:pl-[calc(env(safe-area-inset-left)+1.25rem)] sm:pr-[calc(env(safe-area-inset-right)+1.25rem)]",
@@ -5958,48 +5965,53 @@ function ChatViewContent(props: ChatViewProps) {
             )}
           >
             {!effectiveRightPanelOpen ? panelLayoutControls : null}
-            <ChatHeader
-              activeThreadEnvironmentId={activeThread.environmentId}
-              activeThreadId={activeThread.id}
-              {...(routeKind === "draft" && draftId ? { draftId } : {})}
-              activeThreadTitle={activeThread.title}
-              activeProjectName={activeProject?.title}
-              openInCwd={gitCwd}
-              activeProjectScripts={activeProject?.scripts}
-              preferredScriptId={
-                activeProject ? (lastInvokedScriptByProjectId[activeProject.id] ?? null) : null
-              }
-              keybindings={keybindings}
-              availableEditors={availableEditors}
-              rightPanelOpen={effectiveRightPanelOpen}
-              gitCwd={gitCwd}
-              providerStatuses={providerStatuses as ServerProvider[]}
-              settings={settings}
-              canCreatePanel={centerPanelLaunchContext !== null}
-              onCreateChatPanel={handleCreateChatPanel}
-              onOpenTerminalPanel={handleOpenTerminalPanel}
-              onOpenProviderTerminalPanel={handleOpenProviderTerminalPanel}
-              onRunProjectScript={runProjectScript}
-              onAddProjectScript={saveProjectScript}
-              onUpdateProjectScript={updateProjectScript}
-              onDeleteProjectScript={deleteProjectScript}
-            />
+            <div
+              className="isolate flex min-w-0 flex-1 self-stretch items-center overflow-hidden"
+              data-center-panel-header-row
+            >
+              {activeThreadRef && centerPanelState.surfaces.length > 0 ? (
+                <CenterPanelTabs
+                  hostLabel={centerHostLabel}
+                  surfaces={centerPanelState.surfaces}
+                  activeSurfaceId={centerPanelState.activeSurfaceId}
+                  onActivate={(surface) =>
+                    centerPanelActions.activateSurface(activeThreadRef, surface.id)
+                  }
+                  onCloseSurface={closeCenterPanelSurface}
+                  onCloseOtherSurfaces={closeOtherCenterPanelSurfaces}
+                  onCloseSurfacesToRight={closeCenterPanelSurfacesToRight}
+                  onCloseAllSurfaces={closeAllCenterPanelSurfaces}
+                />
+              ) : (
+                <div className="min-w-0 flex-1" aria-hidden="true" data-center-panel-empty-spacer />
+              )}
+              <ChatHeaderActions
+                activeThreadEnvironmentId={activeThread.environmentId}
+                activeThreadId={activeThread.id}
+                {...(routeKind === "draft" && draftId ? { draftId } : {})}
+                activeProjectName={activeProject?.title}
+                openInCwd={gitCwd}
+                activeProjectScripts={activeProject?.scripts}
+                preferredScriptId={
+                  activeProject ? (lastInvokedScriptByProjectId[activeProject.id] ?? null) : null
+                }
+                keybindings={keybindings}
+                availableEditors={availableEditors}
+                rightPanelOpen={effectiveRightPanelOpen}
+                gitCwd={gitCwd}
+                providerStatuses={providerStatuses as ServerProvider[]}
+                settings={settings}
+                canCreatePanel={centerPanelLaunchContext !== null}
+                onCreateChatPanel={handleCreateChatPanel}
+                onOpenTerminalPanel={handleOpenTerminalPanel}
+                onOpenProviderTerminalPanel={handleOpenProviderTerminalPanel}
+                onRunProjectScript={runProjectScript}
+                onAddProjectScript={saveProjectScript}
+                onUpdateProjectScript={updateProjectScript}
+                onDeleteProjectScript={deleteProjectScript}
+              />
+            </div>
           </header>
-        )}
-
-        {/* Center multipanel tab strip */}
-        {!isPanel && activeThreadRef && centerPanelState.surfaces.length > 0 && (
-          <CenterPanelTabs
-            surfaces={centerPanelState.surfaces}
-            activeSurfaceId={centerPanelState.activeSurfaceId}
-            onActivate={(surface) =>
-              centerPanelActions.activateSurface(activeThreadRef, surface.id)
-            }
-            onCloseSurface={closeCenterPanelSurface}
-            onCloseOtherSurfaces={closeOtherCenterPanelSurfaces}
-            onCloseSurfacesToRight={closeCenterPanelSurfacesToRight}
-            onCloseAllSurfaces={closeAllCenterPanelSurfaces}
-          />
         )}
         {/* Error banner */}
         {!centerHostHidden ? (
@@ -6139,6 +6151,9 @@ function ChatViewContent(props: ChatViewProps) {
                       runtimeMode={runtimeMode}
                       interactionMode={interactionMode}
                       lockedProvider={lockedProvider}
+                      providerBindingInstanceId={providerBinding.instanceId}
+                      lockProviderPickerToActiveInstance={lockProviderPickerToActiveInstance}
+                      providerBindingConflictReason={providerBindingConflictReason}
                       providerStatuses={providerStatuses as ServerProvider[]}
                       activeProjectDefaultModelSelection={activeProject?.defaultModelSelection}
                       activeThreadModelSelection={activeThread?.modelSelection}

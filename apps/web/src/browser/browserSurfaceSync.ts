@@ -82,22 +82,23 @@ export function startBrowserSurfaceSync(
     tabState.tail = tail;
   };
 
-  const push = (byTabId: ReturnType<typeof useBrowserSurfaceStore.getState>["byTabId"]) => {
-    for (const [tabId, presentation] of Object.entries(byTabId)) {
+  const push = (state: ReturnType<typeof useBrowserSurfaceStore.getState>) => {
+    const occluded = state.occlusionOwners.size > 0;
+    for (const [tabId, presentation] of Object.entries(state.byTabId)) {
       if (!presentation.rect) continue;
       const next: SyncedPresentation = {
         x: presentation.rect.x,
         y: presentation.rect.y,
         width: presentation.rect.width,
         height: presentation.rect.height,
-        visible: presentation.visible,
+        visible: presentation.visible && !occluded,
       };
       schedule(tabId, next);
     }
   };
 
-  push(useBrowserSurfaceStore.getState().byTabId);
-  const unsubscribe = useBrowserSurfaceStore.subscribe((state) => push(state.byTabId));
+  push(useBrowserSurfaceStore.getState());
+  const unsubscribe = useBrowserSurfaceStore.subscribe(push);
   return () => {
     if (!active) return;
     active = false;

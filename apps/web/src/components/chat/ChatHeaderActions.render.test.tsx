@@ -1,5 +1,5 @@
 import { DEFAULT_SERVER_SETTINGS, EnvironmentId, ThreadId } from "@bibcode/contracts";
-import type { ComponentProps, ReactNode } from "react";
+import type { ComponentProps } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -35,23 +35,16 @@ vi.mock("../GitActionsControl", () => ({
   },
 }));
 
-vi.mock("../ui/tooltip", () => ({
-  Tooltip: ({ children }: { children?: ReactNode }) => <>{children}</>,
-  TooltipTrigger: ({ render }: { render?: ReactNode }) => <>{render}</>,
-  TooltipPopup: ({ children }: { children?: ReactNode }) => <>{children}</>,
-}));
-
-import { ChatHeader } from "./ChatHeader";
+import { ChatHeaderActions } from "./ChatHeaderActions";
 
 const environmentId = EnvironmentId.make("environment-primary");
 
 function props(
-  overrides: Partial<ComponentProps<typeof ChatHeader>> = {},
-): ComponentProps<typeof ChatHeader> {
+  overrides: Partial<ComponentProps<typeof ChatHeaderActions>> = {},
+): ComponentProps<typeof ChatHeaderActions> {
   return {
     activeThreadEnvironmentId: environmentId,
     activeThreadId: ThreadId.make("thread-1"),
-    activeThreadTitle: "Thread title",
     activeProjectName: undefined,
     openInCwd: null,
     activeProjectScripts: undefined,
@@ -84,11 +77,20 @@ beforeEach(() => {
   harness.gitProps = null;
 });
 
-describe("ChatHeader rendering", () => {
-  it("omits project actions when no project is active", () => {
-    const markup = renderToStaticMarkup(<ChatHeader {...props()} />);
+describe("ChatHeaderActions rendering", () => {
+  it("renders a fixed action cluster without the thread title", () => {
+    const markup = renderToStaticMarkup(<ChatHeaderActions {...props()} />);
 
-    expect(markup).toContain("Thread title");
+    expect(markup).toContain("data-chat-header-actions");
+    expect(markup).toContain("relative z-10");
+    expect(markup).toContain("bg-background");
+    expect(markup).not.toContain("Thread title");
+    expect(markup).toContain("pr-16");
+  });
+
+  it("omits project actions when no project is active", () => {
+    const markup = renderToStaticMarkup(<ChatHeaderActions {...props()} />);
+
     expect(markup).toContain("pr-16");
     expect(markup).not.toContain("scripts-control");
     expect(markup).not.toContain("open-in-picker");
@@ -98,7 +100,7 @@ describe("ChatHeader rendering", () => {
   it("renders every project action and forwards a draft identity", () => {
     const onOpenProviderTerminalPanel = vi.fn();
     const markup = renderToStaticMarkup(
-      <ChatHeader
+      <ChatHeaderActions
         {...props({
           activeProjectName: "Project",
           activeProjectScripts: [],
@@ -122,7 +124,9 @@ describe("ChatHeader rendering", () => {
   it("omits the local editor picker for a remote environment", () => {
     harness.primaryEnvironmentId = EnvironmentId.make("different");
     const markup = renderToStaticMarkup(
-      <ChatHeader {...props({ activeProjectName: "Remote project", activeProjectScripts: [] })} />,
+      <ChatHeaderActions
+        {...props({ activeProjectName: "Remote project", activeProjectScripts: [] })}
+      />,
     );
 
     expect(markup).not.toContain("open-in-picker");
