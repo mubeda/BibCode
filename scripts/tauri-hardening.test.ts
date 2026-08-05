@@ -125,7 +125,7 @@ it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
           { length: source.width * source.height },
           (_, index) => source.pixels[index * 4 + 3]!,
         ).filter((alpha) => alpha === 0).length >= 27_000,
-        "macOS icon must retain the T4-compatible transparent corner area",
+        "macOS icon must retain the proven transparent corner area",
       );
       assert.ok(
         Array.from(
