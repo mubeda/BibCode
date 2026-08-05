@@ -193,11 +193,29 @@ Build the native artifact for the current operating system:
 vp run build:desktop
 ```
 
-On macOS 26, verify Finder's rendered application icon from the generated app
-bundle before publishing the DMG:
+On macOS 26, verify Finder's rendered application icon from the generated DMG
+before publishing it. Build through the artifact wrapper without `--arch` so it
+uses the current Mac's architecture. Choose a fresh, empty output directory and
+use that same directory for the mount check:
 
-```powershell
-swift scripts/check-macos-app-icon.swift target/aarch64-apple-darwin/release/bundle/macos/BiBCode.app
+```sh
+set -e
+artifact_dir=release/desktop/macos
+node scripts/build-desktop-artifact.ts --platform mac --target dmg --output-dir "$artifact_dir" --verbose
+
+dmg=$(find "$artifact_dir" -maxdepth 1 -type f -name '*.dmg' -print -quit)
+test -n "$dmg"
+mount_dir=$(mktemp -d /private/tmp/bibcode-icon-dmg.XXXXXX)
+attached=0
+cleanup() {
+  if [ "$attached" -eq 1 ]; then hdiutil detach "$mount_dir"; fi
+  rmdir "$mount_dir"
+}
+trap cleanup EXIT
+
+hdiutil attach -readonly -nobrowse -noverify -mountpoint "$mount_dir" "$dmg"
+attached=1
+swift scripts/check-macos-app-icon.swift "$mount_dir/BiBCode.app"
 ```
 
 Build a specific release target:
