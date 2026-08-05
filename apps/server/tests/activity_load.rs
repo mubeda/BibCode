@@ -227,15 +227,19 @@ async fn disabled_gate_rejects_dormant_volume_without_work_or_trace_growth() {
     let engine = OrchestrationEngine::start(database.clone(), EngineOptions::default())
         .await
         .expect("orchestration engine");
-    let controller = AgentActivityController::new(true);
-    let projection = ActivityProjection::with_controller(
+    let chat_controller = AgentActivityController::new(true);
+    let terminal_controller = AgentActivityController::new(true);
+    let projections = ActivityProjections::new(
         ActivityRepository::new(database.clone()),
-        controller.clone(),
+        chat_controller.clone(),
+        terminal_controller.clone(),
     );
+    let controller = terminal_controller;
+    let projection = projections.terminal();
     let provider_runtime = Arc::new(ProviderRuntimeSupervisor::start(
         engine.clone(),
         Arc::new(RejectingProviderDriverFactory),
-        projection.clone(),
+        projections.chat(),
         SupervisorOptions::default(),
     ));
 
@@ -275,8 +279,7 @@ async fn disabled_gate_rejects_dormant_volume_without_work_or_trace_growth() {
     );
     let trace = TraceDiagnosticsStore::new(fixture.path().join("agent-activity.trace.ndjson"));
     let coordinator = ProductionAgentActivity::new(
-        controller.clone(),
-        projection.clone(),
+        projections,
         provider_runtime.clone(),
         terminal_manager.clone(),
         trace.clone(),

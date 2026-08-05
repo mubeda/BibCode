@@ -4,9 +4,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use crate::{
-    activity::{
-        ActivityProjection, ActivityProjections, AgentActivityController, AgentActivitySource,
-    },
+    activity::{ActivityProjections, AgentActivityController, AgentActivitySource},
     diagnostics::TraceDiagnosticsStore,
     provider_terminal::{TerminalAgentActivityProviderEpochs, TerminalAgentActivityTransition},
     terminal::TerminalManager,
@@ -315,24 +313,22 @@ pub struct ProductionAgentActivity {
 impl ProductionAgentActivity {
     #[must_use]
     pub fn new(
-        controller: AgentActivityController,
-        projection: ActivityProjection,
+        projections: ActivityProjections,
         provider_runtime: Arc<ProviderRuntimeSupervisor>,
         terminal_manager: TerminalManager,
         trace_diagnostics: TraceDiagnosticsStore,
         environment_id: String,
     ) -> Self {
-        let projections = ActivityProjections::from_shared_projection(projection);
         Self {
             chat_coordinator: AgentActivityCoordinator::new(
                 AgentActivitySource::Chat,
-                controller.clone(),
+                projections.chat().agent_activity_controller(),
                 trace_diagnostics.clone(),
                 environment_id.clone(),
             ),
             terminal_coordinator: AgentActivityCoordinator::new(
                 AgentActivitySource::Terminal,
-                controller,
+                projections.terminal().agent_activity_controller(),
                 trace_diagnostics,
                 environment_id,
             ),
