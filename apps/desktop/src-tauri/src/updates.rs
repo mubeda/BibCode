@@ -794,13 +794,19 @@ mod tests {
     }
 
     async fn wait_for_test_signal(receiver: &mpsc::Receiver<()>, description: &str) {
-        for _ in 0..1_000 {
-            if receiver.try_recv().is_ok() {
-                return;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                match receiver.try_recv() {
+                    Ok(()) => return,
+                    Err(mpsc::TryRecvError::Empty) => tokio::task::yield_now().await,
+                    Err(mpsc::TryRecvError::Disconnected) => {
+                        panic!("{description}: signal sender disconnected")
+                    }
+                }
             }
-            tokio::task::yield_now().await;
-        }
-        panic!("{description}");
+        })
+        .await
+        .unwrap_or_else(|_| panic!("timed out waiting for {description}"));
     }
 
     async fn wait_for_background_check_completion(manager: &DesktopUpdateManager, expected: usize) {
@@ -1108,11 +1114,15 @@ mod tests {
         );
         let requests = Arc::new(AtomicUsize::new(0));
         let server_requests = requests.clone();
+        let (request_started_sender, request_started_receiver) = mpsc::channel();
         let (release_sender, release_receiver) = mpsc::channel();
         let server = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("update request should arrive");
             assert_request_read(&mut stream, "update request should read");
             server_requests.fetch_add(1, Ordering::SeqCst);
+            request_started_sender
+                .send(())
+                .expect("test should observe the update request");
             release_receiver
                 .recv()
                 .expect("test should release update response");
@@ -1126,12 +1136,11 @@ mod tests {
         let first_handle = app.handle().clone();
         let first = tokio::spawn(async move { first_manager.check_for_update(first_handle).await });
 
-        for _ in 0..100 {
-            if requests.load(Ordering::SeqCst) == 1 {
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
+        wait_for_test_signal(
+            &request_started_receiver,
+            "update request should become active",
+        )
+        .await;
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         let second = tokio::time::timeout(
             Duration::from_millis(100),
@@ -1348,15 +1357,11 @@ mod tests {
         let check_manager = manager.clone();
         let check_handle = app.handle().clone();
         let check = tokio::spawn(async move { check_manager.check_for_update(check_handle).await });
-        let mut check_started = false;
-        for _ in 0..100 {
-            if check_started_receiver.try_recv().is_ok() {
-                check_started = true;
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(check_started, "second check should become in flight");
+        wait_for_test_signal(
+            &check_started_receiver,
+            "second check should become in flight",
+        )
+        .await;
 
         let download = tokio::time::timeout(
             Duration::from_millis(100),
@@ -1426,15 +1431,7 @@ mod tests {
         let download_handle = app.handle().clone();
         let download =
             tokio::spawn(async move { download_manager.download_update(download_handle).await });
-        let mut download_started = false;
-        for _ in 0..100 {
-            if download_started_receiver.try_recv().is_ok() {
-                download_started = true;
-                break;
-            }
-            tokio::task::yield_now().await;
-        }
-        assert!(download_started, "download should become active");
+        wait_for_test_signal(&download_started_receiver, "download should become active").await;
 
         let check = manager.check_for_update(app.handle().clone()).await;
         release_download_sender

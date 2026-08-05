@@ -26,9 +26,11 @@ use super::{
     ProviderTerminalObserverFactoryInput, TerminalAgentActivityAdmission,
     TerminalAgentActivityControl, TerminalAgentActivityObservation,
     TerminalAgentActivityObservationKind, TerminalAgentActivityState,
-    TerminalAgentActivityTransition,
-    TerminalGenerationActivityPublisher, TerminalObserverGeneration, TerminalObserverWorkerContext,
+    TerminalAgentActivityTransition, TerminalGenerationActivityPublisher,
+    TerminalObserverGeneration, TerminalObserverWorkerContext,
 };
+#[cfg(test)]
+use crate::provider::opencode::sse::OPENCODE_SSE_EVENT_LIMIT;
 use crate::{
     activity::{ActivityCapabilities, ActivityHistoryRecovery, ProviderActivityMutation},
     process::{
@@ -40,8 +42,6 @@ use crate::{
     },
     provider::opencode::sse::OpenCodeSseDecoder,
 };
-#[cfg(test)]
-use crate::provider::opencode::sse::OPENCODE_SSE_EVENT_LIMIT;
 
 const OPENCODE_PROBE_OUTPUT_LIMIT: usize = 128 * 1024;
 const OPENCODE_CAPABILITY_CACHE_CAPACITY: usize = 64;
@@ -363,13 +363,9 @@ pub trait OpenCodeHelperLauncher: Send + Sync + fmt::Debug {
 }
 
 pub trait OpenCodeEventStream: Send {
-    fn discard_next(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
+    fn discard_next(&mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>>;
 
-    fn next_data(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + '_>>;
+    fn next_data(&mut self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + '_>>;
 }
 
 pub trait OpenCodeRemoteClient: Send {
@@ -405,16 +401,13 @@ pub trait OpenCodeRemoteClient: Send {
         session_id: &str,
     ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>>;
 
-    fn open_event_stream(
-        &mut self,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<Box<dyn OpenCodeEventStream>, String>>
-                + Send
-                + '_,
-        >,
-    >;
+    fn open_event_stream(&mut self) -> OpenCodeEventStreamFuture<'_>;
 }
+
+type OpenCodeEventStreamFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Box<dyn OpenCodeEventStream>, String>> + Send + 'a>>;
+type OpenCodeRemoteClientFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<Box<dyn OpenCodeRemoteClient>, String>> + Send + 'a>>;
 
 pub trait OpenCodeRemoteClientFactory: Send + Sync + fmt::Debug {
     fn connect(
@@ -423,7 +416,7 @@ pub trait OpenCodeRemoteClientFactory: Send + Sync + fmt::Debug {
         username: &str,
         password: &str,
         directory: &Path,
-    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn OpenCodeRemoteClient>, String>> + Send + '_>>;
+    ) -> OpenCodeRemoteClientFuture<'_>;
 }
 
 pub struct OpenCodeTerminalObserverFactory {
@@ -453,13 +446,7 @@ impl OpenCodeTerminalObserverFactory {
         handshake_timeout: Duration,
     ) -> Self {
         let reattach_timeout = complete_opencode_reattach_timeout(handshake_timeout);
-        Self::new_with_reattach_timeout(
-            probe,
-            helper,
-            remote,
-            handshake_timeout,
-            reattach_timeout,
-        )
+        Self::new_with_reattach_timeout(probe, helper, remote, handshake_timeout, reattach_timeout)
     }
 
     #[doc(hidden)]
@@ -559,9 +546,7 @@ impl OpenCodeTerminalObserverFactory {
             helper,
         );
         let (endpoint, resources) = ready.ok()?;
-        let Some(capabilities) = capabilities else {
-            return None;
-        };
+        let capabilities = capabilities?;
         if !capabilities.serve || !capabilities.attach {
             return None;
         };
@@ -989,8 +974,7 @@ fn admit_opencode_live_work(
         return None;
     }
     let admission = fence.activity.admit()?;
-    (fence.activity.admission_is_current(&admission) && fence.is_current())
-        .then_some(admission)
+    (fence.activity.admission_is_current(&admission) && fence.is_current()).then_some(admission)
 }
 
 fn opencode_live_work_is_current(
@@ -1107,12 +1091,8 @@ async fn run_opencode_observer(
     .await;
 
     let mut epoch = 0_u64;
-    let mut stream = establish_opencode_event_stream(
-        &mut *remote,
-        &generation,
-        inner.handshake_timeout,
-    )
-    .await;
+    let mut stream =
+        establish_opencode_event_stream(&mut *remote, &generation, inner.handshake_timeout).await;
     let (mut mode, mut live_state) = if stream.is_some() {
         let state = inner.activity.snapshot();
         let mode = if state.enabled {
@@ -1121,18 +1101,10 @@ async fn run_opencode_observer(
             OpenCodeObserverMode::Dormant
         };
         mark_opencode_observation(&inner, state, epoch, mode);
-        (
-            mode,
-            (mode == OpenCodeObserverMode::Live).then_some(state),
-        )
+        (mode, (mode == OpenCodeObserverMode::Live).then_some(state))
     } else {
         let state = inner.activity.snapshot();
-        mark_opencode_observation(
-            &inner,
-            state,
-            epoch,
-            OpenCodeObserverMode::Unavailable,
-        );
+        mark_opencode_observation(&inner, state, epoch, OpenCodeObserverMode::Unavailable);
         (OpenCodeObserverMode::Unavailable, None)
     };
     let mut interval = tokio::time::interval_at(
@@ -1143,12 +1115,9 @@ async fn run_opencode_observer(
 
     loop {
         if stream.is_none() {
-            stream = establish_opencode_event_stream(
-                &mut *remote,
-                &generation,
-                inner.handshake_timeout,
-            )
-            .await;
+            stream =
+                establish_opencode_event_stream(&mut *remote, &generation, inner.handshake_timeout)
+                    .await;
             if generation.cancellation_reason().is_some() {
                 stop_opencode_observer(&inner, &mut *remote, &root_session_id).await;
                 return;
@@ -1157,9 +1126,8 @@ async fn run_opencode_observer(
                 tracker = OpenCodeActivityTracker::new(&root_session_id);
                 let state = inner.activity.snapshot();
                 mode = if state.enabled {
-                    interval.reset_at(
-                        tokio::time::Instant::now() + OPENCODE_RECONCILIATION_INTERVAL,
-                    );
+                    interval
+                        .reset_at(tokio::time::Instant::now() + OPENCODE_RECONCILIATION_INTERVAL);
                     live_state = Some(state);
                     OpenCodeObserverMode::Live
                 } else {
@@ -1239,12 +1207,7 @@ async fn run_opencode_observer(
                     &mut sequence,
                     Some(publication),
                 );
-                match wait_for_opencode_live_work(
-                    &mut activity,
-                    &generation,
-                    reconciliation,
-                )
-                .await
+                match wait_for_opencode_live_work(&mut activity, &generation, reconciliation).await
                 {
                     OpenCodeLiveWork::Cancelled => OpenCodeObserverEvent::Cancelled,
                     OpenCodeLiveWork::ActivityChanged(changed) => {
@@ -1306,8 +1269,7 @@ async fn run_opencode_observer(
                                 || {
                                     stream = Some(replacement);
                                     epoch = next_epoch;
-                                    tracker =
-                                        OpenCodeActivityTracker::new(&root_session_id);
+                                    tracker = OpenCodeActivityTracker::new(&root_session_id);
                                     live_state = Some(state);
                                     mode = OpenCodeObserverMode::Live;
                                     interval.reset_at(
@@ -1351,12 +1313,7 @@ async fn run_opencode_observer(
                             state = current;
                         }
                         OpenCodeReplacementOutcome::Cancelled => {
-                            stop_opencode_observer(
-                                &inner,
-                                &mut *remote,
-                                &root_session_id,
-                            )
-                            .await;
+                            stop_opencode_observer(&inner, &mut *remote, &root_session_id).await;
                             return;
                         }
                     }
@@ -1383,17 +1340,10 @@ async fn run_opencode_observer(
                         epoch = epoch.saturating_add(1);
                         live_state = None;
                         mode = OpenCodeObserverMode::Unavailable;
-                        mark_opencode_observation(
-                            &inner,
-                            inner.activity.snapshot(),
-                            epoch,
-                            mode,
-                        );
+                        mark_opencode_observation(&inner, inner.activity.snapshot(), epoch, mode);
                         continue;
                     }
-                    OpenCodeLiveData::Output { admission, output } => {
-                        (admission, output)
-                    }
+                    OpenCodeLiveData::Output { admission, output } => (admission, output),
                 };
                 if !opencode_live_work_is_current(fence, &admission) {
                     continue;
@@ -1408,18 +1358,12 @@ async fn run_opencode_observer(
                 sequence = sequence.saturating_add(1);
             }
             OpenCodeObserverEvent::Reconcile => unreachable!("reconciliation is resolved above"),
-            OpenCodeObserverEvent::Data(Err(_))
-            | OpenCodeObserverEvent::Discard(Err(_)) => {
+            OpenCodeObserverEvent::Data(Err(_)) | OpenCodeObserverEvent::Discard(Err(_)) => {
                 stream = None;
                 epoch = epoch.saturating_add(1);
                 live_state = None;
                 mode = OpenCodeObserverMode::Unavailable;
-                mark_opencode_observation(
-                    &inner,
-                    inner.activity.snapshot(),
-                    epoch,
-                    mode,
-                );
+                mark_opencode_observation(&inner, inner.activity.snapshot(), epoch, mode);
             }
             OpenCodeObserverEvent::Discard(Ok(())) => {}
         }
@@ -1448,11 +1392,7 @@ fn commit_opencode_observation(
         OpenCodeObserverMode::Unavailable => TerminalAgentActivityObservationKind::Unavailable,
     };
     inner.activity.commit_observed(
-        TerminalAgentActivityObservation {
-            state,
-            epoch,
-            kind,
-        },
+        TerminalAgentActivityObservation { state, epoch, kind },
         || {
             commit();
         },
@@ -1678,8 +1618,7 @@ async fn reconcile_opencode(
             return;
         }
         let remaining = MAX_RECONCILED_CHILDREN.saturating_sub(children.len());
-        let (output, accepted) =
-            tracker.reconcile_children_limited(&parent, &response, remaining);
+        let (output, accepted) = tracker.reconcile_children_limited(&parent, &response, remaining);
         if live_publication.is_some_and(|publication| !publication.is_current()) {
             return;
         }
@@ -1778,7 +1717,11 @@ async fn apply_opencode_output(
                 )
                 .await
         }
-        None => publisher.apply(native_event_id, mutations, &created_at).await,
+        None => {
+            publisher
+                .apply(native_event_id, mutations, &created_at)
+                .await
+        }
     };
 }
 
@@ -2332,9 +2275,7 @@ impl SystemOpenCodeEventStream {
 }
 
 impl OpenCodeEventStream for SystemOpenCodeEventStream {
-    fn discard_next(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+    fn discard_next(&mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
             loop {
                 match self.sse_decoder.discard_event() {
@@ -2346,9 +2287,7 @@ impl OpenCodeEventStream for SystemOpenCodeEventStream {
         })
     }
 
-    fn next_data(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + '_>> {
+    fn next_data(&mut self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + '_>> {
         Box::pin(async move {
             loop {
                 let buffered_length = self.sse_decoder.buffered_len();
@@ -2489,13 +2428,8 @@ impl OpenCodeRemoteClient for SystemOpenCodeRemoteClient {
 
     fn open_event_stream(
         &mut self,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<Box<dyn OpenCodeEventStream>, String>>
-                + Send
-                + '_,
-        >,
-    > {
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn OpenCodeEventStream>, String>> + Send + '_>>
+    {
         Box::pin(async move {
             let mut url = self.url(&["event"])?;
             url.query_pairs_mut()
@@ -2603,18 +2537,14 @@ mod tests {
                 std::future::pending::<()>().await;
             }
         };
-        let waiting =
-            wait_for_opencode_live_work(&mut changes, &generation, reconciliation);
+        let waiting = wait_for_opencode_live_work(&mut changes, &generation, reconciliation);
         tokio::pin!(waiting);
-        let first_poll = std::future::poll_fn(|context| {
-            std::task::Poll::Ready(waiting.as_mut().poll(context))
-        })
-        .await;
+        let first_poll =
+            std::future::poll_fn(|context| std::task::Poll::Ready(waiting.as_mut().poll(context)))
+                .await;
         assert!(first_poll.is_pending());
 
-        generation.request_cancellation(
-            super::super::TerminalObserverCancellationReason::Closed,
-        );
+        generation.request_cancellation(super::super::TerminalObserverCancellationReason::Closed);
         let outcome = tokio::time::timeout(Duration::from_millis(100), waiting)
             .await
             .expect("cancellation interrupts live reconciliation");
@@ -2922,8 +2852,10 @@ mod tests {
         );
     }
 
+    type RecordedRequest = (Method, String, reqwest::header::HeaderMap, Vec<u8>);
+
     #[derive(Clone, Debug, Default)]
-    struct RecordedRequests(Arc<Mutex<Vec<(Method, String, reqwest::header::HeaderMap, Vec<u8>)>>>);
+    struct RecordedRequests(Arc<Mutex<Vec<RecordedRequest>>>);
 
     async fn opencode_fixture_handler(
         State(recorded): State<RecordedRequests>,
@@ -3065,34 +2997,35 @@ mod tests {
             "SSE body lifetime must not inherit the 500 ms unary timeout"
         );
 
-        let requests = recorded
-            .0
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        assert!(requests.iter().all(|(_, _, headers, _)| {
-            headers
-                .get(reqwest::header::AUTHORIZATION)
-                .and_then(|value| value.to_str().ok())
-                == Some("Basic b3BlbmNvZGU6Zml4dHVyZS1zZWNyZXQ=")
-        }));
-        assert!(requests.iter().all(|(_, _, headers, _)| {
-            headers
-                .get("x-opencode-directory")
-                .and_then(|value| value.to_str().ok())
-                == Some(directory.path().to_string_lossy().as_ref())
-        }));
-        let create = requests
-            .iter()
-            .find(|(method, uri, _, _)| *method == Method::POST && uri == "/session")
-            .expect("OpenCode create-root request");
-        assert_eq!(
-            serde_json::from_slice::<Value>(&create.3).expect("create-root JSON")["model"],
-            json!({
-                "providerID": "openai",
-                "id": "gpt-5.2",
-            })
-        );
-        drop(requests);
+        {
+            let requests = recorded
+                .0
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(requests.iter().all(|(_, _, headers, _)| {
+                headers
+                    .get(reqwest::header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    == Some("Basic b3BlbmNvZGU6Zml4dHVyZS1zZWNyZXQ=")
+            }));
+            assert!(requests.iter().all(|(_, _, headers, _)| {
+                headers
+                    .get("x-opencode-directory")
+                    .and_then(|value| value.to_str().ok())
+                    == Some(directory.path().to_string_lossy().as_ref())
+            }));
+            let create = requests
+                .iter()
+                .find(|(method, uri, _, _)| *method == Method::POST && uri == "/session")
+                .expect("OpenCode create-root request");
+            assert_eq!(
+                serde_json::from_slice::<Value>(&create.3).expect("create-root JSON")["model"],
+                json!({
+                    "providerID": "openai",
+                    "id": "gpt-5.2",
+                })
+            );
+        }
         server.abort();
         let _ = server.await;
     }

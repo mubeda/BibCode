@@ -1,3 +1,4 @@
+use bibcode_server::process::configure_background_std_command;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
@@ -6,7 +7,6 @@ use std::{
     process::Command,
     time::Duration,
 };
-use bibcode_server::process::configure_background_std_command;
 use tauri::{AppHandle, Manager, Runtime, State};
 use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_opener::OpenerExt;
@@ -2344,7 +2344,8 @@ mod tests {
         // Use the generated application context so IPC exercises the same command
         // permissions as the production desktop shell.
         let mut context = crate::desktop_context();
-        context.config_mut().identifier = format!("com.bibcode.bridge-tests-{}", std::process::id());
+        context.config_mut().identifier =
+            format!("com.bibcode.bridge-tests-{}", std::process::id());
         let app = mock_builder()
             .manage(BackendSupervisor::new())
             .manage(NativeContextMenuManager::new())

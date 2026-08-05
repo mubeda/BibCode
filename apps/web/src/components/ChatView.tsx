@@ -260,6 +260,7 @@ import {
   reconcileMountedTerminalThreadIds,
   resolveActivityPageLoadAction,
   resolveCenterPanelLaunchContext,
+  isAgentActivityScopeEnabled,
   resolveActivityScope,
   resolveSendEnvMode,
   revokeBlobPreviewUrl,
@@ -1488,7 +1489,8 @@ function ChatViewContent(props: ChatViewProps) {
     routeKind === "server" ? store.threadLastVisitedAtById[routeThreadKey] : undefined,
   );
   const settings = useEnvironmentSettings(environmentId);
-  const enableAgentActivity = settings.enableAgentActivity;
+  const enableChatAgentActivity = settings.enableChatAgentActivity;
+  const enableTerminalAgentActivity = settings.enableTerminalAgentActivity;
   const setStickyComposerModelSelection = useComposerDraftStore(
     (store) => store.setStickyModelSelection,
   );
@@ -1861,33 +1863,70 @@ function ChatViewContent(props: ChatViewProps) {
   const activeRightPanelSurface = useRightPanelStore((state) =>
     selectActiveRightPanelSurface(state.byThreadKey, activeThreadRef),
   );
+  const persistedActivitySurface =
+    rightPanelState.surfaces.find((surface) => surface.kind === "activity") ?? null;
+  const persistedActivitySurfaceId = persistedActivitySurface?.id ?? null;
+  const persistedActivityScopeTag = persistedActivitySurface?.scope._tag ?? null;
+  const persistedActivityTerminalId =
+    persistedActivitySurface?.scope._tag === "terminal"
+      ? persistedActivitySurface.scope.terminalId
+      : null;
   const activeActivitySurface =
     activeRightPanelSurface?.kind === "activity" ? activeRightPanelSurface : null;
   const activityScope = useMemo(
     () => resolveActivityScope(activeThreadRef, activeActivitySurface?.scope ?? { _tag: "thread" }),
     [activeActivitySurface?.scope, activeThreadRef],
   );
+  const activityScopeEnabled =
+    activityScope !== null &&
+    isAgentActivityScopeEnabled(activityScope, {
+      enableChatAgentActivity,
+      enableTerminalAgentActivity,
+    });
   const activityStateTarget = useMemo<ActivityStateTarget | null>(
     () =>
-      enableAgentActivity &&
+      activityScopeEnabled &&
       activeThreadRef !== null &&
       activityScope !== null &&
       (isPanel || !siblingChatOwnsCenter)
         ? { environmentId: activeThreadRef.environmentId, input: activityScope }
         : null,
-    [activeThreadRef, activityScope, enableAgentActivity, isPanel, siblingChatOwnsCenter],
+    [activeThreadRef, activityScope, activityScopeEnabled, isPanel, siblingChatOwnsCenter],
   );
   useEffect(() => {
-    if (enableAgentActivity || activeThreadRef === null) return;
-    const threadState = selectThreadRightPanelState(
-      useRightPanelStore.getState().byThreadKey,
-      activeThreadRef,
-    );
-    const activitySurface = threadState.surfaces.find((surface) => surface.kind === "activity");
-    if (activitySurface) {
-      useRightPanelStore.getState().closeSurface(activeThreadRef, activitySurface.id);
+    if (
+      activeThreadRef === null ||
+      persistedActivitySurfaceId === null ||
+      persistedActivityScopeTag === null
+    ) {
+      return;
     }
-  }, [activeThreadRef, enableAgentActivity]);
+    const persistedScope =
+      persistedActivityScopeTag === "terminal"
+        ? persistedActivityTerminalId === null
+          ? null
+          : resolveActivityScope(activeThreadRef, {
+              _tag: "terminal",
+              terminalId: persistedActivityTerminalId,
+            })
+        : resolveActivityScope(activeThreadRef, { _tag: "thread" });
+    if (
+      persistedScope !== null &&
+      !isAgentActivityScopeEnabled(persistedScope, {
+        enableChatAgentActivity,
+        enableTerminalAgentActivity,
+      })
+    ) {
+      useRightPanelStore.getState().closeSurface(activeThreadRef, persistedActivitySurfaceId);
+    }
+  }, [
+    activeThreadRef,
+    enableChatAgentActivity,
+    enableTerminalAgentActivity,
+    persistedActivityScopeTag,
+    persistedActivitySurfaceId,
+    persistedActivityTerminalId,
+  ]);
   const panelActivitySurfaceOpen =
     isPanel &&
     rightPanelState.isOpen &&

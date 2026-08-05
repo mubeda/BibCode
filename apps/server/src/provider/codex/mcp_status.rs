@@ -499,11 +499,10 @@ fn dispatch_load(
             root,
         })
         .is_err()
+        && let Some(in_flight) = state.in_flight.take()
     {
-        if let Some(in_flight) = state.in_flight.take() {
-            for waiter in in_flight.waiters {
-                let _ = waiter.send(Err("MCP status effect receiver is unavailable".to_owned()));
-            }
+        for waiter in in_flight.waiters {
+            let _ = waiter.send(Err("MCP status effect receiver is unavailable".to_owned()));
         }
     }
 }

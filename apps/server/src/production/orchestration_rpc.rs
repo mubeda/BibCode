@@ -176,9 +176,7 @@ async fn dispatch_prepared_command(
                 ..
             }
         );
-    if route_before_admission
-        && let Some(provider) = provider.as_ref()
-    {
+    if route_before_admission && let Some(provider) = provider.as_ref() {
         route_orchestration_command(
             &provider.provider,
             &dispatch,

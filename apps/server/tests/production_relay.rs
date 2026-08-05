@@ -4,8 +4,8 @@ use std::{
     time::Duration,
 };
 
-use sha2::{Digest, Sha256};
 use bibcode_server::cloud::{RelayClientInstallEvent, RelayClientStatus};
+use sha2::{Digest, Sha256};
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},

@@ -10,16 +10,14 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use bibcode_server::{
     RpcRegistry, ServerConfig, ServerMessage, ServerRuntime,
     activity::{
         ActivityCapabilities, ActivityEntry, ActivityEntryKind, ActivityEntryTone,
-        ActivityLifecycle, ActivityProjection, ActivityRecordKind, ActivityRepository,
-        ActivityRosterBucket, ActivityScopeSeed, ActivitySection, ActivityWorkItemSummary,
-        AgentActivityController, ProviderActivityMutation, register_activity_rpc,
+        ActivityLifecycle, ActivityProjection, ActivityProjections, ActivityRecordKind,
+        ActivityRepository, ActivityRosterBucket, ActivityScopeSeed, ActivitySection,
+        ActivityWorkItemSummary, AgentActivityController, AgentActivitySource,
+        ProviderActivityMutation, register_activity_rpc,
     },
     diagnostics::{ProcessAttributionRegistry, TraceDiagnosticsStore},
     orchestration::engine::{EngineOptions, OrchestrationEngine},
@@ -43,6 +41,9 @@ use bibcode_server::{
         TerminalLaunchCommand, TerminalManager, TerminalManagerOptions, TerminalOpenInput,
     },
 };
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{Value, json};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tempfile::TempDir;
 use tokio::{
     sync::{Barrier, oneshot},
@@ -226,15 +227,19 @@ async fn disabled_gate_rejects_dormant_volume_without_work_or_trace_growth() {
     let engine = OrchestrationEngine::start(database.clone(), EngineOptions::default())
         .await
         .expect("orchestration engine");
-    let controller = AgentActivityController::new(true);
-    let projection = ActivityProjection::with_controller(
+    let chat_controller = AgentActivityController::new(true);
+    let terminal_controller = AgentActivityController::new(true);
+    let projections = ActivityProjections::new(
         ActivityRepository::new(database.clone()),
-        controller.clone(),
+        chat_controller.clone(),
+        terminal_controller.clone(),
     );
+    let controller = terminal_controller;
+    let projection = projections.terminal();
     let provider_runtime = Arc::new(ProviderRuntimeSupervisor::start(
         engine.clone(),
         Arc::new(RejectingProviderDriverFactory),
-        projection.clone(),
+        projections.chat(),
         SupervisorOptions::default(),
     ));
 
@@ -274,8 +279,7 @@ async fn disabled_gate_rejects_dormant_volume_without_work_or_trace_growth() {
     );
     let trace = TraceDiagnosticsStore::new(fixture.path().join("agent-activity.trace.ndjson"));
     let coordinator = ProductionAgentActivity::new(
-        controller.clone(),
-        projection.clone(),
+        projections,
         provider_runtime.clone(),
         terminal_manager.clone(),
         trace.clone(),
@@ -303,7 +307,9 @@ async fn disabled_gate_rejects_dormant_volume_without_work_or_trace_growth() {
         PREVIOUSLY_INSTRUMENTED_TERMINALS
     );
 
-    let disabled = coordinator.transition(false, 1).await;
+    let disabled = coordinator
+        .transition(AgentActivitySource::Terminal, false, 1)
+        .await;
     assert!(!disabled.enabled);
     assert_eq!(
         disabled.dormant_observers,
@@ -314,7 +320,7 @@ async fn disabled_gate_rejects_dormant_volume_without_work_or_trace_growth() {
         PREVIOUSLY_INSTRUMENTED_TERMINALS
     );
     let trace_count_before_rejected_volume = trace_record_count(&trace);
-    assert_eq!(trace_count_before_rejected_volume, 3);
+    assert_eq!(trace_count_before_rejected_volume, 4);
 
     let queue_observer = database
         .enable_queue_backpressure_observation_for_integration_test()
@@ -332,10 +338,7 @@ async fn disabled_gate_rejects_dormant_volume_without_work_or_trace_growth() {
         terminal_factory.dormant_frames.load(Ordering::Acquire),
         DISABLED_EVENT_COUNT
     );
-    assert_eq!(
-        terminal_factory.decoded_events.load(Ordering::Acquire),
-        0
-    );
+    assert_eq!(terminal_factory.decoded_events.load(Ordering::Acquire), 0);
     assert_eq!(
         controller.active_stream_count_for_integration_test(),
         streams_before
@@ -492,6 +495,7 @@ fn assert_safe_transition_trace(trace: &TraceDiagnosticsStore) {
             .collect::<Vec<_>>(),
         vec![
             "agent_activity_enabled",
+            "agent_activity_enabled",
             "agent_activity_change_requested",
             "agent_activity_disabled",
         ]
@@ -499,6 +503,7 @@ fn assert_safe_transition_trace(trace: &TraceDiagnosticsStore) {
     let allowed_attributes = [
         "cause",
         "environmentId",
+        "source",
         "enabled",
         "settingsGeneration",
         "observationGeneration",
@@ -982,7 +987,7 @@ async fn assert_same_scope_publication_order(database: &Database) {
     // `JoinSet` observes executor scheduling after `apply` returns, so its sequence is
     // intentionally not an ordering contract. The in-lock completion stream above is the
     // authoritative order; this audit proves JoinSet did observe that exact contiguous set.
-    let mut joined_revision_seen = vec![false; QUEUED_WRITER_COUNT + 1];
+    let mut joined_revision_seen = [false; QUEUED_WRITER_COUNT + 1];
     for revision in &joined_completion_revisions {
         assert!(
             (1..=QUEUED_WRITER_COUNT as u64).contains(revision),
@@ -1788,13 +1793,15 @@ impl RpcFixture {
             .await
             .expect("migrations");
         let controller = AgentActivityController::new(true);
-        let projection = ActivityProjection::with_controller_and_capacity(
+        let projections = ActivityProjections::with_capacity(
             ActivityRepository::new(database.clone()),
             controller.clone(),
+            AgentActivityController::new(true),
             capacity,
         );
+        let projection = projections.chat();
         let mut registry = RpcRegistry::empty();
-        register_activity_rpc(&mut registry, projection.clone(), controller);
+        register_activity_rpc(&mut registry, projections);
         let directory = tempfile::tempdir().expect("server directory");
         let handle = ServerRuntime::start_with_registry(
             ServerConfig::new(directory.path())

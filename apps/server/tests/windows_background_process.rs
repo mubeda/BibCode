@@ -3,10 +3,10 @@
 
 use std::{process::Stdio, thread, time::Duration};
 
-use process_wrap::tokio::{ChildWrapper, CommandWrap};
 use bibcode_server::process::{
     configure_background_command, configure_supervised_background_command_wrap,
 };
+use process_wrap::tokio::{ChildWrapper, CommandWrap};
 use windows_sys::Win32::{
     Foundation::GetLastError,
     System::Console::{AttachConsole, FreeConsole, GetConsoleWindow},

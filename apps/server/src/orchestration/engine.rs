@@ -804,7 +804,7 @@ struct DeliveryTransitionEnvelope {
 }
 
 enum WorkerEnvelope {
-    Command(CommandEnvelope),
+    Command(Box<CommandEnvelope>),
     DeliveryTransition(DeliveryTransitionEnvelope),
 }
 
@@ -907,12 +907,12 @@ impl OrchestrationEngine {
         }
         let (response_tx, response_rx) = oneshot::channel();
         self.sender
-            .send(WorkerEnvelope::Command(CommandEnvelope {
+            .send(WorkerEnvelope::Command(Box::new(CommandEnvelope {
                 command,
                 admission,
                 response: response_tx,
                 on_commit,
-            }))
+            })))
             .await
             .map_err(|_| OrchestrationError::WorkerClosed)?;
         response_rx
@@ -1011,6 +1011,7 @@ impl OrchestrationEngine {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn append_bootstrap_activity(
         &self,
         bootstrap_command_id: &str,
@@ -1105,7 +1106,8 @@ fn spawn_worker(
                         break;
                     };
                     match envelope {
-                        WorkerEnvelope::Command(CommandEnvelope { command, admission, response, on_commit }) => {
+                        WorkerEnvelope::Command(envelope) => {
+                            let CommandEnvelope { command, admission, response, on_commit } = *envelope;
                             let has_admission = admission.is_some();
                             let effects = project_command_effects
                                 .lock()
@@ -2446,6 +2448,7 @@ async fn persist_turn_delivery_transition(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_turn_delivery_resolution(
     repositories: &Repositories,
     events: &broadcast::Sender<OrchestrationEvent>,
@@ -4208,13 +4211,8 @@ mod tests {
         message_id: &str,
         created_at: &str,
     ) {
-        let command = delivery_turn_for_message(
-            command_id,
-            thread_id,
-            message_id,
-            command_id,
-            created_at,
-        );
+        let command =
+            delivery_turn_for_message(command_id, thread_id, message_id, command_id, created_at);
         engine
             .dispatch_with_admission(
                 command.clone(),
@@ -4300,7 +4298,10 @@ mod tests {
             result,
             Err(OrchestrationError::InjectedProjectorFailure { .. })
         ));
-        assert_eq!(engine.read_events(0).await.expect("events after").len(), before);
+        assert_eq!(
+            engine.read_events(0).await.expect("events after").len(),
+            before
+        );
         assert!(
             engine
                 .repositories()

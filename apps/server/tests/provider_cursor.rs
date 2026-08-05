@@ -50,11 +50,13 @@ fn cursor_helper_outputs_match_fixtures() {
 
     let config_updates_fixture = fixture("config-updates.json");
     assert_eq!(
-        serde_json::to_value(resolve_acp_config_updates(
-            &config_updates_fixture["options"],
-            &config_updates_fixture["updates"],
+        serde_json::to_value(
+            resolve_acp_config_updates(
+                &config_updates_fixture["options"],
+                &config_updates_fixture["updates"],
+            )
+            .expect("config updates")
         )
-        .expect("config updates"))
         .expect("updates json"),
         config_updates_fixture["expected"]
     );
@@ -98,11 +100,13 @@ fn cursor_config_updates_reject_stale_or_malformed_descriptors_before_rpc() {
         "currentValue": "false",
         "options": [{ "value": "false" }, { "value": "true" }]
     });
-    assert!(resolve_acp_config_updates(
-        &json!([fast]),
-        &json!([{ "id": "fastMode", "value": true }]),
-    )
-    .is_ok());
+    assert!(
+        resolve_acp_config_updates(
+            &json!([fast]),
+            &json!([{ "id": "fastMode", "value": true }]),
+        )
+        .is_ok()
+    );
     assert!(resolve_acp_config_updates(
         &json!([{ "id": "fast", "category": "model", "type": "select", "options": [{ "value": "true" }] }]),
         &json!([{ "id": "fastMode", "value": true }]),
@@ -555,7 +559,8 @@ async fn cursor_model_switch_uses_target_baselines_and_revalidates_active_option
         incoming,
     );
     let config_options = |model: &str, fast: Option<&str>| {
-        let mut options = vec![json!({ "id": "model", "category": "model", "currentValue": model })];
+        let mut options =
+            vec![json!({ "id": "model", "category": "model", "currentValue": model })];
         if let Some(fast) = fast {
             options.push(json!({
                 "id": "fast", "category": "model_config", "type": "select",
@@ -613,7 +618,10 @@ async fn cursor_model_switch_uses_target_baselines_and_revalidates_active_option
         .set_options(vec![json!({ "id": "fastMode", "value": true })])
         .await
         .expect("enable fast on old model");
-    runtime.set_model("target").await.expect("switch to compatible target");
+    runtime
+        .set_model("target")
+        .await
+        .expect("switch to compatible target");
     runtime
         .set_options(vec![json!({ "id": "fastMode", "value": true })])
         .await
@@ -622,12 +630,20 @@ async fn cursor_model_switch_uses_target_baselines_and_revalidates_active_option
         .set_options(Vec::new())
         .await
         .expect("clear uses the target model baseline");
-    runtime.set_model("no-fast").await.expect("switch to target without fast");
-    assert!(runtime
-        .set_options(vec![json!({ "id": "fastMode", "value": true })])
+    runtime
+        .set_model("no-fast")
         .await
-        .is_err());
-    runtime.set_model("old").await.expect("restore the previous model");
+        .expect("switch to target without fast");
+    assert!(
+        runtime
+            .set_options(vec![json!({ "id": "fastMode", "value": true })])
+            .await
+            .is_err()
+    );
+    runtime
+        .set_model("old")
+        .await
+        .expect("restore the previous model");
     runtime
         .set_options(vec![json!({ "id": "fastMode", "value": true })])
         .await
@@ -836,13 +852,15 @@ async fn cursor_option_failure_compensates_acknowledged_updates() {
     let peer_task = tokio::spawn(peer.run());
 
     runtime.start().await.expect("start");
-    assert!(runtime
-        .set_options(vec![
-            json!({ "id": "fastMode", "value": true }),
-            json!({ "id": "contextWindow", "value": "1m" }),
-        ])
-        .await
-        .is_err());
+    assert!(
+        runtime
+            .set_options(vec![
+                json!({ "id": "fastMode", "value": true }),
+                json!({ "id": "contextWindow", "value": "1m" }),
+            ])
+            .await
+            .is_err()
+    );
     runtime
         .set_options(vec![json!({ "id": "fastMode", "value": true })])
         .await
@@ -887,10 +905,12 @@ async fn cursor_malformed_config_acknowledgement_is_compensated() {
     let peer_task = tokio::spawn(peer.run());
 
     runtime.start().await.expect("start");
-    assert!(runtime
-        .set_options(vec![json!({ "id": "fastMode", "value": true })])
-        .await
-        .is_err());
+    assert!(
+        runtime
+            .set_options(vec![json!({ "id": "fastMode", "value": true })])
+            .await
+            .is_err()
+    );
     peer_task.await.expect("peer");
 }
 
@@ -947,19 +967,28 @@ async fn cursor_failed_compensation_latches_configuration_uncertain() {
     let peer_task = tokio::spawn(peer.run());
 
     runtime.start().await.expect("start");
-    assert!(runtime
-        .set_options(vec![
-            json!({ "id": "fastMode", "value": true }),
-            json!({ "id": "contextWindow", "value": "1m" }),
-        ])
-        .await
-        .is_err());
+    assert!(
+        runtime
+            .set_options(vec![
+                json!({ "id": "fastMode", "value": true }),
+                json!({ "id": "contextWindow", "value": "1m" }),
+            ])
+            .await
+            .is_err()
+    );
     assert!(runtime.set_options(Vec::new()).await.is_err());
-    assert!(runtime
-        .set_options(vec![json!({ "id": "fastMode", "value": true })])
-        .await
-        .is_err());
-    assert!(runtime.send_turn(Some("must not send"), Vec::new()).await.is_err());
+    assert!(
+        runtime
+            .set_options(vec![json!({ "id": "fastMode", "value": true })])
+            .await
+            .is_err()
+    );
+    assert!(
+        runtime
+            .send_turn(Some("must not send"), Vec::new())
+            .await
+            .is_err()
+    );
     peer_task.await.expect("peer");
 }
 
@@ -1700,9 +1729,12 @@ impl ScriptedPeer {
                 }
                 PeerStep::ExpectNoRequest => {
                     assert!(
-                        timeout(Duration::from_millis(100), read_json_message(&mut reader, "unexpected request"))
-                            .await
-                            .is_err(),
+                        timeout(
+                            Duration::from_millis(100),
+                            read_json_message(&mut reader, "unexpected request")
+                        )
+                        .await
+                        .is_err(),
                         "Cursor sent an RPC after configuration became uncertain"
                     );
                 }
@@ -1712,6 +1744,7 @@ impl ScriptedPeer {
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum PeerStep {
     ExpectRequest {
         method: String,
@@ -1731,7 +1764,8 @@ impl PeerStep {
     fn expect_params(&mut self, value: Value) -> &mut Self {
         let PeerStep::ExpectRequest {
             expected_params, ..
-        } = self else {
+        } = self
+        else {
             panic!("expected request step");
         };
         *expected_params = Some(value);
@@ -1747,7 +1781,10 @@ impl PeerStep {
     }
 
     fn respond_error(&mut self, error: Value) -> &mut Self {
-        let PeerStep::ExpectRequest { error: response, .. } = self else {
+        let PeerStep::ExpectRequest {
+            error: response, ..
+        } = self
+        else {
             panic!("expected request step");
         };
         *response = Some(error);
@@ -1766,7 +1803,8 @@ impl PeerStep {
         let PeerStep::ExpectRequest {
             emits_after_follow_up,
             ..
-        } = self else {
+        } = self
+        else {
             panic!("expected request step");
         };
         emits_after_follow_up.push(value);
@@ -1776,7 +1814,8 @@ impl PeerStep {
     fn expect_response(&mut self, value: Value) -> &mut Self {
         let PeerStep::ExpectRequest {
             expected_follow_up, ..
-        } = self else {
+        } = self
+        else {
             panic!("expected request step");
         };
         *expected_follow_up = Some(value);
@@ -1787,7 +1826,8 @@ impl PeerStep {
         let PeerStep::ExpectRequest {
             expected_notification,
             ..
-        } = self else {
+        } = self
+        else {
             panic!("expected request step");
         };
         *expected_notification = Some(method.to_owned());
@@ -1797,7 +1837,8 @@ impl PeerStep {
     fn emit_stderr(&mut self, message: &str) -> &mut Self {
         let PeerStep::ExpectRequest {
             stderr_messages, ..
-        } = self else {
+        } = self
+        else {
             panic!("expected request step");
         };
         stderr_messages.push(message.to_owned());

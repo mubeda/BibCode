@@ -127,7 +127,9 @@ const fn enabled_by_default() -> bool {
 #[serde(default, rename_all = "camelCase")]
 pub struct ProviderSettingsState {
     #[serde(default = "enabled_by_default")]
-    pub enable_agent_activity: bool,
+    pub enable_chat_agent_activity: bool,
+    #[serde(default)]
+    pub enable_terminal_agent_activity: bool,
     #[serde(default = "default_git_fetch_interval")]
     pub automatic_git_fetch_interval: u64,
     #[serde(default)]
@@ -145,7 +147,8 @@ pub struct ProviderSettingsState {
 impl Default for ProviderSettingsState {
     fn default() -> Self {
         Self {
-            enable_agent_activity: true,
+            enable_chat_agent_activity: true,
+            enable_terminal_agent_activity: false,
             automatic_git_fetch_interval: default_git_fetch_interval(),
             add_project_base_directory: String::new(),
             worktree_base_directory: String::new(),
@@ -196,7 +199,8 @@ pub struct ProviderInstanceInput {
 
 #[derive(Clone, Debug, Default)]
 pub struct ServerSettingsPatch {
-    pub enable_agent_activity: Option<bool>,
+    pub enable_chat_agent_activity: Option<bool>,
+    pub enable_terminal_agent_activity: Option<bool>,
     pub automatic_git_fetch_interval_ms: Option<u64>,
     pub add_project_base_directory: Option<String>,
     pub worktree_base_directory: Option<String>,
@@ -286,7 +290,13 @@ impl ProviderSettingsStore {
             }
             Err(source) => return Err(ServerSettingsReadError::Read { path, source }),
         };
-        serde_json::from_slice(&bytes)
+        let mut settings =
+            serde_json::from_slice(&bytes).map_err(|source| ServerSettingsReadError::Decode {
+                path: path.clone(),
+                source,
+            })?;
+        normalize_agent_activity_settings(&mut settings);
+        serde_json::from_value(settings)
             .map_err(|source| ServerSettingsReadError::Decode { path, source })
     }
 
@@ -409,8 +419,11 @@ fn apply_patch(
     mut current: ProviderSettingsState,
     patch: ServerSettingsPatch,
 ) -> ProviderSettingsState {
-    if let Some(value) = patch.enable_agent_activity {
-        current.enable_agent_activity = value;
+    if let Some(value) = patch.enable_chat_agent_activity {
+        current.enable_chat_agent_activity = value;
+    }
+    if let Some(value) = patch.enable_terminal_agent_activity {
+        current.enable_terminal_agent_activity = value;
     }
     if let Some(value) = patch.automatic_git_fetch_interval_ms {
         current.automatic_git_fetch_interval = value;
@@ -470,6 +483,22 @@ fn apply_patch(
         current.provider_session_defaults = defaults;
     }
     current
+}
+
+pub(crate) fn normalize_agent_activity_settings(settings: &mut Value) {
+    let Some(object) = settings.as_object_mut() else {
+        return;
+    };
+    let legacy = object.remove("enableAgentActivity");
+    if !object.contains_key("enableChatAgentActivity") {
+        object.insert(
+            "enableChatAgentActivity".to_owned(),
+            legacy.unwrap_or(Value::Bool(true)),
+        );
+    }
+    object
+        .entry("enableTerminalAgentActivity")
+        .or_insert(Value::Bool(false));
 }
 
 fn apply_provider_patch(

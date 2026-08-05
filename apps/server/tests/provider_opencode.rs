@@ -2299,46 +2299,76 @@ async fn opencode_options_use_exact_model_variants_and_reject_conflicts_before_p
     );
     runtime.start().await.expect("start");
 
-    assert!(runtime
-        .set_options(vec![json!({ "id": "madeUp", "value": true })])
-        .await
-        .is_err());
+    assert!(
+        runtime
+            .set_options(vec![json!({ "id": "madeUp", "value": true })])
+            .await
+            .is_err()
+    );
     assert!(state.prompt_body.lock().await.is_none());
-    assert!(runtime
-        .set_options(vec![json!({ "id": "variant", "value": "medium" })])
-        .await
-        .is_err());
+    assert!(
+        runtime
+            .set_options(vec![json!({ "id": "variant", "value": "medium" })])
+            .await
+            .is_err()
+    );
     assert!(state.prompt_body.lock().await.is_none());
 
     runtime
         .set_options(vec![json!({ "id": "fastMode", "value": false })])
         .await
         .expect("false selects the advertised non-fast default");
-    assert!(runtime
-        .set_options(vec![
-            json!({ "id": "fastMode", "value": true }),
-            json!({ "id": "variant", "value": "high" }),
-        ])
+    assert!(
+        runtime
+            .set_options(vec![
+                json!({ "id": "fastMode", "value": true }),
+                json!({ "id": "variant", "value": "high" }),
+            ])
+            .await
+            .is_err()
+    );
+    runtime
+        .send_turn(Some("hello"), Vec::new(), None)
         .await
-        .is_err());
-    runtime.send_turn(Some("hello"), Vec::new(), None).await.unwrap();
-    assert_eq!(state.prompt_body.lock().await.as_ref().unwrap()["variant"], "high");
+        .unwrap();
+    assert_eq!(
+        state.prompt_body.lock().await.as_ref().unwrap()["variant"],
+        "high"
+    );
 
     runtime.set_model("openai/other").await.unwrap();
     runtime
         .set_options(vec![json!({ "id": "fastMode", "value": true })])
         .await
         .expect("compatible target reapplies Fast");
-    runtime.send_turn(Some("fast again"), Vec::new(), None).await.unwrap();
-    assert_eq!(state.prompt_body.lock().await.as_ref().unwrap()["variant"], "fast");
+    runtime
+        .send_turn(Some("fast again"), Vec::new(), None)
+        .await
+        .unwrap();
+    assert_eq!(
+        state.prompt_body.lock().await.as_ref().unwrap()["variant"],
+        "fast"
+    );
 
     runtime.set_model("openai/fast-only").await.unwrap();
     runtime
         .set_options(vec![json!({ "id": "fastMode", "value": false })])
         .await
         .expect("false does not invent a fast-only variant");
-    runtime.send_turn(Some("again"), Vec::new(), None).await.unwrap();
-    assert!(state.prompt_body.lock().await.as_ref().unwrap().get("variant").is_none());
+    runtime
+        .send_turn(Some("again"), Vec::new(), None)
+        .await
+        .unwrap();
+    assert!(
+        state
+            .prompt_body
+            .lock()
+            .await
+            .as_ref()
+            .unwrap()
+            .get("variant")
+            .is_none()
+    );
 
     server.abort();
 }

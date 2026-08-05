@@ -1,5 +1,6 @@
 import {
   ACTIVITY_PAGE_MAX_LENGTH,
+  type ActivityScopeRef,
   EnvironmentId,
   ProjectId,
   ProviderInstanceId,
@@ -43,6 +44,7 @@ import {
   revokeBlobPreviewUrl,
   revokeUserMessagePreviewUrls,
   resolveCenterPanelLaunchContext,
+  isAgentActivityScopeEnabled,
   resolveActivityScope,
   resolveSendEnvMode,
   shouldWriteThreadErrorToCurrentServerThread,
@@ -56,6 +58,20 @@ const threadId = ThreadId.make("thread-1");
 const now = "2026-03-29T00:00:00.000Z";
 
 describe("activity integration helpers", () => {
+  it.each([
+    [{ _tag: "thread", threadId: "thread-1" }, true, false, true],
+    [{ _tag: "thread", threadId: "thread-1" }, false, true, false],
+    [{ _tag: "terminal", threadId: "thread-1", terminalId: "term-1" }, false, true, true],
+    [{ _tag: "terminal", threadId: "thread-1", terminalId: "term-1" }, true, false, false],
+  ])("selects the matching source setting", (scope, chat, terminal, expected) => {
+    expect(
+      isAgentActivityScopeEnabled(scope as ActivityScopeRef, {
+        enableChatAgentActivity: chat,
+        enableTerminalAgentActivity: terminal,
+      }),
+    ).toBe(expected);
+  });
+
   it("refreshes a failed cursor page instead of reselecting the same cursor", () => {
     expect(
       resolveActivityPageLoadAction({

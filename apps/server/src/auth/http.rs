@@ -13,9 +13,9 @@ use uuid::Uuid;
 use super::{
     model::{
         ACCESS_TOKEN_TYPE, BOOTSTRAP_TOKEN_TYPE, BrowserSessionRequest, BrowserSessionResult,
-        ClientMetadata, CreatePairingRequest, RevokeClientRequest,
-        RevokePairingRequest, SCOPE_ACCESS_READ, SCOPE_ACCESS_WRITE, TOKEN_GRANT_TYPE,
-        TokenExchangeRequest, WebSocketTicketResult,
+        ClientMetadata, CreatePairingRequest, RevokeClientRequest, RevokePairingRequest,
+        SCOPE_ACCESS_READ, SCOPE_ACCESS_WRITE, TOKEN_GRANT_TYPE, TokenExchangeRequest,
+        WebSocketTicketResult,
     },
     service::{AuthError, AuthService, default_standard_scopes, format_iso, now_ms, parse_scopes},
 };
@@ -381,9 +381,7 @@ async fn authenticate_request_for_method(
     let cookie = headers
         .get(header::COOKIE)
         .and_then(|value| value.to_str().ok())
-        .and_then(|cookies| {
-            cookie_value(cookies, auth.cookie_name())
-        });
+        .and_then(|cookies| cookie_value(cookies, auth.cookie_name()));
     let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok());

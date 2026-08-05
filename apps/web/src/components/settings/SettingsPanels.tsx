@@ -75,6 +75,7 @@ import {
 } from "../../lib/terminalFont";
 import { formatRelativeTime, formatRelativeTimeLabel } from "../../timestampFormat";
 import { Button } from "../ui/button";
+import { Badge } from "../ui/badge";
 import { DraftInput } from "../ui/draft-input";
 import { Select, SelectItem, SelectPopup, SelectTrigger, SelectValue } from "../ui/select";
 import { Switch } from "../ui/switch";
@@ -944,15 +945,20 @@ export function AgentsSettingsPanel() {
           }
         />
         <SettingsRow
-          title="Agent activity for this environment"
-          description="Show live agent and background-task activity in chats and AI terminals. Disabling this stops activity monitoring and collection."
+          title="Chat agent activity"
+          titleTag={
+            <Badge variant="warning" size="sm">
+              Experimental
+            </Badge>
+          }
+          description="Show live agent and background-task activity in the Chat panel. Disabling this stops Chat activity monitoring and collection."
           resetAction={
-            settings.enableAgentActivity !== DEFAULT_SERVER_SETTINGS.enableAgentActivity ? (
+            settings.enableChatAgentActivity !== DEFAULT_SERVER_SETTINGS.enableChatAgentActivity ? (
               <SettingResetButton
-                label="agent activity"
+                label="chat agent activity"
                 onClick={() =>
                   updateSettings({
-                    enableAgentActivity: DEFAULT_SERVER_SETTINGS.enableAgentActivity,
+                    enableChatAgentActivity: DEFAULT_SERVER_SETTINGS.enableChatAgentActivity,
                   })
                 }
               />
@@ -960,11 +966,43 @@ export function AgentsSettingsPanel() {
           }
           control={
             <Switch
-              checked={settings.enableAgentActivity}
+              checked={settings.enableChatAgentActivity}
               onCheckedChange={(checked) =>
-                updateSettings({ enableAgentActivity: Boolean(checked) })
+                updateSettings({ enableChatAgentActivity: Boolean(checked) })
               }
-              aria-label="Agent activity for this environment"
+              aria-label="Chat agent activity"
+            />
+          }
+        />
+        <SettingsRow
+          title="AI Terminal agent activity"
+          titleTag={
+            <Badge variant="warning" size="sm">
+              Experimental
+            </Badge>
+          }
+          description="Show live agent and background-task activity in AI Terminals. Disabling this stops AI Terminal activity monitoring and collection."
+          resetAction={
+            settings.enableTerminalAgentActivity !==
+            DEFAULT_SERVER_SETTINGS.enableTerminalAgentActivity ? (
+              <SettingResetButton
+                label="AI Terminal agent activity"
+                onClick={() =>
+                  updateSettings({
+                    enableTerminalAgentActivity:
+                      DEFAULT_SERVER_SETTINGS.enableTerminalAgentActivity,
+                  })
+                }
+              />
+            ) : null
+          }
+          control={
+            <Switch
+              checked={settings.enableTerminalAgentActivity}
+              onCheckedChange={(checked) =>
+                updateSettings({ enableTerminalAgentActivity: Boolean(checked) })
+              }
+              aria-label="AI Terminal agent activity"
             />
           }
         />

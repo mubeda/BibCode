@@ -2392,7 +2392,10 @@ mod tests {
             ] {
                 let request = read_runtime_test_json(&mut reader).await;
                 assert_eq!(request["method"], "model/list");
-                assert_eq!(request["params"], cursor.map_or_else(|| json!({}), |value| json!({ "cursor": value })));
+                assert_eq!(
+                    request["params"],
+                    cursor.map_or_else(|| json!({}), |value| json!({ "cursor": value }))
+                );
                 write_runtime_test_json(
                     &mut writer,
                     json!({ "jsonrpc": "2.0", "id": request["id"], "result": response }),
@@ -2405,10 +2408,12 @@ mod tests {
             .validate_turn_options(Some("fast"), Some("high"))
             .await
             .expect("exact model options are advertised");
-        assert!(runtime
-            .validate_turn_options(Some("slow"), Some("high"))
-            .await
-            .is_err());
+        assert!(
+            runtime
+                .validate_turn_options(Some("slow"), Some("high"))
+                .await
+                .is_err()
+        );
         peer.await.expect("peer");
     }
 

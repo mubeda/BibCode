@@ -18,9 +18,8 @@ use tokio::sync::Mutex as AsyncMutex;
 use std::os::{fd::AsRawFd, unix::ffi::OsStrExt};
 
 use super::{
-    PreparedTerminalLaunch, TerminalLaunchPreparation, TerminalLaunchPreparationInput,
-    TerminalGenerationActivityPublisher, TerminalLaunchPreparer,
-    TerminalObserverCancellationReason,
+    PreparedTerminalLaunch, TerminalGenerationActivityPublisher, TerminalLaunchPreparation,
+    TerminalLaunchPreparationInput, TerminalLaunchPreparer, TerminalObserverCancellationReason,
 };
 use crate::{
     activity::{ActivityProjection, AgentActivityController},
@@ -278,8 +277,10 @@ pub struct ProviderTerminalActivitySupervisor {
     runtime_dir: PathBuf,
     factories: ProviderTerminalObserverFactories,
     warnings: Arc<Mutex<WarningState>>,
-    publication_locks: Arc<Mutex<BTreeMap<(String, String), Weak<AsyncMutex<()>>>>>,
+    publication_locks: PublicationLocks,
 }
+
+type PublicationLocks = Arc<Mutex<BTreeMap<(String, String), Weak<AsyncMutex<()>>>>>;
 
 impl fmt::Debug for ProviderTerminalActivitySupervisor {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -359,10 +360,7 @@ impl ProviderTerminalActivitySupervisor {
         }
     }
 
-    fn publication_lock(
-        &self,
-        input: &TerminalLaunchPreparationInput,
-    ) -> Arc<AsyncMutex<()>> {
+    fn publication_lock(&self, input: &TerminalLaunchPreparationInput) -> Arc<AsyncMutex<()>> {
         let key = (
             input.generation.thread_id().to_owned(),
             input.generation.terminal_id().to_owned(),
@@ -482,10 +480,10 @@ impl ProviderTerminalActivitySupervisor {
                 prepared
             }
         };
-        let current_activity_state = self.activity_controller.snapshot();
-        if !current_activity_state.enabled
-            || current_activity_state.generation != activity_state.generation
-        {
+        let activity_admission = self.activity_controller.admit().filter(|admission| {
+            self.activity_controller.snapshot() == activity_state && admission.is_current()
+        });
+        let Some(activity_admission) = activity_admission else {
             drop(preparation);
             observer_generation
                 .request_cancellation(TerminalObserverCancellationReason::PreparationRejected);
@@ -496,8 +494,8 @@ impl ProviderTerminalActivitySupervisor {
                 )
                 .await;
             return TerminalLaunchPreparation::PassThrough;
-        }
-        TerminalLaunchPreparation::Prepared(preparation)
+        };
+        TerminalLaunchPreparation::Admitted(preparation, activity_admission)
     }
 }
 
@@ -541,9 +539,7 @@ fn create_owned_generation_directory_unix(
         // SAFETY: `runtime` is an anchored private directory, `slot_name_c` is
         // one exact direct managed name, and mode 0700 grants no group/other
         // access. EEXIST is handled without following the existing entry.
-        let created = unsafe {
-            libc::mkdirat(runtime.as_raw_fd(), slot_name_c.as_ptr(), 0o700)
-        };
+        let created = unsafe { libc::mkdirat(runtime.as_raw_fd(), slot_name_c.as_ptr(), 0o700) };
         if created != 0 {
             let error = std::io::Error::last_os_error();
             if error.raw_os_error() == Some(libc::EEXIST) {
@@ -653,16 +649,15 @@ fn claim_empty_generation_slot_with_phase(
         return false;
     }
     phase(ManagedGenerationSlotPhase::ClaimMarkerWritten);
-    let claimed = has_valid_ownership_marker_at(slot_directory)
+
+    has_valid_ownership_marker_at(slot_directory)
         && list_owned_directory_entries(slot_directory).is_ok_and(|entries| {
             !entries.inspection_failed
                 && !entries.has_nested_directories
                 && entries.non_directories.len() == 1
-                && entries.non_directories[0].as_bytes()
-                    == OWNERSHIP_MARKER_NAME.as_bytes()
+                && entries.non_directories[0].as_bytes() == OWNERSHIP_MARKER_NAME.as_bytes()
         })
-        && open_name_still_references_directory(runtime, slot_name, slot_directory);
-    claimed
+        && open_name_still_references_directory(runtime, slot_name, slot_directory)
 }
 
 #[cfg(unix)]
@@ -678,11 +673,7 @@ fn write_ownership_marker_at(generation: &std::fs::File) -> std::io::Result<()> 
         libc::openat(
             generation.as_raw_fd(),
             marker_name.as_ptr(),
-            libc::O_WRONLY
-                | libc::O_CREAT
-                | libc::O_EXCL
-                | libc::O_CLOEXEC
-                | libc::O_NOFOLLOW,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC | libc::O_NOFOLLOW,
             0o600,
         )
     };
@@ -691,12 +682,9 @@ fn write_ownership_marker_at(generation: &std::fs::File) -> std::io::Result<()> 
     }
     // SAFETY: `descriptor` is newly returned by `openat` and uniquely owned.
     let mut marker = unsafe { std::fs::File::from_raw_fd(descriptor) };
-    if let Err(error) = marker
+    marker
         .write_all(OWNERSHIP_MARKER_CONTENT)
-        .and_then(|()| marker.sync_all())
-    {
-        return Err(error);
-    }
+        .and_then(|()| marker.sync_all())?;
     Ok(())
 }
 
@@ -739,9 +727,12 @@ fn open_name_still_references_directory(
     }
     // SAFETY: successful `fstatat` initialized `named_metadata`.
     let named_metadata = unsafe { named_metadata.assume_init() };
+    // `dev_t` is narrower than `u64` on macOS but already `u64` on Linux.
+    #[allow(clippy::unnecessary_cast)]
+    let same_device = open_metadata.dev() == named_metadata.st_dev as u64;
     named_metadata.st_mode & libc::S_IFMT == libc::S_IFDIR
-        && open_metadata.dev() == named_metadata.st_dev as u64
-        && open_metadata.ino() == named_metadata.st_ino as u64
+        && same_device
+        && open_metadata.ino() == named_metadata.st_ino
 }
 
 pub(crate) fn cleanup_owned_generation_directory(
@@ -801,9 +792,7 @@ fn cleanup_owned_generation_directory_unix(
         // generation inode and `entry` is a NUL-terminated direct child name
         // returned by that descriptor. `unlinkat` removes the entry itself and
         // never follows a symlink child.
-        let result = unsafe {
-            libc::unlinkat(generation.as_raw_fd(), entry.as_ptr(), 0)
-        };
+        let result = unsafe { libc::unlinkat(generation.as_raw_fd(), entry.as_ptr(), 0) };
         if result != 0 {
             removal_failed = true;
         }
@@ -815,10 +804,9 @@ fn cleanup_owned_generation_directory_unix(
     // validated inode. The finite managed slot allocator reclaims only slots
     // whose descriptor-relative post-scan proves them completely empty.
     !removal_failed
-        && list_owned_directory_entries(&generation)
-            .is_ok_and(|remaining| {
-                !remaining.inspection_failed && remaining.non_directories.is_empty()
-            })
+        && list_owned_directory_entries(&generation).is_ok_and(|remaining| {
+            !remaining.inspection_failed && remaining.non_directories.is_empty()
+        })
 }
 
 #[cfg(all(test, unix))]
@@ -827,15 +815,11 @@ fn cleanup_owned_generation_directory_after_validation(
     generation_dir: &Path,
     mut after_validation: impl FnMut(),
 ) -> bool {
-    cleanup_owned_generation_directory_unix(
-        runtime_dir,
-        generation_dir,
-        |phase| {
-            if phase == ManagedGenerationSlotPhase::CleanupAfterValidation {
-                after_validation();
-            }
-        },
-    )
+    cleanup_owned_generation_directory_unix(runtime_dir, generation_dir, |phase| {
+        if phase == ManagedGenerationSlotPhase::CleanupAfterValidation {
+            after_validation();
+        }
+    })
 }
 
 #[cfg(all(test, unix))]
@@ -844,15 +828,11 @@ fn cleanup_owned_generation_directory_after_contents_removed(
     generation_dir: &Path,
     mut after_contents_removed: impl FnMut(),
 ) -> bool {
-    cleanup_owned_generation_directory_unix(
-        runtime_dir,
-        generation_dir,
-        |phase| {
-            if phase == ManagedGenerationSlotPhase::CleanupAfterContentsRemoved {
-                after_contents_removed();
-            }
-        },
-    )
+    cleanup_owned_generation_directory_unix(runtime_dir, generation_dir, |phase| {
+        if phase == ManagedGenerationSlotPhase::CleanupAfterContentsRemoved {
+            after_contents_removed();
+        }
+    })
 }
 
 #[cfg(unix)]
@@ -930,11 +910,7 @@ fn has_valid_ownership_marker_at(generation: &std::fs::File) -> bool {
         return false;
     }
     let mut content = Vec::with_capacity(64);
-    marker
-        .take(65)
-        .read_to_end(&mut content)
-        .is_ok()
-        && content == OWNERSHIP_MARKER_CONTENT
+    marker.take(65).read_to_end(&mut content).is_ok() && content == OWNERSHIP_MARKER_CONTENT
 }
 
 #[cfg(unix)]
@@ -947,9 +923,7 @@ struct OwnedDirectoryEntries {
 #[cfg(unix)]
 impl OwnedDirectoryEntries {
     fn is_completely_empty(&self) -> bool {
-        self.non_directories.is_empty()
-            && !self.has_nested_directories
-            && !self.inspection_failed
+        self.non_directories.is_empty() && !self.has_nested_directories && !self.inspection_failed
     }
 }
 
@@ -1190,16 +1164,12 @@ fn resolve_executable(
                 .or_else(|| std::env::var("PATHEXT").ok())
         })
         .flatten();
-    let extensions =
-        launch_executable_extensions(Platform::current(), path_extensions.as_deref());
+    let extensions = launch_executable_extensions(Platform::current(), path_extensions.as_deref());
     let path = locate_executable(executable, Some(cwd), search_path.as_deref(), &extensions)?;
     std::fs::canonicalize(path).ok()
 }
 
-fn environment_value<'a>(
-    environment: &'a BTreeMap<String, String>,
-    key: &str,
-) -> Option<&'a str> {
+fn environment_value<'a>(environment: &'a BTreeMap<String, String>, key: &str) -> Option<&'a str> {
     environment
         .iter()
         .find(|(candidate, _)| candidate.eq_ignore_ascii_case(key))
@@ -1244,14 +1214,10 @@ mod tests {
     use std::os::unix::{ffi::OsStrExt as _, fs::symlink};
 
     use super::{
-        ManagedGenerationSlotPhase,
-        claim_empty_generation_slot_with_phase,
+        ManagedGenerationSlotPhase, claim_empty_generation_slot_with_phase,
         cleanup_owned_generation_directory_after_contents_removed,
-        cleanup_owned_generation_directory_after_validation,
-        create_owned_generation_directory,
-        open_owned_directory,
-        open_owned_directory_at,
-        remove_ownership_marker_at,
+        cleanup_owned_generation_directory_after_validation, create_owned_generation_directory,
+        open_owned_directory, open_owned_directory_at, remove_ownership_marker_at,
         write_ownership_marker_at,
     };
 
@@ -1262,11 +1228,8 @@ mod tests {
         std::fs::create_dir(&runtime_dir).expect("runtime directory");
         let runtime_dir = std::fs::canonicalize(runtime_dir).expect("canonical runtime directory");
         super::restrict_runtime_directory(&runtime_dir).expect("private runtime directory");
-        let generation_dir = create_owned_generation_directory(
-            &runtime_dir,
-            "cffffffffffffffff",
-        )
-        .expect("generation");
+        let generation_dir = create_owned_generation_directory(&runtime_dir, "cffffffffffffffff")
+            .expect("generation");
         let runtime = open_owned_directory(&runtime_dir).expect("runtime descriptor");
         let generation_name = std::ffi::CString::new(
             generation_dir
@@ -1295,16 +1258,12 @@ mod tests {
             )
         });
 
-        cleanup_owned_generation_directory_after_validation(
-            &runtime_dir,
-            &generation_dir,
-            || {
-                start_claim.send(()).expect("release successor claim");
-                cleanup_may_continue
-                    .recv()
-                    .expect("successor reached operation lock");
-            },
-        );
+        cleanup_owned_generation_directory_after_validation(&runtime_dir, &generation_dir, || {
+            start_claim.send(()).expect("release successor claim");
+            cleanup_may_continue
+                .recv()
+                .expect("successor reached operation lock");
+        });
 
         assert!(
             claim_thread.join().expect("successor claim thread"),
@@ -1328,11 +1287,8 @@ mod tests {
         std::fs::create_dir(&runtime_dir).expect("runtime directory");
         let runtime_dir = std::fs::canonicalize(runtime_dir).expect("canonical runtime directory");
         super::restrict_runtime_directory(&runtime_dir).expect("private runtime directory");
-        let generation_dir = create_owned_generation_directory(
-            &runtime_dir,
-            "cffffffffffffffff",
-        )
-        .expect("generation");
+        let generation_dir = create_owned_generation_directory(&runtime_dir, "cffffffffffffffff")
+            .expect("generation");
         assert!(super::cleanup_owned_generation_directory(
             &runtime_dir,
             &generation_dir
@@ -1377,11 +1333,8 @@ mod tests {
         std::fs::create_dir(&runtime_dir).expect("runtime directory");
         let runtime_dir = std::fs::canonicalize(runtime_dir).expect("canonical runtime directory");
         super::restrict_runtime_directory(&runtime_dir).expect("private runtime directory");
-        let generation_dir = create_owned_generation_directory(
-            &runtime_dir,
-            "cffffffffffffffff",
-        )
-        .expect("generation");
+        let generation_dir = create_owned_generation_directory(&runtime_dir, "cffffffffffffffff")
+            .expect("generation");
         std::fs::write(generation_dir.join("owned"), b"owned").expect("owned artifact");
         let displaced = runtime_dir.join("displaced");
         let outside = fixture.path().join("outside");
@@ -1389,15 +1342,11 @@ mod tests {
         let outside_file = outside.join("must-survive");
         std::fs::write(&outside_file, b"outside").expect("outside artifact");
 
-        cleanup_owned_generation_directory_after_validation(
-            &runtime_dir,
-            &generation_dir,
-            || {
-                std::fs::rename(&generation_dir, &displaced)
-                    .expect("replace validated generation path");
-                symlink(&outside, &generation_dir).expect("outside replacement symlink");
-            },
-        );
+        cleanup_owned_generation_directory_after_validation(&runtime_dir, &generation_dir, || {
+            std::fs::rename(&generation_dir, &displaced)
+                .expect("replace validated generation path");
+            symlink(&outside, &generation_dir).expect("outside replacement symlink");
+        });
 
         assert!(
             outside_file.exists(),
@@ -1412,11 +1361,8 @@ mod tests {
         std::fs::create_dir(&runtime_dir).expect("runtime directory");
         let runtime_dir = std::fs::canonicalize(runtime_dir).expect("canonical runtime directory");
         super::restrict_runtime_directory(&runtime_dir).expect("private runtime directory");
-        let generation_dir = create_owned_generation_directory(
-            &runtime_dir,
-            "cffffffffffffffff",
-        )
-        .expect("generation");
+        let generation_dir = create_owned_generation_directory(&runtime_dir, "cffffffffffffffff")
+            .expect("generation");
         std::fs::write(generation_dir.join("owned"), b"owned").expect("owned artifact");
         let displaced = runtime_dir.join("validated-generation");
 
@@ -1493,11 +1439,8 @@ mod tests {
         super::restrict_runtime_directory(&ambiguous).expect("private ambiguous generation");
         std::fs::write(ambiguous.join("preserve"), b"not retired").expect("ambiguous payload");
 
-        let claimed = create_owned_generation_directory(
-            &runtime_dir,
-            "c0000000000000002",
-        )
-        .expect("new generation");
+        let claimed = create_owned_generation_directory(&runtime_dir, "c0000000000000002")
+            .expect("new generation");
 
         assert_ne!(
             claimed, ambiguous,
@@ -1525,20 +1468,16 @@ mod tests {
         }
 
         for index in 0..(super::MANAGED_GENERATION_SLOT_COUNT + 8) {
-            let generation = create_owned_generation_directory(
-                &runtime_dir,
-                &format!("c{index:016x}"),
-            )
-            .expect("bounded sequential generation");
+            let generation =
+                create_owned_generation_directory(&runtime_dir, &format!("c{index:016x}"))
+                    .expect("bounded sequential generation");
             super::cleanup_owned_generation_directory(&runtime_dir, &generation);
         }
 
         let managed_count = std::fs::read_dir(&runtime_dir)
             .expect("runtime entries")
             .flatten()
-            .filter(|entry| {
-                super::is_managed_generation_name(entry.file_name().as_encoded_bytes())
-            })
+            .filter(|entry| super::is_managed_generation_name(entry.file_name().as_encoded_bytes()))
             .count();
         assert!(
             managed_count <= super::MANAGED_GENERATION_SLOT_COUNT,
@@ -1554,19 +1493,15 @@ mod tests {
         std::fs::create_dir(&runtime_dir).expect("runtime directory");
         let runtime_dir = std::fs::canonicalize(runtime_dir).expect("canonical runtime directory");
         super::restrict_runtime_directory(&runtime_dir).expect("private runtime directory");
-        let generation_dir = create_owned_generation_directory(
-            &runtime_dir,
-            "c0000000000000001",
-        )
-        .expect("generation");
+        let generation_dir = create_owned_generation_directory(&runtime_dir, "c0000000000000001")
+            .expect("generation");
         let secret = generation_dir.join("credentials.json");
         std::fs::write(&secret, b"secret").expect("direct secret");
         let nested = generation_dir.join("preserve-nested");
         std::fs::create_dir(&nested).expect("nested directory");
         std::fs::write(nested.join("preserve"), b"nested").expect("nested payload");
 
-        let cleaned =
-            super::cleanup_owned_generation_directory(&runtime_dir, &generation_dir);
+        let cleaned = super::cleanup_owned_generation_directory(&runtime_dir, &generation_dir);
 
         assert!(cleaned, "all direct artifacts were removed");
         assert!(!secret.exists(), "direct secret must be removed");
@@ -1590,11 +1525,8 @@ mod tests {
         std::fs::create_dir(&runtime_dir).expect("runtime directory");
         let runtime_dir = std::fs::canonicalize(runtime_dir).expect("canonical runtime directory");
         super::restrict_runtime_directory(&runtime_dir).expect("private runtime directory");
-        let generation_dir = create_owned_generation_directory(
-            &runtime_dir,
-            "c0000000000000001",
-        )
-        .expect("generation");
+        let generation_dir = create_owned_generation_directory(&runtime_dir, "c0000000000000001")
+            .expect("generation");
         let secret = generation_dir.join("credentials.json");
         std::fs::write(&secret, b"secret").expect("direct secret");
 
@@ -1602,25 +1534,22 @@ mod tests {
             &runtime_dir,
             &generation_dir,
             || {
-                std::fs::set_permissions(
-                    &generation_dir,
-                    std::fs::Permissions::from_mode(0o500),
-                )
-                .expect("make direct unlink fail");
+                std::fs::set_permissions(&generation_dir, std::fs::Permissions::from_mode(0o500))
+                    .expect("make direct unlink fail");
             },
         );
 
-        assert!(!cleaned, "remaining direct artifacts make cleanup incomplete");
+        assert!(
+            !cleaned,
+            "remaining direct artifacts make cleanup incomplete"
+        );
         assert!(secret.exists(), "failed direct unlink remains observable");
         assert!(
             generation_dir.join(super::OWNERSHIP_MARKER_NAME).exists(),
             "failed marker unlink remains observable"
         );
-        std::fs::set_permissions(
-            &generation_dir,
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .expect("restore generation permissions");
+        std::fs::set_permissions(&generation_dir, std::fs::Permissions::from_mode(0o700))
+            .expect("restore generation permissions");
         assert!(
             super::cleanup_owned_generation_directory(&runtime_dir, &generation_dir),
             "retry after permissions recover removes every direct artifact"
@@ -1638,14 +1567,10 @@ mod tests {
             let ambiguous = runtime_dir.join(format!("c{slot:016x}"));
             std::fs::create_dir(&ambiguous).expect("ambiguous slot");
             super::restrict_runtime_directory(&ambiguous).expect("private ambiguous slot");
-            std::fs::write(ambiguous.join("preserve"), b"ambiguous")
-                .expect("ambiguous payload");
+            std::fs::write(ambiguous.join("preserve"), b"ambiguous").expect("ambiguous payload");
         }
 
-        let result = create_owned_generation_directory(
-            &runtime_dir,
-            "cffffffffffffffff",
-        );
+        let result = create_owned_generation_directory(&runtime_dir, "cffffffffffffffff");
 
         assert!(
             result.is_err(),

@@ -42,32 +42,89 @@ async fn worktree_workspace_roundtrips_and_empty_is_the_default() {
 }
 
 #[tokio::test]
-async fn agent_activity_setting_defaults_enabled_and_persists_disabled() {
-    let state_dir = tempfile::tempdir().expect("state dir");
-    let store = ProviderSettingsStore::new(state_dir.path());
+async fn agent_activity_defaults_chat_on_and_terminal_off() {
+    let state = tempfile::tempdir().expect("state");
+    let settings = ProviderSettingsStore::new(state.path())
+        .get()
+        .await
+        .expect("settings");
+    assert!(settings.enable_chat_agent_activity);
+    assert!(!settings.enable_terminal_agent_activity);
+}
 
-    assert!(
-        store
+#[tokio::test]
+async fn legacy_agent_activity_migrates_only_to_chat() {
+    let state = tempfile::tempdir().expect("state");
+    tokio::fs::write(
+        state.path().join("settings.json"),
+        br#"{"enableAgentActivity":false}"#,
+    )
+    .await
+    .expect("legacy settings");
+    let settings = ProviderSettingsStore::new(state.path())
+        .get()
+        .await
+        .expect("settings");
+    assert!(!settings.enable_chat_agent_activity);
+    assert!(!settings.enable_terminal_agent_activity);
+}
+
+#[tokio::test]
+async fn agent_activity_migration_preserves_explicit_split_fields() {
+    for (document, expected_chat, expected_terminal) in [
+        (
+            r#"{"enableAgentActivity":false,"enableChatAgentActivity":true}"#,
+            true,
+            false,
+        ),
+        (
+            r#"{"enableAgentActivity":false,"enableTerminalAgentActivity":true}"#,
+            false,
+            true,
+        ),
+        (
+            r#"{"enableAgentActivity":true,"enableChatAgentActivity":false,"enableTerminalAgentActivity":true}"#,
+            false,
+            true,
+        ),
+    ] {
+        let state = tempfile::tempdir().expect("state");
+        tokio::fs::write(state.path().join("settings.json"), document)
+            .await
+            .expect("settings document");
+
+        let settings = ProviderSettingsStore::new(state.path())
             .get()
             .await
-            .expect("default settings")
-            .enable_agent_activity
-    );
+            .expect("settings");
+
+        assert_eq!(settings.enable_chat_agent_activity, expected_chat);
+        assert_eq!(settings.enable_terminal_agent_activity, expected_terminal);
+    }
+}
+
+#[tokio::test]
+async fn agent_activity_split_settings_roundtrip_independently() {
+    let state = tempfile::tempdir().expect("state");
+    let store = ProviderSettingsStore::new(state.path());
 
     let updated = store
         .update(ServerSettingsPatch {
-            enable_agent_activity: Some(false),
+            enable_chat_agent_activity: Some(false),
+            enable_terminal_agent_activity: Some(true),
             ..ServerSettingsPatch::default()
         })
         .await
-        .expect("disable agent activity");
-    assert!(!updated.enable_agent_activity);
+        .expect("update activity settings");
+    assert!(!updated.enable_chat_agent_activity);
+    assert!(updated.enable_terminal_agent_activity);
 
-    let reloaded = ProviderSettingsStore::new(state_dir.path())
+    let reloaded = ProviderSettingsStore::new(state.path())
         .get()
         .await
         .expect("reloaded settings");
-    assert!(!reloaded.enable_agent_activity);
+    assert!(!reloaded.enable_chat_agent_activity);
+    assert!(reloaded.enable_terminal_agent_activity);
 }
 
 #[tokio::test]

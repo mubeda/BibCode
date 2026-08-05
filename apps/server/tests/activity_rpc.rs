@@ -1,19 +1,17 @@
-use std::{
-    sync::mpsc as std_mpsc,
-    time::Duration,
-};
+use std::{sync::mpsc as std_mpsc, time::Duration};
 
-use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
 use bibcode_server::{
     ACTIVE_RPC_METHODS, MethodMode, RpcRegistry, ServerConfig, ServerMessage, ServerRuntime,
     activity::{
         ActivityActorSummary, ActivityCapabilities, ActivityEntry, ActivityEntryKind,
-        ActivityEntryTone, ActivityLifecycle, ActivityProjection, ActivityRecordKind,
-        ActivityScopeSeed, AgentActivityController, ProviderActivityMutation, register_activity_rpc,
+        ActivityEntryTone, ActivityLifecycle, ActivityProjection, ActivityProjections,
+        ActivityRecordKind, ActivityRepository, ActivityScopeSeed, AgentActivityController,
+        ProviderActivityMutation, register_activity_rpc,
     },
     persistence::{Database, run_migrations},
 };
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::time::timeout;
 use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message};
@@ -23,12 +21,12 @@ async fn activity_unary_rpc_pages_rosters_and_detail_and_bounds_scope_errors() {
     let fixture = Fixture::start(16).await;
     let scope = thread_scope("thread:rpc", "rpc");
     fixture
-        .projection
+        .chat_projection
         .ensure_scope(scope.clone())
         .await
         .expect("scope");
     fixture
-        .projection
+        .chat_projection
         .apply(
             &scope.scope_id,
             "event:seed".to_owned(),
@@ -202,12 +200,12 @@ async fn activity_stream_starts_with_snapshot_and_filters_deltas_to_exact_scope(
     let first = thread_scope("thread:first", "first");
     let second = thread_scope("thread:second", "second");
     fixture
-        .projection
+        .chat_projection
         .ensure_scope(first.clone())
         .await
         .expect("first scope");
     fixture
-        .projection
+        .chat_projection
         .ensure_scope(second.clone())
         .await
         .expect("second scope");
@@ -233,7 +231,7 @@ async fn activity_stream_starts_with_snapshot_and_filters_deltas_to_exact_scope(
     ack(&mut socket, "10").await;
 
     fixture
-        .projection
+        .chat_projection
         .apply(
             &second.scope_id,
             "event:other".to_owned(),
@@ -253,7 +251,7 @@ async fn activity_stream_starts_with_snapshot_and_filters_deltas_to_exact_scope(
     );
 
     fixture
-        .projection
+        .chat_projection
         .apply(
             &first.scope_id,
             "event:first".to_owned(),
@@ -278,7 +276,7 @@ async fn activity_stream_starts_with_snapshot_and_filters_deltas_to_exact_scope(
     ack(&mut socket, "10").await;
     assert!(
         fixture
-            .projection
+            .chat_projection
             .apply(
                 &first.scope_id,
                 "event:first".to_owned(),
@@ -304,7 +302,8 @@ async fn activity_stream_starts_with_snapshot_and_filters_deltas_to_exact_scope(
 }
 
 #[tokio::test]
-async fn feature_disabled_stream_emits_one_error_completes_and_unary_reads_reserve_no_database_job() {
+async fn feature_disabled_stream_emits_one_error_completes_and_unary_reads_reserve_no_database_job()
+{
     // Mutation caught: continuing an admitted stream or reserving a database job after disablement.
     let database = Database::open_in_memory().await.expect("database");
     database
@@ -315,17 +314,16 @@ async fn feature_disabled_stream_emits_one_error_completes_and_unary_reads_reser
         .await
         .expect("migrations");
     let controller = AgentActivityController::new(true);
-    let projection = ActivityProjection::with_controller(
-        bibcode_server::activity::ActivityRepository::new(database.clone()),
+    let projections = ActivityProjections::new(
+        ActivityRepository::new(database.clone()),
         controller.clone(),
+        AgentActivityController::new(true),
     );
+    let projection = projections.chat();
     let scope = thread_scope("thread:feature-disabled", "feature-disabled");
-    projection
-        .ensure_scope(scope)
-        .await
-        .expect("scope");
+    projection.ensure_scope(scope).await.expect("scope");
     let mut registry = RpcRegistry::empty();
-    register_activity_rpc(&mut registry, projection, controller.clone());
+    register_activity_rpc(&mut registry, projections);
     let directory = tempfile::tempdir().expect("server directory");
     let handle = ServerRuntime::start_with_registry(
         ServerConfig::new(directory.path())
@@ -347,10 +345,13 @@ async fn feature_disabled_stream_emits_one_error_completes_and_unary_reads_reser
     )
     .await;
     let initial = next_message(&mut socket).await;
-    assert!(matches!(
-        initial,
-        ServerMessage::Chunk { ref values, .. } if values[0]["kind"] == "snapshot"
-    ), "unexpected initial stream message: {initial:?}");
+    assert!(
+        matches!(
+            initial,
+            ServerMessage::Chunk { ref values, .. } if values[0]["kind"] == "snapshot"
+        ),
+        "unexpected initial stream message: {initial:?}"
+    );
     ack(&mut socket, "101").await;
 
     let observer = database
@@ -419,6 +420,224 @@ async fn feature_disabled_stream_emits_one_error_completes_and_unary_reads_reser
     drop(observer);
 }
 
+#[tokio::test]
+async fn source_specific_chat_disable_leaves_terminal_rpc_and_stream_running() {
+    // Mutation caught: selecting the Chat controller/projection for terminal requests.
+    let fixture = SourceSpecificFixture::start().await;
+    let mut chat_socket = fixture.connect().await;
+    let mut terminal_socket = fixture.connect().await;
+
+    request(
+        &mut chat_socket,
+        "201",
+        "subscribeActivity",
+        json!({ "_tag": "thread", "threadId": "rpc" }),
+    )
+    .await;
+    let chat_initial = next_message(&mut chat_socket).await;
+    assert!(
+        matches!(
+            chat_initial,
+            ServerMessage::Chunk { ref values, .. } if values[0]["kind"] == "snapshot"
+        ),
+        "unexpected Chat initial message: {chat_initial:?}"
+    );
+    ack(&mut chat_socket, "201").await;
+    request(
+        &mut terminal_socket,
+        "301",
+        "subscribeActivity",
+        json!({ "_tag": "terminal", "threadId": "rpc", "terminalId": "terminal-rpc" }),
+    )
+    .await;
+    let terminal_initial = next_message(&mut terminal_socket).await;
+    assert!(
+        matches!(
+            terminal_initial,
+            ServerMessage::Chunk { ref values, .. } if values[0]["kind"] == "snapshot"
+        ),
+        "unexpected terminal initial message: {terminal_initial:?}"
+    );
+    ack(&mut terminal_socket, "301").await;
+
+    fixture.chat_controller.disable().await;
+    assert!(matches!(
+        next_message(&mut chat_socket).await,
+        ServerMessage::Exit {
+            exit: bibcode_server::RpcExit::Failure { .. },
+            ..
+        }
+    ));
+    assert!(
+        tokio::time::timeout(
+            Duration::from_millis(50),
+            next_message(&mut terminal_socket),
+        )
+        .await
+        .is_err()
+    );
+    assert!(
+        unary(
+            &mut terminal_socket,
+            "302",
+            "activity.getSnapshot",
+            json!({ "_tag": "terminal", "threadId": "rpc", "terminalId": "terminal-rpc" }),
+        )
+        .await
+        .is_ok()
+    );
+    assert_eq!(
+        unary(
+            &mut chat_socket,
+            "202",
+            "activity.getSnapshot",
+            json!({ "_tag": "thread", "threadId": "rpc" }),
+        )
+        .await
+        .expect_err("Chat disabled")["reason"],
+        "featureDisabled",
+    );
+
+    fixture
+        .projections
+        .terminal()
+        .apply(
+            "terminal:rpc",
+            "event:terminal".to_owned(),
+            vec![
+                ProviderActivityMutation::upsert_actor(
+                    "actor:terminal",
+                    None,
+                    "Terminal actor",
+                    "running",
+                )
+                .expect("terminal actor"),
+            ],
+            "2026-08-04T12:00:00Z".to_owned(),
+        )
+        .await
+        .expect("terminal delta");
+    let delta = next_message(&mut terminal_socket).await;
+    assert!(matches!(
+        delta,
+        ServerMessage::Chunk { ref values, .. }
+            if values[0]["kind"] == "delta"
+                && values[0]["delta"]["scopeId"] == "terminal:rpc"
+    ));
+
+    chat_socket.close(None).await.expect("close chat socket");
+    terminal_socket
+        .close(None)
+        .await
+        .expect("close terminal socket");
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn source_specific_terminal_disable_leaves_chat_rpc_and_stream_running() {
+    // Mutation caught: selecting the Terminal controller/projection for thread requests.
+    let fixture = SourceSpecificFixture::start().await;
+    let mut chat_socket = fixture.connect().await;
+    let mut terminal_socket = fixture.connect().await;
+
+    request(
+        &mut chat_socket,
+        "401",
+        "subscribeActivity",
+        json!({ "_tag": "thread", "threadId": "rpc" }),
+    )
+    .await;
+    let chat_initial = next_message(&mut chat_socket).await;
+    assert!(
+        matches!(
+            chat_initial,
+            ServerMessage::Chunk { ref values, .. } if values[0]["kind"] == "snapshot"
+        ),
+        "unexpected Chat initial message: {chat_initial:?}"
+    );
+    ack(&mut chat_socket, "401").await;
+    request(
+        &mut terminal_socket,
+        "501",
+        "subscribeActivity",
+        json!({ "_tag": "terminal", "threadId": "rpc", "terminalId": "terminal-rpc" }),
+    )
+    .await;
+    let terminal_initial = next_message(&mut terminal_socket).await;
+    assert!(
+        matches!(
+            terminal_initial,
+            ServerMessage::Chunk { ref values, .. } if values[0]["kind"] == "snapshot"
+        ),
+        "unexpected terminal initial message: {terminal_initial:?}"
+    );
+    ack(&mut terminal_socket, "501").await;
+
+    fixture.terminal_controller.disable().await;
+    assert!(matches!(
+        next_message(&mut terminal_socket).await,
+        ServerMessage::Exit {
+            exit: bibcode_server::RpcExit::Failure { .. },
+            ..
+        }
+    ));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), next_message(&mut chat_socket))
+            .await
+            .is_err()
+    );
+    assert!(
+        unary(
+            &mut chat_socket,
+            "402",
+            "activity.getSnapshot",
+            json!({ "_tag": "thread", "threadId": "rpc" }),
+        )
+        .await
+        .is_ok()
+    );
+    assert_eq!(
+        unary(
+            &mut terminal_socket,
+            "502",
+            "activity.getSnapshot",
+            json!({ "_tag": "terminal", "threadId": "rpc", "terminalId": "terminal-rpc" }),
+        )
+        .await
+        .expect_err("Terminal disabled")["reason"],
+        "featureDisabled",
+    );
+
+    fixture
+        .projections
+        .chat()
+        .apply(
+            "thread:rpc",
+            "event:chat".to_owned(),
+            vec![
+                ProviderActivityMutation::upsert_actor("actor:chat", None, "Chat actor", "running")
+                    .expect("chat actor"),
+            ],
+            "2026-08-04T12:00:00Z".to_owned(),
+        )
+        .await
+        .expect("chat delta");
+    let delta = next_message(&mut chat_socket).await;
+    assert!(matches!(
+        delta,
+        ServerMessage::Chunk { ref values, .. }
+            if values[0]["kind"] == "delta"
+                && values[0]["delta"]["scopeId"] == "thread:rpc"
+    ));
+
+    chat_socket.close(None).await.expect("close chat socket");
+    terminal_socket
+        .close(None)
+        .await
+        .expect("close terminal socket");
+    fixture.shutdown().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn unary_activity_reads_are_drained_and_fenced_when_disable_wins() {
     // Mutations caught:
@@ -471,10 +690,12 @@ async fn assert_unary_activity_read_is_drained_and_fenced(
         .await
         .expect("migrations");
     let controller = AgentActivityController::new(true);
-    let projection = ActivityProjection::with_controller(
-        bibcode_server::activity::ActivityRepository::new(database.clone()),
+    let projections = ActivityProjections::new(
+        ActivityRepository::new(database.clone()),
         controller.clone(),
+        AgentActivityController::new(true),
     );
+    let projection = projections.chat();
     let scope = thread_scope("thread:unary-disable-race", "unary-disable-race");
     projection.ensure_scope(scope.clone()).await.expect("scope");
     projection
@@ -496,7 +717,7 @@ async fn assert_unary_activity_read_is_drained_and_fenced(
         .expect("seed activity");
 
     let mut registry = RpcRegistry::empty();
-    register_activity_rpc(&mut registry, projection, controller.clone());
+    register_activity_rpc(&mut registry, projections);
     let directory = tempfile::tempdir().expect("server directory");
     let handle = ServerRuntime::start_with_registry(
         ServerConfig::new(directory.path())
@@ -638,12 +859,12 @@ async fn hardening_generation_scope_stream_replaces_snapshot_when_terminal_gener
     )
     .expect("first terminal scope");
     fixture
-        .projection
+        .terminal_projection
         .ensure_scope(first.clone())
         .await
         .expect("first scope");
     fixture
-        .projection
+        .terminal_projection
         .apply(
             &first.scope_id,
             "generation-1:event".to_owned(),
@@ -696,7 +917,7 @@ async fn hardening_generation_scope_stream_replaces_snapshot_when_terminal_gener
     )
     .expect("second terminal scope");
     fixture
-        .projection
+        .terminal_projection
         .ensure_scope(second)
         .await
         .expect("replacement scope");
@@ -722,7 +943,7 @@ async fn lag_replaces_the_stream_from_a_fresh_snapshot_and_interrupt_cancels_it(
     let fixture = Fixture::start(2).await;
     let scope = thread_scope("thread:lag", "lag");
     fixture
-        .projection
+        .chat_projection
         .ensure_scope(scope.clone())
         .await
         .expect("scope");
@@ -742,7 +963,7 @@ async fn lag_replaces_the_stream_from_a_fresh_snapshot_and_interrupt_cancels_it(
 
     for index in 0..12 {
         fixture
-            .projection
+            .chat_projection
             .apply(
                 &scope.scope_id,
                 format!("event:{index:02}"),
@@ -808,7 +1029,7 @@ async fn lag_replaces_the_stream_from_a_fresh_snapshot_and_interrupt_cancels_it(
 async fn terminal_scope_cannot_be_requested_through_a_different_thread() {
     let fixture = Fixture::start(16).await;
     fixture
-        .projection
+        .terminal_projection
         .ensure_scope(
             ActivityScopeSeed::terminal(
                 "terminal:generation",
@@ -895,12 +1116,12 @@ async fn activity_paging_binds_a_current_scope_id_to_its_terminal_root() {
     )
     .expect("current terminal scope");
     fixture
-        .projection
+        .terminal_projection
         .ensure_scope(stale.clone())
         .await
         .expect("stale scope");
     fixture
-        .projection
+        .terminal_projection
         .ensure_scope(current.clone())
         .await
         .expect("current scope");
@@ -992,17 +1213,17 @@ async fn foreign_activity_detail_is_indistinguishable_from_a_missing_record() {
     let foreign_scope = thread_scope("thread:foreign-detail", "foreign-detail");
     let requested_scope = thread_scope("thread:requested-detail", "requested-detail");
     fixture
-        .projection
+        .chat_projection
         .ensure_scope(foreign_scope.clone())
         .await
         .expect("foreign scope");
     fixture
-        .projection
+        .chat_projection
         .ensure_scope(requested_scope.clone())
         .await
         .expect("requested scope");
     fixture
-        .projection
+        .chat_projection
         .apply(
             &foreign_scope.scope_id,
             "event:foreign-record".to_owned(),
@@ -1113,7 +1334,16 @@ async fn activity_authorization_rejects_unauthenticated_websocket_before_unary_o
 
 struct Fixture {
     _directory: TempDir,
-    projection: ActivityProjection,
+    chat_projection: ActivityProjection,
+    terminal_projection: ActivityProjection,
+    handle: bibcode_server::ServerHandle,
+}
+
+struct SourceSpecificFixture {
+    _directory: TempDir,
+    projections: ActivityProjections,
+    chat_controller: AgentActivityController,
+    terminal_controller: AgentActivityController,
     handle: bibcode_server::ServerHandle,
 }
 
@@ -1132,14 +1362,14 @@ impl AuthRequiredFixture {
             })
             .await
             .expect("migrations");
-        let controller = AgentActivityController::new(true);
-        let projection = ActivityProjection::with_controller_and_capacity(
-            bibcode_server::activity::ActivityRepository::new(database),
-            controller.clone(),
+        let projections = ActivityProjections::with_capacity(
+            ActivityRepository::new(database),
+            AgentActivityController::new(true),
+            AgentActivityController::new(true),
             capacity,
         );
         let mut registry = RpcRegistry::empty();
-        register_activity_rpc(&mut registry, projection, controller);
+        register_activity_rpc(&mut registry, projections);
         let directory = tempfile::tempdir().expect("temporary server directory");
         let handle = ServerRuntime::start_with_registry(
             ServerConfig::new(directory.path()).with_bind("127.0.0.1", 0),
@@ -1169,14 +1399,16 @@ impl Fixture {
             })
             .await
             .expect("migrations");
-        let controller = AgentActivityController::new(true);
-        let projection = ActivityProjection::with_controller_and_capacity(
-            bibcode_server::activity::ActivityRepository::new(database),
-            controller.clone(),
+        let projections = ActivityProjections::with_capacity(
+            ActivityRepository::new(database),
+            AgentActivityController::new(true),
+            AgentActivityController::new(true),
             capacity,
         );
+        let chat_projection = projections.chat();
+        let terminal_projection = projections.terminal();
         let mut registry = RpcRegistry::empty();
-        register_activity_rpc(&mut registry, projection.clone(), controller);
+        register_activity_rpc(&mut registry, projections);
         let directory = tempfile::tempdir().expect("temporary server directory");
         let handle = ServerRuntime::start_with_registry(
             ServerConfig::new(directory.path())
@@ -1188,7 +1420,81 @@ impl Fixture {
         .expect("server");
         Self {
             _directory: directory,
-            projection,
+            chat_projection,
+            terminal_projection,
+            handle,
+        }
+    }
+
+    async fn connect(
+        &self,
+    ) -> WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>> {
+        connect_async(format!("ws://{}/ws", self.handle.local_addr()))
+            .await
+            .expect("WebSocket")
+            .0
+    }
+
+    async fn shutdown(self) {
+        self.handle.shutdown();
+        self.handle.join().await.expect("server joins");
+    }
+}
+
+impl SourceSpecificFixture {
+    async fn start() -> Self {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let chat_controller = AgentActivityController::new(true);
+        let terminal_controller = AgentActivityController::new(true);
+        let projections = ActivityProjections::new(
+            ActivityRepository::new(database),
+            chat_controller.clone(),
+            terminal_controller.clone(),
+        );
+        projections
+            .chat()
+            .ensure_scope(thread_scope("thread:rpc", "rpc"))
+            .await
+            .expect("chat scope");
+        projections
+            .terminal()
+            .ensure_scope(
+                ActivityScopeSeed::terminal(
+                    "terminal:rpc",
+                    "terminal-generation:rpc",
+                    "rpc",
+                    "terminal-rpc",
+                    "codex",
+                    Some("codex"),
+                    ActivityCapabilities::structured_full(true),
+                )
+                .expect("terminal scope"),
+            )
+            .await
+            .expect("terminal scope persistence");
+        let mut registry = RpcRegistry::empty();
+        register_activity_rpc(&mut registry, projections.clone());
+        let directory = tempfile::tempdir().expect("temporary server directory");
+        let handle = ServerRuntime::start_with_registry(
+            ServerConfig::new(directory.path())
+                .with_bind("127.0.0.1", 0)
+                .with_unsafe_no_auth(),
+            registry,
+        )
+        .await
+        .expect("server");
+        Self {
+            _directory: directory,
+            projections,
+            chat_controller,
+            terminal_controller,
             handle,
         }
     }

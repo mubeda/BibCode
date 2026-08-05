@@ -1,5 +1,5 @@
-use serde_json::json;
 use bibcode_server::diagnostics::TraceDiagnosticsStore;
+use serde_json::json;
 
 #[test]
 fn actionable_failures_are_redacted_and_survive_restart() {

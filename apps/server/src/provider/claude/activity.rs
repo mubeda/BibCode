@@ -168,9 +168,7 @@ impl ClaudeActivityTracker {
 
     pub(crate) fn is_correlated_actor(&self, session_id: &str, agent_id: &str) -> bool {
         session_key(session_id) == self.root_session_key
-            && self
-                .actors
-                .contains_key(&retained_key("agent", agent_id))
+            && self.actors.contains_key(&retained_key("agent", agent_id))
     }
 
     pub(crate) fn handle_value(
@@ -359,10 +357,14 @@ impl ClaudeActivityTracker {
                     };
                     self.recovery_seen_events.insert(&semantic_key);
                     let tool_key = retained_key("tool", tool_use_id);
-                    if self.tool_owner_by_use_id.get(&tool_key).is_some_and(|lifecycle| {
-                        lifecycle.owner_key == owner_key
-                            && lifecycle.tool_name_key == retained_key("tool-name", tool_name)
-                    }) {
+                    if self
+                        .tool_owner_by_use_id
+                        .get(&tool_key)
+                        .is_some_and(|lifecycle| {
+                            lifecycle.owner_key == owner_key
+                                && lifecycle.tool_name_key == retained_key("tool-name", tool_name)
+                        })
+                    {
                         self.tool_owner_by_use_id.remove(&tool_key);
                     }
                     output.push(ProviderActivityMutation::AppendEntry(entry));

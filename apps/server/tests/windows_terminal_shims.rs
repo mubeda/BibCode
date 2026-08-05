@@ -8,8 +8,8 @@ use std::{
 };
 
 use base64::Engine as _;
-use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use bibcode_server::terminal::{PortablePtyBackend, PtyBackend, PtySpawnInput};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use windows_sys::Win32::{
     Foundation::{
         CloseHandle, ERROR_INVALID_PARAMETER, GetLastError, HANDLE, INVALID_HANDLE_VALUE,

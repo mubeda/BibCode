@@ -1562,13 +1562,14 @@ fn migration_039(transaction: &Transaction<'_>) -> Result<()> {
         while let Some(row) = rows.next()? {
             let command_id: String = row.get(0)?;
             let payload_json: String = row.get(1)?;
-            let payload: serde_json::Value = serde_json::from_str(&payload_json).map_err(|error| {
-                rusqlite::Error::FromSqlConversionFailure(
-                    1,
-                    rusqlite::types::Type::Text,
-                    Box::new(error),
-                )
-            })?;
+            let payload: serde_json::Value =
+                serde_json::from_str(&payload_json).map_err(|error| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Text,
+                        Box::new(error),
+                    )
+                })?;
             let Some(attachments) = payload.get("attachments") else {
                 continue;
             };
@@ -1581,16 +1582,24 @@ fn migration_039(transaction: &Transaction<'_>) -> Result<()> {
                 )
             })?;
             for attachment in attachments {
-                let attachment_id = attachment.get("id").and_then(serde_json::Value::as_str).ok_or_else(|| {
-                    rusqlite::Error::InvalidParameterName(
-                        "legacy attachment is missing string id".to_owned(),
-                    )
-                })?;
-                let size_bytes = attachment.get("sizeBytes").and_then(serde_json::Value::as_i64).filter(|size| *size >= 0).ok_or_else(|| {
-                    rusqlite::Error::InvalidParameterName(
-                        "legacy attachment is missing non-negative integer sizeBytes".to_owned(),
-                    )
-                })?;
+                let attachment_id = attachment
+                    .get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .ok_or_else(|| {
+                        rusqlite::Error::InvalidParameterName(
+                            "legacy attachment is missing string id".to_owned(),
+                        )
+                    })?;
+                let size_bytes = attachment
+                    .get("sizeBytes")
+                    .and_then(serde_json::Value::as_i64)
+                    .filter(|size| *size >= 0)
+                    .ok_or_else(|| {
+                        rusqlite::Error::InvalidParameterName(
+                            "legacy attachment is missing non-negative integer sizeBytes"
+                                .to_owned(),
+                        )
+                    })?;
                 refs.push((command_id.clone(), attachment_id.to_owned(), size_bytes));
             }
         }
@@ -1611,40 +1620,173 @@ fn migration_039(transaction: &Transaction<'_>) -> Result<()> {
 mod tests {
     use super::{MIGRATIONS, Migration, migration_001, run_migrations};
 
+    type DeliveryColumn = (String, String, i64, Option<String>, i64);
+
     fn assert_delivery_schema(connection: &rusqlite::Connection) -> rusqlite::Result<()> {
-        let columns = |table: &str| -> rusqlite::Result<Vec<(String, String, i64, Option<String>, i64)>> {
-            connection.prepare(&format!("PRAGMA table_info({table})"))?.query_map([], |row| Ok((row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))?.collect()
+        let columns = |table: &str| -> rusqlite::Result<Vec<DeliveryColumn>> {
+            connection
+                .prepare(&format!("PRAGMA table_info({table})"))?
+                .query_map([], |row| {
+                    Ok((
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })?
+                .collect()
         };
-        assert_eq!(columns("orchestration_command_receipts")?.into_iter().find(|column| column.0 == "payload_digest"), Some(("payload_digest".to_owned(), "TEXT".to_owned(), 0, None, 0)));
+        assert_eq!(
+            columns("orchestration_command_receipts")?
+                .into_iter()
+                .find(|column| column.0 == "payload_digest"),
+            Some(("payload_digest".to_owned(), "TEXT".to_owned(), 0, None, 0))
+        );
         for name in ["delivery_state", "delivery_provider", "delivery_detail"] {
-            assert_eq!(columns("projection_thread_messages")?.into_iter().find(|column| column.0 == name), Some((name.to_owned(), "TEXT".to_owned(), 0, None, 0)));
+            assert_eq!(
+                columns("projection_thread_messages")?
+                    .into_iter()
+                    .find(|column| column.0 == name),
+                Some((name.to_owned(), "TEXT".to_owned(), 0, None, 0))
+            );
         }
         assert_eq!(
             columns("provider_turn_outbox")?,
             vec![
-                ("command_id".to_owned(), "TEXT".to_owned(), 0, None, 1), ("thread_id".to_owned(), "TEXT".to_owned(), 1, None, 0), ("message_id".to_owned(), "TEXT".to_owned(), 1, None, 0), ("provider_instance_id".to_owned(), "TEXT".to_owned(), 1, None, 0), ("provider_kind".to_owned(), "TEXT".to_owned(), 1, None, 0), ("provider_session_id".to_owned(), "TEXT".to_owned(), 0, None, 0), ("delivery_key".to_owned(), "TEXT".to_owned(), 1, None, 0), ("payload_json".to_owned(), "TEXT".to_owned(), 1, None, 0), ("state".to_owned(), "TEXT".to_owned(), 1, None, 0), ("attempts".to_owned(), "INTEGER".to_owned(), 1, Some("0".to_owned()), 0), ("last_error".to_owned(), "TEXT".to_owned(), 0, None, 0), ("created_at".to_owned(), "TEXT".to_owned(), 1, None, 0), ("updated_at".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                ("command_id".to_owned(), "TEXT".to_owned(), 0, None, 1),
+                ("thread_id".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                ("message_id".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                (
+                    "provider_instance_id".to_owned(),
+                    "TEXT".to_owned(),
+                    1,
+                    None,
+                    0
+                ),
+                ("provider_kind".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                (
+                    "provider_session_id".to_owned(),
+                    "TEXT".to_owned(),
+                    0,
+                    None,
+                    0
+                ),
+                ("delivery_key".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                ("payload_json".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                ("state".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                (
+                    "attempts".to_owned(),
+                    "INTEGER".to_owned(),
+                    1,
+                    Some("0".to_owned()),
+                    0
+                ),
+                ("last_error".to_owned(), "TEXT".to_owned(), 0, None, 0),
+                ("created_at".to_owned(), "TEXT".to_owned(), 1, None, 0),
+                ("updated_at".to_owned(), "TEXT".to_owned(), 1, None, 0),
             ]
         );
-        assert_eq!(columns("orchestration_attachment_refs")?, vec![("command_id".to_owned(), "TEXT".to_owned(), 1, None, 1), ("attachment_id".to_owned(), "TEXT".to_owned(), 1, None, 2), ("content_digest".to_owned(), "TEXT".to_owned(), 0, None, 0), ("size_bytes".to_owned(), "INTEGER".to_owned(), 1, None, 0)]);
+        assert_eq!(
+            columns("orchestration_attachment_refs")?,
+            vec![
+                ("command_id".to_owned(), "TEXT".to_owned(), 1, None, 1),
+                ("attachment_id".to_owned(), "TEXT".to_owned(), 1, None, 2),
+                ("content_digest".to_owned(), "TEXT".to_owned(), 0, None, 0),
+                ("size_bytes".to_owned(), "INTEGER".to_owned(), 1, None, 0)
+            ]
+        );
         for (table, expected_columns) in [
-            ("provider_turn_outbox", vec!["command_id", "thread_id", "message_id", "provider_instance_id", "provider_kind", "provider_session_id", "delivery_key", "payload_json", "state", "attempts", "last_error", "created_at", "updated_at"]),
-            ("orchestration_attachment_refs", vec!["command_id", "attachment_id", "content_digest", "size_bytes"]),
+            (
+                "provider_turn_outbox",
+                vec![
+                    "command_id",
+                    "thread_id",
+                    "message_id",
+                    "provider_instance_id",
+                    "provider_kind",
+                    "provider_session_id",
+                    "delivery_key",
+                    "payload_json",
+                    "state",
+                    "attempts",
+                    "last_error",
+                    "created_at",
+                    "updated_at",
+                ],
+            ),
+            (
+                "orchestration_attachment_refs",
+                vec![
+                    "command_id",
+                    "attachment_id",
+                    "content_digest",
+                    "size_bytes",
+                ],
+            ),
         ] {
-            let columns = connection.prepare(&format!("PRAGMA table_info({table})"))?.query_map([], |row| row.get::<_, String>(1))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let columns = connection
+                .prepare(&format!("PRAGMA table_info({table})"))?
+                .query_map([], |row| row.get::<_, String>(1))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             assert_eq!(columns, expected_columns);
         }
         for table in ["provider_turn_outbox", "orchestration_attachment_refs"] {
-            let foreign_keys = connection.prepare(&format!("PRAGMA foreign_key_list({table})"))?.query_map([], |row| Ok((row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, String>(4)?, row.get::<_, String>(6)?)))?.collect::<rusqlite::Result<Vec<_>>>()?;
-            assert_eq!(foreign_keys, vec![("orchestration_command_receipts".to_owned(), "command_id".to_owned(), "command_id".to_owned(), "CASCADE".to_owned())]);
+            let foreign_keys = connection
+                .prepare(&format!("PRAGMA foreign_key_list({table})"))?
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(6)?,
+                    ))
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            assert_eq!(
+                foreign_keys,
+                vec![(
+                    "orchestration_command_receipts".to_owned(),
+                    "command_id".to_owned(),
+                    "command_id".to_owned(),
+                    "CASCADE".to_owned()
+                )]
+            );
         }
         for (index, columns, unique) in [
-            ("idx_provider_turn_outbox_thread_state", vec!["thread_id", "state", "created_at", "command_id"], 0_i64),
-            ("idx_provider_turn_outbox_message", vec!["message_id"], 1_i64),
-            ("idx_orchestration_attachment_refs_attachment", vec!["attachment_id"], 0_i64),
+            (
+                "idx_provider_turn_outbox_thread_state",
+                vec!["thread_id", "state", "created_at", "command_id"],
+                0_i64,
+            ),
+            (
+                "idx_provider_turn_outbox_message",
+                vec!["message_id"],
+                1_i64,
+            ),
+            (
+                "idx_orchestration_attachment_refs_attachment",
+                vec!["attachment_id"],
+                0_i64,
+            ),
         ] {
-            let index_meta = connection.query_row(&format!("SELECT name, [unique] FROM pragma_index_list('{}') WHERE name = ?", if index.starts_with("idx_orchestration") { "orchestration_attachment_refs" } else { "provider_turn_outbox" }), [index], |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)))?;
+            let index_meta = connection.query_row(
+                &format!(
+                    "SELECT name, [unique] FROM pragma_index_list('{}') WHERE name = ?",
+                    if index.starts_with("idx_orchestration") {
+                        "orchestration_attachment_refs"
+                    } else {
+                        "provider_turn_outbox"
+                    }
+                ),
+                [index],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?)),
+            )?;
             assert_eq!(index_meta, (index.to_owned(), unique));
-            let actual = connection.prepare(&format!("PRAGMA index_info({index})"))?.query_map([], |row| row.get::<_, String>(2))?.collect::<rusqlite::Result<Vec<_>>>()?;
+            let actual = connection
+                .prepare(&format!("PRAGMA index_info({index})"))?
+                .query_map([], |row| row.get::<_, String>(2))?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
             assert_eq!(actual, columns);
         }
         connection.execute(
@@ -1783,8 +1925,8 @@ mod tests {
     }
 
     #[test]
-    fn migration_39_adds_delivery_storage_and_backfills_attachment_references(
-    ) -> rusqlite::Result<()> {
+    fn migration_39_adds_delivery_storage_and_backfills_attachment_references()
+    -> rusqlite::Result<()> {
         let mut connection = rusqlite::Connection::open_in_memory()?;
         run_migrations(&mut connection, Some(38))?;
         connection.execute(
@@ -1830,7 +1972,10 @@ mod tests {
             assert!(table_exists(table)?);
         }
         assert_delivery_schema(&connection)?;
-        assert!(column_exists("orchestration_command_receipts", "payload_digest")?);
+        assert!(column_exists(
+            "orchestration_command_receipts",
+            "payload_digest"
+        )?);
         for column in ["delivery_state", "delivery_provider", "delivery_detail"] {
             assert!(column_exists("projection_thread_messages", column)?);
         }
@@ -1843,7 +1988,10 @@ mod tests {
             [],
             |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, i64>(3)?)),
         )?;
-        assert_eq!(reference, ("command-1".to_owned(), "attachment-1".to_owned(), None, 3));
+        assert_eq!(
+            reference,
+            ("command-1".to_owned(), "attachment-1".to_owned(), None, 3)
+        );
 
         Ok(())
     }

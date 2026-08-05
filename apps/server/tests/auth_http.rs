@@ -1,12 +1,12 @@
 use std::{path::PathBuf, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+use bibcode_server::{ROUTE_INVENTORY, RpcRegistry, ServerConfig, ServerHandle, ServerRuntime};
 use futures_util::{SinkExt, StreamExt};
 use p256::ecdsa::{Signature, SigningKey, signature::hazmat::PrehashSigner};
 use reqwest::{Client, Response, StatusCode, header};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
-use bibcode_server::{ROUTE_INVENTORY, RpcRegistry, ServerConfig, ServerHandle, ServerRuntime};
 use tempfile::TempDir;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite};

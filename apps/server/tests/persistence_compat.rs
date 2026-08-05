@@ -4,9 +4,9 @@ use std::{
     path::{Path, PathBuf},
 };
 
+use bibcode_server::persistence::run_migrations;
 use rusqlite::{Connection, OpenFlags, Params, types::ValueRef};
 use serde::Deserialize;
-use bibcode_server::persistence::run_migrations;
 use tempfile::TempDir;
 
 const FIXED_LEDGER_TIMESTAMP: &str = "2026-01-01 00:00:00";
