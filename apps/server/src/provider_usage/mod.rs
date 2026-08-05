@@ -486,7 +486,10 @@ pub fn production_fetchers() -> Vec<ProviderUsageFetcher> {
 }
 
 fn claude_fetcher() -> ProviderUsageFetcher {
+    #[cfg(any(target_os = "macos", test))]
     let credential_cache = ClaudeCredentialCache::default();
+    #[cfg(all(not(target_os = "macos"), not(test)))]
+    let credential_cache = ClaudeCredentialCache;
     ProviderUsageFetcher {
         provider: ProviderUsageProvider::Claude,
         fetch: Arc::new(move || Box::pin(fetch_claude_usage(credential_cache.clone()))),
