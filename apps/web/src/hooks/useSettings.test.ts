@@ -132,7 +132,9 @@ import {
 
 const environmentId = EnvironmentId.make("environment-1");
 
-const installRejectedSettingsCommand = Effect.fn("installRejectedSettingsCommand")(function* () {
+const installRejectedSettingsCommand = Effect.fn("installRejectedSettingsCommand")(function* (
+  initialSettings = DEFAULT_SERVER_SETTINGS,
+) {
   const calls: Array<unknown> = [];
   const session = yield* SubscriptionRef.make(
     Option.some({
@@ -166,7 +168,7 @@ const installRejectedSettingsCommand = Effect.fn("installRejectedSettingsCommand
     keybindingsConfigPath: null,
     observability: null,
     providers: [],
-    settings: DEFAULT_SERVER_SETTINGS,
+    settings: initialSettings,
   } as unknown as ServerConfig;
   const serverAtoms = createServerEnvironmentAtoms(
     Atom.runtime(Layer.succeed(EnvironmentRegistry, environmentRegistry)),
@@ -411,27 +413,32 @@ describe("useUpdateEnvironmentSettings routing", () => {
 
 describe("useUpdatePrimarySettings", () => {
   effectIt.effect(
-    "keeps authoritative server settings visible when an update command is rejected",
+    "rolls back a rejected terminal activity update without changing chat activity",
     () =>
       Effect.gen(function* () {
         h.primaryEnv = { environmentId };
-        const { atomRegistry, calls, selectedEnvironments } =
-          yield* installRejectedSettingsCommand();
+        const { atomRegistry, calls, selectedEnvironments } = yield* installRejectedSettingsCommand(
+          {
+            ...DEFAULT_SERVER_SETTINGS,
+            enableChatAgentActivity: false,
+          },
+        );
 
         return yield* Effect.gen(function* () {
           const result = yield* Effect.promise<AsyncResult.AsyncResult<unknown, unknown>>(
             () =>
               useUpdatePrimarySettings()({
-                enableAgentActivity: false,
+                enableTerminalAgentActivity: true,
               }) as Promise<AsyncResult.AsyncResult<unknown, unknown>>,
           );
 
           expect(AsyncResult.isFailure(result)).toBe(true);
           expect(selectedEnvironments).toEqual([environmentId]);
-          expect(calls).toEqual([{ patch: { enableAgentActivity: false } }]);
-          expect(usePrimarySettings().enableAgentActivity).toBe(
-            DEFAULT_SERVER_SETTINGS.enableAgentActivity,
-          );
+          expect(calls).toEqual([{ patch: { enableTerminalAgentActivity: true } }]);
+          expect(usePrimarySettings()).toMatchObject({
+            enableChatAgentActivity: false,
+            enableTerminalAgentActivity: DEFAULT_SERVER_SETTINGS.enableTerminalAgentActivity,
+          });
         }).pipe(Effect.ensuring(Effect.sync(() => atomRegistry.dispose())));
       }),
   );

@@ -269,6 +269,7 @@ vi.mock("./settingsLayout", () => ({
     return (
       <div data-testid="settings-row">
         {props.title as ReactNode}
+        {props.titleTag as ReactNode}
         {props.resetAction as ReactNode}
         {props.description as ReactNode}
         {props.status as ReactNode}
@@ -811,44 +812,51 @@ describe("GeneralSettingsPanel", () => {
 });
 
 describe("AgentsSettingsPanel", () => {
-  it("renders the per-environment agent activity copy", () => {
+  it("renders independent experimental activity settings", () => {
     const markup = render(<AgentsSettingsPanel />);
 
-    expect(markup).toContain("Agent activity for this environment");
-    expect(markup).toContain(
-      "Show live agent and background-task activity in chats and AI terminals. Disabling this stops activity monitoring and collection.",
-    );
+    expect(markup).toContain("Chat agent activity");
+    expect(markup).toContain("AI Terminal agent activity");
+    expect(markup.match(/Experimental/g)).toHaveLength(2);
+    expect(markup).toContain("Show live agent and background-task activity in the Chat panel.");
+    expect(markup).toContain("Show live agent and background-task activity in AI Terminals.");
   });
 
-  it("checks agent activity by default", () => {
+  it("uses independent defaults", () => {
     render(<AgentsSettingsPanel />);
 
-    expect(control("switch", "Agent activity for this environment").props.checked).toBe(
-      DEFAULT_SERVER_SETTINGS.enableAgentActivity,
-    );
-    expect(findControls("button", "Reset agent activity to default")).toHaveLength(0);
+    expect(control("switch", "Chat agent activity").props.checked).toBe(true);
+    expect(control("switch", "AI Terminal agent activity").props.checked).toBe(false);
+    expect(findControls("button", "Reset chat agent activity to default")).toHaveLength(0);
+    expect(findControls("button", "Reset AI Terminal agent activity to default")).toHaveLength(0);
   });
 
-  it("updates agent activity through the primary environment settings", () => {
+  it("updates each activity setting through only its matching field", () => {
     render(<AgentsSettingsPanel />);
 
-    invoke(control("switch", "Agent activity for this environment"), "onCheckedChange", false);
-    expect(h.updateSettings).toHaveBeenCalledWith({ enableAgentActivity: false });
+    invoke(control("switch", "Chat agent activity"), "onCheckedChange", false);
+    invoke(control("switch", "AI Terminal agent activity"), "onCheckedChange", true);
+    expect(h.updateSettings).toHaveBeenNthCalledWith(1, { enableChatAgentActivity: false });
+    expect(h.updateSettings).toHaveBeenNthCalledWith(2, { enableTerminalAgentActivity: true });
   });
 
-  it("resets agent activity to the shared server default", () => {
+  it("resets each activity setting to its independent server default", () => {
     h.settings = {
       ...DEFAULT_UNIFIED_SETTINGS,
-      enableAgentActivity: !DEFAULT_SERVER_SETTINGS.enableAgentActivity,
+      enableChatAgentActivity: false,
+      enableTerminalAgentActivity: true,
     };
     render(<AgentsSettingsPanel />);
 
-    expect(control("switch", "Agent activity for this environment").props.checked).toBe(
-      !DEFAULT_SERVER_SETTINGS.enableAgentActivity,
-    );
-    invoke(control("button", "Reset agent activity to default"), "onClick");
-    expect(h.updateSettings).toHaveBeenCalledWith({
-      enableAgentActivity: DEFAULT_SERVER_SETTINGS.enableAgentActivity,
+    expect(control("switch", "Chat agent activity").props.checked).toBe(false);
+    expect(control("switch", "AI Terminal agent activity").props.checked).toBe(true);
+    invoke(control("button", "Reset chat agent activity to default"), "onClick");
+    invoke(control("button", "Reset AI Terminal agent activity to default"), "onClick");
+    expect(h.updateSettings).toHaveBeenNthCalledWith(1, {
+      enableChatAgentActivity: DEFAULT_SERVER_SETTINGS.enableChatAgentActivity,
+    });
+    expect(h.updateSettings).toHaveBeenNthCalledWith(2, {
+      enableTerminalAgentActivity: DEFAULT_SERVER_SETTINGS.enableTerminalAgentActivity,
     });
   });
 
