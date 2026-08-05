@@ -3,9 +3,9 @@
 ## Summary
 
 BiBCode's macOS application icon appears as a small black tile on a large pale
-plate in Finder on macOS 26. The working T4Code fork uses the same Tauri bundle
+plate in Finder on macOS 26. The working reference fork uses the same Tauri bundle
 configuration and a traditional ICNS file without that plate. BiBCode must
-restore T4Code's macOS enclosure geometry while retaining the current white
+restore the reference fork's macOS enclosure geometry while retaining the current white
 `BiB` mark.
 
 ## Diagnosis
@@ -16,14 +16,14 @@ packaging, signing, and the ICNS format are therefore not the differentiators.
 
 The macOS PNG alpha masks differ materially:
 
-| Measurement | T4Code | BiBCode |
+| Measurement | Reference fork | BiBCode |
 | --- | ---: | ---: |
 | Transparent corner area | 2.7% | 0.5% |
 | First opaque pixel on the top row | x=171 | x=71 |
 | Finder-rendered dark pixels | 77.6% | 42.6% |
 | Finder-rendered pale pixels | 17.6% | 57.2% |
 
-A differential probe applied only T4Code's alpha channel to the existing
+A differential probe applied only the reference fork's alpha channel to the existing
 BiBCode pixels, regenerated an ICNS, and placed it into a temporary copy of the
 BiBCode application. Finder then rendered that copy with 81.9% dark pixels and
 13.3% pale pixels. This isolates the regression to the macOS enclosure mask.
@@ -32,7 +32,7 @@ BiBCode application. Finder then rendered that copy with 81.9% dark pixels and
 
 - Render the BiBCode application as a full black macOS enclosure with the
   existing white `BiB` mark.
-- Match the proven T4Code macOS corner geometry.
+- Match the proven reference macOS corner geometry.
 - Preserve the existing macOS 11 minimum version.
 - Keep the existing Tauri, DMG, updater, and ad-hoc signing workflows.
 - Prevent future icon regeneration from restoring the incorrect shallow corner
@@ -49,7 +49,7 @@ BiBCode application. Finder then rendered that copy with 81.9% dark pixels and
 
 The macOS application artwork remains a platform-specific transparent PNG at
 `assets/prod/black-macos-1024.png`. Its black enclosure uses the same alpha mask
-as T4Code's known-good macOS artwork. The current BiBCode RGB artwork supplies
+as the reference fork's known-good macOS artwork. The current BiBCode RGB artwork supplies
 the black field and white lettering, so only the enclosure alpha geometry
 changes.
 
@@ -60,9 +60,9 @@ reference this ICNS through the existing `bundle.icon` configuration.
 
 The canonical SVG and non-macOS assets remain unchanged. This avoids coupling
 the macOS enclosure mask to platforms that require full square artwork or use
-different masking rules. The sibling T4Code checkout is diagnosis-only input;
-BiBCode's checked-in PNG and ICNS remain self-contained and no build or test may
-depend on `/Users/admin/projects/t4code`.
+different masking rules. The sibling reference checkout is diagnosis-only
+input; BiBCode's checked-in PNG and ICNS remain self-contained and no build or
+test may depend on it.
 
 ## Implementation Boundary
 
@@ -71,7 +71,7 @@ The change is intentionally asset-local:
 1. Add a regression assertion for the macOS PNG's alpha geometry and ICNS
    contents.
 2. Verify that the assertion fails against the current shallow mask.
-3. Replace only the alpha channel of the macOS PNG with the proven T4Code mask.
+3. Replace only the alpha channel of the macOS PNG with the proven reference mask.
 4. Regenerate only the macOS ICNS from the corrected PNG.
 5. Verify the focused tests, repository gates, native macOS build, bundle
    signature, and Finder-rendered appearance.
@@ -85,7 +85,7 @@ The portable repository test must reject the exact source regression by
 checking all of the following:
 
 - the macOS PNG is 1024 by 1024 with an alpha channel;
-- the top-row opaque bounds match the T4Code enclosure within a narrow
+- the top-row opaque bounds match the reference enclosure within a narrow
   antialiasing tolerance;
 - transparent and partially transparent pixels exist in the rounded corners;
 - the center remains opaque;
@@ -95,7 +95,7 @@ checking all of the following:
 The macOS artifact check exercises the real user-visible seam. It renders the
 built `.app` icon through `NSWorkspace`, measures opaque dark and pale pixels,
 and requires a predominantly black result. The threshold must distinguish the
-known failing BiBCode result from both the working T4Code artifact and the
+known failing BiBCode result from both the working reference artifact and the
 corrected BiBCode probe without relying on an exact OS-dependent pixel count.
 
 ## Failure Handling
@@ -120,6 +120,6 @@ when the source-level geometry test passes.
 
 ## Expected Outcome
 
-BiBCode displays the same full-black macOS enclosure behavior as T4Code while
+BiBCode displays the same full-black macOS enclosure behavior as the reference fork while
 showing the current `BiB` mark. The fix requires no new packaging format,
 dependency, runtime component, or release branch.

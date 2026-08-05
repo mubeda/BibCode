@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Restore T4Code's proven macOS enclosure alpha geometry around the current white `BiB` mark so Finder renders the application as a predominantly black icon without the large pale plate.
+**Goal:** Restore the reference fork's proven macOS enclosure alpha geometry around the current white `BiB` mark so Finder renders the application as a predominantly black icon without the large pale plate.
 
 **Architecture:** Keep the current Tauri, ICNS, DMG, updater, and signing paths. Correct only the checked-in macOS PNG alpha channel, regenerate its ICNS derivative, protect the geometry with a dependency-free PNG/ICNS regression test, and add a macOS `NSWorkspace` verifier for the built application artifact.
 
@@ -11,8 +11,8 @@
 ## Global Constraints
 
 - Preserve the existing white `BiB` mark without changing its size, font, placement, or wording.
-- Match the alpha geometry from `/Users/admin/projects/t4code/assets/prod/black-macos-1024.png`, whose SHA-256 is `e2c15e608caa593671b1d38d88eb2b62c4cd2d6e7d3603cd98c18bb0bb44ee6d`.
-- Do not make any build, test, or runtime path depend on the sibling T4Code checkout; it is one-time diagnosis and generation input only.
+- Match the diagnosed reference alpha geometry, whose source SHA-256 is `e2c15e608caa593671b1d38d88eb2b62c4cd2d6e7d3603cd98c18bb0bb44ee6d`.
+- Do not make any build, test, or runtime path depend on the sibling reference checkout; it is one-time diagnosis and generation input only.
 - Keep `assets/prod/black-macos-1024.png` and `assets/prod/bibcode-black-macos.icns` as the checked-in canonical macOS asset and derivative.
 - Do not change Windows, Linux, web, marketing, or favicon assets.
 - Preserve the macOS 11 minimum version and ad-hoc signing identity.
@@ -25,7 +25,7 @@
 
 - `scripts/lib/png-rgba.ts`: dependency-free decoder for trusted, non-interlaced 8-bit RGBA PNG assets used by repository hardening checks.
 - `scripts/tauri-hardening.test.ts`: portable source-PNG and embedded-ICNS geometry regression.
-- `assets/prod/black-macos-1024.png`: corrected BiBCode macOS artwork using the T4Code alpha mask.
+- `assets/prod/black-macos-1024.png`: corrected BiBCode macOS artwork using the reference alpha mask.
 - `assets/prod/bibcode-black-macos.icns`: regenerated standard icon family derived from the corrected PNG.
 - `scripts/check-macos-app-icon.swift`: macOS-only end-to-end Finder rendering verifier.
 - `docs/operations/release.md`: release-checklist entry for the rendering verifier.
@@ -199,7 +199,7 @@ it.effect("uses the proven full-black macOS enclosure geometry", () =>
     assert.ok(
       Array.from({ length: source.width * source.height }, (_, index) => source.pixels[index * 4 + 3]!)
         .filter((alpha) => alpha === 0).length >= 27_000,
-      "macOS icon must retain the T4-compatible transparent corner area",
+      "macOS icon must retain the proven transparent corner area",
     );
     assert.ok(
       Array.from({ length: source.width * source.height }, (_, index) => source.pixels[index * 4 + 3]!)
@@ -233,38 +233,38 @@ Expected: FAIL because the current source reports top-row bounds `[71, 952]` ins
 
 - [ ] **Step 5: Replace only the macOS PNG alpha channel**
 
-First verify the one-time T4 reference input:
+First verify the one-time reference input:
 
 ```bash
-shasum -a 256 /Users/admin/projects/t4code/assets/prod/black-macos-1024.png
+shasum -a 256 /absolute/path/to/reference-fork/assets/prod/black-macos-1024.png
 ```
 
 Expected:
 
 ```text
-e2c15e608caa593671b1d38d88eb2b62c4cd2d6e7d3603cd98c18bb0bb44ee6d  /Users/admin/projects/t4code/assets/prod/black-macos-1024.png
+e2c15e608caa593671b1d38d88eb2b62c4cd2d6e7d3603cd98c18bb0bb44ee6d  /absolute/path/to/reference-fork/assets/prod/black-macos-1024.png
 ```
 
-Generate the corrected BiBCode PNG with AppKit, retaining BiBCode RGB values and taking only T4Code alpha values:
+Generate the corrected BiBCode PNG with AppKit, retaining BiBCode RGB values and taking only reference alpha values:
 
 ```bash
 BIBCODE_MAC_ICON=assets/prod/black-macos-1024.png \
-T4CODE_MAC_ICON=/Users/admin/projects/t4code/assets/prod/black-macos-1024.png \
+REFERENCE_MAC_ICON=/absolute/path/to/reference-fork/assets/prod/black-macos-1024.png \
 swift -e 'import AppKit
 let env = ProcessInfo.processInfo.environment
 let outputUrl = URL(fileURLWithPath: env["BIBCODE_MAC_ICON"]!)
 let bib = NSBitmapImageRep(data: try Data(contentsOf: outputUrl))!
-let t4 = NSBitmapImageRep(
-  data: try Data(contentsOf: URL(fileURLWithPath: env["T4CODE_MAC_ICON"]!))
+let reference = NSBitmapImageRep(
+  data: try Data(contentsOf: URL(fileURLWithPath: env["REFERENCE_MAC_ICON"]!))
 )!
 guard bib.pixelsWide == 1024, bib.pixelsHigh == 1024,
-      t4.pixelsWide == bib.pixelsWide, t4.pixelsHigh == bib.pixelsHigh else {
+      reference.pixelsWide == bib.pixelsWide, reference.pixelsHigh == bib.pixelsHigh else {
   fatalError("macOS icon inputs must both be 1024 by 1024")
 }
 for y in 0..<bib.pixelsHigh {
   for x in 0..<bib.pixelsWide {
     let color = bib.colorAt(x: x, y: y)!.usingColorSpace(.deviceRGB)!
-    let alpha = t4.colorAt(x: x, y: y)!.usingColorSpace(.deviceRGB)!.alphaComponent
+    let alpha = reference.colorAt(x: x, y: y)!.usingColorSpace(.deviceRGB)!.alphaComponent
     bib.setColor(
       NSColor(
         deviceRed: color.redComponent,
@@ -563,4 +563,4 @@ Expected: no debug-tag output, no task-owned temporary directories, and a clean 
 
 - [ ] **Step 5: Record the root cause in the final handoff**
 
-State that the BiB rebrand reduced the macOS transparent-corner mask from T4Code's 2.7% to 0.5%, causing macOS 26 Finder to treat the nearly square artwork as inset legacy content on a pale plate. Include the final Finder-rendered dark/pale ratios from the built DMG and note that Windows, Linux, web, and marketing assets were unchanged.
+State that the BiB rebrand reduced the macOS transparent-corner mask from the reference fork's 2.7% to 0.5%, causing macOS 26 Finder to treat the nearly square artwork as inset legacy content on a pale plate. Include the final Finder-rendered dark/pale ratios from the built DMG and note that Windows, Linux, web, and marketing assets were unchanged.
