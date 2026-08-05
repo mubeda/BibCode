@@ -3562,7 +3562,7 @@ describe("ChatView handlers (captured from mocked children)", () => {
     return {
       focusAtEnd: () => undefined,
       resetCursorState: () => undefined,
-      addTerminalContext: () => undefined,
+      addTerminalContext: () => false,
       getSendContext: () => ({
         attachments: [],
         terminalContexts: [],

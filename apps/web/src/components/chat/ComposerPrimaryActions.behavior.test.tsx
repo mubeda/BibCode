@@ -173,6 +173,7 @@ describe("ComposerPrimaryActions", () => {
   it("interrupts a running response and preserves composer focus", () => {
     const { markup } = renderActions({
       isRunning: true,
+      sendBlockedReason: "Provider metadata conflicts with the active session.",
       preserveComposerFocusOnPointerDown: true,
     });
     expect(markup).toContain("Stop generation");
@@ -189,6 +190,7 @@ describe("ComposerPrimaryActions", () => {
     const { markup } = renderActions({
       isSendBusy: true,
       canCancelPendingSend: true,
+      sendBlockedReason: "Provider metadata conflicts with the active session.",
     });
 
     expect(markup).toContain("Stop generation");
