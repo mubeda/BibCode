@@ -753,8 +753,8 @@ Invoke the `computer-use:computer-use` skill and use its plugin-owned `node_repl
 Create `/Users/admin/.codex/visualizations/2026/08/04/019fcf0b-6bc4-7d23-a1b1-edec8db1adc5/macos-resource-manager/` and, from `node_repl`, copy the file behind each `state.screenshot.url` into these durable PNGs outside the Git worktree:
 
 1. `01-complete-observation.png` — Resource Manager open after at least two refreshes in the steady state.
-2. `02-preview-open.png` — the same panel after opening a native preview WebView and waiting for a later sample.
-3. `03-preview-closed.png` — the panel after closing that preview WebView and waiting for a later sample.
+2. `02-preview-open.png` — the same readable panel after opening a native preview WebView and waiting for a later sample; Resource Manager temporarily hides the native child while its logical preview remains open.
+3. `03-preview-closed.png` — the panel after closing that logical preview and waiting for a later sample; the process-lifetime native host is hidden but remains owned and attributable.
 4. `04-unrelated-webkit-excluded.png` — Resource Manager while another running macOS application owns generic `com.apple.WebKit.*` helpers.
 
 For each captured state, save the accessibility text beside the PNG so exact labels and numbers can be corroborated without treating AX text as a substitute for visual inspection.
@@ -765,7 +765,9 @@ Inspect every screenshot at full resolution with the image-viewing tool. Zoom in
 - `core/server` and role-validated `core/ui` rows are visible;
 - Combined equals Core plus External for memory, CPU, and process count, allowing only the UI's displayed rounding precision;
 - opening a native preview can add or rotate validated Core UI helpers on a later sample without moving provider/terminal rows into Core;
-- closing the preview removes obsolete helpers on a later sample;
+- closing the logical preview hides rather than destroys the process-lifetime
+  native host, whose validated helper remains Core-attributed until app
+  shutdown;
 - another application's generic WebKit helpers do not appear in BiBCode's list; and
 - no clipping, overlap, theme regression, unreadable contrast, or misleading status icon was introduced.
 
