@@ -51,7 +51,7 @@ function props(
     preferredScriptId: null,
     keybindings: {} as never,
     availableEditors: [],
-    rightPanelOpen: false,
+    reserveTitlebarControls: true,
     gitCwd: null,
     providerStatuses: [],
     settings: {
@@ -104,7 +104,7 @@ describe("ChatHeaderActions rendering", () => {
         {...props({
           activeProjectName: "Project",
           activeProjectScripts: [],
-          rightPanelOpen: true,
+          reserveTitlebarControls: false,
           draftId: "draft-1" as never,
           onOpenProviderTerminalPanel,
         })}
@@ -132,5 +132,17 @@ describe("ChatHeaderActions rendering", () => {
     expect(markup).not.toContain("open-in-picker");
     expect(markup).toContain("git-actions");
     expect(harness.gitProps).not.toHaveProperty("draftId");
+  });
+
+  it("reserves titlebar space only when requested by the focused pane", () => {
+    const reserved = renderToStaticMarkup(
+      <ChatHeaderActions {...props()} reserveTitlebarControls />,
+    );
+    const unreserved = renderToStaticMarkup(
+      <ChatHeaderActions {...props()} reserveTitlebarControls={false} />,
+    );
+
+    expect(reserved).toContain("pr-16");
+    expect(unreserved).toContain("pr-0");
   });
 });

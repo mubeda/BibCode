@@ -57,6 +57,7 @@ import {
   useMemo,
   useRef,
   useState,
+  type ReactNode,
 } from "react";
 import { useNavigate } from "@tanstack/react-router";
 import { useShallow } from "zustand/react/shallow";
@@ -140,14 +141,21 @@ import {
 } from "../rightPanelStore";
 import {
   type CenterSurface,
-  HOST_SURFACE_ID,
+  selectFocusedCenterSurface,
   selectThreadCenterPanelState,
+  type ThreadCenterPanelState,
   type OpenTerminalPanelOptions,
   useCenterPanelStore,
 } from "../centerPanelStore";
+import {
+  findCenterPanelGroupEdges,
+  type CenterPanelDropRequest,
+  type CenterPanelLayoutPath,
+} from "../centerPanelLayout";
 import { useCenterPanelActions } from "../centerPanelActions";
 import { type ProviderInstanceEntry } from "../providerInstances";
-import { CenterPanelTabs } from "./CenterPanelTabs";
+import { CenterPanelWorkspace, type CenterPanelWorkspaceProps } from "./CenterPanelWorkspace";
+import type { CenterPanelSurfaceRenderContext } from "./CenterPanelSurfaceHosts";
 import { CenterTerminalPanel } from "./CenterTerminalPanel";
 import {
   isPreviewSupportedInRuntime,
@@ -168,7 +176,6 @@ import ThreadTerminalDrawer, {
 } from "./ThreadTerminalDrawer";
 import { ChevronDownIcon, TriangleAlertIcon, WifiOffIcon } from "lucide-react";
 import { cn, randomHex } from "~/lib/utils";
-import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 import { stackedThreadToast, toastManager } from "./ui/toast";
 import { decodeProjectScriptKeybindingRule } from "~/lib/projectScriptKeybindings";
 import { type NewProjectScriptInput } from "./ProjectScriptsControl";
@@ -1408,6 +1415,114 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
   );
 });
 
+interface LiveCenterPanelWorkspaceProps {
+  readonly state: ThreadCenterPanelState;
+  readonly hostLabel: string;
+  readonly terminalLabelsById: ReadonlyMap<string, string>;
+  readonly focusedActions: ReactNode;
+  readonly hostChatSurfaceBody: ReactNode;
+  readonly hostThread: Thread;
+  readonly hostThreadRef: ScopedThreadRef;
+  readonly centerTerminalLaunchContext: {
+    readonly cwd: string;
+    readonly worktreePath: string | null;
+    readonly runtimeEnv: Record<string, string>;
+  } | null;
+  readonly keybindings: ResolvedKeybindingsConfig;
+  readonly terminalFocusRequestId: number;
+  readonly onAddTerminalContext: (selection: TerminalContextSelection) => void;
+  readonly onFocusGroup: CenterPanelWorkspaceProps["onFocusGroup"];
+  readonly onActivate: CenterPanelWorkspaceProps["onActivate"];
+  readonly onCloseSurface: CenterPanelWorkspaceProps["onCloseSurface"];
+  readonly onCloseOtherSurfaces: CenterPanelWorkspaceProps["onCloseOtherSurfaces"];
+  readonly onCloseSurfacesToRight: CenterPanelWorkspaceProps["onCloseSurfacesToRight"];
+  readonly onCloseAllSurfaces: CenterPanelWorkspaceProps["onCloseAllSurfaces"];
+  readonly onDropSurface: CenterPanelWorkspaceProps["onDropSurface"];
+  readonly onMergeGroup: CenterPanelWorkspaceProps["onMergeGroup"];
+  readonly onSetSplitRatio: CenterPanelWorkspaceProps["onSetSplitRatio"];
+}
+
+const LiveCenterPanelWorkspace = memo(function LiveCenterPanelWorkspace({
+  state,
+  hostLabel,
+  terminalLabelsById,
+  focusedActions,
+  hostChatSurfaceBody,
+  hostThread,
+  hostThreadRef,
+  centerTerminalLaunchContext,
+  keybindings,
+  terminalFocusRequestId,
+  onAddTerminalContext,
+  onFocusGroup,
+  onActivate,
+  onCloseSurface,
+  onCloseOtherSurfaces,
+  onCloseSurfacesToRight,
+  onCloseAllSurfaces,
+  onDropSurface,
+  onMergeGroup,
+  onSetSplitRatio,
+}: LiveCenterPanelWorkspaceProps) {
+  const renderCenterSurface = useCallback(
+    (surface: CenterSurface, context: CenterPanelSurfaceRenderContext) => {
+      switch (surface.kind) {
+        case "chat-host":
+          return hostChatSurfaceBody;
+        case "chat":
+          return (
+            <ChatView
+              variant="panel"
+              panelThreadRef={scopeThreadRef(hostThreadRef.environmentId, surface.threadId)}
+            />
+          );
+        case "terminal":
+          return (
+            <CenterTerminalPanel
+              threadRef={hostThreadRef}
+              projectId={hostThread.projectId}
+              surface={surface}
+              launchContext={centerTerminalLaunchContext}
+              keybindings={keybindings}
+              focusRequestId={context.focused ? terminalFocusRequestId : 0}
+              onAddTerminalContext={onAddTerminalContext}
+              onClose={() => onCloseSurface(context.groupId, surface)}
+            />
+          );
+      }
+    },
+    [
+      centerTerminalLaunchContext,
+      hostChatSurfaceBody,
+      hostThread.projectId,
+      hostThreadRef,
+      keybindings,
+      onAddTerminalContext,
+      onCloseSurface,
+      terminalFocusRequestId,
+    ],
+  );
+
+  return (
+    <CenterPanelWorkspace
+      state={state}
+      hostLabel={hostLabel}
+      terminalLabelsById={terminalLabelsById}
+      focusedActions={focusedActions}
+      renderSurface={renderCenterSurface}
+      onFocusGroup={onFocusGroup}
+      onActivate={onActivate}
+      onCloseSurface={onCloseSurface}
+      onCloseOtherSurfaces={onCloseOtherSurfaces}
+      onCloseSurfacesToRight={onCloseSurfacesToRight}
+      onCloseAllSurfaces={onCloseAllSurfaces}
+      onDropSurface={onDropSurface}
+      onMergeGroup={onMergeGroup}
+      onSetSplitRatio={onSetSplitRatio}
+    />
+  );
+});
+
 function ChatViewContent(props: ChatViewProps) {
   // In "panel" variant, thread identity comes from panelThreadRef (always a
   // server thread) instead of the route. Resolving environmentId/threadId here
@@ -1770,81 +1885,100 @@ function ChatViewContent(props: ChatViewProps) {
   // Center multipanel state (host variant only; a panel instance never hosts
   // its own sub-panels). The host chat surface is always present at index 0.
   const centerPanelByThreadKey = useCenterPanelStore((state) => state.byThreadKey);
-  const centerPanelActions = useCenterPanelActions();
+  const closeCenterTerminalResource = useCallback(
+    (hostRef: ScopedThreadRef, surface: Extract<CenterSurface, { kind: "terminal" }>) => {
+      storeCloseTerminal(hostRef, surface.terminalId);
+      void closeTerminalMutation({
+        environmentId: hostRef.environmentId,
+        input: {
+          threadId: hostRef.threadId,
+          terminalId: surface.terminalId,
+          deleteHistory: true,
+        },
+      }).then((result) => {
+        if (result._tag === "Success") {
+          releaseTerminalInputScheduler(
+            hostRef.environmentId,
+            hostRef.threadId,
+            surface.terminalId,
+          );
+        }
+      });
+    },
+    [closeTerminalMutation, storeCloseTerminal],
+  );
+  const centerPanelActions = useCenterPanelActions({
+    onCloseTerminal: closeCenterTerminalResource,
+  });
   const centerPanelState = selectThreadCenterPanelState(
     centerPanelByThreadKey,
     isPanel ? null : activeThreadRef,
   );
-  const cleanupCenterPanelSurfaces = useCallback(
-    (surfaces: readonly CenterSurface[]) => {
-      if (!activeThreadRef) return;
-      const terminalIds = new Set(
-        surfaces.flatMap((surface) => (surface.kind === "terminal" ? [surface.terminalId] : [])),
-      );
-
-      for (const terminalId of terminalIds) {
-        storeCloseTerminal(activeThreadRef, terminalId);
-        void (async () => {
-          const closeResult = await closeTerminalMutation({
-            environmentId: activeThreadRef.environmentId,
-            input: {
-              threadId: activeThreadRef.threadId,
-              terminalId,
-              deleteHistory: true,
-            },
-          });
-          if (closeResult._tag === "Success") {
-            releaseTerminalInputScheduler(
-              activeThreadRef.environmentId,
-              activeThreadRef.threadId,
-              terminalId,
-            );
-          }
-        })();
-      }
-    },
-    [activeThreadRef, closeTerminalMutation, storeCloseTerminal],
-  );
   const closeCenterPanelSurface = useCallback(
-    (surface: CenterSurface) => {
+    (groupId: string, surface: CenterSurface) => {
       if (!activeThreadRef) return;
-      cleanupCenterPanelSurfaces([surface]);
-      centerPanelActions.closeSurface(activeThreadRef, surface);
+      centerPanelActions.closeSurface(activeThreadRef, groupId, surface);
     },
-    [activeThreadRef, centerPanelActions, cleanupCenterPanelSurfaces],
+    [activeThreadRef, centerPanelActions],
   );
   const closeOtherCenterPanelSurfaces = useCallback(
-    (surface: CenterSurface) => {
+    (groupId: string, surface: CenterSurface) => {
       if (!activeThreadRef) return;
-      const keptIds = new Set([HOST_SURFACE_ID, surface.id]);
-      cleanupCenterPanelSurfaces(
-        centerPanelState.surfaces.filter((entry) => !keptIds.has(entry.id)),
-      );
-      centerPanelActions.closeOtherSurfaces(activeThreadRef, surface);
+      centerPanelActions.closeOtherSurfaces(activeThreadRef, groupId, surface);
     },
-    [activeThreadRef, centerPanelActions, centerPanelState.surfaces, cleanupCenterPanelSurfaces],
+    [activeThreadRef, centerPanelActions],
   );
   const closeCenterPanelSurfacesToRight = useCallback(
-    (surface: CenterSurface) => {
+    (groupId: string, surface: CenterSurface) => {
       if (!activeThreadRef) return;
-      const surfaceIndex = centerPanelState.surfaces.findIndex((entry) => entry.id === surface.id);
-      if (surfaceIndex < 0) return;
-      cleanupCenterPanelSurfaces(centerPanelState.surfaces.slice(surfaceIndex + 1));
-      centerPanelActions.closeSurfacesToRight(activeThreadRef, surface);
+      centerPanelActions.closeSurfacesToRight(activeThreadRef, groupId, surface);
     },
-    [activeThreadRef, centerPanelActions, centerPanelState.surfaces, cleanupCenterPanelSurfaces],
+    [activeThreadRef, centerPanelActions],
   );
-  const closeAllCenterPanelSurfaces = useCallback(() => {
-    if (!activeThreadRef) return;
-    cleanupCenterPanelSurfaces(centerPanelState.surfaces);
-    centerPanelActions.closeAllSurfaces(activeThreadRef);
-  }, [activeThreadRef, centerPanelActions, centerPanelState.surfaces, cleanupCenterPanelSurfaces]);
-  const activeCenterSurface =
-    centerPanelState.surfaces.find((surface) => surface.id === centerPanelState.activeSurfaceId) ??
-    null;
-  const centerHostHidden = !isPanel && activeCenterSurface?.id !== HOST_SURFACE_ID;
-  const siblingChatOwnsCenter = !isPanel && activeCenterSurface?.kind === "chat";
-  const centerPanelEmpty = !isPanel && centerPanelState.surfaces.length === 0;
+  const closeAllCenterPanelSurfaces = useCallback(
+    (groupId: string) => {
+      if (!activeThreadRef) return;
+      centerPanelActions.closeAllSurfaces(activeThreadRef, groupId);
+    },
+    [activeThreadRef, centerPanelActions],
+  );
+  const focusCenterPanelGroup = useCallback(
+    (groupId: string) => {
+      if (!activeThreadRef) return;
+      useCenterPanelStore.getState().focusGroup(activeThreadRef, groupId);
+    },
+    [activeThreadRef],
+  );
+  const activateCenterPanelSurface = useCallback(
+    (groupId: string, surface: CenterSurface) => {
+      if (!activeThreadRef) return;
+      centerPanelActions.activateSurface(activeThreadRef, groupId, surface.id);
+    },
+    [activeThreadRef, centerPanelActions],
+  );
+  const dropCenterPanelSurface = useCallback(
+    (surfaceId: string, target: CenterPanelDropRequest) => {
+      if (!activeThreadRef) return;
+      useCenterPanelStore.getState().dropSurface(activeThreadRef, surfaceId, target);
+    },
+    [activeThreadRef],
+  );
+  const mergeCenterPanelGroup = useCallback(
+    (groupId: string) => {
+      if (!activeThreadRef) return;
+      useCenterPanelStore.getState().mergeGroup(activeThreadRef, groupId);
+    },
+    [activeThreadRef],
+  );
+  const setCenterPanelSplitRatio = useCallback(
+    (path: CenterPanelLayoutPath, ratio: number) => {
+      if (!activeThreadRef) return;
+      useCenterPanelStore.getState().setSplitRatio(activeThreadRef, path, ratio);
+    },
+    [activeThreadRef],
+  );
+  const focusedCenterSurface = selectFocusedCenterSurface(centerPanelState);
+  const siblingChatOwnsCenter = !isPanel && focusedCenterSurface?.kind === "chat";
   const [timelineAnchor, setTimelineAnchor] = useState<{
     readonly threadKey: string | null;
     readonly messageId: MessageId | null;
@@ -5942,9 +6076,7 @@ function ChatViewContent(props: ChatViewProps) {
           }
         />
       ) : null}
-      {!isPanel && effectiveRightPanelOpen && !shouldUsePlanSidebarSheet
-        ? panelLayoutControls
-        : null}
+      {!isPanel ? panelLayoutControls : null}
       <div
         className={cn(
           "flex min-h-0 min-w-0 flex-col overflow-x-hidden",
@@ -5952,309 +6084,281 @@ function ChatViewContent(props: ChatViewProps) {
         )}
         data-chat-column-maximized-away={rightPanelMaximized ? "true" : "false"}
       >
-        {/* Top bar */}
-        {/* Panel variant: host owns the chat header (title, git actions, scripts). */}
-        {!isPanel && (
-          <header
-            data-chat-header
-            aria-label={`${activeThread.title} workspace`}
-            className={cn(
-              "border-b border-border transition-[padding-left] duration-200 ease-linear motion-reduce:transition-none",
-              "workspace-topbar pl-[calc(env(safe-area-inset-left)+0.75rem)] pr-[calc(env(safe-area-inset-right)+0.75rem)] sm:pl-[calc(env(safe-area-inset-left)+1.25rem)] sm:pr-[calc(env(safe-area-inset-right)+1.25rem)]",
-              COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS,
-            )}
-          >
-            {!effectiveRightPanelOpen ? panelLayoutControls : null}
-            <div
-              className="isolate flex min-w-0 flex-1 self-stretch items-center overflow-hidden"
-              data-center-panel-header-row
-            >
-              {activeThreadRef && centerPanelState.surfaces.length > 0 ? (
-                <CenterPanelTabs
-                  hostLabel={centerHostLabel}
-                  surfaces={centerPanelState.surfaces}
-                  activeSurfaceId={centerPanelState.activeSurfaceId}
-                  onActivate={(surface) =>
-                    centerPanelActions.activateSurface(activeThreadRef, surface.id)
-                  }
-                  onCloseSurface={closeCenterPanelSurface}
-                  onCloseOtherSurfaces={closeOtherCenterPanelSurfaces}
-                  onCloseSurfacesToRight={closeCenterPanelSurfacesToRight}
-                  onCloseAllSurfaces={closeAllCenterPanelSurfaces}
-                />
-              ) : (
-                <div className="min-w-0 flex-1" aria-hidden="true" data-center-panel-empty-spacer />
-              )}
-              <ChatHeaderActions
-                activeThreadEnvironmentId={activeThread.environmentId}
-                activeThreadId={activeThread.id}
-                {...(routeKind === "draft" && draftId ? { draftId } : {})}
-                activeProjectName={activeProject?.title}
-                openInCwd={gitCwd}
-                activeProjectScripts={activeProject?.scripts}
-                preferredScriptId={
-                  activeProject ? (lastInvokedScriptByProjectId[activeProject.id] ?? null) : null
-                }
-                keybindings={keybindings}
-                availableEditors={availableEditors}
-                rightPanelOpen={effectiveRightPanelOpen}
-                gitCwd={gitCwd}
-                providerStatuses={providerStatuses as ServerProvider[]}
-                settings={settings}
-                canCreatePanel={centerPanelLaunchContext !== null}
-                onCreateChatPanel={handleCreateChatPanel}
-                onOpenTerminalPanel={handleOpenTerminalPanel}
-                onOpenProviderTerminalPanel={handleOpenProviderTerminalPanel}
-                onRunProjectScript={runProjectScript}
-                onAddProjectScript={saveProjectScript}
-                onUpdateProjectScript={updateProjectScript}
-                onDeleteProjectScript={deleteProjectScript}
-              />
-            </div>
-          </header>
-        )}
-        {/* Error banner */}
-        {!centerHostHidden ? (
-          <>
-            <ProviderStatusBanner status={activeProviderStatus} />
-            <ThreadErrorBanner
-              error={threadError}
-              onDismiss={() => setThreadError(activeThread.id, null)}
+        {(() => {
+          const focusedGroupEdges = findCenterPanelGroupEdges(
+            centerPanelState.layout,
+            centerPanelState.focusedGroupId,
+          );
+          const reserveCenterTitlebarControls =
+            !effectiveRightPanelOpen && focusedGroupEdges?.top === true && focusedGroupEdges.right;
+          const chatHeaderActions = (
+            <ChatHeaderActions
+              activeThreadEnvironmentId={activeThread.environmentId}
+              activeThreadId={activeThread.id}
+              {...(routeKind === "draft" && draftId ? { draftId } : {})}
+              activeProjectName={activeProject?.title}
+              openInCwd={gitCwd}
+              activeProjectScripts={activeProject?.scripts}
+              preferredScriptId={
+                activeProject ? (lastInvokedScriptByProjectId[activeProject.id] ?? null) : null
+              }
+              keybindings={keybindings}
+              availableEditors={availableEditors}
+              reserveTitlebarControls={reserveCenterTitlebarControls}
+              gitCwd={gitCwd}
+              providerStatuses={providerStatuses as ServerProvider[]}
+              settings={settings}
+              canCreatePanel={centerPanelLaunchContext !== null}
+              onCreateChatPanel={handleCreateChatPanel}
+              onOpenTerminalPanel={handleOpenTerminalPanel}
+              onOpenProviderTerminalPanel={handleOpenProviderTerminalPanel}
+              onRunProjectScript={runProjectScript}
+              onAddProjectScript={saveProjectScript}
+              onUpdateProjectScript={updateProjectScript}
+              onDeleteProjectScript={deleteProjectScript}
             />
-          </>
-        ) : null}
-        {/* Main content area with optional plan sidebar. Kept MOUNTED (css-hidden)
-            while a center panel tab is active so the host transcript's scroll and
-            composer state survive tab switches. */}
-        <div className={cn("flex min-h-0 min-w-0 flex-1", centerHostHidden && "hidden")}>
-          {/* Chat column */}
-          <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
-            {/* Messages Wrapper */}
-            <div className="relative flex min-h-0 flex-1 flex-col">
-              {activityStateTarget !== null && activeThreadRef !== null && activeThread !== null ? (
-                <ActivityDockBinding
-                  target={activityStateTarget}
-                  threadRef={activeThreadRef}
-                  projectId={activeThread.projectId}
-                  compact={shouldUseCompactActivityDock}
-                  avoidRightPanelSheet={shouldUsePlanSidebarSheet && effectiveRightPanelOpen}
-                />
-              ) : null}
-              {/* Messages — LegendList handles virtualization and scrolling internally */}
-              <MessagesTimeline
-                key={activeThread.id}
-                isWorking={isWorking}
-                activeTurnInProgress={isWorking || !latestTurnSettled}
-                activeTurnStartedAt={activeWorkStartedAt}
-                listRef={legendListRef}
-                timelineEntries={timelineEntries}
-                latestTurn={activeLatestTurn}
-                runningTurnId={
-                  activeThread.session?.status === "running"
-                    ? activeThread.session.activeTurnId
-                    : null
-                }
-                turnDiffSummaryByAssistantMessageId={turnDiffSummaryByAssistantMessageId}
-                activeThreadEnvironmentId={activeThread.environmentId}
-                routeThreadKey={routeThreadKey}
-                onOpenTurnDiff={onOpenTurnDiff}
-                revertTurnCountByUserMessageId={revertTurnCountByUserMessageId}
-                onRevertUserMessage={onRevertUserMessage}
-                onResolveTurnDelivery={onResolveTurnDelivery}
-                resolvingTurnDeliveryMessageId={resolvingTurnDeliveryMessageId}
-                isRevertingCheckpoint={isRevertingCheckpoint}
-                onImageExpand={onExpandTimelineImage}
-                markdownCwd={gitCwd ?? undefined}
-                resolvedTheme={resolvedTheme}
-                timestampFormat={timestampFormat}
-                workspaceRoot={activeWorkspaceRoot}
-                skills={activeProviderStatus?.skills ?? EMPTY_PROVIDER_SKILLS}
-                anchorMessageId={timelineAnchorMessageId}
-                onAnchorReady={onTimelineAnchorReady}
-                onAnchorSizeChanged={onTimelineAnchorSizeChanged}
-                contentInsetEndAdjustment={composerOverlayHeight}
-                onIsAtEndChange={onIsAtEndChange}
-                onManualNavigation={cancelTimelineLiveFollowForUserNavigation}
+          );
+          const hostChatSurfaceBody = (
+            <>
+              <ProviderStatusBanner status={activeProviderStatus} />
+              <ThreadErrorBanner
+                error={threadError}
+                onDismiss={() => setThreadError(activeThread.id, null)}
               />
-
-              {/* scroll to end pill — shown when user has scrolled away from the live edge */}
-              {showScrollToBottom && (
-                <div
-                  className="pointer-events-none absolute left-1/2 z-30 flex -translate-x-1/2 justify-center py-1.5"
-                  style={{ bottom: composerOverlayHeight + 4 }}
-                >
-                  <button
-                    type="button"
-                    aria-label="Scroll to end"
-                    title="Scroll to end"
-                    onClick={() => scrollToEnd(true)}
-                    className="pointer-events-auto flex items-center gap-1.5 rounded-full border border-border/60 bg-card px-3 py-1 text-muted-foreground text-xs shadow-sm transition-colors hover:border-border hover:text-foreground hover:cursor-pointer"
-                  >
-                    <ChevronDownIcon className="size-3.5" />
-                    Scroll to end
-                  </button>
-                </div>
-              )}
-            </div>
-
-            {/* Input bar */}
-            <div
-              ref={setComposerOverlayElement}
-              data-chat-composer-overlay="true"
-              className="pointer-events-none absolute inset-x-0 bottom-0 z-20 pt-1.5 sm:pt-2"
-            >
-              <div
-                aria-hidden="true"
-                className="chat-composer-horizontal-inset pointer-events-none absolute inset-x-0 top-1.5 bottom-0 z-0 sm:top-2"
-              >
-                <div className="relative mx-auto h-full w-full max-w-3xl overflow-clip rounded-t-[20px]">
-                  <div className="chat-composer-shared-blur absolute -inset-8" />
-                </div>
-              </div>
-              <div className="chat-composer-horizontal-inset">
-                <div className="pointer-events-auto relative z-10 isolate">
-                  <ComposerBannerStack className="relative z-0" items={composerBannerItems} />
-                  <div className="relative z-10">
-                    <ChatComposer
-                      composerRef={composerRef}
-                      composerDraftTarget={composerDraftTarget}
-                      environmentId={environmentId}
-                      routeKind={routeKind}
-                      routeThreadRef={routeThreadRef}
-                      draftId={draftId}
-                      activeThreadId={activeThreadId}
-                      activeThreadEnvironmentId={activeThread?.environmentId}
-                      activeThread={activeThread}
-                      isServerThread={isServerThread}
-                      isLocalDraftThread={isLocalDraftThread}
-                      phase={phase}
-                      isConnecting={isConnecting}
-                      isSendBusy={isSendBusy}
-                      canCancelPendingSend={canCancelPendingSend}
-                      isPreparingWorktree={isPreparingWorktree}
-                      environmentUnavailable={activeEnvironmentUnavailableState}
-                      activePendingApproval={activePendingApproval}
-                      pendingApprovals={pendingApprovals}
-                      pendingUserInputs={pendingUserInputs}
-                      activePendingProgress={activePendingProgress}
-                      activePendingResolvedAnswers={activePendingResolvedAnswers}
-                      activePendingIsResponding={activePendingIsResponding}
-                      activePendingDraftAnswers={activePendingDraftAnswers}
-                      activePendingQuestionIndex={activePendingQuestionIndex}
-                      respondingRequestIds={respondingRequestIds}
-                      showPlanFollowUpPrompt={showPlanFollowUpPrompt}
-                      activeProposedPlan={activeProposedPlan}
-                      activePlan={activePlan as { turnId?: TurnId } | null}
-                      sidebarProposedPlan={sidebarProposedPlan as { turnId?: TurnId } | null}
-                      planSidebarLabel={planSidebarLabel}
-                      planSidebarOpen={planSidebarOpen}
-                      runtimeMode={runtimeMode}
-                      interactionMode={interactionMode}
-                      lockedProvider={lockedProvider}
-                      providerBindingInstanceId={providerBinding.instanceId}
-                      lockProviderPickerToActiveInstance={lockProviderPickerToActiveInstance}
-                      providerBindingConflictReason={providerBindingConflictReason}
-                      providerStatuses={providerStatuses as ServerProvider[]}
-                      activeProjectDefaultModelSelection={activeProject?.defaultModelSelection}
-                      activeThreadModelSelection={activeThread?.modelSelection}
-                      {...(routeKind === "server"
-                        ? { onCommitModelSelection: commitComposerModelSelection }
-                        : {})}
-                      activeThreadActivities={activeThread?.activities}
+              <div className="flex min-h-0 min-w-0 flex-1">
+                {/* Chat column */}
+                <div className="relative flex min-h-0 min-w-0 flex-1 flex-col">
+                  {/* Messages Wrapper */}
+                  <div className="relative flex min-h-0 flex-1 flex-col">
+                    {activityStateTarget !== null &&
+                    activeThreadRef !== null &&
+                    activeThread !== null ? (
+                      <ActivityDockBinding
+                        target={activityStateTarget}
+                        threadRef={activeThreadRef}
+                        projectId={activeThread.projectId}
+                        compact={shouldUseCompactActivityDock}
+                        avoidRightPanelSheet={shouldUsePlanSidebarSheet && effectiveRightPanelOpen}
+                      />
+                    ) : null}
+                    {/* Messages — LegendList handles virtualization and scrolling internally */}
+                    <MessagesTimeline
+                      key={activeThread.id}
+                      isWorking={isWorking}
+                      activeTurnInProgress={isWorking || !latestTurnSettled}
+                      activeTurnStartedAt={activeWorkStartedAt}
+                      listRef={legendListRef}
+                      timelineEntries={timelineEntries}
+                      latestTurn={activeLatestTurn}
+                      runningTurnId={
+                        activeThread.session?.status === "running"
+                          ? activeThread.session.activeTurnId
+                          : null
+                      }
+                      turnDiffSummaryByAssistantMessageId={turnDiffSummaryByAssistantMessageId}
+                      activeThreadEnvironmentId={activeThread.environmentId}
+                      routeThreadKey={routeThreadKey}
+                      onOpenTurnDiff={onOpenTurnDiff}
+                      revertTurnCountByUserMessageId={revertTurnCountByUserMessageId}
+                      onRevertUserMessage={onRevertUserMessage}
+                      onResolveTurnDelivery={onResolveTurnDelivery}
+                      resolvingTurnDeliveryMessageId={resolvingTurnDeliveryMessageId}
+                      isRevertingCheckpoint={isRevertingCheckpoint}
+                      onImageExpand={onExpandTimelineImage}
+                      markdownCwd={gitCwd ?? undefined}
                       resolvedTheme={resolvedTheme}
-                      settings={settings}
-                      keybindings={keybindings}
-                      terminalOpen={Boolean(terminalUiState.terminalOpen)}
-                      gitCwd={gitCwd}
-                      promptRef={promptRef}
-                      composerAttachmentsRef={composerAttachmentsRef}
-                      composerTerminalContextsRef={composerTerminalContextsRef}
-                      composerElementContextsRef={composerElementContextsRef}
-                      onSend={onSend}
-                      onInterrupt={onInterrupt}
-                      onImplementPlanInNewThread={onImplementPlanInNewThread}
-                      onRespondToApproval={onRespondToApproval}
-                      onSelectActivePendingUserInputOption={onSelectActivePendingUserInputOption}
-                      onAdvanceActivePendingUserInput={onAdvanceActivePendingUserInput}
-                      onPreviousActivePendingUserInputQuestion={
-                        onPreviousActivePendingUserInputQuestion
-                      }
-                      onChangeActivePendingUserInputCustomAnswer={
-                        onChangeActivePendingUserInputCustomAnswer
-                      }
-                      onProviderModelSelect={onProviderModelSelect}
-                      getModelDisabledReason={getModelDisabledReason}
-                      toggleInteractionMode={toggleInteractionMode}
-                      handleRuntimeModeChange={handleRuntimeModeChange}
-                      handleInteractionModeChange={handleInteractionModeChange}
-                      togglePlanSidebar={togglePlanSidebar}
-                      focusComposer={focusComposer}
-                      scheduleComposerFocus={scheduleComposerFocus}
-                      setThreadError={setThreadError}
-                      onExpandImage={onExpandTimelineImage}
+                      timestampFormat={timestampFormat}
+                      workspaceRoot={activeWorkspaceRoot}
+                      skills={activeProviderStatus?.skills ?? EMPTY_PROVIDER_SKILLS}
+                      anchorMessageId={timelineAnchorMessageId}
+                      onAnchorReady={onTimelineAnchorReady}
+                      onAnchorSizeChanged={onTimelineAnchorSizeChanged}
+                      contentInsetEndAdjustment={composerOverlayHeight}
+                      onIsAtEndChange={onIsAtEndChange}
+                      onManualNavigation={cancelTimelineLiveFollowForUserNavigation}
+                    />
+
+                    {/* scroll to end pill — shown when user has scrolled away from the live edge */}
+                    {showScrollToBottom && (
+                      <div
+                        className="pointer-events-none absolute left-1/2 z-30 flex -translate-x-1/2 justify-center py-1.5"
+                        style={{ bottom: composerOverlayHeight + 4 }}
+                      >
+                        <button
+                          type="button"
+                          aria-label="Scroll to end"
+                          title="Scroll to end"
+                          onClick={() => scrollToEnd(true)}
+                          className="pointer-events-auto flex items-center gap-1.5 rounded-full border border-border/60 bg-card px-3 py-1 text-muted-foreground text-xs shadow-sm transition-colors hover:border-border hover:text-foreground hover:cursor-pointer"
+                        >
+                          <ChevronDownIcon className="size-3.5" />
+                          Scroll to end
+                        </button>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Input bar */}
+                  <div
+                    ref={setComposerOverlayElement}
+                    data-chat-composer-overlay="true"
+                    className="pointer-events-none absolute inset-x-0 bottom-0 z-20 pt-1.5 sm:pt-2"
+                  >
+                    <div
+                      aria-hidden="true"
+                      className="chat-composer-horizontal-inset pointer-events-none absolute inset-x-0 top-1.5 bottom-0 z-0 sm:top-2"
+                    >
+                      <div className="relative mx-auto h-full w-full max-w-3xl overflow-clip rounded-t-[20px]">
+                        <div className="chat-composer-shared-blur absolute -inset-8" />
+                      </div>
+                    </div>
+                    <div className="chat-composer-horizontal-inset">
+                      <div className="pointer-events-auto relative z-10 isolate">
+                        <ComposerBannerStack className="relative z-0" items={composerBannerItems} />
+                        <div className="relative z-10">
+                          <ChatComposer
+                            composerRef={composerRef}
+                            composerDraftTarget={composerDraftTarget}
+                            environmentId={environmentId}
+                            routeKind={routeKind}
+                            routeThreadRef={routeThreadRef}
+                            draftId={draftId}
+                            activeThreadId={activeThreadId}
+                            activeThreadEnvironmentId={activeThread?.environmentId}
+                            activeThread={activeThread}
+                            isServerThread={isServerThread}
+                            isLocalDraftThread={isLocalDraftThread}
+                            phase={phase}
+                            isConnecting={isConnecting}
+                            isSendBusy={isSendBusy}
+                            canCancelPendingSend={canCancelPendingSend}
+                            isPreparingWorktree={isPreparingWorktree}
+                            environmentUnavailable={activeEnvironmentUnavailableState}
+                            activePendingApproval={activePendingApproval}
+                            pendingApprovals={pendingApprovals}
+                            pendingUserInputs={pendingUserInputs}
+                            activePendingProgress={activePendingProgress}
+                            activePendingResolvedAnswers={activePendingResolvedAnswers}
+                            activePendingIsResponding={activePendingIsResponding}
+                            activePendingDraftAnswers={activePendingDraftAnswers}
+                            activePendingQuestionIndex={activePendingQuestionIndex}
+                            respondingRequestIds={respondingRequestIds}
+                            showPlanFollowUpPrompt={showPlanFollowUpPrompt}
+                            activeProposedPlan={activeProposedPlan}
+                            activePlan={activePlan as { turnId?: TurnId } | null}
+                            sidebarProposedPlan={sidebarProposedPlan as { turnId?: TurnId } | null}
+                            planSidebarLabel={planSidebarLabel}
+                            planSidebarOpen={planSidebarOpen}
+                            runtimeMode={runtimeMode}
+                            interactionMode={interactionMode}
+                            lockedProvider={lockedProvider}
+                            providerBindingInstanceId={providerBinding.instanceId}
+                            lockProviderPickerToActiveInstance={lockProviderPickerToActiveInstance}
+                            providerBindingConflictReason={providerBindingConflictReason}
+                            providerStatuses={providerStatuses as ServerProvider[]}
+                            activeProjectDefaultModelSelection={
+                              activeProject?.defaultModelSelection
+                            }
+                            activeThreadModelSelection={activeThread?.modelSelection}
+                            {...(routeKind === "server"
+                              ? { onCommitModelSelection: commitComposerModelSelection }
+                              : {})}
+                            activeThreadActivities={activeThread?.activities}
+                            resolvedTheme={resolvedTheme}
+                            settings={settings}
+                            keybindings={keybindings}
+                            terminalOpen={Boolean(terminalUiState.terminalOpen)}
+                            gitCwd={gitCwd}
+                            promptRef={promptRef}
+                            composerAttachmentsRef={composerAttachmentsRef}
+                            composerTerminalContextsRef={composerTerminalContextsRef}
+                            composerElementContextsRef={composerElementContextsRef}
+                            onSend={onSend}
+                            onInterrupt={onInterrupt}
+                            onImplementPlanInNewThread={onImplementPlanInNewThread}
+                            onRespondToApproval={onRespondToApproval}
+                            onSelectActivePendingUserInputOption={
+                              onSelectActivePendingUserInputOption
+                            }
+                            onAdvanceActivePendingUserInput={onAdvanceActivePendingUserInput}
+                            onPreviousActivePendingUserInputQuestion={
+                              onPreviousActivePendingUserInputQuestion
+                            }
+                            onChangeActivePendingUserInputCustomAnswer={
+                              onChangeActivePendingUserInputCustomAnswer
+                            }
+                            onProviderModelSelect={onProviderModelSelect}
+                            getModelDisabledReason={getModelDisabledReason}
+                            toggleInteractionMode={toggleInteractionMode}
+                            handleRuntimeModeChange={handleRuntimeModeChange}
+                            handleInteractionModeChange={handleInteractionModeChange}
+                            togglePlanSidebar={togglePlanSidebar}
+                            focusComposer={focusComposer}
+                            scheduleComposerFocus={scheduleComposerFocus}
+                            setThreadError={setThreadError}
+                            onExpandImage={onExpandTimelineImage}
+                          />
+                        </div>
+                      </div>
+                    </div>
+                    <div
+                      className={cn(
+                        "chat-composer-horizontal-inset chat-composer-lower-chrome relative z-10",
+                        "pb-[calc(env(safe-area-inset-bottom)+0.75rem)] sm:pb-[calc(env(safe-area-inset-bottom)+1rem)]",
+                      )}
                     />
                   </div>
+
+                  {pullRequestDialogState ? (
+                    <PullRequestThreadDialog
+                      key={pullRequestDialogState.key}
+                      open
+                      environmentId={activeThread.environmentId}
+                      threadId={activeThread.id}
+                      cwd={activeProject?.workspaceRoot ?? null}
+                      initialReference={pullRequestDialogState.initialReference}
+                      onOpenChange={(open) => {
+                        if (!open) {
+                          closePullRequestDialog();
+                        }
+                      }}
+                      onPrepared={handlePreparedPullRequestThread}
+                    />
+                  ) : null}
                 </div>
+                {/* end chat column */}
               </div>
-              <div
-                className={cn(
-                  "chat-composer-horizontal-inset chat-composer-lower-chrome relative z-10",
-                  "pb-[calc(env(safe-area-inset-bottom)+0.75rem)] sm:pb-[calc(env(safe-area-inset-bottom)+1rem)]",
-                )}
-              />
-            </div>
+              {/* end horizontal flex container */}
+            </>
+          );
 
-            {pullRequestDialogState ? (
-              <PullRequestThreadDialog
-                key={pullRequestDialogState.key}
-                open
-                environmentId={activeThread.environmentId}
-                threadId={activeThread.id}
-                cwd={activeProject?.workspaceRoot ?? null}
-                initialReference={pullRequestDialogState.initialReference}
-                onOpenChange={(open) => {
-                  if (!open) {
-                    closePullRequestDialog();
-                  }
-                }}
-                onPrepared={handlePreparedPullRequestThread}
-              />
-            ) : null}
-          </div>
-          {/* end chat column */}
-        </div>
-        {/* end horizontal flex container */}
-
-        {/* Active center panel body (only the active non-host surface mounts;
-            the host body above is css-hidden, not unmounted) */}
-        {centerHostHidden && activeThreadRef && activeCenterSurface?.kind === "chat" ? (
-          <ChatView
-            key={activeCenterSurface.id}
-            variant="panel"
-            panelThreadRef={scopeThreadRef(
-              activeThreadRef.environmentId,
-              activeCenterSurface.threadId,
-            )}
-          />
-        ) : null}
-        {centerHostHidden && activeThreadRef && activeCenterSurface?.kind === "terminal" ? (
-          <CenterTerminalPanel
-            key={activeCenterSurface.id}
-            threadRef={activeThreadRef}
-            projectId={activeThread.projectId}
-            surface={activeCenterSurface}
-            launchContext={centerTerminalLaunchContext}
-            keybindings={keybindings}
-            focusRequestId={terminalFocusRequestId}
-            onAddTerminalContext={addTerminalContextToDraft}
-            onClose={() => closeCenterPanelSurface(activeCenterSurface)}
-          />
-        ) : null}
-        {centerPanelEmpty ? (
-          <div className="flex min-h-0 flex-1 items-center justify-center px-6 text-sm text-muted-foreground">
-            No chat panels open
-          </div>
-        ) : null}
+          return !isPanel && activeThreadRef ? (
+            <LiveCenterPanelWorkspace
+              state={centerPanelState}
+              hostLabel={centerHostLabel}
+              terminalLabelsById={activeTerminalLabelsById}
+              focusedActions={chatHeaderActions}
+              hostChatSurfaceBody={hostChatSurfaceBody}
+              hostThread={activeThread}
+              hostThreadRef={activeThreadRef}
+              centerTerminalLaunchContext={centerTerminalLaunchContext}
+              keybindings={keybindings}
+              terminalFocusRequestId={terminalFocusRequestId}
+              onAddTerminalContext={addTerminalContextToDraft}
+              onFocusGroup={focusCenterPanelGroup}
+              onActivate={activateCenterPanelSurface}
+              onCloseSurface={closeCenterPanelSurface}
+              onCloseOtherSurfaces={closeOtherCenterPanelSurfaces}
+              onCloseSurfacesToRight={closeCenterPanelSurfacesToRight}
+              onCloseAllSurfaces={closeAllCenterPanelSurfaces}
+              onDropSurface={dropCenterPanelSurface}
+              onMergeGroup={mergeCenterPanelGroup}
+              onSetSplitRatio={setCenterPanelSplitRatio}
+            />
+          ) : (
+            hostChatSurfaceBody
+          );
+        })()}
 
         {!isPanel &&
           mountedTerminalThreadRefs.map(
