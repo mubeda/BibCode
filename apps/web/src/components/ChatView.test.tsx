@@ -1765,6 +1765,33 @@ describe("ChatView", () => {
           expect(container.textContent).toContain("Active reviewer");
           expect(container.textContent).toContain("Done reviewer");
         });
+        await vi.waitFor(() => {
+          expect(h.queryRefreshCalls).toContain(
+            activityKey("activity-roster", {
+              environmentId,
+              input: {
+                scope: snapshot.scope,
+                scopeId: snapshot.scopeId,
+                section: "subagents",
+                bucket: "active",
+                limit: 200,
+              },
+            }),
+          );
+          expect(h.queryRefreshCalls).toContain(
+            activityKey("activity-roster", {
+              environmentId,
+              input: {
+                scope: snapshot.scope,
+                scopeId: snapshot.scopeId,
+                section: "subagents",
+                bucket: "done",
+                limit: 200,
+              },
+            }),
+          );
+        });
+        h.queryRefreshCalls = [];
 
         await act(async () => {
           latestActivityPanelProps().onLoadMoreRoster("active");
