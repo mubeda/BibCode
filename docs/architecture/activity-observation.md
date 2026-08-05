@@ -95,7 +95,17 @@ data from another surface.
 
 Structured chat activity comes from the provider runtime's typed protocol.
 Provider-terminal observation is a separate opt-in path attached only to a
-provider terminal launched by BiBCode. It does not scrape arbitrary PTY text.
+provider terminal launched by BiBCode. It requires explicit enablement before
+that terminal is launched (or reopened), and it does not scrape arbitrary PTY
+text.
+
+## Independent activity controls
+
+Each environment has separate Chat and AI Terminal activity gates. Chat defaults
+on and owns `thread` scopes. AI Terminal defaults off and owns `terminal` scopes.
+RPC admission, generation fencing, projection, cleanup, and observer lifecycle
+are selected from the request scope; changing one gate does not transition the
+other. Legacy `enableAgentActivity` values migrate only to Chat.
 
 | Provider | Structured chat activity                                                                                              | Provider-terminal observation                                                                                                              | Recovery and truthful downgrade                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | -------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
