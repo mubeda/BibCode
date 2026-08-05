@@ -2733,6 +2733,9 @@ describe("ChatView", () => {
 
       expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe("Claude");
       expect(
+        capturedProps<Record<string, unknown>>("chatComposer")["lockedProviderInstanceId"],
+      ).toBeNull();
+      expect(
         useCenterPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)]?.surfaces,
       ).toEqual(initialSurfaces);
     });
@@ -2835,6 +2838,9 @@ describe("ChatView", () => {
       expect(capturedProps<Record<string, unknown>>("chatComposer")["lockedProvider"]).toBe(
         "codex",
       );
+      expect(
+        capturedProps<Record<string, unknown>>("chatComposer")["lockedProviderInstanceId"],
+      ).toBeNull();
     });
 
     it("keeps a sessionless started custom instance defensively locked while statuses load", () => {
@@ -2875,8 +2881,60 @@ describe("ChatView", () => {
       expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe(
         "Codex Personal",
       );
-      expect(capturedProps<Record<string, unknown>>("chatComposer")["lockedProvider"]).toBe(
-        "codex_personal",
+      const composer = capturedProps<Record<string, unknown>>("chatComposer");
+      expect(composer["lockedProvider"]).toBeNull();
+      expect(composer["lockedProviderInstanceId"]).toBe("codex_personal");
+    });
+
+    it("uses an exact instance lock when a live driver collides with a missing bound instance", () => {
+      const boundInstanceId = ProviderInstanceId.make("codex_personal");
+      const staleInstanceId = ProviderInstanceId.make("stale_selection");
+      const collidingProvider: ServerProvider = {
+        ...codexProvider,
+        instanceId: staleInstanceId,
+        driver: ProviderDriverKind.make("codex_personal"),
+        displayName: "Colliding Provider",
+      };
+      seedEnvironment(
+        makeEnvironmentPresentation({
+          serverConfig: {
+            providers: [collidingProvider],
+            environment: { label: "Local" },
+          },
+        }),
+      );
+      seedProject(makeProject());
+      seedServerThread(
+        makeThread({
+          modelSelection: { instanceId: boundInstanceId, model: "gpt-5.4" },
+          session: null,
+          messages: [
+            {
+              id: MessageId.make("started-colliding-instance"),
+              role: "user",
+              text: "Started",
+              turnId: null,
+              createdAt: now,
+              updatedAt: now,
+              streaming: false,
+            },
+          ],
+        }),
+      );
+      useComposerDraftStore.getState().setModelSelection(threadRef, {
+        instanceId: staleInstanceId,
+        model: "collision-model",
+      });
+      publishSeededStoreState(useComposerDraftStore);
+      seedGitStatus(true);
+
+      renderServerRoute();
+
+      const composer = capturedProps<Record<string, unknown>>("chatComposer");
+      expect(composer["lockedProvider"]).toBeNull();
+      expect(composer["lockedProviderInstanceId"]).toBe("codex_personal");
+      expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe(
+        "Codex Personal",
       );
     });
 
@@ -2933,6 +2991,9 @@ describe("ChatView", () => {
       expect(capturedProps<Record<string, unknown>>("chatComposer")["lockedProvider"]).toBe(
         "codex",
       );
+      expect(
+        capturedProps<Record<string, unknown>>("chatComposer")["lockedProviderInstanceId"],
+      ).toBeNull();
     });
 
     it("keeps header actions aligned when every center surface is closed", () => {
@@ -3519,6 +3580,67 @@ describe("ChatView handlers (captured from mocked children)", () => {
       key: "thread.updateMetadata",
       input: { environmentId, input: { threadId, modelSelection: selection } },
     });
+  });
+
+  it("rejects model selection outside an exact missing-instance lock", () => {
+    const boundInstanceId = ProviderInstanceId.make("codex_personal");
+    const staleInstanceId = ProviderInstanceId.make("stale_selection");
+    const collidingProvider: ServerProvider = {
+      ...codexProvider,
+      instanceId: staleInstanceId,
+      driver: ProviderDriverKind.make("codex_personal"),
+      models: [
+        {
+          slug: "collision-model",
+          name: "Collision Model",
+          isCustom: false,
+          capabilities: null,
+        },
+      ],
+    };
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        serverConfig: {
+          providers: [collidingProvider],
+          environment: { label: "Local" },
+        },
+      }),
+    );
+    seedProject(makeProject());
+    seedServerThread(
+      makeThread({
+        modelSelection: { instanceId: boundInstanceId, model: "gpt-5.4" },
+        messages: [
+          {
+            id: MessageId.make("started-handler-exact-lock"),
+            role: "user",
+            text: "Started",
+            turnId: null,
+            createdAt: now,
+            updatedAt: now,
+            streaming: false,
+          },
+        ],
+      }),
+    );
+    useComposerDraftStore.getState().setModelSelection(threadRef, {
+      instanceId: boundInstanceId,
+      model: "gpt-5.4",
+    });
+    publishSeededStoreState(useComposerDraftStore);
+    seedGitStatus(true);
+
+    renderServerRoute();
+    const composer = capturedProps<Record<string, unknown>>("chatComposer");
+    const onProviderModelSelect = composer["onProviderModelSelect"] as (
+      instanceId: ProviderInstanceId,
+      model: string,
+    ) => void;
+    onProviderModelSelect(staleInstanceId, "collision-model");
+
+    const draft = useComposerDraftStore.getState().getComposerDraft(threadRef);
+    expect(draft?.activeProvider).toBe("codex_personal");
+    expect(draft?.modelSelectionByProvider[staleInstanceId]).toBeUndefined();
   });
 
   it("onRespondToApproval interrupts the active turn when cancellation is requested", async () => {

@@ -125,7 +125,7 @@ import { isCommandPaletteOpen } from "../commandPaletteContext";
 import { buildTemporaryWorktreeBranchName } from "@bibcode/shared/git";
 import { useMediaQuery } from "../hooks/useMediaQuery";
 import { resolveProviderSessionSelectionForInstance } from "../providerSessionSelection";
-import { formatProviderDriverKindLabel } from "../providerModels";
+import { formatProviderDriverKindLabel, formatProviderSlugLabel } from "../providerModels";
 import {
   ACTIVITY_DOCK_COMPACT_MEDIA_QUERY,
   RIGHT_PANEL_INLINE_LAYOUT_MEDIA_QUERY,
@@ -264,6 +264,7 @@ import {
   resolveSendEnvMode,
   revokeBlobPreviewUrl,
   revokeUserMessagePreviewUrls,
+  threadHasStarted,
   waitForStartedServerThread,
 } from "./ChatView.logic";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
@@ -2329,15 +2330,21 @@ function ChatViewContent(props: ChatViewProps) {
     versionMismatchServerLabel,
   ]);
   const providerStatuses = serverConfig?.providers ?? EMPTY_PROVIDERS;
-  const boundProviderLock = boundProviderInstanceId
-    ? (providerStatuses.find((status) => status.instanceId === boundProviderInstanceId)?.driver ??
-      ProviderDriverKind.make(boundProviderInstanceId))
+  const boundProviderStatus = boundProviderInstanceId
+    ? (providerStatuses.find((status) => status.instanceId === boundProviderInstanceId) ?? null)
     : null;
-  const lockedProvider = deriveLockedProvider({
-    thread: activeThread,
-    selectedProvider: null,
-    threadProvider: boundProviderLock,
-  });
+  const lockedProviderInstanceId =
+    threadHasStarted(activeThread) && boundProviderInstanceId && !boundProviderStatus
+      ? boundProviderInstanceId
+      : null;
+  const lockedProvider =
+    lockedProviderInstanceId === null
+      ? deriveLockedProvider({
+          thread: activeThread,
+          selectedProvider: null,
+          threadProvider: boundProviderStatus?.driver ?? null,
+        })
+      : null;
   const unlockedSelectedProvider = resolveSelectableProvider(
     providerStatuses,
     selectedProviderByThreadId ?? boundProviderInstanceId ?? ProviderDriverKind.make("codex"),
@@ -2754,7 +2761,9 @@ function ChatViewContent(props: ChatViewProps) {
     providerStatuses.find((status) => status.instanceId === selectedProviderByThreadId)
       ?.instanceId ?? null;
   const activeProviderInstanceId =
-    (lockedProvider === null ? selectedProviderInstanceId : null) ??
+    (lockedProvider === null && lockedProviderInstanceId === null
+      ? selectedProviderInstanceId
+      : null) ??
     boundProviderInstanceId ??
     activeProject?.defaultModelSelection?.instanceId ??
     null;
@@ -2768,7 +2777,10 @@ function ChatViewContent(props: ChatViewProps) {
     return providerStatuses.find((status) => status.instanceId === defaultInstanceId) ?? null;
   }, [activeProviderInstanceId, providerStatuses, selectedProvider]);
   const centerHostLabel =
-    activeProviderStatus?.displayName?.trim() || formatProviderDriverKindLabel(selectedProvider);
+    activeProviderStatus?.displayName?.trim() ||
+    (lockedProviderInstanceId
+      ? formatProviderSlugLabel(lockedProviderInstanceId)
+      : formatProviderDriverKindLabel(selectedProvider));
   const activeProjectCwd = activeProject?.workspaceRoot ?? null;
   const activeThreadWorktreePath = activeThread?.worktreePath ?? null;
   const activeWorkspaceRoot = activeThreadWorktreePath ?? activeProjectCwd ?? undefined;
@@ -5666,6 +5678,10 @@ function ChatViewContent(props: ChatViewProps) {
   const onProviderModelSelect = useCallback(
     (instanceId: ProviderInstanceId, model: string) => {
       if (!activeThread) return;
+      if (lockedProviderInstanceId && instanceId !== lockedProviderInstanceId) {
+        scheduleComposerFocus();
+        return;
+      }
       // Look up the configured instance so model normalization and custom
       // model lookup stay scoped to that exact instance. Unknown instance ids
       // are rejected by returning early; the server remains authoritative too.
@@ -5732,6 +5748,7 @@ function ChatViewContent(props: ChatViewProps) {
     [
       activeThread,
       lockedProvider,
+      lockedProviderInstanceId,
       scheduleComposerFocus,
       setComposerDraftModelSelection,
       setStickyComposerModelSelection,
@@ -6112,6 +6129,7 @@ function ChatViewContent(props: ChatViewProps) {
                       runtimeMode={runtimeMode}
                       interactionMode={interactionMode}
                       lockedProvider={lockedProvider}
+                      lockedProviderInstanceId={lockedProviderInstanceId}
                       providerStatuses={providerStatuses as ServerProvider[]}
                       activeProjectDefaultModelSelection={activeProject?.defaultModelSelection}
                       activeThreadModelSelection={activeThread?.modelSelection}

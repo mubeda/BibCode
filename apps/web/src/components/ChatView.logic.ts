@@ -390,12 +390,10 @@ export function threadHasStarted(thread: Thread | null | undefined): boolean {
   );
 }
 
-// Both provider inputs are open branded slugs. Callers should resolve a bound
-// instance id to its live driver before passing `threadProvider`. While provider
-// metadata is unavailable, the bound instance id itself may be branded as a
-// defensive lock key: it cannot match another provider's driver, so a started
-// thread remains locked until the authoritative instance-to-driver mapping
-// returns.
+// Both provider inputs are open branded driver slugs. Callers should resolve a
+// bound instance id to its live driver before passing `threadProvider`; an
+// unresolved exact-instance binding must stay separate rather than being
+// rebranded as a driver kind because the two open slug namespaces can collide.
 export function deriveLockedProvider(input: {
   thread: Thread | null | undefined;
   selectedProvider: string | null;

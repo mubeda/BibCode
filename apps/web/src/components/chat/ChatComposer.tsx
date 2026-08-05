@@ -539,6 +539,8 @@ export interface ChatComposerProps {
 
   // Provider / model
   lockedProvider: ProviderDriverKind | null;
+  /** Exact routing-key lock used only while a started thread's provider metadata is unavailable. */
+  lockedProviderInstanceId: ProviderInstanceId | null;
   providerStatuses: ServerProvider[];
   activeProjectDefaultModelSelection: ModelSelection | null | undefined;
   activeThreadModelSelection: ModelSelection | null | undefined;
@@ -633,6 +635,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     runtimeMode,
     interactionMode,
     lockedProvider,
+    lockedProviderInstanceId,
     providerStatuses,
     activeProjectDefaultModelSelection,
     activeThreadModelSelection,
@@ -734,7 +737,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     activeThreadModelSelection?.instanceId ??
     activeProjectDefaultModelSelection?.instanceId ??
     null;
-  const explicitSelectedInstanceId = selectedProviderByThreadId ?? threadProvider;
+  const explicitSelectedInstanceId =
+    lockedProviderInstanceId ?? selectedProviderByThreadId ?? threadProvider;
 
   const unlockedSelectedProvider =
     resolveProviderDriverKindForInstanceSelection(
@@ -770,6 +774,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   //   5. First enabled entry overall / default instance for the kind.
   //
   const selectedInstanceId = useMemo<ProviderInstanceId>(() => {
+    if (lockedProviderInstanceId) {
+      return lockedProviderInstanceId;
+    }
     const candidates: Array<string | null | undefined> = [
       composerDraft.activeProvider,
       activeThread?.session?.providerInstanceId,
@@ -820,6 +827,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     explicitSelectedInstanceId,
     lockedContinuationGroupKey,
     lockedProvider,
+    lockedProviderInstanceId,
     providerInstanceEntries,
     selectedProvider,
   ]);

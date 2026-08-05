@@ -785,6 +785,7 @@ function renderComposer(overrides: Partial<ChatComposerProps> = {}): RenderResul
     runtimeMode: "approval-required",
     interactionMode: "default",
     lockedProvider: null,
+    lockedProviderInstanceId: null,
     providerStatuses: [codexProvider],
     activeProjectDefaultModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
     activeThreadModelSelection: null,
@@ -2549,6 +2550,42 @@ describe("ChatComposer provider selection", () => {
     });
     const picker = findCapture("ProviderModelPicker");
     expect(picker["activeInstanceId"]).toBe("codex_personal");
+  });
+
+  it("keeps an exact missing-instance lock ahead of a colliding stale selection", () => {
+    const boundInstanceId = ProviderInstanceId.make("codex_personal");
+    const staleInstanceId = ProviderInstanceId.make("stale_selection");
+    const collidingProvider: ServerProvider = {
+      ...codexProvider,
+      instanceId: staleInstanceId,
+      driver: ProviderDriverKind.make("codex_personal"),
+      models: [
+        {
+          slug: "collision-model",
+          name: "Collision Model",
+          isCustom: false,
+          capabilities: null,
+        },
+      ],
+    };
+    draftStore().setModelSelection(threadRef, {
+      instanceId: staleInstanceId,
+      model: "collision-model",
+    });
+    publishSeededStoreState();
+
+    renderComposer({
+      lockedProvider: null,
+      lockedProviderInstanceId: boundInstanceId,
+      providerStatuses: [collidingProvider],
+      activeProjectDefaultModelSelection: null,
+      activeThreadModelSelection: { instanceId: boundInstanceId, model: "gpt-5.4" },
+    });
+
+    const picker = findCapture("ProviderModelPicker");
+    expect(picker["activeInstanceId"]).toBe("codex_personal");
+    expect(picker["lockToActiveInstance"]).toBe(true);
+    expect(picker["lockedProvider"]).toBeNull();
   });
 
   it("locks the provider and derives the continuation group", () => {
