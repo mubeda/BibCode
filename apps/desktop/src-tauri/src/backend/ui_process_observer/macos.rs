@@ -119,7 +119,7 @@ fn reduce_webview_results(
             .issues
             .insert(MacosObservationIssue::WebviewDispatch);
     }
-    if timed_out && completed_callbacks < expected_callbacks {
+    if timed_out || completed_callbacks < expected_callbacks {
         collection
             .issues
             .insert(MacosObservationIssue::WebviewDeadline);
@@ -606,6 +606,48 @@ XPCServices/com.apple.WebKit.WebContent.xpc/Contents/MacOS/com.apple.WebKit.WebC
             [MacosObservationIssue::WebviewDeadline]
                 .into_iter()
                 .collect()
+        );
+    }
+
+    #[test]
+    fn macos_ui_collection_early_channel_close_preserves_a_candidate_as_partial() {
+        // Mutation caught: requiring a timeout before recording incomplete callback coverage
+        // lets an early closed channel report Available from one completed WebView.
+        let rows = vec![server_row(), web_content_row(501, 2_001)];
+        let coalitions = [(SERVER_PID, Ok(HOST_COALITION)), (501, Ok(HOST_COALITION))]
+            .into_iter()
+            .collect();
+        let collection = reduce_webview_results(
+            2,
+            0,
+            false,
+            vec![WebViewPidResult {
+                candidates: vec![WebKitProcessCandidate {
+                    pid: 501,
+                    role: WebKitProcessRole::WebContent,
+                }],
+                missing_selectors: 0,
+            }],
+        );
+
+        assert_eq!(
+            collection.issues,
+            [MacosObservationIssue::WebviewDeadline]
+                .into_iter()
+                .collect()
+        );
+        let observation = observe(&rows, collection, coalitions);
+        assert_eq!(
+            observation.identities,
+            vec![ProcessIdentity {
+                pid: 501,
+                started_at: 2_001,
+            }]
+        );
+        assert_eq!(observation.coverage.status, UiCoverageStatus::Partial);
+        assert_eq!(
+            observation.coverage.message.as_deref(),
+            Some("WebView process discovery exceeded its deadline.")
         );
     }
 
