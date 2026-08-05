@@ -5,6 +5,8 @@ import * as FileSystem from "effect/FileSystem";
 import * as Path from "effect/Path";
 import * as Schema from "effect/Schema";
 
+import { decodeRgbaPng, type DecodedRgbaPng } from "./lib/png-rgba.ts";
+
 const TauriConfiguration = Schema.fromJsonString(
   Schema.Struct({
     identifier: Schema.String,
@@ -62,7 +64,72 @@ const decodeDesktopPackageConfiguration = Schema.decodeUnknownEffect(DesktopPack
 const decodeBaseUpdaterConfiguration = Schema.decodeUnknownEffect(BaseUpdaterConfiguration);
 const decodeReleaseUpdaterConfiguration = Schema.decodeUnknownEffect(ReleaseUpdaterConfiguration);
 
+function topRowOpaqueBounds(image: DecodedRgbaPng): readonly [number, number] {
+  const opaqueColumns: Array<number> = [];
+  for (let x = 0; x < image.width; x++) {
+    if (image.pixels[x * 4 + 3]! >= 128) opaqueColumns.push(x);
+  }
+  assert.ok(opaqueColumns.length > 0, "macOS icon top row must contain opaque pixels");
+  return [opaqueColumns[0]!, opaqueColumns.at(-1)!];
+}
+
+function readIcnsChunks(icns: Uint8Array): ReadonlyMap<string, Uint8Array> {
+  const bytes = Buffer.from(icns.buffer, icns.byteOffset, icns.byteLength);
+  assert.equal(bytes.toString("ascii", 0, 4), "icns");
+  assert.equal(bytes.readUInt32BE(4), bytes.length);
+  const chunks = new Map<string, Uint8Array>();
+  for (let offset = 8; offset < bytes.length;) {
+    const type = bytes.toString("ascii", offset, offset + 4);
+    const size = bytes.readUInt32BE(offset + 4);
+    assert.ok(size >= 8 && offset + size <= bytes.length, `Invalid ICNS ${type} chunk`);
+    chunks.set(type, bytes.subarray(offset + 8, offset + size));
+    offset += size;
+  }
+  return chunks;
+}
+
 it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
+  it.effect("uses the proven full-black macOS enclosure geometry", () =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const repoRoot = yield* path.fromFileUrl(new URL("..", import.meta.url));
+      const source = decodeRgbaPng(
+        yield* fs.readFile(path.join(repoRoot, "assets/prod/black-macos-1024.png")),
+      );
+
+      assert.equal(source.width, 1024);
+      assert.equal(source.height, 1024);
+      assert.deepEqual(topRowOpaqueBounds(source), [171, 852]);
+      assert.equal(source.pixels[(512 * source.width + 512) * 4 + 3], 255);
+      assert.ok(
+        Array.from(
+          { length: source.width * source.height },
+          (_, index) => source.pixels[index * 4 + 3]!,
+        ).filter((alpha) => alpha === 0).length >= 27_000,
+        "macOS icon must retain the T4-compatible transparent corner area",
+      );
+      assert.ok(
+        Array.from(
+          { length: source.width * source.height },
+          (_, index) => source.pixels[index * 4 + 3]!,
+        ).some((alpha) => alpha > 0 && alpha < 255),
+        "macOS icon corners must retain antialiasing",
+      );
+
+      const chunks = readIcnsChunks(
+        yield* fs.readFile(path.join(repoRoot, "assets/prod/bibcode-black-macos.icns")),
+      );
+      for (const type of ["ic11", "ic12", "ic13", "ic07", "ic08", "ic14", "ic09", "ic10"]) {
+        assert.equal(chunks.has(type), true, `ICNS must contain ${type}`);
+      }
+      const largest = decodeRgbaPng(chunks.get("ic10")!);
+      assert.equal(largest.width, 1024);
+      assert.equal(largest.height, 1024);
+      assert.deepEqual(topRowOpaqueBounds(largest), [171, 852]);
+    }),
+  );
+
   it.effect("prepares repository-local AppImage tools only for Linux bundle builds", () =>
     Effect.gen(function* () {
       const fs = yield* FileSystem.FileSystem;
