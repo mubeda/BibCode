@@ -2646,6 +2646,47 @@ describe("ChatComposer provider selection", () => {
     });
   });
 
+  it("routes an exact session account while only another account has status", () => {
+    const customInstanceId = ProviderInstanceId.make("codex_personal");
+    const { handle } = renderComposer({
+      activeThread: makeThread({
+        modelSelection: { instanceId: customInstanceId, model: "gpt-5.4" },
+        session: {
+          threadId,
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: customInstanceId,
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+      }),
+      lockedProvider: ProviderDriverKind.make("codex"),
+      providerBindingInstanceId: customInstanceId,
+      lockProviderPickerToActiveInstance: true,
+      providerStatuses: [codexProvider],
+      activeProjectDefaultModelSelection: {
+        instanceId: codexInstanceId,
+        model: "gpt-5.4",
+      },
+      activeThreadModelSelection: {
+        instanceId: customInstanceId,
+        model: "gpt-5.4",
+      },
+    });
+
+    expect(findCapture("ProviderModelPicker")).toMatchObject({
+      activeInstanceId: "codex_personal",
+      lockedProvider: "codex",
+      lockToActiveInstance: true,
+    });
+    expect(handle().getSendContext()).toMatchObject({
+      selectedProvider: "codex",
+      selectedModelSelection: { instanceId: "codex_personal", model: "gpt-5.4" },
+    });
+  });
+
   it("locks the provider and derives the continuation group", () => {
     renderComposer({
       lockedProvider: ProviderDriverKind.make("codex"),

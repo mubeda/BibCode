@@ -94,7 +94,7 @@ describe("resolveThreadProviderBinding", () => {
     });
   });
 
-  it("rejects a session instance whose live driver contradicts the authoritative session driver", () => {
+  it("preserves an exact session instance whose live driver contradicts the session driver", () => {
     const binding = resolveThreadProviderBinding({
       thread: thread({
         modelSelection: { instanceId: claudeInstanceId, model: "claude-sonnet" },
@@ -115,11 +115,75 @@ describe("resolveThreadProviderBinding", () => {
     });
 
     expect(binding).toMatchObject({
-      instanceId: "codex",
+      instanceId: "claude",
       driver: "codex",
-      status: { instanceId: "codex" },
+      status: null,
       lockedProvider: "codex",
-      lockedProviderInstanceId: null,
+      lockedProviderInstanceId: "claude",
+    });
+  });
+
+  it("preserves an exact session instance while provider statuses are empty", () => {
+    const customInstanceId = ProviderInstanceId.make("codex_personal");
+    const binding = resolveThreadProviderBinding({
+      thread: thread({
+        modelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+        session: {
+          threadId,
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: customInstanceId,
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+      }),
+      projectDefaultModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+      selectedProviderInstanceId: codexInstanceId,
+      providers: [],
+    });
+
+    expect(binding).toEqual({
+      instanceId: "codex_personal",
+      driver: "codex",
+      status: null,
+      lockedProvider: "codex",
+      lockedProviderInstanceId: "codex_personal",
+    });
+  });
+
+  it("preserves an exact session instance when only another account has agreeing status", () => {
+    const customInstanceId = ProviderInstanceId.make("codex_personal");
+    const contradictoryStatus = {
+      ...claudeProvider,
+      instanceId: customInstanceId,
+    };
+    const binding = resolveThreadProviderBinding({
+      thread: thread({
+        modelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+        session: {
+          threadId,
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: customInstanceId,
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+      }),
+      projectDefaultModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+      selectedProviderInstanceId: codexInstanceId,
+      providers: [contradictoryStatus, codexProvider],
+    });
+
+    expect(binding).toEqual({
+      instanceId: "codex_personal",
+      driver: "codex",
+      status: null,
+      lockedProvider: "codex",
+      lockedProviderInstanceId: "codex_personal",
     });
   });
 

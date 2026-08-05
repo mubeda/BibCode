@@ -3798,6 +3798,76 @@ describe("ChatView handlers (captured from mocked children)", () => {
     ).toBeUndefined();
   });
 
+  it("keeps an exact session account in the label, picker guard, and outgoing turn", async () => {
+    const customInstanceId = ProviderInstanceId.make("codex_personal");
+    const startedThread = makeThread({
+      modelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
+      session: {
+        threadId,
+        status: "ready",
+        providerName: "codex",
+        providerInstanceId: customInstanceId,
+        runtimeMode: "full-access",
+        activeTurnId: null,
+        lastError: null,
+        updatedAt: now,
+      },
+    });
+    seedConnectedServerThread(startedThread);
+    useComposerDraftStore.getState().setModelSelection(threadRef, {
+      instanceId: customInstanceId,
+      model: "gpt-5.4",
+    });
+    publishSeededStoreState(useComposerDraftStore);
+
+    renderServerRoute();
+    const composer = capturedProps<Record<string, unknown>>("chatComposer");
+    expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe(
+      "Codex Personal",
+    );
+    expect(composer["lockedProvider"]).toBe("codex");
+    expect(composer["providerBindingInstanceId"]).toBe("codex_personal");
+    expect(composer["lockProviderPickerToActiveInstance"]).toBe(true);
+
+    const onProviderModelSelect = composer["onProviderModelSelect"] as (
+      instanceId: ProviderInstanceId,
+      model: string,
+    ) => void;
+    onProviderModelSelect(codexInstanceId, "gpt-5.4");
+    expect(useComposerDraftStore.getState().getComposerDraft(threadRef)?.activeProvider).toBe(
+      "codex_personal",
+    );
+
+    const composerRef = composer["composerRef"] as RefObject<ChatComposerHandle | null>;
+    composerRef.current = composerHandle({
+      getSendContext: () => ({
+        prompt: "keep exact account",
+        attachments: [],
+        terminalContexts: [],
+        elementContexts: [],
+        previewAnnotations: [],
+        reviewComments: [],
+        selectedProvider: ProviderDriverKind.make("codex"),
+        selectedModel: "gpt-5.4",
+        selectedProviderModels: codexProvider.models,
+        selectedPromptEffort: null,
+        selectedModelOptionsForDispatch: [],
+        selectedModelSelection: { instanceId: customInstanceId, model: "gpt-5.4" },
+      }),
+    });
+    const promptRef = composer["promptRef"] as RefObject<string>;
+    promptRef.current = "keep exact account";
+
+    await (composer["onSend"] as () => Promise<void>)();
+
+    expect(commandCallsFor("thread.startTurn")).toHaveLength(1);
+    expect(commandCallsFor("thread.startTurn")[0]!.input).toMatchObject({
+      input: {
+        modelSelection: { instanceId: "codex_personal", model: "gpt-5.4" },
+      },
+    });
+  });
+
   it("canonicalizes legacy file links before starting a provider turn", async () => {
     seedConnectedServerThread();
 
