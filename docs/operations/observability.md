@@ -109,9 +109,10 @@ ownership.
 
 On macOS, the desktop observer obtains PIDs from every WKWebView owned by the
 current Tauri `AppHandle`, then validates each PID with an exact role-specific
-executable match and matching resource and jetsam coalition IDs. Coalition
-membership is validation rather than a discovery mechanism. A missing private
-selector, failed dispatch, missing snapshot row, or unavailable coalition data
+executable match and matching resource and jetsam coalition IDs, both nonzero.
+Coalition membership is validation rather than a discovery mechanism. A
+missing private selector, failed dispatch, missing snapshot row, or unavailable
+coalition data
 yields `partial` or `unavailable` coverage. This requires neither elevated
 privileges nor a new entitlement, but it uses private WebKit and process SPI,
 so it is incompatible with a strict Mac App Store public-API-only policy.
