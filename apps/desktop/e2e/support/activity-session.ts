@@ -323,6 +323,7 @@ export async function configureDesktopActivityCodexExecutable(executable: string
       tag: "server.updateSettings",
       payload: {
         patch: {
+          enableTerminalAgentActivity: true,
           providers: {
             codex: {
               enabled: true,

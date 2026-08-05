@@ -1,6 +1,15 @@
 pub mod delivery;
 pub mod engine;
 
+pub use delivery::{
+    AttachmentReference, CommandAdmission, NewProviderTurnDelivery, ProviderTurnDelivery,
+    TurnDeliveryState, TurnDeliveryTransition, canonical_command_digest,
+};
+pub use engine::{
+    EngineOptions, OrchestrationCommand, OrchestrationEngine, OrchestrationError, Snapshot,
+    load_snapshot,
+};
+
 #[cfg(test)]
 mod delivery_tests {
     use serde_json::json;
@@ -21,12 +30,3 @@ mod delivery_tests {
         );
     }
 }
-
-pub use delivery::{
-    AttachmentReference, CommandAdmission, NewProviderTurnDelivery, ProviderTurnDelivery,
-    TurnDeliveryState, TurnDeliveryTransition, canonical_command_digest,
-};
-pub use engine::{
-    EngineOptions, OrchestrationCommand, OrchestrationEngine, OrchestrationError, Snapshot,
-    load_snapshot,
-};

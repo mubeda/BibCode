@@ -16,7 +16,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     ServerConfig,
     activity::{
-        ActivityProjection, ActivityRepository, AgentActivityController, register_activity_rpc,
+        ActivityProjections, ActivityRepository, AgentActivityController, AgentActivitySource,
+        register_activity_rpc,
     },
     assets::{AssetAccess, ResolvedAsset},
     auth::AuthService,
@@ -76,7 +77,7 @@ use crate::{
 pub struct ProductionRuntime {
     pub registry: RpcRegistry,
     pub orchestration: OrchestrationEngine,
-    pub activity_projection: ActivityProjection,
+    pub activity_projections: ActivityProjections,
     pub preview_automation: PreviewAutomationBroker,
     asset_access: AssetAccess,
     terminal_services: ServerTerminalServices,
@@ -124,8 +125,16 @@ impl ProductionRuntime {
             .await,
         );
         let provider_update_checks = control.start_provider_update_checks();
-        let activity_controller =
-            AgentActivityController::new(control.agent_activity_enabled().await);
+        let chat_activity_controller = AgentActivityController::new(
+            control
+                .agent_activity_enabled(AgentActivitySource::Chat)
+                .await,
+        );
+        let terminal_activity_controller = AgentActivityController::new(
+            control
+                .agent_activity_enabled(AgentActivitySource::Terminal)
+                .await,
+        );
         let orchestration = OrchestrationEngine::start(
             database,
             EngineOptions {
@@ -136,11 +145,13 @@ impl ProductionRuntime {
         .await
         .map_err(|error| error.to_string())?;
         let repositories = orchestration.repositories();
-        let activity_projection = ActivityProjection::with_controller(
+        let activity_projections = ActivityProjections::new(
             ActivityRepository::new(repositories.database().clone()),
-            activity_controller.clone(),
+            chat_activity_controller.clone(),
+            terminal_activity_controller.clone(),
         );
-        activity_projection
+        activity_projections
+            .terminal()
             .interrupt_unresolved_terminal_scopes()
             .await
             .map_err(|error| error.to_string())?;
@@ -161,8 +172,8 @@ impl ProductionRuntime {
         let provider_settings = ProviderSettingsStore::new(&state_paths.state_dir);
         let provider_terminal_preparer = ProviderTerminalActivitySupervisor::new_with_authority(
             Arc::new(ProviderSettingsInventoryAuthority::new(provider_settings)),
-            activity_controller.clone(),
-            activity_projection.clone(),
+            terminal_activity_controller.clone(),
+            activity_projections.terminal(),
             process_attribution.clone(),
             state_paths.state_dir.join("runtime/provider-terminal"),
             production_provider_terminal_observer_factories(),
@@ -201,10 +212,10 @@ impl ProductionRuntime {
                 NativeProviderDriverFactory::with_process_attribution_and_agent_activity_controller(
                     state_paths.attachments_dir.clone(),
                     process_attribution.clone(),
-                    activity_controller.clone(),
+                    chat_activity_controller.clone(),
                 ),
             ),
-            activity_projection.clone(),
+            activity_projections.chat(),
             SupervisorOptions::default(),
             operational_logs.provider(),
         ));
@@ -231,8 +242,7 @@ impl ProductionRuntime {
             ProviderUsageService::new(production_fetchers(), Arc::new(OffsetDateTime::now_utc));
         let relay = relay_client_service(config.state_dir());
         let agent_activity = Arc::new(ProductionAgentActivity::new(
-            activity_controller.clone(),
-            activity_projection.clone(),
+            activity_projections.clone(),
             provider_runtime.clone(),
             terminal_manager.clone(),
             trace_diagnostics.clone(),
@@ -271,11 +281,7 @@ impl ProductionRuntime {
 
         let mut registry = RpcRegistry::with_trace_diagnostics(trace_diagnostics.clone());
         crate::auth::register_rpc_handlers(&mut registry, auth);
-        register_activity_rpc(
-            &mut registry,
-            activity_projection.clone(),
-            activity_controller.clone(),
-        );
+        register_activity_rpc(&mut registry, activity_projections.clone());
         register_orchestration_rpc_with_delivery(
             &mut registry,
             orchestration.clone(),
@@ -297,7 +303,7 @@ impl ProductionRuntime {
         Ok(Self {
             registry,
             orchestration,
-            activity_projection,
+            activity_projections,
             preview_automation,
             asset_access,
             terminal_services,
@@ -818,7 +824,6 @@ fn production_provider_terminal_observer_factories() -> ProviderTerminalObserver
         codex: Some(Arc::new(CodexTerminalObserverFactory::system())),
         claude: Some(Arc::new(ClaudeTerminalObserverFactory::system())),
         opencode: Some(Arc::new(OpenCodeTerminalObserverFactory::system())),
-        ..ProviderTerminalObserverFactories::default()
     }
 }
 
@@ -853,15 +858,19 @@ const FALLBACK_FAVICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewB
 mod tests {
     use super::*;
     use crate::{
+        ServerMessage, ServerRuntime,
         activity::{
-            ActivityCapabilities, ActivityLifecycle, ActivityScopeRef, ActivityScopeSeed,
-            ProviderActivityMutation,
+            ActivityCapabilities, ActivityLifecycle, ActivityProjection, ActivityScopeRef,
+            ActivityScopeSeed, ProviderActivityMutation,
         },
         assets::{AssetIssueRequest, AssetResource},
         persistence::run_migrations,
     };
     use axum::http::{HeaderMap, Uri};
+    use futures_util::{SinkExt, StreamExt};
     use tempfile::TempDir;
+    use tokio::time::timeout;
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
 
     fn route_context() -> RouteContext {
         RouteContext {
@@ -887,6 +896,162 @@ mod tests {
             factories.opencode.is_some(),
             "production must install the OpenCode terminal observer factory"
         );
+    }
+
+    #[tokio::test]
+    async fn production_activity_rpc_stream_receives_producer_projection_deltas() {
+        // Mutation caught: registering RPC with fresh projections that do not share producer buses.
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let state = TempDir::new().expect("temporary state directory");
+        let config = ServerConfig::new(state.path())
+            .with_bind("127.0.0.1", 0)
+            .with_unsafe_no_auth();
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let runtime = ProductionRuntime::start(
+            &config,
+            database,
+            AuthService::new(&config, vec![7_u8; 32]),
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("production runtime start");
+        let producer_projection = runtime.activity_projections.chat();
+        producer_projection
+            .ensure_scope(
+                ActivityScopeSeed::thread(
+                    "thread:production-rpc",
+                    "production-rpc",
+                    "codex",
+                    Some("codex"),
+                    ActivityCapabilities::structured_full(false),
+                )
+                .expect("thread scope"),
+            )
+            .await
+            .expect("scope persistence");
+        let handle = ServerRuntime::start_with_registry(config, runtime.registry.clone())
+            .await
+            .expect("RPC server");
+        let mut socket = connect_async(format!("ws://{}/ws", handle.local_addr()))
+            .await
+            .expect("WebSocket")
+            .0;
+        socket
+            .send(Message::Text(
+                json!({
+                    "_tag": "Request",
+                    "id": "701",
+                    "tag": "subscribeActivity",
+                    "payload": { "_tag": "thread", "threadId": "production-rpc" },
+                    "headers": []
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("subscribe to activity");
+        let initial = next_activity_message(&mut socket).await;
+        assert!(matches!(
+            initial,
+            ServerMessage::Chunk { ref values, .. }
+                if values[0]["kind"] == "snapshot"
+                    && values[0]["snapshot"]["scopeId"] == "thread:production-rpc"
+        ));
+        socket
+            .send(Message::Text(
+                json!({ "_tag": "Ack", "requestId": "701" })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("acknowledge initial snapshot");
+
+        producer_projection
+            .apply(
+                "thread:production-rpc",
+                "event:production-rpc".to_owned(),
+                vec![
+                    ProviderActivityMutation::upsert_actor(
+                        "actor:production-rpc",
+                        None,
+                        "Production RPC actor",
+                        "running",
+                    )
+                    .expect("actor mutation"),
+                ],
+                "2026-08-04T12:00:00Z".to_owned(),
+            )
+            .await
+            .expect("producer mutation");
+        let delta = next_activity_message(&mut socket).await;
+        assert!(matches!(
+            delta,
+            ServerMessage::Chunk { ref values, .. }
+                if values[0]["kind"] == "delta"
+                    && values[0]["delta"]["scopeId"] == "thread:production-rpc"
+        ));
+
+        socket.close(None).await.expect("close WebSocket");
+        handle.shutdown();
+        handle.join().await.expect("RPC server joins");
+        runtime.shutdown().await;
+    }
+
+    async fn next_activity_message<S>(
+        socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    ) -> ServerMessage
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let frame = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("activity message timeout")
+            .expect("WebSocket remains open")
+            .expect("WebSocket frame");
+        let Message::Text(text) = frame else {
+            panic!("unexpected WebSocket frame: {frame:?}");
+        };
+        serde_json::from_str(&text).expect("server message")
+    }
+
+    async fn request_settings_update<S>(
+        socket: &mut tokio_tungstenite::WebSocketStream<S>,
+        request_id: &str,
+        patch: Value,
+    ) -> Value
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        socket
+            .send(Message::Text(
+                json!({
+                    "_tag": "Request",
+                    "id": request_id,
+                    "tag": "server.updateSettings",
+                    "payload": { "patch": patch },
+                    "headers": []
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send settings update");
+        let message = next_activity_message(socket).await;
+        match message {
+            ServerMessage::Exit {
+                exit: crate::RpcExit::Success { value: Some(value) },
+                ..
+            } => value,
+            other => panic!("unexpected settings response: {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -970,6 +1135,12 @@ mod tests {
         let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
+        std::fs::create_dir_all(config.state_dir()).expect("state directory");
+        std::fs::write(
+            config.state_dir().join("settings.json"),
+            br#"{"enableChatAgentActivity":true,"enableTerminalAgentActivity":true}"#,
+        )
+        .expect("activity settings fixture");
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {
@@ -1058,7 +1229,8 @@ mod tests {
         .expect("production runtime start");
 
         let terminal_snapshot = runtime
-            .activity_projection
+            .activity_projections
+            .terminal()
             .snapshot(&ActivityScopeRef::Terminal {
                 thread_id: "thread-restart".to_owned(),
                 terminal_id: "terminal-restart".to_owned(),
@@ -1084,7 +1256,8 @@ mod tests {
             ActivityLifecycle::Completed
         );
         let thread_snapshot = runtime
-            .activity_projection
+            .activity_projections
+            .chat()
             .snapshot(&ActivityScopeRef::Thread {
                 thread_id: "thread-restart".to_owned(),
             })
@@ -1103,16 +1276,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_activity_startup_uses_persisted_authority_without_transition() {
+    async fn agent_activity_startup_migrates_legacy_true_to_chat_enabled_and_terminal_disabled() {
         let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
         std::fs::create_dir_all(config.state_dir()).expect("state directory");
         std::fs::write(
             config.state_dir().join("settings.json"),
-            br#"{"enableAgentActivity":false}"#,
+            br#"{"enableAgentActivity":true}"#,
         )
-        .expect("disabled settings fixture");
+        .expect("legacy settings fixture");
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {
@@ -1132,29 +1305,115 @@ mod tests {
         .await
         .expect("production runtime start");
 
-        assert!(matches!(
-            runtime
-                .activity_projection
-                .snapshot(&ActivityScopeRef::Thread {
-                    thread_id: "disabled-startup".to_owned(),
-                })
-                .await,
-            Err(crate::activity::ActivityRepositoryError::FeatureDisabled)
-        ));
+        let chat_state = runtime
+            .activity_projections
+            .chat()
+            .agent_activity_controller_for_integration_test()
+            .snapshot();
+        let terminal_state = runtime
+            .activity_projections
+            .terminal()
+            .agent_activity_controller_for_integration_test()
+            .snapshot();
+        assert!(chat_state.enabled);
+        assert!(!terminal_state.enabled);
+        assert_eq!(chat_state.generation, 0);
+        assert_eq!(terminal_state.generation, 0);
         let trace_path = config.state_dir().join("logs/server.trace.ndjson");
         let records = std::fs::read_to_string(trace_path).expect("startup trace");
         let records = records
             .lines()
             .map(|line| serde_json::from_str::<Value>(line).expect("valid trace record"))
             .collect::<Vec<_>>();
-        assert_eq!(records.len(), 1);
-        assert_eq!(records[0]["name"], "agent_activity_disabled");
-        assert_eq!(records[0]["events"][0]["attributes"]["cause"], "startup");
-        assert_eq!(records[0]["events"][0]["attributes"]["enabled"], false);
-        assert_eq!(
-            records[0]["events"][0]["attributes"]["observationGeneration"],
-            0
-        );
+        assert_eq!(records.len(), 2);
+        assert!(records.iter().any(|record| {
+            record["name"] == "agent_activity_enabled"
+                && record["events"][0]["attributes"]["cause"] == "startup"
+                && record["events"][0]["attributes"]["source"] == "chat"
+                && record["events"][0]["attributes"]["enabled"] == true
+                && record["events"][0]["attributes"]["observationGeneration"] == 0
+        }));
+        assert!(records.iter().any(|record| {
+            record["name"] == "agent_activity_disabled"
+                && record["events"][0]["attributes"]["cause"] == "startup"
+                && record["events"][0]["attributes"]["source"] == "terminal"
+                && record["events"][0]["attributes"]["enabled"] == false
+                && record["events"][0]["attributes"]["observationGeneration"] == 0
+        }));
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn agent_activity_runtime_settings_updates_change_only_the_selected_source_controller() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let state = TempDir::new().expect("temporary state directory");
+        let config = ServerConfig::new(state.path())
+            .with_bind("127.0.0.1", 0)
+            .with_unsafe_no_auth();
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let runtime = ProductionRuntime::start(
+            &config,
+            database,
+            AuthService::new(&config, vec![7_u8; 32]),
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("production runtime start");
+        let chat_controller = runtime
+            .activity_projections
+            .chat()
+            .agent_activity_controller_for_integration_test();
+        let terminal_controller = runtime
+            .activity_projections
+            .terminal()
+            .agent_activity_controller_for_integration_test();
+        let initial_chat = chat_controller.snapshot();
+        let initial_terminal = terminal_controller.snapshot();
+        assert!(initial_chat.enabled);
+        assert!(!initial_terminal.enabled);
+
+        let handle = ServerRuntime::start_with_registry(config, runtime.registry.clone())
+            .await
+            .expect("RPC server");
+        let mut socket = connect_async(format!("ws://{}/ws", handle.local_addr()))
+            .await
+            .expect("WebSocket")
+            .0;
+        let terminal_settings = request_settings_update(
+            &mut socket,
+            "801",
+            json!({ "enableTerminalAgentActivity": true }),
+        )
+        .await;
+        assert_eq!(terminal_settings["enableTerminalAgentActivity"], true);
+        assert_eq!(chat_controller.snapshot(), initial_chat);
+        let terminal_enabled = terminal_controller.snapshot();
+        assert!(terminal_enabled.enabled);
+        assert_eq!(terminal_enabled.generation, initial_terminal.generation + 1);
+
+        let chat_settings = request_settings_update(
+            &mut socket,
+            "802",
+            json!({ "enableChatAgentActivity": false }),
+        )
+        .await;
+        assert_eq!(chat_settings["enableChatAgentActivity"], false);
+        assert_eq!(terminal_controller.snapshot(), terminal_enabled);
+        let chat_disabled = chat_controller.snapshot();
+        assert!(!chat_disabled.enabled);
+        assert_eq!(chat_disabled.generation, initial_chat.generation + 1);
+
+        socket.close(None).await.expect("close WebSocket");
+        handle.shutdown();
+        handle.join().await.expect("RPC server joins");
         runtime.shutdown().await;
     }
 

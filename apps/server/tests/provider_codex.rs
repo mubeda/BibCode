@@ -7510,6 +7510,7 @@ where
     }
 }
 
+#[allow(clippy::large_enum_variant)]
 enum PeerStep {
     ExpectRequest {
         method: String,

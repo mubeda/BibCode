@@ -756,16 +756,14 @@ impl SessionGeneration {
         if self
             .output_started
             .load(std::sync::atomic::Ordering::Acquire)
-        {
-            if tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, self.output_completed.cancelled())
+            && tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, self.output_completed.cancelled())
                 .await
                 .is_err()
-            {
-                tracing::warn!(
-                    timeout_ms = OUTPUT_DRAIN_TIMEOUT.as_millis(),
-                    "terminal output drain timed out"
-                );
-            }
+        {
+            tracing::warn!(
+                timeout_ms = OUTPUT_DRAIN_TIMEOUT.as_millis(),
+                "terminal output drain timed out"
+            );
         }
     }
 
@@ -1267,6 +1265,7 @@ impl TerminalManager {
         });
         let mut command_candidate = original_command_candidate.clone();
         let mut command_was_prepared = false;
+        let mut activity_admission = None;
         if let (Some(preparer), Some(command)) = (
             self.inner.options.launch_preparer.as_ref(),
             input.command.as_ref(),
@@ -1297,7 +1296,7 @@ impl TerminalManager {
             .await
             .unwrap_or(OBSERVER_CALLBACK_TIMEOUT)
             .min(MAX_PREPARATION_EXECUTION_BUDGET);
-            match run_observer_callback(
+            let prepared = match run_observer_callback(
                 self.inner.callback_isolation.clone(),
                 "prepare",
                 execution_budget,
@@ -1305,64 +1304,75 @@ impl TerminalManager {
             )
             .await
             {
-                None | Some(TerminalLaunchPreparation::PassThrough) => {
-                    generation.observation.request_cancellation(
-                        TerminalObserverCancellationReason::PreparationRejected,
-                    );
-                    generation
-                        .observation
-                        .shutdown_workers(
-                            OBSERVER_WORKER_SHUTDOWN_TIMEOUT,
-                            OBSERVER_WORKER_ABORT_TIMEOUT,
-                        )
+                None | Some(TerminalLaunchPreparation::PassThrough) => None,
+                Some(TerminalLaunchPreparation::Prepared(prepared)) => Some((prepared, None)),
+                Some(TerminalLaunchPreparation::Admitted(prepared, admission)) => {
+                    if admission.is_current() {
+                        Some((prepared, Some(admission)))
+                    } else {
+                        drop(prepared);
+                        drop(admission);
+                        None
+                    }
+                }
+            };
+            if let Some((prepared, admission)) = prepared {
+                activity_admission = admission;
+                let observer = PreparedObserverHandle::new(
+                    prepared.observer,
+                    generation.observation.clone(),
+                    self.inner.callback_isolation.clone(),
+                );
+                if generation.is_invalidated() {
+                    observer
+                        .cancel(TerminalObserverCancellationReason::GenerationInvalidated)
                         .await;
+                    return Err(invalidated_creation_error(&input));
                 }
-                Some(TerminalLaunchPreparation::Prepared(prepared)) => {
-                    let observer = PreparedObserverHandle::new(
-                        prepared.observer,
-                        generation.observation.clone(),
-                        self.inner.callback_isolation.clone(),
-                    );
-                    if generation.is_invalidated() {
-                        observer
-                            .cancel(TerminalObserverCancellationReason::GenerationInvalidated)
-                            .await;
-                        return Err(invalidated_creation_error(&input));
-                    }
-                    if let Some(reserved_key) = prepared.private_env.keys().find(|private_key| {
-                        input.env.keys().any(|client_key| {
-                            environment_keys_equal(Platform::current(), client_key, private_key)
-                        })
-                    }) {
-                        observer
-                            .cancel(TerminalObserverCancellationReason::PreparationRejected)
-                            .await;
-                        return Err(TerminalError::Io(format!(
-                            "terminal environment contains a reserved observer key: {reserved_key}"
-                        )));
-                    }
-                    private_values.extend(
-                        prepared
-                            .private_env
-                            .values()
-                            .filter(|value| !value.is_empty())
-                            .cloned(),
-                    );
-                    private_values.sort_by(|left, right| {
-                        right.len().cmp(&left.len()).then_with(|| left.cmp(right))
-                    });
-                    private_values.dedup();
-                    let mut env = input.env.clone();
-                    env.extend(prepared.private_env);
-                    command_candidate = Some((prepared.executable, prepared.args, env));
-                    if let Err(observer) = generation.install_observer(observer) {
-                        observer
-                            .cancel(TerminalObserverCancellationReason::GenerationInvalidated)
-                            .await;
-                        return Err(invalidated_creation_error(&input));
-                    }
-                    command_was_prepared = true;
+                if let Some(reserved_key) = prepared.private_env.keys().find(|private_key| {
+                    input.env.keys().any(|client_key| {
+                        environment_keys_equal(Platform::current(), client_key, private_key)
+                    })
+                }) {
+                    observer
+                        .cancel(TerminalObserverCancellationReason::PreparationRejected)
+                        .await;
+                    return Err(TerminalError::Io(format!(
+                        "terminal environment contains a reserved observer key: {reserved_key}"
+                    )));
                 }
+                private_values.extend(
+                    prepared
+                        .private_env
+                        .values()
+                        .filter(|value| !value.is_empty())
+                        .cloned(),
+                );
+                private_values.sort_by(|left, right| {
+                    right.len().cmp(&left.len()).then_with(|| left.cmp(right))
+                });
+                private_values.dedup();
+                let mut env = input.env.clone();
+                env.extend(prepared.private_env);
+                command_candidate = Some((prepared.executable, prepared.args, env));
+                if let Err(observer) = generation.install_observer(observer) {
+                    observer
+                        .cancel(TerminalObserverCancellationReason::GenerationInvalidated)
+                        .await;
+                    return Err(invalidated_creation_error(&input));
+                }
+                command_was_prepared = true;
+            } else {
+                generation
+                    .observation
+                    .request_cancellation(TerminalObserverCancellationReason::PreparationRejected);
+                generation
+                    .observation
+                    .shutdown_workers(
+                        OBSERVER_WORKER_SHUTDOWN_TIMEOUT,
+                        OBSERVER_WORKER_ABORT_TIMEOUT,
+                    )
+                    .await;
             }
         }
 
@@ -1570,6 +1580,8 @@ impl TerminalManager {
             .insert(key, session.clone());
         self.supervise(session.clone(), process, exit, generation.clone());
         uncommitted_process.commit();
+        // The installed observer is now visible to the lifecycle snapshot used by disable.
+        drop(activity_admission);
         let snapshot = session.lock().await.snapshot();
         let event = if restarted {
             TerminalEvent::Restarted {

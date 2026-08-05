@@ -1,16 +1,16 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use serde_json::json;
 use bibcode_server::{
     activity::{
         ActivityActorSummary, ActivityCapabilities, ActivityChange, ActivityDelta, ActivityEntry,
         ActivityEntryKind, ActivityEntryTone, ActivityHistoryRecovery, ActivityLifecycle,
-        ActivityObservationState, ActivityProjection, ActivityRecordKind, ActivityRepository,
-        ActivityRepositoryError, ActivityRosterBucket, ActivityScopeRef, ActivityScopeSeed,
-        ActivitySection, ActivitySectionHealth, ActivityWorkItemSummary, AgentActivityController,
-        ProviderActivityMutation,
+        ActivityObservationState, ActivityProjection, ActivityProjections, ActivityRecordKind,
+        ActivityRepository, ActivityRepositoryError, ActivityRosterBucket, ActivityScopeRef,
+        ActivityScopeSeed, ActivitySection, ActivitySectionHealth, ActivityWorkItemSummary,
+        AgentActivityController, AgentActivitySource, ProviderActivityMutation,
     },
     persistence::{Database, run_migrations},
 };
+use serde_json::json;
 
 const MAX_ACTIVITY_MUTATIONS: usize = 256;
 
@@ -315,7 +315,11 @@ async fn monitoring_disabled_waits_for_a_blocked_retention_worker_and_defers_ree
 
     let mut finalizing = tokio::spawn({
         let projection = projection.clone();
-        async move { projection.interrupt_for_monitoring_disabled().await }
+        async move {
+            projection
+                .interrupt_for_monitoring_disabled(AgentActivitySource::Chat)
+                .await
+        }
     });
     tokio::task::yield_now().await;
     assert!(!finalizing.is_finished());
@@ -383,14 +387,14 @@ async fn monitoring_disabled_finalization_interrupts_once_and_preserves_complete
 
     assert_eq!(
         projection
-            .interrupt_for_monitoring_disabled()
+            .interrupt_for_monitoring_disabled(AgentActivitySource::Chat)
             .await
             .expect("first finalization"),
         2
     );
     assert_eq!(
         projection
-            .interrupt_for_monitoring_disabled()
+            .interrupt_for_monitoring_disabled(AgentActivitySource::Chat)
             .await
             .expect("idempotent finalization"),
         0
@@ -459,6 +463,236 @@ async fn monitoring_disabled_finalization_interrupts_once_and_preserves_complete
 }
 
 #[tokio::test]
+async fn source_specific_chat_finalization_does_not_interrupt_terminal_activity() {
+    // Mutations caught: omitting the source filter or sharing one controller across projections.
+    let database = migrated_database().await;
+    let thread_scope = thread_scope("thread:source-specific-chat", "source-specific-chat");
+    let terminal_scope = ActivityScopeSeed::terminal(
+        "terminal:source-specific-chat",
+        "generation:source-specific-chat",
+        "source-specific-chat",
+        "terminal:source-specific-chat",
+        "codex",
+        Some("codex"),
+        ActivityCapabilities::structured_full(true),
+    )
+    .expect("terminal scope");
+    let projections = ActivityProjections::new(
+        ActivityRepository::new(database),
+        AgentActivityController::new(true),
+        AgentActivityController::new(true),
+    );
+    seed_running_actor(&projections.chat(), &thread_scope, "actor:chat").await;
+    seed_running_actor(&projections.terminal(), &terminal_scope, "actor:terminal").await;
+
+    assert_eq!(
+        projections
+            .chat()
+            .interrupt_for_monitoring_disabled(AgentActivitySource::Chat)
+            .await
+            .expect("disable Chat"),
+        1,
+    );
+    assert!(
+        projections
+            .terminal()
+            .agent_activity_controller_for_integration_test()
+            .snapshot()
+            .enabled
+    );
+    projections
+        .chat()
+        .agent_activity_controller_for_integration_test()
+        .enable();
+    let thread_snapshot = projections
+        .chat()
+        .snapshot(&thread_scope.scope)
+        .await
+        .expect("thread snapshot");
+    let terminal_snapshot = projections
+        .terminal()
+        .snapshot(&terminal_scope.scope)
+        .await
+        .expect("terminal snapshot");
+    assert_eq!(
+        thread_snapshot.actors[0].status,
+        ActivityLifecycle::Interrupted
+    );
+    assert_eq!(
+        terminal_snapshot.actors[0].status,
+        ActivityLifecycle::Running
+    );
+}
+
+#[tokio::test]
+async fn source_specific_terminal_finalization_does_not_interrupt_chat_activity() {
+    // Mutations caught: routing Terminal to Chat or clearing the other source's controller state.
+    let database = migrated_database().await;
+    let thread_scope = thread_scope(
+        "thread:source-specific-terminal",
+        "source-specific-terminal",
+    );
+    let terminal_scope = ActivityScopeSeed::terminal(
+        "terminal:source-specific-terminal",
+        "generation:source-specific-terminal",
+        "source-specific-terminal",
+        "terminal:source-specific-terminal",
+        "codex",
+        Some("codex"),
+        ActivityCapabilities::structured_full(true),
+    )
+    .expect("terminal scope");
+    let projections = ActivityProjections::new(
+        ActivityRepository::new(database),
+        AgentActivityController::new(true),
+        AgentActivityController::new(true),
+    );
+    seed_running_actor(&projections.chat(), &thread_scope, "actor:chat").await;
+    seed_running_actor(&projections.terminal(), &terminal_scope, "actor:terminal").await;
+
+    assert_eq!(
+        projections
+            .terminal()
+            .interrupt_for_monitoring_disabled(AgentActivitySource::Terminal)
+            .await
+            .expect("disable Terminal"),
+        1,
+    );
+    assert!(
+        projections
+            .chat()
+            .agent_activity_controller_for_integration_test()
+            .snapshot()
+            .enabled
+    );
+    projections
+        .terminal()
+        .agent_activity_controller_for_integration_test()
+        .enable();
+    let thread_snapshot = projections
+        .chat()
+        .snapshot(&thread_scope.scope)
+        .await
+        .expect("thread snapshot");
+    let terminal_snapshot = projections
+        .terminal()
+        .snapshot(&terminal_scope.scope)
+        .await
+        .expect("terminal snapshot");
+    assert_eq!(thread_snapshot.actors[0].status, ActivityLifecycle::Running);
+    assert_eq!(
+        terminal_snapshot.actors[0].status,
+        ActivityLifecycle::Interrupted
+    );
+}
+
+#[tokio::test]
+async fn source_specific_mismatched_finalization_leaves_both_sources_unchanged() {
+    // Mutation caught: trusting the call-site source instead of the routed projection identity.
+    let database = migrated_database().await;
+    let thread_scope = thread_scope(
+        "thread:source-specific-mismatch",
+        "source-specific-mismatch",
+    );
+    let terminal_scope = ActivityScopeSeed::terminal(
+        "terminal:source-specific-mismatch",
+        "generation:source-specific-mismatch",
+        "source-specific-mismatch",
+        "terminal:source-specific-mismatch",
+        "codex",
+        Some("codex"),
+        ActivityCapabilities::structured_full(true),
+    )
+    .expect("terminal scope");
+    let projections = ActivityProjections::new(
+        ActivityRepository::new(database),
+        AgentActivityController::new(true),
+        AgentActivityController::new(true),
+    );
+    seed_running_actor(&projections.chat(), &thread_scope, "actor:chat").await;
+    seed_running_actor(&projections.terminal(), &terminal_scope, "actor:terminal").await;
+    let chat_registry_counts = projections.chat().registry_counts_for_integration_test();
+    let terminal_registry_counts = projections
+        .terminal()
+        .registry_counts_for_integration_test();
+    assert_ne!(chat_registry_counts, (0, 0));
+    assert_ne!(terminal_registry_counts, (0, 0));
+    let chat_controller_state = projections
+        .chat()
+        .agent_activity_controller_for_integration_test()
+        .snapshot();
+    let terminal_controller_state = projections
+        .terminal()
+        .agent_activity_controller_for_integration_test()
+        .snapshot();
+    let thread_snapshot = projections
+        .chat()
+        .snapshot(&thread_scope.scope)
+        .await
+        .expect("thread snapshot before mismatch");
+    let terminal_snapshot = projections
+        .terminal()
+        .snapshot(&terminal_scope.scope)
+        .await
+        .expect("terminal snapshot before mismatch");
+
+    assert!(matches!(
+        projections
+            .chat()
+            .interrupt_for_monitoring_disabled(AgentActivitySource::Terminal)
+            .await,
+        Err(ActivityRepositoryError::InvalidScope(_))
+    ));
+    assert!(matches!(
+        projections
+            .terminal()
+            .interrupt_for_monitoring_disabled(AgentActivitySource::Chat)
+            .await,
+        Err(ActivityRepositoryError::InvalidScope(_))
+    ));
+    assert_eq!(
+        projections
+            .chat()
+            .agent_activity_controller_for_integration_test()
+            .snapshot(),
+        chat_controller_state
+    );
+    assert_eq!(
+        projections
+            .terminal()
+            .agent_activity_controller_for_integration_test()
+            .snapshot(),
+        terminal_controller_state
+    );
+    assert_eq!(
+        projections.chat().registry_counts_for_integration_test(),
+        chat_registry_counts
+    );
+    assert_eq!(
+        projections
+            .terminal()
+            .registry_counts_for_integration_test(),
+        terminal_registry_counts
+    );
+    assert_eq!(
+        projections
+            .chat()
+            .snapshot(&thread_scope.scope)
+            .await
+            .expect("thread snapshot after mismatch"),
+        thread_snapshot
+    );
+    assert_eq!(
+        projections
+            .terminal()
+            .snapshot(&terminal_scope.scope)
+            .await
+            .expect("terminal snapshot after mismatch"),
+        terminal_snapshot
+    );
+}
+
+#[tokio::test]
 async fn monitoring_disabled_reactivation_records_each_disable_generation_once() {
     // Mutation caught: reusing one interruption-entry identity across distinct disable generations.
     let database = migrated_database().await;
@@ -487,14 +721,14 @@ async fn monitoring_disabled_reactivation_records_each_disable_generation_once()
 
     assert_eq!(
         projection
-            .interrupt_for_monitoring_disabled()
+            .interrupt_for_monitoring_disabled(AgentActivitySource::Chat)
             .await
             .expect("first disable"),
         1
     );
     assert_eq!(
         projection
-            .interrupt_for_monitoring_disabled()
+            .interrupt_for_monitoring_disabled(AgentActivitySource::Chat)
             .await
             .expect("repeat first disable"),
         0
@@ -515,14 +749,14 @@ async fn monitoring_disabled_reactivation_records_each_disable_generation_once()
         .expect("reactivated actor");
     assert_eq!(
         projection
-            .interrupt_for_monitoring_disabled()
+            .interrupt_for_monitoring_disabled(AgentActivitySource::Chat)
             .await
             .expect("second disable"),
         1
     );
     assert_eq!(
         projection
-            .interrupt_for_monitoring_disabled()
+            .interrupt_for_monitoring_disabled(AgentActivitySource::Chat)
             .await
             .expect("repeat second disable"),
         0
@@ -3104,6 +3338,26 @@ async fn wait_for_entry_retention_cap(database: &Database, scope_id: &str) {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
     panic!("entry retention worker did not converge within two seconds");
+}
+
+async fn seed_running_actor(
+    projection: &ActivityProjection,
+    scope: &ActivityScopeSeed,
+    actor_id: &str,
+) {
+    projection.ensure_scope(scope.clone()).await.expect("scope");
+    projection
+        .apply(
+            &scope.scope_id,
+            format!("event:{actor_id}"),
+            vec![
+                ProviderActivityMutation::upsert_actor(actor_id, None, actor_id, "running")
+                    .expect("actor"),
+            ],
+            "2026-08-04T12:00:00Z".to_owned(),
+        )
+        .await
+        .expect("running actor");
 }
 
 fn thread_scope(scope_id: &str, thread_id: &str) -> ActivityScopeSeed {

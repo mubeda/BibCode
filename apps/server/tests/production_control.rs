@@ -1,6 +1,5 @@
 use std::{path::PathBuf, time::Duration};
 
-use serde_json::{Value, json};
 use bibcode_server::{
     ACTIVE_RPC_METHODS, MethodMode, RpcRegistry, ServerConfig,
     production::{
@@ -8,9 +7,10 @@ use bibcode_server::{
         server_terminal::ProductionServerControl,
     },
 };
+use serde_json::{Value, json};
 use tempfile::TempDir;
-use tokio::{net::TcpListener, sync::mpsc};
 use tokio::time::timeout;
+use tokio::{net::TcpListener, sync::mpsc};
 use tokio_util::sync::CancellationToken;
 
 fn auth_descriptor() -> Value {
@@ -29,14 +29,16 @@ fn complete_registry_without(excluded: &[&str]) -> RpcRegistry {
             continue;
         }
         match method.mode {
-            MethodMode::Unary => registry.register_unary(
-                method.name,
-                |_request, _cancellation| async { Ok(json!({})) },
-            ),
-            MethodMode::Stream => registry.register_stream(method.name, |_request, _cancellation| {
-                let (_sender, receiver) = mpsc::channel(1);
-                receiver
-            }),
+            MethodMode::Unary => registry
+                .register_unary(method.name, |_request, _cancellation| async {
+                    Ok(json!({}))
+                }),
+            MethodMode::Stream => {
+                registry.register_stream(method.name, |_request, _cancellation| {
+                    let (_sender, receiver) = mpsc::channel(1);
+                    receiver
+                })
+            }
         }
     }
     registry
@@ -397,13 +399,11 @@ async fn activity_protocol_cannot_be_advertised_before_registry_validation() {
     let post_registration_welcome = next_event(&mut post_registration_lifecycle).await;
     let post_registration_ready = next_event(&mut post_registration_lifecycle).await;
     assert_eq!(
-        post_registration_welcome["payload"]["environment"]["capabilities"]
-            ["activityProtocolVersion"],
+        post_registration_welcome["payload"]["environment"]["capabilities"]["activityProtocolVersion"],
         1
     );
     assert_eq!(
-        post_registration_ready["payload"]["environment"]["capabilities"]
-            ["activityProtocolVersion"],
+        post_registration_ready["payload"]["environment"]["capabilities"]["activityProtocolVersion"],
         1
     );
     cancellation.cancel();
@@ -919,7 +919,8 @@ async fn refresh_providers_returns_version_advisories_without_registry_access() 
     )
     .await
     .expect("write settings fixture");
-    let control = NativeServerControl::new(ServerConfig::new(directory.path()), auth_descriptor()).await;
+    let control =
+        NativeServerControl::new(ServerConfig::new(directory.path()), auth_descriptor()).await;
 
     let refreshed = call(
         &control,
@@ -962,7 +963,8 @@ async fn provider_update_executes_a_supported_cursor_command_but_cannot_verify_v
     )
     .await
     .expect("write settings fixture");
-    let control = NativeServerControl::new(ServerConfig::new(directory.path()), auth_descriptor()).await;
+    let control =
+        NativeServerControl::new(ServerConfig::new(directory.path()), auth_descriptor()).await;
 
     let result = call(
         &control,
@@ -1022,7 +1024,8 @@ async fn provider_update_rejects_malformed_instance_ids_without_publishing_updat
     )
     .await
     .expect("write settings fixture");
-    let control = NativeServerControl::new(ServerConfig::new(directory.path()), auth_descriptor()).await;
+    let control =
+        NativeServerControl::new(ServerConfig::new(directory.path()), auth_descriptor()).await;
 
     for instance_id in [Value::Null, json!(7), json!({}), json!("not a slug")] {
         let error = control
@@ -1035,7 +1038,11 @@ async fn provider_update_rejects_malformed_instance_ids_without_publishing_updat
             .expect_err("malformed instance ID must be rejected");
         assert_eq!(error["_tag"], "ServerProviderUpdateError");
         assert_eq!(error["provider"], "cursor");
-        assert!(error["reason"].as_str().is_some_and(|reason| reason.contains("instanceId")));
+        assert!(
+            error["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("instanceId"))
+        );
     }
 
     let config = call(&control, "server.getConfig", json!({})).await;

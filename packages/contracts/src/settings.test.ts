@@ -41,21 +41,40 @@ describe("ServerSettings Grok defaults", () => {
 });
 
 describe("ServerSettings agent activity", () => {
-  it("defaults agent activity to enabled", () => {
-    expect(decodeServerSettings({}).enableAgentActivity).toBe(true);
-    expect(DEFAULT_SERVER_SETTINGS.enableAgentActivity).toBe(true);
+  it("defaults Chat on and AI Terminal off", () => {
+    expect(decodeServerSettings({})).toMatchObject({
+      enableChatAgentActivity: true,
+      enableTerminalAgentActivity: false,
+    });
+    expect(DEFAULT_SERVER_SETTINGS).toMatchObject({
+      enableChatAgentActivity: true,
+      enableTerminalAgentActivity: false,
+    });
   });
 
-  it("decodes explicit agent activity settings and patches", () => {
-    expect(decodeServerSettings({ enableAgentActivity: false }).enableAgentActivity).toBe(false);
-    expect(decodeServerSettingsPatch({ enableAgentActivity: false }).enableAgentActivity).toBe(
-      false,
-    );
+  it("decodes and patches both activity settings independently", () => {
+    expect(
+      decodeServerSettings({
+        enableChatAgentActivity: false,
+        enableTerminalAgentActivity: true,
+      }),
+    ).toMatchObject({
+      enableChatAgentActivity: false,
+      enableTerminalAgentActivity: true,
+    });
+    expect(decodeServerSettingsPatch({ enableChatAgentActivity: false })).toEqual({
+      enableChatAgentActivity: false,
+    });
+    expect(decodeServerSettingsPatch({ enableTerminalAgentActivity: true })).toEqual({
+      enableTerminalAgentActivity: true,
+    });
   });
 
-  it("rejects a non-boolean agent activity setting", () => {
-    expect(() => decodeServerSettings({ enableAgentActivity: "false" })).toThrow();
-    expect(() => decodeServerSettingsPatch({ enableAgentActivity: 0 })).toThrow();
+  it("rejects non-boolean activity settings", () => {
+    expect(() => decodeServerSettings({ enableChatAgentActivity: "false" })).toThrow();
+    expect(() => decodeServerSettings({ enableTerminalAgentActivity: 1 })).toThrow();
+    expect(() => decodeServerSettingsPatch({ enableChatAgentActivity: 0 })).toThrow();
+    expect(() => decodeServerSettingsPatch({ enableTerminalAgentActivity: "true" })).toThrow();
   });
 });
 

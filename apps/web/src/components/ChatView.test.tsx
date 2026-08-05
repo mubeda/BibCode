@@ -1020,13 +1020,16 @@ describe("ChatView", () => {
 
     const publishSettingsUpdated = async (
       nextEnvironmentId: EnvironmentId,
-      enableAgentActivity: boolean,
+      patch: {
+        readonly enableChatAgentActivity?: boolean;
+        readonly enableTerminalAgentActivity?: boolean;
+      },
     ): Promise<void> => {
       const current =
         h.environmentSettingsById.get(nextEnvironmentId) ?? (h.settings as Record<string, unknown>);
       h.environmentSettingsById.set(nextEnvironmentId, {
         ...current,
-        enableAgentActivity,
+        ...patch,
       });
       await act(async () => {
         for (const listener of h.settingsListeners) listener();
@@ -1114,10 +1117,12 @@ describe("ChatView", () => {
       const { container, root } = await mountActivityRoute();
       try {
         await openSubagents(container);
+        const chatTimeline = container.querySelector('[data-mock="messages-timeline"]');
+        expect(chatTimeline).not.toBeNull();
         expect(container.querySelector('[data-testid="activity-dock"]')).not.toBeNull();
         expect(container.querySelector("[data-activity-panel]")).not.toBeNull();
 
-        await publishSettingsUpdated(environmentId, false);
+        await publishSettingsUpdated(environmentId, { enableChatAgentActivity: false });
 
         await vi.waitFor(() => {
           expect(container.querySelector('[data-testid="activity-dock"]')).toBeNull();
@@ -1129,12 +1134,14 @@ describe("ChatView", () => {
                 (surface) => surface.kind === "activity",
               ) ?? false,
           ).toBe(false);
+          expect(container.querySelector('[data-mock="messages-timeline"]')).toBe(chatTimeline);
         });
 
-        await publishSettingsUpdated(environmentId, true);
+        await publishSettingsUpdated(environmentId, { enableChatAgentActivity: true });
 
         await vi.waitFor(() => {
           expect(container.querySelector('[data-testid="activity-dock"]')).not.toBeNull();
+          expect(container.querySelector('[data-mock="messages-timeline"]')).toBe(chatTimeline);
         });
       } finally {
         await act(async () => root.unmount());
@@ -1149,7 +1156,7 @@ describe("ChatView", () => {
       seedGitStatus(true);
       h.environmentSettingsById.set(environmentId, {
         ...(h.settings as Record<string, unknown>),
-        enableAgentActivity: false,
+        enableChatAgentActivity: false,
       });
       useRightPanelStore.getState().openActivity(threadRef, "subagents", { _tag: "thread" });
 
@@ -1168,6 +1175,174 @@ describe("ChatView", () => {
         expect(container.querySelector("[data-activity-panel]")).toBeNull();
         expect(h.activityStateTargets).toEqual([]);
         expect(h.activityAtomTargets).toEqual([]);
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it("closes an Activity surface opened after its source is already disabled", async () => {
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      h.environmentSettingsById.set(environmentId, {
+        ...(h.settings as Record<string, unknown>),
+        enableChatAgentActivity: false,
+        enableTerminalAgentActivity: true,
+      });
+
+      const { container, root } = await mountActivityRoute();
+      try {
+        expect(
+          useRightPanelStore
+            .getState()
+            .byThreadKey[scopedThreadKey(threadRef)]?.surfaces.some(
+              (surface) => surface.kind === "activity",
+            ) ?? false,
+        ).toBe(false);
+
+        await act(async () => {
+          useRightPanelStore.getState().openActivity(threadRef, "subagents", { _tag: "thread" });
+          await Promise.resolve();
+        });
+
+        await vi.waitFor(() => {
+          expect(
+            useRightPanelStore
+              .getState()
+              .byThreadKey[scopedThreadKey(threadRef)]?.surfaces.some(
+                (surface) => surface.kind === "activity",
+              ) ?? false,
+          ).toBe(false);
+        });
+        expect(container.querySelector("[data-activity-panel]")).toBeNull();
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it("closes an inactive persisted Activity surface using its own disabled scope", async () => {
+      const terminalId = "terminal-inactive-activity";
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      h.environmentSettingsById.set(environmentId, {
+        ...(h.settings as Record<string, unknown>),
+        enableChatAgentActivity: true,
+        enableTerminalAgentActivity: true,
+      });
+      useRightPanelStore
+        .getState()
+        .openActivity(threadRef, "subagents", { _tag: "terminal", terminalId });
+      useRightPanelStore.getState().open(threadRef, "plan");
+
+      const { container, root } = await mountActivityRoute();
+      try {
+        const initialRightPanelState =
+          useRightPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)];
+        expect(initialRightPanelState?.activeSurfaceId).toBe("plan");
+        expect(initialRightPanelState?.surfaces).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              kind: "activity",
+              scope: { _tag: "terminal", terminalId },
+            }),
+            expect.objectContaining({ kind: "plan" }),
+          ]),
+        );
+        expect(container.querySelector("[data-activity-panel]")).toBeNull();
+
+        await publishSettingsUpdated(environmentId, { enableTerminalAgentActivity: false });
+
+        await vi.waitFor(() => {
+          const nextRightPanelState =
+            useRightPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)];
+          expect(
+            nextRightPanelState?.surfaces.some((surface) => surface.kind === "activity") ?? false,
+          ).toBe(false);
+          expect(nextRightPanelState?.surfaces).toContainEqual(
+            expect.objectContaining({ kind: "plan" }),
+          );
+          expect(nextRightPanelState?.activeSurfaceId).toBe("plan");
+        });
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it.each([
+      {
+        name: "closes a thread surface when only chat activity is disabled",
+        surfaceScope: { _tag: "thread" } as const,
+        snapshotScope: { _tag: "thread", threadId } as ActivityScopeRef,
+        nextSettings: { enableChatAgentActivity: false, enableTerminalAgentActivity: true },
+        expectedOpen: false,
+      },
+      {
+        name: "keeps a terminal surface when only chat activity is disabled",
+        surfaceScope: { _tag: "terminal", terminalId: "terminal-isolation" } as const,
+        snapshotScope: {
+          _tag: "terminal",
+          threadId,
+          terminalId: "terminal-isolation",
+        } as ActivityScopeRef,
+        nextSettings: { enableChatAgentActivity: false, enableTerminalAgentActivity: true },
+        expectedOpen: true,
+      },
+      {
+        name: "keeps a thread surface when only terminal activity is disabled",
+        surfaceScope: { _tag: "thread" } as const,
+        snapshotScope: { _tag: "thread", threadId } as ActivityScopeRef,
+        nextSettings: { enableChatAgentActivity: true, enableTerminalAgentActivity: false },
+        expectedOpen: true,
+      },
+      {
+        name: "closes a terminal surface when only terminal activity is disabled",
+        surfaceScope: { _tag: "terminal", terminalId: "terminal-isolation" } as const,
+        snapshotScope: {
+          _tag: "terminal",
+          threadId,
+          terminalId: "terminal-isolation",
+        } as ActivityScopeRef,
+        nextSettings: { enableChatAgentActivity: true, enableTerminalAgentActivity: false },
+        expectedOpen: false,
+      },
+    ])("$name", async ({ surfaceScope, snapshotScope, nextSettings, expectedOpen }) => {
+      const snapshot = activitySnapshot(snapshotScope, []);
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      seedActivityState(environmentId, snapshotScope, snapshot);
+      seedActivityQueries(environmentId, snapshot, []);
+      h.environmentSettingsById.set(environmentId, {
+        ...(h.settings as Record<string, unknown>),
+        enableChatAgentActivity: true,
+        enableTerminalAgentActivity: true,
+      });
+      useRightPanelStore.getState().openActivity(threadRef, "subagents", surfaceScope);
+
+      const { container, root } = await mountActivityRoute();
+      try {
+        await vi.waitFor(() => {
+          expect(container.querySelector("[data-activity-panel]")).not.toBeNull();
+        });
+
+        await publishSettingsUpdated(environmentId, nextSettings);
+
+        await vi.waitFor(() => {
+          const activitySurface = useRightPanelStore
+            .getState()
+            .byThreadKey[scopedThreadKey(threadRef)]?.surfaces.find(
+              (surface) => surface.kind === "activity",
+            );
+          expect(activitySurface !== undefined).toBe(expectedOpen);
+          expect(container.querySelector("[data-activity-panel]") !== null).toBe(expectedOpen);
+        });
       } finally {
         await act(async () => root.unmount());
         container.remove();
@@ -2507,6 +2682,10 @@ describe("ChatView", () => {
       seedGitStatus(true);
       seedActivityState(environmentId, scope, snapshot);
       seedActivityQueries(environmentId, snapshot, [child]);
+      h.environmentSettingsById.set(environmentId, {
+        ...(h.settings as Record<string, unknown>),
+        enableTerminalAgentActivity: true,
+      });
       useCenterPanelStore.getState().openTerminalPanel(threadRef, activeCenterTerminalId);
       useRightPanelStore
         .getState()

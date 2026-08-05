@@ -486,12 +486,13 @@ pub fn production_fetchers() -> Vec<ProviderUsageFetcher> {
 }
 
 fn claude_fetcher() -> ProviderUsageFetcher {
+    #[cfg(any(target_os = "macos", test))]
     let credential_cache = ClaudeCredentialCache::default();
+    #[cfg(all(not(target_os = "macos"), not(test)))]
+    let credential_cache = ClaudeCredentialCache;
     ProviderUsageFetcher {
         provider: ProviderUsageProvider::Claude,
-        fetch: Arc::new(move || {
-            Box::pin(fetch_claude_usage(credential_cache.clone()))
-        }),
+        fetch: Arc::new(move || Box::pin(fetch_claude_usage(credential_cache.clone()))),
     }
 }
 
@@ -514,8 +515,7 @@ async fn fetch_claude_usage(
     let store_selection = select_claude_credential_stores(
         credentials_path.is_some(),
         uses_default_config,
-        crate::environment_identity::bibcode_env_var(CLAUDE_KEYCHAIN_ACCESS_ENV)
-        .as_deref(),
+        crate::environment_identity::bibcode_env_var(CLAUDE_KEYCHAIN_ACCESS_ENV).as_deref(),
     );
     #[cfg(target_os = "macos")]
     let mut stores = credentials_path
@@ -530,13 +530,13 @@ async fn fetch_claude_usage(
         .map(ClaudeCredentialStore::File)
         .collect::<Vec<_>>();
     #[cfg(target_os = "macos")]
-    if store_selection.keychain {
-        if let Some(account) = claude_keychain_account() {
-            stores.push(ClaudeCredentialStore::Keychain {
-                account,
-                cache: credential_cache,
-            });
-        }
+    if store_selection.keychain
+        && let Some(account) = claude_keychain_account()
+    {
+        stores.push(ClaudeCredentialStore::Keychain {
+            account,
+            cache: credential_cache,
+        });
     }
     #[cfg(not(target_os = "macos"))]
     let _ = (store_selection, credential_cache);
@@ -688,7 +688,7 @@ impl ClaudeCredentialStore {
                     .map(Some)
                     .map_err(|error| ProviderUsageFetchError::new(error.to_string())),
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-                Err(error) => return Err(ProviderUsageFetchError::new(error.to_string())),
+                Err(error) => Err(ProviderUsageFetchError::new(error.to_string())),
             },
             #[cfg(target_os = "macos")]
             Self::Keychain { account, cache } => {
@@ -2035,16 +2035,10 @@ mod tests {
 
     #[test]
     fn claude_keychain_store_selection_honors_exact_overrides_and_preserves_files() {
-        let explicitly_enabled = select_claude_credential_stores(
-            true,
-            true,
-            Some(std::ffi::OsStr::new("enabled")),
-        );
-        let explicitly_disabled = select_claude_credential_stores(
-            true,
-            true,
-            Some(std::ffi::OsStr::new("disabled")),
-        );
+        let explicitly_enabled =
+            select_claude_credential_stores(true, true, Some(std::ffi::OsStr::new("enabled")));
+        let explicitly_disabled =
+            select_claude_credential_stores(true, true, Some(std::ffi::OsStr::new("disabled")));
 
         assert!(explicitly_enabled.file);
         assert!(explicitly_enabled.keychain);
@@ -2054,11 +2048,8 @@ mod tests {
 
     #[test]
     fn claude_keychain_store_selection_never_uses_keychain_for_explicit_config() {
-        let selection = select_claude_credential_stores(
-            true,
-            false,
-            Some(std::ffi::OsStr::new("enabled")),
-        );
+        let selection =
+            select_claude_credential_stores(true, false, Some(std::ffi::OsStr::new("enabled")));
 
         assert!(selection.file);
         assert!(!selection.keychain);

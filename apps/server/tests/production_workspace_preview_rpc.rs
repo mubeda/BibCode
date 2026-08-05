@@ -1,13 +1,13 @@
 use std::{path::Path, time::Duration};
 
-use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
 use bibcode_server::{
     ClientMessage, RequestId, RpcExit, RpcRegistry, ServerConfig, ServerMessage, ServerRuntime,
     mcp,
     preview::PreviewManager,
     workspace::{WorkspaceRpc, WorkspaceService},
 };
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::time::timeout;
 use tokio_tungstenite::{connect_async, tungstenite::Message};

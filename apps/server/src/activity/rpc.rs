@@ -13,9 +13,9 @@ use crate::{
 
 use super::{
     ACTIVITY_PAGE_MAX_LENGTH, ActivityAdmittedRead, ActivityError, ActivityProjection,
-    ActivityProjectionEvent, ActivityRecordKind, ActivityRepositoryError, ActivityResult,
-    ActivityRosterBucket, ActivityScopeRef, ActivitySection, AgentActivityAdmission,
-    AgentActivityController,
+    ActivityProjectionEvent, ActivityProjections, ActivityRecordKind, ActivityRepositoryError,
+    ActivityResult, ActivityRosterBucket, ActivityScopeRef, ActivitySection,
+    AgentActivityAdmission, AgentActivityController,
 };
 
 const DEFAULT_PAGE_LIMIT: usize = 50;
@@ -71,31 +71,29 @@ const fn default_page_limit() -> usize {
     DEFAULT_PAGE_LIMIT
 }
 
-pub fn register_activity_rpc(
-    registry: &mut RpcRegistry,
-    projection: ActivityProjection,
-    controller: AgentActivityController,
-) {
-    let snapshot_projection = projection.clone();
+pub fn register_activity_rpc(registry: &mut RpcRegistry, projections: ActivityProjections) {
+    let snapshot_projections = projections.clone();
     registry.register_guarded_unary("activity.getSnapshot", move |request, _cancellation| {
-        let projection = snapshot_projection.clone();
+        let projections = snapshot_projections.clone();
         async move {
             let scope = match decode::<ActivityScopeRef>(request.payload) {
                 Ok(scope) => scope,
                 Err(error) => return RpcUnaryResult::plain(Err(error)),
             };
+            let projection = projections.for_scope(&scope);
             encode_admitted_read(projection.snapshot_admitted(&scope).await)
         }
     });
 
-    let roster_projection = projection.clone();
+    let roster_projections = projections.clone();
     registry.register_guarded_unary("activity.listRoster", move |request, _cancellation| {
-        let projection = roster_projection.clone();
+        let projections = roster_projections.clone();
         async move {
             let input = match decode::<ListRosterInput>(request.payload) {
                 Ok(input) => input,
                 Err(error) => return RpcUnaryResult::plain(Err(error)),
             };
+            let projection = projections.for_scope(&input.scope);
             if let Err(error) = validate_limit(input.limit) {
                 return RpcUnaryResult::plain(Err(error));
             }
@@ -114,14 +112,15 @@ pub fn register_activity_rpc(
         }
     });
 
-    let detail_projection = projection.clone();
+    let detail_projections = projections.clone();
     registry.register_guarded_unary("activity.listDetail", move |request, _cancellation| {
-        let projection = detail_projection.clone();
+        let projections = detail_projections.clone();
         async move {
             let input = match decode::<ListDetailInput>(request.payload) {
                 Ok(input) => input,
                 Err(error) => return RpcUnaryResult::plain(Err(error)),
             };
+            let projection = projections.for_scope(&input.scope);
             if let Err(error) = validate_limit(input.limit) {
                 return RpcUnaryResult::plain(Err(error));
             }
@@ -143,13 +142,7 @@ pub fn register_activity_rpc(
     registry.register_stream_with_context(
         "subscribeActivity",
         move |request, context, cancellation| {
-            activity_stream(
-                projection.clone(),
-                controller.clone(),
-                request,
-                context,
-                cancellation,
-            )
+            activity_stream(projections.clone(), request, context, cancellation)
         },
     );
 }
@@ -173,8 +166,7 @@ fn encode_admitted_read<T: serde::Serialize>(
 }
 
 fn activity_stream(
-    projection: ActivityProjection,
-    controller: AgentActivityController,
+    projections: ActivityProjections,
     request: RpcRequest,
     context: RpcSessionContext,
     cancellation: CancellationToken,
@@ -188,6 +180,8 @@ fn activity_stream(
                 return;
             }
         };
+        let projection = projections.for_scope(&scope);
+        let controller = projection.agent_activity_controller();
         if !authorize_activity_read(&context, &sender, &cancellation).await {
             return;
         }
@@ -402,8 +396,9 @@ fn activity_error(error: ActivityError) -> Value {
         | ActivityRepositoryError::InvalidCapabilities(_)
         | ActivityRepositoryError::InvalidLimit => invalid_scope_error(),
         ActivityRepositoryError::FeatureDisabled => feature_disabled_error(),
-        ActivityRepositoryError::Persistence(_)
-        | ActivityRepositoryError::Serialization(_) => internal_error(),
+        ActivityRepositoryError::Persistence(_) | ActivityRepositoryError::Serialization(_) => {
+            internal_error()
+        }
     }
 }
 
@@ -456,11 +451,13 @@ mod tests {
             .await
             .expect("migrations");
         let stream_controller = AgentActivityController::new(true);
-        let stream_projection = ActivityProjection::with_controller_and_capacity(
+        let projections = ActivityProjections::with_capacity(
             ActivityRepository::new(database.clone()),
             stream_controller.clone(),
+            AgentActivityController::new(true),
             8,
         );
+        let stream_projection = projections.chat();
         let external_projection =
             ActivityProjection::with_capacity(ActivityRepository::new(database), 8);
         stream_projection
@@ -479,8 +476,7 @@ mod tests {
 
         let cancellation = CancellationToken::new();
         let mut stream = activity_stream(
-            stream_projection.clone(),
-            stream_controller,
+            projections,
             RpcRequest {
                 id: RequestId::try_from("1").expect("request ID"),
                 tag: "subscribeActivity".to_owned(),
@@ -558,12 +554,13 @@ mod tests {
             })
             .await
             .expect("migrations");
-        let controller = AgentActivityController::new(true);
-        let projection = ActivityProjection::with_controller_and_capacity(
+        let projections = ActivityProjections::with_capacity(
             ActivityRepository::new(database),
-            controller.clone(),
+            AgentActivityController::new(true),
+            AgentActivityController::new(true),
             2,
         );
+        let projection = projections.chat();
         projection
             .ensure_scope(
                 ActivityScopeSeed::thread(
@@ -579,8 +576,7 @@ mod tests {
             .expect("scope persistence");
         let cancellation = CancellationToken::new();
         let mut stream = activity_stream(
-            projection.clone(),
-            controller,
+            projections,
             RpcRequest {
                 id: RequestId::try_from("1").expect("request ID"),
                 tag: "subscribeActivity".to_owned(),
@@ -623,12 +619,13 @@ mod tests {
             })
             .await
             .expect("migrations");
-        let controller = AgentActivityController::new(true);
-        let projection = ActivityProjection::with_controller_and_capacity(
+        let projections = ActivityProjections::with_capacity(
             ActivityRepository::new(database),
-            controller.clone(),
+            AgentActivityController::new(true),
+            AgentActivityController::new(true),
             2,
         );
+        let projection = projections.terminal();
         projection
             .ensure_scope(
                 ActivityScopeSeed::terminal(
@@ -662,8 +659,7 @@ mod tests {
         let context = RpcSessionContext::authenticated(issued.principal.clone(), auth.clone());
         let cancellation = CancellationToken::new();
         let mut stream = activity_stream(
-            projection.clone(),
-            controller,
+            projections,
             RpcRequest {
                 id: RequestId::try_from("1").expect("request ID"),
                 tag: "subscribeActivity".to_owned(),

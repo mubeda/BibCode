@@ -53,6 +53,7 @@ export function SettingsSection({
 
 export function SettingsRow({
   title,
+  titleTag,
   description,
   status,
   resetAction,
@@ -62,6 +63,7 @@ export function SettingsRow({
   ...rowProps
 }: Omit<ComponentPropsWithoutRef<"div">, "title"> & {
   title: ReactNode;
+  titleTag?: ReactNode;
   description: ReactNode;
   status?: ReactNode;
   resetAction?: ReactNode;
@@ -83,6 +85,7 @@ export function SettingsRow({
             <h3 className="text-[13px] font-semibold tracking-[-0.01em] text-foreground">
               {title}
             </h3>
+            {titleTag}
             <span className="inline-flex h-5 w-5 shrink-0 items-center justify-center">
               {resetAction}
             </span>

@@ -236,7 +236,12 @@ impl CursorSessionRuntime {
         *self.inner.baseline_config_options.lock().await = config_options;
         *self.inner.mode_state.lock().await = response.get("modes").cloned();
         if !self.inner.options.model.trim().is_empty()
-            && !self.inner.options.model.trim().eq_ignore_ascii_case("default")
+            && !self
+                .inner
+                .options
+                .model
+                .trim()
+                .eq_ignore_ascii_case("default")
         {
             self.set_model(&self.inner.options.model).await?;
         }
@@ -296,8 +301,9 @@ impl CursorSessionRuntime {
             let config_id = update["configId"]
                 .as_str()
                 .expect("resolved ACP config updates have a string config id");
-            let previous_value = acp_config_option_current_value(&Value::Array(current.clone()), config_id)
-                .map_err(|detail| CursorRuntimeError::UnsupportedOption { detail })?;
+            let previous_value =
+                acp_config_option_current_value(&Value::Array(current.clone()), config_id)
+                    .map_err(|detail| CursorRuntimeError::UnsupportedOption { detail })?;
             match self
                 .set_config_option(&session_id, config_id, update["value"].clone())
                 .await

@@ -50,7 +50,7 @@ impl ProductionServerControl for FixtureControl {
 type TestSocket = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 #[tokio::test]
-async fn agent_activity_setting_controls_the_production_rpc_gate_and_trace() {
+async fn independent_agent_activity_settings_control_routed_rpc_gates_and_trace() {
     let temp = TempDir::new().expect("temporary directory");
     let config = test_config(&temp);
     std::fs::create_dir_all(config.state_dir()).expect("state directory");
@@ -78,20 +78,70 @@ async fn agent_activity_setting_controls_the_production_rpc_gate_and_trace() {
         );
         assert_eq!(disabled["reason"], "featureDisabled");
 
-        let enabled = success_value(
+        let terminal_disabled = failure_value(
             request(
                 socket,
                 "2",
-                "server.updateSettings",
-                json!({ "patch": { "enableAgentActivity": true } }),
+                "activity.getSnapshot",
+                json!({
+                    "_tag": "terminal",
+                    "threadId": "production-toggle",
+                    "terminalId": "terminal-toggle"
+                }),
             )
             .await,
         );
-        assert_eq!(enabled["enableAgentActivity"], true);
-        let missing = failure_value(
+        assert_eq!(terminal_disabled["reason"], "featureDisabled");
+
+        let terminal_enabled = success_value(
             request(
                 socket,
                 "3",
+                "server.updateSettings",
+                json!({ "patch": { "enableTerminalAgentActivity": true } }),
+            )
+            .await,
+        );
+        assert_eq!(terminal_enabled["enableTerminalAgentActivity"], true);
+        let terminal_missing = failure_value(
+            request(
+                socket,
+                "4",
+                "activity.getSnapshot",
+                json!({
+                    "_tag": "terminal",
+                    "threadId": "production-toggle",
+                    "terminalId": "terminal-toggle"
+                }),
+            )
+            .await,
+        );
+        assert_eq!(terminal_missing["reason"], "notFound");
+        let chat_still_disabled = failure_value(
+            request(
+                socket,
+                "5",
+                "activity.getSnapshot",
+                json!({ "_tag": "thread", "threadId": "production-toggle" }),
+            )
+            .await,
+        );
+        assert_eq!(chat_still_disabled["reason"], "featureDisabled");
+
+        let chat_enabled = success_value(
+            request(
+                socket,
+                "6",
+                "server.updateSettings",
+                json!({ "patch": { "enableChatAgentActivity": true } }),
+            )
+            .await,
+        );
+        assert_eq!(chat_enabled["enableChatAgentActivity"], true);
+        let missing = failure_value(
+            request(
+                socket,
+                "7",
                 "activity.getSnapshot",
                 json!({ "_tag": "thread", "threadId": "production-toggle" }),
             )
@@ -102,17 +152,17 @@ async fn agent_activity_setting_controls_the_production_rpc_gate_and_trace() {
         let disabled_again = success_value(
             request(
                 socket,
-                "4",
+                "8",
                 "server.updateSettings",
-                json!({ "patch": { "enableAgentActivity": false } }),
+                json!({ "patch": { "enableChatAgentActivity": false } }),
             )
             .await,
         );
-        assert_eq!(disabled_again["enableAgentActivity"], false);
+        assert_eq!(disabled_again["enableChatAgentActivity"], false);
         let disabled = failure_value(
             request(
                 socket,
-                "5",
+                "9",
                 "activity.getSnapshot",
                 json!({ "_tag": "thread", "threadId": "production-toggle" }),
             )
@@ -121,7 +171,7 @@ async fn agent_activity_setting_controls_the_production_rpc_gate_and_trace() {
         assert_eq!(disabled["reason"], "featureDisabled");
 
         let diagnostics =
-            success_value(request(socket, "6", "server.getTraceDiagnostics", json!({})).await);
+            success_value(request(socket, "10", "server.getTraceDiagnostics", json!({})).await);
         assert!(
             diagnostics["recordCount"]
                 .as_u64()
@@ -131,17 +181,16 @@ async fn agent_activity_setting_controls_the_production_rpc_gate_and_trace() {
             .as_array()
             .expect("trace span summaries");
         assert!(spans.iter().any(|span| {
-            span["name"] == "agent_activity_change_requested" && span["count"] == 2
+            span["name"] == "agent_activity_change_requested" && span["count"] == 3
+        }));
+        assert!(spans.iter().any(|span| {
+            span["name"] == "agent_activity_disabled"
+                && span["count"].as_u64().is_some_and(|count| count >= 2)
         }));
         assert!(
             spans
                 .iter()
-                .any(|span| { span["name"] == "agent_activity_disabled" && span["count"] == 2 })
-        );
-        assert!(
-            spans
-                .iter()
-                .any(|span| span["name"] == "agent_activity_enabled" && span["count"] == 1)
+                .any(|span| span["name"] == "agent_activity_enabled" && span["count"] == 2)
         );
 
         let records = std::fs::read_to_string(&trace_path)
@@ -159,13 +208,17 @@ async fn agent_activity_setting_controls_the_production_rpc_gate_and_trace() {
                 )
             })
             .collect::<Vec<_>>();
-        assert_eq!(
-            records
-                .iter()
-                .filter(|record| record["name"] == "agent_activity_change_requested")
-                .count(),
-            2
-        );
+        let requested_sources = records
+            .iter()
+            .filter(|record| record["name"] == "agent_activity_change_requested")
+            .flat_map(|record| record["events"].as_array().expect("trace events"))
+            .map(|event| {
+                event["attributes"]["source"]
+                    .as_str()
+                    .expect("bounded source label")
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requested_sources, vec!["terminal", "chat", "chat"]);
         for record in records.iter().filter(|record| {
             matches!(
                 record["name"].as_str(),

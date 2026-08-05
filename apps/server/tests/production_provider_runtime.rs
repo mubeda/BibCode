@@ -1,5 +1,8 @@
 #![cfg_attr(not(unix), allow(dead_code, unused_imports))]
+#![allow(clippy::await_holding_lock)]
 // Windows compile-checks shared provider fixtures whose integration tests are Unix-only.
+// Fixture snapshot guards are explicitly dropped before async shutdown, which this lint
+// does not model reliably.
 
 use bibcode_server::production::provider_runtime;
 
@@ -63,10 +66,9 @@ use provider_runtime::{
     ProviderNativeEventId, ProviderReconciliationOutcome, ProviderRuntimeError,
     ProviderRuntimeSupervisor, StartedSession, SupervisorOptions,
     build_claude_launch_arguments_for_test, build_claude_launch_arguments_with_settings_for_test,
-    claude_activity_probe_cache_len_for_test,
-    claude_activity_probe_cache_paths_for_test, claude_output_shutdown_with_open_stream_for_test,
-    deliver_durable_orchestration_turn, deliver_orchestration_turn, freeze_delivery_route,
-    probe_claude_activity_support_for_test,
+    claude_activity_probe_cache_len_for_test, claude_activity_probe_cache_paths_for_test,
+    claude_output_shutdown_with_open_stream_for_test, deliver_durable_orchestration_turn,
+    deliver_orchestration_turn, freeze_delivery_route, probe_claude_activity_support_for_test,
     probe_claude_activity_support_with_resolution_delay_for_test,
     reconcile_abandoned_provider_sessions, reconcile_orchestration_turn,
     reset_claude_activity_probe_cache_for_test, route_orchestration_command,
@@ -6261,7 +6263,9 @@ async fn failed_restart_shutdown_preserves_the_existing_live_session() {
         )
         .await
         .expect_err("failed old-driver shutdown rejects restart");
-    assert!(matches!(error, ProviderRuntimeError::Provider { ref detail, .. } if detail.contains("shutdown failure")));
+    assert!(
+        matches!(error, ProviderRuntimeError::Provider { ref detail, .. } if detail.contains("shutdown failure"))
+    );
 
     supervisor
         .handle_orchestration(
@@ -6285,7 +6289,10 @@ async fn failed_restart_shutdown_preserves_the_existing_live_session() {
         let state = state.lock().unwrap();
         assert_eq!(state.starts, 1);
         assert_eq!(state.launches.len(), 1);
-        assert_eq!(state.approvals, [("request-1".to_owned(), "accept".to_owned())]);
+        assert_eq!(
+            state.approvals,
+            [("request-1".to_owned(), "accept".to_owned())]
+        );
         assert_eq!(state.shutdowns, 1);
     }
     supervisor.shutdown().await.unwrap();
@@ -6497,7 +6504,10 @@ async fn rejected_options_do_not_mutate_the_model_before_a_turn() {
     assert!(supervisor.handle_orchestration(command).await.is_err());
 
     let state = state.lock().unwrap();
-    assert!(state.models.is_empty(), "model update must wait for option validation");
+    assert!(
+        state.models.is_empty(),
+        "model update must wait for option validation"
+    );
     assert!(state.sends.is_empty());
     assert_eq!(state.starts, 1);
     assert_eq!(state.shutdowns, 0);
@@ -6572,7 +6582,10 @@ async fn model_only_option_revalidation_restores_the_previous_open_code_launch()
     assert!(state.sends.is_empty());
     assert_eq!(state.starts, 1);
     assert_eq!(state.shutdowns, 0);
-    assert_eq!(state.launches[0].model.as_deref(), Some("openai/fast-model"));
+    assert_eq!(
+        state.launches[0].model.as_deref(),
+        Some("openai/fast-model")
+    );
     drop(state);
     supervisor.shutdown().await.unwrap();
 }
@@ -6830,7 +6843,8 @@ async fn cursor_persistence_failure_restores_default_model_and_options_before_pr
 }
 
 #[tokio::test]
-async fn failed_default_model_persistence_restoration_blocks_delivery_when_restart_cannot_shutdown() {
+async fn failed_default_model_persistence_restoration_blocks_delivery_when_restart_cannot_shutdown()
+{
     let (engine, database) = engine_and_database().await;
     let state = Arc::new(StdMutex::new(DriverState {
         reapply_options_on_model_change: true,
@@ -6882,21 +6896,27 @@ async fn failed_default_model_persistence_restoration_blocks_delivery_when_resta
         .unwrap();
 
     let error = supervisor
-        .handle_orchestration(serde_json::from_value(json!({
-            "type":"thread.meta.update", "commandId":"unrestorable-configuration",
-            "threadId":"t1",
-            "modelSelection":{
-                "instanceId":"cursor", "model":"target",
-                "options":[{"id":"fastMode","value":true}]
-            }
-        })).unwrap())
+        .handle_orchestration(
+            serde_json::from_value(json!({
+                "type":"thread.meta.update", "commandId":"unrestorable-configuration",
+                "threadId":"t1",
+                "modelSelection":{
+                    "instanceId":"cursor", "model":"target",
+                    "options":[{"id":"fastMode","value":true}]
+                }
+            }))
+            .unwrap(),
+        )
         .await
         .expect_err("failed restoration and restart must be surfaced");
-    assert!(matches!(error, ProviderRuntimeError::Provider { ref detail, .. } if detail.contains("shutdown failure")));
+    assert!(
+        matches!(error, ProviderRuntimeError::Provider { ref detail, .. } if detail.contains("shutdown failure"))
+    );
 
     database
         .call(|connection| {
-            connection.execute_batch("DROP TRIGGER fail_unrestorable_configuration_persistence;")?;
+            connection
+                .execute_batch("DROP TRIGGER fail_unrestorable_configuration_persistence;")?;
             Ok(())
         })
         .await
@@ -6974,19 +6994,21 @@ async fn admitted_durable_delivery_precedes_following_metadata_reconciliation() 
         .await
         .expect("delivery reaches provider preflight");
 
-    let mut metadata = Box::pin(supervisor.handle_orchestration(
-        serde_json::from_value(json!({
-            "type":"thread.meta.update",
-            "commandId":"metadata-after-admission",
-            "threadId":"t1",
-            "modelSelection":{
-                "instanceId":"codex",
-                "model":"gpt-5",
-                "options":[{"id":"fastMode","value":true}]
-            }
-        }))
-        .unwrap(),
-    ));
+    let mut metadata = Box::pin(
+        supervisor.handle_orchestration(
+            serde_json::from_value(json!({
+                "type":"thread.meta.update",
+                "commandId":"metadata-after-admission",
+                "threadId":"t1",
+                "modelSelection":{
+                    "instanceId":"codex",
+                    "model":"gpt-5",
+                    "options":[{"id":"fastMode","value":true}]
+                }
+            }))
+            .unwrap(),
+        ),
+    );
     assert!(
         matches!(futures_util::poll!(metadata.as_mut()), Poll::Pending),
         "following metadata must wait for admitted delivery"
@@ -7012,8 +7034,14 @@ async fn admitted_durable_delivery_precedes_following_metadata_reconciliation() 
         ProviderDeliveryOutcome::Accepted { .. }
     ));
     metadata.await.unwrap();
-    assert_eq!(state.lock().unwrap().approvals, [("request-b".to_owned(), "accept".to_owned())]);
-    assert_eq!(state.lock().unwrap().operation_order, ["delivery", "options"]);
+    assert_eq!(
+        state.lock().unwrap().approvals,
+        [("request-b".to_owned(), "accept".to_owned())]
+    );
+    assert_eq!(
+        state.lock().unwrap().operation_order,
+        ["delivery", "options"]
+    );
     supervisor.shutdown().await.unwrap();
 }
 
@@ -7050,18 +7078,23 @@ async fn panicked_delivery_completes_deferred_configuration_with_an_error() {
         .await
         .expect("delivery reaches provider preflight");
 
-    let mut metadata = Box::pin(supervisor.handle_orchestration(
-        serde_json::from_value(json!({
-            "type":"thread.meta.update", "commandId":"metadata-after-panic",
-            "threadId":"t1",
-            "modelSelection":{
-                "instanceId":"codex", "model":"gpt-5",
-                "options":[{"id":"fastMode","value":true}]
-            }
-        }))
-        .unwrap(),
+    let mut metadata = Box::pin(
+        supervisor.handle_orchestration(
+            serde_json::from_value(json!({
+                "type":"thread.meta.update", "commandId":"metadata-after-panic",
+                "threadId":"t1",
+                "modelSelection":{
+                    "instanceId":"codex", "model":"gpt-5",
+                    "options":[{"id":"fastMode","value":true}]
+                }
+            }))
+            .unwrap(),
+        ),
+    );
+    assert!(matches!(
+        futures_util::poll!(metadata.as_mut()),
+        Poll::Pending
     ));
-    assert!(matches!(futures_util::poll!(metadata.as_mut()), Poll::Pending));
     preflight_release.add_permits(1);
     assert!(matches!(
         delivery.completion().await,
@@ -7071,7 +7104,9 @@ async fn panicked_delivery_completes_deferred_configuration_with_an_error() {
         .await
         .expect("deferred metadata must never strand")
         .expect_err("abnormal delivery completion rejects deferred metadata");
-    assert!(matches!(error, ProviderRuntimeError::Provider { ref detail, .. } if detail.contains("ended abnormally")));
+    assert!(
+        matches!(error, ProviderRuntimeError::Provider { ref detail, .. } if detail.contains("ended abnormally"))
+    );
     supervisor.shutdown().await.unwrap();
 }
 
@@ -7106,20 +7141,28 @@ async fn supervisor_shutdown_completes_deferred_configuration_with_shutdown() {
     timeout(Duration::from_secs(1), preflight_entered.notified())
         .await
         .expect("delivery reaches provider preflight");
-    let mut metadata = Box::pin(supervisor.handle_orchestration(
-        serde_json::from_value(json!({
-            "type":"thread.meta.update", "commandId":"metadata-before-shutdown",
-            "threadId":"t1",
-            "modelSelection":{
-                "instanceId":"codex", "model":"gpt-5",
-                "options":[{"id":"fastMode","value":true}]
-            }
-        }))
-        .unwrap(),
+    let mut metadata = Box::pin(
+        supervisor.handle_orchestration(
+            serde_json::from_value(json!({
+                "type":"thread.meta.update", "commandId":"metadata-before-shutdown",
+                "threadId":"t1",
+                "modelSelection":{
+                    "instanceId":"codex", "model":"gpt-5",
+                    "options":[{"id":"fastMode","value":true}]
+                }
+            }))
+            .unwrap(),
+        ),
+    );
+    assert!(matches!(
+        futures_util::poll!(metadata.as_mut()),
+        Poll::Pending
     ));
-    assert!(matches!(futures_util::poll!(metadata.as_mut()), Poll::Pending));
     supervisor.shutdown().await.unwrap();
-    assert!(matches!(metadata.await, Err(ProviderRuntimeError::Shutdown)));
+    assert!(matches!(
+        metadata.await,
+        Err(ProviderRuntimeError::Shutdown)
+    ));
 
     preflight_release.add_permits(1);
     assert!(matches!(
@@ -7132,13 +7175,16 @@ async fn supervisor_shutdown_completes_deferred_configuration_with_shutdown() {
 async fn bounded_deferred_configuration_rejects_overflow_without_blocking_other_threads() {
     let engine = engine().await;
     engine
-        .dispatch(serde_json::from_value(json!({
-            "type":"thread.create", "commandId":"bounded-thread-b", "threadId":"t2",
-            "projectId":"p1", "title":"Thread B",
-            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
-            "runtimeMode":"full-access", "branch":null, "worktreePath":null,
-            "createdAt":NOW
-        })).unwrap())
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.create", "commandId":"bounded-thread-b", "threadId":"t2",
+                "projectId":"p1", "title":"Thread B",
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access", "branch":null, "worktreePath":null,
+                "createdAt":NOW
+            }))
+            .unwrap(),
+        )
         .await
         .unwrap();
     let preflight_entered = Arc::new(tokio::sync::Notify::new());
@@ -7181,18 +7227,23 @@ async fn bounded_deferred_configuration_rejects_overflow_without_blocking_other_
 
     let mut queued = Vec::new();
     for (index, value) in [true, false].into_iter().enumerate() {
-        let mut request = Box::pin(supervisor.handle_orchestration(
-            serde_json::from_value(json!({
-                "type":"thread.meta.update", "commandId":format!("bounded-metadata-{index}"),
-                "threadId":"t1",
-                "modelSelection":{
-                    "instanceId":"codex", "model":"gpt-5",
-                    "options":[{"id":"fastMode","value":value}]
-                }
-            }))
-            .unwrap(),
+        let mut request = Box::pin(
+            supervisor.handle_orchestration(
+                serde_json::from_value(json!({
+                    "type":"thread.meta.update", "commandId":format!("bounded-metadata-{index}"),
+                    "threadId":"t1",
+                    "modelSelection":{
+                        "instanceId":"codex", "model":"gpt-5",
+                        "options":[{"id":"fastMode","value":value}]
+                    }
+                }))
+                .unwrap(),
+            ),
+        );
+        assert!(matches!(
+            futures_util::poll!(request.as_mut()),
+            Poll::Pending
         ));
-        assert!(matches!(futures_util::poll!(request.as_mut()), Poll::Pending));
         supervisor
             .handle_orchestration(serde_json::from_value(json!({
                 "type":"thread.approval.respond", "commandId":format!("bounded-barrier-{index}"),
@@ -7205,23 +7256,31 @@ async fn bounded_deferred_configuration_rejects_overflow_without_blocking_other_
     }
 
     let overflow = supervisor
-        .handle_orchestration(serde_json::from_value(json!({
-            "type":"thread.meta.update", "commandId":"bounded-metadata-overflow",
-            "threadId":"t1",
-            "modelSelection":{
-                "instanceId":"codex", "model":"gpt-5",
-                "options":[{"id":"fastMode","value":true}]
-            }
-        })).unwrap())
+        .handle_orchestration(
+            serde_json::from_value(json!({
+                "type":"thread.meta.update", "commandId":"bounded-metadata-overflow",
+                "threadId":"t1",
+                "modelSelection":{
+                    "instanceId":"codex", "model":"gpt-5",
+                    "options":[{"id":"fastMode","value":true}]
+                }
+            }))
+            .unwrap(),
+        )
         .await
         .expect_err("per-thread deferred work must be bounded");
-    assert!(matches!(overflow, ProviderRuntimeError::Provider { ref detail, .. } if detail.contains("queue is full")));
+    assert!(
+        matches!(overflow, ProviderRuntimeError::Provider { ref detail, .. } if detail.contains("queue is full"))
+    );
     supervisor
-        .handle_orchestration(serde_json::from_value(json!({
-            "type":"thread.approval.respond", "commandId":"bounded-thread-b-progress",
-            "threadId":"t2", "requestId":"thread-b-progress",
-            "decision":"accept", "createdAt":NOW
-        })).unwrap())
+        .handle_orchestration(
+            serde_json::from_value(json!({
+                "type":"thread.approval.respond", "commandId":"bounded-thread-b-progress",
+                "threadId":"t2", "requestId":"thread-b-progress",
+                "decision":"accept", "createdAt":NOW
+            }))
+            .unwrap(),
+        )
         .await
         .expect("thread B remains responsive with thread A queue full");
 
@@ -7244,13 +7303,16 @@ async fn bounded_deferred_configuration_rejects_overflow_without_blocking_other_
 async fn runtime_and_interaction_restarts_wait_for_same_thread_durable_delivery() {
     let engine = engine().await;
     engine
-        .dispatch(serde_json::from_value(json!({
-            "type":"thread.create", "commandId":"restart-order-thread-b", "threadId":"t2",
-            "projectId":"p1", "title":"Thread B",
-            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
-            "runtimeMode":"full-access", "branch":null, "worktreePath":null,
-            "createdAt":NOW
-        })).unwrap())
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.create", "commandId":"restart-order-thread-b", "threadId":"t2",
+                "projectId":"p1", "title":"Thread B",
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access", "branch":null, "worktreePath":null,
+                "createdAt":NOW
+            }))
+            .unwrap(),
+        )
         .await
         .unwrap();
     let preflight_entered = Arc::new(tokio::sync::Notify::new());
@@ -7316,9 +7378,8 @@ async fn runtime_and_interaction_restarts_wait_for_same_thread_durable_delivery(
         timeout(Duration::from_secs(1), entered)
             .await
             .expect("delivery reaches provider preflight");
-        let mut configuration = Box::pin(
-            supervisor.handle_orchestration(serde_json::from_value(command).unwrap()),
-        );
+        let mut configuration =
+            Box::pin(supervisor.handle_orchestration(serde_json::from_value(command).unwrap()));
         assert!(matches!(
             futures_util::poll!(configuration.as_mut()),
             Poll::Pending
@@ -9716,7 +9777,11 @@ fn claude_fast_mode_is_merged_into_session_settings() {
 
     assert_eq!(settings["fastMode"], true);
     assert!(settings.get("hooks").is_some());
-    assert!(!arguments.iter().any(|argument| argument.contains("settings.json")));
+    assert!(
+        !arguments
+            .iter()
+            .any(|argument| argument.contains("settings.json"))
+    );
 }
 
 #[cfg(unix)]
@@ -10575,7 +10640,7 @@ async fn native_opencode_driver_supports_session_turn_and_control_commands() {
         .unwrap()
         .unwrap();
     assert_eq!(event.event_type, "session.started");
-    let admitted = timeout(Duration::from_secs(2), async {
+    timeout(Duration::from_secs(2), async {
         loop {
             let event = driver.next_event().await.expect("OpenCode provider event");
             if !event.activity.is_empty() {
@@ -10617,7 +10682,7 @@ async fn native_opencode_driver_supports_session_turn_and_control_commands() {
     })
     .await
     .expect("OpenCode child lineage admission");
-    assert_eq!(admitted, ());
+    assert_eq!((), ());
     assert_eq!(
         reconciliation_observed.load(std::sync::atomic::Ordering::SeqCst) & LINEAGE_HANDSHAKE,
         LINEAGE_HANDSHAKE,

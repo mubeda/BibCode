@@ -181,7 +181,9 @@ mod tests {
             .position(|window| window == "é".as_bytes())
             .expect("multibyte marker")
             + 1;
-        decoder.push(&encoded[..split]).expect("partial frame chunk");
+        decoder
+            .push(&encoded[..split])
+            .expect("partial frame chunk");
         assert_eq!(decoder.take_event().expect("partial frame"), None);
         decoder
             .push(&encoded[split..])
@@ -198,10 +200,7 @@ mod tests {
             .push(b"data: {\"type\":\"session.status\"}\n\n")
             .expect("LF frame chunk");
         assert_eq!(
-            decoder
-                .take_event()
-                .expect("LF frame")
-                .expect("LF event")["type"],
+            decoder.take_event().expect("LF frame").expect("LF event")["type"],
             "session.status"
         );
     }

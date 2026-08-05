@@ -1,4 +1,6 @@
-use bibcode_server::{cloud, production::managed_endpoint::ManagedEndpointRuntime, text_generation};
+use bibcode_server::{
+    cloud, production::managed_endpoint::ManagedEndpointRuntime, text_generation,
+};
 
 use cloud::{RelayClientInstallEvent, RelayClientService, RelayClientStatus};
 use serde_json::json;

@@ -559,11 +559,10 @@ fn is_reserved_pty_env_key_on(platform: Platform, key: &str) -> bool {
             OSC_FOREGROUND_ENV,
             OSC_CURSOR_ENV,
         ]
-            .into_iter()
-            .any(|reserved| key.eq_ignore_ascii_case(reserved));
+        .into_iter()
+        .any(|reserved| key.eq_ignore_ascii_case(reserved));
     }
-    key == WINDOWS_CONSOLE_THEME_ENV
-        || is_reserved_osc_env_key(key)
+    key == WINDOWS_CONSOLE_THEME_ENV || is_reserved_osc_env_key(key)
 }
 
 fn resolve_pty_executable_on(

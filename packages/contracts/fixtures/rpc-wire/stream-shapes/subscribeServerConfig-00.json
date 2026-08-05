@@ -39,7 +39,8 @@
         "settings": {
           "enableAssistantStreaming": false,
           "enableProviderUpdateChecks": true,
-          "enableAgentActivity": true,
+          "enableChatAgentActivity": true,
+          "enableTerminalAgentActivity": false,
           "automaticGitFetchInterval": 30000,
           "defaultThreadEnvMode": "local",
           "newWorktreesStartFromOrigin": false,

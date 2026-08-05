@@ -19,7 +19,10 @@ use std::{
 };
 
 #[cfg(unix)]
-use std::{collections::BTreeMap, net::{Ipv4Addr, SocketAddrV4}};
+use std::{
+    collections::BTreeMap,
+    net::{Ipv4Addr, SocketAddrV4},
+};
 
 use axum::{
     Router,
@@ -35,6 +38,8 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(unix)]
+use super::supervisor::create_owned_generation_directory;
 use super::{
     PreparedTerminalLaunch, PreparedTerminalObserver, ProviderTerminalObserverFactory,
     ProviderTerminalObserverFactoryInput, TerminalAgentActivityAdmission,
@@ -43,8 +48,6 @@ use super::{
     TerminalGenerationActivityPublisher, TerminalObserverGeneration, TerminalObserverWorkerContext,
     supervisor::cleanup_owned_generation_directory,
 };
-#[cfg(unix)]
-use super::supervisor::create_owned_generation_directory;
 use crate::{
     activity::{
         ActivityActorSummary, ActivityCapabilities, ActivityHistoryRecovery, ActivityLifecycle,
@@ -203,11 +206,7 @@ impl CachedClaudeCapabilityProbe {
         let pinned_fingerprint = ClaudeExecutableFingerprint::read(pinned)?;
         let (capabilities, approved_pinned_build) = tokio::join!(
             self.probe_cacheable(&source, source_fingerprint.clone()),
-            self.attest_stable_build(
-                pinned,
-                &pinned_fingerprint,
-                APPROVED_ADDITIVE_HOOK_VERSION,
-            ),
+            self.attest_stable_build(pinned, &pinned_fingerprint, APPROVED_ADDITIVE_HOOK_VERSION,),
         );
         let capabilities = capabilities?;
         if ClaudeExecutableFingerprint::read(&source).as_ref() != Some(&source_fingerprint) {
@@ -241,8 +240,8 @@ impl CachedClaudeCapabilityProbe {
             return None;
         }
         let _probe_permit = self.probe_permits.acquire().await.ok()?;
-        let capabilities = self.probe_uncached(&path).await;
-        if ClaudeExecutableFingerprint::read(&path).as_ref() != Some(&fingerprint) {
+        let capabilities = self.probe_uncached(path).await;
+        if ClaudeExecutableFingerprint::read(path).as_ref() != Some(&fingerprint) {
             probe_gate.failed.store(true, Ordering::Release);
             return None;
         }
@@ -983,6 +982,7 @@ fn publish_claude_listener_unavailable(inner: &ClaudeObserverInner) {
         });
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_claude_hook(
     inner: &ClaudeObserverInner,
     generation: &TerminalObserverGeneration,
@@ -1770,14 +1770,13 @@ mod tests {
 
     #[test]
     fn hook_authorization_accepts_canonical_and_legacy_correlation_headers() {
-        for header_name in [
+        let mut headers = HeaderMap::new();
+        headers.insert("authorization", "Bearer token".parse().unwrap());
+        headers.insert(
             CLAUDE_HOOK_CORRELATION_HEADER,
-        ] {
-            let mut headers = HeaderMap::new();
-            headers.insert("authorization", "Bearer token".parse().unwrap());
-            headers.insert(header_name, "correlation".parse().unwrap());
-            assert!(authorized(&headers, "token", "correlation"));
-        }
+            "correlation".parse().unwrap(),
+        );
+        assert!(authorized(&headers, "token", "correlation"));
     }
 
     #[derive(Debug)]
@@ -2196,14 +2195,16 @@ mod tests {
         for phase in ["cold", "cached-capabilities"] {
             let started = std::time::Instant::now();
             let capabilities =
-                tokio::time::timeout(Duration::from_millis(500), probe.probe(&executable))
+                tokio::time::timeout(CLAUDE_PREPARATION_BUDGET, probe.probe(&executable))
                     .await
-                    .unwrap_or_else(|_| panic!("{phase} installed probe exceeded 500ms"))
+                    .unwrap_or_else(|_| {
+                        panic!("{phase} installed probe exceeded {CLAUDE_PREPARATION_BUDGET:?}")
+                    })
                     .unwrap_or_else(|| panic!("{phase} installed probe failed"));
             assert!(capabilities.additive_hook_merge);
             assert!(
-                started.elapsed() < Duration::from_millis(500),
-                "{phase} installed preparation exceeded 500ms"
+                started.elapsed() < CLAUDE_PREPARATION_BUDGET,
+                "{phase} installed preparation exceeded {CLAUDE_PREPARATION_BUDGET:?}"
             );
         }
     }

@@ -1,5 +1,5 @@
-use serde_json::Value;
 use bibcode_server::terminal::TerminalLaunchCommand;
+use serde_json::Value;
 
 #[test]
 fn terminal_wire_fixture_keeps_effect_rpc_method_and_stream_names() {

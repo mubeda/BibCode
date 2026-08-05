@@ -439,17 +439,10 @@ impl ClaudeProviderRuntime {
         {
             return ClaudeRuntimeOutput::default();
         }
-        let records = records_at_or_after(
-            recovered.records,
-            self.activity_not_before_unix_nanos,
-        );
+        let records = records_at_or_after(recovered.records, self.activity_not_before_unix_nanos);
         let mut activity = self
             .activity_tracker
-            .handle_recovered_records(
-                &recovered.agent_id,
-                &recovered.agent_type,
-                &records,
-            )
+            .handle_recovered_records(&recovered.agent_id, &recovered.agent_type, &records)
             .mutations;
         activity.push(ProviderActivityMutation::SetScope {
             capabilities: ActivityCapabilities {
@@ -977,9 +970,9 @@ enum ClaudeMessageRoute {
 
 fn claude_message_route(message: &ClaudeMessage) -> ClaudeMessageRoute {
     let forwarded_task = |parent_tool_use_id: &Option<String>| {
-        parent_tool_use_id.as_ref().map_or(
-            ClaudeMessageRoute::Root,
-            |parent_tool_use_id| {
+        parent_tool_use_id
+            .as_ref()
+            .map_or(ClaudeMessageRoute::Root, |parent_tool_use_id| {
                 if parent_tool_use_id.is_empty() {
                     ClaudeMessageRoute::SuppressedChildText
                 } else {
@@ -1003,8 +996,7 @@ fn claude_message_route(message: &ClaudeMessage) -> ClaudeMessageRoute {
                 StreamEvent::MessageStart { .. }
                 | StreamEvent::ContentBlockDelta {
                     delta:
-                        ContentBlockDelta::ThinkingDelta { .. }
-                        | ContentBlockDelta::TextDelta { .. },
+                        ContentBlockDelta::ThinkingDelta { .. } | ContentBlockDelta::TextDelta { .. },
                     ..
                 } => ClaudeMessageRoute::SuppressedChildText,
             }

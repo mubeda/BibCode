@@ -23,8 +23,8 @@ use uuid::Uuid;
 
 use crate::{
     activity::{
-        ActivityCapabilities, ActivityDelta, ActivityProjection, ActivityResult,
-        ActivityScopeSeed, ProviderActivityMutation,
+        ActivityCapabilities, ActivityDelta, ActivityProjection, ActivityResult, ActivityScopeSeed,
+        AgentActivityAdmission, ProviderActivityMutation,
     },
     terminal::ProviderTerminalActivityLaunch,
 };
@@ -897,6 +897,7 @@ pub trait TerminalLaunchPreparer: Send + Sync {
 pub enum TerminalLaunchPreparation {
     PassThrough,
     Prepared(PreparedTerminalLaunch),
+    Admitted(PreparedTerminalLaunch, AgentActivityAdmission),
 }
 
 impl fmt::Debug for TerminalLaunchPreparation {
@@ -904,6 +905,9 @@ impl fmt::Debug for TerminalLaunchPreparation {
         match self {
             Self::PassThrough => formatter.write_str("PassThrough"),
             Self::Prepared(prepared) => formatter.debug_tuple("Prepared").field(prepared).finish(),
+            Self::Admitted(prepared, _) => {
+                formatter.debug_tuple("Admitted").field(prepared).finish()
+            }
         }
     }
 }
@@ -1021,10 +1025,7 @@ impl TerminalAgentActivityPublicationTestHook {
             observation_release: Arc::new((StdMutex::new(false), std::sync::Condvar::new())),
             acknowledgement_armed: AtomicBool::new(false),
             acknowledgement_reached: Arc::new(tokio::sync::Semaphore::new(0)),
-            acknowledgement_release: Arc::new((
-                StdMutex::new(false),
-                std::sync::Condvar::new(),
-            )),
+            acknowledgement_release: Arc::new((StdMutex::new(false), std::sync::Condvar::new())),
         }
     }
 
@@ -1198,10 +1199,7 @@ impl TerminalAgentActivityControl {
     }
 
     #[allow(dead_code)]
-    pub(crate) fn admission_is_current(
-        &self,
-        admission: &TerminalAgentActivityAdmission,
-    ) -> bool {
+    pub(crate) fn admission_is_current(&self, admission: &TerminalAgentActivityAdmission) -> bool {
         admission.state.enabled && self.snapshot() == admission.state
     }
 
@@ -1471,20 +1469,18 @@ mod tests {
 
     use crate::{
         activity::{
-            ActivityCapabilities, ActivityProjection, ActivityRepository,
-            ActivityScopeRef, ProviderActivityMutation,
+            ActivityCapabilities, ActivityProjection, ActivityRepository, ActivityScopeRef,
+            ProviderActivityMutation,
         },
         persistence::{Database, run_migrations},
     };
 
     use super::{
-        MAX_GLOBAL_OBSERVER_WORKERS, TerminalAgentActivityControl,
-        TerminalAgentActivityAdmission,
+        MAX_GLOBAL_OBSERVER_WORKERS, TerminalAgentActivityAdmission, TerminalAgentActivityControl,
         TerminalAgentActivityObservation, TerminalAgentActivityObservationKind,
         TerminalAgentActivityPublicationTestHook, TerminalAgentActivityTransition,
         TerminalGenerationActivityPublisher, TerminalObserverCancellationReason,
-        TerminalObserverGeneration,
-        TerminalObserverWorkerSpawnError, WorkerThreadExitTestHook,
+        TerminalObserverGeneration, TerminalObserverWorkerSpawnError, WorkerThreadExitTestHook,
     };
 
     static GLOBAL_OBSERVER_WORKER_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
@@ -1542,24 +1538,14 @@ mod tests {
             terminal_id: "terminal-admitted-publication".to_owned(),
         };
         (
-            publisher,
-            projection,
-            generation,
-            activity,
-            admission,
-            scope,
+            publisher, projection, generation, activity, admission, scope,
         )
     }
 
     fn admitted_actor_mutation(actor_id: &str) -> Vec<ProviderActivityMutation> {
         vec![
-            ProviderActivityMutation::upsert_actor(
-                actor_id,
-                None,
-                "Blocked actor",
-                "running",
-            )
-            .expect("actor mutation"),
+            ProviderActivityMutation::upsert_actor(actor_id, None, "Blocked actor", "running")
+                .expect("actor mutation"),
         ]
     }
 
@@ -1597,7 +1583,7 @@ mod tests {
         )
         .await
         .expect("generation-lock waiter must not block the activity transition")
-            .expect("dormant activity state");
+        .expect("dormant activity state");
         let deltas = tokio::time::timeout(Duration::from_millis(100), &mut apply)
             .await
             .expect("disabled publication exits before the held lock is released")
@@ -2132,7 +2118,9 @@ mod tests {
             Err(_) => {
                 hook.release_observation();
                 let current = TerminalAgentActivityObservation {
-                    state: disable.await.expect("disable transition after observation release"),
+                    state: disable
+                        .await
+                        .expect("disable transition after observation release"),
                     epoch: 2,
                     kind: TerminalAgentActivityObservationKind::Dormant,
                 };
@@ -2149,8 +2137,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn terminal_activity_control_retries_unavailable_and_timeout_with_fresh_resume_acknowledgements(
-    ) {
+    async fn terminal_activity_control_retries_unavailable_and_timeout_with_fresh_resume_acknowledgements()
+     {
         let control = Arc::new(TerminalAgentActivityControl::enabled());
         let mut changes = control.subscribe();
         let first = tokio::spawn({
@@ -2169,7 +2157,10 @@ mod tests {
             kind: TerminalAgentActivityObservationKind::Unavailable,
         }));
         assert_eq!(
-            (first.await.expect("first enable").resumed, control.snapshot()),
+            (
+                first.await.expect("first enable").resumed,
+                control.snapshot()
+            ),
             (0, live)
         );
 
@@ -2204,7 +2195,10 @@ mod tests {
                     .await
             }
         });
-        changes.changed().await.expect("post-timeout enable request");
+        changes
+            .changed()
+            .await
+            .expect("post-timeout enable request");
         assert!(control.mark_observed(TerminalAgentActivityObservation {
             state: *changes.borrow(),
             epoch: 3,

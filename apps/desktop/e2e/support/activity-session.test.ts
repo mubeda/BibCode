@@ -340,6 +340,18 @@ describe("materializeDesktopActivitySession", () => {
 
     await configureDesktopActivityCodexExecutable("/fixture/provider-shims/codex");
 
+    const setupRequests = sentRequests;
+    expect(setupRequests).toContainEqual({
+      _tag: "Request",
+      id: "0",
+      tag: "server.updateSettings",
+      payload: {
+        patch: expect.objectContaining({
+          enableTerminalAgentActivity: true,
+        }),
+      },
+      headers: [],
+    });
     expect(sentRequests).toEqual([
       {
         _tag: "Request",
@@ -347,6 +359,7 @@ describe("materializeDesktopActivitySession", () => {
         tag: "server.updateSettings",
         payload: {
           patch: {
+            enableTerminalAgentActivity: true,
             providers: {
               codex: {
                 enabled: true,
