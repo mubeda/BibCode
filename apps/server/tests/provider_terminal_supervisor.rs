@@ -482,6 +482,47 @@ impl TerminalLaunchPreparer for CountingActivityPreparer {
 }
 
 #[derive(Debug)]
+struct PostActivityCheckPausingPreparer {
+    controller: AgentActivityController,
+    entered: Arc<tokio::sync::Semaphore>,
+    release: Arc<tokio::sync::Semaphore>,
+    observer: Arc<CountingActivityObserver>,
+}
+
+impl TerminalLaunchPreparer for PostActivityCheckPausingPreparer {
+    fn prepare(
+        &self,
+        input: TerminalLaunchPreparationInput,
+    ) -> Pin<Box<dyn Future<Output = TerminalLaunchPreparation> + Send + '_>> {
+        Box::pin(async move {
+            let Some(admission) = self.controller.admit() else {
+                return TerminalLaunchPreparation::PassThrough;
+            };
+            self.entered.add_permits(1);
+            self.release
+                .acquire()
+                .await
+                .expect("post-activity-check release")
+                .forget();
+            TerminalLaunchPreparation::Admitted(
+                PreparedTerminalLaunch {
+                    executable: "instrumented-codex".to_owned(),
+                    args: input.args,
+                    private_env: BTreeMap::from([(
+                        "BIBCODE_ACTIVITY_OBSERVER".to_owned(),
+                        "enabled".to_owned(),
+                    )]),
+                    observer: Box::new(CountingActivityObserverProxy {
+                        observer: self.observer.clone(),
+                    }),
+                },
+                admission,
+            )
+        })
+    }
+}
+
+#[derive(Debug)]
 struct CountingActivityObserverProxy {
     observer: Arc<CountingActivityObserver>,
 }
@@ -7998,9 +8039,20 @@ async fn agent_activity_toggle_disable_racing_preparation_drops_owned_resources_
         .forget();
 
     let before_disable = controller.snapshot();
-    controller.disable().await;
-    assert_ne!(controller.snapshot().generation, before_disable.generation);
+    let disabling = tokio::spawn({
+        let controller = controller.clone();
+        async move { controller.disable().await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while controller.snapshot().enabled {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Terminal activity gate closes");
     factory.release.add_permits(1);
+    disabling.await.expect("disable task");
+    assert_ne!(controller.snapshot().generation, before_disable.generation);
     let result = preparation.await.expect("preparation task");
 
     assert!(matches!(result, TerminalLaunchPreparation::PassThrough));
@@ -8009,6 +8061,91 @@ async fn agent_activity_toggle_disable_racing_preparation_drops_owned_resources_
         0,
         "the raced prepared observer and its owned resources are dropped"
     );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn agent_activity_toggle_disable_after_final_check_rejects_late_observer_install() {
+    let fixture = tempfile::tempdir().expect("fixture root");
+    let controller = AgentActivityController::new(true);
+    let entered = Arc::new(tokio::sync::Semaphore::new(0));
+    let release = Arc::new(tokio::sync::Semaphore::new(0));
+    let observer = Arc::new(CountingActivityObserver::default());
+    let backend = Arc::new(RecordingBackend::new(Arc::new(Mutex::new(Vec::new()))));
+    let manager = TerminalManager::new(
+        backend.clone(),
+        TerminalManagerOptions {
+            launch_preparer: Some(Arc::new(PostActivityCheckPausingPreparer {
+                controller: controller.clone(),
+                entered: entered.clone(),
+                release: release.clone(),
+                observer: observer.clone(),
+            })),
+            ..TerminalManagerOptions::default()
+        },
+    );
+    let mut input = TerminalOpenInput::new(
+        "thread-post-check-race",
+        "terminal-post-check-race",
+        fixture.path().to_path_buf(),
+        80,
+        24,
+    );
+    input.command = Some(command(true));
+
+    let opening = tokio::spawn({
+        let manager = manager.clone();
+        async move { manager.open(input).await }
+    });
+    entered
+        .acquire()
+        .await
+        .expect("preparation reached post-check pause")
+        .forget();
+
+    let disabling = tokio::spawn({
+        let controller = controller.clone();
+        let manager = manager.clone();
+        async move {
+            controller.disable().await;
+            manager.set_agent_activity_enabled(false).await
+        }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while controller.snapshot().enabled {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("terminal activity gate closes");
+
+    release.add_permits(1);
+    let stopped = disabling.await.expect("disable transition");
+    opening
+        .await
+        .expect("open task")
+        .expect("pass-through terminal still launches");
+
+    assert_eq!(
+        backend.spawns()[0].executable, "codex",
+        "the stale prepared command never reaches the PTY backend"
+    );
+    assert_eq!(
+        manager.agent_activity_restart_descriptor_count_for_integration_test(),
+        0,
+        "no observer is retained after Terminal activity is disabled"
+    );
+    assert_eq!(observer.disabled.load(Ordering::Acquire), 0);
+    assert_eq!(stopped, TerminalAgentActivityTransition::default());
+    manager
+        .write(
+            "thread-post-check-race",
+            "terminal-post-check-race",
+            "still alive\n",
+        )
+        .await
+        .expect("pass-through PTY remains writable");
+    assert!(!backend.latest().killed.load(Ordering::Acquire));
+    manager.shutdown().await;
 }
 
 #[tokio::test]
@@ -10587,7 +10724,7 @@ async fn opencode_feature_probe_requires_serve_and_attach_support() {
     .expect("feature probing must fit the terminal callback boundary");
 
     assert!(
-        matches!(prepared, TerminalLaunchPreparation::Prepared(_)),
+        matches!(prepared, TerminalLaunchPreparation::Admitted(_, _)),
         "supported serve+attach build is observed"
     );
     let mut probe_calls = runner.calls.lock().expect("OpenCode probe calls").clone();
