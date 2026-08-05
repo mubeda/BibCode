@@ -2090,14 +2090,20 @@ mod tests {
         io::{Read, Write},
         net::TcpListener,
         pin::Pin,
-        sync::mpsc,
+        sync::{
+            atomic::{AtomicUsize, Ordering as AtomicOrdering},
+            mpsc,
+        },
         task::{Context, Poll},
         thread,
         time::Duration,
     };
     use bibcode_server::{RpcExit, ServerMessage};
     use tokio::io::{AsyncRead, ReadBuf};
-    use tokio_tungstenite::{connect_async, tungstenite::Message};
+    use tokio_tungstenite::{
+        connect_async,
+        tungstenite::{Message, client::IntoClientRequest},
+    };
 
     #[derive(Debug)]
     struct MarkerDesktopUiProcessObserver;
@@ -2108,6 +2114,36 @@ mod tests {
             _rows: Arc<[bibcode_server::diagnostics::ProcessRow]>,
             _server_identity: ProcessIdentity,
         ) -> Pin<Box<dyn std::future::Future<Output = DesktopUiObservation> + Send + '_>> {
+            Box::pin(async {
+                DesktopUiObservation {
+                    identities: Vec::new(),
+                    coverage: UiCoverage {
+                        status: UiCoverageStatus::Available,
+                        message: None,
+                    },
+                }
+            })
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingDesktopUiProcessObserver {
+        observations: AtomicUsize,
+    }
+
+    impl RecordingDesktopUiProcessObserver {
+        fn observation_count(&self) -> usize {
+            self.observations.load(AtomicOrdering::SeqCst)
+        }
+    }
+
+    impl DesktopUiProcessObserver for RecordingDesktopUiProcessObserver {
+        fn observe(
+            &self,
+            _rows: Arc<[bibcode_server::diagnostics::ProcessRow]>,
+            _server_identity: ProcessIdentity,
+        ) -> Pin<Box<dyn std::future::Future<Output = DesktopUiObservation> + Send + '_>> {
+            self.observations.fetch_add(1, AtomicOrdering::SeqCst);
             Box::pin(async {
                 DesktopUiObservation {
                     identities: Vec::new(),
@@ -2148,6 +2184,58 @@ mod tests {
 
         assert!(Arc::ptr_eq(&expected, &first));
         assert!(Arc::ptr_eq(&first, &restart));
+    }
+
+    #[tokio::test]
+    async fn configured_ui_observer_reaches_initial_and_restarted_in_process_runtimes() {
+        let state = tempfile::tempdir().expect("state tempdir should open");
+        let supervisor = BackendSupervisor::new();
+        let observer = Arc::new(RecordingDesktopUiProcessObserver::default());
+        supervisor.install_ui_process_observer(observer.clone());
+        let plan = BackendLaunchPlan::local(state.path().to_path_buf(), local_test_config(0));
+        let readiness = BackendReadinessConfig::default();
+        let restart = BackendRestartConfig {
+            initial_delay: Duration::ZERO,
+            max_delay: Duration::ZERO,
+            monitor_interval: Duration::from_millis(10),
+        };
+
+        let initial = supervisor
+            .start_with_options(plan.clone(), readiness, restart)
+            .await
+            .expect("initial in-process backend should start");
+        request_process_diagnostics(&initial).await;
+        assert_eq!(observer.observation_count(), 1);
+
+        let initial_runtime = {
+            let state = supervisor
+                .state
+                .lock()
+                .expect("backend supervisor mutex poisoned");
+            let slot = state
+                .slots
+                .get(PRIMARY_LOCAL_ENVIRONMENT_ID)
+                .expect("initial backend slot should exist");
+            let Some(ManagedBackend::Runtime(runtime)) = &slot.backend else {
+                panic!("initial backend should be in-process");
+            };
+            runtime.clone()
+        };
+        initial_runtime.request_stop();
+        initial_runtime
+            .wait_for_completion()
+            .await
+            .expect("initial in-process backend should stop");
+
+        supervisor.schedule_restart(plan, readiness, restart, "test restart".to_string());
+        let restarted = wait_for_restart_config(&supervisor).await;
+        request_process_diagnostics(&restarted).await;
+        assert_eq!(observer.observation_count(), 2);
+
+        supervisor
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("restarted backend should stop");
     }
 
     struct ScriptedReader {
@@ -2315,6 +2403,74 @@ mod tests {
             panic!("expected an RPC text frame, got {frame:?}");
         };
         serde_json::from_str(&text).expect("RPC response should decode")
+    }
+
+    async fn request_process_diagnostics(config: &BackendRunConfig) {
+        let token: Value = reqwest::Client::new()
+            .post(format!("{}/oauth/token", config.http_base_url()))
+            .form(&[
+                ("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"),
+                ("subject_token", config.desktop_bootstrap_token.as_str()),
+                (
+                    "subject_token_type",
+                    "urn:bibcode:params:oauth:token-type:environment-bootstrap",
+                ),
+                (
+                    "requested_token_type",
+                    "urn:ietf:params:oauth:token-type:access_token",
+                ),
+            ])
+            .send()
+            .await
+            .expect("desktop bootstrap token should exchange")
+            .json()
+            .await
+            .expect("token response should decode");
+        let access_token = token["access_token"]
+            .as_str()
+            .expect("token response should include access token");
+        let mut request = format!("{}/ws", config.ws_base_url())
+            .into_client_request()
+            .expect("WebSocket request should build");
+        request.headers_mut().insert(
+            "Authorization",
+            format!("Bearer {access_token}")
+                .parse()
+                .expect("authorization header should parse"),
+        );
+        let (mut socket, _) = connect_async(request)
+            .await
+            .expect("desktop runtime WebSocket should connect");
+        let response = request_rpc(&mut socket, 1, "server.getProcessDiagnostics", json!({})).await;
+        assert_rpc_completed("server.getProcessDiagnostics", &response);
+        socket.close(None).await.expect("RPC socket should close");
+    }
+
+    async fn wait_for_restart_config(supervisor: &BackendSupervisor) -> BackendRunConfig {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let config = {
+                    let state = supervisor
+                        .state
+                        .lock()
+                        .expect("backend supervisor mutex poisoned");
+                    state.slots.get(PRIMARY_LOCAL_ENVIRONMENT_ID).and_then(|slot| {
+                        let ManagedBackend::Runtime(runtime) = slot.backend.as_ref()? else {
+                            return None;
+                        };
+                        (runtime.run_id == 1 && !slot.restart_scheduled)
+                            .then(|| slot.launch_plan.as_ref().map(|plan| plan.config.clone()))
+                            .flatten()
+                    })
+                };
+                if let Some(config) = config {
+                    return config;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("scheduled restart should start an in-process runtime")
     }
 
     fn assert_rpc_completed(method: &str, message: &ServerMessage) {
