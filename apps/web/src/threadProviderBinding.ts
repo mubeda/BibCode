@@ -132,6 +132,13 @@ export function resolveThreadProviderBinding(
         lockedProviderInstanceId: sessionInstanceId,
       };
     }
+    return {
+      instanceId: sessionInstanceId,
+      driver: sessionDriver,
+      status: null,
+      lockedProvider: sessionDriver,
+      lockedProviderInstanceId: sessionInstanceId,
+    };
   }
 
   if (sessionDriver) {
