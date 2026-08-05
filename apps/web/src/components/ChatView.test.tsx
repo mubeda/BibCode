@@ -2837,6 +2837,104 @@ describe("ChatView", () => {
       );
     });
 
+    it("keeps a sessionless started custom instance defensively locked while statuses load", () => {
+      const customCodexInstanceId = ProviderInstanceId.make("codex_personal");
+      const claudeInstanceId = ProviderInstanceId.make("claude");
+      seedEnvironment(
+        makeEnvironmentPresentation({
+          serverConfig: { providers: [], environment: { label: "Local" } },
+        }),
+      );
+      seedProject(makeProject());
+      seedServerThread(
+        makeThread({
+          modelSelection: { instanceId: customCodexInstanceId, model: "gpt-5.4" },
+          session: null,
+          messages: [
+            {
+              id: MessageId.make("started-custom-instance-loading"),
+              role: "user",
+              text: "Started",
+              turnId: null,
+              createdAt: now,
+              updatedAt: now,
+              streaming: false,
+            },
+          ],
+        }),
+      );
+      useComposerDraftStore.getState().setModelSelection(threadRef, {
+        instanceId: claudeInstanceId,
+        model: "claude-sonnet",
+      });
+      publishSeededStoreState(useComposerDraftStore);
+      seedGitStatus(true);
+
+      renderServerRoute();
+
+      expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe(
+        "Codex Personal",
+      );
+      expect(capturedProps<Record<string, unknown>>("chatComposer")["lockedProvider"]).toBe(
+        "codex_personal",
+      );
+    });
+
+    it("prefers a partial session custom instance over stale model selection", () => {
+      const customCodexInstanceId = ProviderInstanceId.make("codex_personal");
+      const claudeInstanceId = ProviderInstanceId.make("claude");
+      const customCodexProvider: ServerProvider = {
+        ...codexProvider,
+        instanceId: customCodexInstanceId,
+        displayName: "Codex Personal",
+      };
+      const claudeProvider: ServerProvider = {
+        ...codexProvider,
+        instanceId: claudeInstanceId,
+        driver: ProviderDriverKind.make("claude"),
+        displayName: "Claude",
+      };
+      seedEnvironment(
+        makeEnvironmentPresentation({
+          serverConfig: {
+            providers: [customCodexProvider, claudeProvider],
+            environment: { label: "Local" },
+          },
+        }),
+      );
+      seedProject(makeProject());
+      seedServerThread(
+        makeThread({
+          modelSelection: { instanceId: claudeInstanceId, model: "claude-sonnet" },
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "" as never,
+            providerInstanceId: customCodexInstanceId,
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+        }),
+      );
+      useComposerDraftStore.getState().setModelSelection(threadRef, {
+        instanceId: claudeInstanceId,
+        model: "claude-sonnet",
+      });
+      publishSeededStoreState(useComposerDraftStore);
+      seedGitStatus(true);
+
+      renderServerRoute();
+
+      expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe(
+        "Codex Personal",
+      );
+      expect(capturedProps<Record<string, unknown>>("chatComposer")["lockedProvider"]).toBe(
+        "codex",
+      );
+    });
+
     it("keeps header actions aligned when every center surface is closed", () => {
       seedEnvironment(makeEnvironmentPresentation());
       seedProject(makeProject());
