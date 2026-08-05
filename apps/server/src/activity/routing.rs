@@ -39,18 +39,6 @@ pub struct ActivityProjections {
 }
 
 impl ActivityProjections {
-    /// Bridges the legacy production runtime until it owns independent source projections.
-    ///
-    /// Both routes intentionally share the producer-backed projection, including its controller
-    /// and event buses.
-    #[must_use]
-    pub(crate) fn from_shared_projection(projection: ActivityProjection) -> Self {
-        Self {
-            chat: projection.clone(),
-            terminal: projection,
-        }
-    }
-
     #[must_use]
     pub fn new(
         repository: ActivityRepository,

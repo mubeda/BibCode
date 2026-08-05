@@ -342,13 +342,8 @@ impl NativeServerControl {
         *self.agent_activity_handler.handler.write().await = Some(handler);
     }
 
-    pub async fn agent_activity_enabled(&self) -> bool {
-        self.settings
-            .read()
-            .await
-            .get("enableAgentActivity")
-            .and_then(Value::as_bool)
-            .unwrap_or(true)
+    pub async fn agent_activity_enabled(&self, source: AgentActivitySource) -> bool {
+        agent_activity_enabled(&*self.settings.read().await, source)
     }
 
     async fn update_settings(&self, payload: Value) -> Result<Value, Value> {
@@ -378,10 +373,16 @@ impl NativeServerControl {
             return Err(error.clone());
         }
         let current = self.settings.read().await.clone();
-        let previous_agent_activity = current
-            .get("enableAgentActivity")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
+        let previous_agent_activity = [
+            (
+                AgentActivitySource::Chat,
+                agent_activity_enabled(&current, AgentActivitySource::Chat),
+            ),
+            (
+                AgentActivitySource::Terminal,
+                agent_activity_enabled(&current, AgentActivitySource::Terminal),
+            ),
+        ];
         let mut next = current;
         apply_settings_patch(&mut next, patch);
         validate_settings_document(&next)
@@ -399,23 +400,21 @@ impl NativeServerControl {
             })?;
         redact_sensitive_environment(&mut next);
         let generation = self.settings_generation.fetch_add(1, Ordering::AcqRel) + 1;
-        let next_agent_activity = next
-            .get("enableAgentActivity")
-            .and_then(Value::as_bool)
-            .unwrap_or(true);
         let commit_control = self.clone();
         let commit = tokio::spawn(async move {
-            if next_agent_activity != previous_agent_activity
-                && let Some(handler) = commit_control
-                    .agent_activity_handler
-                    .handler
-                    .read()
-                    .await
-                    .clone()
+            if let Some(handler) = commit_control
+                .agent_activity_handler
+                .handler
+                .read()
+                .await
+                .clone()
             {
-                let _ = handler
-                    .transition(AgentActivitySource::Chat, next_agent_activity, generation)
-                    .await;
+                for (source, previous_enabled) in previous_agent_activity {
+                    let next_enabled = agent_activity_enabled(&next, source);
+                    if next_enabled != previous_enabled {
+                        let _ = handler.transition(source, next_enabled, generation).await;
+                    }
+                }
             }
             commit_control
                 .provider_maintenance
@@ -1085,6 +1084,17 @@ impl NativeServerControl {
     fn trace_diagnostics(&self) -> Value {
         self.trace_diagnostics.read()
     }
+}
+
+fn agent_activity_enabled(settings: &Value, source: AgentActivitySource) -> bool {
+    let (field, fallback) = match source {
+        AgentActivitySource::Chat => ("enableChatAgentActivity", true),
+        AgentActivitySource::Terminal => ("enableTerminalAgentActivity", false),
+    };
+    settings
+        .get(field)
+        .and_then(Value::as_bool)
+        .unwrap_or(fallback)
 }
 
 impl ProductionServerControl for NativeServerControl {
@@ -1918,25 +1928,17 @@ pub(crate) fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use std::{
-        sync::{
-            Mutex as StdMutex,
-            atomic::{AtomicBool, Ordering as AtomicOrdering},
-        },
+        sync::Mutex as StdMutex,
         time::Duration,
     };
 
     use crate::{
-        activity::AgentActivityController,
-        diagnostics::TraceDiagnosticsStore,
         production::{
             agent_activity::{
-                AgentActivityCoordinator, AgentActivitySettingsHandler,
-                AgentActivityTransitionReport, AgentActivityTransitionRuntime,
-                BoxAgentActivityFuture,
+                AgentActivitySettingsHandler, AgentActivityTransitionReport,
             },
             server_terminal::ProductionServerControl,
         },
-        provider_terminal::TerminalAgentActivityTransition,
     };
 
     use super::*;
@@ -2496,59 +2498,13 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct UnifiedTestRuntime {
-        provider_enabled: Arc<AtomicBool>,
-        terminal_enabled: Arc<AtomicBool>,
-    }
-
-    impl UnifiedTestRuntime {
-        fn new(enabled: bool) -> Self {
-            Self {
-                provider_enabled: Arc::new(AtomicBool::new(enabled)),
-                terminal_enabled: Arc::new(AtomicBool::new(enabled)),
-            }
-        }
-    }
-
-    impl AgentActivityTransitionRuntime for UnifiedTestRuntime {
-        fn finalize_disabled_activity(
-            &self,
-            _source: AgentActivitySource,
-        ) -> BoxAgentActivityFuture<'_, Result<usize, ()>> {
-            Box::pin(async { Ok(0) })
-        }
-
-        fn set_provider_activity_enabled(
-            &self,
-            enabled: bool,
-        ) -> BoxAgentActivityFuture<'_, Result<usize, ()>> {
-            Box::pin(async move {
-                self.provider_enabled
-                    .store(enabled, AtomicOrdering::Release);
-                Ok(1)
-            })
-        }
-
-        fn set_terminal_activity_enabled(
-            &self,
-            enabled: bool,
-        ) -> BoxAgentActivityFuture<'_, TerminalAgentActivityTransition> {
-            Box::pin(async move {
-                self.terminal_enabled
-                    .store(enabled, AtomicOrdering::Release);
-                TerminalAgentActivityTransition::default()
-            })
-        }
-    }
-
-    #[derive(Clone)]
-    struct UnifiedTestHandler {
-        coordinator: AgentActivityCoordinator,
-        runtime: UnifiedTestRuntime,
+    struct BlockingAgentActivityHandler {
         calls: Arc<StdMutex<Vec<(AgentActivitySource, bool, u64)>>>,
+        first_transition_entered: Arc<Notify>,
+        release_first_transition: Arc<Notify>,
     }
 
-    impl AgentActivitySettingsHandler for UnifiedTestHandler {
+    impl AgentActivitySettingsHandler for BlockingAgentActivityHandler {
         fn transition(
             &self,
             source: AgentActivitySource,
@@ -2558,14 +2514,20 @@ mod tests {
             Box<dyn std::future::Future<Output = AgentActivityTransitionReport> + Send + '_>,
         > {
             Box::pin(async move {
-                self.calls.lock().expect("handler calls").push((
-                    source,
+                let is_first = {
+                    let mut calls = self.calls.lock().expect("handler calls");
+                    calls.push((source, enabled, settings_generation));
+                    calls.len() == 1
+                };
+                if is_first {
+                    self.first_transition_entered.notify_one();
+                    self.release_first_transition.notified().await;
+                }
+                AgentActivityTransitionReport {
                     enabled,
                     settings_generation,
-                ));
-                self.coordinator
-                    .transition(&self.runtime, enabled, settings_generation)
-                    .await
+                    ..AgentActivityTransitionReport::default()
+                }
             })
         }
     }
@@ -2687,7 +2649,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_activity_split_settings_do_not_drive_unified_runtime_handler() {
+    async fn agent_activity_terminal_only_update_dispatches_after_persistence() {
         let temp = tempfile::tempdir().expect("control root");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
@@ -2698,19 +2660,12 @@ mod tests {
                 calls: calls.clone(),
             }))
             .await;
-        assert!(control.agent_activity_enabled().await);
-        let mut events = control.config_events.subscribe();
         let updated = control
-            .update_settings(json!({
-                "patch": {
-                    "enableChatAgentActivity": false,
-                    "enableTerminalAgentActivity": true,
-                }
-            }))
+            .update_settings(json!({"patch":{"enableTerminalAgentActivity":true}}))
             .await
-            .expect("persist split activity settings");
+            .expect("enable terminal activity");
 
-        assert_eq!(updated["enableChatAgentActivity"], false);
+        assert_eq!(updated["enableChatAgentActivity"], true);
         assert_eq!(updated["enableTerminalAgentActivity"], true);
         let persisted: Value = serde_json::from_slice(
             &tokio::fs::read(&settings_path)
@@ -2718,13 +2673,94 @@ mod tests {
                 .expect("persisted settings"),
         )
         .expect("valid persisted settings");
-        assert_eq!(persisted["enableChatAgentActivity"], false);
+        assert_eq!(persisted["enableChatAgentActivity"], true);
         assert_eq!(persisted["enableTerminalAgentActivity"], true);
-        assert!(calls.lock().expect("handler calls").is_empty());
-        assert!(control.agent_activity_enabled().await);
         assert_eq!(
-            events.recv().await.expect("settings event")["type"],
-            "settingsUpdated"
+            *calls.lock().expect("handler calls"),
+            vec![(AgentActivitySource::Terminal, true, 1)]
+        );
+        assert!(
+            control
+                .agent_activity_enabled(AgentActivitySource::Chat)
+                .await
+        );
+        assert!(
+            control
+                .agent_activity_enabled(AgentActivitySource::Terminal)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_activity_chat_only_update_dispatches_after_persistence() {
+        let temp = tempfile::tempdir().expect("control root");
+        let config = ServerConfig::new(temp.path());
+        let settings_path = config.state_dir().join("settings.json");
+        let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        control
+            .attach_agent_activity_handler(Arc::new(TestAgentActivityHandler {
+                calls: calls.clone(),
+            }))
+            .await;
+
+        control
+            .update_settings(json!({"patch":{"enableChatAgentActivity":false}}))
+            .await
+            .expect("disable chat activity");
+
+        let persisted: Value = serde_json::from_slice(
+            &tokio::fs::read(&settings_path)
+                .await
+                .expect("persisted settings"),
+        )
+        .expect("valid persisted settings");
+        assert_eq!(persisted["enableChatAgentActivity"], false);
+        assert_eq!(persisted["enableTerminalAgentActivity"], false);
+        assert_eq!(
+            *calls.lock().expect("handler calls"),
+            vec![(AgentActivitySource::Chat, false, 1)]
+        );
+        assert!(
+            !control
+                .agent_activity_enabled(AgentActivitySource::Chat)
+                .await
+        );
+        assert!(
+            !control
+                .agent_activity_enabled(AgentActivitySource::Terminal)
+                .await
+        );
+    }
+
+    #[tokio::test]
+    async fn agent_activity_two_source_update_dispatches_chat_then_terminal() {
+        let temp = tempfile::tempdir().expect("control root");
+        let config = ServerConfig::new(temp.path());
+        let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        control
+            .attach_agent_activity_handler(Arc::new(TestAgentActivityHandler {
+                calls: calls.clone(),
+            }))
+            .await;
+
+        control
+            .update_settings(json!({
+                "patch": {
+                    "enableChatAgentActivity": false,
+                    "enableTerminalAgentActivity": true,
+                }
+            }))
+            .await
+            .expect("change both activity settings");
+
+        assert_eq!(
+            *calls.lock().expect("handler calls"),
+            vec![
+                (AgentActivitySource::Chat, false, 1),
+                (AgentActivitySource::Terminal, true, 1),
+            ]
         );
     }
 
@@ -2751,48 +2787,77 @@ mod tests {
                 .is_err()
         );
         assert!(calls.lock().expect("handler calls").is_empty());
-        assert!(control.agent_activity_enabled().await);
+        assert!(
+            control
+                .agent_activity_enabled(AgentActivitySource::Chat)
+                .await
+        );
+        assert!(
+            !control
+                .agent_activity_enabled(AgentActivitySource::Terminal)
+                .await
+        );
     }
 
     #[tokio::test]
-    async fn split_activity_settings_do_not_transition_unified_activity_runtime() {
+    async fn agent_activity_commit_survives_caller_cancellation_and_publishes_after_ordered_transitions(
+    ) {
         let temp = tempfile::tempdir().expect("control root");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
         let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
-        let runtime = UnifiedTestRuntime::new(true);
-        let trace = TraceDiagnosticsStore::new(temp.path().join("activity.trace.ndjson"));
-        let coordinator = AgentActivityCoordinator::new(
-            AgentActivitySource::Chat,
-            AgentActivityController::new(true),
-            trace,
-            "cancellation-test".to_owned(),
-        );
-        let controller = coordinator.controller();
         let calls = Arc::new(StdMutex::new(Vec::new()));
+        let first_transition_entered = Arc::new(Notify::new());
+        let release_first_transition = Arc::new(Notify::new());
         control
-            .attach_agent_activity_handler(Arc::new(UnifiedTestHandler {
-                coordinator,
-                runtime: runtime.clone(),
+            .attach_agent_activity_handler(Arc::new(BlockingAgentActivityHandler {
                 calls: calls.clone(),
+                first_transition_entered: first_transition_entered.clone(),
+                release_first_transition: release_first_transition.clone(),
             }))
             .await;
         let mut events = control.config_events.subscribe();
 
-        let updated = control
-            .update_settings(json!({
-                "patch": {
-                    "enableChatAgentActivity": false,
-                    "enableTerminalAgentActivity": true,
-                }
-            }))
+        let update = {
+            let control = control.clone();
+            tokio::spawn(async move {
+                control
+                    .update_settings(json!({
+                        "patch": {
+                            "enableChatAgentActivity": false,
+                            "enableTerminalAgentActivity": true,
+                        }
+                    }))
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), first_transition_entered.notified())
             .await
-            .expect("persist split activity settings");
-        assert_eq!(updated["enableChatAgentActivity"], false);
-        assert_eq!(updated["enableTerminalAgentActivity"], true);
+            .expect("first transition starts after persistence");
+        let persisted_before_transition_release: Value = serde_json::from_slice(
+            &tokio::fs::read(&settings_path)
+                .await
+                .expect("settings persisted before transition"),
+        )
+        .expect("valid settings persisted before transition");
+        assert_eq!(
+            persisted_before_transition_release["enableChatAgentActivity"],
+            false
+        );
+        assert_eq!(
+            persisted_before_transition_release["enableTerminalAgentActivity"],
+            true
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+        update.abort();
+        release_first_transition.notify_one();
+
         let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
             .await
-            .expect("settings publication")
+            .expect("detached commit publishes settings")
             .expect("settings event");
         assert_eq!(
             event["payload"]["settings"]["enableChatAgentActivity"],
@@ -2803,11 +2868,13 @@ mod tests {
             true
         );
 
-        assert!(control.agent_activity_enabled().await);
-        assert!(controller.snapshot().enabled);
-        assert!(runtime.provider_enabled.load(AtomicOrdering::Acquire));
-        assert!(runtime.terminal_enabled.load(AtomicOrdering::Acquire));
-        assert!(calls.lock().expect("handler calls").is_empty());
+        assert_eq!(
+            *calls.lock().expect("handler calls"),
+            vec![
+                (AgentActivitySource::Chat, false, 1),
+                (AgentActivitySource::Terminal, true, 1),
+            ]
+        );
         let persisted: Value = serde_json::from_slice(
             &tokio::fs::read(&settings_path)
                 .await
@@ -2816,6 +2883,16 @@ mod tests {
         .expect("valid split settings");
         assert_eq!(persisted["enableChatAgentActivity"], false);
         assert_eq!(persisted["enableTerminalAgentActivity"], true);
+        assert!(
+            !control
+                .agent_activity_enabled(AgentActivitySource::Chat)
+                .await
+        );
+        assert!(
+            control
+                .agent_activity_enabled(AgentActivitySource::Terminal)
+                .await
+        );
         assert_eq!(control.settings_generation.load(Ordering::Acquire), 1);
     }
 
