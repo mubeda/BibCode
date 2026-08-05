@@ -822,6 +822,7 @@ git commit -m "refactor(web): remove retired terminal drawer state"
 
 - Modify: `docs/user/workspace-ui.md`
 - Local only: `.artifacts/visual-qa/terminal-drawer-retirement/`
+- Local only: `.artifacts/visual-qa/orange-theme/`
 
 - [ ] **Step 1: Document current terminal entry points**
 
@@ -869,6 +870,18 @@ Invoke `computer-use:computer-use` (the Codex bundled skill, not Orca's CLI) and
 5. Right-panel terminal new/split/close still work.
 6. Project scripts run in a visible center terminal.
 7. Restarting the app removes only legacy drawer storage and preserves center/right layouts.
+
+For the final **combined** verification, the root controller owns the orange
+theme QA after this terminal-drawer-retirement plan and the responsive-toolbar
+plan are implemented and `vp run build:desktop` succeeds. Still using Codex
+`computer-use:computer-use`, verify in both light and dark themes that:
+
+8. Buttons, toggles, selected tabs/rows, and focus rings use the exact
+   `#d8610e` orange interaction treatment, with white text for solid
+   selections.
+9. Links and informational states remain blue.
+10. Full-resolution screenshots for those checks are saved under ignored
+    `.artifacts/visual-qa/orange-theme/` and inspected before final approval.
 
 Save screenshots under ignored `.artifacts/visual-qa/terminal-drawer-retirement/` and inspect full-resolution captures before completion.
 
