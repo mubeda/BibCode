@@ -12,7 +12,7 @@ use super::{
     ActivityDelta, ActivityDetailPage, ActivityRecordKind, ActivityRepository,
     ActivityRepositoryError, ActivityRosterBucket, ActivityRosterPage, ActivityScopeRef,
     ActivityScopeSeed, ActivitySection, ActivitySnapshot, AgentActivityAdmission,
-    AgentActivityController, ProviderActivityMutation,
+    AgentActivityController, AgentActivitySource, ProviderActivityMutation,
 };
 
 const DEFAULT_BROADCAST_CAPACITY: usize = 256;
@@ -249,7 +249,10 @@ impl ActivityProjection {
         self.repository.interrupt_unresolved_terminal_scopes().await
     }
 
-    pub async fn interrupt_for_monitoring_disabled(&self) -> ActivityResult<usize> {
+    pub async fn interrupt_for_monitoring_disabled(
+        &self,
+        source: AgentActivitySource,
+    ) -> ActivityResult<usize> {
         let Some(finalization) = self.controller.disable_for_finalization().await else {
             return Ok(0);
         };
@@ -259,6 +262,7 @@ impl ActivityProjection {
             .interrupt_unresolved_activity_scopes_for_generation(
                 "Agent activity monitoring disabled",
                 disable_generation,
+                source,
             )
             .await?;
         self.publication_locks

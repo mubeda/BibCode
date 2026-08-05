@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use crate::{
-    activity::{ActivityProjection, AgentActivityController},
+    activity::{ActivityProjection, AgentActivityController, AgentActivitySource},
     diagnostics::TraceDiagnosticsStore,
     provider_terminal::{TerminalAgentActivityProviderEpochs, TerminalAgentActivityTransition},
     terminal::TerminalManager,
@@ -325,7 +325,7 @@ impl AgentActivityTransitionRuntime for ProductionAgentActivity {
     fn finalize_disabled_activity(&self) -> BoxAgentActivityFuture<'_, Result<usize, ()>> {
         Box::pin(async move {
             self.projection
-                .interrupt_for_monitoring_disabled()
+                .interrupt_for_monitoring_disabled(AgentActivitySource::Chat)
                 .await
                 .map_err(|_| ())
         })

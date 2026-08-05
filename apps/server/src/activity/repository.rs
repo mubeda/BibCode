@@ -24,6 +24,7 @@ use super::model::{
     ActivityWorkItemSummary, ProviderActivityMutation, compare_timestamps, max_timestamp,
     validate_text, validate_timestamp,
 };
+use super::routing::AgentActivitySource;
 
 pub const ACTIVE_STATUSES: &[&str] = &["starting", "running", "waiting", "unknown"];
 pub const DONE_STATUSES: &[&str] = &["completed", "failed", "cancelled", "interrupted"];
@@ -271,11 +272,16 @@ impl ActivityRepository {
     pub async fn interrupt_unresolved_activity_scopes(
         &self,
         reason: &'static str,
+        source: AgentActivitySource,
     ) -> ActivityRepositoryResult<usize> {
+        let source_kind = source.storage_kind();
         self.database
             .call(move |connection| {
                 Ok(interrupt_unresolved_activity_scopes(
-                    connection, reason, None,
+                    connection,
+                    reason,
+                    None,
+                    source_kind,
                 ))
             })
             .await?
@@ -285,13 +291,16 @@ impl ActivityRepository {
         &self,
         reason: &'static str,
         disable_generation: u64,
+        source: AgentActivitySource,
     ) -> ActivityRepositoryResult<usize> {
+        let source_kind = source.storage_kind();
         self.database
             .call(move |connection| {
                 Ok(interrupt_unresolved_activity_scopes(
                     connection,
                     reason,
                     Some(disable_generation),
+                    source_kind,
                 ))
             })
             .await?
@@ -540,19 +549,22 @@ fn interrupt_unresolved_activity_scopes(
     connection: &mut Connection,
     reason: &'static str,
     disable_generation: Option<u64>,
+    source_kind: &'static str,
 ) -> ActivityRepositoryResult<usize> {
     let transaction = connection.transaction().map_err(sql_error)?;
     let now = database_now(&transaction)?;
     let scope_ids = {
         let mut statement = transaction
             .prepare(
-                "SELECT DISTINCT scope_id
-                 FROM activity_records
-                 WHERE status IN ('starting', 'running', 'waiting', 'unknown')",
+                "SELECT DISTINCT s.scope_id
+                 FROM activity_scopes s
+                 JOIN activity_records r ON r.scope_id = s.scope_id
+                 WHERE s.source_kind = ?
+                   AND r.status IN ('starting', 'running', 'waiting', 'unknown')",
             )
             .map_err(sql_error)?;
         statement
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([source_kind], |row| row.get::<_, String>(0))
             .map_err(sql_error)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .map_err(sql_error)?
