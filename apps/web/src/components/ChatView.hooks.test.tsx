@@ -485,10 +485,46 @@ vi.mock("./ThreadTerminalDrawer", () => ({
   releaseTerminalInputScheduler: vi.fn(),
 }));
 
-vi.mock("./CenterPanelTabs", () => ({
-  CenterPanelTabs: (props: Record<string, unknown>) => {
-    h.capture("centerPanelTabs", props);
-    return <div data-mock="center-panel-tabs" />;
+vi.mock("./CenterPanelWorkspace", () => ({
+  CenterPanelWorkspace: (props: Record<string, unknown>) => {
+    h.capture("centerWorkspace", props);
+    const state = props["state"] as {
+      surfaces: Array<{ id: string }>;
+      groups: Array<{ id: string; activeSurfaceId: string | null; surfaceIds: string[] }>;
+      focusedGroupId: string;
+    };
+    const renderSurface = props["renderSurface"] as (
+      surface: { id: string },
+      context: { groupId: string; visible: boolean; focused: boolean },
+    ) => ReactNode;
+    const membership = new Map(
+      state.groups.flatMap((group) => group.surfaceIds.map((surfaceId) => [surfaceId, group.id])),
+    );
+    const visibleIds = new Set(state.groups.flatMap((group) => group.activeSurfaceId ?? []));
+    return (
+      <div data-mock="center-panel-workspace">
+        {props["focusedActions"] as ReactNode}
+        {state.surfaces
+          .filter((surface) => surface.id === "chat:host" || visibleIds.has(surface.id))
+          .map((surface) => {
+            const groupId = membership.get(surface.id)!;
+            return (
+              <div
+                key={surface.id}
+                data-mock-center-surface={surface.id}
+                data-visible={String(visibleIds.has(surface.id))}
+                className={visibleIds.has(surface.id) ? undefined : "hidden"}
+              >
+                {renderSurface(surface, {
+                  groupId,
+                  visible: visibleIds.has(surface.id),
+                  focused: groupId === state.focusedGroupId,
+                })}
+              </div>
+            );
+          })}
+      </div>
+    );
   },
 }));
 
@@ -846,6 +882,40 @@ function closedTerminalIds(): string[] {
     expect(command.input.threadId).toBe(threadId);
     expect(command.input.deleteHistory).toBe(true);
     return command.input.terminalId;
+  });
+}
+
+function seedTwoGroupCenterState(): void {
+  useCenterPanelStore.setState({
+    byThreadKey: {
+      [threadKey]: {
+        surfaces: [
+          { id: HOST_SURFACE_ID, kind: "chat-host" },
+          { id: "terminal:term-a", kind: "terminal", terminalId: "term-a" },
+          { id: "terminal:term-b", kind: "terminal", terminalId: "term-b" },
+        ],
+        groups: [
+          {
+            id: "group-a",
+            surfaceIds: [HOST_SURFACE_ID, "terminal:term-a"],
+            activeSurfaceId: "terminal:term-a",
+          },
+          {
+            id: "group-b",
+            surfaceIds: ["terminal:term-b"],
+            activeSurfaceId: "terminal:term-b",
+          },
+        ],
+        layout: {
+          type: "split",
+          direction: "horizontal",
+          ratio: 0.5,
+          first: { type: "leaf", groupId: "group-a" },
+          second: { type: "leaf", groupId: "group-b" },
+        },
+        focusedGroupId: "group-a",
+      },
+    },
   });
 }
 
@@ -1357,7 +1427,7 @@ describe("ChatView center panel variant", () => {
     renderServerRoute();
 
     expect(h.capturedList.filter((entry) => entry.name === "messagesTimeline")).toHaveLength(2);
-    expect(h.captured["centerPanelTabs"]).toBeDefined();
+    expect(h.captured["centerWorkspace"]).toBeDefined();
   });
 
   it("renders the empty center-panel state when every surface was closed", () => {
@@ -1366,13 +1436,16 @@ describe("ChatView center panel variant", () => {
       byThreadKey: {
         [threadKey]: {
           surfaces: [],
-          activeSurfaceId: null,
+          groups: [{ id: "center:root", surfaceIds: [], activeSurfaceId: null }],
+          layout: { type: "leaf", groupId: "center:root" },
+          focusedGroupId: "center:root",
         },
       },
     });
     publishSeededStoreState(useCenterPanelStore);
 
-    expect(renderServerRoute()).toContain("No chat panels open");
+    expect(renderServerRoute()).toContain('data-mock="center-panel-workspace"');
+    expect(capturedProps("centerWorkspace")["focusedActions"]).toBeDefined();
   });
 });
 
@@ -2715,7 +2788,9 @@ describe("ChatView project script handlers", () => {
       threadId: createInput.input.threadId,
       providerLabel: "Claude",
     });
-    expect(centerState?.activeSurfaceId).toBe(claudeSurface?.id);
+    expect(
+      centerState?.groups.find((group) => group.id === centerState.focusedGroupId)?.activeSurfaceId,
+    ).toBe(claudeSurface?.id);
   });
 
   it("covers explicit script launch options and opaque terminal failures", async () => {
@@ -4947,18 +5022,70 @@ describe("ChatView banners and dialogs", () => {
     expect(draft?.interactionMode).toBe("plan");
   });
 
+  it("routes creation to the focused center group and cleans only explicit group removals", () => {
+    seedConnectedServerThread();
+    seedTwoGroupCenterState();
+    publishSeededStoreState(useCenterPanelStore);
+    renderServerRoute();
+
+    const workspace = capturedProps("centerWorkspace");
+    (workspace["onFocusGroup"] as (groupId: string) => void)("group-b");
+    const header = capturedProps("chatHeaderActions");
+    (header["onOpenTerminalPanel"] as () => void)();
+
+    const focusedGroup = useCenterPanelStore
+      .getState()
+      .byThreadKey[threadKey]!.groups.find((group) => group.id === "group-b")!;
+    expect(focusedGroup.surfaceIds.at(-1)).toMatch(/^terminal:/);
+    expect(focusedGroup.surfaceIds.at(-1)).not.toBe("terminal:term-b");
+
+    seedTwoGroupCenterState();
+    h.commandCalls.length = 0;
+    (workspace["onCloseAllSurfaces"] as (groupId: string) => void)("group-b");
+
+    expect(closedTerminalIds()).toEqual(["term-b"]);
+    expect(closedTerminalIds()).not.toContain("term-a");
+  });
+
+  it("moves and merges center layout without cleaning terminal or chat resources", () => {
+    seedConnectedServerThread();
+    seedTwoGroupCenterState();
+    publishSeededStoreState(useCenterPanelStore);
+    renderServerRoute();
+
+    const workspace = capturedProps("centerWorkspace");
+    (workspace["onDropSurface"] as (surfaceId: string, target: { groupId: string }) => void)(
+      "terminal:term-a",
+      { groupId: "group-b" },
+    );
+    (workspace["onMergeGroup"] as (groupId: string) => void)("group-b");
+
+    expect(commandCallsFor("terminal.close")).toEqual([]);
+    expect(commandCallsFor("thread.delete")).toEqual([]);
+    expect(useCenterPanelStore.getState().byThreadKey[threadKey]!.groups).toHaveLength(1);
+    expect(
+      useCenterPanelStore.getState().byThreadKey[threadKey]!.surfaces.map((surface) => surface.id),
+    ).toEqual([HOST_SURFACE_ID, "terminal:term-a", "terminal:term-b"]);
+  });
+
   it("closes a center terminal session when its tab is closed", () => {
     seedConnectedServerThread();
     useCenterPanelStore.getState().openTerminalPanel(threadRef, "terminal-42");
     publishSeededStoreState(useCenterPanelStore);
     renderServerRoute();
 
-    const tabs = capturedProps("centerPanelTabs");
+    const workspace = capturedProps("centerWorkspace");
     const surfaces = useCenterPanelStore.getState().byThreadKey[threadKey]!.surfaces;
     const terminalSurface = surfaces.find((surface) => surface.kind === "terminal")!;
 
-    (tabs["onActivate"] as (surface: unknown) => void)(terminalSurface);
-    (tabs["onCloseSurface"] as (surface: unknown) => void)(terminalSurface);
+    (workspace["onActivate"] as (groupId: string, surface: unknown) => void)(
+      "center:root",
+      terminalSurface,
+    );
+    (workspace["onCloseSurface"] as (groupId: string, surface: unknown) => void)(
+      "center:root",
+      terminalSurface,
+    );
     expect(
       useCenterPanelStore
         .getState()
@@ -4994,11 +5121,14 @@ describe("ChatView banners and dialogs", () => {
     publishSeededStoreState(useCenterPanelStore);
     renderServerRoute();
 
-    const tabs = capturedProps("centerPanelTabs");
+    const workspace = capturedProps("centerWorkspace");
     const kept = useCenterPanelStore
       .getState()
       .byThreadKey[threadKey]!.surfaces.find((surface) => surface.id === "terminal:terminal-kept")!;
-    (tabs["onCloseOtherSurfaces"] as (surface: typeof kept) => void)(kept);
+    (workspace["onCloseOtherSurfaces"] as (groupId: string, surface: typeof kept) => void)(
+      "center:root",
+      kept,
+    );
 
     expect(closedTerminalIds()).toEqual(["terminal-left", "terminal-right"]);
     expect(
@@ -5014,11 +5144,14 @@ describe("ChatView banners and dialogs", () => {
     publishSeededStoreState(useCenterPanelStore);
     renderServerRoute();
 
-    const tabs = capturedProps("centerPanelTabs");
+    const workspace = capturedProps("centerWorkspace");
     const selected = useCenterPanelStore
       .getState()
       .byThreadKey[threadKey]!.surfaces.find((surface) => surface.id === "terminal:terminal-left")!;
-    (tabs["onCloseSurfacesToRight"] as (surface: typeof selected) => void)(selected);
+    (workspace["onCloseSurfacesToRight"] as (groupId: string, surface: typeof selected) => void)(
+      "center:root",
+      selected,
+    );
 
     expect(closedTerminalIds()).toEqual(["terminal-middle", "terminal-right"]);
     expect(
@@ -5034,8 +5167,8 @@ describe("ChatView banners and dialogs", () => {
     publishSeededStoreState(useCenterPanelStore);
     renderServerRoute();
 
-    const tabs = capturedProps("centerPanelTabs");
-    (tabs["onCloseAllSurfaces"] as () => void)();
+    const workspace = capturedProps("centerWorkspace");
+    (workspace["onCloseAllSurfaces"] as (groupId: string) => void)("center:root");
 
     expect(closedTerminalIds()).toEqual(["terminal-one", "terminal-two"]);
     expect(useCenterPanelStore.getState().byThreadKey[threadKey]?.surfaces ?? []).toEqual([]);
@@ -5048,11 +5181,14 @@ describe("ChatView banners and dialogs", () => {
     publishSeededStoreState(useCenterPanelStore);
     renderServerRoute();
 
-    const tabs = capturedProps("centerPanelTabs");
+    const workspace = capturedProps("centerWorkspace");
     const chatSurface = useCenterPanelStore
       .getState()
       .byThreadKey[threadKey]!.surfaces.find((surface) => surface.kind === "chat")!;
-    (tabs["onCloseSurface"] as (surface: typeof chatSurface) => void)(chatSurface);
+    (workspace["onCloseSurface"] as (groupId: string, surface: typeof chatSurface) => void)(
+      "center:root",
+      chatSurface,
+    );
 
     expect(commandCallsFor("terminal.close")).toHaveLength(0);
     expect(commandCallsFor("thread.delete")).toHaveLength(1);

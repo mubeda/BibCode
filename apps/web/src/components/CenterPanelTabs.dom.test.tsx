@@ -72,14 +72,18 @@ class FakeResizeObserver {
 
 function input(hostLabel: string) {
   return {
+    groupId: "group-a",
     hostLabel,
     surfaces: [host, chat],
     activeSurfaceId: host.id,
+    canMoveToSplit: () => true,
+    dragInProgress: false,
     onActivate: vi.fn(),
     onCloseSurface: vi.fn(),
     onCloseOtherSurfaces: vi.fn(),
     onCloseSurfacesToRight: vi.fn(),
     onCloseAllSurfaces: vi.fn(),
+    onMoveToSplit: vi.fn(),
   };
 }
 

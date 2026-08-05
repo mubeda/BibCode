@@ -83,11 +83,16 @@ describe("CenterTerminalPanel", () => {
     );
 
     expect(h.drawerProps).toMatchObject({
+      mode: "panel",
       projectId: ProjectId.make("project-1"),
       cwd: "/repo/.bibcode/worktrees/feature",
       worktreePath: "/repo/.bibcode/worktrees/feature",
       terminalIds: ["term-1"],
+      activeTerminalId: "term-1",
+      terminalGroups: [{ id: "terminal:term-1", terminalIds: ["term-1"] }],
     });
+    expect(h.drawerProps?.["onSplitTerminal"]).toBeUndefined();
+    expect(h.drawerProps?.["onSplitTerminalVertical"]).toBeUndefined();
     expect(
       (h.drawerProps!["terminalCommandsById"] as ReadonlyMap<string, unknown>).get("term-1"),
     ).toEqual(surface.command);

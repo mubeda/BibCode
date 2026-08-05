@@ -459,10 +459,46 @@ vi.mock("./ThreadTerminalDrawer", () => ({
   },
 }));
 
-vi.mock("./CenterPanelTabs", () => ({
-  CenterPanelTabs: (props: Record<string, unknown>) => {
-    h.captured["centerPanelTabs"] = props;
-    return <div data-mock="center-panel-tabs" />;
+vi.mock("./CenterPanelWorkspace", () => ({
+  CenterPanelWorkspace: (props: Record<string, unknown>) => {
+    h.captured["centerWorkspace"] = props;
+    const state = props["state"] as {
+      surfaces: Array<{ id: string }>;
+      groups: Array<{ id: string; activeSurfaceId: string | null; surfaceIds: string[] }>;
+      focusedGroupId: string;
+    };
+    const renderSurface = props["renderSurface"] as (
+      surface: { id: string },
+      context: { groupId: string; visible: boolean; focused: boolean },
+    ) => ReactNode;
+    const membership = new Map(
+      state.groups.flatMap((group) => group.surfaceIds.map((surfaceId) => [surfaceId, group.id])),
+    );
+    const visibleIds = new Set(state.groups.flatMap((group) => group.activeSurfaceId ?? []));
+    return (
+      <div data-mock="center-panel-workspace">
+        {props["focusedActions"] as ReactNode}
+        {state.surfaces
+          .filter((surface) => surface.id === "chat:host" || visibleIds.has(surface.id))
+          .map((surface) => {
+            const groupId = membership.get(surface.id)!;
+            return (
+              <div
+                key={surface.id}
+                data-mock-center-surface={surface.id}
+                data-visible={String(visibleIds.has(surface.id))}
+                className={visibleIds.has(surface.id) ? undefined : "hidden"}
+              >
+                {renderSurface(surface, {
+                  groupId,
+                  visible: visibleIds.has(surface.id),
+                  focused: groupId === state.focusedGroupId,
+                })}
+              </div>
+            );
+          })}
+      </div>
+    );
   },
 }));
 
@@ -2428,7 +2464,7 @@ describe("ChatView", () => {
       ]);
     });
 
-    it("does not show the hidden host error over a sibling chat panel", () => {
+    it("keeps the inactive host error mounted inside its hidden surface host", () => {
       const siblingThreadId = ThreadId.make("thread-sibling-without-host-error");
       seedEnvironment(makeEnvironmentPresentation());
       seedProject(makeProject());
@@ -2453,7 +2489,10 @@ describe("ChatView", () => {
 
       const markup = renderServerRoute();
 
-      expect(markup).not.toContain("hidden host disconnected");
+      expect(markup).toContain(
+        'data-mock-center-surface="chat:host" data-visible="false" class="hidden"',
+      );
+      expect(markup).toContain("hidden host disconnected");
     });
 
     it("hands the inspector between host and sibling chat without duplicate shells or targets", async () => {
@@ -2476,7 +2515,7 @@ describe("ChatView", () => {
       seedActivityQueries(environmentId, siblingSnapshot, [siblingActor]);
       useRightPanelStore.getState().openActivity(threadRef, "subagents", { _tag: "thread" });
       useCenterPanelStore.getState().openChatPanel(threadRef, siblingThreadId, "Codex");
-      useCenterPanelStore.getState().activateSurface(threadRef, HOST_SURFACE_ID);
+      useCenterPanelStore.getState().activateSurface(threadRef, "center:root", HOST_SURFACE_ID);
       publishSeededStoreState(useRightPanelStore);
       publishSeededStoreState(useCenterPanelStore);
 
@@ -2490,17 +2529,20 @@ describe("ChatView", () => {
           threadId,
         });
 
-        const centerTabs = capturedProps<{
-          surfaces: Array<{ id: string; kind: string }>;
-          onActivate: (surface: { id: string; kind: string }) => void;
-        }>("centerPanelTabs");
-        const siblingSurface = centerTabs.surfaces.find(
+        const centerWorkspace = capturedProps<{
+          state: {
+            focusedGroupId: string;
+            surfaces: Array<{ id: string; kind: string }>;
+          };
+          onActivate: (groupId: string, surface: { id: string; kind: string }) => void;
+        }>("centerWorkspace");
+        const siblingSurface = centerWorkspace.state.surfaces.find(
           (surface) => surface.id === `chat:${siblingThreadId}`,
         );
         expect(siblingSurface).toBeDefined();
         const siblingTargetStart = h.activityStateTargets.length;
         await act(async () => {
-          centerTabs.onActivate(siblingSurface!);
+          centerWorkspace.onActivate(centerWorkspace.state.focusedGroupId, siblingSurface!);
           await Promise.resolve();
         });
         await vi.waitFor(() => {
@@ -2532,8 +2574,9 @@ describe("ChatView", () => {
 
         const hostTargetStart = h.activityStateTargets.length;
         await act(async () => {
-          centerTabs.onActivate(
-            centerTabs.surfaces.find((surface) => surface.id === HOST_SURFACE_ID)!,
+          centerWorkspace.onActivate(
+            centerWorkspace.state.focusedGroupId,
+            centerWorkspace.state.surfaces.find((surface) => surface.id === HOST_SURFACE_ID)!,
           );
           await Promise.resolve();
         });
@@ -2581,7 +2624,7 @@ describe("ChatView", () => {
       seedActivityQueries(environmentId, siblingSnapshot, [siblingActor]);
       useRightPanelStore.getState().openActivity(threadRef, "subagents", { _tag: "thread" });
       useCenterPanelStore.getState().openChatPanel(threadRef, siblingThreadId, "Codex");
-      useCenterPanelStore.getState().activateSurface(threadRef, HOST_SURFACE_ID);
+      useCenterPanelStore.getState().activateSurface(threadRef, "center:root", HOST_SURFACE_ID);
       publishSeededStoreState(useRightPanelStore);
       publishSeededStoreState(useCenterPanelStore);
 
@@ -2600,16 +2643,19 @@ describe("ChatView", () => {
           ).not.toBeNull();
         });
 
-        const centerTabs = capturedProps<{
-          surfaces: Array<{ id: string; kind: string }>;
-          onActivate: (surface: { id: string; kind: string }) => void;
-        }>("centerPanelTabs");
-        const siblingSurface = centerTabs.surfaces.find(
+        const centerWorkspace = capturedProps<{
+          state: {
+            focusedGroupId: string;
+            surfaces: Array<{ id: string; kind: string }>;
+          };
+          onActivate: (groupId: string, surface: { id: string; kind: string }) => void;
+        }>("centerWorkspace");
+        const siblingSurface = centerWorkspace.state.surfaces.find(
           (surface) => surface.id === `chat:${siblingThreadId}`,
         );
         expect(siblingSurface).toBeDefined();
         await act(async () => {
-          centerTabs.onActivate(siblingSurface!);
+          centerWorkspace.onActivate(centerWorkspace.state.focusedGroupId, siblingSurface!);
           await Promise.resolve();
         });
 
@@ -2623,9 +2669,10 @@ describe("ChatView", () => {
         expect(
           capturedProps<{ rightPanelOpen: boolean }>("panelLayoutControls").rightPanelOpen,
         ).toBe(false);
-        expect(capturedProps<{ rightPanelOpen: boolean }>("chatHeaderActions").rightPanelOpen).toBe(
-          false,
-        );
+        expect(
+          capturedProps<{ reserveTitlebarControls: boolean }>("chatHeaderActions")
+            .reserveTitlebarControls,
+        ).toBe(true);
 
         await openSubagents(container);
         await vi.waitFor(() => {
@@ -2639,8 +2686,9 @@ describe("ChatView", () => {
         });
 
         await act(async () => {
-          centerTabs.onActivate(
-            centerTabs.surfaces.find((surface) => surface.id === HOST_SURFACE_ID)!,
+          centerWorkspace.onActivate(
+            centerWorkspace.state.focusedGroupId,
+            centerWorkspace.state.surfaces.find((surface) => surface.id === HOST_SURFACE_ID)!,
           );
           await Promise.resolve();
         });
@@ -2657,9 +2705,10 @@ describe("ChatView", () => {
         expect(
           capturedProps<{ rightPanelOpen: boolean }>("panelLayoutControls").rightPanelOpen,
         ).toBe(true);
-        expect(capturedProps<{ rightPanelOpen: boolean }>("chatHeaderActions").rightPanelOpen).toBe(
-          true,
-        );
+        expect(
+          capturedProps<{ reserveTitlebarControls: boolean }>("chatHeaderActions")
+            .reserveTitlebarControls,
+        ).toBe(false);
       } finally {
         await act(async () => root.unmount());
         container.remove();
@@ -2793,23 +2842,17 @@ describe("ChatView", () => {
 
       const markup = renderServerRoute();
 
-      expect(markup).toContain('data-mock="center-panel-tabs"');
+      expect(markup).toContain('data-mock="center-panel-workspace"');
       expect(markup).toContain('data-mock="chat-header-actions"');
-      expect(markup).toContain("data-center-panel-header-row");
-      expect(markup).toContain(
-        "isolate flex min-w-0 flex-1 self-stretch items-center overflow-hidden",
-      );
-      expect(markup).toContain('aria-label="Demo Thread workspace"');
-      expect(markup.indexOf('data-mock="center-panel-tabs"')).toBeLessThan(
-        markup.indexOf('data-mock="chat-header-actions"'),
-      );
+      expect(markup).not.toContain("data-center-panel-header-row");
       expect(markup).toContain('data-mock="messages-timeline"');
       expect(markup).toContain('data-mock="chat-composer"');
       expect(markup).not.toContain('data-mock="branch-toolbar"');
       expect(markup).not.toContain('data-mock="no-active-thread"');
 
-      const tabs = capturedProps<Record<string, unknown>>("centerPanelTabs");
-      expect(tabs["hostLabel"]).toBe("Codex");
+      const workspace = capturedProps<Record<string, unknown>>("centerWorkspace");
+      expect(workspace["hostLabel"]).toBe("Codex");
+      expect(workspace["focusedActions"]).toBeDefined();
       expect(capturedProps<Record<string, unknown>>("chatHeaderActions")).not.toHaveProperty(
         "activeThreadTitle",
       );
@@ -2835,11 +2878,58 @@ describe("ChatView", () => {
       expect(panelControls["terminalAvailable"]).toBe(true);
       expect(panelControls["rightPanelAvailable"]).toBe(true);
       expect(panelControls["rightPanelOpen"]).toBe(false);
+      expect(markup.match(/data-mock="panel-layout-controls"/g)).toHaveLength(1);
+      expect(workspace).not.toHaveProperty("panelLayoutControls");
 
       const bannerStack = capturedProps<{ items: ComposerBannerStackItem[] }>(
         "composerBannerStack",
       );
       expect(bannerStack.items).toEqual([]);
+    });
+
+    it("does not reserve titlebar controls for a focused left center group", () => {
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      useCenterPanelStore.setState({
+        byThreadKey: {
+          [scopedThreadKey(threadRef)]: {
+            surfaces: [
+              { id: HOST_SURFACE_ID, kind: "chat-host" },
+              { id: "terminal:term-right", kind: "terminal", terminalId: "term-right" },
+            ],
+            groups: [
+              {
+                id: "group-left",
+                surfaceIds: [HOST_SURFACE_ID],
+                activeSurfaceId: HOST_SURFACE_ID,
+              },
+              {
+                id: "group-right",
+                surfaceIds: ["terminal:term-right"],
+                activeSurfaceId: "terminal:term-right",
+              },
+            ],
+            layout: {
+              type: "split",
+              direction: "horizontal",
+              ratio: 0.5,
+              first: { type: "leaf", groupId: "group-left" },
+              second: { type: "leaf", groupId: "group-right" },
+            },
+            focusedGroupId: "group-left",
+          },
+        },
+      });
+      publishSeededStoreState(useCenterPanelStore);
+
+      renderServerRoute();
+
+      expect(
+        capturedProps<{ reserveTitlebarControls: boolean }>("chatHeaderActions")
+          .reserveTitlebarControls,
+      ).toBe(false);
     });
 
     it("uses the selected provider display name for the host tab", () => {
@@ -2858,7 +2948,7 @@ describe("ChatView", () => {
 
       renderServerRoute();
 
-      expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe(
+      expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe(
         "Codex Personal",
       );
     });
@@ -2875,7 +2965,7 @@ describe("ChatView", () => {
 
       renderServerRoute();
 
-      expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe("Codex");
+      expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe("Codex");
     });
 
     it("updates the pre-start host tab label when the selected provider changes", () => {
@@ -2899,7 +2989,7 @@ describe("ChatView", () => {
       seedGitStatus(true);
 
       renderServerRoute();
-      expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe("Codex");
+      expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe("Codex");
       const initialComposer = capturedProps<Record<string, unknown>>("chatComposer");
       expect(initialComposer["lockProviderPickerToActiveInstance"]).toBe(false);
       const initialSurfaces =
@@ -2913,7 +3003,7 @@ describe("ChatView", () => {
       publishSeededStoreState(useComposerDraftStore);
       renderServerRoute();
 
-      expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe("Claude");
+      expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe("Claude");
       expect(
         useCenterPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)]?.surfaces,
       ).toEqual(initialSurfaces);
@@ -2938,7 +3028,7 @@ describe("ChatView", () => {
       expect(startedComposer["lockedProvider"]).toBe("codex");
       expect(startedComposer["providerBindingInstanceId"]).toBe("codex");
       expect(startedComposer["lockProviderPickerToActiveInstance"]).toBe(false);
-      expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe("Codex");
+      expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe("Codex");
 
       const selectStartedProviderModel = startedComposer["onProviderModelSelect"] as (
         instanceId: ProviderInstanceId,
@@ -2991,7 +3081,7 @@ describe("ChatView", () => {
 
       renderServerRoute();
 
-      expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe("Codex");
+      expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe("Codex");
     });
 
     it("uses the authoritative session driver when a legacy session has no instance id", () => {
@@ -3043,7 +3133,7 @@ describe("ChatView", () => {
       renderServerRoute();
 
       const composer = capturedProps<Record<string, unknown>>("chatComposer");
-      expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe("Codex");
+      expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe("Codex");
       expect(composer["lockedProvider"]).toBe("codex");
       expect(composer["providerBindingInstanceId"]).toBe("codex");
     });
@@ -3097,7 +3187,7 @@ describe("ChatView", () => {
 
       renderServerRoute();
 
-      expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe(
+      expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe(
         "Codex Personal",
       );
       expect(capturedProps<Record<string, unknown>>("chatComposer")["lockedProvider"]).toBe(
@@ -3140,7 +3230,7 @@ describe("ChatView", () => {
 
       renderServerRoute();
 
-      expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe(
+      expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe(
         "Codex Personal",
       );
       const composer = capturedProps<Record<string, unknown>>("chatComposer");
@@ -3196,7 +3286,7 @@ describe("ChatView", () => {
       const composer = capturedProps<Record<string, unknown>>("chatComposer");
       expect(composer["lockedProvider"]).toBeNull();
       expect(composer["providerBindingInstanceId"]).toBe("codex_personal");
-      expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe(
+      expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe(
         "Codex Personal",
       );
     });
@@ -3248,7 +3338,7 @@ describe("ChatView", () => {
 
       renderServerRoute();
 
-      expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe(
+      expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe(
         "Codex Personal",
       );
       expect(capturedProps<Record<string, unknown>>("chatComposer")["lockedProvider"]).toBe(
@@ -3261,14 +3351,16 @@ describe("ChatView", () => {
       seedProject(makeProject());
       seedServerThread(makeThread());
       seedGitStatus(true);
-      useCenterPanelStore.getState().closeAllSurfaces(threadRef);
+      useCenterPanelStore.getState().closeAllSurfaces(threadRef, "center:root");
       publishSeededStoreState(useCenterPanelStore);
 
       const markup = renderServerRoute();
 
       expect(markup).toContain('data-mock="chat-header-actions"');
-      expect(markup).not.toContain('data-mock="center-panel-tabs"');
-      expect(markup).toContain("data-center-panel-empty-spacer");
+      expect(markup).toContain('data-mock="center-panel-workspace"');
+      expect(
+        capturedProps<Record<string, unknown>>("centerWorkspace")["focusedActions"],
+      ).toBeDefined();
     });
 
     it("keeps ordinary chat and terminal launches available after activity is downgraded", async () => {
@@ -3717,7 +3809,7 @@ describe("ChatView", () => {
 
       const markup = renderServerRoute();
 
-      expect(markup).toContain('data-mock="center-panel-tabs"');
+      expect(markup).toContain('data-mock="center-panel-workspace"');
       expect(markup).toContain('data-mock="center-terminal-panel"');
 
       const centerTerminal = capturedProps<Record<string, unknown>>("centerTerminalPanel");
@@ -4001,7 +4093,7 @@ describe("ChatView handlers (captured from mocked children)", () => {
 
     renderServerRoute();
     const composer = capturedProps<Record<string, unknown>>("chatComposer");
-    expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe(
+    expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe(
       "Codex Personal",
     );
     expect(composer["lockedProvider"]).toBe("codex");
@@ -4099,7 +4191,7 @@ describe("ChatView handlers (captured from mocked children)", () => {
 
     renderServerRoute();
     const composer = capturedProps<Record<string, unknown>>("chatComposer");
-    expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe(
+    expect(capturedProps<Record<string, unknown>>("centerWorkspace")["hostLabel"]).toBe(
       "Codex Personal",
     );
     expect(composer["lockedProvider"]).toBeNull();
