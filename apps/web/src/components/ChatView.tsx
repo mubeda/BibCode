@@ -2231,7 +2231,8 @@ function ChatViewContent(props: ChatViewProps) {
   ]);
 
   const selectedProviderByThreadId = composerActiveProvider ?? null;
-  const threadProvider =
+  const boundProviderInstanceId =
+    activeThread?.session?.providerInstanceId ??
     activeThread?.modelSelection.instanceId ??
     activeProject?.defaultModelSelection?.instanceId ??
     null;
@@ -2328,16 +2329,18 @@ function ChatViewContent(props: ChatViewProps) {
     versionMismatchServerLabel,
   ]);
   const providerStatuses = serverConfig?.providers ?? EMPTY_PROVIDERS;
-  const boundProviderDriver =
-    providerStatuses.find((status) => status.instanceId === threadProvider)?.driver ?? null;
+  const boundProviderLock = boundProviderInstanceId
+    ? (providerStatuses.find((status) => status.instanceId === boundProviderInstanceId)?.driver ??
+      ProviderDriverKind.make(boundProviderInstanceId))
+    : null;
   const lockedProvider = deriveLockedProvider({
     thread: activeThread,
     selectedProvider: null,
-    threadProvider: boundProviderDriver,
+    threadProvider: boundProviderLock,
   });
   const unlockedSelectedProvider = resolveSelectableProvider(
     providerStatuses,
-    selectedProviderByThreadId ?? threadProvider ?? ProviderDriverKind.make("codex"),
+    selectedProviderByThreadId ?? boundProviderInstanceId ?? ProviderDriverKind.make("codex"),
   );
   const selectedProvider: ProviderDriverKind = lockedProvider ?? unlockedSelectedProvider;
   const phase = derivePhase(activeThread?.session ?? null);
@@ -2750,8 +2753,6 @@ function ChatViewContent(props: ChatViewProps) {
   const selectedProviderInstanceId =
     providerStatuses.find((status) => status.instanceId === selectedProviderByThreadId)
       ?.instanceId ?? null;
-  const boundProviderInstanceId =
-    activeThread?.session?.providerInstanceId ?? activeThread?.modelSelection.instanceId ?? null;
   const activeProviderInstanceId =
     (lockedProvider === null ? selectedProviderInstanceId : null) ??
     boundProviderInstanceId ??
