@@ -4,7 +4,9 @@ use serde_json::{Value, json};
 use tokio::sync::Mutex;
 
 use crate::{
-    activity::{ActivityProjection, AgentActivityController, AgentActivitySource},
+    activity::{
+        ActivityProjection, ActivityProjections, AgentActivityController, AgentActivitySource,
+    },
     diagnostics::TraceDiagnosticsStore,
     provider_terminal::{TerminalAgentActivityProviderEpochs, TerminalAgentActivityTransition},
     terminal::TerminalManager,
@@ -49,13 +51,17 @@ pub struct AgentActivityTransitionReport {
 pub trait AgentActivitySettingsHandler: Send + Sync {
     fn transition(
         &self,
+        source: AgentActivitySource,
         enabled: bool,
         settings_generation: u64,
     ) -> Pin<Box<dyn Future<Output = AgentActivityTransitionReport> + Send + '_>>;
 }
 
 pub(crate) trait AgentActivityTransitionRuntime: Send + Sync {
-    fn finalize_disabled_activity(&self) -> BoxAgentActivityFuture<'_, Result<usize, ()>>;
+    fn finalize_disabled_activity(
+        &self,
+        source: AgentActivitySource,
+    ) -> BoxAgentActivityFuture<'_, Result<usize, ()>>;
 
     fn set_provider_activity_enabled(
         &self,
@@ -70,6 +76,7 @@ pub(crate) trait AgentActivityTransitionRuntime: Send + Sync {
 
 #[derive(Clone)]
 pub(crate) struct AgentActivityCoordinator {
+    source: AgentActivitySource,
     controller: AgentActivityController,
     trace_diagnostics: TraceDiagnosticsStore,
     environment_id: Arc<str>,
@@ -79,11 +86,13 @@ pub(crate) struct AgentActivityCoordinator {
 impl AgentActivityCoordinator {
     #[must_use]
     pub(crate) fn new(
+        source: AgentActivitySource,
         controller: AgentActivityController,
         trace_diagnostics: TraceDiagnosticsStore,
         environment_id: String,
     ) -> Self {
         Self {
+            source,
             controller,
             trace_diagnostics,
             environment_id: Arc::from(bound_identifier(&environment_id)),
@@ -140,6 +149,7 @@ impl AgentActivityCoordinator {
             json!({
                 "cause": "settings",
                 "environmentId": self.environment_id.as_ref(),
+                "source": self.source.trace_label(),
                 "enabled": enabled,
                 "settingsGeneration": settings_generation,
                 "observationGeneration": before.generation,
@@ -155,36 +165,50 @@ impl AgentActivityCoordinator {
         if enabled {
             let state = self.controller.enable();
             report.observation_generation = state.generation;
-            match runtime.set_provider_activity_enabled(true).await {
-                Ok(resumed) => {
-                    report.resumed_observers = report.resumed_observers.saturating_add(resumed);
+            match self.source {
+                AgentActivitySource::Chat => {
+                    match runtime.set_provider_activity_enabled(true).await {
+                        Ok(resumed) => {
+                            report.resumed_observers =
+                                report.resumed_observers.saturating_add(resumed);
+                        }
+                        Err(()) => {
+                            report.failed_observers = report.failed_observers.saturating_add(1);
+                        }
+                    }
                 }
-                Err(()) => {
-                    report.failed_observers = report.failed_observers.saturating_add(1);
+                AgentActivitySource::Terminal => {
+                    let terminal = runtime.set_terminal_activity_enabled(true).await;
+                    merge_terminal_transition(&mut report, terminal);
                 }
             }
-            let terminal = runtime.set_terminal_activity_enabled(true).await;
-            merge_terminal_transition(&mut report, terminal);
         } else {
             let disabled = self.controller.disable().await;
             report.observation_generation = disabled.state.generation;
             report.closed_subscriptions = disabled.closed_subscriptions;
-            match runtime.finalize_disabled_activity().await {
+            match runtime.finalize_disabled_activity(self.source).await {
                 Ok(finalized) => report.finalized_records = finalized,
                 Err(()) => {
                     report.failure = Some(AgentActivityTransitionFailure::RecordFinalization);
                 }
             }
-            match runtime.set_provider_activity_enabled(false).await {
-                Ok(stopped) => {
-                    report.stopped_observers = report.stopped_observers.saturating_add(stopped);
+            match self.source {
+                AgentActivitySource::Chat => {
+                    match runtime.set_provider_activity_enabled(false).await {
+                        Ok(stopped) => {
+                            report.stopped_observers =
+                                report.stopped_observers.saturating_add(stopped);
+                        }
+                        Err(()) => {
+                            report.failed_observers = report.failed_observers.saturating_add(1);
+                        }
+                    }
                 }
-                Err(()) => {
-                    report.failed_observers = report.failed_observers.saturating_add(1);
+                AgentActivitySource::Terminal => {
+                    let terminal = runtime.set_terminal_activity_enabled(false).await;
+                    merge_terminal_transition(&mut report, terminal);
                 }
             }
-            let terminal = runtime.set_terminal_activity_enabled(false).await;
-            merge_terminal_transition(&mut report, terminal);
         }
 
         let effective = self.controller.snapshot();
@@ -196,6 +220,7 @@ impl AgentActivityCoordinator {
         }
         if report.failed_observers > 0 {
             tracing::warn!(
+                source = self.source.trace_label(),
                 enabled,
                 failed_observers = report.failed_observers,
                 "agent activity observer transition completed with bounded failures"
@@ -208,6 +233,7 @@ impl AgentActivityCoordinator {
                 json!({
                     "cause": "settings",
                     "environmentId": self.environment_id.as_ref(),
+                    "source": self.source.trace_label(),
                     "enabled": enabled,
                     "settingsGeneration": settings_generation,
                     "observationGeneration": report.observation_generation,
@@ -242,6 +268,7 @@ impl AgentActivityCoordinator {
             json!({
                 "cause": cause,
                 "environmentId": self.environment_id.as_ref(),
+                "source": self.source.trace_label(),
                 "enabled": report.enabled,
                 "settingsGeneration": report.settings_generation,
                 "observationGeneration": report.observation_generation,
@@ -278,8 +305,9 @@ impl AgentActivityCoordinator {
 
 #[derive(Clone)]
 pub struct ProductionAgentActivity {
-    coordinator: AgentActivityCoordinator,
-    projection: ActivityProjection,
+    chat_coordinator: AgentActivityCoordinator,
+    terminal_coordinator: AgentActivityCoordinator,
+    projections: ActivityProjections,
     provider_runtime: Arc<ProviderRuntimeSupervisor>,
     terminal_manager: TerminalManager,
 }
@@ -294,38 +322,63 @@ impl ProductionAgentActivity {
         trace_diagnostics: TraceDiagnosticsStore,
         environment_id: String,
     ) -> Self {
+        let projections = ActivityProjections::from_shared_projection(projection);
         Self {
-            coordinator: AgentActivityCoordinator::new(
+            chat_coordinator: AgentActivityCoordinator::new(
+                AgentActivitySource::Chat,
+                controller.clone(),
+                trace_diagnostics.clone(),
+                environment_id.clone(),
+            ),
+            terminal_coordinator: AgentActivityCoordinator::new(
+                AgentActivitySource::Terminal,
                 controller,
                 trace_diagnostics,
                 environment_id,
             ),
-            projection,
+            projections,
             provider_runtime,
             terminal_manager,
         }
     }
 
     pub async fn record_startup(&self, settings_generation: u64) {
-        self.coordinator.record_startup(settings_generation).await;
+        self.chat_coordinator
+            .record_startup(settings_generation)
+            .await;
+        self.terminal_coordinator
+            .record_startup(settings_generation)
+            .await;
     }
 
     pub async fn transition(
         &self,
+        source: AgentActivitySource,
         enabled: bool,
         settings_generation: u64,
     ) -> AgentActivityTransitionReport {
-        self.coordinator
+        self.coordinator(source)
             .transition(self, enabled, settings_generation)
             .await
+    }
+
+    fn coordinator(&self, source: AgentActivitySource) -> &AgentActivityCoordinator {
+        match source {
+            AgentActivitySource::Chat => &self.chat_coordinator,
+            AgentActivitySource::Terminal => &self.terminal_coordinator,
+        }
     }
 }
 
 impl AgentActivityTransitionRuntime for ProductionAgentActivity {
-    fn finalize_disabled_activity(&self) -> BoxAgentActivityFuture<'_, Result<usize, ()>> {
+    fn finalize_disabled_activity(
+        &self,
+        source: AgentActivitySource,
+    ) -> BoxAgentActivityFuture<'_, Result<usize, ()>> {
         Box::pin(async move {
-            self.projection
-                .interrupt_for_monitoring_disabled(AgentActivitySource::Chat)
+            self.projections
+                .for_source(source)
+                .interrupt_for_monitoring_disabled(source)
                 .await
                 .map_err(|_| ())
         })
@@ -358,11 +411,12 @@ impl AgentActivityTransitionRuntime for ProductionAgentActivity {
 impl AgentActivitySettingsHandler for ProductionAgentActivity {
     fn transition(
         &self,
+        source: AgentActivitySource,
         enabled: bool,
         settings_generation: u64,
     ) -> Pin<Box<dyn Future<Output = AgentActivityTransitionReport> + Send + '_>> {
         Box::pin(async move {
-            ProductionAgentActivity::transition(self, enabled, settings_generation).await
+            ProductionAgentActivity::transition(self, source, enabled, settings_generation).await
         })
     }
 }
@@ -404,7 +458,7 @@ mod tests {
     };
 
     use crate::{
-        activity::AgentActivityController,
+        activity::{AgentActivityController, AgentActivitySource},
         diagnostics::TraceDiagnosticsStore,
         provider_terminal::{TerminalAgentActivityProviderEpochs, TerminalAgentActivityTransition},
     };
@@ -435,15 +489,21 @@ mod tests {
     }
 
     impl TestTransitionRuntime {
-        fn calls(&self) -> Vec<&'static str> {
-            self.calls.lock().expect("calls lock").clone()
+        fn take_calls(&self) -> Vec<&'static str> {
+            std::mem::take(&mut *self.calls.lock().expect("calls lock"))
         }
     }
 
     impl AgentActivityTransitionRuntime for TestTransitionRuntime {
-        fn finalize_disabled_activity(&self) -> BoxAgentActivityFuture<'_, Result<usize, ()>> {
+        fn finalize_disabled_activity(
+            &self,
+            source: AgentActivitySource,
+        ) -> BoxAgentActivityFuture<'_, Result<usize, ()>> {
             Box::pin(async move {
-                self.calls.lock().expect("calls lock").push("finalize");
+                self.calls.lock().expect("calls lock").push(match source {
+                    AgentActivitySource::Chat => "finalize:chat",
+                    AgentActivitySource::Terminal => "finalize:terminal",
+                });
                 self.finalize_result
                     .lock()
                     .expect("finalize result")
@@ -457,9 +517,9 @@ mod tests {
         ) -> BoxAgentActivityFuture<'_, Result<usize, ()>> {
             Box::pin(async move {
                 self.calls.lock().expect("calls lock").push(if enabled {
-                    "provider-enable"
+                    "provider:true"
                 } else {
-                    "provider-disable"
+                    "provider:false"
                 });
                 self.provider_result
                     .lock()
@@ -474,9 +534,9 @@ mod tests {
         ) -> BoxAgentActivityFuture<'_, TerminalAgentActivityTransition> {
             Box::pin(async move {
                 self.calls.lock().expect("calls lock").push(if enabled {
-                    "terminal-enable"
+                    "terminal:true"
                 } else {
-                    "terminal-disable"
+                    "terminal:false"
                 });
                 *self.terminal_result.lock().expect("terminal result")
             })
@@ -492,6 +552,7 @@ mod tests {
     }
 
     fn test_coordinator(
+        source: AgentActivitySource,
         enabled: bool,
     ) -> (
         AgentActivityCoordinator,
@@ -504,6 +565,7 @@ mod tests {
         let trace = TraceDiagnosticsStore::new(path);
         let runtime = TestTransitionRuntime::default();
         let coordinator = AgentActivityCoordinator::new(
+            source,
             AgentActivityController::new(enabled),
             trace.clone(),
             "environment-test".to_owned(),
@@ -513,7 +575,8 @@ mod tests {
 
     #[tokio::test]
     async fn disable_waits_for_stream_drain_then_finalizes_before_observer_shutdown() {
-        let (coordinator, runtime, trace, _temp) = test_coordinator(true);
+        let (coordinator, runtime, trace, _temp) =
+            test_coordinator(AgentActivitySource::Chat, true);
         *runtime.terminal_result.lock().expect("terminal result") =
             TerminalAgentActivityTransition {
                 stopped: 2,
@@ -547,34 +610,81 @@ mod tests {
         let report = transition.await.expect("transition task");
 
         assert_eq!(
-            runtime.calls(),
-            vec!["finalize", "provider-disable", "terminal-disable"]
+            runtime.take_calls(),
+            vec!["finalize:chat", "provider:false"]
         );
         assert_eq!(report.closed_subscriptions, 1);
         assert_eq!(report.finalized_records, 0);
-        assert_eq!(report.stopped_observers, 2);
-        assert_eq!(report.dormant_observers, 1);
+        assert_eq!(report.stopped_observers, 0);
+        assert_eq!(report.dormant_observers, 0);
+        assert_eq!(
+            report.terminal_observation_epochs,
+            TerminalAgentActivityProviderEpochs::default()
+        );
         assert_eq!(report.failure, None);
         let records = trace_records(&trace);
         assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["events"][0]["attributes"]["source"], "chat");
         assert_eq!(records[1]["name"], "agent_activity_disabled");
         assert_eq!(records[1]["events"][0]["attributes"]["enabled"], false);
+        assert_eq!(records[1]["events"][0]["attributes"]["source"], "chat");
+    }
+
+    #[tokio::test]
+    async fn terminal_disable_finalizes_terminal_records_and_stops_only_terminal_observers() {
+        let (coordinator, runtime, trace, _temp) =
+            test_coordinator(AgentActivitySource::Terminal, true);
+        *runtime.provider_result.lock().expect("provider result") = Ok(7);
+        *runtime.terminal_result.lock().expect("terminal result") =
+            TerminalAgentActivityTransition {
+                stopped: 2,
+                dormant: 1,
+                epochs: TerminalAgentActivityProviderEpochs {
+                    claude: 3,
+                    codex: 5,
+                    opencode: 4,
+                },
+                ..TerminalAgentActivityTransition::default()
+            };
+
+        let report = coordinator.transition(&runtime, false, 2).await;
+
+        assert_eq!(
+            runtime.take_calls(),
+            vec!["finalize:terminal", "terminal:false"]
+        );
+        assert_eq!(report.stopped_observers, 2);
+        assert_eq!(report.dormant_observers, 1);
+        assert_eq!(
+            report.terminal_observation_epochs,
+            TerminalAgentActivityProviderEpochs {
+                claude: 3,
+                codex: 5,
+                opencode: 4,
+            }
+        );
+        let records = trace_records(&trace);
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0]["events"][0]["attributes"]["source"], "terminal");
+        assert_eq!(records[1]["events"][0]["attributes"]["source"], "terminal");
     }
 
     #[tokio::test]
     async fn repeated_requested_state_is_idempotent_without_trace_or_runtime_work() {
-        let (coordinator, runtime, trace, _temp) = test_coordinator(false);
+        let (coordinator, runtime, trace, _temp) =
+            test_coordinator(AgentActivitySource::Chat, false);
 
         let report = coordinator.transition(&runtime, false, 5).await;
 
         assert!(!report.enabled);
-        assert!(runtime.calls().is_empty());
+        assert!(runtime.take_calls().is_empty());
         assert!(trace_records(&trace).is_empty());
     }
 
     #[tokio::test]
     async fn enabling_stays_effective_and_reports_bounded_observer_failures() {
-        let (coordinator, runtime, trace, _temp) = test_coordinator(false);
+        let (coordinator, runtime, trace, _temp) =
+            test_coordinator(AgentActivitySource::Terminal, false);
         *runtime.provider_result.lock().expect("provider result") = Ok(2);
         *runtime.terminal_result.lock().expect("terminal result") =
             TerminalAgentActivityTransition {
@@ -593,7 +703,8 @@ mod tests {
 
         assert!(coordinator.controller().snapshot().enabled);
         assert!(report.enabled);
-        assert_eq!(report.resumed_observers, 5);
+        assert_eq!(runtime.take_calls(), vec!["terminal:true"]);
+        assert_eq!(report.resumed_observers, 3);
         assert_eq!(report.failed_observers, 1);
         assert_eq!(report.unavailable_observers, 1);
         assert_eq!(
@@ -634,7 +745,8 @@ mod tests {
 
     #[tokio::test]
     async fn invariant_failure_emits_one_bounded_failure_event() {
-        let (coordinator, runtime, trace, _temp) = test_coordinator(true);
+        let (coordinator, runtime, trace, _temp) =
+            test_coordinator(AgentActivitySource::Chat, true);
         *runtime.finalize_result.lock().expect("finalize result") = Err("secret payload");
 
         let report = coordinator.transition(&runtime, false, 7).await;
@@ -652,12 +764,60 @@ mod tests {
             records[1]["events"][0]["attributes"]["errorCategory"],
             "record_finalization"
         );
+        assert_eq!(records[1]["events"][0]["attributes"]["source"], "chat");
         assert!(!records[1].to_string().contains("secret payload"));
     }
 
     #[tokio::test]
+    async fn chat_enable_resumes_only_provider_observers_without_terminal_epochs() {
+        let (coordinator, runtime, _trace, _temp) =
+            test_coordinator(AgentActivitySource::Chat, false);
+        *runtime.provider_result.lock().expect("provider result") = Ok(2);
+        *runtime.terminal_result.lock().expect("terminal result") =
+            TerminalAgentActivityTransition {
+                resumed: 9,
+                epochs: TerminalAgentActivityProviderEpochs {
+                    claude: 2,
+                    codex: 4,
+                    opencode: 3,
+                },
+                ..TerminalAgentActivityTransition::default()
+            };
+
+        let report = coordinator.transition(&runtime, true, 8).await;
+
+        assert_eq!(runtime.take_calls(), vec!["provider:true"]);
+        assert_eq!(report.resumed_observers, 2);
+        assert_eq!(
+            report.terminal_observation_epochs,
+            TerminalAgentActivityProviderEpochs::default()
+        );
+    }
+
+    #[tokio::test]
+    async fn startup_trace_records_the_coordinator_source() {
+        let (chat, _runtime, chat_trace, _chat_temp) =
+            test_coordinator(AgentActivitySource::Chat, true);
+        let (terminal, _runtime, terminal_trace, _terminal_temp) =
+            test_coordinator(AgentActivitySource::Terminal, false);
+
+        chat.record_startup(1).await;
+        terminal.record_startup(2).await;
+
+        assert_eq!(
+            trace_records(&chat_trace)[0]["events"][0]["attributes"]["source"],
+            "chat"
+        );
+        assert_eq!(
+            trace_records(&terminal_trace)[0]["events"][0]["attributes"]["source"],
+            "terminal"
+        );
+    }
+
+    #[tokio::test]
     async fn rejected_event_volume_creates_no_trace_records() {
-        let (coordinator, _runtime, trace, _temp) = test_coordinator(false);
+        let (coordinator, _runtime, trace, _temp) =
+            test_coordinator(AgentActivitySource::Chat, false);
 
         for _ in 0..10_000 {
             assert!(coordinator.controller().admit().is_none());

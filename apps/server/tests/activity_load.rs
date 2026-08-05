@@ -19,8 +19,8 @@ use bibcode_server::{
         ActivityCapabilities, ActivityEntry, ActivityEntryKind, ActivityEntryTone,
         ActivityLifecycle, ActivityProjection, ActivityProjections, ActivityRecordKind,
         ActivityRepository, ActivityRosterBucket, ActivityScopeSeed, ActivitySection,
-        ActivityWorkItemSummary, AgentActivityController, ProviderActivityMutation,
-        register_activity_rpc,
+        ActivityWorkItemSummary, AgentActivityController, AgentActivitySource,
+        ProviderActivityMutation, register_activity_rpc,
     },
     diagnostics::{ProcessAttributionRegistry, TraceDiagnosticsStore},
     orchestration::engine::{EngineOptions, OrchestrationEngine},
@@ -304,7 +304,9 @@ async fn disabled_gate_rejects_dormant_volume_without_work_or_trace_growth() {
         PREVIOUSLY_INSTRUMENTED_TERMINALS
     );
 
-    let disabled = coordinator.transition(false, 1).await;
+    let disabled = coordinator
+        .transition(AgentActivitySource::Terminal, false, 1)
+        .await;
     assert!(!disabled.enabled);
     assert_eq!(
         disabled.dormant_observers,
@@ -315,7 +317,7 @@ async fn disabled_gate_rejects_dormant_volume_without_work_or_trace_growth() {
         PREVIOUSLY_INSTRUMENTED_TERMINALS
     );
     let trace_count_before_rejected_volume = trace_record_count(&trace);
-    assert_eq!(trace_count_before_rejected_volume, 3);
+    assert_eq!(trace_count_before_rejected_volume, 4);
 
     let queue_observer = database
         .enable_queue_backpressure_observation_for_integration_test()
@@ -493,6 +495,7 @@ fn assert_safe_transition_trace(trace: &TraceDiagnosticsStore) {
             .collect::<Vec<_>>(),
         vec![
             "agent_activity_enabled",
+            "agent_activity_enabled",
             "agent_activity_change_requested",
             "agent_activity_disabled",
         ]
@@ -500,6 +503,7 @@ fn assert_safe_transition_trace(trace: &TraceDiagnosticsStore) {
     let allowed_attributes = [
         "cause",
         "environmentId",
+        "source",
         "enabled",
         "settingsGeneration",
         "observationGeneration",
