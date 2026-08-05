@@ -199,6 +199,7 @@ uses the current Mac's architecture. Choose a fresh, empty output directory and
 use that same directory for the mount check:
 
 ```sh
+(
 set -e
 artifact_dir=release/desktop/macos
 node scripts/build-desktop-artifact.ts --platform mac --target dmg --output-dir "$artifact_dir" --verbose
@@ -216,6 +217,7 @@ trap cleanup EXIT
 hdiutil attach -readonly -nobrowse -noverify -mountpoint "$mount_dir" "$dmg"
 attached=1
 swift scripts/check-macos-app-icon.swift "$mount_dir/BiBCode.app"
+)
 ```
 
 Build a specific release target:
