@@ -28,7 +28,7 @@ use crate::{
         },
         server_terminal::{JsonFuture, JsonStream, ProductionServerControl},
     },
-    server_settings::ProviderSettingsState,
+    server_settings::{ProviderSettingsState, normalize_agent_activity_settings},
 };
 
 const MAX_KEYBINDINGS: usize = 256;
@@ -345,7 +345,7 @@ impl NativeServerControl {
         self.settings
             .read()
             .await
-            .get("enableAgentActivity")
+            .get("enableChatAgentActivity")
             .and_then(Value::as_bool)
             .unwrap_or(true)
     }
@@ -378,11 +378,13 @@ impl NativeServerControl {
         }
         let current = self.settings.read().await.clone();
         let previous_agent_activity = current
-            .get("enableAgentActivity")
+            .get("enableChatAgentActivity")
             .and_then(Value::as_bool)
             .unwrap_or(true);
         let mut next = current;
         apply_settings_patch(&mut next, patch);
+        validate_settings_document(&next)
+            .map_err(|cause| settings_error(&self.settings_path, "normalize", &cause))?;
         apply_settings_defaults(&mut next);
         validate_settings_document(&next)
             .map_err(|cause| settings_error(&self.settings_path, "normalize", &cause))?;
@@ -397,7 +399,7 @@ impl NativeServerControl {
         redact_sensitive_environment(&mut next);
         let generation = self.settings_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let next_agent_activity = next
-            .get("enableAgentActivity")
+            .get("enableChatAgentActivity")
             .and_then(Value::as_bool)
             .unwrap_or(true);
         let commit_control = self.clone();
@@ -1258,6 +1260,8 @@ fn validate_settings_document(settings: &Value) -> Result<(), String> {
     validate_optional_bool(object, "enableAssistantStreaming")?;
     validate_optional_bool(object, "enableProviderUpdateChecks")?;
     validate_optional_bool(object, "enableAgentActivity")?;
+    validate_optional_bool(object, "enableChatAgentActivity")?;
+    validate_optional_bool(object, "enableTerminalAgentActivity")?;
     validate_optional_bool(object, "newWorktreesStartFromOrigin")?;
     validate_optional_string(object, "worktreeBaseDirectory")?;
     validate_optional_string(object, "addProjectBaseDirectory")?;
@@ -1621,6 +1625,7 @@ fn apply_settings_defaults(settings: &mut Value) {
     if !settings.is_object() {
         *settings = json!({});
     }
+    normalize_agent_activity_settings(settings);
     settings
         .as_object_mut()
         .expect("settings object")
@@ -1630,7 +1635,8 @@ fn apply_settings_defaults(settings: &mut Value) {
         &json!({
             "enableAssistantStreaming": false,
             "enableProviderUpdateChecks": true,
-            "enableAgentActivity": true,
+            "enableChatAgentActivity": true,
+            "enableTerminalAgentActivity": false,
             "automaticGitFetchInterval": 30_000,
             "defaultThreadEnvMode": "local",
             "newWorktreesStartFromOrigin": false,
@@ -2602,34 +2608,105 @@ mod tests {
         let settings_path = config.state_dir().join("settings.json");
         let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
 
-        assert_eq!(control.settings.read().await["enableAgentActivity"], true);
+        assert_eq!(
+            control.settings.read().await["enableChatAgentActivity"],
+            true
+        );
         let mut events = control.config_events.subscribe();
 
         let updated = control
-            .update_settings(json!({"patch":{"enableAgentActivity":false}}))
+            .update_settings(json!({"patch":{"enableChatAgentActivity":false}}))
             .await
             .expect("disable agent activity");
-        assert_eq!(updated["enableAgentActivity"], false);
-        assert_eq!(control.settings.read().await["enableAgentActivity"], false);
+        assert_eq!(updated["enableChatAgentActivity"], false);
+        assert_eq!(
+            control.settings.read().await["enableChatAgentActivity"],
+            false
+        );
         let event = tokio::time::timeout(std::time::Duration::from_secs(1), events.recv())
             .await
             .expect("settings update publishes an event")
             .expect("settings update event");
         assert_eq!(event["type"], "settingsUpdated");
-        assert_eq!(event["payload"]["settings"]["enableAgentActivity"], false);
+        assert_eq!(
+            event["payload"]["settings"]["enableChatAgentActivity"],
+            false
+        );
 
         let persisted: Value = serde_json::from_slice(
             &tokio::fs::read(settings_path).await.expect("persisted settings"),
         )
         .expect("valid JSON");
-        assert_eq!(persisted["enableAgentActivity"], false);
+        assert_eq!(persisted["enableChatAgentActivity"], false);
 
         assert!(
             control
-                .update_settings(json!({"patch":{"enableAgentActivity":"false"}}))
+                .update_settings(json!({"patch":{"enableChatAgentActivity":"false"}}))
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn agent_activity_legacy_key_is_removed_on_the_next_persisted_settings_write() {
+        let temp = tempfile::tempdir().expect("control root");
+        let config = ServerConfig::new(temp.path());
+        let settings_path = config.state_dir().join("settings.json");
+        tokio::fs::create_dir_all(config.state_dir())
+            .await
+            .expect("state directory");
+        tokio::fs::write(&settings_path, br#"{"enableAgentActivity":false}"#)
+            .await
+            .expect("legacy settings");
+
+        let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
+        assert_eq!(
+            control.settings.read().await["enableChatAgentActivity"],
+            false
+        );
+        assert_eq!(
+            control.settings.read().await["enableTerminalAgentActivity"],
+            false
+        );
+
+        control
+            .update_settings(json!({"patch":{"terminalDefaultShell":"/bin/test-shell"}}))
+            .await
+            .expect("persist migrated settings");
+        let persisted: Value = serde_json::from_slice(
+            &tokio::fs::read(settings_path).await.expect("persisted settings"),
+        )
+        .expect("valid JSON");
+        assert!(persisted.get("enableAgentActivity").is_none());
+        assert_eq!(persisted["enableChatAgentActivity"], false);
+        assert_eq!(persisted["enableTerminalAgentActivity"], false);
+    }
+
+    #[tokio::test]
+    async fn agent_activity_malformed_legacy_value_is_rejected_before_normalization() {
+        let temp = tempfile::tempdir().expect("control root");
+        let config = ServerConfig::new(temp.path());
+        let settings_path = config.state_dir().join("settings.json");
+        tokio::fs::create_dir_all(config.state_dir())
+            .await
+            .expect("state directory");
+        tokio::fs::write(&settings_path, br#"{"enableAgentActivity":"false"}"#)
+            .await
+            .expect("malformed legacy settings");
+
+        let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
+        assert!(
+            control
+                .update_settings(json!({"patch":{"terminalDefaultShell":"/bin/test-shell"}}))
+                .await
+                .is_err()
+        );
+        let persisted: Value = serde_json::from_slice(
+            &tokio::fs::read(settings_path).await.expect("original settings"),
+        )
+        .expect("valid JSON");
+        assert_eq!(persisted["enableAgentActivity"], "false");
+        assert!(persisted.get("enableChatAgentActivity").is_none());
     }
 
     #[tokio::test]
@@ -2652,7 +2729,7 @@ mod tests {
             let control = control.clone();
             async move {
                 control
-                    .update_settings(json!({"patch":{"enableAgentActivity":false}}))
+                    .update_settings(json!({"patch":{"enableChatAgentActivity":false}}))
                     .await
             }
         });
@@ -2664,8 +2741,11 @@ mod tests {
                 .expect("settings persisted before transition"),
         )
         .expect("valid persisted settings");
-        assert_eq!(persisted["enableAgentActivity"], false);
-        assert_eq!(control.settings.read().await["enableAgentActivity"], true);
+        assert_eq!(persisted["enableChatAgentActivity"], false);
+        assert_eq!(
+            control.settings.read().await["enableChatAgentActivity"],
+            true
+        );
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(25), events.recv())
                 .await
@@ -2675,7 +2755,7 @@ mod tests {
         pause.wait().await;
 
         let updated = update.await.expect("update task").expect("settings update");
-        assert_eq!(updated["enableAgentActivity"], false);
+        assert_eq!(updated["enableChatAgentActivity"], false);
         assert_eq!(&*calls.lock().expect("handler calls"), &[(false, 1)]);
         assert_eq!(
             events.recv().await.expect("settings event")["type"],
@@ -2702,7 +2782,7 @@ mod tests {
 
         assert!(
             control
-                .update_settings(json!({"patch":{"enableAgentActivity":false}}))
+                .update_settings(json!({"patch":{"enableChatAgentActivity":false}}))
                 .await
                 .is_err()
         );
@@ -2739,7 +2819,7 @@ mod tests {
             let control = control.clone();
             async move {
                 control
-                    .update_settings(json!({"patch":{"enableAgentActivity":false}}))
+                    .update_settings(json!({"patch":{"enableChatAgentActivity":false}}))
                     .await
             }
         });
@@ -2772,7 +2852,7 @@ mod tests {
             .expect("disabled publication")
             .expect("settings event");
         assert_eq!(
-            disabled_event["payload"]["settings"]["enableAgentActivity"],
+            disabled_event["payload"]["settings"]["enableChatAgentActivity"],
             false
         );
         followup
@@ -2788,7 +2868,7 @@ mod tests {
                 .expect("disabled settings"),
         )
         .expect("valid disabled settings");
-        assert_eq!(persisted["enableAgentActivity"], false);
+        assert_eq!(persisted["enableChatAgentActivity"], false);
 
         while events.try_recv().is_ok() {}
         let enable_pause = runtime.pause_next_provider_transition();
@@ -2796,7 +2876,7 @@ mod tests {
             let control = control.clone();
             async move {
                 control
-                    .update_settings(json!({"patch":{"enableAgentActivity":true}}))
+                    .update_settings(json!({"patch":{"enableChatAgentActivity":true}}))
                     .await
             }
         });
@@ -2816,7 +2896,7 @@ mod tests {
             .expect("enabled publication")
             .expect("settings event");
         assert_eq!(
-            enabled_event["payload"]["settings"]["enableAgentActivity"],
+            enabled_event["payload"]["settings"]["enableChatAgentActivity"],
             true
         );
         assert!(control.agent_activity_enabled().await);
@@ -2828,7 +2908,7 @@ mod tests {
                 .expect("enabled settings"),
         )
         .expect("valid enabled settings");
-        assert_eq!(persisted["enableAgentActivity"], true);
+        assert_eq!(persisted["enableChatAgentActivity"], true);
         assert_eq!(
             &*calls.lock().expect("handler calls"),
             &[(false, 1), (true, 3)]
