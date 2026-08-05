@@ -2616,6 +2616,10 @@ describe("ChatView", () => {
 
       expect(markup).toContain('data-mock="center-panel-tabs"');
       expect(markup).toContain('data-mock="chat-header-actions"');
+      expect(markup).toContain("data-center-panel-header-row");
+      expect(markup).toContain(
+        "isolate flex min-w-0 flex-1 self-stretch items-center overflow-hidden",
+      );
       expect(markup).toContain('aria-label="Demo Thread workspace"');
       expect(markup.indexOf('data-mock="center-panel-tabs"')).toBeLessThan(
         markup.indexOf('data-mock="chat-header-actions"'),
@@ -2695,7 +2699,7 @@ describe("ChatView", () => {
       expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe("Codex");
     });
 
-    it("updates the host tab label when the selected provider changes", () => {
+    it("updates the pre-start host tab label when the selected provider changes", () => {
       const claudeInstanceId = ProviderInstanceId.make("claude");
       const claudeProvider: ServerProvider = {
         ...codexProvider,
@@ -2731,6 +2735,49 @@ describe("ChatView", () => {
       expect(
         useCenterPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)]?.surfaces,
       ).toEqual(initialSurfaces);
+    });
+
+    it("keeps a started host labeled from its bound provider despite stale composer selection", () => {
+      const claudeInstanceId = ProviderInstanceId.make("claude");
+      const claudeProvider: ServerProvider = {
+        ...codexProvider,
+        instanceId: claudeInstanceId,
+        driver: ProviderDriverKind.make("claude"),
+        displayName: "Claude",
+      };
+      seedEnvironment(
+        makeEnvironmentPresentation({
+          serverConfig: {
+            providers: [codexProvider, claudeProvider],
+            environment: { label: "Local" },
+          },
+        }),
+      );
+      seedProject(makeProject());
+      seedServerThread(
+        makeThread({
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "codex",
+            providerInstanceId: codexInstanceId,
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+        }),
+      );
+      useComposerDraftStore.getState().setModelSelection(threadRef, {
+        instanceId: claudeInstanceId,
+        model: "claude-sonnet",
+      });
+      publishSeededStoreState(useComposerDraftStore);
+      seedGitStatus(true);
+
+      renderServerRoute();
+
+      expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe("Codex");
     });
 
     it("keeps header actions aligned when every center surface is closed", () => {
