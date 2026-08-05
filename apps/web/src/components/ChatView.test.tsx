@@ -1181,6 +1181,99 @@ describe("ChatView", () => {
       }
     });
 
+    it("closes an Activity surface opened after its source is already disabled", async () => {
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      h.environmentSettingsById.set(environmentId, {
+        ...(h.settings as Record<string, unknown>),
+        enableChatAgentActivity: false,
+        enableTerminalAgentActivity: true,
+      });
+
+      const { container, root } = await mountActivityRoute();
+      try {
+        expect(
+          useRightPanelStore
+            .getState()
+            .byThreadKey[scopedThreadKey(threadRef)]?.surfaces.some(
+              (surface) => surface.kind === "activity",
+            ) ?? false,
+        ).toBe(false);
+
+        await act(async () => {
+          useRightPanelStore.getState().openActivity(threadRef, "subagents", { _tag: "thread" });
+          await Promise.resolve();
+        });
+
+        await vi.waitFor(() => {
+          expect(
+            useRightPanelStore
+              .getState()
+              .byThreadKey[scopedThreadKey(threadRef)]?.surfaces.some(
+                (surface) => surface.kind === "activity",
+              ) ?? false,
+          ).toBe(false);
+        });
+        expect(container.querySelector("[data-activity-panel]")).toBeNull();
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it("closes an inactive persisted Activity surface using its own disabled scope", async () => {
+      const terminalId = "terminal-inactive-activity";
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      h.environmentSettingsById.set(environmentId, {
+        ...(h.settings as Record<string, unknown>),
+        enableChatAgentActivity: true,
+        enableTerminalAgentActivity: true,
+      });
+      useRightPanelStore
+        .getState()
+        .openActivity(threadRef, "subagents", { _tag: "terminal", terminalId });
+      useRightPanelStore.getState().open(threadRef, "plan");
+
+      const { container, root } = await mountActivityRoute();
+      try {
+        const initialRightPanelState =
+          useRightPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)];
+        expect(initialRightPanelState?.activeSurfaceId).toBe("plan");
+        expect(initialRightPanelState?.surfaces).toEqual(
+          expect.arrayContaining([
+            expect.objectContaining({
+              kind: "activity",
+              scope: { _tag: "terminal", terminalId },
+            }),
+            expect.objectContaining({ kind: "plan" }),
+          ]),
+        );
+        expect(container.querySelector("[data-activity-panel]")).toBeNull();
+
+        await publishSettingsUpdated(environmentId, { enableTerminalAgentActivity: false });
+
+        await vi.waitFor(() => {
+          const nextRightPanelState =
+            useRightPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)];
+          expect(
+            nextRightPanelState?.surfaces.some((surface) => surface.kind === "activity") ?? false,
+          ).toBe(false);
+          expect(nextRightPanelState?.surfaces).toContainEqual(
+            expect.objectContaining({ kind: "plan" }),
+          );
+          expect(nextRightPanelState?.activeSurfaceId).toBe("plan");
+        });
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
     it.each([
       {
         name: "closes a thread surface when only chat activity is disabled",
