@@ -15,6 +15,13 @@ const harness = vi.hoisted(() => ({
   effects: [] as Array<() => void>,
   animationFrames: [] as FrameRequestCallback[],
   overflowState: false,
+  useSortable: vi.fn(() => ({
+    attributes: { "data-sortable": true },
+    listeners: {},
+    setActivatorNodeRef: vi.fn(),
+    setNodeRef: vi.fn(),
+    isDragging: false,
+  })),
 }));
 
 vi.mock("react", async (importOriginal) => {
@@ -52,6 +59,9 @@ vi.mock("~/components/ui/menu", () => ({
   DropdownMenuContent: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
   DropdownMenuItem: (props: React.ComponentProps<"button">) => <button {...props} />,
 }));
+vi.mock("@dnd-kit/sortable", () => ({
+  useSortable: harness.useSortable,
+}));
 
 import { CenterPanelTabs } from "./CenterPanelTabs";
 
@@ -82,15 +92,19 @@ type KeyboardEventStub = {
 
 function props(surfaces: CenterSurface[] = [host, chat, terminal]) {
   return {
+    groupId: "group-a",
     hostLabel: "Codex",
     surfaces,
     activeSurfaceId: chat.id,
     terminalLabelsById: new Map([["terminal-1", "Build terminal"]]),
+    canMoveToSplit: (_direction: string) => true,
+    dragInProgress: false,
     onActivate: vi.fn(),
     onCloseSurface: vi.fn(),
     onCloseOtherSurfaces: vi.fn(),
     onCloseSurfacesToRight: vi.fn(),
     onCloseAllSurfaces: vi.fn(),
+    onMoveToSplit: vi.fn(),
   };
 }
 
@@ -100,6 +114,12 @@ function visit(node: React.ReactNode, entries: ReactElement[] = []): ReactElemen
     return entries;
   }
   if (!React.isValidElement(node)) return entries;
+  if (typeof node.type === "function") {
+    entries.push(node);
+    const Component = node.type as unknown as (props: unknown) => React.ReactNode;
+    visit(Component(node.props), entries);
+    return entries;
+  }
   entries.push(node);
   visit((node.props as { children?: React.ReactNode }).children, entries);
   const render = (node.props as { render?: React.ReactNode }).render;
@@ -113,6 +133,7 @@ beforeEach(() => {
   harness.effects.length = 0;
   harness.animationFrames.length = 0;
   harness.overflowState = false;
+  harness.useSortable.mockClear();
   vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
     harness.animationFrames.push(callback);
     return harness.animationFrames.length;
@@ -136,6 +157,18 @@ describe("CenterPanelTabs", () => {
     expect(markup).toContain("Claude");
     expect(markup).toContain("Codex Terminal");
     expect(markup).not.toContain("Build terminal");
+    expect(harness.useSortable).toHaveBeenCalledWith(
+      expect.objectContaining({
+        id: chat.id,
+        data: expect.objectContaining({
+          type: "center-panel-tab",
+          surfaceId: chat.id,
+          groupId: "group-a",
+          surfaceKind: "chat",
+          title: "Claude",
+        }),
+      }),
+    );
     expect(scrollIntoView).toHaveBeenCalledWith({ block: "nearest", inline: "nearest" });
 
     const { terminalLabelsById: _terminalLabelsById, ...unlabeledProps } = props([
@@ -147,8 +180,12 @@ describe("CenterPanelTabs", () => {
     expect(unlabeled).toContain("Terminal 1");
   });
 
-  it("returns null for an empty surface collection", () => {
-    expect(CenterPanelTabs(props([]))).toBeNull();
+  it("keeps an accessible tablist and empty state when a pane has no surfaces", () => {
+    const markup = renderToStaticMarkup(<CenterPanelTabs {...props([])} />);
+
+    expect(markup).toContain('role="tablist"');
+    expect(markup).toContain('aria-label="Workspace panels"');
+    expect(markup).toContain("No chat panels open");
   });
 
   it("translates vertical wheel input only when the tab viewport overflows", () => {
@@ -212,7 +249,7 @@ describe("CenterPanelTabs", () => {
     (activeButton.props as { onKeyDown: (event: KeyboardEventStub) => void }).onKeyDown(event);
 
     expect(event.preventDefault).toHaveBeenCalledOnce();
-    expect(input.onActivate).toHaveBeenCalledWith(terminal);
+    expect(input.onActivate).toHaveBeenCalledWith("group-a", terminal);
     expect(activationButtons[2]?.focus).not.toHaveBeenCalled();
     expect(harness.animationFrames).toHaveLength(1);
     const firstFrame = harness.animationFrames.splice(0);
@@ -298,7 +335,7 @@ describe("CenterPanelTabs", () => {
     expect(terminalJump).toBeDefined();
     if (!terminalJump) throw new Error("All tabs terminal item not found");
     (terminalJump.props as { onClick: () => void }).onClick();
-    expect(input.onActivate).toHaveBeenCalledWith(terminal);
+    expect(input.onActivate).toHaveBeenCalledWith("group-a", terminal);
     const frames = harness.animationFrames.splice(0);
     for (const callback of frames) callback(0);
     expect(activationButtons[2]?.scrollIntoView).toHaveBeenCalledWith({
@@ -361,6 +398,25 @@ describe("CenterPanelTabs", () => {
     expect(focusedElement).toBe("terminal");
   });
 
+  it("does not activate a tab while a drag is in progress", () => {
+    harness.refCurrent = {
+      querySelector: vi.fn(() => ({ scrollIntoView: vi.fn() })),
+      querySelectorAll: vi.fn(),
+    };
+    const input = { ...props(), dragInProgress: true };
+    const tree = CenterPanelTabs(input);
+    const activeButton = visit(tree).find(
+      (element) =>
+        element.type === "button" &&
+        (element.props as Record<string, unknown>)["aria-selected"] === true,
+    );
+    if (!activeButton) throw new Error("Active tab button not found");
+
+    (activeButton.props as { onClick: () => void }).onClick();
+
+    expect(input.onActivate).not.toHaveBeenCalled();
+  });
+
   it("handles activation, close buttons, middle click, and context-menu actions", async () => {
     const surfaces: CenterSurface[] = [host, chat, terminal];
     const input = props(surfaces);
@@ -373,6 +429,9 @@ describe("CenterPanelTabs", () => {
     );
     if (!chatTab) throw new Error("Active chat tab not found");
     const tabProps = chatTab.props as Record<string, unknown>;
+    expect(tabProps["data-center-panel-tab-id"]).toBe(chat.id);
+    expect(tabProps["data-center-panel-group-id"]).toBe("group-a");
+    expect(tabProps.style).toBeUndefined();
 
     const mouseEvent = (button: number) => ({
       button,
@@ -393,7 +452,7 @@ describe("CenterPanelTabs", () => {
     expect(input.onCloseSurface).not.toHaveBeenCalled();
     const middleAux = mouseEvent(1);
     (tabProps.onAuxClick as (event: unknown) => void)(middleAux);
-    expect(input.onCloseSurface).toHaveBeenCalledWith(chat);
+    expect(input.onCloseSurface).toHaveBeenCalledWith("group-a", chat);
     expect(middleAux.stopPropagation).toHaveBeenCalled();
 
     const chatElements = visit(chatTab, []);
@@ -404,15 +463,20 @@ describe("CenterPanelTabs", () => {
     );
     if (!activate) throw new Error("Activate button not found");
     (activate.props as { onClick: () => void }).onClick();
-    expect(input.onActivate).toHaveBeenCalledWith(chat);
+    expect(input.onActivate).toHaveBeenCalledWith("group-a", chat);
     const close = chatElements.find(
       (element) =>
         element.type === "button" &&
         (element.props as Record<string, unknown>)["aria-label"] === "Close Claude",
     );
     if (!close) throw new Error("Close button not found");
+    const closePointerDown = mouseEvent(0);
+    (close.props as { onPointerDown: (event: typeof closePointerDown) => void }).onPointerDown(
+      closePointerDown,
+    );
+    expect(closePointerDown.stopPropagation).toHaveBeenCalledOnce();
     (close.props as { onClick: () => void }).onClick();
-    expect(input.onCloseSurface).toHaveBeenCalledWith(chat);
+    expect(input.onCloseSurface).toHaveBeenCalledWith("group-a", chat);
 
     const contextEvent = mouseEvent(0);
     await (tabProps.onContextMenu as (event: unknown) => Promise<void>)(contextEvent);
@@ -430,13 +494,68 @@ describe("CenterPanelTabs", () => {
     ] as const) {
       show.mockResolvedValueOnce(action);
       await (tabProps.onContextMenu as (event: unknown) => Promise<void>)(mouseEvent(0));
-      if (action === "close-all") expect(callback).toHaveBeenCalledWith();
-      else if (action !== null) expect(callback).toHaveBeenCalledWith(chat);
+      if (action === "close-all") expect(callback).toHaveBeenCalledWith("group-a");
+      else if (action !== null) expect(callback).toHaveBeenCalledWith("group-a", chat);
     }
     expect(show).toHaveBeenCalledWith(
       expect.arrayContaining([
+        expect.objectContaining({
+          id: "move-to-split",
+          label: "Move Tab to Split",
+          disabled: false,
+          children: [
+            { id: "move-to-split:left", label: "Left", disabled: false },
+            { id: "move-to-split:right", label: "Right", disabled: false },
+            { id: "move-to-split:up", label: "Up", disabled: false },
+            { id: "move-to-split:down", label: "Down", disabled: false },
+          ],
+        }),
         expect.objectContaining({ id: "close-others", disabled: false }),
         expect.objectContaining({ id: "close-to-right", disabled: false }),
+      ]),
+      { x: 10, y: 20 },
+    );
+
+    show.mockResolvedValueOnce("move-to-split:down");
+    await (tabProps.onContextMenu as (event: unknown) => Promise<void>)(mouseEvent(0));
+    expect(input.onMoveToSplit).toHaveBeenCalledWith("group-a", chat, "down");
+
+    input.canMoveToSplit = (direction: string) => direction === "left";
+    show.mockClear();
+    show.mockResolvedValueOnce(null);
+    await (tabProps.onContextMenu as (event: unknown) => Promise<void>)(mouseEvent(0));
+    expect(show).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "move-to-split",
+          disabled: false,
+          children: [
+            { id: "move-to-split:left", label: "Left", disabled: false },
+            { id: "move-to-split:right", label: "Right", disabled: true },
+            { id: "move-to-split:up", label: "Up", disabled: true },
+            { id: "move-to-split:down", label: "Down", disabled: true },
+          ],
+        }),
+      ]),
+      { x: 10, y: 20 },
+    );
+
+    input.canMoveToSplit = () => false;
+    show.mockClear();
+    show.mockResolvedValueOnce(null);
+    await (tabProps.onContextMenu as (event: unknown) => Promise<void>)(mouseEvent(0));
+    expect(show).toHaveBeenCalledWith(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "move-to-split",
+          disabled: true,
+          children: [
+            { id: "move-to-split:left", label: "Left", disabled: true },
+            { id: "move-to-split:right", label: "Right", disabled: true },
+            { id: "move-to-split:up", label: "Up", disabled: true },
+            { id: "move-to-split:down", label: "Down", disabled: true },
+          ],
+        }),
       ]),
       { x: 10, y: 20 },
     );

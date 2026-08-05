@@ -14,7 +14,8 @@ const h = vi.hoisted(() => ({
   closeOtherSurfaces: vi.fn(),
   closeSurfacesToRight: vi.fn(),
   closeAllSurfaces: vi.fn(),
-  surfaces: [] as unknown[],
+  dropSurface: vi.fn(),
+  mergeGroup: vi.fn(),
 }));
 
 vi.mock("react", () => ({
@@ -33,10 +34,8 @@ vi.mock("~/components/ui/toast", () => ({
 
 vi.mock("~/centerPanelStore", () => ({
   HOST_SURFACE_ID: "host",
-  selectThreadCenterPanelState: () => ({ surfaces: h.surfaces }),
   useCenterPanelStore: {
     getState: () => ({
-      byThreadKey: {},
       openChatPanel: h.openChatPanel,
       openTerminalPanel: h.openTerminalPanel,
       activateSurface: h.activateSurface,
@@ -44,6 +43,8 @@ vi.mock("~/centerPanelStore", () => ({
       closeOtherSurfaces: h.closeOtherSurfaces,
       closeSurfacesToRight: h.closeSurfacesToRight,
       closeAllSurfaces: h.closeAllSurfaces,
+      dropSurface: h.dropSurface,
+      mergeGroup: h.mergeGroup,
     }),
   },
 }));
@@ -61,17 +62,19 @@ vi.mock("~/state/use-atom-command", () => ({
 }));
 
 import { useCenterPanelActions } from "./centerPanelActions";
+import { useCenterPanelStore } from "~/centerPanelStore";
 
 const hostRef = {
   environmentId: EnvironmentId.make("environment-1"),
   threadId: ThreadId.make("host-thread"),
 };
 
+const onCloseTerminal = vi.fn();
+
 beforeEach(() => {
   vi.clearAllMocks();
   h.createResult = { _tag: "Success", value: undefined };
   h.deleteResults = [];
-  h.surfaces = [];
   h.createThread.mockImplementation(() => Promise.resolve(h.createResult));
   h.deleteThread.mockImplementation(() =>
     Promise.resolve(h.deleteResults.shift() ?? { _tag: "Success", value: undefined }),
@@ -84,7 +87,7 @@ afterEach(() => {
 
 describe("center panel actions", () => {
   it("creates chat panels with the resolved selection and copied workspace values", async () => {
-    const actions = useCenterPanelActions();
+    const actions = useCenterPanelActions({ onCloseTerminal });
     const modelSelection = {
       instanceId: ProviderInstanceId.make("codex"),
       model: "gpt-5.4",
@@ -133,7 +136,7 @@ describe("center panel actions", () => {
   });
 
   it("returns null for interrupted creation and reports typed and untyped failures", async () => {
-    const actions = useCenterPanelActions();
+    const actions = useCenterPanelActions({ onCloseTerminal });
     const input = {
       hostRef,
       projectId: ProjectId.make("project-1"),
@@ -161,8 +164,8 @@ describe("center panel actions", () => {
     );
   });
 
-  it("opens, activates, and closes individual surfaces", async () => {
-    const actions = useCenterPanelActions();
+  it("opens, activates, and closes individual surfaces within the selected group", async () => {
+    const actions = useCenterPanelActions({ onCloseTerminal });
     const options = {
       label: "Codex Terminal",
       command: {
@@ -174,56 +177,95 @@ describe("center panel actions", () => {
     expect(actions.openTerminalPanel(hostRef, ["term-1", "term-3"], options)).toBe("term-2");
     expect(h.openTerminalPanel).toHaveBeenCalledWith(hostRef, "term-2", options);
 
-    actions.activateSurface(hostRef, "terminal:term-2");
-    expect(h.activateSurface).toHaveBeenCalledWith(hostRef, "terminal:term-2");
+    actions.activateSurface(hostRef, "group-left", "terminal:term-2");
+    expect(h.activateSurface).toHaveBeenCalledWith(hostRef, "group-left", "terminal:term-2");
 
-    actions.closeSurface(hostRef, { id: "terminal:term-2", kind: "terminal" } as never);
+    const terminal = {
+      id: "terminal:term-2",
+      kind: "terminal",
+      terminalId: "term-2",
+    } as const;
+    h.closeSurface.mockReturnValueOnce([terminal]);
+    actions.closeSurface(hostRef, "group-left", terminal);
     expect(h.deleteThread).not.toHaveBeenCalled();
+    expect(onCloseTerminal).toHaveBeenCalledWith(hostRef, terminal);
 
-    actions.closeSurface(hostRef, {
+    const chat = {
       id: "chat:panel-1",
       kind: "chat",
       threadId: ThreadId.make("panel-1"),
-    } as never);
+    } as const;
+    h.closeSurface.mockReturnValueOnce([chat]);
+    actions.closeSurface(hostRef, "group-left", chat);
     await Promise.resolve();
-    expect(h.closeSurface).toHaveBeenCalledTimes(2);
+    expect(h.closeSurface).toHaveBeenLastCalledWith(hostRef, "group-left", chat.id);
     expect(h.deleteThread).toHaveBeenCalledOnce();
   });
 
-  it("deletes dropped chat threads for other, right, and all close operations", async () => {
-    const chatOne = {
+  it("cleans up only the exact surfaces removed from the selected group", async () => {
+    const chatSurface = {
       id: "chat:panel-1",
       kind: "chat",
       threadId: ThreadId.make("panel-1"),
-    };
-    const terminal = { id: "terminal:term-1", kind: "terminal" };
-    const chatTwo = {
+    } as const;
+    const removedChat = {
       id: "chat:panel-2",
       kind: "chat",
       threadId: ThreadId.make("panel-2"),
-    };
-    h.surfaces = [{ id: "host", kind: "host" }, chatOne, terminal, chatTwo];
-    const actions = useCenterPanelActions();
+    } as const;
+    const removedTerminal = {
+      id: "terminal:term-1",
+      kind: "terminal",
+      terminalId: "term-1",
+    } as const;
+    const terminalInOtherGroup = {
+      id: "terminal:term-2",
+      kind: "terminal",
+      terminalId: "term-2",
+    } as const;
+    h.closeOtherSurfaces.mockReturnValueOnce([removedChat, removedTerminal]);
+    const actions = useCenterPanelActions({ onCloseTerminal });
 
-    actions.closeOtherSurfaces(hostRef, chatOne as never);
+    actions.closeOtherSurfaces(hostRef, "group-right", chatSurface);
     await Promise.resolve();
     expect(h.deleteThread).toHaveBeenCalledWith({
       environmentId: hostRef.environmentId,
-      input: { threadId: "panel-2" },
+      input: { threadId: removedChat.threadId },
     });
+    expect(onCloseTerminal).toHaveBeenCalledWith(hostRef, removedTerminal);
+    expect(onCloseTerminal).not.toHaveBeenCalledWith(hostRef, terminalInOtherGroup);
 
     h.deleteThread.mockClear();
-    actions.closeSurfacesToRight(hostRef, terminal as never);
+    h.closeSurfacesToRight.mockReturnValueOnce([removedChat]);
+    actions.closeSurfacesToRight(hostRef, "group-right", chatSurface);
     await Promise.resolve();
     expect(h.deleteThread).toHaveBeenCalledOnce();
 
     h.deleteThread.mockClear();
-    actions.closeSurfacesToRight(hostRef, { id: "missing", kind: "terminal" } as never);
+    h.closeSurfacesToRight.mockReturnValueOnce([]);
+    actions.closeSurfacesToRight(hostRef, "group-right", terminalInOtherGroup);
     expect(h.deleteThread).not.toHaveBeenCalled();
 
-    actions.closeAllSurfaces(hostRef);
+    h.closeAllSurfaces.mockReturnValueOnce([chatSurface, removedChat]);
+    actions.closeAllSurfaces(hostRef, "group-right");
     await Promise.resolve();
     expect(h.deleteThread).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not clean up surfaces during layout-only drop and merge operations", () => {
+    const terminal = {
+      id: "terminal:term-1",
+      kind: "terminal",
+      terminalId: "term-1",
+    } as const;
+    useCenterPanelStore.getState().dropSurface(hostRef, terminal.id, {
+      groupId: "group-right",
+      index: 0,
+    });
+    useCenterPanelStore.getState().mergeGroup(hostRef, "group-right");
+
+    expect(h.deleteThread).not.toHaveBeenCalled();
+    expect(onCloseTerminal).not.toHaveBeenCalled();
   });
 
   it("reports non-interrupted panel deletion failures", async () => {
@@ -232,16 +274,17 @@ describe("center panel actions", () => {
       { _tag: "Failure", cause: new Error("delete failed") },
       { _tag: "Failure", cause: "unknown" },
     ];
-    const actions = useCenterPanelActions();
+    const actions = useCenterPanelActions({ onCloseTerminal });
     const surface = {
       id: "chat:panel-1",
       kind: "chat",
       threadId: ThreadId.make("panel-1"),
     } as never;
 
-    actions.closeSurface(hostRef, surface);
-    actions.closeSurface(hostRef, surface);
-    actions.closeSurface(hostRef, surface);
+    h.closeSurface.mockReturnValue([surface]);
+    actions.closeSurface(hostRef, "group-left", surface);
+    actions.closeSurface(hostRef, "group-left", surface);
+    actions.closeSurface(hostRef, "group-left", surface);
     await Promise.resolve();
     await Promise.resolve();
 

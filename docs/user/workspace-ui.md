@@ -32,8 +32,10 @@ delete worktree for worktree rows and remove project for primary rows.
 
 ## Center Panel
 
-The active thread's main chat is always the first center tab and cannot be
-closed. The chat header `+` menu contains:
+The active thread's main chat starts as the first center tab. It can be reordered,
+moved between split panes, or closed from the center layout without deleting the
+thread. While present, it remains mounted throughout layout and tab changes. The
+chat header `+` menu contains:
 
 - enabled AI providers, which create new chat panels
 - Open Terminal, which creates a shell terminal panel in the current worktree
@@ -48,6 +50,17 @@ panel and are deleted when their tab closes.
 
 Tabs persist across reloads. The host chat remains mounted while another center
 tab is active, so its transcript, scroll state, and composer state are preserved.
+
+Center tabs can be arranged into as many as four visible split panes. Drag a tab
+within its strip to reorder it, into another pane to move it, or onto a pane edge
+to create a left, right, upper, or lower split. The tab context menu offers the
+same four moves. Each pane has its own active tab; the focused pane owns the
+center creation actions, so new chats and terminals open there.
+
+Drag pane dividers to resize them. Layout, focus, tab order, and split ratios
+persist across reloads. Closing a split pane merges its tabs into the adjacent
+layout without closing chats or terminals. Explicit tab close commands remain
+pane-local and do close their underlying panel thread or terminal session.
 
 ## Right Panel
 
