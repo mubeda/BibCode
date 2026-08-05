@@ -1863,6 +1863,14 @@ function ChatViewContent(props: ChatViewProps) {
   const activeRightPanelSurface = useRightPanelStore((state) =>
     selectActiveRightPanelSurface(state.byThreadKey, activeThreadRef),
   );
+  const persistedActivitySurface =
+    rightPanelState.surfaces.find((surface) => surface.kind === "activity") ?? null;
+  const persistedActivitySurfaceId = persistedActivitySurface?.id ?? null;
+  const persistedActivityScopeTag = persistedActivitySurface?.scope._tag ?? null;
+  const persistedActivityTerminalId =
+    persistedActivitySurface?.scope._tag === "terminal"
+      ? persistedActivitySurface.scope.terminalId
+      : null;
   const activeActivitySurface =
     activeRightPanelSurface?.kind === "activity" ? activeRightPanelSurface : null;
   const activityScope = useMemo(
@@ -1886,14 +1894,22 @@ function ChatViewContent(props: ChatViewProps) {
     [activeThreadRef, activityScope, activityScopeEnabled, isPanel, siblingChatOwnsCenter],
   );
   useEffect(() => {
-    if (activeThreadRef === null) return;
-    const threadState = selectThreadRightPanelState(
-      useRightPanelStore.getState().byThreadKey,
-      activeThreadRef,
-    );
-    const activitySurface = threadState.surfaces.find((surface) => surface.kind === "activity");
-    if (activitySurface === undefined) return;
-    const persistedScope = resolveActivityScope(activeThreadRef, activitySurface.scope);
+    if (
+      activeThreadRef === null ||
+      persistedActivitySurfaceId === null ||
+      persistedActivityScopeTag === null
+    ) {
+      return;
+    }
+    const persistedScope =
+      persistedActivityScopeTag === "terminal"
+        ? persistedActivityTerminalId === null
+          ? null
+          : resolveActivityScope(activeThreadRef, {
+              _tag: "terminal",
+              terminalId: persistedActivityTerminalId,
+            })
+        : resolveActivityScope(activeThreadRef, { _tag: "thread" });
     if (
       persistedScope !== null &&
       !isAgentActivityScopeEnabled(persistedScope, {
@@ -1901,9 +1917,16 @@ function ChatViewContent(props: ChatViewProps) {
         enableTerminalAgentActivity,
       })
     ) {
-      useRightPanelStore.getState().closeSurface(activeThreadRef, activitySurface.id);
+      useRightPanelStore.getState().closeSurface(activeThreadRef, persistedActivitySurfaceId);
     }
-  }, [activeThreadRef, enableChatAgentActivity, enableTerminalAgentActivity]);
+  }, [
+    activeThreadRef,
+    enableChatAgentActivity,
+    enableTerminalAgentActivity,
+    persistedActivityScopeTag,
+    persistedActivitySurfaceId,
+    persistedActivityTerminalId,
+  ]);
   const panelActivitySurfaceOpen =
     isPanel &&
     rightPanelState.isOpen &&
