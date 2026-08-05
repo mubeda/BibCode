@@ -859,7 +859,7 @@ function composerHandle(overrides: Partial<ChatComposerHandle> = {}): ChatCompos
     isModelPickerOpen: () => false,
     readSnapshot: () => ({ value: "", cursor: 0, expandedCursor: 0, terminalContextIds: [] }),
     resetCursorState: () => undefined,
-    addTerminalContext: () => undefined,
+    addTerminalContext: () => false,
     getSendContext: () => ({
       prompt: "",
       attachments: [],
@@ -2169,6 +2169,7 @@ describe("ChatView persistent terminal drawer", () => {
     installComposerHandle({
       addTerminalContext: (selection: TerminalContextSelection) => {
         selections.push(selection);
+        return true;
       },
     });
     const selection: TerminalContextSelection = {

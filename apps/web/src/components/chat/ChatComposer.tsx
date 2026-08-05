@@ -462,7 +462,7 @@ export interface ChatComposerHandle {
     detectTrigger?: boolean;
   }) => void;
   /** Insert a terminal context from the terminal drawer. */
-  addTerminalContext: (selection: TerminalContextSelection) => void;
+  addTerminalContext: (selection: TerminalContextSelection) => boolean;
   /** Get the current prompt/effort/model state for use in send. */
   getSendContext: () => {
     prompt: string;
@@ -677,6 +677,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     setThreadError,
     onExpandImage,
   } = props;
+  const isProviderBindingConflicted = providerBindingConflictReason !== null;
 
   // ------------------------------------------------------------------
   // Store subscriptions (prompt / attachments / terminal contexts)
@@ -854,6 +855,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   }, []);
   const commitComposerModelOptions = useCallback(
     async (nextOptions: ModelSelection["options"]) => {
+      if (isProviderBindingConflicted) return;
       const commitKey = `${selectedProvider}:${selectedInstanceId}:${selectedModel}`;
       const selection = createModelSelection(selectedInstanceId, selectedModel, nextOptions);
       if (routeKind === "server") {
@@ -868,6 +870,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     },
     [
       composerDraftTarget,
+      isProviderBindingConflicted,
       onCommitModelSelection,
       routeKind,
       selectedInstanceId,
@@ -1095,6 +1098,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // ------------------------------------------------------------------
   const setPromptFromTraits = useCallback(
     (nextPrompt: string) => {
+      if (isProviderBindingConflicted) return;
       if (nextPrompt === promptRef.current) {
         scheduleComposerFocus();
         return;
@@ -1116,13 +1120,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       composerCapabilities,
       composerDraftTarget,
       composerInlineTokenContext,
+      isProviderBindingConflicted,
       promptRef,
       scheduleComposerFocus,
       setComposerDraftPrompt,
     ],
   );
 
-  const composerTraitControls = renderComposerTraitControls({
+  const renderedComposerTraitControls = renderComposerTraitControls({
     provider: selectedProvider,
     instanceId: selectedInstanceId,
     ...(routeKind === "server" ? { threadRef: routeThreadRef } : {}),
@@ -1135,6 +1140,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     onPromptChange: setPromptFromTraits,
     onModelOptionsChange: commitComposerModelOptions,
   });
+  const composerTraitControls = isProviderBindingConflicted ? null : renderedComposerTraitControls;
   const pendingPrimaryAction = useMemo(
     () =>
       activePendingProgress
@@ -1149,7 +1155,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     [activePendingIsResponding, activePendingProgress, activePendingResolvedAnswers],
   );
   const collapsedComposerPrimaryActionDisabled =
-    providerBindingConflictReason !== null ||
+    isProviderBindingConflicted ||
     phase === "running" ||
     isSendBusy ||
     isConnecting ||
@@ -1163,9 +1169,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // ------------------------------------------------------------------
   const setPrompt = useCallback(
     (nextPrompt: string) => {
+      if (isProviderBindingConflicted) return;
       setComposerDraftPrompt(composerDraftTarget, nextPrompt);
     },
-    [composerDraftTarget, setComposerDraftPrompt],
+    [composerDraftTarget, isProviderBindingConflicted, setComposerDraftPrompt],
   );
 
   const addComposerAttachmentsToDraft = useCallback(
@@ -1179,13 +1186,15 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
   const removeComposerAttachmentFromDraft = useCallback(
     (attachmentId: string) => {
+      if (isProviderBindingConflicted) return;
       removeComposerDraftAttachment(composerDraftTarget, attachmentId);
     },
-    [composerDraftTarget, removeComposerDraftAttachment],
+    [composerDraftTarget, isProviderBindingConflicted, removeComposerDraftAttachment],
   );
 
   const removeComposerTerminalContextFromDraft = useCallback(
     (contextId: string) => {
+      if (isProviderBindingConflicted) return;
       const contextIndex = composerTerminalContexts.findIndex(
         (context) => context.id === contextId,
       );
@@ -1209,6 +1218,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       composerCapabilities,
       composerInlineTokenContext,
       composerTerminalContexts,
+      isProviderBindingConflicted,
       promptRef,
       removeComposerDraftTerminalContext,
       setPrompt,
@@ -1485,6 +1495,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       cursorAdjacentToMention: boolean,
       terminalContextIds: string[],
     ) => {
+      if (isProviderBindingConflicted) return;
       if (activePendingProgress?.activeQuestion && pendingUserInputs.length > 0) {
         setComposerCursor(nextCursor);
         setComposerTrigger(
@@ -1525,6 +1536,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       setPrompt,
       composerDraftTarget,
       composerTerminalContexts,
+      isProviderBindingConflicted,
       setComposerDraftTerminalContexts,
     ],
   );
@@ -1539,6 +1551,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       replacement: string,
       options?: { expectedText?: string; focusEditorAfterReplace?: boolean },
     ): boolean => {
+      if (isProviderBindingConflicted) return false;
       const currentText = promptRef.current;
       const safeStart = Math.max(0, Math.min(currentText.length, rangeStart));
       const safeEnd = Math.max(safeStart, Math.min(currentText.length, rangeEnd));
@@ -1588,6 +1601,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       activePendingUserInput,
       composerCapabilities,
       composerInlineTokenContext,
+      isProviderBindingConflicted,
       onChangeActivePendingUserInputCustomAnswer,
       promptRef,
       setPrompt,
@@ -1759,7 +1773,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
 
   const submitComposer = useCallback(
     (event?: { preventDefault: () => void }) => {
-      if (providerBindingConflictReason !== null) {
+      if (isProviderBindingConflicted) {
         event?.preventDefault();
         return;
       }
@@ -1787,9 +1801,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       applyPromptReplacement,
       blurMobileComposerAfterSend,
       executeBiBCodeAction,
+      isProviderBindingConflicted,
       onSend,
       promptRef,
-      providerBindingConflictReason,
       shouldBlurMobileComposerOnSubmit,
     ],
   );
@@ -1823,6 +1837,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     key: "ArrowDown" | "ArrowUp" | "Enter" | "Tab",
     event: KeyboardEvent,
   ) => {
+    if (isProviderBindingConflicted) return true;
     if (key === "Tab" && event.shiftKey) {
       toggleInteractionMode();
       return true;
@@ -1856,6 +1871,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   // Callbacks: attachments
   // ------------------------------------------------------------------
   const addComposerAttachments = (files: File[]) => {
+    if (isProviderBindingConflicted) return;
     if (!activeThreadId || files.length === 0) return;
     if (isComposerApprovalState || pendingUserInputs.length > 0) {
       toastManager.add({
@@ -1914,7 +1930,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   };
 
   const onComposerFileInputChange = (event: React.ChangeEvent<HTMLInputElement>) => {
-    addComposerAttachments(Array.from(event.currentTarget.files ?? []));
+    if (!isProviderBindingConflicted) {
+      addComposerAttachments(Array.from(event.currentTarget.files ?? []));
+    }
     event.currentTarget.value = "";
   };
 
@@ -1925,12 +1943,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     const files = Array.from(event.clipboardData.files);
     if (files.length === 0) return;
     event.preventDefault();
+    if (isProviderBindingConflicted) return;
     addComposerAttachments(files);
   };
 
   const onComposerDragEnter = (event: React.DragEvent<HTMLDivElement>) => {
     if (!event.dataTransfer.types.includes("Files")) return;
     event.preventDefault();
+    if (isProviderBindingConflicted) return;
     dragDepthRef.current += 1;
     setIsDragOverComposer(true);
   };
@@ -1938,6 +1958,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const onComposerDragOver = (event: React.DragEvent<HTMLDivElement>) => {
     if (!event.dataTransfer.types.includes("Files")) return;
     event.preventDefault();
+    if (isProviderBindingConflicted) {
+      event.dataTransfer.dropEffect = "none";
+      return;
+    }
     event.dataTransfer.dropEffect = "copy";
     setIsDragOverComposer(true);
   };
@@ -1945,6 +1969,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   const onComposerDragLeave = (event: React.DragEvent<HTMLDivElement>) => {
     if (!event.dataTransfer.types.includes("Files")) return;
     event.preventDefault();
+    if (isProviderBindingConflicted) return;
     const nextTarget = event.relatedTarget;
     if (nextTarget instanceof Node && event.currentTarget.contains(nextTarget)) return;
     dragDepthRef.current = Math.max(0, dragDepthRef.current - 1);
@@ -1958,6 +1983,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     event.preventDefault();
     dragDepthRef.current = 0;
     setIsDragOverComposer(false);
+    if (isProviderBindingConflicted) return;
     const files = Array.from(event.dataTransfer.files);
     addComposerAttachments(files);
     focusComposer();
@@ -2029,7 +2055,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         if (
           text.length === 0 ||
           isConnecting ||
-          providerBindingConflictReason !== null ||
+          isProviderBindingConflicted ||
           isComposerApprovalState ||
           pendingUserInputs.length > 0 ||
           (environmentUnavailable !== null && activePendingProgress === null)
@@ -2040,11 +2066,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         return applyPromptReplacement(rangeEnd, rangeEnd, text);
       },
       openModelPicker: () => {
-        if (providerBindingConflictReason !== null) return;
+        if (isProviderBindingConflicted) return;
         setIsComposerModelPickerOpen(true);
       },
       toggleModelPicker: () => {
-        if (providerBindingConflictReason !== null) return;
+        if (isProviderBindingConflicted) return;
         setIsComposerModelPickerOpen((open) => !open);
       },
       isModelPickerOpen: () => isComposerModelPickerOpen,
@@ -2076,7 +2102,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         );
       },
       addTerminalContext: (selection: TerminalContextSelection) => {
-        if (!activeThread) return;
+        if (isProviderBindingConflicted || !activeThread) return false;
         const snapshot = composerEditorRef.current?.readSnapshot() ?? {
           value: promptRef.current,
           cursor: composerCursor,
@@ -2107,7 +2133,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
           },
           insertion.contextIndex,
         );
-        if (!inserted) return;
+        if (!inserted) return false;
         promptRef.current = insertion.prompt;
         setComposerCursor(nextCollapsedCursor);
         setComposerTrigger(
@@ -2116,6 +2142,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         window.requestAnimationFrame(() => {
           composerEditorRef.current?.focusAt(nextCollapsedCursor);
         });
+        return true;
       },
       getSendContext: () => ({
         prompt: promptRef.current,
@@ -2148,7 +2175,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
       composerReviewComments,
       isConnecting,
       isComposerApprovalState,
-      providerBindingConflictReason,
+      isProviderBindingConflicted,
       pendingUserInputs.length,
       environmentUnavailable,
       activePendingProgress,
@@ -2179,9 +2206,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         multiple
         hidden
         disabled={
-          providerBindingConflictReason !== null ||
-          isComposerApprovalState ||
-          pendingUserInputs.length > 0
+          isProviderBindingConflicted || isComposerApprovalState || pendingUserInputs.length > 0
         }
         onChange={onComposerFileInputChange}
       />
@@ -2399,9 +2424,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 <ComposerPreviewAnnotationCards
                   annotations={composerPreviewAnnotations}
                   images={composerImages}
-                  onRemove={(annotationId) =>
-                    removeComposerDraftPreviewAnnotation(composerDraftTarget, annotationId)
-                  }
+                  onRemove={(annotationId) => {
+                    if (isProviderBindingConflicted) return;
+                    removeComposerDraftPreviewAnnotation(composerDraftTarget, annotationId);
+                  }}
                   onExpandImage={(imageId) => {
                     const preview = buildExpandedImagePreview(composerImages, imageId);
                     if (preview) onExpandImage(preview);
@@ -2416,9 +2442,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
               composerReviewComments.length > 0 && (
                 <ComposerPendingReviewComments
                   comments={composerReviewComments}
-                  onRemove={(commentId) =>
-                    removeComposerDraftReviewComment(composerDraftTarget, commentId)
-                  }
+                  onRemove={(commentId) => {
+                    if (isProviderBindingConflicted) return;
+                    removeComposerDraftReviewComment(composerDraftTarget, commentId);
+                  }}
                   className="mb-3"
                 />
               )}
@@ -2429,9 +2456,10 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
               composerElementContexts.length > 0 && (
                 <ComposerPendingElementContexts
                   contexts={composerElementContexts}
-                  onRemove={(contextId) =>
-                    removeComposerDraftElementContext(composerDraftTarget, contextId)
-                  }
+                  onRemove={(contextId) => {
+                    if (isProviderBindingConflicted) return;
+                    removeComposerDraftElementContext(composerDraftTarget, contextId);
+                  }}
                   className="mb-3"
                 />
               )}
@@ -2512,6 +2540,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                             className="absolute right-1 top-1 bg-background/80 hover:bg-background/90"
                             onClick={() => removeComposerAttachment(attachment.id)}
                             aria-label={`Remove ${attachment.name}`}
+                            disabled={isProviderBindingConflicted}
                           >
                             <XIcon />
                           </Button>
@@ -2608,7 +2637,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                 }
                 disabled={
                   isConnecting ||
-                  providerBindingConflictReason !== null ||
+                  isProviderBindingConflicted ||
                   isComposerApprovalState ||
                   (environmentUnavailable !== null && activePendingProgress === null)
                 }
@@ -2682,7 +2711,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   activeInstanceId={selectedInstanceId}
                   model={selectedModelForPickerWithCustomFallback}
                   lockToActiveInstance={lockProviderPickerToActiveInstance}
-                  disabled={providerBindingConflictReason !== null}
+                  disabled={isProviderBindingConflicted}
                   lockedProvider={lockedProvider}
                   lockedContinuationGroupKey={lockedContinuationGroupKey}
                   instanceEntries={providerInstanceEntries}
@@ -2696,10 +2725,14 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                       }
                     : {})}
                   onOpenChange={(open) => {
+                    if (isProviderBindingConflicted) return;
                     setIsComposerModelPickerOpen(open);
                   }}
                   getModelDisabledReason={getModelDisabledReason}
-                  onInstanceModelChange={onProviderModelSelect}
+                  onInstanceModelChange={(instanceId, model) => {
+                    if (isProviderBindingConflicted) return;
+                    onProviderModelSelect(instanceId, model);
+                  }}
                 />
 
                 {composerTraitControls ? (
@@ -2746,7 +2779,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   isPreparingWorktree={isPreparingWorktree}
                   hasSendableContent={composerSendState.hasSendableContent}
                   isAttachmentSelectionDisabled={
-                    providerBindingConflictReason !== null ||
+                    isProviderBindingConflicted ||
                     isComposerApprovalState ||
                     pendingUserInputs.length > 0
                   }
