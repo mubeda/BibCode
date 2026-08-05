@@ -345,7 +345,7 @@ impl NativeServerControl {
         self.settings
             .read()
             .await
-            .get("enableChatAgentActivity")
+            .get("enableAgentActivity")
             .and_then(Value::as_bool)
             .unwrap_or(true)
     }
@@ -378,7 +378,7 @@ impl NativeServerControl {
         }
         let current = self.settings.read().await.clone();
         let previous_agent_activity = current
-            .get("enableChatAgentActivity")
+            .get("enableAgentActivity")
             .and_then(Value::as_bool)
             .unwrap_or(true);
         let mut next = current;
@@ -399,7 +399,7 @@ impl NativeServerControl {
         redact_sensitive_environment(&mut next);
         let generation = self.settings_generation.fetch_add(1, Ordering::AcqRel) + 1;
         let next_agent_activity = next
-            .get("enableChatAgentActivity")
+            .get("enableAgentActivity")
             .and_then(Value::as_bool)
             .unwrap_or(true);
         let commit_control = self.clone();
@@ -2466,7 +2466,6 @@ mod tests {
     #[derive(Clone)]
     struct TestAgentActivityHandler {
         calls: Arc<StdMutex<Vec<(bool, u64)>>>,
-        pause: Option<Arc<Barrier>>,
     }
 
     impl AgentActivitySettingsHandler for TestAgentActivityHandler {
@@ -2482,10 +2481,6 @@ mod tests {
                     .lock()
                     .expect("handler calls")
                     .push((enabled, settings_generation));
-                if let Some(pause) = &self.pause {
-                    pause.wait().await;
-                    pause.wait().await;
-                }
                 AgentActivityTransitionReport {
                     enabled,
                     settings_generation,
@@ -2496,44 +2491,21 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct TransitionPause {
-        entered: Arc<Notify>,
-        release: Arc<Notify>,
-    }
-
-    impl TransitionPause {
-        fn new() -> Self {
-            Self {
-                entered: Arc::new(Notify::new()),
-                release: Arc::new(Notify::new()),
-            }
-        }
-    }
-
-    #[derive(Clone)]
-    struct CancellationTestRuntime {
+    struct UnifiedTestRuntime {
         provider_enabled: Arc<AtomicBool>,
         terminal_enabled: Arc<AtomicBool>,
-        provider_pause: Arc<StdMutex<Option<TransitionPause>>>,
     }
 
-    impl CancellationTestRuntime {
+    impl UnifiedTestRuntime {
         fn new(enabled: bool) -> Self {
             Self {
                 provider_enabled: Arc::new(AtomicBool::new(enabled)),
                 terminal_enabled: Arc::new(AtomicBool::new(enabled)),
-                provider_pause: Arc::default(),
             }
-        }
-
-        fn pause_next_provider_transition(&self) -> TransitionPause {
-            let pause = TransitionPause::new();
-            *self.provider_pause.lock().expect("provider pause") = Some(pause.clone());
-            pause
         }
     }
 
-    impl AgentActivityTransitionRuntime for CancellationTestRuntime {
+    impl AgentActivityTransitionRuntime for UnifiedTestRuntime {
         fn finalize_disabled_activity(&self) -> BoxAgentActivityFuture<'_, Result<usize, ()>> {
             Box::pin(async { Ok(0) })
         }
@@ -2543,11 +2515,6 @@ mod tests {
             enabled: bool,
         ) -> BoxAgentActivityFuture<'_, Result<usize, ()>> {
             Box::pin(async move {
-                let pause = self.provider_pause.lock().expect("provider pause").take();
-                if let Some(pause) = pause {
-                    pause.entered.notify_one();
-                    pause.release.notified().await;
-                }
                 self.provider_enabled
                     .store(enabled, AtomicOrdering::Release);
                 Ok(1)
@@ -2567,13 +2534,13 @@ mod tests {
     }
 
     #[derive(Clone)]
-    struct CancellationTestHandler {
+    struct UnifiedTestHandler {
         coordinator: AgentActivityCoordinator,
-        runtime: CancellationTestRuntime,
+        runtime: UnifiedTestRuntime,
         calls: Arc<StdMutex<Vec<(bool, u64)>>>,
     }
 
-    impl AgentActivitySettingsHandler for CancellationTestHandler {
+    impl AgentActivitySettingsHandler for UnifiedTestHandler {
         fn transition(
             &self,
             enabled: bool,
@@ -2710,53 +2677,41 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_activity_handler_runs_after_persistence_before_publication() {
+    async fn agent_activity_split_settings_do_not_drive_unified_runtime_handler() {
         let temp = tempfile::tempdir().expect("control root");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
         let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
         let calls = Arc::new(StdMutex::new(Vec::new()));
-        let pause = Arc::new(Barrier::new(2));
         control
             .attach_agent_activity_handler(Arc::new(TestAgentActivityHandler {
                 calls: calls.clone(),
-                pause: Some(pause.clone()),
             }))
             .await;
         assert!(control.agent_activity_enabled().await);
         let mut events = control.config_events.subscribe();
-        let update = tokio::spawn({
-            let control = control.clone();
-            async move {
-                control
-                    .update_settings(json!({"patch":{"enableChatAgentActivity":false}}))
-                    .await
-            }
-        });
+        let updated = control
+            .update_settings(json!({
+                "patch": {
+                    "enableChatAgentActivity": false,
+                    "enableTerminalAgentActivity": true,
+                }
+            }))
+            .await
+            .expect("persist split activity settings");
 
-        pause.wait().await;
+        assert_eq!(updated["enableChatAgentActivity"], false);
+        assert_eq!(updated["enableTerminalAgentActivity"], true);
         let persisted: Value = serde_json::from_slice(
             &tokio::fs::read(&settings_path)
                 .await
-                .expect("settings persisted before transition"),
+                .expect("persisted settings"),
         )
         .expect("valid persisted settings");
         assert_eq!(persisted["enableChatAgentActivity"], false);
-        assert_eq!(
-            control.settings.read().await["enableChatAgentActivity"],
-            true
-        );
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(25), events.recv())
-                .await
-                .is_err(),
-            "settings publication waits for the effective transition"
-        );
-        pause.wait().await;
-
-        let updated = update.await.expect("update task").expect("settings update");
-        assert_eq!(updated["enableChatAgentActivity"], false);
-        assert_eq!(&*calls.lock().expect("handler calls"), &[(false, 1)]);
+        assert_eq!(persisted["enableTerminalAgentActivity"], true);
+        assert!(calls.lock().expect("handler calls").is_empty());
+        assert!(control.agent_activity_enabled().await);
         assert_eq!(
             events.recv().await.expect("settings event")["type"],
             "settingsUpdated"
@@ -2776,7 +2731,6 @@ mod tests {
         control
             .attach_agent_activity_handler(Arc::new(TestAgentActivityHandler {
                 calls: calls.clone(),
-                pause: None,
             }))
             .await;
 
@@ -2791,12 +2745,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persisted_activity_transitions_survive_cancellation_and_serialize_followups() {
+    async fn split_activity_settings_do_not_transition_unified_activity_runtime() {
         let temp = tempfile::tempdir().expect("control root");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
         let control = NativeServerControl::new(config, json!({"policy":"test"})).await;
-        let runtime = CancellationTestRuntime::new(true);
+        let runtime = UnifiedTestRuntime::new(true);
         let trace = TraceDiagnosticsStore::new(temp.path().join("activity.trace.ndjson"));
         let coordinator = AgentActivityCoordinator::new(
             AgentActivityController::new(true),
@@ -2806,7 +2760,7 @@ mod tests {
         let controller = coordinator.controller();
         let calls = Arc::new(StdMutex::new(Vec::new()));
         control
-            .attach_agent_activity_handler(Arc::new(CancellationTestHandler {
+            .attach_agent_activity_handler(Arc::new(UnifiedTestHandler {
                 coordinator,
                 runtime: runtime.clone(),
                 calls: calls.clone(),
@@ -2814,106 +2768,44 @@ mod tests {
             .await;
         let mut events = control.config_events.subscribe();
 
-        let disable_pause = runtime.pause_next_provider_transition();
-        let disable = tokio::spawn({
-            let control = control.clone();
-            async move {
-                control
-                    .update_settings(json!({"patch":{"enableChatAgentActivity":false}}))
-                    .await
-            }
-        });
-        disable_pause.entered.notified().await;
-        disable.abort();
-        assert!(!controller.snapshot().enabled);
-
-        let followup = tokio::spawn({
-            let control = control.clone();
-            async move {
-                control
-                    .update_settings(json!({"patch":{"terminalDefaultShell":"/bin/test-shell"}}))
-                    .await
-            }
-        });
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(25), events.recv())
-                .await
-                .is_err(),
-            "publication waits for the disabled transition"
-        );
-        assert!(
-            !followup.is_finished(),
-            "a concurrent settings update waits for the committed transition"
-        );
-        disable_pause.release.notify_one();
-
-        let disabled_event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+        let updated = control
+            .update_settings(json!({
+                "patch": {
+                    "enableChatAgentActivity": false,
+                    "enableTerminalAgentActivity": true,
+                }
+            }))
             .await
-            .expect("disabled publication")
+            .expect("persist split activity settings");
+        assert_eq!(updated["enableChatAgentActivity"], false);
+        assert_eq!(updated["enableTerminalAgentActivity"], true);
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
+            .await
+            .expect("settings publication")
             .expect("settings event");
         assert_eq!(
-            disabled_event["payload"]["settings"]["enableChatAgentActivity"],
+            event["payload"]["settings"]["enableChatAgentActivity"],
             false
         );
-        followup
-            .await
-            .expect("followup task")
-            .expect("followup update");
-        assert!(!control.agent_activity_enabled().await);
-        assert!(!runtime.provider_enabled.load(AtomicOrdering::Acquire));
-        assert!(!runtime.terminal_enabled.load(AtomicOrdering::Acquire));
+        assert_eq!(
+            event["payload"]["settings"]["enableTerminalAgentActivity"],
+            true
+        );
+
+        assert!(control.agent_activity_enabled().await);
+        assert!(controller.snapshot().enabled);
+        assert!(runtime.provider_enabled.load(AtomicOrdering::Acquire));
+        assert!(runtime.terminal_enabled.load(AtomicOrdering::Acquire));
+        assert!(calls.lock().expect("handler calls").is_empty());
         let persisted: Value = serde_json::from_slice(
             &tokio::fs::read(&settings_path)
                 .await
-                .expect("disabled settings"),
+                .expect("split settings"),
         )
-        .expect("valid disabled settings");
+        .expect("valid split settings");
         assert_eq!(persisted["enableChatAgentActivity"], false);
-
-        while events.try_recv().is_ok() {}
-        let enable_pause = runtime.pause_next_provider_transition();
-        let enable = tokio::spawn({
-            let control = control.clone();
-            async move {
-                control
-                    .update_settings(json!({"patch":{"enableChatAgentActivity":true}}))
-                    .await
-            }
-        });
-        enable_pause.entered.notified().await;
-        enable.abort();
-        assert!(controller.snapshot().enabled);
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(25), events.recv())
-                .await
-                .is_err(),
-            "publication waits for the enabled transition"
-        );
-        enable_pause.release.notify_one();
-
-        let enabled_event = tokio::time::timeout(std::time::Duration::from_secs(2), events.recv())
-            .await
-            .expect("enabled publication")
-            .expect("settings event");
-        assert_eq!(
-            enabled_event["payload"]["settings"]["enableChatAgentActivity"],
-            true
-        );
-        assert!(control.agent_activity_enabled().await);
-        assert!(runtime.provider_enabled.load(AtomicOrdering::Acquire));
-        assert!(runtime.terminal_enabled.load(AtomicOrdering::Acquire));
-        let persisted: Value = serde_json::from_slice(
-            &tokio::fs::read(settings_path)
-                .await
-                .expect("enabled settings"),
-        )
-        .expect("valid enabled settings");
-        assert_eq!(persisted["enableChatAgentActivity"], true);
-        assert_eq!(
-            &*calls.lock().expect("handler calls"),
-            &[(false, 1), (true, 3)]
-        );
-        assert_eq!(control.settings_generation.load(Ordering::Acquire), 3);
+        assert_eq!(persisted["enableTerminalAgentActivity"], true);
+        assert_eq!(control.settings_generation.load(Ordering::Acquire), 1);
     }
 
     #[test]
