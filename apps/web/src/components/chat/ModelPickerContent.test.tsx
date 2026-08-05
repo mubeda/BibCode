@@ -564,6 +564,30 @@ describe("ModelPickerContent", () => {
     expect(onInstanceModelChange.mock.calls.map(([instanceId]) => instanceId)).toEqual(["codex"]);
   });
 
+  it("allows a foreign provider before start and removes it under a started family lock", () => {
+    const onInstanceModelChange = vi.fn();
+    render(buildProps({ lockToActiveInstance: false, onInstanceModelChange }));
+
+    expect(captured.sidebar[0]?.selectedInstanceId).toBe("codex");
+    captured.combobox[0]?.onValueChange("claude:opus");
+    expect(onInstanceModelChange).toHaveBeenCalledWith("claude", "opus");
+
+    onInstanceModelChange.mockClear();
+    render(
+      buildProps({
+        activeInstanceId: id("codex"),
+        lockToActiveInstance: false,
+        lockedProvider: driver("codex"),
+        onInstanceModelChange,
+      }),
+    );
+    captured.input[0]?.onChange({ target: { value: "opus" } });
+    rerender();
+
+    expect(renderedRowKeys()).toEqual([]);
+    expect(captured.combobox[0]?.filteredItems).toEqual([]);
+  });
+
   it("follows active instance changes while the mounted picker is locked", () => {
     render(buildProps({ lockToActiveInstance: true }));
     expect(renderedRowKeys()).toEqual(["codex:gpt-5", "codex:gpt-5-codex"]);

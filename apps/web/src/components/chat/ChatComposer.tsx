@@ -119,7 +119,6 @@ import {
 import {
   applyProviderInstanceSettings,
   deriveProviderInstanceEntries,
-  resolveProviderDriverKindForInstanceSelection,
   sortProviderInstanceEntries,
   type ProviderInstanceEntry,
 } from "../../providerInstances";
@@ -539,8 +538,10 @@ export interface ChatComposerProps {
 
   // Provider / model
   lockedProvider: ProviderDriverKind | null;
-  /** Exact routing-key lock used only while a started thread's provider metadata is unavailable. */
-  lockedProviderInstanceId: ProviderInstanceId | null;
+  /** Authoritative routing key resolved by the host from thread/session/provider state. */
+  providerBindingInstanceId: ProviderInstanceId;
+  /** Restricts provider/model navigation to the active instance for panel or exact-lock chats. */
+  lockProviderPickerToActiveInstance: boolean;
   providerStatuses: ServerProvider[];
   activeProjectDefaultModelSelection: ModelSelection | null | undefined;
   activeThreadModelSelection: ModelSelection | null | undefined;
@@ -635,7 +636,8 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     runtimeMode,
     interactionMode,
     lockedProvider,
-    lockedProviderInstanceId,
+    providerBindingInstanceId,
+    lockProviderPickerToActiveInstance,
     providerStatuses,
     activeProjectDefaultModelSelection,
     activeThreadModelSelection,
@@ -732,105 +734,24 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     [providerStatuses, settings],
   );
   const selectedProviderByThreadId = composerDraft.activeProvider ?? null;
-  const threadProvider =
+  const hasExplicitSelectedInstanceId = Boolean(
+    selectedProviderByThreadId ??
     activeThread?.session?.providerInstanceId ??
     activeThreadModelSelection?.instanceId ??
-    activeProjectDefaultModelSelection?.instanceId ??
-    null;
-  const explicitSelectedInstanceId =
-    lockedProviderInstanceId ?? selectedProviderByThreadId ?? threadProvider;
-
+    activeProjectDefaultModelSelection?.instanceId,
+  );
   const unlockedSelectedProvider =
-    resolveProviderDriverKindForInstanceSelection(
-      providerInstanceEntries,
-      providerStatuses,
-      explicitSelectedInstanceId,
-    ) ?? ProviderDriverKind.make("codex");
+    providerInstanceEntries.find((entry) => entry.instanceId === providerBindingInstanceId)
+      ?.driverKind ?? ProviderDriverKind.make("codex");
   const selectedProvider: ProviderDriverKind = lockedProvider ?? unlockedSelectedProvider;
   const lockedContinuationGroupKey = useMemo((): string | null => {
     if (!lockedProvider || !activeThread) return null;
-    const lockedInstanceId =
-      activeThread.session?.providerInstanceId ?? activeThreadModelSelection?.instanceId;
-    if (!lockedInstanceId) return null;
     return (
-      providerInstanceEntries.find((entry) => entry.instanceId === lockedInstanceId)
+      providerInstanceEntries.find((entry) => entry.instanceId === providerBindingInstanceId)
         ?.continuationGroupKey ?? null
     );
-  }, [
-    activeThread,
-    activeThreadModelSelection?.instanceId,
-    lockedProvider,
-    providerInstanceEntries,
-  ]);
-
-  // Resolve which configured instance the composer is currently targeting.
-  // Priority:
-  //   1. The composer draft's `activeProvider` — the user's unsaved pick
-  //      from the model picker (must win, otherwise the UI appears to
-  //      ignore picker selections).
-  //   2. Thread's persisted instance id (server-side saved selection).
-  //   3. Project default's instance id.
-  //   4. First enabled entry matching the current driver kind.
-  //   5. First enabled entry overall / default instance for the kind.
-  //
-  const selectedInstanceId = useMemo<ProviderInstanceId>(() => {
-    if (lockedProviderInstanceId) {
-      return lockedProviderInstanceId;
-    }
-    const candidates: Array<string | null | undefined> = [
-      composerDraft.activeProvider,
-      activeThread?.session?.providerInstanceId,
-      activeThreadModelSelection?.instanceId,
-      activeProjectDefaultModelSelection?.instanceId,
-    ];
-    for (const candidate of candidates) {
-      if (!candidate) continue;
-      const match = providerInstanceEntries.find(
-        (entry) => entry.instanceId === candidate && entry.enabled,
-      );
-      if (match) {
-        // When locked to a specific driver kind, ignore persisted instance
-        // ids from a different kind or continuation group.
-        if (lockedProvider && match.driverKind !== lockedProvider) continue;
-        if (
-          lockedContinuationGroupKey &&
-          match.continuationGroupKey !== lockedContinuationGroupKey
-        ) {
-          continue;
-        }
-        return match.instanceId;
-      }
-    }
-    if (explicitSelectedInstanceId) {
-      return ProviderInstanceId.make(explicitSelectedInstanceId);
-    }
-    const byKind = providerInstanceEntries.find(
-      (entry) =>
-        entry.enabled &&
-        entry.driverKind === selectedProvider &&
-        (!lockedContinuationGroupKey || entry.continuationGroupKey === lockedContinuationGroupKey),
-    );
-    if (byKind) return byKind.instanceId;
-    const anyEnabled = providerInstanceEntries.find((entry) => entry.enabled);
-    return (
-      anyEnabled?.instanceId ??
-      providerInstanceEntries[0]?.instanceId ??
-      activeThreadModelSelection?.instanceId ??
-      activeProjectDefaultModelSelection?.instanceId ??
-      ProviderInstanceId.make("codex")
-    );
-  }, [
-    activeProjectDefaultModelSelection?.instanceId,
-    activeThread?.session?.providerInstanceId,
-    activeThreadModelSelection?.instanceId,
-    composerDraft.activeProvider,
-    explicitSelectedInstanceId,
-    lockedContinuationGroupKey,
-    lockedProvider,
-    lockedProviderInstanceId,
-    providerInstanceEntries,
-    selectedProvider,
-  ]);
+  }, [activeThread, lockedProvider, providerBindingInstanceId, providerInstanceEntries]);
+  const selectedInstanceId = providerBindingInstanceId;
 
   const { modelOptions: composerModelOptions, selectedModel } = useEffectiveComposerModelState({
     threadRef: composerDraftTarget,
@@ -902,11 +823,11 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
         providerStatuses,
         selectedProvider,
         selectedInstanceId,
-        explicitSelectedInstanceId !== null,
+        hasExplicitSelectedInstanceId,
       ),
     }),
     [
-      explicitSelectedInstanceId,
+      hasExplicitSelectedInstanceId,
       providerStatuses,
       selectedInstanceId,
       selectedProvider,
@@ -2732,7 +2653,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   compact={isComposerFooterCompact}
                   activeInstanceId={selectedInstanceId}
                   model={selectedModelForPickerWithCustomFallback}
-                  lockToActiveInstance
+                  lockToActiveInstance={lockProviderPickerToActiveInstance}
                   lockedProvider={lockedProvider}
                   lockedContinuationGroupKey={lockedContinuationGroupKey}
                   instanceEntries={providerInstanceEntries}

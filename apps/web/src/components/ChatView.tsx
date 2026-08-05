@@ -181,6 +181,7 @@ import { newDraftId, newMessageId, newThreadId } from "~/lib/utils";
 import { getProviderModelCapabilities, resolveSelectableProvider } from "../providerModels";
 import { useEnvironmentSettings } from "../hooks/useSettings";
 import { resolveAppModelSelectionForInstance } from "../modelSelection";
+import { resolveThreadProviderBinding } from "../threadProviderBinding";
 import { getTerminalFocusOwner } from "../lib/terminalFocus";
 import { DesktopPreviewTabHosts } from "../browser/DesktopPreviewTabHosts";
 import {
@@ -254,7 +255,6 @@ import {
   type LocalDispatchSnapshot,
   PullRequestDialogState,
   cloneComposerAttachmentForRetry,
-  deriveLockedProvider,
   readFileAsDataUrl,
   reconcileBoundedActivityPages,
   reconcileMountedTerminalThreadIds,
@@ -264,7 +264,6 @@ import {
   resolveSendEnvMode,
   revokeBlobPreviewUrl,
   revokeUserMessagePreviewUrls,
-  threadHasStarted,
   waitForStartedServerThread,
 } from "./ChatView.logic";
 import { useLocalStorage } from "~/hooks/useLocalStorage";
@@ -2232,11 +2231,6 @@ function ChatViewContent(props: ChatViewProps) {
   ]);
 
   const selectedProviderByThreadId = composerActiveProvider ?? null;
-  const boundProviderInstanceId =
-    activeThread?.session?.providerInstanceId ??
-    activeThread?.modelSelection.instanceId ??
-    activeProject?.defaultModelSelection?.instanceId ??
-    null;
   // Once a thread selects an environment, never substitute the primary
   // environment's config while the selected environment is still loading.
   const serverConfig = activeThread
@@ -2330,26 +2324,20 @@ function ChatViewContent(props: ChatViewProps) {
     versionMismatchServerLabel,
   ]);
   const providerStatuses = serverConfig?.providers ?? EMPTY_PROVIDERS;
-  const boundProviderStatus = boundProviderInstanceId
-    ? (providerStatuses.find((status) => status.instanceId === boundProviderInstanceId) ?? null)
-    : null;
-  const lockedProviderInstanceId =
-    threadHasStarted(activeThread) && boundProviderInstanceId && !boundProviderStatus
-      ? boundProviderInstanceId
-      : null;
-  const lockedProvider =
-    lockedProviderInstanceId === null
-      ? deriveLockedProvider({
-          thread: activeThread,
-          selectedProvider: null,
-          threadProvider: boundProviderStatus?.driver ?? null,
-        })
-      : null;
+  const providerBinding = resolveThreadProviderBinding({
+    thread: activeThread,
+    projectDefaultModelSelection: activeProject?.defaultModelSelection,
+    selectedProviderInstanceId: selectedProviderByThreadId,
+    providers: providerStatuses,
+  });
+  const { lockedProvider, lockedProviderInstanceId } = providerBinding;
+  const lockProviderPickerToActiveInstance = isPanel || lockedProviderInstanceId !== null;
   const unlockedSelectedProvider = resolveSelectableProvider(
     providerStatuses,
-    selectedProviderByThreadId ?? boundProviderInstanceId ?? ProviderDriverKind.make("codex"),
+    providerBinding.instanceId,
   );
-  const selectedProvider: ProviderDriverKind = lockedProvider ?? unlockedSelectedProvider;
+  const selectedProvider: ProviderDriverKind =
+    lockedProvider ?? providerBinding.driver ?? unlockedSelectedProvider;
   const phase = derivePhase(activeThread?.session ?? null);
   const threadActivities = activeThread?.activities ?? EMPTY_ACTIVITIES;
   const workLogEntries = useMemo(() => deriveWorkLogEntries(threadActivities), [threadActivities]);
@@ -2753,34 +2741,12 @@ function ChatViewContent(props: ChatViewProps) {
   );
   const keybindings = useAtomValue(primaryServerKeybindingsAtom);
   const availableEditors = useAtomValue(primaryServerAvailableEditorsAtom);
-  // Prefer an instance-id match so a custom Codex instance (e.g.
-  // `codex_personal`) surfaces its own status/message in the banner rather
-  // than the default Codex's. Falls back to first-match-by-kind when no
-  // saved instance id is available or the instance no longer exists.
-  const selectedProviderInstanceId =
-    providerStatuses.find((status) => status.instanceId === selectedProviderByThreadId)
-      ?.instanceId ?? null;
-  const activeProviderInstanceId =
-    (lockedProvider === null && lockedProviderInstanceId === null
-      ? selectedProviderInstanceId
-      : null) ??
-    boundProviderInstanceId ??
-    activeProject?.defaultModelSelection?.instanceId ??
-    null;
-  const activeProviderStatus = useMemo(() => {
-    if (activeProviderInstanceId) {
-      return (
-        providerStatuses.find((status) => status.instanceId === activeProviderInstanceId) ?? null
-      );
-    }
-    const defaultInstanceId = defaultInstanceIdForDriver(selectedProvider);
-    return providerStatuses.find((status) => status.instanceId === defaultInstanceId) ?? null;
-  }, [activeProviderInstanceId, providerStatuses, selectedProvider]);
+  const activeProviderStatus = providerBinding.status;
   const centerHostLabel =
     activeProviderStatus?.displayName?.trim() ||
     (lockedProviderInstanceId
       ? formatProviderSlugLabel(lockedProviderInstanceId)
-      : formatProviderDriverKindLabel(selectedProvider));
+      : formatProviderDriverKindLabel(providerBinding.driver ?? selectedProvider));
   const activeProjectCwd = activeProject?.workspaceRoot ?? null;
   const activeThreadWorktreePath = activeThread?.worktreePath ?? null;
   const activeWorkspaceRoot = activeThreadWorktreePath ?? activeProjectCwd ?? undefined;
@@ -6129,7 +6095,8 @@ function ChatViewContent(props: ChatViewProps) {
                       runtimeMode={runtimeMode}
                       interactionMode={interactionMode}
                       lockedProvider={lockedProvider}
-                      lockedProviderInstanceId={lockedProviderInstanceId}
+                      providerBindingInstanceId={providerBinding.instanceId}
+                      lockProviderPickerToActiveInstance={lockProviderPickerToActiveInstance}
                       providerStatuses={providerStatuses as ServerProvider[]}
                       activeProjectDefaultModelSelection={activeProject?.defaultModelSelection}
                       activeThreadModelSelection={activeThread?.modelSelection}

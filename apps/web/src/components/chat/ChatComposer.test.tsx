@@ -785,7 +785,8 @@ function renderComposer(overrides: Partial<ChatComposerProps> = {}): RenderResul
     runtimeMode: "approval-required",
     interactionMode: "default",
     lockedProvider: null,
-    lockedProviderInstanceId: null,
+    providerBindingInstanceId: codexInstanceId,
+    lockProviderPickerToActiveInstance: false,
     providerStatuses: [codexProvider],
     activeProjectDefaultModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
     activeThreadModelSelection: null,
@@ -955,7 +956,7 @@ describe("ChatComposer rendering", () => {
     expect(select["value"]).toBe("approval-required");
     const picker = findCapture("ProviderModelPicker");
     expect(picker["lockedProvider"]).toBeNull();
-    expect(picker["lockToActiveInstance"]).toBe(true);
+    expect(picker["lockToActiveInstance"]).toBe(false);
 
     // Path search targets nothing while no path trigger is active.
     const pathSearch = findCapture("useComposerPathSearch")["target"] as Record<string, unknown>;
@@ -995,6 +996,7 @@ describe("ChatComposer rendering", () => {
         { ...codexProvider, supportsMcpStatus: true },
         { ...codexProvider, instanceId: personalInstanceId, supportsMcpStatus: true },
       ],
+      providerBindingInstanceId: personalInstanceId,
       activeProjectDefaultModelSelection: { instanceId: personalInstanceId, model: "gpt-5.4" },
       activeThreadActivities: [
         ...activeThreadActivities,
@@ -1017,12 +1019,12 @@ describe("ChatComposer rendering", () => {
     expect(filterCaptures("McpStatusPopover")).toEqual([]);
   });
 
-  it("locks the provider picker to the active instance after the provider is fixed", () => {
+  it("uses a provider-family lock without fixing the active instance", () => {
     renderComposer({ lockedProvider: ProviderDriverKind.make("codex") });
 
     const picker = findCapture("ProviderModelPicker");
     expect(picker["lockedProvider"]).toBe("codex");
-    expect(picker["lockToActiveInstance"]).toBe(true);
+    expect(picker["lockToActiveInstance"]).toBe(false);
   });
 
   it("presents a raw Claude Ultrathink session default before the first send", () => {
@@ -1060,6 +1062,7 @@ describe("ChatComposer rendering", () => {
 
     const { markup, handle } = renderComposer({
       providerStatuses: [claudeProvider],
+      providerBindingInstanceId: claudeInstanceId,
       activeProjectDefaultModelSelection: null,
       activeThreadModelSelection: rawDefault,
     });
@@ -2542,6 +2545,7 @@ describe("ChatComposer provider selection", () => {
   it("keeps an explicitly selected instance even when it has no live entry", () => {
     renderComposer({
       providerStatuses: [],
+      providerBindingInstanceId: ProviderInstanceId.make("codex_personal"),
       activeProjectDefaultModelSelection: null,
       activeThreadModelSelection: {
         instanceId: ProviderInstanceId.make("codex_personal"),
@@ -2576,7 +2580,8 @@ describe("ChatComposer provider selection", () => {
 
     renderComposer({
       lockedProvider: null,
-      lockedProviderInstanceId: boundInstanceId,
+      providerBindingInstanceId: boundInstanceId,
+      lockProviderPickerToActiveInstance: true,
       providerStatuses: [collidingProvider],
       activeProjectDefaultModelSelection: null,
       activeThreadModelSelection: { instanceId: boundInstanceId, model: "gpt-5.4" },
@@ -2586,6 +2591,59 @@ describe("ChatComposer provider selection", () => {
     expect(picker["activeInstanceId"]).toBe("codex_personal");
     expect(picker["lockToActiveInstance"]).toBe(true);
     expect(picker["lockedProvider"]).toBeNull();
+  });
+
+  it("routes a legacy partial session through its authoritative binding", () => {
+    const claudeInstanceId = ProviderInstanceId.make("claude");
+    const claudeProvider: ServerProvider = {
+      ...codexProvider,
+      instanceId: claudeInstanceId,
+      driver: ProviderDriverKind.make("claude"),
+      models: [
+        {
+          slug: "claude-sonnet",
+          name: "Claude Sonnet",
+          isCustom: false,
+          capabilities: null,
+        },
+      ],
+    };
+    draftStore().setModelSelection(threadRef, {
+      instanceId: claudeInstanceId,
+      model: "claude-sonnet",
+    });
+    publishSeededStoreState();
+
+    const { handle } = renderComposer({
+      activeThread: makeThread({
+        modelSelection: { instanceId: claudeInstanceId, model: "claude-sonnet" },
+        session: {
+          threadId,
+          status: "ready",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+      }),
+      lockedProvider: ProviderDriverKind.make("codex"),
+      providerBindingInstanceId: codexInstanceId,
+      providerStatuses: [codexProvider, claudeProvider],
+      activeProjectDefaultModelSelection: null,
+      activeThreadModelSelection: {
+        instanceId: claudeInstanceId,
+        model: "claude-sonnet",
+      },
+    });
+
+    const picker = findCapture("ProviderModelPicker");
+    expect(picker["activeInstanceId"]).toBe("codex");
+    expect(picker["model"]).toBe("gpt-5.4");
+    expect(handle().getSendContext()).toMatchObject({
+      selectedProvider: "codex",
+      selectedModelSelection: { instanceId: "codex", model: "gpt-5.4" },
+    });
   });
 
   it("locks the provider and derives the continuation group", () => {

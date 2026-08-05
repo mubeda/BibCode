@@ -2721,23 +2721,55 @@ describe("ChatView", () => {
 
       renderServerRoute();
       expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe("Codex");
+      const initialComposer = capturedProps<Record<string, unknown>>("chatComposer");
+      expect(initialComposer["lockProviderPickerToActiveInstance"]).toBe(false);
       const initialSurfaces =
         useCenterPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)]?.surfaces;
 
-      useComposerDraftStore.getState().setModelSelection(threadRef, {
-        instanceId: claudeInstanceId,
-        model: "claude-sonnet",
-      });
+      const selectProviderModel = initialComposer["onProviderModelSelect"] as (
+        instanceId: ProviderInstanceId,
+        model: string,
+      ) => void;
+      selectProviderModel(claudeInstanceId, "gpt-5.4");
       publishSeededStoreState(useComposerDraftStore);
       renderServerRoute();
 
       expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe("Claude");
       expect(
-        capturedProps<Record<string, unknown>>("chatComposer")["lockedProviderInstanceId"],
-      ).toBeNull();
-      expect(
         useCenterPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)]?.surfaces,
       ).toEqual(initialSurfaces);
+
+      seedServerThread(
+        makeThread({
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "codex",
+            providerInstanceId: codexInstanceId,
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+        }),
+      );
+      renderServerRoute();
+
+      const startedComposer = capturedProps<Record<string, unknown>>("chatComposer");
+      expect(startedComposer["lockedProvider"]).toBe("codex");
+      expect(startedComposer["providerBindingInstanceId"]).toBe("codex");
+      expect(startedComposer["lockProviderPickerToActiveInstance"]).toBe(false);
+      expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe("Codex");
+
+      const selectStartedProviderModel = startedComposer["onProviderModelSelect"] as (
+        instanceId: ProviderInstanceId,
+        model: string,
+      ) => void;
+      selectStartedProviderModel(codexInstanceId, "gpt-5.4");
+      selectStartedProviderModel(claudeInstanceId, "gpt-5.4");
+      expect(useComposerDraftStore.getState().getComposerDraft(threadRef)?.activeProvider).toBe(
+        "codex",
+      );
     });
 
     it("keeps a started host labeled from its bound provider despite stale composer selection", () => {
@@ -2781,6 +2813,60 @@ describe("ChatView", () => {
       renderServerRoute();
 
       expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe("Codex");
+    });
+
+    it("uses the authoritative session driver when a legacy session has no instance id", () => {
+      const claudeInstanceId = ProviderInstanceId.make("claude");
+      const claudeProvider: ServerProvider = {
+        ...codexProvider,
+        instanceId: claudeInstanceId,
+        driver: ProviderDriverKind.make("claude"),
+        displayName: "Claude",
+        models: [
+          {
+            slug: "claude-sonnet",
+            name: "Claude Sonnet",
+            isCustom: false,
+            capabilities: null,
+          },
+        ],
+      };
+      seedEnvironment(
+        makeEnvironmentPresentation({
+          serverConfig: {
+            providers: [codexProvider, claudeProvider],
+            environment: { label: "Local" },
+          },
+        }),
+      );
+      seedProject(makeProject({ defaultModelSelection: null }));
+      seedServerThread(
+        makeThread({
+          modelSelection: { instanceId: claudeInstanceId, model: "claude-sonnet" },
+          session: {
+            threadId,
+            status: "ready",
+            providerName: "codex",
+            runtimeMode: "full-access",
+            activeTurnId: null,
+            lastError: null,
+            updatedAt: now,
+          },
+        }),
+      );
+      useComposerDraftStore.getState().setModelSelection(threadRef, {
+        instanceId: claudeInstanceId,
+        model: "claude-sonnet",
+      });
+      publishSeededStoreState(useComposerDraftStore);
+      seedGitStatus(true);
+
+      renderServerRoute();
+
+      const composer = capturedProps<Record<string, unknown>>("chatComposer");
+      expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe("Codex");
+      expect(composer["lockedProvider"]).toBe("codex");
+      expect(composer["providerBindingInstanceId"]).toBe("codex");
     });
 
     it("locks a sessionless started custom instance to its provider family", () => {
@@ -2838,9 +2924,6 @@ describe("ChatView", () => {
       expect(capturedProps<Record<string, unknown>>("chatComposer")["lockedProvider"]).toBe(
         "codex",
       );
-      expect(
-        capturedProps<Record<string, unknown>>("chatComposer")["lockedProviderInstanceId"],
-      ).toBeNull();
     });
 
     it("keeps a sessionless started custom instance defensively locked while statuses load", () => {
@@ -2883,7 +2966,8 @@ describe("ChatView", () => {
       );
       const composer = capturedProps<Record<string, unknown>>("chatComposer");
       expect(composer["lockedProvider"]).toBeNull();
-      expect(composer["lockedProviderInstanceId"]).toBe("codex_personal");
+      expect(composer["providerBindingInstanceId"]).toBe("codex_personal");
+      expect(composer["lockProviderPickerToActiveInstance"]).toBe(true);
     });
 
     it("uses an exact instance lock when a live driver collides with a missing bound instance", () => {
@@ -2932,7 +3016,7 @@ describe("ChatView", () => {
 
       const composer = capturedProps<Record<string, unknown>>("chatComposer");
       expect(composer["lockedProvider"]).toBeNull();
-      expect(composer["lockedProviderInstanceId"]).toBe("codex_personal");
+      expect(composer["providerBindingInstanceId"]).toBe("codex_personal");
       expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe(
         "Codex Personal",
       );
@@ -2991,9 +3075,6 @@ describe("ChatView", () => {
       expect(capturedProps<Record<string, unknown>>("chatComposer")["lockedProvider"]).toBe(
         "codex",
       );
-      expect(
-        capturedProps<Record<string, unknown>>("chatComposer")["lockedProviderInstanceId"],
-      ).toBeNull();
     });
 
     it("keeps header actions aligned when every center surface is closed", () => {
@@ -3281,6 +3362,7 @@ describe("ChatView", () => {
       const composer = capturedProps<Record<string, unknown>>("chatComposer");
       expect(composer["routeKind"]).toBe("server");
       expect(composer["isServerThread"]).toBe(true);
+      expect(composer["lockProviderPickerToActiveInstance"]).toBe(true);
     });
   });
 
