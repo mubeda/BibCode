@@ -3828,6 +3828,7 @@ describe("ChatView handlers (captured from mocked children)", () => {
     expect(composer["lockedProvider"]).toBe("codex");
     expect(composer["providerBindingInstanceId"]).toBe("codex_personal");
     expect(composer["lockProviderPickerToActiveInstance"]).toBe(true);
+    expect(composer["providerBindingConflictReason"]).toBeNull();
 
     const onProviderModelSelect = composer["onProviderModelSelect"] as (
       instanceId: ProviderInstanceId,
@@ -3866,6 +3867,115 @@ describe("ChatView handlers (captured from mocked children)", () => {
         modelSelection: { instanceId: "codex_personal", model: "gpt-5.4" },
       },
     });
+  });
+
+  it("fails closed when live status contradicts the exact session account", async () => {
+    const customInstanceId = ProviderInstanceId.make("codex_personal");
+    const contradictoryProvider: ServerProvider = {
+      ...codexProvider,
+      instanceId: customInstanceId,
+      driver: ProviderDriverKind.make("claude"),
+      displayName: "Contradictory Claude",
+      models: [
+        {
+          slug: "claude-sonnet",
+          name: "Claude Sonnet",
+          isCustom: false,
+          capabilities: null,
+        },
+      ],
+    };
+    const conflictReason =
+      'Provider instance "codex_personal" reports driver "claude", but the active session expects "codex". Sending is blocked until provider metadata agrees.';
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        serverConfig: {
+          providers: [contradictoryProvider, codexProvider],
+          environment: { label: "Local" },
+        },
+      }),
+    );
+    seedProject(makeProject());
+    seedServerThread(
+      makeThread({
+        modelSelection: { instanceId: customInstanceId, model: "gpt-5.4" },
+        session: {
+          threadId,
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: customInstanceId,
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+      }),
+    );
+    useComposerDraftStore.getState().setModelSelection(threadRef, {
+      instanceId: customInstanceId,
+      model: "gpt-5.4",
+    });
+    publishSeededStoreState(useComposerDraftStore);
+    seedGitStatus(true);
+
+    renderServerRoute();
+    const composer = capturedProps<Record<string, unknown>>("chatComposer");
+    expect(capturedProps<Record<string, unknown>>("centerPanelTabs")["hostLabel"]).toBe(
+      "Codex Personal",
+    );
+    expect(composer["lockedProvider"]).toBeNull();
+    expect(composer["providerBindingInstanceId"]).toBe("codex_personal");
+    expect(composer["lockProviderPickerToActiveInstance"]).toBe(true);
+    expect(composer["providerBindingConflictReason"]).toBe(conflictReason);
+    const banners = capturedProps<{ items: ComposerBannerStackItem[] }>("composerBannerStack");
+    expect(banners.items).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          id: "provider-binding-conflict:codex_personal",
+          variant: "warning",
+          title: "Provider session conflict",
+          description: conflictReason,
+        }),
+      ]),
+    );
+
+    const onProviderModelSelect = composer["onProviderModelSelect"] as (
+      instanceId: ProviderInstanceId,
+      model: string,
+    ) => void;
+    onProviderModelSelect(customInstanceId, "claude-sonnet");
+    const draftAfterRejectedSelection = useComposerDraftStore
+      .getState()
+      .getComposerDraft(threadRef);
+    expect(draftAfterRejectedSelection?.activeProvider).toBe("codex_personal");
+    expect(draftAfterRejectedSelection?.modelSelectionByProvider[customInstanceId]).toEqual({
+      instanceId: customInstanceId,
+      model: "gpt-5.4",
+    });
+
+    const getSendContext = vi.fn(() => ({
+      prompt: "must stay blocked",
+      attachments: [],
+      terminalContexts: [],
+      elementContexts: [],
+      previewAnnotations: [],
+      reviewComments: [],
+      selectedProvider: ProviderDriverKind.make("claude"),
+      selectedModel: "claude-sonnet",
+      selectedProviderModels: contradictoryProvider.models,
+      selectedPromptEffort: null,
+      selectedModelOptionsForDispatch: [],
+      selectedModelSelection: { instanceId: customInstanceId, model: "claude-sonnet" },
+    }));
+    const composerRef = composer["composerRef"] as RefObject<ChatComposerHandle | null>;
+    composerRef.current = composerHandle({ getSendContext });
+    const promptRef = composer["promptRef"] as RefObject<string>;
+    promptRef.current = "must stay blocked";
+
+    await (composer["onSend"] as () => Promise<void>)();
+
+    expect(getSendContext).not.toHaveBeenCalled();
+    expect(commandCallsFor("thread.startTurn")).toEqual([]);
   });
 
   it("canonicalizes legacy file links before starting a provider turn", async () => {

@@ -2236,6 +2236,14 @@ function ChatViewContent(props: ChatViewProps) {
   const serverConfig = activeThread
     ? (activeEnvironment?.serverConfig ?? null)
     : (primaryEnvironment?.serverConfig ?? null);
+  const providerStatuses = serverConfig?.providers ?? EMPTY_PROVIDERS;
+  const providerBinding = resolveThreadProviderBinding({
+    thread: activeThread,
+    projectDefaultModelSelection: activeProject?.defaultModelSelection,
+    selectedProviderInstanceId: selectedProviderByThreadId,
+    providers: providerStatuses,
+  });
+  const providerBindingConflictReason = providerBinding.conflict?.reason ?? null;
   const versionMismatch = resolveServerConfigVersionMismatch(serverConfig);
   const versionMismatchDismissKey =
     versionMismatch && activeThread
@@ -2294,6 +2302,15 @@ function ChatViewContent(props: ChatViewProps) {
         ),
       });
     }
+    if (providerBinding.conflict) {
+      items.push({
+        id: `provider-binding-conflict:${providerBinding.conflict.instanceId}`,
+        variant: "warning",
+        icon: <TriangleAlertIcon />,
+        title: "Provider session conflict",
+        description: providerBinding.conflict.reason,
+      });
+    }
     if (showVersionMismatchBanner && versionMismatch && versionMismatchDismissKey) {
       items.push({
         id: `version-mismatch:${versionMismatchDismissKey}`,
@@ -2318,18 +2335,12 @@ function ChatViewContent(props: ChatViewProps) {
     activeEnvironmentUnavailableState,
     handleReconnectActiveEnvironment,
     navigate,
+    providerBinding.conflict,
     showVersionMismatchBanner,
     versionMismatch,
     versionMismatchDismissKey,
     versionMismatchServerLabel,
   ]);
-  const providerStatuses = serverConfig?.providers ?? EMPTY_PROVIDERS;
-  const providerBinding = resolveThreadProviderBinding({
-    thread: activeThread,
-    projectDefaultModelSelection: activeProject?.defaultModelSelection,
-    selectedProviderInstanceId: selectedProviderByThreadId,
-    providers: providerStatuses,
-  });
   const { lockedProvider, lockedProviderInstanceId } = providerBinding;
   const lockProviderPickerToActiveInstance = isPanel || lockedProviderInstanceId !== null;
   const unlockedSelectedProvider = resolveSelectableProvider(
@@ -4692,6 +4703,7 @@ function ChatViewContent(props: ChatViewProps) {
       isSendBusy ||
       isConnecting ||
       activeEnvironmentUnavailable ||
+      providerBinding.conflict !== null ||
       sendInFlightRef.current
     )
       return;
@@ -5644,6 +5656,10 @@ function ChatViewContent(props: ChatViewProps) {
   const onProviderModelSelect = useCallback(
     (instanceId: ProviderInstanceId, model: string) => {
       if (!activeThread) return;
+      if (providerBinding.conflict !== null) {
+        scheduleComposerFocus();
+        return;
+      }
       if (lockedProviderInstanceId && instanceId !== lockedProviderInstanceId) {
         scheduleComposerFocus();
         return;
@@ -5719,6 +5735,7 @@ function ChatViewContent(props: ChatViewProps) {
       setComposerDraftModelSelection,
       setStickyComposerModelSelection,
       providerStatuses,
+      providerBinding.conflict,
       settings,
     ],
   );
@@ -6097,6 +6114,7 @@ function ChatViewContent(props: ChatViewProps) {
                       lockedProvider={lockedProvider}
                       providerBindingInstanceId={providerBinding.instanceId}
                       lockProviderPickerToActiveInstance={lockProviderPickerToActiveInstance}
+                      providerBindingConflictReason={providerBindingConflictReason}
                       providerStatuses={providerStatuses as ServerProvider[]}
                       activeProjectDefaultModelSelection={activeProject?.defaultModelSelection}
                       activeThreadModelSelection={activeThread?.modelSelection}

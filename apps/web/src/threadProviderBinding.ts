@@ -15,6 +15,15 @@ export interface ThreadProviderBinding {
   readonly status: ServerProvider | null;
   readonly lockedProvider: ProviderDriverKind | null;
   readonly lockedProviderInstanceId: ProviderInstanceId | null;
+  readonly conflict: ThreadProviderBindingConflict | null;
+}
+
+export interface ThreadProviderBindingConflict {
+  readonly kind: "session-provider-driver-mismatch";
+  readonly instanceId: ProviderInstanceId;
+  readonly expectedDriver: ProviderDriverKind;
+  readonly observedDriver: ProviderDriverKind;
+  readonly reason: string;
 }
 
 interface ResolveThreadProviderBindingInput {
@@ -86,6 +95,7 @@ export function resolveThreadProviderBinding(
           status,
           lockedProvider: null,
           lockedProviderInstanceId: null,
+          conflict: null,
         };
       }
     }
@@ -102,6 +112,7 @@ export function resolveThreadProviderBinding(
       status: fallbackStatus,
       lockedProvider: null,
       lockedProviderInstanceId: null,
+      conflict: null,
     };
   }
 
@@ -113,7 +124,23 @@ export function resolveThreadProviderBinding(
 
   if (sessionInstanceId) {
     const sessionStatus = findProvider(input.providers, sessionInstanceId);
-    if (sessionStatus && (!sessionDriver || sessionStatus.driver === sessionDriver)) {
+    if (sessionStatus && sessionDriver && sessionStatus.driver !== sessionDriver) {
+      return {
+        instanceId: sessionInstanceId,
+        driver: null,
+        status: null,
+        lockedProvider: null,
+        lockedProviderInstanceId: sessionInstanceId,
+        conflict: {
+          kind: "session-provider-driver-mismatch",
+          instanceId: sessionInstanceId,
+          expectedDriver: sessionDriver,
+          observedDriver: sessionStatus.driver,
+          reason: `Provider instance "${sessionInstanceId}" reports driver "${sessionStatus.driver}", but the active session expects "${sessionDriver}". Sending is blocked until provider metadata agrees.`,
+        },
+      };
+    }
+    if (sessionStatus) {
       const driver = sessionDriver ?? sessionStatus.driver;
       return {
         instanceId: sessionInstanceId,
@@ -121,6 +148,7 @@ export function resolveThreadProviderBinding(
         status: sessionStatus,
         lockedProvider: driver,
         lockedProviderInstanceId: null,
+        conflict: null,
       };
     }
     if (!sessionDriver) {
@@ -130,6 +158,7 @@ export function resolveThreadProviderBinding(
         status: null,
         lockedProvider: null,
         lockedProviderInstanceId: sessionInstanceId,
+        conflict: null,
       };
     }
     return {
@@ -138,6 +167,7 @@ export function resolveThreadProviderBinding(
       status: null,
       lockedProvider: sessionDriver,
       lockedProviderInstanceId: sessionInstanceId,
+      conflict: null,
     };
   }
 
@@ -153,6 +183,7 @@ export function resolveThreadProviderBinding(
       driver: sessionDriver,
       lockedProvider: sessionDriver,
       lockedProviderInstanceId: null,
+      conflict: null,
     };
   }
 
@@ -165,6 +196,7 @@ export function resolveThreadProviderBinding(
       status: persistedStatus,
       lockedProvider: persistedStatus.driver,
       lockedProviderInstanceId: null,
+      conflict: null,
     };
   }
   if (persistedInstanceId) {
@@ -174,6 +206,7 @@ export function resolveThreadProviderBinding(
       status: null,
       lockedProvider: null,
       lockedProviderInstanceId: persistedInstanceId,
+      conflict: null,
     };
   }
 
@@ -186,5 +219,6 @@ export function resolveThreadProviderBinding(
     status: fallbackStatus,
     lockedProvider: fallbackStatus?.driver ?? null,
     lockedProviderInstanceId: fallbackStatus ? null : fallbackInstanceId,
+    conflict: null,
   };
 }
