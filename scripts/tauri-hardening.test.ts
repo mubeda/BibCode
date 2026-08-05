@@ -1,3 +1,5 @@
+import * as NodeCrypto from "node:crypto";
+
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { assert, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -73,6 +75,17 @@ function topRowOpaqueBounds(image: DecodedRgbaPng): readonly [number, number] {
   return [opaqueColumns[0]!, opaqueColumns.at(-1)!];
 }
 
+function rgbChannelSha256(image: DecodedRgbaPng): string {
+  const rgb = Buffer.alloc(image.width * image.height * 3);
+  for (let sourceOffset = 0, rgbOffset = 0; sourceOffset < image.pixels.length;) {
+    rgb[rgbOffset++] = image.pixels[sourceOffset++]!;
+    rgb[rgbOffset++] = image.pixels[sourceOffset++]!;
+    rgb[rgbOffset++] = image.pixels[sourceOffset++]!;
+    sourceOffset++;
+  }
+  return NodeCrypto.createHash("sha256").update(rgb).digest("hex");
+}
+
 function readIcnsChunks(icns: Uint8Array): ReadonlyMap<string, Uint8Array> {
   const bytes = Buffer.from(icns.buffer, icns.byteOffset, icns.byteLength);
   assert.equal(bytes.toString("ascii", 0, 4), "icns");
@@ -101,6 +114,11 @@ it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
       assert.equal(source.width, 1024);
       assert.equal(source.height, 1024);
       assert.deepEqual(topRowOpaqueBounds(source), [171, 852]);
+      assert.equal(
+        rgbChannelSha256(source),
+        "8b6e2020b1bf741409862203340d693ad2926bba7e26020f7bf8c239de1eb42b",
+        "macOS icon RGB values must preserve the pre-mask BiBCode artwork",
+      );
       assert.equal(source.pixels[(512 * source.width + 512) * 4 + 3], 255);
       assert.ok(
         Array.from(
@@ -127,6 +145,11 @@ it.layer(NodeServices.layer)("Tauri production hardening", (it) => {
       assert.equal(largest.width, 1024);
       assert.equal(largest.height, 1024);
       assert.deepEqual(topRowOpaqueBounds(largest), [171, 852]);
+      assert.equal(
+        rgbChannelSha256(largest),
+        "8b6e2020b1bf741409862203340d693ad2926bba7e26020f7bf8c239de1eb42b",
+        "ICNS must preserve the pre-mask BiBCode RGB artwork",
+      );
     }),
   );
 
