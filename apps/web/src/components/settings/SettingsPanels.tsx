@@ -951,7 +951,7 @@ export function AgentsSettingsPanel() {
               Experimental
             </Badge>
           }
-          description="Show live agent and background-task activity in the Chat panel."
+          description="Show live agent and background-task activity in the Chat panel. Disabling this stops Chat activity monitoring and collection."
           resetAction={
             settings.enableChatAgentActivity !== DEFAULT_SERVER_SETTINGS.enableChatAgentActivity ? (
               <SettingResetButton
@@ -981,7 +981,7 @@ export function AgentsSettingsPanel() {
               Experimental
             </Badge>
           }
-          description="Show live agent and background-task activity in AI Terminals."
+          description="Show live agent and background-task activity in AI Terminals. Disabling this stops AI Terminal activity monitoring and collection."
           resetAction={
             settings.enableTerminalAgentActivity !==
             DEFAULT_SERVER_SETTINGS.enableTerminalAgentActivity ? (
