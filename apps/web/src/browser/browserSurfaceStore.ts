@@ -27,6 +27,7 @@ export interface BrowserSurfaceContentPresentation {
 
 interface BrowserSurfaceStoreState {
   readonly byTabId: Record<string, BrowserSurfacePresentation>;
+  readonly occlusionOwners: ReadonlySet<symbol>;
   readonly claim: (tabId: string, owner: symbol) => void;
   readonly present: (
     tabId: string,
@@ -40,6 +41,10 @@ interface BrowserSurfaceStoreState {
 
 export interface BrowserSurfaceLease {
   readonly present: (rect: BrowserSurfaceRect, visible: boolean) => void;
+  readonly release: () => void;
+}
+
+export interface BrowserSurfaceOcclusionLease {
   readonly release: () => void;
 }
 
@@ -72,6 +77,7 @@ const rectEquals = (left: BrowserSurfaceRect | null, right: BrowserSurfaceRect):
 
 export const useBrowserSurfaceStore = create<BrowserSurfaceStoreState>()((set) => ({
   byTabId: {},
+  occlusionOwners: new Set(),
   claim: (tabId, owner) =>
     set((state) => {
       const current = state.byTabId[tabId];
@@ -150,6 +156,27 @@ export const useBrowserSurfaceStore = create<BrowserSurfaceStoreState>()((set) =
       };
     }),
 }));
+
+export function acquireBrowserSurfaceOcclusion(): BrowserSurfaceOcclusionLease {
+  const owner = Symbol("browser-surface-occlusion");
+  let released = false;
+  useBrowserSurfaceStore.setState((state) => ({
+    occlusionOwners: new Set(state.occlusionOwners).add(owner),
+  }));
+
+  return {
+    release: () => {
+      if (released) return;
+      released = true;
+      useBrowserSurfaceStore.setState((state) => {
+        if (!state.occlusionOwners.has(owner)) return state;
+        const occlusionOwners = new Set(state.occlusionOwners);
+        occlusionOwners.delete(owner);
+        return { occlusionOwners };
+      });
+    },
+  };
+}
 
 export function acquireBrowserSurface(tabId: string): BrowserSurfaceLease {
   const owner = Symbol(`browser-surface:${tabId}`);

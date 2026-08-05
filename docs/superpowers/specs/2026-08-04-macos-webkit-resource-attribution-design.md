@@ -174,8 +174,9 @@ available. No deployment-target increase is part of this change.
   introduced.
 - A WebKit crash or process rotation may yield one partial sample; the next
   sample re-queries every owned WebView and converges on the new identities.
-- A closed preview WebView disappears from `AppHandle::webviews()` and is no
-  longer claimed.
+- Closing a logical preview hides the process-lifetime native host instead of
+  destroying its WKWebView. The hidden host remains in `AppHandle::webviews()`,
+  stays owned and attributable, and may be reused until app shutdown.
 - Observer failure cannot stop or restart the backend, provider, terminal, or
   desktop UI.
 - The existing server-level 250-millisecond timeout remains the final bound.
@@ -229,7 +230,9 @@ On macOS, open Resource Manager and confirm that:
 - the warning disappears when complete observation is available;
 - `core/server` and the expected `core/ui` rows are present;
 - Combined equals Core plus External for memory, CPU, and process count;
-- opening and closing preview WebViews updates the Core process set;
+- opening a logical preview can add or rotate validated Core UI helpers, while
+  closing it hides the retained native host and keeps that host attributable
+  until app shutdown;
 - provider and terminal processes remain External;
 - another application's WebKit helpers are excluded; and
 - quitting BiBCode leaves no owned WebKit or supervised process behind.
