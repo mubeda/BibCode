@@ -9,6 +9,17 @@ import { createModelSelection } from "./model.ts";
 import { applyServerSettingsPatch } from "./serverSettings.ts";
 
 describe("serverSettings helpers", () => {
+  it("patches terminal activity without changing Chat activity", () => {
+    expect(
+      applyServerSettingsPatch(DEFAULT_SERVER_SETTINGS, {
+        enableTerminalAgentActivity: true,
+      }),
+    ).toMatchObject({
+      enableChatAgentActivity: true,
+      enableTerminalAgentActivity: true,
+    });
+  });
+
   it("applies ordinary nested patches and explicit automatic fetch intervals", () => {
     const interval = Duration.seconds(60);
     const next = applyServerSettingsPatch(DEFAULT_SERVER_SETTINGS, {
