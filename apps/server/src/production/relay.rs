@@ -96,10 +96,9 @@ impl RelayClientOptions {
 
     #[must_use]
     pub fn native(base_dir: impl Into<PathBuf>) -> Self {
-        Self::new(base_dir, native_platform(), native_arch())
-            .with_optional_executable_override(crate::environment_identity::bibcode_env_var(
-                CLOUDFLARED_PATH_ENV_NAME,
-            ))
+        Self::new(base_dir, native_platform(), native_arch()).with_optional_executable_override(
+            crate::environment_identity::bibcode_env_var(CLOUDFLARED_PATH_ENV_NAME),
+        )
     }
 
     #[must_use]

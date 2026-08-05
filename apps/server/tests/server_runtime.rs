@@ -1,12 +1,12 @@
 use std::{io::ErrorKind, net::SocketAddr, path::PathBuf, time::Duration};
 
-use futures_util::{SinkExt, StreamExt};
-use reqwest::{Client, StatusCode, redirect::Policy};
-use serde_json::Value;
 use bibcode_server::{
     ConfigError, DESKTOP_SHUTDOWN_PATH, DESKTOP_SHUTDOWN_TOKEN_HEADER, ROUTE_INVENTORY,
     RpcRegistry, ServerConfig, ServerError, ServerMode, ServerRuntime,
 };
+use futures_util::{SinkExt, StreamExt};
+use reqwest::{Client, StatusCode, redirect::Policy};
+use serde_json::Value;
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},

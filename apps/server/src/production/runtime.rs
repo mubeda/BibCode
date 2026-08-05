@@ -824,7 +824,6 @@ fn production_provider_terminal_observer_factories() -> ProviderTerminalObserver
         codex: Some(Arc::new(CodexTerminalObserverFactory::system())),
         claude: Some(Arc::new(ClaudeTerminalObserverFactory::system())),
         opencode: Some(Arc::new(OpenCodeTerminalObserverFactory::system())),
-        ..ProviderTerminalObserverFactories::default()
     }
 }
 

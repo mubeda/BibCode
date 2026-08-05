@@ -227,10 +227,11 @@ pub fn resolve_acp_config_updates(options: &Value, updates: &Value) -> Result<Ve
     for update in updates {
         let (config_id, value) = match update.get("id").and_then(Value::as_str) {
             Some("reasoning") => {
-                let (config_id, descriptor) = if let Some(descriptor) = options.iter().find(|option| {
-                    option.get("category").and_then(Value::as_str) == Some("model_option")
-                        && option.get("id").and_then(Value::as_str) == Some("effort")
-                }) {
+                let (config_id, descriptor) = if let Some(descriptor) =
+                    options.iter().find(|option| {
+                        option.get("category").and_then(Value::as_str) == Some("model_option")
+                            && option.get("id").and_then(Value::as_str) == Some("effort")
+                    }) {
                     ("effort", descriptor)
                 } else {
                     (
@@ -309,7 +310,10 @@ pub fn resolve_acp_config_updates_with_baseline(
         .ok_or_else(|| "Cursor session did not advertise baseline config options".to_owned())?;
 
     for (config_id, category) in supported_baseline_config_options(baseline) {
-        if requested_config_ids.iter().any(|requested| requested == config_id) {
+        if requested_config_ids
+            .iter()
+            .any(|requested| requested == config_id)
+        {
             continue;
         }
         let descriptor = expected_config_option(baseline, config_id, category)?;
@@ -353,7 +357,9 @@ pub fn resolve_acp_default_model_config(options: &Value) -> Result<(String, Valu
                 .cloned()
         })
         .ok_or_else(|| {
-            format!("Cursor model config option {config_id} has no advertised default or current value")
+            format!(
+                "Cursor model config option {config_id} has no advertised default or current value"
+            )
         })?;
     Ok((config_id, value))
 }
@@ -424,7 +430,9 @@ fn acp_config_option_baseline_value(options: &[Value], config_id: &str) -> Resul
                 .filter(|value| !value.is_null())
                 .cloned()
         })
-        .ok_or_else(|| format!("Cursor config option {config_id} has no advertised default or current value"))
+        .ok_or_else(|| {
+            format!("Cursor config option {config_id} has no advertised default or current value")
+        })
 }
 
 fn expected_config_option<'a>(
@@ -437,17 +445,23 @@ fn expected_config_option<'a>(
         .find(|option| option.get("id").and_then(Value::as_str) == Some(config_id))
         .ok_or_else(|| format!("Cursor session did not advertise config option {config_id}"))?;
     if descriptor.get("category").and_then(Value::as_str) != Some(category) {
-        return Err(format!("Cursor config option {config_id} has an unsupported category"));
+        return Err(format!(
+            "Cursor config option {config_id} has an unsupported category"
+        ));
     }
     Ok(descriptor)
 }
 
 fn ensure_select_config_option(descriptor: &Value, config_id: &str) -> Result<(), String> {
     if descriptor.get("type").and_then(Value::as_str) != Some("select") {
-        return Err(format!("Cursor config option {config_id} has an unsupported type"));
+        return Err(format!(
+            "Cursor config option {config_id} has an unsupported type"
+        ));
     }
     if advertised_values(descriptor).is_empty() {
-        return Err(format!("Cursor config option {config_id} has no advertised values"));
+        return Err(format!(
+            "Cursor config option {config_id} has no advertised values"
+        ));
     }
     Ok(())
 }
@@ -457,10 +471,15 @@ fn ensure_advertised_value(
     value: &Value,
     config_id: &str,
 ) -> Result<(), String> {
-    if advertised_values(descriptor).iter().any(|candidate| candidate == value) {
+    if advertised_values(descriptor)
+        .iter()
+        .any(|candidate| candidate == value)
+    {
         Ok(())
     } else {
-        Err(format!("Cursor config option {config_id} does not advertise the requested value"))
+        Err(format!(
+            "Cursor config option {config_id} does not advertise the requested value"
+        ))
     }
 }
 
@@ -470,9 +489,7 @@ fn advertised_values(descriptor: &Value) -> Vec<Value> {
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|option| {
-            advertised_option_value(option)
-        })
+        .filter_map(advertised_option_value)
         .collect()
 }
 

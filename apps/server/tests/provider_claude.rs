@@ -6,6 +6,11 @@ use std::{
     path::PathBuf,
 };
 
+use bibcode_server::activity::{
+    ACTIVITY_DETAIL_MAX_LENGTH, ACTIVITY_SUMMARY_MAX_LENGTH, ActivityActorSummary,
+    ActivityCapabilities, ActivityEntry, ActivityLifecycle, ActivityObservationState,
+    ActivityRecordKind, ProviderActivityMutation,
+};
 use claude::{
     ClaudeActivityFixtureAdapter, ClaudeActivityInputSource, ClaudeTranscriptFixtureAdapter,
     canonical::{CanonicalEvent, CanonicalEventTrace},
@@ -18,11 +23,6 @@ use claude::{
 };
 use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
-use bibcode_server::activity::{
-    ACTIVITY_DETAIL_MAX_LENGTH, ACTIVITY_SUMMARY_MAX_LENGTH, ActivityActorSummary,
-    ActivityCapabilities, ActivityEntry, ActivityLifecycle, ActivityObservationState,
-    ActivityRecordKind, ProviderActivityMutation,
-};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
 fn fixture_dir() -> PathBuf {
@@ -571,10 +571,19 @@ fn transcript_recovery_parser_accepts_only_correlated_sidechain_activity_records
         })
         .collect::<Vec<_>>();
     assert_eq!(entries.len(), 3);
-    assert_eq!(entries[0].kind, bibcode_server::activity::ActivityEntryKind::Commentary);
+    assert_eq!(
+        entries[0].kind,
+        bibcode_server::activity::ActivityEntryKind::Commentary
+    );
     assert_eq!(entries[0].detail.as_deref(), Some("Recovered commentary"));
-    assert_eq!(entries[1].kind, bibcode_server::activity::ActivityEntryKind::Tool);
-    assert_eq!(entries[2].tone, bibcode_server::activity::ActivityEntryTone::Success);
+    assert_eq!(
+        entries[1].kind,
+        bibcode_server::activity::ActivityEntryKind::Tool
+    );
+    assert_eq!(
+        entries[2].tone,
+        bibcode_server::activity::ActivityEntryTone::Success
+    );
     assert!(
         entries
             .iter()
@@ -696,7 +705,10 @@ fn transcript_recovery_tool_lifecycle_ids_deduplicate_in_both_delivery_orders() 
     assert_eq!(recovered_ids, live_ids);
     assert!(
         recovery_first.handle_hook(&pre, 2_000).mutations.is_empty()
-            && recovery_first.handle_hook(&post, 3_000).mutations.is_empty(),
+            && recovery_first
+                .handle_hook(&post, 3_000)
+                .mutations
+                .is_empty(),
         "live after recovery must be idempotent"
     );
 }
@@ -746,9 +758,12 @@ fn transcript_recovery_partial_tool_start_completes_from_live_success_without_re
         "Explore",
         partial_transcript.as_bytes(),
     );
-    assert!(recovered.mutations.iter().all(
-        |mutation| matches!(mutation, ProviderActivityMutation::AppendEntry(_))
-    ));
+    assert!(
+        recovered
+            .mutations
+            .iter()
+            .all(|mutation| matches!(mutation, ProviderActivityMutation::AppendEntry(_)))
+    );
     assert!(matches!(
         recovered.mutations.as_slice(),
         [ProviderActivityMutation::AppendEntry(entry)] if entry.id == expected_ids[0]
@@ -989,15 +1004,12 @@ fn transcript_recovery_parentage_uses_only_explicit_parent_agent_identity() {
         transcript.as_bytes(),
     );
     assert!(
-        recovered
-            .mutations
-            .iter()
-            .all(|mutation| !matches!(
-                mutation,
-                ProviderActivityMutation::UpsertActor(actor)
-                    if actor.parent_actor_id.as_deref()
-                        == Some("claude:agent:parent-message-not-actor")
-            )),
+        recovered.mutations.iter().all(|mutation| !matches!(
+            mutation,
+            ProviderActivityMutation::UpsertActor(actor)
+                if actor.parent_actor_id.as_deref()
+                    == Some("claude:agent:parent-message-not-actor")
+        )),
         "transcript parentUuid is message lineage, never actor lineage"
     );
 }
@@ -2180,9 +2192,7 @@ fn claude_hook_native_ids_are_length_framed_and_reject_ambiguous_control_fields(
     });
     assert_eq!(
         claude_hook_native_event_id_for_test(&stable).as_deref(),
-        Some(
-            "claude:hook:d522f68beee25576d97830b627590aa34a417885338384ec366469f8b0dda4b9"
-        )
+        Some("claude:hook:d522f68beee25576d97830b627590aa34a417885338384ec366469f8b0dda4b9")
     );
 
     let ambiguous_left = json!({

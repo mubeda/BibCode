@@ -525,10 +525,14 @@ impl ActivityProjection {
         cursor: Option<&str>,
         limit: usize,
     ) -> ActivityResult<ActivityAdmittedRead<ActivityDetailPage>> {
-        self.admit_read(
-            self.repository
-                .list_detail(scope, scope_id, record_kind, record_id, cursor, limit),
-        )
+        self.admit_read(self.repository.list_detail(
+            scope,
+            scope_id,
+            record_kind,
+            record_id,
+            cursor,
+            limit,
+        ))
         .await
     }
 

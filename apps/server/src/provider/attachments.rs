@@ -1420,7 +1420,7 @@ mod tests {
             path: PathBuf::from("/safe/notes"),
         };
         let prompt = "x".repeat(32 * 1024);
-        let appended = super::append_file_references(prompt.clone(), &[file.clone()])
+        let appended = super::append_file_references(prompt.clone(), std::slice::from_ref(&file))
             .expect("generated references do not cap the prompt");
         assert!(appended.starts_with(&prompt));
         assert!(appended.contains("<attached_files>"));

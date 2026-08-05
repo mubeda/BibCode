@@ -241,6 +241,7 @@ fn unavailable_reconciler() -> DeliveryReconciler {
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run(
     engine: OrchestrationEngine,
     router: ProviderDeliveryRouter,
@@ -461,11 +462,11 @@ async fn wait_for_dispatch_signal(
     };
     tokio::pin!(recovery_wait);
     tokio::select! {
-        () = shutdown.cancelled() => return DispatchWait::Shutdown,
-        () = wake.notified() => return DispatchWait::Continue,
+        () = shutdown.cancelled() => DispatchWait::Shutdown,
+        () = wake.notified() => DispatchWait::Continue,
         completion = tasks.join_next(), if !tasks.is_empty() => DispatchWait::Completion(completion),
         completion = &mut recovery_wait => DispatchWait::Recovery(completion),
-        () = &mut retry_wait => return DispatchWait::Continue,
+        () = &mut retry_wait => DispatchWait::Continue,
     }
 }
 
@@ -552,6 +553,7 @@ async fn recover_sending(
     Ok(!recovery_cohort.is_empty())
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn fill_available_slots(
     engine: &OrchestrationEngine,
     router: &ProviderDeliveryRouter,
@@ -665,9 +667,7 @@ fn remove_completion(
     in_flight_commands: &mut HashSet<String>,
     in_flight_threads: &mut HashSet<String>,
 ) -> Option<DeliveryCompletion> {
-    let Some(completion) = completion else {
-        return None;
-    };
+    let completion = completion?;
     let Ok(completion) = completion else {
         tracing::warn!("provider delivery task failed; keeping its in-flight guard");
         return None;
@@ -1363,17 +1363,20 @@ mod tests {
         .expect("authoritative absent eventually permits resend");
         let attempts = reconciliations.load(Ordering::SeqCst);
         assert_eq!(attempts, 3);
-        let reconciliation_times = reconciliation_times.lock().unwrap();
-        assert!(
-            reconciliation_times[1].duration_since(reconciliation_times[0])
-                >= Duration::from_millis(40)
-        );
-        assert!(
-            reconciliation_times[2].duration_since(reconciliation_times[1])
-                >= Duration::from_millis(90)
-        );
+        let last_reconciliation = {
+            let reconciliation_times = reconciliation_times.lock().unwrap();
+            assert!(
+                reconciliation_times[1].duration_since(reconciliation_times[0])
+                    >= Duration::from_millis(40)
+            );
+            assert!(
+                reconciliation_times[2].duration_since(reconciliation_times[1])
+                    >= Duration::from_millis(90)
+            );
+            reconciliation_times[2]
+        };
         assert_eq!(sends.load(Ordering::SeqCst), 1);
-        assert!(send_times.lock().unwrap()[0] >= reconciliation_times[2]);
+        assert!(send_times.lock().unwrap()[0] >= last_reconciliation);
         assert_eq!(
             engine
                 .repositories()

@@ -1,3 +1,4 @@
+use bibcode_server::process::configure_background_command;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -8,7 +9,6 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
-use bibcode_server::process::configure_background_command;
 use tauri::{AppHandle, Emitter, Runtime};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::oneshot;

@@ -22,9 +22,8 @@ const MAX_PENDING_TEXT_EVENTS: usize = 256;
 const MAX_LIVE_TEXT_EVENTS: usize = MAX_TEXT_BYTES;
 // Cover every part in the supported terminal reconciliation slice, one root
 // history page, and the bounded in-flight text queue without unbounded growth.
-const MAX_DETAIL_BASELINE_IDENTITIES: usize = MAX_RECONCILED_CHILDREN * MAX_HISTORY_PARTS
-    + MAX_HISTORY_PARTS
-    + MAX_PENDING_TEXT_EVENTS;
+const MAX_DETAIL_BASELINE_IDENTITIES: usize =
+    MAX_RECONCILED_CHILDREN * MAX_HISTORY_PARTS + MAX_HISTORY_PARTS + MAX_PENDING_TEXT_EVENTS;
 pub(crate) const TEXT_COALESCE_MS: u64 = 100;
 const MAX_NATIVE_ID_BYTES: usize = 64;
 const MAX_FORMATTABLE_UNIX_NANOSECONDS: i128 = 253_402_300_799_999_999_999;
@@ -36,10 +35,8 @@ pub struct OpenCodeActivityOutput {
 }
 
 impl OpenCodeActivityOutput {
-    fn push(
-        &mut self,
-        mutation: ProviderActivityMutation,
-    ) -> Result<(), ProviderActivityMutation> {
+    #[allow(clippy::result_large_err)]
+    fn push(&mut self, mutation: ProviderActivityMutation) -> Result<(), ProviderActivityMutation> {
         if self.mutations.len() < MAX_MUTATIONS {
             self.mutations.push(mutation);
             Ok(())
@@ -382,12 +379,7 @@ impl OpenCodeActivityTracker {
             Some("message.updated") => self.handle_message_info(properties),
             Some("message.part.updated") => self.handle_part(properties),
             Some("message.part.delta") => {
-                self.handle_text_delta(
-                    properties,
-                    received_at_ms,
-                    None,
-                    raw_string(event, "id"),
-                )
+                self.handle_text_delta(properties, received_at_ms, None, raw_string(event, "id"))
             }
             Some("command.executed") => {
                 self.handle_command(properties, raw_string(event, "id"), received_at_ms)
@@ -418,10 +410,8 @@ impl OpenCodeActivityTracker {
         if event_type == Some("session.error") {
             return self.handle_event_at(event, candidate_at_ms);
         }
-        let sequenced = sequence_observation_timestamp(
-            self.last_observed_event_at_ns,
-            candidate_at_ms,
-        );
+        let sequenced =
+            sequence_observation_timestamp(self.last_observed_event_at_ns, candidate_at_ms);
         let event_semantic = event
             .get("properties")
             .and_then(|properties| string(properties, "sessionID"))
@@ -470,7 +460,8 @@ impl OpenCodeActivityTracker {
             if string(info, "sessionID") != Some(session_id) {
                 continue;
             }
-            let deferred = output.extend(self.handle_message_info_value(session_id, info).mutations);
+            let deferred =
+                output.extend(self.handle_message_info_value(session_id, info).mutations);
             debug_assert!(deferred.is_empty());
             for part in message
                 .get("parts")
@@ -512,7 +503,7 @@ impl OpenCodeActivityTracker {
                 break;
             }
             let (session_id, part_id) = &keys[(start + offset) % keys.len()];
-            self.flush_text_stream(&session_id, &part_id, &mut output, limit);
+            self.flush_text_stream(session_id, part_id, &mut output, limit);
             self.text_drain_cursor = Some((session_id.clone(), part_id.clone()));
         }
         output
@@ -796,17 +787,11 @@ impl OpenCodeActivityTracker {
         }
     }
 
-    fn resolve_part_timestamp_ms(
-        &self,
-        session_id: &str,
-        part: &Value,
-        enclosing: &Value,
-    ) -> u64 {
+    fn resolve_part_timestamp_ms(&self, session_id: &str, part: &Value, enclosing: &Value) -> u64 {
         let part_timestamp = match string(part, "type") {
-            Some("text") => first_valid_timestamp([
-                part.pointer("/time/end"),
-                part.pointer("/time/start"),
-            ]),
+            Some("text") => {
+                first_valid_timestamp([part.pointer("/time/end"), part.pointer("/time/start")])
+            }
             Some("tool")
                 if matches!(
                     part.pointer("/state/status").and_then(Value::as_str),
@@ -818,10 +803,7 @@ impl OpenCodeActivityTracker {
                     part.pointer("/state/time/start"),
                 ])
             }
-            Some("tool") => first_valid_timestamp([
-                part.pointer("/state/time/start"),
-                None,
-            ]),
+            Some("tool") => first_valid_timestamp([part.pointer("/state/time/start"), None]),
             _ => None,
         };
         part_timestamp
@@ -883,11 +865,7 @@ impl OpenCodeActivityTracker {
             return OpenCodeActivityOutput::default();
         }
         let detail = bounded_text_with_marker(delta);
-        let id = entry_id(
-            message_id,
-            part_id,
-            &format!("event:{}", digest(event_id)),
-        );
+        let id = entry_id(message_id, part_id, &format!("event:{}", digest(event_id)));
         let semantic = format!("text-delta:{session_id}:{message_id}:{part_id}:{event_id}");
         let (output, accepted) = self.enqueue_delta(
             session_id,
@@ -972,10 +950,9 @@ impl OpenCodeActivityTracker {
             stream.coverage_saturated = false;
             return OpenCodeActivityOutput::default();
         }
-        let candidate_suffix =
-            append_only_suffix(text, &previous, previous_source_bytes)
-                .map(bounded_text)
-                .or_else(|| normalized.strip_prefix(&previous).map(str::to_owned));
+        let candidate_suffix = append_only_suffix(text, &previous, previous_source_bytes)
+            .map(bounded_text)
+            .or_else(|| normalized.strip_prefix(&previous).map(str::to_owned));
         if let Some(matched) = candidate_suffix
             .as_deref()
             .and_then(|suffix| match_newest_live_segments(&live_segments, suffix))
@@ -1017,15 +994,12 @@ impl OpenCodeActivityTracker {
             digest(&normalized)
         );
         if self.seen_entries.contains(&semantic)
-            || self
-                .message_text
-                .get(&key)
-                .is_some_and(|stream| {
-                    stream
-                        .pending
-                        .iter()
-                        .any(|pending| pending.semantic == semantic)
-                })
+            || self.message_text.get(&key).is_some_and(|stream| {
+                stream
+                    .pending
+                    .iter()
+                    .any(|pending| pending.semantic == semantic)
+            })
         {
             let stream = self.message_text.entry(key).or_default();
             stream.normalized = normalized;
@@ -1097,11 +1071,7 @@ impl OpenCodeActivityTracker {
         (output, true)
     }
 
-    fn enqueue_snapshot(
-        &mut self,
-        key: &(String, String),
-        pending: PendingTextEntry,
-    ) -> bool {
+    fn enqueue_snapshot(&mut self, key: &(String, String), pending: PendingTextEntry) -> bool {
         let stream = self.message_text.entry(key.clone()).or_default();
         if let Some(last) = stream
             .pending
@@ -1299,6 +1269,7 @@ impl OpenCodeActivityTracker {
         stream.pending_at_ms = stream.pending.front().map(|pending| pending.at_ms);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn entry(
         &self,
         session_id: &str,
@@ -1310,22 +1281,16 @@ impl OpenCodeActivityTracker {
         at_ms: u64,
     ) -> OpenCodeActivityOutput {
         let mut output = OpenCodeActivityOutput::default();
-        if let Some(mutation) = self.entry_mutation(
-            session_id,
-            id,
-            kind,
-            title,
-            detail,
-            tone,
-            at_ms,
-            None,
-        ) {
+        if let Some(mutation) =
+            self.entry_mutation(session_id, id, kind, title, detail, tone, at_ms, None)
+        {
             let result = output.push(mutation);
             debug_assert!(result.is_ok());
         }
         output
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn entry_mutation(
         &self,
         session_id: &str,
@@ -1569,9 +1534,7 @@ fn digest(value: &str) -> String {
         .map(|byte| format!("{byte:02x}"))
         .collect()
 }
-fn first_valid_timestamp<'a>(
-    values: impl IntoIterator<Item = Option<&'a Value>>,
-) -> Option<u64> {
+fn first_valid_timestamp<'a>(values: impl IntoIterator<Item = Option<&'a Value>>) -> Option<u64> {
     values
         .into_iter()
         .flatten()
@@ -1847,7 +1810,12 @@ mod tests {
                 },
                 "parts": parts
             }]);
-            assert!(tracker.handle_history(&child_id, &history).mutations.is_empty());
+            assert!(
+                tracker
+                    .handle_history(&child_id, &history)
+                    .mutations
+                    .is_empty()
+            );
         }
         let rejected_history = json!([{
             "info": {
@@ -2032,10 +2000,7 @@ mod tests {
         assert_eq!(before_rejection.source_bytes, MAX_TEXT_BYTES);
         assert_eq!(before_rejection.live_bytes, MAX_TEXT_BYTES);
         assert!(before_rejection.coverage_saturated);
-        assert_eq!(
-            before_rejection.pending.len(),
-            MAX_PENDING_TEXT_EVENTS
-        );
+        assert_eq!(before_rejection.pending.len(), MAX_PENDING_TEXT_EVENTS);
         assert!(
             tracker
                 .handle_text_part("child", &changed_part, 2_000_001)
@@ -2049,7 +2014,10 @@ mod tests {
         assert!(rejected.coverage_saturated);
         assert_eq!(rejected.pending.len(), MAX_PENDING_TEXT_EVENTS);
 
-        assert_eq!(tracker.flush_text().mutations.len(), MAX_PENDING_TEXT_EVENTS);
+        assert_eq!(
+            tracker.flush_text().mutations.len(),
+            MAX_PENDING_TEXT_EVENTS
+        );
         assert!(
             tracker
                 .handle_text_part("child", &changed_part, 2_000_001)
@@ -2217,10 +2185,7 @@ mod tests {
             sequence_observation_timestamp(Some(formatter_ceiling_ns), formatter_ceiling_ms)
                 .expect("the valid formatter ceiling remains representable");
         assert_eq!(exhausted.unix_nanos, formatter_ceiling_ns);
-        assert_eq!(
-            exhausted.created_at,
-            "9999-12-31T23:59:59.999999999Z"
-        );
+        assert_eq!(exhausted.created_at, "9999-12-31T23:59:59.999999999Z");
         assert_ne!(exhausted.created_at, epoch());
 
         let repeated =

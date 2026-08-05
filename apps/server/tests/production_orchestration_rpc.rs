@@ -5,8 +5,6 @@ use std::{
     time::Duration,
 };
 
-use futures_util::{FutureExt, SinkExt, StreamExt};
-use serde_json::{Value, json};
 use bibcode_server::{
     RpcExit, RpcRegistry, ServerConfig, ServerHandle, ServerMessage, ServerRuntime,
     orchestration::{EngineOptions, OrchestrationCommand, OrchestrationEngine, load_snapshot},
@@ -15,6 +13,8 @@ use bibcode_server::{
         host_paths::process_compatible_path, orchestration_rpc::register_orchestration_rpc,
     },
 };
+use futures_util::{FutureExt, SinkExt, StreamExt};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::time::timeout;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};

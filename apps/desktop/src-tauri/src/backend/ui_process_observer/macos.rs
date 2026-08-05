@@ -143,10 +143,10 @@ fn reduce_webview_results(
 }
 
 fn push_candidate(result: &mut WebViewPidResult, pid: libc::pid_t, role: WebKitProcessRole) {
-    if let Ok(pid) = u32::try_from(pid) {
-        if pid > 0 {
-            result.candidates.push(WebKitProcessCandidate { pid, role });
-        }
+    if let Ok(pid) = u32::try_from(pid)
+        && pid > 0
+    {
+        result.candidates.push(WebKitProcessCandidate { pid, role });
     }
 }
 

@@ -68,7 +68,8 @@ pub struct TurnDeliveryTransition {
 
 pub fn canonical_command_digest<T: Serialize>(value: &T) -> Result<String, String> {
     let value = serde_json::to_value(value).map_err(|error| error.to_string())?;
-    let canonical = serde_json::to_string(&canonicalize(value)).map_err(|error| error.to_string())?;
+    let canonical =
+        serde_json::to_string(&canonicalize(value)).map_err(|error| error.to_string())?;
     Ok(crate::crypto::sha256_hex(canonical))
 }
 

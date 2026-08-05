@@ -139,6 +139,7 @@ impl ProviderOperationalLog {
     }
 
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn record_option_reconciliation(
         &self,
         thread_id: &str,

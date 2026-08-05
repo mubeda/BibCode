@@ -1,6 +1,6 @@
+use bibcode_server::process::configure_background_command;
 use serde_json::Value;
 use std::{path::Path, time::Duration};
-use bibcode_server::process::configure_background_command;
 use tokio::process::Command;
 
 const DEFAULT_TAILSCALE_SERVE_PORT: u16 = 443;

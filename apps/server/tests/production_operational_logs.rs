@@ -1,6 +1,5 @@
 use std::path::PathBuf;
 
-use serde_json::json;
 use bibcode_server::production::{
     operational_logs::{OperationalLogOptions, ProviderOperationalLog},
     provider_runtime::ProviderEvent,
@@ -8,6 +7,7 @@ use bibcode_server::production::{
 use bibcode_server::{
     production::operational_logs::TerminalOperationalLog, terminal::TerminalEvent,
 };
+use serde_json::json;
 use tempfile::TempDir;
 
 #[tokio::test]

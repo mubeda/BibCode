@@ -426,6 +426,7 @@ impl OpenCodeSessionRuntime {
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_with_options_reconciliation_revision_and_agent_activity(
         base_url: &str,
         thread_id: &str,
@@ -818,11 +819,13 @@ impl OpenCodeSessionRuntime {
             })?;
             match id {
                 "fastMode" if fast_mode.is_none() => {
-                    fast_mode = Some(option.get("value").and_then(Value::as_bool).ok_or_else(|| {
-                        OpenCodeRuntimeError::InvalidResponse(
-                            "option fastMode requires a boolean value".to_owned(),
-                        )
-                    })?);
+                    fast_mode = Some(option.get("value").and_then(Value::as_bool).ok_or_else(
+                        || {
+                            OpenCodeRuntimeError::InvalidResponse(
+                                "option fastMode requires a boolean value".to_owned(),
+                            )
+                        },
+                    )?);
                 }
                 "variant" if requested_variant.is_none() => {
                     requested_variant = Some(
@@ -892,17 +895,11 @@ impl OpenCodeSessionRuntime {
     }
 
     async fn advertised_variants(&self) -> Result<(String, Vec<String>), OpenCodeRuntimeError> {
-        let (provider_id, model_id) = self
-            .inner
-            .model
-            .lock()
-            .await
-            .clone()
-            .ok_or_else(|| {
-                OpenCodeRuntimeError::InvalidResponse(
-                    "options require a selected provider/model".to_owned(),
-                )
-            })?;
+        let (provider_id, model_id) = self.inner.model.lock().await.clone().ok_or_else(|| {
+            OpenCodeRuntimeError::InvalidResponse(
+                "options require a selected provider/model".to_owned(),
+            )
+        })?;
         let response = self
             .inner
             .client

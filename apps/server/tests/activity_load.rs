@@ -10,9 +10,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use bibcode_server::{
     RpcRegistry, ServerConfig, ServerMessage, ServerRuntime,
     activity::{
@@ -44,6 +41,9 @@ use bibcode_server::{
         TerminalLaunchCommand, TerminalManager, TerminalManagerOptions, TerminalOpenInput,
     },
 };
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{Value, json};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 use tempfile::TempDir;
 use tokio::{
     sync::{Barrier, oneshot},
@@ -338,10 +338,7 @@ async fn disabled_gate_rejects_dormant_volume_without_work_or_trace_growth() {
         terminal_factory.dormant_frames.load(Ordering::Acquire),
         DISABLED_EVENT_COUNT
     );
-    assert_eq!(
-        terminal_factory.decoded_events.load(Ordering::Acquire),
-        0
-    );
+    assert_eq!(terminal_factory.decoded_events.load(Ordering::Acquire), 0);
     assert_eq!(
         controller.active_stream_count_for_integration_test(),
         streams_before
@@ -990,7 +987,7 @@ async fn assert_same_scope_publication_order(database: &Database) {
     // `JoinSet` observes executor scheduling after `apply` returns, so its sequence is
     // intentionally not an ordering contract. The in-lock completion stream above is the
     // authoritative order; this audit proves JoinSet did observe that exact contiguous set.
-    let mut joined_revision_seen = vec![false; QUEUED_WRITER_COUNT + 1];
+    let mut joined_revision_seen = [false; QUEUED_WRITER_COUNT + 1];
     for revision in &joined_completion_revisions {
         assert!(
             (1..=QUEUED_WRITER_COUNT as u64).contains(revision),

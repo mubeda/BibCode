@@ -1,5 +1,4 @@
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use serde_json::json;
 use bibcode_server::{
     activity::{
         ActivityActorSummary, ActivityCapabilities, ActivityChange, ActivityDelta, ActivityEntry,
@@ -11,6 +10,7 @@ use bibcode_server::{
     },
     persistence::{Database, run_migrations},
 };
+use serde_json::json;
 
 const MAX_ACTIVITY_MUTATIONS: usize = 256;
 
@@ -483,12 +483,7 @@ async fn source_specific_chat_finalization_does_not_interrupt_terminal_activity(
         AgentActivityController::new(true),
     );
     seed_running_actor(&projections.chat(), &thread_scope, "actor:chat").await;
-    seed_running_actor(
-        &projections.terminal(),
-        &terminal_scope,
-        "actor:terminal",
-    )
-    .await;
+    seed_running_actor(&projections.terminal(), &terminal_scope, "actor:terminal").await;
 
     assert_eq!(
         projections
@@ -553,12 +548,7 @@ async fn source_specific_terminal_finalization_does_not_interrupt_chat_activity(
         AgentActivityController::new(true),
     );
     seed_running_actor(&projections.chat(), &thread_scope, "actor:chat").await;
-    seed_running_actor(
-        &projections.terminal(),
-        &terminal_scope,
-        "actor:terminal",
-    )
-    .await;
+    seed_running_actor(&projections.terminal(), &terminal_scope, "actor:terminal").await;
 
     assert_eq!(
         projections
@@ -589,10 +579,7 @@ async fn source_specific_terminal_finalization_does_not_interrupt_chat_activity(
         .snapshot(&terminal_scope.scope)
         .await
         .expect("terminal snapshot");
-    assert_eq!(
-        thread_snapshot.actors[0].status,
-        ActivityLifecycle::Running
-    );
+    assert_eq!(thread_snapshot.actors[0].status, ActivityLifecycle::Running);
     assert_eq!(
         terminal_snapshot.actors[0].status,
         ActivityLifecycle::Interrupted
@@ -623,12 +610,7 @@ async fn source_specific_mismatched_finalization_leaves_both_sources_unchanged()
         AgentActivityController::new(true),
     );
     seed_running_actor(&projections.chat(), &thread_scope, "actor:chat").await;
-    seed_running_actor(
-        &projections.terminal(),
-        &terminal_scope,
-        "actor:terminal",
-    )
-    .await;
+    seed_running_actor(&projections.terminal(), &terminal_scope, "actor:terminal").await;
     let chat_registry_counts = projections.chat().registry_counts_for_integration_test();
     let terminal_registry_counts = projections
         .terminal()
@@ -3363,21 +3345,15 @@ async fn seed_running_actor(
     scope: &ActivityScopeSeed,
     actor_id: &str,
 ) {
-    projection
-        .ensure_scope(scope.clone())
-        .await
-        .expect("scope");
+    projection.ensure_scope(scope.clone()).await.expect("scope");
     projection
         .apply(
             &scope.scope_id,
             format!("event:{actor_id}"),
-            vec![ProviderActivityMutation::upsert_actor(
-                actor_id,
-                None,
-                actor_id,
-                "running",
-            )
-            .expect("actor")],
+            vec![
+                ProviderActivityMutation::upsert_actor(actor_id, None, actor_id, "running")
+                    .expect("actor"),
+            ],
             "2026-08-04T12:00:00Z".to_owned(),
         )
         .await

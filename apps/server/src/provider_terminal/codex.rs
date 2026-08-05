@@ -22,17 +22,18 @@ use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::process::Child;
 
+#[cfg(unix)]
+use super::supervisor::create_owned_generation_directory;
 use super::{
     PreparedTerminalLaunch, PreparedTerminalObserver, ProviderTerminalObserverFactory,
     ProviderTerminalObserverFactoryInput, TerminalAgentActivityControl,
     TerminalAgentActivityObservation, TerminalAgentActivityObservationKind,
     TerminalAgentActivityState, TerminalAgentActivityTransition,
-    TerminalGenerationActivityPublisher,
-    TerminalObserverGeneration, TerminalObserverWorkerContext,
+    TerminalGenerationActivityPublisher, TerminalObserverGeneration, TerminalObserverWorkerContext,
     supervisor::cleanup_owned_generation_directory,
 };
 #[cfg(unix)]
-use super::supervisor::create_owned_generation_directory;
+use crate::provider::codex::model::CODEX_REMOTE_MESSAGE_MAX_BYTES;
 use crate::{
     activity::{ActivityCapabilities, ActivityObservationState, ProviderActivityMutation},
     process::{
@@ -44,15 +45,12 @@ use crate::{
         build_initialize_params,
         model::{
             CODEX_RECONCILIATION_BACKGROUND_LIMIT, CODEX_RECONCILIATION_THREAD_LIMIT,
-            ThreadBackgroundTerminalsListParams, ThreadListParams,
-            ThreadReadParams, decode_background_terminals_list_response,
-            decode_thread_list_response, decode_thread_read_response,
-            is_recoverable_thread_resume_error,
+            ThreadBackgroundTerminalsListParams, ThreadListParams, ThreadReadParams,
+            decode_background_terminals_list_response, decode_thread_list_response,
+            decode_thread_read_response, is_recoverable_thread_resume_error,
         },
     },
 };
-#[cfg(unix)]
-use crate::provider::codex::model::CODEX_REMOTE_MESSAGE_MAX_BYTES;
 
 const CODEX_PROBE_OUTPUT_LIMIT: usize = 128 * 1024;
 const CODEX_CAPABILITY_CACHE_CAPACITY: usize = 64;
@@ -840,8 +838,7 @@ async fn run_codex_observer_inner(
                 };
                 client = reconnected;
                 discovery_state = CodexRootDiscoveryState::Ready;
-                discovery_deadline =
-                    tokio::time::Instant::now() + CODEX_ROOT_DISCOVERY_INTERVAL;
+                discovery_deadline = tokio::time::Instant::now() + CODEX_ROOT_DISCOVERY_INTERVAL;
             }
             Err(_) => {
                 match discover_codex_tui_root(
@@ -1161,8 +1158,7 @@ async fn run_codex_observer_inner(
                 continue;
             }
             let outcome = {
-                let native_event_key_prefix =
-                    format!("codex:terminal-observation:{epoch}");
+                let native_event_key_prefix = format!("codex:terminal-observation:{epoch}");
                 let reconciliation = reconcile_codex_terminal(
                     inner,
                     &native_event_key_prefix,
@@ -1192,17 +1188,21 @@ async fn run_codex_observer_inner(
                     if !changed.enabled {
                         live_state = None;
                         pending_barrier = None;
-                        inner.activity.mark_observed(TerminalAgentActivityObservation {
-                            state: changed,
-                            epoch,
-                            kind: TerminalAgentActivityObservationKind::Dormant,
-                        });
+                        inner
+                            .activity
+                            .mark_observed(TerminalAgentActivityObservation {
+                                state: changed,
+                                epoch,
+                                kind: TerminalAgentActivityObservationKind::Dormant,
+                            });
                     } else if live_state == Some(changed) {
-                        inner.activity.mark_observed(TerminalAgentActivityObservation {
-                            state: changed,
-                            epoch,
-                            kind: TerminalAgentActivityObservationKind::Live,
-                        });
+                        inner
+                            .activity
+                            .mark_observed(TerminalAgentActivityObservation {
+                                state: changed,
+                                epoch,
+                                kind: TerminalAgentActivityObservationKind::Live,
+                            });
                     } else {
                         live_state = None;
                         pending_barrier = Some(changed);
@@ -2547,6 +2547,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[allow(clippy::result_large_err)]
     async fn system_remote_client_uses_websocket_rpc_over_a_real_unix_socket() {
         let root = tempfile::tempdir().expect("UDS directory");
         let socket_path = root.path().join("app-server.sock");
