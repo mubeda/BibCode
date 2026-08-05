@@ -105,8 +105,20 @@ included in Core:
 On Windows, the desktop observer associates WebView2 roots only when they are
 current BiBCode descendants carrying WebView2's embedded-browser marker and the
 running desktop executable name. Their helper descendants inherit Core UI
-ownership. Unsupported platforms report `unavailable`; the observer never
-claims generic browser or renderer executable-name matches.
+ownership.
+
+On macOS, the desktop observer obtains PIDs from every WKWebView owned by the
+current Tauri `AppHandle`, then validates each PID with an exact role-specific
+executable match and matching resource and jetsam coalition IDs, both nonzero.
+Coalition membership is validation rather than a discovery mechanism. A
+missing private selector, failed dispatch, missing snapshot row, or unavailable
+coalition data
+yields `partial` or `unavailable` coverage. This requires neither elevated
+privileges nor a new entitlement, but it uses private WebKit and process SPI,
+so it is incompatible with a strict Mac App Store public-API-only policy.
+
+Linux and other unsupported desktop targets report `unavailable`; the observer
+never claims generic browser or renderer executable-name matches.
 
 Production provider and terminal launchers register their root PID, scope,
 kind, and bounded label. The schema reserves the `helper` kind, but no

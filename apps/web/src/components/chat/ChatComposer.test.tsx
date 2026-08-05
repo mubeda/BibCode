@@ -72,6 +72,7 @@ const h = vi.hoisted(() => {
       error: null as string | null,
       isPending: false,
     },
+    traitInputs: [] as unknown[],
     isMobile: false,
     toastAdd: vi.fn(),
     recordHost(type: unknown, props: unknown) {
@@ -306,6 +307,19 @@ vi.mock("../../hooks/useMediaQuery", () => ({
 vi.mock("../../state/threads", () => ({
   environmentThreadDetails: { detailAtom: () => ({}) },
 }));
+
+vi.mock("./composerProviderState", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("./composerProviderState")>();
+  return {
+    ...actual,
+    renderComposerTraitControls: (
+      input: Parameters<typeof actual.renderComposerTraitControls>[0],
+    ) => {
+      h.traitInputs.push(input);
+      return actual.renderComposerTraitControls(input);
+    },
+  };
+});
 
 import { type ChatComposerHandle, type ChatComposerProps, ChatComposer } from "./ChatComposer";
 import {
@@ -785,6 +799,9 @@ function renderComposer(overrides: Partial<ChatComposerProps> = {}): RenderResul
     runtimeMode: "approval-required",
     interactionMode: "default",
     lockedProvider: null,
+    providerBindingInstanceId: codexInstanceId,
+    lockProviderPickerToActiveInstance: false,
+    providerBindingConflictReason: null,
     providerStatuses: [codexProvider],
     activeProjectDefaultModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
     activeThreadModelSelection: null,
@@ -822,6 +839,7 @@ function renderComposer(overrides: Partial<ChatComposerProps> = {}): RenderResul
   h.stateIndex = 0;
   h.captures.length = 0;
   h.hostElements.length = 0;
+  h.traitInputs.length = 0;
   publishSeededStoreState();
   const markup = renderToStaticMarkup(<ChatComposer {...props} />);
   flushQueuedEffects();
@@ -954,7 +972,7 @@ describe("ChatComposer rendering", () => {
     expect(select["value"]).toBe("approval-required");
     const picker = findCapture("ProviderModelPicker");
     expect(picker["lockedProvider"]).toBeNull();
-    expect(picker["lockToActiveInstance"]).toBe(true);
+    expect(picker["lockToActiveInstance"]).toBe(false);
 
     // Path search targets nothing while no path trigger is active.
     const pathSearch = findCapture("useComposerPathSearch")["target"] as Record<string, unknown>;
@@ -994,6 +1012,7 @@ describe("ChatComposer rendering", () => {
         { ...codexProvider, supportsMcpStatus: true },
         { ...codexProvider, instanceId: personalInstanceId, supportsMcpStatus: true },
       ],
+      providerBindingInstanceId: personalInstanceId,
       activeProjectDefaultModelSelection: { instanceId: personalInstanceId, model: "gpt-5.4" },
       activeThreadActivities: [
         ...activeThreadActivities,
@@ -1016,12 +1035,12 @@ describe("ChatComposer rendering", () => {
     expect(filterCaptures("McpStatusPopover")).toEqual([]);
   });
 
-  it("locks the provider picker to the active instance after the provider is fixed", () => {
+  it("uses a provider-family lock without fixing the active instance", () => {
     renderComposer({ lockedProvider: ProviderDriverKind.make("codex") });
 
     const picker = findCapture("ProviderModelPicker");
     expect(picker["lockedProvider"]).toBe("codex");
-    expect(picker["lockToActiveInstance"]).toBe(true);
+    expect(picker["lockToActiveInstance"]).toBe(false);
   });
 
   it("presents a raw Claude Ultrathink session default before the first send", () => {
@@ -1059,6 +1078,7 @@ describe("ChatComposer rendering", () => {
 
     const { markup, handle } = renderComposer({
       providerStatuses: [claudeProvider],
+      providerBindingInstanceId: claudeInstanceId,
       activeProjectDefaultModelSelection: null,
       activeThreadModelSelection: rawDefault,
     });
@@ -1454,6 +1474,30 @@ describe("ChatComposer attachments", () => {
     (annotationCards["onRemove"] as (id: string) => void)("ann-1");
     // Removing the last annotation empties the draft, which the store drops.
     expect(draftOf(threadRef)?.previewAnnotations ?? []).toEqual([]);
+  });
+
+  it("preserves existing contexts and attachments while a provider conflict is active", () => {
+    draftStore().addAttachments(threadRef, [makeFile()]);
+    draftStore().setTerminalContexts(threadRef, [makeTerminalContext("ctx-locked")]);
+    draftStore().setElementContexts(threadRef, [makeElementContext("el-locked")]);
+    seedPrompt(`${INLINE_TERMINAL_CONTEXT_PLACEHOLDER} keep this`);
+    renderComposer({
+      providerBindingConflictReason: "Provider metadata conflicts with the active session.",
+    });
+
+    (editorProps()["onChange"] as PromptChange)("replace this", 12, 12, false, []);
+    (editorProps()["onRemoveTerminalContext"] as (id: string) => void)("ctx-locked");
+    (findCapture("ComposerPendingElementContexts")["onRemove"] as (id: string) => void)(
+      "el-locked",
+    );
+    const attachmentButton = captureByLabel("Button", "Remove notes.txt");
+    (attachmentButton["onClick"] as () => void)();
+
+    const draft = draftOf(threadRef);
+    expect(draft?.prompt).toBe(`${INLINE_TERMINAL_CONTEXT_PLACEHOLDER} keep this`);
+    expect(draft?.terminalContexts.map((context) => context.id)).toEqual(["ctx-locked"]);
+    expect(draft?.elementContexts.map((context) => context.id)).toEqual(["el-locked"]);
+    expect(draft?.attachments.map((attachment) => attachment.name)).toEqual(["notes.txt"]);
   });
 
   it("expands the image attached to a preview annotation", () => {
@@ -2140,6 +2184,37 @@ describe("ChatComposer paste and drag", () => {
     ).toHaveBeenCalled();
   });
 
+  it("blocks paste, file input, and drag attachment ingress during a provider conflict", () => {
+    const conflictReason = "Provider metadata conflicts with the active session.";
+    const { spies } = renderComposer({ providerBindingConflictReason: conflictReason });
+    const pasted = pasteEvent([imageFile("pasted.png")]);
+    const onPaste = editorProps()["onPaste"] as (event: unknown) => void;
+    const fileInput = findHost(
+      (element) => element.type === "input" && element.props["type"] === "file",
+    );
+    const inputTarget = {
+      files: [imageFile("selected.png")],
+      value: "/fake/selected.png",
+    };
+    const dragHost = findHost((element) => typeof element.props["onDrop"] === "function");
+    const entered = dragEvent({ files: [imageFile("entered.png")] });
+    const dropped = dragEvent({ files: [imageFile("dropped.png")] });
+
+    onPaste(pasted);
+    (fileInput.props["onChange"] as (event: unknown) => void)({ currentTarget: inputTarget });
+    (dragHost.props["onDragEnter"] as (event: unknown) => void)(entered);
+    (dragHost.props["onDrop"] as (event: unknown) => void)(dropped);
+
+    expect(pasted.preventDefault).toHaveBeenCalled();
+    expect(inputTarget.value).toBe("");
+    expect(entered.preventDefault).toHaveBeenCalled();
+    expect(dropped.preventDefault).toHaveBeenCalled();
+    expect(setStateValues(STATE.dragOver)).not.toContain(true);
+    expect(draftOf(threadRef)?.attachments ?? []).toEqual([]);
+    expect(spies.setThreadError).not.toHaveBeenCalled();
+    expect(spies.focusComposer).not.toHaveBeenCalled();
+  });
+
   it("rejects attachments while plan questions are pending", () => {
     renderComposer({
       pendingUserInputs: [makePendingUserInput()],
@@ -2495,6 +2570,25 @@ describe("ChatComposer imperative handle", () => {
     expect(h.editorHandle.focusAt).toHaveBeenCalled();
   });
 
+  it("returns false without mutating when terminal context is added during a provider conflict", () => {
+    seedPrompt("hello");
+    const { handle } = renderComposer({
+      providerBindingConflictReason: "Provider metadata conflicts with the active session.",
+    });
+
+    const inserted = handle().addTerminalContext({
+      terminalId: "term-9",
+      terminalLabel: "Terminal 9",
+      lineStart: 10,
+      lineEnd: 12,
+      text: "compile ok",
+    });
+
+    expect(inserted).toBe(false);
+    expect(draftOf(threadRef)?.prompt).toBe("hello");
+    expect(draftOf(threadRef)?.terminalContexts ?? []).toEqual([]);
+  });
+
   it("skips terminal context insertion without an active thread", () => {
     seedPrompt("hello");
     const { handle } = renderComposer({ activeThread: undefined });
@@ -2532,6 +2626,52 @@ describe("ChatComposer imperative handle", () => {
 // ---------------------------------------------------------------------------
 
 describe("ChatComposer provider selection", () => {
+  it("disables composing and submission for a provider binding conflict", () => {
+    const conflictReason =
+      'Provider instance "codex_personal" reports driver "claude", but the active session expects "codex". Sending is blocked until provider metadata agrees.';
+    const conflictOverrides = {
+      providerBindingConflictReason: conflictReason,
+      providerBindingInstanceId: ProviderInstanceId.make("codex_personal"),
+      lockProviderPickerToActiveInstance: true,
+    } as Partial<ChatComposerProps> & { providerBindingConflictReason: string };
+    seedPrompt("do not send");
+
+    const { spies } = renderComposer(conflictOverrides);
+
+    expect(editorProps()["disabled"]).toBe(true);
+    expect(editorProps()["placeholder"]).toBe(conflictReason);
+    expect(findCapture("ProviderModelPicker")["disabled"]).toBe(true);
+    expect(lastCapture("ComposerPrimaryActions")["sendBlockedReason"]).toBe(conflictReason);
+
+    setEditorSnapshot("do not send", 11);
+    const onKey = editorProps()["onCommandKeyDown"] as CommandKey;
+    onKey("Enter", keyEvent());
+    expect(spies.onSend).not.toHaveBeenCalled();
+  });
+
+  it("ignores provider trait prompt and model-option callbacks during a binding conflict", async () => {
+    seedPrompt("keep this prompt");
+    const onCommitModelSelection = vi.fn(async () => undefined);
+    renderComposer({
+      providerBindingConflictReason: "Provider metadata conflicts with the active session.",
+      onCommitModelSelection,
+    });
+    const traitInput = h.traitInputs.at(-1) as {
+      onPromptChange: (nextPrompt: string) => void;
+      onModelOptionsChange?: (
+        nextOptions: ReadonlyArray<{ id: string; value: string | boolean }> | undefined,
+      ) => void | Promise<void>;
+    };
+
+    traitInput.onPromptChange("replace this prompt");
+    await traitInput.onModelOptionsChange?.([{ id: "effort", value: "high" }]);
+
+    const draft = draftOf(threadRef);
+    expect(draft?.prompt).toBe("keep this prompt");
+    expect(draft?.modelSelectionByProvider ?? {}).toEqual({});
+    expect(onCommitModelSelection).not.toHaveBeenCalled();
+  });
+
   it("falls back to codex when no providers are configured", () => {
     renderComposer({ providerStatuses: [], activeProjectDefaultModelSelection: null });
     const picker = findCapture("ProviderModelPicker");
@@ -2541,6 +2681,7 @@ describe("ChatComposer provider selection", () => {
   it("keeps an explicitly selected instance even when it has no live entry", () => {
     renderComposer({
       providerStatuses: [],
+      providerBindingInstanceId: ProviderInstanceId.make("codex_personal"),
       activeProjectDefaultModelSelection: null,
       activeThreadModelSelection: {
         instanceId: ProviderInstanceId.make("codex_personal"),
@@ -2549,6 +2690,137 @@ describe("ChatComposer provider selection", () => {
     });
     const picker = findCapture("ProviderModelPicker");
     expect(picker["activeInstanceId"]).toBe("codex_personal");
+  });
+
+  it("keeps an exact missing-instance lock ahead of a colliding stale selection", () => {
+    const boundInstanceId = ProviderInstanceId.make("codex_personal");
+    const staleInstanceId = ProviderInstanceId.make("stale_selection");
+    const collidingProvider: ServerProvider = {
+      ...codexProvider,
+      instanceId: staleInstanceId,
+      driver: ProviderDriverKind.make("codex_personal"),
+      models: [
+        {
+          slug: "collision-model",
+          name: "Collision Model",
+          isCustom: false,
+          capabilities: null,
+        },
+      ],
+    };
+    draftStore().setModelSelection(threadRef, {
+      instanceId: staleInstanceId,
+      model: "collision-model",
+    });
+    publishSeededStoreState();
+
+    renderComposer({
+      lockedProvider: null,
+      providerBindingInstanceId: boundInstanceId,
+      lockProviderPickerToActiveInstance: true,
+      providerStatuses: [collidingProvider],
+      activeProjectDefaultModelSelection: null,
+      activeThreadModelSelection: { instanceId: boundInstanceId, model: "gpt-5.4" },
+    });
+
+    const picker = findCapture("ProviderModelPicker");
+    expect(picker["activeInstanceId"]).toBe("codex_personal");
+    expect(picker["lockToActiveInstance"]).toBe(true);
+    expect(picker["lockedProvider"]).toBeNull();
+  });
+
+  it("routes a legacy partial session through its authoritative binding", () => {
+    const claudeInstanceId = ProviderInstanceId.make("claude");
+    const claudeProvider: ServerProvider = {
+      ...codexProvider,
+      instanceId: claudeInstanceId,
+      driver: ProviderDriverKind.make("claude"),
+      models: [
+        {
+          slug: "claude-sonnet",
+          name: "Claude Sonnet",
+          isCustom: false,
+          capabilities: null,
+        },
+      ],
+    };
+    draftStore().setModelSelection(threadRef, {
+      instanceId: claudeInstanceId,
+      model: "claude-sonnet",
+    });
+    publishSeededStoreState();
+
+    const { handle } = renderComposer({
+      activeThread: makeThread({
+        modelSelection: { instanceId: claudeInstanceId, model: "claude-sonnet" },
+        session: {
+          threadId,
+          status: "ready",
+          providerName: "codex",
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+      }),
+      lockedProvider: ProviderDriverKind.make("codex"),
+      providerBindingInstanceId: codexInstanceId,
+      providerStatuses: [codexProvider, claudeProvider],
+      activeProjectDefaultModelSelection: null,
+      activeThreadModelSelection: {
+        instanceId: claudeInstanceId,
+        model: "claude-sonnet",
+      },
+    });
+
+    const picker = findCapture("ProviderModelPicker");
+    expect(picker["activeInstanceId"]).toBe("codex");
+    expect(picker["model"]).toBe("gpt-5.4");
+    expect(handle().getSendContext()).toMatchObject({
+      selectedProvider: "codex",
+      selectedModelSelection: { instanceId: "codex", model: "gpt-5.4" },
+    });
+  });
+
+  it("routes an exact session account while only another account has status", () => {
+    const customInstanceId = ProviderInstanceId.make("codex_personal");
+    const { handle } = renderComposer({
+      activeThread: makeThread({
+        modelSelection: { instanceId: customInstanceId, model: "gpt-5.4" },
+        session: {
+          threadId,
+          status: "ready",
+          providerName: "codex",
+          providerInstanceId: customInstanceId,
+          runtimeMode: "full-access",
+          activeTurnId: null,
+          lastError: null,
+          updatedAt: now,
+        },
+      }),
+      lockedProvider: ProviderDriverKind.make("codex"),
+      providerBindingInstanceId: customInstanceId,
+      lockProviderPickerToActiveInstance: true,
+      providerStatuses: [codexProvider],
+      activeProjectDefaultModelSelection: {
+        instanceId: codexInstanceId,
+        model: "gpt-5.4",
+      },
+      activeThreadModelSelection: {
+        instanceId: customInstanceId,
+        model: "gpt-5.4",
+      },
+    });
+
+    expect(findCapture("ProviderModelPicker")).toMatchObject({
+      activeInstanceId: "codex_personal",
+      lockedProvider: "codex",
+      lockToActiveInstance: true,
+    });
+    expect(handle().getSendContext()).toMatchObject({
+      selectedProvider: "codex",
+      selectedModelSelection: { instanceId: "codex_personal", model: "gpt-5.4" },
+    });
   });
 
   it("locks the provider and derives the continuation group", () => {

@@ -6,8 +6,15 @@ import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const harness = vi.hoisted(() => ({
   api: null as null | { contextMenu: { show: ReturnType<typeof vi.fn> } },
-  refCurrent: null as null | { querySelector: ReturnType<typeof vi.fn> },
+  refCurrent: null as null | {
+    clientWidth?: number;
+    dataset?: Record<string, string>;
+    querySelector: ReturnType<typeof vi.fn>;
+    querySelectorAll: ReturnType<typeof vi.fn>;
+  },
   effects: [] as Array<() => void>,
+  animationFrames: [] as FrameRequestCallback[],
+  overflowState: false,
 }));
 
 vi.mock("react", async (importOriginal) => {
@@ -20,6 +27,12 @@ vi.mock("react", async (importOriginal) => {
       effect();
     },
     useRef: () => ({ current: harness.refCurrent }),
+    useState: () => [
+      harness.overflowState,
+      (next: boolean | ((current: boolean) => boolean)) => {
+        harness.overflowState = typeof next === "function" ? next(harness.overflowState) : next;
+      },
+    ],
   };
 });
 vi.mock("~/localApi", () => ({ readLocalApi: () => harness.api }));
@@ -29,7 +42,15 @@ vi.mock("~/components/ui/tooltip", () => ({
   TooltipPopup: ({ children }: { children: React.ReactNode }) => <span>{children}</span>,
 }));
 vi.mock("~/components/ui/scroll-area", () => ({
-  ScrollArea: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  ScrollArea: ({ children, ...props }: React.ComponentProps<"div">) => (
+    <div {...props}>{children}</div>
+  ),
+}));
+vi.mock("~/components/ui/menu", () => ({
+  DropdownMenu: ({ children }: { children: React.ReactNode }) => <>{children}</>,
+  DropdownMenuTrigger: (props: React.ComponentProps<"button">) => <button {...props} />,
+  DropdownMenuContent: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  DropdownMenuItem: (props: React.ComponentProps<"button">) => <button {...props} />,
 }));
 
 import { CenterPanelTabs } from "./CenterPanelTabs";
@@ -48,8 +69,20 @@ const terminal = {
   label: "Codex Terminal",
 } as const;
 
+type WheelEventStub = {
+  deltaX: number;
+  deltaY: number;
+  preventDefault: ReturnType<typeof vi.fn>;
+};
+
+type KeyboardEventStub = {
+  key: string;
+  preventDefault: ReturnType<typeof vi.fn>;
+};
+
 function props(surfaces: CenterSurface[] = [host, chat, terminal]) {
   return {
+    hostLabel: "Codex",
     surfaces,
     activeSurfaceId: chat.id,
     terminalLabelsById: new Map([["terminal-1", "Build terminal"]]),
@@ -78,16 +111,28 @@ beforeEach(() => {
   harness.api = null;
   harness.refCurrent = null;
   harness.effects.length = 0;
+  harness.animationFrames.length = 0;
+  harness.overflowState = false;
+  vi.stubGlobal("requestAnimationFrame", (callback: FrameRequestCallback) => {
+    harness.animationFrames.push(callback);
+    return harness.animationFrames.length;
+  });
 });
 
 describe("CenterPanelTabs", () => {
-  it("renders every surface title and scrolls the active tab into view", () => {
+  it("names the host from its current provider and preserves other surface labels", () => {
     const scrollIntoView = vi.fn();
-    harness.refCurrent = { querySelector: vi.fn(() => ({ scrollIntoView })) };
+    harness.refCurrent = {
+      querySelector: vi.fn(() => ({ scrollIntoView })),
+      querySelectorAll: vi.fn(),
+    };
     const input = props();
     const markup = renderToStaticMarkup(<CenterPanelTabs {...input} />);
 
-    expect(markup).toContain("Main");
+    expect(markup).toContain("data-center-panel-overflow-boundary");
+    expect(markup).toContain("isolate");
+    expect(markup).toContain("Codex");
+    expect(markup).not.toContain("Main");
     expect(markup).toContain("Claude");
     expect(markup).toContain("Codex Terminal");
     expect(markup).not.toContain("Build terminal");
@@ -104,6 +149,216 @@ describe("CenterPanelTabs", () => {
 
   it("returns null for an empty surface collection", () => {
     expect(CenterPanelTabs(props([]))).toBeNull();
+  });
+
+  it("translates vertical wheel input only when the tab viewport overflows", () => {
+    const viewport = { scrollWidth: 640, clientWidth: 240, scrollLeft: 12 };
+    const activeTab = { scrollIntoView: vi.fn() };
+    const activationButtons = [
+      { focus: vi.fn(), scrollIntoView: vi.fn() },
+      { focus: vi.fn(), scrollIntoView: vi.fn() },
+      { focus: vi.fn(), scrollIntoView: vi.fn() },
+    ];
+    harness.refCurrent = {
+      querySelector: vi.fn((selector: string) =>
+        selector === '[data-slot="scroll-area-viewport"]' ? viewport : activeTab,
+      ),
+      querySelectorAll: vi.fn(() => activationButtons),
+    };
+    const input = props();
+    const tree = CenterPanelTabs(input);
+    const scrollArea = visit(tree).find(
+      (element) =>
+        (element.props as Record<string, unknown>)["data-center-panel-tab-list"] === true,
+    );
+    if (!scrollArea) throw new Error("Tab scroll area not found");
+
+    const event: WheelEventStub = { deltaX: 0, deltaY: 48, preventDefault: vi.fn() };
+    (scrollArea.props as { onWheel: (event: WheelEventStub) => void }).onWheel(event);
+
+    expect(viewport.scrollLeft).toBe(60);
+    expect(event.preventDefault).toHaveBeenCalledOnce();
+
+    viewport.clientWidth = viewport.scrollWidth;
+    (scrollArea.props as { onWheel: (event: WheelEventStub) => void }).onWheel(event);
+    expect(viewport.scrollLeft).toBe(60);
+  });
+
+  it("moves to and reveals the adjacent tab with horizontal arrow keys", () => {
+    const viewport = { scrollWidth: 640, clientWidth: 240, scrollLeft: 12 };
+    const activeTab = { scrollIntoView: vi.fn() };
+    const activationButtons = [
+      { focus: vi.fn(), scrollIntoView: vi.fn() },
+      { focus: vi.fn(), scrollIntoView: vi.fn() },
+      { focus: vi.fn(), scrollIntoView: vi.fn() },
+    ];
+    harness.refCurrent = {
+      querySelector: vi.fn((selector: string) =>
+        selector === '[data-slot="scroll-area-viewport"]' ? viewport : activeTab,
+      ),
+      querySelectorAll: vi.fn(() => activationButtons),
+    };
+    const input = props();
+    const tree = CenterPanelTabs(input);
+    const elements = visit(tree);
+    const activeButton = elements.find(
+      (element) =>
+        element.type === "button" &&
+        (element.props as Record<string, unknown>)["aria-selected"] === true,
+    );
+    if (!activeButton) throw new Error("Active tab button not found");
+
+    const event: KeyboardEventStub = { key: "ArrowRight", preventDefault: vi.fn() };
+    (activeButton.props as { onKeyDown: (event: KeyboardEventStub) => void }).onKeyDown(event);
+
+    expect(event.preventDefault).toHaveBeenCalledOnce();
+    expect(input.onActivate).toHaveBeenCalledWith(terminal);
+    expect(activationButtons[2]?.focus).not.toHaveBeenCalled();
+    expect(harness.animationFrames).toHaveLength(1);
+    const firstFrame = harness.animationFrames.splice(0);
+    for (const callback of firstFrame) callback(0);
+    expect(activationButtons[2]?.focus).not.toHaveBeenCalled();
+    expect(harness.animationFrames).toHaveLength(1);
+    const secondFrame = harness.animationFrames.splice(0);
+    for (const callback of secondFrame) callback(16);
+    expect(activationButtons[2]?.focus).toHaveBeenCalledOnce();
+    expect(activationButtons[2]?.scrollIntoView).toHaveBeenCalledWith({
+      block: "nearest",
+      inline: "nearest",
+    });
+  });
+
+  it("shows overflow navigation only for an overflowing rail and pages or jumps to hidden tabs", () => {
+    const scrollBy = vi.fn();
+    const viewport = {
+      scrollWidth: 800,
+      clientWidth: 240,
+      scrollLeft: 0,
+      scrollBy,
+      addEventListener: vi.fn(),
+      removeEventListener: vi.fn(),
+    };
+    const activationButtons = [
+      { scrollIntoView: vi.fn() },
+      { scrollIntoView: vi.fn() },
+      { scrollIntoView: vi.fn() },
+    ];
+    const boundary = {
+      clientWidth: 320,
+      dataset: {} as Record<string, string>,
+      querySelector: vi.fn((selector: string) =>
+        selector === '[data-slot="scroll-area-viewport"]' ? viewport : activationButtons[1],
+      ),
+      querySelectorAll: vi.fn(() => activationButtons),
+    };
+    harness.refCurrent = boundary;
+    const input = props();
+    const tree = CenterPanelTabs(input);
+    const elements = visit(tree);
+
+    expect(harness.overflowState).toBe(true);
+    const navigator = elements.find(
+      (element) =>
+        (element.props as Record<string, unknown>)["data-center-panel-overflow-navigator"] === true,
+    );
+    const navigatorClassName = (navigator?.props as Record<string, unknown> | undefined)?.[
+      "className"
+    ];
+    expect(navigatorClassName).toContain("hidden");
+    expect(navigatorClassName).toContain("group-data-[overflow=true]/tabbar:flex");
+
+    const previous = elements.find(
+      (element) => (element.props as Record<string, unknown>)["aria-label"] === "Previous tabs",
+    );
+    const next = elements.find(
+      (element) => (element.props as Record<string, unknown>)["aria-label"] === "Next tabs",
+    );
+    const allTabs = elements.find(
+      (element) => (element.props as Record<string, unknown>)["aria-label"] === "All tabs",
+    );
+    expect(previous).toBeDefined();
+    expect(next).toBeDefined();
+    expect(allTabs).toBeDefined();
+    const allTabsPopup = elements.find(
+      (element) =>
+        (element.props as Record<string, unknown>)["className"] === "max-h-80 w-64 overflow-y-auto",
+    );
+    expect(allTabsPopup).toBeDefined();
+    if (!previous || !next) throw new Error("Overflow page controls not found");
+
+    (next.props as { onClick: () => void }).onClick();
+    (previous.props as { onClick: () => void }).onClick();
+    expect(scrollBy).toHaveBeenNthCalledWith(1, { behavior: "smooth", left: 216 });
+    expect(scrollBy).toHaveBeenNthCalledWith(2, { behavior: "smooth", left: -216 });
+
+    const terminalJump = elements.find(
+      (element) =>
+        (element.props as Record<string, unknown>)["data-center-panel-all-tab-id"] === terminal.id,
+    );
+    expect(terminalJump).toBeDefined();
+    if (!terminalJump) throw new Error("All tabs terminal item not found");
+    (terminalJump.props as { onClick: () => void }).onClick();
+    expect(input.onActivate).toHaveBeenCalledWith(terminal);
+    const frames = harness.animationFrames.splice(0);
+    for (const callback of frames) callback(0);
+    expect(activationButtons[2]?.scrollIntoView).toHaveBeenCalledWith({
+      block: "nearest",
+      inline: "nearest",
+    });
+
+    const rerendered = CenterPanelTabs({ ...input, activeSurfaceId: terminal.id });
+    const rerenderedBoundary = visit(rerendered).find(
+      (element) =>
+        (element.props as Record<string, unknown>)["data-center-panel-overflow-boundary"] === true,
+    );
+    expect(
+      (rerenderedBoundary?.props as Record<string, unknown> | undefined)?.["data-overflow"],
+    ).toBe(true);
+
+    viewport.scrollWidth = 300;
+    boundary.clientWidth = 320;
+    for (const effect of harness.effects) effect();
+    expect(harness.overflowState).toBe(false);
+  });
+
+  it("restores adjacent-tab focus after activation rerenders the active chat", () => {
+    let focusedElement = "chat";
+    const activationButtons = [
+      { focus: () => (focusedElement = "host"), scrollIntoView: vi.fn() },
+      { focus: () => (focusedElement = "chat"), scrollIntoView: vi.fn() },
+      { focus: () => (focusedElement = "terminal"), scrollIntoView: vi.fn() },
+    ];
+    harness.refCurrent = {
+      querySelector: vi.fn(() => ({ scrollIntoView: vi.fn() })),
+      querySelectorAll: vi.fn(() => activationButtons),
+    };
+    const input = props();
+    input.onActivate.mockImplementation(() => {
+      focusedElement = "composer";
+    });
+    const tree = CenterPanelTabs(input);
+    const activeButton = visit(tree).find(
+      (element) =>
+        element.type === "button" &&
+        (element.props as Record<string, unknown>)["aria-selected"] === true,
+    );
+    if (!activeButton) throw new Error("Active tab button not found");
+
+    const event: KeyboardEventStub = { key: "ArrowRight", preventDefault: vi.fn() };
+    (activeButton.props as { onKeyDown: (event: KeyboardEventStub) => void }).onKeyDown(event);
+
+    expect(focusedElement).toBe("composer");
+    expect(harness.animationFrames).toHaveLength(1);
+    requestAnimationFrame(() => {
+      focusedElement = "composer";
+    });
+    const firstFrame = harness.animationFrames.splice(0);
+    for (const callback of firstFrame) callback(0);
+    expect(focusedElement).toBe("composer");
+    expect(harness.animationFrames).toHaveLength(1);
+    const secondFrame = harness.animationFrames.splice(0);
+    for (const callback of secondFrame) callback(16);
+    expect(focusedElement).toBe("terminal");
   });
 
   it("handles activation, close buttons, middle click, and context-menu actions", async () => {
@@ -145,8 +400,7 @@ describe("CenterPanelTabs", () => {
     const activate = chatElements.find(
       (element) =>
         element.type === "button" &&
-        (element.props as Record<string, unknown>).className ===
-          "flex min-w-0 flex-1 items-center gap-1.5",
+        (element.props as Record<string, unknown>)["data-center-panel-tab-activation"] === true,
     );
     if (!activate) throw new Error("Activate button not found");
     (activate.props as { onClick: () => void }).onClick();

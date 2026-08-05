@@ -20,12 +20,16 @@ export type ProviderControlAvailability =
   | { state: "unknown"; reason: string }
   | { state: "unsupported"; reason: string };
 
-export function formatProviderDriverKindLabel(provider: ProviderDriverKind): string {
+export function formatProviderSlugLabel(provider: string): string {
   return provider
     .replace(/([a-z])([A-Z])/g, "$1 $2")
     .replace(/[_-]+/g, " ")
     .trim()
     .replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+export function formatProviderDriverKindLabel(provider: ProviderDriverKind): string {
+  return formatProviderSlugLabel(provider);
 }
 
 export function getProviderModels(

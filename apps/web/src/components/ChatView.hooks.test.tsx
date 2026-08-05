@@ -405,10 +405,10 @@ vi.mock("./chat/MessagesTimeline", () => ({
   },
 }));
 
-vi.mock("./chat/ChatHeader", () => ({
-  ChatHeader: (props: Record<string, unknown>) => {
-    h.capture("chatHeader", props);
-    return <div data-mock="chat-header">{String(props["activeThreadTitle"] ?? "")}</div>;
+vi.mock("./chat/ChatHeaderActions", () => ({
+  ChatHeaderActions: (props: Record<string, unknown>) => {
+    h.capture("chatHeaderActions", props);
+    return <div data-mock="chat-header-actions" />;
   },
 }));
 
@@ -859,7 +859,7 @@ function composerHandle(overrides: Partial<ChatComposerHandle> = {}): ChatCompos
     isModelPickerOpen: () => false,
     readSnapshot: () => ({ value: "", cursor: 0, expandedCursor: 0, terminalContextIds: [] }),
     resetCursorState: () => undefined,
-    addTerminalContext: () => undefined,
+    addTerminalContext: () => false,
     getSendContext: () => ({
       prompt: "",
       attachments: [],
@@ -1342,7 +1342,7 @@ describe("ChatView center panel variant", () => {
 
     expect(h.captured["messagesTimeline"]).toBeDefined();
     expect(h.captured["chatComposer"]).toBeDefined();
-    expect(h.captured["chatHeader"]).toBeUndefined();
+    expect(h.captured["chatHeaderActions"]).toBeUndefined();
     runEffects();
     expect(windowStub.listeners.some((listener) => listener.type === "keydown")).toBe(false);
   });
@@ -2169,6 +2169,7 @@ describe("ChatView persistent terminal drawer", () => {
     installComposerHandle({
       addTerminalContext: (selection: TerminalContextSelection) => {
         selections.push(selection);
+        return true;
       },
     });
     const selection: TerminalContextSelection = {
@@ -2260,7 +2261,7 @@ describe("ChatView project script handlers", () => {
     seedServerThread(makeThread());
     seedGitStatus(true);
     renderServerRoute();
-    return capturedProps("chatHeader");
+    return capturedProps("chatHeaderActions");
   }
 
   it("creates a chat panel from configured defaults instead of stale project options", async () => {
@@ -2314,7 +2315,7 @@ describe("ChatView project script handlers", () => {
       },
     };
     renderServerRoute();
-    const header = capturedProps("chatHeader");
+    const header = capturedProps("chatHeaderActions");
     const entry = {
       instanceId: codexInstanceId,
       driverKind: ProviderDriverKind.make("codex"),
@@ -2386,7 +2387,7 @@ describe("ChatView project script handlers", () => {
       },
     };
     renderServerRoute();
-    const header = capturedProps("chatHeader");
+    const header = capturedProps("chatHeaderActions");
     const entry = {
       instanceId: claudeInstanceId,
       driverKind: claudeDriver,
@@ -2427,7 +2428,7 @@ describe("ChatView project script handlers", () => {
       },
     };
     renderServerRoute();
-    const header = capturedProps("chatHeader");
+    const header = capturedProps("chatHeaderActions");
     const entry = {
       instanceId: codexInstanceId,
       driverKind: ProviderDriverKind.make("codex"),
@@ -2482,7 +2483,7 @@ describe("ChatView project script handlers", () => {
       },
     ];
     renderServerRoute();
-    const header = capturedProps("chatHeader");
+    const header = capturedProps("chatHeaderActions");
 
     await (header["onRunProjectScript"] as (input: typeof script) => Promise<void>)(script);
 
@@ -2633,7 +2634,7 @@ describe("ChatView project script handlers", () => {
       },
     };
     renderServerRoute();
-    const header = capturedProps("chatHeader");
+    const header = capturedProps("chatHeaderActions");
     const entry = {
       instanceId: targetInstanceId,
       driverKind: ProviderDriverKind.make("codex"),
@@ -2795,7 +2796,7 @@ describe("ChatView project script handlers", () => {
     seedServerThread(makeThread());
     seedGitStatus(true);
     renderServerRoute();
-    const header = capturedProps("chatHeader");
+    const header = capturedProps("chatHeaderActions");
     const input = {
       name: "No project",
       command: "true",

@@ -2,7 +2,11 @@ import type { DesktopPreviewBridge } from "@bibcode/contracts";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { startBrowserSurfaceSync } from "./browserSurfaceSync";
-import { acquireBrowserSurface, useBrowserSurfaceStore } from "./browserSurfaceStore";
+import {
+  acquireBrowserSurface,
+  acquireBrowserSurfaceOcclusion,
+  useBrowserSurfaceStore,
+} from "./browserSurfaceStore";
 
 function deferred<T>() {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -28,7 +32,7 @@ describe("browserSurfaceSync", () => {
   };
 
   beforeEach(() => {
-    useBrowserSurfaceStore.setState({ byTabId: {} });
+    useBrowserSurfaceStore.setState({ byTabId: {}, occlusionOwners: new Set() } as never);
   });
 
   afterEach(() => {
@@ -119,6 +123,56 @@ describe("browserSurfaceSync", () => {
 
     second.resolve();
     await flushPromises();
+    stop();
+  });
+
+  it("keeps a live surface hidden until every occlusion lease releases", async () => {
+    const setBounds = vi.fn().mockResolvedValue(undefined);
+    const stop = startSync(setBounds);
+    const surface = acquireBrowserSurface("sync-occluded");
+    const rect = { x: 10, y: 20, width: 300, height: 400 };
+    surface.present(rect, true);
+
+    const firstBlocker = acquireBrowserSurfaceOcclusion();
+    const secondBlocker = acquireBrowserSurfaceOcclusion();
+    firstBlocker.release();
+    firstBlocker.release();
+    await flushPromises();
+
+    expect(setBounds.mock.calls).toEqual([
+      ["sync-occluded", rect, true],
+      ["sync-occluded", rect, false],
+    ]);
+
+    secondBlocker.release();
+    await flushPromises();
+
+    expect(setBounds.mock.calls).toEqual([
+      ["sync-occluded", rect, true],
+      ["sync-occluded", rect, false],
+      ["sync-occluded", rect, true],
+    ]);
+    stop();
+  });
+
+  it("restores the latest desired bounds after an occlusion", async () => {
+    const setBounds = vi.fn().mockResolvedValue(undefined);
+    const stop = startSync(setBounds);
+    const surface = acquireBrowserSurface("sync-occlusion-bounds");
+    const initial = { x: 1, y: 2, width: 30, height: 40 };
+    const latest = { x: 5, y: 6, width: 70, height: 80 };
+    surface.present(initial, true);
+    const blocker = acquireBrowserSurfaceOcclusion();
+    surface.present(latest, true);
+    blocker.release();
+    await flushPromises();
+
+    expect(setBounds.mock.calls).toEqual([
+      ["sync-occlusion-bounds", initial, true],
+      ["sync-occlusion-bounds", initial, false],
+      ["sync-occlusion-bounds", latest, false],
+      ["sync-occlusion-bounds", latest, true],
+    ]);
     stop();
   });
 
