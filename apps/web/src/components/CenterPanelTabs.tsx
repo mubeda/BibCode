@@ -213,6 +213,7 @@ export function CenterPanelTabs(props: CenterPanelTabsProps) {
     const boundary = tabListRef.current;
     const viewport = getTabViewport();
     if (!boundary || !viewport) return;
+    const content = boundary.querySelector<HTMLElement>('[role="tablist"]');
 
     const syncOverflow = () => {
       setHasOverflow(viewport.scrollWidth > boundary.clientWidth + 1);
@@ -223,6 +224,7 @@ export function CenterPanelTabs(props: CenterPanelTabsProps) {
       typeof ResizeObserver === "undefined" ? null : new ResizeObserver(syncOverflow);
     resizeObserver?.observe(boundary);
     resizeObserver?.observe(viewport);
+    if (content) resizeObserver?.observe(content);
     return () => {
       viewport.removeEventListener?.("scroll", syncOverflow);
       resizeObserver?.disconnect();
