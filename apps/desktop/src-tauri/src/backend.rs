@@ -1,8 +1,6 @@
 use bibcode_server::diagnostics::{
     DesktopUiProcessObserver, UnavailableDesktopUiProcessObserver,
 };
-#[cfg(windows)]
-use bibcode_server::diagnostics::WebView2DesktopUiProcessObserver;
 use bibcode_server::process::{configure_background_command, configure_background_std_command};
 use bibcode_server::{
     DESKTOP_SHUTDOWN_PATH as SERVER_BACKEND_SHUTDOWN_PATH,
@@ -32,6 +30,8 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::config::state_dir;
+
+mod ui_process_observer;
 
 const PRIMARY_LOCAL_ENVIRONMENT_ID: &str = "primary";
 const DESKTOP_MODE: &str = "desktop";
@@ -459,6 +459,7 @@ type BackendStartPublishGate = (oneshot::Sender<()>, oneshot::Receiver<()>);
 pub struct BackendSupervisor {
     state: Arc<Mutex<BackendState>>,
     start_completed: Arc<Notify>,
+    ui_process_observer: Arc<Mutex<Option<Arc<dyn DesktopUiProcessObserver>>>>,
     #[cfg(test)]
     start_publish_gate: Arc<Mutex<Option<BackendStartPublishGate>>>,
     #[cfg(test)]
@@ -470,6 +471,21 @@ pub struct BackendSupervisor {
 impl BackendSupervisor {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn install_ui_process_observer(&self, observer: Arc<dyn DesktopUiProcessObserver>) {
+        *self
+            .ui_process_observer
+            .lock()
+            .expect("desktop UI observer mutex poisoned") = Some(observer);
+    }
+
+    fn ui_process_observer_for_start(&self) -> Arc<dyn DesktopUiProcessObserver> {
+        self.ui_process_observer
+            .lock()
+            .expect("desktop UI observer mutex poisoned")
+            .clone()
+            .unwrap_or_else(|| Arc::new(UnavailableDesktopUiProcessObserver))
     }
 
     pub fn local_environment_bootstraps(&self) -> Vec<Value> {
@@ -539,6 +555,7 @@ impl BackendSupervisor {
         app: AppHandle<R>,
         reason: &'static str,
     ) -> Result<BackendRunConfig, String> {
+        self.install_ui_process_observer(ui_process_observer::for_app(&app));
         let mut plans = default_launch_plans(&app)?;
         let primary_index = plans
             .iter()
@@ -613,8 +630,10 @@ impl BackendSupervisor {
         reset_restart_attempt: bool,
     ) -> Result<BackendRunConfig, String> {
         let permit = self.begin_start(reset_restart_attempt)?;
+        let ui_process_observer = self.ui_process_observer_for_start();
         let (config, managed, pid) =
-            start_managed_backend(plan.clone(), readiness, permit.run_id).await?;
+            start_managed_backend(plan.clone(), readiness, ui_process_observer, permit.run_id)
+                .await?;
         #[cfg(test)]
         self.wait_for_start_publish_gate().await;
         let mut active_plan = plan;
@@ -1080,17 +1099,18 @@ fn emit_backend_ready<R: Runtime>(
 async fn start_managed_backend(
     plan: BackendLaunchPlan,
     readiness: BackendReadinessConfig,
+    ui_process_observer: Arc<dyn DesktopUiProcessObserver>,
     run_id: u64,
 ) -> Result<(BackendRunConfig, ManagedBackend, Option<u32>), String> {
     match &plan.target {
         BackendLaunchTarget::InProcess { base_dir } => {
             let server_config = server_config_for_launch(base_dir.clone(), &plan.config);
-            let handle = ServerRuntime::start_with_ui_process_observer(
-                server_config,
-                desktop_ui_process_observer(),
-            )
-            .await
-            .map_err(|error| format!("Could not start in-process desktop backend: {error}"))?;
+            let handle =
+                ServerRuntime::start_with_ui_process_observer(server_config, ui_process_observer)
+                    .await
+                    .map_err(|error| {
+                        format!("Could not start in-process desktop backend: {error}")
+                    })?;
 
             let mut config = plan.config.clone();
             config.port = handle.local_addr().port();
@@ -1150,18 +1170,6 @@ async fn start_managed_backend(
             ))
         }
     }
-}
-
-fn desktop_ui_process_observer() -> Arc<dyn DesktopUiProcessObserver> {
-    #[cfg(windows)]
-    if let Some(executable_name) = std::env::current_exe().ok().and_then(|path| {
-        path.file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-    }) {
-        return Arc::new(WebView2DesktopUiProcessObserver::new(executable_name));
-    }
-
-    Arc::new(UnavailableDesktopUiProcessObserver)
 }
 
 fn server_config_for_launch(base_dir: PathBuf, config: &BackendRunConfig) -> ServerConfig {
@@ -2072,6 +2080,9 @@ fn desktop_base_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bibcode_server::diagnostics::{
+        DesktopUiObservation, ProcessIdentity, UiCoverage, UiCoverageStatus,
+    };
     use futures_util::{SinkExt, StreamExt};
     use std::{
         cell::Cell,
@@ -2087,6 +2098,57 @@ mod tests {
     use bibcode_server::{RpcExit, ServerMessage};
     use tokio::io::{AsyncRead, ReadBuf};
     use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+    #[derive(Debug)]
+    struct MarkerDesktopUiProcessObserver;
+
+    impl DesktopUiProcessObserver for MarkerDesktopUiProcessObserver {
+        fn observe(
+            &self,
+            _rows: Arc<[bibcode_server::diagnostics::ProcessRow]>,
+            _server_identity: ProcessIdentity,
+        ) -> Pin<Box<dyn std::future::Future<Output = DesktopUiObservation> + Send + '_>> {
+            Box::pin(async {
+                DesktopUiObservation {
+                    identities: Vec::new(),
+                    coverage: UiCoverage {
+                        status: UiCoverageStatus::Available,
+                        message: None,
+                    },
+                }
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn new_supervisor_falls_back_to_unavailable_ui_observation() {
+        let supervisor = BackendSupervisor::new();
+        let observer = supervisor.ui_process_observer_for_start();
+        let observation = observer
+            .observe(
+                Arc::from([]),
+                ProcessIdentity {
+                    pid: 1,
+                    started_at: 1,
+                },
+            )
+            .await;
+
+        assert_eq!(observation.coverage.status, UiCoverageStatus::Unavailable);
+    }
+
+    #[test]
+    fn configured_ui_observer_is_reused_for_restart_snapshots() {
+        let supervisor = BackendSupervisor::new();
+        let expected: Arc<dyn DesktopUiProcessObserver> = Arc::new(MarkerDesktopUiProcessObserver);
+
+        supervisor.install_ui_process_observer(expected.clone());
+        let first = supervisor.ui_process_observer_for_start();
+        let restart = supervisor.ui_process_observer_for_start();
+
+        assert!(Arc::ptr_eq(&expected, &first));
+        assert!(Arc::ptr_eq(&first, &restart));
+    }
 
     struct ScriptedReader {
         steps: VecDeque<io::Result<Vec<u8>>>,
@@ -3761,6 +3823,7 @@ exit /b 9
                 interval: Duration::ZERO,
                 request_timeout: Duration::ZERO,
             },
+            Arc::new(UnavailableDesktopUiProcessObserver),
             0,
         )
         .await
@@ -3777,6 +3840,7 @@ exit /b 9
                 interval: Duration::ZERO,
                 request_timeout: Duration::ZERO,
             },
+            Arc::new(UnavailableDesktopUiProcessObserver),
             1,
         )
         .await
@@ -3796,6 +3860,7 @@ exit /b 9
                 interval: Duration::ZERO,
                 request_timeout: Duration::from_millis(20),
             },
+            Arc::new(UnavailableDesktopUiProcessObserver),
             8,
         )
         .await
@@ -4203,6 +4268,7 @@ while (-not [IO.File]::Exists({})) {{
                 interval: Duration::from_millis(10),
                 request_timeout: Duration::from_secs(1),
             },
+            Arc::new(UnavailableDesktopUiProcessObserver),
             10,
         )
         .await
@@ -4277,6 +4343,7 @@ while (-not [IO.File]::Exists({})) {{
                 interval: Duration::ZERO,
                 request_timeout: Duration::from_secs(1),
             },
+            Arc::new(UnavailableDesktopUiProcessObserver),
             11,
         )
         .await
