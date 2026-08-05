@@ -756,16 +756,14 @@ impl SessionGeneration {
         if self
             .output_started
             .load(std::sync::atomic::Ordering::Acquire)
-        {
-            if tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, self.output_completed.cancelled())
+            && tokio::time::timeout(OUTPUT_DRAIN_TIMEOUT, self.output_completed.cancelled())
                 .await
                 .is_err()
-            {
-                tracing::warn!(
-                    timeout_ms = OUTPUT_DRAIN_TIMEOUT.as_millis(),
-                    "terminal output drain timed out"
-                );
-            }
+        {
+            tracing::warn!(
+                timeout_ms = OUTPUT_DRAIN_TIMEOUT.as_millis(),
+                "terminal output drain timed out"
+            );
         }
     }
 
@@ -1365,9 +1363,9 @@ impl TerminalManager {
                 }
                 command_was_prepared = true;
             } else {
-                generation.observation.request_cancellation(
-                    TerminalObserverCancellationReason::PreparationRejected,
-                );
+                generation
+                    .observation
+                    .request_cancellation(TerminalObserverCancellationReason::PreparationRejected);
                 generation
                     .observation
                     .shutdown_workers(

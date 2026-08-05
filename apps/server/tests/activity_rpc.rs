@@ -1,10 +1,5 @@
-use std::{
-    sync::mpsc as std_mpsc,
-    time::Duration,
-};
+use std::{sync::mpsc as std_mpsc, time::Duration};
 
-use futures_util::{SinkExt, StreamExt};
-use serde_json::{Value, json};
 use bibcode_server::{
     ACTIVE_RPC_METHODS, MethodMode, RpcRegistry, ServerConfig, ServerMessage, ServerRuntime,
     activity::{
@@ -15,6 +10,8 @@ use bibcode_server::{
     },
     persistence::{Database, run_migrations},
 };
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::time::timeout;
 use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message};
@@ -305,7 +302,8 @@ async fn activity_stream_starts_with_snapshot_and_filters_deltas_to_exact_scope(
 }
 
 #[tokio::test]
-async fn feature_disabled_stream_emits_one_error_completes_and_unary_reads_reserve_no_database_job() {
+async fn feature_disabled_stream_emits_one_error_completes_and_unary_reads_reserve_no_database_job()
+{
     // Mutation caught: continuing an admitted stream or reserving a database job after disablement.
     let database = Database::open_in_memory().await.expect("database");
     database
@@ -323,10 +321,7 @@ async fn feature_disabled_stream_emits_one_error_completes_and_unary_reads_reser
     );
     let projection = projections.chat();
     let scope = thread_scope("thread:feature-disabled", "feature-disabled");
-    projection
-        .ensure_scope(scope)
-        .await
-        .expect("scope");
+    projection.ensure_scope(scope).await.expect("scope");
     let mut registry = RpcRegistry::empty();
     register_activity_rpc(&mut registry, projections);
     let directory = tempfile::tempdir().expect("server directory");
@@ -350,10 +345,13 @@ async fn feature_disabled_stream_emits_one_error_completes_and_unary_reads_reser
     )
     .await;
     let initial = next_message(&mut socket).await;
-    assert!(matches!(
-        initial,
-        ServerMessage::Chunk { ref values, .. } if values[0]["kind"] == "snapshot"
-    ), "unexpected initial stream message: {initial:?}");
+    assert!(
+        matches!(
+            initial,
+            ServerMessage::Chunk { ref values, .. } if values[0]["kind"] == "snapshot"
+        ),
+        "unexpected initial stream message: {initial:?}"
+    );
     ack(&mut socket, "101").await;
 
     let observer = database

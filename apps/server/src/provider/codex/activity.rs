@@ -281,7 +281,9 @@ impl CodexActivityTracker {
         {
             return;
         }
-        let Some(canonical_id) = self.canonical_ids.resolve("codex:thread:", native_thread_id)
+        let Some(canonical_id) = self
+            .canonical_ids
+            .resolve("codex:thread:", native_thread_id)
         else {
             return;
         };
@@ -378,9 +380,7 @@ impl CodexActivityTracker {
         receive_sequence: u128,
     ) -> CodexActivityOutput {
         match method {
-            "item/agentMessage/delta" => {
-                self.handle_text_delta(method, params, receive_sequence)
-            }
+            "item/agentMessage/delta" => self.handle_text_delta(method, params, receive_sequence),
             "item/reasoning/summaryTextDelta" => {
                 self.handle_text_delta(method, params, receive_sequence)
             }
@@ -458,14 +458,9 @@ impl CodexActivityTracker {
         }
         if matches!(
             item_type,
-            "dynamicToolCall"
-                | "mcpToolCall"
-                | "commandExecution"
-                | "agentMessage"
-                | "reasoning"
-        ) && self.suppress_detail_identity(item_detail_identity(
-            thread_id, turn_id, item_id,
-        )) {
+            "dynamicToolCall" | "mcpToolCall" | "commandExecution" | "agentMessage" | "reasoning"
+        ) && self.suppress_detail_identity(item_detail_identity(thread_id, turn_id, item_id))
+        {
             return CodexActivityOutput::default();
         }
         let status = item
@@ -498,16 +493,8 @@ impl CodexActivityTracker {
             "agentMessage" if method == "item/completed" => {
                 self.flush_completed_text(thread_id, turn_id, item_id, item, timestamp)
             }
-            "reasoning" if method == "item/completed" => {
-                self.flush_completed_reasoning(
-                    event_key,
-                    thread_id,
-                    turn_id,
-                    item_id,
-                    item,
-                    timestamp,
-                )
-            }
+            "reasoning" if method == "item/completed" => self
+                .flush_completed_reasoning(event_key, thread_id, turn_id, item_id, item, timestamp),
             _ => CodexActivityOutput::default(),
         }
     }
@@ -531,11 +518,7 @@ impl CodexActivityTracker {
             .get("kind")
             .and_then(Value::as_str)
             .is_some_and(|kind| matches!(kind, "started" | "interacted" | "interrupted"));
-        if !owning_thread_in_scope
-            || !valid_agent_thread_id
-            || !valid_agent_path
-            || !valid_kind
-        {
+        if !owning_thread_in_scope || !valid_agent_thread_id || !valid_agent_path || !valid_kind {
             return CodexActivityOutput::default();
         }
         CodexActivityOutput {
@@ -603,9 +586,10 @@ impl CodexActivityTracker {
             .clone()
             .unwrap_or_else(|| unix_millis_to_timestamp(timestamp_ms));
         let reopen_authority = if tool == "resumeAgent" {
-            provider_timestamp
-                .as_deref()
-                .map_or(ActorReopenAuthority::None, ActorReopenAuthority::ProviderTimestamp)
+            provider_timestamp.as_deref().map_or(
+                ActorReopenAuthority::None,
+                ActorReopenAuthority::ProviderTimestamp,
+            )
         } else {
             ActorReopenAuthority::None
         };
@@ -701,8 +685,7 @@ impl CodexActivityTracker {
         let native_key = thread_key(native_thread_id);
         if let Some(existing) = self.actors_by_thread.get_mut(&native_key) {
             if existing.status.is_terminal() && !status.is_terminal() {
-                let ActorReopenAuthority::ProviderTimestamp(provider_timestamp) =
-                    reopen_authority
+                let ActorReopenAuthority::ProviderTimestamp(provider_timestamp) = reopen_authority
                 else {
                     return None;
                 };
@@ -767,7 +750,9 @@ impl CodexActivityTracker {
         if self.actors_by_thread.len() >= MAX_TRACKED_ACTORS {
             return None;
         }
-        let canonical_id = self.canonical_ids.resolve("codex:thread:", native_thread_id)?;
+        let canonical_id = self
+            .canonical_ids
+            .resolve("codex:thread:", native_thread_id)?;
         let actor = ActivityActorState {
             canonical_id,
             parent_actor_id: parent_actor_id.map(str::to_owned),
@@ -821,8 +806,7 @@ impl CodexActivityTracker {
             return CodexActivityOutput::default();
         }
         let summary_index = params.get("summaryIndex").and_then(Value::as_u64);
-        let replay_key =
-            delta_replay_key(method, &buffer_key, receive_sequence, summary_index);
+        let replay_key = delta_replay_key(method, &buffer_key, receive_sequence, summary_index);
         if !self.seen_native_events.insert(replay_key) {
             return CodexActivityOutput::default();
         }
@@ -1212,9 +1196,10 @@ impl CodexActivityTracker {
             .clone()
             .unwrap_or_else(|| unix_millis_to_timestamp(emitted_at_ms));
         let reopen_authority = if allow_reopen {
-            provider_timestamp
-                .as_deref()
-                .map_or(ActorReopenAuthority::None, ActorReopenAuthority::ProviderTimestamp)
+            provider_timestamp.as_deref().map_or(
+                ActorReopenAuthority::None,
+                ActorReopenAuthority::ProviderTimestamp,
+            )
         } else {
             ActorReopenAuthority::None
         };
@@ -1229,8 +1214,7 @@ impl CodexActivityTracker {
             &timestamp,
             false,
             reopen_authority,
-        )
-        {
+        ) {
             output.push(ProviderActivityMutation::UpsertActor(actor));
         }
         output
@@ -1250,8 +1234,7 @@ impl CodexActivityTracker {
                     return false;
                 }
                 let thread = &threads[*index];
-                let Some(native_thread_id) =
-                    thread.id.as_deref().filter(|id| usable_native_id(id))
+                let Some(native_thread_id) = thread.id.as_deref().filter(|id| usable_native_id(id))
                 else {
                     return false;
                 };
@@ -1266,13 +1249,13 @@ impl CodexActivityTracker {
                     return false;
                 }
                 let parent_key = thread_key(parent_native_id);
-                let parent_actor_id =
-                    if self.root_thread_id.as_deref() == Some(parent_key.as_str()) {
-                        None
-                    } else if let Some(parent) = self.actors_by_thread.get(&parent_key) {
-                        Some(parent.canonical_id.clone())
-                    } else {
-                        return true;
+                let parent_actor_id = if self.root_thread_id.as_deref() == Some(parent_key.as_str())
+                {
+                    None
+                } else if let Some(parent) = self.actors_by_thread.get(&parent_key) {
+                    Some(parent.canonical_id.clone())
+                } else {
+                    return true;
                 };
                 let native_key = thread_key(native_thread_id);
                 if !accepted_native_keys.insert(native_key.clone()) {
@@ -1307,10 +1290,7 @@ impl CodexActivityTracker {
                 if let Some(mut actor) = self.upsert_actor_state(
                     native_thread_id,
                     parent_actor_id.as_deref(),
-                    thread
-                        .agent_nickname
-                        .as_deref()
-                        .or(thread.name.as_deref()),
+                    thread.agent_nickname.as_deref().or(thread.name.as_deref()),
                     thread.agent_role.as_deref(),
                     status,
                     None,
@@ -1401,9 +1381,10 @@ impl CodexActivityTracker {
                 .or(thread.updated_at)
                 .unwrap_or_default()
                 .saturating_mul(1_000);
-            let terminal_status = turn.status.as_deref().filter(|status| {
-                CodexActivityTracker::map_status(status).is_terminal()
-            });
+            let terminal_status = turn
+                .status
+                .as_deref()
+                .filter(|status| CodexActivityTracker::map_status(status).is_terminal());
             if let Some(status) = terminal_status {
                 if normalized_entry_count == MAX_RECONCILED_ENTRIES {
                     break;
@@ -1464,8 +1445,7 @@ impl CodexActivityTracker {
         }
         let native_status_allows_terminal_projection = matches!(
             thread.status,
-            None
-                | Some(ReconciliationThreadStatus::NotLoaded)
+            None | Some(ReconciliationThreadStatus::NotLoaded)
                 | Some(ReconciliationThreadStatus::Idle)
                 | Some(ReconciliationThreadStatus::Unknown)
         );
@@ -1484,8 +1464,7 @@ impl CodexActivityTracker {
                         .updated_at
                         .and_then(checked_provider_timestamp_seconds)
                 })
-        {
-            if let Some(actor) = self.upsert_actor_state(
+            && let Some(actor) = self.upsert_actor_state(
                 native_thread_id,
                 None,
                 None,
@@ -1495,9 +1474,9 @@ impl CodexActivityTracker {
                 &timestamp,
                 true,
                 ActorReopenAuthority::None,
-            ) {
-                output.push(ProviderActivityMutation::UpsertActor(actor));
-            }
+            )
+        {
+            output.push(ProviderActivityMutation::UpsertActor(actor));
         }
         self.reconciled_thread_versions
             .insert(native_key, thread.updated_at.unwrap_or_default());
@@ -1513,7 +1492,10 @@ impl CodexActivityTracker {
         let mut output = CodexActivityOutput::default();
         let mut accepted_native_keys = HashSet::new();
         for terminal in terminals {
-            let Some(native_id) = terminal.item_id.as_deref().filter(|id| usable_native_id(id))
+            let Some(native_id) = terminal
+                .item_id
+                .as_deref()
+                .filter(|id| usable_native_id(id))
             else {
                 continue;
             };
@@ -1599,10 +1581,7 @@ impl CodexActivityTracker {
             if existing.status.is_terminal() && !status.is_terminal() {
                 return None;
             }
-            if existing.status.is_terminal()
-                && status.is_terminal()
-                && existing.status != status
-            {
+            if existing.status.is_terminal() && status.is_terminal() && existing.status != status {
                 return None;
             }
             if existing.status == status && existing.summary == summary {
@@ -1700,9 +1679,7 @@ impl CodexActivityFixtureAdapter {
         receive_sequence: u64,
     ) -> CodexActivityOutput {
         let receive_sequence = u128::from(receive_sequence);
-        self.next_receive_sequence = self
-            .next_receive_sequence
-            .max(receive_sequence + 1);
+        self.next_receive_sequence = self.next_receive_sequence.max(receive_sequence + 1);
         self.tracker
             .handle_notification(method, params, emitted_at_ms, receive_sequence)
     }
@@ -1717,6 +1694,7 @@ impl CodexActivityFixtureAdapter {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn make_entry(
     canonical_ids: &mut CanonicalIdGenerator,
     id: String,
@@ -1766,8 +1744,12 @@ fn event_fallback_key(
         item_id,
         status_key,
     ];
-    let legacy_length =
-        components.iter().map(|component| component.len()).sum::<usize>() + components.len() - 1;
+    let legacy_length = components
+        .iter()
+        .map(|component| component.len())
+        .sum::<usize>()
+        + components.len()
+        - 1;
     if legacy_length <= MAX_INLINE_EVENT_KEY_BYTES
         && components
             .iter()
@@ -1913,7 +1895,9 @@ fn is_reserved_canonical_hash(native: &str) -> bool {
     native
         .strip_prefix('h')
         .and_then(|value| value.split('-').next())
-        .is_some_and(|digest| digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        .is_some_and(|digest| {
+            digest.len() == 64 && digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
 }
 
 fn canonical_digest(bytes: &[u8]) -> CanonicalDigest {
@@ -2121,6 +2105,7 @@ fn normalize_fractional_seconds(mut timestamp: String) -> String {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)]
 mod tests {
     use super::*;
 
@@ -2434,12 +2419,7 @@ mod tests {
         live_tracker.seed_actor("child-1");
         let live = [
             ("completed-turn", "completed", None, 2_u64),
-            (
-                "failed-turn",
-                "failed",
-                Some("provider failed"),
-                3_u64,
-            ),
+            ("failed-turn", "failed", Some("provider failed"), 3_u64),
             ("interrupted-turn", "interrupted", None, 4_u64),
             ("cancelled-turn", "cancelled", None, 5_u64),
         ]
@@ -2479,7 +2459,10 @@ mod tests {
                 .collect::<Vec<_>>()
         };
 
-        assert_eq!(stable_entry_view(&recovered.mutations), stable_entry_view(&live));
+        assert_eq!(
+            stable_entry_view(&recovered.mutations),
+            stable_entry_view(&live)
+        );
         assert_eq!(stable_entry_view(&recovered.mutations).len(), 4);
         assert!(stable_entry_view(&recovered.mutations).len() <= MAX_RECONCILED_ENTRIES);
         assert!(recovered.mutations.iter().any(|mutation| matches!(
@@ -2703,7 +2686,7 @@ mod tests {
         .expect("official thread/read response");
         let terminal_tracker = || {
             let mut tracker = CodexActivityTracker::new(Some("root-1"));
-            tracker.reconcile_descendants(&[response.thread.clone()]);
+            tracker.reconcile_descendants(std::slice::from_ref(&response.thread));
             tracker.reconcile_thread_history(&response.thread);
             tracker
         };
@@ -2719,22 +2702,32 @@ mod tests {
         let mut older_tracker = terminal_tracker();
         let older_output = older_tracker.reconcile_descendants(&[active_thread(1)]);
         assert!(
-            older_output.output.mutations.iter().all(|mutation| !matches!(
-                mutation,
-                ProviderActivityMutation::UpsertActor(actor)
-                    if actor.status == ActivityLifecycle::Running
-            )),
+            older_output
+                .output
+                .mutations
+                .iter()
+                .all(|mutation| !matches!(
+                    mutation,
+                    ProviderActivityMutation::UpsertActor(actor)
+                        if actor.status == ActivityLifecycle::Running
+                )),
             "an older Active snapshot must not reopen a terminal actor"
         );
 
         let mut equal_tracker = terminal_tracker();
         let equal_output = equal_tracker.reconcile_descendants(&[active_thread(2)]);
-        assert!(equal_output.output.mutations.iter().any(|mutation| matches!(
-            mutation,
-            ProviderActivityMutation::UpsertActor(actor)
-                if actor.status == ActivityLifecycle::Running
-                    && actor.terminal_at.is_none()
-        )));
+        assert!(
+            equal_output
+                .output
+                .mutations
+                .iter()
+                .any(|mutation| matches!(
+                    mutation,
+                    ProviderActivityMutation::UpsertActor(actor)
+                        if actor.status == ActivityLifecycle::Running
+                            && actor.terminal_at.is_none()
+                ))
+        );
     }
 
     #[test]
@@ -2827,10 +2820,12 @@ mod tests {
         let mut reconciliation_first = CodexActivityTracker::new(Some("root-1"));
         reconciliation_first.seed_actor("child-1");
         let recovered = reconciliation_first.reconcile_thread_history(&response.thread);
-        assert!(recovered.mutations.iter().any(|mutation| matches!(
-            mutation,
-            ProviderActivityMutation::AppendEntry(_)
-        )));
+        assert!(
+            recovered
+                .mutations
+                .iter()
+                .any(|mutation| matches!(mutation, ProviderActivityMutation::AppendEntry(_)))
+        );
         let recovered_commentary_id = recovered
             .mutations
             .iter()
@@ -2949,18 +2944,8 @@ mod tests {
 
     #[test]
     fn reasoning_replay_identity_includes_summary_index() {
-        let first = delta_replay_key(
-            "item/reasoning/summaryTextDelta",
-            "stream",
-            42,
-            Some(0),
-        );
-        let second = delta_replay_key(
-            "item/reasoning/summaryTextDelta",
-            "stream",
-            42,
-            Some(1),
-        );
+        let first = delta_replay_key("item/reasoning/summaryTextDelta", "stream", 42, Some(0));
+        let second = delta_replay_key("item/reasoning/summaryTextDelta", "stream", 42, Some(1));
 
         assert_ne!(first, second);
     }
@@ -3330,14 +3315,18 @@ mod tests {
                 0,
             );
             assert!(output.request_reconciliation);
-            assert!(output.mutations.iter().any(|mutation| matches!(
-                mutation,
-                ProviderActivityMutation::AppendEntry(_)
-            )));
-            assert!(output.mutations.iter().all(|mutation| !matches!(
-                mutation,
-                ProviderActivityMutation::UpsertActor(_)
-            )));
+            assert!(
+                output
+                    .mutations
+                    .iter()
+                    .any(|mutation| matches!(mutation, ProviderActivityMutation::AppendEntry(_)))
+            );
+            assert!(
+                output
+                    .mutations
+                    .iter()
+                    .all(|mutation| !matches!(mutation, ProviderActivityMutation::UpsertActor(_)))
+            );
         }
     }
 
@@ -3428,10 +3417,12 @@ mod tests {
             let mut tracker = CodexActivityTracker::new(Some("root-1"));
             tracker.seed_actor("child-1");
             let output = tracker.reconcile_thread_history(&response.thread);
-            assert!(output.mutations.iter().any(|mutation| matches!(
-                mutation,
-                ProviderActivityMutation::AppendEntry(_)
-            )));
+            assert!(
+                output
+                    .mutations
+                    .iter()
+                    .any(|mutation| matches!(mutation, ProviderActivityMutation::AppendEntry(_)))
+            );
             assert!(output.mutations.iter().all(|mutation| !matches!(
                 mutation,
                 ProviderActivityMutation::UpsertActor(actor) if actor.status.is_terminal()
@@ -3493,12 +3484,7 @@ mod tests {
                 "completedAt": 2
             }
         });
-        let output = tracker.handle_notification(
-            "turn/completed",
-            &params,
-            9_000,
-            0,
-        );
+        let output = tracker.handle_notification("turn/completed", &params, 9_000, 0);
 
         assert!(output.request_reconciliation);
         assert!(
@@ -3569,10 +3555,12 @@ mod tests {
             1,
         );
 
-        assert!(older.mutations.iter().all(|mutation| !matches!(
-            mutation,
-            ProviderActivityMutation::UpsertActor(_)
-        )));
+        assert!(
+            older
+                .mutations
+                .iter()
+                .all(|mutation| !matches!(mutation, ProviderActivityMutation::UpsertActor(_)))
+        );
         let actor = tracker
             .actors_by_thread
             .get(&thread_key("child-1"))

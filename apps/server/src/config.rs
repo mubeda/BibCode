@@ -239,13 +239,11 @@ impl Cli {
                 })
             })
             .unwrap_or_default();
-        let raw_base_dir = args
-            .base_dir
-            .or_else(|| {
-                bootstrap
-                    .as_ref()
-                    .and_then(|value| value.bibcode_home.clone())
-            });
+        let raw_base_dir = args.base_dir.or_else(|| {
+            bootstrap
+                .as_ref()
+                .and_then(|value| value.bibcode_home.clone())
+        });
         let base_dir = match raw_base_dir {
             Some(path) => resolve_base_dir(path)?,
             None => default_base_dir()?,

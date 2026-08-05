@@ -1,8 +1,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use serde::{Deserialize, de::DeserializeOwned};
-use serde_json::{Value, json};
 use bibcode_server::{
     activity::{
         ACTIVITY_DETAIL_MAX_LENGTH, ACTIVITY_ID_MAX_LENGTH, ACTIVITY_LABEL_MAX_LENGTH,
@@ -21,6 +19,8 @@ use bibcode_server::{
         opencode::OpenCodeActivityFixtureAdapter,
     },
 };
+use serde::{Deserialize, de::DeserializeOwned};
+use serde_json::{Value, json};
 
 const CANONICAL_SCENARIOS: &str =
     include_str!("fixtures/activity-conformance/canonical-scenarios.json");

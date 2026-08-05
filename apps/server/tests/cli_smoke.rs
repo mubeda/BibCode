@@ -3,9 +3,9 @@ use std::{
     time::Duration,
 };
 
+use bibcode_server::Cli;
 use clap::Parser;
 use serde_json::{Value, json};
-use bibcode_server::Cli;
 use tempfile::TempDir;
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader},

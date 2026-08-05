@@ -400,11 +400,11 @@ async fn probe_one_snapshot(
     include_slow_capabilities: bool,
 ) -> ProviderProbeResult {
     let checked_at = super::control::now_iso();
-    let default_models = provider_models_without_version(&definition);
+    let default_models = provider_models_without_version(definition);
     if !definition.available {
         return ProviderProbeResult::new(
             snapshot(
-                &definition,
+                definition,
                 false,
                 None,
                 "disabled",
@@ -421,7 +421,7 @@ async fn probe_one_snapshot(
     if !definition.enabled {
         return ProviderProbeResult::new(
             snapshot(
-                &definition,
+                definition,
                 false,
                 None,
                 "disabled",
@@ -441,7 +441,7 @@ async fn probe_one_snapshot(
     {
         return ProviderProbeResult::new(
             snapshot(
-                &definition,
+                definition,
                 true,
                 None,
                 "ready",
@@ -476,7 +476,7 @@ async fn probe_one_snapshot(
         };
         return ProviderProbeResult::new(
             snapshot(
-                &definition,
+                definition,
                 true,
                 None,
                 "ready",
@@ -498,7 +498,7 @@ async fn probe_one_snapshot(
     let Some(executable) = resolve_provider_executable(&definition.binary_path) else {
         return ProviderProbeResult::new(
             snapshot(
-                &definition,
+                definition,
                 false,
                 None,
                 "error",
@@ -515,7 +515,7 @@ async fn probe_one_snapshot(
     if !include_slow_capabilities {
         return ProviderProbeResult::new(
             snapshot(
-                &definition,
+                definition,
                 true,
                 None,
                 "ready",
@@ -618,7 +618,7 @@ async fn probe_one_snapshot(
                 }
                 return ProviderProbeResult::new(
                     snapshot_owned_message(
-                        &definition,
+                        definition,
                         installed,
                         about.version.or(version),
                         status,
@@ -710,7 +710,7 @@ async fn probe_one_snapshot(
 
     let result = ProviderProbeResult::new(
         snapshot(
-            &definition,
+            definition,
             installed,
             version,
             status,
@@ -1984,6 +1984,7 @@ mod tests {
                 .expect("serve fake OpenCode API");
         });
         let settings = json!({
+            "enableProviderUpdateChecks": false,
             "providerInstances": {
                 "first": {
                     "driver": "opencode",

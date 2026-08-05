@@ -92,9 +92,7 @@ pub const OSC_CURSOR_ENV: &str = "BIBCODE_OSC_CURSOR";
 pub fn is_reserved_osc_env_key(key: &str) -> bool {
     matches!(
         key,
-        OSC_BACKGROUND_ENV
-            | OSC_FOREGROUND_ENV
-            | OSC_CURSOR_ENV
+        OSC_BACKGROUND_ENV | OSC_FOREGROUND_ENV | OSC_CURSOR_ENV
     )
 }
 
@@ -106,8 +104,7 @@ pub fn colors_from_env(env: &std::collections::BTreeMap<String, String>) -> OscC
             .and_then(|value| parse_rgb_triplet(value)),
         background: environment_value(env, OSC_BACKGROUND_ENV)
             .and_then(|value| parse_rgb_triplet(value)),
-        cursor: environment_value(env, OSC_CURSOR_ENV)
-            .and_then(|value| parse_rgb_triplet(value)),
+        cursor: environment_value(env, OSC_CURSOR_ENV).and_then(|value| parse_rgb_triplet(value)),
     }
 }
 

@@ -13,8 +13,6 @@ use std::{
 };
 
 use axum::body::Bytes;
-use futures_util::StreamExt;
-use serde_json::Value;
 use bibcode_server::{
     ServerConfig,
     activity::{
@@ -35,16 +33,15 @@ use bibcode_server::{
         ClaudeExecutablePinner, ClaudeProbeOutput, ClaudeTerminalObserverFactory,
         CodexCapabilityProbeRunner, CodexHelperLaunch, CodexHelperLauncher, CodexHelperProcess,
         CodexProbeOutput, CodexRemoteClient, CodexRemoteClientFactory,
-        CodexTerminalObserverFactory, OpenCodeCapabilityProbeRunner, OpenCodeHelperLaunch,
-        OpenCodeEventStream, OpenCodeHelperLauncher, OpenCodeHelperProcess, OpenCodeHelperReady,
+        CodexTerminalObserverFactory, OpenCodeCapabilityProbeRunner, OpenCodeEventStream,
+        OpenCodeHelperLaunch, OpenCodeHelperLauncher, OpenCodeHelperProcess, OpenCodeHelperReady,
         OpenCodeProbeOutput, OpenCodeRemoteClient, OpenCodeRemoteClientFactory,
         OpenCodeTerminalObserverFactory, PreparedTerminalLaunch, PreparedTerminalObserver,
         ProviderSettingsInventoryAuthority, ProviderTerminalActivitySupervisor,
         ProviderTerminalInventory, ProviderTerminalInventoryAuthority,
-        ProviderTerminalObserverFactories,
-        ProviderTerminalObserverFactory, ProviderTerminalObserverFactoryInput,
-        TerminalAgentActivityTransition, TerminalGenerationActivityPublisher,
-        TerminalLaunchPreparation,
+        ProviderTerminalObserverFactories, ProviderTerminalObserverFactory,
+        ProviderTerminalObserverFactoryInput, TerminalAgentActivityTransition,
+        TerminalGenerationActivityPublisher, TerminalLaunchPreparation,
         TerminalLaunchPreparationInput, TerminalLaunchPreparer, TerminalObserverCancellationReason,
         TerminalObserverGeneration, TerminalObserverWorkerContext,
         TerminalObserverWorkerSpawnError,
@@ -56,6 +53,8 @@ use bibcode_server::{
         TerminalStatus,
     },
 };
+use futures_util::StreamExt;
+use serde_json::Value;
 use tokio::sync::{broadcast, oneshot, watch};
 use tokio_util::sync::CancellationToken;
 
@@ -69,7 +68,10 @@ const OPENCODE_ATTACH_FIXTURE: &str =
 
 #[cfg(unix)]
 fn assert_empty_retired_generation(directory: &std::path::Path, context: &str) {
-    assert!(directory.is_dir(), "{context}: retired directory is preserved");
+    assert!(
+        directory.is_dir(),
+        "{context}: retired directory is preserved"
+    );
     assert_eq!(
         std::fs::read_dir(directory)
             .unwrap_or_else(|error| panic!("{context}: read retired directory: {error}"))
@@ -110,7 +112,10 @@ struct TraceCaptureWriter(Arc<Mutex<Vec<u8>>>);
 
 impl io::Write for TraceCaptureWriter {
     fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-        self.0.lock().expect("trace capture").extend_from_slice(bytes);
+        self.0
+            .lock()
+            .expect("trace capture")
+            .extend_from_slice(bytes);
         Ok(bytes.len())
     }
 
@@ -1934,7 +1939,10 @@ async fn lifecycle_prepared_launch_replaces_command_and_notifies_only_after_spaw
                     "BIBCODE_PRIVATE_SOCKET".to_owned(),
                     "/private/socket".to_owned(),
                 ),
-                ("BIBCODE_PRIVATE_TOKEN".to_owned(), "secret-token".to_owned()),
+                (
+                    "BIBCODE_PRIVATE_TOKEN".to_owned(),
+                    "secret-token".to_owned(),
+                ),
             ]),
             observer: observer.clone(),
         })],
@@ -1971,17 +1979,18 @@ async fn lifecycle_prepared_launch_replaces_command_and_notifies_only_after_spaw
         Some("secret-token")
     );
 
-    let spawned = observer.spawned.lock().expect("spawned lock");
-    assert_eq!(spawned.len(), 1);
-    assert_eq!(spawned[0].pid, opened.pid.expect("terminal pid"));
-    assert!(spawned[0].generation.is_current());
-    assert_eq!(
-        spawned[0].generation.scope_id(),
-        format!("terminal:{}", spawned[0].generation.id())
-    );
-    assert_eq!(spawned[0].generation.thread_id(), "thread-1");
-    assert_eq!(spawned[0].generation.terminal_id(), "terminal-1");
-    drop(spawned);
+    {
+        let spawned = observer.spawned.lock().expect("spawned lock");
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(spawned[0].pid, opened.pid.expect("terminal pid"));
+        assert!(spawned[0].generation.is_current());
+        assert_eq!(
+            spawned[0].generation.scope_id(),
+            format!("terminal:{}", spawned[0].generation.id())
+        );
+        assert_eq!(spawned[0].generation.thread_id(), "thread-1");
+        assert_eq!(spawned[0].generation.terminal_id(), "terminal-1");
+    }
 
     let mut terminal_events = manager.subscribe_events();
     backend.latest().emit("secret-token from provider");
@@ -2037,9 +2046,10 @@ async fn lifecycle_rejects_client_collision_with_private_environment_without_spa
     );
     let mut input =
         TerminalOpenInput::new("thread-1", "terminal-1", root.path().to_path_buf(), 80, 24);
-    input
-        .env
-        .insert("BIBCODE_PRIVATE_TOKEN".to_owned(), "client-value".to_owned());
+    input.env.insert(
+        "BIBCODE_PRIVATE_TOKEN".to_owned(),
+        "client-value".to_owned(),
+    );
     input.command = Some(command(true));
 
     let rendered = manager
@@ -2554,11 +2564,8 @@ async fn hardening_startup_cleans_only_direct_marked_private_runtime_artifacts_w
     std::fs::write(&marker_target, b"bibcode-provider-terminal-v1\n").expect("marker target");
     let linked_marker_dir = runtime_dir.join("linked-marker");
     std::fs::create_dir(&linked_marker_dir).expect("linked marker dir");
-    std::fs::set_permissions(
-        &linked_marker_dir,
-        std::fs::Permissions::from_mode(0o700),
-    )
-    .expect("linked marker permissions");
+    std::fs::set_permissions(&linked_marker_dir, std::fs::Permissions::from_mode(0o700))
+        .expect("linked marker permissions");
     std::os::unix::fs::symlink(
         &marker_target,
         linked_marker_dir.join(".bibcode-provider-terminal-owner"),
@@ -2586,12 +2593,12 @@ async fn hardening_startup_cleans_only_direct_marked_private_runtime_artifacts_w
     )
     .expect("supervisor");
 
-    assert_empty_retired_generation(
-        &owned,
-        "direct marked stale generation cleanup",
-    );
+    assert_empty_retired_generation(&owned, "direct marked stale generation cleanup");
     assert!(unmarked.exists(), "unmarked private directory is preserved");
-    assert!(outside.exists(), "symlink target outside the runtime is preserved");
+    assert!(
+        outside.exists(),
+        "symlink target outside the runtime is preserved"
+    );
     assert!(
         linked_marker_dir.exists(),
         "a symlinked marker never proves ownership"
@@ -3909,7 +3916,10 @@ async fn hardening_rejected_hint_diagnostics_are_bounded_to_provider_strategy_an
         diagnostic.contains("strategy=\"remote-app-server\""),
         "{diagnostic}"
     );
-    assert!(diagnostic.contains("status=\"unknown_instance\""), "{diagnostic}");
+    assert!(
+        diagnostic.contains("status=\"unknown_instance\""),
+        "{diagnostic}"
+    );
     for secret in [
         "private_instance",
         "private-argument",
@@ -4317,9 +4327,7 @@ struct CodexFixtureRemoteClient {
 
 impl Drop for CodexFixtureRemoteClient {
     fn drop(&mut self) {
-        self.state
-            .active_connections
-            .fetch_sub(1, Ordering::AcqRel);
+        self.state.active_connections.fetch_sub(1, Ordering::AcqRel);
     }
 }
 
@@ -4402,7 +4410,7 @@ impl CodexRemoteClient for CodexFixtureRemoteClient {
                         .completed_resume_responses
                         .fetch_add(1, Ordering::AcqRel);
                     return Err(
-                        "thread/resume excludeTurns requires the experimental API".to_owned(),
+                        "thread/resume excludeTurns requires the experimental API".to_owned()
                     );
                 }
                 if let Some(events) = self
@@ -4573,11 +4581,8 @@ impl CodexRemoteClientFactory for CodexFixtureRemoteFactory {
                 .expect("scripted Codex events lock")
                 .pop_front()
                 .unwrap_or_else(|| self.state.events.clone());
-            let active_connections = self
-                .state
-                .active_connections
-                .fetch_add(1, Ordering::AcqRel)
-                + 1;
+            let active_connections =
+                self.state.active_connections.fetch_add(1, Ordering::AcqRel) + 1;
             self.state
                 .maximum_active_connections
                 .fetch_max(active_connections, Ordering::AcqRel);
@@ -5270,13 +5275,11 @@ async fn codex_clean_close_before_root_discovery_reconnects_on_a_fresh_epoch() {
         .expect("scripted Codex events")
         .extend([
             Arc::new(Mutex::new(VecDeque::new())),
-            Arc::new(Mutex::new(VecDeque::from([
-                codex_root_notification(
-                    &fixture,
-                    "terminal-pre-root-close-root",
-                    root.path(),
-                ),
-            ]))),
+            Arc::new(Mutex::new(VecDeque::from([codex_root_notification(
+                &fixture,
+                "terminal-pre-root-close-root",
+                root.path(),
+            )]))),
         ]);
     remote_state
         .clean_close_requests
@@ -5293,9 +5296,7 @@ async fn codex_clean_close_before_root_discovery_reconnects_on_a_fresh_epoch() {
     wait_for_codex_initial_live(&projection, &scope).await;
 
     assert_eq!(
-        remote_state
-            .completed_clean_closes
-            .load(Ordering::Acquire),
+        remote_state.completed_clean_closes.load(Ordering::Acquire),
         1
     );
     assert_eq!(
@@ -5371,11 +5372,7 @@ async fn codex_pre_root_reconnect_failure_publishes_unavailable_and_parks() {
         .clean_close_requests
         .store(1, Ordering::Release);
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while remote_state
-            .completed_clean_closes
-            .load(Ordering::Acquire)
-            != 1
-        {
+        while remote_state.completed_clean_closes.load(Ordering::Acquire) != 1 {
             tokio::task::yield_now().await;
         }
     })
@@ -5384,7 +5381,11 @@ async fn codex_pre_root_reconnect_failure_publishes_unavailable_and_parks() {
 
     let unavailable = manager.set_agent_activity_enabled(true).await;
     assert_eq!(
-        (unavailable.resumed, unavailable.failed, unavailable.unavailable),
+        (
+            unavailable.resumed,
+            unavailable.failed,
+            unavailable.unavailable
+        ),
         (0, 1, 1)
     );
     assert_eq!(unavailable.epochs.codex, 1);
@@ -5448,11 +5449,7 @@ async fn agent_activity_toggle_codex_clean_close_advances_epoch_and_recovers() {
         .clean_close_requests
         .fetch_add(1, Ordering::Release);
     tokio::time::timeout(std::time::Duration::from_secs(1), async {
-        while remote_state
-            .completed_clean_closes
-            .load(Ordering::Acquire)
-            == 0
-        {
+        while remote_state.completed_clean_closes.load(Ordering::Acquire) == 0 {
             tokio::task::yield_now().await;
         }
     })
@@ -5461,7 +5458,11 @@ async fn agent_activity_toggle_codex_clean_close_advances_epoch_and_recovers() {
 
     let unavailable = manager.set_agent_activity_enabled(true).await;
     assert_eq!(
-        (unavailable.resumed, unavailable.failed, unavailable.unavailable),
+        (
+            unavailable.resumed,
+            unavailable.failed,
+            unavailable.unavailable
+        ),
         (0, 1, 1)
     );
     assert_eq!(unavailable.epochs.codex, 1);
@@ -5867,11 +5868,15 @@ async fn codex_helper_precedes_pty_and_generation_worker_owns_remote_transport()
         ["helper", "spawn", "connect", "initialize", "initialized"],
         "the helper must precede the PTY, while transport registration must occur on the durable generation worker"
     );
-    let launches = helper.launches.lock().expect("helper launches lock");
-    assert_eq!(launches.len(), 1);
-    let endpoint = launches[0].endpoint.clone();
+    let (endpoint, socket) = {
+        let launches = helper.launches.lock().expect("helper launches lock");
+        assert_eq!(launches.len(), 1);
+        (
+            launches[0].endpoint.clone(),
+            launches[0].socket_path.clone(),
+        )
+    };
     assert!(endpoint.starts_with("unix://"));
-    let socket = launches[0].socket_path.clone();
     assert!(socket.starts_with(
         std::fs::canonicalize(root.path().join("runtime")).expect("canonical runtime directory")
     ));
@@ -5897,8 +5902,10 @@ async fn codex_helper_precedes_pty_and_generation_worker_owns_remote_transport()
             }
         })
         .collect::<Vec<_>>();
-    assert_eq!(launches[0].args, expected_helper);
-    drop(launches);
+    assert_eq!(
+        helper.launches.lock().expect("helper launches lock")[0].args,
+        expected_helper
+    );
     let expected_tui = fixture["tuiArgs"]
         .as_array()
         .expect("TUI args")
@@ -5978,11 +5985,7 @@ async fn codex_helper_precedes_pty_and_generation_worker_owns_remote_transport()
             "source",
             serde_json::json!("appServer"),
         ),
-        (
-            "arbitrary source",
-            "source",
-            serde_json::json!("extension"),
-        ),
+        ("arbitrary source", "source", serde_json::json!("extension")),
         (
             "non-null thread source",
             "threadSource",
@@ -6339,10 +6342,7 @@ async fn codex_resume_retries_transient_materialization_without_losing_pending_e
     );
 
     manager
-        .close(
-            "thread-codex",
-            Some("terminal-materialization-retry"),
-        )
+        .close("thread-codex", Some("terminal-materialization-retry"))
         .await
         .expect("close materialization-retry terminal");
     manager.shutdown().await;
@@ -6513,10 +6513,7 @@ async fn codex_resume_reconnects_after_the_remote_tui_replaces_the_materializing
     );
 
     manager
-        .close(
-            "thread-codex",
-            Some("terminal-reconnected-resume"),
-        )
+        .close("thread-codex", Some("terminal-reconnected-resume"))
         .await
         .expect("close reconnected terminal");
     manager.shutdown().await;
@@ -7205,13 +7202,9 @@ async fn codex_generation_slot_exhaustion_fails_open_without_growing_the_namespa
     for slot in 0..64 {
         let ambiguous = runtime.join(format!("c{slot:016x}"));
         std::fs::create_dir(&ambiguous).expect("ambiguous Codex slot");
-        std::fs::set_permissions(
-            &ambiguous,
-            std::fs::Permissions::from_mode(0o700),
-        )
-        .expect("ambiguous slot permissions");
-        std::fs::write(ambiguous.join("preserve"), b"ambiguous")
-            .expect("ambiguous slot payload");
+        std::fs::set_permissions(&ambiguous, std::fs::Permissions::from_mode(0o700))
+            .expect("ambiguous slot permissions");
+        std::fs::write(ambiguous.join("preserve"), b"ambiguous").expect("ambiguous slot payload");
     }
     let configured = root.path().join("configured-codex");
     std::fs::write(&configured, b"configured").expect("configured executable");
@@ -7256,7 +7249,11 @@ async fn codex_generation_slot_exhaustion_fails_open_without_growing_the_namespa
             .collect::<Vec<_>>()
     );
     assert!(
-        helper.launches.lock().expect("helper launches lock").is_empty(),
+        helper
+            .launches
+            .lock()
+            .expect("helper launches lock")
+            .is_empty(),
         "slot exhaustion is rejected before helper launch"
     );
     assert!(
@@ -7346,8 +7343,7 @@ async fn codex_list_discovery_correlates_root_when_broadcast_is_absent() {
             .clone();
     let mut ambiguous_candidate = root_candidate.clone();
     ambiguous_candidate["id"] = serde_json::json!("terminal-listed-root-ambiguous");
-    ambiguous_candidate["sessionId"] =
-        serde_json::json!("terminal-listed-root-ambiguous");
+    ambiguous_candidate["sessionId"] = serde_json::json!("terminal-listed-root-ambiguous");
     remote_state
         .request_responses
         .lock()
@@ -7534,10 +7530,12 @@ async fn codex_list_discovery_retries_only_after_the_timed_out_response_is_drain
             "thread/list".to_owned(),
             VecDeque::from([std::time::Duration::from_secs(5)]),
         );
-    let root_candidate =
-        codex_root_notification(&fixture, "terminal-root-after-late-response", root.path())
-            ["params"]["thread"]
-            .clone();
+    let root_candidate = codex_root_notification(
+        &fixture,
+        "terminal-root-after-late-response",
+        root.path(),
+    )["params"]["thread"]
+        .clone();
     remote_state
         .request_responses
         .lock()
@@ -7621,10 +7619,7 @@ async fn codex_list_discovery_retries_only_after_the_timed_out_response_is_drain
     );
 
     manager
-        .close(
-            "thread-codex",
-            Some("terminal-late-discovery-response"),
-        )
+        .close("thread-codex", Some("terminal-late-discovery-response"))
         .await
         .expect("close late-response terminal");
     manager.shutdown().await;
@@ -7815,21 +7810,24 @@ async fn codex_terminals_isolate_endpoints_scopes_and_owned_helper_cleanup() {
     assert_eq!(snapshot_a.actors.len(), 1);
     assert_eq!(snapshot_b.actors.len(), 1);
     assert_ne!(snapshot_a.actors[0].id, snapshot_b.actors[0].id);
-    let launches = helper.launches.lock().expect("helper launches lock");
-    assert_eq!(launches.len(), 2);
-    assert_ne!(launches[0].endpoint, launches[1].endpoint);
-    assert_ne!(launches[0].socket_path, launches[1].socket_path);
-    let directory_a = launches[0]
-        .socket_path
-        .parent()
-        .expect("terminal A generation directory")
-        .to_path_buf();
-    let directory_b = launches[1]
-        .socket_path
-        .parent()
-        .expect("terminal B generation directory")
-        .to_path_buf();
-    drop(launches);
+    let (directory_a, directory_b) = {
+        let launches = helper.launches.lock().expect("helper launches lock");
+        assert_eq!(launches.len(), 2);
+        assert_ne!(launches[0].endpoint, launches[1].endpoint);
+        assert_ne!(launches[0].socket_path, launches[1].socket_path);
+        (
+            launches[0]
+                .socket_path
+                .parent()
+                .expect("terminal A generation directory")
+                .to_path_buf(),
+            launches[1]
+                .socket_path
+                .parent()
+                .expect("terminal B generation directory")
+                .to_path_buf(),
+        )
+    };
     for directory in [&directory_a, &directory_b] {
         assert_eq!(
             std::fs::read(directory.join(".bibcode-provider-terminal-owner"))
@@ -7843,10 +7841,11 @@ async fn codex_terminals_isolate_endpoints_scopes_and_owned_helper_cleanup() {
         .close("thread-codex", Some("terminal-a"))
         .await
         .expect("close terminal");
-    let processes = helper.processes.lock().expect("helper processes lock");
-    assert!(processes[0].terminated.load(Ordering::Acquire));
-    assert!(!processes[1].terminated.load(Ordering::Acquire));
-    drop(processes);
+    {
+        let processes = helper.processes.lock().expect("helper processes lock");
+        assert!(processes[0].terminated.load(Ordering::Acquire));
+        assert!(!processes[1].terminated.load(Ordering::Acquire));
+    }
     assert_empty_retired_generation(&directory_a, "terminal A cleanup");
     assert!(directory_b.exists());
 
@@ -8096,7 +8095,10 @@ async fn agent_activity_toggle_disabled_launch_is_pure_pass_through() {
         })
         .await;
 
-    assert!(matches!(preparation, TerminalLaunchPreparation::PassThrough));
+    assert!(matches!(
+        preparation,
+        TerminalLaunchPreparation::PassThrough
+    ));
     assert_eq!(authority.calls.load(Ordering::Acquire), 0);
     assert_eq!(factory.prepare_calls.load(Ordering::Acquire), 0);
 }
@@ -8128,10 +8130,8 @@ async fn agent_activity_toggle_disable_racing_preparation_drops_owned_resources_
         .await
         .expect("migrations");
     let controller = AgentActivityController::new(true);
-    let projection = ActivityProjection::with_controller(
-        ActivityRepository::new(database),
-        controller.clone(),
-    );
+    let projection =
+        ActivityProjection::with_controller(ActivityRepository::new(database), controller.clone());
     let supervisor = ProviderTerminalActivitySupervisor::new_with_authority(
         authority,
         controller.clone(),
@@ -8263,7 +8263,8 @@ async fn agent_activity_toggle_disable_after_final_check_rejects_late_observer_i
         .expect("pass-through terminal still launches");
 
     assert_eq!(
-        backend.spawns()[0].executable, "codex",
+        backend.spawns()[0].executable,
+        "codex",
         "the stale prepared command never reaches the PTY backend"
     );
     assert_eq!(
@@ -8304,18 +8305,12 @@ async fn agent_activity_hung_factory_does_not_block_terminal_disable_or_later_se
         .await
         .expect("enable Terminal activity before attaching runtime handler");
     let stream_cancellation = CancellationToken::new();
-    let mut config_events = control.subscribe(
-        "subscribeServerConfig",
-        stream_cancellation.clone(),
-    );
-    let snapshot = tokio::time::timeout(
-        std::time::Duration::from_secs(2),
-        config_events.recv(),
-    )
-    .await
-    .expect("config snapshot timeout")
-    .expect("config stream remains open")
-    .expect("config snapshot succeeds");
+    let mut config_events = control.subscribe("subscribeServerConfig", stream_cancellation.clone());
+    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(2), config_events.recv())
+        .await
+        .expect("config snapshot timeout")
+        .expect("config stream remains open")
+        .expect("config snapshot succeeds");
     assert_eq!(snapshot[0]["type"], "snapshot");
 
     let mut settings = ProviderSettingsState::default();
@@ -8329,10 +8324,8 @@ async fn agent_activity_hung_factory_does_not_block_terminal_disable_or_later_se
         })
         .await
         .expect("migrations");
-    let projection = ActivityProjection::with_controller(
-        ActivityRepository::new(database),
-        controller.clone(),
-    );
+    let projection =
+        ActivityProjection::with_controller(ActivityRepository::new(database), controller.clone());
     let entered = Arc::new(tokio::sync::Semaphore::new(0));
     let release = Arc::new(tokio::sync::Semaphore::new(0));
     let returned = Arc::new(tokio::sync::Semaphore::new(0));
@@ -8443,16 +8436,10 @@ async fn agent_activity_hung_factory_does_not_block_terminal_disable_or_later_se
             .expect("disable settings update"),
         Err(_) => {
             release_guard.release();
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                &mut disabling_update,
-            )
-            .await;
-            let _ = tokio::time::timeout(
-                std::time::Duration::from_secs(2),
-                dropped.acquire(),
-            )
-            .await;
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(2), &mut disabling_update)
+                .await;
+            let _ =
+                tokio::time::timeout(std::time::Duration::from_secs(2), dropped.acquire()).await;
             panic!("Terminal settings publication waited for the hung provider factory");
         }
     };
@@ -8542,10 +8529,8 @@ async fn agent_activity_toggle_terminal_launched_disabled_stays_uninstrumented_a
         .await
         .expect("migrations");
     let controller = AgentActivityController::new(false);
-    let projection = ActivityProjection::with_controller(
-        ActivityRepository::new(database),
-        controller.clone(),
-    );
+    let projection =
+        ActivityProjection::with_controller(ActivityRepository::new(database), controller.clone());
     let supervisor = ProviderTerminalActivitySupervisor::new_with_authority(
         authority.clone(),
         controller.clone(),
@@ -8999,7 +8984,10 @@ async fn versioned_claude_source_is_privately_pinned_and_cleans_overlay() {
         .expect("versioned Claude preparation");
     let spawn = backend.spawns().pop().expect("versioned Claude PTY spawn");
     let pinned = std::path::PathBuf::from(&spawn.executable);
-    assert_ne!(pinned, installed, "the installed launch must use a private pin");
+    assert_ne!(
+        pinned, installed,
+        "the installed launch must use a private pin"
+    );
     assert_eq!(
         pinned
             .parent()
@@ -9246,13 +9234,8 @@ async fn claude_fixture_terminal(
         .expect("Claude launch"),
     );
     manager.open(input).await.expect("Claude terminal");
-    let pinned_executable = std::path::PathBuf::from(
-        backend
-            .spawns()
-            .pop()
-            .expect("Claude PTY spawn")
-            .executable,
-    );
+    let pinned_executable =
+        std::path::PathBuf::from(backend.spawns().pop().expect("Claude PTY spawn").executable);
     assert_eq!(
         std::fs::read(
             pinned_executable
@@ -9268,9 +9251,7 @@ async fn claude_fixture_terminal(
         thread_id: "thread-claude".to_owned(),
         terminal_id: terminal_id.to_owned(),
     };
-    (
-        root, manager, backend, projection, scope, database, factory,
-    )
+    (root, manager, backend, projection, scope, database, factory)
 }
 
 fn claude_hook_launch(backend: &RecordingBackend) -> (String, String, String, std::path::PathBuf) {
@@ -9488,7 +9469,9 @@ async fn agent_activity_toggle_claude_hook_is_dormant_without_stopping_terminal(
             .body(body)
             .send(),
     );
-    first_chunk_seen.await.expect("first malformed body chunk sent");
+    first_chunk_seen
+        .await
+        .expect("first malformed body chunk sent");
     tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
     let stopped = manager.set_agent_activity_enabled(false).await;
@@ -10131,9 +10114,7 @@ impl OpenCodeHelperProcess for OpenCodeFixtureProcess {
         }
     }
 
-    fn terminate_and_reap(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn terminate_and_reap(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             if !self.reap_delay.is_zero() {
                 tokio::time::sleep(self.reap_delay).await;
@@ -10253,9 +10234,7 @@ impl OpenCodeHelperProcess for ActualExitedOpenCodeHelperProcess {
             .kill();
     }
 
-    fn terminate_and_reap(
-        &self,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    fn terminate_and_reap(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
         Box::pin(async move {
             self.cleanup_calls.fetch_add(1, Ordering::AcqRel);
             self.exit_and_reap();
@@ -10319,14 +10298,8 @@ impl PtyBackend for ExitHelperOnFirstSpawnBackend {
                 .exit_and_reap();
         }
         let process = Arc::new(RecordingProcess::new(
-            u32::try_from(
-                self.processes
-                    .lock()
-                    .expect("gap processes")
-                    .len()
-                    + 1,
-            )
-            .expect("gap PID"),
+            u32::try_from(self.processes.lock().expect("gap processes").len() + 1)
+                .expect("gap PID"),
         ));
         self.processes
             .lock()
@@ -10336,9 +10309,11 @@ impl PtyBackend for ExitHelperOnFirstSpawnBackend {
     }
 }
 
+type OpenCodeFixtureFrames = Arc<Mutex<VecDeque<Result<Vec<u8>, String>>>>;
+
 #[derive(Clone, Debug)]
 struct OpenCodeFixtureStreamScript {
-    frames: Arc<Mutex<VecDeque<Result<Vec<u8>, String>>>>,
+    frames: OpenCodeFixtureFrames,
     notify: Arc<tokio::sync::Notify>,
     busy_dormant: bool,
 }
@@ -10352,9 +10327,7 @@ impl OpenCodeFixtureStreamScript {
         }
     }
 
-    fn busy_dormant(
-        frames: impl IntoIterator<Item = Result<Vec<u8>, String>>,
-    ) -> Self {
+    fn busy_dormant(frames: impl IntoIterator<Item = Result<Vec<u8>, String>>) -> Self {
         Self {
             busy_dormant: true,
             ..Self::new(frames)
@@ -10371,11 +10344,7 @@ struct OpenCodeReplacementPause {
 impl OpenCodeReplacementPause {
     fn wait_until_released(&self) {
         self.entered.notify_one();
-        let mut released = self
-            .released
-            .0
-            .lock()
-            .expect("OpenCode replacement pause");
+        let mut released = self.released.0.lock().expect("OpenCode replacement pause");
         while !*released {
             released = self
                 .released
@@ -10386,11 +10355,7 @@ impl OpenCodeReplacementPause {
     }
 
     fn release(&self) {
-        *self
-            .released
-            .0
-            .lock()
-            .expect("OpenCode replacement pause") = true;
+        *self.released.0.lock().expect("OpenCode replacement pause") = true;
         self.released.1.notify_all();
     }
 }
@@ -10614,9 +10579,7 @@ impl Drop for OpenCodeFixtureEventStream {
 }
 
 impl OpenCodeEventStream for OpenCodeFixtureEventStream {
-    fn discard_next(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+    fn discard_next(&mut self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
         Box::pin(async move {
             if !self.script.busy_dormant
                 || !self
@@ -10628,16 +10591,12 @@ impl OpenCodeEventStream for OpenCodeFixtureEventStream {
             {
                 self.next_raw_frame().await?;
             }
-            self.state
-                .discarded_frames
-                .fetch_add(1, Ordering::AcqRel);
+            self.state.discarded_frames.fetch_add(1, Ordering::AcqRel);
             Ok(())
         })
     }
 
-    fn next_data(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + '_>> {
+    fn next_data(&mut self) -> Pin<Box<dyn Future<Output = Result<Vec<u8>, String>> + Send + '_>> {
         Box::pin(async move {
             loop {
                 let raw = match self.next_raw_frame().await {
@@ -10656,12 +10615,7 @@ impl OpenCodeEventStream for OpenCodeFixtureEventStream {
                 };
                 if serde_json::from_slice::<Value>(&data)
                     .ok()
-                    .and_then(|event| {
-                        event
-                            .get("type")
-                            .and_then(Value::as_str)
-                            .map(str::to_owned)
-                    })
+                    .and_then(|event| event.get("type").and_then(Value::as_str).map(str::to_owned))
                     .is_some_and(|event_type| event_type != "server.connected")
                 {
                     self.state
@@ -10805,17 +10759,14 @@ impl OpenCodeRemoteClient for OpenCodeFixtureRemoteClient {
                 .expect("OpenCode sessions")
                 .iter()
                 .find(|session| {
-                    session.get("id").and_then(Value::as_str)
-                        == Some(root_session_id.as_str())
+                    session.get("id").and_then(Value::as_str) == Some(root_session_id.as_str())
                 })
                 .cloned()
                 .ok_or_else(|| "missing OpenCode root".to_owned())
         })
     }
 
-    fn statuses(
-        &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
+    fn statuses(&mut self) -> Pin<Box<dyn Future<Output = Result<Value, String>> + Send + '_>> {
         Box::pin(async move {
             apply_opencode_fixture_delay(&self.state, "statuses").await;
             self.state
@@ -10880,13 +10831,8 @@ impl OpenCodeRemoteClient for OpenCodeFixtureRemoteClient {
 
     fn open_event_stream(
         &mut self,
-    ) -> Pin<
-        Box<
-            dyn Future<Output = Result<Box<dyn OpenCodeEventStream>, String>>
-                + Send
-                + '_,
-        >,
-    > {
+    ) -> Pin<Box<dyn Future<Output = Result<Box<dyn OpenCodeEventStream>, String>> + Send + '_>>
+    {
         Box::pin(async move {
             let script = self
                 .state
@@ -10897,8 +10843,11 @@ impl OpenCodeRemoteClient for OpenCodeFixtureRemoteClient {
                 .unwrap_or_else(|| {
                     OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())])
                 });
-            let replacement =
-                self.state.opened_stream_count.fetch_add(1, Ordering::AcqRel) > 0;
+            let replacement = self
+                .state
+                .opened_stream_count
+                .fetch_add(1, Ordering::AcqRel)
+                > 0;
             self.state
                 .active_streams
                 .lock()
@@ -10994,7 +10943,10 @@ fn opencode_attach_fixture() -> Value {
 
 fn opencode_fixture_probe(
     fixture: &Value,
-) -> (Arc<OpenCodeProbeFixtureRunner>, Arc<OpenCodeTerminalObserverFactory>) {
+) -> (
+    Arc<OpenCodeProbeFixtureRunner>,
+    Arc<OpenCodeTerminalObserverFactory>,
+) {
     let runner = Arc::new(OpenCodeProbeFixtureRunner {
         calls: Mutex::new(Vec::new()),
         outputs: Mutex::new(
@@ -11679,11 +11631,7 @@ struct OpenCodeToggleFixture {
 #[cfg(unix)]
 impl OpenCodeToggleFixture {
     async fn open(stream_scripts: Vec<OpenCodeFixtureStreamScript>) -> Self {
-        Self::open_with_reattach_timeout(
-            stream_scripts,
-            std::time::Duration::from_secs(3),
-        )
-        .await
+        Self::open_with_reattach_timeout(stream_scripts, std::time::Duration::from_secs(3)).await
     }
 
     async fn open_with_reattach_timeout(
@@ -11800,8 +11748,7 @@ impl OpenCodeToggleFixture {
         );
         input.env = BTreeMap::from([(
             "OPENCODE_CONFIG_CONTENT".to_owned(),
-            serde_json::to_string(&fixture["originalConfig"])
-                .expect("OpenCode fixture config"),
+            serde_json::to_string(&fixture["originalConfig"]).expect("OpenCode fixture config"),
         )]);
         input.command = Some(TerminalLaunchCommand {
             executable: configured.to_string_lossy().into_owned(),
@@ -11815,7 +11762,10 @@ impl OpenCodeToggleFixture {
                 provider_instance_id: "opencode".to_owned(),
             }),
         });
-        manager.open(input).await.expect("observed OpenCode terminal");
+        manager
+            .open(input)
+            .await
+            .expect("observed OpenCode terminal");
         tokio::time::timeout(std::time::Duration::from_secs(2), async {
             loop {
                 let connected = remote_state
@@ -11956,9 +11906,9 @@ async fn wait_for_opencode_discard_count(state: &OpenCodeFixtureRemoteState, exp
 #[cfg(unix)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn agent_activity_toggle_opencode_drains_raw_dormant_stream() {
-    let fixture = OpenCodeToggleFixture::open(vec![OpenCodeFixtureStreamScript::new([
-        Ok(opencode_fixture_connected_frame()),
-    ])])
+    let fixture = OpenCodeToggleFixture::open(vec![OpenCodeFixtureStreamScript::new([Ok(
+        opencode_fixture_connected_frame(),
+    )])])
     .await;
     let decoded_before = fixture
         .remote_state
@@ -12001,10 +11951,7 @@ async fn agent_activity_toggle_opencode_handoff_requires_server_connected() {
         async move { manager.set_agent_activity_enabled(true).await }
     });
     replacement_waiting.await;
-    assert!(
-        !enabling.is_finished(),
-        "enable waits for server.connected"
-    );
+    assert!(!enabling.is_finished(), "enable waits for server.connected");
     push_connected_frame_to_replacement(&fixture.remote_state);
     let enabled = enabling.await.expect("enable transition");
 
@@ -12014,10 +11961,7 @@ async fn agent_activity_toggle_opencode_handoff_requires_server_connected() {
         opencode_history_call_count(&fixture.remote_state),
         unary_before
     );
-    assert_eq!(
-        fixture.remote_state.open_streams.load(Ordering::Acquire),
-        1
-    );
+    assert_eq!(fixture.remote_state.open_streams.load(Ordering::Acquire), 1);
     assert!(
         fixture
             .remote_state
@@ -12034,9 +11978,7 @@ async fn agent_activity_toggle_opencode_handoff_requires_server_connected() {
 async fn agent_activity_toggle_opencode_busy_dormant_stream_does_not_starve_connected_replacement()
 {
     let fixture = OpenCodeToggleFixture::open(vec![
-        OpenCodeFixtureStreamScript::busy_dormant([Ok(
-            opencode_fixture_connected_frame(),
-        )]),
+        OpenCodeFixtureStreamScript::busy_dormant([Ok(opencode_fixture_connected_frame())]),
         OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
     ])
     .await;
@@ -12066,9 +12008,7 @@ async fn agent_activity_toggle_opencode_busy_dormant_stream_does_not_starve_conn
 async fn agent_activity_toggle_opencode_busy_dormant_stream_does_not_starve_handoff_deadline() {
     let fixture = OpenCodeToggleFixture::open_with_reattach_timeout(
         vec![
-            OpenCodeFixtureStreamScript::busy_dormant([Ok(
-                opencode_fixture_connected_frame(),
-            )]),
+            OpenCodeFixtureStreamScript::busy_dormant([Ok(opencode_fixture_connected_frame())]),
             OpenCodeFixtureStreamScript::new([]),
         ],
         std::time::Duration::from_millis(50),
@@ -12159,10 +12099,7 @@ async fn agent_activity_toggle_opencode_retries_latest_enabled_generation_after_
 
     assert_eq!((enabled.resumed, enabled.failed), (1, 0));
     assert_eq!(enabled.epochs.opencode, 1);
-    assert_eq!(
-        fixture.remote_state.open_streams.load(Ordering::Acquire),
-        1
-    );
+    assert_eq!(fixture.remote_state.open_streams.load(Ordering::Acquire), 1);
     assert_eq!(
         fixture
             .remote_state
@@ -12186,16 +12123,17 @@ async fn agent_activity_toggle_opencode_retries_latest_enabled_generation_after_
 async fn agent_activity_toggle_opencode_failed_handoff_stays_dormant() {
     let fixture = OpenCodeToggleFixture::open(vec![
         OpenCodeFixtureStreamScript::new([Ok(opencode_fixture_connected_frame())]),
-        OpenCodeFixtureStreamScript::new([Err(
-            "injected replacement stream failure".to_owned(),
-        )]),
+        OpenCodeFixtureStreamScript::new([Err("injected replacement stream failure".to_owned())]),
     ])
     .await;
     let unary_before = opencode_history_call_count(&fixture.remote_state);
     fixture.manager.set_agent_activity_enabled(false).await;
 
     let failed = fixture.manager.set_agent_activity_enabled(true).await;
-    assert_eq!((failed.resumed, failed.failed, failed.unavailable), (0, 1, 1));
+    assert_eq!(
+        (failed.resumed, failed.failed, failed.unavailable),
+        (0, 1, 1)
+    );
     assert_eq!(
         fixture.remote_state.open_streams.load(Ordering::Acquire),
         1,
@@ -12236,10 +12174,7 @@ async fn agent_activity_toggle_opencode_repeated_handoffs_return_to_one_stream()
         let enabled = fixture.manager.set_agent_activity_enabled(true).await;
         assert_eq!((enabled.resumed, enabled.failed), (1, 0));
         assert_eq!(enabled.epochs.opencode, expected_epoch);
-        assert_eq!(
-            fixture.remote_state.open_streams.load(Ordering::Acquire),
-            1
-        );
+        assert_eq!(fixture.remote_state.open_streams.load(Ordering::Acquire), 1);
     }
 
     assert!(
@@ -12424,8 +12359,7 @@ async fn repeated_activity_toggle_across_providers_keeps_resources_bounded_and_r
     );
 
     for expected_epoch in 1..=3 {
-        let disabling_activity =
-            begin_activity_controller_disables(&activity_controllers).await;
+        let disabling_activity = begin_activity_controller_disables(&activity_controllers).await;
         assert_eq!(
             activity_controllers
                 .each_ref()
@@ -12446,21 +12380,17 @@ async fn repeated_activity_toggle_across_providers_keeps_resources_bounded_and_r
         .expect("real activity registrations drain on disable");
         for report in disabled_activity {
             assert_eq!(
-                report.expect("activity controller disable").closed_subscriptions,
+                report
+                    .expect("activity controller disable")
+                    .closed_subscriptions,
                 1
             );
         }
         let claude_disabled = claude_manager.set_agent_activity_enabled(false).await;
         let codex_disabled = codex_manager.set_agent_activity_enabled(false).await;
         let opencode_disabled = opencode.manager.set_agent_activity_enabled(false).await;
-        assert_eq!(
-            (claude_disabled.stopped, claude_disabled.dormant),
-            (1, 1)
-        );
-        assert_eq!(
-            (codex_disabled.stopped, codex_disabled.dormant),
-            (1, 1)
-        );
+        assert_eq!((claude_disabled.stopped, claude_disabled.dormant), (1, 1));
+        assert_eq!((codex_disabled.stopped, codex_disabled.dormant), (1, 1));
         assert_eq!(
             (opencode_disabled.stopped, opencode_disabled.dormant),
             (1, 1)
@@ -12497,15 +12427,9 @@ async fn repeated_activity_toggle_across_providers_keeps_resources_bounded_and_r
         let claude_enabled = claude_manager.set_agent_activity_enabled(true).await;
         let codex_enabled = codex_manager.set_agent_activity_enabled(true).await;
         let opencode_enabled = opencode.manager.set_agent_activity_enabled(true).await;
-        assert_eq!(
-            (claude_enabled.resumed, claude_enabled.failed),
-            (1, 0)
-        );
+        assert_eq!((claude_enabled.resumed, claude_enabled.failed), (1, 0));
         assert_eq!((codex_enabled.resumed, codex_enabled.failed), (1, 0));
-        assert_eq!(
-            (opencode_enabled.resumed, opencode_enabled.failed),
-            (1, 0)
-        );
+        assert_eq!((opencode_enabled.resumed, opencode_enabled.failed), (1, 0));
         assert_eq!(opencode_enabled.epochs.opencode, expected_epoch);
         for controller in &activity_controllers {
             controller.enable();
@@ -12564,7 +12488,10 @@ async fn repeated_activity_toggle_across_providers_keeps_resources_bounded_and_r
         );
     }
 
-    assert_eq!(count_codex_history_calls(&codex_remote_state), codex_history_before);
+    assert_eq!(
+        count_codex_history_calls(&codex_remote_state),
+        codex_history_before
+    );
     assert_eq!(
         opencode_history_call_count(&opencode.remote_state),
         opencode_history_before
@@ -12583,8 +12510,7 @@ async fn repeated_activity_toggle_across_providers_keeps_resources_bounded_and_r
             <= 2
     );
 
-    let disabling_activity =
-        begin_activity_controller_disables(&activity_controllers).await;
+    let disabling_activity = begin_activity_controller_disables(&activity_controllers).await;
     assert_eq!(
         activity_controllers
             .each_ref()
@@ -12629,22 +12555,21 @@ async fn repeated_activity_toggle_across_providers_keeps_resources_bounded_and_r
         .expect("close Codex resource terminal");
     opencode
         .manager
-        .close(
-            "thread-opencode-toggle",
-            Some("terminal-opencode-toggle"),
-        )
+        .close("thread-opencode-toggle", Some("terminal-opencode-toggle"))
         .await
         .expect("close OpenCode resource terminal");
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
-            let codex_released =
-                codex_remote_state.active_connections.load(Ordering::Acquire) == 0
-                    && codex_helper
-                        .processes
-                        .lock()
-                        .expect("Codex helper processes")
-                        .first()
-                        .is_some_and(|process| process.terminated.load(Ordering::Acquire));
+            let codex_released = codex_remote_state
+                .active_connections
+                .load(Ordering::Acquire)
+                == 0
+                && codex_helper
+                    .processes
+                    .lock()
+                    .expect("Codex helper processes")
+                    .first()
+                    .is_some_and(|process| process.terminated.load(Ordering::Acquire));
             let opencode_released = opencode
                 .helper
                 .processes
@@ -12682,11 +12607,7 @@ async fn repeated_activity_toggle_across_providers_keeps_resources_bounded_and_r
         "activity registrations remain drained after every provider closes"
     );
     assert!(
-        claude_client
-            .post(&claude_endpoint)
-            .send()
-            .await
-            .is_err(),
+        claude_client.post(&claude_endpoint).send().await.is_err(),
         "closing the Claude terminal releases its sole listener"
     );
     assert_eq!(
@@ -12817,7 +12738,12 @@ async fn opencode_parallel_terminals_have_unique_endpoints_credentials_roots_and
             .env
             .get("OPENCODE_SERVER_PASSWORD")
             .expect("OpenCode private credential");
-        assert!(!spawn.args.iter().any(|argument| argument.contains(password)));
+        assert!(
+            !spawn
+                .args
+                .iter()
+                .any(|argument| argument.contains(password))
+        );
     }
     for terminal_id in ["terminal-opencode-a", "terminal-opencode-b"] {
         let scope = ActivityScopeRef::Terminal {
@@ -12840,17 +12766,11 @@ async fn opencode_parallel_terminals_have_unique_endpoints_credentials_roots_and
         .expect("independent OpenCode activity scope");
     }
     manager
-        .close(
-            "thread-opencode-parallel",
-            Some("terminal-opencode-a"),
-        )
+        .close("thread-opencode-parallel", Some("terminal-opencode-a"))
         .await
         .expect("close terminal");
     manager
-        .close(
-            "thread-opencode-parallel",
-            Some("terminal-opencode-b"),
-        )
+        .close("thread-opencode-parallel", Some("terminal-opencode-b"))
         .await
         .expect("close terminal");
     manager.shutdown().await;
@@ -12927,8 +12847,7 @@ async fn opencode_helper_already_exited_before_prepared_observer_is_rejected() {
             worktree_path: Some(root.path().to_path_buf()),
             launch_env: BTreeMap::from([(
                 "OPENCODE_CONFIG_CONTENT".to_owned(),
-                serde_json::to_string(&fixture["originalConfig"])
-                    .expect("OpenCode fixture config"),
+                serde_json::to_string(&fixture["originalConfig"]).expect("OpenCode fixture config"),
             )]),
             activity: ProviderTerminalActivityLaunch {
                 driver_kind: "opencode".to_owned(),
@@ -13119,25 +13038,38 @@ async fn opencode_helper_failure_and_unsafe_args_are_exact_pass_through() {
     let fixture = opencode_attach_fixture();
     for (args, config, helper_fail, connect_fail) in [
         (
-            vec!["--model".to_owned(), "anthropic/claude-sonnet-4-5".to_owned()],
+            vec![
+                "--model".to_owned(),
+                "anthropic/claude-sonnet-4-5".to_owned(),
+            ],
             serde_json::to_string(&fixture["originalConfig"]).expect("OpenCode fixture config"),
             true,
             false,
         ),
         (
-            vec!["--model".to_owned(), "anthropic/claude-sonnet-4-5".to_owned()],
+            vec![
+                "--model".to_owned(),
+                "anthropic/claude-sonnet-4-5".to_owned(),
+            ],
             serde_json::to_string(&fixture["originalConfig"]).expect("OpenCode fixture config"),
             false,
             true,
         ),
         (
-            vec!["--model".to_owned(), "anthropic/claude-sonnet-4-5".to_owned(), "--unknown".to_owned()],
+            vec![
+                "--model".to_owned(),
+                "anthropic/claude-sonnet-4-5".to_owned(),
+                "--unknown".to_owned(),
+            ],
             serde_json::to_string(&fixture["originalConfig"]).expect("OpenCode fixture config"),
             false,
             false,
         ),
         (
-            vec!["--model".to_owned(), "anthropic/claude-sonnet-4-5".to_owned()],
+            vec![
+                "--model".to_owned(),
+                "anthropic/claude-sonnet-4-5".to_owned(),
+            ],
             "[]".to_owned(),
             false,
             false,
@@ -13233,7 +13165,10 @@ async fn opencode_helper_failure_and_unsafe_args_are_exact_pass_through() {
                 provider_instance_id: "opencode".to_owned(),
             }),
         });
-        manager.open(input).await.expect("pass-through OpenCode terminal");
+        manager
+            .open(input)
+            .await
+            .expect("pass-through OpenCode terminal");
         let spawn = backend.spawns().pop().expect("pass-through spawn");
         assert_eq!(spawn.executable, configured.to_string_lossy());
         assert_eq!(spawn.args, args);
@@ -13289,9 +13224,7 @@ async fn installed_opencode_1184_cold_topology_reaps_owned_listener() {
     else {
         return;
     };
-    if !version.status.success()
-        || String::from_utf8_lossy(&version.stdout).trim() != "1.18.4"
-    {
+    if !version.status.success() || String::from_utf8_lossy(&version.stdout).trim() != "1.18.4" {
         return;
     }
     let root = tempfile::tempdir().expect("installed OpenCode root");
@@ -13348,14 +13281,20 @@ async fn installed_opencode_1184_cold_topology_reaps_owned_listener() {
     });
     let started = std::time::Instant::now();
 
-    manager.open(input).await.expect("installed OpenCode terminal");
+    manager
+        .open(input)
+        .await
+        .expect("installed OpenCode terminal");
     let elapsed = started.elapsed();
     assert!(
         elapsed < std::time::Duration::from_millis(850),
         "installed OpenCode preparation took {elapsed:?}"
     );
 
-    let spawn = backend.spawns().pop().expect("installed OpenCode PTY spawn");
+    let spawn = backend
+        .spawns()
+        .pop()
+        .expect("installed OpenCode PTY spawn");
     assert_eq!(spawn.args.first().map(String::as_str), Some("attach"));
     assert_eq!(spawn.args.get(2).map(String::as_str), Some("--dir"));
     assert_eq!(spawn.args.get(4).map(String::as_str), Some("--session"));

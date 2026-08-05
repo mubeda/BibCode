@@ -5,11 +5,11 @@ use std::{
     time::Duration,
 };
 
-#[cfg(unix)]
-use serde_json::Value;
 use bibcode_server::process::{
     OutputMode, ProcessError, ProcessRunInput, ProcessRunner, TimeoutBehavior,
 };
+#[cfg(unix)]
+use serde_json::Value;
 use tempfile::TempDir;
 use tokio::time::sleep;
 use tokio_util::sync::CancellationToken;

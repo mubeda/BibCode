@@ -442,12 +442,8 @@ impl NativeServerControl {
             commit_control
                 .provider_maintenance
                 .invalidate_update_lifecycles(|instance_id, driver| {
-                    provider_inventory::maintenance_target(
-                        &next,
-                        driver,
-                        Some(instance_id),
-                    )
-                    .is_some()
+                    provider_inventory::maintenance_target(&next, driver, Some(instance_id))
+                        .is_some()
                 });
             *commit_control.settings.write().await = next.clone();
             let next_fetch_interval = automatic_git_fetch_interval(&next);
@@ -570,11 +566,7 @@ impl NativeServerControl {
             );
         } else {
             self.provider_maintenance
-                .invalidate_update_lifecycle_if_current(
-                    &target.instance_id,
-                    &target.driver,
-                    token,
-                );
+                .invalidate_update_lifecycle_if_current(&target.instance_id, &target.driver, token);
         }
         let mut providers = self.providers.write().await;
         for provider in providers.iter_mut() {
@@ -594,8 +586,11 @@ impl NativeServerControl {
         let provider = payload
             .get("provider")
             .and_then(Value::as_str)
-            .ok_or_else(|| provider_update_error("unknown", "provider must be a valid provider slug"))?;
-        validate_slug(provider, "provider").map_err(|reason| provider_update_error("unknown", reason))?;
+            .ok_or_else(|| {
+                provider_update_error("unknown", "provider must be a valid provider slug")
+            })?;
+        validate_slug(provider, "provider")
+            .map_err(|reason| provider_update_error("unknown", reason))?;
         let instance_id = match payload.get("instanceId") {
             None => None,
             Some(Value::String(instance_id)) => {
@@ -769,10 +764,13 @@ impl NativeServerControl {
                     _ if verification.iter().any(|provider| {
                         provider["instanceId"] == target.instance_id
                             && provider["versionAdvisory"]["status"] == "behind_latest"
-                    }) => {
+                    }) =>
+                    {
                         "Update command completed, but BiBCode still detects an outdated provider version."
                     }
-                    _ => "Update command completed, but BiBCode could not verify the provider version.",
+                    _ => {
+                        "Update command completed, but BiBCode could not verify the provider version."
+                    }
                 };
                 (status, message)
             }
@@ -819,15 +817,11 @@ impl NativeServerControl {
         if cancellation.is_cancelled() {
             return;
         }
-        if let Some(task) = self.start_full_provider_refresh(
-            generation,
-            settings,
-            cwd,
-            Some(cancellation),
-        ) {
-            if let Some(previous) = refresh_task.lock().await.replace(task) {
-                let _ = previous.await;
-            }
+        if let Some(task) =
+            self.start_full_provider_refresh(generation, settings, cwd, Some(cancellation))
+            && let Some(previous) = refresh_task.lock().await.replace(task)
+        {
+            let _ = previous.await;
         }
     }
 
@@ -978,9 +972,8 @@ impl NativeServerControl {
                 .collect();
         }
         if !partial {
-            self.provider_maintenance.prune_update_states(
-                current.iter().filter_map(provider_snapshot_identity),
-            );
+            self.provider_maintenance
+                .prune_update_states(current.iter().filter_map(provider_snapshot_identity));
         }
         for provider in current.iter_mut() {
             self.provider_maintenance.overlay_update_state(provider);
@@ -1231,13 +1224,10 @@ impl ProductionServerControl for NativeServerControl {
                         .and_then(|name| name.to_str())
                         .filter(|name| !name.is_empty())
                         .unwrap_or("BiBCode");
-                    let activity_protocol_registered = control
-                        .activity_protocol_registered
-                        .load(Ordering::Acquire);
-                    let environment = environment_descriptor(
-                        &control.config,
-                        activity_protocol_registered,
-                    );
+                    let activity_protocol_registered =
+                        control.activity_protocol_registered.load(Ordering::Acquire);
+                    let environment =
+                        environment_descriptor(&control.config, activity_protocol_registered);
                     if send_event(
                         &sender,
                         json!({
@@ -1957,17 +1947,12 @@ pub(crate) fn now_iso() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{
-        sync::Mutex as StdMutex,
-        time::Duration,
-    };
+    use std::{sync::Mutex as StdMutex, time::Duration};
 
     use crate::{
         activity::AgentActivityController,
         production::{
-            agent_activity::{
-                AgentActivitySettingsHandler, AgentActivityTransitionReport,
-            },
+            agent_activity::{AgentActivitySettingsHandler, AgentActivityTransitionReport},
             server_terminal::ProductionServerControl,
         },
     };
@@ -2056,7 +2041,9 @@ mod tests {
 
     async fn control_with_cursor_update_fixture(executable: PathBuf) -> NativeServerControl {
         let directory = executable.parent().expect("fixture directory");
-        let settings_path = ServerConfig::new(directory).state_dir().join("settings.json");
+        let settings_path = ServerConfig::new(directory)
+            .state_dir()
+            .join("settings.json");
         tokio::fs::create_dir_all(settings_path.parent().expect("settings directory"))
             .await
             .expect("create settings directory");
@@ -2122,7 +2109,10 @@ mod tests {
 
     async fn wait_for_full_refresh_idle(control: &NativeServerControl) {
         for _ in 0..100 {
-            if !control.full_provider_refresh_running.load(Ordering::Acquire) {
+            if !control
+                .full_provider_refresh_running
+                .load(Ordering::Acquire)
+            {
                 return;
             }
             tokio::task::yield_now().await;
@@ -2213,7 +2203,9 @@ mod tests {
         checks.shutdown().await;
 
         assert!(
-            !control.full_provider_refresh_running.load(Ordering::Acquire),
+            !control
+                .full_provider_refresh_running
+                .load(Ordering::Acquire),
             "scheduled full refresh must finish before shutdown returns"
         );
     }
@@ -2305,12 +2297,14 @@ mod tests {
             }))
             .await
             .expect("settings replace provider");
-        assert!(control
-            .providers
-            .read()
-            .await
-            .iter()
-            .all(|provider| provider["instanceId"] != "cursor-work"));
+        assert!(
+            control
+                .providers
+                .read()
+                .await
+                .iter()
+                .all(|provider| provider["instanceId"] != "cursor-work")
+        );
 
         let mut removed_snapshot = json!({
             "instanceId": "cursor-work",
@@ -2367,8 +2361,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn absent_target_verification_removes_update_state_while_settings_refresh_is_paused(
-    ) {
+    async fn absent_target_verification_removes_update_state_while_settings_refresh_is_paused() {
         let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("state directory");
         let control = control_with_cursor_update_fixture(
@@ -2393,10 +2386,12 @@ mod tests {
                 if event["type"] == "providerStatuses"
                     && event["payload"]["providers"]
                         .as_array()
-                        .is_some_and(|providers| providers.iter().any(|provider| {
-                            provider["instanceId"] == "cursor-work"
-                                && provider["updateState"]["status"] == "running"
-                        }))
+                        .is_some_and(|providers| {
+                            providers.iter().any(|provider| {
+                                provider["instanceId"] == "cursor-work"
+                                    && provider["updateState"]["status"] == "running"
+                            })
+                        })
                 {
                     break;
                 }
@@ -2472,10 +2467,12 @@ mod tests {
                 if event["type"] == "providerStatuses"
                     && event["payload"]["providers"]
                         .as_array()
-                        .is_some_and(|providers| providers.iter().any(|provider| {
-                            provider["instanceId"] == "cursor-work"
-                                && provider["updateState"]["status"] == "running"
-                        }))
+                        .is_some_and(|providers| {
+                            providers.iter().any(|provider| {
+                                provider["instanceId"] == "cursor-work"
+                                    && provider["updateState"]["status"] == "running"
+                            })
+                        })
                 {
                     break;
                 }
@@ -2645,7 +2642,9 @@ mod tests {
         );
 
         let persisted: Value = serde_json::from_slice(
-            &tokio::fs::read(settings_path).await.expect("persisted settings"),
+            &tokio::fs::read(settings_path)
+                .await
+                .expect("persisted settings"),
         )
         .expect("valid JSON");
         assert_eq!(persisted["enableChatAgentActivity"], false);
@@ -2685,7 +2684,9 @@ mod tests {
             .await
             .expect("persist migrated settings");
         let persisted: Value = serde_json::from_slice(
-            &tokio::fs::read(settings_path).await.expect("persisted settings"),
+            &tokio::fs::read(settings_path)
+                .await
+                .expect("persisted settings"),
         )
         .expect("valid JSON");
         assert!(persisted.get("enableAgentActivity").is_none());
@@ -2713,7 +2714,9 @@ mod tests {
                 .is_err()
         );
         let persisted: Value = serde_json::from_slice(
-            &tokio::fs::read(settings_path).await.expect("original settings"),
+            &tokio::fs::read(settings_path)
+                .await
+                .expect("original settings"),
         )
         .expect("valid JSON");
         assert_eq!(persisted["enableAgentActivity"], "false");
@@ -2872,8 +2875,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn agent_activity_commit_survives_caller_cancellation_and_publishes_after_ordered_transitions(
-    ) {
+    async fn agent_activity_commit_survives_caller_cancellation_and_publishes_after_ordered_transitions()
+     {
         let temp = tempfile::tempdir().expect("control root");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
@@ -2970,7 +2973,7 @@ mod tests {
 
     #[tokio::test]
     async fn agent_activity_persisted_settings_converge_after_cancellation_before_commit_task_setup()
-    {
+     {
         let temp = tempfile::tempdir().expect("control root");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
@@ -3004,7 +3007,10 @@ mod tests {
         )
         .expect("valid persisted settings");
         assert_eq!(disk_during_pause["enableChatAgentActivity"], false);
-        assert_eq!(control.settings.read().await["enableChatAgentActivity"], true);
+        assert_eq!(
+            control.settings.read().await["enableChatAgentActivity"],
+            true
+        );
         assert!(chat.snapshot().enabled);
         assert!(!terminal.snapshot().enabled);
         assert!(calls.lock().expect("handler calls").is_empty());
@@ -3025,7 +3031,10 @@ mod tests {
             event["payload"]["settings"]["enableChatAgentActivity"],
             false
         );
-        assert_eq!(control.settings.read().await["enableChatAgentActivity"], false);
+        assert_eq!(
+            control.settings.read().await["enableChatAgentActivity"],
+            false
+        );
         assert!(!chat.snapshot().enabled);
         assert!(!terminal.snapshot().enabled);
         assert_eq!(

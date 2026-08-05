@@ -11,10 +11,6 @@ pub use activity::{
     ClaudeActivityFixtureAdapter, ClaudeActivityInputSource, ClaudeActivityOutput,
     ClaudeActivityStateCounts,
 };
-#[doc(hidden)]
-pub use transcript::{ClaudeTranscriptFixtureAdapter, ClaudeTranscriptFixtureOutput};
-#[doc(hidden)]
-pub use transcript::{ClaudeTranscriptReadFixtureOutput, ClaudeTranscriptReaderFixture};
 pub use canonical::{CanonicalEvent, CanonicalEventTrace};
 pub use protocol::{AssistantMessage, ClaudeMessage};
 pub use runtime::{
@@ -22,3 +18,7 @@ pub use runtime::{
     LaunchRequestInput, PermissionRequestInput, ReconnectSnapshot, ResolvedUserInput, RuntimeMode,
     TurnInput, UserInputRequestInput,
 };
+#[doc(hidden)]
+pub use transcript::{ClaudeTranscriptFixtureAdapter, ClaudeTranscriptFixtureOutput};
+#[doc(hidden)]
+pub use transcript::{ClaudeTranscriptReadFixtureOutput, ClaudeTranscriptReaderFixture};

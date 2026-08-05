@@ -396,8 +396,9 @@ fn activity_error(error: ActivityError) -> Value {
         | ActivityRepositoryError::InvalidCapabilities(_)
         | ActivityRepositoryError::InvalidLimit => invalid_scope_error(),
         ActivityRepositoryError::FeatureDisabled => feature_disabled_error(),
-        ActivityRepositoryError::Persistence(_)
-        | ActivityRepositoryError::Serialization(_) => internal_error(),
+        ActivityRepositoryError::Persistence(_) | ActivityRepositoryError::Serialization(_) => {
+            internal_error()
+        }
     }
 }
 

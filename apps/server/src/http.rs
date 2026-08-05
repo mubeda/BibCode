@@ -143,10 +143,7 @@ fn cors_layer(config: &ServerConfig) -> CorsLayer {
     if let Ok(origin) = dev_url.origin().ascii_serialization().parse() {
         origins.push(origin);
     }
-    for origin in [
-        "bibcode://app",
-        "bibcode-dev://app",
-    ] {
+    for origin in ["bibcode://app", "bibcode-dev://app"] {
         if let Ok(origin) = origin.parse() {
             origins.push(origin);
         }

@@ -1607,6 +1607,7 @@ fn delivery_route_fingerprint(
     delivery_route_fingerprint_with_cwd(&partial, &request.cwd)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn delivery_route_fingerprint_values(
     provider: &str,
     provider_instance_id: Option<&str>,
@@ -1758,6 +1759,7 @@ fn provider_binary_settings(
     settings
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_supervisor(
     engine: OrchestrationEngine,
     factory: Arc<dyn ProviderDriverFactory>,
@@ -1774,14 +1776,7 @@ async fn run_supervisor(
     let mut sessions = HashMap::<String, SessionEntry>::new();
     let mut delivery_sequences = HashMap::<String, ThreadDeliverySequence>::new();
     let mut next_delivery_generation = 0_u64;
-    let mut deferred_configuration = HashMap::<
-        String,
-        VecDeque<(
-            u64,
-            Box<OrchestrationCommand>,
-            oneshot::Sender<Result<(), ProviderRuntimeError>>,
-        )>,
-    >::new();
+    let mut deferred_configuration = DeferredConfigurations::new();
     loop {
         let message = tokio::select! {
             message = receiver.recv() => {
@@ -1815,7 +1810,9 @@ async fn run_supervisor(
                         .get(thread_id)
                         .and_then(|sequence| sequence.active_generation)
                 {
-                    let queued = deferred_configuration.entry(thread_id.to_owned()).or_default();
+                    let queued = deferred_configuration
+                        .entry(thread_id.to_owned())
+                        .or_default();
                     if queued.len() >= deferred_capacity {
                         let _ = response.send(Err(ProviderRuntimeError::Provider {
                             provider: "orchestration".to_owned(),
@@ -2083,15 +2080,15 @@ fn schedule_deferred_drain(
     });
 }
 
+type DeferredConfiguration = (
+    u64,
+    Box<OrchestrationCommand>,
+    oneshot::Sender<Result<(), ProviderRuntimeError>>,
+);
+type DeferredConfigurations = HashMap<String, VecDeque<DeferredConfiguration>>;
+
 fn reject_deferred_generation(
-    deferred: &mut HashMap<
-        String,
-        VecDeque<(
-            u64,
-            Box<OrchestrationCommand>,
-            oneshot::Sender<Result<(), ProviderRuntimeError>>,
-        )>,
-    >,
+    deferred: &mut DeferredConfigurations,
     thread_id: &str,
     generation: u64,
     detail: &str,
@@ -2115,17 +2112,7 @@ fn reject_deferred_generation(
     }
 }
 
-fn reject_all_deferred(
-    deferred: &mut HashMap<
-        String,
-        VecDeque<(
-            u64,
-            Box<OrchestrationCommand>,
-            oneshot::Sender<Result<(), ProviderRuntimeError>>,
-        )>,
-    >,
-    error: ProviderRuntimeError,
-) {
+fn reject_all_deferred(deferred: &mut DeferredConfigurations, error: ProviderRuntimeError) {
     for (_, mut queued) in deferred.drain() {
         while let Some((_, _, response)) = queued.pop_front() {
             let _ = response.send(Err(match &error {
@@ -2271,17 +2258,17 @@ async fn spawn_delivery(
             {
                 Ok(Some(_)) => None,
                 Ok(None) => Some(ProviderDeliveryOutcome::DefinitelyNotSent {
-                        detail: format!(
-                            "durable provider session freeze conflicted for {} at attempt {}",
-                            row.command_id, row.attempts
-                        ),
-                    }),
+                    detail: format!(
+                        "durable provider session freeze conflicted for {} at attempt {}",
+                        row.command_id, row.attempts
+                    ),
+                }),
                 Err(error) => Some(ProviderDeliveryOutcome::DefinitelyNotSent {
-                        detail: format!(
-                            "durable provider session freeze failed for {}: {error}",
-                            row.command_id
-                        ),
-                    }),
+                    detail: format!(
+                        "durable provider session freeze failed for {}: {error}",
+                        row.command_id
+                    ),
+                }),
             }
         } else {
             None
@@ -2441,6 +2428,7 @@ fn normalize_agent_activity_transition_error(error: ProviderRuntimeError) -> Pro
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn launch_session(
     engine: &OrchestrationEngine,
     factory: &Arc<dyn ProviderDriverFactory>,
@@ -2763,16 +2751,16 @@ async fn reconcile_model_selection(
     let mut restore_restart = None;
     let mut rejected_update = None;
     {
-        let entry = sessions
-            .get_mut(thread_id)
-            .ok_or_else(|| ProviderRuntimeError::SessionNotFound {
-                thread_id: thread_id.to_owned(),
-            })?;
+        let entry =
+            sessions
+                .get_mut(thread_id)
+                .ok_or_else(|| ProviderRuntimeError::SessionNotFound {
+                    thread_id: thread_id.to_owned(),
+                })?;
         if !entry.configuration_healthy {
             return Err(ProviderRuntimeError::Provider {
                 provider: entry.launch.provider.clone(),
-                detail: "provider configuration is unavailable after failed restoration"
-                    .to_owned(),
+                detail: "provider configuration is unavailable after failed restoration".to_owned(),
             });
         }
         let target_options = provider_session_options(&entry.launch.provider, &selection_options);
@@ -2868,7 +2856,8 @@ async fn reconcile_model_selection(
                     entry.launch.service_tier = target_service_tier;
                     entry.launch.effort = target_effort;
                     entry.launch.agent = target_agent;
-                    if let Err(error) = persist_entry(&engine.repositories(), entry, "ready").await {
+                    if let Err(error) = persist_entry(&engine.repositories(), entry, "ready").await
+                    {
                         entry.launch = previous_launch.clone();
                         if !restore_driver_configuration(
                             entry,
@@ -3178,6 +3167,7 @@ fn parse_provider_command(text: &str) -> Option<(&str, &str)> {
     Some((name, command[split..].trim()))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_event_pump(
     engine: OrchestrationEngine,
     driver: Arc<dyn ProviderDriver>,
@@ -5641,7 +5631,7 @@ fn claude_session_settings(
     if let Some(fast_mode) = selection_boolean_option(&request.options, "fastMode") {
         settings.insert("fastMode".to_owned(), Value::Bool(fast_mode));
     }
-    (!settings.is_empty()).then(|| Value::Object(settings))
+    (!settings.is_empty()).then_some(Value::Object(settings))
 }
 
 fn selection_boolean_option(options: &[Value], id: &str) -> Option<bool> {
@@ -6237,6 +6227,7 @@ fn spawn_claude_recovery_worker(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_claude_output(
     runtime: Arc<Mutex<ClaudeProviderRuntime>>,
     thread_id: String,
@@ -6714,6 +6705,7 @@ mod claude_recovery_worker_tests {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn emit_claude_value(
     runtime: &Arc<Mutex<ClaudeProviderRuntime>>,
     thread_id: &str,
@@ -7476,9 +7468,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejected_option_logging_redacts_untrusted_ids_and_string_values() {
-        use crate::production::operational_logs::{
-            OperationalLogOptions, ProviderOperationalLog,
-        };
+        use crate::production::operational_logs::{OperationalLogOptions, ProviderOperationalLog};
 
         let temp = TempDir::new().expect("provider option log directory");
         let path = temp.path().join("provider-options.log");
@@ -7504,7 +7494,9 @@ mod tests {
             "live",
             "failed",
         );
-        log.shutdown().await.expect("provider option log shuts down");
+        log.shutdown()
+            .await
+            .expect("provider option log shuts down");
 
         let contents = std::fs::read_to_string(path).expect("read provider option log");
         assert!(!contents.contains("PRIVATE_OPTION_ID"));
@@ -7845,7 +7837,10 @@ printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
                 .await,
             Err(super::ProviderRuntimeError::Provider { .. })
         ));
-        driver.shutdown().await.expect("Claude driver should shut down");
+        driver
+            .shutdown()
+            .await
+            .expect("Claude driver should shut down");
     }
 
     #[tokio::test]
@@ -8476,11 +8471,11 @@ done
                 self.prompt_detected = true;
             }
             let result = Pin::new(&mut self.inner).poll_write(context, bytes);
-            if self.prompt_detected {
-                if let Poll::Ready(Ok(written)) = result {
-                    self.accepted_prompt_bytes
-                        .fetch_add(written, std::sync::atomic::Ordering::SeqCst);
-                }
+            if self.prompt_detected
+                && let Poll::Ready(Ok(written)) = result
+            {
+                self.accepted_prompt_bytes
+                    .fetch_add(written, std::sync::atomic::Ordering::SeqCst);
             }
             result
         }
@@ -8806,7 +8801,10 @@ done
             .unwrap()
             .expect("resume state is retained");
         assert_eq!(runtime.status, "suspended");
-        assert_eq!(runtime.resume_cursor, Some(json!({"threadId":"unit-session"})));
+        assert_eq!(
+            runtime.resume_cursor,
+            Some(json!({"threadId":"unit-session"}))
+        );
 
         let stop: OrchestrationCommand = serde_json::from_value(json!({
             "type":"thread.session.stop", "commandId":"stop-idle", "threadId":"t1",
@@ -8878,18 +8876,23 @@ done
             })
             .await
             .unwrap();
-        let mut metadata = Box::pin(supervisor.handle_orchestration(
-            serde_json::from_value(json!({
-                "type":"thread.meta.update", "commandId":"generation-metadata",
-                "threadId":"t1",
-                "modelSelection":{
-                    "instanceId":"codex", "model":"gpt-5",
-                    "options":[{"id":"fastMode","value":true}]
-                }
-            }))
-            .unwrap(),
+        let mut metadata = Box::pin(
+            supervisor.handle_orchestration(
+                serde_json::from_value(json!({
+                    "type":"thread.meta.update", "commandId":"generation-metadata",
+                    "threadId":"t1",
+                    "modelSelection":{
+                        "instanceId":"codex", "model":"gpt-5",
+                        "options":[{"id":"fastMode","value":true}]
+                    }
+                }))
+                .unwrap(),
+            ),
+        );
+        assert!(matches!(
+            futures_util::poll!(metadata.as_mut()),
+            Poll::Pending
         ));
-        assert!(matches!(futures_util::poll!(metadata.as_mut()), Poll::Pending));
         supervisor
             .handle_orchestration(
                 serde_json::from_value(json!({
@@ -8901,7 +8904,10 @@ done
             )
             .await
             .unwrap();
-        assert!(matches!(futures_util::poll!(metadata.as_mut()), Poll::Pending));
+        assert!(matches!(
+            futures_util::poll!(metadata.as_mut()),
+            Poll::Pending
+        ));
 
         gate.notify_one();
         assert!(matches!(

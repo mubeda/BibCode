@@ -1,8 +1,6 @@
 #![allow(dead_code)]
 
-use bibcode_server::{
-    git, production::host_paths::process_compatible_path, source_control, vcs,
-};
+use bibcode_server::{git, production::host_paths::process_compatible_path, source_control, vcs};
 
 use std::{
     fs,

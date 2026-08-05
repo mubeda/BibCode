@@ -1,3 +1,7 @@
+#![allow(clippy::await_holding_lock)]
+// These subprocess recovery tests intentionally hold a process-wide serialization guard
+// across their async lifecycle so environment variables and child processes cannot overlap.
+
 use std::{
     fs::OpenOptions,
     io::Write,
@@ -1080,14 +1084,9 @@ async fn bootstrap_restart_after_setup_launch_reuses_worktree_and_terminal_for_p
         });
         let command = serde_json::from_value::<OrchestrationCommand>(payload.clone())
             .expect("bootstrap command");
-        freeze_delivery_route(
-            &engine,
-            &state.path().to_path_buf(),
-            &command,
-            &mut payload,
-        )
-        .await
-        .expect("freeze admission route before worktree setup");
+        freeze_delivery_route(&engine, &state.path().to_path_buf(), &command, &mut payload)
+            .await
+            .expect("freeze admission route before worktree setup");
         engine
             .dispatch(
                 serde_json::from_value(serde_json::json!({

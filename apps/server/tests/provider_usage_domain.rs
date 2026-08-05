@@ -1,5 +1,5 @@
-use serde_json::json;
 use bibcode_server::provider_usage;
+use serde_json::json;
 
 use provider_usage::{
     MIN_MANUAL_REFRESH_MS, ProviderUsageFetchError, ProviderUsageFetcher, ProviderUsageProvider,

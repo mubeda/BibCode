@@ -1717,14 +1717,11 @@ fn find_activity_secret_boundary(characters: &[RedactionCharacter]) -> Option<us
     let mut in_quotes = false;
     while index < characters.len() {
         if characters[index].character == '"' {
-            if !in_quotes {
-                if let Some((key, key_end)) = quoted_redaction_key(characters, index) {
-                    if let Some(redaction_end) =
-                        secret_assignment_boundary(characters, key_end, &key)
-                    {
-                        return Some(redaction_end);
-                    }
-                }
+            if !in_quotes
+                && let Some((key, key_end)) = quoted_redaction_key(characters, index)
+                && let Some(redaction_end) = secret_assignment_boundary(characters, key_end, &key)
+            {
+                return Some(redaction_end);
             }
             in_quotes = !in_quotes;
             index += 1;

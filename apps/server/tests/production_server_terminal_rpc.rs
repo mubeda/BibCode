@@ -183,14 +183,10 @@ async fn independent_agent_activity_settings_control_routed_rpc_gates_and_trace(
         assert!(spans.iter().any(|span| {
             span["name"] == "agent_activity_change_requested" && span["count"] == 3
         }));
-        assert!(
-            spans
-                .iter()
-                .any(|span| {
-                    span["name"] == "agent_activity_disabled"
-                        && span["count"].as_u64().is_some_and(|count| count >= 2)
-                })
-        );
+        assert!(spans.iter().any(|span| {
+            span["name"] == "agent_activity_disabled"
+                && span["count"].as_u64().is_some_and(|count| count >= 2)
+        }));
         assert!(
             spans
                 .iter()

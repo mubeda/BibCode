@@ -1,12 +1,12 @@
 use std::{path::PathBuf, time::Duration};
 
-use futures_util::{SinkExt, StreamExt};
-use serde::Deserialize;
-use serde_json::{Value, json};
 use bibcode_server::{
     ACTIVE_RPC_METHODS, CauseItem, ClientMessage, MethodMode, RequestId, RpcExit, RpcRegistry,
     ServerConfig, ServerMessage, ServerRuntime, WireMessage,
 };
+use futures_util::{SinkExt, StreamExt};
+use serde::Deserialize;
+use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::{process::Command, sync::mpsc, time::timeout};
 use tokio_tungstenite::{connect_async, tungstenite::Message};

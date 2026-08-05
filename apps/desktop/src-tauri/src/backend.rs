@@ -1,6 +1,4 @@
-use bibcode_server::diagnostics::{
-    DesktopUiProcessObserver, UnavailableDesktopUiProcessObserver,
-};
+use bibcode_server::diagnostics::{DesktopUiProcessObserver, UnavailableDesktopUiProcessObserver};
 use bibcode_server::process::{configure_background_command, configure_background_std_command};
 use bibcode_server::{
     DESKTOP_SHUTDOWN_PATH as SERVER_BACKEND_SHUTDOWN_PATH,
@@ -1878,8 +1876,7 @@ fn wsl_server_binary_candidates() -> Result<Vec<PathBuf>, String> {
     {
         candidates.push(path);
     }
-    if let Some(path) =
-        crate::config::bibcode_env_var(WSL_SERVER_BINARY_ENV)
+    if let Some(path) = crate::config::bibcode_env_var(WSL_SERVER_BINARY_ENV)
         && !path.is_empty()
     {
         candidates.push(PathBuf::from(path));
@@ -2083,6 +2080,7 @@ mod tests {
     use bibcode_server::diagnostics::{
         DesktopUiObservation, ProcessIdentity, UiCoverage, UiCoverageStatus,
     };
+    use bibcode_server::{RpcExit, ServerMessage};
     use futures_util::{SinkExt, StreamExt};
     use std::{
         cell::Cell,
@@ -2098,7 +2096,6 @@ mod tests {
         thread,
         time::Duration,
     };
-    use bibcode_server::{RpcExit, ServerMessage};
     use tokio::io::{AsyncRead, ReadBuf};
     use tokio_tungstenite::{
         connect_async,
@@ -2348,7 +2345,9 @@ mod tests {
         format!("'{}'", path.to_string_lossy().replace('\'', "''"))
     }
 
-    async fn start_test_server(base_dir: &Path) -> (bibcode_server::ServerHandle, BackendRunConfig) {
+    async fn start_test_server(
+        base_dir: &Path,
+    ) -> (bibcode_server::ServerHandle, BackendRunConfig) {
         let mut config = local_test_config(0);
         let handle =
             ServerRuntime::start(server_config_for_launch(base_dir.to_path_buf(), &config))
@@ -2409,7 +2408,10 @@ mod tests {
         let token: Value = reqwest::Client::new()
             .post(format!("{}/oauth/token", config.http_base_url()))
             .form(&[
-                ("grant_type", "urn:ietf:params:oauth:grant-type:token-exchange"),
+                (
+                    "grant_type",
+                    "urn:ietf:params:oauth:grant-type:token-exchange",
+                ),
                 ("subject_token", config.desktop_bootstrap_token.as_str()),
                 (
                     "subject_token_type",
@@ -2454,14 +2456,17 @@ mod tests {
                         .state
                         .lock()
                         .expect("backend supervisor mutex poisoned");
-                    state.slots.get(PRIMARY_LOCAL_ENVIRONMENT_ID).and_then(|slot| {
-                        let ManagedBackend::Runtime(runtime) = slot.backend.as_ref()? else {
-                            return None;
-                        };
-                        (runtime.run_id == 1 && !slot.restart_scheduled)
-                            .then(|| slot.launch_plan.as_ref().map(|plan| plan.config.clone()))
-                            .flatten()
-                    })
+                    state
+                        .slots
+                        .get(PRIMARY_LOCAL_ENVIRONMENT_ID)
+                        .and_then(|slot| {
+                            let ManagedBackend::Runtime(runtime) = slot.backend.as_ref()? else {
+                                return None;
+                            };
+                            (runtime.run_id == 1 && !slot.restart_scheduled)
+                                .then(|| slot.launch_plan.as_ref().map(|plan| plan.config.clone()))
+                                .flatten()
+                        })
                 };
                 if let Some(config) = config {
                     return config;

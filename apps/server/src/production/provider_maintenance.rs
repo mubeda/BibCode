@@ -139,16 +139,8 @@ mod tests {
     #[test]
     fn native_installers_require_exact_paths() {
         let cases = [
-            (
-                "claudeAgent",
-                "/srv/.local/bin/claude-wrapper",
-                None,
-            ),
-            (
-                "opencode",
-                "/srv/.opencode/bin/opencode-backup",
-                None,
-            ),
+            ("claudeAgent", "/srv/.local/bin/claude-wrapper", None),
+            ("opencode", "/srv/.opencode/bin/opencode-backup", None),
             (
                 "claudeAgent",
                 "C:/Users/me/.local/bin/claude.exe",
@@ -448,10 +440,12 @@ mod tests {
             .await
             .expect("command result");
         assert_eq!(result.exit_code, 0);
-        assert!(result
-            .output
-            .as_deref()
-            .is_some_and(|value| value.chars().count() <= 10_000));
+        assert!(
+            result
+                .output
+                .as_deref()
+                .is_some_and(|value| value.chars().count() <= 10_000)
+        );
     }
 
     #[tokio::test]
@@ -548,9 +542,7 @@ mod tests {
         assert_eq!(snapshot["updateState"]["message"], "new");
 
         drop(new);
-        assert!(maintenance
-            .reserve_target("cursor-work", "cursor")
-            .is_ok());
+        assert!(maintenance.reserve_target("cursor-work", "cursor").is_ok());
     }
 
     #[tokio::test]
@@ -566,7 +558,7 @@ mod tests {
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
-    path::{Path, PathBuf},
+    path::Path,
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -787,9 +779,11 @@ impl ProviderMaintenance {
             .updates
             .lock()
             .expect("provider update coordinator lock");
-        if !updates.lifecycles.get(instance_id).is_some_and(|lifecycle| {
-            lifecycle.driver == driver && lifecycle.token == token
-        }) {
+        if !updates
+            .lifecycles
+            .get(instance_id)
+            .is_some_and(|lifecycle| lifecycle.driver == driver && lifecycle.token == token)
+        {
             return false;
         }
         updates.states.insert(
@@ -814,9 +808,11 @@ impl ProviderMaintenance {
             .updates
             .lock()
             .expect("provider update coordinator lock");
-        if !updates.lifecycles.get(instance_id).is_some_and(|lifecycle| {
-            lifecycle.driver == driver && lifecycle.token == token
-        }) {
+        if !updates
+            .lifecycles
+            .get(instance_id)
+            .is_some_and(|lifecycle| lifecycle.driver == driver && lifecycle.token == token)
+        {
             return;
         }
         updates.lifecycles.remove(instance_id);
@@ -841,9 +837,7 @@ impl ProviderMaintenance {
         let invalid = updates
             .lifecycles
             .iter()
-            .filter(|(instance_id, lifecycle)| {
-                !is_configured(instance_id, &lifecycle.driver)
-            })
+            .filter(|(instance_id, lifecycle)| !is_configured(instance_id, &lifecycle.driver))
             .map(|(instance_id, _)| instance_id.clone())
             .collect::<Vec<_>>();
         for instance_id in invalid {
@@ -890,10 +884,8 @@ impl ProviderMaintenance {
         }
     }
 
-    pub(crate) fn prune_update_states<'a, I>(
-        &self,
-        identities: I,
-    ) where
+    pub(crate) fn prune_update_states<'a, I>(&self, identities: I)
+    where
         I: IntoIterator<Item = (&'a str, &'a str)>,
     {
         let identities = identities.into_iter().collect::<HashSet<_>>();
@@ -911,8 +903,7 @@ impl ProviderMaintenance {
                         .lifecycles
                         .get(instance_id.as_str())
                         .is_some_and(|lifecycle| {
-                            lifecycle.driver == retained.driver
-                                && lifecycle.token == retained.token
+                            lifecycle.driver == retained.driver && lifecycle.token == retained.token
                         })
             })
             .map(|(instance_id, _)| instance_id.clone())
@@ -969,8 +960,11 @@ impl ProviderMaintenance {
             .find(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("path"))
             .map(|(_, value)| value.clone())
             .or_else(|| std::env::var_os("PATH"));
-        let executable = resolve_provider_executable_in_path(&update.executable, search_path.as_deref())
-            .ok_or_else(|| format!("Could not resolve update command '{}'.", update.executable))?;
+        let executable =
+            resolve_provider_executable_in_path(&update.executable, search_path.as_deref())
+                .ok_or_else(|| {
+                    format!("Could not resolve update command '{}'.", update.executable)
+                })?;
         let launch = prepare_provider_launch(&executable, &update.args)?;
         let cwd = std::env::current_dir()
             .map_err(|error| format!("Could not determine update working directory: {error}"))?;
@@ -980,7 +974,7 @@ impl ProviderMaintenance {
                     operation: "provider.maintenance.update".to_owned(),
                     command: launch.program,
                     args: launch.args,
-                    cwd: PathBuf::from(cwd),
+                    cwd,
                     env: target.environment.clone(),
                     stdin: None,
                     timeout,
@@ -1000,7 +994,8 @@ impl ProviderMaintenance {
             .join("\n");
         Ok(ProviderUpdateCommandResult {
             exit_code: process_output.exit_code,
-            output: (!output.is_empty()).then(|| output.chars().take(UPDATE_OUTPUT_LIMIT).collect()),
+            output: (!output.is_empty())
+                .then(|| output.chars().take(UPDATE_OUTPUT_LIMIT).collect()),
         })
     }
 

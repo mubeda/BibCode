@@ -450,9 +450,8 @@ fn read_transcript_path_blocking(
     #[cfg(unix)]
     let identity_matches = same_file_identity(&before_metadata, &opened_metadata);
     #[cfg(windows)]
-    let identity_matches = windows_file_identity(&file).is_ok_and(|opened_identity| {
-        opened_identity == before_identity
-    });
+    let identity_matches = windows_file_identity(&file)
+        .is_ok_and(|opened_identity| opened_identity == before_identity);
     if !opened_metadata.file_type().is_file() || !identity_matches {
         return ClaudeTranscriptRead::Unavailable;
     }
@@ -528,9 +527,8 @@ fn windows_file_identity(file: &File) -> std::io::Result<(u32, u64)> {
     let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
     // SAFETY: `information` is writable storage for the exact Win32 structure,
     // and `file` keeps the borrowed operating-system handle alive for the call.
-    let succeeded = unsafe {
-        GetFileInformationByHandle(file.as_raw_handle() as _, information.as_mut_ptr())
-    };
+    let succeeded =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, information.as_mut_ptr()) };
     if succeeded == 0 {
         return Err(std::io::Error::last_os_error());
     }
