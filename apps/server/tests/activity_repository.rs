@@ -600,6 +600,117 @@ async fn source_specific_terminal_finalization_does_not_interrupt_chat_activity(
 }
 
 #[tokio::test]
+async fn source_specific_mismatched_finalization_leaves_both_sources_unchanged() {
+    // Mutation caught: trusting the call-site source instead of the routed projection identity.
+    let database = migrated_database().await;
+    let thread_scope = thread_scope(
+        "thread:source-specific-mismatch",
+        "source-specific-mismatch",
+    );
+    let terminal_scope = ActivityScopeSeed::terminal(
+        "terminal:source-specific-mismatch",
+        "generation:source-specific-mismatch",
+        "source-specific-mismatch",
+        "terminal:source-specific-mismatch",
+        "codex",
+        Some("codex"),
+        ActivityCapabilities::structured_full(true),
+    )
+    .expect("terminal scope");
+    let projections = ActivityProjections::new(
+        ActivityRepository::new(database),
+        AgentActivityController::new(true),
+        AgentActivityController::new(true),
+    );
+    seed_running_actor(&projections.chat(), &thread_scope, "actor:chat").await;
+    seed_running_actor(
+        &projections.terminal(),
+        &terminal_scope,
+        "actor:terminal",
+    )
+    .await;
+    let chat_registry_counts = projections.chat().registry_counts_for_integration_test();
+    let terminal_registry_counts = projections
+        .terminal()
+        .registry_counts_for_integration_test();
+    assert_ne!(chat_registry_counts, (0, 0));
+    assert_ne!(terminal_registry_counts, (0, 0));
+    let chat_controller_state = projections
+        .chat()
+        .agent_activity_controller_for_integration_test()
+        .snapshot();
+    let terminal_controller_state = projections
+        .terminal()
+        .agent_activity_controller_for_integration_test()
+        .snapshot();
+    let thread_snapshot = projections
+        .chat()
+        .snapshot(&thread_scope.scope)
+        .await
+        .expect("thread snapshot before mismatch");
+    let terminal_snapshot = projections
+        .terminal()
+        .snapshot(&terminal_scope.scope)
+        .await
+        .expect("terminal snapshot before mismatch");
+
+    assert!(matches!(
+        projections
+            .chat()
+            .interrupt_for_monitoring_disabled(AgentActivitySource::Terminal)
+            .await,
+        Err(ActivityRepositoryError::InvalidScope(_))
+    ));
+    assert!(matches!(
+        projections
+            .terminal()
+            .interrupt_for_monitoring_disabled(AgentActivitySource::Chat)
+            .await,
+        Err(ActivityRepositoryError::InvalidScope(_))
+    ));
+    assert_eq!(
+        projections
+            .chat()
+            .agent_activity_controller_for_integration_test()
+            .snapshot(),
+        chat_controller_state
+    );
+    assert_eq!(
+        projections
+            .terminal()
+            .agent_activity_controller_for_integration_test()
+            .snapshot(),
+        terminal_controller_state
+    );
+    assert_eq!(
+        projections.chat().registry_counts_for_integration_test(),
+        chat_registry_counts
+    );
+    assert_eq!(
+        projections
+            .terminal()
+            .registry_counts_for_integration_test(),
+        terminal_registry_counts
+    );
+    assert_eq!(
+        projections
+            .chat()
+            .snapshot(&thread_scope.scope)
+            .await
+            .expect("thread snapshot after mismatch"),
+        thread_snapshot
+    );
+    assert_eq!(
+        projections
+            .terminal()
+            .snapshot(&terminal_scope.scope)
+            .await
+            .expect("terminal snapshot after mismatch"),
+        terminal_snapshot
+    );
+}
+
+#[tokio::test]
 async fn monitoring_disabled_reactivation_records_each_disable_generation_once() {
     // Mutation caught: reusing one interruption-entry identity across distinct disable generations.
     let database = migrated_database().await;

@@ -46,8 +46,16 @@ impl ActivityProjections {
         terminal_controller: AgentActivityController,
     ) -> Self {
         Self {
-            chat: ActivityProjection::with_controller(repository.clone(), chat_controller),
-            terminal: ActivityProjection::with_controller(repository, terminal_controller),
+            chat: ActivityProjection::with_source_controller(
+                repository.clone(),
+                chat_controller,
+                AgentActivitySource::Chat,
+            ),
+            terminal: ActivityProjection::with_source_controller(
+                repository,
+                terminal_controller,
+                AgentActivitySource::Terminal,
+            ),
         }
     }
 
@@ -83,14 +91,16 @@ impl ActivityProjections {
         capacity: usize,
     ) -> Self {
         Self {
-            chat: ActivityProjection::with_controller_and_capacity(
+            chat: ActivityProjection::with_source_controller_and_capacity(
                 repository.clone(),
                 chat_controller,
+                AgentActivitySource::Chat,
                 capacity,
             ),
-            terminal: ActivityProjection::with_controller_and_capacity(
+            terminal: ActivityProjection::with_source_controller_and_capacity(
                 repository,
                 terminal_controller,
+                AgentActivitySource::Terminal,
                 capacity,
             ),
         }

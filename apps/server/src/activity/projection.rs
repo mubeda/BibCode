@@ -74,6 +74,7 @@ pub struct ActivityProjectionApplyCompletionForIntegrationTest {
 pub struct ActivityProjection {
     repository: ActivityRepository,
     controller: AgentActivityController,
+    source: Option<AgentActivitySource>,
     events: broadcast::Sender<ActivityProjectionEvent>,
     apply_completions: broadcast::Sender<ActivityProjectionApplyCompletionForIntegrationTest>,
     publication_locks: Arc<StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
@@ -145,6 +146,20 @@ impl ActivityProjection {
     }
 
     #[must_use]
+    pub(crate) fn with_source_controller(
+        repository: ActivityRepository,
+        controller: AgentActivityController,
+        source: AgentActivitySource,
+    ) -> Self {
+        Self::configured(
+            repository,
+            controller,
+            Some(source),
+            DEFAULT_BROADCAST_CAPACITY,
+        )
+    }
+
+    #[must_use]
     pub(crate) fn agent_activity_controller(&self) -> AgentActivityController {
         self.controller.clone()
     }
@@ -169,11 +184,31 @@ impl ActivityProjection {
         controller: AgentActivityController,
         capacity: usize,
     ) -> Self {
+        Self::configured(repository, controller, None, capacity)
+    }
+
+    #[must_use]
+    pub(crate) fn with_source_controller_and_capacity(
+        repository: ActivityRepository,
+        controller: AgentActivityController,
+        source: AgentActivitySource,
+        capacity: usize,
+    ) -> Self {
+        Self::configured(repository, controller, Some(source), capacity)
+    }
+
+    fn configured(
+        repository: ActivityRepository,
+        controller: AgentActivityController,
+        source: Option<AgentActivitySource>,
+        capacity: usize,
+    ) -> Self {
         let (events, _) = broadcast::channel(capacity.max(1));
         let (apply_completions, _) = broadcast::channel(capacity.max(1));
         Self {
             repository,
             controller,
+            source,
             events,
             apply_completions,
             publication_locks: Arc::new(StdMutex::new(HashMap::new())),
@@ -253,6 +288,15 @@ impl ActivityProjection {
         &self,
         source: AgentActivitySource,
     ) -> ActivityResult<usize> {
+        if let Some(bound_source) = self.source
+            && bound_source != source
+        {
+            return Err(ActivityRepositoryError::InvalidScope(format!(
+                "activity projection is bound to {} activity, not {} activity",
+                bound_source.trace_label(),
+                source.trace_label(),
+            )));
+        }
         let Some(finalization) = self.controller.disable_for_finalization().await else {
             return Ok(0);
         };
