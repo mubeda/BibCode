@@ -746,19 +746,32 @@ vp run build:desktop
 
 Expected: the macOS application links and packages successfully, proving the dynamic Objective-C selector calls and `proc_pidinfo` symbol resolve in the production target.
 
-- [ ] **Step 4: Perform the live Resource Manager smoke test**
+- [ ] **Step 4: Use Codex Computer Use for the live Resource Manager acceptance test**
 
-Launch the newly built application, open Resource Manager, and record evidence for each check:
+Invoke the `computer-use:computer-use` skill and use its plugin-owned `node_repl` wrapper for every macOS UI interaction. Target the newly built packaged BiBCode app, not an older installed copy. Fetch a fresh full app state before each action and a new state after it; never reuse stale accessibility element indices.
 
-- complete observation removes the unavailable warning;
-- `core/server` and role-validated `core/ui` rows appear;
-- Combined equals Core plus External for memory, CPU, and process count;
-- opening and closing a native preview WebView updates the Core UI process set on a later sample;
-- provider and terminal processes remain External;
-- another application's `com.apple.WebKit.*` helpers do not appear; and
-- quitting the packaged app leaves no BiBCode-owned WebKit or supervised helper behind.
+Create `/Users/admin/.codex/visualizations/2026/08/04/019fcf0b-6bc4-7d23-a1b1-edec8db1adc5/macos-resource-manager/` and, from `node_repl`, copy the file behind each `state.screenshot.url` into these durable PNGs outside the Git worktree:
 
-If a supported macOS version lacks one private selector, confirm the UI reports `partial` with validated rows retained. If no PID validates, confirm it reports `unavailable`; do not weaken validation to make the warning disappear.
+1. `01-complete-observation.png` — Resource Manager open after at least two refreshes in the steady state.
+2. `02-preview-open.png` — the same panel after opening a native preview WebView and waiting for a later sample.
+3. `03-preview-closed.png` — the panel after closing that preview WebView and waiting for a later sample.
+4. `04-unrelated-webkit-excluded.png` — Resource Manager while another running macOS application owns generic `com.apple.WebKit.*` helpers.
+
+For each captured state, save the accessibility text beside the PNG so exact labels and numbers can be corroborated without treating AX text as a substitute for visual inspection.
+
+Inspect every screenshot at full resolution with the image-viewing tool. Zoom into the warning/banner area, Combined totals, Core/External cards, every visible highest-consumer row, ownership badge, process label, memory value, CPU value, and truncated executable path. Compare the three lifecycle screenshots side by side and explicitly record whether each visual assertion passes:
+
+- steady-state complete observation has no unavailable warning;
+- `core/server` and role-validated `core/ui` rows are visible;
+- Combined equals Core plus External for memory, CPU, and process count, allowing only the UI's displayed rounding precision;
+- opening a native preview can add or rotate validated Core UI helpers on a later sample without moving provider/terminal rows into Core;
+- closing the preview removes obsolete helpers on a later sample;
+- another application's generic WebKit helpers do not appear in BiBCode's list; and
+- no clipping, overlap, theme regression, unreadable contrast, or misleading status icon was introduced.
+
+After the screenshots are secured, quit the packaged app through Computer Use and confirm no BiBCode-owned WebKit or supervised helper remains. If a supported macOS version lacks one private selector, capture the `partial` state with validated rows retained. If no PID validates, capture `unavailable`; do not weaken validation to make the warning disappear.
+
+Any ambiguous image, unreadable row, unexplained total mismatch, warning banner, or lifecycle result fails this step. Diagnose and fix the issue, rebuild, then repeat all four screenshots rather than accepting a partial visual pass.
 
 - [ ] **Step 5: Review the final diff for scope and unsafe-call documentation**
 
@@ -779,4 +792,4 @@ Invoke `superpowers:requesting-code-review` against the completed commit range. 
 
 - [ ] **Step 7: Record final verification evidence**
 
-In the handoff, report the exact commands that passed, the packaged macOS version used for the smoke test, observed coverage status, and any private-SPI compatibility caveat. Do not claim completion if either required repository gate or the packaged smoke test failed.
+In the handoff, report the exact commands that passed, the packaged macOS version used for the smoke test, observed coverage status, every visual assertion result, and any private-SPI compatibility caveat. Link all four full-resolution PNGs and their accessibility-text companions by absolute local path. Do not claim completion if either required repository gate or the Computer Use screenshot review failed.
