@@ -16,7 +16,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     ServerConfig,
     activity::{
-        ActivityProjection, ActivityRepository, AgentActivityController, register_activity_rpc,
+        ActivityProjection, ActivityProjections, ActivityRepository, AgentActivityController,
+        register_activity_rpc,
     },
     assets::{AssetAccess, ResolvedAsset},
     auth::AuthService,
@@ -136,8 +137,9 @@ impl ProductionRuntime {
         .await
         .map_err(|error| error.to_string())?;
         let repositories = orchestration.repositories();
+        let activity_repository = ActivityRepository::new(repositories.database().clone());
         let activity_projection = ActivityProjection::with_controller(
-            ActivityRepository::new(repositories.database().clone()),
+            activity_repository.clone(),
             activity_controller.clone(),
         );
         activity_projection
@@ -271,11 +273,12 @@ impl ProductionRuntime {
 
         let mut registry = RpcRegistry::with_trace_diagnostics(trace_diagnostics.clone());
         crate::auth::register_rpc_handlers(&mut registry, auth);
-        register_activity_rpc(
-            &mut registry,
-            activity_projection.clone(),
+        let activity_rpc_projections = ActivityProjections::new(
+            activity_repository,
+            activity_controller.clone(),
             activity_controller.clone(),
         );
+        register_activity_rpc(&mut registry, activity_rpc_projections);
         register_orchestration_rpc_with_delivery(
             &mut registry,
             orchestration.clone(),
