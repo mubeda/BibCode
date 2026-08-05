@@ -4443,6 +4443,18 @@ while (-not [IO.File]::Exists({})) {{
             .to_ascii_lowercase();
         assert!(readiness.starts_with(&format!("get {BACKEND_READINESS_PATH} http/1.1")));
 
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !bootstrap_path.is_file() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("external backend should capture bootstrap before shutdown");
+        assert_eq!(
+            fs::read_to_string(&bootstrap_path).expect("bootstrap should be captured"),
+            bootstrap_line
+        );
+
         stop_managed_backend(
             backend,
             BackendShutdownConfig {
@@ -4451,11 +4463,6 @@ while (-not [IO.File]::Exists({})) {{
         )
         .await
         .expect("external backend should shut down gracefully");
-
-        assert_eq!(
-            fs::read_to_string(&bootstrap_path).expect("bootstrap should be captured"),
-            bootstrap_line
-        );
         let shutdown = requests
             .recv_timeout(Duration::from_secs(1))
             .expect("shutdown request should be captured")
