@@ -13,7 +13,7 @@ export function readPreviewAnnotationTheme(): DesktopPreviewAnnotationTheme {
     foreground: readVariable(styles, "--foreground", "oklch(0.269 0 0)"),
     popover: readVariable(styles, "--popover", "white"),
     popoverForeground: readVariable(styles, "--popover-foreground", "oklch(0.269 0 0)"),
-    primary: readVariable(styles, "--primary", "oklch(0.488 0.217 264)"),
+    primary: readVariable(styles, "--primary", "#d8610e"),
     primaryForeground: readVariable(styles, "--primary-foreground", "white"),
     muted: readVariable(styles, "--muted", "rgb(0 0 0 / 4%)"),
     mutedForeground: readVariable(styles, "--muted-foreground", "oklch(0.556 0 0)"),
@@ -21,7 +21,7 @@ export function readPreviewAnnotationTheme(): DesktopPreviewAnnotationTheme {
     accentForeground: readVariable(styles, "--accent-foreground", "oklch(0.269 0 0)"),
     border: readVariable(styles, "--border", "rgb(0 0 0 / 8%)"),
     input: readVariable(styles, "--input", "rgb(0 0 0 / 10%)"),
-    ring: readVariable(styles, "--ring", "oklch(0.488 0.217 264)"),
+    ring: readVariable(styles, "--ring", "#d8610e"),
     fontSans: readVariable(styles, "--font-sans", styles.fontFamily || "system-ui, sans-serif"),
     fontMono: readVariable(styles, "--font-mono", "ui-monospace, monospace"),
   };
