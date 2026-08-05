@@ -137,9 +137,8 @@ impl ProductionRuntime {
         .await
         .map_err(|error| error.to_string())?;
         let repositories = orchestration.repositories();
-        let activity_repository = ActivityRepository::new(repositories.database().clone());
         let activity_projection = ActivityProjection::with_controller(
-            activity_repository.clone(),
+            ActivityRepository::new(repositories.database().clone()),
             activity_controller.clone(),
         );
         activity_projection
@@ -273,11 +272,8 @@ impl ProductionRuntime {
 
         let mut registry = RpcRegistry::with_trace_diagnostics(trace_diagnostics.clone());
         crate::auth::register_rpc_handlers(&mut registry, auth);
-        let activity_rpc_projections = ActivityProjections::new(
-            activity_repository,
-            activity_controller.clone(),
-            activity_controller.clone(),
-        );
+        let activity_rpc_projections =
+            ActivityProjections::from_shared_projection(activity_projection.clone());
         register_activity_rpc(&mut registry, activity_rpc_projections);
         register_orchestration_rpc_with_delivery(
             &mut registry,
@@ -856,6 +852,7 @@ const FALLBACK_FAVICON: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" viewB
 mod tests {
     use super::*;
     use crate::{
+        ServerMessage, ServerRuntime,
         activity::{
             ActivityCapabilities, ActivityLifecycle, ActivityScopeRef, ActivityScopeSeed,
             ProviderActivityMutation,
@@ -864,7 +861,10 @@ mod tests {
         persistence::run_migrations,
     };
     use axum::http::{HeaderMap, Uri};
+    use futures_util::{SinkExt, StreamExt};
     use tempfile::TempDir;
+    use tokio::time::timeout;
+    use tokio_tungstenite::{connect_async, tungstenite::Message};
 
     fn route_context() -> RouteContext {
         RouteContext {
@@ -890,6 +890,130 @@ mod tests {
             factories.opencode.is_some(),
             "production must install the OpenCode terminal observer factory"
         );
+    }
+
+    #[tokio::test]
+    async fn production_activity_rpc_stream_receives_producer_projection_deltas() {
+        // Mutation caught: registering RPC with fresh projections that do not share producer buses.
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let state = TempDir::new().expect("temporary state directory");
+        let config = ServerConfig::new(state.path())
+            .with_bind("127.0.0.1", 0)
+            .with_unsafe_no_auth();
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let runtime = ProductionRuntime::start(
+            &config,
+            database,
+            AuthService::new(&config, vec![7_u8; 32]),
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("production runtime start");
+        let producer_projection = runtime.activity_projection.clone();
+        producer_projection
+            .ensure_scope(
+                ActivityScopeSeed::thread(
+                    "thread:production-rpc",
+                    "production-rpc",
+                    "codex",
+                    Some("codex"),
+                    ActivityCapabilities::structured_full(false),
+                )
+                .expect("thread scope"),
+            )
+            .await
+            .expect("scope persistence");
+        let handle = ServerRuntime::start_with_registry(config, runtime.registry.clone())
+            .await
+            .expect("RPC server");
+        let mut socket = connect_async(format!("ws://{}/ws", handle.local_addr()))
+            .await
+            .expect("WebSocket")
+            .0;
+        socket
+            .send(Message::Text(
+                json!({
+                    "_tag": "Request",
+                    "id": "701",
+                    "tag": "subscribeActivity",
+                    "payload": { "_tag": "thread", "threadId": "production-rpc" },
+                    "headers": []
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("subscribe to activity");
+        let initial = next_activity_message(&mut socket).await;
+        assert!(matches!(
+            initial,
+            ServerMessage::Chunk { ref values, .. }
+                if values[0]["kind"] == "snapshot"
+                    && values[0]["snapshot"]["scopeId"] == "thread:production-rpc"
+        ));
+        socket
+            .send(Message::Text(
+                json!({ "_tag": "Ack", "requestId": "701" })
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("acknowledge initial snapshot");
+
+        producer_projection
+            .apply(
+                "thread:production-rpc",
+                "event:production-rpc".to_owned(),
+                vec![
+                    ProviderActivityMutation::upsert_actor(
+                        "actor:production-rpc",
+                        None,
+                        "Production RPC actor",
+                        "running",
+                    )
+                    .expect("actor mutation"),
+                ],
+                "2026-08-04T12:00:00Z".to_owned(),
+            )
+            .await
+            .expect("producer mutation");
+        let delta = next_activity_message(&mut socket).await;
+        assert!(matches!(
+            delta,
+            ServerMessage::Chunk { ref values, .. }
+                if values[0]["kind"] == "delta"
+                    && values[0]["delta"]["scopeId"] == "thread:production-rpc"
+        ));
+
+        socket.close(None).await.expect("close WebSocket");
+        handle.shutdown();
+        handle.join().await.expect("RPC server joins");
+        runtime.shutdown().await;
+    }
+
+    async fn next_activity_message<S>(
+        socket: &mut tokio_tungstenite::WebSocketStream<S>,
+    ) -> ServerMessage
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let frame = timeout(Duration::from_secs(2), socket.next())
+            .await
+            .expect("activity message timeout")
+            .expect("WebSocket remains open")
+            .expect("WebSocket frame");
+        let Message::Text(text) = frame else {
+            panic!("unexpected WebSocket frame: {frame:?}");
+        };
+        serde_json::from_str(&text).expect("server message")
     }
 
     #[tokio::test]
