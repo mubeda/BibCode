@@ -263,4 +263,17 @@ describe("ComposerPrimaryActions", () => {
       }).markup,
     ).toContain('aria-label="Environment disconnected"');
   });
+
+  it("uses a provider binding conflict as the accessible disabled reason", () => {
+    const reason =
+      'Provider instance "codex_personal" reports driver "claude", but the active session expects "codex". Sending is blocked until provider metadata agrees.';
+
+    renderActions({ sendBlockedReason: reason });
+
+    const trigger = harness.tooltipTriggers[0]!;
+    expect(trigger.props["aria-label"]).toBe(reason);
+    const sendButton = trigger.props.children as ReactElement<Record<string, unknown>>;
+    expect(sendButton.props["aria-label"]).toBe(reason);
+    expect(sendButton.props.disabled).toBe(true);
+  });
 });

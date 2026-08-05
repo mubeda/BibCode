@@ -787,6 +787,7 @@ function renderComposer(overrides: Partial<ChatComposerProps> = {}): RenderResul
     lockedProvider: null,
     providerBindingInstanceId: codexInstanceId,
     lockProviderPickerToActiveInstance: false,
+    providerBindingConflictReason: null,
     providerStatuses: [codexProvider],
     activeProjectDefaultModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
     activeThreadModelSelection: null,
@@ -2536,6 +2537,29 @@ describe("ChatComposer imperative handle", () => {
 // ---------------------------------------------------------------------------
 
 describe("ChatComposer provider selection", () => {
+  it("disables composing and submission for a provider binding conflict", () => {
+    const conflictReason =
+      'Provider instance "codex_personal" reports driver "claude", but the active session expects "codex". Sending is blocked until provider metadata agrees.';
+    const conflictOverrides = {
+      providerBindingConflictReason: conflictReason,
+      providerBindingInstanceId: ProviderInstanceId.make("codex_personal"),
+      lockProviderPickerToActiveInstance: true,
+    } as Partial<ChatComposerProps> & { providerBindingConflictReason: string };
+    seedPrompt("do not send");
+
+    const { spies } = renderComposer(conflictOverrides);
+
+    expect(editorProps()["disabled"]).toBe(true);
+    expect(editorProps()["placeholder"]).toBe(conflictReason);
+    expect(findCapture("ProviderModelPicker")["disabled"]).toBe(true);
+    expect(lastCapture("ComposerPrimaryActions")["sendBlockedReason"]).toBe(conflictReason);
+
+    setEditorSnapshot("do not send", 11);
+    const onKey = editorProps()["onCommandKeyDown"] as CommandKey;
+    onKey("Enter", keyEvent());
+    expect(spies.onSend).not.toHaveBeenCalled();
+  });
+
   it("falls back to codex when no providers are configured", () => {
     renderComposer({ providerStatuses: [], activeProjectDefaultModelSelection: null });
     const picker = findCapture("ProviderModelPicker");

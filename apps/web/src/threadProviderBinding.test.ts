@@ -116,10 +116,18 @@ describe("resolveThreadProviderBinding", () => {
 
     expect(binding).toMatchObject({
       instanceId: "claude",
-      driver: "codex",
+      driver: null,
       status: null,
-      lockedProvider: "codex",
+      lockedProvider: null,
       lockedProviderInstanceId: "claude",
+      conflict: {
+        kind: "session-provider-driver-mismatch",
+        instanceId: "claude",
+        expectedDriver: "codex",
+        observedDriver: "claude",
+        reason:
+          'Provider instance "claude" reports driver "claude", but the active session expects "codex". Sending is blocked until provider metadata agrees.',
+      },
     });
   });
 
@@ -150,6 +158,7 @@ describe("resolveThreadProviderBinding", () => {
       status: null,
       lockedProvider: "codex",
       lockedProviderInstanceId: "codex_personal",
+      conflict: null,
     });
   });
 
@@ -180,10 +189,18 @@ describe("resolveThreadProviderBinding", () => {
 
     expect(binding).toEqual({
       instanceId: "codex_personal",
-      driver: "codex",
+      driver: null,
       status: null,
-      lockedProvider: "codex",
+      lockedProvider: null,
       lockedProviderInstanceId: "codex_personal",
+      conflict: {
+        kind: "session-provider-driver-mismatch",
+        instanceId: "codex_personal",
+        expectedDriver: "codex",
+        observedDriver: "claude",
+        reason:
+          'Provider instance "codex_personal" reports driver "claude", but the active session expects "codex". Sending is blocked until provider metadata agrees.',
+      },
     });
   });
 

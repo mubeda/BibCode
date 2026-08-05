@@ -279,6 +279,7 @@ function makeProps(
     lockedProvider: null,
     providerBindingInstanceId: selectedProviderStatus.instanceId,
     lockProviderPickerToActiveInstance: false,
+    providerBindingConflictReason: null,
     providerStatuses,
     activeProjectDefaultModelSelection: {
       instanceId: selectedProviderStatus.instanceId,
