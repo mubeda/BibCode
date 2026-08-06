@@ -463,6 +463,17 @@ vi.mock("./ThreadTerminalPanel", () => ({
     h.captured["threadTerminalPanel"] = props;
     return <div data-mock="thread-terminal-panel" data-owner={String(props["owner"] ?? "")} />;
   },
+  enqueueTerminalInput: (input: {
+    data: string;
+    write: (data: string) => Promise<{ _tag: string; cause?: unknown }>;
+    onWriteError?: (error: unknown) => void;
+  }) => {
+    void input.write(input.data).then((result) => {
+      if (result._tag === "Failure") {
+        input.onWriteError?.(result.cause);
+      }
+    });
+  },
   releaseTerminalInputScheduler: (environmentId: string, threadId: string, terminalId: string) => {
     h.releasedTerminalInputs.push({ environmentId, threadId, terminalId });
   },
@@ -3936,7 +3947,7 @@ describe("ChatView", () => {
       expect(h.releasedTerminalInputs).toEqual([{ environmentId, threadId, terminalId: "term-1" }]);
     });
 
-    it("retains terminal input state when close fails", async () => {
+    it("falls back to exit and retains terminal input state when close fails", async () => {
       seedEnvironment(makeEnvironmentPresentation());
       seedProject(makeProject());
       seedServerThread(makeThread());
@@ -3954,12 +3965,19 @@ describe("ChatView", () => {
 
       renderServerRoute();
       const panel = capturedProps<Record<string, unknown>>("threadTerminalPanel");
-      const onCloseTerminal = panel["onCloseTerminal"] as (terminalId: string) => void;
-      onCloseTerminal("term-1");
-      await Promise.resolve();
-      await Promise.resolve();
+      const onCloseTerminal = panel["onCloseTerminal"] as (terminalId: string) => Promise<unknown>;
+      await expect(onCloseTerminal("term-1")).resolves.toBe("exit-fallback");
 
       expect(h.releasedTerminalInputs).toEqual([]);
+      expect(h.commandCalls.filter((call) => call.key === "terminal.write")).toEqual([
+        {
+          key: "terminal.write",
+          input: {
+            environmentId,
+            input: { threadId, terminalId: "term-1", data: "exit\n" },
+          },
+        },
+      ]);
     });
   });
 
