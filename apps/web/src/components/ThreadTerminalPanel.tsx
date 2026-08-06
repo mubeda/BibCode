@@ -2027,7 +2027,10 @@ export default function ThreadTerminalPanel({
     >
       {!hasTerminalSidebar && hasTerminalToolbarActions ? (
         <div className="pointer-events-none absolute right-2 top-2 z-20">
-          <div className="pointer-events-auto inline-flex items-center overflow-hidden rounded-md border border-border/80 bg-background/70">
+          <div
+            data-terminal-toolbar="floating"
+            className="pointer-events-auto inline-flex items-center overflow-hidden rounded-md border border-border/80 bg-background/70"
+          >
             {onSplitTerminal ? (
               <>
                 <TerminalActionButton
@@ -2042,7 +2045,7 @@ export default function ThreadTerminalPanel({
                   <SquareSplitHorizontal className="size-3.25" />
                 </TerminalActionButton>
                 {onSplitTerminalVertical || onNewTerminal ? (
-                  <div className="h-4 w-px bg-border/80" />
+                  <div data-terminal-toolbar-separator className="h-4 w-px bg-border/80" />
                 ) : null}
               </>
             ) : null}
@@ -2059,7 +2062,9 @@ export default function ThreadTerminalPanel({
                 >
                   <SquareSplitVertical className="size-3.25" />
                 </TerminalActionButton>
-                {onNewTerminal ? <div className="h-4 w-px bg-border/80" /> : null}
+                {onNewTerminal ? (
+                  <div data-terminal-toolbar-separator className="h-4 w-px bg-border/80" />
+                ) : null}
               </>
             ) : null}
             {onNewTerminal ? (
@@ -2175,7 +2180,10 @@ export default function ThreadTerminalPanel({
           {hasTerminalSidebar && (
             <aside className="flex w-36 min-w-36 flex-col border border-border/70 bg-muted/10">
               {hasTerminalToolbarActions ? (
-                <div className="flex h-[22px] items-stretch justify-end border-b border-border/70">
+                <div
+                  data-terminal-toolbar="sidebar"
+                  className="flex h-[22px] items-stretch justify-end border-b border-border/70"
+                >
                   <div className="inline-flex h-full items-stretch">
                     {onSplitTerminal ? (
                       <TerminalActionButton
