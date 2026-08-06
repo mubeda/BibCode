@@ -80,7 +80,8 @@ const h = vi.hoisted(() => {
     toasts: [] as unknown[],
     shortcutCommandByKey: new Map<string, string>(),
     shortcutLabel: "Mod+K" as string | null,
-    terminalFocusOwner: null as "drawer" | "right-panel" | null,
+    terminalFocusOwner: null as "center-panel" | "right-panel" | null,
+    centerCanSplit: vi.fn((_groupId: string, _direction: "right" | "down") => true),
     commandPaletteOpen: false,
     localApi: null as unknown,
     mediaQueryMatches: false,
@@ -94,6 +95,8 @@ const h = vi.hoisted(() => {
     stateCalls: [] as Array<{ index: number; initial: unknown }>,
     stateSeeds: new Map<number, { value: unknown; expectInitial: (value: unknown) => boolean }>(),
     setStateCalls: [] as Array<{ index: number; next: unknown; applied: unknown }>,
+    refCalls: [] as Array<{ index: number; initial: unknown }>,
+    refSeeds: new Map<number, { value: unknown; expectInitial: (value: unknown) => boolean }>(),
     effects: [] as Array<() => void | (() => void)>,
   };
   return state;
@@ -130,9 +133,22 @@ vi.mock("react", async (importOriginal) => {
     h.effects.push(effect);
   };
 
+  const useRef = (initial: unknown) => {
+    const index = h.refCalls.length;
+    h.refCalls.push({ index, initial });
+    const seed = h.refSeeds.get(index);
+    if (seed && !seed.expectInitial(initial)) {
+      throw new Error(
+        `useRef seed mismatch at index ${index}: initial value ${String(initial)} did not match the expected shape`,
+      );
+    }
+    return { current: seed ? seed.value : initial };
+  };
+
   return {
     ...actual,
     useState: useState as typeof actual.useState,
+    useRef: useRef as typeof actual.useRef,
     useEffect: useEffect as typeof actual.useEffect,
     useLayoutEffect: useEffect as typeof actual.useLayoutEffect,
   };
@@ -485,48 +501,59 @@ vi.mock("./ThreadTerminalPanel", () => ({
   releaseTerminalInputScheduler: vi.fn(),
 }));
 
-vi.mock("./CenterPanelWorkspace", () => ({
-  CenterPanelWorkspace: (props: Record<string, unknown>) => {
-    h.capture("centerWorkspace", props);
-    const state = props["state"] as {
-      surfaces: Array<{ id: string }>;
-      groups: Array<{ id: string; activeSurfaceId: string | null; surfaceIds: string[] }>;
-      focusedGroupId: string;
-    };
-    const renderSurface = props["renderSurface"] as (
-      surface: { id: string },
-      context: { groupId: string; visible: boolean; focused: boolean },
-    ) => ReactNode;
-    const membership = new Map(
-      state.groups.flatMap((group) => group.surfaceIds.map((surfaceId) => [surfaceId, group.id])),
-    );
-    const visibleIds = new Set(state.groups.flatMap((group) => group.activeSurfaceId ?? []));
-    return (
-      <div data-mock="center-panel-workspace">
-        {props["focusedActions"] as ReactNode}
-        {state.surfaces
-          .filter((surface) => surface.id === "chat:host" || visibleIds.has(surface.id))
-          .map((surface) => {
-            const groupId = membership.get(surface.id)!;
-            return (
-              <div
-                key={surface.id}
-                data-mock-center-surface={surface.id}
-                data-visible={String(visibleIds.has(surface.id))}
-                className={visibleIds.has(surface.id) ? undefined : "hidden"}
-              >
-                {renderSurface(surface, {
-                  groupId,
-                  visible: visibleIds.has(surface.id),
-                  focused: groupId === state.focusedGroupId,
-                })}
-              </div>
-            );
-          })}
-      </div>
-    );
-  },
-}));
+vi.mock("./CenterPanelWorkspace", async () => {
+  const React = await import("react");
+
+  class CenterPanelWorkspace extends React.Component<Record<string, unknown>> {
+    canSplitGroup(groupId: string, direction: "right" | "down"): boolean {
+      return h.centerCanSplit(groupId, direction);
+    }
+
+    override render() {
+      const props = this.props;
+      h.capture("centerWorkspace", props);
+      const state = props["state"] as {
+        surfaces: Array<{ id: string }>;
+        groups: Array<{ id: string; activeSurfaceId: string | null; surfaceIds: string[] }>;
+        focusedGroupId: string;
+      };
+      const renderSurface = props["renderSurface"] as (
+        surface: { id: string },
+        context: { groupId: string; visible: boolean; focused: boolean },
+      ) => ReactNode;
+      const membership = new Map(
+        state.groups.flatMap((group) => group.surfaceIds.map((surfaceId) => [surfaceId, group.id])),
+      );
+      const visibleIds = new Set(state.groups.flatMap((group) => group.activeSurfaceId ?? []));
+      return (
+        <div data-mock="center-panel-workspace">
+          {props["focusedActions"] as ReactNode}
+          {state.surfaces
+            .filter((surface) => surface.id === "chat:host" || visibleIds.has(surface.id))
+            .map((surface) => {
+              const groupId = membership.get(surface.id)!;
+              return (
+                <div
+                  key={surface.id}
+                  data-mock-center-surface={surface.id}
+                  data-visible={String(visibleIds.has(surface.id))}
+                  className={visibleIds.has(surface.id) ? undefined : "hidden"}
+                >
+                  {renderSurface(surface, {
+                    groupId,
+                    visible: visibleIds.has(surface.id),
+                    focused: groupId === state.focusedGroupId,
+                  })}
+                </div>
+              );
+            })}
+        </div>
+      );
+    }
+  }
+
+  return { CenterPanelWorkspace };
+});
 
 vi.mock("./CenterTerminalPanel", () => ({
   CenterTerminalPanel: (props: Record<string, unknown>) => {
@@ -639,6 +666,7 @@ const HOST_STATE = {
   expandedImage: { index: 1, expectInitial: isNull },
   optimisticUserMessages: { index: 2, expectInitial: isEmptyArray },
   maximizedRightPanelThreadKey: { index: 7, expectInitial: isNull },
+  terminalFocusRequestId: { index: 12, expectInitial: (value: unknown) => value === 0 },
   pullRequestDialogState: { index: 13, expectInitial: isNull },
   terminalUiLaunchContext: { index: 14, expectInitial: isNull },
   pendingUserInputAnswersByRequestId: {
@@ -652,7 +680,6 @@ const HOST_STATE = {
       typeof value === "object" && value !== null && Object.keys(value).length === 0,
   },
   composerOverlayElement: { index: 19, expectInitial: isNull },
-  mountedTerminalThreadKeys: { index: 21, expectInitial: isEmptyArray },
 } as const;
 
 function seedHostState(name: keyof typeof HOST_STATE, value: unknown): void {
@@ -812,6 +839,7 @@ function resetRenderCaptures(): void {
   h.captured = {};
   h.capturedList.length = 0;
   h.stateCalls.length = 0;
+  h.refCalls.length = 0;
   h.effects.length = 0;
   h.previewActionSubscribers.length = 0;
 }
@@ -866,6 +894,12 @@ function runEffects(): Array<() => void> {
 
 function commandCallsFor(key: string): Array<{ key: string; input: unknown }> {
   return h.commandCalls.filter((call) => call.key === key);
+}
+
+async function flushTerminalAction(): Promise<void> {
+  await Promise.resolve();
+  await Promise.resolve();
+  await Promise.resolve();
 }
 
 function closedTerminalIds(): string[] {
@@ -1321,6 +1355,8 @@ beforeEach(() => {
   h.shortcutCommandByKey.clear();
   h.shortcutLabel = "Mod+K";
   h.terminalFocusOwner = null;
+  h.centerCanSplit.mockReset();
+  h.centerCanSplit.mockReturnValue(true);
   h.commandPaletteOpen = false;
   h.localApi = null;
   h.mediaQueryMatches = false;
@@ -1333,6 +1369,8 @@ beforeEach(() => {
   h.stateCalls.length = 0;
   h.stateSeeds.clear();
   h.setStateCalls.length = 0;
+  h.refCalls.length = 0;
+  h.refSeeds.clear();
   h.effects.length = 0;
 
   for (const { store, pristine } of resettableStores) {
@@ -1772,6 +1810,10 @@ describe("ChatView keydown shortcuts", () => {
 
   function renderWithKeydown(thread: Thread = makeThread()) {
     seedConnectedServerThread(thread);
+    h.refSeeds.set(0, {
+      value: { canSplitGroup: h.centerCanSplit },
+      expectInitial: (value) => value === null,
+    });
     renderServerRoute();
     const composer = installComposerHandle();
     runEffects();
@@ -1814,79 +1856,255 @@ describe("ChatView keydown shortcuts", () => {
     expect(inserted).toEqual(["a"]);
   });
 
-  it("terminal.newCenter opens a first terminal through the store and server", () => {
+  it.each([null, "center-panel", "right-panel"] as const)(
+    "terminal.newCenter targets the focused center group from %s focus",
+    async (owner) => {
+      if (owner === "center-panel") {
+        useCenterPanelStore.getState().openTerminalPanel(threadRef, "term-existing");
+        publishSeededStoreState(useCenterPanelStore);
+      } else if (owner === "right-panel") {
+        useRightPanelStore.getState().openTerminal(threadRef, "term-right");
+        publishSeededStoreState(useRightPanelStore);
+      }
+      h.terminalFocusOwner = owner;
+      const place = vi.spyOn(useCenterPanelStore.getState(), "placeTerminalPanel");
+      const { handler } = renderWithKeydown();
+      h.shortcutCommandByKey.set("F1", "terminal.newCenter");
+
+      handler(makeKeyEvent({ key: "F1" }));
+      await flushTerminalAction();
+
+      expect(place).toHaveBeenCalledWith(
+        threadRef,
+        expect.any(String),
+        { type: "tab", groupId: "center:root" },
+        {},
+      );
+      expect(commandCallsFor("terminal.open")).toHaveLength(1);
+    },
+  );
+
+  it.each([
+    ["terminal.new", { type: "tab", groupId: "center:root" }],
+    ["terminal.split", { type: "split", groupId: "center:root", direction: "right" }],
+    ["terminal.splitVertical", { type: "split", groupId: "center:root", direction: "down" }],
+  ] as const)("routes %s to the focused center terminal group", async (command, placement) => {
+    useCenterPanelStore.getState().openTerminalPanel(threadRef, "term-existing");
+    publishSeededStoreState(useCenterPanelStore);
+    h.terminalFocusOwner = "center-panel";
+    const place = vi.spyOn(useCenterPanelStore.getState(), "placeTerminalPanel");
     const { handler } = renderWithKeydown();
-    h.shortcutCommandByKey.set("F1", "terminal.newCenter");
+    h.shortcutCommandByKey.set("F1", command);
 
     handler(makeKeyEvent({ key: "F1" }));
+    await flushTerminalAction();
 
-    expect(
-      useTerminalUiStateStore.getState().terminalUiStateByThreadKey[threadKey]?.terminalOpen,
-    ).toBe(true);
+    expect(place).toHaveBeenCalledWith(threadRef, expect.any(String), placement, {});
     expect(commandCallsFor("terminal.open")).toHaveLength(1);
-    const openInput = commandCallsFor("terminal.open")[0]!.input as {
-      input: { cwd: string; threadId: ThreadId };
-    };
-    expect(openInput.input.cwd).toBe("X:/demo");
-    expect(openInput.input.threadId).toBe(threadId);
   });
 
-  it("terminal.split / splitVertical / new / close and panel toggles dispatch", () => {
-    const { handler } = renderWithKeydown();
-    h.shortcutCommandByKey.set("F1", "terminal.split");
-    h.shortcutCommandByKey.set("F2", "terminal.splitVertical");
-    h.shortcutCommandByKey.set("F3", "terminal.new");
-    h.shortcutCommandByKey.set("F4", "terminal.close");
-    h.shortcutCommandByKey.set("F5", "rightPanel.toggle");
-    h.shortcutCommandByKey.set("F6", "diff.toggle");
-    h.shortcutCommandByKey.set("F7", "modelPicker.toggle");
+  it.each(["terminal.new", "terminal.split", "terminal.splitVertical", "terminal.close"] as const)(
+    "leaves %s as a no-op when no terminal surface owns focus",
+    async (command) => {
+      const { handler } = renderWithKeydown();
+      h.shortcutCommandByKey.set("F1", command);
 
-    handler(makeKeyEvent({ key: "F1" }));
-    handler(makeKeyEvent({ key: "F2" }));
-    handler(makeKeyEvent({ key: "F3" }));
-    // terminal.close with the drawer closed is a no-op.
-    handler(makeKeyEvent({ key: "F4" }));
-    handler(makeKeyEvent({ key: "F5" }));
-    handler(makeKeyEvent({ key: "F6" }));
-    handler(makeKeyEvent({ key: "F7" }));
+      handler(makeKeyEvent({ key: "F1" }));
+      await flushTerminalAction();
 
-    // split, splitVertical, and new each opened a terminal.
-    expect(commandCallsFor("terminal.open")).toHaveLength(3);
-    expect(commandCallsFor("terminal.close")).toHaveLength(0);
-    // rightPanel.toggle opened the (empty) right panel.
-    expect(useRightPanelStore.getState().byThreadKey[threadKey]?.isOpen ?? false).toBe(true);
-    // diff.toggle opened the diff surface.
-    expect(useDiffPanelStore.getState()).toBeDefined();
-  });
+      expect(commandCallsFor("terminal.open")).toHaveLength(0);
+      expect(commandCallsFor("terminal.close")).toHaveLength(0);
+    },
+  );
 
-  it("routes split/new/close to the right panel when it owns terminal focus", () => {
+  it.each([
+    ["terminal.new", "new"],
+    ["terminal.split", "horizontal"],
+    ["terminal.splitVertical", "vertical"],
+  ] as const)("preserves right-panel %s routing", async (command, expectedAction) => {
     seedConnectedServerThread();
     useRightPanelStore.getState().openTerminal(threadRef, "terminal-77");
     publishSeededStoreState(useRightPanelStore);
     h.terminalFocusOwner = "right-panel";
-
+    const rightStore = useRightPanelStore.getState();
+    const action =
+      expectedAction === "new"
+        ? vi.spyOn(rightStore, "openTerminal")
+        : vi.spyOn(rightStore, "splitTerminal");
     renderServerRoute();
     installComposerHandle();
     runEffects();
     const handler = windowKeydownHandler();
-
-    h.shortcutCommandByKey.set("F1", "terminal.split");
-    h.shortcutCommandByKey.set("F2", "terminal.splitVertical");
-    h.shortcutCommandByKey.set("F3", "terminal.new");
-    h.shortcutCommandByKey.set("F4", "terminal.close");
+    h.shortcutCommandByKey.set("F1", command);
 
     handler(makeKeyEvent({ key: "F1" }));
-    handler(makeKeyEvent({ key: "F2" }));
-    handler(makeKeyEvent({ key: "F3" }));
-    handler(makeKeyEvent({ key: "F4" }));
+    await flushTerminalAction();
 
-    // Panel split x2 + panel new terminal each open a server terminal; close
-    // closes the focused panel terminal.
-    expect(commandCallsFor("terminal.open").length).toBeGreaterThanOrEqual(3);
-    expect(commandCallsFor("terminal.close")).toHaveLength(1);
+    expect(action).toHaveBeenCalled();
+    expect(commandCallsFor("terminal.open")).toHaveLength(1);
   });
 
-  it("project script shortcuts run the mapped script in a terminal", () => {
+  it("preserves right-panel close routing", async () => {
+    seedConnectedServerThread();
+    useRightPanelStore.getState().openTerminal(threadRef, "terminal-77");
+    publishSeededStoreState(useRightPanelStore);
+    h.terminalFocusOwner = "right-panel";
+    const closeRightTerminal = vi.spyOn(useRightPanelStore.getState(), "closeTerminal");
+    renderServerRoute();
+    installComposerHandle();
+    runEffects();
+    const handler = windowKeydownHandler();
+    h.shortcutCommandByKey.set("F1", "terminal.close");
+
+    handler(makeKeyEvent({ key: "F1" }));
+    await flushTerminalAction();
+
+    expect(closeRightTerminal).toHaveBeenCalledWith(threadRef, expect.any(String), "terminal-77");
+    expect(closedTerminalIds()).toEqual(["terminal-77"]);
+  });
+
+  it("rejects an infeasible center split before opening a server terminal", async () => {
+    useCenterPanelStore.getState().openTerminalPanel(threadRef, "term-existing");
+    publishSeededStoreState(useCenterPanelStore);
+    h.terminalFocusOwner = "center-panel";
+    h.centerCanSplit.mockReturnValue(false);
+    const { handler } = renderWithKeydown();
+    h.shortcutCommandByKey.set("F1", "terminal.split");
+
+    handler(makeKeyEvent({ key: "F1" }));
+    await flushTerminalAction();
+
+    expect(commandCallsFor("terminal.open")).toHaveLength(0);
+    expect(h.toasts).toHaveLength(1);
+  });
+
+  it("compensates with history deletion when center placement loses its race", async () => {
+    useCenterPanelStore.getState().openTerminalPanel(threadRef, "term-existing");
+    publishSeededStoreState(useCenterPanelStore);
+    h.terminalFocusOwner = "center-panel";
+    vi.spyOn(useCenterPanelStore.getState(), "placeTerminalPanel").mockReturnValue(false);
+    const { handler } = renderWithKeydown();
+    h.shortcutCommandByKey.set("F1", "terminal.new");
+
+    handler(makeKeyEvent({ key: "F1" }));
+    await flushTerminalAction();
+
+    expect(commandCallsFor("terminal.close")).toHaveLength(1);
+    expect(commandCallsFor("terminal.close")[0]?.input).toMatchObject({
+      input: { deleteHistory: true },
+    });
+  });
+
+  it("surfaces a durable notice when compensating center close fails", async () => {
+    useCenterPanelStore.getState().openTerminalPanel(threadRef, "term-existing");
+    publishSeededStoreState(useCenterPanelStore);
+    h.terminalFocusOwner = "center-panel";
+    vi.spyOn(useCenterPanelStore.getState(), "placeTerminalPanel").mockReturnValue(false);
+    h.commandResults["terminal.close"] = () =>
+      AsyncResult.failure(Cause.fail(new Error("close backend unavailable")));
+    const { handler } = renderWithKeydown();
+    h.shortcutCommandByKey.set("F1", "terminal.new");
+
+    handler(makeKeyEvent({ key: "F1" }));
+
+    await vi.waitFor(() => {
+      expect(h.toasts).toEqual([
+        expect.objectContaining({
+          type: "error",
+          description: expect.stringContaining(
+            "spawned session could not be closed: close backend unavailable",
+          ),
+        }),
+      ]);
+    });
+  });
+
+  it("classifies interrupted compensating center close without a failure notice", async () => {
+    useCenterPanelStore.getState().openTerminalPanel(threadRef, "term-existing");
+    publishSeededStoreState(useCenterPanelStore);
+    h.terminalFocusOwner = "center-panel";
+    vi.spyOn(useCenterPanelStore.getState(), "placeTerminalPanel").mockReturnValue(false);
+    h.commandResults["terminal.close"] = () => AsyncResult.failure(Cause.interrupt(1));
+    const { handler } = renderWithKeydown();
+    h.shortcutCommandByKey.set("F1", "terminal.new");
+
+    handler(makeKeyEvent({ key: "F1" }));
+    await flushTerminalAction();
+
+    expect(commandCallsFor("terminal.close")).toHaveLength(1);
+    expect(h.toasts).toEqual([]);
+  });
+
+  it("requests terminal focus only after center placement succeeds", async () => {
+    let finishOpen: ((result: unknown) => void) | undefined;
+    h.commandResults["terminal.open"] = () =>
+      new Promise((resolve) => {
+        finishOpen = resolve;
+      });
+    useCenterPanelStore.getState().openTerminalPanel(threadRef, "term-existing");
+    publishSeededStoreState(useCenterPanelStore);
+    h.terminalFocusOwner = "center-panel";
+    const { handler } = renderWithKeydown();
+    h.shortcutCommandByKey.set("F1", "terminal.split");
+
+    handler(makeKeyEvent({ key: "F1" }));
+    expect(setStateCallsFor("terminalFocusRequestId")).toHaveLength(0);
+
+    finishOpen?.(AsyncResult.success(undefined));
+    await flushTerminalAction();
+    expect(setStateCallsFor("terminalFocusRequestId")).toHaveLength(1);
+  });
+
+  it("center close activates the next local tab", async () => {
+    seedConnectedServerThread();
+    useCenterPanelStore.getState().openTerminalPanel(threadRef, "term-next");
+    useCenterPanelStore.getState().openTerminalPanel(threadRef, "term-active");
+    publishSeededStoreState(useCenterPanelStore);
+    h.terminalFocusOwner = "center-panel";
+    renderServerRoute();
+    installComposerHandle();
+    runEffects();
+    const handler = windowKeydownHandler();
+    h.shortcutCommandByKey.set("F1", "terminal.close");
+
+    handler(makeKeyEvent({ key: "F1" }));
+    await flushTerminalAction();
+
+    const state = useCenterPanelStore.getState().byThreadKey[threadKey]!;
+    expect(state.groups[0]?.activeSurfaceId).toBe("terminal:term-next");
+    expect(closedTerminalIds()).toEqual(["term-active"]);
+  });
+
+  it("center close collapses an empty split and focuses the surviving group", async () => {
+    seedConnectedServerThread();
+    useCenterPanelStore.getState().openTerminalPanel(threadRef, "term-survivor");
+    useCenterPanelStore
+      .getState()
+      .placeTerminalPanel(
+        threadRef,
+        "term-closing",
+        { type: "split", groupId: "center:root", direction: "right" },
+        undefined,
+      );
+    publishSeededStoreState(useCenterPanelStore);
+    h.terminalFocusOwner = "center-panel";
+    renderServerRoute();
+    installComposerHandle();
+    runEffects();
+    const handler = windowKeydownHandler();
+    h.shortcutCommandByKey.set("F1", "terminal.close");
+
+    handler(makeKeyEvent({ key: "F1" }));
+    await flushTerminalAction();
+
+    const state = useCenterPanelStore.getState().byThreadKey[threadKey]!;
+    expect(state.groups).toHaveLength(1);
+    expect(state.focusedGroupId).toBe("center:root");
+    expect(state.groups[0]?.activeSurfaceId).toBe("terminal:term-survivor");
+    expect(setStateCallsFor("terminalFocusRequestId")).toHaveLength(1);
+  });
+
+  it("project script shortcuts run the mapped script in a terminal", async () => {
     const script: ProjectScript = {
       id: "dev-server",
       name: "Dev server",
@@ -1906,10 +2124,13 @@ describe("ChatView keydown shortcuts", () => {
 
     handler(makeKeyEvent({ key: "F9" }));
 
-    return Promise.resolve().then(async () => {
-      await Promise.resolve();
-      await Promise.resolve();
+    await vi.waitFor(() => {
       expect(commandCallsFor("terminal.open")).toHaveLength(1);
+      expect(
+        useCenterPanelStore
+          .getState()
+          .byThreadKey[threadKey]?.surfaces.some((surface) => surface.kind === "terminal"),
+      ).toBe(true);
       const writes = commandCallsFor("terminal.write");
       expect(writes).toHaveLength(1);
       expect((writes[0]!.input as { input: { data: string } }).input.data).toBe("pnpm dev\r");
@@ -2143,16 +2364,16 @@ describe("ChatView right panel handlers", () => {
     expect(useRightPanelStore.getState().byThreadKey[threadKey]?.isOpen).toBe(false);
   });
 
-  it("toggles the terminal drawer and right panel from the layout controls", () => {
+  it("exposes only the right panel from the layout controls", () => {
     seedConnectedServerThread();
     renderServerRoute();
     const controls = capturedProps("panelLayoutControls");
 
     (controls["onToggleRightPanel"] as () => void)();
     expect(useRightPanelStore.getState().byThreadKey[threadKey]?.isOpen).toBe(true);
-
-    (controls["onToggleTerminal"] as () => void)();
-    expect(commandCallsFor("terminal.open")).toHaveLength(1);
+    expect(controls).not.toHaveProperty("onToggleTerminal");
+    expect(controls).not.toHaveProperty("terminalOpen");
+    expect(controls).not.toHaveProperty("terminalAvailable");
   });
 
   it("maximizes the inline right panel via the maximize control", () => {
@@ -2178,7 +2399,7 @@ describe("ChatView right panel handlers", () => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe("ChatView retired bottom terminal composition", () => {
-  function seedDrawer(options: { knownIds?: string[]; storeIds?: string[] } = {}) {
+  function seedRetiredTerminalUiState(options: { knownIds?: string[]; storeIds?: string[] } = {}) {
     seedConnectedServerThread();
     const storeIds = options.storeIds ?? ["terminal-1"];
     const store = useTerminalUiStateStore.getState();
@@ -2196,14 +2417,17 @@ describe("ChatView retired bottom terminal composition", () => {
         },
       },
     }));
-    seedHostState("mountedTerminalThreadKeys", [threadKey]);
   }
 
   it("does not compose the retired bottom terminal drawer", () => {
-    seedDrawer();
+    seedRetiredTerminalUiState();
 
     const markup = renderServerRoute();
     expect(markup).not.toContain('data-mock="thread-terminal-panel"');
+    expect(markup).not.toContain("PersistentThreadTerminalDrawer");
+    expect(markup).not.toContain('data-terminal-owner="drawer"');
+    expect(markup).not.toContain("Toggle terminal drawer");
+    expect(markup).not.toContain("panel-bottom");
   });
 });
 
@@ -2416,7 +2640,15 @@ describe("ChatView project script handlers", () => {
     });
   });
 
-  it("runs a script in the active terminal and remembers it per project", async () => {
+  it("runs a script in the focused idle center terminal", async () => {
+    useCenterPanelStore.getState().openTerminalPanel(threadRef, "terminal-1");
+    publishSeededStoreState(useCenterPanelStore);
+    h.knownSessions = [
+      {
+        target: { environmentId, threadId, terminalId: "terminal-1" },
+        state: { summary: { label: "Shell", cwd: "X:/demo", worktreePath: null } },
+      },
+    ];
     const header = renderWithScripts();
     const onRunProjectScript = header["onRunProjectScript"] as (
       target: ProjectScript,
@@ -2426,21 +2658,28 @@ describe("ChatView project script handlers", () => {
     await onRunProjectScript(script);
 
     expect(commandCallsFor("terminal.open")).toHaveLength(1);
+    expect(commandCallsFor("terminal.open")[0]?.input).toMatchObject({
+      input: { terminalId: "terminal-1" },
+    });
     const writes = commandCallsFor("terminal.write");
     expect(writes).toHaveLength(1);
     expect((writes[0]!.input as { input: { data: string } }).input.data).toBe("pnpm dev\r");
     expect(h.terminalInputEnqueues.at(-1)?.data).toBe("pnpm dev\r");
+    expect(
+      useCenterPanelStore
+        .getState()
+        .byThreadKey[threadKey]?.surfaces.filter((surface) => surface.kind === "terminal"),
+    ).toHaveLength(1);
   });
 
-  it("prefers a fresh terminal when the base terminal is busy", async () => {
+  it("opens a fresh center terminal when the focused terminal is busy", async () => {
     h.runningTerminalIds = ["terminal-1"];
     seedEnvironment(makeEnvironmentPresentation());
     seedProject(makeProject({ scripts: [script] }));
     seedServerThread(makeThread());
     seedGitStatus(true);
-    const store = useTerminalUiStateStore.getState();
-    store.ensureTerminal(threadRef, "terminal-1", { open: true });
-    publishSeededStoreState(useTerminalUiStateStore);
+    useCenterPanelStore.getState().openTerminalPanel(threadRef, "terminal-1");
+    publishSeededStoreState(useCenterPanelStore);
     h.knownSessions = [
       {
         target: { environmentId, threadId, terminalId: "terminal-1" },
@@ -2457,6 +2696,11 @@ describe("ChatView project script handlers", () => {
     const openInput = openCalls[0]!.input as { input: { terminalId: string; cols?: number } };
     expect(openInput.input.terminalId).not.toBe("terminal-1");
     expect(openInput.input.cols).toBe(120);
+    expect(
+      useCenterPanelStore
+        .getState()
+        .byThreadKey[threadKey]?.surfaces.filter((surface) => surface.kind === "terminal"),
+    ).toHaveLength(2);
   });
 
   it("reports script terminal failures as thread errors", async () => {
@@ -2533,7 +2777,7 @@ describe("ChatView project script handlers", () => {
     ).toBe(true);
   });
 
-  it("creates chat panels and center terminal panels from the header", () => {
+  it("creates chat panels and center terminal panels from the header", async () => {
     const header = renderWithScripts();
 
     const entry = {
@@ -2546,6 +2790,7 @@ describe("ChatView project script handlers", () => {
     expect(commandCallsFor("thread.create").length).toBeGreaterThanOrEqual(0);
 
     (header["onOpenTerminalPanel"] as () => void)();
+    await flushTerminalAction();
     const centerState = useCenterPanelStore.getState().byThreadKey[threadKey];
     expect(centerState?.surfaces.some((surface) => surface.kind === "terminal")).toBe(true);
 
@@ -2561,6 +2806,7 @@ describe("ChatView project script handlers", () => {
     (header["onOpenProviderTerminalPanel"] as (action: typeof providerTerminalAction) => void)(
       providerTerminalAction,
     );
+    await flushTerminalAction();
     const providerSurface = useCenterPanelStore
       .getState()
       .byThreadKey[threadKey]?.surfaces.find(
@@ -4914,7 +5160,7 @@ describe("ChatView banners and dialogs", () => {
     expect(draft?.interactionMode).toBe("plan");
   });
 
-  it("routes creation to the focused center group and cleans only explicit group removals", () => {
+  it("routes creation to the focused center group and cleans only explicit group removals", async () => {
     seedConnectedServerThread();
     seedTwoGroupCenterState();
     publishSeededStoreState(useCenterPanelStore);
@@ -4924,6 +5170,7 @@ describe("ChatView banners and dialogs", () => {
     (workspace["onFocusGroup"] as (groupId: string) => void)("group-b");
     const header = capturedProps("chatHeaderActions");
     (header["onOpenTerminalPanel"] as () => void)();
+    await flushTerminalAction();
 
     const focusedGroup = useCenterPanelStore
       .getState()

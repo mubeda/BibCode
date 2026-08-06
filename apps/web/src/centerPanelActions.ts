@@ -23,15 +23,10 @@ import type {
   ThreadId,
 } from "@bibcode/contracts";
 import { DEFAULT_PROVIDER_INTERACTION_MODE, DEFAULT_RUNTIME_MODE } from "@bibcode/contracts";
-import { nextTerminalId } from "@bibcode/shared/terminalLabels";
 import { useCallback } from "react";
 
 import { stackedThreadToast, toastManager } from "~/components/ui/toast";
-import {
-  useCenterPanelStore,
-  type CenterSurface,
-  type OpenTerminalPanelOptions,
-} from "~/centerPanelStore";
+import { useCenterPanelStore, type CenterSurface } from "~/centerPanelStore";
 import { newThreadId } from "~/lib/utils";
 import { threadEnvironment } from "~/state/threads";
 import { useAtomCommand } from "~/state/use-atom-command";
@@ -51,11 +46,6 @@ export interface CreateChatPanelInput {
 
 export interface CenterPanelActions {
   createChatPanel: (input: CreateChatPanelInput) => Promise<ThreadId | null>;
-  openTerminalPanel: (
-    hostRef: ScopedThreadRef,
-    existingTerminalIds: ReadonlyArray<string>,
-    options?: OpenTerminalPanelOptions,
-  ) => string;
   activateSurface: (hostRef: ScopedThreadRef, groupId: string, surfaceId: string) => void;
   closeSurface: (hostRef: ScopedThreadRef, groupId: string, surface: CenterSurface) => void;
   closeOtherSurfaces: (hostRef: ScopedThreadRef, groupId: string, surface: CenterSurface) => void;
@@ -134,22 +124,6 @@ export function useCenterPanelActions({
     [createThread],
   );
 
-  const openTerminalPanel = useCallback(
-    (
-      hostRef: ScopedThreadRef,
-      existingTerminalIds: ReadonlyArray<string>,
-      options?: OpenTerminalPanelOptions,
-    ): string => {
-      // term-N ids get the human "Terminal N" tab label everywhere; the caller
-      // passes every id the host thread already uses (drawer + center panels)
-      // so the id never aliases an existing attach-created terminal.
-      const terminalId = nextTerminalId(existingTerminalIds);
-      useCenterPanelStore.getState().openTerminalPanel(hostRef, terminalId, options);
-      return terminalId;
-    },
-    [],
-  );
-
   const cleanupRemoved = useCallback(
     (hostRef: ScopedThreadRef, removed: readonly CenterSurface[]) => {
       for (const surface of removed) {
@@ -209,7 +183,6 @@ export function useCenterPanelActions({
 
   return {
     createChatPanel,
-    openTerminalPanel,
     activateSurface,
     closeSurface,
     closeOtherSurfaces,
