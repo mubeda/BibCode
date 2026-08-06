@@ -21,6 +21,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test"
 const h = vi.hoisted(() => ({
   environmentIds: [] as EnvironmentId[],
   shellStates: new Map<EnvironmentId, EnvironmentShellState>(),
+  shellStateListeners: new Set<() => void>(),
   archivedStates: new Map<
     EnvironmentId,
     {
@@ -39,10 +40,20 @@ vi.mock("@tanstack/react-router", () => ({
   RouterProvider: () => null,
 }));
 
-vi.mock("@effect/atom-react", () => ({
-  useAtomValue: (atom: { readonly environmentId: EnvironmentId }) =>
-    h.shellStates.get(atom.environmentId),
-}));
+vi.mock("@effect/atom-react", async () => {
+  const { useSyncExternalStore } = await import("react");
+  return {
+    useAtomValue: (atom: { readonly environmentId: EnvironmentId }) =>
+      useSyncExternalStore(
+        (listener) => {
+          h.shellStateListeners.add(listener);
+          return () => h.shellStateListeners.delete(listener);
+        },
+        () => h.shellStates.get(atom.environmentId),
+        () => h.shellStates.get(atom.environmentId),
+      ),
+  };
+});
 
 vi.mock("./rpc/atomRegistry", () => ({
   AppAtomRegistryProvider: ({ children }: { readonly children?: React.ReactNode }) => children,
@@ -129,6 +140,13 @@ function shellState(
   };
 }
 
+function publishShellState(environmentId: EnvironmentId, state: EnvironmentShellState): void {
+  h.shellStates.set(environmentId, state);
+  for (const listener of h.shellStateListeners) {
+    listener();
+  }
+}
+
 let container: HTMLDivElement;
 let root: Root;
 
@@ -136,6 +154,7 @@ beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   h.environmentIds = [ENVIRONMENT_ID];
   h.shellStates.clear();
+  h.shellStateListeners.clear();
   h.archivedStates.clear();
   h.refreshArchived.mockReset();
   useCenterPanelStore.setState({ byThreadKey: {} });
@@ -159,7 +178,7 @@ afterEach(async () => {
 
 describe("AppRoot thread lifecycle reconciliation", () => {
   it("prunes a remote deletion, preserves archive state, and safely replays the snapshot", async () => {
-    h.shellStates.set(ENVIRONMENT_ID, shellState("live", snapshot(12, [HOST_ID])));
+    publishShellState(ENVIRONMENT_ID, shellState("live", snapshot(12, [HOST_ID])));
     h.archivedStates.set(ENVIRONMENT_ID, {
       snapshots: [{ environmentId: ENVIRONMENT_ID, snapshot: snapshot(12, [ARCHIVED_ID]) }],
       error: null,
@@ -195,7 +214,7 @@ describe("AppRoot thread lifecycle reconciliation", () => {
     [
       "cached live-shell data",
       () => {
-        h.shellStates.set(ENVIRONMENT_ID, shellState("cached", snapshot(20, [HOST_ID])));
+        publishShellState(ENVIRONMENT_ID, shellState("cached", snapshot(20, [HOST_ID])));
         h.archivedStates.set(ENVIRONMENT_ID, {
           snapshots: [{ environmentId: ENVIRONMENT_ID, snapshot: snapshot(20, []) }],
           error: null,
@@ -206,7 +225,7 @@ describe("AppRoot thread lifecycle reconciliation", () => {
     [
       "a synchronizing shell",
       () => {
-        h.shellStates.set(ENVIRONMENT_ID, shellState("synchronizing", snapshot(20, [HOST_ID])));
+        publishShellState(ENVIRONMENT_ID, shellState("synchronizing", snapshot(20, [HOST_ID])));
         h.archivedStates.set(ENVIRONMENT_ID, {
           snapshots: [{ environmentId: ENVIRONMENT_ID, snapshot: snapshot(20, []) }],
           error: null,
@@ -217,7 +236,7 @@ describe("AppRoot thread lifecycle reconciliation", () => {
     [
       "an archived snapshot refresh in flight",
       () => {
-        h.shellStates.set(ENVIRONMENT_ID, shellState("live", snapshot(20, [HOST_ID])));
+        publishShellState(ENVIRONMENT_ID, shellState("live", snapshot(20, [HOST_ID])));
         h.archivedStates.set(ENVIRONMENT_ID, {
           snapshots: [{ environmentId: ENVIRONMENT_ID, snapshot: snapshot(20, []) }],
           error: null,
@@ -228,7 +247,7 @@ describe("AppRoot thread lifecycle reconciliation", () => {
     [
       "a partial response with no archived environment snapshot",
       () => {
-        h.shellStates.set(ENVIRONMENT_ID, shellState("live", snapshot(20, [HOST_ID])));
+        publishShellState(ENVIRONMENT_ID, shellState("live", snapshot(20, [HOST_ID])));
         h.archivedStates.set(ENVIRONMENT_ID, {
           snapshots: [],
           error: null,
@@ -239,7 +258,7 @@ describe("AppRoot thread lifecycle reconciliation", () => {
     [
       "an archived snapshot failure",
       () => {
-        h.shellStates.set(ENVIRONMENT_ID, shellState("live", snapshot(20, [HOST_ID])));
+        publishShellState(ENVIRONMENT_ID, shellState("live", snapshot(20, [HOST_ID])));
         h.archivedStates.set(ENVIRONMENT_ID, {
           snapshots: [{ environmentId: ENVIRONMENT_ID, snapshot: snapshot(20, []) }],
           error: "Failed to load archived threads.",
@@ -250,7 +269,7 @@ describe("AppRoot thread lifecycle reconciliation", () => {
     [
       "sequence-skewed live and archived snapshots",
       () => {
-        h.shellStates.set(ENVIRONMENT_ID, shellState("live", snapshot(21, [HOST_ID])));
+        publishShellState(ENVIRONMENT_ID, shellState("live", snapshot(21, [HOST_ID])));
         h.archivedStates.set(ENVIRONMENT_ID, {
           snapshots: [{ environmentId: ENVIRONMENT_ID, snapshot: snapshot(20, []) }],
           error: null,
@@ -275,7 +294,7 @@ describe("AppRoot thread lifecycle reconciliation", () => {
       error: null,
       isLoading: false,
     };
-    h.shellStates.set(ENVIRONMENT_ID, shellState("cached", snapshot(30, [HOST_ID])));
+    publishShellState(ENVIRONMENT_ID, shellState("cached", snapshot(30, [HOST_ID])));
     h.archivedStates.set(ENVIRONMENT_ID, archived);
     useCenterPanelStore.getState().openTerminalPanel(DELETED_REF, "term-deleted");
     useRightPanelStore.getState().openTerminal(DELETED_REF, "term-deleted");
@@ -283,12 +302,14 @@ describe("AppRoot thread lifecycle reconciliation", () => {
     await act(async () => root.render(<AppRoot router={{} as AppRouter} />));
     expect(useCenterPanelStore.getState().byThreadKey[scopedThreadKey(DELETED_REF)]).toBeDefined();
 
-    h.shellStates.set(ENVIRONMENT_ID, shellState("synchronizing", snapshot(30, [HOST_ID])));
-    await act(async () => root.render(<AppRoot router={{} as AppRouter} />));
+    await act(async () =>
+      publishShellState(ENVIRONMENT_ID, shellState("synchronizing", snapshot(30, [HOST_ID]))),
+    );
     expect(useCenterPanelStore.getState().byThreadKey[scopedThreadKey(DELETED_REF)]).toBeDefined();
 
-    h.shellStates.set(ENVIRONMENT_ID, shellState("live", snapshot(30, [HOST_ID])));
-    await act(async () => root.render(<AppRoot router={{} as AppRouter} />));
+    await act(async () =>
+      publishShellState(ENVIRONMENT_ID, shellState("live", snapshot(30, [HOST_ID]))),
+    );
     await vi.waitFor(() => {
       expect(
         useCenterPanelStore.getState().byThreadKey[scopedThreadKey(DELETED_REF)],
@@ -300,7 +321,7 @@ describe("AppRoot thread lifecycle reconciliation", () => {
   });
 
   it("refreshes stale archived knowledge without pruning from the skewed pair", async () => {
-    h.shellStates.set(ENVIRONMENT_ID, shellState("live", snapshot(41, [HOST_ID])));
+    publishShellState(ENVIRONMENT_ID, shellState("live", snapshot(41, [HOST_ID])));
     h.archivedStates.set(ENVIRONMENT_ID, {
       snapshots: [{ environmentId: ENVIRONMENT_ID, snapshot: snapshot(40, []) }],
       error: null,
@@ -315,7 +336,7 @@ describe("AppRoot thread lifecycle reconciliation", () => {
   });
 
   it("protects draft identities and retains panel state across archive then unarchive", async () => {
-    h.shellStates.set(ENVIRONMENT_ID, shellState("live", snapshot(50, [HOST_ID])));
+    publishShellState(ENVIRONMENT_ID, shellState("live", snapshot(50, [HOST_ID])));
     h.archivedStates.set(ENVIRONMENT_ID, {
       snapshots: [{ environmentId: ENVIRONMENT_ID, snapshot: snapshot(50, [ARCHIVED_ID]) }],
       error: null,
@@ -351,7 +372,7 @@ describe("AppRoot thread lifecycle reconciliation", () => {
       selectThreadCenterPanelState(useCenterPanelStore.getState().byThreadKey, HOST_REF).surfaces,
     ).toContainEqual(expect.objectContaining({ kind: "chat", threadId: DRAFT_THREAD_ID }));
 
-    h.shellStates.set(ENVIRONMENT_ID, shellState("live", snapshot(51, [HOST_ID, ARCHIVED_ID])));
+    publishShellState(ENVIRONMENT_ID, shellState("live", snapshot(51, [HOST_ID, ARCHIVED_ID])));
     h.archivedStates.set(ENVIRONMENT_ID, {
       snapshots: [{ environmentId: ENVIRONMENT_ID, snapshot: snapshot(51, []) }],
       error: null,
