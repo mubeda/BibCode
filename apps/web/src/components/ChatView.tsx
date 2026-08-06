@@ -2947,9 +2947,13 @@ function ChatViewContent(props: ChatViewProps) {
       const reservation = reserveActiveTerminalId();
       if (!reservation) return;
       const terminalId = reservation.terminalId;
-      useRightPanelStore
+      const didSplit = useRightPanelStore
         .getState()
         .splitTerminal(activeThreadRef, activeRightPanelSurface.id, terminalId, direction);
+      if (!didSplit) {
+        reservation.release();
+        return;
+      }
       setTerminalFocusRequestId((value) => value + 1);
       openReservedRightPanelTerminal(reservation, cwd);
     },
