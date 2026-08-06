@@ -530,7 +530,7 @@ vi.mock("./CenterPanelWorkspace", async () => {
       const visibleIds = new Set(state.groups.flatMap((group) => group.activeSurfaceId ?? []));
       return (
         <div data-mock="center-panel-workspace">
-          {props["focusedActions"] as ReactNode}
+          {(props["renderFocusedActions"] as (density: "compact") => ReactNode)("compact")}
           {state.surfaces
             .filter((surface) => surface.id === "chat:host" || visibleIds.has(surface.id))
             .map((surface) => {
@@ -1484,7 +1484,7 @@ describe("ChatView center panel variant", () => {
     publishSeededStoreState(useCenterPanelStore);
 
     expect(renderServerRoute()).toContain('data-mock="center-panel-workspace"');
-    expect(capturedProps("centerWorkspace")["focusedActions"]).toBeDefined();
+    expect(capturedProps("centerWorkspace")["renderFocusedActions"]).toBeTypeOf("function");
   });
 });
 

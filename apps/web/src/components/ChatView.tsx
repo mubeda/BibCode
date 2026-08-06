@@ -1057,7 +1057,7 @@ interface LiveCenterPanelWorkspaceProps {
   readonly state: ThreadCenterPanelState;
   readonly hostLabel: string;
   readonly terminalLabelsById: ReadonlyMap<string, string>;
-  readonly focusedActions: ReactNode;
+  readonly renderFocusedActions: CenterPanelWorkspaceProps["renderFocusedActions"];
   readonly hostChatSurfaceBody: ReactNode;
   readonly hostThread: Thread;
   readonly hostThreadRef: ScopedThreadRef;
@@ -1085,7 +1085,7 @@ const LiveCenterPanelWorkspace = memo(function LiveCenterPanelWorkspace({
   state,
   hostLabel,
   terminalLabelsById,
-  focusedActions,
+  renderFocusedActions,
   hostChatSurfaceBody,
   hostThread,
   hostThreadRef,
@@ -1148,7 +1148,7 @@ const LiveCenterPanelWorkspace = memo(function LiveCenterPanelWorkspace({
       state={state}
       hostLabel={hostLabel}
       terminalLabelsById={terminalLabelsById}
-      focusedActions={focusedActions}
+      renderFocusedActions={renderFocusedActions}
       renderSurface={renderCenterSurface}
       onFocusGroup={onFocusGroup}
       onActivate={onActivate}
@@ -5837,7 +5837,7 @@ function ChatViewContent(props: ChatViewProps) {
               state={centerPanelState}
               hostLabel={centerHostLabel}
               terminalLabelsById={activeTerminalLabelsById}
-              focusedActions={chatHeaderActions}
+              renderFocusedActions={() => chatHeaderActions}
               hostChatSurfaceBody={hostChatSurfaceBody}
               hostThread={activeThread}
               hostThreadRef={activeThreadRef}

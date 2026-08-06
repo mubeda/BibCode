@@ -10,6 +10,7 @@ import {
   useLayoutEffect,
   useMemo,
   useRef,
+  useState,
 } from "react";
 
 import {
@@ -26,6 +27,10 @@ import { COLLAPSED_SIDEBAR_TITLEBAR_INSET_CLASS } from "~/workspaceTitlebar";
 import { Menu, MenuItem, MenuPopup, MenuTrigger } from "~/components/ui/menu";
 
 import { CenterPanelTabs } from "./CenterPanelTabs";
+import {
+  resolveCenterPaneHeaderDensity,
+  type CenterPaneHeaderDensity,
+} from "./centerPaneHeaderDensity";
 
 const HORIZONTAL_MINIMUM_PIXELS = 240;
 const VERTICAL_MINIMUM_PIXELS = 160;
@@ -36,7 +41,7 @@ export interface CenterPanelSplitLayoutProps {
   readonly hostLabel: string;
   readonly terminalLabelsById?: ReadonlyMap<string, string>;
   readonly dragInProgress: boolean;
-  readonly focusedActions: ReactNode;
+  readonly renderFocusedActions: (density: CenterPaneHeaderDensity) => ReactNode;
   readonly registerBodyTarget: (groupId: string) => (node: HTMLDivElement | null) => void;
   readonly onResizeFrame: () => void;
   readonly onFocusGroup: (groupId: string) => void;
@@ -145,6 +150,8 @@ function RecursiveLayout(props: RecursiveLayoutProps) {
 function GroupLeaf(
   props: RecursiveLayoutProps & { readonly node: Extract<CenterPanelLayoutNode, { type: "leaf" }> },
 ) {
+  const headerRef = useRef<HTMLElement>(null);
+  const [density, setDensity] = useState<CenterPaneHeaderDensity>("compact");
   const group = props.groupsById.get(props.node.groupId) ?? {
     id: props.node.groupId,
     surfaceIds: [],
@@ -184,6 +191,22 @@ function GroupLeaf(
     [focusGroup],
   );
 
+  useLayoutEffect(() => {
+    const header = headerRef.current;
+    if (!header) return;
+    const update = (width: number) => {
+      const next = resolveCenterPaneHeaderDensity(width);
+      setDensity((current) => (current === next ? current : next));
+    };
+    update(header.getBoundingClientRect().width);
+    if (typeof ResizeObserver === "undefined") return;
+    const observer = new ResizeObserver(([entry]) => {
+      if (entry) update(entry.contentRect.width);
+    });
+    observer.observe(header);
+    return () => observer.disconnect();
+  }, []);
+
   return (
     <section
       role="region"
@@ -202,12 +225,13 @@ function GroupLeaf(
       onFocusCapture={handleFocusCapture}
     >
       <header
+        ref={headerRef}
         data-center-panel-group-header
         data-touches-top-edge={props.touchesTopEdge}
         data-touches-left-edge={props.touchesLeftEdge}
         data-touches-right-edge={props.touchesRightEdge}
         className={cn(
-          "relative z-30 flex min-w-0 shrink-0 items-center border-b border-border/60 bg-background",
+          "@container/center-pane-header relative z-30 flex min-w-0 shrink-0 items-center border-b border-border/60 bg-background",
           props.touchesTopEdge ? "workspace-topbar" : "h-8",
           props.touchesTopEdge &&
             props.touchesLeftEdge &&
@@ -261,7 +285,7 @@ function GroupLeaf(
                 </MenuPopup>
               </Menu>
             ) : null}
-            {props.rootProps.focusedActions}
+            {props.rootProps.renderFocusedActions(density)}
           </div>
         ) : null}
       </header>

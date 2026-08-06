@@ -87,7 +87,7 @@ function workspaceProps(state: ThreadCenterPanelState): CenterPanelWorkspaceProp
   return {
     state,
     hostLabel: "Codex",
-    focusedActions: null,
+    renderFocusedActions: () => null,
     renderSurface: (surface) => (
       <div className="min-h-0 flex-1" data-live-surface-content={surface.id} />
     ),

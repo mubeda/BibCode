@@ -275,7 +275,7 @@ function input(state: ThreadCenterPanelState = twoGroupState) {
   return {
     state,
     hostLabel: "Codex",
-    focusedActions: <button type="button">New panel</button>,
+    renderFocusedActions: () => <button type="button">New panel</button>,
     renderSurface: (surface) => <div data-surface={surface.id} />,
     onFocusGroup: vi.fn(),
     onActivate: vi.fn(),
@@ -753,7 +753,10 @@ describe("CenterPanelWorkspace", () => {
     await renderWorkspace(props);
     const first = (harness.layoutProps as { readonly onResizeFrame: () => void }).onResizeFrame;
 
-    await renderWorkspace({ ...props, focusedActions: <button type="button">Changed</button> });
+    await renderWorkspace({
+      ...props,
+      renderFocusedActions: () => <button type="button">Changed</button>,
+    });
     const second = (harness.layoutProps as { readonly onResizeFrame: () => void }).onResizeFrame;
     expect(second).toBe(first);
 
