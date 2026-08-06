@@ -2171,6 +2171,32 @@ describe("ChatView keydown shortcuts", () => {
     },
   );
 
+  it("caps rapid same-render right-panel splits without opening an orphan terminal", () => {
+    h.commandResults["terminal.open"] = () => AsyncResult.success(undefined);
+    const store = useRightPanelStore.getState();
+    store.openTerminal(threadRef, "right-seed");
+    store.splitTerminal(threadRef, "terminal:right-seed", "right-2");
+    store.splitTerminal(threadRef, "terminal:right-seed", "right-3");
+    publishSeededStoreState(useRightPanelStore);
+    h.terminalFocusOwner = "right-panel";
+    const { handler } = renderWithKeydown();
+    h.shortcutCommandByKey.set("F1", "terminal.split");
+
+    handler(makeKeyEvent({ key: "F1" }));
+    handler(makeKeyEvent({ key: "F1" }));
+
+    expect(openedTerminalIds()).toHaveLength(1);
+    const terminalSurface = useRightPanelStore
+      .getState()
+      .byThreadKey[scopedThreadKey(threadRef)]?.surfaces.find(
+        (surface) => surface.id === "terminal:right-seed" && surface.kind === "terminal",
+      );
+    expect(terminalSurface).toMatchObject({
+      terminalIds: expect.arrayContaining(["right-seed", "right-2", "right-3"]),
+    });
+    expect(terminalSurface?.kind === "terminal" ? terminalSurface.terminalIds : []).toHaveLength(4);
+  });
+
   it("releases a right-panel terminal reservation after a rejected open settles", async () => {
     const finishOpen: Array<(result: unknown) => void> = [];
     h.commandResults["terminal.open"] = () =>
