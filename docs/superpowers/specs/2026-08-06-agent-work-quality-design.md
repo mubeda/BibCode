@@ -4,7 +4,7 @@
 
 BiBCode's root `AGENTS.md` will become the single operational contract for
 coding agents. It will require agents to establish current repository context
-before analysis or implementation, use CodeGraph when it is already available,
+before analysis or implementation, use CodeGraph only after a successful sync,
 trace architectural consequences before editing, and finish with evidence that
 matches the risk of the change. `CLAUDE.md` will continue pointing to the root
 contract so Codex and Claude receive the same guidance.
@@ -12,7 +12,8 @@ contract so Codex and Claude receive the same guidance.
 ## Goals
 
 - Make reading current, task-relevant documentation a required pre-work step.
-- Refresh an existing CodeGraph index before analysis without making CodeGraph
+- Attempt to refresh CodeGraph before analysis when its binary is available,
+  and use graph queries only after the sync succeeds, without making CodeGraph
   a repository dependency or a prerequisite for work.
 - Improve architectural decisions by requiring ownership, dependency, data-flow,
   lifecycle, failure, security, and performance analysis.
@@ -47,7 +48,7 @@ architectural review process.
 dated plans, specifications, dependency reports, and performance measurements
 as historical material. The repository also ignores `.codegraph/`, and prior
 planning artifacts refer to CodeGraph data as generated local state. The
-CodeGraph CLI is not present in the current environment, so its use must remain
+CodeGraph CLI's availability varies by environment, so its use must remain
 conditional.
 
 ## Instruction Architecture
@@ -77,17 +78,20 @@ Before non-trivial diagnosis, design, or implementation, an agent must:
 2. Inspect `git status --short` and preserve unrelated user changes.
 3. Identify the requested outcome, constraints, and evidence needed to prove
    completion.
-4. If `codegraph` is on `PATH`, run `codegraph sync . --quiet` from the repository
-   root before using its results.
-5. If the sync fails, mention that the graph may be stale and continue with
-   normal source navigation, including `rg`, manifests, tests, and direct source
-   inspection. The failure does not block work.
+4. If the `codegraph` binary is on `PATH`, attempt `codegraph sync . --quiet`
+   from the repository root. A graph is usable only after the sync succeeds;
+   successful sync may update ignored generated `.codegraph/` data.
+5. If the binary is unavailable or sync fails, disclose that graph data is
+   unavailable, stale, or unusable and immediately continue with normal source
+   navigation, including `rg`, manifests, tests, and direct source inspection.
+   The failure does not block work.
 
-Agents must not automatically run `codegraph install`, `codegraph init`,
-`codegraph index`, `codegraph unlock`, or other mutating repair/setup commands.
-When CodeGraph is available, agents should use its relationship and impact
-queries for unfamiliar or cross-package code, but must confirm critical claims
-against source and tests.
+Agents must not hand-edit, stage, or commit `.codegraph/` data, nor
+automatically run `codegraph install`, `codegraph init`, `codegraph index`,
+`codegraph unlock`, or other mutating repair/setup commands. Only after a
+successful sync may agents use CodeGraph relationship and impact queries for
+unfamiliar or cross-package code; they must confirm critical claims against
+source and tests.
 
 ## Required Documentation Reading
 
@@ -148,8 +152,9 @@ Before editing, an agent must be able to state:
 
 The package roles and dependency direction in `AGENTS.md` remain hard boundaries.
 Contracts stay schema-only, Rust continues owning production backend behavior,
-privileged desktop operations continue crossing `DesktopBridge`, and normal
-application traffic continues using typed HTTP/WebSocket RPC.
+privileged desktop operations must cross `DesktopBridge` commands/events, and
+normal application traffic must use typed HTTP/WebSocket RPC in browser and
+desktop modes.
 
 Agents should prefer the smallest coherent change that preserves these
 boundaries. They should reuse or improve the correct shared abstraction when the
@@ -161,7 +166,9 @@ Any change to package ownership, protocol flow, persisted shape, runtime
 topology, lifecycle guarantees, security boundaries, or documented invariants
 must update the corresponding living architecture documentation in the same
 change. A non-trivial new decision must record its alternatives and trade-offs
-in the task's approved design document before implementation.
+in the task's approved design document before implementation. If no approved
+design exists, implementation pauses until the alternatives and trade-offs are
+presented and approved.
 
 ## Implementation and Test Discipline
 
@@ -207,7 +214,7 @@ coverage for newly changed behavior.
 ## Expected Outcome
 
 Agents begin work with an accurate model of the current repository, use a fresh
-CodeGraph index when available, and ground architectural decisions in verified
-boundaries and call paths. Changes include proportionate behavioral coverage,
-keep living documentation synchronized with architectural reality, and finish
-with explicit evidence rather than unsupported completion claims.
+CodeGraph graph only after a successful sync, and ground architectural decisions
+in verified boundaries and call paths. Changes include proportionate behavioral
+coverage, keep living documentation synchronized with architectural reality,
+and finish with explicit evidence rather than unsupported completion claims.
