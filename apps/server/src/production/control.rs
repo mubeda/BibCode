@@ -4086,7 +4086,7 @@ mod tests {
         let added = control
             .update_keybinding(
                 "server.upsertKeybinding",
-                json!({"key":"ctrl+shift+k","command":"terminal.toggle"}),
+                json!({"key":"ctrl+shift+k","command":"terminal.newCenter"}),
             )
             .await
             .expect("keybinding adds");
@@ -4099,7 +4099,7 @@ mod tests {
         let removed = control
             .update_keybinding(
                 "server.removeKeybinding",
-                json!({"key":"ctrl+shift+k","command":"terminal.toggle"}),
+                json!({"key":"ctrl+shift+k","command":"terminal.newCenter"}),
             )
             .await
             .expect("keybinding removes");

@@ -1814,9 +1814,9 @@ describe("ChatView keydown shortcuts", () => {
     expect(inserted).toEqual(["a"]);
   });
 
-  it("terminal.toggle opens a first terminal through the store and server", () => {
+  it("terminal.newCenter opens a first terminal through the store and server", () => {
     const { handler } = renderWithKeydown();
-    h.shortcutCommandByKey.set("F1", "terminal.toggle");
+    h.shortcutCommandByKey.set("F1", "terminal.newCenter");
 
     handler(makeKeyEvent({ key: "F1" }));
 
@@ -1919,7 +1919,7 @@ describe("ChatView keydown shortcuts", () => {
   it("ignores shortcuts while the command palette is open", () => {
     const { handler } = renderWithKeydown();
     h.commandPaletteOpen = true;
-    h.shortcutCommandByKey.set("F1", "terminal.toggle");
+    h.shortcutCommandByKey.set("F1", "terminal.newCenter");
 
     handler(makeKeyEvent({ key: "F1" }));
 

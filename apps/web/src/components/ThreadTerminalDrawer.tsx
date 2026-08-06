@@ -60,7 +60,7 @@ import {
   isTerminalNewShortcut,
   isTerminalSplitShortcut,
   isTerminalSplitVerticalShortcut,
-  isTerminalToggleShortcut,
+  isTerminalNewCenterShortcut,
   terminalClipboardShortcut,
   terminalDeleteShortcutData,
   terminalNavigationShortcutData,
@@ -1161,7 +1161,7 @@ export function TerminalViewport({
       const currentKeybindings = keybindingsRef.current;
       const options = { context: { terminalFocus: true, terminalOpen: true } };
       if (
-        isTerminalToggleShortcut(event, currentKeybindings, options) ||
+        isTerminalNewCenterShortcut(event, currentKeybindings, options) ||
         isTerminalSplitShortcut(event, currentKeybindings, options) ||
         isTerminalSplitVerticalShortcut(event, currentKeybindings, options) ||
         isTerminalNewShortcut(event, currentKeybindings, options) ||
