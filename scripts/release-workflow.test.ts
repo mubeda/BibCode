@@ -39,7 +39,7 @@ it("documents nightly releases as manual-only", () => {
   assert.notInclude(releaseDocumentation, "scheduled nightly");
   assert.notInclude(releaseDocumentation, "every three hours");
   assert.include(releaseDocumentation, "manual stable or nightly releases");
-  assert.include(releaseDocumentation, "Manual nightly releases are GitHub prereleases");
+  assert.match(releaseDocumentation, /manual nightly\s+releases are GitHub prereleases/i);
 });
 
 it("publishes stable updater metadata atomically from a verified draft", () => {
