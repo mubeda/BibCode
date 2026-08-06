@@ -13,7 +13,19 @@ vi.mock("~/components/ui/tooltip", () => ({
 }));
 vi.mock("~/components/ui/menu", () => ({
   DropdownMenu: ({ children }: { children: ReactNode }) => <>{children}</>,
-  DropdownMenuTrigger: (props: React.ComponentProps<"button">) => <button {...props} />,
+  DropdownMenuTrigger: ({
+    children,
+    render,
+    ...props
+  }: React.ComponentProps<"button"> & { render?: ReactNode }) =>
+    render ? (
+      <>
+        {render}
+        {children}
+      </>
+    ) : (
+      <button {...props}>{children}</button>
+    ),
   DropdownMenuContent: ({ children, ...props }: React.ComponentProps<"div">) => (
     <div {...props}>{children}</div>
   ),
