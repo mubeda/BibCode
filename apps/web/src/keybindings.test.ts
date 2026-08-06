@@ -19,7 +19,7 @@ import {
   isTerminalNewShortcut,
   isTerminalSplitShortcut,
   isTerminalSplitVerticalShortcut,
-  isTerminalToggleShortcut,
+  isTerminalNewCenterShortcut,
   resolveShortcutCommand,
   shouldShowModelPickerJumpHints,
   shouldShowThreadJumpHints,
@@ -91,7 +91,7 @@ function compile(bindings: TestBinding[]): ResolvedKeybindingsConfig {
 
 const DEFAULT_BINDINGS = compile([
   { shortcut: modShortcut("b"), command: "sidebar.toggle" },
-  { shortcut: modShortcut("j"), command: "terminal.toggle" },
+  { shortcut: modShortcut("j"), command: "terminal.newCenter" },
   { shortcut: modShortcut("b", { altKey: true }), command: "rightPanel.toggle" },
   {
     shortcut: modShortcut("d"),
@@ -153,10 +153,10 @@ const DEFAULT_BINDINGS = compile([
   },
 ]);
 
-describe("isTerminalToggleShortcut", () => {
+describe("isTerminalNewCenterShortcut", () => {
   it("matches Cmd+J on macOS", () => {
     assert.isTrue(
-      isTerminalToggleShortcut(event({ metaKey: true }), DEFAULT_BINDINGS, {
+      isTerminalNewCenterShortcut(event({ metaKey: true }), DEFAULT_BINDINGS, {
         platform: "MacIntel",
       }),
     );
@@ -164,13 +164,15 @@ describe("isTerminalToggleShortcut", () => {
 
   it("matches Ctrl+J on non-macOS", () => {
     assert.isTrue(
-      isTerminalToggleShortcut(event({ ctrlKey: true }), DEFAULT_BINDINGS, { platform: "Win32" }),
+      isTerminalNewCenterShortcut(event({ ctrlKey: true }), DEFAULT_BINDINGS, {
+        platform: "Win32",
+      }),
     );
   });
 
   it("matches Ctrl+J on non-macOS while terminalFocus is true", () => {
     assert.isTrue(
-      isTerminalToggleShortcut(event({ ctrlKey: true }), DEFAULT_BINDINGS, {
+      isTerminalNewCenterShortcut(event({ ctrlKey: true }), DEFAULT_BINDINGS, {
         platform: "Win32",
         context: { terminalFocus: true },
       }),
@@ -253,7 +255,7 @@ describe("split/new/close terminal shortcuts", () => {
         command: "terminal.new",
         whenAst: whenAnd(whenIdentifier("terminalOpen"), whenNot(whenIdentifier("terminalFocus"))),
       },
-      { shortcut: modShortcut("j"), command: "terminal.toggle" },
+      { shortcut: modShortcut("j"), command: "terminal.newCenter" },
     ]);
     assert.isTrue(
       isTerminalSplitShortcut(event({ key: "\\", ctrlKey: true }), keybindings, {
@@ -745,7 +747,7 @@ describe("resolveShortcutCommand", () => {
     try {
       assert.strictEqual(
         resolveShortcutCommand(event({ key: "j", ctrlKey: true }), DEFAULT_BINDINGS),
-        "terminal.toggle",
+        "terminal.newCenter",
       );
     } finally {
       Object.defineProperty(globalThis, "navigator", {
@@ -923,14 +925,14 @@ describe("terminalNavigationShortcutData", () => {
 
 describe("plus key parsing", () => {
   it("matches the plus key shortcut", () => {
-    const plusBindings = compile([{ shortcut: modShortcut("+"), command: "terminal.toggle" }]);
+    const plusBindings = compile([{ shortcut: modShortcut("+"), command: "terminal.newCenter" }]);
     assert.isTrue(
-      isTerminalToggleShortcut(event({ key: "+", metaKey: true }), plusBindings, {
+      isTerminalNewCenterShortcut(event({ key: "+", metaKey: true }), plusBindings, {
         platform: "MacIntel",
       }),
     );
     assert.isTrue(
-      isTerminalToggleShortcut(event({ key: "+", ctrlKey: true }), plusBindings, {
+      isTerminalNewCenterShortcut(event({ key: "+", ctrlKey: true }), plusBindings, {
         platform: "Linux",
       }),
     );

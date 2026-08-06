@@ -290,7 +290,6 @@ function makeProps(
     resolvedTheme: "dark",
     settings: DEFAULT_UNIFIED_SETTINGS,
     keybindings: emptyKeybindings,
-    terminalOpen: false,
     gitCwd: "/repo",
     promptRef,
     composerAttachmentsRef: { current: [] },

@@ -68,7 +68,7 @@ export const ModelListRow = memo(function ModelListRow(props: {
                   props.preferShortName ? { preferShortName: true } : undefined,
                 )}
           </div>
-          {props.isSelected ? <CheckIcon className="size-3.5 shrink-0 text-blue-400" /> : null}
+          {props.isSelected ? <CheckIcon className="size-3.5 shrink-0 text-primary" /> : null}
           {props.showNewBadge ? (
             <span
               className="shrink-0 rounded border border-amber-500/35 bg-amber-500/15 px-0.5 py-px text-[10px] font-bold uppercase leading-none tracking-wide text-amber-800 dark:border-amber-400/30 dark:bg-amber-400/12 dark:text-amber-200"

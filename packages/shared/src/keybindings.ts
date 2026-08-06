@@ -4,11 +4,10 @@ import {
   type KeybindingWhenNode,
   MAX_KEYBINDINGS_COUNT,
   MAX_WHEN_EXPRESSION_DEPTH,
-  MODEL_PICKER_JUMP_KEYBINDING_COMMANDS,
   type ResolvedKeybindingRule,
   type ResolvedKeybindingsConfig,
-  THREAD_JUMP_KEYBINDING_COMMANDS,
 } from "@bibcode/contracts";
+import shippedKeybindings from "./keybindings.defaults.json" with { type: "json" };
 
 type WhenToken =
   | { type: "identifier"; value: string }
@@ -18,40 +17,7 @@ type WhenToken =
   | { type: "lparen" }
   | { type: "rparen" };
 
-export const DEFAULT_KEYBINDINGS: ReadonlyArray<KeybindingRule> = [
-  { key: "mod+b", command: "sidebar.toggle" },
-  { key: "mod+j", command: "terminal.toggle" },
-  { key: "mod+alt+b", command: "rightPanel.toggle" },
-  { key: "mod+d", command: "terminal.split", when: "terminalFocus" },
-  { key: "mod+shift+d", command: "terminal.splitVertical", when: "terminalFocus" },
-  { key: "mod+n", command: "terminal.new", when: "terminalFocus" },
-  { key: "mod+w", command: "terminal.close", when: "terminalFocus" },
-  { key: "mod+d", command: "diff.toggle", when: "!terminalFocus" },
-  { key: "mod+shift+j", command: "preview.toggle" },
-  { key: "mod+r", command: "preview.refresh", when: "previewFocus" },
-  { key: "mod+l", command: "preview.focusUrl", when: "previewFocus" },
-  { key: "mod+=", command: "preview.zoomIn", when: "previewFocus" },
-  { key: "mod++", command: "preview.zoomIn", when: "previewFocus" },
-  { key: "mod+-", command: "preview.zoomOut", when: "previewFocus" },
-  { key: "mod+0", command: "preview.resetZoom", when: "previewFocus" },
-  { key: "mod+k", command: "commandPalette.toggle", when: "!terminalFocus" },
-  { key: "mod+n", command: "chat.new", when: "!terminalFocus" },
-  { key: "mod+shift+o", command: "chat.new", when: "!terminalFocus" },
-  { key: "mod+shift+n", command: "chat.newLocal", when: "!terminalFocus" },
-  { key: "mod+shift+m", command: "modelPicker.toggle", when: "!terminalFocus" },
-  { key: "mod+o", command: "editor.openFavorite" },
-  { key: "mod+shift+[", command: "thread.previous" },
-  { key: "mod+shift+]", command: "thread.next" },
-  ...THREAD_JUMP_KEYBINDING_COMMANDS.map((command, index) => ({
-    key: `mod+${index + 1}`,
-    command,
-  })),
-  ...MODEL_PICKER_JUMP_KEYBINDING_COMMANDS.map((command, index) => ({
-    key: `mod+${index + 1}`,
-    command,
-    when: "modelPickerOpen",
-  })),
-];
+export const DEFAULT_KEYBINDINGS = shippedKeybindings as ReadonlyArray<KeybindingRule>;
 
 function normalizeKeyToken(token: string): string {
   if (token === "space") return " ";

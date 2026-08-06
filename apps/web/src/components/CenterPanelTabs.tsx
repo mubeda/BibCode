@@ -32,6 +32,7 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from "~/components/ui/menu";
+import { CenterHeaderIconButton } from "./CenterHeaderIconButton";
 import type { CenterPanelTabDragData } from "./centerPanelDnd";
 
 interface CenterPanelTabsProps {
@@ -420,34 +421,28 @@ export function CenterPanelTabs(props: CenterPanelTabsProps) {
         </div>
       </ScrollArea>
       <div
-        className="relative z-10 hidden shrink-0 items-center gap-0.5 border-l border-border/60 bg-background pl-1 group-data-[overflow=true]/tabbar:flex"
+        className="relative z-10 hidden shrink-0 items-center gap-1 border-l border-border/60 bg-background px-1 group-data-[overflow=true]/tabbar:flex"
         data-center-panel-overflow-navigator
       >
-        <button
-          type="button"
+        <CenterHeaderIconButton
           aria-label="Previous tabs"
           title="Previous tabs"
-          className="flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
           onClick={() => scrollTabPage(-1)}
         >
-          <ChevronLeftIcon className="size-3.5" />
-        </button>
-        <button
-          type="button"
+          <ChevronLeftIcon className="size-4" />
+        </CenterHeaderIconButton>
+        <CenterHeaderIconButton
           aria-label="Next tabs"
           title="Next tabs"
-          className="flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
           onClick={() => scrollTabPage(1)}
         >
-          <ChevronRightIcon className="size-3.5" />
-        </button>
+          <ChevronRightIcon className="size-4" />
+        </CenterHeaderIconButton>
         <DropdownMenu>
           <DropdownMenuTrigger
-            aria-label="All tabs"
-            title="All tabs"
-            className="flex size-7 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring/70"
+            render={<CenterHeaderIconButton aria-label="All tabs" title="All tabs" />}
           >
-            <Rows3Icon className="size-3.5" />
+            <Rows3Icon className="size-4" />
           </DropdownMenuTrigger>
           <DropdownMenuContent align="end" className="max-h-80 w-64 overflow-y-auto">
             {props.surfaces.map((surface, surfaceIndex) => {

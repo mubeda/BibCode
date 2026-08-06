@@ -20,7 +20,7 @@ describe("KeybindingsSettings.logic", () => {
     const rows = buildKeybindingRows(
       [
         {
-          command: "terminal.toggle",
+          command: "terminal.newCenter",
           shortcut: {
             key: "j",
             modKey: true,
@@ -40,7 +40,7 @@ describe("KeybindingsSettings.logic", () => {
 
     expect(rows).toEqual([
       expect.objectContaining({
-        command: "terminal.toggle",
+        command: "terminal.newCenter",
         key: "mod+j",
         when: "!terminalFocus",
         defaultKey: "mod+j",
@@ -122,6 +122,7 @@ describe("KeybindingsSettings.logic", () => {
   });
 
   it("formats static and project script command labels", () => {
+    expect(commandLabel("terminal.newCenter")).toBe("New Center Terminal");
     expect(commandLabel("commandPalette.toggle")).toBe("Command Palette: Toggle");
     expect(commandLabel("script.setup-db.run")).toBe("Run Script: Setup Db");
   });
@@ -292,7 +293,7 @@ describe("KeybindingsSettings.logic", () => {
         whenAst: { type: "identifier", name: "terminalOpen" } as const,
       },
       {
-        command: "terminal.toggle",
+        command: "terminal.newCenter",
         shortcut: {
           key: "j",
           modKey: true,

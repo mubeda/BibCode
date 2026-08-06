@@ -32,7 +32,7 @@ const decodeKeybindingCommand = Schema.decodeUnknownSync(KeybindingCommand);
 
 const EXPECTED_STATIC_KEYBINDING_COMMANDS = [
   "sidebar.toggle",
-  "terminal.toggle",
+  "terminal.newCenter",
   "terminal.split",
   "terminal.splitVertical",
   "terminal.new",
@@ -79,13 +79,17 @@ it("anchors every static KeybindingCommand literal", () => {
   );
 });
 
+it("accepts the center-terminal command", () => {
+  assert.strictEqual(decodeKeybindingCommand("terminal.newCenter"), "terminal.newCenter");
+});
+
 it.effect("parses keybinding rules", () =>
   Effect.gen(function* () {
     const parsed = yield* decode(KeybindingRule, {
       key: "mod+j",
-      command: "terminal.toggle",
+      command: "terminal.newCenter",
     });
-    assert.strictEqual(parsed.command, "terminal.toggle");
+    assert.strictEqual(parsed.command, "terminal.newCenter");
 
     const parsedSidebarToggle = yield* decode(KeybindingRule, {
       key: "mod+b",
@@ -167,7 +171,7 @@ it.effect("accepts dynamic script run commands", () =>
 it.effect("parses keybindings array payload", () =>
   Effect.gen(function* () {
     const parsed = yield* decode(KeybindingsConfig, [
-      { key: "mod+j", command: "terminal.toggle" },
+      { key: "mod+j", command: "terminal.newCenter" },
       { key: "mod+d", command: "terminal.split", when: "terminalFocus" },
       { key: "mod+shift+d", command: "terminal.splitVertical", when: "terminalFocus" },
     ]);
@@ -204,7 +208,7 @@ it.effect("parses resolved keybindings arrays", () =>
   Effect.gen(function* () {
     const parsed = yield* decode(ResolvedKeybindingsConfig, [
       {
-        command: "terminal.toggle",
+        command: "terminal.newCenter",
         shortcut: {
           key: "j",
           metaKey: false,
@@ -232,7 +236,7 @@ it.effect("parses resolved keybindings arrays", () =>
 
 it.effect("drops unknown fields in resolved keybinding rules", () =>
   decodeResolvedRule({
-    command: "terminal.toggle",
+    command: "terminal.newCenter",
     shortcut: {
       key: "j",
       metaKey: false,
@@ -246,7 +250,7 @@ it.effect("drops unknown fields in resolved keybinding rules", () =>
     Effect.map((parsed) => {
       const view = parsed as Record<string, unknown>;
       assert.strictEqual("key" in view, false);
-      assert.strictEqual(view.command, "terminal.toggle");
+      assert.strictEqual(view.command, "terminal.newCenter");
     }),
   ),
 );

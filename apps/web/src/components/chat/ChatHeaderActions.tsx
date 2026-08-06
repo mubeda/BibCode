@@ -8,21 +8,30 @@ import {
   type ThreadId,
 } from "@bibcode/contracts";
 import { scopeThreadRef } from "@bibcode/client-runtime/environment";
-import { memo, useState } from "react";
+import { MoreHorizontal } from "lucide-react";
+import { memo } from "react";
 import GitActionsControl from "../GitActionsControl";
 import { type DraftId } from "~/composerDraftStore";
 import { type ProviderInstanceEntry } from "~/providerInstances";
-import ProjectScriptsControl, {
+import { type CenterPaneHeaderDensity } from "../centerPaneHeaderDensity";
+import { CenterHeaderIconButton } from "../CenterHeaderIconButton";
+import {
   type NewProjectScriptInput,
   type ProjectScriptActionResult,
+  ProjectScriptsDialogs,
+  ProjectScriptsExpandedActions,
+  ProjectScriptsMenuItems,
+  useProjectScriptsController,
 } from "../ProjectScriptsControl";
+import { Menu, MenuPopup, MenuSeparator, MenuTrigger } from "../ui/menu";
 import { ChatHeaderPanelMenu } from "./ChatHeaderPanelMenu";
-import { OpenInPicker } from "./OpenInPicker";
+import { OpenInExpandedActions, OpenInMenuItems, useOpenInEditorController } from "./OpenInPicker";
 import { type ProviderTerminalAction } from "./providerTerminalActions";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { cn } from "~/lib/utils";
 
 interface ChatHeaderActionsProps {
+  readonly density: CenterPaneHeaderDensity;
   activeThreadEnvironmentId: EnvironmentId;
   activeThreadId: ThreadId;
   draftId?: DraftId;
@@ -62,6 +71,7 @@ export function shouldShowOpenInPicker(input: {
 }
 
 export const ChatHeaderActions = memo(function ChatHeaderActions({
+  density,
   activeThreadEnvironmentId,
   activeThreadId,
   draftId,
@@ -90,15 +100,34 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
     activeThreadEnvironmentId,
     primaryEnvironmentId,
   });
-  // Bumped to ask ProjectScriptsControl to open its "Add action" dialog — the
-  // entry point that replaces its old bare "+" (now driven from the panel menu).
-  const [addDialogRequestId, setAddDialogRequestId] = useState(0);
+  const projectScripts = useProjectScriptsController({
+    scripts: activeProjectScripts ?? [],
+    keybindings,
+    preferredScriptId,
+    enabled: activeProjectScripts !== undefined,
+    onRunScript: onRunProjectScript,
+    onAddScript: onAddProjectScript,
+    onUpdateScript: onUpdateProjectScript,
+    onDeleteScript: onDeleteProjectScript,
+  });
+  const openInEditor = useOpenInEditorController({
+    environmentId: activeThreadEnvironmentId,
+    keybindings,
+    availableEditors,
+    openInCwd,
+    enableShortcut: showOpenInPicker,
+  });
+  const projectScriptActionsAvailable = activeProjectScripts !== undefined;
+  const openInActionsAvailable = showOpenInPicker && openInEditor.options.length > 0;
+  const compactActionsAvailable = projectScriptActionsAvailable || openInActionsAvailable;
+
   return (
     <div
       data-chat-header-actions
       className={cn(
-        "@container/header-actions relative z-10 flex shrink-0 items-center justify-end gap-2 bg-background @3xl/header-actions:gap-3",
-        reserveTitlebarControls ? "pr-16" : "pr-0",
+        "relative z-10 flex shrink-0 items-center justify-end bg-background [-webkit-app-region:no-drag]",
+        density === "compact" ? "gap-1" : "gap-2 @3xl/header-actions:gap-3",
+        reserveTitlebarControls ? "pr-[4.5rem]" : "pr-2",
       )}
     >
       <ChatHeaderPanelMenu
@@ -108,28 +137,28 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
         onCreateChatPanel={onCreateChatPanel}
         onOpenTerminalPanel={onOpenTerminalPanel}
         onOpenProviderTerminalPanel={onOpenProviderTerminalPanel}
-        onAddCustomAction={() => setAddDialogRequestId((id) => id + 1)}
+        onAddCustomAction={projectScripts.openAddDialog}
       />
-      {activeProjectScripts && (
-        <ProjectScriptsControl
-          scripts={activeProjectScripts}
-          keybindings={keybindings}
-          preferredScriptId={preferredScriptId}
-          addDialogRequestId={addDialogRequestId}
-          onRunScript={onRunProjectScript}
-          onAddScript={onAddProjectScript}
-          onUpdateScript={onUpdateProjectScript}
-          onDeleteScript={onDeleteProjectScript}
-        />
-      )}
-      {showOpenInPicker && (
-        <OpenInPicker
-          environmentId={activeThreadEnvironmentId}
-          keybindings={keybindings}
-          availableEditors={availableEditors}
-          openInCwd={openInCwd}
-        />
-      )}
+      {density === "expanded" ? (
+        <>
+          <ProjectScriptsExpandedActions controller={projectScripts} />
+          {showOpenInPicker ? <OpenInExpandedActions controller={openInEditor} /> : null}
+        </>
+      ) : compactActionsAvailable ? (
+        <Menu>
+          <MenuTrigger render={<CenterHeaderIconButton aria-label="More workspace actions" />}>
+            <MoreHorizontal className="size-4" />
+          </MenuTrigger>
+          <MenuPopup align="end" className="min-w-56">
+            {projectScriptActionsAvailable ? (
+              <ProjectScriptsMenuItems controller={projectScripts} />
+            ) : null}
+            {projectScriptActionsAvailable && openInActionsAvailable ? <MenuSeparator /> : null}
+            {openInActionsAvailable ? <OpenInMenuItems controller={openInEditor} /> : null}
+          </MenuPopup>
+        </Menu>
+      ) : null}
+      <ProjectScriptsDialogs controller={projectScripts} />
       {activeProjectName && (
         <GitActionsControl
           gitCwd={gitCwd}

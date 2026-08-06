@@ -2,6 +2,10 @@ use std::{collections::HashSet, path::Path};
 
 use serde_json::{Value, json};
 
+const DEFAULT_KEYBINDINGS_JSON: &str = include_str!(
+    "../../../../packages/shared/src/keybindings.defaults.json"
+);
+
 #[derive(Debug, Default)]
 pub(crate) struct LoadedKeybindings {
     pub(crate) rules: Vec<Value>,
@@ -12,7 +16,10 @@ pub(crate) async fn load(path: &Path) -> LoadedKeybindings {
     let bytes = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return LoadedKeybindings::default();
+            return LoadedKeybindings {
+                rules: default_rules(),
+                issues: Vec::new(),
+            };
         }
         Err(error) => return malformed(error.to_string()),
     };
@@ -22,7 +29,7 @@ pub(crate) async fn load(path: &Path) -> LoadedKeybindings {
     };
 
     let mut loaded = LoadedKeybindings::default();
-    for (index, rule) in entries.into_iter().enumerate() {
+    for (index, rule) in entries.into_iter().map(normalize_legacy_commands).enumerate() {
         match validate(&rule, false) {
             Ok(()) => loaded.rules.push(rule),
             Err(message) => loaded.issues.push(json!({
@@ -33,6 +40,23 @@ pub(crate) async fn load(path: &Path) -> LoadedKeybindings {
         }
     }
     loaded
+}
+
+fn default_rules() -> Vec<Value> {
+    serde_json::from_str(DEFAULT_KEYBINDINGS_JSON)
+        .expect("embedded default keybindings must be valid JSON")
+}
+
+fn normalize_legacy_commands(mut rule: Value) -> Value {
+    if let Some(object) = rule.as_object_mut() {
+        if object.get("command").and_then(Value::as_str) == Some("terminal.toggle") {
+            object.insert("command".to_owned(), json!("terminal.newCenter"));
+        }
+        if let Some(replace) = object.remove("replace") {
+            object.insert("replace".to_owned(), normalize_legacy_commands(replace));
+        }
+    }
+    rule
 }
 
 fn malformed(message: String) -> LoadedKeybindings {
@@ -210,6 +234,31 @@ fn split_condition<'a>(input: &'a str, operator: &str) -> Option<(&'a str, &'a s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_terminal_toggle_is_normalized_recursively() {
+        let rule = json!({
+            "key": "alt+j",
+            "command": "terminal.toggle",
+            "when": "!terminalFocus",
+            "replace": {
+                "key": "mod+j",
+                "command": "terminal.toggle"
+            }
+        });
+        assert_eq!(
+            normalize_legacy_commands(rule),
+            json!({
+                "key": "alt+j",
+                "command": "terminal.newCenter",
+                "when": "!terminalFocus",
+                "replace": {
+                    "key": "mod+j",
+                    "command": "terminal.newCenter"
+                }
+            })
+        );
+    }
 
     #[test]
     fn condition_parser_respects_nested_precedence_negation_and_balance() {

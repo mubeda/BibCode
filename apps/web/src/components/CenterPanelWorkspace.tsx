@@ -13,8 +13,10 @@ import {
   type Over,
 } from "@dnd-kit/core";
 import {
+  forwardRef,
   useCallback,
   useEffect,
+  useImperativeHandle,
   useRef,
   useState,
   type CSSProperties,
@@ -22,6 +24,7 @@ import {
 } from "react";
 
 import {
+  MAX_CENTER_PANEL_GROUPS,
   canDropCenterPanelSurface,
   findCenterPanelGroup,
   findCenterPanelGroupForSurface,
@@ -45,6 +48,7 @@ import {
   type CenterPanelTabRect,
 } from "./centerPanelDnd";
 import { CenterPanelSplitLayout } from "./CenterPanelSplitLayout";
+import type { CenterPaneHeaderDensity } from "./centerPaneHeaderDensity";
 import {
   CenterPanelSurfaceHosts,
   type CenterPanelSurfaceHostsHandle,
@@ -57,7 +61,7 @@ export interface CenterPanelWorkspaceProps {
   readonly state: ThreadCenterPanelState;
   readonly hostLabel: string;
   readonly terminalLabelsById?: ReadonlyMap<string, string>;
-  readonly focusedActions: ReactNode;
+  readonly renderFocusedActions: (density: CenterPaneHeaderDensity) => ReactNode;
   readonly renderSurface: (
     surface: CenterSurface,
     context: CenterPanelSurfaceRenderContext,
@@ -71,6 +75,10 @@ export interface CenterPanelWorkspaceProps {
   readonly onDropSurface: (surfaceId: string, target: CenterPanelDropRequest) => void;
   readonly onMergeGroup: (groupId: string) => void;
   readonly onSetSplitRatio: (path: CenterPanelLayoutPath, ratio: number) => void;
+}
+
+export interface CenterPanelWorkspaceHandle {
+  canSplitGroup(groupId: string, direction: "right" | "down"): boolean;
 }
 
 interface TabSnapshot {
@@ -241,7 +249,10 @@ function previewStyle(
   };
 }
 
-export function CenterPanelWorkspace(props: CenterPanelWorkspaceProps) {
+export const CenterPanelWorkspace = forwardRef<
+  CenterPanelWorkspaceHandle,
+  CenterPanelWorkspaceProps
+>(function CenterPanelWorkspace(props, ref) {
   const targets = useCenterPanelBodyTargets();
   const surfaceHostsRef = useRef<CenterPanelSurfaceHostsHandle>(null);
   const workspaceElementRef = useRef<HTMLDivElement | null>(null);
@@ -406,6 +417,21 @@ export function CenterPanelWorkspace(props: CenterPanelWorkspaceProps) {
     },
     [resolveIntent, setChangedPreview],
   );
+  const canSplitGroup = useCallback(
+    (groupId: string, direction: "right" | "down"): boolean => {
+      const currentProps = propsRef.current;
+      if (
+        !findCenterPanelGroup(currentProps.state, groupId) ||
+        currentProps.state.groups.length >= MAX_CENTER_PANEL_GROUPS
+      ) {
+        return false;
+      }
+      const rect = targets.readBodyRect(groupId);
+      return rect !== null && canCenterPanelPaneSplit(rect, direction);
+    },
+    [targets.readBodyRect],
+  );
+  useImperativeHandle(ref, () => ({ canSplitGroup }), [canSplitGroup]);
   const canMoveToSplit = useCallback(
     (groupId: string, direction: CenterPanelSplitDirection): boolean => {
       const currentProps = propsRef.current;
@@ -536,7 +562,7 @@ export function CenterPanelWorkspace(props: CenterPanelWorkspaceProps) {
           hostLabel={props.hostLabel}
           {...(props.terminalLabelsById ? { terminalLabelsById: props.terminalLabelsById } : {})}
           dragInProgress={active !== null}
-          focusedActions={props.focusedActions}
+          renderFocusedActions={props.renderFocusedActions}
           registerBodyTarget={targets.registerBodyTarget}
           onResizeFrame={syncSurfaceRects}
           onFocusGroup={props.onFocusGroup}
@@ -565,4 +591,4 @@ export function CenterPanelWorkspace(props: CenterPanelWorkspaceProps) {
       </div>
     </DndContext>
   );
-}
+});

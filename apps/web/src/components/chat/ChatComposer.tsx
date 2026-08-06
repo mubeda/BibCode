@@ -133,6 +133,7 @@ import {
 } from "../../lib/contextWindow";
 import { useMediaQuery } from "../../hooks/useMediaQuery";
 import type { ReviewCommentContext } from "../../reviewCommentContext";
+import { useThreadHasTerminalSurface } from "../../terminalSurfaceState";
 
 const ATTACHMENT_SIZE_LIMIT_LABEL = `${Math.round(PROVIDER_SEND_TURN_MAX_ATTACHMENT_BYTES / (1024 * 1024))}MB`;
 
@@ -461,7 +462,7 @@ export interface ChatComposerHandle {
     prompt?: string;
     detectTrigger?: boolean;
   }) => void;
-  /** Insert a terminal context from the terminal drawer. */
+  /** Insert a terminal context from a supported terminal surface. */
   addTerminalContext: (selection: TerminalContextSelection) => boolean;
   /** Get the current prompt/effort/model state for use in send. */
   getSendContext: () => {
@@ -558,7 +559,6 @@ export interface ChatComposerProps {
   resolvedTheme: "light" | "dark";
   settings: UnifiedSettings;
   keybindings: ResolvedKeybindingsConfig;
-  terminalOpen: boolean;
   gitCwd: string | null;
 
   // Refs the parent needs kept in sync
@@ -651,7 +651,6 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     resolvedTheme,
     settings,
     keybindings,
-    terminalOpen,
     gitCwd,
     promptRef,
     composerRef,
@@ -678,6 +677,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     onExpandImage,
   } = props;
   const isProviderBindingConflicted = providerBindingConflictReason !== null;
+  const terminalOpen = useThreadHasTerminalSurface(routeThreadRef);
 
   // ------------------------------------------------------------------
   // Store subscriptions (prompt / attachments / terminal contexts)

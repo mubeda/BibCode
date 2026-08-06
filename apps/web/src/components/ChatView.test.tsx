@@ -6,7 +6,7 @@
  * ChatView is a very large route component; these tests render it through
  * `renderToStaticMarkup` (no DOM, per web test conventions) with the heavy
  * state/atom modules and child components replaced by prop-capturing mocks.
- * Real zustand stores (composer drafts, right/center panel, terminal ui) are
+ * Real zustand stores (composer drafts and right/center panels) are
  * seeded directly so the component's derivation pipeline runs against
  * realistic state. Handler props captured from mocked children are then
  * invoked to exercise the send/interrupt/approval command flows.
@@ -100,6 +100,8 @@ const h = vi.hoisted(() => {
     activityPanelRenderProps: [] as unknown[],
     environmentSettingsById: new Map<string, Record<string, unknown>>(),
     settingsListeners: new Set<() => void>(),
+    centerHeaderDensityByGroupId: new Map<string, "expanded" | "compact">(),
+    chatHeaderActionsInstanceCount: 0,
   };
 });
 
@@ -390,8 +392,15 @@ vi.mock("./chat/MessagesTimeline", () => ({
 
 vi.mock("./chat/ChatHeaderActions", () => ({
   ChatHeaderActions: (props: Record<string, unknown>) => {
+    const [instanceId] = useState(() => ++h.chatHeaderActionsInstanceCount);
     h.captured["chatHeaderActions"] = props;
-    return <div data-mock="chat-header-actions" />;
+    return (
+      <div
+        data-mock="chat-header-actions"
+        data-density={String(props["density"])}
+        data-instance-id={instanceId}
+      />
+    );
   },
 }));
 
@@ -449,10 +458,21 @@ vi.mock("./PlanSidebar", () => ({
   },
 }));
 
-vi.mock("./ThreadTerminalDrawer", () => ({
+vi.mock("./ThreadTerminalPanel", () => ({
   default: (props: Record<string, unknown>) => {
-    h.captured["threadTerminalDrawer"] = props;
-    return <div data-mock="thread-terminal-drawer" data-mode={String(props["mode"] ?? "drawer")} />;
+    h.captured["threadTerminalPanel"] = props;
+    return <div data-mock="thread-terminal-panel" data-owner={String(props["owner"] ?? "")} />;
+  },
+  enqueueTerminalInput: (input: {
+    data: string;
+    write: (data: string) => Promise<{ _tag: string; cause?: unknown }>;
+    onWriteError?: (error: unknown) => void;
+  }) => {
+    void input.write(input.data).then((result) => {
+      if (result._tag === "Failure") {
+        input.onWriteError?.(result.cause);
+      }
+    });
   },
   releaseTerminalInputScheduler: (environmentId: string, threadId: string, terminalId: string) => {
     h.releasedTerminalInputs.push({ environmentId, threadId, terminalId });
@@ -477,7 +497,15 @@ vi.mock("./CenterPanelWorkspace", () => ({
     const visibleIds = new Set(state.groups.flatMap((group) => group.activeSurfaceId ?? []));
     return (
       <div data-mock="center-panel-workspace">
-        {props["focusedActions"] as ReactNode}
+        {state.groups.map((group) => (
+          <div key={group.id} data-mock-center-header={group.id}>
+            {group.id === state.focusedGroupId
+              ? (props["renderFocusedActions"] as (density: "expanded" | "compact") => ReactNode)(
+                  h.centerHeaderDensityByGroupId.get(group.id) ?? "compact",
+                )
+              : null}
+          </div>
+        ))}
         {state.surfaces
           .filter((surface) => surface.id === "chat:host" || visibleIds.has(surface.id))
           .map((surface) => {
@@ -619,7 +647,6 @@ import type { Project, Thread } from "../types";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { useRightPanelStore } from "../rightPanelStore";
 import { HOST_SURFACE_ID, useCenterPanelStore } from "../centerPanelStore";
-import { useTerminalUiStateStore } from "../terminalUiStateStore";
 import { useUiStateStore } from "../uiStateStore";
 import { useDiffPanelStore } from "../diffPanelStore";
 import { useActivityDockStore } from "../activityDockStore";
@@ -806,7 +833,6 @@ const resettableStores: ReadonlyArray<{ store: ResettableStore; pristine: object
   useComposerDraftStore,
   useRightPanelStore,
   useCenterPanelStore,
-  useTerminalUiStateStore,
   useUiStateStore,
   useDiffPanelStore,
   useActivityDockStore,
@@ -870,6 +896,8 @@ beforeEach(() => {
   h.activityPanelRenderProps = [];
   h.environmentSettingsById.clear();
   h.settingsListeners.clear();
+  h.centerHeaderDensityByGroupId.clear();
+  h.chatHeaderActionsInstanceCount = 0;
 
   for (const { store, pristine } of resettableStores) {
     store.setState({ ...pristine }, true);
@@ -2879,7 +2907,7 @@ describe("ChatView", () => {
 
       const workspace = capturedProps<Record<string, unknown>>("centerWorkspace");
       expect(workspace["hostLabel"]).toBe("Codex");
-      expect(workspace["focusedActions"]).toBeDefined();
+      expect(workspace["renderFocusedActions"]).toBeTypeOf("function");
       expect(capturedProps<Record<string, unknown>>("chatHeaderActions")).not.toHaveProperty(
         "activeThreadTitle",
       );
@@ -2897,21 +2925,140 @@ describe("ChatView", () => {
       expect(activeThread.latestTurn).toBeNull();
 
       const header = capturedProps<Record<string, unknown>>("chatHeaderActions");
+      expect(header["density"]).toBe("compact");
       expect(header["activeThreadId"]).toBe(threadId);
       expect(header["activeProjectName"]).toBe("Demo Project");
       expect(header["canCreatePanel"]).toBe(true);
 
       const panelControls = capturedProps<Record<string, unknown>>("panelLayoutControls");
-      expect(panelControls["terminalAvailable"]).toBe(true);
+      expect(panelControls).not.toHaveProperty("terminalAvailable");
+      expect(panelControls).not.toHaveProperty("terminalOpen");
+      expect(panelControls).not.toHaveProperty("onToggleTerminal");
       expect(panelControls["rightPanelAvailable"]).toBe(true);
       expect(panelControls["rightPanelOpen"]).toBe(false);
       expect(markup.match(/data-mock="panel-layout-controls"/g)).toHaveLength(1);
+      expect(markup).not.toContain("panel-bottom");
       expect(workspace).not.toHaveProperty("panelLayoutControls");
 
       const bannerStack = capturedProps<{ items: ComposerBannerStackItem[] }>(
         "composerBannerStack",
       );
       expect(bannerStack.items).toEqual([]);
+    });
+
+    it("renders one focused header owner with the focused group's local density", async () => {
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      useCenterPanelStore.setState({
+        byThreadKey: {
+          [scopedThreadKey(threadRef)]: {
+            surfaces: [
+              { id: HOST_SURFACE_ID, kind: "chat-host" },
+              { id: "terminal:term-right", kind: "terminal", terminalId: "term-right" },
+            ],
+            groups: [
+              {
+                id: "group-left",
+                surfaceIds: [HOST_SURFACE_ID],
+                activeSurfaceId: HOST_SURFACE_ID,
+              },
+              {
+                id: "group-right",
+                surfaceIds: ["terminal:term-right"],
+                activeSurfaceId: "terminal:term-right",
+              },
+            ],
+            layout: {
+              type: "split",
+              direction: "horizontal",
+              ratio: 0.5,
+              first: { type: "leaf", groupId: "group-left" },
+              second: { type: "leaf", groupId: "group-right" },
+            },
+            focusedGroupId: "group-left",
+          },
+        },
+      });
+      h.centerHeaderDensityByGroupId.set("group-left", "expanded");
+      h.centerHeaderDensityByGroupId.set("group-right", "compact");
+
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      Object.defineProperty(Element.prototype, "getAnimations", {
+        configurable: true,
+        value: () => [],
+      });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      const renderView = () => (
+        <ChatView
+          environmentId={environmentId}
+          threadId={threadId}
+          routeKind="server"
+          reserveTitleBarControlInset
+        />
+      );
+
+      try {
+        await act(async () => {
+          root.render(renderView());
+          await Promise.resolve();
+        });
+
+        const leftHeader = container.querySelector('[data-mock-center-header="group-left"]');
+        const rightHeader = container.querySelector('[data-mock-center-header="group-right"]');
+        const expandedActions = leftHeader?.querySelector('[data-mock="chat-header-actions"]');
+        expect(expandedActions?.getAttribute("data-density")).toBe("expanded");
+        expect(rightHeader?.querySelector('[data-mock="chat-header-actions"]')).toBeNull();
+        expect(container.querySelectorAll('[data-mock="chat-header-actions"]')).toHaveLength(1);
+        expect(
+          capturedProps<{ reserveTitlebarControls: boolean }>("chatHeaderActions")
+            .reserveTitlebarControls,
+        ).toBe(false);
+        const expandedInstanceId = expandedActions?.getAttribute("data-instance-id");
+
+        h.centerHeaderDensityByGroupId.set("group-left", "compact");
+        await act(async () => {
+          root.render(renderView());
+          await Promise.resolve();
+        });
+
+        const compactActions = container.querySelector(
+          '[data-mock-center-header="group-left"] [data-mock="chat-header-actions"]',
+        );
+        expect(compactActions?.getAttribute("data-density")).toBe("compact");
+        expect(compactActions?.getAttribute("data-instance-id")).toBe(expandedInstanceId);
+        expect(h.chatHeaderActionsInstanceCount).toBe(1);
+
+        await act(async () => {
+          useCenterPanelStore.getState().focusGroup(threadRef, "group-right");
+          await Promise.resolve();
+        });
+
+        expect(
+          container.querySelector(
+            '[data-mock-center-header="group-left"] [data-mock="chat-header-actions"]',
+          ),
+        ).toBeNull();
+        expect(
+          container
+            .querySelector(
+              '[data-mock-center-header="group-right"] [data-mock="chat-header-actions"]',
+            )
+            ?.getAttribute("data-density"),
+        ).toBe("compact");
+        expect(container.querySelectorAll('[data-mock="chat-header-actions"]')).toHaveLength(1);
+        expect(
+          capturedProps<{ reserveTitlebarControls: boolean }>("chatHeaderActions")
+            .reserveTitlebarControls,
+        ).toBe(true);
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
     });
 
     it("does not reserve titlebar controls for a focused left center group", () => {
@@ -3386,8 +3533,8 @@ describe("ChatView", () => {
       expect(markup).toContain('data-mock="chat-header-actions"');
       expect(markup).toContain('data-mock="center-panel-workspace"');
       expect(
-        capturedProps<Record<string, unknown>>("centerWorkspace")["focusedActions"],
-      ).toBeDefined();
+        capturedProps<Record<string, unknown>>("centerWorkspace")["renderFocusedActions"],
+      ).toBeTypeOf("function");
     });
 
     it("keeps ordinary chat and terminal launches available after activity is downgraded", async () => {
@@ -3762,14 +3909,16 @@ describe("ChatView", () => {
       const markup = renderServerRoute();
 
       expect(markup).toContain('data-mock="right-panel-tabs"');
-      expect(markup).toContain('data-mock="thread-terminal-drawer"');
-      expect(markup).toContain('data-mode="panel"');
+      expect(markup).toContain('data-mock="thread-terminal-panel"');
+      expect(capturedProps<Record<string, unknown>>("threadTerminalPanel")["owner"]).toBe(
+        "right-panel",
+      );
 
-      const drawer = capturedProps<Record<string, unknown>>("threadTerminalDrawer");
-      expect(drawer["terminalIds"]).toEqual(["term-1"]);
-      expect(drawer["activeTerminalId"]).toBe("term-1");
-      expect(drawer["cwd"]).toBe("X:/demo");
-      const labels = drawer["terminalLabelsById"] as ReadonlyMap<string, string>;
+      const panel = capturedProps<Record<string, unknown>>("threadTerminalPanel");
+      expect(panel["terminalIds"]).toEqual(["term-1"]);
+      expect(panel["activeTerminalId"]).toBe("term-1");
+      expect(panel["cwd"]).toBe("X:/demo");
+      const labels = panel["terminalLabelsById"] as ReadonlyMap<string, string>;
       expect(labels.get("term-1")).toBe("Build shell");
     });
 
@@ -3789,8 +3938,8 @@ describe("ChatView", () => {
       h.commandResults["terminal.close"] = () => AsyncResult.success(undefined);
 
       renderServerRoute();
-      const drawer = capturedProps<Record<string, unknown>>("threadTerminalDrawer");
-      const onCloseTerminal = drawer["onCloseTerminal"] as (terminalId: string) => void;
+      const panel = capturedProps<Record<string, unknown>>("threadTerminalPanel");
+      const onCloseTerminal = panel["onCloseTerminal"] as (terminalId: string) => void;
       onCloseTerminal("term-1");
       await Promise.resolve();
       await Promise.resolve();
@@ -3798,7 +3947,7 @@ describe("ChatView", () => {
       expect(h.releasedTerminalInputs).toEqual([{ environmentId, threadId, terminalId: "term-1" }]);
     });
 
-    it("retains terminal input state when close fails", async () => {
+    it("falls back to exit and retains terminal input state when close fails", async () => {
       seedEnvironment(makeEnvironmentPresentation());
       seedProject(makeProject());
       seedServerThread(makeThread());
@@ -3815,13 +3964,20 @@ describe("ChatView", () => {
         AsyncResult.failure(Cause.fail(new Error("close rejected")));
 
       renderServerRoute();
-      const drawer = capturedProps<Record<string, unknown>>("threadTerminalDrawer");
-      const onCloseTerminal = drawer["onCloseTerminal"] as (terminalId: string) => void;
-      onCloseTerminal("term-1");
-      await Promise.resolve();
-      await Promise.resolve();
+      const panel = capturedProps<Record<string, unknown>>("threadTerminalPanel");
+      const onCloseTerminal = panel["onCloseTerminal"] as (terminalId: string) => Promise<unknown>;
+      await expect(onCloseTerminal("term-1")).resolves.toBe("exit-fallback");
 
       expect(h.releasedTerminalInputs).toEqual([]);
+      expect(h.commandCalls.filter((call) => call.key === "terminal.write")).toEqual([
+        {
+          key: "terminal.write",
+          input: {
+            environmentId,
+            input: { threadId, terminalId: "term-1", data: "exit\n" },
+          },
+        },
+      ]);
     });
   });
 

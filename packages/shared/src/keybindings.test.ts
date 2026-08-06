@@ -237,12 +237,12 @@ describe("compileResolvedKeybindingsConfig", () => {
   it("compiles valid rules and drops the invalid ones", () => {
     const config: ReadonlyArray<KeybindingRule> = [
       { key: "mod+b", command: "sidebar.toggle" },
-      { key: "a+b", command: "terminal.toggle" },
+      { key: "a+b", command: "terminal.newCenter" },
       { key: "mod+d", command: "terminal.split", when: "@bad" },
-      { key: "mod+j", command: "terminal.toggle" },
+      { key: "mod+j", command: "terminal.newCenter" },
     ];
     const compiled = compileResolvedKeybindingsConfig(config);
-    expect(compiled.map((rule) => rule.command)).toEqual(["sidebar.toggle", "terminal.toggle"]);
+    expect(compiled.map((rule) => rule.command)).toEqual(["sidebar.toggle", "terminal.newCenter"]);
   });
 
   it("returns an empty config when every rule is invalid", () => {
@@ -253,12 +253,12 @@ describe("compileResolvedKeybindingsConfig", () => {
   it("preserves conflicting shortcuts in declaration order", () => {
     const config: ReadonlyArray<KeybindingRule> = [
       { key: "mod+b", command: "sidebar.toggle" },
-      { key: "mod+b", command: "terminal.toggle" },
+      { key: "mod+b", command: "terminal.newCenter" },
     ];
 
     expect(compileResolvedKeybindingsConfig(config).map((rule) => rule.command)).toEqual([
       "sidebar.toggle",
-      "terminal.toggle",
+      "terminal.newCenter",
     ]);
   });
 
@@ -277,6 +277,13 @@ describe("compileResolvedKeybindingsConfig", () => {
 });
 
 describe("DEFAULT_KEYBINDINGS", () => {
+  it("opens a new center terminal from mod+j", () => {
+    expect(DEFAULT_KEYBINDINGS).toContainEqual({
+      key: "mod+j",
+      command: "terminal.newCenter",
+    });
+  });
+
   it("includes the thread jump and model picker jump bindings", () => {
     expect(DEFAULT_KEYBINDINGS.some((rule) => rule.command === "thread.jump.1")).toBe(true);
     expect(

@@ -6,7 +6,7 @@ import type { TerminalContextSelection } from "~/lib/terminalContext";
 import type { CenterSurface } from "~/centerPanelStore";
 import { useKnownTerminalSessions } from "~/state/terminalSessions";
 
-import ThreadTerminalDrawer from "./ThreadTerminalDrawer";
+import ThreadTerminalPanel from "./ThreadTerminalPanel";
 
 interface CenterTerminalPanelProps {
   /** The HOST thread ref — center terminals reuse the host thread's attach layer. */
@@ -30,8 +30,7 @@ const noop = () => undefined;
 /**
  * Thin center-area host for a single terminal, tied to the host thread.
  *
- * The xterm view + attach layer already work outside the bottom drawer via
- * `<ThreadTerminalDrawer mode="panel">` (see research-ui.md §4). This resolves
+ * The xterm view + attach layer are owned by `ThreadTerminalPanel`. This resolves
  * cwd/worktree/runtimeEnv from the host thread's project — the same derivation
  * as ChatView's PersistentThreadTerminalPanel, which is kept private to that
  * file to avoid a ChatView↔CenterTerminalPanel import cycle. This component
@@ -68,15 +67,14 @@ export function CenterTerminalPanel({
   if (launchContext === null) return null;
 
   return (
-    <ThreadTerminalDrawer
-      mode="panel"
+    <ThreadTerminalPanel
+      owner="center-panel"
       threadRef={threadRef}
       threadId={threadRef.threadId}
       projectId={projectId}
       cwd={launchContext.cwd}
       worktreePath={launchContext.worktreePath}
       runtimeEnv={launchContext.runtimeEnv}
-      height={0}
       terminalIds={[terminalId]}
       activeTerminalId={terminalId}
       terminalGroups={[{ id: `terminal:${terminalId}`, terminalIds: [terminalId] }]}
@@ -84,7 +82,6 @@ export function CenterTerminalPanel({
       focusRequestId={focusRequestId}
       onActiveTerminalChange={noop}
       onCloseTerminal={onClose}
-      onHeightChange={noop}
       onAddTerminalContext={onAddTerminalContext}
       terminalLabelsById={terminalLabelsById}
       {...(terminalCommandsById ? { terminalCommandsById } : {})}

@@ -54,7 +54,8 @@ const h = vi.hoisted(() => {
     refreshArchived: vi.fn(),
     clearDraftThread: vi.fn(),
     clearProjectDraftThreadById: vi.fn(),
-    clearTerminalUiState: vi.fn(),
+    removeCenterPanelThread: vi.fn(),
+    removeRightPanelThread: vi.fn(),
     toastAdd: vi.fn(),
   };
   return state;
@@ -115,9 +116,16 @@ vi.mock("../composerDraftStore", () => ({
     }),
 }));
 
-vi.mock("../terminalUiStateStore", () => ({
-  useTerminalUiStateStore: (selector: (state: unknown) => unknown) =>
-    selector({ clearTerminalUiState: h.clearTerminalUiState }),
+vi.mock("../centerPanelStore", () => ({
+  useCenterPanelStore: {
+    getState: () => ({ removeThread: h.removeCenterPanelThread }),
+  },
+}));
+
+vi.mock("../rightPanelStore", () => ({
+  useRightPanelStore: {
+    getState: () => ({ removeThread: h.removeRightPanelThread }),
+  },
 }));
 
 vi.mock("./useSettings", () => ({
@@ -161,6 +169,8 @@ vi.mock("../components/ui/toast", () => ({
 }));
 
 import { ThreadArchiveBlockedError, useThreadActions } from "./useThreadActions";
+import { useCenterPanelStore } from "../centerPanelStore";
+import { useRightPanelStore } from "../rightPanelStore";
 
 // ── fixtures ──────────────────────────────────────────────────────────────────
 
@@ -281,7 +291,8 @@ beforeEach(() => {
   h.refreshArchived.mockReset();
   h.clearDraftThread.mockReset();
   h.clearProjectDraftThreadById.mockReset();
-  h.clearTerminalUiState.mockReset();
+  h.removeCenterPanelThread.mockReset();
+  h.removeRightPanelThread.mockReset();
   h.toastAdd.mockReset();
 });
 
@@ -406,10 +417,13 @@ describe("unarchiveThread", () => {
 describe("deleteThread", () => {
   it("dispatches a direct delete for a thread missing from the store", async () => {
     const actions = renderActions();
-    const result = await actions.deleteThread(scopeThreadRef(ENV, ThreadId.make("archived-1")));
+    const ref = scopeThreadRef(ENV, ThreadId.make("archived-1"));
+    const result = await actions.deleteThread(ref);
     expect(result._tag).toBe("Success");
     expect(commandKeys()).toEqual(["thread.delete"]);
     expect(h.refreshArchived).toHaveBeenCalledWith(ENV);
+    expect(useCenterPanelStore.getState().removeThread).toHaveBeenCalledWith(ref);
+    expect(useRightPanelStore.getState().removeThread).toHaveBeenCalledWith(ref);
   });
 
   it("returns the direct-delete failure without refreshing", async () => {
@@ -418,9 +432,11 @@ describe("deleteThread", () => {
     const result = await actions.deleteThread(scopeThreadRef(ENV, ThreadId.make("archived-1")));
     expect(result._tag).toBe("Failure");
     expect(h.refreshArchived).not.toHaveBeenCalled();
+    expect(useCenterPanelStore.getState().removeThread).not.toHaveBeenCalled();
+    expect(useRightPanelStore.getState().removeThread).not.toHaveBeenCalled();
   });
 
-  it("stops a running session, closes the terminal, then deletes and clears state", async () => {
+  it("stops a running session, closes the terminal, then deletes and clears supported state", async () => {
     const shell = makeShell("t-del", { session: makeSession({ status: "running" }) });
     const ref = registerShell(shell);
     const actions = renderActions();
@@ -431,7 +447,8 @@ describe("deleteThread", () => {
     expect(h.refreshArchived).toHaveBeenCalledWith(ENV);
     expect(h.clearDraftThread).toHaveBeenCalledWith(ref);
     expect(h.clearProjectDraftThreadById).toHaveBeenCalled();
-    expect(h.clearTerminalUiState).toHaveBeenCalledWith(ref);
+    expect(useCenterPanelStore.getState().removeThread).toHaveBeenCalledWith(ref);
+    expect(useRightPanelStore.getState().removeThread).toHaveBeenCalledWith(ref);
   });
 
   it("skips stopping the session when it is already stopped", async () => {
@@ -470,6 +487,8 @@ describe("deleteThread", () => {
     const result = await actions.deleteThread(ref);
     expect(result._tag).toBe("Failure");
     expect(h.refreshArchived).not.toHaveBeenCalled();
+    expect(useCenterPanelStore.getState().removeThread).not.toHaveBeenCalled();
+    expect(useRightPanelStore.getState().removeThread).not.toHaveBeenCalled();
   });
 
   it("does not delete the thread or worktree when terminal teardown fails", async () => {
@@ -610,6 +629,11 @@ describe("deleteThread", () => {
       .filter((call) => call.key === "thread.delete")
       .map((call) => (call.input as { input: { threadId: ThreadId } }).input.threadId);
     expect(deletedThreadIds).toEqual([panel.id, workspace.id]);
+    const panelRef = scopeThreadRef(ENV, panel.id);
+    expect(useCenterPanelStore.getState().removeThread).toHaveBeenNthCalledWith(1, panelRef);
+    expect(useCenterPanelStore.getState().removeThread).toHaveBeenNthCalledWith(2, workspaceRef);
+    expect(useRightPanelStore.getState().removeThread).toHaveBeenNthCalledWith(1, panelRef);
+    expect(useRightPanelStore.getState().removeThread).toHaveBeenNthCalledWith(2, workspaceRef);
     expect(commandKeys().indexOf("vcs.removeWorktree")).toBeLessThan(
       commandKeys().indexOf("thread.delete"),
     );

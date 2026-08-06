@@ -101,13 +101,36 @@ class FakeResizeObserver {
   }
 }
 
+function emitHeaderWidth(width: number): void {
+  const observer = resizeObservers.find((candidate) =>
+    [...candidate.observed].some(
+      (element) =>
+        element.hasAttribute("data-center-panel-group-header") &&
+        element.closest("[data-center-panel-group]")?.getAttribute("data-focused") === "true",
+    ),
+  );
+  if (!observer) throw new Error("Center header ResizeObserver was not installed");
+  act(() => {
+    observer.callback(
+      [{ contentRect: { width } as DOMRectReadOnly } as ResizeObserverEntry],
+      observer as unknown as ResizeObserver,
+    );
+  });
+}
+
+const renderFocusedActions: CenterPanelSplitLayoutProps["renderFocusedActions"] = (density) => (
+  <button type="button" data-density={density}>
+    New panel
+  </button>
+);
+
 function input(state: ThreadCenterPanelState = threeLeafState): CenterPanelSplitLayoutProps {
   return {
     state,
     hostLabel: "Codex",
     terminalLabelsById: new Map([["term-c", "Build terminal"]]),
     dragInProgress: false,
-    focusedActions: <button type="button">New panel</button>,
+    renderFocusedActions,
     registerBodyTarget: (groupId) => (node) => {
       if (node) node.dataset.registeredBodyTarget = groupId;
     },
@@ -191,13 +214,38 @@ function dispatchKey(target: Element, key: string): void {
 }
 
 describe("CenterPanelSplitLayout", () => {
+  it("renders compact actions for a narrow focused pane", async () => {
+    await renderLayout(input());
+    emitHeaderWidth(420);
+    const compactAction = container.querySelector("[data-density='compact']");
+    const paneMenu = container.querySelector('[aria-label="Pane actions"]');
+    expect(compactAction).not.toBeNull();
+    expect(paneMenu?.compareDocumentPosition(compactAction!) ?? 0).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+
+  it("renders expanded actions for a wide focused pane", async () => {
+    await renderLayout(input());
+    emitHeaderWidth(800);
+    const expandedAction = container.querySelector("[data-density='expanded']");
+    const paneMenu = container.querySelector('[aria-label="Pane actions"]');
+    expect(expandedAction).not.toBeNull();
+    expect(paneMenu?.compareDocumentPosition(expandedAction!) ?? 0).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+
   it("keeps the top-right titlebar reservation after every pane action", async () => {
     const topRightActions = (
       <div data-chat-header-actions className="pr-16">
         Header actions
       </div>
     );
-    await renderLayout({ ...input(threeLeafState), focusedActions: topRightActions });
+    await renderLayout({
+      ...input(threeLeafState),
+      renderFocusedActions: () => topRightActions,
+    });
 
     const topRightCluster = container.querySelector<HTMLElement>(
       "[data-center-panel-focused-actions]",
@@ -214,7 +262,7 @@ describe("CenterPanelSplitLayout", () => {
     const lowerRightState = { ...threeLeafState, focusedGroupId: "group-c" };
     await renderLayout({
       ...input(lowerRightState),
-      focusedActions: <div data-chat-header-actions className="pr-0" />,
+      renderFocusedActions: () => <div data-chat-header-actions className="pr-0" />,
     });
     const lowerRightCluster = container.querySelector<HTMLElement>(
       "[data-center-panel-focused-actions]",
@@ -227,7 +275,7 @@ describe("CenterPanelSplitLayout", () => {
     const topLeftState = { ...threeLeafState, focusedGroupId: "group-a" };
     await renderLayout({
       ...input(topLeftState),
-      focusedActions: <div data-chat-header-actions className="pr-0" />,
+      renderFocusedActions: () => <div data-chat-header-actions className="pr-0" />,
     });
     const topLeftCluster = container.querySelector<HTMLElement>(
       "[data-center-panel-focused-actions]",
@@ -249,6 +297,12 @@ describe("CenterPanelSplitLayout", () => {
     );
     expect(container.querySelector('[aria-label="Center pane 2: Claude"]')).not.toBeNull();
     expect(container.querySelectorAll("[data-center-panel-focused-actions]")).toHaveLength(1);
+    expect(
+      container
+        .querySelector("[data-center-panel-focused-actions]")
+        ?.closest("[data-center-panel-group]")
+        ?.getAttribute("data-center-panel-group-id"),
+    ).toBe("group-b");
     expect(container.querySelectorAll(".workspace-topbar")).toHaveLength(2);
     expect(
       container.querySelector('[data-center-panel-group-id="group-c"] .workspace-topbar'),
@@ -258,6 +312,11 @@ describe("CenterPanelSplitLayout", () => {
     ).toContain("workspace-titlebar-content-left");
 
     for (const groupId of ["group-a", "group-b", "group-c"]) {
+      expect(
+        container
+          .querySelector<HTMLElement>(`[data-center-panel-group-id="${groupId}"] header`)
+          ?.classList.contains("@container/header-actions"),
+      ).toBe(true);
       const target = container.querySelector<HTMLElement>(
         `[data-center-panel-body-target="${groupId}"]`,
       );
