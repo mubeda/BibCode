@@ -1,10 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
 
 import {
-  clampDrawerHeight,
   fitTerminalSafely,
   getTerminalSelectionRect,
-  maxDrawerHeight,
   normalizeComputedColor,
   resolveTerminalDocumentVisibility,
   resolveTerminalSelectionActionPosition,
@@ -12,24 +10,13 @@ import {
   shouldHandleTerminalSelectionMouseUp,
   terminalSelectionActionDelayForClickCount,
   writeTerminalBuffer,
-} from "./ThreadTerminalDrawer";
+} from "./ThreadTerminalPanel";
 
 afterEach(() => {
   vi.unstubAllGlobals();
 });
 
-describe("terminal drawer utilities", () => {
-  it("clamps finite and invalid drawer heights to the available viewport", () => {
-    vi.stubGlobal("window", { innerHeight: 400 });
-    expect(maxDrawerHeight()).toBe(300);
-    expect(clampDrawerHeight(50)).toBe(180);
-    expect(clampDrawerHeight(999)).toBe(300);
-    expect(clampDrawerHeight(Number.NaN)).toBe(280);
-
-    vi.stubGlobal("window", undefined);
-    expect(maxDrawerHeight()).toBe(280);
-  });
-
+describe("terminal panel utilities", () => {
   it("restores terminal buffers only when content exists", () => {
     const terminal = { write: vi.fn() };
 
@@ -82,7 +69,7 @@ describe("terminal drawer utilities", () => {
     expect(normalizeComputedColor(" RGB(1, 2, 3) ", "fallback")).toBe(" RGB(1, 2, 3) ");
   });
 
-  it("rejects absent, collapsed, and out-of-drawer browser selections", () => {
+  it("rejects absent, collapsed, and out-of-panel browser selections", () => {
     class FakeElement {
       parentElement: FakeElement | null = null;
       contains = vi.fn(() => true);
@@ -177,7 +164,7 @@ describe("resolveTerminalSelectionActionPosition", () => {
     });
   });
 
-  it("clamps the pointer fallback into the terminal drawer bounds", () => {
+  it("clamps the pointer fallback into the terminal panel bounds", () => {
     expect(
       resolveTerminalSelectionActionPosition({
         bounds: { left: 100, top: 50, width: 500, height: 220 },

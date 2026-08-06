@@ -30,9 +30,7 @@ import {
 import { getTerminalLabel } from "@bibcode/shared/terminalLabels";
 import { Terminal, type ITheme } from "@xterm/xterm";
 import {
-  type PointerEvent as ReactPointerEvent,
   type ReactNode,
-  type SetStateAction,
   useCallback,
   useEffect,
   useEffectEvent,
@@ -42,7 +40,6 @@ import {
 } from "react";
 import { Popover, PopoverPopup, PopoverTrigger } from "~/components/ui/popover";
 import { Button } from "~/components/ui/button";
-import { cn } from "~/lib/utils";
 import { type TerminalContextSelection } from "~/lib/terminalContext";
 import { useOpenInPreferredEditor } from "../editorPreferences";
 import {
@@ -65,11 +62,7 @@ import {
   terminalDeleteShortcutData,
   terminalNavigationShortcutData,
 } from "../keybindings";
-import {
-  DEFAULT_THREAD_TERMINAL_HEIGHT,
-  MAX_TERMINALS_PER_GROUP,
-  type ThreadTerminalGroup,
-} from "../types";
+import { MAX_TERMINALS_PER_GROUP, type ThreadTerminalGroup } from "../types";
 import { readLocalApi } from "~/localApi";
 import { useAttachedTerminalSession } from "../state/terminalSessions";
 import { serverEnvironment } from "../state/server";
@@ -90,8 +83,6 @@ import {
 } from "./terminalTheme";
 import { ProviderTerminalActivityDock } from "./activity/ProviderTerminalActivityDock";
 
-const MIN_DRAWER_HEIGHT = 180;
-const MAX_DRAWER_HEIGHT_RATIO = 0.75;
 const MULTI_CLICK_SELECTION_ACTION_DELAY_MS = 260;
 const terminalInputRegistry = createTerminalInputSchedulerRegistry();
 const terminalInputBindings = new Map<string, TerminalInputBinding>();
@@ -236,17 +227,6 @@ export function enqueueTerminalInput<A, E>(input: {
     onWriteError: input.onWriteError,
   });
   scheduler.enqueue(input.data);
-}
-
-export function maxDrawerHeight(): number {
-  if (typeof window === "undefined") return DEFAULT_THREAD_TERMINAL_HEIGHT;
-  return Math.max(MIN_DRAWER_HEIGHT, Math.floor(window.innerHeight * MAX_DRAWER_HEIGHT_RATIO));
-}
-
-export function clampDrawerHeight(height: number): number {
-  const safeHeight = Number.isFinite(height) ? height : DEFAULT_THREAD_TERMINAL_HEIGHT;
-  const maxHeight = maxDrawerHeight();
-  return Math.min(Math.max(Math.round(safeHeight), MIN_DRAWER_HEIGHT), maxHeight);
 }
 
 function writeSystemMessage(terminal: Terminal, message: string): void {
@@ -439,23 +419,23 @@ function terminalThemeFromApp(
   const isDark = resolvedTheme === "dark";
   const fallbackBackground = isDark ? "rgb(14, 18, 24)" : "rgb(255, 255, 255)";
   const fallbackForeground = isDark ? "rgb(237, 241, 247)" : "rgb(28, 33, 41)";
-  const drawerSurface =
-    mountElement?.closest(".thread-terminal-drawer") ??
-    document.querySelector(".thread-terminal-drawer") ??
+  const panelSurface =
+    mountElement?.closest(".thread-terminal-panel") ??
+    document.querySelector(".thread-terminal-panel") ??
     document.body;
-  const drawerStyles = getComputedStyle(drawerSurface);
+  const panelStyles = getComputedStyle(panelSurface);
   const bodyStyles = getComputedStyle(document.body);
   const requestedThemeMatchesDocument =
     document.documentElement.classList.contains("dark") === isDark;
   const background = requestedThemeMatchesDocument
     ? normalizeComputedColor(
-        drawerStyles.backgroundColor,
+        panelStyles.backgroundColor,
         normalizeComputedColor(bodyStyles.backgroundColor, fallbackBackground),
       )
     : fallbackBackground;
   const foreground = requestedThemeMatchesDocument
     ? normalizeComputedColor(
-        drawerStyles.color,
+        panelStyles.color,
         normalizeComputedColor(bodyStyles.color, fallbackForeground),
       )
     : fallbackForeground;
@@ -553,22 +533,22 @@ export function resolveTerminalSelectionActionPosition(options: {
   const viewportHeight =
     viewport?.height ??
     (typeof window === "undefined" ? bounds.top + bounds.height + 8 : window.innerHeight);
-  const drawerLeft = Math.round(bounds.left);
-  const drawerTop = Math.round(bounds.top);
-  const drawerRight = Math.round(bounds.left + bounds.width);
-  const drawerBottom = Math.round(bounds.top + bounds.height);
+  const panelLeft = Math.round(bounds.left);
+  const panelTop = Math.round(bounds.top);
+  const panelRight = Math.round(bounds.left + bounds.width);
+  const panelBottom = Math.round(bounds.top + bounds.height);
   const preferredX =
     selectionRect !== null
       ? Math.round(selectionRect.right)
       : pointer === null
         ? Math.round(bounds.left + bounds.width - 140)
-        : Math.max(drawerLeft, Math.min(Math.round(pointer.x), drawerRight));
+        : Math.max(panelLeft, Math.min(Math.round(pointer.x), panelRight));
   const preferredY =
     selectionRect !== null
       ? Math.round(selectionRect.bottom + 4)
       : pointer === null
         ? Math.round(bounds.top + 12)
-        : Math.max(drawerTop, Math.min(Math.round(pointer.y), drawerBottom));
+        : Math.max(panelTop, Math.min(Math.round(pointer.y), panelBottom));
   return {
     x: Math.max(8, Math.min(preferredX, Math.max(viewportWidth - 8, 8))),
     y: Math.max(8, Math.min(preferredY, Math.max(viewportHeight - 8, 8))),
@@ -602,7 +582,6 @@ interface TerminalViewportProps {
   focusRequestId: number;
   autoFocus: boolean;
   resizeEpoch: number;
-  drawerHeight: number;
   keybindings: ResolvedKeybindingsConfig;
 }
 
@@ -641,7 +620,6 @@ export function TerminalViewport({
   focusRequestId,
   autoFocus,
   resizeEpoch,
-  drawerHeight,
   keybindings,
 }: TerminalViewportProps) {
   const { resolvedTheme } = useTheme();
@@ -1697,7 +1675,7 @@ export function TerminalViewport({
     return () => {
       window.cancelAnimationFrame(frame);
     };
-  }, [drawerHeight, environmentId, resizeEpoch, shouldRender, terminalId, threadId]);
+  }, [environmentId, resizeEpoch, shouldRender, terminalId, threadId]);
   return (
     <div className="relative h-full w-full overflow-hidden rounded-[4px] bg-background">
       <div
@@ -1766,16 +1744,16 @@ export function TerminalViewport({
   );
 }
 
-interface ThreadTerminalDrawerProps {
-  mode?: "drawer" | "panel";
+export type TerminalPanelOwner = "center-panel" | "right-panel";
+
+interface ThreadTerminalPanelProps {
+  readonly owner: TerminalPanelOwner;
   threadRef: ScopedThreadRef;
   threadId: ThreadId;
   projectId: ProjectId;
   cwd: string;
   worktreePath?: string | null;
   runtimeEnv?: Record<string, string>;
-  visible?: boolean;
-  height: number;
   terminalIds: string[];
   activeTerminalId: string;
   terminalGroups: ThreadTerminalGroup[];
@@ -1790,7 +1768,6 @@ interface ThreadTerminalDrawerProps {
   closeShortcutLabel?: string | undefined;
   onActiveTerminalChange: (terminalId: string) => void;
   onCloseTerminal: (terminalId: string) => void;
-  onHeightChange: (height: number) => void;
   onAddTerminalContext: (selection: TerminalContextSelection) => void;
   keybindings: ResolvedKeybindingsConfig;
   /** Prefer server-provided tab titles when present (e.g. active subprocess name). */
@@ -1830,16 +1807,14 @@ function TerminalActionButton({ label, className, onClick, children }: TerminalA
   );
 }
 
-export default function ThreadTerminalDrawer({
-  mode = "drawer",
+export default function ThreadTerminalPanel({
+  owner,
   threadRef,
   threadId,
   projectId,
   cwd,
   worktreePath,
   runtimeEnv,
-  visible = true,
-  height,
   terminalIds,
   activeTerminalId,
   terminalGroups,
@@ -1854,48 +1829,12 @@ export default function ThreadTerminalDrawer({
   closeShortcutLabel,
   onActiveTerminalChange,
   onCloseTerminal,
-  onHeightChange,
   onAddTerminalContext,
   keybindings,
   terminalLabelsById,
   terminalCommandsById,
   terminalLaunchLocationsById,
-}: ThreadTerminalDrawerProps) {
-  const isPanel = mode === "panel";
-  const controlledDrawerHeight = clampDrawerHeight(height);
-  const [drawerHeightState, setDrawerHeightState] = useState(() => ({
-    threadId,
-    height: controlledDrawerHeight,
-  }));
-  const drawerHeight =
-    drawerHeightState.threadId === threadId ? drawerHeightState.height : controlledDrawerHeight;
-  const setDrawerHeight = useCallback(
-    (update: SetStateAction<number>) => {
-      setDrawerHeightState((current) => {
-        const currentHeight =
-          current.threadId === threadId ? current.height : controlledDrawerHeight;
-        const nextHeight = typeof update === "function" ? update(currentHeight) : update;
-        return nextHeight === currentHeight && current.threadId === threadId
-          ? current
-          : { threadId, height: nextHeight };
-      });
-    },
-    [controlledDrawerHeight, threadId],
-  );
-  const setDrawerHeightFromWindowResize = useEffectEvent((nextHeight: number) => {
-    setDrawerHeight(nextHeight);
-  });
-  const [resizeEpoch, setResizeEpoch] = useState(0);
-  const drawerHeightRef = useRef(drawerHeight);
-  const lastSyncedHeightRef = useRef(controlledDrawerHeight);
-  const onHeightChangeRef = useRef(onHeightChange);
-  const resizeStateRef = useRef<{
-    pointerId: number;
-    startY: number;
-    startHeight: number;
-  } | null>(null);
-  const didResizeDuringDragRef = useRef(false);
-
+}: ThreadTerminalPanelProps) {
   const normalizedTerminalIds = useMemo(() => {
     const normalizedIds: string[] = [];
     const seen = new Set<string>();
@@ -2058,127 +1997,12 @@ export default function ThreadTerminalDrawer({
     onNewTerminal?.();
   }, [onNewTerminal]);
 
-  useEffect(() => {
-    onHeightChangeRef.current = onHeightChange;
-  }, [onHeightChange]);
-
-  useEffect(() => {
-    drawerHeightRef.current = drawerHeight;
-  }, [drawerHeight]);
-
-  const syncHeight = useCallback((nextHeight: number) => {
-    const clampedHeight = clampDrawerHeight(nextHeight);
-    if (lastSyncedHeightRef.current === clampedHeight) return;
-    lastSyncedHeightRef.current = clampedHeight;
-    onHeightChangeRef.current(clampedHeight);
-  }, []);
-
-  useEffect(() => {
-    lastSyncedHeightRef.current = controlledDrawerHeight;
-  }, [controlledDrawerHeight, threadId]);
-
-  const handleResizePointerDown = useCallback((event: ReactPointerEvent<HTMLDivElement>) => {
-    if (event.button !== 0) return;
-    event.preventDefault();
-    event.currentTarget.setPointerCapture(event.pointerId);
-    didResizeDuringDragRef.current = false;
-    resizeStateRef.current = {
-      pointerId: event.pointerId,
-      startY: event.clientY,
-      startHeight: drawerHeightRef.current,
-    };
-  }, []);
-
-  const handleResizePointerMove = useCallback(
-    (event: ReactPointerEvent<HTMLDivElement>) => {
-      const resizeState = resizeStateRef.current;
-      if (!resizeState || resizeState.pointerId !== event.pointerId) return;
-      event.preventDefault();
-      const clampedHeight = clampDrawerHeight(
-        resizeState.startHeight + (resizeState.startY - event.clientY),
-      );
-      if (clampedHeight === drawerHeightRef.current) {
-        return;
-      }
-      didResizeDuringDragRef.current = true;
-      drawerHeightRef.current = clampedHeight;
-      setDrawerHeight(clampedHeight);
-    },
-    [setDrawerHeight],
-  );
-
-  const handleResizePointerEnd = useCallback(
-    (event: ReactPointerEvent<HTMLDivElement>) => {
-      const resizeState = resizeStateRef.current;
-      if (!resizeState || resizeState.pointerId !== event.pointerId) return;
-      resizeStateRef.current = null;
-      if (event.currentTarget.hasPointerCapture(event.pointerId)) {
-        event.currentTarget.releasePointerCapture(event.pointerId);
-      }
-      if (!didResizeDuringDragRef.current) {
-        return;
-      }
-      syncHeight(drawerHeightRef.current);
-      setResizeEpoch((value) => value + 1);
-    },
-    [syncHeight],
-  );
-
-  useEffect(() => {
-    if (!visible) {
-      return;
-    }
-
-    const onWindowResize = () => {
-      const clampedHeight = clampDrawerHeight(drawerHeightRef.current);
-      const changed = clampedHeight !== drawerHeightRef.current;
-      if (changed) {
-        setDrawerHeightFromWindowResize(clampedHeight);
-        drawerHeightRef.current = clampedHeight;
-      }
-      if (!resizeStateRef.current) {
-        syncHeight(clampedHeight);
-      }
-      setResizeEpoch((value) => value + 1);
-    };
-    window.addEventListener("resize", onWindowResize);
-    return () => {
-      window.removeEventListener("resize", onWindowResize);
-    };
-  }, [syncHeight, visible]);
-
-  useEffect(() => {
-    if (!visible) {
-      return;
-    }
-    setResizeEpoch((value) => value + 1);
-  }, [visible]);
-
-  useEffect(() => {
-    return () => {
-      syncHeight(drawerHeightRef.current);
-    };
-  }, [syncHeight]);
-
   if (normalizedTerminalIds.length === 0) {
     return (
       <aside
-        data-terminal-owner={isPanel ? "right-panel" : "drawer"}
-        className={cn(
-          "thread-terminal-drawer relative flex min-w-0 flex-col overflow-hidden bg-background",
-          isPanel ? "h-full flex-1" : "shrink-0 border-t border-border/80",
-        )}
-        style={isPanel ? undefined : { height: `${drawerHeight}px` }}
+        data-terminal-owner={owner}
+        className="thread-terminal-panel relative flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-background"
       >
-        {!isPanel ? (
-          <div
-            className="absolute inset-x-0 top-0 z-20 h-1.5 cursor-row-resize"
-            onPointerDown={handleResizePointerDown}
-            onPointerMove={handleResizePointerMove}
-            onPointerUp={handleResizePointerEnd}
-            onPointerCancel={handleResizePointerEnd}
-          />
-        ) : null}
         <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-3 px-4 py-6 text-center text-sm text-muted-foreground">
           <p>No terminal sessions for this thread yet.</p>
           {onNewTerminal ? (
@@ -2199,23 +2023,9 @@ export default function ThreadTerminalDrawer({
 
   return (
     <aside
-      data-terminal-owner={isPanel ? "right-panel" : "drawer"}
-      className={cn(
-        "thread-terminal-drawer relative flex min-w-0 flex-col overflow-hidden bg-background",
-        isPanel ? "h-full flex-1" : "shrink-0 border-t border-border/80",
-      )}
-      style={isPanel ? undefined : { height: `${drawerHeight}px` }}
+      data-terminal-owner={owner}
+      className="thread-terminal-panel relative flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-background"
     >
-      {!isPanel ? (
-        <div
-          className="absolute inset-x-0 top-0 z-20 h-1.5 cursor-row-resize"
-          onPointerDown={handleResizePointerDown}
-          onPointerMove={handleResizePointerMove}
-          onPointerUp={handleResizePointerEnd}
-          onPointerCancel={handleResizePointerEnd}
-        />
-      ) : null}
-
       {!hasTerminalSidebar && (
         <div className="pointer-events-none absolute right-2 top-2 z-20">
           <div className="pointer-events-auto inline-flex items-center overflow-hidden rounded-md border border-border/80 bg-background/70">
@@ -2327,13 +2137,12 @@ export default function ThreadTerminalDrawer({
                           {...(terminalCommandsById?.get(terminalId)
                             ? { command: terminalCommandsById.get(terminalId)! }
                             : {})}
-                          visible={visible}
+                          visible
                           onSessionExited={() => onCloseTerminal(terminalId)}
                           onAddTerminalContext={onAddTerminalContext}
                           focusRequestId={focusRequestId}
                           autoFocus={terminalId === resolvedActiveTerminalId}
-                          resizeEpoch={resizeEpoch}
-                          drawerHeight={drawerHeight}
+                          resizeEpoch={0}
                           keybindings={keybindings}
                         />
                       </div>
@@ -2360,13 +2169,12 @@ export default function ThreadTerminalDrawer({
                   {...(terminalCommandsById?.get(resolvedActiveTerminalId)
                     ? { command: terminalCommandsById.get(resolvedActiveTerminalId)! }
                     : {})}
-                  visible={visible}
+                  visible
                   onSessionExited={() => onCloseTerminal(resolvedActiveTerminalId)}
                   onAddTerminalContext={onAddTerminalContext}
                   focusRequestId={focusRequestId}
                   autoFocus
-                  resizeEpoch={resizeEpoch}
-                  drawerHeight={drawerHeight}
+                  resizeEpoch={0}
                   keybindings={keybindings}
                 />
               </div>

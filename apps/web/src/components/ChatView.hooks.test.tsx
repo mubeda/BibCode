@@ -465,10 +465,10 @@ vi.mock("./PlanSidebar", () => ({
   },
 }));
 
-vi.mock("./ThreadTerminalDrawer", () => ({
+vi.mock("./ThreadTerminalPanel", () => ({
   default: (props: Record<string, unknown>) => {
-    h.capture("threadTerminalDrawer", props);
-    return <div data-mock="thread-terminal-drawer" data-mode={String(props["mode"] ?? "drawer")} />;
+    h.capture("threadTerminalPanel", props);
+    return <div data-mock="thread-terminal-panel" data-owner={String(props["owner"] ?? "")} />;
   },
   enqueueTerminalInput: (input: {
     data: string;
@@ -600,7 +600,7 @@ import {
 import type { ChatComposerHandle } from "./chat/ChatComposer";
 import type { ComposerBannerStackItem } from "./chat/ComposerBannerStack";
 import type { ProviderInstanceEntry } from "../providerInstances";
-import type { TerminalContextDraft, TerminalContextSelection } from "../lib/terminalContext";
+import type { TerminalContextDraft } from "../lib/terminalContext";
 import { getComposerProviderState } from "./chat/composerProviderState";
 
 const environmentId = EnvironmentId.make("environment-local");
@@ -2174,10 +2174,10 @@ describe("ChatView right panel handlers", () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────
-// Persistent terminal drawer
+// Retired bottom terminal composition
 // ─────────────────────────────────────────────────────────────────────
 
-describe("ChatView persistent terminal drawer", () => {
+describe("ChatView retired bottom terminal composition", () => {
   function seedDrawer(options: { knownIds?: string[]; storeIds?: string[] } = {}) {
     seedConnectedServerThread();
     const storeIds = options.storeIds ?? ["terminal-1"];
@@ -2199,119 +2199,11 @@ describe("ChatView persistent terminal drawer", () => {
     seedHostState("mountedTerminalThreadKeys", [threadKey]);
   }
 
-  it("renders the drawer and exercises split/new/activate/close callbacks", async () => {
+  it("does not compose the retired bottom terminal drawer", () => {
     seedDrawer();
 
     const markup = renderServerRoute();
-    expect(markup).toContain('data-mock="thread-terminal-drawer"');
-
-    const drawer = capturedProps("threadTerminalDrawer");
-    expect(drawer["mode"]).toBeUndefined();
-    expect(drawer["cwd"]).toBe("X:/demo");
-
-    (drawer["onSplitTerminal"] as () => void)();
-    (drawer["onSplitTerminalVertical"] as () => void)();
-    (drawer["onNewTerminal"] as () => void)();
-    (drawer["onActiveTerminalChange"] as (terminalId: string) => void)("terminal-1");
-    (drawer["onHeightChange"] as (height: number) => void)(333);
-
-    expect(commandCallsFor("terminal.open")).toHaveLength(3);
-    expect(
-      useTerminalUiStateStore.getState().terminalUiStateByThreadKey[threadKey]?.terminalHeight,
-    ).toBe(333);
-
-    // Successful close deletes the terminal server-side without a fallback write.
-    (drawer["onCloseTerminal"] as (terminalId: string) => void)("terminal-1");
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(commandCallsFor("terminal.close")).toHaveLength(1);
-    expect(commandCallsFor("terminal.write")).toHaveLength(0);
-
-    // Failed close falls back to writing an exit into the terminal.
-    h.commandResults["terminal.close"] = () =>
-      AsyncResult.failure(Cause.fail(new Error("close failed")));
-    (drawer["onCloseTerminal"] as (terminalId: string) => void)("terminal-2");
-    await Promise.resolve();
-    await Promise.resolve();
-    await Promise.resolve();
-    expect(commandCallsFor("terminal.write")).toHaveLength(1);
-    expect(h.terminalInputEnqueues.at(-1)?.data).toBe("exit\n");
-
-    // Terminal context selections forward to the composer only while visible.
-    const selections: TerminalContextSelection[] = [];
-    installComposerHandle({
-      addTerminalContext: (selection: TerminalContextSelection) => {
-        selections.push(selection);
-        return true;
-      },
-    });
-    const selection: TerminalContextSelection = {
-      terminalId: "terminal-1",
-      terminalLabel: "Shell terminal-1",
-      lineStart: 1,
-      lineEnd: 2,
-      text: "output",
-    };
-    (drawer["onAddTerminalContext"] as (selection: TerminalContextSelection) => void)(selection);
-    expect(selections).toEqual([selection]);
-  });
-
-  it("reconciles when server terminal ids diverge but not for strict subsets", () => {
-    // Case 1: identical ids (order ignored) — no reconcile.
-    seedDrawer({ storeIds: ["terminal-1"], knownIds: ["terminal-1"] });
-    renderServerRoute();
-    runEffects();
-    expect(
-      useTerminalUiStateStore.getState().terminalUiStateByThreadKey[threadKey]?.terminalIds,
-    ).toEqual(["terminal-1"]);
-
-    // Case 2: server ids are a strict subset of local ids — reconcile skipped.
-    h.knownSessions = [
-      {
-        target: { environmentId, threadId, terminalId: "terminal-1" },
-        state: { summary: { label: "Shell", cwd: "X:/demo", worktreePath: null } },
-      },
-    ];
-    useTerminalUiStateStore.getState().splitTerminal(threadRef, "terminal-2");
-    publishSeededStoreState(useTerminalUiStateStore);
-    seedHostState("mountedTerminalThreadKeys", [threadKey]);
-    renderServerRoute();
-    runEffects();
-    expect(
-      useTerminalUiStateStore.getState().terminalUiStateByThreadKey[threadKey]?.terminalIds,
-    ).toEqual(["terminal-1", "terminal-2"]);
-
-    // Case 3: server knows about a different set — reconcile applies it.
-    h.knownSessions = ["terminal-8", "terminal-9"].map((terminalId) => ({
-      target: { environmentId, threadId, terminalId },
-      state: { summary: { label: terminalId, cwd: "X:/demo", worktreePath: null } },
-    }));
-    seedHostState("mountedTerminalThreadKeys", [threadKey]);
-    renderServerRoute();
-    runEffects();
-    expect(
-      useTerminalUiStateStore.getState().terminalUiStateByThreadKey[threadKey]?.terminalIds,
-    ).toEqual(["terminal-8", "terminal-9"]);
-  });
-
-  it("uses the script launch context for the drawer cwd when one is active", () => {
-    seedDrawer();
-    seedHostState("terminalUiLaunchContext", {
-      threadId,
-      cwd: "X:/demo/worktrees/wt-1",
-      worktreePath: "X:/demo/worktrees/wt-1",
-    });
-
-    renderServerRoute();
-
-    const drawer = capturedProps("threadTerminalDrawer");
-    expect(drawer["cwd"]).toBe("X:/demo/worktrees/wt-1");
-    expect(drawer["worktreePath"]).toBe("X:/demo/worktrees/wt-1");
-    const locations = drawer["terminalLaunchLocationsById"] as ReadonlyMap<
-      string,
-      { cwd: string; worktreePath: string | null }
-    >;
-    expect(locations.get("terminal-1")?.cwd).toBe("X:/demo/worktrees/wt-1");
+    expect(markup).not.toContain('data-mock="thread-terminal-panel"');
   });
 });
 
