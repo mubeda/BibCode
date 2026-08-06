@@ -46,9 +46,9 @@ enum ApplicationMenuAction {
 fn menu_action_for_id(id: &str) -> Option<ApplicationMenuAction> {
     match id {
         MENU_ID_OPEN_SETTINGS => Some(ApplicationMenuAction::Emit(MENU_ACTION_OPEN_SETTINGS)),
-        MENU_ID_CHECK_FOR_UPDATES => Some(ApplicationMenuAction::Emit(
-            MENU_ACTION_CHECK_FOR_UPDATES,
-        )),
+        MENU_ID_CHECK_FOR_UPDATES => {
+            Some(ApplicationMenuAction::Emit(MENU_ACTION_CHECK_FOR_UPDATES))
+        }
         MENU_ID_CLOSE_SHORTCUT => Some(ApplicationMenuAction::Emit(MENU_ACTION_CLOSE_SHORTCUT)),
         MENU_ID_CLOSE_WINDOW => Some(ApplicationMenuAction::CloseWindow),
         _ => None,
@@ -94,8 +94,7 @@ fn build_application_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<
     let close_shortcut = MenuItemBuilder::with_id(MENU_ID_CLOSE_SHORTCUT, "Close Active Surface")
         .accelerator("CmdOrCtrl+W")
         .build(app)?;
-    let close_window =
-        MenuItemBuilder::with_id(MENU_ID_CLOSE_WINDOW, "Close Window").build(app)?;
+    let close_window = MenuItemBuilder::with_id(MENU_ID_CLOSE_WINDOW, "Close Window").build(app)?;
 
     let file = SubmenuBuilder::new(app, "File")
         .item(&settings)

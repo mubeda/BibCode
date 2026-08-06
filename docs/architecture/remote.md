@@ -1,382 +1,137 @@
-# Remote Architecture
+# Remote architecture
 
-This document describes the target architecture for first-class remote environments in BiBCode.
+A BiBCode server represents one execution environment: the machine, filesystem,
+credentials, provider processes, terminals, repositories, and durable server
+state reached through that server. Clients may reach the same environment by a
+direct endpoint, BiBCode Connect, or desktop-managed SSH without changing the
+environment identity.
 
-It is intentionally architecture-first. It does not define a complete implementation plan or user-facing rollout checklist. The goal is to establish the core model so remote support can be added without another broad rewrite.
+## Design rules
 
-## Goals
+- One server process represents one environment.
+- Access and launch are separate decisions. An endpoint says how to connect;
+  SSH may additionally launch or discover a server before creating forwarding.
+- `environmentId` is the stable identity. URLs, tunnel hostnames, SSH ports, and
+  labels may change without creating a new environment.
+- Remote clients use the same HTTP and Effect RPC APIs as local clients.
+- Credentials are exchanged for bounded sessions; raw bootstrap credentials do
+  not remain in WebSocket URLs.
 
-- Treat remote environments as first-class product primitives, not special cases.
-- Support multiple ways to reach the same environment.
-- Keep the BiBCode server as the execution boundary.
-- Let desktop and browser clients share the same conceptual model.
-- Avoid introducing a local control plane unless product pressure proves it is necessary.
+## Client targets
 
-## Non-goals
+The connection runtime defines four target types in
+[`connection/model.ts`](../../packages/client-runtime/src/connection/model.ts).
 
-- Replacing the existing WebSocket server boundary with a custom transport protocol.
-- Making SSH the only remote story.
-- Syncing provider auth across machines.
-- Shipping every access method in the first iteration.
+| Target                    | Use                                                                                    |
+| ------------------------- | -------------------------------------------------------------------------------------- |
+| `PrimaryConnectionTarget` | The server supplied by the current browser or desktop host.                            |
+| `BearerConnectionTarget`  | A manually saved HTTP/WSS endpoint plus a separately stored pairing credential.        |
+| `RelayConnectionTarget`   | An environment discovered through BiBCode Connect and authorized with Clerk plus DPoP. |
+| `SshConnectionTarget`     | A desktop-managed SSH profile that prepares a remote server and local forwarding.      |
 
-## High-level architecture
+Only bearer, relay, and SSH targets are persisted as saved connection targets.
+`EnvironmentRegistry` creates one scoped supervisor per catalog entry and keeps
+domain state keyed by environment.
 
-BiBCode already has a clean runtime boundary: the client talks to a BiBCode server over HTTP/WebSocket, and the server owns orchestration, providers, terminals, git, and filesystem operations.
+## Advertised endpoints
 
-Remote support should preserve that boundary.
+An `AdvertisedEndpoint` is a connection candidate, not an environment. Its
+contract records:
 
-```text
-┌──────────────────────────────────────────────┐
-│ Client (Tauri desktop / browser)             │
-│                                              │
-│ - known environments                         │
-│ - connection manager                         │
-│ - environment-aware routing                  │
-└───────────────┬──────────────────────────────┘
-                │
-                │ resolves one access endpoint
-                │
-┌───────────────▼──────────────────────────────┐
-│ Access method                               │
-│                                              │
-│ - direct ws / wss                           │
-│ - tunneled ws / wss                         │
-│ - desktop-managed ssh bootstrap + forward   │
-└───────────────┬──────────────────────────────┘
-                │
-                │ connects to one BiBCode server
-                │
-┌───────────────▼──────────────────────────────┐
-│ Execution environment = one BiBCode server       │
-│                                              │
-│ - environment identity                       │
-│ - provider state                             │
-│ - projects / threads / terminals             │
-│ - git / filesystem / process runtime         │
-└──────────────────────────────────────────────┘
-```
+- provider kind: core, private network, tunnel, or manual;
+- HTTP and derived WebSocket base URLs;
+- reachability: loopback, LAN, private network, or public;
+- hosted-HTTPS and desktop compatibility;
+- source and availability status.
 
-The important decision is that remoteness is expressed at the environment connection layer, not by splitting the BiBCode runtime itself.
-
-## Domain model
-
-### ExecutionEnvironment
-
-An `ExecutionEnvironment` is one running BiBCode server instance.
-
-It is the unit that owns:
-
-- provider availability and auth state
-- model availability
-- projects and threads
-- terminal processes
-- filesystem access
-- git operations
-- server settings
-
-It is identified by a stable `environmentId`.
-
-This is the shared cross-client primitive. Desktop and browser clients should reason about the same concept here.
-
-### KnownEnvironment
-
-A `KnownEnvironment` is a client-side saved entry for an environment the client knows how to reach.
-
-It is not server-authored. It is local to a device or client profile.
-
-Examples:
-
-- a saved LAN URL
-- a saved public `wss://` endpoint
-- a desktop-managed SSH host entry
-- a saved tunneled environment
-
-A known environment may or may not know the target `environmentId` before first successful connect.
-
-In the hosted web app, known environments are browser-local. A hosted pairing URL can create the saved entry, but it does not give the hosted app a server-side control plane or a copy of the session state.
-
-### AccessEndpoint
-
-An `AccessEndpoint` is one concrete way to reach a known environment.
-
-This is the key abstraction that keeps SSH from taking over the model.
-
-A single environment may have many endpoints:
-
-- `wss://bibcode.example.com`
-- `ws://10.0.0.25:3773`
-- a tunneled relay URL
-- a desktop-managed SSH tunnel that resolves to a local forwarded WebSocket URL
-
-The environment stays the same. Only the access path changes.
-
-### AdvertisedEndpoint
-
-An `AdvertisedEndpoint` is a server or desktop-authored candidate endpoint for an environment. It is how the backend tells the client which URLs may be useful for pairing and reconnecting.
-
-`AdvertisedEndpoint` is deliberately narrower than the full access model:
-
-- it describes a concrete HTTP and WebSocket base URL pair
-- it can mark the endpoint as default, available, or unavailable
-- it includes reachability hints such as loopback, LAN, private, public, or tunnel
-- it includes compatibility hints such as whether the endpoint can be used from the hosted HTTPS app
-
-Clients should treat advertised endpoints as hints, not as proof that a route works from the current device. The final connection attempt still decides whether the endpoint is reachable.
-
-The UI presents one default advertised endpoint in the network-access summary and keeps the rest behind an expandable advanced list. The default controls pairing QR codes and primary copy actions. Users can override it, but that override is a UI preference, not backend configuration.
-
-Persist the override by stable endpoint kind rather than raw URL whenever possible. For example, a LAN endpoint should be stored as the desktop LAN endpoint preference, not as `192.168.x.y`, because the address can change when the user switches networks. Provider endpoints should use provider-specific stable keys such as Tailscale IP or Tailscale MagicDNS HTTPS. Custom endpoints may fall back to their concrete identity.
-
-When no user default is saved, endpoint selection should prefer:
-
-1. endpoints compatible with the hosted HTTPS app
-2. explicitly default endpoints
-3. non-loopback endpoints
-4. loopback endpoints only for same-machine clients
-
-This keeps endpoint discovery centralized without making any one provider, such as Tailscale or a future tunnel service, part of the core environment model.
-
-### Endpoint providers
-
-Endpoint providers are add-ons that contribute advertised endpoints for the current environment.
-
-The provider boundary is intentionally outside the core environment model:
-
-- core owns `ExecutionEnvironment`, saved environments, pairing, and connection lifecycle
-- providers discover or synthesize endpoints
-- providers return normalized `AdvertisedEndpoint` records
-- the UI and pairing logic select from those records without knowing provider-specific commands
-
-The first provider is Tailscale. It can discover Tailnet IP and MagicDNS addresses from the local machine and publish them as additional endpoint candidates. Future providers, such as a hosted tunnel service, should plug into the same shape rather than adding a separate remote environment path.
-
-Provider-specific confidence should remain a hint. A Tailscale endpoint still needs a successful browser or desktop connection before the client treats it as connected.
-
-### Hosted pairing request
-
-A hosted pairing request is a bootstrap URL for the static web app, not a transport.
-
-Example:
-
-```text
-https://app.example.com/pair?host=https://backend.example.com:3773#token=PAIRCODE
-```
-
-The hosted app reads the `host` parameter and pairing token, exchanges the token directly with that backend, then saves the resulting environment record in browser local storage.
-
-Important constraints:
-
-- the hosted app does not proxy HTTP or WebSocket traffic
-- the backend must still be reachable directly from the browser
-- HTTPS pages can only connect to HTTPS/WSS backends
-- HTTP LAN endpoints should keep using direct desktop or CLI pairing URLs
-- the token belongs in the URL hash so it is not sent to the hosted app origin
-
-### RepositoryIdentity
-
-`RepositoryIdentity` remains a best-effort logical repo grouping mechanism across environments.
-
-It is not used for routing. It is only used for UI grouping and correlation between local and remote clones of the same repository.
-
-### Workspace / Project
-
-The current `Project` model remains environment-local.
-
-That means:
-
-- a local clone and a remote clone are different projects
-- they may share a `RepositoryIdentity`
-- threads still bind to one project in one environment
+Contracts live in
+[`remoteAccess.ts`](../../packages/contracts/src/remoteAccess.ts), and URL
+normalization lives in
+[`advertisedEndpoint.ts`](../../packages/shared/src/advertisedEndpoint.ts).
+Desktop discovery can add host capabilities such as Tailscale endpoints. The
+user's default is persisted by stable endpoint ID rather than by array position.
 
 ## Access methods
 
-Access methods answer one question:
-
-How does the client speak WebSocket to a BiBCode server?
-
-They do not answer:
-
-- how the server got started
-- who manages the server process
-- whether the environment is local or remote
-
-### 1. Direct WebSocket access
-
-Examples:
-
-- `ws://10.0.0.15:3773`
-- `wss://bibcode.example.com`
-
-This is the base model and should be the first-class default.
-
-Benefits:
-
-- works for desktop and browser clients
-- no client-specific process management required
-- best fit for hosted or self-managed remote BiBCode deployments
-
-Browser security rules are part of this access method. A hosted HTTPS web client can connect to `wss://` backends, but it cannot connect to plain `ws://` or `http://` LAN backends because that would be mixed content.
-
-### 2. Tunneled WebSocket access
-
-Examples:
-
-- public relay URLs
-- private network relay URLs
-- local tunnel products such as pipenet
-
-This is still direct WebSocket access from the client's perspective. The difference is that the route is mediated by a tunnel or relay.
-
-For BiBCode, tunnels are best modeled as another `AccessEndpoint`, not as a different kind of environment.
-
-This is especially useful when:
-
-- the host is behind NAT
-- inbound ports are unavailable
-- another browser or desktop client must reach a desktop-hosted environment
-- a machine should be reachable without exposing raw LAN or public ports
-
-Tailscale-backed access sits here architecturally even though the current implementation is endpoint discovery rather than a BiBCode-managed tunnel. It contributes private-network endpoints and lets the existing HTTP/WebSocket client path do the actual connection.
-
-### 3. Desktop-managed SSH access
-
-SSH is an access and launch helper, not a separate environment type.
-
-The Tauri Rust host can use SSH to:
-
-- reach a machine
-- probe it
-- launch or reuse a remote BiBCode server
-- establish a local port forward
-
-After that, the renderer should still connect using an ordinary WebSocket URL against the forwarded local port.
-
-This keeps the renderer transport model consistent with every other access method.
-
-The Tauri Rust host owns the SSH bridge because it can spawn local SSH processes, manage askpass prompts, write temporary launch scripts, and clean up forwards. The React client receives a saved environment record and connects through the forwarded URL; it does not need SSH-specific RPC paths for normal environment traffic.
-
-## Launch methods
-
-Launch methods answer a different question:
-
-How does a BiBCode server come to exist on the target machine?
-
-Launch and access should stay separate in the design.
-
-### 1. Pre-existing server
-
-The simplest launch method is no launch at all.
-
-The user or operator already runs BiBCode on the target machine, and the client connects through a direct or tunneled WebSocket endpoint.
-
-This should be the first remote mode shipped because it validates the environment model with minimal extra machinery.
-
-### 2. Desktop-managed remote launch over SSH
-
-This is the main place where Zed is a useful reference.
-
-Useful ideas to borrow from Zed:
-
-- remote probing
-- platform detection
-- session directories with pid/log metadata
-- reconnect-friendly launcher behavior
-- desktop-owned connection UX
-
-What should be different in BiBCode:
-
-- no custom stdio/socket proxy protocol between renderer and remote runtime
-- no attempt to make the remote runtime look like an editor transport
-- keep the final client-to-server connection as WebSocket
-
-The recommended BiBCode flow is:
-
-1. Desktop connects over SSH.
-2. Desktop probes the remote machine and verifies BiBCode availability.
-3. Desktop launches or reuses a remote BiBCode server.
-4. Desktop establishes local port forwarding.
-5. Renderer connects to the forwarded WebSocket endpoint as a normal environment.
-
-The saved environment should remember that it was created by desktop SSH launch only for reconnect and lifecycle UX. That metadata should not change the server protocol or the environment identity model.
-
-Failure handling should be explicit:
-
-- SSH authentication failure should surface before any environment is saved
-- remote launch failure should include remote logs or the launcher command output when available
-- forwarded-port failure should leave the saved environment disconnected rather than falling back to an unrelated endpoint
-- reconnect should attempt to restore the SSH bridge before reconnecting the normal WebSocket client
-
-### 3. Client-managed local publish
-
-This is the inverse of remote launch: a local BiBCode server is already running, and the client publishes it through a tunnel.
-
-This is useful for:
-
-- exposing a desktop-hosted environment to another client
-- temporary remote access without changing router or firewall settings
-
-This is still a launch concern, not a new environment kind.
-
-## Why access and launch must stay separate
-
-These concerns are easy to conflate, but separating them prevents architectural drift.
-
-Examples:
-
-- A manually hosted BiBCode server might be reached through direct `wss`.
-- The same server might also be reachable through a tunnel.
-- An SSH-managed server might be launched over SSH but then reached through forwarded WebSocket.
-- A local desktop server might be published through a tunnel for another client.
-
-In all of those cases, the `ExecutionEnvironment` is the same kind of thing.
-
-Only the launch and access paths differ.
-
-## Security model
-
-Remote support must assume that some environments will be reachable over untrusted networks.
-
-That means:
-
-- remote-capable environments should require explicit authentication
-- tunnel exposure should not rely on obscurity
-- client-saved endpoints should carry enough auth metadata to reconnect safely
-
-BiBCode already supports a WebSocket auth token on the server. That should become a first-class part of environment access rather than remaining an incidental query parameter convention.
-
-For publicly reachable environments, authenticated access should be treated as required.
-
-Hosted pairing should be treated as a client-side convenience only. The hosted app must not receive pairing tokens through query parameters, must not store pairing state server-side, and must not imply that an HTTP backend is safe or reachable from an HTTPS browser context.
-
-## Relationship to Zed
-
-Zed is a useful reference implementation for managed remote launch and reconnect behavior.
-
-The relevant lessons are:
-
-- remote bootstrap should be explicit
-- reconnect should be first-class
-- connection UX belongs in the client shell
-- runtime ownership should stay clearly on the remote host
-
-The important mismatch is transport shape.
-
-Zed needs a custom proxy/server protocol because its remote boundary sits below the editor and project runtime.
-
-BiBCode should not copy that part.
-
-BiBCode already has the right runtime boundary:
-
-- one BiBCode server per environment
-- ordinary HTTP/WebSocket between client and environment
-
-So BiBCode should borrow Zed's launch discipline, not its transport protocol.
-
-## Recommended rollout
-
-1. First-class known environments and access endpoints.
-2. Direct `ws` / `wss` remote environments.
-3. Authenticated tunnel-backed environments.
-4. Desktop-managed SSH launch and forwarding.
-5. Multi-environment UI improvements after the base runtime path is proven.
-
-This ordering keeps the architecture network-first and transport-agnostic while still leaving room for richer managed remote flows.
+### Direct bearer access
+
+Manual pairing produces a one-time bootstrap credential and advertised
+endpoint. The onboarding flow saves the endpoint profile separately from the
+credential, exchanges the bootstrap at `/oauth/token`, verifies the returned
+environment identity, and obtains a WebSocket ticket from
+`/api/auth/websocket-ticket`.
+
+Pairing links may carry a bootstrap in the URL fragment. Fragments are not sent
+to the hosting web server. Compatibility parsing accepts older query-form links,
+but newly generated links use the fragment form.
+
+### BiBCode Connect
+
+The signed-in client discovers linked environments from the relay. To connect,
+it exchanges a Clerk token and client DPoP proof for a relay DPoP token, asks
+the relay for environment status or a connection bootstrap, then exchanges that
+bootstrap with the environment for a DPoP-bound access token. HTTP requests use
+that token and fresh DPoP proofs; the WebSocket URL contains only a short-lived
+`wsTicket`.
+
+The relay is a control plane. It verifies user and DPoP authorization, stores
+environment links, provisions the managed endpoint, and brokers signed health
+and mint requests. It does not become the owner of environment sessions or
+provider state. See [BiBCode Connect auth flow](../cloud/bibcode-connect-auth-flow.md).
+
+### Desktop-managed SSH
+
+The Tauri host owns SSH, not the server or React app. It validates the SSH
+profile, probes or launches `bibcode` remotely, establishes local forwarding,
+and returns a local HTTP/WSS bootstrap plus bearer credential to the connection
+runtime. The resulting `SshConnectionTarget` enters the same authorization and
+RPC pipeline as other targets.
+
+SSH is a desktop capability. Browser clients cannot assume a local SSH binary,
+process supervision, or access to the user's SSH configuration.
+
+## Access versus launch
+
+Direct and relay targets expect a server to be reachable through an existing
+endpoint. SSH can prepare both the server and the transport, but those remain
+separate steps internally:
+
+```mermaid
+flowchart LR
+  Profile["SSH profile"] --> Probe["probe or launch remote bibcode"]
+  Probe --> Forward["establish local forwarding"]
+  Forward --> Bootstrap["return endpoint + bootstrap"]
+  Bootstrap --> Auth["environment token exchange"]
+  Auth --> RPC["Effect RPC session"]
+```
+
+Keeping launch separate prevents connection code from assuming that every
+endpoint can install software, start a process, or use SSH.
+
+## Security boundaries
+
+- Pairing credentials and access tokens are secrets; connection catalog labels
+  and endpoint metadata are not authorization.
+- Bearer or DPoP authentication is performed over HTTP before a WebSocket is
+  opened. Only a single-purpose, short-lived `wsTicket` appears in the socket
+  URL.
+- DPoP binds Connect-issued relay and environment tokens to the client's proof
+  key and the target HTTP request.
+- Relay request proofs and environment health/mint responses are independently
+  signed and scoped to their nonce and operation.
+- A tunnel changes reachability, not the environment's authorization rules.
+- Hosted HTTPS clients must not select plain-HTTP endpoints that browsers would
+  block as mixed content.
+
+## Current limitations
+
+- OS-backed protection for the desktop connection catalog is implemented on
+  Windows; other platforms currently use renderer storage fallback.
+- The desktop SSH launcher and forwarding implementation exist, but fresh SSH
+  setup is currently blocked: its pairing step invokes the removed
+  `bibcode auth pairing create` command while the native CLI exposes only
+  `start` and `serve`.
+- Desktop SSH and some advertised endpoint providers are host capabilities and
+  are unavailable in an ordinary browser.
+- Endpoint availability is advisory. The connection supervisor still verifies
+  identity, authentication, and initial RPC synchronization on every attempt.

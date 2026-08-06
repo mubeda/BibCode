@@ -53,20 +53,33 @@ rows, pin/unread state, context menus, and running agent sub-rows.
 
 ### Center Panel
 
-The main chat area. The host chat is the first unclosable tab. Extra AI chat
-panels and terminal panels are opened from the chat header `+` menu.
+The main chat and terminal workspace. Center surfaces live in tab groups, with
+up to four groups arranged as resizable horizontal or vertical split panes.
+Each group has its own active tab; the focused group receives newly created AI
+chat and terminal panels. Layout, focus, tab order, and split ratios persist
+across reloads.
+
+### Center Surface
+
+A chat or terminal tab inside one center tab group. The host chat represents the
+selected workspace thread. Extra chat surfaces use panel threads; closing one
+deletes that panel thread. Closing a split pane instead merges its surfaces into
+an adjacent group without closing them.
 
 ### Right Panel
 
-The tool surface area for the active thread. It hosts Files, Source Control,
-Diff, Preview, Terminal, and related project tools.
+The tool surface area for the active thread. Its supported surface kinds are
+Plan, Diff, Source Control, Files, an individual file, Preview, Terminal, and
+Activity. Singleton tools and resource-backed file/browser/terminal tabs share
+one ordered, persisted surface rail.
 
 ### Source Control
 
 The right-panel Git UI for the active project/worktree. It groups files by
 staged, unstaged, and untracked state; exposes stage/unstage/discard/delete
 actions; provides commit history and AI commit messages; and drives commit,
-pull, push, publish, and PR actions.
+pull, push, and PR actions. Its publish control is currently disabled; GitHub
+publishing is available from the chat-header Git actions control.
 
 ### Files Manager
 
@@ -109,15 +122,18 @@ settled far enough for tests and orchestration to continue deterministically.
 
 ## Provider Runtime
 
-### Provider
+### Provider Driver
 
-The backend agent driver/runtime, such as Codex, Claude, Cursor, Grok, or
+The implementation that probes, launches, and translates one backend agent
+protocol. BiBCode supports four built-in drivers: Codex, Claude, Cursor, and
 OpenCode.
 
 ### Provider Instance
 
 A configured provider entry with its own display name, settings, credentials,
-home path, environment variables, and model availability.
+home path, environment variables, and model availability. An instance has a
+user-facing routing ID and references one provider driver; multiple instances
+may use the same driver.
 
 ### Session
 
@@ -126,11 +142,30 @@ panel threads each own their own session.
 
 ### Runtime Mode
 
-The safety/access mode for a session, such as full access or supervised mode.
+The safety/access mode for a session. The exact persisted values and UI labels
+are `approval-required` (Supervised), `auto-accept-edits` (Auto-accept edits),
+and `full-access` (Full access).
 
 ### Interaction Mode
 
 The agent interaction style for a session, such as default or plan mode.
+
+### Environment
+
+A local or remote server connection and its host-scoped projects, threads,
+terminals, provider runtimes, and diagnostics. Selecting a remote environment
+changes the host on which those operations run; it does not merge remote and
+local process or resource state.
+
+### Activity Actor
+
+A provider-observed participant, such as a subagent, shown in the Activity
+right-panel surface when the selected provider exposes reliable activity data.
+
+### Activity Work Item
+
+A provider-observed background task or unit of work associated with an activity
+actor and thread or terminal scope.
 
 ## Checkpointing
 
