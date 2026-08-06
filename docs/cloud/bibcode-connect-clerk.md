@@ -1,168 +1,107 @@
-# BiBCode Connect Clerk Setup
+# BiBCode Connect Clerk setup
 
-BiBCode Connect uses one Clerk application for web and desktop authentication. The relay accepts
-Clerk JWTs only when they are generated from the `bibcode-relay` template with the shared
-`bibcode-relay` audience.
+BiBCode Connect uses one Clerk application for browser and desktop sign-in. The
+relay accepts Clerk JWTs only from the configured issuer and audience. Clients
+then exchange a Clerk token plus a DPoP proof for relay-scoped access; Clerk
+tokens are not environment credentials.
 
-## Application Keys
+## Client configuration
 
-BiBCode Connect is disabled in a fresh clone. To enable it for source builds, add a repository-root `.env`
-or `.env.local` file:
+Cloud UI is disabled in a fresh clone. To enable it for source builds, add these
+public values to the repository-root `.env.local` or `.env`:
 
 ```dotenv
 BIBCODE_CLERK_PUBLISHABLE_KEY=<publishable key>
-BIBCODE_CLERK_JWT_TEMPLATE=<JWT template name>
-BIBCODE_CLERK_CLI_OAUTH_CLIENT_ID=<public OAuth application client ID>
+BIBCODE_CLERK_JWT_TEMPLATE=bibcode-relay
 BIBCODE_RELAY_URL=https://relay.example.com
 ```
 
-The shared client loader projects these canonical values into framework-specific `VITE_*` aliases.
-Existing aliases remain accepted as overrides for compatibility, but new client configuration should
-use the canonical names.
+The shared loader projects canonical `BIBCODE_*` values into the `VITE_*`
+aliases consumed by the web build. Precedence is:
 
-Configuration precedence is:
+1. process or CI environment variables;
+2. repository-root `.env.local`;
+3. repository-root `.env`.
 
-1. Process or CI environment variables.
-2. Repository-root `.env.local`.
-3. Repository-root `.env`.
+These three values are public build-time configuration, not secrets. Web and
+desktop builds omit Connect UI unless all three are valid. A built desktop
+artifact does not need an environment file at runtime.
 
-The Clerk publishable key, JWT template name, CLI OAuth client ID, and relay URL are public
-identifiers, not secrets.
-Web and desktop builds statically inject the public values they consume during
-their build step. The native server reads operator overrides from its process
-environment. A built desktop artifact does not need an environment file at runtime. CI release builds
-should set `BIBCODE_CLERK_PUBLISHABLE_KEY`, `BIBCODE_CLERK_JWT_TEMPLATE`,
-`BIBCODE_CLERK_CLI_OAUTH_CLIENT_ID`, and `BIBCODE_RELAY_URL` before building.
+Never expose `CLERK_SECRET_KEY` in a client environment, desktop artifact, or
+repository file.
 
-When any client-facing public value is absent, cloud UI is omitted. When the CLI public values are
-absent, the `bibcode connect` CLI command group is omitted. The native server accepts runtime
-overrides for self-hosted or operator-managed
-deployments.
+## Clerk JWT template
 
-For a hosted relay deployment, copy `infra/relay/.env.example` to `infra/relay/.env`. The relay
-deployment reads `RELAY_DOMAIN`, `RELAY_API_ZONE_NAME`, `RELAY_TUNNEL_ZONE_NAME`,
-`CLERK_PUBLISHABLE_KEY`, and `CLERK_JWT_AUDIENCE` through Effect `Config`. There are no checked-in
-deployment defaults.
-`vp run --filter bibcode-relay deploy` invokes Alchemy from the relay directory, so Alchemy loads
-`infra/relay/.env`. After a successful deployment, the wrapper updates the repository-root `.env`
-with the deployed HTTPS relay URL. The relay still requires
-`CLERK_SECRET_KEY` as an Alchemy secret. Never put `CLERK_SECRET_KEY` in a client application
-environment or commit it to the repository.
-
-The `prod` Alchemy stage owns the retained PlanetScale database. Non-production stages reference
-that database and provision isolated PlanetScale branches, so deploy `prod` before creating a
-personal developer stage.
-
-## Headless CLI OAuth Application
-
-The `bibcode connect` commands authorize a headless environment with a separate Clerk OAuth application.
-This uses an OAuth public client with PKCE, so the CLI stores no client secret.
-
-In **Clerk Dashboard > OAuth applications**:
-
-1. Create an OAuth application for the BiBCode CLI.
-2. Enable the **Public** option so authorization-code exchange uses PKCE.
-3. Add `http://127.0.0.1:34338/callback` as an allowed redirect URI.
-4. Enable the `openid`, `profile`, and `email` scopes.
-5. Set `BIBCODE_CLERK_CLI_OAUTH_CLIENT_ID` in the repository-root `.env` file and release build
-   environment to the generated public client ID.
-
-The CLI derives Clerk's frontend API URL from the publishable key and calls Clerk's
-`/oauth/authorize` and `/oauth/token` endpoints directly. The relay is not involved in the OAuth
-handshake; it only validates the issued Clerk bearer token when the CLI manages an environment link.
-
-The CLI supports these headless operations:
-
-```sh
-bibcode connect login
-bibcode connect link
-bibcode connect status
-bibcode connect unlink
-bibcode connect logout
-bibcode serve
-```
-
-`bibcode connect login` opens the Clerk authorization flow and stores the CLI credential without enabling
-cloud exposure. `bibcode connect link` installs the pinned managed `cloudflared` binary when needed,
-authorizes when needed, and records durable intent to expose the environment. It works without a
-running BiBCode server. The next `bibcode serve` or `bibcode start` reconciles the relay link and launches the
-managed tunnel. `bibcode connect unlink` records disabled intent immediately, stops a reachable running
-connector, and attempts to revoke the relay-side environment record. It retains the stored CLI
-authorization so `bibcode connect link` can re-enable exposure without another browser flow. `bibcode connect
-logout` performs the same cleanup and removes the stored CLI authorization.
-
-The current OAuth callback listener binds to loopback port `34338`. When running the CLI over SSH,
-forward that port before running `bibcode connect login` or `bibcode connect link`:
-
-```sh
-ssh -L 34338:127.0.0.1:34338 <host>
-```
-
-A relay-hosted callback broker can remove this port-forward requirement later without changing the
-stored PKCE token model.
-
-## JWT Template
-
-In **Clerk Dashboard > JWT templates**, create a template with:
+Create a template under **Clerk Dashboard > JWT templates**:
 
 | Setting | Value                        |
 | ------- | ---------------------------- |
 | Name    | `bibcode-relay`              |
 | Claims  | `{ "aud": "bibcode-relay" }` |
 
-Set `BIBCODE_CLERK_JWT_TEMPLATE=bibcode-relay` in the repository-root `.env`, and set
-`CLERK_JWT_AUDIENCE=bibcode-relay` in `infra/relay/.env`. Define `CLERK_JWT_TEMPLATE` and
-`CLERK_JWT_AUDIENCE` in the production relay deployment environment as well. The stable `aud` value
-is shared by production and non-production relay stages. The client-facing `BIBCODE_RELAY_URL` still
-selects the concrete relay deployment, but changing that URL does not require a JWT template change.
+Set `BIBCODE_CLERK_JWT_TEMPLATE=bibcode-relay` for the client and
+`CLERK_JWT_AUDIENCE=bibcode-relay` for the relay. The stable audience is shared
+across deployment stages; `BIBCODE_RELAY_URL` chooses the concrete relay.
 
-## Desktop Authentication
+## Relay deployment
 
-The Tauri desktop loads the same React application and `@clerk/react` provider
-as the browser build. Include the public Clerk and relay variables at build
-time to enable BiBCode Connect in either host. The desktop does not use
-`@clerk/electron`, an Electron request adapter, or Electron token storage.
+Copy `infra/relay/.env.example` to `infra/relay/.env` for a local deployment.
+The relay reads `RELAY_DOMAIN`, `RELAY_API_ZONE_NAME`,
+`RELAY_TUNNEL_ZONE_NAME`, `CLERK_PUBLISHABLE_KEY`, and
+`CLERK_JWT_AUDIENCE` through Effect `Config`. `CLERK_SECRET_KEY` is supplied as
+an Alchemy secret.
 
-The current implementation supports Clerk flows that work inside the
-operating-system WebView. A native external-browser OAuth callback flow and
-native desktop passkeys are not implemented. Do not configure custom
-`bibcode://` redirects or claim native passkey support until a Tauri-specific
-transport, secure token store, platform entitlements, and end-to-end tests have
-been added.
+`vp run --filter bibcode-relay deploy` runs Alchemy from `infra/relay`, so that
+directory's environment file is loaded. After deployment, the wrapper writes
+the deployed HTTPS relay URL to the repository-root environment configuration.
 
-The production desktop identifier is `com.bibcode.app`. It is relevant to
-future code signing and native entitlement work, but it does not by itself
-enable Clerk native authentication.
+The `prod` Alchemy stage owns the retained PlanetScale database.
+Non-production stages reference that database and provision isolated branches;
+deploy `prod` before a personal developer stage.
 
-Never put `CLERK_SECRET_KEY` in the desktop app, a client-facing environment
-file, or a build artifact.
+## Client-driven link flow
 
-## Enable Waitlist Access
+Linking is initiated from the Connections settings in the running React client:
 
-For a private beta where people should request access, use **Clerk Dashboard > Waitlist**:
+1. Clerk supplies a JWT from the configured template.
+2. The client ensures the environment's managed relay binary is available.
+3. The client requests a relay link challenge.
+4. The local environment signs the challenge and endpoint descriptor.
+5. The client submits the proof to the relay.
+6. The relay provisions a managed endpoint and returns signed runtime
+   configuration.
+7. The client stores that configuration in the environment through its
+   authenticated Connect API.
 
-1. Toggle on **Enable waitlist** and save.
-2. Review requests on the same page and select **Invite** or **Deny**.
+Unlinking clears the environment configuration first, then best-effort revokes
+the cloud link. Environment link state is durable server state and is
+reconciled when the server runs. The implementation entry points are
+[`apps/web/src/cloud/linkEnvironment.ts`](../../apps/web/src/cloud/linkEnvironment.ts)
+and
+[`apps/server/src/production/connect_mcp.rs`](../../apps/server/src/production/connect_mcp.rs).
 
-Approved signed-in users manage BiBCode Connect under **Connections**. The web and desktop sidebars do
-not expose a dedicated account or waitlist control. Signed-out users reach Clerk's waitlist and
-sign-in flow contextually from the BiBCode Connect controls on the Connections page.
+See [BiBCode Connect auth flow](./bibcode-connect-auth-flow.md) for the relay and
+DPoP connection sequence.
 
-## Alternative: Known-User Allowlist
+## Desktop authentication
 
-For a closed beta where all permitted users are known in advance, use an allowlist instead of a
-request-and-approval waitlist:
+The Tauri desktop loads the same React app and `@clerk/react` provider as the
+browser build. It does not use an Electron adapter or Electron token storage.
+The production application identifier is `com.bibcode.desktop`.
 
-To restrict the beta to permitted email addresses or domains:
+Current Clerk flows must work inside the operating-system WebView. External-
+browser native callbacks, custom `bibcode://` redirects, and native desktop
+passkeys are not implemented. Do not claim them until a Tauri-specific secure
+token transport, platform entitlements, and end-to-end tests exist.
 
-1. In **Clerk Dashboard > Restrictions > Allowlist**, add each permitted email address or email
-   domain.
-2. Enable the allowlist and save.
-3. Alternatively, enable **Restricted mode** when all new users must be explicitly invited or
-   manually created without a waitlist request flow.
+## Private beta access
 
-Do not enable an empty allowlist: it blocks all new sign-ups.
+For request-and-approval access, enable **Clerk Dashboard > Waitlist** and
+invite or deny requests there. Approved signed-in users manage Connect in the
+Connections settings; signed-out users reach Clerk sign-in or waitlist UI from
+those controls.
 
-Clerk allowlists control who can sign up. They do not revoke an existing user's active cloud
-access. To remove an already-created user's access, ban that user in Clerk so their active
-sessions are ended and future sign-ins are rejected.
+For a closed known-user beta, use **Restrictions > Allowlist** or Clerk's
+restricted mode. An empty allowlist blocks all new sign-ups. Allowlisting
+controls account creation; ban an existing user to terminate their Clerk
+sessions and prevent future cloud sign-in.

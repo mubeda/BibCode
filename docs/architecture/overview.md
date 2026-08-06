@@ -1,117 +1,113 @@
 # Architecture
 
-BiBCode has one retained React/Vite frontend and one native Rust backend. Browser
-mode connects to a running `bibcode` server. Desktop mode runs the same frontend in
-Tauri 2 and starts the Axum/Tokio server in-process. Native shell capabilities
-cross a narrow `DesktopBridge`; normal application traffic uses the same typed
-HTTP/WebSocket boundary in both modes.
+BiBCode has one React/Vite frontend and one native Rust backend. Browser mode
+connects to a running `bibcode` server. Desktop mode runs the same frontend in
+Tauri 2 and starts the primary Axum/Tokio server in-process. Native shell
+capabilities cross a narrow `DesktopBridge`; application traffic uses the same
+typed HTTP and WebSocket RPC boundaries in both modes.
 
 ```mermaid
 flowchart TB
-  Web["Browser\nReact 19 + Vite"]
+  Browser["Browser\nReact + Vite"]
   Desktop["Tauri 2 desktop\nRust host + system WebView"]
   Bridge["DesktopBridge\nTauri commands and events"]
-  Server["Native server\nRust + Axum + Tokio"]
-  Providers["Codex / Claude / Cursor / Grok / OpenCode"]
+  Server["BiBCode server\nRust + Axum + Tokio"]
+  Providers["Codex / Claude / Cursor / OpenCode"]
 
-  Web -->|"typed WebSocket/RPC"| Server
+  Browser -->|"HTTP + Effect RPC over WebSocket"| Server
   Desktop --> Bridge
-  Desktop -->|"starts in-process runtime"| Server
-  Bridge --> Desktop
-  Server -->|"provider protocols"| Providers
+  Desktop -->|"starts primary runtime"| Server
+  Server -->|"provider-native protocols"| Providers
 ```
 
 ## Components
 
-- **Tauri host (`apps/desktop`)**: owns application/window lifecycle, native
-  menus and context menus, dialogs, settings, update state, secure connection
-  catalog storage, WSL/SSH preparation, in-process server lifecycle, and
-  shutdown. Tauri capabilities explicitly authorize bridge commands.
-- **React app (`apps/web`)**: owns all user-facing work areas and state. It uses
-  hash history in desktop mode and browser history on the web. The frontend has
-  no Electron dependency and uses the same components in both modes.
-- **Tauri adapter (`apps/web/src/tauriDesktopBridge.ts`)**: installs
-  `window.desktopBridge` only when Tauri globals are present. Native calls use
-  Tauri commands/events; safe browser fallbacks cover low-risk operations.
-- **Server (`apps/server`)**: a Rust library and native `bibcode` binary. Axum serves HTTP and static
-  assets, Tokio owns async lifecycle and bounded tasks, SQLite stores durable
-  state, and Rust modules coordinate providers, terminals, Git, files,
-  authentication, relay access, diagnostics, and orchestration.
-- **Contracts (`packages/contracts`)**: schema-only definitions for the desktop
-  bridge, WebSocket/RPC requests, push events, provider state, and persisted
-  protocol values.
-- **Client runtime (`packages/client-runtime`)**: environment registration,
-  connection supervision, authorization, RPC sessions, caches, and client
-  command construction shared by browser and desktop clients.
-- **Activity observation**: Codex, Claude, and OpenCode adapters normalize
-  provable subagent and background-task state into a bounded server projection.
-  Structured provider chat and managed provider terminals use separate
-  ingestion paths but share the same authorized snapshot/delta protocol. See
-  [Activity observation](./activity-observation.md).
+- **Tauri host (`apps/desktop`)** owns native windows, menus, dialogs, updates,
+  WSL and SSH launch, the desktop connection catalog, and backend lifecycle.
+  Windows protects the catalog with DPAPI. Other platforms currently fall back
+  to renderer storage because OS-backed protection is not implemented there.
+- **React app (`apps/web`)** owns the user interface and client-side state. It
+  uses hash history in desktop mode and browser history on the web. Preview
+  content is hosted in Tauri child webviews; preview automation is brokered by
+  the Rust server and consumed by the React host.
+- **Desktop adapter (`apps/web/src/tauriDesktopBridge.ts`)** installs
+  `window.desktopBridge` only when Tauri globals are present. Tauri commands and
+  events implement privileged operations; browser fallbacks are limited to
+  explicitly safe capabilities.
+- **Server (`apps/server`)** is both a Rust library and the native `bibcode`
+  binary. It owns HTTP/WebSocket RPC, authentication, SQLite persistence,
+  orchestration, providers, terminals, Git, files, diagnostics, relay access,
+  and process supervision.
+- **Contracts (`packages/contracts`)** contains Effect schemas and TypeScript
+  contracts only. It defines persisted models, RPC methods, HTTP APIs, desktop
+  bridge values, and provider events without application runtime logic.
+- **Client runtime (`packages/client-runtime`)** owns environment registration,
+  connection supervision, authorization, RPC sessions, and shared client state.
+  It is used by browser and desktop clients.
+- **Shared runtime (`packages/shared`)** contains runtime utilities used by
+  multiple packages through explicit subpath exports.
 
-## Desktop Startup
+## Runtime topology
+
+The desktop WebView loads the bundled `apps/web` build (`frontendDist`) or the
+Vite development URL. Separately, the Tauri host starts the primary backend
+through `BackendSupervisor` and publishes its ready descriptor to the renderer.
+The renderer then establishes the normal HTTP/WebSocket connection.
 
 ```mermaid
 sequenceDiagram
-    participant Host as Tauri Rust host
-    participant Server as In-process Rust server
-    participant WebView as React WebView
-    participant Provider as Provider runtime
+  participant Host as Tauri host
+  participant Server as Rust server runtime
+  participant UI as React WebView
+  participant Provider as Provider process
 
-    Host->>Server: start ServerRuntime with desktop bootstrap
-    Server-->>Host: bound address and ready descriptor
-    Host->>WebView: navigate to the local Axum URL
-    WebView->>Host: invoke DesktopBridge command
-    Host-->>WebView: typed JSON result or event
-    WebView->>Server: typed HTTP/WebSocket RPC
-    Server->>Provider: supervised provider-native protocol
-    Provider-->>Server: runtime events
-    Server-->>WebView: ordered typed pushes
+  Host->>Server: start primary runtime with desktop bootstrap
+  Server-->>Host: bound address and ready descriptor
+  Host-->>UI: backend-ready event / bootstrap query
+  UI->>Server: authenticate and open Effect RPC session
+  UI->>Host: invoke privileged DesktopBridge operation
+  Server->>Provider: provider-native request
+  Provider-->>Server: provider event
+  Server-->>UI: RPC result or stream chunk
 ```
 
-The desktop host and server share one native process. The server supervises
-provider CLIs, terminals, SSH forwarding, and managed relay processes with
-bounded queues, cancellation, and process-tree cleanup. No Node runtime or
-server sidecar is staged into desktop artifacts.
+The primary backend uses `BackendLaunchTarget::InProcess`. Optional WSL
+backends use `BackendLaunchTarget::ExternalProcess`, so not every desktop
+environment shares the host process. SSH forwarding is owned by the Tauri host;
+provider, terminal, and managed relay processes are supervised by the server.
+Neither path introduces a production Node server or packaged helper sidecar.
 
-The Browser surface is split between React and the native host. React owns its
-chrome, tab state, and persistence, while Tauri child webviews render site
-content through `desktop_preview_*` commands. Desktop builds expose
-`window.desktopBridge.preview` as the stable host boundary; Phase 2 automation
-will control those same host-managed tabs.
+## Request and event flow
 
-## Request And Event Flow
+1. The client runtime resolves a connection target and obtains any required
+   bearer, DPoP, relay, or SSH authorization.
+2. `RpcSessionFactory` opens a WebSocket and synchronizes `server.getConfig`.
+3. Effect RPC schemas encode requests and decode unary results or streams.
+4. The Rust `RpcRegistry` authorizes and routes each method.
+5. Orchestration commands are admitted and persisted before provider delivery.
+6. Provider runtimes translate commands to provider-native protocols and feed
+   normalized events back into durable projections.
 
-1. The frontend resolves an environment through the client runtime.
-2. `WsTransport` opens one authenticated RPC session for that environment.
-3. The server decodes requests with shared schemas and routes them to services.
-4. Provider drivers translate requests into provider-native protocols.
-5. Runtime ingestion normalizes provider events into orchestration events.
-6. Queue-backed reactors persist and project state in order.
-7. `ServerPushBus` publishes ordered typed pushes to connected clients.
-8. Runtime receipts let tests and orchestration wait for completion without
-   polling internal state.
+See [RPC and orchestration](./rpc-and-orchestration.md) and
+[Connection runtime](./connection-runtime.md) for the detailed boundaries.
 
-## Boundaries And Invariants
+## Boundaries and invariants
 
-- React never imports Rust or host implementation details directly.
-- Native desktop functionality crosses only `DesktopBridge` commands/events.
-- Normal application traffic remains WebSocket/RPC, including in desktop mode.
-- `packages/contracts` contains schemas and types only.
-- Rust owns all production backend behavior. TypeScript remains in the React
-  frontend, shared schemas/client runtime, relay infrastructure, and build/test
-  tooling only.
-- Production code must not fall back to Node.js, Electron, or a TypeScript
-  server when native functionality is unavailable.
-- Preview and preview automation are capability-driven and use the Tauri/native
-  implementation, never Electron WebContents APIs.
-- Activity protocol support is negotiated per environment and provider
-  capabilities are downgraded when source data cannot be proven; Cursor and
-  Grok do not expose structured activity in protocol v1.
+- React does not import Rust or native-host implementation details.
+- Privileged desktop behavior crosses `DesktopBridge` commands and events.
+- Normal application traffic uses HTTP and WebSocket RPC in every host.
+- `packages/contracts` remains schema-only.
+- Rust owns all production backend behavior. TypeScript is limited to clients,
+  contracts, shared utilities, relay infrastructure, and development tooling.
+- Capability negotiation controls optional behavior such as activity and
+  preview automation; clients must downgrade when a server cannot prove support.
+- Activity observation is bounded, authorized, and independent for structured
+  provider chat and managed provider terminals. See
+  [Activity observation](./activity-observation.md).
 
 ## Performance
 
-The migration preserves the mature React frontend while removing both the
-bundled Chromium/Electron shell and the Node server process. See
-[Desktop Performance Baseline](./desktop-performance-baseline.md) for methods,
-raw snapshots, and remaining cross-platform measurements.
+The Tauri/Rust migration retained the React frontend while removing the bundled
+Chromium/Electron shell and Node server process. Historical measurements and
+the repeatable capture commands are recorded in the
+[Desktop Performance Baseline](./desktop-performance-baseline.md).

@@ -1,7 +1,7 @@
 # BiBCode
 
-BiBCode is a minimal web GUI for coding agents (currently Codex, Claude, Cursor, and OpenCode,
-with more coming soon).
+BiBCode is a web and Tauri 2 desktop GUI for coding agents. The current provider
+drivers are Codex, Claude, OpenCode, and Cursor (Early Access).
 
 This project is maintained in the public [mubeda/BibCode repository](https://github.com/mubeda/BibCode).
 
@@ -77,12 +77,13 @@ BiBCode is organized around three work areas:
   create worktrees, pin/unread rows, and switch between agent sessions.
 - The center panel hosts the active chat. Its `+` menu can open additional AI
   chat panels, a terminal panel in the same worktree, or the custom action
-  dialog. Extra chat panels are isolated sessions that share the host worktree.
-- The right panel hosts project tools, including the Source Control panel and
-  Files manager. Source Control supports staging, commit history, AI commit
-  messages, per-file actions, and pull/push/PR flows. Files supports context
-  menus, create/rename/delete/duplicate, external open/preview, and explicit
-  Ctrl/Cmd+S saves.
+  dialog. Up to four split panes can share a worktree while keeping their agent
+  sessions isolated.
+- The right panel hosts Browser, Terminal, Diff, Activity, Plan, Files, and
+  Source Control tools. Source Control supports staging, commit history, AI
+  commit messages, per-file actions, and pull/push/PR flows. Files supports
+  context menus, create/rename/delete/duplicate, external open/preview, and
+  explicit Ctrl/Cmd+S saves.
 
 See [Workspace UI](./docs/user/workspace-ui.md) for the detailed guide.
 
@@ -92,15 +93,16 @@ We are very very early in this project. Expect bugs.
 
 We are not accepting contributions yet.
 
-There's no public docs site yet, so start with the markdown files in [docs](./docs).
+There's no public docs site yet, so start with the [documentation index](./docs/README.md).
 
 ## Documentation
 
+- [Documentation index](./docs/README.md)
 - [Getting started](./docs/getting-started/quick-start.md)
 - [Workspace UI](./docs/user/workspace-ui.md)
 - [Source Control](./docs/integrations/source-control-providers.md#source-control-panel)
 - [Architecture overview](./docs/architecture/overview.md)
-- [Provider guides](./docs/providers/codex.md)
+- [Provider guides](./docs/providers/README.md)
 - [Operations](./docs/operations/ci.md)
 - [Reference](./docs/reference/encyclopedia.md)
 
@@ -127,7 +129,7 @@ Checkout their getting started guide for more information: https://viteplus.dev/
 ### Install dependencies
 
 ```bash
-vp i
+vp install
 ```
 
 Read [CONTRIBUTING.md](./CONTRIBUTING.md) before opening an issue or PR.

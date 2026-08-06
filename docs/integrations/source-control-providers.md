@@ -1,154 +1,154 @@
 # Source Control Integrations
 
-BiBCode connects directly to your Git hosting provider so you can create pull requests, review code, and manage repositories without leaving your editor. Work stays in flow without jumping between browser tabs and terminal windows.
+BiBCode uses Git for local repository operations and provider-specific tools for
+hosted repository and pull-request operations. Authentication belongs on the
+machine running the BiBCode server.
 
-## Supported Providers
+## Current capability matrix
 
-BiBCode works with the platforms your team already uses:
+| Operation                             | GitHub           | GitLab           | Bitbucket        | Azure DevOps     |
+| ------------------------------------- | ---------------- | ---------------- | ---------------- | ---------------- |
+| Clone a supplied Git URL              | Yes, through Git | Yes, through Git | Yes, through Git | Yes, through Git |
+| Look up a repository by provider/name | Yes, `gh`        | Yes, `glab`      | No               | No               |
+| Publish a local repository natively   | **Yes, `gh`**    | No               | No               | No               |
+| Resolve the current PR/MR             | Yes              | Yes              | Yes              | Yes              |
+| Create a PR/MR                        | Yes              | Yes              | Yes              | Yes              |
+| Open or prepare a PR branch locally   | Yes              | Yes              | Yes              | Yes              |
 
-- **GitHub** – Pull requests, repository creation, and clone integration
-- **GitLab** – Merge requests, repository publishing, and hosted clones
-- **Bitbucket** – Pull request workflows (via API token authentication)
-- **Azure DevOps** – Pull request support for Microsoft-hosted repositories
+“Clone from URL” is a generic Git clone. It does not require BiBCode to identify
+the hosting provider, but the URL's normal SSH or HTTPS credentials must work on
+the server.
 
-## What You Can Do
+Native repository publishing is implemented only for GitHub. The server rejects
+publish requests for GitLab, Bitbucket, and Azure DevOps as unavailable, even if
+a UI control happens to list those providers.
 
-### Start Projects from Anywhere
+## Add an existing project
 
-**Clone repositories directly**
+Open the Command Palette (`Cmd/Ctrl+K`) and choose **Add Project**. You can:
 
-- Open the Command Palette (`Cmd/Ctrl + K`) → **Add Project**
-- Choose **Clone from URL**
-- Paste a Git URL, pick a destination folder and directory name, and start coding
+- browse to one existing project folder;
+- clone a Git URL into a chosen destination; or
+- create one new local Git repository.
 
-**Import local repositories**
+Selecting a folder adds that folder as one project. The dialog does not scan a
+parent directory for nested repositories or import multiple projects at once.
 
-- Use the Add Project dialog's Local host flow to browse to a folder
-- Select a Git repository directly, or choose a folder containing repositories
-  and import multiple projects at once
+## Publish a local repository
 
-**Publish local projects to the cloud**
+GitHub publishing uses `gh repo create`, adds the selected remote, and pushes the
+current branch. Install and authenticate GitHub CLI first, then use the publish
+flow in the chat-header Git actions control:
 
-- Have a local Git repository without a remote?
-- Use the **Publish Repository** action to create a new hosted repository (GitHub, GitLab, Bitbucket, or Azure DevOps), add it as your origin remote, and push—all in one flow
-- Perfect for turning a weekend prototype into a real project
+```bash
+gh auth login
+```
 
-### Manage Code Reviews Without Context Switching
+The right-panel Source Control surface currently renders publish actions as
+disabled; publishing is not wired there.
 
-**Create pull requests while you work**
+## Pull requests and merge requests
 
-- Push a branch and create a pull request from the Source Control panel
-- BiBCode can suggest titles and descriptions based on your commits
-- Supports GitHub Pull Requests, GitLab Merge Requests, and Bitbucket Pull Requests
+From the Git actions or Source Control UI, BiBCode can:
 
-**Stay on top of open reviews**
+- detect an open PR/MR for the current branch;
+- generate proposed title and description text;
+- push and create a PR/MR;
+- open the hosted review in a browser; and
+- switch to the review branch or create a worktree for it.
 
-- See if your current branch already has an open PR/MR
-- Open the review directly in your browser with one click
-- Check out a teammate's branch to review code locally
+Provider terminology follows the host: GitLab uses merge requests, while the
+other supported hosts use pull requests.
 
-### Know Your Setup at a Glance
+## Source Control panel
 
-The **Source Control settings** page shows you exactly what's connected:
+The right-panel Source Control surface manages the active project or worktree:
 
-- ✅ Which providers are authenticated and ready
-- ⚠️ What's missing and how to fix it
-- 👤 Which account is signed in (when available)
-
-Run a quick **Rescan** after setting up a new machine or changing credentials.
-
-## Source Control Panel
-
-The right-panel Source Control surface manages the active project/worktree:
-
-- The primary button adapts to the repository state. It commits staged files by
-  default, changes to Stage All Changes when nothing is staged, then exposes
-  pull, push, publish, and PR states for clean-tree workflows.
-- The dropdown stays visible and shows unavailable actions as disabled.
+- The primary action commits staged files, stages all when nothing is staged,
+  and exposes available pull, push, and PR states for clean trees.
+- The dropdown remains visible and shows unavailable actions as disabled.
 - Changes are grouped into Staged Changes, Changes, and Untracked Files with
   per-file status badges.
-- File rows show one contextual checkbox. It stages or unstages normally; use
-  **Select** to enter a dedicated mode for choosing arbitrary files to discard,
-  delete, or ignore in bulk.
-- Per-file hover actions stage, unstage, discard, restore deleted files, or
-  delete untracked files. Destructive actions ask for confirmation.
-- Row context menus are for navigation only: view, copy path, copy relative
-  path, and open in an external editor.
-- Commit history and AI commit-message generation are available in the panel.
+- The per-file checkbox stages or unstages normally. **Select** mode chooses
+  arbitrary files for bulk discard, delete, or ignore actions.
+- Hover actions can stage, unstage, discard, restore a deleted file, or delete an
+  untracked file. Destructive actions require confirmation.
+- Context menus can view a file, copy its path, open it externally, or add ignore
+  rules for its name or parent folder when available.
+- Commit history and AI commit-message generation are available.
 
-There is intentionally no stash or amend action in this UI pass.
+The panel intentionally has no stash or amend action. A staged row also does not
+yet open a true `git diff --cached` view.
 
-## Getting Started
+## Provider setup
 
-### For GitHub (Recommended for most users)
+### GitHub
 
-1. Install the GitHub CLI on the machine running BiBCode:
-   ```bash
-   brew install gh
-   ```
-2. Sign in:
-   ```bash
-   gh auth login
-   ```
-3. Open **Settings → Source Control** in BiBCode and verify GitHub shows as authenticated
+Install [GitHub CLI](https://cli.github.com/) and authenticate:
 
-That's it—you can now clone, publish, and create pull requests.
+```bash
+gh auth login
+```
 
-### For GitLab
+GitHub supports provider lookup, native publish, and pull-request operations.
+Open **Settings → Source Control** and rescan to verify the server-side CLI and
+account.
 
-1. Install the GitLab CLI:
-   ```bash
-   brew install glab
-   ```
-2. Authenticate:
-   ```bash
-   glab auth login
-   ```
-3. Check **Settings → Source Control** to confirm the connection
+### GitLab
 
-### For Bitbucket
+Install [GitLab CLI](https://gitlab.com/gitlab-org/cli) and authenticate:
 
-Bitbucket uses API tokens instead of a CLI tool:
+```bash
+glab auth login
+```
 
-1. Create an API token in your Atlassian account with read/write access to pull requests and repositories
-2. Add these environment variables to the environment running BiBCode:
-   ```bash
-   export BIBCODE_BITBUCKET_EMAIL="you@example.com"
-   export BIBCODE_BITBUCKET_API_TOKEN="your-token"
-   ```
-3. Restart BiBCode and verify the connection in **Source Control settings**
+GitLab supports provider lookup and merge-request operations. Native repository
+publishing is not implemented.
 
-### For Azure DevOps
+### Azure DevOps
 
-1. Install Azure CLI:
-   ```bash
-   brew install azure-cli
-   ```
-2. Add the DevOps extension:
-   ```bash
-   az extension add --name azure-devops
-   ```
-3. Sign in:
-   ```bash
-   az login
-   ```
+Install [Azure CLI](https://learn.microsoft.com/cli/azure/install-azure-cli), add
+the DevOps extension, and sign in:
 
----
+```bash
+az extension add --name azure-devops
+az login
+```
 
-## Requirements & Troubleshooting
+BiBCode invokes `az repos pr` with repository auto-detection for pull-request
+operations. Native repository lookup and publishing are not implemented.
 
-**Git is required** – BiBCode uses Git for all local operations. Ensure `git` is installed on your server.
+### Bitbucket
 
-**Server-side setup** – Authentication happens on the machine running BiBCode (the server), not your local browser. If you're using a hosted or team instance, your administrator may have already configured providers.
+Bitbucket pull-request operations use its REST API directly. Configure either a
+bearer access token:
 
-**Common issues:**
+```bash
+export BIBCODE_BITBUCKET_ACCESS_TOKEN="your-access-token"
+```
 
-- **Provider shows "Not authenticated"** – Run the login command for that provider (e.g., `gh auth login`) in a terminal on the server, then rescan in Settings
-- **Bitbucket not connecting** – Double-check your environment variables are set in the correct shell profile and the server was restarted
-- **Can't push to a remote** – Verify your Git remote URL matches the provider you've authenticated with (SSH vs HTTPS remotes may need different credentials)
+or an Atlassian email/API-token pair:
 
-**Need more help?** Check your provider's CLI documentation:
+```bash
+export BIBCODE_BITBUCKET_EMAIL="you@example.com"
+export BIBCODE_BITBUCKET_API_TOKEN="your-api-token"
+```
 
-- [GitHub CLI](https://cli.github.com/)
-- [GitLab CLI](https://gitlab.com/gitlab-org/cli)
-- [Azure CLI](https://docs.microsoft.com/en-us/cli/azure/)
+Restart the server after changing its environment. The `origin` remote must be a
+recognizable Bitbucket URL so BiBCode can identify the workspace and repository.
+
+The current Source Control discovery screen does not probe these environment
+variables; it always reports Bitbucket as missing/unknown. That status is not a
+credential test. Attempting a Bitbucket PR operation returns a specific error if
+credentials are absent.
+
+## Troubleshooting
+
+- Confirm `git` and the relevant provider CLI are on the BiBCode server's
+  `PATH`, not only on the browser machine.
+- Rescan **Settings → Source Control** after installing or authenticating `gh`,
+  `glab`, or `az`.
+- Check whether the remote uses SSH or HTTPS and whether that transport's Git
+  credentials work in a server-side shell.
+- For Bitbucket, verify the server process inherited the environment variables
+  and restart it after changes.

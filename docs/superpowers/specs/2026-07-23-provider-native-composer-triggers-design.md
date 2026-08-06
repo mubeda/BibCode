@@ -29,7 +29,7 @@ The current composer has a fixed trigger model:
   with `/` or prose;
 - `@` searches only workspace files and folders; and
 - selected files are serialized as Markdown links such as
-  `[main.ts](src/main.ts)`.
+  <code>&#91;main.ts](src/main.ts)</code>.
 
 This creates several inconsistencies:
 
