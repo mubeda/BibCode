@@ -4,18 +4,28 @@
 
 **Goal:** Turn the root `AGENTS.md` into a concrete preflight, architectural-analysis, implementation-quality, and evidence-based completion contract for every coding agent used on BiBCode.
 
-**Architecture:** Keep `AGENTS.md` as the single source of policy and keep `CLAUDE.md` as its pointer. Extend the existing repository-specific rules with an ordered workflow that reads living documentation, conditionally synchronizes CodeGraph, verifies architecture against executable evidence, and selects validation according to change risk.
+**Architecture:** Keep `AGENTS.md` as the single source of policy and keep `CLAUDE.md` as its pointer. Extend the existing repository-specific rules with an ordered workflow that reads living documentation, conditionally synchronizes CodeGraph and treats it as usable only after sync succeeds, verifies architecture against executable evidence, and selects validation according to change risk.
 
 **Tech Stack:** Markdown agent instructions, Git, CodeGraph CLI when already installed, Vite+, Cargo.
 
 ## Global Constraints
 
 - `AGENTS.md` remains the only source of agent policy; do not duplicate the policy in `CLAUDE.md` or new package-local files.
-- CodeGraph remains optional and best-effort. Do not add a dependency, repository script, CI step, installation action, initialization action, unlock action, or full-index action.
-- A failed CodeGraph sync must be disclosed but must not block normal source navigation or implementation.
+- CodeGraph remains optional and best-effort. If its binary is available, attempt
+  `codegraph sync . --quiet`; use relationship and impact queries only after it
+  succeeds. Successful sync may update ignored generated `.codegraph/` data.
+- Do not hand-edit, stage, or commit `.codegraph/` data, and do not add a
+  dependency, repository script, CI step, installation action, initialization
+  action, unlock action, repair action, or full-index action.
+- An unavailable binary or failed CodeGraph sync must be disclosed as an
+  unavailable, stale, or unusable graph, but must not block normal source
+  navigation or implementation.
 - Living documentation describes intended current architecture; historical plans, specifications, reports, and measurements remain history rather than instructions.
 - Critical architectural claims must be confirmed against current source, schemas, manifests, tests, and CI.
-- Preserve the existing package roles, production Rust constraint, schema-only contracts boundary, `DesktopBridge` boundary, typed application-traffic boundary, and vendored-repository rules.
+- Preserve the existing package roles, production Rust constraint, schema-only
+  contracts boundary, `DesktopBridge` commands/events boundary, typed
+  HTTP/WebSocket RPC boundary in browser and desktop modes, and
+  vendored-repository rules.
 - `vp check` and `vp run typecheck` must pass before the task is complete.
 - Preserve unrelated user changes and do not modify `.repos/` or `.codegraph/`.
 
@@ -102,13 +112,17 @@ Before non-trivial diagnosis, design, or implementation:
 2. Run `git status --short`; preserve unrelated user changes.
 3. State the requested outcome, constraints, affected packages, and evidence
    that will prove completion.
-4. If `codegraph` is available on `PATH`, run `codegraph sync . --quiet` from
-   the repository root before relying on graph results.
-5. If CodeGraph sync fails, note that its data may be stale and continue with
-   `rg`, manifests, tests, and direct source inspection. Do not block the task.
+4. If the `codegraph` binary is available on `PATH`, attempt
+   `codegraph sync . --quiet` from the repository root. A CodeGraph graph is
+   usable only after the sync succeeds; successful sync may update ignored generated
+   `.codegraph/` data.
+5. If the binary is unavailable or CodeGraph sync fails, disclose that graph
+   data is unavailable, stale, or unusable and immediately continue with `rg`,
+   manifests, tests, and direct source inspection. Do not block the task.
 
-Do not install, initialize, unlock, repair, or fully re-index CodeGraph unless
-the user explicitly requests it. When CodeGraph is available, use its
+Do not hand-edit, stage, or commit `.codegraph/` data. Do not install,
+initialize, unlock, repair, or fully re-index CodeGraph unless the user
+explicitly requests it. When and only when the graph is usable, use its
 relationship and impact queries for unfamiliar or cross-package code, then
 confirm critical findings in source and tests.
 ```
@@ -120,8 +134,8 @@ For non-trivial code work, read `docs/README.md`,
 `docs/architecture/overview.md`, `docs/reference/workspace-layout.md`, and
 `docs/reference/scripts.md`, then read the task-relevant living documentation
 linked by the index. Also inspect the closest package README and manifest,
-public contracts, existing tests, CI configuration, and recent history for
-affected paths when intent is unclear.
+public contracts, existing tests, and CI configuration. Inspect recent history
+for affected paths when intent is unclear.
 ```
 
 Allow documentation-only and very small mechanical work to use the relevant
@@ -180,6 +194,8 @@ patch whenever package ownership, protocol flow, persisted shape, runtime
 topology, lifecycle guarantees, security boundaries, or documented invariants
 change. Require alternatives and trade-offs to be recorded in an approved
 design document before a non-trivial new architectural decision is implemented.
+Require implementation to pause until alternatives and trade-offs are presented
+and approved if that decision lacks an approved design.
 
 - [ ] **Step 6: Add implementation-quality rules**
 
@@ -242,14 +258,21 @@ const claudeInstructions = readFileSync("CLAUDE.md", "utf8");
 const requiredFragments = [
   "## Required Pre-Work",
   "codegraph sync . --quiet",
+  "If the `codegraph` binary is available on `PATH`, attempt\n   `codegraph sync . --quiet`",
   "docs/architecture/overview.md",
   "docs/reference/workspace-layout.md",
   "docs/reference/scripts.md",
   "## Evidence and Documentation",
   "## Architectural Decision Standards",
   "partial-stream",
+  "`DesktopBridge` commands/events",
+  "HTTP/WebSocket RPC in browser and desktop modes",
   "## Implementation Quality",
-  "Do not install, initialize, unlock, repair, or fully re-index CodeGraph",
+  "CodeGraph graph is\n   usable only after the sync succeeds",
+  "unavailable, stale, or unusable",
+  "Do not hand-edit, stage, or commit `.codegraph/` data",
+  "Do not install,\ninitialize, unlock, repair, or fully re-index CodeGraph",
+  "When and only when the graph is usable, use its\nrelationship and impact queries",
   "cargo fmt --all --check",
   "exact validation commands",
 ];

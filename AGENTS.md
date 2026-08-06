@@ -9,13 +9,17 @@ Before non-trivial diagnosis, design, or implementation:
 2. Run `git status --short`; preserve unrelated user changes.
 3. State the requested outcome, constraints, affected packages, and evidence
    that will prove completion.
-4. If `codegraph` is available on `PATH`, run `codegraph sync . --quiet` from
-   the repository root before relying on graph results.
-5. If CodeGraph sync fails, note that its data may be stale and continue with
-   `rg`, manifests, tests, and direct source inspection. Do not block the task.
+4. If the `codegraph` binary is available on `PATH`, attempt
+   `codegraph sync . --quiet` from the repository root. A CodeGraph graph is
+   usable only after the sync succeeds; successful sync may update ignored generated
+   `.codegraph/` data.
+5. If the binary is unavailable or CodeGraph sync fails, disclose that graph
+   data is unavailable, stale, or unusable and immediately continue with `rg`,
+   manifests, tests, and direct source inspection. Do not block the task.
 
-Do not install, initialize, unlock, repair, or fully re-index CodeGraph unless
-the user explicitly requests it. When CodeGraph is available, use its
+Do not hand-edit, stage, or commit `.codegraph/` data. Do not install,
+initialize, unlock, repair, or fully re-index CodeGraph unless the user
+explicitly requests it. When and only when the graph is usable, use its
 relationship and impact queries for unfamiliar or cross-package code, then
 confirm critical findings in source and tests.
 
@@ -23,8 +27,8 @@ For non-trivial code work, read `docs/README.md`,
 `docs/architecture/overview.md`, `docs/reference/workspace-layout.md`, and
 `docs/reference/scripts.md`, then read the task-relevant living documentation
 linked by the index. Also inspect the closest package README and manifest,
-public contracts, existing tests, CI configuration, and recent history for
-affected paths when intent is unclear.
+public contracts, existing tests, and CI configuration. Inspect recent history
+for affected paths when intent is unclear.
 
 Documentation-only and very small mechanical work may use the relevant subset
 only after consulting `docs/README.md`. This keeps the workflow proportionate
@@ -61,6 +65,10 @@ Before editing, identify:
   paths;
 - existing tests and living documents that define the behavior.
 
+Treat these as hard runtime boundaries: privileged desktop operations must cross
+`DesktopBridge` commands/events, and normal application traffic must use typed
+HTTP/WebSocket RPC in browser and desktop modes.
+
 Make the smallest coherent change that preserves repository boundaries. Improve
 the correct shared abstraction when multiple consumers need the same policy,
 while avoiding speculative generalization, duplicate sources of truth,
@@ -71,7 +79,9 @@ Change the corresponding living architecture document in the same patch whenever
 package ownership, protocol flow, persisted shape, runtime topology, lifecycle
 guarantees, security boundaries, or documented invariants change. Record
 alternatives and trade-offs in an approved design document before implementing a
-non-trivial new architectural decision.
+non-trivial new architectural decision. If that decision lacks an approved
+design, pause implementation until its alternatives and trade-offs are
+presented and approved.
 
 ## Implementation Quality
 
