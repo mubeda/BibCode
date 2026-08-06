@@ -60,11 +60,8 @@ vi.mock("~/components/ui/menu", () => ({
     render,
     ...props
   }: React.ComponentProps<"button"> & { render?: React.ReactNode }) =>
-    render ? (
-      <>
-        {render}
-        {children}
-      </>
+    render && React.isValidElement(render) ? (
+      React.cloneElement(render, props, children)
     ) : (
       <button {...props}>{children}</button>
     ),
@@ -341,6 +338,7 @@ describe("CenterPanelTabs", () => {
     expect(previous).toBeDefined();
     expect(next).toBeDefined();
     expect(allTabs).toBeDefined();
+    if (!previous || !next || !allTabs) throw new Error("Overflow controls not found");
     for (const control of [previous, next, allTabs]) {
       expect(
         (control?.props as Record<string, unknown> | undefined)?.[
@@ -348,6 +346,9 @@ describe("CenterPanelTabs", () => {
         ],
       ).toBe(true);
     }
+    expect(
+      renderToStaticMarkup((allTabs.props as { children?: React.ReactNode }).children),
+    ).toContain("<svg");
     expect(String(navigatorClassName)).toContain("gap-1");
     expect(String(navigatorClassName)).toContain("border-l");
     expect(String(navigatorClassName)).not.toContain("gap-0.5");
@@ -356,7 +357,6 @@ describe("CenterPanelTabs", () => {
         (element.props as Record<string, unknown>)["className"] === "max-h-80 w-64 overflow-y-auto",
     );
     expect(allTabsPopup).toBeDefined();
-    if (!previous || !next) throw new Error("Overflow page controls not found");
 
     (next.props as { onClick: () => void }).onClick();
     (previous.props as { onClick: () => void }).onClick();
