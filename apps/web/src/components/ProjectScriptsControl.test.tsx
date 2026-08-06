@@ -4,8 +4,8 @@
  * The control is a stateful dialog-driven component, so it uses the repo's
  * instrumented-hooks pattern (see ChatView.hooks.test.tsx / Sidebar.test.tsx):
  * a partial `vi.mock("react")` seeds `useState` by call index (guarded by an
- * expected-initial check so hook-order drift fails loudly), records setter
- * calls, captures effects, and exposes `useRef`s. Every leaf UI primitive is a
+ * expected-initial check so hook-order drift fails loudly), and records setter
+ * calls. Every leaf UI primitive is a
  * capture-mock that records its props during a `renderToStaticMarkup` pass;
  * tests then look up host/handler props (menu items, inputs, the form, the icon
  * grid) and invoke them directly with fake events.
@@ -15,7 +15,11 @@ import { renderToStaticMarkup } from "react-dom/server";
 import * as React from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import type { NewProjectScriptInput, ProjectScriptActionResult } from "./ProjectScriptsControl";
+import type {
+  NewProjectScriptInput,
+  ProjectScriptActionResult,
+  ProjectScriptsController,
+} from "./ProjectScriptsControl";
 
 const h = vi.hoisted(() => {
   const state = {
@@ -25,8 +29,6 @@ const h = vi.hoisted(() => {
     stateCalls: [] as Array<{ index: number; initial: unknown }>,
     stateSeeds: new Map<number, { value: unknown; expectInitial: (value: unknown) => boolean }>(),
     setStateCalls: [] as Array<{ index: number; next: unknown; applied: unknown }>,
-    effects: [] as Array<() => void | (() => void)>,
-    refs: [] as Array<{ current: unknown }>,
     // logic seams
     capturedKeybinding: null as string | null,
     keybindingValue: null as string | null,
@@ -62,21 +64,9 @@ vi.mock("react", async (importOriginal) => {
     return [value, setValue];
   };
 
-  const useEffect = (effect: () => void | (() => void)) => {
-    h.effects.push(effect);
-  };
-
-  const useRef = (initial?: unknown) => {
-    const ref = { current: initial ?? null };
-    h.refs.push(ref);
-    return ref;
-  };
-
   return {
     ...actual,
     useState: useState as typeof actual.useState,
-    useEffect: useEffect as typeof actual.useEffect,
-    useRef: useRef as typeof actual.useRef,
   };
 });
 
@@ -169,7 +159,12 @@ vi.mock("./ui/alert-dialog", () => ({
   AlertDialogTitle: makeMock("AlertDialogTitle"),
 }));
 
-import ProjectScriptsControl from "./ProjectScriptsControl";
+import ProjectScriptsControl, {
+  ProjectScriptsDialogs,
+  ProjectScriptsExpandedActions,
+  ProjectScriptsMenuItems,
+  useProjectScriptsController,
+} from "./ProjectScriptsControl";
 
 type Props = Parameters<typeof ProjectScriptsControl>[0];
 
@@ -257,13 +252,37 @@ function renderControl(
   h.captures.length = 0;
   h.stateCalls.length = 0;
   h.setStateCalls.length = 0;
-  h.effects.length = 0;
-  h.refs.length = 0;
   h.stateSeeds.clear();
   for (const [name, value] of Object.entries(seeds)) {
     seed(name as keyof typeof STATE, value);
   }
   return renderToStaticMarkup(<ProjectScriptsControl {...props} />);
+}
+
+function renderControllerSurfaces(
+  props: Props = baseProps(),
+  seeds: Partial<Record<keyof typeof STATE, unknown>> = {},
+): string {
+  h.captures.length = 0;
+  h.stateCalls.length = 0;
+  h.setStateCalls.length = 0;
+  h.stateSeeds.clear();
+  for (const [name, value] of Object.entries(seeds)) {
+    seed(name as keyof typeof STATE, value);
+  }
+
+  function ControllerSurfaces() {
+    const controller = useProjectScriptsController(props);
+    return (
+      <>
+        <ProjectScriptsExpandedActions controller={controller} />
+        <ProjectScriptsMenuItems controller={controller} />
+        <ProjectScriptsDialogs controller={controller} />
+      </>
+    );
+  }
+
+  return renderToStaticMarkup(<ControllerSurfaces />);
 }
 
 // ── capture lookup helpers ────────────────────────────────────────────────────
@@ -344,8 +363,6 @@ beforeEach(() => {
   h.captures.length = 0;
   h.stateCalls.length = 0;
   h.setStateCalls.length = 0;
-  h.effects.length = 0;
-  h.refs.length = 0;
   h.stateSeeds.clear();
   h.capturedKeybinding = null;
   h.keybindingValue = null;
@@ -404,6 +421,114 @@ describe("rendering", () => {
     h.shortcutLabel = null;
     renderControl();
     expect(byName("MenuShortcut")).toHaveLength(0);
+  });
+});
+
+describe("shared controller presentations", () => {
+  it("routes expanded primary and dropdown actions through the controller", () => {
+    const scripts = [
+      makeScript({ id: "build", name: "Build", icon: "build" }),
+      makeScript({ id: "test", name: "Test", icon: "test" }),
+    ];
+    const runScript = vi.fn<(script: ProjectScript) => void>();
+    const openEditDialog = vi.fn<(script: ProjectScript) => void>();
+    const controller = {
+      scripts,
+      primaryScript: scripts[0]!,
+      openAddDialog: vi.fn(),
+      openEditDialog,
+      runScript,
+    } satisfies ProjectScriptsController;
+
+    renderToStaticMarkup(<ProjectScriptsExpandedActions controller={controller} />);
+    invoke(
+      mustFind((props) => props["aria-label"] === "Run Build", "run Build"),
+      "onClick",
+      {},
+    );
+    invoke(
+      mustFind((props) => props["aria-label"] === "Edit Test", "edit Test"),
+      "onClick",
+      {
+        preventDefault: vi.fn(),
+        stopPropagation: vi.fn(),
+      },
+    );
+
+    expect(runScript).toHaveBeenCalledWith(scripts[0]);
+    expect(openEditDialog).toHaveBeenCalledWith(scripts[1]);
+  });
+
+  it("renders every script, shortcut, edit action, and Add action as bare menu items", () => {
+    const scripts = [
+      makeScript({ id: "build", name: "Build", icon: "build" }),
+      makeScript({ id: "test", name: "Test", icon: "test" }),
+    ];
+    const controller = {
+      scripts,
+      primaryScript: scripts[0]!,
+      openAddDialog: vi.fn(),
+      openEditDialog: vi.fn(),
+      runScript: vi.fn(),
+    } satisfies ProjectScriptsController;
+
+    const markup = renderToStaticMarkup(<ProjectScriptsMenuItems controller={controller} />);
+
+    expect(byName("Menu")).toHaveLength(0);
+    expect(byName("MenuPopup")).toHaveLength(0);
+    expect(byName("MenuItem")).toHaveLength(3);
+    expect(byName("MenuShortcut")).toHaveLength(2);
+    expect(markup).toContain("Build");
+    expect(markup).toContain("Test");
+    expect(markup).toContain("Add action");
+    expect(mustFind((props) => props["aria-label"] === "Edit Build", "edit Build")).toBeDefined();
+    expect(mustFind((props) => props["aria-label"] === "Edit Test", "edit Test")).toBeDefined();
+  });
+
+  it("shares edit dialog state between menu items and dialogs", () => {
+    const props = baseProps({
+      scripts: [makeScript({ id: "build", name: "Build", command: "vp build", icon: "build" })],
+    });
+    renderControllerSurfaces(props);
+
+    const editBuild = mustFind((entry) => entry["aria-label"] === "Edit Build", "edit Build");
+    invoke(editBuild, "onClick", {
+      preventDefault: vi.fn(),
+      stopPropagation: vi.fn(),
+    });
+    expect(appliedValues("editingScriptId")).toContain("build");
+    expect(appliedValues("dialogOpen")).toContain(true);
+
+    renderControllerSurfaces(props, {
+      editingScriptId: "build",
+      dialogOpen: true,
+      name: "Build",
+      command: "vp build",
+      icon: "build",
+    });
+    expect(byName("Dialog")[0]?.["open"]).toBe(true);
+    expect(byName("DialogTitle")[0]?.["children"]).toBe("Edit Action");
+    expect(mustFind((entry) => entry["id"] === "script-name", "script name")["value"]).toBe(
+      "Build",
+    );
+  });
+
+  it("shares add dialog state between the controller action and dialogs", () => {
+    const props = baseProps();
+
+    renderControllerSurfaces(props);
+    const addAction = byName("MenuItem").find((entry) => {
+      const children = entry["children"];
+      return Array.isArray(children) && children.includes("Add action");
+    });
+    if (!addAction) throw new Error("could not find Add action menu item");
+    invoke(addAction, "onClick", {});
+    expect(appliedValues("editingScriptId")).toContain(null);
+    expect(appliedValues("dialogOpen")).toContain(true);
+
+    renderControllerSurfaces(props, { dialogOpen: true });
+    expect(byName("Dialog")[0]?.["open"]).toBe(true);
+    expect(byName("DialogTitle")[0]?.["children"]).toBe("Add Action");
   });
 });
 
@@ -701,31 +826,5 @@ describe("delete flow", () => {
     const alert = byName("AlertDialog")[0]!;
     invoke(alert, "onOpenChange", true);
     expect(appliedValues("deleteConfirmOpen")).toContain(true);
-  });
-});
-
-describe("external add-dialog request effect", () => {
-  it("opens the add dialog when the request id changes to a truthy value", () => {
-    renderControl(baseProps({ addDialogRequestId: 3 }));
-    // The ref starts at the current request id; simulate a prior handled value.
-    h.refs[0]!.current = 0;
-    for (const effect of h.effects) effect();
-    expect(appliedValues("dialogOpen")).toContain(true);
-    expect(h.refs[0]!.current).toBe(3);
-  });
-
-  it("ignores the effect when the request id is unchanged", () => {
-    renderControl(baseProps({ addDialogRequestId: 3 }));
-    h.refs[0]!.current = 3;
-    for (const effect of h.effects) effect();
-    expect(setCallsFor("dialogOpen")).toHaveLength(0);
-  });
-
-  it("records a changed request id of zero without opening the dialog", () => {
-    renderControl(baseProps({ addDialogRequestId: 0 }));
-    h.refs[0]!.current = 9;
-    for (const effect of h.effects) effect();
-    expect(h.refs[0]!.current).toBe(0);
-    expect(setCallsFor("dialogOpen")).toHaveLength(0);
   });
 });

@@ -7,6 +7,16 @@ const harness = vi.hoisted(() => ({
   primaryEnvironmentId: "environment-primary" as EnvironmentId | null,
   panelProps: null as Record<string, unknown> | null,
   gitProps: null as Record<string, unknown> | null,
+  projectController: {
+    scripts: [] as unknown[],
+    primaryScript: null as unknown,
+    openAddDialog: vi.fn(),
+    openEditDialog: vi.fn(),
+    runScript: vi.fn(),
+  },
+  projectControllerProps: [] as Array<Record<string, unknown>>,
+  expandedControllers: [] as unknown[],
+  dialogControllers: [] as unknown[],
 }));
 
 vi.mock("../../state/environments", () => ({
@@ -22,6 +32,20 @@ vi.mock("./ChatHeaderPanelMenu", () => ({
 
 vi.mock("../ProjectScriptsControl", () => ({
   default: () => <div data-testid="scripts-control" />,
+  useProjectScriptsController: (props: Record<string, unknown>) => {
+    harness.projectControllerProps.push(props);
+    harness.projectController.scripts = props["scripts"] as unknown[];
+    harness.projectController.primaryScript = harness.projectController.scripts[0] ?? null;
+    return harness.projectController;
+  },
+  ProjectScriptsExpandedActions: ({ controller }: { controller: unknown }) => {
+    harness.expandedControllers.push(controller);
+    return harness.projectController.primaryScript ? <div data-testid="scripts-control" /> : null;
+  },
+  ProjectScriptsDialogs: ({ controller }: { controller: unknown }) => {
+    harness.dialogControllers.push(controller);
+    return null;
+  },
 }));
 
 vi.mock("./OpenInPicker", () => ({
@@ -75,6 +99,10 @@ beforeEach(() => {
   harness.primaryEnvironmentId = environmentId;
   harness.panelProps = null;
   harness.gitProps = null;
+  harness.projectController.openAddDialog.mockReset();
+  harness.projectControllerProps.length = 0;
+  harness.expandedControllers.length = 0;
+  harness.dialogControllers.length = 0;
 });
 
 describe("ChatHeaderActions rendering", () => {
@@ -103,7 +131,15 @@ describe("ChatHeaderActions rendering", () => {
       <ChatHeaderActions
         {...props({
           activeProjectName: "Project",
-          activeProjectScripts: [],
+          activeProjectScripts: [
+            {
+              id: "dev",
+              name: "Dev",
+              command: "vp dev",
+              icon: "play",
+              runOnWorktreeCreate: false,
+            },
+          ],
           reserveTitlebarControls: false,
           draftId: "draft-1" as never,
           onOpenProviderTerminalPanel,
@@ -119,6 +155,19 @@ describe("ChatHeaderActions rendering", () => {
     expect(harness.panelProps?.["onOpenProviderTerminalPanel"]).toBe(onOpenProviderTerminalPanel);
 
     (harness.panelProps!["onAddCustomAction"] as () => void)();
+  });
+
+  it("owns one project-script controller for expanded actions, panel Add, and dialogs", () => {
+    renderToStaticMarkup(
+      <ChatHeaderActions {...props({ activeProjectName: "Project", activeProjectScripts: [] })} />,
+    );
+
+    expect(harness.projectControllerProps).toHaveLength(1);
+    expect(harness.expandedControllers).toEqual([harness.projectController]);
+    expect(harness.dialogControllers).toEqual([harness.projectController]);
+
+    (harness.panelProps!["onAddCustomAction"] as () => void)();
+    expect(harness.projectController.openAddDialog).toHaveBeenCalledOnce();
   });
 
   it("omits the local editor picker for a remote environment", () => {

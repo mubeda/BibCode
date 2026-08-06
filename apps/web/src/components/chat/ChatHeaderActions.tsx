@@ -8,13 +8,16 @@ import {
   type ThreadId,
 } from "@bibcode/contracts";
 import { scopeThreadRef } from "@bibcode/client-runtime/environment";
-import { memo, useState } from "react";
+import { memo } from "react";
 import GitActionsControl from "../GitActionsControl";
 import { type DraftId } from "~/composerDraftStore";
 import { type ProviderInstanceEntry } from "~/providerInstances";
-import ProjectScriptsControl, {
+import {
   type NewProjectScriptInput,
   type ProjectScriptActionResult,
+  ProjectScriptsDialogs,
+  ProjectScriptsExpandedActions,
+  useProjectScriptsController,
 } from "../ProjectScriptsControl";
 import { ChatHeaderPanelMenu } from "./ChatHeaderPanelMenu";
 import { OpenInPicker } from "./OpenInPicker";
@@ -90,9 +93,16 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
     activeThreadEnvironmentId,
     primaryEnvironmentId,
   });
-  // Bumped to ask ProjectScriptsControl to open its "Add action" dialog — the
-  // entry point that replaces its old bare "+" (now driven from the panel menu).
-  const [addDialogRequestId, setAddDialogRequestId] = useState(0);
+  const projectScripts = useProjectScriptsController({
+    scripts: activeProjectScripts ?? [],
+    keybindings,
+    preferredScriptId,
+    enabled: activeProjectScripts !== undefined,
+    onRunScript: onRunProjectScript,
+    onAddScript: onAddProjectScript,
+    onUpdateScript: onUpdateProjectScript,
+    onDeleteScript: onDeleteProjectScript,
+  });
   return (
     <div
       data-chat-header-actions
@@ -108,20 +118,10 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
         onCreateChatPanel={onCreateChatPanel}
         onOpenTerminalPanel={onOpenTerminalPanel}
         onOpenProviderTerminalPanel={onOpenProviderTerminalPanel}
-        onAddCustomAction={() => setAddDialogRequestId((id) => id + 1)}
+        onAddCustomAction={projectScripts.openAddDialog}
       />
-      {activeProjectScripts && (
-        <ProjectScriptsControl
-          scripts={activeProjectScripts}
-          keybindings={keybindings}
-          preferredScriptId={preferredScriptId}
-          addDialogRequestId={addDialogRequestId}
-          onRunScript={onRunProjectScript}
-          onAddScript={onAddProjectScript}
-          onUpdateScript={onUpdateProjectScript}
-          onDeleteScript={onDeleteProjectScript}
-        />
-      )}
+      <ProjectScriptsExpandedActions controller={projectScripts} />
+      <ProjectScriptsDialogs controller={projectScripts} />
       {showOpenInPicker && (
         <OpenInPicker
           environmentId={activeThreadEnvironmentId}
