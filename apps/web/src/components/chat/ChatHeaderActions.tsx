@@ -14,6 +14,7 @@ import GitActionsControl from "../GitActionsControl";
 import { type DraftId } from "~/composerDraftStore";
 import { type ProviderInstanceEntry } from "~/providerInstances";
 import { type CenterPaneHeaderDensity } from "../centerPaneHeaderDensity";
+import { CenterHeaderIconButton } from "../CenterHeaderIconButton";
 import {
   type NewProjectScriptInput,
   type ProjectScriptActionResult,
@@ -22,7 +23,6 @@ import {
   ProjectScriptsMenuItems,
   useProjectScriptsController,
 } from "../ProjectScriptsControl";
-import { Button } from "../ui/button";
 import { Menu, MenuPopup, MenuSeparator, MenuTrigger } from "../ui/menu";
 import { ChatHeaderPanelMenu } from "./ChatHeaderPanelMenu";
 import { OpenInExpandedActions, OpenInMenuItems, useOpenInEditorController } from "./OpenInPicker";
@@ -125,7 +125,8 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
     <div
       data-chat-header-actions
       className={cn(
-        "@container/header-actions relative z-10 flex shrink-0 items-center justify-end gap-2 bg-background [-webkit-app-region:no-drag] @3xl/header-actions:gap-3",
+        "@container/header-actions relative z-10 flex shrink-0 items-center justify-end bg-background [-webkit-app-region:no-drag]",
+        density === "compact" ? "gap-1" : "gap-2 @3xl/header-actions:gap-3",
         reserveTitlebarControls ? "pr-[4.5rem]" : "pr-2",
       )}
     >
@@ -145,9 +146,7 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
         </>
       ) : compactActionsAvailable ? (
         <Menu>
-          <MenuTrigger
-            render={<Button size="icon-xs" variant="outline" aria-label="More workspace actions" />}
-          >
+          <MenuTrigger render={<CenterHeaderIconButton aria-label="More workspace actions" />}>
             <MoreHorizontal className="size-4" />
           </MenuTrigger>
           <MenuPopup align="end" className="min-w-56">

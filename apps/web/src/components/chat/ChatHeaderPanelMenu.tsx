@@ -3,7 +3,7 @@ import { PlusIcon, TerminalSquare } from "lucide-react";
 import { memo, type ReactElement } from "react";
 
 import type { ProviderInstanceEntry } from "~/providerInstances";
-import { Button } from "../ui/button";
+import { CenterHeaderIconButton } from "../CenterHeaderIconButton";
 import { Menu, MenuItem, MenuPopup, MenuSeparator, MenuTrigger } from "../ui/menu";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 import { ProviderInstanceIcon } from "./ProviderInstanceIcon";
@@ -55,7 +55,7 @@ export const ChatHeaderPanelMenu = memo(function ChatHeaderPanelMenu({
 
   return (
     <Menu>
-      <MenuTrigger render={<Button size="icon-xs" variant="outline" aria-label="New panel" />}>
+      <MenuTrigger render={<CenterHeaderIconButton aria-label="New panel" />}>
         <PlusIcon className="size-4" />
       </MenuTrigger>
       <MenuPopup align="end" className="min-w-52">
