@@ -1,44 +1,53 @@
-# Environment Authentication Profile
+# Environment authentication profile
 
-The environment server and the relay use separate credentials, issuers, and trust
-boundaries. They intentionally use a similar OAuth-shaped model so that permission
-checks and token exchange behavior can be audited against established concepts.
+The environment server and the BiBCode Connect relay have separate issuers,
+credentials, and trust boundaries. Both use OAuth-shaped tokens and scopes, but
+an environment token is never valid at the relay and a relay token is never an
+environment session.
 
-## Authorization Model
+## Environment scopes
 
-Environment authorization is capability-based. A session carries zero or more
-OAuth-style scope strings:
+Canonical scope constants are in
+[`apps/server/src/auth/model.rs`](../../apps/server/src/auth/model.rs).
 
-| Scope                   | Permission                                                               |
-| ----------------------- | ------------------------------------------------------------------------ |
-| `orchestration:read`    | Read snapshots, status, events, configuration, and filesystem/VCS state. |
-| `orchestration:operate` | Dispatch user operations and mutate environment-side workspace state.    |
-| `terminal:operate`      | Create, attach, input, resize, clear, restart, and terminate terminals.  |
-| `review:write`          | Read review diff previews used to compose review feedback.               |
-| `access:read`           | Inspect pairing links and client sessions.                               |
-| `access:write`          | Create or revoke pairing links and client sessions.                      |
-| `relay:read`            | Inspect managed relay connectivity.                                      |
-| `relay:write`           | Link, configure, or unlink managed relay connectivity.                   |
+| Scope                   | Permission                                                                    |
+| ----------------------- | ----------------------------------------------------------------------------- |
+| `orchestration:read`    | Read configuration, snapshots, events, filesystem/VCS state, and diagnostics. |
+| `orchestration:operate` | Dispatch operations and mutate environment-side workspace state.              |
+| `terminal:operate`      | Create, attach, write, resize, clear, restart, and close terminals.           |
+| `review:write`          | Read diff previews used to compose review feedback.                           |
+| `access:read`           | Inspect pairing links and authorized client sessions.                         |
+| `access:write`          | Create or revoke pairing links and client sessions.                           |
+| `relay:read`            | Read the environment's persisted Connect link state.                          |
+| `relay:write`           | Install/configure the relay client and link or unlink the environment.        |
 
-Ordinary pairing links grant the four client-operation scopes and read access to
-managed relay connectivity:
-`orchestration:read orchestration:operate terminal:operate review:write relay:read`.
-The desktop bootstrap credential and command-line administrative bootstrap
-credentials additionally grant `access:read access:write relay:write`.
+Ordinary pairing credentials grant:
 
-## Authentication Flows
+```text
+orchestration:read orchestration:operate terminal:operate review:write relay:read
+```
 
-### Browser Session
+Desktop and command-line administrative bootstraps additionally grant
+`access:read`, `access:write`, and `relay:write`. The current
+`cloud.getRelayClientStatus` and `cloud.installRelayClient` RPC methods require
+`relay:write`; ordinary paired clients cannot invoke them. The exact RPC map is
+[`required_scope`](../../apps/server/src/auth/scope.rs), and the Connect HTTP
+route scopes are declared in
+[`http_routes.rs`](../../apps/server/src/production/http_routes.rs).
 
-`POST /api/auth/browser-session` consumes a one-time bootstrap credential and creates a
-browser session cookie. The cookie is an HTTP transport adapter for the same
-scoped session model; the response never exposes the session secret to browser
-JavaScript.
+## Bootstrap and session flows
 
-### Bearer Access Token
+### Browser session
 
-Non-browser clients use `POST /oauth/token` with an
-`application/x-www-form-urlencoded` body:
+`POST /api/auth/browser-session` consumes a one-time bootstrap credential and
+creates an HTTP-only, SameSite browser session cookie. The response exposes the
+granted scopes and expiry, not the session secret. Browser HTTP and WebSocket
+ticket requests authenticate with this cookie.
+
+### Bearer or DPoP token exchange
+
+Non-cookie clients exchange a bootstrap at `POST /oauth/token` using an
+`application/x-www-form-urlencoded` OAuth token-exchange request:
 
 ```text
 grant_type=urn:ietf:params:oauth:grant-type:token-exchange
@@ -48,66 +57,59 @@ requested_token_type=urn:ietf:params:oauth:token-type:access_token
 scope=orchestration:read orchestration:operate terminal:operate review:write relay:read
 ```
 
-Clients may additionally submit `client_label`, `client_device_type`, and
-`client_os` extension parameters so the authorized-clients UI can identify the
-device that established the session. These are presentation hints only; the
-environment derives transport metadata such as IP address and user agent from
-the request and does not use these fields for authorization.
+Requested scopes must be a subset of the bootstrap grant. Optional
+`client_label`, `client_device_type`, and `client_os` values are presentation
+hints for the authorized-clients UI; the environment does not use them for
+authorization.
 
-The response has the token-exchange shape:
+Without a `DPoP` proof header the response token type is `Bearer`. With a valid
+proof, the issued access token is bound to the proof-key thumbprint and the
+response token type is `DPoP`. Subsequent DPoP requests present both
+`Authorization: DPoP <token>` and a fresh proof for the method and URL.
 
-```json
-{
-  "access_token": "<opaque session token>",
-  "issued_token_type": "urn:ietf:params:oauth:token-type:access_token",
-  "token_type": "Bearer",
-  "expires_in": 3600,
-  "scope": "orchestration:read orchestration:operate terminal:operate review:write relay:read"
-}
-```
+### WebSocket ticket
 
-Requested scopes must be a subset of the one-time bootstrap credential grant.
-An ordinary paired client therefore cannot exchange its grant for
-`access:read`, `access:write`, or `relay:write`.
+`POST /api/auth/websocket-ticket` accepts a valid cookie, bearer token, or DPoP
+session and issues a short-lived, single-purpose ticket. The client opens
+`/ws?wsTicket=<ticket>`; bearer and DPoP access tokens do not appear in the
+WebSocket URL.
 
-### WebSocket Ticket
+The ticket carries the session scopes, but each RPC still checks its own
+required scope. Authentication therefore does not imply permission to call
+every method. Tickets are bounded and consumed by
+`authenticate_websocket` in
+[`auth/http.rs`](../../apps/server/src/auth/http.rs).
 
-`POST /api/auth/websocket-ticket` accepts any authenticated session and returns
-a short-lived, single-purpose WebSocket ticket. This keeps bearer tokens and
-browser cookies out of WebSocket URLs while allowing the socket handshake to
-authenticate. The ticket carries its session's scopes; each RPC method then
-enforces `orchestration:read`, `orchestration:operate`, `terminal:operate`,
-`review:write`, or `access:read` as appropriate. Review feedback submission
-currently dispatches an orchestration operation, so clients performing it also
-need `orchestration:operate`. Creating a ticket is not
-authorization to call every RPC method.
+## Access administration
 
-## Standards Alignment
+Administrative sessions use the `/api/auth/pairing-*` and
+`/api/auth/clients*` routes to create, inspect, and revoke credentials. Pairing
+links are one-time bootstraps; successful exchange creates a separate bounded
+client session. Revoking a pairing link prevents future exchange, while
+revoking a client ends that client's current access.
 
-- Bearer access tokens are used through the `Authorization: Bearer` scheme from
-  RFC 6750.
-- The token endpoint profiles the request and response vocabulary from OAuth 2.0
-  Token Exchange (RFC 8693), including `subject_token`, `requested_token_type`,
-  `access_token`, `issued_token_type`, and `token_type`.
-- Scope values follow the OAuth 2.0 scope model from RFC 6749: space-delimited,
-  unordered capabilities with subset checking during exchange.
+Migration `031_AuthAuthorizationScopes` is a deliberate hard cutover from
+role-bearing records to scoped records. It removes existing pairing links and
+sessions without changing unrelated environment state. Upgraded clients must
+pair again; old roles are not silently promoted to scopes.
 
-This is intentionally not a general-purpose OAuth authorization server. The
-environment bootstrap token type is private, the bootstrap cookie and WebSocket
-connection-token routes are product-specific adapters, and the API returns its
-typed `HttpApi` errors rather than implementing every OAuth error response
-surface.
+## Standards profile
 
-## Upgrade Behavior
+- Bearer use follows the RFC 6750 authorization scheme.
+- Token exchange uses the RFC 8693 request and response vocabulary.
+- Scope strings use the RFC 6749 space-delimited subset model.
+- DPoP-bound sessions verify the proof method, URL, key thumbprint, nonce when
+  required, and access-token hash.
 
-Migration `031_AuthAuthorizationScopes` is a hard cutover from role-bearing auth
-records to scoped records. It deletes existing pairing links and sessions while
-leaving non-authentication environment state unchanged. Upgraded clients must
-pair again; old `owner` or `client` credentials are never silently mapped to new
-capabilities.
+This is not a general-purpose OAuth authorization server. The environment
+bootstrap token type, browser-session adapter, and WebSocket ticket are
+product-specific, and API failures use BiBCode's typed HTTP/RPC error schemas.
 
-## Relay Boundary
+## Relay boundary
 
-Relay-managed tunnels use their own tokens and keys. The relay can reuse scope
-parsing and token-exchange conventions, but an environment access token is not a
-relay token and cannot be presented to the relay.
+The relay uses Clerk bearer tokens to identify cloud users and relay-issued
+DPoP tokens for status/connect operations. It sends separately signed,
+nonce-bound requests to an environment's public health and mint endpoints. The
+environment validates those proofs and returns signed results before the relay
+passes a bootstrap to the client. See
+[BiBCode Connect auth flow](./bibcode-connect-auth-flow.md).

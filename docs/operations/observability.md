@@ -61,10 +61,39 @@ Git failures retain bounded stderr so errors such as malformed `.gitmodules`
 entries remain actionable both in the original notification and after restart.
 
 Provider and terminal lifecycle summaries are written as bounded NDJSON under
-`userdata/logs/provider/events.log` and `userdata/logs/terminals/`. These logs
-rotate at 4 MiB with three backups. They contain identifiers, event types,
-status, and byte counts only: terminal output, prompts, provider payloads, tool
-arguments, environment values, and credentials are never persisted.
+`userdata/logs/provider/events.log` and
+`userdata/logs/terminals/events.log`. Each file rotates at 4 MiB and retains
+three files total: the active file and two rotated generations. Records include
+lifecycle identifiers, event types, statuses, sequence/PID/exit metadata, and
+bounded counts. Provider option-reconciliation records may also include the
+provider instance, model, option ID, application method, result, and requested
+option value. Terminal output and provider prompts or response payloads are not
+written to these operational logs. Do not put credentials or raw environment
+values in option values or other diagnostic fields.
+
+## Diagnostic Bundle
+
+The Diagnostics settings page can prepare a timestamped, redacted ZIP through
+`POST /api/diagnostics/logs.zip`. Desktop clients open a native save dialog;
+browser clients download the response. The archive contains exactly:
+
+- `server.log`, assembled oldest-first from the active native server log and up
+  to three retained backups;
+- `server.trace.ndjson`, assembled the same way from the active trace file and
+  up to three retained backups; and
+- `frontend.log`, containing the frontend warning/error snapshot supplied by
+  the requesting client.
+
+Provider and terminal operational logs are not included. Each retained server
+or trace file is read up to 4 MiB and marked when truncated. The frontend
+request and retained frontend content are bounded to 512 KiB; when necessary,
+the client omits the oldest frontend records before upload.
+
+Before writing the ZIP, the server redacts authorization and proxy-authorization
+lines, bearer values, common token/API-key/password/secret assignments, and URL
+credentials. This is a defensive pattern-based filter, not a proof that every
+possible secret format is absent. Review an archive before sharing it outside
+the trusted support boundary.
 
 The former Effect logger, `Logger.tracerLogger`, TypeScript `TraceRecord`, and
 Node OTLP exporter paths were removed with the TypeScript server. Environment

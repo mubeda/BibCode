@@ -1,211 +1,151 @@
 # Remote Access
 
-Use this when you want to connect to a BiBCode server from another device such as a phone, tablet, or separate desktop app.
+Remote access connects a browser or another desktop app to the BiBCode server
+running on a different machine. That server owns projects, files, Git state,
+terminals, provider CLIs, credentials, and agent sessions.
 
-## Recommended Setup
+Use a trusted private network such as a LAN or tailnet. Do not expose a plain
+BiBCode HTTP endpoint directly to the public internet.
 
-Use a trusted private network that meshes your devices together, such as a tailnet.
+## Desktop network access
 
-That gives you:
+To expose the backend embedded in the desktop app:
 
-- a stable address to connect to
-- transport security at the network layer
-- less exposure than opening the server to the public internet
+1. Open **Settings → Connections**.
+2. Under **Manage Local Backend**, enable **Network access**. The desktop app
+   restarts its backend bound to the network-accessible host.
+3. Inspect the reachable endpoints. The list can include loopback, LAN, Tailnet
+   IP, MagicDNS, or verified HTTPS endpoints.
+4. Choose the endpoint you want to use and select **Create Link** to issue a
+   pairing link.
 
-## Enabling Network Access
+The selected endpoint type becomes the default for later links. A LAN endpoint
+can remain the default across ordinary IP address changes.
 
-There are two ways to expose your server for remote connections: from the desktop app or from the CLI.
+- A loopback URL works only on the server machine.
+- A plain LAN or Tailnet HTTP URL can be used by a desktop client or by a page
+  served over HTTP.
+- An HTTPS-hosted web app cannot connect to an insecure HTTP/WS backend because
+  browsers block mixed content. Use an HTTPS/WSS endpoint in that case.
 
-### Option 1: Desktop App
+### Tailscale endpoints
 
-If you are already running the desktop app and want to make it reachable from other devices:
+When the desktop app can read `tailscale status --json`, it can add the machine's
+Tailnet IPv4 addresses and MagicDNS name to the endpoint list.
 
-1. Open **Settings** → **Connections**.
-2. Under **Manage Local Backend**, toggle **Network access** on. This will restart the app and run the backend on all network interfaces.
-3. The settings panel will show the default reachable endpoint, with a `+N` control when more endpoints are available. Expand it to inspect alternatives such as loopback, LAN, private-network, or HTTPS endpoints.
-4. Use **Create Link** to generate a pairing link you can share with another device.
+An HTTPS MagicDNS endpoint is shown as available only after its well-known
+BiBCode endpoint responds successfully. Configure Tailscale Serve separately to
+proxy the chosen HTTPS address to the local BiBCode backend, then let the desktop
+app rescan it. The native `bibcode` CLI does not currently provide Tailscale
+Serve setup flags.
 
-The default endpoint controls the QR code and primary copy action for pairing links. You can change it from the expanded endpoint list. The preference is stored by endpoint type, so choosing the local LAN endpoint survives normal IP address changes when you move between networks.
+## Headless server
 
-When no user default is saved, the app uses the built-in LAN endpoint for pairing links when
-available. You can set another endpoint as the default from the expanded endpoint list.
+`bibcode start` and `bibcode serve` run the same native server. `start` opens the
+startup URL in a browser by default; `serve` does not.
 
-- HTTPS/WSS-compatible endpoints work from a configured HTTPS-hosted BiBCode web app, but are not
-  made the default automatically.
-- Non-loopback HTTP endpoints are useful for direct LAN pairing.
-- Loopback-only endpoints are not useful for another device unless that device is the same machine.
-
-If the copied link points directly at `http://192.168.x.y:3773`, open it from a client that can reach that LAN address. If it points at the configured hosted app's `/pair` route, the hosted web app will save the environment and connect directly to the backend URL in the link.
-
-### Tailscale Endpoints
-
-When the desktop app can detect Tailscale, it adds Tailnet endpoints to the reachable endpoint list.
-
-Depending on your Tailscale setup, this may include:
-
-- the machine's `100.x.y.z` Tailnet IP
-- a MagicDNS name
-- an HTTPS MagicDNS endpoint when Tailscale Serve is configured for this backend
-
-The Tailscale HTTPS endpoint uses the clean MagicDNS URL, such as
-`https://machine.tailnet.ts.net/`, and is disabled until the app verifies that the URL reaches this
-backend. Use **Setup** on the Tailscale HTTPS row to opt in. The desktop app restarts the backend
-with the same server-side behavior as `bibcode serve --tailscale-serve`, then the server asks Tailscale
-Serve to proxy HTTPS traffic to the local backend.
-
-The Tailscale support is an endpoint provider add-on. The core remote model still works without Tailscale: LAN HTTP endpoints, custom HTTPS endpoints, future tunnels, and SSH-launched environments all use the same saved environment and pairing flow.
-
-For a hosted HTTPS app, prefer an HTTPS Tailnet or other HTTPS endpoint. A plain `http://100.x.y.z:3773` endpoint can still work from a desktop client or another browser page served over HTTP, but it will not work from the hosted HTTPS app because of browser mixed-content rules.
-
-### Option 2: Headless Server (CLI)
-
-Use this when you want to run the server without a GUI, for example on a remote machine over SSH.
-
-Run the server with `bibcode serve`.
+For example, bind to a trusted Tailnet address and serve built web assets:
 
 ```bash
-bibcode serve --host "$(tailscale ip -4)"
+bibcode serve \
+  --host "$(tailscale ip -4)" \
+  --static-dir /path/to/BibCode/apps/web/dist
 ```
 
-`bibcode serve` starts the server without opening a browser and prints:
+The server prints one JSON object to stdout. In authenticated web mode it has
+this shape:
 
-- a connection string
-- a pairing token
-- a pairing URL
-- a QR code for the pairing URL
-
-From there, connect from another device in either of these ways:
-
-- scan the QR code on your phone
-- in the desktop app, enter the full pairing URL
-- in the desktop app, enter the host and token separately
-- in the hosted web app, open a hosted pairing URL when the backend is reachable over HTTPS
-
-Use `bibcode serve --help` for the full flag reference. It supports the same general startup options as the normal server command, including an optional `cwd` argument.
-
-For hosted web pairing over Tailscale HTTPS, opt in to Tailscale Serve:
-
-```bash
-bibcode serve --tailscale-serve
+```json
+{
+  "address": "100.64.0.10:3773",
+  "httpBaseUrl": "http://100.64.0.10:3773",
+  "token": "one-time-pairing-credential",
+  "pairingUrl": "http://100.64.0.10:3773/pair#token=one-time-pairing-credential"
+}
 ```
 
-By default this configures Tailscale Serve on HTTPS port 443 and advertises
-`https://machine.tailnet.ts.net/`. Advanced users can choose a different HTTPS port:
+The CLI does not print a QR code. It also has no `auth` or `project` subcommands,
+no positional working-directory argument, and no `--tailscale-serve` flags. Use
+`bibcode serve --help` for the implemented options.
 
-```bash
-bibcode serve --tailscale-serve --tailscale-serve-port 8443
+`--static-dir` is needed only when this server should deliver the web client.
+A separately hosted HTTPS web app can connect directly to an HTTPS/WSS backend
+without the backend serving static files.
+
+## Pairing
+
+On startup in authenticated web mode, the server issues an owner pairing
+credential. The credential is carried in the URL fragment so it is not sent as
+part of the initial HTTP request:
+
+```text
+http://server.example:3773/pair#token=PAIRING_CREDENTIAL
 ```
 
-> Note
-> The Add Project dialog currently exposes the Local host flow. For project
-> management on a separate remote host, use `bibcode project ...` on that server
-> until remote-host project selection is wired into the dialog.
+The client exchanges the credential for a session. Treat the credential and
+pairing URL as passwords until the exchange completes.
 
-### Option 3: Desktop-Managed SSH Launch
+For a configured hosted web app, use a URL shaped like:
 
-Use this when you want the desktop app to start or reuse BiBCode on another machine over SSH.
-
-1. Open **Settings** → **Connections**.
-2. Under **Remote Environments**, choose **Add environment**.
-3. Select the SSH launch flow.
-4. Enter the SSH target, such as `user@example.com`.
-5. Confirm the launch. The desktop app probes the host, starts or reuses a remote BiBCode server, opens a local port forward, and saves the environment.
-
-After setup, the renderer connects to a local forwarded HTTP/WebSocket endpoint. The remote host still owns the actual BiBCode server, projects, files, git state, terminals, and provider sessions.
-
-SSH launch is a desktop feature because it needs local process and SSH access. Once the environment is paired and saved, it uses the same environment list and connection model as direct LAN, Tailscale, HTTPS, or future tunnel-backed environments.
-
-#### SSH Launch Troubleshooting
-
-The desktop SSH launcher connects with a non-interactive `sh` session, writes a small launcher script under `~/.bibcode/ssh-launch/<host-key>/`, starts or reuses a remote BiBCode server, and forwards the remote loopback port back to your desktop.
-
-The remote host must have a compatible native `bibcode` executable on the
-non-interactive shell `PATH`. Node.js, npm, npx, and JavaScript package-manager
-shims are not searched or installed by the launcher. Install the `bibcode` binary
-for the remote operating system and architecture before adding the environment.
-
-If launch fails with `bibcode: command not found`, SSH into the host and test the
-same non-interactive shell used by the desktop launcher:
-
-```bash
-ssh user@example.com 'sh -lc "command -v bibcode && bibcode --version"'
+```text
+https://app.example.com/pair?host=https://backend.example.com#token=PAIRING_CREDENTIAL
 ```
 
-If that command does not resolve the native executable, install it in a standard
-location such as `~/.local/bin`, `/usr/local/bin`, or another directory exported
-by non-interactive `sh`. The remote binary must match the desktop release's
-server protocol.
+The hosted app saves the backend address, but it does not proxy traffic. The
+browser still connects directly to the backend, which must therefore be
+reachable over HTTPS/WSS from that browser.
 
-If reconnecting after an app update fails, retry the SSH launch once. The launcher now compares its generated runner script, stops stale launcher-managed remote servers, clears the SSH launch PID/port state, and starts a fresh remote server. You should not normally need to delete `~/.bibcode/ssh-launch` or kill `bibcode` processes manually.
+Create and revoke additional access from **Settings → Connections**. There is no
+current CLI access-management command.
 
-### Windows Subsystem For Linux
+## Desktop-managed SSH status
 
-The optional WSL backend also runs a native Linux `bibcode` binary. It never invokes
+The desktop contains an SSH launcher that can install a small runner under
+`~/.bibcode-ssh-launch/<state-key>`, start or reuse `bibcode serve` on remote
+loopback, and create a local port forward. The remote host must provide:
+
+- a compatible native `bibcode` executable on non-interactive `sh`'s `PATH`;
+- `curl` or `wget` for the readiness probe; and
+- each provider CLI and its credentials.
+
+However, end-to-end setup of a new SSH environment is **currently unavailable**.
+The desktop pairing step invokes `bibcode auth pairing create`, while the native
+CLI currently implements only `start` and `serve`. Do not rely on the SSH **Add
+environment** flow until that CLI mismatch is resolved.
+
+The launcher does not install Node.js, npm, npx, package-manager shims, or a
+BiBCode binary on the remote host.
+
+## Windows Subsystem for Linux
+
+The optional WSL backend runs a native Linux `bibcode` binary. It does not invoke
 WSL Node.js, npm, npx, or a JavaScript server package.
 
 Prerequisites:
 
-- Windows Subsystem for Linux and at least one installed distribution;
+- Windows Subsystem for Linux and an installed distribution;
 - `wsl.exe` available to the desktop process;
-- a `bibcode` Linux binary matching the distribution architecture;
-- normal provider CLIs and credentials installed inside that distribution.
+- a `bibcode` Linux binary matching the distribution architecture; and
+- provider CLIs and credentials installed inside the distribution.
 
-For source development, build the Linux server under
-`target/<linux-triple>/(debug|release)/bibcode`. The desktop searches the
-`x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` targets. To use a
-binary elsewhere on the Windows filesystem, set `BIBCODE_WSL_SERVER_BINARY` to
-its Windows path before starting the desktop app; the host translates it with
-`wslpath` for the selected distribution.
+For source development, the desktop searches
+`target/x86_64-unknown-linux-gnu/(debug|release)/bibcode` and
+`target/aarch64-unknown-linux-gnu/(debug|release)/bibcode`. Set
+`BIBCODE_WSL_SERVER_BINARY` to a different Windows-side binary path when needed;
+the desktop translates it with `wslpath` for the selected distribution.
 
-The WSL launcher uses a fixed system `PATH` inside the distribution and starts
-`bibcode serve` directly. If launch fails, verify the binary from Windows:
+The WSL launcher uses a fixed system `PATH` and starts `bibcode serve` directly.
+Verify a custom binary from Windows with:
 
 ```powershell
 wsl.exe -d <distribution> -- /path/to/bibcode --version
 ```
 
-## How Pairing Works
+## Security notes
 
-The remote device does not need a long-lived secret up front.
-
-Instead:
-
-1. `bibcode serve` issues a one-time owner pairing token.
-2. The remote device exchanges that token with the server.
-3. The server creates an authenticated session for that device.
-
-After pairing, future access is session-based. You do not need to keep reusing the original token unless you are pairing a new device.
-
-## Hosted Web App Pairing
-
-The configured hosted web app can save a remote backend in browser local storage from a URL like:
-
-```text
-https://app.example.com/pair?host=https://backend.example.com:3773#token=PAIRCODE
-```
-
-Use hosted pairing when the backend is reachable from the browser over HTTPS/WSS. This includes a backend behind a trusted HTTPS tunnel or another HTTPS endpoint you operate.
-
-Do not use hosted pairing for plain HTTP LAN URLs such as `http://192.168.x.y:3773`. Browsers block an HTTPS page from connecting to an insecure HTTP or WS backend. For those endpoints, use the direct pairing URL shown by the desktop app or CLI from a client that can open that HTTP URL directly.
-
-Hosted pairing does not proxy traffic through BiBCode. The browser still connects directly to the backend URL in the pairing link.
-
-## Managing Access Later
-
-Use `bibcode auth` to manage access after the initial pairing flow.
-
-Typical uses:
-
-- issue additional pairing credentials
-- inspect active sessions
-- revoke old pairing links or sessions
-
-Use `bibcode auth --help` and the nested subcommand help pages for the full reference.
-
-## Security Notes
-
-- Treat pairing URLs and pairing tokens like passwords.
-- Prefer binding `--host` to a trusted private address, such as a Tailnet IP, instead of exposing the server broadly.
-- Anyone with a valid pairing credential can create a session until that credential expires or is revoked.
-- Hosted pairing links keep the credential in the URL hash so it is not sent to the hosted app server, but it can still be exposed through browser history, screenshots, logs, or copy/paste.
-- Use `bibcode auth` to revoke credentials or sessions you no longer trust.
+- Bind the server only to a trusted private address.
+- Prefer HTTPS/WSS whenever the browser page itself is served over HTTPS.
+- Treat pairing URLs and credentials as secrets.
+- Review and revoke sessions you no longer trust in **Settings → Connections**.
+- Credentials can leak through browser history, screenshots, logs, or copied
+  text even when they are placed in a URL fragment.

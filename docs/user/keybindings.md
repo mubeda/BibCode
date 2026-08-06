@@ -1,8 +1,14 @@
 # Keybindings
 
-BiBCode reads keybindings from:
+BiBCode reads production keybindings from:
 
-- `~/.bibcode/keybindings.json`
+- `~/.bibcode/userdata/keybindings.json`
+
+When `--base-dir` or `BIBCODE_HOME` changes the server base directory, the path
+is `<base-dir>/userdata/keybindings.json`. A server launched with a development
+URL uses `<base-dir>/dev/keybindings.json` instead. The safest way to find the
+active file is **Settings → Keybindings → Open keybindings.json**, which uses the
+path reported by the connected server.
 
 The file must be a JSON array of rules:
 
@@ -16,6 +22,8 @@ The file must be a JSON array of rules:
 See the full schema for more details: [`packages/contracts/src/keybindings.ts`](../../packages/contracts/src/keybindings.ts)
 
 ## Defaults
+
+The fixed defaults are:
 
 ```json
 [
@@ -45,7 +53,15 @@ See the full schema for more details: [`packages/contracts/src/keybindings.ts`](
 ]
 ```
 
-The native server validates and persists overrides in
+BiBCode also generates these numbered defaults:
+
+- `mod+1` through `mod+9` run `thread.jump.1` through `thread.jump.9`.
+- While the model picker is open, the same keys run `modelPicker.jump.1` through
+  `modelPicker.jump.9`.
+
+The native server validates overrides in
+[`apps/server/src/production/keybindings.rs`](../../apps/server/src/production/keybindings.rs)
+and exposes the resolved file path and configuration issues through
 [`apps/server/src/production/control.rs`](../../apps/server/src/production/control.rs).
 
 ## Configuration
@@ -58,7 +74,9 @@ Each entry supports:
 - `command` (required): action ID
 - `when` (optional): boolean expression controlling when the shortcut is active
 
-Invalid rules are ignored. Invalid config files are ignored. Warnings are logged by the server.
+Invalid rules are ignored. A malformed config file contributes no overrides.
+The server reports both cases as configuration issues so the connected app can
+surface them.
 
 ### Available Commands
 

@@ -194,7 +194,7 @@ describe("canonicalizeLegacyComposerFileReferences", () => {
   it("migrates only recognized legacy file links", () => {
     expect(
       canonicalizeLegacyComposerFileReferences(
-        "Inspect [main.ts](src/main.ts) and [docs](https://example.com) next",
+        "Inspect \u005bmain.ts](src/main.ts) and [docs](https://example.com) next",
       ),
     ).toBe("Inspect @src/main.ts and [docs](https://example.com) next");
   });
@@ -879,7 +879,7 @@ Cover a successful turn, failed turn restoration, mixed native/legacy references
 
 ```ts
 it("canonicalizes legacy file links before starting a provider turn", async () => {
-  seedPrompt("Inspect [main.ts](src/main.ts) and @README.md");
+  seedPrompt("Inspect \u005bmain.ts](src/main.ts) and @README.md");
   await onSend();
 
   expect(startTurn).toHaveBeenCalledWith(

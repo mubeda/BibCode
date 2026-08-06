@@ -30,7 +30,6 @@ Numeric stable versions are updater candidates and are marked latest only after
 manual publication approval. Stable prerelease versions and manual nightly
 releases are GitHub prereleases, are never marked latest, and remain
 installer-only.
-Manual nightly releases are GitHub prereleases and remain auto-published.
 
 ## Supported Platforms
 
@@ -61,6 +60,10 @@ Clerk production configuration exists, the workflow resolves and injects:
 - `BIBCODE_CLERK_CLI_OAUTH_CLIENT_ID`;
 - `BIBCODE_RELAY_URL`.
 
+`BIBCODE_CLERK_CLI_OAUTH_CLIENT_ID` remains in build and release plumbing, but
+the current native runtime has no matching headless Connect CLI or OAuth
+consumer. It does not enable a CLI login flow.
+
 Without that configuration, desktop artifacts are still built with BiBCode Connect
 disabled. Never place `CLERK_SECRET_KEY` in client build variables or artifacts.
 
@@ -82,8 +85,9 @@ signed/unnotarized. Tauri updater signatures verify update payloads; they do
 not replace Apple Developer ID signing, macOS notarization, or Windows
 Authenticode.
 
-The password-protected private-key backup is approved only at
-`C:\Users\mauro\Downloads`. Keep its passphrase separate from that backup.
+Keep a password-protected backup of the updater private key in an approved
+offline recovery location, with access restricted to release maintainers. Keep
+its passphrase in a separate approved secret store.
 Release CI receives the key only through the GitHub secrets
 `TAURI_SIGNING_PRIVATE_KEY` and `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`; never add
 the key or passphrase to the repository, a release asset, or a log.
@@ -121,17 +125,6 @@ Stable-channel and nightly prereleases are installer-only. They never receive
 the updater signing overlay, updater signatures, descriptors, or `latest.json`,
 and never feed the app updater.
 
-### Bootstrap Release Note
-
-`v0.2.10` cannot discover the first updater-enabled stable release. Add this
-exact note to the first updater-enabled stable release notes:
-
-```text
-Users running BiBCode v0.2.10 must install this release manually once from
-GitHub Releases. After that one-time bootstrap, future stable releases can be
-checked, downloaded, and installed from within BiBCode.
-```
-
 ## Stable Release Runbook
 
 1. Confirm the intended version and commit have passed the local verification
@@ -139,9 +132,10 @@ checked, downloaded, and installed from within BiBCode.
    that explicit version) with `publish` left at its default `false`.
 2. Confirm the four native build jobs complete and that the stable jobs received
    the two signing secrets above. Do not inspect or print their values.
-3. Before descriptor cleanup in the release job, inspect the merged
-   `release-assets` workspace. It must contain exactly four
-   `updater-*.json` descriptors, one for each manifest target listed above.
+3. Confirm the workflow's descriptor-validation and updater-signature steps
+   passed. The workflow must validate exactly four `updater-*.json` descriptors,
+   one for each manifest target listed above, before it removes those internal
+   descriptors from the public asset set.
 4. Let the workflow create the GitHub Release as a **draft**. Before allowing
    publication, inspect its uploaded assets and `latest.json`:
 
@@ -164,8 +158,6 @@ checked, downloaded, and installed from within BiBCode.
    releases are marked latest.
 7. Install and smoke-test each ordinary installer on its target operating
    system after publication.
-8. Add the bootstrap note above when preparing the first updater-enabled stable
-   release. Do not add it to an unrelated release.
 
 ## Local Verification
 
@@ -228,8 +220,9 @@ node scripts/build-desktop-artifact.ts --platform win --target nsis --arch x64 -
 
 Equivalent root shortcuts are `dist:desktop:dmg`,
 `dist:desktop:dmg:arm64`, `dist:desktop:dmg:x64`,
-`dist:desktop:linux`, `dist:desktop:win`, `dist:desktop:win:arm64`, and
-`dist:desktop:win:x64`.
+`dist:desktop:linux`, `dist:desktop:win`, and `dist:desktop:win:x64`. The root
+package retains an ARM64 Windows artifact command for development experiments,
+but Windows ARM is not a supported release target.
 
 ## References
 
