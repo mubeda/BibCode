@@ -618,7 +618,6 @@ import type { ChatMessage, Project, Thread } from "../types";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { useRightPanelStore, type RightPanelSurface } from "../rightPanelStore";
 import { HOST_SURFACE_ID, useCenterPanelStore } from "../centerPanelStore";
-import { useTerminalUiStateStore } from "../terminalUiStateStore";
 import { useUiStateStore } from "../uiStateStore";
 import { useDiffPanelStore } from "../diffPanelStore";
 import { FileEditingSessionRegistry } from "./files/fileEditingSessionRegistry";
@@ -671,18 +670,17 @@ const HOST_STATE = {
   maximizedRightPanelThreadKey: { index: 7, expectInitial: isNull },
   terminalFocusRequestId: { index: 12, expectInitial: (value: unknown) => value === 0 },
   pullRequestDialogState: { index: 13, expectInitial: isNull },
-  terminalUiLaunchContext: { index: 14, expectInitial: isNull },
   pendingUserInputAnswersByRequestId: {
     index: 10,
     expectInitial: (value: unknown) =>
       typeof value === "object" && value !== null && Object.keys(value).length === 0,
   },
   attachmentPreviewHandoffByMessageId: {
-    index: 15,
+    index: 14,
     expectInitial: (value: unknown) =>
       typeof value === "object" && value !== null && Object.keys(value).length === 0,
   },
-  composerOverlayElement: { index: 19, expectInitial: isNull },
+  composerOverlayElement: { index: 18, expectInitial: isNull },
 } as const;
 
 function seedHostState(name: keyof typeof HOST_STATE, value: unknown): void {
@@ -1308,7 +1306,6 @@ const resettableStores: ReadonlyArray<{ store: ResettableStore; pristine: object
   useComposerDraftStore,
   useRightPanelStore,
   useCenterPanelStore,
-  useTerminalUiStateStore,
   useUiStateStore,
   useDiffPanelStore,
 ].map((store) => ({
@@ -1575,13 +1572,13 @@ describe("ChatView effects (captured and run manually)", () => {
       getBoundingClientRect: () => ({ height: 42 }),
     };
     seedHostState("composerOverlayElement", overlayElement);
-    h.stateSeeds.set(20, { value: 42, expectInitial: (value) => value === 0 });
+    h.stateSeeds.set(19, { value: 42, expectInitial: (value) => value === 0 });
     vi.stubGlobal("ResizeObserver", undefined);
 
     renderServerRoute();
     const cleanups = runEffects();
 
-    expect(h.setStateCalls.some((call) => call.index === 20 && call.applied === 42)).toBe(true);
+    expect(h.setStateCalls.some((call) => call.index === 19 && call.applied === 42)).toBe(true);
     for (const cleanup of cleanups) cleanup();
   });
 
@@ -2550,43 +2547,6 @@ describe("ChatView right panel handlers", () => {
     const toggles = setStateCallsFor("maximizedRightPanelThreadKey");
     expect(toggles).toHaveLength(1);
     expect(toggles[0]!.applied).toBeNull();
-  });
-});
-
-// ─────────────────────────────────────────────────────────────────────
-// Retired bottom terminal composition
-// ─────────────────────────────────────────────────────────────────────
-
-describe("ChatView retired bottom terminal composition", () => {
-  function seedRetiredTerminalUiState(options: { knownIds?: string[]; storeIds?: string[] } = {}) {
-    seedConnectedServerThread();
-    const storeIds = options.storeIds ?? ["terminal-1"];
-    const store = useTerminalUiStateStore.getState();
-    for (const [index, id] of storeIds.entries()) {
-      store.ensureTerminal(threadRef, id, { open: index === 0 });
-    }
-    publishSeededStoreState(useTerminalUiStateStore);
-    h.knownSessions = (options.knownIds ?? storeIds).map((terminalId) => ({
-      target: { environmentId, threadId, terminalId },
-      state: {
-        summary: {
-          label: `Shell ${terminalId}`,
-          cwd: "X:/demo",
-          worktreePath: null,
-        },
-      },
-    }));
-  }
-
-  it("does not compose the retired bottom terminal drawer", () => {
-    seedRetiredTerminalUiState();
-
-    const markup = renderServerRoute();
-    expect(markup).not.toContain('data-mock="thread-terminal-panel"');
-    expect(markup).not.toContain("PersistentThreadTerminalDrawer");
-    expect(markup).not.toContain('data-terminal-owner="drawer"');
-    expect(markup).not.toContain("Toggle terminal drawer");
-    expect(markup).not.toContain("panel-bottom");
   });
 });
 

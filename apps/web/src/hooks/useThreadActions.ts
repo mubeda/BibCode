@@ -12,6 +12,7 @@ import { useRouter } from "@tanstack/react-router";
 import { useCallback, useMemo, useRef } from "react";
 
 import { getFallbackThreadIdAfterDelete } from "../components/Sidebar.logic";
+import { useCenterPanelStore } from "../centerPanelStore";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { terminalEnvironment } from "../state/terminal";
 import { threadEnvironment } from "../state/threads";
@@ -20,7 +21,7 @@ import { useNewThreadHandler } from "./useHandleNewThread";
 import { refreshArchivedThreadsForEnvironment } from "../lib/archivedThreadsState";
 import { readLocalApi } from "../localApi";
 import { readEnvironmentThreadRefs, readProject, readThreadShell } from "../state/entities";
-import { useTerminalUiStateStore } from "../terminalUiStateStore";
+import { useRightPanelStore } from "../rightPanelStore";
 import { buildThreadRouteParams, resolveThreadRouteRef } from "../threadRoutes";
 import { formatWorktreePathForDisplay, getWorktreeDeletionPlanForThread } from "../worktreeCleanup";
 import { stackedThreadToast, toastManager } from "../components/ui/toast";
@@ -37,6 +38,11 @@ export class ThreadArchiveBlockedError extends Schema.TaggedErrorClass<ThreadArc
   override get message(): string {
     return "Cannot archive a running thread.";
   }
+}
+
+function removeThreadPanelState(threadRef: ScopedThreadRef): void {
+  useCenterPanelStore.getState().removeThread(threadRef);
+  useRightPanelStore.getState().removeThread(threadRef);
 }
 
 export function useThreadActions() {
@@ -63,7 +69,6 @@ export function useThreadActions() {
   const clearProjectDraftThreadById = useComposerDraftStore(
     (store) => store.clearProjectDraftThreadById,
   );
-  const clearTerminalUiState = useTerminalUiStateStore((state) => state.clearTerminalUiState);
   const router = useRouter();
   const handleNewThread = useNewThreadHandler();
   // Keep a ref so archiveThread can call handleNewThread without appearing in
@@ -158,6 +163,7 @@ export function useThreadActions() {
         });
         if (result._tag === "Success") {
           refreshArchivedThreadsForEnvironment(target.environmentId);
+          removeThreadPanelState(target);
         }
         return result;
       }
@@ -294,7 +300,7 @@ export function useThreadActions() {
           scopeProjectRef(threadRef.environmentId, dependentPanelThread.projectId),
           dependentPanelRef,
         );
-        clearTerminalUiState(dependentPanelRef);
+        removeThreadPanelState(dependentPanelRef);
       }
       const deleteResult = await deleteThreadMutation({
         environmentId: threadRef.environmentId,
@@ -309,7 +315,7 @@ export function useThreadActions() {
         scopeProjectRef(threadRef.environmentId, thread.projectId),
         threadRef,
       );
-      clearTerminalUiState(threadRef);
+      removeThreadPanelState(threadRef);
 
       if (shouldNavigateToFallback) {
         if (fallbackThreadId) {
@@ -379,7 +385,6 @@ export function useThreadActions() {
     [
       clearComposerDraftForThread,
       clearProjectDraftThreadById,
-      clearTerminalUiState,
       closeTerminal,
       deleteThreadMutation,
       getCurrentRouteThreadRef,

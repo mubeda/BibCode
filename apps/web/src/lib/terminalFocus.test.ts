@@ -64,18 +64,6 @@ describe("isTerminalFocused", () => {
     expect(isTerminalFocused()).toBe(true);
   });
 
-  it("rejects the retired drawer owner", () => {
-    const attached = new MockHTMLElement();
-    attached.isConnected = true;
-    attached.terminalOwner = "drawer";
-    attached.dataset.terminalOwner = "drawer";
-
-    globalThis.HTMLElement = MockHTMLElement as unknown as typeof HTMLElement;
-    globalThis.document = { activeElement: attached } as unknown as Document;
-
-    expect(getTerminalFocusOwner()).toBeNull();
-  });
-
   it("returns the right panel owner for focus inside its terminal UI", () => {
     const sidebarButton = new MockHTMLElement();
     sidebarButton.className = "terminal-sidebar-button";

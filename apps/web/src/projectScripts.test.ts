@@ -17,7 +17,6 @@ describe("projectScripts helpers", () => {
     const command = commandForProjectScript("lint");
     expect(command).toBe("script.lint.run");
     expect(projectScriptIdFromCommand(command)).toBe("lint");
-    expect(projectScriptIdFromCommand("terminal.toggle")).toBeNull();
   });
 
   it("slugifies and dedupes project script ids", () => {

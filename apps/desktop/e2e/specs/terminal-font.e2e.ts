@@ -3,7 +3,7 @@ import * as NodePath from "node:path";
 
 import { desktopUiFixture } from "../support/test-project.ts";
 import { terminalOutputEventCount } from "../support/terminal-events.ts";
-import { sendTerminalText } from "../support/terminal-input.ts";
+import { openCenterTerminal, sendTerminalText } from "../support/terminal-input.ts";
 import {
   ensureMainSidebarOpen,
   mockDesktopUiFolderPicker,
@@ -138,9 +138,7 @@ describe("packaged terminal font support", () => {
     await expect(newChat).toBeEnabled();
     await newChat.click();
 
-    const terminalToggle = browser.$('button[aria-label="Toggle terminal drawer"]');
-    await expect(terminalToggle).toBeEnabled();
-    await terminalToggle.click();
+    await openCenterTerminal();
     const terminalScreen = browser.$(".xterm-screen");
     await expect(terminalScreen).toBeDisplayed();
     await terminalScreen.click();
