@@ -289,10 +289,14 @@ describe("AppRoot thread lifecycle reconciliation", () => {
 
     h.shellStates.set(ENVIRONMENT_ID, shellState("live", snapshot(30, [HOST_ID])));
     await act(async () => root.render(<AppRoot router={{} as AppRouter} />));
-    expect(
-      useCenterPanelStore.getState().byThreadKey[scopedThreadKey(DELETED_REF)],
-    ).toBeUndefined();
-    expect(useRightPanelStore.getState().byThreadKey[scopedThreadKey(DELETED_REF)]).toBeUndefined();
+    await vi.waitFor(() => {
+      expect(
+        useCenterPanelStore.getState().byThreadKey[scopedThreadKey(DELETED_REF)],
+      ).toBeUndefined();
+      expect(
+        useRightPanelStore.getState().byThreadKey[scopedThreadKey(DELETED_REF)],
+      ).toBeUndefined();
+    });
   });
 
   it("refreshes stale archived knowledge without pruning from the skewed pair", async () => {
