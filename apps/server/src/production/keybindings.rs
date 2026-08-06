@@ -2,6 +2,10 @@ use std::{collections::HashSet, path::Path};
 
 use serde_json::{Value, json};
 
+const DEFAULT_KEYBINDINGS_JSON: &str = include_str!(
+    "../../../../packages/shared/src/keybindings.defaults.json"
+);
+
 #[derive(Debug, Default)]
 pub(crate) struct LoadedKeybindings {
     pub(crate) rules: Vec<Value>,
@@ -12,7 +16,10 @@ pub(crate) async fn load(path: &Path) -> LoadedKeybindings {
     let bytes = match tokio::fs::read(path).await {
         Ok(bytes) => bytes,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return LoadedKeybindings::default();
+            return LoadedKeybindings {
+                rules: default_rules(),
+                issues: Vec::new(),
+            };
         }
         Err(error) => return malformed(error.to_string()),
     };
@@ -33,6 +40,11 @@ pub(crate) async fn load(path: &Path) -> LoadedKeybindings {
         }
     }
     loaded
+}
+
+fn default_rules() -> Vec<Value> {
+    serde_json::from_str(DEFAULT_KEYBINDINGS_JSON)
+        .expect("embedded default keybindings must be valid JSON")
 }
 
 fn normalize_legacy_commands(mut rule: Value) -> Value {

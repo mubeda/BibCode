@@ -4104,10 +4104,16 @@ mod tests {
             .await
             .expect("keybinding removes");
         assert!(
-            removed["keybindings"]
+            !removed["keybindings"]
                 .as_array()
                 .expect("keybindings")
-                .is_empty()
+                .iter()
+                .any(|binding| {
+                    binding["command"] == "terminal.newCenter"
+                        && binding["shortcut"]["key"] == "k"
+                        && binding["shortcut"]["ctrlKey"] == true
+                        && binding["shortcut"]["shiftKey"] == true
+                })
         );
         assert!(
             control

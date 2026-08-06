@@ -2223,10 +2223,13 @@ describe("ChatView keydown shortcuts", () => {
     const handler = windowKeydownHandler();
     h.shortcutCommandByKey.set("F1", "terminal.close");
 
-    handler(makeKeyEvent({ key: "F1" }));
+    const event = makeKeyEvent({ key: "F1" });
+    handler(event);
     await flushTerminalAction();
 
     const state = useCenterPanelStore.getState().byThreadKey[threadKey]!;
+    expect(event.prevented).toBe(true);
+    expect(event.stopped).toBe(true);
     expect(state.groups[0]?.activeSurfaceId).toBe("terminal:term-next");
     expect(closedTerminalIds()).toEqual(["term-active"]);
   });

@@ -4,6 +4,8 @@ import "@fontsource/jetbrains-mono/500.css";
 import "@xterm/xterm/css/xterm.css";
 import "./index.css";
 import { runClientStateMigrationsV1 } from "./clientStateMigrations";
+import { installDesktopWindowCloseGuard } from "./desktopWindowCloseGuard";
+import { isTauri } from "./env";
 import { resolveStorage } from "./lib/storage";
 
 async function main(): Promise<void> {
@@ -16,6 +18,9 @@ async function main(): Promise<void> {
   }
   if (import.meta.env.VITE_BIBCODE_DESKTOP_E2E === "1") {
     await import("@wdio/tauri-plugin");
+  }
+  if (isTauri) {
+    await installDesktopWindowCloseGuard().catch(() => undefined);
   }
   const { renderApplication } = await import("./bootstrap");
   await renderApplication();

@@ -344,6 +344,27 @@ async fn config_and_settings_match_the_typescript_contract_without_faking_provid
 }
 
 #[tokio::test]
+async fn missing_keybindings_file_uses_the_shipped_defaults() {
+    let (_directory, control) = fixture().await;
+
+    let config = call(&control, "server.getConfig", json!({})).await;
+    let keybindings = config["keybindings"]
+        .as_array()
+        .expect("resolved keybindings");
+
+    assert!(keybindings.iter().any(|binding| {
+        binding["command"] == "sidebar.toggle"
+            && binding["shortcut"]["key"] == "b"
+            && binding["shortcut"]["modKey"] == true
+    }));
+    assert!(keybindings.iter().any(|binding| {
+        binding["command"] == "terminal.newCenter"
+            && binding["shortcut"]["key"] == "j"
+            && binding["shortcut"]["modKey"] == true
+    }));
+}
+
+#[tokio::test]
 async fn activity_protocol_cannot_be_advertised_before_registry_validation() {
     let directory = tempfile::tempdir().expect("temporary state directory");
     let control =
@@ -521,7 +542,11 @@ async fn keybinding_upsert_replace_and_remove_are_resolved_persisted_and_streame
             .as_array()
             .unwrap()
             .iter()
-            .any(|row| { row["command"] == "terminal.newCenter" && row["shortcut"]["key"] == "j" })
+            .any(|row| {
+                row["command"] == "terminal.newCenter"
+                    && row["shortcut"]["key"] == "j"
+                    && row["shortcut"]["altKey"] == true
+            })
     );
     let persisted: Value = serde_json::from_slice(
         &tokio::fs::read(directory.path().join("userdata/keybindings.json"))
@@ -529,7 +554,12 @@ async fn keybinding_upsert_replace_and_remove_are_resolved_persisted_and_streame
             .expect("persisted keybindings"),
     )
     .expect("valid keybindings JSON");
-    assert_eq!(persisted, json!([]));
+    assert!(persisted.as_array().unwrap().iter().any(|rule| {
+        rule["key"] == "mod+j" && rule["command"] == "terminal.newCenter"
+    }));
+    assert!(!persisted.as_array().unwrap().iter().any(|rule| {
+        rule["key"] == "alt+j" && rule["command"] == "terminal.newCenter"
+    }));
     cancellation.cancel();
 }
 
