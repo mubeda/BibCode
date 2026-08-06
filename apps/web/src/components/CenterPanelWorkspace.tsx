@@ -13,8 +13,10 @@ import {
   type Over,
 } from "@dnd-kit/core";
 import {
+  forwardRef,
   useCallback,
   useEffect,
+  useImperativeHandle,
   useRef,
   useState,
   type CSSProperties,
@@ -22,6 +24,7 @@ import {
 } from "react";
 
 import {
+  MAX_CENTER_PANEL_GROUPS,
   canDropCenterPanelSurface,
   findCenterPanelGroup,
   findCenterPanelGroupForSurface,
@@ -71,6 +74,10 @@ export interface CenterPanelWorkspaceProps {
   readonly onDropSurface: (surfaceId: string, target: CenterPanelDropRequest) => void;
   readonly onMergeGroup: (groupId: string) => void;
   readonly onSetSplitRatio: (path: CenterPanelLayoutPath, ratio: number) => void;
+}
+
+export interface CenterPanelWorkspaceHandle {
+  canSplitGroup(groupId: string, direction: "right" | "down"): boolean;
 }
 
 interface TabSnapshot {
@@ -241,7 +248,10 @@ function previewStyle(
   };
 }
 
-export function CenterPanelWorkspace(props: CenterPanelWorkspaceProps) {
+export const CenterPanelWorkspace = forwardRef<
+  CenterPanelWorkspaceHandle,
+  CenterPanelWorkspaceProps
+>(function CenterPanelWorkspace(props, ref) {
   const targets = useCenterPanelBodyTargets();
   const surfaceHostsRef = useRef<CenterPanelSurfaceHostsHandle>(null);
   const workspaceElementRef = useRef<HTMLDivElement | null>(null);
@@ -406,6 +416,21 @@ export function CenterPanelWorkspace(props: CenterPanelWorkspaceProps) {
     },
     [resolveIntent, setChangedPreview],
   );
+  const canSplitGroup = useCallback(
+    (groupId: string, direction: "right" | "down"): boolean => {
+      const currentProps = propsRef.current;
+      if (
+        !findCenterPanelGroup(currentProps.state, groupId) ||
+        currentProps.state.groups.length >= MAX_CENTER_PANEL_GROUPS
+      ) {
+        return false;
+      }
+      const rect = targets.readBodyRect(groupId);
+      return rect !== null && canCenterPanelPaneSplit(rect, direction);
+    },
+    [targets.readBodyRect],
+  );
+  useImperativeHandle(ref, () => ({ canSplitGroup }), [canSplitGroup]);
   const canMoveToSplit = useCallback(
     (groupId: string, direction: CenterPanelSplitDirection): boolean => {
       const currentProps = propsRef.current;
@@ -565,4 +590,4 @@ export function CenterPanelWorkspace(props: CenterPanelWorkspaceProps) {
       </div>
     </DndContext>
   );
-}
+});
