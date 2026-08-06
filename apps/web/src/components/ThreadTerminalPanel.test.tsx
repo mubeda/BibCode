@@ -7,6 +7,7 @@ import {
   type TerminalLaunchCommand,
 } from "@bibcode/contracts";
 import { scopeThreadRef } from "@bibcode/client-runtime/environment";
+import { Window } from "happy-dom";
 import { type ComponentProps, type ReactElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -150,6 +151,128 @@ function panelProps(overrides: Partial<PanelProps> = {}): PanelProps {
     keybindings: EMPTY_KEYBINDINGS,
     ...overrides,
   };
+}
+
+type TerminalToolbarCase = {
+  readonly availability: string;
+  readonly callbacks: Pick<
+    PanelProps,
+    "onSplitTerminal" | "onSplitTerminalVertical" | "onNewTerminal"
+  >;
+  readonly actionLabels: readonly string[];
+  readonly floatingSequence: readonly string[];
+  readonly sidebarDividerBefore: readonly boolean[];
+};
+
+const TERMINAL_TOOLBAR_CASES: readonly TerminalToolbarCase[] = [
+  {
+    availability: "000",
+    callbacks: {
+      onSplitTerminal: undefined,
+      onSplitTerminalVertical: undefined,
+      onNewTerminal: undefined,
+    },
+    actionLabels: [],
+    floatingSequence: [],
+    sidebarDividerBefore: [],
+  },
+  {
+    availability: "001",
+    callbacks: {
+      onSplitTerminal: undefined,
+      onSplitTerminalVertical: undefined,
+      onNewTerminal: () => {},
+    },
+    actionLabels: ["New Terminal"],
+    floatingSequence: ["New Terminal"],
+    sidebarDividerBefore: [false],
+  },
+  {
+    availability: "010",
+    callbacks: {
+      onSplitTerminal: undefined,
+      onSplitTerminalVertical: () => {},
+      onNewTerminal: undefined,
+    },
+    actionLabels: ["Split Terminal Vertically"],
+    floatingSequence: ["Split Terminal Vertically"],
+    sidebarDividerBefore: [false],
+  },
+  {
+    availability: "011",
+    callbacks: {
+      onSplitTerminal: undefined,
+      onSplitTerminalVertical: () => {},
+      onNewTerminal: () => {},
+    },
+    actionLabels: ["Split Terminal Vertically", "New Terminal"],
+    floatingSequence: ["Split Terminal Vertically", "divider", "New Terminal"],
+    sidebarDividerBefore: [false, true],
+  },
+  {
+    availability: "100",
+    callbacks: {
+      onSplitTerminal: () => {},
+      onSplitTerminalVertical: undefined,
+      onNewTerminal: undefined,
+    },
+    actionLabels: ["Split Terminal Horizontally"],
+    floatingSequence: ["Split Terminal Horizontally"],
+    sidebarDividerBefore: [false],
+  },
+  {
+    availability: "101",
+    callbacks: {
+      onSplitTerminal: () => {},
+      onSplitTerminalVertical: undefined,
+      onNewTerminal: () => {},
+    },
+    actionLabels: ["Split Terminal Horizontally", "New Terminal"],
+    floatingSequence: ["Split Terminal Horizontally", "divider", "New Terminal"],
+    sidebarDividerBefore: [false, true],
+  },
+  {
+    availability: "110",
+    callbacks: {
+      onSplitTerminal: () => {},
+      onSplitTerminalVertical: () => {},
+      onNewTerminal: undefined,
+    },
+    actionLabels: ["Split Terminal Horizontally", "Split Terminal Vertically"],
+    floatingSequence: ["Split Terminal Horizontally", "divider", "Split Terminal Vertically"],
+    sidebarDividerBefore: [false, true],
+  },
+  {
+    availability: "111",
+    callbacks: {
+      onSplitTerminal: () => {},
+      onSplitTerminalVertical: () => {},
+      onNewTerminal: () => {},
+    },
+    actionLabels: ["Split Terminal Horizontally", "Split Terminal Vertically", "New Terminal"],
+    floatingSequence: [
+      "Split Terminal Horizontally",
+      "divider",
+      "Split Terminal Vertically",
+      "divider",
+      "New Terminal",
+    ],
+    sidebarDividerBefore: [false, true, true],
+  },
+];
+
+function renderPanelDocument(overrides: Partial<PanelProps>): Document {
+  const window = new Window();
+  window.document.body.innerHTML = renderToStaticMarkup(
+    <ThreadTerminalPanel {...panelProps(overrides)} />,
+  );
+  return window.document;
+}
+
+function toolbarActionLabels(toolbar: Element): string[] {
+  return Array.from(toolbar.querySelectorAll<HTMLButtonElement>("button[aria-label]"), (button) =>
+    button.getAttribute("aria-label"),
+  ).filter((label): label is string => label !== null);
 }
 
 function viewportProps(overrides: Partial<ViewportProps> = {}): ViewportProps {
@@ -494,6 +617,94 @@ describe("ThreadTerminalPanel single terminal", () => {
     // A single surviving terminal renders without the multi-terminal sidebar.
     expect(markup).not.toContain("Group 1");
   });
+});
+
+describe("ThreadTerminalPanel terminal-local toolbar callback matrix", () => {
+  for (const toolbarCase of TERMINAL_TOOLBAR_CASES) {
+    it(`renders floating actions without dangling chrome for ${toolbarCase.availability}`, () => {
+      const document = renderPanelDocument({
+        owner: "center-panel",
+        ...toolbarCase.callbacks,
+        closeShortcutLabel: "Ctrl+W",
+      });
+      const toolbar = document.querySelector('[data-terminal-toolbar="floating"]');
+
+      expect(document.querySelector('[data-terminal-toolbar="sidebar"]')).toBeNull();
+      expect(document.querySelector('button[aria-label="Close Terminal"]')).toBeNull();
+      expect(document.querySelector('button[aria-label="Close Terminal (Ctrl+W)"]')).toBeNull();
+
+      if (toolbarCase.actionLabels.length === 0) {
+        expect(toolbar).toBeNull();
+        return;
+      }
+
+      expect(toolbar).not.toBeNull();
+      if (!toolbar) return;
+      expect(toolbarActionLabels(toolbar)).toEqual(toolbarCase.actionLabels);
+
+      const sequence = Array.from(toolbar.children).flatMap((child) => {
+        if (child.matches('[data-slot="popover-trigger"]')) {
+          const label = child.querySelector("button")?.getAttribute("aria-label");
+          return label ? [label] : [];
+        }
+        return child.matches("[data-terminal-toolbar-separator]") ? ["divider"] : [];
+      });
+      const separatorCount = toolbar.querySelectorAll("[data-terminal-toolbar-separator]").length;
+
+      expect(sequence).toEqual(toolbarCase.floatingSequence);
+      expect(separatorCount).toBe(Math.max(toolbarCase.actionLabels.length - 1, 0));
+      expect(sequence[0]).not.toBe("divider");
+      expect(sequence.at(-1)).not.toBe("divider");
+    });
+
+    it(`renders sidebar actions and per-session close controls for ${toolbarCase.availability}`, () => {
+      const document = renderPanelDocument({
+        owner: "right-panel",
+        terminalIds: ["term-1", "term-2"],
+        activeTerminalId: "term-1",
+        terminalGroups: [{ id: "group-a", terminalIds: ["term-1", "term-2"] }],
+        activeTerminalGroupId: "group-a",
+        ...toolbarCase.callbacks,
+        closeShortcutLabel: "Ctrl+W",
+      });
+      const toolbar = document.querySelector('[data-terminal-toolbar="sidebar"]');
+      const sessionCloseLabels = Array.from(
+        document.querySelectorAll<HTMLButtonElement>('button[aria-label^="Close Terminal"]'),
+        (button) => button.getAttribute("aria-label"),
+      );
+
+      expect(document.querySelector('[data-terminal-toolbar="floating"]')).toBeNull();
+      expect(document.querySelector('button[aria-label="Close Terminal"]')).toBeNull();
+      expect(document.querySelector('button[aria-label="Close Terminal (Ctrl+W)"]')).toBeNull();
+      expect(sessionCloseLabels).toEqual(["Close Terminal 1 (Ctrl+W)", "Close Terminal 2"]);
+
+      if (toolbarCase.actionLabels.length === 0) {
+        expect(toolbar).toBeNull();
+        return;
+      }
+
+      expect(toolbar).not.toBeNull();
+      if (!toolbar) return;
+      expect(toolbarActionLabels(toolbar)).toEqual(toolbarCase.actionLabels);
+
+      const actionButtons = Array.from(
+        toolbar.querySelectorAll<HTMLButtonElement>("button[aria-label]"),
+      );
+      const dividerBefore = actionButtons.map(
+        (button) =>
+          button.classList.contains("border-l") && button.classList.contains("border-border/70"),
+      );
+      const dividerChrome = Array.from(toolbar.querySelectorAll("[class]")).filter(
+        (element) =>
+          element.classList.contains("border-l") && element.classList.contains("border-border/70"),
+      );
+
+      expect(dividerBefore).toEqual(toolbarCase.sidebarDividerBefore);
+      expect(dividerChrome).toHaveLength(Math.max(toolbarCase.actionLabels.length - 1, 0));
+      expect(dividerBefore[0]).toBe(false);
+      expect(dividerBefore.at(-1)).toBe(toolbarCase.actionLabels.length > 1);
+    });
+  }
 });
 
 describe("ThreadTerminalPanel split groups", () => {
