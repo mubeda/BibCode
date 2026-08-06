@@ -629,6 +629,47 @@ async fn exposes_in_progress_state_without_waiting_for_the_fetch() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn completes_a_refresh_when_a_provider_fetcher_never_returns() {
+    let now = fixed_time();
+    let service = ProviderUsageService::new(
+        vec![fetcher(ProviderUsageProvider::Claude, || async move {
+            std::future::pending::<Result<ProviderUsageSnapshot, ProviderUsageFetchError>>().await
+        })],
+        Arc::new(move || now),
+    );
+    let mut refresh = tokio::spawn({
+        let service = service.clone();
+        async move {
+            service
+                .refresh(Some(vec![ProviderUsageProvider::Claude]))
+                .await
+        }
+    });
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(std::time::Duration::from_secs(11)).await;
+    tokio::task::yield_now().await;
+    if !refresh.is_finished() {
+        refresh.abort();
+        let _ = refresh.await;
+        panic!("provider usage refresh remained stuck after its fetch timeout");
+    }
+
+    let completed = (&mut refresh).await.expect("refresh task");
+    assert!(!completed.is_fetching);
+    let claude = completed
+        .providers
+        .iter()
+        .find(|provider| provider.provider == ProviderUsageProvider::Claude)
+        .expect("claude snapshot");
+    assert_eq!(claude.status, ProviderUsageStatus::Error);
+    assert_eq!(
+        claude.error.as_deref(),
+        Some("Provider usage request timed out.")
+    );
+}
+
 #[tokio::test]
 async fn production_fetchers_handle_local_credentials_and_codex_rpc_responses() {
     let temporary = tempfile::tempdir().expect("temporary directory");
