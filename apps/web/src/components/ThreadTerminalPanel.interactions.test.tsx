@@ -74,8 +74,15 @@ interface FakeTerminalLinkProvider {
   ): void;
 }
 
+interface FakeWebglCanvas {
+  width: number;
+  height: number;
+  getBoundingClientRect(): { width: number; height: number };
+}
+
 interface FakeWebglContext {
   readonly getExtension: ReturnType<typeof vi.fn>;
+  readonly canvas: FakeWebglCanvas | null;
 }
 
 interface FakeWebglAddonInstance {
@@ -113,7 +120,9 @@ const webglState = vi.hoisted(() => ({
     | "missing-extension"
     | "getter-throws"
     | "extension-throws"
-    | "lose-throws",
+    | "lose-throws"
+    | "missing-canvas",
+  canvas: null as FakeWebglCanvas | null,
   loseContextSpy: vi.fn(),
   events: [] as string[],
   WebglAddonConstructor: null as (new () => FakeWebglAddonInstance) | null,
@@ -160,7 +169,16 @@ vi.mock("@xterm/addon-webgl", () => {
 
     activate(terminal: unknown): void {
       this.activateSpy(terminal);
+      // xterm rounds the CSS box to 608px while the backing store stays at the
+      // exact 1215 device pixels, which is the mismatch WebKit never corrects.
+      const canvas: FakeWebglCanvas = {
+        width: 1215,
+        height: 600,
+        getBoundingClientRect: () => ({ width: 608, height: 300 }),
+      };
+      webglState.canvas = canvas;
       const context: FakeWebglContext = {
+        canvas: webglState.contextMode === "missing-canvas" ? null : canvas,
         getExtension: vi.fn((name: string) => {
           expect(name).toBe("WEBGL_lose_context");
           if (webglState.contextMode === "extension-throws") {
@@ -228,7 +246,10 @@ vi.mock("@xterm/addon-webgl", () => {
   return { WebglAddon };
 });
 
-vi.mock("./terminalWebgl", () => ({
+// Only the loader is faked; `webglContextFrom`/`webglCanvasFrom` stay real so
+// the addon plumbing under test is the code that actually ships.
+vi.mock("./terminalWebgl", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./terminalWebgl")>()),
   loadTerminalWebglAddon: async () => {
     webglState.importCount += 1;
     if (webglState.WebglAddonConstructor === null) {
@@ -1054,6 +1075,7 @@ beforeEach(() => {
   webglState.listenerDisposeShouldThrow = false;
   webglState.disposeShouldThrow = false;
   webglState.contextMode = "present";
+  webglState.canvas = null;
   webglState.loseContextSpy.mockReset();
   webglState.events = [];
   const defaultRuntime = createTerminalTranscriptRuntime();
@@ -2304,6 +2326,43 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(diagnosticSpy).toHaveBeenCalledOnce();
     expect(view.fakeTerminal).toBe(terminal);
     expect(terminal.dispose).not.toHaveBeenCalled();
+  });
+
+  it("corrects the canvas backing store where the browser cannot report its device-pixel box", async () => {
+    // A Retina ratio; at dpr 1 the CSS box and the backing store cannot disagree.
+    vi.stubGlobal("devicePixelRatio", 2);
+    const view = await mountViewport({ visible: true, webglEnabled: true });
+    await view.settleWebgl();
+    const canvas = webglState.canvas!;
+    const observer = resizeObserverInstances.find(
+      (candidate) => candidate.observe.mock.calls[0]?.[0] === canvas,
+    )!;
+    expect(observer).toBeDefined();
+
+    observer.callback([], observer as unknown as ResizeObserver);
+
+    // 608 CSS px at dpr 2 is 1216 device px, not the 1215 xterm left behind.
+    expect(canvas.width).toBe(1216);
+    expect(canvas.height).toBe(600);
+
+    await view.setVisible(false);
+    expect(observer.disconnect).toHaveBeenCalled();
+  });
+
+  it("skips the correction when the addon exposes no measurable canvas", async () => {
+    const view = await mountViewport({
+      visible: true,
+      webglEnabled: true,
+      webglContextMode: "missing-canvas",
+    });
+    await view.settleWebgl();
+
+    expect(view.webglAddon!.disposeSpy).not.toHaveBeenCalled();
+    expect(
+      resizeObserverInstances.some(
+        (candidate) => candidate.observe.mock.calls[0]?.[0] === webglState.canvas,
+      ),
+    ).toBe(false);
   });
 
   it("releases the real WebGL context before disposing xterm on hide", async () => {

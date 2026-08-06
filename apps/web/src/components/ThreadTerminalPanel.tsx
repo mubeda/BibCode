@@ -69,7 +69,13 @@ import { previewEnvironment } from "../state/preview";
 import { terminalEnvironment } from "../state/terminal";
 import { openTerminalLinkInPreview } from "./preview/openTerminalLinkInPreview";
 import { createTerminalOutputSink } from "./terminalOutputSink";
-import { loadTerminalWebglAddon } from "./terminalWebgl";
+import { observeCanvasDevicePixelSize } from "./terminalDevicePixelCorrection";
+import {
+  loadTerminalWebglAddon,
+  webglCanvasFrom,
+  webglContextFrom,
+  type WebglAddonInstance,
+} from "./terminalWebgl";
 import { useAtomCommand } from "../state/use-atom-command";
 import { useEnvironmentSettings, usePrimarySettings } from "../hooks/useSettings";
 import { useTheme } from "../hooks/useTheme";
@@ -97,8 +103,6 @@ interface TerminalInputBinding {
   }>;
 }
 
-type WebglAddonInstance = import("@xterm/addon-webgl").WebglAddon;
-
 interface WebglContextLossDisposable {
   dispose(): void;
 }
@@ -107,6 +111,7 @@ interface WebglLifecycle {
   readonly terminal: Terminal;
   readonly disposed: boolean;
   setContextLossDisposable(disposable: WebglContextLossDisposable): void;
+  setDevicePixelDisposable(disposable: WebglContextLossDisposable): void;
   dispose(): void;
 }
 
@@ -117,6 +122,7 @@ interface WebglLoseContextExtension {
 function createWebglLifecycle(addon: WebglAddonInstance, terminal: Terminal): WebglLifecycle {
   let disposed = false;
   let contextLossDisposable: WebglContextLossDisposable | null = null;
+  let devicePixelDisposable: WebglContextLossDisposable | null = null;
 
   return {
     terminal,
@@ -134,20 +140,29 @@ function createWebglLifecycle(addon: WebglAddonInstance, terminal: Terminal): We
       }
       contextLossDisposable = disposable;
     },
+    setDevicePixelDisposable(disposable) {
+      if (disposed) {
+        try {
+          disposable.dispose();
+        } catch {
+          // Best-effort listener cleanup must not make the terminal unusable.
+        }
+        return;
+      }
+      devicePixelDisposable = disposable;
+    },
     dispose() {
       if (disposed) return;
       disposed = true;
 
-      let context: WebGL2RenderingContext | undefined;
+      const context = webglContextFrom(addon);
+
       try {
-        context = (
-          addon as unknown as {
-            readonly _renderer?: { readonly _gl?: WebGL2RenderingContext };
-          }
-        )._renderer?._gl;
+        devicePixelDisposable?.dispose();
       } catch {
-        // Private renderer details can change between compatible addon releases.
+        // Our own observer; never block the addon's teardown on it.
       }
+      devicePixelDisposable = null;
 
       try {
         contextLossDisposable?.dispose();
@@ -1469,6 +1484,19 @@ export function TerminalViewport({
         if (!isCurrent()) {
           lifecycle.dispose();
           return;
+        }
+
+        // WebKit never reports a canvas's exact device-pixel box, and the addon
+        // responds by disconnecting its own observer for good, so the backing
+        // store keeps a rounded size and the compositor rescales every glyph.
+        const webglCanvas = webglCanvasFrom(addon);
+        if (webglCanvas) {
+          lifecycle.setDevicePixelDisposable(
+            observeCanvasDevicePixelSize(webglCanvas, () => {
+              if (terminalRef.current !== terminal) return;
+              terminal.refresh(0, terminal.rows - 1);
+            }),
+          );
         }
 
         const contextLossDisposable = addon.onContextLoss(() => {
