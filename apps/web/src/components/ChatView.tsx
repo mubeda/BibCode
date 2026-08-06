@@ -165,6 +165,7 @@ import {
   type CenterTerminalSessionCommandResult,
 } from "../centerTerminalActions";
 import { reserveCenterTerminalId } from "../centerTerminalIdReservations";
+import { retireTerminalSession, type TerminalRetirementTarget } from "../terminalRetirement";
 import type { CenterPanelSurfaceRenderContext } from "./CenterPanelSurfaceHosts";
 import { CenterTerminalPanel } from "./CenterTerminalPanel";
 import {
@@ -845,45 +846,6 @@ function useLocalDispatchState(input: {
   };
 }
 
-/** Same terminal ids (order ignored) — avoids reconcile when only server session ordering differs. */
-export function terminalIdListsEqual(left: readonly string[], right: readonly string[]): boolean {
-  if (left.length !== right.length) {
-    return false;
-  }
-  if (left.length === 0) {
-    return true;
-  }
-  const sortedLeft = left.toSorted((a, b) => a.localeCompare(b));
-  const sortedRight = right.toSorted((a, b) => a.localeCompare(b));
-  for (let index = 0; index < sortedLeft.length; index += 1) {
-    if (sortedLeft[index] !== sortedRight[index]) {
-      return false;
-    }
-  }
-  return true;
-}
-
-/**
- * Server knows about fewer sessions than the client, but every server id still exists locally.
- * Typical right after `terminal.open`: known-session list lags; reconciling would drop the new id
- * and later re-add it as a separate group (no split layout).
- */
-export function serverTerminalIdsStrictSubsetOfClient(
-  serverIds: readonly string[],
-  clientIds: readonly string[],
-): boolean {
-  if (serverIds.length >= clientIds.length || clientIds.length === 0) {
-    return false;
-  }
-  const clientSet = new Set(clientIds);
-  for (const id of serverIds) {
-    if (!clientSet.has(id)) {
-      return false;
-    }
-  }
-  return true;
-}
-
 interface PersistentThreadTerminalPanelProps {
   threadRef: ScopedThreadRef;
   surface: Extract<RightPanelSurface, { kind: "terminal" }>;
@@ -1500,26 +1462,39 @@ function ChatViewContent(props: ChatViewProps) {
   // Center multipanel state (host variant only; a panel instance never hosts
   // its own sub-panels). The host chat surface is always present at index 0.
   const centerPanelByThreadKey = useCenterPanelStore((state) => state.byThreadKey);
+  const retireTerminalResource = useCallback(
+    (target: TerminalRetirementTarget) =>
+      retireTerminalSession(target, {
+        closeSession: closeTerminalMutation,
+        writeExit: ({ environmentId, threadId, terminalId, data }) => {
+          enqueueTerminalInput({
+            environmentId,
+            threadId,
+            terminalId,
+            data,
+            fallbackError: "Terminal exit fallback failed",
+            write: (nextData) =>
+              writeTerminal({
+                environmentId,
+                input: { threadId, terminalId, data: nextData },
+              }),
+          });
+        },
+        releaseInput: ({ environmentId, threadId, terminalId }) => {
+          releaseTerminalInputScheduler(environmentId, threadId, terminalId);
+        },
+      }),
+    [closeTerminalMutation, writeTerminal],
+  );
   const closeCenterTerminalResource = useCallback(
     (hostRef: ScopedThreadRef, surface: Extract<CenterSurface, { kind: "terminal" }>) => {
-      void closeTerminalMutation({
+      void retireTerminalResource({
         environmentId: hostRef.environmentId,
-        input: {
-          threadId: hostRef.threadId,
-          terminalId: surface.terminalId,
-          deleteHistory: true,
-        },
-      }).then((result) => {
-        if (result._tag === "Success") {
-          releaseTerminalInputScheduler(
-            hostRef.environmentId,
-            hostRef.threadId,
-            surface.terminalId,
-          );
-        }
+        threadId: hostRef.threadId,
+        terminalId: surface.terminalId,
       });
     },
-    [closeTerminalMutation],
+    [retireTerminalResource],
   );
   const centerPanelActions = useCenterPanelActions({
     onCloseTerminal: closeCenterTerminalResource,
@@ -2982,26 +2957,18 @@ function ChatViewContent(props: ChatViewProps) {
   const closePanelTerminal = useCallback(
     (terminalId: string) => {
       if (!activeThreadRef || activeRightPanelSurface?.kind !== "terminal") return;
-      const closePromise = (async () => {
-        const closeResult = await closeTerminalMutation({
-          environmentId: activeThreadRef.environmentId,
-          input: { threadId: activeThreadRef.threadId, terminalId, deleteHistory: true },
-        });
-        if (closeResult._tag === "Success") {
-          releaseTerminalInputScheduler(
-            activeThreadRef.environmentId,
-            activeThreadRef.threadId,
-            terminalId,
-          );
-        }
-      })();
+      const closePromise = retireTerminalResource({
+        environmentId: activeThreadRef.environmentId,
+        threadId: activeThreadRef.threadId,
+        terminalId,
+      });
       useRightPanelStore
         .getState()
         .closeTerminal(activeThreadRef, activeRightPanelSurface.id, terminalId);
       setTerminalFocusRequestId((value) => value + 1);
       return closePromise;
     },
-    [activeRightPanelSurface, activeThreadRef, closeTerminalMutation],
+    [activeRightPanelSurface, activeThreadRef, retireTerminalResource],
   );
   const activateRightPanelSurface = useCallback(
     (surface: RightPanelSurface) => {
@@ -3060,19 +3027,11 @@ function ChatViewContent(props: ChatViewProps) {
         }
         if (surface.kind === "terminal") {
           for (const terminalId of surface.terminalIds) {
-            void (async () => {
-              const closeResult = await closeTerminalMutation({
-                environmentId: activeThreadRef.environmentId,
-                input: { threadId: activeThreadRef.threadId, terminalId, deleteHistory: true },
-              });
-              if (closeResult._tag === "Success") {
-                releaseTerminalInputScheduler(
-                  activeThreadRef.environmentId,
-                  activeThreadRef.threadId,
-                  terminalId,
-                );
-              }
-            })();
+            void retireTerminalResource({
+              environmentId: activeThreadRef.environmentId,
+              threadId: activeThreadRef.threadId,
+              terminalId,
+            });
           }
         }
       }
@@ -3081,8 +3040,8 @@ function ChatViewContent(props: ChatViewProps) {
       activeThreadRef,
       activePreviewState.sessions,
       closePreview,
-      closeTerminalMutation,
       dismissPlanSidebarForCurrentTurn,
+      retireTerminalResource,
     ],
   );
   const syncActivePreviewSurface = useCallback(() => {
