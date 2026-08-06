@@ -96,6 +96,7 @@ const h = vi.hoisted(() => {
     stateSeeds: new Map<number, { value: unknown; expectInitial: (value: unknown) => boolean }>(),
     setStateCalls: [] as Array<{ index: number; next: unknown; applied: unknown }>,
     refCalls: [] as Array<{ index: number; initial: unknown }>,
+    refObjects: [] as Array<{ current: unknown }>,
     refSeeds: new Map<number, { value: unknown; expectInitial: (value: unknown) => boolean }>(),
     effects: [] as Array<() => void | (() => void)>,
   };
@@ -142,7 +143,9 @@ vi.mock("react", async (importOriginal) => {
         `useRef seed mismatch at index ${index}: initial value ${String(initial)} did not match the expected shape`,
       );
     }
-    return { current: seed ? seed.value : initial };
+    const ref = { current: seed ? seed.value : initial };
+    h.refObjects.push(ref);
+    return ref;
   };
 
   return {
@@ -1370,6 +1373,7 @@ beforeEach(() => {
   h.stateSeeds.clear();
   h.setStateCalls.length = 0;
   h.refCalls.length = 0;
+  h.refObjects.length = 0;
   h.refSeeds.clear();
   h.effects.length = 0;
 
@@ -1820,6 +1824,13 @@ describe("ChatView keydown shortcuts", () => {
     return { handler: windowKeydownHandler(), composer };
   }
 
+  function openedTerminalIds(): string[] {
+    return commandCallsFor("terminal.open").map((call) => {
+      const command = call.input as { input: { terminalId: string } };
+      return command.input.terminalId;
+    });
+  }
+
   it("routes printable keys into the composer (type-to-focus)", () => {
     const inserted: string[] = [];
     seedConnectedServerThread();
@@ -1940,7 +1951,16 @@ describe("ChatView keydown shortcuts", () => {
     handler(makeKeyEvent({ key: "F1" }));
     await flushTerminalAction();
 
-    expect(action).toHaveBeenCalled();
+    if (expectedAction === "new") {
+      expect(action).toHaveBeenCalled();
+    } else {
+      expect(action).toHaveBeenCalledWith(
+        threadRef,
+        expect.any(String),
+        expect.any(String),
+        expectedAction,
+      );
+    }
     expect(commandCallsFor("terminal.open")).toHaveLength(1);
   });
 
@@ -2011,6 +2031,7 @@ describe("ChatView keydown shortcuts", () => {
       expect(h.toasts).toEqual([
         expect.objectContaining({
           type: "error",
+          timeout: 0,
           description: expect.stringContaining(
             "spawned session could not be closed: close backend unavailable",
           ),
@@ -2053,6 +2074,144 @@ describe("ChatView keydown shortcuts", () => {
     finishOpen?.(AsyncResult.success(undefined));
     await flushTerminalAction();
     expect(setStateCallsFor("terminalFocusRequestId")).toHaveLength(1);
+  });
+
+  it("reserves distinct terminal ids for concurrent center opens without closing either winner", async () => {
+    const finishOpen: Array<(result: unknown) => void> = [];
+    h.commandResults["terminal.open"] = () =>
+      new Promise((resolve) => {
+        finishOpen.push(resolve);
+      });
+    useCenterPanelStore.getState().openTerminalPanel(threadRef, "term-existing");
+    publishSeededStoreState(useCenterPanelStore);
+    h.terminalFocusOwner = "center-panel";
+    const place = vi.spyOn(useCenterPanelStore.getState(), "placeTerminalPanel");
+    const { handler } = renderWithKeydown();
+    h.shortcutCommandByKey.set("F1", "terminal.new");
+
+    handler(makeKeyEvent({ key: "F1" }));
+    handler(makeKeyEvent({ key: "F1" }));
+
+    expect(openedTerminalIds()).toHaveLength(2);
+    expect(new Set(openedTerminalIds()).size).toBe(2);
+
+    finishOpen[0]?.(AsyncResult.success(undefined));
+    finishOpen[1]?.(AsyncResult.success(undefined));
+    await flushTerminalAction();
+
+    expect(place).toHaveBeenCalledTimes(2);
+    expect(commandCallsFor("terminal.close")).toHaveLength(0);
+  });
+
+  it.each([
+    ["failure", AsyncResult.failure(Cause.fail(new Error("open failed")))],
+    ["interruption", AsyncResult.failure(Cause.interrupt(1))],
+  ] as const)("releases a reserved terminal id after open %s", async (_kind, failedResult) => {
+    const finishOpen: Array<(result: unknown) => void> = [];
+    h.commandResults["terminal.open"] = () =>
+      new Promise((resolve) => {
+        finishOpen.push(resolve);
+      });
+    useCenterPanelStore.getState().openTerminalPanel(threadRef, "term-existing");
+    publishSeededStoreState(useCenterPanelStore);
+    h.terminalFocusOwner = "center-panel";
+    const { handler } = renderWithKeydown();
+    h.shortcutCommandByKey.set("F1", "terminal.new");
+
+    handler(makeKeyEvent({ key: "F1" }));
+    handler(makeKeyEvent({ key: "F1" }));
+    const [failedId, pendingId] = openedTerminalIds();
+    expect(failedId).not.toBe(pendingId);
+
+    finishOpen[0]?.(failedResult);
+    await flushTerminalAction();
+    handler(makeKeyEvent({ key: "F1" }));
+
+    expect(openedTerminalIds()[2]).toBe(failedId);
+    expect(openedTerminalIds()[2]).not.toBe(pendingId);
+
+    finishOpen[1]?.(AsyncResult.success(undefined));
+    finishOpen[2]?.(AsyncResult.success(undefined));
+    await flushTerminalAction();
+  });
+
+  it("compensates an open when navigation replaces its originating thread and workspace", async () => {
+    let finishOpen: ((result: unknown) => void) | undefined;
+    h.commandResults["terminal.open"] = () =>
+      new Promise((resolve) => {
+        finishOpen = resolve;
+      });
+    useCenterPanelStore.getState().openTerminalPanel(threadRef, "term-existing");
+    publishSeededStoreState(useCenterPanelStore);
+    h.terminalFocusOwner = "center-panel";
+    const place = vi.spyOn(useCenterPanelStore.getState(), "placeTerminalPanel");
+    const { handler } = renderWithKeydown();
+    h.shortcutCommandByKey.set("F1", "terminal.split");
+
+    handler(makeKeyEvent({ key: "F1" }));
+    expect(h.centerCanSplit).toHaveBeenCalledTimes(1);
+    const terminalId = openedTerminalIds()[0]!;
+
+    const nextWorkspaceCanSplit = vi.fn(() => true);
+    h.refObjects[0]!.current = { canSplitGroup: nextWorkspaceCanSplit };
+    h.refObjects[1]!.current = {
+      threadKey: `${environmentId}:${ThreadId.make("thread-2")}`,
+      revision: 1,
+    };
+    finishOpen?.(AsyncResult.success(undefined));
+    await flushTerminalAction();
+
+    expect(nextWorkspaceCanSplit).not.toHaveBeenCalled();
+    expect(place).not.toHaveBeenCalled();
+    expect(setStateCallsFor("terminalFocusRequestId")).toHaveLength(0);
+    expect(commandCallsFor("terminal.close")).toEqual([
+      expect.objectContaining({
+        input: expect.objectContaining({
+          input: {
+            threadId,
+            terminalId,
+            deleteHistory: true,
+          },
+        }),
+      }),
+    ]);
+  });
+
+  it("does not place or focus a pending center tab after thread navigation", async () => {
+    let finishOpen: ((result: unknown) => void) | undefined;
+    h.commandResults["terminal.open"] = () =>
+      new Promise((resolve) => {
+        finishOpen = resolve;
+      });
+    useCenterPanelStore.getState().openTerminalPanel(threadRef, "term-existing");
+    publishSeededStoreState(useCenterPanelStore);
+    h.terminalFocusOwner = "center-panel";
+    const place = vi.spyOn(useCenterPanelStore.getState(), "placeTerminalPanel");
+    const { handler } = renderWithKeydown();
+    h.shortcutCommandByKey.set("F1", "terminal.new");
+
+    handler(makeKeyEvent({ key: "F1" }));
+    const terminalId = openedTerminalIds()[0]!;
+    h.refObjects[1]!.current = {
+      threadKey: `${environmentId}:${ThreadId.make("thread-2")}`,
+      revision: 1,
+    };
+    finishOpen?.(AsyncResult.success(undefined));
+    await flushTerminalAction();
+
+    expect(place).not.toHaveBeenCalled();
+    expect(setStateCallsFor("terminalFocusRequestId")).toHaveLength(0);
+    expect(commandCallsFor("terminal.close")).toEqual([
+      expect.objectContaining({
+        input: expect.objectContaining({
+          input: {
+            threadId,
+            terminalId,
+            deleteHistory: true,
+          },
+        }),
+      }),
+    ]);
   });
 
   it("center close activates the next local tab", async () => {
