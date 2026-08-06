@@ -24,7 +24,6 @@ vi.mock("../rpc/atomRegistry", () => ({
 
 import {
   MAX_HIDDEN_MOUNTED_PREVIEW_THREADS,
-  MAX_HIDDEN_MOUNTED_TERMINAL_THREADS,
   buildLocalDraftThread,
   buildExpiredTerminalContextToastCopy,
   buildThreadTurnInterruptInput,
@@ -39,7 +38,6 @@ import {
   readFileAsDataUrl,
   reconcileBoundedActivityPages,
   resolveActivityPageLoadAction,
-  reconcileMountedTerminalThreadIds,
   reconcileRetainedMountedThreadIds,
   revokeBlobPreviewUrl,
   revokeUserMessagePreviewUrls,
@@ -744,35 +742,6 @@ describe("resolveSendEnvMode", () => {
   it("keeps worktree mode only for git repositories", () => {
     expect(resolveSendEnvMode({ requestedEnvMode: "worktree", isGitRepo: true })).toBe("worktree");
     expect(resolveSendEnvMode({ requestedEnvMode: "worktree", isGitRepo: false })).toBe("local");
-  });
-});
-
-describe("reconcileMountedTerminalThreadIds", () => {
-  it("keeps open threads and makes the active thread most recent", () => {
-    expect(
-      reconcileMountedTerminalThreadIds({
-        currentThreadIds: ["thread-a", "thread-b", "thread-c"],
-        openThreadIds: ["thread-a", "thread-b", "thread-c"],
-        activeThreadId: "thread-a",
-        activeThreadTerminalOpen: true,
-        maxHiddenThreadCount: 2,
-      }),
-    ).toEqual(["thread-b", "thread-c", "thread-a"]);
-  });
-
-  it("drops closed threads and enforces the hidden mounted cap", () => {
-    const ids = Array.from(
-      { length: MAX_HIDDEN_MOUNTED_TERMINAL_THREADS + 2 },
-      (_, index) => `thread-${index}`,
-    );
-    expect(
-      reconcileMountedTerminalThreadIds({
-        currentThreadIds: ids,
-        openThreadIds: ids.slice(1),
-        activeThreadId: null,
-        activeThreadTerminalOpen: false,
-      }),
-    ).toEqual(ids.slice(-MAX_HIDDEN_MOUNTED_TERMINAL_THREADS));
   });
 });
 

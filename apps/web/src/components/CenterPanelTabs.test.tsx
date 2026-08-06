@@ -55,9 +55,25 @@ vi.mock("~/components/ui/scroll-area", () => ({
 }));
 vi.mock("~/components/ui/menu", () => ({
   DropdownMenu: ({ children }: { children: React.ReactNode }) => <>{children}</>,
-  DropdownMenuTrigger: (props: React.ComponentProps<"button">) => <button {...props} />,
+  DropdownMenuTrigger: ({
+    children,
+    render,
+    ...props
+  }: React.ComponentProps<"button"> & { render?: React.ReactNode }) =>
+    render && React.isValidElement(render) ? (
+      React.cloneElement(render, props, children)
+    ) : (
+      <button {...props}>{children}</button>
+    ),
   DropdownMenuContent: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
   DropdownMenuItem: (props: React.ComponentProps<"button">) => <button {...props} />,
+}));
+vi.mock("./CenterHeaderIconButton", () => ({
+  CenterHeaderIconButton: ({ children, ...props }: React.ComponentProps<"button">) => (
+    <button type="button" data-center-header-icon-control {...props}>
+      {children}
+    </button>
+  ),
 }));
 vi.mock("@dnd-kit/sortable", () => ({
   useSortable: harness.useSortable,
@@ -305,23 +321,42 @@ describe("CenterPanelTabs", () => {
     expect(navigatorClassName).toContain("group-data-[overflow=true]/tabbar:flex");
 
     const previous = elements.find(
-      (element) => (element.props as Record<string, unknown>)["aria-label"] === "Previous tabs",
+      (element) =>
+        element.type === "button" &&
+        (element.props as Record<string, unknown>)["aria-label"] === "Previous tabs",
     );
     const next = elements.find(
-      (element) => (element.props as Record<string, unknown>)["aria-label"] === "Next tabs",
+      (element) =>
+        element.type === "button" &&
+        (element.props as Record<string, unknown>)["aria-label"] === "Next tabs",
     );
     const allTabs = elements.find(
-      (element) => (element.props as Record<string, unknown>)["aria-label"] === "All tabs",
+      (element) =>
+        element.type === "button" &&
+        (element.props as Record<string, unknown>)["aria-label"] === "All tabs",
     );
     expect(previous).toBeDefined();
     expect(next).toBeDefined();
     expect(allTabs).toBeDefined();
+    if (!previous || !next || !allTabs) throw new Error("Overflow controls not found");
+    for (const control of [previous, next, allTabs]) {
+      expect(
+        (control?.props as Record<string, unknown> | undefined)?.[
+          "data-center-header-icon-control"
+        ],
+      ).toBe(true);
+    }
+    expect(
+      renderToStaticMarkup((allTabs.props as { children?: React.ReactNode }).children),
+    ).toContain("<svg");
+    expect(String(navigatorClassName)).toContain("gap-1");
+    expect(String(navigatorClassName)).toContain("border-l");
+    expect(String(navigatorClassName)).not.toContain("gap-0.5");
     const allTabsPopup = elements.find(
       (element) =>
         (element.props as Record<string, unknown>)["className"] === "max-h-80 w-64 overflow-y-auto",
     );
     expect(allTabsPopup).toBeDefined();
-    if (!previous || !next) throw new Error("Overflow page controls not found");
 
     (next.props as { onClick: () => void }).onClick();
     (previous.props as { onClick: () => void }).onClick();

@@ -1,5 +1,5 @@
 import { EditorId, type EnvironmentId, type ResolvedKeybindingsConfig } from "@bibcode/contracts";
-import { memo, useCallback, useEffect, useMemo } from "react";
+import { memo, type ReactNode, useCallback, useEffect, useMemo } from "react";
 import { isOpenFavoriteEditorShortcut, shortcutLabelForCommand } from "../../keybindings";
 import { usePreferredEditor } from "../../editorPreferences";
 import { ChevronDownIcon, FolderClosedIcon } from "lucide-react";
@@ -35,8 +35,35 @@ import { isMacPlatform, isWindowsPlatform } from "~/lib/utils";
 import { shellEnvironment } from "~/state/shell";
 import { useAtomCommand } from "~/state/use-atom-command";
 
-const resolveOptions = (platform: string, availableEditors: ReadonlyArray<EditorId>) => {
-  const baseOptions: ReadonlyArray<{ label: string; Icon: Icon; value: EditorId }> = [
+export interface OpenInEditorOption {
+  readonly label: string;
+  readonly Icon: Icon;
+  readonly value: EditorId;
+}
+
+export interface OpenInPickerProps {
+  readonly environmentId: EnvironmentId;
+  readonly keybindings: ResolvedKeybindingsConfig;
+  readonly availableEditors: ReadonlyArray<EditorId>;
+  readonly openInCwd: string | null;
+  readonly compact?: boolean;
+  readonly enableShortcut?: boolean;
+}
+
+export interface OpenInEditorController {
+  readonly options: ReadonlyArray<OpenInEditorOption>;
+  readonly preferredEditor: EditorId | null;
+  readonly primaryOption: OpenInEditorOption | null;
+  readonly shortcutLabel: string | null;
+  readonly disabled: boolean;
+  readonly openInEditor: (editorId: EditorId | null) => unknown;
+}
+
+const resolveOptions = (
+  platform: string,
+  availableEditors: ReadonlyArray<EditorId>,
+): ReadonlyArray<OpenInEditorOption> => {
+  const baseOptions: ReadonlyArray<OpenInEditorOption> = [
     {
       label: "Cursor",
       Icon: CursorIcon,
@@ -151,21 +178,13 @@ const resolveOptions = (platform: string, availableEditors: ReadonlyArray<Editor
   return baseOptions.filter((option) => availableEditorSet.has(option.value));
 };
 
-export const OpenInPicker = memo(function OpenInPicker({
+export function useOpenInEditorController({
   environmentId,
   keybindings,
   availableEditors,
   openInCwd,
-  compact = false,
   enableShortcut = true,
-}: {
-  environmentId: EnvironmentId;
-  keybindings: ResolvedKeybindingsConfig;
-  availableEditors: ReadonlyArray<EditorId>;
-  openInCwd: string | null;
-  compact?: boolean;
-  enableShortcut?: boolean;
-}) {
+}: OpenInPickerProps): OpenInEditorController {
   const openInEditorMutation = useAtomCommand(shellEnvironment.openInEditor, "open in editor");
   const [preferredEditor, setPreferredEditor] = usePreferredEditor(availableEditors);
   const options = useMemo(
@@ -192,7 +211,7 @@ export const OpenInPicker = memo(function OpenInPicker({
     [environmentId, openInCwd, openInEditorMutation, preferredEditor, setPreferredEditor],
   );
 
-  const openFavoriteEditorShortcutLabel = useMemo(
+  const shortcutLabel = useMemo(
     () => shortcutLabelForCommand(keybindings, "editor.openFavorite"),
     [keybindings],
   );
@@ -224,13 +243,51 @@ export const OpenInPicker = memo(function OpenInPicker({
     preferredEditor,
   ]);
 
+  return {
+    options,
+    preferredEditor,
+    primaryOption,
+    shortcutLabel,
+    disabled: !preferredEditor || !openInCwd,
+    openInEditor,
+  };
+}
+
+export function OpenInMenuItems({ controller }: { controller: OpenInEditorController }): ReactNode {
+  const { openInEditor, options, preferredEditor, shortcutLabel } = controller;
+
+  return (
+    <>
+      {options.length === 0 && <MenuItem disabled>No installed editors found</MenuItem>}
+      {options.map(({ label, Icon, value }) => (
+        <MenuItem key={value} onClick={() => openInEditor(value)}>
+          <Icon aria-hidden="true" className="text-muted-foreground" />
+          {label}
+          {value === preferredEditor && shortcutLabel && (
+            <MenuShortcut>{shortcutLabel}</MenuShortcut>
+          )}
+        </MenuItem>
+      ))}
+    </>
+  );
+}
+
+function OpenInExpandedActionsView({
+  controller,
+  compact,
+}: {
+  controller: OpenInEditorController;
+  compact: boolean;
+}) {
+  const { disabled, openInEditor, preferredEditor, primaryOption } = controller;
+
   return (
     <Group aria-label="Open in editor">
       <Button
         aria-label={compact ? "Open file in preferred editor" : undefined}
         size="xs"
         variant="outline"
-        disabled={!preferredEditor || !openInCwd}
+        disabled={disabled}
         onClick={() => openInEditor(preferredEditor)}
       >
         {primaryOption?.Icon && <primaryOption.Icon aria-hidden="true" className="size-3.5" />}
@@ -258,18 +315,22 @@ export const OpenInPicker = memo(function OpenInPicker({
           <ChevronDownIcon aria-hidden="true" className="size-4" />
         </MenuTrigger>
         <MenuPopup align="end">
-          {options.length === 0 && <MenuItem disabled>No installed editors found</MenuItem>}
-          {options.map(({ label, Icon, value }) => (
-            <MenuItem key={value} onClick={() => openInEditor(value)}>
-              <Icon aria-hidden="true" className="text-muted-foreground" />
-              {label}
-              {value === preferredEditor && openFavoriteEditorShortcutLabel && (
-                <MenuShortcut>{openFavoriteEditorShortcutLabel}</MenuShortcut>
-              )}
-            </MenuItem>
-          ))}
+          <OpenInMenuItems controller={controller} />
         </MenuPopup>
       </Menu>
     </Group>
   );
+}
+
+export function OpenInExpandedActions({
+  controller,
+}: {
+  controller: OpenInEditorController;
+}): ReactNode {
+  return <OpenInExpandedActionsView controller={controller} compact={false} />;
+}
+
+export const OpenInPicker = memo(function OpenInPicker(props: OpenInPickerProps) {
+  const controller = useOpenInEditorController(props);
+  return <OpenInExpandedActionsView controller={controller} compact={props.compact ?? false} />;
 });

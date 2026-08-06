@@ -89,7 +89,9 @@ describe("ModelListRow", () => {
   });
 
   it("renders simple and fully decorated model rows", () => {
-    expect(renderRow()).toContain("Display model");
+    const unselected = renderRow();
+    expect(unselected).toContain("Display model");
+    expect(unselected).not.toContain("lucide-check");
     expect(harness.getDisplayName).toHaveBeenCalledWith(model, undefined);
 
     const decorated = renderRow({
@@ -105,6 +107,9 @@ describe("ModelListRow", () => {
     expect(decorated).toContain("provider");
     expect(decorated).toContain("⌘1");
     expect(decorated).toContain("Remove from favorites");
+    expect(decorated).toContain("lucide-check");
+    expect(decorated).toContain("text-primary");
+    expect(decorated).not.toContain("text-blue-400");
     expect(harness.getDisplayName).toHaveBeenLastCalledWith(model, { preferShortName: true });
   });
 

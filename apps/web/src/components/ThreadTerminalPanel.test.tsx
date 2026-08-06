@@ -7,6 +7,7 @@ import {
   type TerminalLaunchCommand,
 } from "@bibcode/contracts";
 import { scopeThreadRef } from "@bibcode/client-runtime/environment";
+import { Window } from "happy-dom";
 import { type ComponentProps, type ReactElement, type ReactNode } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
@@ -14,7 +15,7 @@ import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 const settingsState = vi.hoisted(() => ({ enableTerminalAgentActivity: false }));
 
 // ── Module mocks ────────────────────────────────────────────────────────────
-// The drawer's `TerminalViewport` child wires xterm + Effect atom state at
+// The panel's `TerminalViewport` child wires xterm + Effect atom state at
 // mount time (inside effects). Static server rendering never runs effects, so
 // the mocks only need to satisfy the render-time hook calls.
 
@@ -109,33 +110,33 @@ vi.mock("~/components/ui/popover", () => ({
   ),
 }));
 
-import ThreadTerminalDrawer, {
+import ThreadTerminalPanel, {
   TerminalViewport,
   resolveTerminalSelectionActionPosition,
   shouldHandleTerminalSelectionMouseUp,
   terminalSelectionActionDelayForClickCount,
-} from "./ThreadTerminalDrawer";
+} from "./ThreadTerminalPanel";
 
-const TEST_ENVIRONMENT_ID = EnvironmentId.make("environment-terminal-drawer");
-const TEST_THREAD_ID = ThreadId.make("thread-terminal-drawer");
+const TEST_ENVIRONMENT_ID = EnvironmentId.make("environment-terminal-panel");
+const TEST_THREAD_ID = ThreadId.make("thread-terminal-panel");
 const TEST_THREAD_REF = scopeThreadRef(TEST_ENVIRONMENT_ID, TEST_THREAD_ID);
-const TEST_PROJECT_ID = ProjectId.make("project-terminal-drawer");
+const TEST_PROJECT_ID = ProjectId.make("project-terminal-panel");
 const EMPTY_KEYBINDINGS: ResolvedKeybindingsConfig = [];
 
 beforeEach(() => {
   settingsState.enableTerminalAgentActivity = false;
 });
 
-type DrawerProps = ComponentProps<typeof ThreadTerminalDrawer>;
+type PanelProps = ComponentProps<typeof ThreadTerminalPanel>;
 type ViewportProps = ComponentProps<typeof TerminalViewport>;
 
-function drawerProps(overrides: Partial<DrawerProps> = {}): DrawerProps {
+function panelProps(overrides: Partial<PanelProps> = {}): PanelProps {
   return {
+    owner: "right-panel",
     threadRef: TEST_THREAD_REF,
     threadId: TEST_THREAD_ID,
     projectId: TEST_PROJECT_ID,
     cwd: "/repo",
-    height: 220,
     terminalIds: ["term-1"],
     activeTerminalId: "term-1",
     terminalGroups: [],
@@ -146,11 +147,132 @@ function drawerProps(overrides: Partial<DrawerProps> = {}): DrawerProps {
     onNewTerminal: () => {},
     onActiveTerminalChange: () => {},
     onCloseTerminal: () => {},
-    onHeightChange: () => {},
     onAddTerminalContext: () => {},
     keybindings: EMPTY_KEYBINDINGS,
     ...overrides,
   };
+}
+
+type TerminalToolbarCase = {
+  readonly availability: string;
+  readonly callbacks: Pick<
+    PanelProps,
+    "onSplitTerminal" | "onSplitTerminalVertical" | "onNewTerminal"
+  >;
+  readonly actionLabels: readonly string[];
+  readonly floatingSequence: readonly string[];
+  readonly sidebarDividerBefore: readonly boolean[];
+};
+
+const TERMINAL_TOOLBAR_CASES: readonly TerminalToolbarCase[] = [
+  {
+    availability: "000",
+    callbacks: {
+      onSplitTerminal: undefined,
+      onSplitTerminalVertical: undefined,
+      onNewTerminal: undefined,
+    },
+    actionLabels: [],
+    floatingSequence: [],
+    sidebarDividerBefore: [],
+  },
+  {
+    availability: "001",
+    callbacks: {
+      onSplitTerminal: undefined,
+      onSplitTerminalVertical: undefined,
+      onNewTerminal: () => {},
+    },
+    actionLabels: ["New Terminal"],
+    floatingSequence: ["New Terminal"],
+    sidebarDividerBefore: [false],
+  },
+  {
+    availability: "010",
+    callbacks: {
+      onSplitTerminal: undefined,
+      onSplitTerminalVertical: () => {},
+      onNewTerminal: undefined,
+    },
+    actionLabels: ["Split Terminal Vertically"],
+    floatingSequence: ["Split Terminal Vertically"],
+    sidebarDividerBefore: [false],
+  },
+  {
+    availability: "011",
+    callbacks: {
+      onSplitTerminal: undefined,
+      onSplitTerminalVertical: () => {},
+      onNewTerminal: () => {},
+    },
+    actionLabels: ["Split Terminal Vertically", "New Terminal"],
+    floatingSequence: ["Split Terminal Vertically", "divider", "New Terminal"],
+    sidebarDividerBefore: [false, true],
+  },
+  {
+    availability: "100",
+    callbacks: {
+      onSplitTerminal: () => {},
+      onSplitTerminalVertical: undefined,
+      onNewTerminal: undefined,
+    },
+    actionLabels: ["Split Terminal Horizontally"],
+    floatingSequence: ["Split Terminal Horizontally"],
+    sidebarDividerBefore: [false],
+  },
+  {
+    availability: "101",
+    callbacks: {
+      onSplitTerminal: () => {},
+      onSplitTerminalVertical: undefined,
+      onNewTerminal: () => {},
+    },
+    actionLabels: ["Split Terminal Horizontally", "New Terminal"],
+    floatingSequence: ["Split Terminal Horizontally", "divider", "New Terminal"],
+    sidebarDividerBefore: [false, true],
+  },
+  {
+    availability: "110",
+    callbacks: {
+      onSplitTerminal: () => {},
+      onSplitTerminalVertical: () => {},
+      onNewTerminal: undefined,
+    },
+    actionLabels: ["Split Terminal Horizontally", "Split Terminal Vertically"],
+    floatingSequence: ["Split Terminal Horizontally", "divider", "Split Terminal Vertically"],
+    sidebarDividerBefore: [false, true],
+  },
+  {
+    availability: "111",
+    callbacks: {
+      onSplitTerminal: () => {},
+      onSplitTerminalVertical: () => {},
+      onNewTerminal: () => {},
+    },
+    actionLabels: ["Split Terminal Horizontally", "Split Terminal Vertically", "New Terminal"],
+    floatingSequence: [
+      "Split Terminal Horizontally",
+      "divider",
+      "Split Terminal Vertically",
+      "divider",
+      "New Terminal",
+    ],
+    sidebarDividerBefore: [false, true, true],
+  },
+];
+
+function renderPanelDocument(overrides: Partial<PanelProps>): Document {
+  const window = new Window();
+  window.document.body.innerHTML = renderToStaticMarkup(
+    <ThreadTerminalPanel {...panelProps(overrides)} />,
+  );
+  return window.document;
+}
+
+function toolbarActionLabels(toolbar: Element): string[] {
+  return Array.from(toolbar.querySelectorAll<HTMLButtonElement>("button[aria-label]"), (button) =>
+    button.getAttribute("aria-label"),
+  ).filter((label): label is string => label !== null);
 }
 
 function viewportProps(overrides: Partial<ViewportProps> = {}): ViewportProps {
@@ -166,7 +288,6 @@ function viewportProps(overrides: Partial<ViewportProps> = {}): ViewportProps {
     focusRequestId: 0,
     autoFocus: false,
     resizeEpoch: 0,
-    drawerHeight: 220,
     keybindings: EMPTY_KEYBINDINGS,
     ...overrides,
   };
@@ -196,7 +317,7 @@ describe("resolveTerminalSelectionActionPosition", () => {
     expect(position).toEqual({ x: 250, y: 324 });
   });
 
-  it("falls back to the drawer's top-right corner without a selection or pointer", () => {
+  it("falls back to the panel's top-right corner without a selection or pointer", () => {
     const position = resolveTerminalSelectionActionPosition({
       bounds,
       selectionRect: null,
@@ -206,7 +327,7 @@ describe("resolveTerminalSelectionActionPosition", () => {
     expect(position).toEqual({ x: 100 + 400 - 140, y: 200 + 12 });
   });
 
-  it("clamps a pointer position inside the drawer bounds", () => {
+  it("clamps a pointer position inside the panel bounds", () => {
     const position = resolveTerminalSelectionActionPosition({
       bounds,
       selectionRect: null,
@@ -236,9 +357,9 @@ describe("resolveTerminalSelectionActionPosition", () => {
     expect(position).toEqual({ x: 8, y: 8 });
   });
 
-  it("derives a fallback viewport from the drawer bounds when window is unavailable", () => {
+  it("derives a fallback viewport from the panel bounds when window is unavailable", () => {
     // In this node test environment `window` is undefined, so the fallback
-    // viewport is the drawer's bottom-right corner plus an 8px margin.
+    // viewport is the panel's bottom-right corner plus an 8px margin.
     const position = resolveTerminalSelectionActionPosition({
       bounds,
       selectionRect: { right: 5000, bottom: 5000 },
@@ -372,12 +493,12 @@ describe("TerminalViewport", () => {
   });
 });
 
-describe("ThreadTerminalDrawer provider activity isolation", () => {
+describe("ThreadTerminalPanel provider activity isolation", () => {
   it("binds each visible split terminal to its own eligible activity host", () => {
     settingsState.enableTerminalAgentActivity = true;
     const markup = renderToStaticMarkup(
-      <ThreadTerminalDrawer
-        {...drawerProps({
+      <ThreadTerminalPanel
+        {...panelProps({
           terminalIds: ["terminal-codex", "terminal-claude"],
           activeTerminalId: "terminal-codex",
           terminalGroups: [
@@ -401,25 +522,27 @@ describe("ThreadTerminalDrawer provider activity isolation", () => {
   });
 });
 
-describe("ThreadTerminalDrawer empty state", () => {
-  it("renders the empty state with a new-terminal action in drawer mode", () => {
+describe("ThreadTerminalPanel empty state", () => {
+  it("renders the empty state as an explicitly owned full-height panel", () => {
     const markup = renderToStaticMarkup(
-      <ThreadTerminalDrawer
-        {...drawerProps({ terminalIds: [], activeTerminalId: "", newShortcutLabel: "Ctrl+T" })}
+      <ThreadTerminalPanel
+        {...panelProps({ terminalIds: [], activeTerminalId: "", newShortcutLabel: "Ctrl+T" })}
       />,
     );
     expect(markup).toContain("No terminal sessions for this thread yet.");
     expect(markup).toContain("New Terminal (Ctrl+T)");
-    expect(markup).toContain('data-terminal-owner="drawer"');
-    expect(markup).toContain("cursor-row-resize");
-    expect(markup).toContain("height:220px");
+    expect(markup).toContain('data-terminal-owner="right-panel"');
+    expect(markup).toContain("thread-terminal-panel");
+    expect(markup).toContain("h-full");
+    expect(markup).not.toContain("cursor-row-resize");
+    expect(markup).not.toContain("height:220px");
   });
 
-  it("omits the resize handle and inline height in panel mode", () => {
+  it("uses the center owner supplied by a center host", () => {
     const markup = renderToStaticMarkup(
-      <ThreadTerminalDrawer {...drawerProps({ mode: "panel", terminalIds: [] })} />,
+      <ThreadTerminalPanel {...panelProps({ owner: "center-panel", terminalIds: [] })} />,
     );
-    expect(markup).toContain('data-terminal-owner="right-panel"');
+    expect(markup).toContain('data-terminal-owner="center-panel"');
     expect(markup).not.toContain("cursor-row-resize");
     expect(markup).not.toContain("height:220px");
     expect(markup).toContain("New Terminal");
@@ -427,26 +550,35 @@ describe("ThreadTerminalDrawer empty state", () => {
 
   it("treats blank-only terminal ids as an empty terminal list", () => {
     const markup = renderToStaticMarkup(
-      <ThreadTerminalDrawer {...drawerProps({ terminalIds: ["  ", ""] })} />,
+      <ThreadTerminalPanel {...panelProps({ terminalIds: ["  ", ""] })} />,
     );
     expect(markup).toContain("No terminal sessions for this thread yet.");
   });
 });
 
-describe("ThreadTerminalDrawer single terminal", () => {
-  it("renders the floating action strip without a sidebar", () => {
-    const markup = renderToStaticMarkup(<ThreadTerminalDrawer {...drawerProps()} />);
+describe("ThreadTerminalPanel single terminal", () => {
+  it("renders terminal-local actions without a whole-surface close control", () => {
+    const markup = renderToStaticMarkup(<ThreadTerminalPanel {...panelProps()} />);
     expect(markup).toContain('aria-label="Split Terminal Horizontally"');
     expect(markup).toContain('aria-label="Split Terminal Vertically"');
     expect(markup).toContain('aria-label="New Terminal"');
-    expect(markup).toContain('aria-label="Close Terminal"');
+    expect(markup).not.toContain('aria-label="Close Terminal"');
+    expect(markup).not.toContain("lucide-trash-2");
     expect(markup).not.toContain("Group 1");
+  });
+
+  it("does not render a whole-surface close control for a center terminal", () => {
+    const markup = renderToStaticMarkup(
+      <ThreadTerminalPanel {...panelProps({ owner: "center-panel" })} />,
+    );
+    expect(markup).not.toContain('aria-label="Close Terminal"');
+    expect(markup).not.toContain("lucide-trash-2");
   });
 
   it("omits split and new controls when the host does not support them", () => {
     const markup = renderToStaticMarkup(
-      <ThreadTerminalDrawer
-        {...drawerProps({
+      <ThreadTerminalPanel
+        {...panelProps({
           onSplitTerminal: undefined as unknown as () => void,
           onSplitTerminalVertical: undefined as unknown as () => void,
           onNewTerminal: undefined as unknown as () => void,
@@ -457,45 +589,13 @@ describe("ThreadTerminalDrawer single terminal", () => {
     expect(markup).not.toContain('aria-label="Split Terminal Horizontally"');
     expect(markup).not.toContain('aria-label="Split Terminal Vertically"');
     expect(markup).not.toContain('aria-label="New Terminal"');
-    expect(markup).toContain('aria-label="Close Terminal"');
-  });
-
-  it("clamps the drawer height between the minimum and the default maximum", () => {
-    // Without a window the max drawer height falls back to the 280px default.
-    const tall = renderToStaticMarkup(<ThreadTerminalDrawer {...drawerProps({ height: 5000 })} />);
-    expect(tall).toContain("height:280px");
-
-    const short = renderToStaticMarkup(<ThreadTerminalDrawer {...drawerProps({ height: 10 })} />);
-    expect(short).toContain("height:180px");
-
-    const invalid = renderToStaticMarkup(
-      <ThreadTerminalDrawer {...drawerProps({ height: Number.NaN })} />,
-    );
-    expect(invalid).toContain("height:280px");
-  });
-
-  it("derives the max drawer height from the window when one exists", () => {
-    vi.stubGlobal("window", {
-      innerWidth: 1024,
-      innerHeight: 768,
-      addEventListener: () => {},
-      removeEventListener: () => {},
-    });
-    try {
-      const markup = renderToStaticMarkup(
-        <ThreadTerminalDrawer {...drawerProps({ height: 5000 })} />,
-      );
-      // 75% of the 768px window height.
-      expect(markup).toContain("height:576px");
-    } finally {
-      vi.unstubAllGlobals();
-    }
+    expect(markup).not.toContain("pointer-events-none absolute right-2 top-2 z-20");
   });
 
   it("includes shortcut labels in the action tooltips when provided", () => {
     const markup = renderToStaticMarkup(
-      <ThreadTerminalDrawer
-        {...drawerProps({
+      <ThreadTerminalPanel
+        {...panelProps({
           splitShortcutLabel: "Ctrl+Shift+H",
           splitVerticalShortcutLabel: "Ctrl+Shift+V",
           newShortcutLabel: "Ctrl+T",
@@ -506,39 +606,125 @@ describe("ThreadTerminalDrawer single terminal", () => {
     expect(markup).toContain("Split Terminal Horizontally (Ctrl+Shift+H)");
     expect(markup).toContain("Split Terminal Vertically (Ctrl+Shift+V)");
     expect(markup).toContain("New Terminal (Ctrl+T)");
-    expect(markup).toContain("Close Terminal (Ctrl+W)");
   });
 
   it("deduplicates and trims terminal ids before rendering", () => {
     const markup = renderToStaticMarkup(
-      <ThreadTerminalDrawer
-        {...drawerProps({ terminalIds: [" term-1 ", "term-1", ""], activeTerminalId: "term-1" })}
+      <ThreadTerminalPanel
+        {...panelProps({ terminalIds: [" term-1 ", "term-1", ""], activeTerminalId: "term-1" })}
       />,
     );
     // A single surviving terminal renders without the multi-terminal sidebar.
     expect(markup).not.toContain("Group 1");
-    expect(markup).toContain('aria-label="Close Terminal"');
   });
 });
 
-describe("ThreadTerminalDrawer split groups", () => {
+describe("ThreadTerminalPanel terminal-local toolbar callback matrix", () => {
+  for (const toolbarCase of TERMINAL_TOOLBAR_CASES) {
+    it(`renders floating actions without dangling chrome for ${toolbarCase.availability}`, () => {
+      const document = renderPanelDocument({
+        owner: "center-panel",
+        ...toolbarCase.callbacks,
+        closeShortcutLabel: "Ctrl+W",
+      });
+      const toolbar = document.querySelector('[data-terminal-toolbar="floating"]');
+
+      expect(document.querySelector('[data-terminal-toolbar="sidebar"]')).toBeNull();
+      expect(document.querySelector('button[aria-label="Close Terminal"]')).toBeNull();
+      expect(document.querySelector('button[aria-label="Close Terminal (Ctrl+W)"]')).toBeNull();
+
+      if (toolbarCase.actionLabels.length === 0) {
+        expect(toolbar).toBeNull();
+        return;
+      }
+
+      expect(toolbar).not.toBeNull();
+      if (!toolbar) return;
+      expect(toolbarActionLabels(toolbar)).toEqual(toolbarCase.actionLabels);
+
+      const sequence = Array.from(toolbar.children).flatMap((child) => {
+        if (child.matches('[data-slot="popover-trigger"]')) {
+          const label = child.querySelector("button")?.getAttribute("aria-label");
+          return label ? [label] : [];
+        }
+        return child.matches("[data-terminal-toolbar-separator]") ? ["divider"] : [];
+      });
+      const separatorCount = toolbar.querySelectorAll("[data-terminal-toolbar-separator]").length;
+
+      expect(sequence).toEqual(toolbarCase.floatingSequence);
+      expect(separatorCount).toBe(Math.max(toolbarCase.actionLabels.length - 1, 0));
+      expect(sequence[0]).not.toBe("divider");
+      expect(sequence.at(-1)).not.toBe("divider");
+    });
+
+    it(`renders sidebar actions and per-session close controls for ${toolbarCase.availability}`, () => {
+      const document = renderPanelDocument({
+        owner: "right-panel",
+        terminalIds: ["term-1", "term-2"],
+        activeTerminalId: "term-1",
+        terminalGroups: [{ id: "group-a", terminalIds: ["term-1", "term-2"] }],
+        activeTerminalGroupId: "group-a",
+        ...toolbarCase.callbacks,
+        closeShortcutLabel: "Ctrl+W",
+      });
+      const toolbar = document.querySelector('[data-terminal-toolbar="sidebar"]');
+      const sessionCloseLabels = Array.from(
+        document.querySelectorAll<HTMLButtonElement>('button[aria-label^="Close Terminal"]'),
+        (button) => button.getAttribute("aria-label"),
+      );
+
+      expect(document.querySelector('[data-terminal-toolbar="floating"]')).toBeNull();
+      expect(document.querySelector('button[aria-label="Close Terminal"]')).toBeNull();
+      expect(document.querySelector('button[aria-label="Close Terminal (Ctrl+W)"]')).toBeNull();
+      expect(sessionCloseLabels).toEqual(["Close Terminal 1 (Ctrl+W)", "Close Terminal 2"]);
+
+      if (toolbarCase.actionLabels.length === 0) {
+        expect(toolbar).toBeNull();
+        return;
+      }
+
+      expect(toolbar).not.toBeNull();
+      if (!toolbar) return;
+      expect(toolbarActionLabels(toolbar)).toEqual(toolbarCase.actionLabels);
+
+      const actionButtons = Array.from(
+        toolbar.querySelectorAll<HTMLButtonElement>("button[aria-label]"),
+      );
+      const dividerBefore = actionButtons.map(
+        (button) =>
+          button.classList.contains("border-l") && button.classList.contains("border-border/70"),
+      );
+      const dividerChrome = Array.from(toolbar.querySelectorAll("[class]")).filter(
+        (element) =>
+          element.classList.contains("border-l") && element.classList.contains("border-border/70"),
+      );
+
+      expect(dividerBefore).toEqual(toolbarCase.sidebarDividerBefore);
+      expect(dividerChrome).toHaveLength(Math.max(toolbarCase.actionLabels.length - 1, 0));
+      expect(dividerBefore[0]).toBe(false);
+      expect(dividerBefore.at(-1)).toBe(toolbarCase.actionLabels.length > 1);
+    });
+  }
+});
+
+describe("ThreadTerminalPanel split groups", () => {
   const twoInOneGroup = {
     terminalIds: ["term-1", "term-2"],
     activeTerminalId: "term-1",
     terminalGroups: [{ id: "group-a", terminalIds: ["term-1", "term-2"] }],
     activeTerminalGroupId: "group-a",
-  } satisfies Partial<DrawerProps>;
+  } satisfies Partial<PanelProps>;
 
   it("renders a horizontal split grid for a two-terminal group", () => {
-    const markup = renderToStaticMarkup(<ThreadTerminalDrawer {...drawerProps(twoInOneGroup)} />);
+    const markup = renderToStaticMarkup(<ThreadTerminalPanel {...panelProps(twoInOneGroup)} />);
     expect(markup).toContain("grid-template-columns:repeat(2, minmax(0, 1fr))");
     expect(markup).not.toContain("grid-template-rows");
   });
 
   it("renders a vertical split grid when the group direction is vertical", () => {
     const markup = renderToStaticMarkup(
-      <ThreadTerminalDrawer
-        {...drawerProps({
+      <ThreadTerminalPanel
+        {...panelProps({
           ...twoInOneGroup,
           terminalGroups: [
             { id: "group-a", terminalIds: ["term-1", "term-2"], splitDirection: "vertical" },
@@ -552,8 +738,8 @@ describe("ThreadTerminalDrawer split groups", () => {
   it("disables split actions at the per-group terminal limit", () => {
     const ids = ["term-1", "term-2", "term-3", "term-4"];
     const markup = renderToStaticMarkup(
-      <ThreadTerminalDrawer
-        {...drawerProps({
+      <ThreadTerminalPanel
+        {...panelProps({
           terminalIds: ids,
           activeTerminalId: "term-1",
           terminalGroups: [{ id: "group-a", terminalIds: ids }],
@@ -568,8 +754,8 @@ describe("ThreadTerminalDrawer split groups", () => {
 
   it("shows group headers when multiple groups exist", () => {
     const markup = renderToStaticMarkup(
-      <ThreadTerminalDrawer
-        {...drawerProps({
+      <ThreadTerminalPanel
+        {...panelProps({
           terminalIds: ["term-1", "term-2"],
           activeTerminalId: "term-2",
           terminalGroups: [
@@ -588,8 +774,8 @@ describe("ThreadTerminalDrawer split groups", () => {
 
   it("sanitizes group definitions: blanks, duplicates, unknown and reassigned ids", () => {
     const markup = renderToStaticMarkup(
-      <ThreadTerminalDrawer
-        {...drawerProps({
+      <ThreadTerminalPanel
+        {...panelProps({
           terminalIds: ["term-1", "term-2", "term-3"],
           activeTerminalId: "term-2",
           terminalGroups: [
@@ -614,8 +800,8 @@ describe("ThreadTerminalDrawer split groups", () => {
 
   it("assigns unique group ids when duplicate group ids collide", () => {
     const markup = renderToStaticMarkup(
-      <ThreadTerminalDrawer
-        {...drawerProps({
+      <ThreadTerminalPanel
+        {...panelProps({
           terminalIds: ["term-1", "term-2"],
           activeTerminalId: "term-1",
           terminalGroups: [
@@ -632,8 +818,8 @@ describe("ThreadTerminalDrawer split groups", () => {
 
   it("keeps probing suffixes when the deduplicated group id is also taken", () => {
     const markup = renderToStaticMarkup(
-      <ThreadTerminalDrawer
-        {...drawerProps({
+      <ThreadTerminalPanel
+        {...panelProps({
           terminalIds: ["term-1", "term-2", "term-3"],
           activeTerminalId: "term-1",
           terminalGroups: [
@@ -653,8 +839,8 @@ describe("ThreadTerminalDrawer split groups", () => {
 
   it("falls back to the first terminal when the active id is unknown", () => {
     const markup = renderToStaticMarkup(
-      <ThreadTerminalDrawer
-        {...drawerProps({
+      <ThreadTerminalPanel
+        {...panelProps({
           terminalIds: ["term-1", "term-2"],
           activeTerminalId: "missing",
           terminalGroups: [
@@ -667,17 +853,18 @@ describe("ThreadTerminalDrawer split groups", () => {
       />,
     );
     // The resolved active terminal (term-1) carries the close shortcut label.
+    expect(markup).not.toContain('aria-label="Close Terminal"');
     expect(markup).toContain("Close Terminal 1 (Ctrl+W)");
     expect(markup).toContain("Close Terminal 2");
     expect(markup).not.toContain("Close Terminal 2 (Ctrl+W)");
   });
 });
 
-describe("ThreadTerminalDrawer sidebar labels", () => {
+describe("ThreadTerminalPanel sidebar labels", () => {
   it("prefers server-provided labels over derived terminal labels", () => {
     const markup = renderToStaticMarkup(
-      <ThreadTerminalDrawer
-        {...drawerProps({
+      <ThreadTerminalPanel
+        {...panelProps({
           terminalIds: ["term-1", "custom-shell"],
           activeTerminalId: "term-1",
           terminalLabelsById: new Map([["custom-shell", "vitest watch"]]),
@@ -691,8 +878,8 @@ describe("ThreadTerminalDrawer sidebar labels", () => {
 
   it("uses per-terminal launch locations when the server knows the session", () => {
     const markup = renderToStaticMarkup(
-      <ThreadTerminalDrawer
-        {...drawerProps({
+      <ThreadTerminalPanel
+        {...panelProps({
           terminalIds: ["term-1", "term-2"],
           activeTerminalId: "term-2",
           runtimeEnv: { FALLBACK: "1" },

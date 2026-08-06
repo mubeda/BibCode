@@ -7,6 +7,7 @@ const harness = vi.hoisted(() => ({
   setPreferredEditor: vi.fn(),
   openInEditor: vi.fn(),
   buttons: [] as Array<Record<string, unknown>>,
+  menus: 0,
   menuItems: [] as Array<Record<string, unknown>>,
   effects: [] as Array<() => void | (() => void)>,
   shortcutMatches: false,
@@ -44,7 +45,10 @@ vi.mock("../ui/group", () => ({
   GroupSeparator: (props: Record<string, unknown>) => <hr className={props.className as string} />,
 }));
 vi.mock("../ui/menu", () => ({
-  Menu: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  Menu: ({ children }: { children: React.ReactNode }) => {
+    harness.menus += 1;
+    return <div>{children}</div>;
+  },
   MenuTrigger: ({ children, render }: { children: React.ReactNode; render: React.ReactNode }) => (
     <>
       {render}
@@ -59,7 +63,13 @@ vi.mock("../ui/menu", () => ({
   MenuShortcut: ({ children }: { children: React.ReactNode }) => <kbd>{children}</kbd>,
 }));
 
-import { OpenInPicker } from "./OpenInPicker";
+import {
+  OpenInExpandedActions,
+  OpenInMenuItems,
+  OpenInPicker,
+  useOpenInEditorController,
+  type OpenInPickerProps,
+} from "./OpenInPicker";
 
 const environmentId = EnvironmentId.make("environment-1");
 const keybindings = [] as ResolvedKeybindingsConfig;
@@ -99,6 +109,31 @@ function renderPicker(overrides: Partial<React.ComponentProps<typeof OpenInPicke
   );
 }
 
+function controllerProps(overrides: Partial<OpenInPickerProps> = {}): OpenInPickerProps {
+  return {
+    environmentId,
+    keybindings,
+    availableEditors: allEditors,
+    openInCwd: "/repo",
+    ...overrides,
+  };
+}
+
+function OpenInMenuHarness({ props }: { props: OpenInPickerProps }) {
+  const controller = useOpenInEditorController(props);
+  return <OpenInMenuItems controller={controller} />;
+}
+
+function OpenInComposedHarness({ props }: { props: OpenInPickerProps }) {
+  const controller = useOpenInEditorController(props);
+  return (
+    <>
+      <OpenInExpandedActions controller={controller} />
+      <OpenInMenuItems controller={controller} />
+    </>
+  );
+}
+
 function invokeClick(props: Record<string, unknown> | undefined): unknown {
   if (typeof props?.onClick !== "function") throw new Error("Missing click handler");
   return props.onClick();
@@ -110,6 +145,7 @@ beforeEach(() => {
   harness.openInEditor.mockReset();
   harness.openInEditor.mockReturnValue("opened");
   harness.buttons.length = 0;
+  harness.menus = 0;
   harness.menuItems.length = 0;
   harness.effects.length = 0;
   harness.shortcutMatches = false;
@@ -128,6 +164,71 @@ afterEach(() => {
 });
 
 describe("OpenInPicker", () => {
+  it("lists only installed editors in the standalone menu presentation", () => {
+    const markup = renderToStaticMarkup(
+      <OpenInMenuHarness
+        props={controllerProps({ availableEditors: ["cursor", "webstorm", "file-manager"] })}
+      />,
+    );
+
+    expect(markup).toContain("Cursor");
+    expect(markup).toContain("WebStorm");
+    expect(markup).toContain("Finder");
+    expect(markup).not.toContain("VS Code");
+    expect(harness.menuItems).toHaveLength(3);
+    expect(harness.menus).toBe(0);
+  });
+
+  it("opens and remembers an editor selected from the standalone menu presentation", () => {
+    renderToStaticMarkup(
+      <OpenInMenuHarness props={controllerProps({ availableEditors: ["cursor"] })} />,
+    );
+
+    invokeClick(harness.menuItems[0]);
+
+    expect(harness.openInEditor).toHaveBeenCalledOnce();
+    expect(harness.openInEditor).toHaveBeenCalledWith({
+      environmentId,
+      input: { cwd: "/repo", editor: "cursor" },
+    });
+    expect(harness.setPreferredEditor).toHaveBeenCalledOnce();
+    expect(harness.setPreferredEditor).toHaveBeenCalledWith("cursor");
+  });
+
+  it("shares one favorite-editor shortcut owner across expanded and menu presentations", () => {
+    renderToStaticMarkup(<OpenInComposedHarness props={controllerProps()} />);
+
+    expect(harness.effects).toHaveLength(1);
+    harness.effects[0]?.();
+    expect(harness.addEventListener).toHaveBeenCalledOnce();
+
+    harness.shortcutMatches = true;
+    const handler = harness.addEventListener.mock.calls[0]?.[1] as (event: KeyboardEvent) => void;
+    const event = { preventDefault: vi.fn() } as unknown as KeyboardEvent;
+    handler(event);
+
+    expect(event.preventDefault).toHaveBeenCalledOnce();
+    expect(harness.openInEditor).toHaveBeenCalledOnce();
+    expect(harness.openInEditor).toHaveBeenCalledWith({
+      environmentId,
+      input: { cwd: "/repo", editor: "vscode" },
+    });
+  });
+
+  it("disables the expanded action and safely ignores menu selection without cwd or favorite", () => {
+    harness.preferredEditor = null;
+    renderToStaticMarkup(
+      <OpenInComposedHarness
+        props={controllerProps({ availableEditors: ["cursor"], openInCwd: null })}
+      />,
+    );
+
+    expect(harness.buttons[0]).toMatchObject({ disabled: true });
+    invokeClick(harness.menuItems[0]);
+    expect(harness.openInEditor).not.toHaveBeenCalled();
+    expect(harness.setPreferredEditor).not.toHaveBeenCalled();
+  });
+
   it("renders every available editor and the platform-specific file manager", () => {
     const markup = renderPicker();
     expect(markup).toContain("Cursor");

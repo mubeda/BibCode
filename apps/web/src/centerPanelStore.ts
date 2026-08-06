@@ -1,17 +1,17 @@
 /** Host-thread-scoped, persisted center-panel surface and group layout state. */
-import { scopedThreadKey } from "@bibcode/client-runtime/environment";
+import { parseScopedThreadKey, scopedThreadKey } from "@bibcode/client-runtime/environment";
 import {
   TERMINAL_LAUNCH_LABEL_MAX_LENGTH,
   type ScopedThreadRef,
   type TerminalLaunchCommand,
   type ThreadId,
 } from "@bibcode/contracts";
-import { nextTerminalId } from "@bibcode/shared/terminalLabels";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 
 import {
   CENTER_PANEL_ROOT_GROUP_ID,
+  MAX_CENTER_PANEL_GROUPS,
   canDropCenterPanelSurface,
   createCenterPanelLayoutState,
   dropCenterPanelSurface,
@@ -29,6 +29,7 @@ import {
 } from "./centerPanelLayout";
 import { decodePersistedTerminalLaunchCommand } from "./lib/terminalLaunchCommand";
 import { resolveStorage } from "./lib/storage";
+import { reserveTerminalId } from "./terminalIdReservations";
 
 export const HOST_SURFACE_ID = "chat:host" as const;
 
@@ -51,6 +52,18 @@ export interface OpenTerminalPanelOptions {
   readonly command?: TerminalLaunchCommand;
 }
 
+export type CenterTerminalPlacement =
+  | { readonly type: "tab"; readonly groupId: string }
+  | {
+      readonly type: "split";
+      readonly groupId: string;
+      readonly direction: "right" | "down";
+    };
+
+export type CenterTerminalPlacementValidation =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: "missing-group" | "pane-limit" };
+
 export interface ThreadCenterPanelState extends CenterPanelLayoutState {
   readonly surfaces: readonly CenterSurface[];
 }
@@ -58,6 +71,16 @@ export interface ThreadCenterPanelState extends CenterPanelLayoutState {
 interface CenterPanelStoreState {
   byThreadKey: Record<string, ThreadCenterPanelState>;
   openChatPanel: (ref: ScopedThreadRef, threadId: ThreadId, providerLabel?: string) => void;
+  validateTerminalPanelPlacement: (
+    ref: ScopedThreadRef,
+    placement: CenterTerminalPlacement,
+  ) => CenterTerminalPlacementValidation;
+  placeTerminalPanel: (
+    ref: ScopedThreadRef,
+    terminalId: string,
+    placement: CenterTerminalPlacement,
+    options?: OpenTerminalPanelOptions,
+  ) => boolean;
   openTerminalPanel: (
     ref: ScopedThreadRef,
     terminalId: string,
@@ -187,6 +210,19 @@ function insertSurface(
   return { ...mutation.state, surfaces };
 }
 
+function validateTerminalPanelPlacement(
+  current: ThreadCenterPanelState,
+  placement: CenterTerminalPlacement,
+): CenterTerminalPlacementValidation {
+  if (!findCenterPanelGroup(current, placement.groupId)) {
+    return { ok: false, reason: "missing-group" };
+  }
+  if (placement.type === "split" && current.groups.length >= MAX_CENTER_PANEL_GROUPS) {
+    return { ok: false, reason: "pane-limit" };
+  }
+  return { ok: true };
+}
+
 function activateGroupSurface(
   current: ThreadCenterPanelState,
   groupId: string,
@@ -303,28 +339,72 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
             insertSurface(current, chatSurface(threadId, providerLabel)),
           ),
         ),
-      openTerminalPanel: (ref, terminalId, options) =>
+      validateTerminalPanelPlacement: (ref, placement) => {
+        const current = get().byThreadKey[scopedThreadKey(ref)] ?? EMPTY_THREAD_STATE;
+        return validateTerminalPanelPlacement(current, placement);
+      },
+      placeTerminalPanel: (ref, terminalId, placement, options) => {
+        const surface = terminalSurface(terminalId, options);
+        let changed = false;
         set((state) =>
-          withUpdatedThread(state, ref, (current) =>
-            insertSurface(current, terminalSurface(terminalId, options)),
-          ),
-        ),
+          withUpdatedThread(state, ref, (current) => {
+            if (!validateTerminalPanelPlacement(current, placement).ok) return current;
+            const inserted = insertCenterPanelSurface(current, surface.id, placement.groupId);
+            if (placement.type === "tab") {
+              if (!inserted.changed) return current;
+              changed = true;
+              const surfaces = current.surfaces.some((entry) => entry.id === surface.id)
+                ? current.surfaces
+                : [...current.surfaces, surface];
+              return { ...inserted.state, surfaces };
+            }
+
+            // @effect-diagnostics-next-line cryptoRandomUUID:off -- Group identifiers are generated at the impure Zustand store boundary.
+            const newGroupId = `center-group:${crypto.randomUUID()}`;
+            const mutation = dropCenterPanelSurface(inserted.state, surface.id, {
+              groupId: placement.groupId,
+              splitDirection: placement.direction,
+              newGroupId,
+            });
+            if (!mutation.changed) return current;
+            changed = true;
+            const surfaces = current.surfaces.some((entry) => entry.id === surface.id)
+              ? current.surfaces
+              : [...current.surfaces, surface];
+            return { ...mutation.state, surfaces };
+          }),
+        );
+        return changed;
+      },
+      openTerminalPanel: (ref, terminalId, options) => {
+        const current = get().byThreadKey[scopedThreadKey(ref)] ?? EMPTY_THREAD_STATE;
+        get().placeTerminalPanel(
+          ref,
+          terminalId,
+          { type: "tab", groupId: current.focusedGroupId },
+          options,
+        );
+      },
       replaceMainWithTerminal: (ref, existingTerminalIds, options) => {
         const threadKey = scopedThreadKey(ref);
         const current = get().byThreadKey[threadKey] ?? EMPTY_THREAD_STATE;
         const storedTerminalIds = current.surfaces.flatMap((surface) =>
           surface.kind === "terminal" ? [surface.terminalId] : [],
         );
-        const terminalId = nextTerminalId([...existingTerminalIds, ...storedTerminalIds]);
-        const surface = terminalSurface(terminalId, options);
-        const layoutState = createCenterPanelLayoutState([surface.id], surface.id);
-        set((state) => ({
-          byThreadKey: {
-            ...state.byThreadKey,
-            [threadKey]: { surfaces: [surface], ...layoutState },
-          },
-        }));
-        return terminalId;
+        const reservation = reserveTerminalId(ref, [...existingTerminalIds, ...storedTerminalIds]);
+        try {
+          const surface = terminalSurface(reservation.terminalId, options);
+          const layoutState = createCenterPanelLayoutState([surface.id], surface.id);
+          set((state) => ({
+            byThreadKey: {
+              ...state.byThreadKey,
+              [threadKey]: { surfaces: [surface], ...layoutState },
+            },
+          }));
+          return reservation.terminalId;
+        } finally {
+          reservation.release();
+        }
       },
       focusGroup: (ref, groupId) =>
         set((state) =>
@@ -441,9 +521,28 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
       removeThread: (ref) =>
         set((state) => {
           const threadKey = scopedThreadKey(ref);
-          if (!(threadKey in state.byThreadKey)) return state;
-          const { [threadKey]: _removed, ...byThreadKey } = state.byThreadKey;
-          return { byThreadKey };
+          let byThreadKey = state.byThreadKey;
+          if (threadKey in byThreadKey) {
+            const { [threadKey]: _removed, ...rest } = byThreadKey;
+            byThreadKey = rest;
+          }
+          for (const [hostThreadKey, hostState] of Object.entries(state.byThreadKey)) {
+            if (hostThreadKey === threadKey) continue;
+            const hostRef = parseScopedThreadKey(hostThreadKey);
+            if (!hostRef || hostRef.environmentId !== ref.environmentId) continue;
+            const referencedSurfaceIds = new Set(
+              hostState.surfaces.flatMap((surface) =>
+                surface.kind === "chat" && surface.threadId === ref.threadId ? [surface.id] : [],
+              ),
+            );
+            if (referencedSurfaceIds.size === 0) continue;
+            byThreadKey = updateThread(
+              byThreadKey,
+              hostThreadKey,
+              (current) => applySurfaceRemoval(current, referencedSurfaceIds).state,
+            );
+          }
+          return byThreadKey === state.byThreadKey ? state : { byThreadKey };
         }),
     }),
     {

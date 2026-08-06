@@ -4,7 +4,7 @@ import * as NodePath from "node:path";
 
 import { desktopUiFixture } from "../support/test-project.ts";
 import { terminalOutputEventCount } from "../support/terminal-events.ts";
-import { sendTerminalCommand } from "../support/terminal-input.ts";
+import { openCenterTerminal, sendTerminalCommand } from "../support/terminal-input.ts";
 import { ensureMainSidebarOpen, setDesktopUiWindowSize } from "../support/ui-state.ts";
 
 const artifactDirectory = process.env.BIBCODE_E2E_ARTIFACT_DIR;
@@ -51,9 +51,7 @@ describe("packaged project session and terminal", () => {
     );
     await expect(streamedResponse).toBeDisplayed();
 
-    const terminalToggle = browser.$('button[aria-label="Toggle terminal drawer"]');
-    await expect(terminalToggle).toBeEnabled();
-    await terminalToggle.click();
+    await openCenterTerminal();
     const terminalScreen = browser.$(".xterm-screen");
     await expect(terminalScreen).toBeDisplayed();
     await terminalScreen.click();

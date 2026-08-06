@@ -157,7 +157,7 @@ const testState = vi.hoisted(() => ({
   shortcutCommand: null as string | null,
   shortcutCalls: [] as unknown[][],
   routeParams: {} as Record<string, string>,
-  terminalOpen: false,
+  terminalSurfaceOpen: false,
   projects: [] as unknown[],
   threads: [] as unknown[],
   activeThread: null as unknown,
@@ -247,10 +247,8 @@ vi.mock("../lib/terminalFocus", () => ({
   isTerminalFocused: () => false,
 }));
 
-vi.mock("../terminalUiStateStore", () => ({
-  selectThreadTerminalUiState: () => ({ terminalOpen: testState.terminalOpen }),
-  useTerminalUiStateStore: (selector: (state: Record<string, unknown>) => unknown) =>
-    selector({ terminalUiStateByThreadKey: {} }),
+vi.mock("../terminalSurfaceState", () => ({
+  useThreadHasTerminalSurface: () => testState.terminalSurfaceOpen,
 }));
 
 vi.mock("../state/server", () => ({
@@ -569,7 +567,7 @@ beforeEach(() => {
   testState.shortcutCommand = null;
   testState.shortcutCalls = [];
   testState.routeParams = {};
-  testState.terminalOpen = false;
+  testState.terminalSurfaceOpen = false;
   testState.projects = [
     makeProject("project-a"),
     makeProject("project-b", {
@@ -695,11 +693,20 @@ describe("palette shell", () => {
     expect(rerender()).toContain('data-open="false"');
   });
 
-  it("selects terminal ui state for the active server thread route", () => {
+  it("passes active terminal surfaces to shortcut resolution", () => {
     testState.routeParams = { environmentId: "env-primary", threadId: "thread-1" };
-    testState.terminalOpen = true;
-    const markup = render();
-    expect(markup).toContain('data-testid="app-child"');
+    testState.terminalSurfaceOpen = true;
+    render();
+    hooks.runEffects();
+
+    const event = { defaultPrevented: false };
+    keydownHandler()(event as never);
+
+    expect(testState.shortcutCalls.at(-1)?.[2]).toEqual(
+      expect.objectContaining({
+        context: expect.objectContaining({ terminalOpen: true }),
+      }),
+    );
   });
 });
 

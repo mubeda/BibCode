@@ -51,6 +51,20 @@ panel and are deleted when their tab closes.
 Tabs persist across reloads. The host chat remains mounted while another center
 tab is active, so its transcript, scroll state, and composer state are preserved.
 
+Use `Cmd+J` on macOS or `Ctrl+J` elsewhere to create and focus a terminal tab in
+the focused center pane. When a center terminal owns focus, `Cmd/Ctrl+N` creates
+another terminal tab, `Cmd/Ctrl+D` creates a terminal in a new right-hand center
+split, `Cmd/Ctrl+Shift+D` creates one in a new lower center split, and
+`Cmd/Ctrl+W` closes the focused terminal. Closing the final tab in a split
+collapses the empty pane. Infeasible splits, including attempts beyond the
+four-pane limit or below the minimum pane size, show a notice without opening a
+terminal session.
+
+Project script actions run in a visible center terminal. They reuse the focused
+idle center terminal when possible and otherwise open a new center terminal.
+The retired bottom terminal drawer and its bottom-toolbar toggle no longer
+exist.
+
 Center tabs can be arranged into as many as four visible split panes. Drag a tab
 within its strip to reorder it, into another pane to move it, or onto a pane edge
 to create a left, right, upper, or lower split. The tab context menu offers the
@@ -74,6 +88,11 @@ Plan surfaces can also appear when the active provider/session supplies them.
 - **Diff** reviews branch or worktree changes.
 - **Activity** shows structured provider activity when available.
 - **Plan** displays the active agent plan when available.
+
+Right-panel terminals retain their internal terminal grouping and splitting.
+When a right-panel terminal owns focus, the terminal new, split right, split
+down, and close shortcuts operate within that right-panel terminal surface;
+`Cmd/Ctrl+J` still creates a center terminal.
 
 ### Source Control
 
