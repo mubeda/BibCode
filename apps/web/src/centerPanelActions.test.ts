@@ -8,7 +8,6 @@ const h = vi.hoisted(() => ({
   deleteThread: vi.fn(),
   addToast: vi.fn(),
   openChatPanel: vi.fn(),
-  openTerminalPanel: vi.fn(),
   activateSurface: vi.fn(),
   closeSurface: vi.fn(),
   closeOtherSurfaces: vi.fn(),
@@ -37,7 +36,6 @@ vi.mock("~/centerPanelStore", () => ({
   useCenterPanelStore: {
     getState: () => ({
       openChatPanel: h.openChatPanel,
-      openTerminalPanel: h.openTerminalPanel,
       activateSurface: h.activateSurface,
       closeSurface: h.closeSurface,
       closeOtherSurfaces: h.closeOtherSurfaces,
@@ -164,19 +162,8 @@ describe("center panel actions", () => {
     );
   });
 
-  it("opens, activates, and closes individual surfaces within the selected group", async () => {
+  it("activates and closes individual surfaces within the selected group", async () => {
     const actions = useCenterPanelActions({ onCloseTerminal });
-    const options = {
-      label: "Codex Terminal",
-      command: {
-        executable: "/opt/codex",
-        args: ["--dangerously-bypass-approvals-and-sandbox"],
-        label: "Codex Terminal",
-      },
-    };
-    expect(actions.openTerminalPanel(hostRef, ["term-1", "term-3"], options)).toBe("term-2");
-    expect(h.openTerminalPanel).toHaveBeenCalledWith(hostRef, "term-2", options);
-
     actions.activateSurface(hostRef, "group-left", "terminal:term-2");
     expect(h.activateSurface).toHaveBeenCalledWith(hostRef, "group-left", "terminal:term-2");
 

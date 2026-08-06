@@ -390,7 +390,7 @@ code {
   display: none;
 }
 
-/* Terminal drawer scrollbar parity with chat */
+/* Terminal panel scrollbar parity with chat */
 .thread-terminal-panel .xterm .xterm-scrollable-element > .scrollbar.vertical {
   width: 6px !important;
 }

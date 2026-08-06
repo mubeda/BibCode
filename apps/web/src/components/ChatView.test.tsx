@@ -2902,10 +2902,16 @@ describe("ChatView", () => {
       expect(header["canCreatePanel"]).toBe(true);
 
       const panelControls = capturedProps<Record<string, unknown>>("panelLayoutControls");
-      expect(panelControls["terminalAvailable"]).toBe(true);
+      expect(panelControls).not.toHaveProperty("terminalAvailable");
+      expect(panelControls).not.toHaveProperty("terminalOpen");
+      expect(panelControls).not.toHaveProperty("onToggleTerminal");
       expect(panelControls["rightPanelAvailable"]).toBe(true);
       expect(panelControls["rightPanelOpen"]).toBe(false);
       expect(markup.match(/data-mock="panel-layout-controls"/g)).toHaveLength(1);
+      expect(markup).not.toContain("PersistentThreadTerminalDrawer");
+      expect(markup).not.toContain('data-terminal-owner="drawer"');
+      expect(markup).not.toContain("Toggle terminal drawer");
+      expect(markup).not.toContain("panel-bottom");
       expect(workspace).not.toHaveProperty("panelLayoutControls");
 
       const bannerStack = capturedProps<{ items: ComposerBannerStackItem[] }>(

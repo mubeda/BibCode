@@ -17,6 +17,8 @@ export interface CenterTerminalLaunch {
   readonly env: Record<string, string>;
   readonly label?: string;
   readonly command?: TerminalLaunchCommand;
+  readonly cols?: number;
+  readonly rows?: number;
 }
 
 export interface CreateCenterTerminalInput {
@@ -29,22 +31,24 @@ export interface CreateCenterTerminalInput {
 export type CenterTerminalCreationResult =
   | { readonly status: "opened"; readonly terminalId: string }
   | { readonly status: "rejected"; readonly reason: string }
-  | { readonly status: "failed"; readonly reason: string };
+  | { readonly status: "failed"; readonly reason: string; readonly interrupted?: true };
+
+export type CenterTerminalSessionCommandResult =
+  | { readonly ok: true }
+  | { readonly ok: false; readonly reason: string; readonly interrupted?: true };
 
 export interface CenterTerminalActionDependencies {
   readonly validatePlacement: (
     placement: CenterTerminalPlacement,
   ) => CenterTerminalPlacementValidation;
   readonly canSplit: (groupId: string, direction: "right" | "down") => boolean;
-  readonly openSession: (
-    input: TerminalOpenInput,
-  ) => Promise<{ readonly ok: true } | { readonly ok: false; readonly reason: string }>;
+  readonly openSession: (input: TerminalOpenInput) => Promise<CenterTerminalSessionCommandResult>;
   readonly place: (
     terminalId: string,
     placement: CenterTerminalPlacement,
     options?: OpenTerminalPanelOptions,
   ) => boolean;
-  readonly closeSession: (input: TerminalCloseInput) => Promise<void>;
+  readonly closeSession: (input: TerminalCloseInput) => Promise<CenterTerminalSessionCommandResult>;
 }
 
 function hasText(value: unknown): value is string {
@@ -71,6 +75,32 @@ function placementRejectionReason(
   return validation.reason === "pane-limit"
     ? "Center pane limit reached."
     : "Center pane is no longer available.";
+}
+
+async function compensateSpawnedSession(
+  input: CreateCenterTerminalInput,
+  dependencies: CenterTerminalActionDependencies,
+  placementFailureReason: string,
+): Promise<CenterTerminalCreationResult> {
+  const closeResult = await dependencies.closeSession({
+    threadId: input.threadRef.threadId,
+    terminalId: input.terminalId,
+    deleteHistory: true,
+  });
+  if (closeResult.ok) {
+    return { status: "failed", reason: placementFailureReason };
+  }
+  if (closeResult.interrupted === true) {
+    return {
+      status: "failed",
+      reason: "Center terminal placement failed and cleanup was interrupted.",
+      interrupted: true,
+    };
+  }
+  return {
+    status: "failed",
+    reason: `Center terminal placement failed and the spawned session could not be closed: ${closeResult.reason}`,
+  };
 }
 
 export async function createCenterTerminal(
@@ -100,9 +130,22 @@ export async function createCenterTerminal(
     worktreePath: launch.worktreePath,
     env: launch.env,
     ...(launch.command !== undefined ? { command: launch.command } : {}),
+    ...(launch.cols !== undefined ? { cols: launch.cols } : {}),
+    ...(launch.rows !== undefined ? { rows: launch.rows } : {}),
   });
   if (!openResult.ok) {
-    return { status: "failed", reason: openResult.reason };
+    return {
+      status: "failed",
+      reason: openResult.reason,
+      ...(openResult.interrupted === true ? { interrupted: true as const } : {}),
+    };
+  }
+
+  if (
+    input.placement.type === "split" &&
+    !dependencies.canSplit(input.placement.groupId, input.placement.direction)
+  ) {
+    return compensateSpawnedSession(input, dependencies, "Center pane became too small to split.");
   }
 
   const placed = dependencies.place(input.terminalId, input.placement, {
@@ -110,12 +153,11 @@ export async function createCenterTerminal(
     ...(launch.command !== undefined ? { command: launch.command } : {}),
   });
   if (!placed) {
-    await dependencies.closeSession({
-      threadId: input.threadRef.threadId,
-      terminalId: input.terminalId,
-      deleteHistory: true,
-    });
-    return { status: "failed", reason: "Center terminal placement is no longer available." };
+    return compensateSpawnedSession(
+      input,
+      dependencies,
+      "Center terminal placement is no longer available.",
+    );
   }
 
   return { status: "opened", terminalId: input.terminalId };

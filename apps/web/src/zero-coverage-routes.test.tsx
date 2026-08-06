@@ -118,7 +118,7 @@ vi.mock("./state/terminalSessions", () => ({
 vi.mock("./components/ThreadTerminalPanel", () => ({
   default: (props: Record<string, unknown>) => {
     h.panelProps = props;
-    return <div data-terminal-drawer>{String(props.cwd)}</div>;
+    return <div data-terminal-panel>{String(props.cwd)}</div>;
   },
 }));
 

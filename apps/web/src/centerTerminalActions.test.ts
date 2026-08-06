@@ -35,7 +35,7 @@ function dependencies(
     canSplit: vi.fn(() => true),
     openSession: vi.fn(async () => ({ ok: true as const })),
     place: vi.fn(() => true),
-    closeSession: vi.fn(async () => undefined),
+    closeSession: vi.fn(async () => ({ ok: true as const })),
     ...overrides,
   };
 }
@@ -101,7 +101,7 @@ describe("createCenterTerminal", () => {
   });
 
   it("closes a spawned session when the atomic placement loses its race", async () => {
-    const closeSession = vi.fn(async () => undefined);
+    const closeSession = vi.fn(async () => ({ ok: true as const }));
     const deps = dependencies({ place: vi.fn(() => false), closeSession });
 
     const result = await createCenterTerminal(validAction, deps);
@@ -121,8 +121,8 @@ describe("createCenterTerminal", () => {
     let finishClose: (() => void) | undefined;
     const closeSession = vi.fn(
       () =>
-        new Promise<void>((resolve) => {
-          finishClose = resolve;
+        new Promise<{ readonly ok: true }>((resolve) => {
+          finishClose = () => resolve({ ok: true });
         }),
     );
     const deps = dependencies({ place: vi.fn(() => false), closeSession });
@@ -139,6 +139,67 @@ describe("createCenterTerminal", () => {
     await expect(resultPromise).resolves.toEqual({
       status: "failed",
       reason: "Center terminal placement is no longer available.",
+    });
+  });
+
+  it("rechecks split geometry after session startup before committing placement", async () => {
+    const canSplit = vi.fn().mockReturnValueOnce(true).mockReturnValueOnce(false);
+    const closeSession = vi.fn(async () => ({ ok: true as const }));
+    const deps = dependencies({ canSplit, closeSession });
+    const action: CreateCenterTerminalInput = {
+      ...validAction,
+      placement: { type: "split", groupId: CENTER_PANEL_ROOT_GROUP_ID, direction: "right" },
+    };
+
+    const result = await createCenterTerminal(action, deps);
+
+    expect(result).toEqual({
+      status: "failed",
+      reason: "Center pane became too small to split.",
+    });
+    expect(canSplit).toHaveBeenCalledTimes(2);
+    expect(deps.place).not.toHaveBeenCalled();
+    expect(closeSession).toHaveBeenCalledWith({
+      threadId: validAction.threadRef.threadId,
+      terminalId: validAction.terminalId,
+      deleteHistory: true,
+    });
+  });
+
+  it("reports when compensating close fails and the spawned session may remain", async () => {
+    const deps = dependencies({
+      place: vi.fn(() => false),
+      closeSession: vi.fn(async () => ({
+        ok: false as const,
+        reason: "terminal backend unavailable",
+      })),
+    });
+
+    const result = await createCenterTerminal(validAction, deps);
+
+    expect(result).toEqual({
+      status: "failed",
+      reason:
+        "Center terminal placement failed and the spawned session could not be closed: terminal backend unavailable",
+    });
+  });
+
+  it("classifies interrupted compensating close separately for notice suppression", async () => {
+    const deps = dependencies({
+      place: vi.fn(() => false),
+      closeSession: vi.fn(async () => ({
+        ok: false as const,
+        reason: "interrupted",
+        interrupted: true as const,
+      })),
+    });
+
+    const result = await createCenterTerminal(validAction, deps);
+
+    expect(result).toEqual({
+      status: "failed",
+      reason: "Center terminal placement failed and cleanup was interrupted.",
+      interrupted: true,
     });
   });
 
