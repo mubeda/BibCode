@@ -4647,7 +4647,7 @@ function ChatViewContent(props: ChatViewProps) {
       });
       if (!command) return;
 
-      if (command === "terminal.toggle") {
+      if (command === "terminal.newCenter") {
         event.preventDefault();
         event.stopPropagation();
         toggleTerminalVisibility();
@@ -5947,7 +5947,7 @@ function ChatViewContent(props: ChatViewProps) {
     <PanelLayoutControls
       terminalAvailable={activeProject !== null}
       terminalOpen={terminalUiState.terminalOpen}
-      terminalShortcutLabel={shortcutLabelForCommand(keybindings, "terminal.toggle")}
+      terminalShortcutLabel={shortcutLabelForCommand(keybindings, "terminal.newCenter")}
       rightPanelAvailable={activeProject !== null}
       rightPanelOpen={effectiveRightPanelOpen}
       rightPanelShortcutLabel={shortcutLabelForCommand(keybindings, "rightPanel.toggle")}

@@ -347,12 +347,12 @@ export function shouldShowModelPickerJumpHintsForModifiers(
   return false;
 }
 
-export function isTerminalToggleShortcut(
+export function isTerminalNewCenterShortcut(
   event: ShortcutEventLike,
   keybindings: ResolvedKeybindingsConfig,
   options?: ShortcutMatchOptions,
 ): boolean {
-  return matchesCommandShortcut(event, keybindings, "terminal.toggle", options);
+  return matchesCommandShortcut(event, keybindings, "terminal.newCenter", options);
 }
 
 export function isTerminalSplitShortcut(

@@ -479,12 +479,12 @@ async fn keybinding_upsert_replace_and_remove_are_resolved_persisted_and_streame
     let added = call(
         &control,
         "server.upsertKeybinding",
-        json!({ "key": "ctrl+shift+k", "command": "terminal.toggle" }),
+        json!({ "key": "ctrl+shift+k", "command": "terminal.newCenter" }),
     )
     .await;
     assert_eq!(added["issues"], json!([]));
     let binding = added["keybindings"].as_array().unwrap().last().unwrap();
-    assert_eq!(binding["command"], "terminal.toggle");
+    assert_eq!(binding["command"], "terminal.newCenter");
     assert_eq!(binding["shortcut"]["key"], "k");
     assert_eq!(binding["shortcut"]["ctrlKey"], true);
     assert_eq!(binding["shortcut"]["shiftKey"], true);
@@ -496,8 +496,8 @@ async fn keybinding_upsert_replace_and_remove_are_resolved_persisted_and_streame
         "server.upsertKeybinding",
         json!({
             "key": "alt+j",
-            "command": "terminal.toggle",
-            "replace": { "key": "ctrl+shift+k", "command": "terminal.toggle" }
+            "command": "terminal.newCenter",
+            "replace": { "key": "ctrl+shift+k", "command": "terminal.newCenter" }
         }),
     )
     .await;
@@ -506,14 +506,14 @@ async fn keybinding_upsert_replace_and_remove_are_resolved_persisted_and_streame
             .as_array()
             .unwrap()
             .iter()
-            .any(|row| { row["command"] == "terminal.toggle" && row["shortcut"]["key"] == "j" })
+            .any(|row| { row["command"] == "terminal.newCenter" && row["shortcut"]["key"] == "j" })
     );
     let _replace_event = next_event_of_type(&mut stream, "keybindingsUpdated").await;
 
     let removed = call(
         &control,
         "server.removeKeybinding",
-        json!({ "key": "alt+j", "command": "terminal.toggle" }),
+        json!({ "key": "alt+j", "command": "terminal.newCenter" }),
     )
     .await;
     assert!(
@@ -521,7 +521,7 @@ async fn keybinding_upsert_replace_and_remove_are_resolved_persisted_and_streame
             .as_array()
             .unwrap()
             .iter()
-            .any(|row| { row["command"] == "terminal.toggle" && row["shortcut"]["key"] == "j" })
+            .any(|row| { row["command"] == "terminal.newCenter" && row["shortcut"]["key"] == "j" })
     );
     let persisted: Value = serde_json::from_slice(
         &tokio::fs::read(directory.path().join("userdata/keybindings.json"))
@@ -562,11 +562,41 @@ async fn invalid_keybinding_entries_are_reported_by_original_index_while_valid_e
 
     let config = call(&control, "server.getConfig", json!({})).await;
     assert_eq!(config["keybindings"].as_array().unwrap().len(), 1);
-    assert_eq!(config["keybindings"][0]["command"], "terminal.toggle");
+    assert_eq!(config["keybindings"][0]["command"], "terminal.newCenter");
     assert_eq!(config["issues"].as_array().unwrap().len(), 2);
     assert_eq!(config["issues"][0]["kind"], "keybindings.invalid-entry");
     assert_eq!(config["issues"][0]["index"], 1);
     assert_eq!(config["issues"][1]["index"], 2);
+}
+
+#[tokio::test]
+async fn persisted_legacy_terminal_toggle_is_returned_as_new_center_without_losing_context() {
+    let rules = json!([
+        {
+            "key": "alt+j",
+            "command": "terminal.toggle",
+            "when": "!terminalFocus"
+        }
+    ]);
+    let (_directory, control) = fixture_with_state_file(
+        "keybindings.json",
+        &serde_json::to_vec(&rules).expect("serialize keybindings fixture"),
+    )
+    .await;
+
+    let config = call(&control, "server.getConfig", json!({})).await;
+    assert_eq!(config["issues"], json!([]));
+    assert_eq!(config["keybindings"].as_array().unwrap().len(), 1);
+    assert_eq!(config["keybindings"][0]["command"], "terminal.newCenter");
+    assert_eq!(config["keybindings"][0]["shortcut"]["key"], "j");
+    assert_eq!(config["keybindings"][0]["shortcut"]["altKey"], true);
+    assert_eq!(
+        config["keybindings"][0]["whenAst"],
+        json!({
+            "type": "not",
+            "node": { "type": "identifier", "name": "terminalFocus" }
+        })
+    );
 }
 
 #[tokio::test]
