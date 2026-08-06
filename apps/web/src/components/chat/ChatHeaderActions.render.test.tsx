@@ -29,6 +29,7 @@ const harness = vi.hoisted(() => ({
   expandedOpenInControllers: [] as unknown[],
   menuOpenInControllers: [] as unknown[],
   openFavoriteEditor: vi.fn(),
+  iconControlProps: [] as Array<Record<string, unknown>>,
 }));
 
 vi.mock("../../state/environments", () => ({
@@ -172,6 +173,17 @@ vi.mock("../ui/button", () => ({
   ),
 }));
 
+vi.mock("../CenterHeaderIconButton", () => ({
+  CenterHeaderIconButton: ({ children, ...props }: Record<string, unknown>) => {
+    harness.iconControlProps.push(props);
+    return (
+      <button type="button" data-center-header-icon-control {...props}>
+        {children as ReactNode}
+      </button>
+    );
+  },
+}));
+
 vi.mock("../ui/menu", () => ({
   Menu: ({ children }: { children: ReactNode }) => <div data-menu-root>{children}</div>,
   MenuTrigger: ({ children, render }: { children: ReactNode; render: ReactNode }) => (
@@ -285,6 +297,7 @@ beforeEach(() => {
   harness.expandedOpenInControllers.length = 0;
   harness.menuOpenInControllers.length = 0;
   harness.openFavoriteEditor.mockReset();
+  harness.iconControlProps.length = 0;
 });
 
 afterEach(async () => {
@@ -301,6 +314,8 @@ describe("ChatHeaderActions rendering", () => {
     expect(markup).toContain('aria-label="Open in editor"');
     expect(markup).not.toContain('aria-label="More workspace actions"');
     expect(markup.match(/data-testid="git-actions"/g)).toHaveLength(1);
+    expect(markup).toContain("gap-2");
+    expect(markup).toContain("@3xl/header-actions:gap-3");
   });
 
   it("keeps New panel and one overflow trigger at compact density", () => {
@@ -311,6 +326,11 @@ describe("ChatHeaderActions rendering", () => {
     expect(markup).not.toContain('aria-label="Script actions"');
     expect(markup).not.toContain('aria-label="Copy options"');
     expect(markup.match(/data-testid="git-actions"/g)).toHaveLength(1);
+    expect(harness.iconControlProps).toEqual([
+      expect.objectContaining({ "aria-label": "More workspace actions" }),
+    ]);
+    expect(markup).toContain('data-center-header-icon-control="true"');
+    expect(markup).toContain("gap-1");
   });
 
   it("renders flat compact script and editor actions with one non-empty separator", () => {

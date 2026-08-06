@@ -40,8 +40,12 @@ vi.mock("./providerTerminalActions", () => ({
 vi.mock("./ProviderInstanceIcon", () => ({
   ProviderInstanceIcon: () => <span data-provider-icon />,
 }));
-vi.mock("../ui/button", () => ({
-  Button: (props: Record<string, unknown>) => <button>{props.children as React.ReactNode}</button>,
+vi.mock("../CenterHeaderIconButton", () => ({
+  CenterHeaderIconButton: ({ children, ...props }: React.ComponentProps<"button">) => (
+    <button type="button" data-center-header-icon-control {...props}>
+      {children}
+    </button>
+  ),
 }));
 vi.mock("../ui/menu", () => ({
   Menu: ({ children }: { children?: React.ReactNode }) => <>{children}</>,
@@ -116,6 +120,8 @@ describe("ChatHeaderPanelMenu", () => {
     expect(markup).toContain("Open Terminal");
     expect(markup).toContain("Codex Terminal");
     expect(markup).toContain("Add custom action");
+    expect(markup).toContain('aria-label="New panel"');
+    expect(markup).toContain('data-center-header-icon-control="true"');
     expect(markup.indexOf("Open Terminal")).toBeLessThan(markup.indexOf("Codex Terminal"));
     expect(markup.indexOf("Codex Terminal")).toBeLessThan(markup.indexOf("Add custom action"));
     expect(markup.match(/<hr/g)).toHaveLength(3);
