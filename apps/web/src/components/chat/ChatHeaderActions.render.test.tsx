@@ -430,6 +430,17 @@ describe("ChatHeaderActions rendering", () => {
     expect(reserved).toContain("[-webkit-app-region:no-drag]");
   });
 
+  it("keeps the compact action rail intrinsically sized for sibling flex layout", () => {
+    const wrapper = document.createElement("div");
+    wrapper.innerHTML = renderToStaticMarkup(
+      <ChatHeaderActions {...props()} reserveTitlebarControls={false} density="compact" />,
+    );
+    const actionRail = wrapper.querySelector<HTMLElement>("[data-chat-header-actions]");
+
+    expect(actionRail?.classList.contains("shrink-0")).toBe(true);
+    expect(actionRail?.classList.contains("@container/header-actions")).toBe(false);
+  });
+
   it("disables the editor shortcut owner outside the primary environment", () => {
     harness.primaryEnvironmentId = EnvironmentId.make("different");
     renderToStaticMarkup(<ChatHeaderActions {...props()} density="compact" />);

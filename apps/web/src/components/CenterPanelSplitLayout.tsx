@@ -231,7 +231,7 @@ function GroupLeaf(
         data-touches-left-edge={props.touchesLeftEdge}
         data-touches-right-edge={props.touchesRightEdge}
         className={cn(
-          "@container/center-pane-header relative z-30 flex min-w-0 shrink-0 items-center border-b border-border/60 bg-background",
+          "@container/header-actions relative z-30 flex min-w-0 shrink-0 items-center border-b border-border/60 bg-background",
           props.touchesTopEdge ? "workspace-topbar" : "h-8",
           props.touchesTopEdge &&
             props.touchesLeftEdge &&
