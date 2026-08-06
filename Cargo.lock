@@ -441,7 +441,6 @@ dependencies = [
  "process-wrap",
  "reqwest",
  "rusqlite",
- "security-framework",
  "semver",
  "serde",
  "serde_json",
