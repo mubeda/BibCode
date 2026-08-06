@@ -4173,7 +4173,7 @@ describe("ThreadTerminalPanel mounted controls", () => {
     expect(mounted.container.querySelector("button")).toBeNull();
   });
 
-  it("runs split, new, close, and terminal activation from rendered controls", async () => {
+  it("runs split, new, per-session close, and terminal activation from rendered controls", async () => {
     const onSplitTerminal = vi.fn();
     const onSplitTerminalVertical = vi.fn();
     const onNewTerminal = vi.fn();
@@ -4199,7 +4199,7 @@ describe("ThreadTerminalPanel mounted controls", () => {
     await click(buttonByLabel("Split Terminal Horizontally"));
     await click(buttonByLabel("Split Terminal Vertically"));
     await click(buttonByLabel("New Terminal"));
-    await click(buttonByLabel("Close Terminal"));
+    await click(buttonByLabel("Close Terminal 1"));
     expect(onSplitTerminal).toHaveBeenCalledOnce();
     expect(onSplitTerminalVertical).toHaveBeenCalledOnce();
     expect(onNewTerminal).toHaveBeenCalledOnce();
@@ -4285,7 +4285,7 @@ describe("ThreadTerminalPanel mounted controls", () => {
     expect(onSplitTerminalVertical).not.toHaveBeenCalled();
 
     await click(buttonByLabel("New Terminal (Ctrl+N)"));
-    await click(buttonByLabel("Close Terminal (Ctrl+W)"));
+    await click(buttonByLabel("Close Primary (Ctrl+W)"));
     expect(onNewTerminal).toHaveBeenCalledOnce();
     expect(onCloseTerminal).toHaveBeenCalledWith("term-1");
 
@@ -4341,7 +4341,7 @@ describe("ThreadTerminalPanel mounted controls", () => {
 
     expect(document.querySelectorAll('button[aria-label^="Split Terminal"]')).toHaveLength(0);
     expect(document.querySelector('button[aria-label^="New Terminal"]')).toBeNull();
-    await click(buttonByLabel("Close Terminal"));
-    expect(onCloseTerminal).toHaveBeenCalledWith("term-1");
+    expect(document.querySelector('button[aria-label="Close Terminal"]')).toBeNull();
+    expect(onCloseTerminal).not.toHaveBeenCalled();
   });
 });

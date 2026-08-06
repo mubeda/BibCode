@@ -51,6 +51,7 @@ beforeEach(() => {
 
 describe("CenterTerminalPanel", () => {
   it("uses the host worktree and forwards the provider command", () => {
+    const onClose = vi.fn();
     const surface = {
       id: "terminal:term-1",
       kind: "terminal",
@@ -78,7 +79,7 @@ describe("CenterTerminalPanel", () => {
         keybindings={{} as never}
         focusRequestId={1}
         onAddTerminalContext={vi.fn()}
-        onClose={vi.fn()}
+        onClose={onClose}
       />,
     );
 
@@ -93,6 +94,7 @@ describe("CenterTerminalPanel", () => {
     });
     expect(h.panelProps?.["onSplitTerminal"]).toBeUndefined();
     expect(h.panelProps?.["onSplitTerminalVertical"]).toBeUndefined();
+    expect(h.panelProps?.["onCloseTerminal"]).toBe(onClose);
     expect(
       (h.panelProps!["terminalCommandsById"] as ReadonlyMap<string, unknown>).get("term-1"),
     ).toEqual(surface.command);
