@@ -477,7 +477,7 @@ vi.mock("./CenterPanelWorkspace", () => ({
     const visibleIds = new Set(state.groups.flatMap((group) => group.activeSurfaceId ?? []));
     return (
       <div data-mock="center-panel-workspace">
-        {props["focusedActions"] as ReactNode}
+        {(props["renderFocusedActions"] as (density: "compact") => ReactNode)("compact")}
         {state.surfaces
           .filter((surface) => surface.id === "chat:host" || visibleIds.has(surface.id))
           .map((surface) => {
@@ -2877,7 +2877,7 @@ describe("ChatView", () => {
 
       const workspace = capturedProps<Record<string, unknown>>("centerWorkspace");
       expect(workspace["hostLabel"]).toBe("Codex");
-      expect(workspace["focusedActions"]).toBeDefined();
+      expect(workspace["renderFocusedActions"]).toBeTypeOf("function");
       expect(capturedProps<Record<string, unknown>>("chatHeaderActions")).not.toHaveProperty(
         "activeThreadTitle",
       );
@@ -3387,8 +3387,8 @@ describe("ChatView", () => {
       expect(markup).toContain('data-mock="chat-header-actions"');
       expect(markup).toContain('data-mock="center-panel-workspace"');
       expect(
-        capturedProps<Record<string, unknown>>("centerWorkspace")["focusedActions"],
-      ).toBeDefined();
+        capturedProps<Record<string, unknown>>("centerWorkspace")["renderFocusedActions"],
+      ).toBeTypeOf("function");
     });
 
     it("keeps ordinary chat and terminal launches available after activity is downgraded", async () => {

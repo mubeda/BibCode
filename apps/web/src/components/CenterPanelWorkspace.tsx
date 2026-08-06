@@ -48,6 +48,7 @@ import {
   type CenterPanelTabRect,
 } from "./centerPanelDnd";
 import { CenterPanelSplitLayout } from "./CenterPanelSplitLayout";
+import type { CenterPaneHeaderDensity } from "./centerPaneHeaderDensity";
 import {
   CenterPanelSurfaceHosts,
   type CenterPanelSurfaceHostsHandle,
@@ -60,7 +61,7 @@ export interface CenterPanelWorkspaceProps {
   readonly state: ThreadCenterPanelState;
   readonly hostLabel: string;
   readonly terminalLabelsById?: ReadonlyMap<string, string>;
-  readonly focusedActions: ReactNode;
+  readonly renderFocusedActions: (density: CenterPaneHeaderDensity) => ReactNode;
   readonly renderSurface: (
     surface: CenterSurface,
     context: CenterPanelSurfaceRenderContext,
@@ -561,7 +562,7 @@ export const CenterPanelWorkspace = forwardRef<
           hostLabel={props.hostLabel}
           {...(props.terminalLabelsById ? { terminalLabelsById: props.terminalLabelsById } : {})}
           dragInProgress={active !== null}
-          focusedActions={props.focusedActions}
+          renderFocusedActions={props.renderFocusedActions}
           registerBodyTarget={targets.registerBodyTarget}
           onResizeFrame={syncSurfaceRects}
           onFocusGroup={props.onFocusGroup}
