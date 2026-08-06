@@ -508,11 +508,11 @@ vi.mock("~/components/ui/popover", () => ({
   PopoverPopup: ({ children }: { children?: React.ReactNode }) => <span>{children}</span>,
 }));
 
-import ThreadTerminalDrawer, {
+import ThreadTerminalPanel, {
   enqueueTerminalInput,
   releaseTerminalInputScheduler,
   TerminalViewport,
-} from "./ThreadTerminalDrawer";
+} from "./ThreadTerminalPanel";
 import { decodeTerminalLaunchCommand } from "../lib/terminalLaunchCommand";
 import { openTerminalLinkInPreview } from "./preview/openTerminalLinkInPreview";
 
@@ -523,7 +523,7 @@ const PROJECT_ID = ProjectId.make("project-terminal-interactions");
 const EMPTY_KEYBINDINGS: ResolvedKeybindingsConfig = [];
 
 type ViewportProps = Parameters<typeof TerminalViewport>[0];
-type DrawerProps = Parameters<typeof ThreadTerminalDrawer>[0];
+type PanelProps = Parameters<typeof ThreadTerminalPanel>[0];
 
 interface MountedTree {
   readonly container: HTMLDivElement;
@@ -604,19 +604,18 @@ function viewportProps(overrides: Partial<ViewportProps> = {}): ViewportProps {
     focusRequestId: 0,
     autoFocus: false,
     resizeEpoch: 0,
-    drawerHeight: 280,
     keybindings: EMPTY_KEYBINDINGS,
     ...overrides,
   };
 }
 
-function drawerProps(overrides: Partial<DrawerProps> = {}): DrawerProps {
+function panelProps(overrides: Partial<PanelProps> = {}): PanelProps {
   return {
+    owner: "right-panel",
     threadRef: THREAD_REF,
     threadId: THREAD_ID,
     projectId: PROJECT_ID,
     cwd: "/repo",
-    height: 280,
     terminalIds: ["term-1"],
     activeTerminalId: "term-1",
     terminalGroups: [{ id: "group-1", terminalIds: ["term-1"] }],
@@ -627,7 +626,6 @@ function drawerProps(overrides: Partial<DrawerProps> = {}): DrawerProps {
     onNewTerminal: vi.fn(),
     onActiveTerminalChange: vi.fn(),
     onCloseTerminal: vi.fn(),
-    onHeightChange: vi.fn(),
     onAddTerminalContext: vi.fn(),
     keybindings: EMPTY_KEYBINDINGS,
     ...overrides,
@@ -1355,8 +1353,8 @@ describe("TerminalViewport provider activity mount", () => {
     await publishTerminalAgentActivitySetting(secondEnvironmentId, true);
     const mounted = await mount(
       <>
-        <ThreadTerminalDrawer
-          {...drawerProps({
+        <ThreadTerminalPanel
+          {...panelProps({
             threadRef: firstThreadRef,
             threadId: firstThreadId,
             terminalIds: [firstTerminalId],
@@ -1366,8 +1364,8 @@ describe("TerminalViewport provider activity mount", () => {
             terminalCommandsById: new Map([[firstTerminalId, observedCommand()]]),
           })}
         />
-        <ThreadTerminalDrawer
-          {...drawerProps({
+        <ThreadTerminalPanel
+          {...panelProps({
             threadRef: secondThreadRef,
             threadId: secondThreadId,
             terminalIds: [secondTerminalId],
@@ -4093,7 +4091,7 @@ describe("TerminalViewport mounted lifecycle", () => {
   });
 });
 
-describe("ThreadTerminalDrawer mounted controls", () => {
+describe("ThreadTerminalPanel mounted controls", () => {
   it("forwards each split terminal's provider launch command to its own attachment", async () => {
     const codexCommand = {
       executable: "/opt/codex",
@@ -4106,8 +4104,8 @@ describe("ThreadTerminalDrawer mounted controls", () => {
       label: "Cursor Terminal",
     };
     await mount(
-      <ThreadTerminalDrawer
-        {...drawerProps({
+      <ThreadTerminalPanel
+        {...panelProps({
           threadRef: scopeThreadRef(EnvironmentId.make("environment-1"), THREAD_ID),
           terminalIds: ["term-1", "term-2"],
           terminalGroups: [{ id: "group-1", terminalIds: ["term-1", "term-2"] }],
@@ -4141,29 +4139,11 @@ describe("ThreadTerminalDrawer mounted controls", () => {
     );
   });
 
-  it("passes visibility to every active split pane without retaining hidden xterms", async () => {
-    const props = drawerProps({
-      visible: false,
-      terminalIds: ["term-1", "term-2"],
-      terminalGroups: [{ id: "group-1", terminalIds: ["term-1", "term-2"] }],
-    });
-    const mounted = await mount(<ThreadTerminalDrawer {...props} />);
-    expect(xtermState.terminals).toHaveLength(0);
-
-    await act(async () => mounted.root.render(<ThreadTerminalDrawer {...props} visible />));
-    expect(xtermState.terminals).toHaveLength(2);
-
-    await act(async () => mounted.root.render(<ThreadTerminalDrawer {...props} visible={false} />));
-    for (const terminal of xtermState.terminals) {
-      expect(terminal.dispose).toHaveBeenCalledOnce();
-    }
-  });
-
   it("creates the first terminal from the rendered empty state", async () => {
     const onNewTerminal = vi.fn();
     await mount(
-      <ThreadTerminalDrawer
-        {...drawerProps({ terminalIds: [], terminalGroups: [], onNewTerminal })}
+      <ThreadTerminalPanel
+        {...panelProps({ terminalIds: [], terminalGroups: [], onNewTerminal })}
       />,
     );
 
@@ -4175,12 +4155,10 @@ describe("ThreadTerminalDrawer mounted controls", () => {
     expect(onNewTerminal).toHaveBeenCalledOnce();
   });
 
-  it("renders an empty panel without drawer resize or create controls", async () => {
+  it("renders an empty panel without resize or create controls", async () => {
     const mounted = await mount(
-      <ThreadTerminalDrawer
-        {...drawerProps({
-          mode: "panel",
-          height: Number.NaN,
+      <ThreadTerminalPanel
+        {...panelProps({
           terminalIds: [],
           terminalGroups: [],
           onNewTerminal: undefined,
@@ -4202,8 +4180,8 @@ describe("ThreadTerminalDrawer mounted controls", () => {
     const onCloseTerminal = vi.fn();
     const onActiveTerminalChange = vi.fn();
     await mount(
-      <ThreadTerminalDrawer
-        {...drawerProps({
+      <ThreadTerminalPanel
+        {...panelProps({
           terminalIds: ["term-1", "term-2"],
           terminalGroups: [
             { id: "group-1", terminalIds: ["term-1"] },
@@ -4242,9 +4220,8 @@ describe("ThreadTerminalDrawer mounted controls", () => {
     const onCloseTerminal = vi.fn();
     const onActiveTerminalChange = vi.fn();
     const mounted = await mount(
-      <ThreadTerminalDrawer
-        {...drawerProps({
-          mode: "panel",
+      <ThreadTerminalPanel
+        {...panelProps({
           worktreePath: "/worktree",
           runtimeEnv: { ROOT_TERMINAL: "1" },
           terminalIds: [" term-1 ", "term-1", "", "term-2", "term-3", "term-4", "orphan"],
@@ -4326,8 +4303,8 @@ describe("ThreadTerminalDrawer mounted controls", () => {
     const onSplitTerminal = vi.fn();
     const onSplitTerminalVertical = vi.fn();
     await mount(
-      <ThreadTerminalDrawer
-        {...drawerProps({
+      <ThreadTerminalPanel
+        {...panelProps({
           terminalIds: ["term-1", "term-2"],
           activeTerminalId: "term-2",
           terminalGroups: [{ id: "group-1", terminalIds: ["term-1", "term-2"] }],
@@ -4348,8 +4325,8 @@ describe("ThreadTerminalDrawer mounted controls", () => {
   it("derives a default group and omits unavailable terminal actions", async () => {
     const onCloseTerminal = vi.fn();
     await mount(
-      <ThreadTerminalDrawer
-        {...drawerProps({
+      <ThreadTerminalPanel
+        {...panelProps({
           terminalIds: ["term-1"],
           activeTerminalId: "missing",
           activeTerminalGroupId: "missing",
@@ -4366,107 +4343,5 @@ describe("ThreadTerminalDrawer mounted controls", () => {
     expect(document.querySelector('button[aria-label^="New Terminal"]')).toBeNull();
     await click(buttonByLabel("Close Terminal"));
     expect(onCloseTerminal).toHaveBeenCalledWith("term-1");
-  });
-
-  it("resizes the drawer by pointer and syncs the clamped height", async () => {
-    const onHeightChange = vi.fn();
-    const mounted = await mount(
-      <ThreadTerminalDrawer
-        {...drawerProps({ onHeightChange, terminalIds: [], terminalGroups: [] })}
-      />,
-    );
-    const handle = mounted.container.querySelector<HTMLElement>(".cursor-row-resize")!;
-    const captured = new Set<number>();
-    Object.defineProperties(handle, {
-      setPointerCapture: {
-        configurable: true,
-        value: (pointerId: number) => captured.add(pointerId),
-      },
-      hasPointerCapture: {
-        configurable: true,
-        value: (pointerId: number) => captured.has(pointerId),
-      },
-      releasePointerCapture: {
-        configurable: true,
-        value: (pointerId: number) => captured.delete(pointerId),
-      },
-    });
-
-    await act(async () => {
-      handle.dispatchEvent(
-        new PointerEvent("pointerdown", { bubbles: true, button: 0, pointerId: 7, clientY: 300 }),
-      );
-      handle.dispatchEvent(
-        new PointerEvent("pointermove", { bubbles: true, pointerId: 7, clientY: 250 }),
-      );
-      handle.dispatchEvent(
-        new PointerEvent("pointerup", { bubbles: true, pointerId: 7, clientY: 250 }),
-      );
-    });
-
-    expect(mounted.container.querySelector("aside")?.getAttribute("style")).toContain("330px");
-    expect(onHeightChange).toHaveBeenCalledWith(330);
-  });
-
-  it("ignores unrelated resize gestures and clamps a window resize", async () => {
-    vi.stubGlobal("innerHeight", 800);
-    const onHeightChange = vi.fn();
-    const props = drawerProps({
-      onHeightChange,
-      terminalIds: [],
-      terminalGroups: [],
-      onNewTerminal: undefined,
-    });
-    const mounted = await mount(<ThreadTerminalDrawer {...props} />);
-    const handle = mounted.container.querySelector<HTMLElement>(".cursor-row-resize")!;
-    Object.defineProperties(handle, {
-      setPointerCapture: {
-        configurable: true,
-        value: vi.fn(),
-      },
-      hasPointerCapture: {
-        configurable: true,
-        value: () => false,
-      },
-      releasePointerCapture: {
-        configurable: true,
-        value: vi.fn(),
-      },
-    });
-
-    await act(async () => {
-      handle.dispatchEvent(
-        new PointerEvent("pointerdown", { bubbles: true, button: 1, pointerId: 1, clientY: 300 }),
-      );
-      handle.dispatchEvent(
-        new PointerEvent("pointermove", { bubbles: true, pointerId: 1, clientY: 250 }),
-      );
-      handle.dispatchEvent(
-        new PointerEvent("pointerup", { bubbles: true, pointerId: 1, clientY: 250 }),
-      );
-      handle.dispatchEvent(
-        new PointerEvent("pointerdown", { bubbles: true, button: 0, pointerId: 2, clientY: 300 }),
-      );
-      handle.dispatchEvent(
-        new PointerEvent("pointermove", { bubbles: true, pointerId: 2, clientY: 300 }),
-      );
-      handle.dispatchEvent(
-        new PointerEvent("pointerup", { bubbles: true, pointerId: 2, clientY: 300 }),
-      );
-    });
-    expect(onHeightChange).not.toHaveBeenCalled();
-
-    vi.stubGlobal("innerHeight", 240);
-    await act(async () => window.dispatchEvent(new Event("resize")));
-    expect(mounted.container.querySelector("aside")?.getAttribute("style")).toContain("180px");
-    expect(onHeightChange).toHaveBeenCalledWith(180);
-
-    const nextThreadId = ThreadId.make("thread-resized");
-    await act(async () =>
-      mounted.root.render(
-        <ThreadTerminalDrawer {...props} threadId={nextThreadId} height={360} visible={false} />,
-      ),
-    );
-    expect(mounted.container.querySelector("aside")?.getAttribute("style")).toContain("180px");
   });
 });

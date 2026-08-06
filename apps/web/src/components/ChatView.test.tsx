@@ -449,10 +449,10 @@ vi.mock("./PlanSidebar", () => ({
   },
 }));
 
-vi.mock("./ThreadTerminalDrawer", () => ({
+vi.mock("./ThreadTerminalPanel", () => ({
   default: (props: Record<string, unknown>) => {
-    h.captured["threadTerminalDrawer"] = props;
-    return <div data-mock="thread-terminal-drawer" data-mode={String(props["mode"] ?? "drawer")} />;
+    h.captured["threadTerminalPanel"] = props;
+    return <div data-mock="thread-terminal-panel" data-owner={String(props["owner"] ?? "")} />;
   },
   releaseTerminalInputScheduler: (environmentId: string, threadId: string, terminalId: string) => {
     h.releasedTerminalInputs.push({ environmentId, threadId, terminalId });
@@ -3762,14 +3762,16 @@ describe("ChatView", () => {
       const markup = renderServerRoute();
 
       expect(markup).toContain('data-mock="right-panel-tabs"');
-      expect(markup).toContain('data-mock="thread-terminal-drawer"');
-      expect(markup).toContain('data-mode="panel"');
+      expect(markup).toContain('data-mock="thread-terminal-panel"');
+      expect(capturedProps<Record<string, unknown>>("threadTerminalPanel")["owner"]).toBe(
+        "right-panel",
+      );
 
-      const drawer = capturedProps<Record<string, unknown>>("threadTerminalDrawer");
-      expect(drawer["terminalIds"]).toEqual(["term-1"]);
-      expect(drawer["activeTerminalId"]).toBe("term-1");
-      expect(drawer["cwd"]).toBe("X:/demo");
-      const labels = drawer["terminalLabelsById"] as ReadonlyMap<string, string>;
+      const panel = capturedProps<Record<string, unknown>>("threadTerminalPanel");
+      expect(panel["terminalIds"]).toEqual(["term-1"]);
+      expect(panel["activeTerminalId"]).toBe("term-1");
+      expect(panel["cwd"]).toBe("X:/demo");
+      const labels = panel["terminalLabelsById"] as ReadonlyMap<string, string>;
       expect(labels.get("term-1")).toBe("Build shell");
     });
 
@@ -3789,8 +3791,8 @@ describe("ChatView", () => {
       h.commandResults["terminal.close"] = () => AsyncResult.success(undefined);
 
       renderServerRoute();
-      const drawer = capturedProps<Record<string, unknown>>("threadTerminalDrawer");
-      const onCloseTerminal = drawer["onCloseTerminal"] as (terminalId: string) => void;
+      const panel = capturedProps<Record<string, unknown>>("threadTerminalPanel");
+      const onCloseTerminal = panel["onCloseTerminal"] as (terminalId: string) => void;
       onCloseTerminal("term-1");
       await Promise.resolve();
       await Promise.resolve();
@@ -3815,8 +3817,8 @@ describe("ChatView", () => {
         AsyncResult.failure(Cause.fail(new Error("close rejected")));
 
       renderServerRoute();
-      const drawer = capturedProps<Record<string, unknown>>("threadTerminalDrawer");
-      const onCloseTerminal = drawer["onCloseTerminal"] as (terminalId: string) => void;
+      const panel = capturedProps<Record<string, unknown>>("threadTerminalPanel");
+      const onCloseTerminal = panel["onCloseTerminal"] as (terminalId: string) => void;
       onCloseTerminal("term-1");
       await Promise.resolve();
       await Promise.resolve();

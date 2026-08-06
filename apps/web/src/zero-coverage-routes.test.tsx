@@ -12,7 +12,7 @@ const h = vi.hoisted(() => ({
   canGoBack: false,
   cloudConfigured: false,
   draftThread: null as Record<string, unknown> | null,
-  drawerProps: null as Record<string, unknown> | null,
+  panelProps: null as Record<string, unknown> | null,
   knownSessions: [] as Array<Record<string, any>>,
   lease: {
     present: vi.fn(),
@@ -115,9 +115,9 @@ vi.mock("./state/terminalSessions", () => ({
   useKnownTerminalSessions: () => h.knownSessions,
 }));
 
-vi.mock("./components/ThreadTerminalDrawer", () => ({
+vi.mock("./components/ThreadTerminalPanel", () => ({
   default: (props: Record<string, unknown>) => {
-    h.drawerProps = props;
+    h.panelProps = props;
     return <div data-terminal-drawer>{String(props.cwd)}</div>;
   },
 }));
@@ -196,7 +196,7 @@ beforeEach(() => {
   h.canGoBack = false;
   h.cloudConfigured = false;
   h.draftThread = null;
-  h.drawerProps = null;
+  h.panelProps = null;
   h.knownSessions = [];
   h.navigate.mockReset().mockResolvedValue(undefined);
   h.openAuthPrompt.mockReset();
@@ -397,8 +397,8 @@ describe("center terminal and preview surfaces", () => {
         runtimeEnv: { BIBCODE_PROJECT_ROOT: "/repo" },
       }),
     );
-    expect(h.drawerProps).toMatchObject({
-      mode: "panel",
+    expect(h.panelProps).toMatchObject({
+      owner: "center-panel",
       cwd: "/repo/worktree",
       worktreePath: "/repo/worktree",
       terminalIds: ["terminal-1"],
@@ -420,16 +420,15 @@ describe("center terminal and preview surfaces", () => {
         runtimeEnv: { BIBCODE_PROJECT_ROOT: "/repo" },
       }),
     );
-    expect(h.drawerProps).toMatchObject({
+    expect(h.panelProps).toMatchObject({
       cwd: "/repo/current-worktree",
       worktreePath: "/repo/current-worktree",
     });
-    (h.drawerProps!.onCloseTerminal as () => void)();
-    (h.drawerProps!.onAddTerminalContext as (value: unknown) => void)({
+    (h.panelProps!.onCloseTerminal as () => void)();
+    (h.panelProps!.onAddTerminalContext as (value: unknown) => void)({
       terminalId: "terminal-1",
     });
-    (h.drawerProps!.onActiveTerminalChange as () => void)();
-    (h.drawerProps!.onHeightChange as () => void)();
+    (h.panelProps!.onActiveTerminalChange as () => void)();
     expect(onClose).toHaveBeenCalledOnce();
     expect(onAddTerminalContext).toHaveBeenCalledOnce();
   });
