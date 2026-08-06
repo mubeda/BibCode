@@ -8,24 +8,30 @@ import {
   type ThreadId,
 } from "@bibcode/contracts";
 import { scopeThreadRef } from "@bibcode/client-runtime/environment";
+import { MoreHorizontal } from "lucide-react";
 import { memo } from "react";
 import GitActionsControl from "../GitActionsControl";
 import { type DraftId } from "~/composerDraftStore";
 import { type ProviderInstanceEntry } from "~/providerInstances";
+import { type CenterPaneHeaderDensity } from "../centerPaneHeaderDensity";
 import {
   type NewProjectScriptInput,
   type ProjectScriptActionResult,
   ProjectScriptsDialogs,
   ProjectScriptsExpandedActions,
+  ProjectScriptsMenuItems,
   useProjectScriptsController,
 } from "../ProjectScriptsControl";
+import { Button } from "../ui/button";
+import { Menu, MenuPopup, MenuSeparator, MenuTrigger } from "../ui/menu";
 import { ChatHeaderPanelMenu } from "./ChatHeaderPanelMenu";
-import { OpenInPicker } from "./OpenInPicker";
+import { OpenInExpandedActions, OpenInMenuItems, useOpenInEditorController } from "./OpenInPicker";
 import { type ProviderTerminalAction } from "./providerTerminalActions";
 import { usePrimaryEnvironmentId } from "../../state/environments";
 import { cn } from "~/lib/utils";
 
 interface ChatHeaderActionsProps {
+  readonly density: CenterPaneHeaderDensity;
   activeThreadEnvironmentId: EnvironmentId;
   activeThreadId: ThreadId;
   draftId?: DraftId;
@@ -65,6 +71,7 @@ export function shouldShowOpenInPicker(input: {
 }
 
 export const ChatHeaderActions = memo(function ChatHeaderActions({
+  density,
   activeThreadEnvironmentId,
   activeThreadId,
   draftId,
@@ -103,12 +110,23 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
     onUpdateScript: onUpdateProjectScript,
     onDeleteScript: onDeleteProjectScript,
   });
+  const openInEditor = useOpenInEditorController({
+    environmentId: activeThreadEnvironmentId,
+    keybindings,
+    availableEditors,
+    openInCwd,
+    enableShortcut: showOpenInPicker,
+  });
+  const projectScriptActionsAvailable = activeProjectScripts !== undefined;
+  const openInActionsAvailable = showOpenInPicker && openInEditor.options.length > 0;
+  const compactActionsAvailable = projectScriptActionsAvailable || openInActionsAvailable;
+
   return (
     <div
       data-chat-header-actions
       className={cn(
-        "@container/header-actions relative z-10 flex shrink-0 items-center justify-end gap-2 bg-background @3xl/header-actions:gap-3",
-        reserveTitlebarControls ? "pr-16" : "pr-0",
+        "@container/header-actions relative z-10 flex shrink-0 items-center justify-end gap-2 bg-background [-webkit-app-region:no-drag] @3xl/header-actions:gap-3",
+        reserveTitlebarControls ? "pr-[4.5rem]" : "pr-2",
       )}
     >
       <ChatHeaderPanelMenu
@@ -120,16 +138,28 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
         onOpenProviderTerminalPanel={onOpenProviderTerminalPanel}
         onAddCustomAction={projectScripts.openAddDialog}
       />
-      <ProjectScriptsExpandedActions controller={projectScripts} />
+      {density === "expanded" ? (
+        <>
+          <ProjectScriptsExpandedActions controller={projectScripts} />
+          {showOpenInPicker ? <OpenInExpandedActions controller={openInEditor} /> : null}
+        </>
+      ) : compactActionsAvailable ? (
+        <Menu>
+          <MenuTrigger
+            render={<Button size="icon-xs" variant="outline" aria-label="More workspace actions" />}
+          >
+            <MoreHorizontal className="size-4" />
+          </MenuTrigger>
+          <MenuPopup align="end" className="min-w-56">
+            {projectScriptActionsAvailable ? (
+              <ProjectScriptsMenuItems controller={projectScripts} />
+            ) : null}
+            {projectScriptActionsAvailable && openInActionsAvailable ? <MenuSeparator /> : null}
+            {openInActionsAvailable ? <OpenInMenuItems controller={openInEditor} /> : null}
+          </MenuPopup>
+        </Menu>
+      ) : null}
       <ProjectScriptsDialogs controller={projectScripts} />
-      {showOpenInPicker && (
-        <OpenInPicker
-          environmentId={activeThreadEnvironmentId}
-          keybindings={keybindings}
-          availableEditors={availableEditors}
-          openInCwd={openInCwd}
-        />
-      )}
       {activeProjectName && (
         <GitActionsControl
           gitCwd={gitCwd}

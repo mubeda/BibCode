@@ -5593,6 +5593,7 @@ function ChatViewContent(props: ChatViewProps) {
             !effectiveRightPanelOpen && focusedGroupEdges?.top === true && focusedGroupEdges.right;
           const chatHeaderActions = (
             <ChatHeaderActions
+              density="expanded"
               activeThreadEnvironmentId={activeThread.environmentId}
               activeThreadId={activeThread.id}
               {...(routeKind === "draft" && draftId ? { draftId } : {})}
