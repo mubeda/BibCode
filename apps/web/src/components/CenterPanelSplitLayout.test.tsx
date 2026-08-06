@@ -315,7 +315,7 @@ describe("CenterPanelSplitLayout", () => {
       expect(
         container
           .querySelector<HTMLElement>(`[data-center-panel-group-id="${groupId}"] header`)
-          ?.classList.contains("@container/center-pane-header"),
+          ?.classList.contains("@container/header-actions"),
       ).toBe(true);
       const target = container.querySelector<HTMLElement>(
         `[data-center-panel-body-target="${groupId}"]`,

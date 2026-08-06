@@ -125,7 +125,7 @@ export const ChatHeaderActions = memo(function ChatHeaderActions({
     <div
       data-chat-header-actions
       className={cn(
-        "@container/header-actions relative z-10 flex shrink-0 items-center justify-end bg-background [-webkit-app-region:no-drag]",
+        "relative z-10 flex shrink-0 items-center justify-end bg-background [-webkit-app-region:no-drag]",
         density === "compact" ? "gap-1" : "gap-2 @3xl/header-actions:gap-3",
         reserveTitlebarControls ? "pr-[4.5rem]" : "pr-2",
       )}
