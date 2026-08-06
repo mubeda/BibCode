@@ -8,7 +8,7 @@ The file must be a JSON array of rules:
 
 ```json
 [
-  { "key": "mod+g", "command": "terminal.toggle" },
+  { "key": "mod+g", "command": "terminal.newCenter" },
   { "key": "mod+shift+g", "command": "terminal.new", "when": "terminalFocus" }
 ]
 ```
@@ -20,7 +20,7 @@ See the full schema for more details: [`packages/contracts/src/keybindings.ts`](
 ```json
 [
   { "key": "mod+b", "command": "sidebar.toggle" },
-  { "key": "mod+j", "command": "terminal.toggle" },
+  { "key": "mod+j", "command": "terminal.newCenter" },
   { "key": "mod+alt+b", "command": "rightPanel.toggle" },
   { "key": "mod+d", "command": "terminal.split", "when": "terminalFocus" },
   { "key": "mod+shift+d", "command": "terminal.splitVertical", "when": "terminalFocus" },
@@ -63,11 +63,11 @@ Invalid rules are ignored. Invalid config files are ignored. Warnings are logged
 ### Available Commands
 
 - `sidebar.toggle`: open/close the left workspace panel
-- `terminal.toggle`: open/close the thread terminal drawer
-- `terminal.split`: split terminal horizontally in the focused terminal context
-- `terminal.splitVertical`: split terminal vertically in the focused terminal context
-- `terminal.new`: create a new terminal in the focused terminal context
-- `terminal.close`: close/kill the focused terminal
+- `terminal.newCenter`: create and focus a terminal tab in the focused center pane
+- `terminal.split`: create a right-hand center split when a center terminal is focused, or split within the right-panel terminal when it owns focus
+- `terminal.splitVertical`: create a lower center split when a center terminal is focused, or split vertically within the right-panel terminal when it owns focus
+- `terminal.new`: create a terminal tab when a center terminal is focused, or create a terminal in the focused right-panel terminal group
+- `terminal.close`: close/kill the focused center or right-panel terminal
 - `rightPanel.toggle`: open/close the right tool panel
 - `diff.toggle`: open/close the thread diff view
 - `preview.toggle`: open/close the in-app browser preview when the active host exposes preview support
@@ -127,6 +127,11 @@ Examples:
 - `"when": "terminalFocus || terminalOpen"`
 
 Unknown condition keys evaluate to `false`.
+
+`terminalFocus` is true when either a center or right-panel terminal owns focus.
+`terminalOpen` is true when the active thread has at least one terminal surface
+in the center or right panel. The retired bottom terminal drawer is not part of
+either context.
 
 ### Precedence
 
