@@ -14,6 +14,12 @@ const releaseDocumentation = NodeFS.readFileSync(
   NodePath.join(repoRoot, "docs", "operations", "release.md"),
   "utf8",
 );
+/**
+ * The release documentation is hard-wrapped, so any asserted phrase long enough
+ * to be worth asserting can span a line break. Match against a single-spaced
+ * view so these checks track the documented facts rather than the wrapping.
+ */
+const releaseDocumentationText = releaseDocumentation.replace(/\s+/gu, " ");
 
 it("keeps nightly releases manual-only", () => {
   assert.equal(
@@ -36,10 +42,10 @@ it("keeps nightly releases manual-only", () => {
 });
 
 it("documents nightly releases as manual-only", () => {
-  assert.notInclude(releaseDocumentation, "scheduled nightly");
-  assert.notInclude(releaseDocumentation, "every three hours");
-  assert.include(releaseDocumentation, "manual stable or nightly releases");
-  assert.include(releaseDocumentation, "Manual nightly releases are GitHub prereleases");
+  assert.notInclude(releaseDocumentationText, "scheduled nightly");
+  assert.notInclude(releaseDocumentationText, "every three hours");
+  assert.include(releaseDocumentationText, "manual stable or nightly releases");
+  assert.include(releaseDocumentationText, "manual nightly releases are GitHub prereleases");
 });
 
 it("publishes stable updater metadata atomically from a verified draft", () => {
