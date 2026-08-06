@@ -31,7 +31,12 @@ export interface CreateCenterTerminalInput {
 export type CenterTerminalCreationResult =
   | { readonly status: "opened"; readonly terminalId: string }
   | { readonly status: "rejected"; readonly reason: string }
-  | { readonly status: "failed"; readonly reason: string; readonly interrupted?: true };
+  | {
+      readonly status: "failed";
+      readonly reason: string;
+      readonly interrupted?: true;
+      readonly cleanupFailed?: true;
+    };
 
 export type CenterTerminalSessionCommandResult =
   | { readonly ok: true }
@@ -100,6 +105,7 @@ async function compensateSpawnedSession(
   return {
     status: "failed",
     reason: `Center terminal placement failed and the spawned session could not be closed: ${closeResult.reason}`,
+    cleanupFailed: true,
   };
 }
 

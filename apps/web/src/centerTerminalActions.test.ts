@@ -181,6 +181,7 @@ describe("createCenterTerminal", () => {
       status: "failed",
       reason:
         "Center terminal placement failed and the spawned session could not be closed: terminal backend unavailable",
+      cleanupFailed: true,
     });
   });
 

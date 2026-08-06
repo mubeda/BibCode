@@ -164,6 +164,7 @@ import {
   type CenterTerminalLaunch,
   type CenterTerminalSessionCommandResult,
 } from "../centerTerminalActions";
+import { reserveCenterTerminalId } from "../centerTerminalIdReservations";
 import type { CenterPanelSurfaceRenderContext } from "./CenterPanelSurfaceHosts";
 import { CenterTerminalPanel } from "./CenterTerminalPanel";
 import {
@@ -1173,6 +1174,10 @@ function ChatViewContent(props: ChatViewProps) {
   // thread automatically. `isPanel` additionally gates singleton chrome/effects.
   const isPanel = props.variant === "panel";
   const centerPanelWorkspaceRef = useRef<CenterPanelWorkspaceHandle | null>(null);
+  const centerTerminalRouteBindingRef = useRef<{
+    readonly threadKey: string | null;
+    readonly revision: number;
+  }>({ threadKey: null, revision: 0 });
   const environmentId =
     props.variant === "panel" ? props.panelThreadRef.environmentId : props.environmentId;
   const threadId = props.variant === "panel" ? props.panelThreadRef.threadId : props.threadId;
@@ -1492,6 +1497,21 @@ function ChatViewContent(props: ChatViewProps) {
     [activeThreadIdentityEnvironmentId, activeThreadIdentityId],
   );
   const activeThreadKey = activeThreadRef ? scopedThreadKey(activeThreadRef) : null;
+  useLayoutEffect(() => {
+    const binding = {
+      threadKey: activeThreadKey,
+      revision: centerTerminalRouteBindingRef.current.revision + 1,
+    };
+    centerTerminalRouteBindingRef.current = binding;
+    return () => {
+      if (centerTerminalRouteBindingRef.current === binding) {
+        centerTerminalRouteBindingRef.current = {
+          threadKey: null,
+          revision: binding.revision + 1,
+        };
+      }
+    };
+  }, [activeThreadKey]);
   // Center multipanel state (host variant only; a panel instance never hosts
   // its own sub-panels). The host chat surface is always present at index 0.
   const centerPanelByThreadKey = useCenterPanelStore((state) => state.byThreadKey);
@@ -3797,11 +3817,17 @@ function ChatViewContent(props: ChatViewProps) {
       const centerTerminalIds = currentCenterPanelState.surfaces.flatMap((surface) =>
         surface.kind === "terminal" ? [surface.terminalId] : [],
       );
-      const terminalId = nextTerminalId([
+      const reservation = reserveCenterTerminalId(activeThreadRef, [
         ...activeKnownTerminalIds,
         ...centerTerminalIds,
         ...panelTerminalIds,
       ]);
+      const terminalId = reservation.terminalId;
+      const originRouteBinding = centerTerminalRouteBindingRef.current;
+      const originWorkspace = centerPanelWorkspaceRef.current;
+      const isOriginCurrent = () =>
+        centerTerminalRouteBindingRef.current === originRouteBinding &&
+        centerPanelWorkspaceRef.current === originWorkspace;
       const defaultLaunch: CenterTerminalLaunch | null = centerTerminalLaunchContext
         ? {
             cwd: centerTerminalLaunchContext.cwd,
@@ -3817,77 +3843,92 @@ function ChatViewContent(props: ChatViewProps) {
             ...(options?.command !== undefined ? { command: options.command } : {}),
           }
         : null;
-      const result = await createCenterTerminal(
-        {
-          threadRef: activeThreadRef,
-          terminalId,
-          placement,
-          launch,
-        },
-        {
-          validatePlacement: (candidate) =>
-            useCenterPanelStore
-              .getState()
-              .validateTerminalPanelPlacement(activeThreadRef, candidate),
-          canSplit: (groupId, direction) =>
-            centerPanelWorkspaceRef.current?.canSplitGroup(groupId, direction) ?? false,
-          openSession: async (input): Promise<CenterTerminalSessionCommandResult> => {
-            const openResult = await openTerminal({
-              environmentId: activeThreadRef.environmentId,
-              input,
-            });
-            if (openResult._tag === "Success") {
-              return { ok: true };
-            }
-            if (isAtomCommandInterrupted(openResult)) {
-              return { ok: false, reason: "Terminal open was interrupted.", interrupted: true };
-            }
-            const error = squashAtomCommandFailure(openResult);
-            return {
-              ok: false,
-              reason: error instanceof Error ? error.message : "Failed to open terminal.",
-            };
+      try {
+        const result = await createCenterTerminal(
+          {
+            threadRef: activeThreadRef,
+            terminalId,
+            placement,
+            launch,
           },
-          place: (nextTerminalId, candidate, nextOptions) =>
-            useCenterPanelStore
-              .getState()
-              .placeTerminalPanel(activeThreadRef, nextTerminalId, candidate, nextOptions),
-          closeSession: async (input): Promise<CenterTerminalSessionCommandResult> => {
-            const closeResult = await closeTerminalMutation({
-              environmentId: activeThreadRef.environmentId,
-              input,
-            });
-            if (closeResult._tag === "Success") {
-              releaseTerminalInputScheduler(
-                activeThreadRef.environmentId,
-                input.threadId,
-                input.terminalId ?? terminalId,
-              );
-              return { ok: true };
-            }
-            if (isAtomCommandInterrupted(closeResult)) {
-              return { ok: false, reason: "Terminal cleanup was interrupted.", interrupted: true };
-            }
-            const error = squashAtomCommandFailure(closeResult);
-            return {
-              ok: false,
-              reason: error instanceof Error ? error.message : "Failed to close spawned terminal.",
-            };
+          {
+            validatePlacement: (candidate) =>
+              useCenterPanelStore
+                .getState()
+                .validateTerminalPanelPlacement(activeThreadRef, candidate),
+            canSplit: (groupId, direction) =>
+              isOriginCurrent() && (originWorkspace?.canSplitGroup(groupId, direction) ?? false),
+            openSession: async (input): Promise<CenterTerminalSessionCommandResult> => {
+              const openResult = await openTerminal({
+                environmentId: activeThreadRef.environmentId,
+                input,
+              });
+              if (openResult._tag === "Success") {
+                return { ok: true };
+              }
+              if (isAtomCommandInterrupted(openResult)) {
+                return { ok: false, reason: "Terminal open was interrupted.", interrupted: true };
+              }
+              const error = squashAtomCommandFailure(openResult);
+              return {
+                ok: false,
+                reason: error instanceof Error ? error.message : "Failed to open terminal.",
+              };
+            },
+            place: (nextTerminalId, candidate, nextOptions) =>
+              isOriginCurrent() &&
+              useCenterPanelStore
+                .getState()
+                .placeTerminalPanel(activeThreadRef, nextTerminalId, candidate, nextOptions),
+            closeSession: async (input): Promise<CenterTerminalSessionCommandResult> => {
+              const closeResult = await closeTerminalMutation({
+                environmentId: activeThreadRef.environmentId,
+                input,
+              });
+              if (closeResult._tag === "Success") {
+                releaseTerminalInputScheduler(
+                  activeThreadRef.environmentId,
+                  input.threadId,
+                  input.terminalId ?? terminalId,
+                );
+                return { ok: true };
+              }
+              if (isAtomCommandInterrupted(closeResult)) {
+                return {
+                  ok: false,
+                  reason: "Terminal cleanup was interrupted.",
+                  interrupted: true,
+                };
+              }
+              const error = squashAtomCommandFailure(closeResult);
+              return {
+                ok: false,
+                reason:
+                  error instanceof Error ? error.message : "Failed to close spawned terminal.",
+              };
+            },
           },
-        },
-      );
-      if (result.status === "opened") {
-        setTerminalFocusRequestId((value) => value + 1);
-      } else if (!(result.status === "failed" && result.interrupted === true)) {
-        toastManager.add(
-          stackedThreadToast({
-            type: result.status === "rejected" ? "warning" : "error",
-            title: "Could not open terminal",
-            description: result.reason,
-          }),
         );
+        if (result.status === "opened") {
+          if (isOriginCurrent()) {
+            setTerminalFocusRequestId((value) => value + 1);
+          }
+        } else if (!(result.status === "failed" && result.interrupted === true)) {
+          toastManager.add(
+            stackedThreadToast({
+              type: result.status === "rejected" ? "warning" : "error",
+              title: "Could not open terminal",
+              description: result.reason,
+              ...(result.status === "failed" && result.cleanupFailed === true
+                ? { timeout: 0 }
+                : {}),
+            }),
+          );
+        }
+        return result;
+      } finally {
+        reservation.release();
       }
-      return result;
     },
     [
       activeKnownTerminalIds,
