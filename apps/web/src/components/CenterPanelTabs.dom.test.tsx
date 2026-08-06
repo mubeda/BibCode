@@ -11,26 +11,6 @@ vi.mock("~/components/ui/tooltip", () => ({
   TooltipTrigger: ({ render }: { render: ReactNode }) => <>{render}</>,
   TooltipPopup: ({ children }: { children: ReactNode }) => <>{children}</>,
 }));
-vi.mock("~/components/ui/menu", () => ({
-  DropdownMenu: ({ children }: { children: ReactNode }) => <>{children}</>,
-  DropdownMenuTrigger: ({
-    children,
-    render,
-    ...props
-  }: React.ComponentProps<"button"> & { render?: ReactNode }) =>
-    render ? (
-      <>
-        {render}
-        {children}
-      </>
-    ) : (
-      <button {...props}>{children}</button>
-    ),
-  DropdownMenuContent: ({ children, ...props }: React.ComponentProps<"div">) => (
-    <div {...props}>{children}</div>
-  ),
-  DropdownMenuItem: (props: React.ComponentProps<"button">) => <button {...props} />,
-}));
 vi.mock("~/components/ui/scroll-area", () => ({
   ScrollArea: ({
     children,
@@ -127,6 +107,21 @@ afterEach(() => {
 });
 
 describe("CenterPanelTabs DOM overflow measurement", () => {
+  it("composes the All tabs icon into a trigger that opens its menu", async () => {
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    await act(async () => root.render(<CenterPanelTabs {...input("Codex")} />));
+    const allTabs = container.querySelector<HTMLButtonElement>('[aria-label="All tabs"]');
+    expect(allTabs?.querySelector("svg")).not.toBeNull();
+
+    await act(async () => allTabs?.click());
+    expect(document.body.querySelector('[role="menu"]')).not.toBeNull();
+
+    await act(async () => root.unmount());
+  });
+
   it("remeasures when a same-count label change expands the scroll content", async () => {
     const container = document.createElement("div");
     document.body.append(container);
