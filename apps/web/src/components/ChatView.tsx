@@ -5591,34 +5591,6 @@ function ChatViewContent(props: ChatViewProps) {
           );
           const reserveCenterTitlebarControls =
             !effectiveRightPanelOpen && focusedGroupEdges?.top === true && focusedGroupEdges.right;
-          const chatHeaderActions = (
-            <ChatHeaderActions
-              density="expanded"
-              activeThreadEnvironmentId={activeThread.environmentId}
-              activeThreadId={activeThread.id}
-              {...(routeKind === "draft" && draftId ? { draftId } : {})}
-              activeProjectName={activeProject?.title}
-              openInCwd={gitCwd}
-              activeProjectScripts={activeProject?.scripts}
-              preferredScriptId={
-                activeProject ? (lastInvokedScriptByProjectId[activeProject.id] ?? null) : null
-              }
-              keybindings={keybindings}
-              availableEditors={availableEditors}
-              reserveTitlebarControls={reserveCenterTitlebarControls}
-              gitCwd={gitCwd}
-              providerStatuses={providerStatuses as ServerProvider[]}
-              settings={settings}
-              canCreatePanel={centerPanelLaunchContext !== null}
-              onCreateChatPanel={handleCreateChatPanel}
-              onOpenTerminalPanel={handleOpenTerminalPanel}
-              onOpenProviderTerminalPanel={handleOpenProviderTerminalPanel}
-              onRunProjectScript={runProjectScript}
-              onAddProjectScript={saveProjectScript}
-              onUpdateProjectScript={updateProjectScript}
-              onDeleteProjectScript={deleteProjectScript}
-            />
-          );
           const hostChatSurfaceBody = (
             <>
               <ProviderStatusBanner status={activeProviderStatus} />
@@ -5838,7 +5810,34 @@ function ChatViewContent(props: ChatViewProps) {
               state={centerPanelState}
               hostLabel={centerHostLabel}
               terminalLabelsById={activeTerminalLabelsById}
-              renderFocusedActions={() => chatHeaderActions}
+              renderFocusedActions={(density) => (
+                <ChatHeaderActions
+                  density={density}
+                  activeThreadEnvironmentId={activeThread.environmentId}
+                  activeThreadId={activeThread.id}
+                  {...(routeKind === "draft" && draftId ? { draftId } : {})}
+                  activeProjectName={activeProject?.title}
+                  openInCwd={gitCwd}
+                  activeProjectScripts={activeProject?.scripts}
+                  preferredScriptId={
+                    activeProject ? (lastInvokedScriptByProjectId[activeProject.id] ?? null) : null
+                  }
+                  keybindings={keybindings}
+                  availableEditors={availableEditors}
+                  reserveTitlebarControls={reserveCenterTitlebarControls}
+                  gitCwd={gitCwd}
+                  providerStatuses={providerStatuses as ServerProvider[]}
+                  settings={settings}
+                  canCreatePanel={centerPanelLaunchContext !== null}
+                  onCreateChatPanel={handleCreateChatPanel}
+                  onOpenTerminalPanel={handleOpenTerminalPanel}
+                  onOpenProviderTerminalPanel={handleOpenProviderTerminalPanel}
+                  onRunProjectScript={runProjectScript}
+                  onAddProjectScript={saveProjectScript}
+                  onUpdateProjectScript={updateProjectScript}
+                  onDeleteProjectScript={deleteProjectScript}
+                />
+              )}
               hostChatSurfaceBody={hostChatSurfaceBody}
               hostThread={activeThread}
               hostThreadRef={activeThreadRef}

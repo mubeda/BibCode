@@ -99,6 +99,7 @@ const h = vi.hoisted(() => {
     refObjects: [] as Array<{ current: unknown }>,
     refSeeds: new Map<number, { value: unknown; expectInitial: (value: unknown) => boolean }>(),
     effects: [] as Array<() => void | (() => void)>,
+    centerHeaderDensityByGroupId: new Map<string, "expanded" | "compact">(),
   };
   return state;
 });
@@ -530,7 +531,15 @@ vi.mock("./CenterPanelWorkspace", async () => {
       const visibleIds = new Set(state.groups.flatMap((group) => group.activeSurfaceId ?? []));
       return (
         <div data-mock="center-panel-workspace">
-          {(props["renderFocusedActions"] as (density: "compact") => ReactNode)("compact")}
+          {state.groups.map((group) => (
+            <div key={group.id} data-mock-center-header={group.id}>
+              {group.id === state.focusedGroupId
+                ? (props["renderFocusedActions"] as (density: "expanded" | "compact") => ReactNode)(
+                    h.centerHeaderDensityByGroupId.get(group.id) ?? "compact",
+                  )
+                : null}
+            </div>
+          ))}
           {state.surfaces
             .filter((surface) => surface.id === "chat:host" || visibleIds.has(surface.id))
             .map((surface) => {
@@ -1373,6 +1382,7 @@ beforeEach(() => {
   h.refObjects.length = 0;
   h.refSeeds.clear();
   h.effects.length = 0;
+  h.centerHeaderDensityByGroupId.clear();
 
   for (const { store, pristine } of resettableStores) {
     store.setState({ ...pristine }, true);
@@ -1454,6 +1464,15 @@ describe("ChatView center panel variant", () => {
     expect(h.captured["chatHeaderActions"]).toBeUndefined();
     runEffects();
     expect(windowStub.listeners.some((listener) => listener.type === "keydown")).toBe(false);
+  });
+
+  it("forwards the focused group's expanded density to the host header actions", () => {
+    seedConnectedServerThread();
+    h.centerHeaderDensityByGroupId.set("center:root", "expanded");
+
+    renderServerRoute();
+
+    expect(capturedProps("chatHeaderActions")["density"]).toBe("expanded");
   });
 
   it("mounts an active sibling chat surface from host center-panel state", () => {
