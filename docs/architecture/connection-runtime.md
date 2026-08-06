@@ -1,137 +1,74 @@
-# Connection Runtime
+# Connection runtime
 
-The connection runtime is shared by browser and Tauri desktop clients. It owns connectivity,
-authentication, retries, transport lifetime, cached environment data, and
-environment-scoped operations.
-
-Browser and desktop modes mount this runtime once at the application root. There is no
-legacy connection owner or supported mixed mode.
+`@bibcode/client-runtime` gives browser and desktop clients one supervised
+connection model for local, manually paired, relay, and SSH environments. The
+public package has no root export; callers use focused subpaths such as
+`connection`, `authorization`, `rpc`, `relay`, and `state/<domain>`.
 
 ## Ownership
 
-Each registered environment has one scoped Effect `Context` containing focused
-services:
+- `ConnectionResolver` converts a catalog entry into a `PreparedConnection`.
+  It recovers profiles and credentials and performs bearer, DPoP, relay, or SSH
+  preparation as required by the target.
+- `ConnectionDriver` reports `preparing`, `opening`, and `synchronizing`
+  progress, creates an `RpcSession`, and waits for its initial configuration.
+- `EnvironmentSupervisor` owns desired state, connectivity, retries, the
+  prepared connection, and the live RPC session for one environment.
+- `EnvironmentRegistry` owns catalog entries and their scoped supervisors. It
+  reconciles platform-provided registrations and exposes environment-scoped
+  execution to domain state.
+- Domain modules under `state/*` consume the registry and expose focused Atom
+  constructors. React presentation does not own sockets or retry loops.
 
-- `EnvironmentSupervisor` owns desired state, retry scheduling, and the active
-  session scope.
-- `ConnectionBroker` prepares credentials and endpoints for primary, bearer,
-  relay, and SSH targets.
-- `RpcSessionFactory` performs one transport attempt. It does not retry.
-- `EnvironmentRpc` exposes the active session without leaking the transport.
-- `EnvironmentProjectCommands` and `EnvironmentThreadCommands` construct
-  orchestration commands, IDs, and timestamps.
-- `EnvironmentShell` and `EnvironmentThreads` own live subscriptions and cached
-  snapshots.
+The composition root is
+[`connection/layer.ts`](../../packages/client-runtime/src/connection/layer.ts).
 
-`EnvironmentServicesFactory` assembles that context, and `EnvironmentRegistry`
-owns its scope. There is no aggregate environment runtime facade. React
-components do not create connections, transports, retry loops, or RPC clients.
+## Targets
 
-## Connection State
+Canonical targets are defined in
+[`connection/model.ts`](../../packages/client-runtime/src/connection/model.ts).
 
-The supervisor is the only retry owner.
+| Target                    | Preparation                                                                                                                                        |
+| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PrimaryConnectionTarget` | Uses the host-provided HTTP/WebSocket address and optional primary bearer credential. It is runtime-provided, not persisted as a saved connection. |
+| `BearerConnectionTarget`  | Loads a saved endpoint profile and bearer credential, validates the environment identity, then exchanges/uses authorization.                       |
+| `RelayConnectionTarget`   | Uses the Clerk session and relay to obtain a DPoP-bound environment bootstrap, then prepares direct HTTP/WSS access.                               |
+| `SshConnectionTarget`     | Asks the desktop SSH gateway to probe or launch the remote server and create local forwarding, then authorizes with the returned bootstrap.        |
 
-1. A persisted or platform registration marks an environment as desired.
-2. If the device is offline, the supervisor releases the active session and
-   waits without consuming retry attempts.
-3. When online, the supervisor asks the broker for one prepared connection and
-   asks the session factory for one RPC session.
-4. Transient failures retry forever with exponential backoff capped at 16
-   seconds.
-5. Connectivity changes, application activation, credential changes, and
-   explicit user retry interrupt the current wait and trigger a fresh attempt.
-6. Authentication or configuration failures remain blocked until an external
-   wakeup changes the relevant input.
-7. An involuntary session close keeps the registration and cache, then retries.
-8. Explicit removal closes the session and deletes the registration,
-   credentials, shell cache, and thread cache.
+Bearer, relay, and SSH targets may be persisted in the connection catalog.
+Profiles and credentials remain separate so catalog metadata can be listed
+without exposing secrets.
 
-The UI derives `available`, `offline`, `connecting`, `reconnecting`,
-`connected`, and `error` from supervisor state plus explicit data-sync state.
-It does not infer connection health from cached data or the existence of a
-transport object. An environment becomes `connected` after the socket opens and
-the initial config RPC succeeds, proving that the server is responsive. Shell
-and thread synchronization are independent data states. A healthy RPC
-transport with a failed shell subscription is shown as connected with a
-synchronization error, not as a reconnect that is not actually scheduled.
+## State and retry policy
 
-## Data Boundary
+The supervisor publishes these phases:
 
-Finite requests, durable subscriptions, and commands are separate APIs:
+- `available`: disconnected and not requested;
+- `offline`: requested while network state is offline;
+- `connecting`: preparing, opening, or synchronizing;
+- `backoff`: a transient failure is waiting for retry;
+- `connected`: the WebSocket is open and `server.getConfig` succeeded;
+- `blocked`: configuration, authentication, permission, or capability requires
+  an explicit wakeup or user action.
 
-- Query atoms revalidate when the RPC generation changes.
-- Subscription atoms switch to replacement sessions.
-- Expected subscription failures update domain sync state and wait for a
-  replacement session; they do not take down a healthy transport.
-- Mutations resolve the current environment runtime at execution time.
-- Shell and thread snapshots are available while offline.
-- A connected transport may have `empty`, `cached`, `synchronizing`, `live`, or
-  failed shell and thread data independently.
-- Cached shell and thread projections are never allowed to overwrite newer live
-  data during a fast reconnect.
-- Domain atom factories route effects through the environment registry and
-  resolve the current scoped service at execution time.
-- Browser and desktop modes own their Atom runtimes, React hooks, and feature composition.
+Transient failures retry after 1, 2, 4, 8, then 16 seconds, with 16 seconds as
+the cap. The sequence continues while the connection remains desired. A stable
+30-second connection resets accumulated backoff. Network changes, credential
+changes, catalog reconciliation, and explicit retry requests wake the
+supervisor. Disconnect and scope closure interrupt in-flight work.
 
-The Promise bridge exists only at the React/Atom boundary. Runtime and business
-logic remain Effect-native.
+`RpcSessionFactory` disables protocol-owned reconnects. This is deliberate: one
+supervisor owns retry state, status, cancellation, and generation fencing, so a
+stale socket cannot silently become current.
 
-## Platform Layers
+## Data boundary
 
-Browser and Tauri platform layers provide:
+A session becomes ready only after the socket connects and the initial
+`server.getConfig` call succeeds. Domain requests resolve the current scoped
+session through the registry; they fail or wait according to the domain API
+instead of retaining a global client. Removing a saved environment also removes
+its registration, profile, credential, supervisor scope, and environment-keyed
+client state.
 
-- network status and network-change streams;
-- application lifecycle wakeups;
-- cloud session credentials;
-- device identity;
-- platform registrations;
-- persistent catalog, credential, shell, and thread stores;
-- HTTP and crypto layers.
-
-Platform layers adapt operating-system capabilities. They do not implement
-connection policy.
-
-## Source Boundaries
-
-The public package subpaths mirror the runtime layers:
-
-- `connection/core` contains state, catalog, retry policy, and connectivity.
-- `connection/transport` contains brokerage, authorization, attempts, and RPC
-  sessions.
-- `connection/platform` declares capabilities and persistence contracts.
-- `connection/services` contains environment-scoped data services.
-- `connection/application` assembles registries, discovery, and startup.
-- `connection/atoms` adapts shared services to application-owned Atom runtimes.
-- `connection/presentation` contains pure UI projections.
-
-Other reusable state lives in domain subpaths such as `shell`, `threads`,
-`terminal`, and `vcs`. Applications must import explicit package subpaths; the
-package intentionally has no root export.
-
-## Application Boundary
-
-The application root mounts the shared connection application layer, creates
-its own Atom runtime, and selects the domain atom factories required by that
-platform. Browser and desktop modes may expose different hooks and features without
-changing connection ownership.
-
-Application code must not construct `WsTransport`, RPC clients, retry loops, or
-raw orchestration commands. Persistence paths belong to the platform
-registration and cache stores, with explicit migration or invalidation policy.
-
-## Verification
-
-Core state-machine tests use `@effect/vitest` and deterministic service layers.
-Required coverage includes:
-
-- offline startup and online wakeup;
-- forever retry with the 16-second cap;
-- explicit retry interrupting backoff;
-- authentication wakeups;
-- involuntary close and reconnect;
-- explicit removal clearing all owned state;
-- relay token reuse and refresh;
-- progressive relay discovery;
-- shell and thread cache hydration;
-- durable subscriptions switching sessions;
-- command metadata and idempotent queued-command metadata.
+See [Remote architecture](./remote.md) for access methods and
+[RPC and orchestration](./rpc-and-orchestration.md) for the wire boundary.

@@ -14,6 +14,7 @@ import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 
 import { resolveStorage } from "./lib/storage";
+import { MAX_TERMINALS_PER_GROUP } from "./types";
 
 export const RIGHT_PANEL_KINDS = [
   "plan",
@@ -92,7 +93,7 @@ interface RightPanelStoreState {
     surfaceId: string,
     terminalId: string,
     direction?: "horizontal" | "vertical",
-  ) => void;
+  ) => boolean;
   activateTerminal: (ref: ScopedThreadRef, surfaceId: string, terminalId: string) => void;
   closeTerminal: (ref: ScopedThreadRef, surfaceId: string, terminalId: string) => void;
   activateSurface: (ref: ScopedThreadRef, surfaceId: string) => void;
@@ -523,26 +524,38 @@ export const useRightPanelStore = create<RightPanelStoreState>()(
             upsertSurface(current, terminalSurface(terminalId)),
           ),
         })),
-      splitTerminal: (ref, surfaceId, terminalId, direction = "horizontal") =>
+      splitTerminal: (ref, surfaceId, terminalId, direction = "horizontal") => {
+        let didSplit = false;
         set((state) => ({
-          byThreadKey: updateThread(state.byThreadKey, scopedThreadKey(ref), (current) => ({
-            ...current,
-            isOpen: true,
-            activeSurfaceId: surfaceId,
-            surfaces: current.surfaces.map((surface) => {
-              if (surface.id !== surfaceId || surface.kind !== "terminal") return surface;
-              const { splitDirection: _splitDirection, ...baseSurface } = surface;
-              return {
-                ...baseSurface,
-                terminalIds: surface.terminalIds.includes(terminalId)
-                  ? surface.terminalIds
-                  : [...surface.terminalIds, terminalId],
-                activeTerminalId: terminalId,
-                ...(direction === "vertical" ? { splitDirection: "vertical" as const } : {}),
-              };
-            }),
-          })),
-        })),
+          byThreadKey: updateThread(state.byThreadKey, scopedThreadKey(ref), (current) => {
+            const surface = current.surfaces.find((entry) => entry.id === surfaceId);
+            if (
+              surface?.kind !== "terminal" ||
+              surface.terminalIds.includes(terminalId) ||
+              surface.terminalIds.length >= MAX_TERMINALS_PER_GROUP
+            ) {
+              return current;
+            }
+            didSplit = true;
+            const { splitDirection: _splitDirection, ...baseSurface } = surface;
+            const nextSurface: RightPanelSurface = {
+              ...baseSurface,
+              terminalIds: [...surface.terminalIds, terminalId],
+              activeTerminalId: terminalId,
+              ...(direction === "vertical" ? { splitDirection: "vertical" as const } : {}),
+            };
+            return {
+              ...current,
+              isOpen: true,
+              activeSurfaceId: surfaceId,
+              surfaces: current.surfaces.map((entry) =>
+                entry.id === surfaceId ? nextSurface : entry,
+              ),
+            };
+          }),
+        }));
+        return didSplit;
+      },
       activateTerminal: (ref, surfaceId, terminalId) =>
         set((state) => ({
           byThreadKey: updateThread(state.byThreadKey, scopedThreadKey(ref), (current) => ({

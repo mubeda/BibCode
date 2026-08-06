@@ -2,9 +2,8 @@ use std::{collections::HashSet, path::Path};
 
 use serde_json::{Value, json};
 
-const DEFAULT_KEYBINDINGS_JSON: &str = include_str!(
-    "../../../../packages/shared/src/keybindings.defaults.json"
-);
+const DEFAULT_KEYBINDINGS_JSON: &str =
+    include_str!("../../../../packages/shared/src/keybindings.defaults.json");
 
 #[derive(Debug, Default)]
 pub(crate) struct LoadedKeybindings {
@@ -29,7 +28,11 @@ pub(crate) async fn load(path: &Path) -> LoadedKeybindings {
     };
 
     let mut loaded = LoadedKeybindings::default();
-    for (index, rule) in entries.into_iter().map(normalize_legacy_commands).enumerate() {
+    for (index, rule) in entries
+        .into_iter()
+        .map(normalize_legacy_commands)
+        .enumerate()
+    {
         match validate(&rule, false) {
             Ok(()) => loaded.rules.push(rule),
             Err(message) => loaded.issues.push(json!({

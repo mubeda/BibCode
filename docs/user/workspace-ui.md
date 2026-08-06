@@ -78,7 +78,16 @@ pane-local and do close their underlying panel thread or terminal session.
 
 ## Right Panel
 
-The right panel hosts persistent tool surfaces for the active thread.
+The right panel hosts persistent tool surfaces for the active thread. Use its
+`+` menu to add Browser, Terminal, Files, Diff, or Source Control. Activity and
+Plan surfaces can also appear when the active provider/session supplies them.
+
+- **Browser** opens a local application preview or URL when the environment
+  supports previewing.
+- **Terminal** starts a shell in the active workspace.
+- **Diff** reviews branch or worktree changes.
+- **Activity** shows structured provider activity when available.
+- **Plan** displays the active agent plan when available.
 
 Right-panel terminals retain their internal terminal grouping and splitting.
 When a right-panel terminal owns focus, the terminal new, split right, split
@@ -91,15 +100,18 @@ The Source Control panel is Orca-parity for the shipped local Git workflow:
 
 - The primary action is adaptive. With staged files it defaults to Commit. With
   only unstaged or untracked files it becomes Stage All Changes. Clean-tree
-  states then move through pull, push, publish, and PR actions when available.
+  states then move through pull, push, and PR actions when available. Publish is
+  currently shown disabled in this right-panel surface; the separate GitHub
+  publish flow lives in the chat-header Git actions control.
 - The dropdown is always rendered and disables unavailable actions instead of
   hiding them.
 - Files are grouped into staged, unstaged, and untracked sections with status
   badges.
 - Per-file hover actions support stage, unstage, discard, restore deleted files,
   and delete untracked files. Destructive actions require confirmation.
-- Row context menus are navigation-only: view, copy path, copy relative path,
-  and open in external editor.
+- Row context menus provide view, copy path, copy relative path, open in external
+  editor, ignore file name, and ignore parent folder when the corresponding host
+  actions are available.
 - Commit history and AI commit-message generation are available in the panel.
 
 Stash and amend are intentionally not present; this matches the Orca reference
@@ -121,10 +133,6 @@ The Files surface is a full file manager for the active workspace:
   native history for each open source file. Read-only views keep unavailable
   actions visible but disabled.
 
-## Known Limitations
-
-These are documented follow-ups, not shipped behavior:
+## Current limitation
 
 - Staged-row diff viewing does not yet use a true `git diff --cached` source.
-- Center panel creation from local draft hosts is not fully defined.
-- Terminal center tabs still use raw IDs instead of friendly labels.

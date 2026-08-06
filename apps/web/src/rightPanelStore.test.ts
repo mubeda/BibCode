@@ -1155,9 +1155,13 @@ describe("rightPanelStore", () => {
 
   it("ignores invalid terminal operations and preserves non-active panes", () => {
     useRightPanelStore.getState().openTerminal(refA, "term-1");
-    useRightPanelStore.getState().splitTerminal(refA, "terminal:term-1", "term-2", "vertical");
-    useRightPanelStore.getState().splitTerminal(refA, "terminal:term-1", "term-2");
-    useRightPanelStore.getState().splitTerminal(refA, "missing", "term-3");
+    expect(
+      useRightPanelStore.getState().splitTerminal(refA, "terminal:term-1", "term-2", "vertical"),
+    ).toBe(true);
+    expect(useRightPanelStore.getState().splitTerminal(refA, "terminal:term-1", "term-2")).toBe(
+      false,
+    );
+    expect(useRightPanelStore.getState().splitTerminal(refA, "missing", "term-3")).toBe(false);
     useRightPanelStore.getState().activateTerminal(refA, "terminal:term-1", "missing");
     useRightPanelStore.getState().closeTerminal(refA, "missing", "term-1");
     useRightPanelStore.getState().activateTerminal(refA, "terminal:term-1", "term-1");
@@ -1169,6 +1173,7 @@ describe("rightPanelStore", () => {
       resourceId: "term-1",
       terminalIds: ["term-1"],
       activeTerminalId: "term-1",
+      splitDirection: "vertical",
     });
   });
 
