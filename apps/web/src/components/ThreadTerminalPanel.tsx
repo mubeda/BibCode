@@ -17,7 +17,6 @@ import {
   SquareSplitHorizontal,
   SquareSplitVertical,
   TerminalSquare,
-  Trash2,
   XIcon,
 } from "lucide-react";
 import {
@@ -1982,9 +1981,9 @@ export default function ThreadTerminalPanel({
   const newTerminalActionLabel = newShortcutLabel
     ? `New Terminal (${newShortcutLabel})`
     : "New Terminal";
-  const closeTerminalActionLabel = closeShortcutLabel
-    ? `Close Terminal (${closeShortcutLabel})`
-    : "Close Terminal";
+  const hasTerminalToolbarActions = Boolean(
+    onSplitTerminal || onSplitTerminalVertical || onNewTerminal,
+  );
   const onSplitTerminalAction = useCallback(() => {
     if (hasReachedSplitLimit || !onSplitTerminal) return;
     onSplitTerminal();
@@ -2026,7 +2025,7 @@ export default function ThreadTerminalPanel({
       data-terminal-owner={owner}
       className="thread-terminal-panel relative flex h-full min-w-0 flex-1 flex-col overflow-hidden bg-background"
     >
-      {!hasTerminalSidebar && (
+      {!hasTerminalSidebar && hasTerminalToolbarActions ? (
         <div className="pointer-events-none absolute right-2 top-2 z-20">
           <div className="pointer-events-auto inline-flex items-center overflow-hidden rounded-md border border-border/80 bg-background/70">
             {onSplitTerminal ? (
@@ -2042,7 +2041,9 @@ export default function ThreadTerminalPanel({
                 >
                   <SquareSplitHorizontal className="size-3.25" />
                 </TerminalActionButton>
-                <div className="h-4 w-px bg-border/80" />
+                {onSplitTerminalVertical || onNewTerminal ? (
+                  <div className="h-4 w-px bg-border/80" />
+                ) : null}
               </>
             ) : null}
             {onSplitTerminalVertical ? (
@@ -2058,31 +2059,21 @@ export default function ThreadTerminalPanel({
                 >
                   <SquareSplitVertical className="size-3.25" />
                 </TerminalActionButton>
-                <div className="h-4 w-px bg-border/80" />
+                {onNewTerminal ? <div className="h-4 w-px bg-border/80" /> : null}
               </>
             ) : null}
             {onNewTerminal ? (
-              <>
-                <TerminalActionButton
-                  className="p-1 text-foreground/90 transition-colors hover:bg-accent"
-                  onClick={onNewTerminalAction}
-                  label={newTerminalActionLabel}
-                >
-                  <Plus className="size-3.25" />
-                </TerminalActionButton>
-                <div className="h-4 w-px bg-border/80" />
-              </>
+              <TerminalActionButton
+                className="p-1 text-foreground/90 transition-colors hover:bg-accent"
+                onClick={onNewTerminalAction}
+                label={newTerminalActionLabel}
+              >
+                <Plus className="size-3.25" />
+              </TerminalActionButton>
             ) : null}
-            <TerminalActionButton
-              className="p-1 text-foreground/90 transition-colors hover:bg-accent"
-              onClick={() => onCloseTerminal(resolvedActiveTerminalId)}
-              label={closeTerminalActionLabel}
-            >
-              <Trash2 className="size-3.25" />
-            </TerminalActionButton>
           </div>
         </div>
-      )}
+      ) : null}
 
       <div className="min-h-0 w-full flex-1">
         <div className={`flex h-full min-h-0 ${hasTerminalSidebar ? "gap-1.5" : ""}`}>
@@ -2183,52 +2174,53 @@ export default function ThreadTerminalPanel({
 
           {hasTerminalSidebar && (
             <aside className="flex w-36 min-w-36 flex-col border border-border/70 bg-muted/10">
-              <div className="flex h-[22px] items-stretch justify-end border-b border-border/70">
-                <div className="inline-flex h-full items-stretch">
-                  {onSplitTerminal ? (
-                    <TerminalActionButton
-                      className={`inline-flex h-full items-center px-1 text-foreground/90 transition-colors ${
-                        hasReachedSplitLimit
-                          ? "cursor-not-allowed opacity-45 hover:bg-transparent"
-                          : "hover:bg-accent/70"
-                      }`}
-                      onClick={onSplitTerminalAction}
-                      label={splitTerminalActionLabel}
-                    >
-                      <SquareSplitHorizontal className="size-3.25" />
-                    </TerminalActionButton>
-                  ) : null}
-                  {onSplitTerminalVertical ? (
-                    <TerminalActionButton
-                      className={`inline-flex h-full items-center border-l border-border/70 px-1 text-foreground/90 transition-colors ${
-                        hasReachedSplitLimit
-                          ? "cursor-not-allowed opacity-45 hover:bg-transparent"
-                          : "hover:bg-accent/70"
-                      }`}
-                      onClick={onSplitTerminalVerticalAction}
-                      label={splitTerminalVerticalActionLabel}
-                    >
-                      <SquareSplitVertical className="size-3.25" />
-                    </TerminalActionButton>
-                  ) : null}
-                  {onNewTerminal ? (
-                    <TerminalActionButton
-                      className="inline-flex h-full items-center border-l border-border/70 px-1 text-foreground/90 transition-colors hover:bg-accent/70"
-                      onClick={onNewTerminalAction}
-                      label={newTerminalActionLabel}
-                    >
-                      <Plus className="size-3.25" />
-                    </TerminalActionButton>
-                  ) : null}
-                  <TerminalActionButton
-                    className="inline-flex h-full items-center border-l border-border/70 px-1 text-foreground/90 transition-colors hover:bg-accent/70"
-                    onClick={() => onCloseTerminal(resolvedActiveTerminalId)}
-                    label={closeTerminalActionLabel}
-                  >
-                    <Trash2 className="size-3.25" />
-                  </TerminalActionButton>
+              {hasTerminalToolbarActions ? (
+                <div className="flex h-[22px] items-stretch justify-end border-b border-border/70">
+                  <div className="inline-flex h-full items-stretch">
+                    {onSplitTerminal ? (
+                      <TerminalActionButton
+                        className={`inline-flex h-full items-center px-1 text-foreground/90 transition-colors ${
+                          hasReachedSplitLimit
+                            ? "cursor-not-allowed opacity-45 hover:bg-transparent"
+                            : "hover:bg-accent/70"
+                        }`}
+                        onClick={onSplitTerminalAction}
+                        label={splitTerminalActionLabel}
+                      >
+                        <SquareSplitHorizontal className="size-3.25" />
+                      </TerminalActionButton>
+                    ) : null}
+                    {onSplitTerminalVertical ? (
+                      <TerminalActionButton
+                        className={`inline-flex h-full items-center px-1 text-foreground/90 transition-colors ${
+                          onSplitTerminal ? "border-l border-border/70" : ""
+                        } ${
+                          hasReachedSplitLimit
+                            ? "cursor-not-allowed opacity-45 hover:bg-transparent"
+                            : "hover:bg-accent/70"
+                        }`}
+                        onClick={onSplitTerminalVerticalAction}
+                        label={splitTerminalVerticalActionLabel}
+                      >
+                        <SquareSplitVertical className="size-3.25" />
+                      </TerminalActionButton>
+                    ) : null}
+                    {onNewTerminal ? (
+                      <TerminalActionButton
+                        className={`inline-flex h-full items-center px-1 text-foreground/90 transition-colors hover:bg-accent/70 ${
+                          onSplitTerminal || onSplitTerminalVertical
+                            ? "border-l border-border/70"
+                            : ""
+                        }`}
+                        onClick={onNewTerminalAction}
+                        label={newTerminalActionLabel}
+                      >
+                        <Plus className="size-3.25" />
+                      </TerminalActionButton>
+                    ) : null}
+                  </div>
                 </div>
-              </div>
+              ) : null}
 
               <div className="min-h-0 flex-1 overflow-y-auto px-1 py-1">
                 {resolvedTerminalGroups.map((terminalGroup, groupIndex) => {

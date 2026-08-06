@@ -434,13 +434,22 @@ describe("ThreadTerminalPanel empty state", () => {
 });
 
 describe("ThreadTerminalPanel single terminal", () => {
-  it("renders the floating action strip without a sidebar", () => {
+  it("renders terminal-local actions without a whole-surface close control", () => {
     const markup = renderToStaticMarkup(<ThreadTerminalPanel {...panelProps()} />);
     expect(markup).toContain('aria-label="Split Terminal Horizontally"');
     expect(markup).toContain('aria-label="Split Terminal Vertically"');
     expect(markup).toContain('aria-label="New Terminal"');
-    expect(markup).toContain('aria-label="Close Terminal"');
+    expect(markup).not.toContain('aria-label="Close Terminal"');
+    expect(markup).not.toContain("lucide-trash-2");
     expect(markup).not.toContain("Group 1");
+  });
+
+  it("does not render a whole-surface close control for a center terminal", () => {
+    const markup = renderToStaticMarkup(
+      <ThreadTerminalPanel {...panelProps({ owner: "center-panel" })} />,
+    );
+    expect(markup).not.toContain('aria-label="Close Terminal"');
+    expect(markup).not.toContain("lucide-trash-2");
   });
 
   it("omits split and new controls when the host does not support them", () => {
@@ -457,7 +466,7 @@ describe("ThreadTerminalPanel single terminal", () => {
     expect(markup).not.toContain('aria-label="Split Terminal Horizontally"');
     expect(markup).not.toContain('aria-label="Split Terminal Vertically"');
     expect(markup).not.toContain('aria-label="New Terminal"');
-    expect(markup).toContain('aria-label="Close Terminal"');
+    expect(markup).not.toContain("pointer-events-none absolute right-2 top-2 z-20");
   });
 
   it("includes shortcut labels in the action tooltips when provided", () => {
@@ -474,7 +483,6 @@ describe("ThreadTerminalPanel single terminal", () => {
     expect(markup).toContain("Split Terminal Horizontally (Ctrl+Shift+H)");
     expect(markup).toContain("Split Terminal Vertically (Ctrl+Shift+V)");
     expect(markup).toContain("New Terminal (Ctrl+T)");
-    expect(markup).toContain("Close Terminal (Ctrl+W)");
   });
 
   it("deduplicates and trims terminal ids before rendering", () => {
@@ -485,7 +493,6 @@ describe("ThreadTerminalPanel single terminal", () => {
     );
     // A single surviving terminal renders without the multi-terminal sidebar.
     expect(markup).not.toContain("Group 1");
-    expect(markup).toContain('aria-label="Close Terminal"');
   });
 });
 
@@ -635,6 +642,7 @@ describe("ThreadTerminalPanel split groups", () => {
       />,
     );
     // The resolved active terminal (term-1) carries the close shortcut label.
+    expect(markup).not.toContain('aria-label="Close Terminal"');
     expect(markup).toContain("Close Terminal 1 (Ctrl+W)");
     expect(markup).toContain("Close Terminal 2");
     expect(markup).not.toContain("Close Terminal 2 (Ctrl+W)");
