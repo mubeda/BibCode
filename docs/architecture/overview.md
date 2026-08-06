@@ -77,6 +77,22 @@ environment shares the host process. SSH forwarding is owned by the Tauri host;
 provider, terminal, and managed relay processes are supervised by the server.
 Neither path introduces a production Node server or packaged helper sidecar.
 
+The WebView engine is the operating system's, so it differs per platform:
+WKWebView on macOS, WebKitGTK on Linux, and WebView2 on Windows. Browser API
+support therefore varies between desktop hosts, and between desktop and browser
+mode. The frontend feature-detects optional APIs and supplies its own fallback
+rather than assuming the Chromium behavior that browser mode and Windows
+happen to share.
+
+The terminal's WebGL renderer is the current instance. xterm keeps its canvas
+backing store aligned to the exact device-pixel box by observing
+`ResizeObserver`'s `device-pixel-content-box`; WebKit does not implement that
+box and throws from `observe`, leaving the backing store misaligned with its
+CSS box on any non-integer device pixel ratio, which rescales every glyph.
+[`terminalDevicePixelCorrection.ts`](../../apps/web/src/components/terminalDevicePixelCorrection.ts)
+restores the correction from `getBoundingClientRect` where the native box is
+unavailable, and stays inert where it is.
+
 ## Request and event flow
 
 1. The client runtime resolves a connection target and obtains any required
@@ -101,6 +117,8 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   contracts, shared utilities, relay infrastructure, and development tooling.
 - Capability negotiation controls optional behavior such as activity and
   preview automation; clients must downgrade when a server cannot prove support.
+- Host WebView engines differ by platform, so optional browser APIs are
+  feature-detected and given a frontend fallback rather than assumed present.
 - Activity observation is bounded, authorized, and independent for structured
   provider chat and managed provider terminals. See
   [Activity observation](./activity-observation.md).
