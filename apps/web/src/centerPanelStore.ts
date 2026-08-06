@@ -1,12 +1,11 @@
 /** Host-thread-scoped, persisted center-panel surface and group layout state. */
-import { scopedThreadKey } from "@bibcode/client-runtime/environment";
+import { parseScopedThreadKey, scopedThreadKey } from "@bibcode/client-runtime/environment";
 import {
   TERMINAL_LAUNCH_LABEL_MAX_LENGTH,
   type ScopedThreadRef,
   type TerminalLaunchCommand,
   type ThreadId,
 } from "@bibcode/contracts";
-import { nextTerminalId } from "@bibcode/shared/terminalLabels";
 import { create } from "zustand";
 import { createJSONStorage, persist } from "zustand/middleware";
 
@@ -30,6 +29,7 @@ import {
 } from "./centerPanelLayout";
 import { decodePersistedTerminalLaunchCommand } from "./lib/terminalLaunchCommand";
 import { resolveStorage } from "./lib/storage";
+import { reserveTerminalId } from "./terminalIdReservations";
 
 export const HOST_SURFACE_ID = "chat:host" as const;
 
@@ -391,16 +391,20 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
         const storedTerminalIds = current.surfaces.flatMap((surface) =>
           surface.kind === "terminal" ? [surface.terminalId] : [],
         );
-        const terminalId = nextTerminalId([...existingTerminalIds, ...storedTerminalIds]);
-        const surface = terminalSurface(terminalId, options);
-        const layoutState = createCenterPanelLayoutState([surface.id], surface.id);
-        set((state) => ({
-          byThreadKey: {
-            ...state.byThreadKey,
-            [threadKey]: { surfaces: [surface], ...layoutState },
-          },
-        }));
-        return terminalId;
+        const reservation = reserveTerminalId(ref, [...existingTerminalIds, ...storedTerminalIds]);
+        try {
+          const surface = terminalSurface(reservation.terminalId, options);
+          const layoutState = createCenterPanelLayoutState([surface.id], surface.id);
+          set((state) => ({
+            byThreadKey: {
+              ...state.byThreadKey,
+              [threadKey]: { surfaces: [surface], ...layoutState },
+            },
+          }));
+          return reservation.terminalId;
+        } finally {
+          reservation.release();
+        }
       },
       focusGroup: (ref, groupId) =>
         set((state) =>
@@ -517,9 +521,28 @@ export const useCenterPanelStore = create<CenterPanelStoreState>()(
       removeThread: (ref) =>
         set((state) => {
           const threadKey = scopedThreadKey(ref);
-          if (!(threadKey in state.byThreadKey)) return state;
-          const { [threadKey]: _removed, ...byThreadKey } = state.byThreadKey;
-          return { byThreadKey };
+          let byThreadKey = state.byThreadKey;
+          if (threadKey in byThreadKey) {
+            const { [threadKey]: _removed, ...rest } = byThreadKey;
+            byThreadKey = rest;
+          }
+          for (const [hostThreadKey, hostState] of Object.entries(state.byThreadKey)) {
+            if (hostThreadKey === threadKey) continue;
+            const hostRef = parseScopedThreadKey(hostThreadKey);
+            if (!hostRef || hostRef.environmentId !== ref.environmentId) continue;
+            const referencedSurfaceIds = new Set(
+              hostState.surfaces.flatMap((surface) =>
+                surface.kind === "chat" && surface.threadId === ref.threadId ? [surface.id] : [],
+              ),
+            );
+            if (referencedSurfaceIds.size === 0) continue;
+            byThreadKey = updateThread(
+              byThreadKey,
+              hostThreadKey,
+              (current) => applySurfaceRemoval(current, referencedSurfaceIds).state,
+            );
+          }
+          return byThreadKey === state.byThreadKey ? state : { byThreadKey };
         }),
     }),
     {
