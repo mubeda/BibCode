@@ -84,7 +84,7 @@
   "inventorySummary": {
     "javascriptDirect": 79,
     "javascriptLedger": 78,
-    "rustRegistry": 78,
+    "rustRegistry": 77,
     "rustPath": 1,
     "actions": 9,
     "toolchains": 9
@@ -1646,12 +1646,13 @@
       "key": "rust:workspace:security-framework",
       "name": "security-framework",
       "current": "3.7.0",
-      "target": "3.7.0",
-      "channel": "stable",
+      "target": "removed",
+      "channel": "removal",
       "source": "https://crates.io/crates/security-framework",
       "cohort": "rust-current",
       "platforms": ["macos"],
-      "status": "current"
+      "status": "removed",
+      "notes": "Replaced by the system /usr/bin/security boundary so ad-hoc desktop builds can read Claude credentials without an unstable application Keychain ACL. Credential updates use a private pseudo-terminal and never place secrets in process arguments."
     },
     {
       "key": "rust:workspace:semver",

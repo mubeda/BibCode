@@ -30,6 +30,15 @@ const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
 const CLAUDE_KEYCHAIN_ACCESS_ENV: &str = "BIBCODE_CLAUDE_KEYCHAIN_ACCESS";
 #[cfg(target_os = "macos")]
 const CLAUDE_KEYCHAIN_SERVICE: &str = "Claude Code-credentials";
+#[cfg(target_os = "macos")]
+const MACOS_SECURITY_CLI: &str = "/usr/bin/security";
+
+#[cfg(target_os = "macos")]
+#[derive(Debug, Eq, PartialEq)]
+struct MacOsKeychainCommand {
+    program: &'static str,
+    args: Vec<String>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Ord, PartialOrd)]
 pub enum ProviderUsageProvider {
@@ -155,8 +164,10 @@ fn select_claude_credential_stores(
     uses_default_config: bool,
     keychain_access: Option<&OsStr>,
 ) -> ClaudeCredentialStoreSelection {
-    let keychain_access_enabled =
-        matches!(keychain_access.and_then(OsStr::to_str), Some("enabled"));
+    let keychain_access_enabled = matches!(
+        keychain_access.and_then(OsStr::to_str),
+        None | Some("enabled")
+    );
     ClaudeCredentialStoreSelection {
         file: has_credentials_path,
         keychain: uses_default_config && keychain_access_enabled,
@@ -407,9 +418,15 @@ impl ProviderUsageService {
         let mut next_snapshots = Vec::with_capacity(selected.len());
         for &provider in selected {
             let snapshot = match self.fetchers.get(&provider) {
-                Some(fetcher) => match (fetcher.fetch)().await {
-                    Ok(snapshot) => snapshot,
-                    Err(error) => error_snapshot(provider, read_at, error.message),
+                Some(fetcher) => match tokio::time::timeout(USAGE_TIMEOUT, (fetcher.fetch)()).await
+                {
+                    Ok(Ok(snapshot)) => snapshot,
+                    Ok(Err(error)) => error_snapshot(provider, read_at, error.message),
+                    Err(_) => error_snapshot(
+                        provider,
+                        read_at,
+                        "Provider usage request timed out.".to_owned(),
+                    ),
                 },
                 None => unavailable_snapshot(
                     provider,
@@ -721,16 +738,7 @@ impl ClaudeCredentialStore {
                 let account = account.clone();
                 cache
                     .persist_and_replace_with(credentials, move || async move {
-                        tokio::task::spawn_blocking(move || {
-                            security_framework::passwords::set_generic_password(
-                                CLAUDE_KEYCHAIN_SERVICE,
-                                &account,
-                                &encoded,
-                            )
-                            .map_err(|error| ProviderUsageFetchError::new(error.to_string()))
-                        })
-                        .await
-                        .map_err(|error| ProviderUsageFetchError::new(error.to_string()))?
+                        write_claude_keychain_credentials(&account, &encoded).await
                     })
                     .await
             }
@@ -863,25 +871,124 @@ async fn refresh_claude_oauth_credentials(
 
 #[cfg(target_os = "macos")]
 async fn read_claude_keychain_credentials(account: &str) -> Option<String> {
-    let account = account.to_owned();
-    tokio::task::spawn_blocking(move || {
-        read_claude_keychain_credentials_with(
-            &account,
-            security_framework::passwords::get_generic_password,
-        )
-    })
-    .await
-    .ok()
-    .flatten()
+    let command_spec = claude_keychain_read_command(account);
+    let mut command = Command::new(command_spec.program);
+    configure_background_command(&mut command);
+    command
+        .args(command_spec.args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true);
+    let output = command.output().await.ok()?;
+    decode_claude_keychain_credentials(output.status.success(), output.stdout)
 }
 
 #[cfg(target_os = "macos")]
-fn read_claude_keychain_credentials_with<E>(
+fn claude_keychain_read_command(account: &str) -> MacOsKeychainCommand {
+    MacOsKeychainCommand {
+        program: MACOS_SECURITY_CLI,
+        args: [
+            "find-generic-password",
+            "-a",
+            account,
+            "-s",
+            CLAUDE_KEYCHAIN_SERVICE,
+            "-w",
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn claude_keychain_write_command(account: &str) -> MacOsKeychainCommand {
+    MacOsKeychainCommand {
+        program: MACOS_SECURITY_CLI,
+        args: [
+            "add-generic-password",
+            "-U",
+            "-a",
+            account,
+            "-s",
+            CLAUDE_KEYCHAIN_SERVICE,
+            "-w",
+        ]
+        .into_iter()
+        .map(ToOwned::to_owned)
+        .collect(),
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn decode_claude_keychain_credentials(success: bool, bytes: Vec<u8>) -> Option<String> {
+    success.then(|| String::from_utf8(bytes).ok()).flatten()
+}
+
+#[cfg(target_os = "macos")]
+async fn write_claude_keychain_credentials(
     account: &str,
-    read_password: impl FnOnce(&str, &str) -> Result<Vec<u8>, E>,
-) -> Option<String> {
-    let bytes = read_password(CLAUDE_KEYCHAIN_SERVICE, account).ok()?;
-    String::from_utf8(bytes).ok()
+    credentials: &[u8],
+) -> Result<(), ProviderUsageFetchError> {
+    let command_spec = claude_keychain_write_command(account);
+    let credentials = credentials.to_vec();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+
+        let pair = native_pty_system()
+            .openpty(PtySize {
+                rows: 2,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            })
+            .map_err(|error| ProviderUsageFetchError::new(error.to_string()))?;
+        let mut command = CommandBuilder::new(command_spec.program);
+        command.args(command_spec.args);
+        let mut child = pair
+            .slave
+            .spawn_command(command)
+            .map_err(|error| ProviderUsageFetchError::new(error.to_string()))?;
+        drop(pair.slave);
+        let mut writer = pair
+            .master
+            .take_writer()
+            .map_err(|error| ProviderUsageFetchError::new(error.to_string()))?;
+        writer
+            .write_all(&credentials)
+            .and_then(|()| writer.write_all(b"\r"))
+            .and_then(|()| writer.flush())
+            .map_err(|error| ProviderUsageFetchError::new(error.to_string()))?;
+
+        let deadline = std::time::Instant::now() + USAGE_TIMEOUT;
+        loop {
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|error| ProviderUsageFetchError::new(error.to_string()))?
+            {
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(ProviderUsageFetchError::new(
+                        "macOS Keychain credential update failed.",
+                    ))
+                };
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(ProviderUsageFetchError::new(
+                    "macOS Keychain credential update timed out.",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    })
+    .await
+    .map_err(|error| ProviderUsageFetchError::new(error.to_string()))?
 }
 
 async fn fetch_codex_usage() -> Result<ProviderUsageSnapshot, ProviderUsageFetchError> {
@@ -2026,11 +2133,11 @@ mod tests {
     }
 
     #[test]
-    fn claude_keychain_store_selection_defaults_to_disabled_without_explicit_opt_in() {
+    fn claude_keychain_store_selection_defaults_to_enabled_for_the_default_config() {
         let selection = select_claude_credential_stores(true, true, None);
 
         assert!(selection.file);
-        assert!(!selection.keychain);
+        assert!(selection.keychain);
     }
 
     #[test]
@@ -2247,26 +2354,51 @@ mod tests {
 
     #[cfg(target_os = "macos")]
     #[test]
-    fn reads_claude_credentials_through_the_native_macos_keychain_reader() {
-        let credentials = read_claude_keychain_credentials_with("admin", |service, account| {
-            assert_eq!(service, "Claude Code-credentials");
-            assert_eq!(account, "admin");
-            Ok::<_, ()>(
-                br#"{"claudeAiOauth":{"accessToken":"keychain-oauth-token","refreshToken":"refresh-token","expiresAt":1900000000000,"refreshTokenExpiresAt":1900000000000,"scopes":["user:profile"],"subscriptionType":"team","rateLimitTier":"default"},"mcpOAuth":{}}"#
-                    .to_vec(),
-            )
-        })
+    fn macos_keychain_commands_use_the_system_cli_without_secrets_in_arguments() {
+        let read = claude_keychain_read_command("admin");
+        assert_eq!(read.program, "/usr/bin/security");
+        assert_eq!(
+            read.args,
+            [
+                "find-generic-password",
+                "-a",
+                "admin",
+                "-s",
+                "Claude Code-credentials",
+                "-w",
+            ]
+        );
+
+        let write = claude_keychain_write_command("admin");
+        assert_eq!(write.program, "/usr/bin/security");
+        assert_eq!(
+            write.args,
+            [
+                "add-generic-password",
+                "-U",
+                "-a",
+                "admin",
+                "-s",
+                "Claude Code-credentials",
+                "-w",
+            ]
+        );
+        assert!(!write.args.iter().any(|arg| arg.contains("access-token")));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn decodes_only_successful_utf8_keychain_output() {
+        let credentials = decode_claude_keychain_credentials(
+            true,
+            br#"{"claudeAiOauth":{"accessToken":"keychain-oauth-token","refreshToken":"refresh-token","expiresAt":1900000000000}}"#.to_vec(),
+        )
         .expect("keychain credentials");
         let token = select_claude_oauth_token(None, Some(&credentials));
 
         assert_eq!(token.as_deref(), Some("keychain-oauth-token"));
-        assert!(
-            read_claude_keychain_credentials_with("admin", |_, _| Err::<Vec<u8>, _>(())).is_none()
-        );
-        assert!(
-            read_claude_keychain_credentials_with("admin", |_, _| Ok::<_, ()>(vec![0xff]))
-                .is_none()
-        );
+        assert!(decode_claude_keychain_credentials(false, b"ignored".to_vec()).is_none());
+        assert!(decode_claude_keychain_credentials(true, vec![0xff]).is_none());
     }
 
     #[tokio::test]
