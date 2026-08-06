@@ -1,4 +1,4 @@
-import { scopeThreadRef } from "@bibcode/client-runtime/environment";
+import { scopedThreadKey, scopeThreadRef } from "@bibcode/client-runtime/environment";
 import {
   EnvironmentId,
   ProviderDriverKind,
@@ -18,6 +18,7 @@ import {
   selectVisibleCenterSurfaces,
   useCenterPanelStore,
 } from "./centerPanelStore";
+import { reserveTerminalId } from "./terminalIdReservations";
 
 const HOST = scopeThreadRef(EnvironmentId.make("environment-1"), ThreadId.make("host-1"));
 const PANEL_A = ThreadId.make("panel-a");
@@ -127,6 +128,18 @@ describe("centerPanelStore", () => {
           },
         ],
       });
+    });
+
+    it("allocates replacement terminals through the shared pending reservation authority", () => {
+      const pending = reserveTerminalId(HOST, []);
+
+      const terminalId = store().replaceMainWithTerminal(HOST, [], {
+        label: "Codex Terminal",
+      });
+
+      expect(pending.terminalId).toBe("term-1");
+      expect(terminalId).toBe("term-2");
+      pending.release();
     });
   });
 
@@ -496,6 +509,24 @@ describe("centerPanelStore", () => {
       const before = store();
       store().removeThread(HOST);
       expect(store()).toBe(before);
+    });
+
+    it("removes every nested chat surface that references the deleted thread", () => {
+      const otherHost = scopeThreadRef(
+        HOST.environmentId,
+        ThreadId.make("host-with-panel-reference"),
+      );
+      const deletedPanelRef = scopeThreadRef(HOST.environmentId, PANEL_A);
+      store().openTerminalPanel(deletedPanelRef, "term-deleted");
+      store().openChatPanel(HOST, PANEL_A, "Codex");
+      store().openTerminalPanel(HOST, "term-host");
+      store().openChatPanel(otherHost, PANEL_A, "Codex");
+
+      store().removeThread(deletedPanelRef);
+
+      expect(store().byThreadKey[scopedThreadKey(deletedPanelRef)]).toBeUndefined();
+      expect(surfaceIds()).toEqual([HOST_SURFACE_ID, "terminal:term-host"]);
+      expect(surfaceIds(otherHost)).toEqual([HOST_SURFACE_ID]);
     });
   });
 });

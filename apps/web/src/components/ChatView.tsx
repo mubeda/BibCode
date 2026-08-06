@@ -42,7 +42,7 @@ import { resolveProviderSessionDefault } from "@bibcode/shared/providerSessionDe
 import { CHAT_LIST_ANCHOR_OFFSET } from "@bibcode/shared/chatList";
 import { projectScriptCwd, projectScriptRuntimeEnv } from "@bibcode/shared/projectScripts";
 import { truncate } from "@bibcode/shared/String";
-import { nextTerminalId, resolveTerminalSessionLabel } from "@bibcode/shared/terminalLabels";
+import { resolveTerminalSessionLabel } from "@bibcode/shared/terminalLabels";
 import { Debouncer } from "@tanstack/react-pacer";
 import { useAtomRefresh, useAtomValue } from "@effect/atom-react";
 import {
@@ -164,7 +164,7 @@ import {
   type CenterTerminalLaunch,
   type CenterTerminalSessionCommandResult,
 } from "../centerTerminalActions";
-import { reserveCenterTerminalId } from "../centerTerminalIdReservations";
+import { reserveTerminalId, type TerminalIdReservation } from "../terminalIdReservations";
 import { retireTerminalSession, type TerminalRetirementTarget } from "../terminalRetirement";
 import type { CenterPanelSurfaceRenderContext } from "./CenterPanelSurfaceHosts";
 import { CenterTerminalPanel } from "./CenterTerminalPanel";
@@ -2869,34 +2869,68 @@ function ChatViewContent(props: ChatViewProps) {
       useRightPanelStore.getState().close(activeThreadRef);
     }
   }, [activeThreadRef]);
+  const reserveActiveTerminalId = useCallback((): TerminalIdReservation | null => {
+    if (!activeThreadRef) return null;
+    const centerTerminalIds = selectThreadCenterPanelState(
+      useCenterPanelStore.getState().byThreadKey,
+      activeThreadRef,
+    ).surfaces.flatMap((surface) => (surface.kind === "terminal" ? [surface.terminalId] : []));
+    const rightTerminalIds = selectThreadRightPanelState(
+      useRightPanelStore.getState().byThreadKey,
+      activeThreadRef,
+    ).surfaces.flatMap((surface) => (surface.kind === "terminal" ? surface.terminalIds : []));
+    return reserveTerminalId(activeThreadRef, [
+      ...activeKnownTerminalIds,
+      ...centerTerminalIds,
+      ...rightTerminalIds,
+    ]);
+  }, [activeKnownTerminalIds, activeThreadRef]);
+  const openReservedRightPanelTerminal = useCallback(
+    (reservation: TerminalIdReservation, cwd: string) => {
+      if (!activeThreadRef || !activeThreadId || !activeProject) {
+        reservation.release();
+        return;
+      }
+      void (async () => {
+        try {
+          await openTerminal({
+            environmentId: activeThreadRef.environmentId,
+            input: {
+              threadId: activeThreadId,
+              terminalId: reservation.terminalId,
+              cwd,
+              ...(activeThreadWorktreePath != null
+                ? { worktreePath: activeThreadWorktreePath }
+                : {}),
+              env: projectScriptRuntimeEnv({
+                project: { cwd: activeProject.workspaceRoot },
+                worktreePath: activeThreadWorktreePath,
+              }),
+            },
+          });
+        } finally {
+          reservation.release();
+        }
+      })();
+    },
+    [activeProject, activeThreadId, activeThreadRef, activeThreadWorktreePath, openTerminal],
+  );
   const addTerminalSurface = useCallback(() => {
     if (!activeThreadRef || !activeThreadId || !activeProject) return;
     const cwd = gitCwd ?? activeProject.workspaceRoot;
-    const terminalId = nextTerminalId([...activeKnownTerminalIds, ...panelTerminalIds]);
+    const reservation = reserveActiveTerminalId();
+    if (!reservation) return;
+    const terminalId = reservation.terminalId;
     useRightPanelStore.getState().openTerminal(activeThreadRef, terminalId);
     setTerminalFocusRequestId((value) => value + 1);
-    void openTerminal({
-      environmentId: activeThreadRef.environmentId,
-      input: {
-        threadId: activeThreadId,
-        terminalId,
-        cwd,
-        ...(activeThreadWorktreePath != null ? { worktreePath: activeThreadWorktreePath } : {}),
-        env: projectScriptRuntimeEnv({
-          project: { cwd: activeProject.workspaceRoot },
-          worktreePath: activeThreadWorktreePath,
-        }),
-      },
-    });
+    openReservedRightPanelTerminal(reservation, cwd);
   }, [
-    activeKnownTerminalIds,
     activeProject,
     activeThreadId,
     activeThreadRef,
-    activeThreadWorktreePath,
     gitCwd,
-    openTerminal,
-    panelTerminalIds,
+    openReservedRightPanelTerminal,
+    reserveActiveTerminalId,
   ]);
   const splitPanelTerminal = useCallback(
     (direction: "horizontal" | "vertical" = "horizontal") => {
@@ -2909,36 +2943,24 @@ function ChatViewContent(props: ChatViewProps) {
       ) {
         return;
       }
-      const terminalId = nextTerminalId([...activeKnownTerminalIds, ...panelTerminalIds]);
       const cwd = gitCwd ?? activeProject.workspaceRoot;
+      const reservation = reserveActiveTerminalId();
+      if (!reservation) return;
+      const terminalId = reservation.terminalId;
       useRightPanelStore
         .getState()
         .splitTerminal(activeThreadRef, activeRightPanelSurface.id, terminalId, direction);
       setTerminalFocusRequestId((value) => value + 1);
-      void openTerminal({
-        environmentId: activeThreadRef.environmentId,
-        input: {
-          threadId: activeThreadId,
-          terminalId,
-          cwd,
-          ...(activeThreadWorktreePath != null ? { worktreePath: activeThreadWorktreePath } : {}),
-          env: projectScriptRuntimeEnv({
-            project: { cwd: activeProject.workspaceRoot },
-            worktreePath: activeThreadWorktreePath,
-          }),
-        },
-      });
+      openReservedRightPanelTerminal(reservation, cwd);
     },
     [
-      activeKnownTerminalIds,
       activeProject,
       activeRightPanelSurface,
       activeThreadId,
       activeThreadRef,
-      activeThreadWorktreePath,
       gitCwd,
-      openTerminal,
-      panelTerminalIds,
+      openReservedRightPanelTerminal,
+      reserveActiveTerminalId,
     ],
   );
   const splitPanelTerminalVertical = useCallback(() => {
@@ -3748,18 +3770,13 @@ function ChatViewContent(props: ChatViewProps) {
         );
         return result;
       }
-      const currentCenterPanelState = selectThreadCenterPanelState(
-        useCenterPanelStore.getState().byThreadKey,
-        activeThreadRef,
-      );
-      const centerTerminalIds = currentCenterPanelState.surfaces.flatMap((surface) =>
-        surface.kind === "terminal" ? [surface.terminalId] : [],
-      );
-      const reservation = reserveCenterTerminalId(activeThreadRef, [
-        ...activeKnownTerminalIds,
-        ...centerTerminalIds,
-        ...panelTerminalIds,
-      ]);
+      const reservation = reserveActiveTerminalId();
+      if (!reservation) {
+        return {
+          status: "rejected",
+          reason: "Terminal launch context is unavailable.",
+        };
+      }
       const terminalId = reservation.terminalId;
       const originRouteBinding = centerTerminalRouteBindingRef.current;
       const originWorkspace = centerPanelWorkspaceRef.current;
@@ -3869,12 +3886,11 @@ function ChatViewContent(props: ChatViewProps) {
       }
     },
     [
-      activeKnownTerminalIds,
       activeThreadRef,
       centerTerminalLaunchContext,
       closeTerminalMutation,
       openTerminal,
-      panelTerminalIds,
+      reserveActiveTerminalId,
     ],
   );
   const handleOpenTerminalPanel = useCallback(() => {

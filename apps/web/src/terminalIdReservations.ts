@@ -1,8 +1,8 @@
-import type { ScopedThreadRef } from "@bibcode/contracts";
 import { scopedThreadKey } from "@bibcode/client-runtime/environment";
+import type { ScopedThreadRef } from "@bibcode/contracts";
 import { nextTerminalId } from "@bibcode/shared/terminalLabels";
 
-export interface CenterTerminalIdReservation {
+export interface TerminalIdReservation {
   readonly terminalId: string;
   release(): void;
 }
@@ -10,14 +10,14 @@ export interface CenterTerminalIdReservation {
 const reservedIdsByThreadKey = new Map<string, Set<string>>();
 
 /**
- * Reserves the next center-terminal id until the caller's asynchronous open
- * transaction settles. Reservations are scoped to the server thread so
- * concurrent ChatView actions cannot alias the same backend session.
+ * Reserves the next terminal id for a server thread until the caller's open
+ * transaction settles. Every center and right-panel creation path shares this
+ * authority so concurrent surfaces cannot alias the same backend session.
  */
-export function reserveCenterTerminalId(
+export function reserveTerminalId(
   threadRef: ScopedThreadRef,
   existingTerminalIds: ReadonlyArray<string>,
-): CenterTerminalIdReservation {
+): TerminalIdReservation {
   const threadKey = scopedThreadKey(threadRef);
   const reservedIds = reservedIdsByThreadKey.get(threadKey) ?? new Set<string>();
   reservedIdsByThreadKey.set(threadKey, reservedIds);

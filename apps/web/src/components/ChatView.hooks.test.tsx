@@ -2120,6 +2120,87 @@ describe("ChatView keydown shortcuts", () => {
     expect(commandCallsFor("terminal.close")).toHaveLength(0);
   });
 
+  it("reserves distinct terminal ids across concurrent center and right-panel opens", async () => {
+    const finishOpen: Array<(result: unknown) => void> = [];
+    h.commandResults["terminal.open"] = () =>
+      new Promise((resolve) => {
+        finishOpen.push(resolve);
+      });
+    useRightPanelStore.getState().openTerminal(threadRef, "right-seed");
+    publishSeededStoreState(useRightPanelStore);
+    const { handler } = renderWithKeydown();
+
+    h.shortcutCommandByKey.set("F1", "terminal.newCenter");
+    handler(makeKeyEvent({ key: "F1" }));
+    h.terminalFocusOwner = "right-panel";
+    h.shortcutCommandByKey.set("F1", "terminal.new");
+    handler(makeKeyEvent({ key: "F1" }));
+
+    expect(openedTerminalIds()).toHaveLength(2);
+    expect(new Set(openedTerminalIds()).size).toBe(2);
+
+    finishOpen[0]?.(AsyncResult.success(undefined));
+    finishOpen[1]?.(AsyncResult.success(undefined));
+    await flushTerminalAction();
+    expect(commandCallsFor("terminal.close")).toHaveLength(0);
+  });
+
+  it.each(["terminal.new", "terminal.split"] as const)(
+    "reserves distinct terminal ids for rapid right-panel %s opens",
+    async (command) => {
+      const finishOpen: Array<(result: unknown) => void> = [];
+      h.commandResults["terminal.open"] = () =>
+        new Promise((resolve) => {
+          finishOpen.push(resolve);
+        });
+      useRightPanelStore.getState().openTerminal(threadRef, "right-seed");
+      publishSeededStoreState(useRightPanelStore);
+      h.terminalFocusOwner = "right-panel";
+      const { handler } = renderWithKeydown();
+      h.shortcutCommandByKey.set("F1", command);
+
+      handler(makeKeyEvent({ key: "F1" }));
+      handler(makeKeyEvent({ key: "F1" }));
+
+      expect(openedTerminalIds()).toHaveLength(2);
+      expect(new Set(openedTerminalIds()).size).toBe(2);
+
+      finishOpen[0]?.(AsyncResult.success(undefined));
+      finishOpen[1]?.(AsyncResult.success(undefined));
+      await flushTerminalAction();
+    },
+  );
+
+  it("releases a right-panel terminal reservation after a rejected open settles", async () => {
+    const finishOpen: Array<(result: unknown) => void> = [];
+    h.commandResults["terminal.open"] = () =>
+      new Promise((resolve) => {
+        finishOpen.push(resolve);
+      });
+    useRightPanelStore.getState().openTerminal(threadRef, "right-seed");
+    publishSeededStoreState(useRightPanelStore);
+    h.terminalFocusOwner = "right-panel";
+    const { handler } = renderWithKeydown();
+    h.shortcutCommandByKey.set("F1", "terminal.new");
+
+    handler(makeKeyEvent({ key: "F1" }));
+    handler(makeKeyEvent({ key: "F1" }));
+    const [rejectedId, pendingId] = openedTerminalIds();
+    expect(rejectedId).not.toBe(pendingId);
+
+    finishOpen[0]?.(AsyncResult.failure(Cause.fail(new Error("open rejected"))));
+    await flushTerminalAction();
+    useRightPanelStore.getState().closeSurface(threadRef, `terminal:${rejectedId}`);
+    handler(makeKeyEvent({ key: "F1" }));
+
+    expect(openedTerminalIds()[2]).toBe(rejectedId);
+    expect(openedTerminalIds()[2]).not.toBe(pendingId);
+
+    finishOpen[1]?.(AsyncResult.success(undefined));
+    finishOpen[2]?.(AsyncResult.success(undefined));
+    await flushTerminalAction();
+  });
+
   it.each([
     ["failure", AsyncResult.failure(Cause.fail(new Error("open failed")))],
     ["interruption", AsyncResult.failure(Cause.interrupt(1))],
