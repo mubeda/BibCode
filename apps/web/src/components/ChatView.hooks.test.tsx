@@ -617,12 +617,7 @@ vi.mock("./files/ProjectFilesPreloader", () => ({
   },
 }));
 
-import ChatView, {
-  eventPathContainsSelector,
-  serverTerminalIdsStrictSubsetOfClient,
-  shouldTypeToFocusComposer,
-  terminalIdListsEqual,
-} from "./ChatView";
+import ChatView, { eventPathContainsSelector, shouldTypeToFocusComposer } from "./ChatView";
 import type { ChatMessage, Project, Thread } from "../types";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { useRightPanelStore, type RightPanelSurface } from "../rightPanelStore";
@@ -1816,18 +1811,6 @@ describe("ChatView keydown shortcuts", () => {
     ).toBe(false);
   });
 
-  it("compares terminal ids without relying on server ordering", () => {
-    expect(terminalIdListsEqual([], [])).toBe(true);
-    expect(terminalIdListsEqual(["one"], [])).toBe(false);
-    expect(terminalIdListsEqual(["two", "one"], ["one", "two"])).toBe(true);
-    expect(terminalIdListsEqual(["one", "three"], ["one", "two"])).toBe(false);
-
-    expect(serverTerminalIdsStrictSubsetOfClient(["one"], ["one", "two"])).toBe(true);
-    expect(serverTerminalIdsStrictSubsetOfClient(["missing"], ["one", "two"])).toBe(false);
-    expect(serverTerminalIdsStrictSubsetOfClient(["one"], ["one"])).toBe(false);
-    expect(serverTerminalIdsStrictSubsetOfClient([], ["one"])).toBe(true);
-  });
-
   function renderWithKeydown(thread: Thread = makeThread()) {
     seedConnectedServerThread(thread);
     h.refSeeds.set(0, {
@@ -1997,6 +1980,24 @@ describe("ChatView keydown shortcuts", () => {
 
     expect(closeRightTerminal).toHaveBeenCalledWith(threadRef, expect.any(String), "terminal-77");
     expect(closedTerminalIds()).toEqual(["terminal-77"]);
+  });
+
+  it("consumes a native close-style shortcut only when the resolver closes the focused terminal", async () => {
+    seedConnectedServerThread();
+    useRightPanelStore.getState().openTerminal(threadRef, "terminal-native-close");
+    publishSeededStoreState(useRightPanelStore);
+    h.terminalFocusOwner = "right-panel";
+    renderServerRoute();
+    installComposerHandle();
+    runEffects();
+    h.shortcutCommandByKey.set("w", "terminal.close");
+    const event = makeKeyEvent({ key: "w", metaKey: true });
+
+    windowKeydownHandler()(event);
+    await flushTerminalAction();
+
+    expect(event.prevented).toBe(true);
+    expect(closedTerminalIds()).toEqual(["terminal-native-close"]);
   });
 
   it("rejects an infeasible center split before opening a server terminal", async () => {
@@ -2448,6 +2449,34 @@ describe("ChatView right panel handlers", () => {
     onCloseAllSurfaces();
 
     expect(useRightPanelStore.getState().byThreadKey[threadKey]?.surfaces ?? []).toHaveLength(0);
+  });
+
+  it("falls back to terminal exit when right-panel session close fails", async () => {
+    h.commandResults["terminal.close"] = () =>
+      AsyncResult.failure(Cause.fail(new Error("temporary close failure")));
+    const props = openedPanelProps((ref) => {
+      useRightPanelStore.getState().openTerminal(ref, "terminal-fallback");
+    });
+    const terminalSurface = useRightPanelStore
+      .getState()
+      .byThreadKey[threadKey]!.surfaces.find((surface) => surface.kind === "terminal")!;
+
+    (props["onCloseSurface"] as (surface: RightPanelSurface) => void)(terminalSurface);
+    await flushTerminalAction();
+
+    expect(closedTerminalIds()).toEqual(["terminal-fallback"]);
+    expect(commandCallsFor("terminal.write")).toEqual([
+      expect.objectContaining({
+        input: expect.objectContaining({
+          input: {
+            threadId,
+            terminalId: "terminal-fallback",
+            data: "exit\n",
+          },
+        }),
+      }),
+    ]);
+    expect(useRightPanelStore.getState().byThreadKey[threadKey]?.surfaces ?? []).toEqual([]);
   });
 
   it("adds browser/terminal/diff/source-control/files surfaces on demand", () => {
@@ -5372,6 +5401,43 @@ describe("ChatView banners and dialogs", () => {
         .byThreadKey[threadKey]?.surfaces.some((surface) => surface.kind === "terminal") ?? false,
     ).toBe(false);
     expect(closedTerminalIds()).toEqual(["terminal-42"]);
+  });
+
+  it("falls back to terminal exit after a center session close failure", async () => {
+    h.commandResults["terminal.close"] = () =>
+      AsyncResult.failure(Cause.fail(new Error("temporary close failure")));
+    seedConnectedServerThread();
+    useCenterPanelStore.getState().openTerminalPanel(threadRef, "terminal-fallback");
+    publishSeededStoreState(useCenterPanelStore);
+    renderServerRoute();
+
+    const workspace = capturedProps("centerWorkspace");
+    const terminalSurface = useCenterPanelStore
+      .getState()
+      .byThreadKey[threadKey]!.surfaces.find((surface) => surface.kind === "terminal")!;
+    (workspace["onCloseSurface"] as (groupId: string, surface: unknown) => void)(
+      "center:root",
+      terminalSurface,
+    );
+    await flushTerminalAction();
+
+    expect(closedTerminalIds()).toEqual(["terminal-fallback"]);
+    expect(commandCallsFor("terminal.write")).toEqual([
+      expect.objectContaining({
+        input: expect.objectContaining({
+          input: {
+            threadId,
+            terminalId: "terminal-fallback",
+            data: "exit\n",
+          },
+        }),
+      }),
+    ]);
+    expect(
+      useCenterPanelStore
+        .getState()
+        .byThreadKey[threadKey]?.surfaces.some((surface) => surface.kind === "terminal") ?? false,
+    ).toBe(false);
   });
 
   it("closes a center terminal session from the panel close control", () => {

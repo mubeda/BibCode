@@ -11,21 +11,41 @@ import {
   useRightPanelStore,
 } from "./rightPanelStore";
 
+function centerHasTerminalSurface(
+  centerByThreadKey: Record<string, ThreadCenterPanelState>,
+  ref: ScopedThreadRef | null | undefined,
+): boolean {
+  return selectThreadCenterPanelState(centerByThreadKey, ref).surfaces.some(
+    (surface) => surface.kind === "terminal",
+  );
+}
+
+function rightHasTerminalSurface(
+  rightByThreadKey: Record<string, ThreadRightPanelState>,
+  ref: ScopedThreadRef | null | undefined,
+): boolean {
+  return selectThreadRightPanelState(rightByThreadKey, ref).surfaces.some(
+    (surface) => surface.kind === "terminal",
+  );
+}
+
 export function selectThreadHasTerminalSurface(
   centerByThreadKey: Record<string, ThreadCenterPanelState>,
   rightByThreadKey: Record<string, ThreadRightPanelState>,
   ref: ScopedThreadRef | null | undefined,
 ): boolean {
-  const centerState = selectThreadCenterPanelState(centerByThreadKey, ref);
-  const rightState = selectThreadRightPanelState(rightByThreadKey, ref);
   return (
-    centerState.surfaces.some((surface) => surface.kind === "terminal") ||
-    rightState.surfaces.some((surface) => surface.kind === "terminal")
+    centerHasTerminalSurface(centerByThreadKey, ref) ||
+    rightHasTerminalSurface(rightByThreadKey, ref)
   );
 }
 
 export function useThreadHasTerminalSurface(ref: ScopedThreadRef | null | undefined): boolean {
-  const centerByThreadKey = useCenterPanelStore((state) => state.byThreadKey);
-  const rightByThreadKey = useRightPanelStore((state) => state.byThreadKey);
-  return selectThreadHasTerminalSurface(centerByThreadKey, rightByThreadKey, ref);
+  const centerHasTerminal = useCenterPanelStore((state) =>
+    centerHasTerminalSurface(state.byThreadKey, ref),
+  );
+  const rightHasTerminal = useRightPanelStore((state) =>
+    rightHasTerminalSurface(state.byThreadKey, ref),
+  );
+  return centerHasTerminal || rightHasTerminal;
 }

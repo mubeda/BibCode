@@ -4,7 +4,7 @@ import "@fontsource/jetbrains-mono/500.css";
 import "@xterm/xterm/css/xterm.css";
 import "./index.css";
 import { runClientStateMigrationsV1 } from "./clientStateMigrations";
-import { installDesktopWindowCloseGuard } from "./desktopWindowCloseGuard";
+import { installDesktopCloseShortcutRouter } from "./desktopCloseShortcut";
 import { isTauri } from "./env";
 import { resolveStorage } from "./lib/storage";
 
@@ -20,7 +20,7 @@ async function main(): Promise<void> {
     await import("@wdio/tauri-plugin");
   }
   if (isTauri) {
-    await installDesktopWindowCloseGuard().catch(() => undefined);
+    await installDesktopCloseShortcutRouter().catch(() => undefined);
   }
   const { renderApplication } = await import("./bootstrap");
   await renderApplication();

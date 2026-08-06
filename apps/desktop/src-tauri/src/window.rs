@@ -13,10 +13,13 @@ use crate::context_menu::NativeContextMenuManager;
 pub const MENU_ACTION_EVENT: &str = "desktop:menu-action";
 pub const MENU_ACTION_OPEN_SETTINGS: &str = "open-settings";
 pub const MENU_ACTION_CHECK_FOR_UPDATES: &str = "check-for-updates";
+pub const MENU_ACTION_CLOSE_SHORTCUT: &str = "close-shortcut";
 
 const MAIN_WINDOW_LABEL: &str = "main";
 const MENU_ID_OPEN_SETTINGS: &str = "bibcode:open-settings";
 const MENU_ID_CHECK_FOR_UPDATES: &str = "bibcode:check-for-updates";
+const MENU_ID_CLOSE_SHORTCUT: &str = "bibcode:close-shortcut";
+const MENU_ID_CLOSE_WINDOW: &str = "bibcode:close-window";
 const MIN_RESTORED_WINDOW_HEIGHT: u32 = 480;
 const MIN_RESTORED_WINDOW_WIDTH: u32 = 640;
 const MAX_RESTORED_WINDOW_HEIGHT: u32 = 10_000;
@@ -34,10 +37,20 @@ struct MainWindowState {
     fullscreen: bool,
 }
 
-pub fn menu_action_for_id(id: &str) -> Option<&'static str> {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ApplicationMenuAction {
+    Emit(&'static str),
+    CloseWindow,
+}
+
+fn menu_action_for_id(id: &str) -> Option<ApplicationMenuAction> {
     match id {
-        MENU_ID_OPEN_SETTINGS => Some(MENU_ACTION_OPEN_SETTINGS),
-        MENU_ID_CHECK_FOR_UPDATES => Some(MENU_ACTION_CHECK_FOR_UPDATES),
+        MENU_ID_OPEN_SETTINGS => Some(ApplicationMenuAction::Emit(MENU_ACTION_OPEN_SETTINGS)),
+        MENU_ID_CHECK_FOR_UPDATES => Some(ApplicationMenuAction::Emit(
+            MENU_ACTION_CHECK_FOR_UPDATES,
+        )),
+        MENU_ID_CLOSE_SHORTCUT => Some(ApplicationMenuAction::Emit(MENU_ACTION_CLOSE_SHORTCUT)),
+        MENU_ID_CLOSE_WINDOW => Some(ApplicationMenuAction::CloseWindow),
         _ => None,
     }
 }
@@ -52,13 +65,21 @@ pub fn configure_application_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Resu
         {
             return;
         }
-        if let Some(action) = menu_action_for_id(event.id().0.as_str()) {
-            if action == MENU_ACTION_OPEN_SETTINGS
-                && let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL)
-            {
-                let _ = window.set_focus();
+        match menu_action_for_id(event.id().0.as_str()) {
+            Some(ApplicationMenuAction::Emit(action)) => {
+                if action == MENU_ACTION_OPEN_SETTINGS
+                    && let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL)
+                {
+                    let _ = window.set_focus();
+                }
+                let _ = app.emit(MENU_ACTION_EVENT, action);
             }
-            let _ = app.emit(MENU_ACTION_EVENT, action);
+            Some(ApplicationMenuAction::CloseWindow) => {
+                if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+                    let _ = window.close();
+                }
+            }
+            None => {}
         }
     });
     Ok(())
@@ -70,9 +91,16 @@ fn build_application_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<
         .build(app)?;
     let check_for_updates =
         MenuItemBuilder::with_id(MENU_ID_CHECK_FOR_UPDATES, "Check for Updates...").build(app)?;
+    let close_shortcut = MenuItemBuilder::with_id(MENU_ID_CLOSE_SHORTCUT, "Close Active Surface")
+        .accelerator("CmdOrCtrl+W")
+        .build(app)?;
+    let close_window =
+        MenuItemBuilder::with_id(MENU_ID_CLOSE_WINDOW, "Close Window").build(app)?;
 
     let file = SubmenuBuilder::new(app, "File")
         .item(&settings)
+        .separator()
+        .item(&close_shortcut)
         .separator()
         .quit()
         .build()?;
@@ -90,7 +118,7 @@ fn build_application_menu<R: Runtime>(app: &AppHandle<R>) -> tauri::Result<Menu<
         .minimize()
         .maximize()
         .separator()
-        .close_window()
+        .item(&close_window)
         .build()?;
     let help = SubmenuBuilder::new(app, "Help")
         .item(&check_for_updates)
@@ -213,11 +241,19 @@ mod tests {
     fn maps_known_application_menu_ids_to_actions() {
         assert_eq!(
             menu_action_for_id(MENU_ID_OPEN_SETTINGS),
-            Some(MENU_ACTION_OPEN_SETTINGS)
+            Some(ApplicationMenuAction::Emit(MENU_ACTION_OPEN_SETTINGS))
         );
         assert_eq!(
             menu_action_for_id(MENU_ID_CHECK_FOR_UPDATES),
-            Some(MENU_ACTION_CHECK_FOR_UPDATES)
+            Some(ApplicationMenuAction::Emit(MENU_ACTION_CHECK_FOR_UPDATES))
+        );
+        assert_eq!(
+            menu_action_for_id(MENU_ID_CLOSE_SHORTCUT),
+            Some(ApplicationMenuAction::Emit(MENU_ACTION_CLOSE_SHORTCUT))
+        );
+        assert_eq!(
+            menu_action_for_id(MENU_ID_CLOSE_WINDOW),
+            Some(ApplicationMenuAction::CloseWindow)
         );
         assert_eq!(menu_action_for_id("copy"), None);
     }
