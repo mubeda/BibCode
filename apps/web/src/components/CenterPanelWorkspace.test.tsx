@@ -7,7 +7,7 @@ import type {
   DragMoveEvent,
   DragStartEvent,
 } from "@dnd-kit/core";
-import { act, forwardRef, useImperativeHandle, type ReactNode } from "react";
+import { act, createRef, forwardRef, useImperativeHandle, type ReactNode } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
@@ -90,7 +90,11 @@ vi.mock("./CenterPanelTabs", () => ({
   ),
 }));
 
-import { CenterPanelWorkspace, type CenterPanelWorkspaceProps } from "./CenterPanelWorkspace";
+import {
+  CenterPanelWorkspace,
+  type CenterPanelWorkspaceHandle,
+  type CenterPanelWorkspaceProps,
+} from "./CenterPanelWorkspace";
 
 const chatA = {
   id: "chat:a",
@@ -652,6 +656,24 @@ describe("CenterPanelWorkspace", () => {
       readonly canMoveToSplit: (groupId: string, direction: "left") => boolean;
     };
     expect(fourGroupLayoutProps.canMoveToSplit("group-a", "left")).toBe(false);
+  });
+
+  it("exposes current split feasibility through its narrow workspace handle", async () => {
+    const workspaceRef = createRef<CenterPanelWorkspaceHandle>();
+    const props = input();
+    await act(async () => root.render(<CenterPanelWorkspace ref={workspaceRef} {...props} />));
+    await flushFrames();
+
+    groupABodyRect = { ...groupABodyRect, width: 480, height: 319 };
+    expect(workspaceRef.current?.canSplitGroup("group-a", "right")).toBe(true);
+    expect(workspaceRef.current?.canSplitGroup("group-a", "down")).toBe(false);
+    expect(workspaceRef.current?.canSplitGroup("missing", "right")).toBe(false);
+
+    await act(async () =>
+      root.render(<CenterPanelWorkspace ref={workspaceRef} {...input(fourGroupState)} />),
+    );
+    await flushFrames();
+    expect(workspaceRef.current?.canSplitGroup("group-a", "right")).toBe(false);
   });
 
   it("snapshots geometry once per drag and recaptures only after workspace bounds change", async () => {
