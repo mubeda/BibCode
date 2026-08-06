@@ -100,6 +100,8 @@ const h = vi.hoisted(() => {
     activityPanelRenderProps: [] as unknown[],
     environmentSettingsById: new Map<string, Record<string, unknown>>(),
     settingsListeners: new Set<() => void>(),
+    centerHeaderDensityByGroupId: new Map<string, "expanded" | "compact">(),
+    chatHeaderActionsInstanceCount: 0,
   };
 });
 
@@ -390,8 +392,15 @@ vi.mock("./chat/MessagesTimeline", () => ({
 
 vi.mock("./chat/ChatHeaderActions", () => ({
   ChatHeaderActions: (props: Record<string, unknown>) => {
+    const [instanceId] = useState(() => ++h.chatHeaderActionsInstanceCount);
     h.captured["chatHeaderActions"] = props;
-    return <div data-mock="chat-header-actions" />;
+    return (
+      <div
+        data-mock="chat-header-actions"
+        data-density={String(props["density"])}
+        data-instance-id={instanceId}
+      />
+    );
   },
 }));
 
@@ -477,7 +486,15 @@ vi.mock("./CenterPanelWorkspace", () => ({
     const visibleIds = new Set(state.groups.flatMap((group) => group.activeSurfaceId ?? []));
     return (
       <div data-mock="center-panel-workspace">
-        {(props["renderFocusedActions"] as (density: "compact") => ReactNode)("compact")}
+        {state.groups.map((group) => (
+          <div key={group.id} data-mock-center-header={group.id}>
+            {group.id === state.focusedGroupId
+              ? (props["renderFocusedActions"] as (density: "expanded" | "compact") => ReactNode)(
+                  h.centerHeaderDensityByGroupId.get(group.id) ?? "compact",
+                )
+              : null}
+          </div>
+        ))}
         {state.surfaces
           .filter((surface) => surface.id === "chat:host" || visibleIds.has(surface.id))
           .map((surface) => {
@@ -868,6 +885,8 @@ beforeEach(() => {
   h.activityPanelRenderProps = [];
   h.environmentSettingsById.clear();
   h.settingsListeners.clear();
+  h.centerHeaderDensityByGroupId.clear();
+  h.chatHeaderActionsInstanceCount = 0;
 
   for (const { store, pristine } of resettableStores) {
     store.setState({ ...pristine }, true);
@@ -2895,6 +2914,7 @@ describe("ChatView", () => {
       expect(activeThread.latestTurn).toBeNull();
 
       const header = capturedProps<Record<string, unknown>>("chatHeaderActions");
+      expect(header["density"]).toBe("compact");
       expect(header["activeThreadId"]).toBe(threadId);
       expect(header["activeProjectName"]).toBe("Demo Project");
       expect(header["canCreatePanel"]).toBe(true);
@@ -2913,6 +2933,121 @@ describe("ChatView", () => {
         "composerBannerStack",
       );
       expect(bannerStack.items).toEqual([]);
+    });
+
+    it("renders one focused header owner with the focused group's local density", async () => {
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      useCenterPanelStore.setState({
+        byThreadKey: {
+          [scopedThreadKey(threadRef)]: {
+            surfaces: [
+              { id: HOST_SURFACE_ID, kind: "chat-host" },
+              { id: "terminal:term-right", kind: "terminal", terminalId: "term-right" },
+            ],
+            groups: [
+              {
+                id: "group-left",
+                surfaceIds: [HOST_SURFACE_ID],
+                activeSurfaceId: HOST_SURFACE_ID,
+              },
+              {
+                id: "group-right",
+                surfaceIds: ["terminal:term-right"],
+                activeSurfaceId: "terminal:term-right",
+              },
+            ],
+            layout: {
+              type: "split",
+              direction: "horizontal",
+              ratio: 0.5,
+              first: { type: "leaf", groupId: "group-left" },
+              second: { type: "leaf", groupId: "group-right" },
+            },
+            focusedGroupId: "group-left",
+          },
+        },
+      });
+      h.centerHeaderDensityByGroupId.set("group-left", "expanded");
+      h.centerHeaderDensityByGroupId.set("group-right", "compact");
+
+      vi.unstubAllGlobals();
+      Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+      Object.defineProperty(Element.prototype, "getAnimations", {
+        configurable: true,
+        value: () => [],
+      });
+      const container = document.createElement("div");
+      document.body.append(container);
+      const root = createRoot(container);
+      const renderView = () => (
+        <ChatView
+          environmentId={environmentId}
+          threadId={threadId}
+          routeKind="server"
+          reserveTitleBarControlInset
+        />
+      );
+
+      try {
+        await act(async () => {
+          root.render(renderView());
+          await Promise.resolve();
+        });
+
+        const leftHeader = container.querySelector('[data-mock-center-header="group-left"]');
+        const rightHeader = container.querySelector('[data-mock-center-header="group-right"]');
+        const expandedActions = leftHeader?.querySelector('[data-mock="chat-header-actions"]');
+        expect(expandedActions?.getAttribute("data-density")).toBe("expanded");
+        expect(rightHeader?.querySelector('[data-mock="chat-header-actions"]')).toBeNull();
+        expect(container.querySelectorAll('[data-mock="chat-header-actions"]')).toHaveLength(1);
+        expect(
+          capturedProps<{ reserveTitlebarControls: boolean }>("chatHeaderActions")
+            .reserveTitlebarControls,
+        ).toBe(false);
+        const expandedInstanceId = expandedActions?.getAttribute("data-instance-id");
+
+        h.centerHeaderDensityByGroupId.set("group-left", "compact");
+        await act(async () => {
+          root.render(renderView());
+          await Promise.resolve();
+        });
+
+        const compactActions = container.querySelector(
+          '[data-mock-center-header="group-left"] [data-mock="chat-header-actions"]',
+        );
+        expect(compactActions?.getAttribute("data-density")).toBe("compact");
+        expect(compactActions?.getAttribute("data-instance-id")).toBe(expandedInstanceId);
+        expect(h.chatHeaderActionsInstanceCount).toBe(1);
+
+        await act(async () => {
+          useCenterPanelStore.getState().focusGroup(threadRef, "group-right");
+          await Promise.resolve();
+        });
+
+        expect(
+          container.querySelector(
+            '[data-mock-center-header="group-left"] [data-mock="chat-header-actions"]',
+          ),
+        ).toBeNull();
+        expect(
+          container
+            .querySelector(
+              '[data-mock-center-header="group-right"] [data-mock="chat-header-actions"]',
+            )
+            ?.getAttribute("data-density"),
+        ).toBe("compact");
+        expect(container.querySelectorAll('[data-mock="chat-header-actions"]')).toHaveLength(1);
+        expect(
+          capturedProps<{ reserveTitlebarControls: boolean }>("chatHeaderActions")
+            .reserveTitlebarControls,
+        ).toBe(true);
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
     });
 
     it("does not reserve titlebar controls for a focused left center group", () => {
