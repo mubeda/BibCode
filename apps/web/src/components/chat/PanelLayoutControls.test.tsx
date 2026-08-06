@@ -38,7 +38,6 @@ describe("PanelLayoutControls", () => {
     );
 
     expect(markup).toContain("Toggle right panel (Ctrl+Shift+P)");
-    expect(markup).not.toContain("terminal drawer");
     expect(harness.toggles).toHaveLength(1);
     (harness.toggles[0]!.onPressedChange as () => void)();
     expect(onToggleRightPanel).toHaveBeenCalledOnce();
@@ -67,7 +66,6 @@ describe("PanelLayoutControls", () => {
       />,
     );
     expect(withoutShortcuts).toContain("Toggle right panel");
-    expect(withoutShortcuts).not.toContain("terminal drawer");
   });
 });
 

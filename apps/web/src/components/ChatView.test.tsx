@@ -6,7 +6,7 @@
  * ChatView is a very large route component; these tests render it through
  * `renderToStaticMarkup` (no DOM, per web test conventions) with the heavy
  * state/atom modules and child components replaced by prop-capturing mocks.
- * Real zustand stores (composer drafts, right/center panel, terminal ui) are
+ * Real zustand stores (composer drafts and right/center panels) are
  * seeded directly so the component's derivation pipeline runs against
  * realistic state. Handler props captured from mocked children are then
  * invoked to exercise the send/interrupt/approval command flows.
@@ -619,7 +619,6 @@ import type { Project, Thread } from "../types";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { useRightPanelStore } from "../rightPanelStore";
 import { HOST_SURFACE_ID, useCenterPanelStore } from "../centerPanelStore";
-import { useTerminalUiStateStore } from "../terminalUiStateStore";
 import { useUiStateStore } from "../uiStateStore";
 import { useDiffPanelStore } from "../diffPanelStore";
 import { useActivityDockStore } from "../activityDockStore";
@@ -806,7 +805,6 @@ const resettableStores: ReadonlyArray<{ store: ResettableStore; pristine: object
   useComposerDraftStore,
   useRightPanelStore,
   useCenterPanelStore,
-  useTerminalUiStateStore,
   useUiStateStore,
   useDiffPanelStore,
   useActivityDockStore,
@@ -2908,9 +2906,6 @@ describe("ChatView", () => {
       expect(panelControls["rightPanelAvailable"]).toBe(true);
       expect(panelControls["rightPanelOpen"]).toBe(false);
       expect(markup.match(/data-mock="panel-layout-controls"/g)).toHaveLength(1);
-      expect(markup).not.toContain("PersistentThreadTerminalDrawer");
-      expect(markup).not.toContain('data-terminal-owner="drawer"');
-      expect(markup).not.toContain("Toggle terminal drawer");
       expect(markup).not.toContain("panel-bottom");
       expect(workspace).not.toHaveProperty("panelLayoutControls");
 

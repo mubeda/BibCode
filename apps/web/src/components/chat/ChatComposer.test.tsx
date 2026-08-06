@@ -74,6 +74,7 @@ const h = vi.hoisted(() => {
     },
     traitInputs: [] as unknown[],
     isMobile: false,
+    terminalSurfaceOpen: false,
     toastAdd: vi.fn(),
     recordHost(type: unknown, props: unknown) {
       if (typeof type === "string" && props && typeof props === "object") {
@@ -300,6 +301,10 @@ vi.mock("../../lib/composerPathSearchState", () => ({
 vi.mock("../../hooks/useMediaQuery", () => ({
   useMediaQuery: () => h.isMobile,
   useIsMobile: () => h.isMobile,
+}));
+
+vi.mock("../../terminalSurfaceState", () => ({
+  useThreadHasTerminalSurface: () => h.terminalSurfaceOpen,
 }));
 
 // ChatView.logic imports the atom-creating threads module at top level; give
@@ -809,7 +814,6 @@ function renderComposer(overrides: Partial<ChatComposerProps> = {}): RenderResul
     resolvedTheme: "dark",
     settings: DEFAULT_UNIFIED_SETTINGS,
     keybindings: emptyKeybindings,
-    terminalOpen: false,
     gitCwd: "/repo",
     promptRef: { current: "" },
     composerAttachmentsRef: { current: [] },
@@ -926,6 +930,7 @@ beforeEach(() => {
   h.editorSnapshot = null;
   h.pathSearch = { entries: [], error: null, isPending: false };
   h.isMobile = false;
+  h.terminalSurfaceOpen = false;
   rafCallbacks.length = 0;
   documentStub.activeElement = null;
   fileReaderShouldFail = false;
@@ -953,6 +958,14 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("ChatComposer rendering", () => {
+  it("derives model-picker terminal context from supported terminal surfaces", () => {
+    h.terminalSurfaceOpen = true;
+
+    renderComposer();
+
+    expect(findCapture("ProviderModelPicker")["terminalOpen"]).toBe(true);
+  });
+
   it("renders the idle composer with editor, model picker, and runtime mode", () => {
     const { markup } = renderComposer();
 

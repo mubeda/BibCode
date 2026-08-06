@@ -443,8 +443,8 @@ async function tabTo(
 }
 
 async function tabToDockSummary(): Promise<void> {
-  const startingFocus = await focusDesktopUiElement('button[aria-label="Toggle terminal drawer"]');
-  expect(startingFocus.ariaLabel).toBe("Toggle terminal drawer");
+  const startingFocus = await focusDesktopUiElement('button[aria-label="Toggle right panel"]');
+  expect(startingFocus.ariaLabel).toBe("Toggle right panel");
   const arrived = await tabTo(
     (element) => element.ariaLabel === desktopActivityAccessibleNames.collapsedSummary,
   );

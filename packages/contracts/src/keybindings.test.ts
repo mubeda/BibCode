@@ -79,9 +79,8 @@ it("anchors every static KeybindingCommand literal", () => {
   );
 });
 
-it("accepts the center-terminal command and rejects the retired terminal toggle command", () => {
+it("accepts the center-terminal command", () => {
   assert.strictEqual(decodeKeybindingCommand("terminal.newCenter"), "terminal.newCenter");
-  assert.throws(() => decodeKeybindingCommand("terminal.toggle"));
 });
 
 it.effect("parses keybinding rules", () =>
