@@ -78,12 +78,13 @@ const h = vi.hoisted(() => {
     commandResults: {},
     commandCalls: [],
     shortcutLabels: {},
+    shortcutLabelOptions: [] as unknown[],
     showJumpHintModifiers: false,
+    terminalSurfaceOpen: false,
     // mock stores
     ui: null,
     selection: null,
     meta: null,
-    terminalUi: null,
   };
 
   const capture = (name: string, props: Record<string, unknown>) => {
@@ -231,14 +232,9 @@ const h = vi.hoisted(() => {
     markRead: spies.markRead,
   }));
 
-  const terminalUiStore = makeStore(() => ({
-    terminalUiStateByThreadKey: {} as Record<string, never>,
-  }));
-
   state.ui = uiStore;
   state.selection = selectionStore;
   state.meta = metaStore;
-  state.terminalUi = terminalUiStore;
   return {
     state,
     spies,
@@ -248,7 +244,6 @@ const h = vi.hoisted(() => {
     uiStore,
     selectionStore,
     metaStore,
-    terminalUiStore,
   };
 });
 
@@ -481,7 +476,8 @@ vi.mock("../localApi", () => ({
 
 vi.mock("../keybindings", () => ({
   resolveShortcutCommand: () => null,
-  shortcutLabelForCommand: (_config: unknown, command: string) => {
+  shortcutLabelForCommand: (_config: unknown, command: string, options: unknown) => {
+    h.state.shortcutLabelOptions.push(options);
     const labels = h.state.shortcutLabels as Record<string, string | null>;
     return command in labels ? labels[command] : "Mod+K";
   },
@@ -509,10 +505,9 @@ vi.mock("../sidebarWorkspaceMetaStore", async (importOriginal) => {
   return { ...actual, useSidebarWorkspaceMetaStore: h.metaStore };
 });
 
-vi.mock("../terminalUiStateStore", async (importOriginal) => {
-  const actual = await importOriginal<Record<string, unknown>>();
-  return { ...actual, useTerminalUiStateStore: h.terminalUiStore };
-});
+vi.mock("../terminalSurfaceState", () => ({
+  useThreadHasTerminalSurface: () => h.state.terminalSurfaceOpen,
+}));
 
 vi.mock("../composerDraftStore", () => ({
   DraftId: { make: (value: string) => value },
@@ -938,7 +933,6 @@ beforeEach(() => {
   h.uiStore.reset();
   h.selectionStore.reset();
   h.metaStore.reset();
-  h.terminalUiStore.reset();
   h.state.captures.length = 0;
   h.state.projects = [];
   h.state.threads = [];
@@ -972,7 +966,9 @@ beforeEach(() => {
   h.state.commandResults = {};
   h.state.commandCalls = [];
   h.state.shortcutLabels = {};
+  h.state.shortcutLabelOptions = [];
   h.state.showJumpHintModifiers = false;
+  h.state.terminalSurfaceOpen = false;
   h.spies.contextMenuShow.mockResolvedValue(null);
   h.spies.dialogConfirm.mockResolvedValue(true);
   h.spies.toastAdd.mockReturnValue("toast-1");
@@ -1149,6 +1145,19 @@ staticDescribe("SidebarBrandContent", () => {
 });
 
 staticDescribe("Sidebar full render", () => {
+  it("passes active terminal surfaces to shortcut label resolution", () => {
+    baseScenario();
+    h.state.terminalSurfaceOpen = true;
+
+    render(<Sidebar />);
+
+    expect(h.state.shortcutLabelOptions).toContainEqual(
+      expect.objectContaining({
+        context: expect.objectContaining({ terminalOpen: true }),
+      }),
+    );
+  });
+
   it("renders the project header, primary row, and workspace thread rows", () => {
     baseScenario();
     const markup = render(<Sidebar />);

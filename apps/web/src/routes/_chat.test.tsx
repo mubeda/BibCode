@@ -14,7 +14,7 @@ const harness = vi.hoisted(() => ({
   activeThread: null as unknown,
   defaultProjectRef: { project: true } as unknown,
   handleNewThread: vi.fn(),
-  terminalOpen: false,
+  terminalSurfaceOpen: false,
   previewPanel: null as string | null,
   command: null as string | null,
   paletteOpen: false,
@@ -74,10 +74,8 @@ vi.mock("../keybindings", () => ({
     return harness.command;
   },
 }));
-vi.mock("../terminalUiStateStore", () => ({
-  selectThreadTerminalUiState: () => ({ terminalOpen: harness.terminalOpen }),
-  useTerminalUiStateStore: (selector: (state: unknown) => unknown) =>
-    selector({ terminalUiStateByThreadKey: {} }),
+vi.mock("../terminalSurfaceState", () => ({
+  useThreadHasTerminalSurface: () => harness.terminalSurfaceOpen,
 }));
 vi.mock("../previewStateStore", () => ({
   isPreviewSupportedInRuntime: () => harness.previewSupported,
@@ -144,7 +142,7 @@ beforeEach(() => {
   harness.activeThread = null;
   harness.defaultProjectRef = { project: true };
   harness.handleNewThread.mockReset();
-  harness.terminalOpen = false;
+  harness.terminalSurfaceOpen = false;
   harness.previewPanel = null;
   harness.command = null;
   harness.paletteOpen = false;
@@ -250,7 +248,7 @@ describe("_chat route", () => {
     ["preview.resetZoom", "reset-zoom"],
   ])("dispatches %s as %s", (command, action) => {
     harness.command = command;
-    harness.terminalOpen = true;
+    harness.terminalSurfaceOpen = true;
     harness.previewPanel = "preview";
     harness.terminalFocused = true;
     harness.previewFocused = true;
