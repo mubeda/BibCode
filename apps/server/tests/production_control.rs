@@ -554,12 +554,20 @@ async fn keybinding_upsert_replace_and_remove_are_resolved_persisted_and_streame
             .expect("persisted keybindings"),
     )
     .expect("valid keybindings JSON");
-    assert!(persisted.as_array().unwrap().iter().any(|rule| {
-        rule["key"] == "mod+j" && rule["command"] == "terminal.newCenter"
-    }));
-    assert!(!persisted.as_array().unwrap().iter().any(|rule| {
-        rule["key"] == "alt+j" && rule["command"] == "terminal.newCenter"
-    }));
+    assert!(
+        persisted
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| { rule["key"] == "mod+j" && rule["command"] == "terminal.newCenter" })
+    );
+    assert!(
+        !persisted
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|rule| { rule["key"] == "alt+j" && rule["command"] == "terminal.newCenter" })
+    );
     cancellation.cancel();
 }
 
