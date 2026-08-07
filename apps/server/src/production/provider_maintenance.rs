@@ -1,3 +1,6 @@
+#[allow(dead_code)] // Source resolution wires these primitives into production in the next slice.
+mod latest;
+
 #[cfg(test)]
 mod tests {
     use std::{
@@ -697,6 +700,8 @@ use std::{
 use serde_json::{Value, json};
 use url::Url;
 
+use latest::LatestVersionFailure;
+
 use crate::git::{OutputPolicy, ProcessRequest, ProcessRunner};
 
 use super::provider_runtime::{prepare_provider_launch, resolve_provider_executable_in_path};
@@ -836,27 +841,6 @@ enum LatestVersionCheck {
     Failed {
         checked_at: Option<String>,
     },
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum LatestVersionFailure {
-    InvalidUrl,
-    Request,
-    HttpStatus,
-    InvalidJson,
-    MissingVersion,
-}
-
-impl LatestVersionFailure {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::InvalidUrl => "invalid_url",
-            Self::Request => "request",
-            Self::HttpStatus => "http_status",
-            Self::InvalidJson => "invalid_json",
-            Self::MissingVersion => "missing_version",
-        }
-    }
 }
 
 impl ProviderMaintenance {
@@ -1390,25 +1374,7 @@ fn capabilities_for_paths(
 }
 
 fn advisory_status(current: Option<&str>, latest: Option<&str>) -> &'static str {
-    match (
-        current.and_then(parse_version),
-        latest.and_then(parse_version),
-    ) {
-        (Some(current), Some(latest)) if current < latest => "behind_latest",
-        (Some(_), Some(_)) => "current",
-        _ => "unknown",
-    }
-}
-
-fn parse_version(value: &str) -> Option<semver::Version> {
-    value
-        .split_whitespace()
-        .map(|part| {
-            part.trim_matches(|character: char| {
-                !(character.is_ascii_alphanumeric() || matches!(character, '.' | '-' | '+'))
-            })
-        })
-        .find_map(|candidate| semver::Version::parse(candidate.trim_start_matches('v')).ok())
+    latest::advisory_status(latest::VersionScheme::Semver, current, latest)
 }
 
 fn resolved_or_configured_binary(
