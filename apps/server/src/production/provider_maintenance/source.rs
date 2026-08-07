@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncRead, AsyncReadExt};
 
 use super::{
     ProviderMaintenanceTarget,
@@ -229,13 +229,27 @@ async fn discover_claude_hints_from_paths(
 }
 
 async fn read_bounded_local_file(path: &Path) -> Option<Vec<u8>> {
-    let file = tokio::fs::File::open(path).await.ok()?;
+    let mut file = tokio::fs::File::open(path).await.ok()?;
+    let metadata = file.metadata().await.ok()?;
+    let regular_file = metadata.is_file();
+    if regular_file && metadata.len() > CLAUDE_LOCAL_FILE_LIMIT {
+        return None;
+    }
+    let bytes = read_bounded_local_reader(&mut file).await?;
+    if regular_file && file.metadata().await.ok()?.len() > CLAUDE_LOCAL_FILE_LIMIT {
+        return None;
+    }
+    Some(bytes)
+}
+
+async fn read_bounded_local_reader(reader: impl AsyncRead + Unpin) -> Option<Vec<u8>> {
     let mut bytes = Vec::new();
-    file.take(CLAUDE_LOCAL_FILE_LIMIT + 1)
+    reader
+        .take(CLAUDE_LOCAL_FILE_LIMIT)
         .read_to_end(&mut bytes)
         .await
         .ok()?;
-    (bytes.len() <= CLAUDE_LOCAL_FILE_LIMIT as usize).then_some(bytes)
+    Some(bytes)
 }
 
 fn claude_config_directory(target: &ProviderMaintenanceTarget) -> Option<PathBuf> {
@@ -744,6 +758,29 @@ fn is_opencode_native_path(path: &str) -> bool {
 mod tests {
     use super::*;
 
+    struct ObservedReader {
+        remaining: usize,
+        consumed: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl tokio::io::AsyncRead for ObservedReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _context: &mut std::task::Context<'_>,
+            buffer: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let reader = self.get_mut();
+            let amount = reader.remaining.min(buffer.remaining());
+            buffer.initialize_unfilled()[..amount].fill(b'x');
+            buffer.advance(amount);
+            reader.remaining -= amount;
+            reader
+                .consumed
+                .fetch_add(amount, std::sync::atomic::Ordering::SeqCst);
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
     fn claude_target(environment: &[(&str, &std::ffi::OsStr)]) -> ProviderMaintenanceTarget {
         ProviderMaintenanceTarget {
             instance_id: "claude".to_owned(),
@@ -852,6 +889,23 @@ mod tests {
             Some(CLAUDE_LOCAL_FILE_LIMIT as usize)
         );
         assert!(read_bounded_local_file(&oversized).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn bounded_claude_reader_never_consumes_a_sentinel_byte() {
+        let consumed = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let bytes = read_bounded_local_reader(ObservedReader {
+            remaining: CLAUDE_LOCAL_FILE_LIMIT as usize + 1,
+            consumed: consumed.clone(),
+        })
+        .await
+        .expect("bounded read");
+
+        assert_eq!(bytes.len(), CLAUDE_LOCAL_FILE_LIMIT as usize);
+        assert_eq!(
+            consumed.load(std::sync::atomic::Ordering::SeqCst),
+            CLAUDE_LOCAL_FILE_LIMIT as usize
+        );
     }
 
     #[tokio::test]
