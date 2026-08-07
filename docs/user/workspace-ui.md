@@ -28,7 +28,10 @@ path. Selecting a folder adds that folder as one project and does not scan for
 nested repositories.
 
 Workspace row context menus include update/open/copy/pin/unread actions, plus
-delete worktree for worktree rows and remove project for primary rows.
+delete worktree for worktree rows and remove project for primary rows. On the
+local desktop environment, **Open in → File Explorer** opens the repository
+folder for a primary row or the worktree folder for a worktree row. The action
+is omitted for remote environments and browser mode.
 
 ## Center Panel
 

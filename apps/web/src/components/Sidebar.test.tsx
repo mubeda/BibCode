@@ -2012,6 +2012,32 @@ staticDescribe("thread context menu", () => {
     expect(openInFileManager).toHaveBeenCalledWith("C:/wt/x", true);
   });
 
+  it.each([
+    [new Error("finder unavailable"), "finder unavailable"],
+    ["opaque failure", "An unexpected error occurred."],
+  ])("reports File Explorer launch failures", async (rejection, description) => {
+    baseScenario();
+    const openInFileManager = vi.fn(async () => Promise.reject(rejection));
+    (globalThis.window as unknown as Record<string, unknown>)["desktopBridge"] = {
+      openInFileManager,
+    };
+    render(<Sidebar />);
+    fakeLocalApi();
+    h.spies.contextMenuShow.mockResolvedValue("open-in:file-explorer");
+    const row = mustFindProps(byTestId("thread-row-thread-active"), "active worktree row");
+
+    invoke(row, "onContextMenu", mouseEvent());
+    await flush();
+
+    expect(h.spies.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "error",
+        title: "Unable to open File Explorer",
+        description,
+      }),
+    );
+  });
+
   it("omits File Explorer for a remote row", async () => {
     const { remoteThread } = groupedScenario();
     const openInFileManager = vi.fn(async () => {});
