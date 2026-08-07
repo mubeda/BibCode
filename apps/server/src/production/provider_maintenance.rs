@@ -18,6 +18,7 @@ mod tests {
     use tokio_util::sync::CancellationToken;
     use url::Url;
 
+    use super::latest::{ClaudeReleaseChannel, LatestVersionSource};
     use super::*;
 
     #[test]
@@ -208,6 +209,158 @@ mod tests {
 
     fn installed_snapshot(driver: &str, version: &str) -> Value {
         json!({ "instanceId": driver, "driver": driver, "enabled": true, "installed": true, "version": version, "checkedAt": "2026-08-01T12:00:00Z" })
+    }
+
+    #[derive(Clone)]
+    struct LatestVersionEndpointFixture {
+        npm_body: Vec<u8>,
+        npm_requests: Arc<AtomicUsize>,
+        claude_stable_requests: Arc<AtomicUsize>,
+        claude_latest_requests: Arc<AtomicUsize>,
+        cursor_installer_requests: Arc<AtomicUsize>,
+    }
+
+    async fn latest_version_endpoint_fixture(
+        npm_body: Vec<u8>,
+    ) -> (LatestVersionEndpoints, LatestVersionEndpointFixture) {
+        let fixture = LatestVersionEndpointFixture {
+            npm_body,
+            npm_requests: Arc::new(AtomicUsize::new(0)),
+            claude_stable_requests: Arc::new(AtomicUsize::new(0)),
+            claude_latest_requests: Arc::new(AtomicUsize::new(0)),
+            cursor_installer_requests: Arc::new(AtomicUsize::new(0)),
+        };
+        let app = Router::new()
+            .route(
+                "/claude/stable",
+                get(|State(fixture): State<LatestVersionEndpointFixture>| async move {
+                    fixture.claude_stable_requests.fetch_add(1, Ordering::SeqCst);
+                    "2.1.220\n"
+                }),
+            )
+            .route(
+                "/claude/latest",
+                get(|State(fixture): State<LatestVersionEndpointFixture>| async move {
+                    fixture.claude_latest_requests.fetch_add(1, Ordering::SeqCst);
+                    "2.1.224\n"
+                }),
+            )
+            .route(
+                "/cursor/install",
+                get(|State(fixture): State<LatestVersionEndpointFixture>| async move {
+                    fixture
+                        .cursor_installer_requests
+                        .fetch_add(1, Ordering::SeqCst);
+                    "DOWNLOAD_URL=\"https://downloads.cursor.com/lab/2026.08.04-aaa8809/${OS}/${ARCH}/agent-cli-package.tar.gz\"\nFINAL_DIR=\"$HOME/.local/share/cursor-agent/versions/2026.08.04-aaa8809\""
+                }),
+            )
+            .route(
+                "/{*path}",
+                get(|State(fixture): State<LatestVersionEndpointFixture>| async move {
+                    fixture.npm_requests.fetch_add(1, Ordering::SeqCst);
+                    fixture.npm_body
+                }),
+            )
+            .with_state(fixture.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("latest-version listener");
+        let address = listener.local_addr().expect("latest-version address");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("latest-version server")
+        });
+        let base_url = Url::parse(&format!("http://{address}/")).expect("latest-version URL");
+        (
+            LatestVersionEndpoints {
+                npm_registry_base_url: base_url.clone(),
+                claude_release_base_url: base_url.join("claude/").expect("Claude URL"),
+                cursor_installer_url: base_url.join("cursor/install").expect("Cursor URL"),
+            },
+            fixture,
+        )
+    }
+
+    #[tokio::test]
+    async fn caches_claude_stable_and_latest_as_distinct_sources() {
+        let (endpoints, fixture) =
+            latest_version_endpoint_fixture(br#"{"version":"0.148.0"}"#.to_vec()).await;
+        let maintenance = ProviderMaintenance::with_version_endpoints(endpoints);
+        let stable = LatestVersionSource::Claude(ClaudeReleaseChannel::Stable);
+        let latest = LatestVersionSource::Claude(ClaudeReleaseChannel::Latest);
+
+        assert_eq!(
+            maintenance.latest_version(stable, None).await,
+            LatestVersionCheck::Success {
+                version: "2.1.220".to_owned(),
+                checked_at: None,
+            }
+        );
+        assert_eq!(
+            maintenance.latest_version(latest, None).await,
+            LatestVersionCheck::Success {
+                version: "2.1.224".to_owned(),
+                checked_at: None,
+            }
+        );
+        assert_eq!(
+            maintenance.latest_version(stable, None).await,
+            LatestVersionCheck::Success {
+                version: "2.1.220".to_owned(),
+                checked_at: None,
+            }
+        );
+        assert_eq!(
+            maintenance.latest_version(latest, None).await,
+            LatestVersionCheck::Success {
+                version: "2.1.224".to_owned(),
+                checked_at: None,
+            }
+        );
+
+        assert_eq!(fixture.claude_stable_requests.load(Ordering::SeqCst), 1);
+        assert_eq!(fixture.claude_latest_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn fetches_and_parses_cursor_installer_metadata() {
+        let (endpoints, fixture) =
+            latest_version_endpoint_fixture(br#"{"version":"0.148.0"}"#.to_vec()).await;
+        let maintenance = ProviderMaintenance::with_version_endpoints(endpoints);
+
+        assert_eq!(
+            maintenance
+                .latest_version(LatestVersionSource::CursorInstaller, None)
+                .await,
+            LatestVersionCheck::Success {
+                version: "2026.08.04-aaa8809".to_owned(),
+                checked_at: None,
+            }
+        );
+        assert_eq!(fixture.cursor_installer_requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rejects_latest_version_responses_larger_than_256_kib() {
+        let (endpoints, fixture) =
+            latest_version_endpoint_fixture(vec![b'x'; 256 * 1024 + 1]).await;
+        let maintenance = ProviderMaintenance::with_version_endpoints(endpoints);
+        let source = LatestVersionSource::Npm("@openai/codex");
+
+        assert_eq!(
+            maintenance.latest_version(source, None).await,
+            LatestVersionCheck::Failed { checked_at: None }
+        );
+        assert_eq!(fixture.npm_requests.load(Ordering::SeqCst), 1);
+        assert!(
+            !maintenance
+                .inner
+                .latest_versions
+                .lock()
+                .await
+                .contains_key(&source)
+        );
     }
 
     async fn npm_registry_fixture(version: &str) -> (Url, Arc<AtomicUsize>) {
@@ -454,7 +607,7 @@ mod tests {
         let (registry_url, requests) = npm_registry_fixture("9.9.9").await;
         let maintenance = ProviderMaintenance::with_registry_base_url(registry_url);
         maintenance.inner.latest_versions.lock().await.insert(
-            "@openai/codex",
+            LatestVersionSource::Npm("@openai/codex"),
             VersionCacheEntry {
                 expires_at: tokio::time::Instant::now() - Duration::from_secs(1),
                 version: "1.0.0".to_owned(),
@@ -697,16 +850,18 @@ use std::{
     time::Duration,
 };
 
+use futures_util::StreamExt;
 use serde_json::{Value, json};
 use url::Url;
 
-use latest::LatestVersionFailure;
+use latest::{LatestVersionFailure, LatestVersionSource};
 
 use crate::git::{OutputPolicy, ProcessRequest, ProcessRunner};
 
 use super::provider_runtime::{prepare_provider_launch, resolve_provider_executable_in_path};
 
 const CACHE_TTL: Duration = Duration::from_secs(60 * 60);
+const LATEST_RESPONSE_LIMIT: usize = 256 * 1024;
 const REGISTRY_TIMEOUT: Duration = Duration::from_secs(4);
 const UPDATE_CHECK_FAILED_MESSAGE: &str =
     "Could not check for provider updates. Refresh provider status to try again.";
@@ -781,10 +936,10 @@ pub(crate) struct ProviderUpdateCommandResult {
 #[derive(Debug)]
 struct ProviderMaintenanceInner {
     client: reqwest::Client,
-    registry_base_url: Url,
+    version_endpoints: LatestVersionEndpoints,
     latest_version_generation: AtomicU64,
-    latest_versions: tokio::sync::Mutex<HashMap<&'static str, VersionCacheEntry>>,
-    latest_version_locks: Mutex<HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>>,
+    latest_versions: tokio::sync::Mutex<HashMap<LatestVersionSource, VersionCacheEntry>>,
+    latest_version_locks: Mutex<HashMap<LatestVersionSource, Arc<tokio::sync::Mutex<()>>>>,
     updates: Arc<Mutex<ProviderUpdateCoordinator>>,
     command_locks: Mutex<HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -832,6 +987,28 @@ struct VersionCacheEntry {
     generation: u64,
 }
 
+#[derive(Clone, Debug)]
+struct LatestVersionEndpoints {
+    npm_registry_base_url: Url,
+    claude_release_base_url: Url,
+    cursor_installer_url: Url,
+}
+
+impl LatestVersionEndpoints {
+    fn production() -> Self {
+        Self {
+            npm_registry_base_url: Url::parse("https://registry.npmjs.org/")
+                .expect("npm registry URL"),
+            claude_release_base_url: Url::parse(
+                "https://downloads.claude.ai/claude-code-releases/",
+            )
+            .expect("Claude release URL"),
+            cursor_installer_url: Url::parse("https://cursor.com/install")
+                .expect("Cursor installer URL"),
+        }
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum LatestVersionCheck {
     Success {
@@ -845,26 +1022,31 @@ enum LatestVersionCheck {
 
 impl ProviderMaintenance {
     pub(crate) fn new() -> Self {
-        Self::with_registry_base_url(
-            Url::parse("https://registry.npmjs.org/").expect("registry URL"),
-        )
+        Self::with_version_endpoints(LatestVersionEndpoints::production())
     }
 
     #[cfg(test)]
     pub(crate) fn with_registry_base_url(registry_base_url: Url) -> Self {
-        Self::with_registry_base_url_inner(registry_base_url)
+        let mut endpoints = LatestVersionEndpoints::production();
+        endpoints.npm_registry_base_url = registry_base_url;
+        Self::with_version_endpoints(endpoints)
+    }
+
+    #[cfg(test)]
+    fn with_version_endpoints(version_endpoints: LatestVersionEndpoints) -> Self {
+        Self::with_version_endpoints_inner(version_endpoints)
     }
 
     #[cfg(not(test))]
-    fn with_registry_base_url(registry_base_url: Url) -> Self {
-        Self::with_registry_base_url_inner(registry_base_url)
+    fn with_version_endpoints(version_endpoints: LatestVersionEndpoints) -> Self {
+        Self::with_version_endpoints_inner(version_endpoints)
     }
 
-    fn with_registry_base_url_inner(registry_base_url: Url) -> Self {
+    fn with_version_endpoints_inner(version_endpoints: LatestVersionEndpoints) -> Self {
         Self {
             inner: Arc::new(ProviderMaintenanceInner {
                 client: reqwest::Client::new(),
-                registry_base_url,
+                version_endpoints,
                 latest_version_generation: AtomicU64::new(0),
                 latest_versions: tokio::sync::Mutex::new(HashMap::new()),
                 latest_version_locks: Mutex::new(HashMap::new()),
@@ -883,12 +1065,12 @@ impl ProviderMaintenance {
             .expect("provider latest-version generations exhausted");
     }
 
-    fn latest_version_lock(&self, package_name: &'static str) -> Arc<tokio::sync::Mutex<()>> {
+    fn latest_version_lock(&self, source: LatestVersionSource) -> Arc<tokio::sync::Mutex<()>> {
         self.inner
             .latest_version_locks
             .lock()
             .expect("provider latest-version locks")
-            .entry(package_name)
+            .entry(source)
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
@@ -1193,9 +1375,10 @@ impl ProviderMaintenance {
             .and_then(Value::as_str)
             .map(str::to_owned);
         let latest_check = match (should_check, capabilities.package_name) {
-            (true, Some(package_name)) => {
-                Some(self.latest_version(package_name, probe_checked_at).await)
-            }
+            (true, Some(package_name)) => Some(
+                self.latest_version_for_package_name(package_name, probe_checked_at)
+                    .await,
+            ),
             _ => None,
         };
         let (latest, checked_at, check_failed) = match latest_check {
@@ -1229,10 +1412,10 @@ impl ProviderMaintenance {
 
     async fn latest_version(
         &self,
-        package_name: &'static str,
+        source: LatestVersionSource,
         checked_at: Option<String>,
     ) -> LatestVersionCheck {
-        let lookup_lock = self.latest_version_lock(package_name);
+        let lookup_lock = self.latest_version_lock(source);
         let _lookup_guard = lookup_lock.lock().await;
         let required_generation = self.inner.latest_version_generation.load(Ordering::Acquire);
         let cached = self
@@ -1240,7 +1423,7 @@ impl ProviderMaintenance {
             .latest_versions
             .lock()
             .await
-            .get(package_name)
+            .get(&source)
             .filter(|entry| {
                 entry.expires_at > tokio::time::Instant::now()
                     && entry.generation >= required_generation
@@ -1253,21 +1436,20 @@ impl ProviderMaintenance {
             };
         }
 
-        let result = self.fetch_latest_version(package_name).await;
+        let result = self.fetch_latest_version(source).await;
         let version = match result {
             Ok(version) => version,
             Err(failure) => {
                 tracing::warn!(
-                    registry_host = self.inner.registry_base_url.host_str().unwrap_or("unknown"),
-                    package_name,
+                    source = latest_source_label(source),
                     failure = failure.as_str(),
-                    "provider registry version check failed"
+                    "provider latest-version check failed"
                 );
                 return LatestVersionCheck::Failed { checked_at };
             }
         };
         self.inner.latest_versions.lock().await.insert(
-            package_name,
+            source,
             VersionCacheEntry {
                 expires_at: tokio::time::Instant::now() + CACHE_TTL,
                 version: version.clone(),
@@ -1281,17 +1463,42 @@ impl ProviderMaintenance {
         }
     }
 
-    async fn fetch_latest_version(
+    async fn latest_version_for_package_name(
         &self,
         package_name: &'static str,
+        checked_at: Option<String>,
+    ) -> LatestVersionCheck {
+        self.latest_version(LatestVersionSource::Npm(package_name), checked_at)
+            .await
+    }
+
+    async fn fetch_latest_version(
+        &self,
+        source: LatestVersionSource,
     ) -> Result<String, LatestVersionFailure> {
-        let encoded: String =
-            url::form_urlencoded::byte_serialize(package_name.as_bytes()).collect();
-        let url = self
-            .inner
-            .registry_base_url
-            .join(&format!("{encoded}/latest"))
-            .map_err(|_| LatestVersionFailure::InvalidUrl)?;
+        let url = match source {
+            LatestVersionSource::Npm(package_name) => {
+                let encoded: String =
+                    url::form_urlencoded::byte_serialize(package_name.as_bytes()).collect();
+                self.inner
+                    .version_endpoints
+                    .npm_registry_base_url
+                    .join(&format!("{encoded}/latest"))
+                    .map_err(|_| LatestVersionFailure::InvalidUrl)?
+            }
+            LatestVersionSource::Claude(channel) => self
+                .inner
+                .version_endpoints
+                .claude_release_base_url
+                .join(match channel {
+                    latest::ClaudeReleaseChannel::Stable => "stable",
+                    latest::ClaudeReleaseChannel::Latest => "latest",
+                })
+                .map_err(|_| LatestVersionFailure::InvalidUrl)?,
+            LatestVersionSource::CursorInstaller => {
+                self.inner.version_endpoints.cursor_installer_url.clone()
+            }
+        };
         let response = self
             .inner
             .client
@@ -1302,16 +1509,25 @@ impl ProviderMaintenance {
             .map_err(|_| LatestVersionFailure::Request)?
             .error_for_status()
             .map_err(|_| LatestVersionFailure::HttpStatus)?;
-        let body = response
-            .json::<Value>()
-            .await
-            .map_err(|_| LatestVersionFailure::InvalidJson)?;
-        body.get("version")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-            .ok_or(LatestVersionFailure::MissingVersion)
+        let mut body = Vec::new();
+        let mut stream = response.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk.map_err(|_| LatestVersionFailure::Request)?;
+            if body.len().saturating_add(chunk.len()) > LATEST_RESPONSE_LIMIT {
+                return Err(LatestVersionFailure::ResponseTooLarge);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        latest::parse_latest_response(source, &body)
+    }
+}
+
+fn latest_source_label(source: LatestVersionSource) -> &'static str {
+    match source {
+        LatestVersionSource::Npm(_) => "npm",
+        LatestVersionSource::Claude(latest::ClaudeReleaseChannel::Stable) => "claude_stable",
+        LatestVersionSource::Claude(latest::ClaudeReleaseChannel::Latest) => "claude_latest",
+        LatestVersionSource::CursorInstaller => "cursor_installer",
     }
 }
 
