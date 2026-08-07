@@ -566,6 +566,7 @@ async fn workspace_rpc_surfaces_optional_dependency_and_backend_failures() {
                 failing_thread_id: None,
             })),
             review_service: None,
+            mutation_observer: None,
         },
     );
     let missing_asset = asset_rpc
@@ -589,6 +590,7 @@ async fn workspace_rpc_surfaces_optional_dependency_and_backend_failures() {
             asset_access: None,
             asset_context_resolver: None,
             review_service: Some(ReviewService::new(Arc::new(FailingReviewBackend))),
+            mutation_observer: None,
         },
     );
     let backend_failure = review_rpc
@@ -849,6 +851,7 @@ async fn workspace_rpc_routes_asset_urls_through_workspace_context_resolution() 
                 failing_thread_id: Some("thread-error".to_owned()),
             })),
             review_service: None,
+            mutation_observer: None,
         },
     );
 
@@ -925,6 +928,7 @@ async fn assets_create_url_never_signs_an_untrusted_attachment_id() {
             asset_access: Some(AssetAccess::new(vec![8; 32], attachments)),
             asset_context_resolver: None,
             review_service: None,
+            mutation_observer: None,
         },
     );
 
@@ -1035,6 +1039,7 @@ async fn workspace_rpc_routes_review_requests_through_the_injected_service() {
             asset_access: None,
             asset_context_resolver: None,
             review_service: Some(service),
+            mutation_observer: None,
         },
     );
     let cwd = path_string(TempDir::new().expect("cwd").path());

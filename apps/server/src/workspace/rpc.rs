@@ -32,9 +32,14 @@ pub const TASK_SIX_RPC_METHODS: [&str; 11] = [
 
 type AssetContextFuture<'a> =
     Pin<Box<dyn Future<Output = Result<Option<PathBuf>, String>> + Send + 'a>>;
+pub type WorkspaceMutationFuture<'a> = Pin<Box<dyn Future<Output = ()> + Send + 'a>>;
 
 pub trait AssetContextResolver: Send + Sync {
     fn resolve_workspace_root<'a>(&'a self, thread_id: &'a str) -> AssetContextFuture<'a>;
+}
+
+pub trait WorkspaceMutationObserver: Send + Sync {
+    fn workspace_mutated<'a>(&'a self, cwd: &'a Path) -> WorkspaceMutationFuture<'a>;
 }
 
 #[derive(Clone, Default)]
@@ -42,6 +47,7 @@ pub struct WorkspaceRpcDependencies {
     pub asset_access: Option<AssetAccess>,
     pub asset_context_resolver: Option<Arc<dyn AssetContextResolver>>,
     pub review_service: Option<ReviewService>,
+    pub mutation_observer: Option<Arc<dyn WorkspaceMutationObserver>>,
 }
 
 #[derive(Clone)]
@@ -92,6 +98,9 @@ impl WorkspaceRpc {
                 match result {
                     Ok(relative_path) => {
                         self.invalidate_index(&input.cwd).await;
+                        if let Some(observer) = &self.dependencies.mutation_observer {
+                            observer.workspace_mutated(Path::new(&input.cwd)).await;
+                        }
                         Ok(json!({ "relativePath": relative_path }))
                     }
                     Err(error) => Err(error.to_project_wire(

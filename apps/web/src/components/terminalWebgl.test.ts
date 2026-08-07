@@ -11,6 +11,7 @@ vi.mock("@xterm/addon-webgl", () => ({ WebglAddon }));
 
 import {
   loadTerminalWebglAddon,
+  resizeWebglCanvasBackingStore,
   webglCanvasFrom,
   webglContextFrom,
   type WebglAddonInstance,
@@ -63,5 +64,27 @@ describe("webglCanvasFrom", () => {
     expect(webglCanvasFrom(addonWithContext({ canvas: { width: 10, height: 10 } }))).toBeNull();
     expect(webglCanvasFrom(addonWithContext({ canvas: null }))).toBeNull();
     expect(webglCanvasFrom({} as WebglAddonInstance)).toBeNull();
+  });
+});
+
+describe("resizeWebglCanvasBackingStore", () => {
+  it("restores the previous backing store when a renderer layer rejects the synchronized resize", () => {
+    const canvas = { width: 1215, height: 600 };
+    const addon = {
+      _renderer: {
+        _gl: { canvas },
+        _rectangleRenderer: { value: { handleResize: () => undefined } },
+        _glyphRenderer: {
+          value: {
+            handleResize: () => {
+              throw new Error("renderer detached");
+            },
+          },
+        },
+      },
+    } as unknown as WebglAddonInstance;
+
+    expect(resizeWebglCanvasBackingStore(addon, 1216, 600)).toBe(false);
+    expect(canvas).toEqual({ width: 1215, height: 600 });
   });
 });

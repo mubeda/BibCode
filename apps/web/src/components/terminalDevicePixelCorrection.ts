@@ -39,7 +39,7 @@ function supportsDevicePixelContentBox(): boolean {
  */
 export function observeCanvasDevicePixelSize(
   canvas: HTMLCanvasElement,
-  requestRedraw: () => void,
+  resizeBackingStore: (width: number, height: number) => void,
 ): DevicePixelCorrectionDisposable {
   if (supportsDevicePixelContentBox()) return NO_CORRECTION;
   if (typeof ResizeObserver === "undefined") return NO_CORRECTION;
@@ -53,9 +53,7 @@ export function observeCanvasDevicePixelSize(
     // drawing buffer and force a redraw of nothing.
     if (width <= 0 || height <= 0) return;
     if (canvas.width === width && canvas.height === height) return;
-    canvas.width = width;
-    canvas.height = height;
-    requestRedraw();
+    resizeBackingStore(width, height);
   };
 
   const observer = new ResizeObserver(applyExactSize);

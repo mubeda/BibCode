@@ -123,6 +123,8 @@ const webglState = vi.hoisted(() => ({
     | "lose-throws"
     | "missing-canvas",
   canvas: null as FakeWebglCanvas | null,
+  drawingViewport: null as { width: number; height: number } | null,
+  glyphResolution: null as { width: number; height: number } | null,
   loseContextSpy: vi.fn(),
   events: [] as string[],
   WebglAddonConstructor: null as (new () => FakeWebglAddonInstance) | null,
@@ -198,6 +200,8 @@ vi.mock("@xterm/addon-webgl", () => {
           };
         }),
       };
+      webglState.drawingViewport = { width: canvas.width, height: canvas.height };
+      webglState.glyphResolution = { width: canvas.width, height: canvas.height };
 
       if (webglState.contextMode === "getter-throws") {
         Object.defineProperty(this, "_renderer", {
@@ -209,7 +213,31 @@ vi.mock("@xterm/addon-webgl", () => {
       } else {
         Object.defineProperty(this, "_renderer", {
           configurable: true,
-          value: webglState.contextMode === "missing-context" ? undefined : { _gl: context },
+          value:
+            webglState.contextMode === "missing-context"
+              ? undefined
+              : {
+                  _gl: context,
+                  _rectangleRenderer: {
+                    value: {
+                      handleResize: () => undefined,
+                    },
+                  },
+                  _glyphRenderer: {
+                    value: {
+                      handleResize: () => {
+                        webglState.drawingViewport = {
+                          width: canvas.width,
+                          height: canvas.height,
+                        };
+                        webglState.glyphResolution = {
+                          width: canvas.width,
+                          height: canvas.height,
+                        };
+                      },
+                    },
+                  },
+                },
         });
       }
     }
@@ -1076,6 +1104,8 @@ beforeEach(() => {
   webglState.disposeShouldThrow = false;
   webglState.contextMode = "present";
   webglState.canvas = null;
+  webglState.drawingViewport = null;
+  webglState.glyphResolution = null;
   webglState.loseContextSpy.mockReset();
   webglState.events = [];
   const defaultRuntime = createTerminalTranscriptRuntime();
@@ -2346,7 +2376,7 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(terminal.dispose).not.toHaveBeenCalled();
   });
 
-  it("corrects the canvas backing store where the browser cannot report its device-pixel box", async () => {
+  it("keeps the WebGL viewport and shader resolution aligned when correcting the backing store", async () => {
     // A Retina ratio; at dpr 1 the CSS box and the backing store cannot disagree.
     vi.stubGlobal("devicePixelRatio", 2);
     const view = await mountViewport({ visible: true, webglEnabled: true });
@@ -2362,6 +2392,8 @@ describe("TerminalViewport mounted lifecycle", () => {
     // 608 CSS px at dpr 2 is 1216 device px, not the 1215 xterm left behind.
     expect(canvas.width).toBe(1216);
     expect(canvas.height).toBe(600);
+    expect(webglState.drawingViewport).toEqual({ width: 1216, height: 600 });
+    expect(webglState.glyphResolution).toEqual({ width: 1216, height: 600 });
 
     await view.setVisible(false);
     expect(observer.disconnect).toHaveBeenCalled();

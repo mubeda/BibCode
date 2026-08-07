@@ -9,7 +9,10 @@ mod watcher;
 #[allow(unused_imports)]
 pub use entries::{BrowseEntry, BrowseResult};
 pub use error::WorkspaceError;
-pub use rpc::{AssetContextResolver, TASK_SIX_RPC_METHODS, WorkspaceRpc, WorkspaceRpcDependencies};
+pub use rpc::{
+    AssetContextResolver, TASK_SIX_RPC_METHODS, WorkspaceMutationFuture, WorkspaceMutationObserver,
+    WorkspaceRpc, WorkspaceRpcDependencies,
+};
 #[allow(unused_imports)]
 pub use search::{EntryKind, SearchLimits, SearchResult, WorkspaceEntry, WorkspaceSearchIndex};
 #[allow(unused_imports)]

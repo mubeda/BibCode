@@ -44,6 +44,7 @@ struct RepositoryState {
     local: VcsStatusLocalResult,
     remote: Option<Option<VcsStatusRemoteResult>>,
     subscribers: HashMap<u64, mpsc::Sender<VcsStatusStreamEvent>>,
+    local_refresh_requests: watch::Sender<u64>,
     poller_cancellation: CancellationToken,
 }
 
@@ -120,20 +121,21 @@ impl StatusBroadcaster {
             .await?;
         let (sender, receiver) = mpsc::channel(self.inner.subscriber_capacity);
 
-        let (subscriber_id, start_poller, poller_cancellation) = {
+        let (subscriber_id, start_poller, poller_cancellation, local_refresh_requests) = {
             let mut state = self.lock_state();
             let subscriber_id = state.next_subscriber_id;
             state.next_subscriber_id = state.next_subscriber_id.wrapping_add(1);
             let start_poller = !state.repositories.contains_key(&cwd);
-            let entry = state
-                .repositories
-                .entry(cwd.clone())
-                .or_insert_with(|| RepositoryState {
+            let entry = state.repositories.entry(cwd.clone()).or_insert_with(|| {
+                let (local_refresh_requests, _) = watch::channel(0);
+                RepositoryState {
                     local: local.clone(),
                     remote: None,
                     subscribers: HashMap::new(),
+                    local_refresh_requests,
                     poller_cancellation: CancellationToken::new(),
-                });
+                }
+            });
             entry.subscribers.insert(subscriber_id, sender);
             let initial_remote = entry.remote.clone().flatten();
             entry
@@ -149,10 +151,11 @@ impl StatusBroadcaster {
                 subscriber_id,
                 start_poller,
                 entry.poller_cancellation.clone(),
+                entry.local_refresh_requests.subscribe(),
             )
         };
         if start_poller {
-            self.spawn_status_poller(cwd.clone(), poller_cancellation);
+            self.spawn_status_poller(cwd.clone(), poller_cancellation, local_refresh_requests);
         }
         Ok(StatusSubscription {
             receiver,
@@ -192,6 +195,18 @@ impl StatusBroadcaster {
             entry.poller_cancellation.cancel();
         }
         Ok(local)
+    }
+
+    pub async fn notify_local_change(&self, cwd: &Path) {
+        let cwd = tokio::fs::canonicalize(cwd)
+            .await
+            .unwrap_or_else(|_| cwd.to_path_buf());
+        let mut state = self.lock_state();
+        if let Some(entry) = state.repositories.get_mut(&cwd) {
+            entry
+                .local_refresh_requests
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
+        }
     }
 
     async fn refresh_ref(
@@ -292,7 +307,12 @@ impl StatusBroadcaster {
         self.lock_state().repositories.len()
     }
 
-    fn spawn_status_poller(&self, cwd: PathBuf, cancellation: CancellationToken) {
+    fn spawn_status_poller(
+        &self,
+        cwd: PathBuf,
+        cancellation: CancellationToken,
+        mut local_refresh_requests: watch::Receiver<u64>,
+    ) {
         let broadcaster = self.clone();
         tokio::spawn(async move {
             let mut ref_interval = tokio::time::interval(broadcaster.inner.ref_refresh_interval);
@@ -312,6 +332,13 @@ impl StatusBroadcaster {
             loop {
                 tokio::select! {
                     _ = cancellation.cancelled() => break,
+                    changed = local_refresh_requests.changed() => {
+                        if changed.is_err() {
+                            break;
+                        }
+                        local_refresh_requests.borrow_and_update();
+                        let _ = broadcaster.refresh_local(&cwd, &cancellation).await;
+                    }
                     _ = local_status_interval.tick() => {
                         let _ = broadcaster.refresh_local(&cwd, &cancellation).await;
                     }

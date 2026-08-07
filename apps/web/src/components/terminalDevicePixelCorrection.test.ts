@@ -73,14 +73,17 @@ describe("observeCanvasDevicePixelSize", () => {
       cssWidth: 608,
       cssHeight: 300,
     });
-    const requestRedraw = vi.fn();
+    const resizeBackingStore = vi.fn((width: number, height: number) => {
+      canvas.width = width;
+      canvas.height = height;
+    });
 
-    const disposable = observeCanvasDevicePixelSize(canvas, requestRedraw);
+    const disposable = observeCanvasDevicePixelSize(canvas, resizeBackingStore);
     resizeObservers[0]?.emit();
 
     expect(canvas.width).toBe(1216);
     expect(canvas.height).toBe(600);
-    expect(requestRedraw).toHaveBeenCalledTimes(1);
+    expect(resizeBackingStore).toHaveBeenCalledWith(1216, 600);
 
     disposable.dispose();
     expect(resizeObservers[0]?.disconnected).toBe(true);
@@ -94,13 +97,13 @@ describe("observeCanvasDevicePixelSize", () => {
       cssWidth: 608,
       cssHeight: 300,
     });
-    const requestRedraw = vi.fn();
+    const resizeBackingStore = vi.fn();
 
-    observeCanvasDevicePixelSize(canvas, requestRedraw).dispose();
+    observeCanvasDevicePixelSize(canvas, resizeBackingStore).dispose();
 
     expect(resizeObservers).toHaveLength(0);
     expect(canvas.width).toBe(1215);
-    expect(requestRedraw).not.toHaveBeenCalled();
+    expect(resizeBackingStore).not.toHaveBeenCalled();
   });
 
   it("leaves an already-exact backing store alone so it never redraws in a loop", () => {
@@ -111,14 +114,14 @@ describe("observeCanvasDevicePixelSize", () => {
       cssWidth: 608,
       cssHeight: 300,
     });
-    const requestRedraw = vi.fn();
+    const resizeBackingStore = vi.fn();
 
-    observeCanvasDevicePixelSize(canvas, requestRedraw);
+    observeCanvasDevicePixelSize(canvas, resizeBackingStore);
     resizeObservers[0]?.emit();
     resizeObservers[0]?.emit();
 
     expect(canvas.width).toBe(1216);
-    expect(requestRedraw).not.toHaveBeenCalled();
+    expect(resizeBackingStore).not.toHaveBeenCalled();
   });
 
   it("ignores a hidden canvas rather than collapsing it to zero", () => {
@@ -129,13 +132,13 @@ describe("observeCanvasDevicePixelSize", () => {
       cssWidth: 0,
       cssHeight: 0,
     });
-    const requestRedraw = vi.fn();
+    const resizeBackingStore = vi.fn();
 
-    observeCanvasDevicePixelSize(canvas, requestRedraw);
+    observeCanvasDevicePixelSize(canvas, resizeBackingStore);
     resizeObservers[0]?.emit();
 
     expect(canvas.width).toBe(1216);
     expect(canvas.height).toBe(600);
-    expect(requestRedraw).not.toHaveBeenCalled();
+    expect(resizeBackingStore).not.toHaveBeenCalled();
   });
 });
