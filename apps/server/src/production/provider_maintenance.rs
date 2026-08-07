@@ -53,8 +53,8 @@ mod tests {
                 "claudeAgent",
                 "claude",
                 Some("/opt/homebrew/bin/claude"),
-                Some("/opt/homebrew/Cellar/claude-code/2.1.0/bin/claude"),
-                Some("brew upgrade claude-code"),
+                Some("/opt/homebrew/Caskroom/claude-code/2.1.0/claude"),
+                Some("brew upgrade --cask claude-code"),
             ),
             (
                 "opencode",
@@ -700,14 +700,21 @@ mod tests {
     async fn fetches_different_package_versions_concurrently() {
         let (registry_url, concurrent_requests) = delayed_npm_registry_fixture("9.9.9").await;
         let maintenance = ProviderMaintenance::with_registry_base_url(registry_url);
-        let codex_target = target("codex", "codex");
-        let claude_target = target("claudeAgent", "claude");
+        let directory = tempfile::tempdir().expect("package manager directory");
+        let package_bin = directory.path().join("node_modules/.bin");
+        std::fs::create_dir_all(&package_bin).expect("package manager bin");
+        let codex_binary = package_bin.join("codex");
+        let opencode_binary = package_bin.join("opencode");
+        std::fs::write(&codex_binary, b"fixture").expect("Codex fixture");
+        std::fs::write(&opencode_binary, b"fixture").expect("OpenCode fixture");
+        let codex_target = target("codex", &codex_binary.to_string_lossy());
+        let opencode_target = target("opencode", &opencode_binary.to_string_lossy());
         let mut codex = installed_snapshot("codex", "1.0.0");
-        let mut claude = installed_snapshot("claudeAgent", "1.0.0");
+        let mut opencode = installed_snapshot("opencode", "1.0.0");
 
         tokio::join!(
             maintenance.enrich_snapshot(&codex_target, &mut codex, true),
-            maintenance.enrich_snapshot(&claude_target, &mut claude, true),
+            maintenance.enrich_snapshot(&opencode_target, &mut opencode, true),
         );
 
         assert!(concurrent_requests.load(Ordering::SeqCst) >= 2);
@@ -830,6 +837,77 @@ mod tests {
             .await
             .expect_err("sleep command must time out");
         assert!(error.contains("timed out"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_claude_package_actions_run_through_cmd_shims() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("update shim directory");
+        let winget_capture = directory.path().join("winget-args.txt");
+        let npm_capture = directory.path().join("npm-args.txt");
+        std::fs::write(
+            directory.path().join("winget.cmd"),
+            "@echo off\r\n> \"%WINGET_CAPTURE%\" echo %*\r\nexit /b 0\r\n",
+        )
+        .expect("WinGet shim");
+        std::fs::write(
+            directory.path().join("npm.cmd"),
+            "@echo off\r\n> \"%NPM_CAPTURE%\" echo %*\r\nexit /b 0\r\n",
+        )
+        .expect("npm shim");
+        let target = ProviderMaintenanceTarget {
+            instance_id: "claude-windows".to_owned(),
+            driver: "claudeAgent".to_owned(),
+            binary_path: "claude".to_owned(),
+            environment: vec![
+                ("PATH".into(), directory.path().as_os_str().to_owned()),
+                (
+                    "WINGET_CAPTURE".into(),
+                    winget_capture.as_os_str().to_owned(),
+                ),
+                ("NPM_CAPTURE".into(), npm_capture.as_os_str().to_owned()),
+            ],
+        };
+        let cases = [
+            (
+                super::source::capabilities_for_paths(
+                    &target,
+                    Some(Path::new(
+                        "C:/Users/me/AppData/Local/Microsoft/WinGet/Links/claude.exe",
+                    )),
+                    None,
+                ),
+                &winget_capture,
+                "upgrade Anthropic.ClaudeCode",
+            ),
+            (
+                super::source::capabilities_for_paths(
+                    &target,
+                    Some(Path::new("C:/Users/me/AppData/Roaming/npm/claude.cmd")),
+                    None,
+                ),
+                &npm_capture,
+                "install -g @anthropic-ai/claude-code@latest",
+            ),
+        ];
+        for (capabilities, capture, expected) in cases {
+            let result = ProviderMaintenance::new()
+                .run_update_command(
+                    &target,
+                    capabilities.update.as_ref().expect("executable action"),
+                    &CancellationToken::new(),
+                )
+                .await
+                .expect("update command result");
+            assert_eq!(result.exit_code, 0);
+            assert_eq!(
+                std::fs::read_to_string(capture)
+                    .expect("captured arguments")
+                    .trim(),
+                expected
+            );
+        }
     }
 
     #[tokio::test]
@@ -1329,7 +1407,18 @@ impl ProviderMaintenance {
             Some(path) => tokio::fs::canonicalize(path).await.ok(),
             None => None,
         };
-        source::capabilities_for_paths(target, resolved.as_deref(), canonical.as_deref())
+        if target.driver == "claudeAgent" {
+            let hints = source::discover_claude_hints(target, resolved.as_deref()).await;
+            source::capabilities_for_paths_with_claude_hints(
+                &target.driver,
+                &target.binary_path,
+                resolved.as_deref(),
+                canonical.as_deref(),
+                &hints,
+            )
+        } else {
+            source::capabilities_for_paths(target, resolved.as_deref(), canonical.as_deref())
+        }
     }
 
     pub(crate) async fn run_update_command(
