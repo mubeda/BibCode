@@ -19,6 +19,28 @@ Shadow home path: empty
 An empty `CODEX_HOME path` lets Codex use its normal default. BiBCode resolves
 that default as `~/.codex` when grouping Codex state internally.
 
+## Updates and version advisories
+
+BiBCode identifies the installation from the resolved `codex` executable and
+its canonical target. It does not use a separate package-manager inventory,
+because another inventory can describe a different Codex installation.
+
+- Official standalone installations use the resolved executable's `codex update`
+  action.
+- Homebrew cask installations use `brew upgrade --cask codex`.
+- Recognized npm, pnpm, Bun, and Vite+ package-manager paths use their matching
+  global-install command.
+
+Each recognized Codex row obtains its latest-version advisory from npm's
+`@openai/codex` latest document; the action is still selected from the
+installation source above.
+
+An arbitrary custom executable or wrapper is manual-only: BiBCode withholds
+both its latest-version advisory and update action rather than applying a
+package-manager command to an unproven installation. After an update command
+exits successfully, BiBCode reprobes the same instance; it reports success only
+when a fresh advisory is current or the installed version provably advanced.
+
 ## Shared state with separate authentication
 
 Codex can use a shared home for sessions and configuration while keeping a

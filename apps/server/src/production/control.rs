@@ -26,6 +26,7 @@ use crate::{
         keybindings, local_servers, provider_inventory,
         provider_maintenance::{
             ProviderMaintenance, ProviderMaintenanceTarget, ProviderUpdateLifecycleToken,
+            provider_version_advanced, provider_version_regressed,
         },
         server_terminal::{JsonFuture, JsonStream, ProductionServerControl},
     },
@@ -86,12 +87,26 @@ fn provider_update_state(
     })
 }
 
-fn post_update_status(providers: &[Value], instance_id: &str) -> &'static str {
-    match providers
+fn post_update_status(
+    providers: &[Value],
+    instance_id: &str,
+    before_version: Option<&str>,
+) -> &'static str {
+    let Some(provider) = providers
         .iter()
         .find(|provider| provider["instanceId"] == instance_id)
-    {
-        Some(provider) if provider["versionAdvisory"]["status"] == "current" => "succeeded",
+    else {
+        return "unchanged";
+    };
+    let driver = provider["driver"].as_str().unwrap_or_default();
+    let after_version = provider["version"].as_str();
+    match provider["versionAdvisory"]["status"].as_str() {
+        Some("current") if provider_version_regressed(driver, before_version, after_version) => {
+            "unchanged"
+        }
+        Some("current") => "succeeded",
+        Some("behind_latest") => "unchanged",
+        _ if provider_version_advanced(driver, before_version, after_version) => "succeeded",
         _ => "unchanged",
     }
 }
@@ -441,9 +456,14 @@ impl NativeServerControl {
             }
             commit_control
                 .provider_maintenance
-                .invalidate_update_lifecycles(|instance_id, driver| {
-                    provider_inventory::maintenance_target(&next, driver, Some(instance_id))
-                        .is_some()
+                .invalidate_update_lifecycles(generation, |target| {
+                    provider_inventory::maintenance_target(
+                        &next,
+                        &target.driver,
+                        Some(&target.instance_id),
+                    )
+                    .as_ref()
+                        == Some(target)
                 });
             *commit_control.settings.write().await = next.clone();
             let next_fetch_interval = automatic_git_fetch_interval(&next);
@@ -521,6 +541,7 @@ impl NativeServerControl {
     }
 
     async fn refresh_providers(&self, payload: &Value) -> Value {
+        self.provider_maintenance.begin_latest_version_refresh();
         let instance_id = payload.get("instanceId").and_then(Value::as_str);
         let (generation, settings) = self.settings_snapshot().await;
         let cwd = std::env::current_dir().unwrap_or_else(|_| self.config.base_dir.clone());
@@ -549,22 +570,25 @@ impl NativeServerControl {
         target: &ProviderMaintenanceTarget,
         token: ProviderUpdateLifecycleToken,
         state: Value,
-    ) -> Vec<Value> {
+    ) -> (Vec<Value>, bool) {
         let _update_guard = self.settings_update_lock.lock().await;
+        let generation = self.settings_generation.load(Ordering::Acquire);
         let configured = provider_inventory::maintenance_target(
             &*self.settings.read().await,
             &target.driver,
             Some(&target.instance_id),
-        )
-        .is_some();
-        if configured {
-            self.provider_maintenance.set_update_state_if_current(
+        );
+        let retained = configured.as_ref() == Some(target)
+            && self
+                .provider_maintenance
+                .update_lifecycle_is_current(target, generation, token)
+            && self.provider_maintenance.set_update_state_if_current(
                 &target.instance_id,
                 &target.driver,
                 token,
                 state,
             );
-        } else {
+        if !retained {
             self.provider_maintenance
                 .invalidate_update_lifecycle_if_current(&target.instance_id, &target.driver, token);
         }
@@ -575,7 +599,7 @@ impl NativeServerControl {
         let snapshot = providers.clone();
         drop(providers);
         self.publish_provider_snapshots(&snapshot);
-        snapshot
+        (snapshot, retained)
     }
 
     async fn update_provider(
@@ -605,7 +629,7 @@ impl NativeServerControl {
                 ));
             }
         };
-        let (_, settings) = self.settings_snapshot().await;
+        let (settings_generation, settings) = self.settings_snapshot().await;
         let target = provider_inventory::maintenance_target(&settings, provider, instance_id)
             .ok_or_else(|| {
                 provider_update_error(
@@ -635,7 +659,7 @@ impl NativeServerControl {
                 ));
             }
             self.provider_maintenance
-                .reserve_target(&target.instance_id, &target.driver)
+                .reserve_target(&target, settings_generation)
         }
         .map_err(|reason| provider_update_error(provider, reason))?;
         let update_token = reservation.token();
@@ -643,23 +667,24 @@ impl NativeServerControl {
         let command_guard = match lock.clone().try_lock_owned() {
             Ok(guard) => guard,
             Err(_) => {
-                self.publish_provider_update_state(
-                    &target,
-                    update_token,
-                    provider_update_state(
-                        "queued",
-                        None,
-                        None,
-                        "Waiting for another provider update to finish.",
-                        None,
-                    ),
-                )
-                .await;
+                let _ = self
+                    .publish_provider_update_state(
+                        &target,
+                        update_token,
+                        provider_update_state(
+                            "queued",
+                            None,
+                            None,
+                            "Waiting for another provider update to finish.",
+                            None,
+                        ),
+                    )
+                    .await;
                 tokio::select! {
                     guard = lock.lock_owned() => guard,
                     () = cancellation.cancelled() => {
                         let finished_at = now_iso();
-                        let providers = self.publish_provider_update_state(
+                        let (providers, _) = self.publish_provider_update_state(
                             &target,
                             update_token,
                             provider_update_state(
@@ -675,19 +700,98 @@ impl NativeServerControl {
                 }
             }
         };
+        let (current_generation, current_settings) = self.settings_snapshot().await;
+        let current_target = provider_inventory::maintenance_target(
+            &current_settings,
+            &target.driver,
+            Some(&target.instance_id),
+        );
+        let current_update = match current_target.as_ref() {
+            Some(current_target) if current_target == &target => {
+                self.provider_maintenance
+                    .capabilities(current_target)
+                    .await
+                    .update
+            }
+            _ => None,
+        };
+        if current_update.as_ref() != Some(&update)
+            || !self.provider_maintenance.update_lifecycle_is_current(
+                &target,
+                current_generation,
+                update_token,
+            )
+        {
+            drop(command_guard);
+            self.provider_maintenance
+                .invalidate_update_lifecycle_if_current(
+                    &target.instance_id,
+                    &target.driver,
+                    update_token,
+                );
+            let (providers, _) = self
+                .publish_provider_update_state(
+                    &target,
+                    update_token,
+                    provider_update_state(
+                        "failed",
+                        None,
+                        Some(&now_iso()),
+                        "Provider settings changed before the queued update could start.",
+                        None,
+                    ),
+                )
+                .await;
+            return Ok(json!({ "providers": providers }));
+        }
+        let cwd = std::env::current_dir().unwrap_or_else(|_| self.config.base_dir.clone());
+        let before_version =
+            provider_inventory::probe_maintenance_target_version(&target, &cwd).await;
+        let (_, pre_run_settings) = self.settings_snapshot().await;
+        let pre_run_target = provider_inventory::maintenance_target(
+            &pre_run_settings,
+            &target.driver,
+            Some(&target.instance_id),
+        );
+        let pre_run_update = match pre_run_target.as_ref() {
+            Some(pre_run_target) if pre_run_target == &target => {
+                self.provider_maintenance
+                    .capabilities(pre_run_target)
+                    .await
+                    .update
+            }
+            _ => None,
+        };
+        if pre_run_update.as_ref() != Some(&update) {
+            drop(command_guard);
+            self.provider_maintenance
+                .invalidate_update_lifecycle_if_current(
+                    &target.instance_id,
+                    &target.driver,
+                    update_token,
+                );
+            let providers = self.providers.read().await.clone();
+            return Ok(json!({ "providers": providers }));
+        }
         let started_at = now_iso();
-        self.publish_provider_update_state(
-            &target,
-            update_token,
-            provider_update_state(
-                "running",
-                Some(&started_at),
-                None,
-                "Updating provider.",
-                None,
-            ),
-        )
-        .await;
+        let (_, running_published) = self
+            .publish_provider_update_state(
+                &target,
+                update_token,
+                provider_update_state(
+                    "running",
+                    Some(&started_at),
+                    None,
+                    "Updating provider.",
+                    None,
+                ),
+            )
+            .await;
+        if !running_published {
+            drop(command_guard);
+            let providers = self.providers.read().await.clone();
+            return Ok(json!({ "providers": providers }));
+        }
         let command_result = match self
             .provider_maintenance
             .run_update_command(&target, &update, &cancellation)
@@ -697,7 +801,7 @@ impl NativeServerControl {
             Err(error) => {
                 drop(command_guard);
                 let finished_at = now_iso();
-                let providers = self
+                let (providers, _) = self
                     .publish_provider_update_state(
                         &target,
                         update_token,
@@ -720,7 +824,7 @@ impl NativeServerControl {
                 "Update command exited with code {}.",
                 command_result.exit_code
             );
-            let providers = self
+            let (providers, _) = self
                 .publish_provider_update_state(
                     &target,
                     update_token,
@@ -737,8 +841,8 @@ impl NativeServerControl {
         }
         drop(command_guard);
 
+        self.provider_maintenance.begin_latest_version_refresh();
         let (generation, settings) = self.settings_snapshot().await;
-        let cwd = std::env::current_dir().unwrap_or_else(|_| self.config.base_dir.clone());
         let probe_sequence = self.begin_provider_probe();
         let refreshed = self
             .probe_full_provider_snapshots(&settings, Some(&target.instance_id), &cwd)
@@ -758,7 +862,11 @@ impl NativeServerControl {
             .await
         {
             Some(_) => {
-                let status = post_update_status(&verification, &target.instance_id);
+                let status = post_update_status(
+                    &verification,
+                    &target.instance_id,
+                    before_version.as_deref(),
+                );
                 let message = match status {
                     "succeeded" => "Provider updated.",
                     _ if verification.iter().any(|provider| {
@@ -780,7 +888,7 @@ impl NativeServerControl {
             ),
         };
         let finished_at = now_iso();
-        let providers = self
+        let (providers, _) = self
             .publish_provider_update_state(
                 &target,
                 update_token,
@@ -1561,6 +1669,7 @@ fn validate_provider_instances(instances: &Value) -> Result<(), String> {
             let environment = environment.as_array().ok_or_else(|| {
                 format!("providerInstances.{instance_id}.environment must be an array")
             })?;
+            let mut names: Vec<&str> = Vec::with_capacity(environment.len());
             for (index, variable) in environment.iter().enumerate() {
                 let variable = variable.as_object().ok_or_else(|| {
                     format!(
@@ -1587,6 +1696,15 @@ fn validate_provider_instances(instances: &Value) -> Result<(), String> {
                         "providerInstances.{instance_id}.environment[{index}].name is invalid"
                     ));
                 }
+                if let Some(existing) = names
+                    .iter()
+                    .find(|existing| existing.eq_ignore_ascii_case(name.trim()))
+                {
+                    return Err(format!(
+                        "providerInstances.{instance_id}.environment[{index}].name duplicates {existing}"
+                    ));
+                }
+                names.push(name.trim());
                 validate_optional_string(variable, "value")?;
                 validate_optional_bool(variable, "sensitive")?;
                 validate_optional_bool(variable, "valueRedacted")?;
@@ -1947,7 +2065,14 @@ pub(crate) fn now_iso() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Mutex as StdMutex, time::Duration};
+    use std::{
+        sync::{Mutex as StdMutex, atomic::AtomicUsize},
+        time::Duration,
+    };
+
+    use axum::{Json, Router, extract::State, routing::get};
+    use tokio::net::TcpListener;
+    use url::Url;
 
     use crate::{
         activity::AgentActivityController,
@@ -1961,82 +2086,212 @@ mod tests {
 
     #[test]
     fn post_update_verification_distinguishes_success_and_unchanged() {
-        let current = json!({
+        let codex = |status: &str, version: &str| {
+            json!({
+                "instanceId": "codex",
+                "driver": "codex",
+                "version": version,
+                "versionAdvisory": { "status": status }
+            })
+        };
+        let cursor = |status: &str, version: &str| {
+            json!({
+                "instanceId": "cursor",
+                "driver": "cursor",
+                "version": version,
+                "versionAdvisory": { "status": status }
+            })
+        };
+
+        assert_eq!(
+            post_update_status(&[codex("current", "0.147.0")], "codex", Some("0.146.0")),
+            "succeeded"
+        );
+        assert_eq!(
+            post_update_status(
+                &[codex("behind_latest", "0.147.0")],
+                "codex",
+                Some("0.146.0")
+            ),
+            "unchanged"
+        );
+        assert_eq!(
+            post_update_status(&[], "codex", Some("0.146.0")),
+            "unchanged"
+        );
+        assert_eq!(
+            post_update_status(&[codex("unknown", "0.147.0")], "codex", Some("0.147.0")),
+            "unchanged"
+        );
+        assert_eq!(
+            post_update_status(
+                &[cursor("unknown", "2026.08.04-aaa8809")],
+                "cursor",
+                Some("2026.06.19-653a7fb")
+            ),
+            "succeeded"
+        );
+        assert_eq!(
+            post_update_status(
+                &[cursor("unknown", "2026.08.04-bbbb")],
+                "cursor",
+                Some("2026.08.04-aaaa")
+            ),
+            "unchanged"
+        );
+        assert_eq!(
+            post_update_status(&[codex("unknown", "0.146.0")], "codex", Some("0.147.0")),
+            "unchanged"
+        );
+        assert_eq!(
+            post_update_status(&[codex("current", "0.147.0")], "codex", Some("0.147.0")),
+            "succeeded"
+        );
+        assert_eq!(
+            post_update_status(&[codex("current", "0.147.0")], "codex", None),
+            "succeeded"
+        );
+        assert_eq!(
+            post_update_status(
+                &[cursor("current", "2026.08.04-bbbb")],
+                "cursor",
+                Some("2026.08.04-aaaa")
+            ),
+            "succeeded"
+        );
+    }
+
+    #[test]
+    fn post_update_verification_rejects_semver_downgrades_despite_current_advisory() {
+        let downgraded = json!({
             "instanceId": "codex",
+            "driver": "codex",
+            "version": "0.146.0",
             "versionAdvisory": { "status": "current" }
         });
-        let behind = json!({
-            "instanceId": "codex",
-            "versionAdvisory": { "status": "behind_latest" }
+
+        assert_eq!(
+            post_update_status(&[downgraded], "codex", Some("0.147.0")),
+            "unchanged"
+        );
+    }
+
+    #[test]
+    fn post_update_verification_rejects_cursor_downgrades_despite_current_advisory() {
+        let downgraded = json!({
+            "instanceId": "cursor",
+            "driver": "cursor",
+            "version": "2026.06.19-653a7fb",
+            "versionAdvisory": { "status": "current" }
         });
-        let unknown = json!({
-            "instanceId": "codex",
-            "versionAdvisory": { "status": "unknown" }
-        });
-        assert_eq!(post_update_status(&[current], "codex"), "succeeded");
-        assert_eq!(post_update_status(&[behind], "codex"), "unchanged");
-        assert_eq!(post_update_status(&[unknown], "codex"), "unchanged");
-        assert_eq!(post_update_status(&[], "codex"), "unchanged");
+
+        assert_eq!(
+            post_update_status(&[downgraded], "cursor", Some("2026.08.04-aaa8809")),
+            "unchanged"
+        );
+    }
+
+    #[test]
+    fn cursor_update_fixture_uses_official_binary_names() {
+        assert_eq!(cursor_update_fixture_executable_name(false), "cursor-agent");
+        assert_eq!(
+            cursor_update_fixture_executable_name(true),
+            "cursor-agent.exe"
+        );
+    }
+
+    fn cursor_update_fixture_executable_name(windows: bool) -> &'static str {
+        if windows {
+            "cursor-agent.exe"
+        } else {
+            "cursor-agent"
+        }
+    }
+
+    async fn compile_cursor_update_fixture(directory: &Path, version: &str) -> PathBuf {
+        let release_directory =
+            directory.join(".local/share/cursor-agent/versions/2026.06.19-653a7fb");
+        tokio::fs::create_dir_all(&release_directory)
+            .await
+            .expect("create Cursor release directory");
+        tokio::fs::write(release_directory.join("version-state"), version)
+            .await
+            .expect("write Cursor version state");
+        let executable =
+            release_directory.join(cursor_update_fixture_executable_name(cfg!(windows)));
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cursor_update_fixture.rs");
+        let output = tokio::process::Command::new(
+            std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
+        )
+        .arg("--edition=2024")
+        .arg(source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .await
+        .expect("compile Cursor update fixture");
+        assert!(
+            output.status.success(),
+            "compile Cursor update fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        executable
+    }
+
+    #[tokio::test]
+    async fn compiled_cursor_update_fixture_reports_and_advances_its_version() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("Cursor fixture directory");
+        let executable =
+            compile_cursor_update_fixture(directory.path(), "2026.06.19-653a7fb").await;
+        let release_directory = executable.parent().expect("Cursor release directory");
+        tokio::fs::write(release_directory.join("next-version"), "2026.08.04-aaa8809")
+            .await
+            .expect("write next Cursor version");
+
+        let before = tokio::process::Command::new(&executable)
+            .arg("about")
+            .output()
+            .await
+            .expect("run Cursor about before update");
+        assert_eq!(
+            String::from_utf8_lossy(&before.stdout).trim(),
+            r#"{"cliVersion":"2026.06.19-653a7fb"}"#
+        );
+        let update = tokio::process::Command::new(&executable)
+            .arg("update")
+            .output()
+            .await
+            .expect("run Cursor update");
+        assert!(update.status.success());
+        let after = tokio::process::Command::new(&executable)
+            .arg("about")
+            .output()
+            .await
+            .expect("run Cursor about after update");
+        assert_eq!(
+            String::from_utf8_lossy(&after.stdout).trim(),
+            r#"{"cliVersion":"2026.08.04-aaa8809"}"#
+        );
     }
 
     async fn write_cursor_update_fixture(directory: &Path) -> PathBuf {
-        #[cfg(windows)]
-        let (name, contents) = (
-            "cursor.cmd",
-            "@echo off\r\nif \"%1\"==\"about\" (echo {\"cliVersion\":\"9.8.7\"}& exit /b 0)\r\necho cursor updated\r\n",
-        );
-        #[cfg(not(windows))]
-        let (name, contents) = (
-            "cursor",
-            "#!/bin/sh\nif [ \"$1\" = \"about\" ]; then\n  echo '{\"cliVersion\":\"9.8.7\"}'\nelse\n  echo 'cursor updated'\nfi\n",
-        );
-        let path = directory.join(name);
-        tokio::fs::write(&path, contents)
-            .await
-            .expect("write cursor fixture");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mut permissions = tokio::fs::metadata(&path)
-                .await
-                .expect("cursor fixture metadata")
-                .permissions();
-            permissions.set_mode(0o755);
-            tokio::fs::set_permissions(&path, permissions)
-                .await
-                .expect("make cursor fixture executable");
-        }
-        path
+        compile_cursor_update_fixture(directory, "9.8.7").await
     }
 
     async fn write_slow_cursor_update_fixture(directory: &Path) -> PathBuf {
-        #[cfg(windows)]
-        let (name, contents) = (
-            "slow-cursor.cmd",
-            "@echo off\r\nif \"%1\"==\"about\" (echo {\"cliVersion\":\"9.8.7\"}& exit /b 0)\r\npowershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 2\"\r\n",
-        );
-        #[cfg(not(windows))]
-        let (name, contents) = (
-            "slow-cursor",
-            "#!/bin/sh\nif [ \"$1\" = \"about\" ]; then\n  echo '{\"cliVersion\":\"9.8.7\"}'\nelse\n  sleep 2\nfi\n",
-        );
-        let path = directory.join(name);
-        tokio::fs::write(&path, contents)
-            .await
-            .expect("write slow cursor fixture");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mut permissions = tokio::fs::metadata(&path)
-                .await
-                .expect("slow cursor fixture metadata")
-                .permissions();
-            permissions.set_mode(0o755);
-            tokio::fs::set_permissions(&path, permissions)
-                .await
-                .expect("make slow cursor fixture executable");
-        }
-        path
+        let executable = compile_cursor_update_fixture(directory, "9.8.7").await;
+        tokio::fs::write(
+            executable
+                .parent()
+                .expect("Cursor release directory")
+                .join("update-sleep-ms"),
+            "2000",
+        )
+        .await
+        .expect("write Cursor update delay");
+        executable
     }
 
     async fn control_with_cursor_update_fixture(executable: PathBuf) -> NativeServerControl {
@@ -2094,6 +2349,279 @@ mod tests {
         .await
         .expect("write settings");
         NativeServerControl::new(config, json!({"policy":"test"})).await
+    }
+
+    async fn mutable_provider_registry(
+        version: &str,
+    ) -> (Url, Arc<tokio::sync::RwLock<String>>, Arc<AtomicUsize>) {
+        let version = Arc::new(tokio::sync::RwLock::new(version.to_owned()));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let state = (version.clone(), requests.clone());
+        let app = Router::new()
+            .route(
+                "/opencode-ai/latest",
+                get(
+                    |State((version, requests)): State<(
+                        Arc<tokio::sync::RwLock<String>>,
+                        Arc<AtomicUsize>,
+                    )>| async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "version": version.read().await.clone() }))
+                    },
+                ),
+            )
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("registry listener");
+        let address = listener.local_addr().expect("registry address");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("registry server") });
+        (
+            Url::parse(&format!("http://{address}/")).expect("registry URL"),
+            version,
+            requests,
+        )
+    }
+
+    async fn cursor_installer_registry() -> (Url, Arc<AtomicUsize>) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/",
+                get(|State(requests): State<Arc<AtomicUsize>>| async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    "DOWNLOAD_URL=\"https://downloads.cursor.com/lab/2026.08.04-aaa8809/${OS}/${ARCH}/agent-cli-package.tar.gz\"\nFINAL_DIR=\"$HOME/.local/share/cursor-agent/versions/2026.08.04-aaa8809\""
+                }),
+            )
+            .with_state(requests.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Cursor installer registry listener");
+        let address = listener.local_addr().expect("Cursor installer address");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("registry server") });
+        (
+            Url::parse(&format!("http://{address}/")).expect("Cursor installer URL"),
+            requests,
+        )
+    }
+
+    #[tokio::test]
+    async fn provider_update_invalidates_latest_version_only_after_zero_exit() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("state directory");
+        let executable =
+            compile_cursor_update_fixture(directory.path(), "2026.06.19-653a7fb").await;
+        let config = ServerConfig::new(directory.path());
+        tokio::fs::create_dir_all(config.state_dir())
+            .await
+            .expect("state directory exists");
+        tokio::fs::write(
+            config.state_dir().join("settings.json"),
+            serde_json::to_vec(&json!({
+                "enableProviderUpdateChecks": true,
+                "providerInstances": {
+                    "cursor-work": {
+                        "driver": "cursor",
+                        "enabled": true,
+                        "config": { "binaryPath": executable }
+                    }
+                }
+            }))
+            .expect("settings JSON"),
+        )
+        .await
+        .expect("write settings");
+        let mut control = NativeServerControl::new(config, json!({})).await;
+        let (installer_url, requests) = cursor_installer_registry().await;
+        control.provider_maintenance =
+            ProviderMaintenance::with_cursor_installer_url(installer_url);
+
+        control
+            .refresh_providers(&json!({ "instanceId": "cursor-work" }))
+            .await;
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        let release_directory = executable.parent().expect("Cursor release directory");
+        tokio::fs::write(release_directory.join("update-exit-code"), "7")
+            .await
+            .expect("write failing update exit code");
+        let failed = control
+            .update_provider(
+                &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("non-zero update returns snapshots");
+        let failed_provider = failed["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("failed Cursor provider");
+        assert_eq!(failed_provider["updateState"]["status"], "failed");
+        let (_, settings) = control.settings_snapshot().await;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| control.config.base_dir.clone());
+        control
+            .probe_full_provider_snapshots(&settings, Some("cursor-work"), &cwd)
+            .await;
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "non-zero exit must preserve the primed latest-version generation"
+        );
+
+        tokio::fs::write(release_directory.join("update-exit-code"), "0")
+            .await
+            .expect("write successful update exit code");
+        let succeeded = control
+            .update_provider(
+                &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("zero-exit update returns snapshots");
+        let succeeded_provider = succeeded["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("successful Cursor provider");
+        assert_eq!(succeeded_provider["updateState"]["status"], "unchanged");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "zero exit must invalidate before post-update verification"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_advisory_does_not_treat_stale_published_version_as_update_progress() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("state directory");
+        let executable =
+            compile_cursor_update_fixture(directory.path(), "2026.08.04-aaa8809").await;
+        let control = control_with_cursor_update_fixture(executable).await;
+
+        control
+            .refresh_providers(&json!({ "instanceId": "cursor-work" }))
+            .await;
+        let mut providers = control.providers.write().await;
+        let cursor = providers
+            .iter_mut()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("Cursor provider");
+        cursor["version"] = json!("2026.06.19-653a7fb");
+        drop(providers);
+
+        let result = control
+            .update_provider(
+                &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("no-op update returns snapshots");
+        let cursor = result["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("updated Cursor provider");
+
+        assert_eq!(cursor["versionAdvisory"]["status"], "unknown");
+        assert_eq!(cursor["version"], "2026.08.04-aaa8809");
+        assert_eq!(cursor["updateState"]["status"], "unchanged");
+    }
+
+    #[tokio::test]
+    async fn failed_exact_target_probe_disables_unknown_advisory_advancement() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("state directory");
+        let executable =
+            compile_cursor_update_fixture(directory.path(), "2026.08.04-aaa8809").await;
+        let control = control_with_cursor_update_fixture(executable.clone()).await;
+        control
+            .refresh_providers(&json!({ "instanceId": "cursor-work" }))
+            .await;
+
+        let release_directory = executable.parent().expect("Cursor release directory");
+        tokio::fs::write(
+            release_directory.join("failed-version-state"),
+            "2026.06.19-653a7fb",
+        )
+        .await
+        .expect("write failed probe version");
+        tokio::fs::write(release_directory.join("version-exit-code"), "7")
+            .await
+            .expect("write version failure");
+        tokio::fs::write(release_directory.join("about-exit-code"), "7")
+            .await
+            .expect("write about failure");
+        let (_, settings) = control.settings_snapshot().await;
+        let target =
+            provider_inventory::maintenance_target(&settings, "cursor", Some("cursor-work"))
+                .expect("Cursor maintenance target");
+        let cwd = std::env::current_dir().unwrap_or_else(|_| control.config.base_dir.clone());
+        let failed_probe =
+            provider_inventory::probe_maintenance_target_version(&target, &cwd).await;
+
+        let result = control
+            .update_provider(
+                &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("no-op update returns snapshots");
+        let cursor = result["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("updated Cursor provider");
+
+        assert_eq!(cursor["versionAdvisory"]["status"], "unknown");
+        assert_eq!(cursor["version"], "2026.08.04-aaa8809");
+        assert_eq!(cursor["updateState"]["status"], "unchanged");
+        assert_eq!(failed_probe, None);
+    }
+
+    #[tokio::test]
+    async fn manual_provider_refresh_requires_a_new_registry_result() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let mut control = scheduler_control(&temp).await;
+        let (registry_url, registry_version, requests) = mutable_provider_registry("1.18.11").await;
+        let maintenance = ProviderMaintenance::with_registry_base_url(registry_url);
+        control.provider_maintenance = maintenance.clone();
+        let target = ProviderMaintenanceTarget {
+            instance_id: "opencode".to_owned(),
+            driver: "opencode".to_owned(),
+            binary_path: "opencode".to_owned(),
+            environment: Vec::new(),
+        };
+        let mut startup = json!({
+            "instanceId": "opencode",
+            "driver": "opencode",
+            "enabled": true,
+            "installed": true,
+            "version": "1.18.11",
+            "checkedAt": "2026-08-01T12:00:00Z"
+        });
+        maintenance
+            .enrich_snapshot(&target, &mut startup, true)
+            .await;
+        *registry_version.write().await = "1.18.15".to_owned();
+
+        control.refresh_providers(&json!({})).await;
+
+        let mut after_manual_refresh = startup;
+        after_manual_refresh["checkedAt"] = json!("2026-08-01T12:05:00Z");
+        maintenance
+            .enrich_snapshot(&target, &mut after_manual_refresh, true)
+            .await;
+        assert_eq!(
+            after_manual_refresh["versionAdvisory"]["latestVersion"],
+            "1.18.15"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 
     async fn wait_for_probe_after(control: &NativeServerControl, previous: u64) -> u64 {
@@ -2358,6 +2886,175 @@ mod tests {
             .find(|provider| provider["instanceId"] == "cursor-work")
             .expect("stored re-added cursor provider");
         assert!(readded.get("updateState").is_none());
+    }
+
+    #[tokio::test]
+    async fn queued_update_revalidates_binary_and_environment_before_execution() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let old_root = tempfile::tempdir().expect("old Cursor fixture root");
+        let new_root = tempfile::tempdir().expect("new Cursor fixture root");
+        let old_executable = compile_cursor_update_fixture(old_root.path(), "2026.01.01-old").await;
+        let new_executable = compile_cursor_update_fixture(new_root.path(), "2026.02.02-new").await;
+        tokio::fs::write(
+            old_executable
+                .parent()
+                .expect("old release directory")
+                .join("next-version"),
+            "2026.03.03-stale-command-ran",
+        )
+        .await
+        .expect("old next version");
+        let control = control_with_cursor_update_fixture(old_executable.clone()).await;
+        let command_lock = control.provider_maintenance.command_lock("cursor-agent");
+        let blocker = command_lock.lock_owned().await;
+        let mut events = control.config_events.subscribe();
+        let updating = {
+            let control = control.clone();
+            tokio::spawn(async move {
+                control
+                    .update_provider(
+                        &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
+                        CancellationToken::new(),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let event = events.recv().await.expect("queued update event");
+                if event["type"] == "providerStatuses"
+                    && event["payload"]["providers"]
+                        .as_array()
+                        .is_some_and(|providers| {
+                            providers.iter().any(|provider| {
+                                provider["instanceId"] == "cursor-work"
+                                    && provider["updateState"]["status"] == "queued"
+                            })
+                        })
+                {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("queued state published");
+
+        control
+            .update_settings(json!({
+                "patch": {
+                    "providerInstances": {
+                        "cursor-work": {
+                            "driver": "cursor",
+                            "enabled": true,
+                            "config": { "binaryPath": new_executable }
+                        }
+                    }
+                }
+            }))
+            .await
+            .expect("replace queued provider target");
+        drop(blocker);
+
+        let result = updating
+            .await
+            .expect("queued update joins")
+            .expect("queued update returns snapshots");
+        assert_eq!(
+            tokio::fs::read_to_string(
+                old_executable
+                    .parent()
+                    .expect("old release directory")
+                    .join("version-state")
+            )
+            .await
+            .expect("old version state"),
+            "2026.01.01-old"
+        );
+        assert_eq!(
+            tokio::fs::read_to_string(
+                new_executable
+                    .parent()
+                    .expect("new release directory")
+                    .join("version-state")
+            )
+            .await
+            .expect("new version state"),
+            "2026.02.02-new"
+        );
+        let provider = result["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("reconfigured Cursor provider");
+        assert!(provider.get("updateState").is_none());
+    }
+
+    #[tokio::test]
+    async fn settings_change_during_fresh_preprobe_prevents_stale_command_execution() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let old_root = tempfile::tempdir().expect("old Cursor fixture root");
+        let new_root = tempfile::tempdir().expect("new Cursor fixture root");
+        let old_executable = compile_cursor_update_fixture(old_root.path(), "2026.01.01-old").await;
+        let new_executable = compile_cursor_update_fixture(new_root.path(), "2026.02.02-new").await;
+        let old_release = old_executable.parent().expect("old release directory");
+        tokio::fs::write(old_release.join("version-pause"), "pause")
+            .await
+            .expect("pause old version probe");
+        let control = control_with_cursor_update_fixture(old_executable.clone()).await;
+        let updating = {
+            let control = control.clone();
+            tokio::spawn(async move {
+                control
+                    .update_provider(
+                        &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
+                        CancellationToken::new(),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !old_release.join("version-entered").is_file() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("fresh pre-probe entered");
+
+        control
+            .update_settings(json!({
+                "patch": {
+                    "providerInstances": {
+                        "cursor-work": {
+                            "driver": "cursor",
+                            "enabled": true,
+                            "config": { "binaryPath": new_executable }
+                        }
+                    }
+                }
+            }))
+            .await
+            .expect("replace target during pre-probe");
+        tokio::fs::write(old_release.join("version-release"), "release")
+            .await
+            .expect("release old version probe");
+
+        let result = updating
+            .await
+            .expect("provider update joins")
+            .expect("stale provider update returns snapshots");
+
+        assert!(
+            !old_release.join("update-invoked").exists(),
+            "the old update command must not run after the target changes"
+        );
+        let provider = result["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("replacement Cursor provider");
+        assert!(provider.get("updateState").is_none());
     }
 
     #[tokio::test]
@@ -3892,6 +4589,26 @@ mod tests {
                 .await
                 .is_err(),
             "invalid update must not publish settings or provider events"
+        );
+    }
+
+    #[test]
+    fn duplicate_case_insensitive_provider_environment_names_are_rejected() {
+        let settings = json!({
+            "providerInstances": {
+                "codex-work": {
+                    "driver": "codex",
+                    "environment": [
+                        { "name": "PATH", "value": "/first" },
+                        { "name": "Path", "value": "/second" }
+                    ]
+                }
+            }
+        });
+
+        assert_eq!(
+            validate_settings_document(&settings).unwrap_err(),
+            "providerInstances.codex-work.environment[1].name duplicates PATH"
         );
     }
 

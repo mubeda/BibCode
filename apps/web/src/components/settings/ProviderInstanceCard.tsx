@@ -7,6 +7,7 @@ import {
   DownloadIcon,
   LoaderIcon,
   PlusIcon,
+  TriangleAlertIcon,
   Trash2Icon,
   XIcon,
 } from "lucide-react";
@@ -417,6 +418,7 @@ export function ProviderInstanceCard({
   const summary = rawSummary;
   const versionLabel = getProviderVersionLabel(liveProvider?.version);
   const versionAdvisory = getProviderVersionAdvisoryPresentation(liveProvider?.versionAdvisory);
+  const hasProviderUpdate = versionAdvisory?.kind === "update";
   const updateCommand = versionAdvisory?.updateCommand ?? null;
   const FallbackIconComponent = driverOption?.icon;
   const displayName =
@@ -627,9 +629,17 @@ export function ProviderInstanceCard({
                             ? "text-warning hover:text-warning"
                             : "text-primary hover:text-primary",
                         )}
-                        aria-label="Update available — view details"
+                        aria-label={
+                          hasProviderUpdate
+                            ? "Update available — view details"
+                            : "Provider update check failed — view details"
+                        }
                       >
-                        <ArrowUpCircleIcon className="size-3.5 [animation:bounce_2.4s_ease-in-out_infinite] motion-reduce:animate-none" />
+                        {hasProviderUpdate ? (
+                          <ArrowUpCircleIcon className="size-3.5 [animation:bounce_2.4s_ease-in-out_infinite] motion-reduce:animate-none" />
+                        ) : (
+                          <TriangleAlertIcon className="size-3.5" />
+                        )}
                       </Button>
                     }
                   />
@@ -641,7 +651,7 @@ export function ProviderInstanceCard({
                     <div className="grid min-w-0 gap-3">
                       <div className="grid gap-0.5">
                         <p className="text-[13px] font-semibold leading-tight text-foreground">
-                          Update available
+                          {versionAdvisory.title}
                         </p>
                         <p
                           className={cn(
@@ -654,7 +664,7 @@ export function ProviderInstanceCard({
                           {versionAdvisory.detail}
                         </p>
                       </div>
-                      {onRunUpdate ? (
+                      {hasProviderUpdate && onRunUpdate ? (
                         <Button
                           type="button"
                           size="xs"
@@ -667,14 +677,14 @@ export function ProviderInstanceCard({
                           {isUpdating ? "Updating" : "Update now"}
                         </Button>
                       ) : null}
-                      {onRunUpdate && updateCommand ? (
+                      {hasProviderUpdate && onRunUpdate && updateCommand ? (
                         <div className="flex items-center gap-2 text-[10px] font-medium uppercase tracking-wider text-muted-foreground">
                           <span aria-hidden className="h-px flex-1 bg-border" />
                           or, update manually using
                           <span aria-hidden className="h-px flex-1 bg-border" />
                         </div>
                       ) : null}
-                      {updateCommand ? (
+                      {hasProviderUpdate && updateCommand ? (
                         <div className="flex min-w-0 items-center gap-1 rounded-md border border-border/70 bg-muted/40 py-0.5 pr-0.5 pl-2">
                           <ScrollArea scrollFade className="h-8 min-w-0 flex-1 rounded-none">
                             <code className="flex h-full w-max items-center whitespace-nowrap pr-3 font-mono text-[11px] text-foreground">
