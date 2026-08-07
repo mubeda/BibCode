@@ -17,7 +17,7 @@ use crate::{
     },
     production::provider_maintenance::{ProviderMaintenance, ProviderMaintenanceTarget},
     production::provider_runtime::{
-        prepare_provider_launch, resolve_provider_executable,
+        prepare_provider_launch, resolve_provider_executable_with_environment,
         sanitize_provider_subprocess_environment,
     },
     provider::{claude, codex, cursor, grok, opencode},
@@ -394,6 +394,33 @@ pub(crate) fn maintenance_target(
         .map(maintenance_target_from_definition)
 }
 
+pub(crate) async fn probe_maintenance_target_version(
+    target: &ProviderMaintenanceTarget,
+    cwd: &Path,
+) -> Option<String> {
+    let executable = resolve_provider_executable_with_environment(
+        &target.binary_path,
+        target
+            .environment
+            .iter()
+            .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+    )?;
+    let version_output = run_command(&executable, &["--version"], cwd, &target.environment).await;
+    let version = normalize_provider_version(
+        &target.driver,
+        version_output
+            .as_ref()
+            .and_then(|output| first_line(&output.stdout, &output.stderr)),
+    );
+    if target.driver != "cursor" {
+        return version;
+    }
+    let about = run_command(&executable, &["about"], cwd, &target.environment)
+        .await
+        .map(|output| cursor::parse_about_output(output.code, &output.stdout, &output.stderr));
+    about.and_then(|about| about.version).or(version)
+}
+
 async fn probe_one_snapshot(
     definition: &ProviderDefinition,
     cwd: &Path,
@@ -495,7 +522,13 @@ async fn probe_one_snapshot(
     } else {
         RichMetadataOutcome::NotRequested
     };
-    let Some(executable) = resolve_provider_executable(&definition.binary_path) else {
+    let Some(executable) = resolve_provider_executable_with_environment(
+        &definition.binary_path,
+        definition
+            .environment
+            .iter()
+            .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+    ) else {
         return ProviderProbeResult::new(
             snapshot(
                 definition,
@@ -1548,6 +1581,73 @@ mod tests {
     use super::*;
 
     use axum::{Json, Router, routing::get};
+
+    #[cfg(unix)]
+    fn write_version_fixture(directory: &Path, name: &str, version: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let executable = directory.join(name);
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = about ]; then printf '%s\\n' '{{\"cliVersion\":\"{version}\"}}'; else printf '%s\\n' '{version}'; fi\n"
+            ),
+        )
+        .expect("write version fixture");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("version fixture metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions)
+            .expect("make version fixture executable");
+        executable
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inventory_probes_the_instance_path_executable_instead_of_ambient_path() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let ambient = tempfile::tempdir().expect("ambient executable directory");
+        let instance = tempfile::tempdir().expect("instance executable directory");
+        write_version_fixture(ambient.path(), "cursor-agent", "2026.01.02-ambient");
+        write_version_fixture(instance.path(), "cursor-agent", "2026.03.04-instance");
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: process-global environment mutation is serialized by the shared test lock.
+        unsafe { std::env::set_var("PATH", ambient.path()) };
+        let settings = json!({
+            "enableProviderUpdateChecks": false,
+            "providerInstances": {
+                "cursor-work": {
+                    "driver": "cursor",
+                    "enabled": true,
+                    "config": { "binaryPath": "cursor-agent" },
+                    "environment": [
+                        { "name": "pAtH", "value": instance.path(), "valueRedacted": false }
+                    ]
+                }
+            }
+        });
+
+        let providers = probe_full(
+            &settings,
+            Some("cursor-work"),
+            instance.path(),
+            &ProviderMaintenance::new(),
+        )
+        .await;
+
+        match original_path {
+            Some(path) => {
+                // SAFETY: process-global environment mutation is serialized by the shared test lock.
+                unsafe { std::env::set_var("PATH", path) };
+            }
+            None => {
+                // SAFETY: process-global environment mutation is serialized by the shared test lock.
+                unsafe { std::env::remove_var("PATH") };
+            }
+        }
+        assert_eq!(providers[0].snapshot["version"], "2026.03.04-instance");
+    }
 
     #[test]
     fn maintenance_target_rejects_mismatched_instance_driver_pairs() {

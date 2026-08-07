@@ -1,9 +1,12 @@
 use std::{
     ffi::{OsStr, OsString},
+    io::ErrorKind,
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 use tokio::io::{AsyncRead, AsyncReadExt};
+use tokio::time::timeout;
 
 use super::{
     ProviderMaintenanceTarget,
@@ -11,6 +14,21 @@ use super::{
 };
 
 const CLAUDE_LOCAL_FILE_LIMIT: u64 = 64 * 1024;
+const CLAUDE_MANAGED_ENTRY_LIMIT: usize = 64;
+const CLAUDE_MANAGED_AGGREGATE_LIMIT: usize = CLAUDE_LOCAL_FILE_LIMIT as usize * 4;
+const CLAUDE_LOCAL_IO_TIMEOUT: Duration = Duration::from_secs(1);
+
+enum LocalEvidenceRead {
+    Missing,
+    Document(Vec<u8>),
+    Invalid,
+}
+
+enum ManagedDirectoryRead {
+    Missing,
+    Documents(Vec<Vec<u8>>),
+    Invalid,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum LinuxPackageManager {
@@ -30,7 +48,7 @@ pub(crate) struct ClaudeSourceHints {
 impl Default for ClaudeSourceHints {
     fn default() -> Self {
         Self {
-            channel: Some(ClaudeReleaseChannel::Stable),
+            channel: Some(ClaudeReleaseChannel::Latest),
             updates_disabled: false,
             linux_package: None,
             invalid_managed_channel: false,
@@ -61,11 +79,7 @@ fn merge_claude_document(
     document: &serde_json::Value,
     managed: bool,
 ) {
-    if let Some(value) = document.get("autoUpdatesChannel")
-        && !value.is_array()
-        && !value.is_object()
-        && !value.is_null()
-    {
+    if let Some(value) = document.get("autoUpdatesChannel") {
         match value.as_str() {
             Some("stable") => {
                 hints.channel = Some(ClaudeReleaseChannel::Stable);
@@ -171,37 +185,45 @@ async fn discover_claude_hints_from_paths(
     repository_paths: &[PathBuf],
 ) -> ClaudeSourceHints {
     let user_settings = claude_config_directory(target).map(|path| path.join("settings.json"));
-    let user_document = match user_settings.as_deref() {
-        Some(path) => read_bounded_local_file(path).await,
-        None => None,
+    let (user_document, mut invalid_local_evidence) = match user_settings.as_deref() {
+        Some(path) => match read_bounded_local_file(path).await {
+            LocalEvidenceRead::Document(document) => (Some(document), false),
+            LocalEvidenceRead::Missing => (None, false),
+            LocalEvidenceRead::Invalid => (None, true),
+        },
+        None => (None, false),
     };
     let mut managed_documents = Vec::new();
-    if let Some(path) = managed_settings
-        && let Some(document) = read_bounded_local_file(path).await
-    {
-        managed_documents.push(document);
+    if let Some(path) = managed_settings {
+        match read_bounded_local_file(path).await {
+            LocalEvidenceRead::Document(document) => managed_documents.push(document),
+            LocalEvidenceRead::Missing => {}
+            LocalEvidenceRead::Invalid => invalid_local_evidence = true,
+        }
     }
     if let Some(directory) = managed_directory {
-        let mut paths = Vec::new();
-        if let Ok(mut entries) = tokio::fs::read_dir(directory).await {
-            while let Ok(Some(entry)) = entries.next_entry().await {
-                let path = entry.path();
-                if path.extension() == Some(OsStr::new("json")) {
-                    paths.push(path);
-                }
-            }
+        match read_managed_directory(directory).await {
+            ManagedDirectoryRead::Documents(documents) => managed_documents.extend(documents),
+            ManagedDirectoryRead::Missing => {}
+            ManagedDirectoryRead::Invalid => invalid_local_evidence = true,
         }
-        paths.sort();
-        for path in paths {
-            if let Some(document) = read_bounded_local_file(&path).await {
-                managed_documents.push(document);
-            }
-        }
+    }
+    if managed_documents
+        .iter()
+        .try_fold(0usize, |total, document| total.checked_add(document.len()))
+        .is_none_or(|total| total > CLAUDE_MANAGED_AGGREGATE_LIMIT)
+    {
+        managed_documents.clear();
+        invalid_local_evidence = true;
     }
     let mut hints = claude_hints_from_documents(
         user_document.as_deref(),
         managed_documents.iter().map(Vec::as_slice),
     );
+    if invalid_local_evidence {
+        hints.channel = None;
+        hints.invalid_managed_channel = true;
+    }
     hints.updates_disabled = effective_environment_value(target, "DISABLE_UPDATES")
         .as_deref()
         .is_some_and(|value| value == OsStr::new("1"))
@@ -209,15 +231,22 @@ async fn discover_claude_hints_from_paths(
 
     if resolved.map(normalized_path).as_deref() == Some("/usr/bin/claude") {
         let mut repository_documents = String::new();
+        let mut invalid_repository_evidence = false;
         for path in repository_paths {
-            if let Some(document) = read_bounded_local_file(path).await
-                && let Ok(document) = std::str::from_utf8(&document)
-            {
-                repository_documents.push_str(document);
-                repository_documents.push('\n');
+            match read_bounded_local_file(path).await {
+                LocalEvidenceRead::Document(document) => {
+                    if let Ok(document) = std::str::from_utf8(&document) {
+                        repository_documents.push_str(document);
+                        repository_documents.push('\n');
+                    }
+                }
+                LocalEvidenceRead::Missing => {}
+                LocalEvidenceRead::Invalid => invalid_repository_evidence = true,
             }
         }
-        if let Some((manager, channel)) = parse_claude_repository_marker(&repository_documents) {
+        if !invalid_repository_evidence
+            && let Some((manager, channel)) = parse_claude_repository_marker(&repository_documents)
+        {
             hints.linux_package = Some(manager);
             hints.channel = Some(channel);
         } else {
@@ -228,18 +257,138 @@ async fn discover_claude_hints_from_paths(
     hints
 }
 
-async fn read_bounded_local_file(path: &Path) -> Option<Vec<u8>> {
-    let mut file = tokio::fs::File::open(path).await.ok()?;
-    let metadata = file.metadata().await.ok()?;
-    let regular_file = metadata.is_file();
-    if regular_file && metadata.len() > CLAUDE_LOCAL_FILE_LIMIT {
-        return None;
+async fn read_managed_directory(path: &Path) -> ManagedDirectoryRead {
+    match timeout(CLAUDE_LOCAL_IO_TIMEOUT, read_managed_directory_inner(path)).await {
+        Ok(result) => result,
+        Err(_) => ManagedDirectoryRead::Invalid,
     }
-    let bytes = read_bounded_local_reader(&mut file).await?;
-    if regular_file && file.metadata().await.ok()?.len() > CLAUDE_LOCAL_FILE_LIMIT {
-        return None;
+}
+
+async fn read_managed_directory_inner(path: &Path) -> ManagedDirectoryRead {
+    let initial_metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.is_dir() => metadata,
+        Ok(_) => return ManagedDirectoryRead::Invalid,
+        Err(error) if error.kind() == ErrorKind::NotFound => return ManagedDirectoryRead::Missing,
+        Err(_) => return ManagedDirectoryRead::Invalid,
+    };
+    let mut entries = match tokio::fs::read_dir(path).await {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == ErrorKind::NotFound => return ManagedDirectoryRead::Invalid,
+        Err(_) => return ManagedDirectoryRead::Invalid,
+    };
+    let mut entry_count = 0usize;
+    let mut paths = Vec::new();
+    loop {
+        match entries.next_entry().await {
+            Ok(Some(entry)) => {
+                entry_count += 1;
+                if entry_count > CLAUDE_MANAGED_ENTRY_LIMIT {
+                    return ManagedDirectoryRead::Invalid;
+                }
+                let path = entry.path();
+                if path.extension() == Some(OsStr::new("json")) {
+                    paths.push(path);
+                }
+            }
+            Ok(None) => break,
+            Err(_) => return ManagedDirectoryRead::Invalid,
+        }
     }
-    Some(bytes)
+    let final_metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(_) => return ManagedDirectoryRead::Invalid,
+    };
+    if !local_metadata_matches(&initial_metadata, &final_metadata) {
+        return ManagedDirectoryRead::Invalid;
+    }
+    paths.sort();
+    let mut documents = Vec::with_capacity(paths.len());
+    let mut total_bytes = 0usize;
+    for path in paths {
+        let document = match read_bounded_local_file_inner(&path).await {
+            LocalEvidenceRead::Document(document) => document,
+            LocalEvidenceRead::Missing | LocalEvidenceRead::Invalid => {
+                return ManagedDirectoryRead::Invalid;
+            }
+        };
+        total_bytes = match total_bytes.checked_add(document.len()) {
+            Some(total) if total <= CLAUDE_MANAGED_AGGREGATE_LIMIT => total,
+            _ => return ManagedDirectoryRead::Invalid,
+        };
+        documents.push(document);
+    }
+    ManagedDirectoryRead::Documents(documents)
+}
+
+async fn read_bounded_local_file(path: &Path) -> LocalEvidenceRead {
+    match timeout(CLAUDE_LOCAL_IO_TIMEOUT, read_bounded_local_file_inner(path)).await {
+        Ok(result) => result,
+        Err(_) => LocalEvidenceRead::Invalid,
+    }
+}
+
+async fn read_bounded_local_file_inner(path: &Path) -> LocalEvidenceRead {
+    let initial_metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return LocalEvidenceRead::Invalid,
+        Err(error) if error.kind() == ErrorKind::NotFound => return LocalEvidenceRead::Missing,
+        Err(_) => return LocalEvidenceRead::Invalid,
+    };
+    if initial_metadata.len() > CLAUDE_LOCAL_FILE_LIMIT {
+        return LocalEvidenceRead::Invalid;
+    }
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(_) => return LocalEvidenceRead::Invalid,
+    };
+    let opened_metadata = match file.metadata().await {
+        Ok(metadata) => metadata,
+        Err(_) => return LocalEvidenceRead::Invalid,
+    };
+    if !local_metadata_matches(&initial_metadata, &opened_metadata) {
+        return LocalEvidenceRead::Invalid;
+    }
+    let bytes = match read_bounded_local_reader(&mut file).await {
+        Some(bytes) => bytes,
+        None => return LocalEvidenceRead::Invalid,
+    };
+    let final_file_metadata = match file.metadata().await {
+        Ok(metadata) => metadata,
+        Err(_) => return LocalEvidenceRead::Invalid,
+    };
+    let final_path_metadata = match tokio::fs::symlink_metadata(path).await {
+        Ok(metadata) => metadata,
+        Err(_) => return LocalEvidenceRead::Invalid,
+    };
+    if !local_metadata_matches(&opened_metadata, &final_file_metadata)
+        || !local_metadata_matches(&final_file_metadata, &final_path_metadata)
+    {
+        return LocalEvidenceRead::Invalid;
+    }
+    LocalEvidenceRead::Document(bytes)
+}
+
+fn local_metadata_matches(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    if left.is_file() != right.is_file()
+        || left.is_dir() != right.is_dir()
+        || left.len() != right.len()
+        || left
+            .modified()
+            .ok()
+            .zip(right.modified().ok())
+            .is_none_or(|(left_modified, right_modified)| left_modified != right_modified)
+    {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        left.dev() == right.dev() && left.ino() == right.ino()
+    }
+    #[cfg(not(unix))]
+    {
+        true
+    }
 }
 
 async fn read_bounded_local_reader(reader: impl AsyncRead + Unpin) -> Option<Vec<u8>> {
@@ -472,27 +621,25 @@ fn resolve_package_managed_capabilities(
     };
     let resolved_path = resolved.map(normalized_path);
     let canonical_path = canonical.map(normalized_path);
-    let paths = [resolved_path.as_deref(), canonical_path.as_deref()]
-        .into_iter()
-        .flatten()
-        .collect::<Vec<_>>();
+    let ownership = match reconcile_installation_ownership(
+        driver,
+        resolved_path.as_deref(),
+        canonical_path.as_deref(),
+    ) {
+        Ok(ownership) => ownership,
+        Err(()) => return ProviderMaintenanceCapabilities::unknown(),
+    };
 
     if driver == "claudeAgent"
-        && let Some(capabilities) = claude_source_capabilities(
-            resolved_path.as_deref(),
-            canonical_path.as_deref(),
-            claude_hints,
-        )
+        && let Some(capabilities) =
+            claude_source_capabilities(resolved_path.as_deref(), ownership, claude_hints)
     {
         return capabilities;
     }
 
     if let Some(native) = definition.native_update
-        && paths.iter().any(|path| (native.path_matches)(path))
-        && !(driver == "claudeAgent"
-            && canonical_path
-                .as_deref()
-                .is_some_and(is_script_package_manager_path))
+        && ownership == Some(InstallationOwnership::Native)
+        && resolved_path.as_deref().is_some_and(native.path_matches)
     {
         let latest = if driver == "claudeAgent" {
             (!claude_hints.invalid_managed_channel)
@@ -514,14 +661,7 @@ fn resolve_package_managed_capabilities(
         }
         return capabilities;
     }
-    if driver == "codex"
-        && (canonical_path
-            .as_deref()
-            .is_some_and(|path| path.contains("/.codex/packages/standalone/"))
-            || resolved_path
-                .as_deref()
-                .is_some_and(|path| path.contains("/appdata/local/programs/openai/codex/bin/")))
-    {
+    if driver == "codex" && ownership == Some(InstallationOwnership::CodexStandalone) {
         return ProviderMaintenanceCapabilities::executable(
             definition.latest,
             VersionScheme::Semver,
@@ -530,7 +670,7 @@ fn resolve_package_managed_capabilities(
             "codex-standalone",
         );
     }
-    if canonical_path.as_deref().is_some_and(is_homebrew_path) {
+    if ownership == Some(InstallationOwnership::Homebrew) {
         return ProviderMaintenanceCapabilities::executable(
             definition.latest,
             VersionScheme::Semver,
@@ -539,7 +679,7 @@ fn resolve_package_managed_capabilities(
             "homebrew",
         );
     }
-    if paths.iter().any(|path| path.contains("/.vite-plus/bin/")) {
+    if ownership == Some(InstallationOwnership::VitePlus) {
         return maybe_disable_claude_update(
             ProviderMaintenanceCapabilities::executable(
                 definition.latest,
@@ -552,7 +692,7 @@ fn resolve_package_managed_capabilities(
             claude_hints,
         );
     }
-    if paths.iter().any(|path| path.contains("/.bun/bin/")) {
+    if ownership == Some(InstallationOwnership::Bun) {
         return maybe_disable_claude_update(
             ProviderMaintenanceCapabilities::executable(
                 definition.latest,
@@ -565,13 +705,7 @@ fn resolve_package_managed_capabilities(
             claude_hints,
         );
     }
-    if paths.iter().any(|path| {
-        path.contains("/.local/share/pnpm/")
-            || path.contains("/local/share/pnpm/")
-            || path.contains("/library/pnpm/")
-            || path.contains("/appdata/local/pnpm/")
-            || path.contains("/appdata/roaming/pnpm/")
-    }) {
+    if ownership == Some(InstallationOwnership::Pnpm) {
         return maybe_disable_claude_update(
             ProviderMaintenanceCapabilities::executable(
                 definition.latest,
@@ -584,13 +718,7 @@ fn resolve_package_managed_capabilities(
             claude_hints,
         );
     }
-    if paths.iter().any(|path| {
-        path.contains("/appdata/roaming/npm/")
-            || path.contains("/.npm-global/")
-            || path.contains("/lib/node_modules/")
-            || path.contains("/node_modules/.bin/")
-            || path.contains("/npm/node_modules/")
-    }) {
+    if ownership == Some(InstallationOwnership::Npm) {
         return maybe_disable_claude_update(
             ProviderMaintenanceCapabilities::executable(
                 definition.latest,
@@ -623,10 +751,10 @@ fn maybe_disable_claude_update(
 
 fn claude_source_capabilities(
     resolved_path: Option<&str>,
-    canonical_path: Option<&str>,
+    ownership: Option<InstallationOwnership>,
     hints: &ClaudeSourceHints,
 ) -> Option<ProviderMaintenanceCapabilities> {
-    let mut capabilities = if canonical_path.is_some_and(is_claude_latest_cask_path) {
+    let mut capabilities = if ownership == Some(InstallationOwnership::ClaudeLatestCask) {
         ProviderMaintenanceCapabilities::executable(
             LatestVersionSource::Claude(ClaudeReleaseChannel::Latest),
             VersionScheme::Semver,
@@ -634,7 +762,7 @@ fn claude_source_capabilities(
             ["upgrade", "--cask", "claude-code@latest"],
             "homebrew",
         )
-    } else if canonical_path.is_some_and(is_claude_stable_cask_path) {
+    } else if ownership == Some(InstallationOwnership::ClaudeStableCask) {
         ProviderMaintenanceCapabilities::executable(
             LatestVersionSource::Claude(ClaudeReleaseChannel::Stable),
             VersionScheme::Semver,
@@ -642,13 +770,7 @@ fn claude_source_capabilities(
             ["upgrade", "--cask", "claude-code"],
             "homebrew",
         )
-    } else if canonical_path.is_some_and(is_homebrew_path) {
-        ProviderMaintenanceCapabilities::unknown()
-    } else if [resolved_path, canonical_path]
-        .into_iter()
-        .flatten()
-        .any(is_claude_winget_path)
-    {
+    } else if ownership == Some(InstallationOwnership::ClaudeWinget) {
         ProviderMaintenanceCapabilities::executable(
             LatestVersionSource::Claude(ClaudeReleaseChannel::Latest),
             VersionScheme::Semver,
@@ -728,43 +850,272 @@ fn normalized_path(path: &Path) -> String {
         .to_ascii_lowercase()
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InstallationOwnership {
+    Native,
+    CodexStandalone,
+    ClaudeStableCask,
+    ClaudeLatestCask,
+    ClaudeWinget,
+    Homebrew,
+    VitePlus,
+    Bun,
+    Pnpm,
+    Npm,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PathOwnershipEvidence {
+    None,
+    Invalid,
+    Owned(InstallationOwnership),
+}
+
+fn reconcile_installation_ownership(
+    driver: &str,
+    resolved: Option<&str>,
+    canonical: Option<&str>,
+) -> Result<Option<InstallationOwnership>, ()> {
+    let resolved = resolved
+        .map(|path| path_ownership_evidence(driver, path))
+        .unwrap_or(PathOwnershipEvidence::None);
+    let canonical = canonical
+        .map(|path| path_ownership_evidence(driver, path))
+        .unwrap_or(PathOwnershipEvidence::None);
+    match (resolved, canonical) {
+        (PathOwnershipEvidence::Invalid, _) | (_, PathOwnershipEvidence::Invalid) => Err(()),
+        (PathOwnershipEvidence::Owned(left), PathOwnershipEvidence::Owned(right))
+            if left != right =>
+        {
+            Err(())
+        }
+        (PathOwnershipEvidence::Owned(source), _) | (_, PathOwnershipEvidence::Owned(source)) => {
+            Ok(Some(source))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn path_ownership_evidence(driver: &str, path: &str) -> PathOwnershipEvidence {
+    let components = path_components(path);
+    let expected_binary = provider_binary_name(driver);
+
+    if contains_component(&components, "caskroom") || contains_component(&components, "cellar") {
+        return match homebrew_ownership(driver, &components, expected_binary) {
+            Some(ownership) => PathOwnershipEvidence::Owned(ownership),
+            None => PathOwnershipEvidence::Invalid,
+        };
+    }
+    if contains_component(&components, "node_modules") {
+        return match global_package_ownership(driver, &components) {
+            Some(ownership) => PathOwnershipEvidence::Owned(ownership),
+            None => PathOwnershipEvidence::Invalid,
+        };
+    }
+    if is_managed_shim_path(&components, &[".vite-plus", "bin"]) {
+        return exact_ownership_evidence(
+            exact_provider_basename(path, expected_binary),
+            InstallationOwnership::VitePlus,
+        );
+    }
+    if is_managed_shim_path(&components, &[".bun", "bin"]) {
+        return exact_ownership_evidence(
+            exact_provider_basename(path, expected_binary),
+            InstallationOwnership::Bun,
+        );
+    }
+    if is_pnpm_shim_path(&components) {
+        return exact_ownership_evidence(
+            exact_provider_basename(path, expected_binary),
+            InstallationOwnership::Pnpm,
+        );
+    }
+    if is_npm_shim_path(&components) {
+        return exact_ownership_evidence(
+            exact_provider_basename(path, expected_binary),
+            InstallationOwnership::Npm,
+        );
+    }
+    if driver == "claudeAgent" && is_winget_location(&components) {
+        return exact_ownership_evidence(
+            exact_provider_basename(path, "claude")
+                && winget_package_identity_is_claude(&components),
+            InstallationOwnership::ClaudeWinget,
+        );
+    }
+    if driver == "claudeAgent" && is_claude_native_path(path) {
+        return PathOwnershipEvidence::Owned(InstallationOwnership::Native);
+    }
+    if driver == "opencode" && is_opencode_native_path(path) {
+        return PathOwnershipEvidence::Owned(InstallationOwnership::Native);
+    }
+    if driver == "codex" && is_codex_standalone_path(path, &components) {
+        return PathOwnershipEvidence::Owned(InstallationOwnership::CodexStandalone);
+    }
+    PathOwnershipEvidence::None
+}
+
+fn exact_ownership_evidence(
+    matches: bool,
+    ownership: InstallationOwnership,
+) -> PathOwnershipEvidence {
+    if matches {
+        PathOwnershipEvidence::Owned(ownership)
+    } else {
+        PathOwnershipEvidence::Invalid
+    }
+}
+
+fn provider_binary_name(driver: &str) -> &str {
+    match driver {
+        "claudeAgent" => "claude",
+        "opencode" => "opencode",
+        _ => "codex",
+    }
+}
+
+fn path_components(path: &str) -> Vec<&str> {
+    path.split('/')
+        .filter(|component| !component.is_empty())
+        .collect()
+}
+
+fn contains_component(components: &[&str], expected: &str) -> bool {
+    components.contains(&expected)
+}
+
+fn contains_component_sequence(components: &[&str], expected: &[&str]) -> bool {
+    components
+        .windows(expected.len())
+        .any(|window| window == expected)
+}
+
+fn exact_provider_basename(path: &str, expected: &str) -> bool {
+    let Some(basename) = path.rsplit('/').next() else {
+        return false;
+    };
+    let stem = [".exe", ".cmd", ".bat", ".ps1"]
+        .into_iter()
+        .find_map(|extension| basename.strip_suffix(extension))
+        .unwrap_or(basename);
+    stem == expected
+}
+
+fn is_managed_shim_path(components: &[&str], marker: &[&str]) -> bool {
+    components
+        .windows(marker.len())
+        .position(|window| window == marker)
+        .is_some_and(|index| index + marker.len() + 1 == components.len())
+}
+
+fn is_pnpm_shim_path(components: &[&str]) -> bool {
+    [
+        &[".local", "share", "pnpm"][..],
+        &["local", "share", "pnpm"][..],
+        &["library", "pnpm"][..],
+        &["appdata", "local", "pnpm"][..],
+        &["appdata", "roaming", "pnpm"][..],
+    ]
+    .into_iter()
+    .any(|marker| contains_component_sequence(components, marker))
+}
+
+fn is_npm_shim_path(components: &[&str]) -> bool {
+    is_managed_shim_path(components, &["appdata", "roaming", "npm"])
+        || is_managed_shim_path(components, &[".npm-global", "bin"])
+}
+
+fn global_package_ownership(driver: &str, components: &[&str]) -> Option<InstallationOwnership> {
+    let node_modules = components
+        .iter()
+        .rposition(|component| *component == "node_modules")?;
+    let package = &components[node_modules + 1..];
+    let expected = match driver {
+        "codex" => &["@openai", "codex"][..],
+        "claudeAgent" => &["@anthropic-ai", "claude-code"][..],
+        "opencode" => &["opencode-ai"][..],
+        _ => return None,
+    };
+    if package.len() < expected.len() || &package[..expected.len()] != expected {
+        return None;
+    }
+    let prefix = &components[..node_modules];
+    if contains_component_sequence(prefix, &[".bun", "install", "global"]) {
+        return Some(InstallationOwnership::Bun);
+    }
+    if contains_component(prefix, "pnpm") && contains_component(prefix, "global") {
+        return Some(InstallationOwnership::Pnpm);
+    }
+    match prefix.last().copied() {
+        Some("lib" | "npm") => Some(InstallationOwnership::Npm),
+        _ => None,
+    }
+}
+
+fn homebrew_ownership(
+    driver: &str,
+    components: &[&str],
+    expected_binary: &str,
+) -> Option<InstallationOwnership> {
+    if !components
+        .last()
+        .is_some_and(|basename| exact_provider_basename(basename, expected_binary))
+    {
+        return None;
+    }
+    let identity_after = |root: &str| {
+        components
+            .iter()
+            .position(|component| *component == root)
+            .and_then(|index| components.get(index + 1))
+            .copied()
+    };
+    match driver {
+        "codex" if identity_after("caskroom") == Some("codex") => {
+            Some(InstallationOwnership::Homebrew)
+        }
+        "claudeAgent" if identity_after("caskroom") == Some("claude-code") => {
+            Some(InstallationOwnership::ClaudeStableCask)
+        }
+        "claudeAgent" if identity_after("caskroom") == Some("claude-code@latest") => {
+            Some(InstallationOwnership::ClaudeLatestCask)
+        }
+        "opencode" if identity_after("cellar") == Some("opencode") => {
+            Some(InstallationOwnership::Homebrew)
+        }
+        _ => None,
+    }
+}
+
+fn is_winget_location(components: &[&str]) -> bool {
+    contains_component_sequence(components, &["microsoft", "winget", "links"])
+        || contains_component_sequence(components, &["microsoft", "winget", "packages"])
+}
+
+fn winget_package_identity_is_claude(components: &[&str]) -> bool {
+    if contains_component_sequence(components, &["microsoft", "winget", "links"]) {
+        return true;
+    }
+    components
+        .iter()
+        .position(|component| *component == "packages")
+        .and_then(|index| components.get(index + 1))
+        .is_some_and(|identity| identity.starts_with("anthropic.claudecode_"))
+}
+
+fn is_codex_standalone_path(path: &str, components: &[&str]) -> bool {
+    (contains_component_sequence(components, &[".codex", "packages", "standalone"])
+        || contains_component_sequence(
+            components,
+            &["appdata", "local", "programs", "openai", "codex", "bin"],
+        ))
+        && exact_provider_basename(path, "codex")
+}
+
 fn resolved_or_configured_binary(binary_path: &str, resolved: Option<&Path>) -> String {
     resolved
         .map(|path| path.to_string_lossy().into_owned())
         .unwrap_or_else(|| binary_path.to_owned())
-}
-
-fn is_homebrew_path(path: &str) -> bool {
-    path.contains("/cellar/") || path.contains("/caskroom/")
-}
-
-fn is_claude_stable_cask_path(path: &str) -> bool {
-    path.contains("/caskroom/claude-code/")
-}
-
-fn is_claude_latest_cask_path(path: &str) -> bool {
-    path.contains("/caskroom/claude-code@latest/")
-}
-
-fn is_claude_winget_path(path: &str) -> bool {
-    path.ends_with("/appdata/local/microsoft/winget/links/claude.exe")
-        || (path.contains("/appdata/local/microsoft/winget/packages/anthropic.claudecode_")
-            && path.ends_with("/claude.exe"))
-}
-
-fn is_script_package_manager_path(path: &str) -> bool {
-    path.contains("/.vite-plus/bin/")
-        || path.contains("/.bun/bin/")
-        || path.contains("/.local/share/pnpm/")
-        || path.contains("/local/share/pnpm/")
-        || path.contains("/library/pnpm/")
-        || path.contains("/appdata/local/pnpm/")
-        || path.contains("/appdata/roaming/pnpm/")
-        || path.contains("/appdata/roaming/npm/")
-        || path.contains("/.npm-global/")
-        || path.contains("/lib/node_modules/")
-        || path.contains("/node_modules/.bin/")
-        || path.contains("/npm/node_modules/")
 }
 
 fn is_claude_native_path(path: &str) -> bool {
@@ -833,6 +1184,28 @@ mod tests {
     }
 
     #[test]
+    fn native_claude_defaults_to_latest_without_valid_user_settings() {
+        for user in [None, Some(br#"{"#.as_slice())] {
+            let hints = claude_hints_from_documents(user, std::iter::empty());
+            assert_eq!(hints.channel, Some(ClaudeReleaseChannel::Latest));
+            assert!(!hints.invalid_managed_channel);
+        }
+    }
+
+    #[test]
+    fn every_present_non_string_managed_claude_channel_fails_closed() {
+        for channel in ["null", "[]", "{}", "true", "false", "1", "1.5"] {
+            let managed = format!(r#"{{"autoUpdatesChannel":{channel}}}"#);
+            let hints = claude_hints_from_documents(
+                Some(br#"{"autoUpdatesChannel":"latest"}"#),
+                [managed.as_bytes()],
+            );
+            assert_eq!(hints.channel, None, "{channel}");
+            assert!(hints.invalid_managed_channel, "{channel}");
+        }
+    }
+
+    #[test]
     fn later_managed_claude_scalars_override_earlier_values() {
         let hints = claude_hints_from_documents(
             Some(br#"{"autoUpdatesChannel":"latest","env":{"DISABLE_UPDATES":"1"}}"#),
@@ -890,6 +1263,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn too_many_managed_claude_fragments_fail_closed() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let config = directory.path().join("target-claude");
+        let managed_directory = directory.path().join("managed-settings.d");
+        std::fs::create_dir_all(&config).expect("config directory");
+        std::fs::create_dir_all(&managed_directory).expect("managed directory");
+        for index in 0..=CLAUDE_MANAGED_ENTRY_LIMIT {
+            std::fs::write(
+                managed_directory.join(format!("{index:03}.json")),
+                br#"{"autoUpdatesChannel":"latest"}"#,
+            )
+            .expect("managed fragment");
+        }
+        let target = claude_target(&[("CLAUDE_CONFIG_DIR", config.as_os_str())]);
+
+        let hints =
+            discover_claude_hints_from_paths(&target, None, None, Some(&managed_directory), &[])
+                .await;
+
+        assert_eq!(hints.channel, None);
+        assert!(hints.invalid_managed_channel);
+    }
+
+    #[tokio::test]
+    async fn aggregate_managed_claude_fragment_overflow_fails_closed() {
+        let directory = tempfile::tempdir().expect("temp directory");
+        let config = directory.path().join("target-claude");
+        let managed_directory = directory.path().join("managed-settings.d");
+        std::fs::create_dir_all(&config).expect("config directory");
+        std::fs::create_dir_all(&managed_directory).expect("managed directory");
+        let mut document = br#"{"autoUpdatesChannel":"latest"}"#.to_vec();
+        document.resize(CLAUDE_LOCAL_FILE_LIMIT as usize, b' ');
+        for index in 0..=CLAUDE_MANAGED_AGGREGATE_LIMIT.div_ceil(CLAUDE_LOCAL_FILE_LIMIT as usize) {
+            std::fs::write(
+                managed_directory.join(format!("{index:03}.json")),
+                &document,
+            )
+            .expect("managed fragment");
+        }
+        let target = claude_target(&[("CLAUDE_CONFIG_DIR", config.as_os_str())]);
+
+        let hints =
+            discover_claude_hints_from_paths(&target, None, None, Some(&managed_directory), &[])
+                .await;
+
+        assert_eq!(hints.channel, None);
+        assert!(hints.invalid_managed_channel);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn non_regular_managed_claude_fragment_fails_closed_without_hanging() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().expect("temp directory");
+        let config = directory.path().join("target-claude");
+        let managed_directory = directory.path().join("managed-settings.d");
+        let outside = directory.path().join("outside.json");
+        std::fs::create_dir_all(&config).expect("config directory");
+        std::fs::create_dir_all(&managed_directory).expect("managed directory");
+        std::fs::write(&outside, br#"{"autoUpdatesChannel":"stable"}"#).expect("outside settings");
+        symlink(&outside, managed_directory.join("01-linked.json"))
+            .expect("managed settings symlink");
+        let target = claude_target(&[("CLAUDE_CONFIG_DIR", config.as_os_str())]);
+
+        let hints = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            discover_claude_hints_from_paths(&target, None, None, Some(&managed_directory), &[]),
+        )
+        .await
+        .expect("non-regular evidence must not block");
+
+        assert_eq!(hints.channel, None);
+        assert!(hints.invalid_managed_channel);
+    }
+
+    #[tokio::test]
     async fn disable_autoupdater_does_not_disable_the_explicit_claude_action() {
         let directory = tempfile::tempdir().expect("temp directory");
         let target = claude_target(&[
@@ -912,13 +1362,15 @@ mod tests {
         std::fs::write(&oversized, vec![b' '; CLAUDE_LOCAL_FILE_LIMIT as usize + 1])
             .expect("oversized document");
 
-        assert_eq!(
-            read_bounded_local_file(&exact)
-                .await
-                .map(|bytes| bytes.len()),
-            Some(CLAUDE_LOCAL_FILE_LIMIT as usize)
-        );
-        assert!(read_bounded_local_file(&oversized).await.is_none());
+        assert!(matches!(
+            read_bounded_local_file(&exact).await,
+            LocalEvidenceRead::Document(bytes)
+                if bytes.len() == CLAUDE_LOCAL_FILE_LIMIT as usize
+        ));
+        assert!(matches!(
+            read_bounded_local_file(&oversized).await,
+            LocalEvidenceRead::Invalid
+        ));
     }
 
     #[tokio::test]
@@ -1058,7 +1510,10 @@ mod tests {
 
     #[test]
     fn resolves_claude_installation_sources() {
-        let stable = ClaudeSourceHints::default();
+        let stable = ClaudeSourceHints {
+            channel: Some(ClaudeReleaseChannel::Stable),
+            ..ClaudeSourceHints::default()
+        };
         let latest = ClaudeSourceHints {
             channel: Some(ClaudeReleaseChannel::Latest),
             ..ClaudeSourceHints::default()
@@ -1162,7 +1617,7 @@ mod tests {
                 None,
             ),
             (
-                "/home/me/.local/bin/claude",
+                "/usr/local/bin/claude",
                 Some("/usr/local/lib/node_modules/@anthropic-ai/claude-code/cli.js"),
                 &latest,
                 Some(LatestVersionSource::Npm("@anthropic-ai/claude-code")),

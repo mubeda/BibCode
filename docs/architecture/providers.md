@@ -41,6 +41,12 @@ manager in the host thread's worktree. Ordinary terminals continue to launch
 the user's shell. Observation is opt-in launch metadata, not terminal-output
 scraping.
 
+Inventory, maintenance, capability probes, and runtime launch share one
+effective executable-search policy. A provider instance's case-insensitive
+`PATH` environment entry overrides the server's ambient `PATH`; without one,
+the ambient value is used. Explicit executable paths retain their normal
+platform-specific handling.
+
 ## Provider maintenance
 
 The Rust server owns installed-version probes, latest-version registry checks,
@@ -60,6 +66,11 @@ obtain its release identifier—the installer script is never executed. Likewise
 the Claude apt, dnf, and apk maintenance commands are display-only guidance,
 not commands run by the server.
 
+Ownership evidence uses exact provider package identities, executable
+basenames, and recognized global shim, Homebrew formula/cask, native, or WinGet
+layouts. Project-local `node_modules/.bin` paths, lookalike path components, and
+conflicting resolved/canonical ownership are unknown rather than inferred.
+
 The source/action mapping is installation-specific:
 
 | Provider | Recognized source and latest metadata                                                                                           | Server update action                                                                                                    |
@@ -69,12 +80,16 @@ The source/action mapping is installation-specific:
 | Cursor   | Official Cursor release paths and parsed official installer metadata                                                            | Resolved `cursor-agent update` only for an official path                                                                |
 | OpenCode | npm `opencode-ai`, selected only for a recognized native, Homebrew, or package-manager path                                     | Native `opencode upgrade`, Homebrew, or the matching package-manager command                                            |
 
-Claude channel discovery reads bounded user and managed settings, with managed
-settings taking precedence, and honors `DISABLE_UPDATES=1` from the effective
-provider environment or settings. That value removes the executable action but
-can leave a recognized latest-version advisory and manual guidance. A managed
-`autoUpdatesChannel` outside `stable` or `latest` is not a valid release source:
-BiBCode withholds its latest-version advisory rather than guessing a channel.
+Claude channel discovery defaults native installations to `latest` when user
+settings are missing or malformed. It reads only regular local evidence under
+bounded per-file, aggregate, entry-count, and I/O limits, with managed settings
+taking precedence. Metadata races, special files, timeouts, overflows, and read
+errors fail closed. Every present managed `autoUpdatesChannel` value other than
+the strings `stable` or `latest` is invalid, including null and non-string
+values; BiBCode withholds its latest-version advisory rather than guessing a
+channel. `DISABLE_UPDATES=1` from the effective provider environment or settings
+removes the executable action but can leave recognized advisory metadata and
+manual guidance.
 
 Successful registry results are cached in memory for one hour. A manual
 `server.refreshProviders` request advances the latest-version generation before
@@ -94,13 +109,21 @@ retry prompt but do not change provider readiness or discard inventory data.
 The advisory timestamp records the registry result or attempt; the provider's
 top-level `checkedAt` continues to record the executable and capability probe.
 
+An update reservation is bound to the complete maintenance target and settings
+generation. After acquiring the per-command lock, the server rereads settings,
+re-resolves the target and action, and rejects a queued update if its binary,
+environment, source, or command changed. Immediately before publishing or
+running the action, it probes the installed version from that exact resolved
+target rather than trusting the last published snapshot.
+
 After an update command exits zero, the server advances the latest-version
 generation and reprobes the target instance. A fresh `current` advisory means
 `succeeded` unless the version comparison proves a downgrade. A fresh
 `behind_latest` advisory, provable downgrade, or absent refreshed target is
-always `unchanged`. When the advisory cannot establish currency, only a
-provable installed-version advance succeeds; equal, ambiguous, or missing
-comparisons remain `unchanged`. A zero exit alone is not success.
+always `unchanged`. When the advisory cannot establish currency, only an
+advance from the exact pre-command version succeeds; a failed pre-command probe
+disables that fallback. Equal, ambiguous, or missing comparisons remain
+`unchanged`. A zero exit alone is not success.
 
 ## Activity support
 

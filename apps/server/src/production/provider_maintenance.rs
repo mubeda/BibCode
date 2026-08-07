@@ -103,7 +103,7 @@ mod tests {
                 "codex",
                 Some("/srv/project/node_modules/.bin/codex"),
                 None,
-                Some("npm install -g @openai/codex@latest"),
+                None,
             ),
             (
                 "codex",
@@ -187,6 +187,56 @@ mod tests {
     }
 
     #[test]
+    fn rejects_inexact_or_conflicting_installation_ownership_evidence() {
+        let cases = [
+            (
+                "project-local npm shim",
+                "/srv/project/node_modules/.bin/codex",
+                None,
+            ),
+            (
+                "unrelated Homebrew formula",
+                "/opt/homebrew/bin/codex",
+                Some("/opt/homebrew/Cellar/unrelated/1.0.0/bin/codex"),
+            ),
+            (
+                "wrong Homebrew basename",
+                "/opt/homebrew/bin/not-codex",
+                Some("/opt/homebrew/Caskroom/codex/0.148.0/not-codex"),
+            ),
+            (
+                "wrong canonical npm package",
+                "/usr/local/bin/codex",
+                Some("/usr/local/lib/node_modules/not-codex/bin/codex.js"),
+            ),
+            (
+                "nested Vite+ lookalike",
+                "/home/me/.vite-plus/bin/nested/codex",
+                None,
+            ),
+            (
+                "conflicting npm and Homebrew evidence",
+                "C:/Users/me/AppData/Roaming/npm/codex.cmd",
+                Some("/opt/homebrew/Caskroom/codex/0.148.0/codex"),
+            ),
+        ];
+
+        for (label, resolved, canonical) in cases {
+            let capabilities = capabilities_for_paths(
+                "codex",
+                "codex",
+                Some(Path::new(resolved)),
+                canonical.map(Path::new),
+            );
+            assert_eq!(
+                capabilities,
+                ProviderMaintenanceCapabilities::unknown(),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
     fn native_installers_require_exact_paths() {
         let cases = [
             ("claudeAgent", "/srv/.local/bin/claude-wrapper", None),
@@ -251,6 +301,22 @@ mod tests {
             binary_path: binary_path.to_owned(),
             environment: Vec::new(),
         }
+    }
+
+    fn global_npm_target(directory: &Path, driver: &str) -> ProviderMaintenanceTarget {
+        let binary_name = match driver {
+            "claudeAgent" => "claude",
+            value => value,
+        };
+        let package_bin = directory.join(".npm-global/bin");
+        std::fs::create_dir_all(&package_bin).expect("global npm bin");
+        let binary = package_bin.join(if cfg!(windows) {
+            format!("{binary_name}.cmd")
+        } else {
+            binary_name.to_owned()
+        });
+        std::fs::write(&binary, b"fixture").expect("global npm executable");
+        target(driver, &binary.to_string_lossy())
     }
 
     fn capabilities_for_paths(
@@ -553,7 +619,8 @@ mod tests {
     async fn enriches_snapshot_and_caches_npm_latest_for_one_hour() {
         let (registry_url, requests) = npm_registry_fixture("9.9.9").await;
         let maintenance = ProviderMaintenance::with_registry_base_url(registry_url);
-        let target = target("codex", "codex");
+        let directory = tempfile::tempdir().expect("global npm directory");
+        let target = global_npm_target(directory.path(), "codex");
         let mut first = installed_snapshot("codex", "1.0.0");
         let mut second = installed_snapshot("codex", "1.0.0");
         second["checkedAt"] = json!("2026-08-01T12:05:00Z");
@@ -606,7 +673,8 @@ mod tests {
         let (registry_url, registry_version, requests) =
             mutable_npm_registry_fixture("1.18.11").await;
         let maintenance = ProviderMaintenance::with_registry_base_url(registry_url);
-        let target = target("opencode", "opencode");
+        let directory = tempfile::tempdir().expect("global npm directory");
+        let target = global_npm_target(directory.path(), "opencode");
         let mut startup = installed_snapshot("opencode", "1.18.11");
         maintenance
             .enrich_snapshot(&target, &mut startup, true)
@@ -633,7 +701,8 @@ mod tests {
     async fn failed_registry_lookup_is_retried_without_waiting_for_cache_expiry() {
         let (registry_url, failing, requests) = recovering_npm_registry_fixture("1.18.15").await;
         let maintenance = ProviderMaintenance::with_registry_base_url(registry_url);
-        let target = target("opencode", "opencode");
+        let directory = tempfile::tempdir().expect("global npm directory");
+        let target = global_npm_target(directory.path(), "opencode");
         let mut failed = installed_snapshot("opencode", "1.18.11");
         maintenance
             .enrich_snapshot(&target, &mut failed, true)
@@ -657,9 +726,14 @@ mod tests {
     async fn disabled_checks_do_not_contact_the_registry() {
         let (registry_url, requests) = npm_registry_fixture("9.9.9").await;
         let maintenance = ProviderMaintenance::with_registry_base_url(registry_url);
+        let directory = tempfile::tempdir().expect("global npm directory");
         let mut snapshot = installed_snapshot("codex", "1.0.0");
         maintenance
-            .enrich_snapshot(&target("codex", "codex"), &mut snapshot, false)
+            .enrich_snapshot(
+                &global_npm_target(directory.path(), "codex"),
+                &mut snapshot,
+                false,
+            )
             .await;
         assert_eq!(snapshot["versionAdvisory"]["status"], "unknown");
         assert_eq!(requests.load(Ordering::SeqCst), 0);
@@ -697,10 +771,15 @@ mod tests {
         let maintenance = ProviderMaintenance::with_registry_base_url(
             Url::parse(&format!("http://{address}/")).expect("registry URL"),
         );
+        let directory = tempfile::tempdir().expect("global npm directory");
         let mut snapshot = installed_snapshot("codex", "1.0.0");
         snapshot["models"] = json!([{ "slug": "existing" }]);
         maintenance
-            .enrich_snapshot(&target("codex", "codex"), &mut snapshot, true)
+            .enrich_snapshot(
+                &global_npm_target(directory.path(), "codex"),
+                &mut snapshot,
+                true,
+            )
             .await;
         assert_eq!(snapshot["versionAdvisory"]["status"], "unknown");
         assert_eq!(snapshot["models"][0]["slug"], "existing");
@@ -710,6 +789,7 @@ mod tests {
     async fn expired_cache_entry_is_refetched() {
         let (registry_url, requests) = npm_registry_fixture("9.9.9").await;
         let maintenance = ProviderMaintenance::with_registry_base_url(registry_url);
+        let directory = tempfile::tempdir().expect("global npm directory");
         maintenance.inner.latest_versions.lock().await.insert(
             LatestVersionSource::Npm("@openai/codex"),
             VersionCacheEntry {
@@ -721,7 +801,11 @@ mod tests {
         );
         let mut snapshot = installed_snapshot("codex", "1.0.0");
         maintenance
-            .enrich_snapshot(&target("codex", "codex"), &mut snapshot, true)
+            .enrich_snapshot(
+                &global_npm_target(directory.path(), "codex"),
+                &mut snapshot,
+                true,
+            )
             .await;
         assert_eq!(snapshot["versionAdvisory"]["latestVersion"], "9.9.9");
         assert_eq!(requests.load(Ordering::SeqCst), 1);
@@ -732,14 +816,8 @@ mod tests {
         let (registry_url, concurrent_requests) = delayed_npm_registry_fixture("9.9.9").await;
         let maintenance = ProviderMaintenance::with_registry_base_url(registry_url);
         let directory = tempfile::tempdir().expect("package manager directory");
-        let package_bin = directory.path().join("node_modules/.bin");
-        std::fs::create_dir_all(&package_bin).expect("package manager bin");
-        let codex_binary = package_bin.join("codex");
-        let opencode_binary = package_bin.join("opencode");
-        std::fs::write(&codex_binary, b"fixture").expect("Codex fixture");
-        std::fs::write(&opencode_binary, b"fixture").expect("OpenCode fixture");
-        let codex_target = target("codex", &codex_binary.to_string_lossy());
-        let opencode_target = target("opencode", &opencode_binary.to_string_lossy());
+        let codex_target = global_npm_target(directory.path(), "codex");
+        let opencode_target = global_npm_target(directory.path(), "opencode");
         let mut codex = installed_snapshot("codex", "1.0.0");
         let mut opencode = installed_snapshot("opencode", "1.0.0");
 
@@ -944,24 +1022,37 @@ mod tests {
     #[tokio::test]
     async fn rejects_a_second_update_for_the_same_instance() {
         let maintenance = ProviderMaintenance::new();
+        let target = target("codex", "codex");
         let first = maintenance
-            .reserve_target("codex-work", "codex")
+            .reserve_target(
+                &ProviderMaintenanceTarget {
+                    instance_id: "codex-work".to_owned(),
+                    ..target.clone()
+                },
+                1,
+            )
             .expect("first reservation");
+        let target = ProviderMaintenanceTarget {
+            instance_id: "codex-work".to_owned(),
+            ..target
+        };
         assert_eq!(
-            maintenance
-                .reserve_target("codex-work", "codex")
-                .unwrap_err(),
+            maintenance.reserve_target(&target, 1).unwrap_err(),
             "An update is already running for this provider."
         );
         drop(first);
-        assert!(maintenance.reserve_target("codex-work", "codex").is_ok());
+        assert!(maintenance.reserve_target(&target, 1).is_ok());
     }
 
     #[test]
     fn stale_update_lifecycle_cannot_overwrite_or_release_a_new_update() {
         let maintenance = ProviderMaintenance::new();
+        let target = ProviderMaintenanceTarget {
+            instance_id: "cursor-work".to_owned(),
+            ..target("cursor", "cursor-agent")
+        };
         let old = maintenance
-            .reserve_target("cursor-work", "cursor")
+            .reserve_target(&target, 1)
             .expect("old reservation");
         assert!(maintenance.set_update_state_if_current(
             "cursor-work",
@@ -969,9 +1060,7 @@ mod tests {
             old.token(),
             json!({ "status": "running", "message": "old" }),
         ));
-        maintenance.invalidate_update_lifecycles(|instance_id, driver| {
-            instance_id == "cursor-work" && driver == "cursor"
-        });
+        maintenance.invalidate_update_lifecycles(2, |current| current == &target);
         assert!(maintenance.set_update_state_if_current(
             "cursor-work",
             "cursor",
@@ -979,9 +1068,9 @@ mod tests {
             json!({ "status": "running", "message": "still-current" }),
         ));
 
-        maintenance.invalidate_update_lifecycles(|_, _| false);
+        maintenance.invalidate_update_lifecycles(3, |_| false);
         let new = maintenance
-            .reserve_target("cursor-work", "cursor")
+            .reserve_target(&target, 3)
             .expect("new reservation");
         assert!(maintenance.set_update_state_if_current(
             "cursor-work",
@@ -998,9 +1087,7 @@ mod tests {
 
         drop(old);
         assert_eq!(
-            maintenance
-                .reserve_target("cursor-work", "cursor")
-                .unwrap_err(),
+            maintenance.reserve_target(&target, 3).unwrap_err(),
             "An update is already running for this provider."
         );
         let mut snapshot = json!({ "instanceId": "cursor-work", "driver": "cursor" });
@@ -1008,7 +1095,7 @@ mod tests {
         assert_eq!(snapshot["updateState"]["message"], "new");
 
         drop(new);
-        assert!(maintenance.reserve_target("cursor-work", "cursor").is_ok());
+        assert!(maintenance.reserve_target(&target, 3).is_ok());
     }
 
     #[tokio::test]
@@ -1019,6 +1106,49 @@ mod tests {
         assert!(lock.clone().try_lock_owned().is_err());
         drop(first);
         assert!(lock.try_lock_owned().is_ok());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn maintenance_classifies_the_instance_path_executable_instead_of_ambient_path() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let root = tempfile::tempdir().expect("maintenance executable root");
+        let ambient = root.path().join("ambient/.npm-global/bin");
+        let instance = root.path().join("instance/.opencode/bin");
+        std::fs::create_dir_all(&ambient).expect("ambient executable directory");
+        std::fs::create_dir_all(&instance).expect("instance executable directory");
+        std::fs::write(ambient.join("opencode"), b"ambient").expect("ambient executable");
+        std::fs::write(instance.join("opencode"), b"instance").expect("instance executable");
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: process-global environment mutation is serialized by the shared test lock.
+        unsafe { std::env::set_var("PATH", &ambient) };
+        let target = ProviderMaintenanceTarget {
+            instance_id: "opencode-work".to_owned(),
+            driver: "opencode".to_owned(),
+            binary_path: "opencode".to_owned(),
+            environment: vec![("PaTh".into(), instance.as_os_str().to_owned())],
+        };
+
+        let capabilities = ProviderMaintenance::new().capabilities(&target).await;
+
+        match original_path {
+            Some(path) => {
+                // SAFETY: process-global environment mutation is serialized by the shared test lock.
+                unsafe { std::env::set_var("PATH", path) };
+            }
+            None => {
+                // SAFETY: process-global environment mutation is serialized by the shared test lock.
+                unsafe { std::env::remove_var("PATH") };
+            }
+        }
+        let expected = format!("{} upgrade", instance.join("opencode").to_string_lossy());
+        assert_eq!(
+            capabilities
+                .update
+                .as_ref()
+                .map(|update| update.display.as_str()),
+            Some(expected.as_str())
+        );
     }
 }
 use std::{
@@ -1039,7 +1169,9 @@ use latest::{LatestVersionFailure, LatestVersionSource};
 
 use crate::git::{OutputPolicy, ProcessRequest, ProcessRunner};
 
-use super::provider_runtime::{prepare_provider_launch, resolve_provider_executable_in_path};
+use super::provider_runtime::{
+    prepare_provider_launch, resolve_provider_executable_with_environment,
+};
 
 const CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 const LATEST_RESPONSE_LIMIT: usize = 256 * 1024;
@@ -1076,7 +1208,7 @@ fn provider_version_scheme(driver: &str) -> Option<latest::VersionScheme> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct ProviderMaintenanceTarget {
     #[allow(dead_code)] // Used by Task 2 for per-provider update state.
     pub(crate) instance_id: String,
@@ -1146,7 +1278,8 @@ struct ProviderUpdateCoordinator {
 
 #[derive(Debug)]
 struct ProviderUpdateLifecycle {
-    driver: String,
+    target: ProviderMaintenanceTarget,
+    settings_generation: u64,
     token: ProviderUpdateLifecycleToken,
     active: bool,
 }
@@ -1263,8 +1396,8 @@ impl ProviderMaintenance {
 
     pub(crate) fn reserve_target(
         &self,
-        instance_id: &str,
-        driver: &str,
+        target: &ProviderMaintenanceTarget,
+        settings_generation: u64,
     ) -> Result<ProviderUpdateReservation, &'static str> {
         let mut updates = self
             .inner
@@ -1273,7 +1406,7 @@ impl ProviderMaintenance {
             .expect("provider update coordinator lock");
         if updates
             .lifecycles
-            .get(instance_id)
+            .get(&target.instance_id)
             .is_some_and(|lifecycle| lifecycle.active)
         {
             return Err("An update is already running for this provider.");
@@ -1284,16 +1417,17 @@ impl ProviderMaintenance {
             .expect("provider update lifecycle tokens exhausted");
         let token = ProviderUpdateLifecycleToken(updates.next_token);
         updates.lifecycles.insert(
-            instance_id.to_owned(),
+            target.instance_id.clone(),
             ProviderUpdateLifecycle {
-                driver: driver.to_owned(),
+                target: target.clone(),
+                settings_generation,
                 token,
                 active: true,
             },
         );
-        updates.states.remove(instance_id);
+        updates.states.remove(&target.instance_id);
         Ok(ProviderUpdateReservation {
-            instance_id: instance_id.to_owned(),
+            instance_id: target.instance_id.clone(),
             token,
             updates: self.inner.updates.clone(),
         })
@@ -1324,7 +1458,7 @@ impl ProviderMaintenance {
         if !updates
             .lifecycles
             .get(instance_id)
-            .is_some_and(|lifecycle| lifecycle.driver == driver && lifecycle.token == token)
+            .is_some_and(|lifecycle| lifecycle.target.driver == driver && lifecycle.token == token)
         {
             return false;
         }
@@ -1353,7 +1487,7 @@ impl ProviderMaintenance {
         if !updates
             .lifecycles
             .get(instance_id)
-            .is_some_and(|lifecycle| lifecycle.driver == driver && lifecycle.token == token)
+            .is_some_and(|lifecycle| lifecycle.target.driver == driver && lifecycle.token == token)
         {
             return;
         }
@@ -1369,7 +1503,8 @@ impl ProviderMaintenance {
 
     pub(crate) fn invalidate_update_lifecycles(
         &self,
-        mut is_configured: impl FnMut(&str, &str) -> bool,
+        settings_generation: u64,
+        mut is_current: impl FnMut(&ProviderMaintenanceTarget) -> bool,
     ) {
         let mut updates = self
             .inner
@@ -1378,16 +1513,22 @@ impl ProviderMaintenance {
             .expect("provider update coordinator lock");
         let invalid = updates
             .lifecycles
-            .iter()
-            .filter(|(instance_id, lifecycle)| !is_configured(instance_id, &lifecycle.driver))
-            .map(|(instance_id, _)| instance_id.clone())
+            .iter_mut()
+            .filter_map(|(instance_id, lifecycle)| {
+                if is_current(&lifecycle.target) {
+                    lifecycle.settings_generation = settings_generation;
+                    None
+                } else {
+                    Some(instance_id.clone())
+                }
+            })
             .collect::<Vec<_>>();
         for instance_id in invalid {
             let Some(lifecycle) = updates.lifecycles.remove(&instance_id) else {
                 continue;
             };
             if updates.states.get(&instance_id).is_some_and(|state| {
-                state.driver == lifecycle.driver && state.token == lifecycle.token
+                state.driver == lifecycle.target.driver && state.token == lifecycle.token
             }) {
                 updates.states.remove(&instance_id);
             }
@@ -1412,7 +1553,7 @@ impl ProviderMaintenance {
                 .lifecycles
                 .get(instance_id)
                 .filter(|lifecycle| {
-                    lifecycle.driver == driver
+                    lifecycle.target.driver == driver
                         && retained.driver == driver
                         && lifecycle.token == retained.token
                 })
@@ -1445,7 +1586,8 @@ impl ProviderMaintenance {
                         .lifecycles
                         .get(instance_id.as_str())
                         .is_some_and(|lifecycle| {
-                            lifecycle.driver == retained.driver && lifecycle.token == retained.token
+                            lifecycle.target.driver == retained.driver
+                                && lifecycle.token == retained.token
                         })
             })
             .map(|(instance_id, _)| instance_id.clone())
@@ -1455,18 +1597,37 @@ impl ProviderMaintenance {
         }
     }
 
+    pub(crate) fn update_lifecycle_is_current(
+        &self,
+        target: &ProviderMaintenanceTarget,
+        settings_generation: u64,
+        token: ProviderUpdateLifecycleToken,
+    ) -> bool {
+        self.inner
+            .updates
+            .lock()
+            .expect("provider update coordinator lock")
+            .lifecycles
+            .get(&target.instance_id)
+            .is_some_and(|lifecycle| {
+                lifecycle.target == *target
+                    && lifecycle.settings_generation == settings_generation
+                    && lifecycle.token == token
+                    && lifecycle.active
+            })
+    }
+
     pub(crate) async fn capabilities(
         &self,
         target: &ProviderMaintenanceTarget,
     ) -> ProviderMaintenanceCapabilities {
-        let search_path = target
-            .environment
-            .iter()
-            .find(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("path"))
-            .map(|(_, value)| value.clone())
-            .or_else(|| std::env::var_os("PATH"));
-        let resolved =
-            resolve_provider_executable_in_path(&target.binary_path, search_path.as_deref());
+        let resolved = resolve_provider_executable_with_environment(
+            &target.binary_path,
+            target
+                .environment
+                .iter()
+                .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+        );
         let canonical = match resolved.as_deref() {
             Some(path) => tokio::fs::canonicalize(path).await.ok(),
             None => None,
@@ -1502,17 +1663,14 @@ impl ProviderMaintenance {
         cancellation: &tokio_util::sync::CancellationToken,
         timeout: Duration,
     ) -> Result<ProviderUpdateCommandResult, String> {
-        let search_path = target
-            .environment
-            .iter()
-            .find(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("path"))
-            .map(|(_, value)| value.clone())
-            .or_else(|| std::env::var_os("PATH"));
-        let executable =
-            resolve_provider_executable_in_path(&update.executable, search_path.as_deref())
-                .ok_or_else(|| {
-                    format!("Could not resolve update command '{}'.", update.executable)
-                })?;
+        let executable = resolve_provider_executable_with_environment(
+            &update.executable,
+            target
+                .environment
+                .iter()
+                .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+        )
+        .ok_or_else(|| format!("Could not resolve update command '{}'.", update.executable))?;
         let launch = prepare_provider_launch(&executable, &update.args)?;
         let cwd = std::env::current_dir()
             .map_err(|error| format!("Could not determine update working directory: {error}"))?;

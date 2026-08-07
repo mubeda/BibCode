@@ -39,6 +39,9 @@ official installer document and parses matching release identifiers from its
 download and installation paths; it never executes downloaded installer text.
 For a recognized official installation, BiBCode offers the resolved
 `cursor-agent update` command and compares release dates for the advisory.
+Release identifiers are orderable only when they contain an exact, real
+Gregorian `YYYY.MM.DD-build` date; malformed widths and impossible calendar
+dates remain unknown.
 
 Custom paths and wrapper scripts remain manual-only. BiBCode intentionally
 withholds both latest-version metadata and an update action for those paths

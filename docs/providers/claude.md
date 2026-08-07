@@ -23,32 +23,39 @@ BiBCode resolves the configured executable before selecting a release source
 and action, so a package-manager inventory cannot update a different Claude
 installation. The recognized installation rows are:
 
-| Installation                                    | Latest source                       | Action in BiBCode                                      |
-| ----------------------------------------------- | ----------------------------------- | ------------------------------------------------------ |
-| Native `~/.local/bin/claude`                    | Claude `stable` or `latest` channel | Resolved `claude update`                               |
-| Homebrew `claude-code` cask                     | Claude `stable`                     | `brew upgrade --cask claude-code`                      |
-| Homebrew `claude-code@latest` cask              | Claude `latest`                     | `brew upgrade --cask claude-code@latest`               |
-| WinGet `Anthropic.ClaudeCode`                   | Claude `latest`                     | `winget upgrade Anthropic.ClaudeCode`                  |
-| Marked apt, dnf, or apk repository installation | Repository's stable/latest channel  | Display-only system command; BiBCode never executes it |
-| Recognized npm/pnpm/Bun/Vite+ path              | npm                                 | Matching package-manager command                       |
+| Installation                                    | Latest source                                             | Action in BiBCode                                      |
+| ----------------------------------------------- | --------------------------------------------------------- | ------------------------------------------------------ |
+| Native `~/.local/bin/claude`                    | Claude `stable` or `latest` channel; defaults to `latest` | Resolved `claude update`                               |
+| Homebrew `claude-code` cask                     | Claude `stable`                                           | `brew upgrade --cask claude-code`                      |
+| Homebrew `claude-code@latest` cask              | Claude `latest`                                           | `brew upgrade --cask claude-code@latest`               |
+| WinGet `Anthropic.ClaudeCode`                   | Claude `latest`                                           | `winget upgrade Anthropic.ClaudeCode`                  |
+| Marked apt, dnf, or apk repository installation | Repository's stable/latest channel                        | Display-only system command; BiBCode never executes it |
+| Recognized npm/pnpm/Bun/Vite+ path              | npm                                                       | Matching package-manager command                       |
 
 For Linux repository installations, the display-only guidance is respectively
 `sudo apt update && sudo apt upgrade claude-code`, `sudo dnf upgrade
 claude-code`, or `apk update && apk upgrade claude-code`. It is provided for a
 user to run with the required privileges, not as a server update action.
 
-Channel selection reads bounded user and managed settings. Managed settings take
-precedence, and only managed `autoUpdatesChannel` values of `stable` or `latest`
-are valid for BiBCode's release source; another managed value leaves latest
-metadata unavailable instead of guessing. `DISABLE_UPDATES=1`, whether in the
-effective provider environment or settings, disables executable update actions
-but does not suppress recognized advisory metadata or display-only guidance.
-`DISABLE_AUTOUPDATER` alone does not control this BiBCode action.
+Channel selection defaults native Claude to `latest` when user settings are
+absent or malformed. Managed settings take precedence, and only managed
+`autoUpdatesChannel` strings `stable` and `latest` are valid; every other
+present value, including null or another JSON type, leaves latest metadata
+unavailable instead of guessing.
+
+BiBCode reads only regular local settings and repository evidence. File size,
+managed-fragment count and aggregate size, and I/O time are bounded; special
+files, metadata races, timeouts, overflow, and read errors fail closed.
+`DISABLE_UPDATES=1`, whether in the effective provider environment or settings,
+disables executable update actions but does not suppress recognized advisory
+metadata or display-only guidance. `DISABLE_AUTOUPDATER` alone does not control
+this BiBCode action.
 
 Custom executable paths and wrappers are manual-only. BiBCode does not infer an
 updater for them. A zero command exit is also advisory only: the post-update
 probe must show a current advisory or a provable installed-version advance
-before the update is reported as successful.
+from a fresh exact-target pre-command probe before the update is reported as
+successful.
 
 ## Supported instance customization
 
