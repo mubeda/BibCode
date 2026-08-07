@@ -421,13 +421,7 @@ pub(crate) fn capabilities_for_paths_with_claude_hints(
     claude_hints: &ClaudeSourceHints,
 ) -> ProviderMaintenanceCapabilities {
     match driver {
-        "cursor" => ProviderMaintenanceCapabilities::executable(
-            LatestVersionSource::CursorInstaller,
-            VersionScheme::CursorRelease,
-            resolved_or_configured_binary(binary_path, resolved),
-            ["update"],
-            "cursor-agent",
-        ),
+        "cursor" => cursor_capabilities(binary_path, resolved, canonical),
         "grok" => ProviderMaintenanceCapabilities::unknown(),
         _ => resolve_package_managed_capabilities(
             driver,
@@ -437,6 +431,33 @@ pub(crate) fn capabilities_for_paths_with_claude_hints(
             claude_hints,
         ),
     }
+}
+
+fn cursor_capabilities(
+    binary_path: &str,
+    resolved: Option<&Path>,
+    canonical: Option<&Path>,
+) -> ProviderMaintenanceCapabilities {
+    let Some(canonical_path) = canonical.map(normalized_path) else {
+        return ProviderMaintenanceCapabilities::unknown();
+    };
+    if !is_cursor_release_binary_path(&canonical_path) {
+        return ProviderMaintenanceCapabilities::unknown();
+    }
+    let Some(resolved_path) = resolved.map(normalized_path) else {
+        return ProviderMaintenanceCapabilities::unknown();
+    };
+    if !is_cursor_release_binary_path(&resolved_path) && !is_cursor_launch_link_path(&resolved_path)
+    {
+        return ProviderMaintenanceCapabilities::unknown();
+    }
+    ProviderMaintenanceCapabilities::executable(
+        LatestVersionSource::CursorInstaller,
+        VersionScheme::CursorRelease,
+        resolved_or_configured_binary(binary_path, resolved),
+        ["update"],
+        "cursor-agent",
+    )
 }
 
 fn resolve_package_managed_capabilities(
@@ -752,6 +773,15 @@ fn is_claude_native_path(path: &str) -> bool {
 
 fn is_opencode_native_path(path: &str) -> bool {
     path.ends_with("/.opencode/bin/opencode") || path.ends_with("/.opencode/bin/opencode.exe")
+}
+
+fn is_cursor_release_binary_path(path: &str) -> bool {
+    path.contains("/.local/share/cursor-agent/versions/")
+        && (path.ends_with("/cursor-agent") || path.ends_with("/cursor-agent.exe"))
+}
+
+fn is_cursor_launch_link_path(path: &str) -> bool {
+    path.ends_with("/.local/bin/cursor-agent")
 }
 
 #[cfg(test)]
@@ -1170,5 +1200,40 @@ mod tests {
                 "{resolved}"
             );
         }
+    }
+
+    #[test]
+    fn recognizes_only_official_cursor_release_paths() {
+        let official = capabilities_for_paths(
+            &ProviderMaintenanceTarget {
+                instance_id: "cursor".to_owned(),
+                driver: "cursor".to_owned(),
+                binary_path: "cursor-agent".to_owned(),
+                environment: Vec::new(),
+            },
+            Some(Path::new("/home/me/.local/bin/cursor-agent")),
+            Some(Path::new(
+                "/home/me/.local/share/cursor-agent/versions/2026.06.19-653a7fb/cursor-agent",
+            )),
+        );
+        assert_eq!(official.latest, Some(LatestVersionSource::CursorInstaller));
+        assert_eq!(official.version_scheme, VersionScheme::CursorRelease);
+        assert_eq!(
+            official.display_command.as_deref(),
+            Some("/home/me/.local/bin/cursor-agent update")
+        );
+        assert!(official.update.is_some());
+
+        let wrapper = capabilities_for_paths(
+            &ProviderMaintenanceTarget {
+                instance_id: "cursor".to_owned(),
+                driver: "cursor".to_owned(),
+                binary_path: "cursor-agent".to_owned(),
+                environment: Vec::new(),
+            },
+            Some(Path::new("/srv/tools/cursor-agent")),
+            None,
+        );
+        assert_eq!(wrapper, ProviderMaintenanceCapabilities::unknown());
     }
 }
