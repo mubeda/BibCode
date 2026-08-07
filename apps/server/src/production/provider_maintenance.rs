@@ -867,7 +867,7 @@ impl ProviderMaintenance {
     }
 
     #[cfg(test)]
-    fn with_registry_base_url(registry_base_url: Url) -> Self {
+    pub(crate) fn with_registry_base_url(registry_base_url: Url) -> Self {
         Self::with_registry_base_url_inner(registry_base_url)
     }
 

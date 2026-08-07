@@ -521,6 +521,7 @@ impl NativeServerControl {
     }
 
     async fn refresh_providers(&self, payload: &Value) -> Value {
+        self.provider_maintenance.begin_latest_version_refresh();
         let instance_id = payload.get("instanceId").and_then(Value::as_str);
         let (generation, settings) = self.settings_snapshot().await;
         let cwd = std::env::current_dir().unwrap_or_else(|_| self.config.base_dir.clone());
@@ -1947,7 +1948,14 @@ pub(crate) fn now_iso() -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::{sync::Mutex as StdMutex, time::Duration};
+    use std::{
+        sync::{Mutex as StdMutex, atomic::AtomicUsize},
+        time::Duration,
+    };
+
+    use axum::{Json, Router, extract::State, routing::get};
+    use tokio::net::TcpListener;
+    use url::Url;
 
     use crate::{
         activity::AgentActivityController,
@@ -2094,6 +2102,78 @@ mod tests {
         .await
         .expect("write settings");
         NativeServerControl::new(config, json!({"policy":"test"})).await
+    }
+
+    async fn mutable_provider_registry(
+        version: &str,
+    ) -> (Url, Arc<tokio::sync::RwLock<String>>, Arc<AtomicUsize>) {
+        let version = Arc::new(tokio::sync::RwLock::new(version.to_owned()));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let state = (version.clone(), requests.clone());
+        let app = Router::new()
+            .route(
+                "/{*path}",
+                get(
+                    |State((version, requests)): State<(
+                        Arc<tokio::sync::RwLock<String>>,
+                        Arc<AtomicUsize>,
+                    )>| async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "version": version.read().await.clone() }))
+                    },
+                ),
+            )
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("registry listener");
+        let address = listener.local_addr().expect("registry address");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("registry server") });
+        (
+            Url::parse(&format!("http://{address}/")).expect("registry URL"),
+            version,
+            requests,
+        )
+    }
+
+    #[tokio::test]
+    async fn manual_provider_refresh_requires_a_new_registry_result() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let mut control = scheduler_control(&temp).await;
+        let (registry_url, registry_version, requests) = mutable_provider_registry("1.18.11").await;
+        let maintenance = ProviderMaintenance::with_registry_base_url(registry_url);
+        control.provider_maintenance = maintenance.clone();
+        let target = ProviderMaintenanceTarget {
+            instance_id: "opencode".to_owned(),
+            driver: "opencode".to_owned(),
+            binary_path: "opencode".to_owned(),
+            environment: Vec::new(),
+        };
+        let mut startup = json!({
+            "instanceId": "opencode",
+            "driver": "opencode",
+            "enabled": true,
+            "installed": true,
+            "version": "1.18.11",
+            "checkedAt": "2026-08-01T12:00:00Z"
+        });
+        maintenance
+            .enrich_snapshot(&target, &mut startup, true)
+            .await;
+        *registry_version.write().await = "1.18.15".to_owned();
+
+        control.refresh_providers(&json!({})).await;
+
+        let mut after_manual_refresh = startup;
+        after_manual_refresh["checkedAt"] = json!("2026-08-01T12:05:00Z");
+        maintenance
+            .enrich_snapshot(&target, &mut after_manual_refresh, true)
+            .await;
+        assert_eq!(
+            after_manual_refresh["versionAdvisory"]["latestVersion"],
+            "1.18.15"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 
     async fn wait_for_probe_after(control: &NativeServerControl, previous: u64) -> u64 {
