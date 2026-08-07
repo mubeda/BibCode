@@ -31,6 +31,24 @@ Cursor workspace slash commands, skills, and agents are discovered from the
 server-side workspace environment. Because this integration is Early Access,
 capabilities can vary with the installed Cursor CLI.
 
+## Updates and version advisories
+
+BiBCode recognizes an update source only when the resolved executable and its
+canonical target match the official Cursor release layout. It fetches the
+official installer document and parses matching release identifiers from its
+download and installation paths; it never executes downloaded installer text.
+For a recognized official installation, BiBCode offers the resolved
+`cursor-agent update` command and compares release dates for the advisory.
+Release identifiers are orderable only when they contain an exact, real
+Gregorian `YYYY.MM.DD-build` date; malformed widths and impossible calendar
+dates remain unknown.
+
+Custom paths and wrapper scripts remain manual-only. BiBCode intentionally
+withholds both latest-version metadata and an update action for those paths
+instead of running an update command against an unverified installation. A
+zero exit is not enough to report success: BiBCode reprobes the provider and
+requires either a current advisory or a provable release-date advance.
+
 ## Provider terminal
 
 The provider terminal launches `cursor-agent --yolo` using the configured binary

@@ -106,16 +106,41 @@ describe("provider version presentation", () => {
     expect(getProviderVersionLabel("2.0.0")).toBe("v2.0.0");
   });
 
-  it("hides current and unknown advisories", () => {
+  it("hides current and unexplained unknown advisories", () => {
     expect(getProviderVersionAdvisoryPresentation(undefined)).toBeNull();
     expect(getProviderVersionAdvisoryPresentation(advisory({ status: "current" }))).toBeNull();
-    expect(getProviderVersionAdvisoryPresentation(advisory({ status: "unknown" }))).toBeNull();
+    expect(
+      getProviderVersionAdvisoryPresentation(advisory({ status: "unknown", message: null })),
+    ).toBeNull();
+  });
+
+  it("presents a failed update check without an update command", () => {
+    expect(
+      getProviderVersionAdvisoryPresentation(
+        advisory({
+          status: "unknown",
+          message: "Could not check for provider updates.",
+          updateCommand: "provider update",
+        }),
+      ),
+    ).toEqual({
+      kind: "check_failed",
+      title: "Update check failed",
+      detail: "Could not check for provider updates.",
+      updateCommand: null,
+      emphasis: "strong",
+    });
   });
 
   it("uses server, versioned, and generic update detail", () => {
     expect(
       getProviderVersionAdvisoryPresentation(advisory({ message: "Upgrade now" })),
-    ).toMatchObject({ detail: "Upgrade now", updateCommand: "provider update" });
+    ).toMatchObject({
+      kind: "update",
+      title: "Update available",
+      detail: "Upgrade now",
+      updateCommand: "provider update",
+    });
     expect(getProviderVersionAdvisoryPresentation(advisory())).toMatchObject({
       detail: "Update available: install v2.0.0.",
     });

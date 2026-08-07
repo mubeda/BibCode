@@ -505,6 +505,32 @@ describe("version advisory", () => {
     expect(onRunUpdate).toHaveBeenCalledTimes(1);
   });
 
+  it("shows update-check failures without update or copy actions", () => {
+    const markup = render(
+      baseProps({
+        liveProvider: advisoryProvider({
+          versionAdvisory: {
+            status: "unknown",
+            currentVersion: "1.0.0",
+            latestVersion: null,
+            updateCommand: "npm i -g codex@latest",
+            canUpdate: true,
+            checkedAt: NOW,
+            message: "Could not check for provider updates.",
+          },
+        }),
+        onRunUpdate: vi.fn(),
+      }),
+    );
+
+    expect(markup).toContain("Update check failed");
+    expect(markup).toContain("Could not check for provider updates.");
+    expect(markup).not.toContain("Update now");
+    expect(
+      ui.filter("Button", (props) => props["aria-label"] === "Copy update command"),
+    ).toHaveLength(0);
+  });
+
   it("shows the updating state and omits the run button when no handler is given", () => {
     const markup = render(
       baseProps({ liveProvider: advisoryProvider(), onRunUpdate: vi.fn(), isUpdating: true }),
