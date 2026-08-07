@@ -17,8 +17,8 @@ use crate::{
     },
     production::provider_maintenance::{ProviderMaintenance, ProviderMaintenanceTarget},
     production::provider_runtime::{
-        prepare_provider_launch, resolve_provider_executable,
-        sanitize_provider_subprocess_environment,
+        normalize_provider_environment, prepare_provider_launch,
+        resolve_provider_executable_with_environment, sanitize_provider_subprocess_environment,
     },
     provider::{claude, codex, cursor, grok, opencode},
 };
@@ -323,7 +323,7 @@ fn string_array(value: Option<&Value>, name: &str) -> Option<Vec<String>> {
 }
 
 fn provider_environment(instance: &Value) -> Vec<(OsString, OsString)> {
-    instance
+    let environment = instance
         .get("environment")
         .and_then(Value::as_array)
         .into_iter()
@@ -349,7 +349,12 @@ fn provider_environment(instance: &Value) -> Vec<(OsString, OsString)> {
                 ),
             ))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    normalize_provider_environment(
+        environment
+            .iter()
+            .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+    )
 }
 
 async fn probe_one(
@@ -392,6 +397,35 @@ pub(crate) fn maintenance_target(
         })
         .as_ref()
         .map(maintenance_target_from_definition)
+}
+
+pub(crate) async fn probe_maintenance_target_version(
+    target: &ProviderMaintenanceTarget,
+    cwd: &Path,
+) -> Option<String> {
+    let executable = resolve_provider_executable_with_environment(
+        &target.binary_path,
+        target
+            .environment
+            .iter()
+            .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+    )?;
+    let version_output = run_command(&executable, &["--version"], cwd, &target.environment).await;
+    let version = normalize_provider_version(
+        &target.driver,
+        version_output
+            .as_ref()
+            .filter(|output| output.success)
+            .and_then(|output| first_line(&output.stdout, &output.stderr)),
+    );
+    if target.driver != "cursor" {
+        return version;
+    }
+    let about = run_command(&executable, &["about"], cwd, &target.environment)
+        .await
+        .filter(|output| output.success)
+        .map(|output| cursor::parse_about_output(output.code, &output.stdout, &output.stderr));
+    about.and_then(|about| about.version).or(version)
 }
 
 async fn probe_one_snapshot(
@@ -495,7 +529,13 @@ async fn probe_one_snapshot(
     } else {
         RichMetadataOutcome::NotRequested
     };
-    let Some(executable) = resolve_provider_executable(&definition.binary_path) else {
+    let Some(executable) = resolve_provider_executable_with_environment(
+        &definition.binary_path,
+        definition
+            .environment
+            .iter()
+            .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+    ) else {
         return ProviderProbeResult::new(
             snapshot(
                 definition,
@@ -1088,6 +1128,11 @@ async fn run_command(
     environment: &[(OsString, OsString)],
 ) -> Option<CommandOutput> {
     let launch = prepare_provider_launch(executable, args).ok()?;
+    let environment = normalize_provider_environment(
+        environment
+            .iter()
+            .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+    );
     let output = ProcessRunner
         .run(
             ProcessRequest {
@@ -1095,7 +1140,7 @@ async fn run_command(
                 command: launch.program,
                 args: launch.args,
                 cwd: cwd.to_path_buf(),
-                env: environment.to_vec(),
+                env: environment,
                 stdin: None,
                 timeout: PROBE_TIMEOUT,
                 max_output_bytes: PROBE_OUTPUT_LIMIT,
@@ -1549,6 +1594,115 @@ mod tests {
 
     use axum::{Json, Router, routing::get};
 
+    #[cfg(unix)]
+    fn write_version_fixture(directory: &Path, name: &str, version: &str) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let executable = directory.join(name);
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nif [ \"$1\" = about ]; then printf '%s\\n' '{{\"cliVersion\":\"{version}\"}}'; else printf '%s\\n' '{version}'; fi\n"
+            ),
+        )
+        .expect("write version fixture");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("version fixture metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions)
+            .expect("make version fixture executable");
+        executable
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn inventory_probes_the_instance_path_executable_instead_of_ambient_path() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let ambient = tempfile::tempdir().expect("ambient executable directory");
+        let instance = tempfile::tempdir().expect("instance executable directory");
+        write_version_fixture(ambient.path(), "cursor-agent", "2026.01.02-ambient");
+        write_version_fixture(instance.path(), "cursor-agent", "2026.03.04-instance");
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: process-global environment mutation is serialized by the shared test lock.
+        unsafe { std::env::set_var("PATH", ambient.path()) };
+        let settings = json!({
+            "enableProviderUpdateChecks": false,
+            "providerInstances": {
+                "cursor-work": {
+                    "driver": "cursor",
+                    "enabled": true,
+                    "config": { "binaryPath": "cursor-agent" },
+                    "environment": [
+                        { "name": "pAtH", "value": instance.path(), "valueRedacted": false }
+                    ]
+                }
+            }
+        });
+
+        let providers = probe_full(
+            &settings,
+            Some("cursor-work"),
+            instance.path(),
+            &ProviderMaintenance::new(),
+        )
+        .await;
+
+        match original_path {
+            Some(path) => {
+                // SAFETY: process-global environment mutation is serialized by the shared test lock.
+                unsafe { std::env::set_var("PATH", path) };
+            }
+            None => {
+                // SAFETY: process-global environment mutation is serialized by the shared test lock.
+                unsafe { std::env::remove_var("PATH") };
+            }
+        }
+        assert_eq!(providers[0].snapshot["version"], "2026.03.04-instance");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_target_probe_applies_the_same_case_variant_path_used_for_resolution() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let root = tempfile::tempdir().expect("inventory PATH root");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::create_dir_all(&first).expect("first PATH directory");
+        std::fs::create_dir_all(&second).expect("second PATH directory");
+        let executable = first.join("codex");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nif [ \"$PATH\" = '{}' ]; then printf '1.2.3\\n'; else printf '9.9.9\\n'; fi\n",
+                first.to_string_lossy()
+            ),
+        )
+        .expect("write version fixture");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("version fixture metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions)
+            .expect("make version fixture executable");
+        let target = ProviderMaintenanceTarget {
+            instance_id: "codex-work".to_owned(),
+            driver: "codex".to_owned(),
+            binary_path: "codex".to_owned(),
+            environment: vec![
+                ("pAtH".into(), first.as_os_str().to_owned()),
+                ("PATH".into(), second.as_os_str().to_owned()),
+            ],
+        };
+
+        assert_eq!(
+            probe_maintenance_target_version(&target, root.path()).await,
+            Some("1.2.3".to_owned())
+        );
+    }
+
     #[test]
     fn maintenance_target_rejects_mismatched_instance_driver_pairs() {
         let settings = json!({
@@ -1864,13 +2018,18 @@ mod tests {
         let instance = json!({
             "environment": [
                 { "name": "API_KEY", "value": "secret", "valueRedacted": false },
+                { "name": "pAtH", "value": "/first", "valueRedacted": false },
+                { "name": "PATH", "value": "/second", "valueRedacted": false },
                 { "name": "HIDDEN", "value": "redacted", "valueRedacted": true },
                 { "name": "", "value": "ignored", "valueRedacted": false }
             ]
         });
         assert_eq!(
             provider_environment(&instance),
-            vec![(OsString::from("API_KEY"), OsString::from("secret"))]
+            vec![
+                (OsString::from("API_KEY"), OsString::from("secret")),
+                (OsString::from("PATH"), OsString::from("/first"))
+            ]
         );
     }
 
