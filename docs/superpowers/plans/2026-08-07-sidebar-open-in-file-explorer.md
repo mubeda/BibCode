@@ -87,11 +87,11 @@ vp test run apps/web/src/components/Sidebar.test.tsx -t "opens the local primary
 
 Expected: FAIL because the editor-free `Open in` item is disabled and has no `open-in:file-explorer` child.
 
-- [ ] **Step 3: Add failing worktree and availability-boundary tests**
+- [ ] **Step 3: Add the failing worktree-path test**
 
-The worktree test catches fallback to the repository root. The two omission tests catch leaking a local privileged action to remote paths or hosts without the capability.
+The production mistake this catches is falling back to the repository root instead of using the worktree's effective checkout directory.
 
-Add these tests inside `staticDescribe("thread context menu", ...)`:
+Add this test inside `staticDescribe("thread context menu", ...)`:
 
 ```tsx
 it("opens a local worktree path in File Explorer", async () => {
@@ -110,6 +110,77 @@ it("opens a local worktree path in File Explorer", async () => {
 
   expect(openInFileManager).toHaveBeenCalledWith("C:/wt/x", true);
 });
+```
+
+- [ ] **Step 4: Run both positive-path tests and verify RED**
+
+Run:
+
+```bash
+vp test run apps/web/src/components/Sidebar.test.tsx -t "File Explorer"
+```
+
+Expected: both local primary/worktree tests FAIL because the action does not exist.
+
+- [ ] **Step 5: Implement the minimal positive path through one shared callback**
+
+Inside `SidebarProjectItem`, add one private callback shared by both row handlers. At this stage, deliberately leave eligibility gating for the next red-green cycle:
+
+```tsx
+const openWorkspaceInFileManager = useCallback(async (path: string) => {
+  const bridge =
+    typeof window === "undefined" ? undefined : window.desktopBridge?.openInFileManager;
+  if (!bridge) return;
+  await bridge(path, true);
+}, []);
+```
+
+In both context-menu callbacks, prepend the action to the editor children:
+
+```tsx
+const openInChildren = [
+  { id: "open-in:file-explorer", label: "File Explorer" },
+  ...openInEditorOptions.map((editor) => ({
+    id: `open-in:${editor.id}`,
+    label: editor.label,
+  })),
+];
+```
+
+Replace the current editor-count conditional in both menus with:
+
+```tsx
+{ id: "open-in", label: "Open in", children: openInChildren },
+```
+
+Before the generic `clicked.startsWith("open-in:")` editor branch in each callback, dispatch the exact File Explorer id:
+
+```tsx
+if (clicked === "open-in:file-explorer") {
+  await openWorkspaceInFileManager(threadWorkspacePath);
+  return;
+}
+```
+
+Use `cwd` rather than `threadWorkspacePath` in the primary-row callback. Add `openWorkspaceInFileManager` to both callback dependency arrays. Do not add fallback paths or call the server.
+
+- [ ] **Step 6: Run both positive-path tests and verify GREEN**
+
+Run:
+
+```bash
+vp test run apps/web/src/components/Sidebar.test.tsx -t "File Explorer"
+```
+
+Expected: both local primary/worktree tests PASS with no unhandled promise rejection.
+
+- [ ] **Step 7: Add failing availability-boundary tests**
+
+The production mistakes these catch are exposing a local privileged action to remote paths or displaying an action that its host cannot execute. They are added only after Step 5 intentionally exposes the action broadly, so both tests must fail for the intended reason.
+
+Add these tests inside `staticDescribe("thread context menu", ...)`:
+
+```tsx
 
 it("omits File Explorer for a remote row", async () => {
   const { remoteThread } = groupedScenario();
@@ -152,27 +223,27 @@ it("omits File Explorer when the desktop bridge capability is unavailable", asyn
 });
 ```
 
-- [ ] **Step 4: Run the Task 1 tests and verify RED**
+- [ ] **Step 8: Run the availability tests and verify RED**
 
 Run:
 
 ```bash
-vp test run apps/web/src/components/Sidebar.test.tsx -t "File Explorer"
+vp test run apps/web/src/components/Sidebar.test.tsx -t "omits File Explorer"
 ```
 
-Expected: the local primary/worktree tests FAIL because the action does not exist. The omission tests may already pass; keep them because they protect the trust boundary once production code changes.
+Expected: both omission tests FAIL because Step 5 deliberately exposes `open-in:file-explorer` without environment or capability gates.
 
-- [ ] **Step 5: Implement the minimal submenu composition**
+- [ ] **Step 9: Add the environment and capability gates**
 
-In each context-menu callback, derive capability eligibility from the row environment and bridge:
+In each context-menu callback, derive eligibility for that row:
 
 ```tsx
-const fileManagerBridge =
+const canOpenInFileExplorer =
   thread.environmentId === primaryEnvironmentId && typeof window !== "undefined"
-    ? window.desktopBridge?.openInFileManager
-    : undefined;
+    ? window.desktopBridge?.openInFileManager !== undefined
+    : false;
 const openInChildren = [
-  ...(fileManagerBridge
+  ...(canOpenInFileExplorer
     ? [{ id: "open-in:file-explorer", label: "File Explorer" }]
     : []),
   ...openInEditorOptions.map((editor) => ({
@@ -190,19 +261,9 @@ openInChildren.length > 0
   : { id: "open-in", label: "Open in", disabled: true },
 ```
 
-Before the generic `clicked.startsWith("open-in:")` editor branch in each callback, dispatch the exact File Explorer id:
+Keep the exact action dispatch from Step 5. Ensure `primaryEnvironmentId` remains in both callback dependency arrays.
 
-```tsx
-if (clicked === "open-in:file-explorer") {
-  if (!fileManagerBridge) return;
-  await fileManagerBridge(threadWorkspacePath, true);
-  return;
-}
-```
-
-Use `cwd` rather than `threadWorkspacePath` in the primary-row callback. Ensure `primaryEnvironmentId` is present in both callback dependency arrays. Do not add fallback paths or call the server.
-
-- [ ] **Step 6: Run the focused tests and verify GREEN**
+- [ ] **Step 10: Run all Task 1 tests and verify GREEN**
 
 Run:
 
@@ -212,7 +273,7 @@ vp test run apps/web/src/components/Sidebar.test.tsx -t "File Explorer"
 
 Expected: all File Explorer success and omission tests PASS with no unhandled promise rejection.
 
-- [ ] **Step 7: Run the complete Sidebar test file**
+- [ ] **Step 11: Run the complete Sidebar test file**
 
 Run:
 
@@ -222,7 +283,7 @@ vp test run apps/web/src/components/Sidebar.test.tsx
 
 Expected: all Sidebar tests PASS, including existing editor launch behavior and disabled-menu coverage.
 
-- [ ] **Step 8: Commit Task 1**
+- [ ] **Step 12: Commit Task 1**
 
 ```bash
 git add apps/web/src/components/Sidebar.tsx apps/web/src/components/Sidebar.test.tsx
@@ -235,11 +296,11 @@ git commit -m "feat(web): open local workspaces in File Explorer"
 
 **Files:**
 - Modify: `apps/web/src/components/Sidebar.test.tsx` in the File Explorer context-menu tests
-- Modify: `apps/web/src/components/Sidebar.tsx` in both File Explorer dispatch branches
+- Modify: `apps/web/src/components/Sidebar.tsx` in the shared File Explorer launch callback
 - Modify: `docs/user/workspace-ui.md` under `## Left Panel`
 
 **Interfaces:**
-- Consumes: the `open-in:file-explorer` action and `fileManagerBridge` function introduced in Task 1
+- Consumes: the `open-in:file-explorer` action and `openWorkspaceInFileManager(path: string): Promise<void>` callback introduced in Task 1
 - Produces: visible toast `{ type: "error", title: "Unable to open File Explorer", description: string }`; updated user-facing workspace behavior documentation
 
 - [ ] **Step 1: Add failing rejection tests**
@@ -286,15 +347,17 @@ vp test run apps/web/src/components/Sidebar.test.tsx -t "reports File Explorer l
 
 Expected: FAIL through an unhandled rejection or missing toast because Task 1 performs a bare awaited bridge call.
 
-- [ ] **Step 3: Add the minimal rejection handling**
+- [ ] **Step 3: Add the minimal rejection handling once in the shared callback**
 
-Wrap each exact File Explorer dispatch in `try`/`catch` while retaining the early capability guard:
+Add `try`/`catch` inside the single `openWorkspaceInFileManager` callback while retaining its capability guard:
 
 ```tsx
-if (clicked === "open-in:file-explorer") {
-  if (!fileManagerBridge) return;
+const openWorkspaceInFileManager = useCallback(async (path: string) => {
+  const bridge =
+    typeof window === "undefined" ? undefined : window.desktopBridge?.openInFileManager;
+  if (!bridge) return;
   try {
-    await fileManagerBridge(threadWorkspacePath, true);
+    await bridge(path, true);
   } catch (error) {
     toastManager.add({
       type: "error",
@@ -302,11 +365,10 @@ if (clicked === "open-in:file-explorer") {
       description: error instanceof Error ? error.message : "An unexpected error occurred.",
     });
   }
-  return;
-}
+}, []);
 ```
 
-Use `cwd` in the primary-row version. Do not retry, navigate, mutate project state, or fall back to an editor.
+Both row handlers continue calling this shared callback with their already-selected path. Do not retry, navigate, mutate project state, or fall back to an editor.
 
 - [ ] **Step 4: Run the rejection test and verify GREEN**
 
