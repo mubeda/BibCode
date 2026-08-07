@@ -570,22 +570,25 @@ impl NativeServerControl {
         target: &ProviderMaintenanceTarget,
         token: ProviderUpdateLifecycleToken,
         state: Value,
-    ) -> Vec<Value> {
+    ) -> (Vec<Value>, bool) {
         let _update_guard = self.settings_update_lock.lock().await;
+        let generation = self.settings_generation.load(Ordering::Acquire);
         let configured = provider_inventory::maintenance_target(
             &*self.settings.read().await,
             &target.driver,
             Some(&target.instance_id),
-        )
-        .is_some();
-        if configured {
-            self.provider_maintenance.set_update_state_if_current(
+        );
+        let retained = configured.as_ref() == Some(target)
+            && self
+                .provider_maintenance
+                .update_lifecycle_is_current(target, generation, token)
+            && self.provider_maintenance.set_update_state_if_current(
                 &target.instance_id,
                 &target.driver,
                 token,
                 state,
             );
-        } else {
+        if !retained {
             self.provider_maintenance
                 .invalidate_update_lifecycle_if_current(&target.instance_id, &target.driver, token);
         }
@@ -596,7 +599,7 @@ impl NativeServerControl {
         let snapshot = providers.clone();
         drop(providers);
         self.publish_provider_snapshots(&snapshot);
-        snapshot
+        (snapshot, retained)
     }
 
     async fn update_provider(
@@ -664,23 +667,24 @@ impl NativeServerControl {
         let command_guard = match lock.clone().try_lock_owned() {
             Ok(guard) => guard,
             Err(_) => {
-                self.publish_provider_update_state(
-                    &target,
-                    update_token,
-                    provider_update_state(
-                        "queued",
-                        None,
-                        None,
-                        "Waiting for another provider update to finish.",
-                        None,
-                    ),
-                )
-                .await;
+                let _ = self
+                    .publish_provider_update_state(
+                        &target,
+                        update_token,
+                        provider_update_state(
+                            "queued",
+                            None,
+                            None,
+                            "Waiting for another provider update to finish.",
+                            None,
+                        ),
+                    )
+                    .await;
                 tokio::select! {
                     guard = lock.lock_owned() => guard,
                     () = cancellation.cancelled() => {
                         let finished_at = now_iso();
-                        let providers = self.publish_provider_update_state(
+                        let (providers, _) = self.publish_provider_update_state(
                             &target,
                             update_token,
                             provider_update_state(
@@ -725,7 +729,7 @@ impl NativeServerControl {
                     &target.driver,
                     update_token,
                 );
-            let providers = self
+            let (providers, _) = self
                 .publish_provider_update_state(
                     &target,
                     update_token,
@@ -743,19 +747,51 @@ impl NativeServerControl {
         let cwd = std::env::current_dir().unwrap_or_else(|_| self.config.base_dir.clone());
         let before_version =
             provider_inventory::probe_maintenance_target_version(&target, &cwd).await;
+        let (_, pre_run_settings) = self.settings_snapshot().await;
+        let pre_run_target = provider_inventory::maintenance_target(
+            &pre_run_settings,
+            &target.driver,
+            Some(&target.instance_id),
+        );
+        let pre_run_update = match pre_run_target.as_ref() {
+            Some(pre_run_target) if pre_run_target == &target => {
+                self.provider_maintenance
+                    .capabilities(pre_run_target)
+                    .await
+                    .update
+            }
+            _ => None,
+        };
+        if pre_run_update.as_ref() != Some(&update) {
+            drop(command_guard);
+            self.provider_maintenance
+                .invalidate_update_lifecycle_if_current(
+                    &target.instance_id,
+                    &target.driver,
+                    update_token,
+                );
+            let providers = self.providers.read().await.clone();
+            return Ok(json!({ "providers": providers }));
+        }
         let started_at = now_iso();
-        self.publish_provider_update_state(
-            &target,
-            update_token,
-            provider_update_state(
-                "running",
-                Some(&started_at),
-                None,
-                "Updating provider.",
-                None,
-            ),
-        )
-        .await;
+        let (_, running_published) = self
+            .publish_provider_update_state(
+                &target,
+                update_token,
+                provider_update_state(
+                    "running",
+                    Some(&started_at),
+                    None,
+                    "Updating provider.",
+                    None,
+                ),
+            )
+            .await;
+        if !running_published {
+            drop(command_guard);
+            let providers = self.providers.read().await.clone();
+            return Ok(json!({ "providers": providers }));
+        }
         let command_result = match self
             .provider_maintenance
             .run_update_command(&target, &update, &cancellation)
@@ -765,7 +801,7 @@ impl NativeServerControl {
             Err(error) => {
                 drop(command_guard);
                 let finished_at = now_iso();
-                let providers = self
+                let (providers, _) = self
                     .publish_provider_update_state(
                         &target,
                         update_token,
@@ -788,7 +824,7 @@ impl NativeServerControl {
                 "Update command exited with code {}.",
                 command_result.exit_code
             );
-            let providers = self
+            let (providers, _) = self
                 .publish_provider_update_state(
                     &target,
                     update_token,
@@ -852,7 +888,7 @@ impl NativeServerControl {
             ),
         };
         let finished_at = now_iso();
-        let providers = self
+        let (providers, _) = self
             .publish_provider_update_state(
                 &target,
                 update_token,
@@ -1633,6 +1669,7 @@ fn validate_provider_instances(instances: &Value) -> Result<(), String> {
             let environment = environment.as_array().ok_or_else(|| {
                 format!("providerInstances.{instance_id}.environment must be an array")
             })?;
+            let mut names: Vec<&str> = Vec::with_capacity(environment.len());
             for (index, variable) in environment.iter().enumerate() {
                 let variable = variable.as_object().ok_or_else(|| {
                     format!(
@@ -1659,6 +1696,15 @@ fn validate_provider_instances(instances: &Value) -> Result<(), String> {
                         "providerInstances.{instance_id}.environment[{index}].name is invalid"
                     ));
                 }
+                if let Some(existing) = names
+                    .iter()
+                    .find(|existing| existing.eq_ignore_ascii_case(name.trim()))
+                {
+                    return Err(format!(
+                        "providerInstances.{instance_id}.environment[{index}].name duplicates {existing}"
+                    ));
+                }
+                names.push(name.trim());
                 validate_optional_string(variable, "value")?;
                 validate_optional_bool(variable, "sensitive")?;
                 validate_optional_bool(variable, "valueRedacted")?;
@@ -2941,6 +2987,73 @@ mod tests {
             .iter()
             .find(|provider| provider["instanceId"] == "cursor-work")
             .expect("reconfigured Cursor provider");
+        assert!(provider.get("updateState").is_none());
+    }
+
+    #[tokio::test]
+    async fn settings_change_during_fresh_preprobe_prevents_stale_command_execution() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let old_root = tempfile::tempdir().expect("old Cursor fixture root");
+        let new_root = tempfile::tempdir().expect("new Cursor fixture root");
+        let old_executable = compile_cursor_update_fixture(old_root.path(), "2026.01.01-old").await;
+        let new_executable = compile_cursor_update_fixture(new_root.path(), "2026.02.02-new").await;
+        let old_release = old_executable.parent().expect("old release directory");
+        tokio::fs::write(old_release.join("version-pause"), "pause")
+            .await
+            .expect("pause old version probe");
+        let control = control_with_cursor_update_fixture(old_executable.clone()).await;
+        let updating = {
+            let control = control.clone();
+            tokio::spawn(async move {
+                control
+                    .update_provider(
+                        &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
+                        CancellationToken::new(),
+                    )
+                    .await
+            })
+        };
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !old_release.join("version-entered").is_file() {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("fresh pre-probe entered");
+
+        control
+            .update_settings(json!({
+                "patch": {
+                    "providerInstances": {
+                        "cursor-work": {
+                            "driver": "cursor",
+                            "enabled": true,
+                            "config": { "binaryPath": new_executable }
+                        }
+                    }
+                }
+            }))
+            .await
+            .expect("replace target during pre-probe");
+        tokio::fs::write(old_release.join("version-release"), "release")
+            .await
+            .expect("release old version probe");
+
+        let result = updating
+            .await
+            .expect("provider update joins")
+            .expect("stale provider update returns snapshots");
+
+        assert!(
+            !old_release.join("update-invoked").exists(),
+            "the old update command must not run after the target changes"
+        );
+        let provider = result["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("replacement Cursor provider");
         assert!(provider.get("updateState").is_none());
     }
 
@@ -4476,6 +4589,26 @@ mod tests {
                 .await
                 .is_err(),
             "invalid update must not publish settings or provider events"
+        );
+    }
+
+    #[test]
+    fn duplicate_case_insensitive_provider_environment_names_are_rejected() {
+        let settings = json!({
+            "providerInstances": {
+                "codex-work": {
+                    "driver": "codex",
+                    "environment": [
+                        { "name": "PATH", "value": "/first" },
+                        { "name": "Path", "value": "/second" }
+                    ]
+                }
+            }
+        });
+
+        assert_eq!(
+            validate_settings_document(&settings).unwrap_err(),
+            "providerInstances.codex-work.environment[1].name duplicates PATH"
         );
     }
 
