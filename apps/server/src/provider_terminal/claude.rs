@@ -493,7 +493,7 @@ impl ClaudeTerminalObserverFactory {
         #[cfg(not(unix))]
         {
             let _ = input;
-            return None;
+            None
         }
         #[cfg(unix)]
         {

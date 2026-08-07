@@ -206,6 +206,8 @@ pub struct NativeServerControl {
     #[cfg(test)]
     next_settings_persisted_pause: Arc<Mutex<Option<ProviderProbePause>>>,
     #[cfg(test)]
+    next_provider_capabilities_pause: Arc<Mutex<Option<ProviderProbePause>>>,
+    #[cfg(test)]
     next_quick_provider_probe_pause: Arc<Mutex<Option<ProviderProbePause>>>,
     #[cfg(test)]
     next_full_provider_probe_pause: Arc<Mutex<Option<ProviderProbePause>>>,
@@ -303,6 +305,8 @@ impl NativeServerControl {
             settings_update_barrier: Arc::new(RwLock::new(None)),
             #[cfg(test)]
             next_settings_persisted_pause: Arc::new(Mutex::new(None)),
+            #[cfg(test)]
+            next_provider_capabilities_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
             next_quick_provider_probe_pause: Arc::new(Mutex::new(None)),
             #[cfg(test)]
@@ -520,6 +524,13 @@ impl NativeServerControl {
     }
 
     #[cfg(test)]
+    async fn install_next_provider_capabilities_pause(&self) -> ProviderProbePause {
+        let pause = ProviderProbePause::new();
+        *self.next_provider_capabilities_pause.lock().await = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
     async fn install_next_quick_provider_probe_pause(&self) -> ProviderProbePause {
         let pause = ProviderProbePause::new();
         *self.next_quick_provider_probe_pause.lock().await = Some(pause.clone());
@@ -629,7 +640,7 @@ impl NativeServerControl {
                 ));
             }
         };
-        let (settings_generation, settings) = self.settings_snapshot().await;
+        let (_, settings) = self.settings_snapshot().await;
         let target = provider_inventory::maintenance_target(&settings, provider, instance_id)
             .ok_or_else(|| {
                 provider_update_error(
@@ -638,6 +649,11 @@ impl NativeServerControl {
                 )
             })?;
         let capabilities = self.provider_maintenance.capabilities(&target).await;
+        #[cfg(test)]
+        if let Some(pause) = self.next_provider_capabilities_pause.lock().await.take() {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
         let update = capabilities.update.ok_or_else(|| {
             provider_update_error(
                 provider,
@@ -646,20 +662,22 @@ impl NativeServerControl {
         })?;
         let reservation = {
             let _update_guard = self.settings_update_lock.lock().await;
-            if provider_inventory::maintenance_target(
+            let current_target = match provider_inventory::maintenance_target(
                 &*self.settings.read().await,
                 &target.driver,
                 Some(&target.instance_id),
-            )
-            .is_none()
-            {
-                return Err(provider_update_error(
-                    provider,
-                    "The requested provider instance does not match this provider.",
-                ));
-            }
+            ) {
+                Some(current_target) if current_target == target => current_target,
+                _ => {
+                    return Err(provider_update_error(
+                        provider,
+                        "The requested provider instance does not match this provider.",
+                    ));
+                }
+            };
+            let settings_generation = self.settings_generation.load(Ordering::Acquire);
             self.provider_maintenance
-                .reserve_target(&target, settings_generation)
+                .reserve_target(&current_target, settings_generation)
         }
         .map_err(|reason| provider_update_error(provider, reason))?;
         let update_token = reservation.token();
@@ -2886,6 +2904,107 @@ mod tests {
             .find(|provider| provider["instanceId"] == "cursor-work")
             .expect("stored re-added cursor provider");
         assert!(readded.get("updateState").is_none());
+    }
+
+    #[tokio::test]
+    async fn unrelated_settings_commit_after_capability_resolution_uses_current_generation() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("Cursor fixture root");
+        let executable = compile_cursor_update_fixture(directory.path(), "2026.01.01-old").await;
+        let release_directory = executable
+            .parent()
+            .expect("Cursor release directory")
+            .to_path_buf();
+        tokio::fs::write(release_directory.join("next-version"), "2026.02.02-new")
+            .await
+            .expect("next Cursor version");
+        let control = control_with_cursor_update_fixture(executable).await;
+        let pause = control.install_next_provider_capabilities_pause().await;
+        let updating = {
+            let control = control.clone();
+            tokio::spawn(async move {
+                control
+                    .update_provider(
+                        &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
+                        CancellationToken::new(),
+                    )
+                    .await
+            })
+        };
+        pause.wait_until_entered().await;
+
+        control
+            .update_settings(json!({ "patch": { "enableAssistantStreaming": true } }))
+            .await
+            .expect("commit unrelated settings change");
+        pause.release();
+
+        let result = updating
+            .await
+            .expect("provider update joins")
+            .expect("unchanged target remains reservable");
+        assert!(release_directory.join("update-invoked").is_file());
+        assert_eq!(
+            tokio::fs::read_to_string(release_directory.join("version-state"))
+                .await
+                .expect("updated Cursor version"),
+            "2026.02.02-new"
+        );
+        let provider = result["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("Cursor provider");
+        assert_eq!(provider["updateState"]["status"], "succeeded");
+    }
+
+    #[tokio::test]
+    async fn environment_change_after_capability_resolution_fails_reservation_closed() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("Cursor fixture root");
+        let executable = compile_cursor_update_fixture(directory.path(), "2026.01.01-old").await;
+        let release_directory = executable.parent().expect("Cursor release directory");
+        let control = control_with_cursor_update_fixture(executable.clone()).await;
+        let pause = control.install_next_provider_capabilities_pause().await;
+        let updating = {
+            let control = control.clone();
+            tokio::spawn(async move {
+                control
+                    .update_provider(
+                        &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
+                        CancellationToken::new(),
+                    )
+                    .await
+            })
+        };
+        pause.wait_until_entered().await;
+
+        control
+            .update_settings(json!({
+                "patch": {
+                    "providerInstances": {
+                        "cursor-work": {
+                            "driver": "cursor",
+                            "enabled": true,
+                            "config": { "binaryPath": executable },
+                            "environment": [
+                                { "name": "BIBCODE_RESERVATION_RACE", "value": "changed" }
+                            ]
+                        }
+                    }
+                }
+            }))
+            .await
+            .expect("change provider environment");
+        pause.release();
+
+        let error = updating
+            .await
+            .expect("provider update joins")
+            .expect_err("changed target must fail before reservation");
+        assert_eq!(error["_tag"], "ServerProviderUpdateError");
+        assert!(!release_directory.join("update-invoked").exists());
     }
 
     #[tokio::test]

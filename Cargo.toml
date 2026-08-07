@@ -97,6 +97,8 @@ warnings = "deny"
 
 [patch.crates-io]
 portable-pty = { path = "third_party/portable-pty" }
+# Upstream fix for Windows reentrant keyboard/IME deadlocks; remove once Tauri uses Tao >= 0.36.
+tao = { git = "https://github.com/tauri-apps/tao", rev = "c704261c519c58cfdd0bc2d58ba24e06a0b71c92" }
 
 [profile.release]
 lto = "thin"

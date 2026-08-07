@@ -1118,9 +1118,7 @@ fn homebrew_ownership(
     ]
     .into_iter()
     .find(|(root, _)| components.starts_with(root));
-    let Some((root, kind)) = brew_root else {
-        return None;
-    };
+    let (root, kind) = brew_root?;
     let identity = components.get(root.len()).copied();
     match driver {
         "codex" if kind == "caskroom" && identity == Some("codex") => {
