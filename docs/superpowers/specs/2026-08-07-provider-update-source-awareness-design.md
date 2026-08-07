@@ -12,7 +12,7 @@ binary is a bare command such as `codex` or `claude`, the resolver assumes npm
 even when that command resolved to a standalone binary, WinGet package, system
 package, or custom wrapper.
 
-The original T3 Code implementation has the useful shape of provider-owned
+The original predecessor implementation has the useful shape of provider-owned
 maintenance definitions feeding a shared resolver and command runner. It also
 contains the same unsafe bare-command fallback, npm-only latest-version model,
 and unverifiable Cursor update behavior. It is historical design evidence, not
