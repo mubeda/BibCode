@@ -398,7 +398,7 @@ Run:
 
 ```bash
 vp test run apps/web/src/components/Sidebar.test.tsx
-vp test run --project unit
+vp run --filter @bibcode/web test
 ```
 
 Expected: both commands exit 0 with no failed tests or unhandled rejections.

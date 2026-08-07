@@ -2003,12 +2003,22 @@ staticDescribe("thread context menu", () => {
     };
     render(<Sidebar />);
     fakeLocalApi();
-    h.spies.contextMenuShow.mockResolvedValue("open-in:file-explorer");
+    let openInChildren: Array<{ id: string }> = [];
+    h.spies.contextMenuShow.mockImplementation(
+      async (items: Array<{ id: string; children?: Array<{ id: string }> }>) => {
+        openInChildren = items.find((item) => item.id === "open-in")?.children ?? [];
+        return "open-in:file-explorer";
+      },
+    );
     const row = mustFindProps(byTestId("thread-row-thread-active"), "active worktree row");
 
     invoke(row, "onContextMenu", mouseEvent());
     await flush();
 
+    expect(openInChildren.map((item) => item.id)).toEqual([
+      "open-in:file-explorer",
+      "open-in:vscode",
+    ]);
     expect(openInFileManager).toHaveBeenCalledWith("C:/wt/x", true);
   });
 
