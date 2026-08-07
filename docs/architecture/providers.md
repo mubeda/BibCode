@@ -55,6 +55,10 @@ probing, so it cannot reuse a result from an earlier manual or background
 refresh. Lookups for different packages remain concurrent, while instances of
 the same provider share one lookup per generation.
 
+npm lookups use each package's `/latest` document. The full package document is
+not a latest-version response and does not provide the top-level `version` field
+consumed by provider maintenance.
+
 Registry transport failures, non-success statuses, malformed responses, and
 missing versions are not cached. They produce a visible unknown advisory with a
 retry prompt but do not change provider readiness or discard inventory data.

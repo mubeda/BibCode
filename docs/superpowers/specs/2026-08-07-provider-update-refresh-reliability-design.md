@@ -9,8 +9,10 @@ reported by the provider's package registry. The Rust server currently caches
 both successful registry responses and failed lookups for one hour. The manual
 `server.refreshProviders` path uses the same cache as background checks, so a
 manual refresh can report a newly probed provider timestamp without making a
-new registry request. The web UI hides an `unknown` version advisory, making a
-failed registry lookup indistinguishable from a current provider.
+new registry request. npm requests also target the full package document, which
+does not provide the top-level `version` field expected by the parser; npm's
+`/latest` document does. The web UI hides an `unknown` version advisory, making
+a failed registry lookup indistinguishable from a current provider.
 
 On Windows, separate package managers or `PATH` entries can also resolve
 different OpenCode installations. The provider snapshot must continue to use
@@ -46,6 +48,9 @@ cache carries a monotonic refresh generation:
 - `server.refreshProviders` advances the required generation before starting
   its full probe, so the manual action revalidates the registry;
 - scheduled checks keep using the normal cache policy.
+
+npm registry requests target the package's `/latest` document so the response
+has the expected top-level `version` field.
 
 Each package has an independent asynchronous lookup lock. The first probe for a
 package and generation fetches the registry result; concurrent instances of the

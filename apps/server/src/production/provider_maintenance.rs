@@ -240,7 +240,7 @@ mod tests {
         let state = (version.clone(), requests.clone());
         let app = Router::new()
             .route(
-                "/{*path}",
+                "/opencode-ai/latest",
                 get(
                     |State((version, requests)): State<(
                         Arc<tokio::sync::RwLock<String>>,
@@ -272,7 +272,7 @@ mod tests {
         let state = (version.to_owned(), failing.clone(), requests.clone());
         let app = Router::new()
             .route(
-                "/{*path}",
+                "/opencode-ai/latest",
                 get(
                     |State((version, failing, requests)): State<(
                         String,
@@ -1306,7 +1306,7 @@ impl ProviderMaintenance {
         let url = self
             .inner
             .registry_base_url
-            .join(&encoded)
+            .join(&format!("{encoded}/latest"))
             .map_err(|_| LatestVersionFailure::InvalidUrl)?;
         let response = self
             .inner
