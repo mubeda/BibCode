@@ -47,13 +47,42 @@ The Rust server owns installed-version probes, latest-version registry checks,
 and provider update commands. The installed version always comes from the
 executable BiBCode resolves for that provider instance; package-manager
 inventories from other tools are not authoritative and may describe a different
-installation on hosts with multiple CLI paths.
+installation on hosts with multiple CLI paths. The resolved executable and its
+canonical target select both the latest-version source and the update action.
+This ties an advisory to the installation BiBCode will update rather than to a
+provider name or a package manager detected elsewhere on the host.
+
+Source recognition is intentionally fail-closed. A custom path, wrapper, or
+ambiguous installation gets no latest-version source and no executable update
+action; Settings may still show a manual command when the recognized source is
+display-only. Official Cursor installer metadata is fetched and parsed only to
+obtain its release identifier—the installer script is never executed. Likewise,
+the Claude apt, dnf, and apk maintenance commands are display-only guidance,
+not commands run by the server.
+
+The source/action mapping is installation-specific:
+
+| Provider | Recognized source and latest metadata                                                                                           | Server update action                                                                                                    |
+| -------- | ------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------- |
+| Codex    | npm `@openai/codex`, selected only for a recognized standalone, Homebrew cask, or package-manager path                          | `codex update` for standalone; `brew upgrade --cask codex` for Homebrew; the matching package-manager command otherwise |
+| Claude   | Native stable/latest channel, Homebrew `claude-code` or `claude-code@latest` cask, WinGet, or a marked Linux repository channel | Native `claude update`, Homebrew, and WinGet actions are executable; apt/dnf/apk guidance is display-only               |
+| Cursor   | Official Cursor release paths and parsed official installer metadata                                                            | Resolved `cursor-agent update` only for an official path                                                                |
+| OpenCode | npm `opencode-ai`, selected only for a recognized native, Homebrew, or package-manager path                                     | Native `opencode upgrade`, Homebrew, or the matching package-manager command                                            |
+
+Claude channel discovery reads bounded user and managed settings, with managed
+settings taking precedence, and honors `DISABLE_UPDATES=1` from the effective
+provider environment or settings. That value removes the executable action but
+can leave a recognized latest-version advisory and manual guidance. A managed
+`autoUpdatesChannel` outside `stable` or `latest` is not a valid release source:
+BiBCode withholds its latest-version advisory rather than guessing a channel.
 
 Successful registry results are cached in memory for one hour. A manual
 `server.refreshProviders` request advances the latest-version generation before
 probing, so it cannot reuse a result from an earlier manual or background
-refresh. Lookups for different packages remain concurrent, while instances of
-the same provider share one lookup per generation.
+refresh. Cache and in-flight lock keys are the complete latest source, including
+the npm package and the Claude stable/latest channel. Lookups for different
+sources remain concurrent, while instances of the same source share one lookup
+per generation.
 
 npm lookups use each package's `/latest` document. The full package document is
 not a latest-version response and does not provide the top-level `version` field
@@ -64,6 +93,13 @@ missing versions are not cached. They produce a visible unknown advisory with a
 retry prompt but do not change provider readiness or discard inventory data.
 The advisory timestamp records the registry result or attempt; the provider's
 top-level `checkedAt` continues to record the executable and capability probe.
+
+After an update command exits zero, the server advances the latest-version
+generation and reprobes the target instance. `succeeded` means the fresh
+advisory is `current`, or (when that advisory cannot prove currency) the
+installed version provably advanced under that provider's version scheme. A
+still-`behind_latest` advisory, unchanged version, downgrade, missing snapshot,
+or ambiguous comparison remains `unchanged`; a zero exit alone is not success.
 
 ## Activity support
 
