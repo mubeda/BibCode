@@ -93,12 +93,24 @@ export function getProviderVersionLabel(version: string | null | undefined) {
 export function getProviderVersionAdvisoryPresentation(
   advisory: ServerProviderVersionAdvisory | undefined,
 ): {
+  readonly kind: "update" | "check_failed";
+  readonly title: string;
   readonly detail: string;
   readonly updateCommand: string | null;
   readonly emphasis: "normal" | "strong";
 } | null {
-  if (!advisory || advisory.status === "current" || advisory.status === "unknown") {
+  if (!advisory || advisory.status === "current") {
     return null;
+  }
+  if (advisory.status === "unknown") {
+    if (!advisory.message) return null;
+    return {
+      kind: "check_failed",
+      title: "Update check failed",
+      detail: advisory.message,
+      updateCommand: null,
+      emphasis: "strong",
+    };
   }
 
   const label = "Update available";
@@ -106,6 +118,8 @@ export function getProviderVersionAdvisoryPresentation(
   const versionLabel = getProviderVersionLabel(version);
 
   return {
+    kind: "update",
+    title: label,
     detail:
       advisory.message ??
       (versionLabel

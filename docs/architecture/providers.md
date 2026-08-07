@@ -41,6 +41,26 @@ manager in the host thread's worktree. Ordinary terminals continue to launch
 the user's shell. Observation is opt-in launch metadata, not terminal-output
 scraping.
 
+## Provider maintenance
+
+The Rust server owns installed-version probes, latest-version registry checks,
+and provider update commands. The installed version always comes from the
+executable BiBCode resolves for that provider instance; package-manager
+inventories from other tools are not authoritative and may describe a different
+installation on hosts with multiple CLI paths.
+
+Successful registry results are cached in memory for one hour. A manual
+`server.refreshProviders` request advances the latest-version generation before
+probing, so it cannot reuse a result from an earlier manual or background
+refresh. Lookups for different packages remain concurrent, while instances of
+the same provider share one lookup per generation.
+
+Registry transport failures, non-success statuses, malformed responses, and
+missing versions are not cached. They produce a visible unknown advisory with a
+retry prompt but do not change provider readiness or discard inventory data.
+The advisory timestamp records the registry result or attempt; the provider's
+top-level `checkedAt` continues to record the executable and capability probe.
+
 ## Activity support
 
 Activity is a separate capability from provider execution. The server
