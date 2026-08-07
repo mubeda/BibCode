@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, HashMap, HashSet, VecDeque},
-    ffi::OsStr,
+    ffi::{OsStr, OsString},
     future::Future,
     path::{Path, PathBuf},
     pin::Pin,
@@ -1526,7 +1526,15 @@ async fn resolve_provider_route_settings(
         .into_iter()
         .flat_map(|value| value.environment.iter())
         .filter(|entry| !entry.name.trim().is_empty() && !entry.value_redacted)
-        .map(|entry| (entry.name.clone(), entry.value.clone()))
+        .map(|entry| (OsStr::new(entry.name.trim()), OsStr::new(&entry.value)));
+    let environment = normalize_provider_environment(environment)
+        .into_iter()
+        .map(|(name, value)| {
+            (
+                name.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
         .collect();
     let codex_home = (provider == "codex").then(|| {
         let config = instance.map(|value| &value.config);
@@ -3961,11 +3969,21 @@ fn spawn_child(
     attribution: ProcessAttributionRegistry,
 ) -> Result<Box<dyn ChildWrapper>, ProviderRuntimeError> {
     let provider = request.provider.clone();
-    let executable = resolve_provider_executable(&request.binary_path).ok_or_else(|| {
-        ProviderRuntimeError::Spawn {
-            provider: provider.clone(),
-            detail: format!("provider executable was not found: {}", request.binary_path),
-        }
+    let environment = normalize_provider_environment(
+        request
+            .environment
+            .iter()
+            .map(|(name, value)| (OsStr::new(name), OsStr::new(value))),
+    );
+    let executable = resolve_provider_executable_with_environment(
+        &request.binary_path,
+        environment
+            .iter()
+            .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+    )
+    .ok_or_else(|| ProviderRuntimeError::Spawn {
+        provider: provider.clone(),
+        detail: format!("provider executable was not found: {}", request.binary_path),
     })?;
     let launch = prepare_provider_launch(&executable, args).map_err(|detail| {
         ProviderRuntimeError::Spawn {
@@ -3990,7 +4008,7 @@ fn spawn_child(
             } else {
                 Stdio::null()
             });
-        command.envs(&request.environment);
+        command.envs(environment.iter().cloned());
         sanitize_provider_subprocess_environment(command);
     });
     configure_supervised_background_command_wrap(&mut command);
@@ -4022,7 +4040,43 @@ fn spawn_child(
 }
 
 pub(crate) fn resolve_provider_executable(input: &str) -> Option<PathBuf> {
-    let search_path = std::env::var_os("PATH");
+    resolve_provider_executable_with_environment(input, std::iter::empty())
+}
+
+pub(crate) fn effective_provider_search_path<'a>(
+    environment: impl IntoIterator<Item = (&'a OsStr, &'a OsStr)>,
+) -> Option<OsString> {
+    normalize_provider_environment(environment)
+        .into_iter()
+        .find(|(name, _)| name == "PATH")
+        .map(|(_, value)| value)
+        .or_else(|| std::env::var_os("PATH"))
+}
+
+pub(crate) fn normalize_provider_environment<'a>(
+    environment: impl IntoIterator<Item = (&'a OsStr, &'a OsStr)>,
+) -> Vec<(OsString, OsString)> {
+    let mut normalized = Vec::new();
+    let mut path_seen = false;
+    for (name, value) in environment {
+        if name.to_string_lossy().eq_ignore_ascii_case("path") {
+            if path_seen {
+                continue;
+            }
+            path_seen = true;
+            normalized.push((OsString::from("PATH"), value.to_os_string()));
+        } else {
+            normalized.push((name.to_os_string(), value.to_os_string()));
+        }
+    }
+    normalized
+}
+
+pub(crate) fn resolve_provider_executable_with_environment<'a>(
+    input: &str,
+    environment: impl IntoIterator<Item = (&'a OsStr, &'a OsStr)>,
+) -> Option<PathBuf> {
+    let search_path = effective_provider_search_path(environment);
     resolve_provider_executable_in_path(input, search_path.as_deref())
 }
 
@@ -5316,14 +5370,29 @@ fn claude_probe_cache() -> &'static StdMutex<ClaudeProbeCacheState> {
 }
 
 async fn probe_claude_activity_support(binary_path: &str) -> ClaudeActivitySupport {
-    probe_claude_activity_support_with_resolution_delay(binary_path, Duration::ZERO).await
+    probe_claude_activity_support_with_environment(binary_path, std::iter::empty(), Duration::ZERO)
+        .await
 }
 
 async fn probe_claude_activity_support_with_resolution_delay(
     binary_path: &str,
     resolution_delay: Duration,
 ) -> ClaudeActivitySupport {
+    probe_claude_activity_support_with_environment(
+        binary_path,
+        std::iter::empty(),
+        resolution_delay,
+    )
+    .await
+}
+
+async fn probe_claude_activity_support_with_environment<'a>(
+    binary_path: &str,
+    environment: impl IntoIterator<Item = (&'a OsStr, &'a OsStr)>,
+    resolution_delay: Duration,
+) -> ClaudeActivitySupport {
     let binary_path = binary_path.to_owned();
+    let search_path = effective_provider_search_path(environment);
     tokio::spawn(async move {
         let deadline = Instant::now() + CLAUDE_ACTIVITY_PROBE_TIMEOUT;
         let resolution = tokio::time::timeout_at(
@@ -5332,7 +5401,8 @@ async fn probe_claude_activity_support_with_resolution_delay(
                 if !resolution_delay.is_zero() {
                     std::thread::sleep(resolution_delay);
                 }
-                let resolved = resolve_provider_executable(&binary_path)?;
+                let resolved =
+                    resolve_provider_executable_in_path(&binary_path, search_path.as_deref())?;
                 let executable = std::fs::canonicalize(&resolved).unwrap_or(resolved);
                 let metadata = std::fs::metadata(&executable).ok()?;
                 #[cfg(unix)]
@@ -5790,7 +5860,15 @@ impl ClaudeDriver {
             .environment
             .entry("CLAUDE_CODE_ENTRYPOINT".to_owned())
             .or_insert_with(|| "sdk-rust".to_owned());
-        let support = probe_claude_activity_support(&request.binary_path).await;
+        let support = probe_claude_activity_support_with_environment(
+            &request.binary_path,
+            request
+                .environment
+                .iter()
+                .map(|(name, value)| (OsStr::new(name), OsStr::new(value))),
+            Duration::ZERO,
+        )
+        .await;
         let hook_sink = if support.include_hook_events && support.forward_subagent_text {
             start_claude_hook_sink().await.ok()
         } else {
@@ -9105,6 +9183,50 @@ done
         ));
     }
 
+    #[tokio::test]
+    async fn provider_route_normalizes_case_variant_path_before_map_collection() {
+        let temp = TempDir::new().expect("settings root");
+        let mut settings = ProviderSettingsState::default();
+        settings.provider_instances.insert(
+            "codex-work".to_owned(),
+            ProviderInstanceState {
+                driver: "codex".to_owned(),
+                enabled: true,
+                display_name: None,
+                environment: vec![
+                    ProviderEnvironmentVariableState {
+                        name: "pAtH".to_owned(),
+                        value: "/first".to_owned(),
+                        sensitive: false,
+                        value_redacted: false,
+                    },
+                    ProviderEnvironmentVariableState {
+                        name: "PATH".to_owned(),
+                        value: "/second".to_owned(),
+                        sensitive: false,
+                        value_redacted: false,
+                    },
+                ],
+                config: json!({ "binaryPath": "codex" }),
+            },
+        );
+        std::fs::write(
+            temp.path().join("settings.json"),
+            serde_json::to_vec(&settings).expect("settings JSON"),
+        )
+        .expect("write settings");
+
+        let route =
+            super::resolve_provider_route_settings(&temp.path().to_path_buf(), "codex-work", None)
+                .await
+                .expect("provider route");
+
+        assert_eq!(
+            route.environment,
+            std::collections::BTreeMap::from([("PATH".to_owned(), "/first".to_owned())])
+        );
+    }
+
     #[test]
     fn dropped_delivery_response_is_ambiguous_but_closed_queue_is_not_sent() {
         assert!(matches!(
@@ -10174,6 +10296,113 @@ done
         assert_eq!(
             super::resolve_provider_executable_in_path("codex", Some(&hydrated)),
             Some(executable)
+        );
+    }
+
+    #[tokio::test]
+    async fn executable_resolution_prefers_case_insensitive_instance_path_override() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let ambient = tempfile::TempDir::new().expect("ambient executable directory");
+        let instance = tempfile::TempDir::new().expect("instance executable directory");
+        let executable_name = if cfg!(windows) { "codex.exe" } else { "codex" };
+        let ambient_executable = ambient.path().join(executable_name);
+        let instance_executable = instance.path().join(executable_name);
+        std::fs::write(&ambient_executable, b"ambient").expect("write ambient executable");
+        std::fs::write(&instance_executable, b"instance").expect("write instance executable");
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: process-global environment mutation is serialized by the shared test lock.
+        unsafe { std::env::set_var("PATH", ambient.path()) };
+
+        let environment = [(
+            std::ffi::OsString::from("pAtH"),
+            std::ffi::OsString::from(instance.path()),
+        )];
+        let resolved = super::resolve_provider_executable_with_environment(
+            "codex",
+            environment
+                .iter()
+                .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+        );
+
+        match original_path {
+            Some(path) => {
+                // SAFETY: process-global environment mutation is serialized by the shared test lock.
+                unsafe { std::env::set_var("PATH", path) };
+            }
+            None => {
+                // SAFETY: process-global environment mutation is serialized by the shared test lock.
+                unsafe { std::env::remove_var("PATH") };
+            }
+        }
+        assert_eq!(resolved, Some(instance_executable));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn runtime_launch_executes_the_instance_path_binary_instead_of_ambient_path() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let temp = tempfile::TempDir::new().expect("runtime fixture root");
+        let ambient = temp.path().join("ambient");
+        let instance = temp.path().join("instance");
+        std::fs::create_dir_all(&ambient).expect("ambient executable directory");
+        std::fs::create_dir_all(&instance).expect("instance executable directory");
+        for (directory, value) in [(&ambient, "ambient"), (&instance, "instance")] {
+            let executable = directory.join("provider-fixture");
+            std::fs::write(
+                &executable,
+                format!(
+                    "#!/bin/sh\nprintf '%s' '{value}' > \"$MARKER\"\nprintf '%s' \"$PATH\" > \"$PATH_MARKER\"\n"
+                ),
+            )
+            .expect("write runtime executable");
+            let mut permissions = std::fs::metadata(&executable)
+                .expect("runtime fixture metadata")
+                .permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&executable, permissions)
+                .expect("make runtime fixture executable");
+        }
+        let marker = temp.path().join("launched");
+        let path_marker = temp.path().join("effective-path");
+        let original_path = std::env::var_os("PATH");
+        // SAFETY: process-global environment mutation is serialized by the shared test lock.
+        unsafe { std::env::set_var("PATH", &ambient) };
+        let mut request = native_launch(&temp, "fixture");
+        request.binary_path = "provider-fixture".to_owned();
+        request
+            .environment
+            .insert("pAtH".to_owned(), instance.to_string_lossy().into_owned());
+        request
+            .environment
+            .insert("MARKER".to_owned(), marker.to_string_lossy().into_owned());
+        request.environment.insert(
+            "PATH_MARKER".to_owned(),
+            path_marker.to_string_lossy().into_owned(),
+        );
+
+        let mut child = super::spawn_child(&request, &[], false, ProcessAttributionRegistry::new())
+            .expect("spawn instance executable");
+        child.wait().await.expect("wait for runtime fixture");
+
+        match original_path {
+            Some(path) => {
+                // SAFETY: process-global environment mutation is serialized by the shared test lock.
+                unsafe { std::env::set_var("PATH", path) };
+            }
+            None => {
+                // SAFETY: process-global environment mutation is serialized by the shared test lock.
+                unsafe { std::env::remove_var("PATH") };
+            }
+        }
+        assert_eq!(
+            std::fs::read_to_string(marker).expect("launch marker"),
+            "instance"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path_marker).expect("effective PATH marker"),
+            instance.to_string_lossy()
         );
     }
 

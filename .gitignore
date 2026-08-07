@@ -71,3 +71,4 @@ output/
 /.plans
 .tmp/
 /.artifacts/
+.worktrees/
