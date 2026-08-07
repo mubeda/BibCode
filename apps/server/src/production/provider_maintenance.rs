@@ -1,5 +1,9 @@
-#[allow(dead_code)] // Source resolution wires these primitives into production in the next slice.
+#[allow(dead_code)]
+// Some closed source variants remain available for later provider classifications.
 mod latest;
+mod source;
+
+pub(crate) use source::{ProviderMaintenanceCapabilities, ProviderUpdateCommand};
 
 #[cfg(test)]
 mod tests {
@@ -29,99 +33,121 @@ mod tests {
                 "codex",
                 Some("C:/Users/me/AppData/Roaming/npm/codex.cmd"),
                 None,
-                "npm install -g @openai/codex@latest",
+                Some("npm install -g @openai/codex@latest"),
             ),
             (
                 "codex",
                 "codex",
                 Some("C:/Users/me/.bun/bin/codex.exe"),
                 None,
-                "bun i -g @openai/codex@latest",
+                Some("bun i -g @openai/codex@latest"),
             ),
             (
                 "claudeAgent",
                 "claude",
                 Some("/Users/me/.local/bin/claude"),
                 None,
-                "/Users/me/.local/bin/claude update",
+                Some("/Users/me/.local/bin/claude update"),
             ),
             (
                 "claudeAgent",
                 "claude",
                 Some("/opt/homebrew/bin/claude"),
-                None,
-                "brew upgrade claude-code",
+                Some("/opt/homebrew/Cellar/claude-code/2.1.0/bin/claude"),
+                Some("brew upgrade claude-code"),
             ),
             (
                 "opencode",
                 "opencode",
                 Some("/home/me/.opencode/bin/opencode"),
                 None,
-                "/home/me/.opencode/bin/opencode upgrade",
+                Some("/home/me/.opencode/bin/opencode upgrade"),
+            ),
+            (
+                "opencode",
+                "opencode",
+                Some("C:/Users/me/AppData/Roaming/npm/opencode.cmd"),
+                None,
+                Some("npm install -g opencode-ai@latest"),
             ),
             (
                 "opencode",
                 "opencode",
                 Some("/home/linuxbrew/.linuxbrew/bin/opencode"),
-                None,
-                "brew upgrade anomalyco/tap/opencode",
+                Some("/home/linuxbrew/.linuxbrew/Cellar/opencode/1.0.0/bin/opencode"),
+                Some("brew upgrade anomalyco/tap/opencode"),
             ),
             (
                 "codex",
                 "codex",
                 Some("/home/me/.local/share/pnpm/codex"),
                 None,
-                "pnpm add -g @openai/codex@latest",
+                Some("pnpm add -g @openai/codex@latest"),
             ),
             (
                 "codex",
                 "codex",
                 Some("/home/me/.vite-plus/bin/codex"),
                 None,
-                "vp i -g @openai/codex",
+                Some("vp i -g @openai/codex"),
             ),
             (
                 "codex",
                 "codex",
                 Some("/usr/local/bin/codex"),
                 Some("/usr/local/lib/node_modules/@openai/codex/bin/codex.js"),
-                "npm install -g @openai/codex@latest",
+                Some("npm install -g @openai/codex@latest"),
             ),
             (
                 "codex",
                 "codex",
                 Some("/srv/project/node_modules/.bin/codex"),
                 None,
-                "npm install -g @openai/codex@latest",
+                Some("npm install -g @openai/codex@latest"),
             ),
             (
                 "codex",
                 "codex",
                 Some("C:/npm/node_modules/@openai/codex/bin/codex.js"),
                 None,
-                "npm install -g @openai/codex@latest",
+                Some("npm install -g @openai/codex@latest"),
             ),
             (
                 "codex",
                 "codex",
                 Some("/usr/local/bin/codex"),
                 Some("/Users/me/Library/pnpm/global/5/node_modules/@openai/codex/bin/codex.js"),
-                "pnpm add -g @openai/codex@latest",
+                Some("pnpm add -g @openai/codex@latest"),
             ),
             (
                 "codex",
                 "codex",
                 Some("/usr/bin/codex"),
                 Some("/home/me/.local/share/pnpm/global/5/node_modules/@openai/codex/bin/codex.js"),
-                "pnpm add -g @openai/codex@latest",
+                Some("pnpm add -g @openai/codex@latest"),
             ),
             (
                 "codex",
                 "codex",
-                Some("/srv/tools/codex"),
-                None,
-                "npm install -g @openai/codex@latest",
+                Some("/home/me/.local/bin/codex"),
+                Some("/home/me/.codex/packages/standalone/current/bin/codex"),
+                Some("/home/me/.local/bin/codex update"),
             ),
+            (
+                "codex",
+                "codex",
+                Some("C:/Users/me/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe"),
+                None,
+                Some("C:/Users/me/AppData/Local/Programs/OpenAI/Codex/bin/codex.exe update"),
+            ),
+            (
+                "codex",
+                "codex",
+                Some("/opt/homebrew/bin/codex"),
+                Some("/opt/homebrew/Caskroom/codex/0.148.0/codex"),
+                Some("brew upgrade --cask codex"),
+            ),
+            ("codex", "codex", Some("/srv/tools/codex"), None, None),
         ];
         for (driver, binary, resolved, canonical, expected) in cases {
             let capabilities = capabilities_for_paths(
@@ -135,7 +161,7 @@ mod tests {
                     .update
                     .as_ref()
                     .map(|value| value.display.as_str()),
-                Some(expected)
+                expected
             );
         }
     }
@@ -205,6 +231,15 @@ mod tests {
             binary_path: binary_path.to_owned(),
             environment: Vec::new(),
         }
+    }
+
+    fn capabilities_for_paths(
+        driver: &str,
+        binary_path: &str,
+        resolved: Option<&Path>,
+        canonical: Option<&Path>,
+    ) -> ProviderMaintenanceCapabilities {
+        super::source::capabilities_for_paths(&target(driver, binary_path), resolved, canonical)
     }
 
     fn installed_snapshot(driver: &str, version: &str) -> Value {
@@ -580,6 +615,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unknown_custom_installations_do_not_check_npm() {
+        let wrapper = tempfile::NamedTempFile::new().expect("custom Codex wrapper");
+        let (registry_url, requests) = npm_registry_fixture("9.9.9").await;
+        let maintenance = ProviderMaintenance::with_registry_base_url(registry_url);
+        let mut snapshot = installed_snapshot("codex", "1.0.0");
+        let binary_path = wrapper.path().to_string_lossy().into_owned();
+
+        maintenance
+            .enrich_snapshot(&target("codex", &binary_path), &mut snapshot, true)
+            .await;
+
+        assert_eq!(snapshot["versionAdvisory"]["status"], "unknown");
+        assert!(snapshot["versionAdvisory"]["updateCommand"].is_null());
+        assert_eq!(snapshot["versionAdvisory"]["canUpdate"], false);
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
     async fn registry_failure_keeps_provider_data_and_returns_unknown_advisory() {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
@@ -842,7 +895,6 @@ mod tests {
 use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
-    path::Path,
     sync::{
         Arc, Mutex,
         atomic::{AtomicU64, Ordering},
@@ -876,20 +928,6 @@ pub(crate) struct ProviderMaintenanceTarget {
     pub(crate) driver: String,
     pub(crate) binary_path: String,
     pub(crate) environment: Vec<(OsString, OsString)>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProviderUpdateCommand {
-    pub(crate) display: String,
-    pub(crate) executable: String,
-    pub(crate) args: Vec<String>,
-    pub(crate) lock_key: &'static str,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ProviderMaintenanceCapabilities {
-    pub(crate) package_name: Option<&'static str>,
-    pub(crate) update: Option<ProviderUpdateCommand>,
 }
 
 #[derive(Clone, Debug)]
@@ -963,20 +1001,6 @@ struct RetainedProviderUpdateState {
     driver: String,
     token: ProviderUpdateLifecycleToken,
     state: Value,
-}
-
-#[derive(Clone, Copy)]
-struct NativeUpdate {
-    args: &'static [&'static str],
-    lock_key: &'static str,
-    path_matches: fn(&str) -> bool,
-}
-
-#[derive(Clone, Copy)]
-struct PackageDefinition {
-    package_name: &'static str,
-    homebrew_formula: Option<&'static str>,
-    native_update: Option<NativeUpdate>,
 }
 
 #[derive(Clone, Debug)]
@@ -1285,12 +1309,7 @@ impl ProviderMaintenance {
             Some(path) => tokio::fs::canonicalize(path).await.ok(),
             None => None,
         };
-        capabilities_for_paths(
-            &target.driver,
-            &target.binary_path,
-            resolved.as_deref(),
-            canonical.as_deref(),
-        )
+        source::capabilities_for_paths(target, resolved.as_deref(), canonical.as_deref())
     }
 
     pub(crate) async fn run_update_command(
@@ -1374,11 +1393,8 @@ impl ProviderMaintenance {
             .get("checkedAt")
             .and_then(Value::as_str)
             .map(str::to_owned);
-        let latest_check = match (should_check, capabilities.package_name) {
-            (true, Some(package_name)) => Some(
-                self.latest_version_for_package_name(package_name, probe_checked_at)
-                    .await,
-            ),
+        let latest_check = match (should_check, capabilities.latest) {
+            (true, Some(source)) => Some(self.latest_version(source, probe_checked_at).await),
             _ => None,
         };
         let (latest, checked_at, check_failed) = match latest_check {
@@ -1390,7 +1406,7 @@ impl ProviderMaintenance {
             None => (None, None, false),
         };
         let status = if should_check {
-            advisory_status(current, latest.as_deref())
+            latest::advisory_status(capabilities.version_scheme, current, latest.as_deref())
         } else {
             "unknown"
         };
@@ -1403,7 +1419,7 @@ impl ProviderMaintenance {
             "status": status,
             "currentVersion": current,
             "latestVersion": latest,
-            "updateCommand": capabilities.update.as_ref().map(|update| &update.display),
+            "updateCommand": capabilities.display_command,
             "canUpdate": capabilities.update.is_some(),
             "checkedAt": checked_at,
             "message": message,
@@ -1461,15 +1477,6 @@ impl ProviderMaintenance {
             version,
             checked_at,
         }
-    }
-
-    async fn latest_version_for_package_name(
-        &self,
-        package_name: &'static str,
-        checked_at: Option<String>,
-    ) -> LatestVersionCheck {
-        self.latest_version(LatestVersionSource::Npm(package_name), checked_at)
-            .await
     }
 
     async fn fetch_latest_version(
@@ -1531,216 +1538,7 @@ fn latest_source_label(source: LatestVersionSource) -> &'static str {
     }
 }
 
-fn manual_capabilities(package_name: Option<&'static str>) -> ProviderMaintenanceCapabilities {
-    ProviderMaintenanceCapabilities {
-        package_name,
-        update: None,
-    }
-}
-
-fn capabilities_with_update<I, S>(
-    package_name: Option<&'static str>,
-    executable: impl Into<String>,
-    args: I,
-    lock_key: &'static str,
-) -> ProviderMaintenanceCapabilities
-where
-    I: IntoIterator<Item = S>,
-    S: Into<String>,
-{
-    let executable = executable.into();
-    let args = args.into_iter().map(Into::into).collect::<Vec<String>>();
-    let display = std::iter::once(executable.as_str())
-        .chain(args.iter().map(String::as_str))
-        .collect::<Vec<_>>()
-        .join(" ");
-    ProviderMaintenanceCapabilities {
-        package_name,
-        update: Some(ProviderUpdateCommand {
-            display,
-            executable,
-            args,
-            lock_key,
-        }),
-    }
-}
-
-fn capabilities_for_paths(
-    driver: &str,
-    binary_path: &str,
-    resolved: Option<&Path>,
-    canonical: Option<&Path>,
-) -> ProviderMaintenanceCapabilities {
-    let target = ProviderMaintenanceTarget {
-        instance_id: driver.to_owned(),
-        driver: driver.to_owned(),
-        binary_path: binary_path.to_owned(),
-        environment: Vec::new(),
-    };
-    match driver {
-        "cursor" => capabilities_with_update(
-            None,
-            resolved_or_configured_binary(&target, resolved),
-            ["update"],
-            "cursor-agent",
-        ),
-        "grok" => manual_capabilities(None),
-        _ => resolve_package_managed_capabilities(&target, resolved, canonical),
-    }
-}
-
+#[cfg(test)]
 fn advisory_status(current: Option<&str>, latest: Option<&str>) -> &'static str {
     latest::advisory_status(latest::VersionScheme::Semver, current, latest)
-}
-
-fn resolved_or_configured_binary(
-    target: &ProviderMaintenanceTarget,
-    resolved: Option<&Path>,
-) -> String {
-    resolved
-        .map(|path| path.to_string_lossy().into_owned())
-        .unwrap_or_else(|| target.binary_path.clone())
-}
-
-fn is_claude_native_path(normalized_path: &str) -> bool {
-    normalized_path.ends_with("/.local/bin/claude")
-        || normalized_path.ends_with("/.local/bin/claude.exe")
-}
-
-fn is_opencode_native_path(normalized_path: &str) -> bool {
-    normalized_path.ends_with("/.opencode/bin/opencode")
-        || normalized_path.ends_with("/.opencode/bin/opencode.exe")
-}
-
-fn resolve_package_managed_capabilities(
-    target: &ProviderMaintenanceTarget,
-    resolved: Option<&Path>,
-    canonical: Option<&Path>,
-) -> ProviderMaintenanceCapabilities {
-    let Some(definition) = package_definition(&target.driver) else {
-        return manual_capabilities(None);
-    };
-    let paths = [resolved, canonical]
-        .into_iter()
-        .flatten()
-        .map(|path| {
-            path.to_string_lossy()
-                .replace('\\', "/")
-                .to_ascii_lowercase()
-        })
-        .collect::<Vec<_>>();
-    if let Some(native) = definition.native_update
-        && paths.iter().any(|path| (native.path_matches)(path))
-    {
-        return capabilities_with_update(
-            Some(definition.package_name),
-            resolved_or_configured_binary(target, resolved),
-            native.args.iter().copied(),
-            native.lock_key,
-        );
-    }
-    if paths.iter().any(|path| path.contains("/.vite-plus/bin/")) {
-        return capabilities_with_update(
-            Some(definition.package_name),
-            "vp",
-            ["i", "-g", definition.package_name],
-            "vite-plus",
-        );
-    }
-    if paths.iter().any(|path| path.contains("/.bun/bin/")) {
-        return capabilities_with_update(
-            Some(definition.package_name),
-            "bun",
-            ["i", "-g", &format!("{}@latest", definition.package_name)],
-            "bun",
-        );
-    }
-    if paths.iter().any(|path| {
-        path.contains("/.local/share/pnpm/")
-            || path.contains("/local/share/pnpm/")
-            || path.contains("/library/pnpm/")
-            || path.contains("/appdata/local/pnpm/")
-            || path.contains("/appdata/roaming/pnpm/")
-    }) {
-        return capabilities_with_update(
-            Some(definition.package_name),
-            "pnpm",
-            ["add", "-g", &format!("{}@latest", definition.package_name)],
-            "pnpm",
-        );
-    }
-    if paths.iter().any(|path| {
-        path.contains("/appdata/roaming/npm/")
-            || path.contains("/.npm-global/")
-            || path.contains("/lib/node_modules/")
-            || path.contains("/node_modules/.bin/")
-            || path.contains("/npm/node_modules/")
-    }) {
-        return capabilities_with_update(
-            Some(definition.package_name),
-            "npm",
-            [
-                "install",
-                "-g",
-                &format!("{}@latest", definition.package_name),
-            ],
-            "npm",
-        );
-    }
-    if let Some(formula) = definition.homebrew_formula
-        && paths.iter().any(|path| {
-            path.contains("/opt/homebrew/bin/")
-                || path.contains("/usr/local/bin/")
-                || path.contains("/home/linuxbrew/.linuxbrew/bin/")
-        })
-    {
-        return capabilities_with_update(
-            Some(definition.package_name),
-            "brew",
-            ["upgrade", formula],
-            "homebrew",
-        );
-    }
-    if target.binary_path.contains(['/', '\\']) {
-        return manual_capabilities(Some(definition.package_name));
-    }
-    capabilities_with_update(
-        Some(definition.package_name),
-        "npm",
-        [
-            "install",
-            "-g",
-            &format!("{}@latest", definition.package_name),
-        ],
-        "npm",
-    )
-}
-
-fn package_definition(driver: &str) -> Option<PackageDefinition> {
-    match driver {
-        "codex" => Some(PackageDefinition {
-            package_name: "@openai/codex",
-            homebrew_formula: Some("codex"),
-            native_update: None,
-        }),
-        "claudeAgent" => Some(PackageDefinition {
-            package_name: "@anthropic-ai/claude-code",
-            homebrew_formula: Some("claude-code"),
-            native_update: Some(NativeUpdate {
-                args: &["update"],
-                lock_key: "claude-native",
-                path_matches: is_claude_native_path,
-            }),
-        }),
-        "opencode" => Some(PackageDefinition {
-            package_name: "opencode-ai",
-            homebrew_formula: Some("anomalyco/tap/opencode"),
-            native_update: Some(NativeUpdate {
-                args: &["upgrade"],
-                lock_key: "opencode-native",
-                path_matches: is_opencode_native_path,
-            }),
-        }),
-        _ => None,
-    }
 }
