@@ -108,6 +108,37 @@ async fn write_provider_fixture(directory: &TempDir) -> PathBuf {
     path
 }
 
+#[cfg(unix)]
+async fn write_updating_cursor_fixture(directory: &TempDir) -> PathBuf {
+    let release_directory = directory
+        .path()
+        .join(".local/share/cursor-agent/versions/2026.06.19-653a7fb");
+    tokio::fs::create_dir_all(&release_directory)
+        .await
+        .expect("create Cursor release directory");
+    let version_state = release_directory.join("version-state");
+    tokio::fs::write(&version_state, "2026.06.19-653a7fb")
+        .await
+        .expect("write Cursor version state");
+    let path = release_directory.join("cursor-agent");
+    let contents = "#!/bin/sh\nstate=\"$(dirname \"$0\")/version-state\"\nif [ \"$1\" = \"about\" ]; then\n  printf '{\"cliVersion\":\"%s\"}\\n' \"$(cat \"$state\")\"\nelif [ \"$1\" = \"update\" ]; then\n  printf '2026.08.04-aaa8809' > \"$state\"\n  echo 'cursor updated'\nelse\n  exit 1\nfi\n";
+    tokio::fs::write(&path, contents)
+        .await
+        .expect("write Cursor fixture");
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let mut permissions = tokio::fs::metadata(&path)
+            .await
+            .expect("Cursor fixture metadata")
+            .permissions();
+        permissions.set_mode(0o755);
+        tokio::fs::set_permissions(&path, permissions)
+            .await
+            .expect("make Cursor fixture executable");
+    }
+    path
+}
+
 async fn write_claude_fixture(directory: &TempDir, version: &str) -> PathBuf {
     #[cfg(windows)]
     let (name, contents) = (
@@ -1007,10 +1038,11 @@ async fn refresh_providers_returns_version_advisories_without_registry_access() 
     assert!(codex["versionAdvisory"]["status"].is_string());
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn provider_update_executes_a_supported_cursor_command_but_cannot_verify_version() {
+async fn provider_update_succeeds_when_cursor_installed_version_advances() {
     let directory = tempfile::tempdir().expect("temporary state directory");
-    let executable = write_provider_fixture(&directory).await;
+    let executable = write_updating_cursor_fixture(&directory).await;
     let settings = json!({
         "enableProviderUpdateChecks": false,
         "providerInstances": {
@@ -1033,6 +1065,19 @@ async fn provider_update_executes_a_supported_cursor_command_but_cannot_verify_v
     .expect("write settings fixture");
     let control =
         NativeServerControl::new(ServerConfig::new(directory.path()), auth_descriptor()).await;
+    let initial = call(
+        &control,
+        "server.refreshProviders",
+        json!({ "instanceId": "cursor-work" }),
+    )
+    .await;
+    let provider = initial["providers"]
+        .as_array()
+        .expect("initial providers")
+        .iter()
+        .find(|provider| provider["instanceId"] == "cursor-work")
+        .expect("initial Cursor provider");
+    assert_eq!(provider["version"], "2026.06.19-653a7fb");
 
     let result = call(
         &control,
@@ -1046,11 +1091,9 @@ async fn provider_update_executes_a_supported_cursor_command_but_cannot_verify_v
         .iter()
         .find(|provider| provider["instanceId"] == "cursor-work")
         .expect("updated cursor");
-    assert_eq!(provider["updateState"]["status"], "unchanged");
-    assert_eq!(
-        provider["updateState"]["message"],
-        "Update command completed, but BiBCode could not verify the provider version."
-    );
+    assert_eq!(provider["version"], "2026.08.04-aaa8809");
+    assert_eq!(provider["updateState"]["status"], "succeeded");
+    assert_eq!(provider["updateState"]["message"], "Provider updated.");
 }
 
 #[tokio::test]

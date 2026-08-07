@@ -26,6 +26,7 @@ use crate::{
         keybindings, local_servers, provider_inventory,
         provider_maintenance::{
             ProviderMaintenance, ProviderMaintenanceTarget, ProviderUpdateLifecycleToken,
+            provider_version_advanced,
         },
         server_terminal::{JsonFuture, JsonStream, ProductionServerControl},
     },
@@ -86,13 +87,29 @@ fn provider_update_state(
     })
 }
 
-fn post_update_status(providers: &[Value], instance_id: &str) -> &'static str {
-    match providers
+fn post_update_status(
+    providers: &[Value],
+    instance_id: &str,
+    before_version: Option<&str>,
+) -> &'static str {
+    let Some(provider) = providers
         .iter()
         .find(|provider| provider["instanceId"] == instance_id)
-    {
-        Some(provider) if provider["versionAdvisory"]["status"] == "current" => "succeeded",
-        _ => "unchanged",
+    else {
+        return "unchanged";
+    };
+    match provider["versionAdvisory"]["status"].as_str() {
+        Some("current") => "succeeded",
+        Some("behind_latest") => "unchanged",
+        _ => {
+            let driver = provider["driver"].as_str().unwrap_or_default();
+            let after_version = provider["version"].as_str();
+            if provider_version_advanced(driver, before_version, after_version) {
+                "succeeded"
+            } else {
+                "unchanged"
+            }
+        }
     }
 }
 
@@ -676,6 +693,14 @@ impl NativeServerControl {
                 }
             }
         };
+        let before_version = self
+            .providers
+            .read()
+            .await
+            .iter()
+            .find(|provider| provider["instanceId"] == target.instance_id)
+            .and_then(|provider| provider["version"].as_str())
+            .map(str::to_owned);
         let started_at = now_iso();
         self.publish_provider_update_state(
             &target,
@@ -738,6 +763,7 @@ impl NativeServerControl {
         }
         drop(command_guard);
 
+        self.provider_maintenance.begin_latest_version_refresh();
         let (generation, settings) = self.settings_snapshot().await;
         let cwd = std::env::current_dir().unwrap_or_else(|_| self.config.base_dir.clone());
         let probe_sequence = self.begin_provider_probe();
@@ -759,7 +785,11 @@ impl NativeServerControl {
             .await
         {
             Some(_) => {
-                let status = post_update_status(&verification, &target.instance_id);
+                let status = post_update_status(
+                    &verification,
+                    &target.instance_id,
+                    before_version.as_deref(),
+                );
                 let message = match status {
                     "succeeded" => "Provider updated.",
                     _ if verification.iter().any(|provider| {
@@ -1969,36 +1999,82 @@ mod tests {
 
     #[test]
     fn post_update_verification_distinguishes_success_and_unchanged() {
-        let current = json!({
-            "instanceId": "codex",
-            "versionAdvisory": { "status": "current" }
-        });
-        let behind = json!({
-            "instanceId": "codex",
-            "versionAdvisory": { "status": "behind_latest" }
-        });
-        let unknown = json!({
-            "instanceId": "codex",
-            "versionAdvisory": { "status": "unknown" }
-        });
-        assert_eq!(post_update_status(&[current], "codex"), "succeeded");
-        assert_eq!(post_update_status(&[behind], "codex"), "unchanged");
-        assert_eq!(post_update_status(&[unknown], "codex"), "unchanged");
-        assert_eq!(post_update_status(&[], "codex"), "unchanged");
+        let codex = |status: &str, version: &str| {
+            json!({
+                "instanceId": "codex",
+                "driver": "codex",
+                "version": version,
+                "versionAdvisory": { "status": status }
+            })
+        };
+        let cursor_unknown = |version: &str| {
+            json!({
+                "instanceId": "cursor",
+                "driver": "cursor",
+                "version": version,
+                "versionAdvisory": { "status": "unknown" }
+            })
+        };
+
+        assert_eq!(
+            post_update_status(&[codex("current", "0.147.0")], "codex", Some("0.146.0")),
+            "succeeded"
+        );
+        assert_eq!(
+            post_update_status(
+                &[codex("behind_latest", "0.147.0")],
+                "codex",
+                Some("0.146.0")
+            ),
+            "unchanged"
+        );
+        assert_eq!(
+            post_update_status(&[], "codex", Some("0.146.0")),
+            "unchanged"
+        );
+        assert_eq!(
+            post_update_status(&[codex("unknown", "0.147.0")], "codex", Some("0.147.0")),
+            "unchanged"
+        );
+        assert_eq!(
+            post_update_status(
+                &[cursor_unknown("2026.08.04-aaa8809")],
+                "cursor",
+                Some("2026.06.19-653a7fb")
+            ),
+            "succeeded"
+        );
+        assert_eq!(
+            post_update_status(
+                &[cursor_unknown("2026.08.04-bbbb")],
+                "cursor",
+                Some("2026.08.04-aaaa")
+            ),
+            "unchanged"
+        );
+        assert_eq!(
+            post_update_status(&[codex("unknown", "0.146.0")], "codex", Some("0.147.0")),
+            "unchanged"
+        );
     }
 
     async fn write_cursor_update_fixture(directory: &Path) -> PathBuf {
+        let release_directory =
+            directory.join(".local/share/cursor-agent/versions/2026.06.19-653a7fb");
+        tokio::fs::create_dir_all(&release_directory)
+            .await
+            .expect("create Cursor release directory");
         #[cfg(windows)]
         let (name, contents) = (
-            "cursor.cmd",
+            "cursor-agent.cmd",
             "@echo off\r\nif \"%1\"==\"about\" (echo {\"cliVersion\":\"9.8.7\"}& exit /b 0)\r\necho cursor updated\r\n",
         );
         #[cfg(not(windows))]
         let (name, contents) = (
-            "cursor",
+            "cursor-agent",
             "#!/bin/sh\nif [ \"$1\" = \"about\" ]; then\n  echo '{\"cliVersion\":\"9.8.7\"}'\nelse\n  echo 'cursor updated'\nfi\n",
         );
-        let path = directory.join(name);
+        let path = release_directory.join(name);
         tokio::fs::write(&path, contents)
             .await
             .expect("write cursor fixture");
@@ -2018,17 +2094,22 @@ mod tests {
     }
 
     async fn write_slow_cursor_update_fixture(directory: &Path) -> PathBuf {
+        let release_directory =
+            directory.join(".local/share/cursor-agent/versions/2026.06.19-653a7fb");
+        tokio::fs::create_dir_all(&release_directory)
+            .await
+            .expect("create Cursor release directory");
         #[cfg(windows)]
         let (name, contents) = (
-            "slow-cursor.cmd",
+            "cursor-agent.cmd",
             "@echo off\r\nif \"%1\"==\"about\" (echo {\"cliVersion\":\"9.8.7\"}& exit /b 0)\r\npowershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 2\"\r\n",
         );
         #[cfg(not(windows))]
         let (name, contents) = (
-            "slow-cursor",
+            "cursor-agent",
             "#!/bin/sh\nif [ \"$1\" = \"about\" ]; then\n  echo '{\"cliVersion\":\"9.8.7\"}'\nelse\n  sleep 2\nfi\n",
         );
-        let path = directory.join(name);
+        let path = release_directory.join(name);
         tokio::fs::write(&path, contents)
             .await
             .expect("write slow cursor fixture");
