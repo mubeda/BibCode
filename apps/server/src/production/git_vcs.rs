@@ -1,4 +1,9 @@
-use std::{ffi::OsString, path::PathBuf, sync::Arc, time::Duration};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Duration,
+};
 
 #[cfg(not(windows))]
 use std::process::Stdio;
@@ -21,6 +26,7 @@ use crate::{
         ChangeRequestState, CreatePullRequestInput, ProviderKind, PullRequestService,
         ResolvePullRequestInput, ResolvedPullRequest, SourceControlDiscovery,
     },
+    workspace::{WorkspaceMutationFuture, WorkspaceMutationObserver},
 };
 
 use super::host_paths::resolve_host_directory;
@@ -94,6 +100,14 @@ impl GitVcsRpcServices {
             discovery: SourceControlDiscovery::default(),
             pull_requests: PullRequestService::default(),
         }
+    }
+}
+
+impl WorkspaceMutationObserver for GitVcsRpcServices {
+    fn workspace_mutated<'a>(&'a self, cwd: &'a Path) -> WorkspaceMutationFuture<'a> {
+        Box::pin(async move {
+            self.broadcaster.notify_local_change(cwd).await;
+        })
     }
 }
 

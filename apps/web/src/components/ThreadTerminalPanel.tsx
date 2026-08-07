@@ -72,6 +72,7 @@ import { createTerminalOutputSink } from "./terminalOutputSink";
 import { observeCanvasDevicePixelSize } from "./terminalDevicePixelCorrection";
 import {
   loadTerminalWebglAddon,
+  resizeWebglCanvasBackingStore,
   webglCanvasFrom,
   webglContextFrom,
   type WebglAddonInstance,
@@ -1492,8 +1493,9 @@ export function TerminalViewport({
         const webglCanvas = webglCanvasFrom(addon);
         if (webglCanvas) {
           lifecycle.setDevicePixelDisposable(
-            observeCanvasDevicePixelSize(webglCanvas, () => {
+            observeCanvasDevicePixelSize(webglCanvas, (width, height) => {
               if (terminalRef.current !== terminal) return;
+              if (!resizeWebglCanvasBackingStore(addon, width, height)) return;
               terminal.refresh(0, terminal.rows - 1);
             }),
           );

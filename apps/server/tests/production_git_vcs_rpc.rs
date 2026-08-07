@@ -408,6 +408,116 @@ async fn refresh_status_publishes_external_branch_changes_to_status_subscribers(
 }
 
 #[tokio::test]
+async fn project_file_save_publishes_git_status_without_waiting_for_the_fallback_poller() {
+    let temp = TempDir::new().expect("temporary server directory");
+    let repository = TempDir::new().expect("temporary repository");
+    initialize_repository(&repository);
+    commit_file(repository.path(), "tracked.txt", "base\n", "initial");
+
+    let handle = ServerRuntime::start(test_config(&temp))
+        .await
+        .expect("production server starts");
+    let (mut status_socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("status WebSocket connects");
+    let (mut write_socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("write WebSocket connects");
+    let cwd = repository.path().to_string_lossy();
+
+    request(
+        &mut status_socket,
+        "703",
+        "subscribeVcsStatus",
+        json!({ "cwd": cwd }),
+    )
+    .await;
+    let snapshot = next_server_message(&mut status_socket).await;
+    assert!(matches!(
+        snapshot,
+        ServerMessage::Chunk { request_id, values }
+            if request_id.as_str() == "703"
+                && values[0]["_tag"] == "snapshot"
+                && values[0]["local"]["hasWorkingTreeChanges"] == false
+    ));
+    send_json(
+        &mut status_socket,
+        json!({ "_tag": "Ack", "requestId": "703" }),
+    )
+    .await;
+
+    let initial_remote = next_server_message(&mut status_socket).await;
+    assert!(matches!(
+        initial_remote,
+        ServerMessage::Chunk { request_id, values }
+            if request_id.as_str() == "703" && values[0]["_tag"] == "remoteUpdated"
+    ));
+    send_json(
+        &mut status_socket,
+        json!({ "_tag": "Ack", "requestId": "703" }),
+    )
+    .await;
+
+    // The broadcaster's interval emits one immediate tick when its poller starts.
+    // Let that settle before the save so only event-driven invalidation can meet
+    // the latency assertion below; the fallback interval is 30 seconds.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    request(
+        &mut write_socket,
+        "704",
+        "projects.writeFile",
+        json!({
+            "cwd": cwd,
+            "relativePath": "tracked.txt",
+            "contents": "changed in editor\n"
+        }),
+    )
+    .await;
+    assert_success_eq(
+        &mut write_socket,
+        "704",
+        json!({ "relativePath": "tracked.txt" }),
+    )
+    .await;
+
+    let local_update = timeout(Duration::from_millis(750), async {
+        loop {
+            let message = next_server_message(&mut status_socket).await;
+            if let ServerMessage::Chunk { request_id, values } = message
+                && request_id.as_str() == "703"
+                && values[0]["_tag"] == "localUpdated"
+                && values[0]["local"]["hasWorkingTreeChanges"] == true
+            {
+                break values;
+            }
+            send_json(
+                &mut status_socket,
+                json!({ "_tag": "Ack", "requestId": "703" }),
+            )
+            .await;
+        }
+    })
+    .await
+    .expect("a successful project file save should publish Git status within 750ms");
+    assert_eq!(
+        local_update[0]["local"]["workingTree"]["files"][0]["path"],
+        "tracked.txt"
+    );
+
+    write_socket
+        .close(None)
+        .await
+        .expect("close write WebSocket");
+    status_socket
+        .close(None)
+        .await
+        .expect("close status WebSocket");
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+}
+
+#[tokio::test]
 async fn stacked_commit_stream_finishes_with_a_decodable_success_event() {
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");

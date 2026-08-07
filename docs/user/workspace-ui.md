@@ -117,6 +117,9 @@ The Source Control panel is Orca-parity for the shipped local Git workflow:
   editor, ignore file name, and ignore parent folder when the corresponding host
   actions are available.
 - Commit history and AI commit-message generation are available in the panel.
+- Successful saves from the built-in file editor notify active Source Control
+  subscriptions immediately. Periodic status polling remains a fallback for
+  changes made by external tools.
 
 Stash and amend are intentionally not present; this matches the Orca reference
 behavior for this pass.

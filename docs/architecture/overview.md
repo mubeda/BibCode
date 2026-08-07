@@ -91,7 +91,10 @@ box and throws from `observe`, leaving the backing store misaligned with its
 CSS box on any non-integer device pixel ratio, which rescales every glyph.
 [`terminalDevicePixelCorrection.ts`](../../apps/web/src/components/terminalDevicePixelCorrection.ts)
 restores the correction from `getBoundingClientRect` where the native box is
-unavailable, and stays inert where it is.
+unavailable, and stays inert where it is. The fallback applies each corrected
+backing-store size through xterm's WebGL resize layers so the drawing viewport
+and glyph shader resolution change atomically with the canvas; resizing the
+canvas alone is not a valid renderer state during center-panel splits.
 
 ## Request and event flow
 

@@ -220,12 +220,18 @@ impl ProductionRuntime {
             operational_logs.provider(),
         ));
         let asset_access = AssetAccess::new(asset_secret, state_paths.attachments_dir.clone());
+        let git_repository = Arc::new(GitRepository::with_worktree_settings(control.clone()));
+        let git_vcs = GitVcsRpcServices::with_repository_and_automatic_fetch_interval(
+            git_repository.clone(),
+            control.automatic_git_fetch_interval_signal(),
+        );
         let workspace = WorkspaceRpc::with_dependencies(
             WorkspaceService::default(),
             WorkspaceRpcDependencies {
                 asset_access: Some(asset_access.clone()),
                 asset_context_resolver: Some(Arc::new(ProjectionAssetContext { repositories })),
                 review_service: Some(ReviewService::new(Arc::new(GitReviewBackend))),
+                mutation_observer: Some(Arc::new(git_vcs.clone())),
             },
         );
         let workspace_for_effects = workspace.clone();
@@ -250,7 +256,6 @@ impl ProductionRuntime {
         ));
         agent_activity.record_startup(0).await;
         control.attach_agent_activity_handler(agent_activity).await;
-        let git_repository = Arc::new(GitRepository::with_worktree_settings(control.clone()));
         let terminal_services = ServerTerminalServices::new(
             terminal_manager,
             process_sampler,
@@ -290,13 +295,7 @@ impl ProductionRuntime {
             turn_delivery.clone(),
         );
         register_workspace_preview_rpc(&mut registry, workspace_preview);
-        register_git_vcs_rpc(
-            &mut registry,
-            GitVcsRpcServices::with_repository_and_automatic_fetch_interval(
-                git_repository,
-                control.automatic_git_fetch_interval_signal(),
-            ),
-        );
+        register_git_vcs_rpc(&mut registry, git_vcs);
         register_server_terminal_rpc(&mut registry, terminal_services.clone());
         finalize_rpc_registry(&registry, &control)?;
 
