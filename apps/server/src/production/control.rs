@@ -2112,7 +2112,7 @@ mod tests {
         let state = (version.clone(), requests.clone());
         let app = Router::new()
             .route(
-                "/{*path}",
+                "/opencode-ai/latest",
                 get(
                     |State((version, requests)): State<(
                         Arc<tokio::sync::RwLock<String>>,
