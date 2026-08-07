@@ -167,6 +167,26 @@ mod tests {
     }
 
     #[test]
+    fn canonical_homebrew_evidence_outranks_generic_package_manager_markers() {
+        let capabilities = capabilities_for_paths(
+            "codex",
+            "codex",
+            Some(Path::new("/opt/homebrew/bin/codex")),
+            Some(Path::new(
+                "/opt/homebrew/Caskroom/codex/0.148.0/node_modules/.bin/codex",
+            )),
+        );
+
+        assert_eq!(
+            capabilities
+                .update
+                .as_ref()
+                .map(|value| value.display.as_str()),
+            Some("brew upgrade --cask codex")
+        );
+    }
+
+    #[test]
     fn native_installers_require_exact_paths() {
         let cases = [
             ("claudeAgent", "/srv/.local/bin/claude-wrapper", None),

@@ -151,6 +151,15 @@ fn resolve_package_managed_capabilities(
             "codex-standalone",
         );
     }
+    if canonical_path.as_deref().is_some_and(is_homebrew_path) {
+        return ProviderMaintenanceCapabilities::executable(
+            definition.latest,
+            VersionScheme::Semver,
+            "brew",
+            definition.homebrew_args.iter().copied(),
+            "homebrew",
+        );
+    }
     if paths.iter().any(|path| path.contains("/.vite-plus/bin/")) {
         return ProviderMaintenanceCapabilities::executable(
             definition.latest,
@@ -203,16 +212,6 @@ fn resolve_package_managed_capabilities(
             "npm",
         );
     }
-    if canonical_path.as_deref().is_some_and(is_homebrew_path) {
-        return ProviderMaintenanceCapabilities::executable(
-            definition.latest,
-            VersionScheme::Semver,
-            "brew",
-            definition.homebrew_args.iter().copied(),
-            "homebrew",
-        );
-    }
-
     ProviderMaintenanceCapabilities::unknown()
 }
 
