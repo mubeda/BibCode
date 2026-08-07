@@ -924,7 +924,9 @@ function closedTerminalIds(): string[] {
   });
 }
 
-function seedTwoGroupCenterState(): void {
+function seedTwoGroupCenterState(options?: {
+  readonly hostGroupActiveSurfaceId?: typeof HOST_SURFACE_ID;
+}): void {
   useCenterPanelStore.setState({
     byThreadKey: {
       [threadKey]: {
@@ -937,7 +939,7 @@ function seedTwoGroupCenterState(): void {
           {
             id: "group-a",
             surfaceIds: [HOST_SURFACE_ID, "terminal:term-a"],
-            activeSurfaceId: "terminal:term-a",
+            activeSurfaceId: options?.hostGroupActiveSurfaceId ?? "terminal:term-a",
           },
           {
             id: "group-b",
@@ -1481,6 +1483,36 @@ describe("ChatView center panel variant", () => {
 
     expect(h.capturedList.filter((entry) => entry.name === "messagesTimeline")).toHaveLength(2);
     expect(h.captured["centerWorkspace"]).toBeDefined();
+  });
+
+  it("preserves an outstanding focus request while center-pane eligibility changes", () => {
+    seedConnectedServerThread();
+    seedTwoGroupCenterState({ hostGroupActiveSurfaceId: HOST_SURFACE_ID });
+    publishSeededStoreState(useCenterPanelStore);
+    seedHostState("terminalFocusRequestId", 7);
+
+    renderServerRoute();
+    expect(capturedProps<Record<string, unknown>>("centerTerminalPanel")).toMatchObject({
+      focusRequestId: 7,
+      focusEligible: false,
+    });
+
+    const workspace = capturedProps("centerWorkspace");
+    (workspace["onFocusGroup"] as (groupId: string) => void)("group-b");
+    publishSeededStoreState(useCenterPanelStore);
+    renderServerRoute();
+    expect(capturedProps<Record<string, unknown>>("centerTerminalPanel")).toMatchObject({
+      focusRequestId: 7,
+      focusEligible: true,
+    });
+
+    (workspace["onFocusGroup"] as (groupId: string) => void)("group-a");
+    publishSeededStoreState(useCenterPanelStore);
+    renderServerRoute();
+    expect(capturedProps<Record<string, unknown>>("centerTerminalPanel")).toMatchObject({
+      focusRequestId: 7,
+      focusEligible: false,
+    });
   });
 
   it("renders the empty center-panel state when every surface was closed", () => {

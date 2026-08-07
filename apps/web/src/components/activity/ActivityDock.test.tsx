@@ -676,6 +676,9 @@ describe("ActivityDock", () => {
     );
 
     expect(sectionButtons).toHaveLength(2);
+    expect(sectionButtons.every((button) => button.className.includes("min-h-9"))).toBe(true);
+    expect(sectionButtons.every((button) => button.className.includes("sm:min-h-8"))).toBe(true);
+    expect(sectionButtons.every((button) => !button.className.includes("sm:h-7"))).toBe(true);
     expect(sectionButtons[0]?.textContent).not.toContain("Subagents");
     expect(sectionButtons[0]?.textContent).not.toContain("Active");
     expect(sectionButtons[0]?.textContent).not.toContain("Done");

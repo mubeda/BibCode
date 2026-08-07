@@ -932,7 +932,7 @@ async fn run_codex_observer_inner(
         return;
     }
 
-    let mut tracker = CodexActivityTracker::new(Some(&root));
+    let mut tracker = CodexActivityTracker::new_for_terminal_observation(Some(&root));
     tracker.seed_actor(&root);
     let native_event_key_prefix = format!("codex:terminal-observation:{epoch}");
     let started_at_ms = current_unix_millis();
@@ -1020,7 +1020,7 @@ async fn run_codex_observer_inner(
                 }
                 CodexObserverWait::Completed(Some(reconnected)) => {
                     client = reconnected;
-                    tracker = CodexActivityTracker::new(Some(&root));
+                    tracker = CodexActivityTracker::new_for_terminal_observation(Some(&root));
                     tracker.seed_actor(&root);
                     pending_reconciliation = false;
                     recovering = false;
@@ -1113,7 +1113,7 @@ async fn run_codex_observer_inner(
                         && barrier_epoch == inner.connection_epoch.load(Ordering::Acquire)
                         && inner.activity.snapshot() == desired =>
                 {
-                    tracker = CodexActivityTracker::new(Some(&root));
+                    tracker = CodexActivityTracker::new_for_terminal_observation(Some(&root));
                     tracker.seed_actor(&root);
                     pending_reconciliation = false;
                     retry_at = None;
@@ -2238,6 +2238,39 @@ mod tests {
         let output = bounded_probe_text(&stdout, "stderr");
 
         assert_eq!(output.len(), CODEX_PROBE_OUTPUT_LIMIT);
+    }
+
+    #[test]
+    fn terminal_tracker_uses_sub_agent_activity_only_to_trigger_list_reconciliation() {
+        let mut tracker = CodexActivityTracker::new_for_terminal_observation(Some("terminal-root"));
+        tracker.seed_actor("terminal-root");
+
+        let live_hint = tracker.handle_notification(
+            "item/started",
+            &json!({
+                "threadId": "terminal-root",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "hint-1",
+                    "type": "subAgentActivity",
+                    "agentThreadId": "hint-only-child",
+                    "agentPath": "root/Hint only child",
+                    "kind": "started"
+                }
+            }),
+            1_000,
+            0,
+        );
+        let empty_list = tracker.reconcile_descendants(&[]);
+
+        assert!(
+            live_hint.request_reconciliation,
+            "a terminal hint may wake the existing list-based reconciliation"
+        );
+        assert!(live_hint.hinted_descendant_ids.is_empty());
+        assert!(live_hint.mutations.is_empty());
+        assert!(empty_list.output.mutations.is_empty());
+        assert!(empty_list.threads_to_read.is_empty());
     }
 
     #[tokio::test]

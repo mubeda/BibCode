@@ -293,6 +293,9 @@ describe("ActivityPanel roster", () => {
     expect(older.querySelector("img")).toBeNull();
     expect(older.textContent).toContain("Running");
     expect(older.textContent).toContain("Elapsed 20m");
+    expect(older.className).toContain("min-h-9");
+    expect(older.className).toContain("sm:min-h-8");
+    expect(older.className).not.toContain("sm:h-8");
     expect(older.querySelector('[data-activity-provider-glyph="claude"]')).not.toBeNull();
     expect(older.querySelector('[data-activity-record-glyph="actor"]')).not.toBeNull();
     expect(rows[2]?.textContent).toContain("Completed in 18m");

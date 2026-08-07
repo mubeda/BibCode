@@ -77,7 +77,8 @@ describe("CenterTerminalPanel", () => {
           runtimeEnv: { BIBCODE_PROJECT_ROOT: "/repo" },
         }}
         keybindings={{} as never}
-        focusRequestId={1}
+        focusRequestId={7}
+        focusEligible={false}
         onAddTerminalContext={vi.fn()}
         onClose={onClose}
       />,
@@ -91,6 +92,8 @@ describe("CenterTerminalPanel", () => {
       terminalIds: ["term-1"],
       activeTerminalId: "term-1",
       terminalGroups: [{ id: "terminal:term-1", terminalIds: ["term-1"] }],
+      focusRequestId: 7,
+      focusEligible: false,
     });
     expect(h.panelProps?.["onSplitTerminal"]).toBeUndefined();
     expect(h.panelProps?.["onSplitTerminalVertical"]).toBeUndefined();
@@ -119,6 +122,7 @@ describe("CenterTerminalPanel", () => {
         launchContext={null}
         keybindings={{} as never}
         focusRequestId={1}
+        focusEligible={true}
         onAddTerminalContext={vi.fn()}
         onClose={vi.fn()}
       />,

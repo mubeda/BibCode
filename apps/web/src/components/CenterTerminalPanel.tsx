@@ -20,6 +20,7 @@ interface CenterTerminalPanelProps {
   } | null;
   keybindings: ResolvedKeybindingsConfig;
   focusRequestId: number;
+  focusEligible: boolean;
   onAddTerminalContext: (selection: TerminalContextSelection) => void;
   /** Invoked when the terminal is closed from within its own chrome. */
   onClose: () => void;
@@ -44,6 +45,7 @@ export function CenterTerminalPanel({
   launchContext,
   keybindings,
   focusRequestId,
+  focusEligible,
   onAddTerminalContext,
   onClose,
 }: CenterTerminalPanelProps) {
@@ -80,6 +82,7 @@ export function CenterTerminalPanel({
       terminalGroups={[{ id: `terminal:${terminalId}`, terminalIds: [terminalId] }]}
       activeTerminalGroupId={`terminal:${terminalId}`}
       focusRequestId={focusRequestId}
+      focusEligible={focusEligible}
       onActiveTerminalChange={noop}
       onCloseTerminal={onClose}
       onAddTerminalContext={onAddTerminalContext}

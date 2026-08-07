@@ -382,6 +382,7 @@ describe("center terminal and preview surfaces", () => {
         launchContext={launchContext}
         keybindings={{} as never}
         focusRequestId={3}
+        focusEligible={true}
         onAddTerminalContext={onAddTerminalContext}
         onClose={onClose}
       />

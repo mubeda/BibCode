@@ -86,10 +86,29 @@ events for live activity and feature-detects optional reconciliation methods suc
 as descendant-thread, history, and background-terminal discovery. Unsupported
 methods degrade the affected activity view instead of inventing data.
 
+BiBCode accepts validated `subAgentActivity` items as bounded child-discovery
+hints and direct-reads those child thread IDs. This remains effective when an
+App Server version, including Codex 0.146, omits spawned children from
+`thread/list`; listing remains enabled as a complementary discovery source for
+versions that expose it. Malformed or out-of-scope hints are ignored. When read
+and list methods are incompatible, recovery capabilities downgrade truthfully
+without disabling ordinary chat. Valid mutations accepted before a later
+transient failure or same-root reconnect remain pending until a current
+reconciliation publication succeeds; replacing the root or disabling activity
+discards that root-owned pending state. Pending recovery coalesces superseded
+record states while preserving retained per-actor chronology, and orders each
+parent state before the child or reparent state that depends on it. Unsortable
+or cyclic topology stays pending behind a runtime warning. Valid publication is
+split into bounded events; the first carries scope and health, and only
+successfully queued event prefixes are acknowledged.
+
 Provider-terminal activity is also capability-gated. BiBCode probes the
 configured executable before adding its private remote-observation arguments. If
 the required switches are unavailable or preparation fails safely, the original
 Codex terminal command runs without structured terminal activity.
+Provider-terminal reconciliation remains list-based: `subAgentActivity` can
+trigger a bounded list pass but cannot create a provisional terminal-scope actor
+or opt that observer into structured-chat direct-read recovery.
 
 See [Activity observation](../architecture/activity-observation.md) for the
 shared protocol and provider matrix.

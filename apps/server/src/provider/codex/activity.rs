@@ -16,8 +16,8 @@ use crate::activity::{
 };
 
 use super::model::{
-    ReconciliationBackgroundTerminal, ReconciliationThread, ReconciliationThreadStatus,
-    decode_thread_list_response, decode_thread_read_response,
+    ReconciliationBackgroundTerminal, ReconciliationThread, ReconciliationThreadItem,
+    ReconciliationThreadStatus, decode_thread_list_response, decode_thread_read_response,
 };
 
 pub(crate) const MAX_TRACKED_ACTORS: usize = 256;
@@ -45,12 +45,14 @@ pub struct CodexActivityStateCounts {
 pub struct CodexActivityOutput {
     pub mutations: Vec<ProviderActivityMutation>,
     pub request_reconciliation: bool,
+    pub hinted_descendant_ids: Vec<String>,
 }
 
 #[derive(Debug, Default)]
 pub(crate) struct CodexDescendantReconciliation {
     pub output: CodexActivityOutput,
     pub threads_to_read: Vec<String>,
+    pub accepted_thread_ids: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -65,11 +67,39 @@ enum ActorReopenAuthority<'a> {
     ProviderTimestamp(&'a str),
 }
 
+struct ValidatedSubAgentHint<'a> {
+    native_thread_id: &'a str,
+    fallback_name: String,
+    status: ActivityLifecycle,
+}
+
 impl CodexActivityOutput {
     fn push(&mut self, mutation: ProviderActivityMutation) {
         if self.mutations.len() < MAX_MUTATIONS_PER_OUTPUT {
             self.mutations.push(mutation);
         }
+    }
+
+    fn push_hint(&mut self, native_thread_id: &str) {
+        if self.hinted_descendant_ids.len() < MAX_RECONCILED_DESCENDANTS
+            && !self
+                .hinted_descendant_ids
+                .iter()
+                .any(|existing| existing == native_thread_id)
+        {
+            self.hinted_descendant_ids.push(native_thread_id.to_owned());
+        }
+    }
+
+    #[allow(dead_code, reason = "used by the pending runtime hint integration")]
+    fn merge(&mut self, other: Self) {
+        for mutation in other.mutations {
+            self.push(mutation);
+        }
+        for native_thread_id in other.hinted_descendant_ids {
+            self.push_hint(&native_thread_id);
+        }
+        self.request_reconciliation |= other.request_reconciliation;
     }
 }
 
@@ -221,6 +251,7 @@ impl CanonicalIdGenerator {
 pub(crate) struct CodexActivityTracker {
     root_thread_id: Option<String>,
     actors_by_thread: HashMap<String, ActivityActorState>,
+    provisional_actor_keys: HashSet<String>,
     work_items_by_native_id: HashMap<String, ActivityWorkItemState>,
     seen_native_events: BoundedSeenSet,
     completed_delta_streams: BoundedSeenSet,
@@ -229,14 +260,34 @@ pub(crate) struct CodexActivityTracker {
     reconciled_thread_versions: HashMap<String, u64>,
     detail_baseline: DetailIdentityBaseline,
     canonical_ids: CanonicalIdGenerator,
+    sub_agent_hint_projection: SubAgentHintProjection,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SubAgentHintProjection {
+    StructuredChat,
+    ListTriggerOnly,
 }
 
 impl CodexActivityTracker {
     #[must_use]
     pub fn new(root_thread_id: Option<&str>) -> Self {
+        Self::new_with_hint_projection(root_thread_id, SubAgentHintProjection::StructuredChat)
+    }
+
+    #[must_use]
+    pub(crate) fn new_for_terminal_observation(root_thread_id: Option<&str>) -> Self {
+        Self::new_with_hint_projection(root_thread_id, SubAgentHintProjection::ListTriggerOnly)
+    }
+
+    fn new_with_hint_projection(
+        root_thread_id: Option<&str>,
+        sub_agent_hint_projection: SubAgentHintProjection,
+    ) -> Self {
         Self {
             root_thread_id: root_thread_id.map(thread_key),
             actors_by_thread: HashMap::new(),
+            provisional_actor_keys: HashSet::new(),
             work_items_by_native_id: HashMap::new(),
             seen_native_events: BoundedSeenSet::default(),
             completed_delta_streams: BoundedSeenSet::default(),
@@ -245,6 +296,7 @@ impl CodexActivityTracker {
             reconciled_thread_versions: HashMap::new(),
             detail_baseline: DetailIdentityBaseline::default(),
             canonical_ids: CanonicalIdGenerator::default(),
+            sub_agent_hint_projection,
         }
     }
 
@@ -288,7 +340,7 @@ impl CodexActivityTracker {
             return;
         };
         self.actors_by_thread.insert(
-            native_key,
+            native_key.clone(),
             ActivityActorState {
                 canonical_id,
                 parent_actor_id: None,
@@ -301,6 +353,7 @@ impl CodexActivityTracker {
                 terminal_at: None,
             },
         );
+        self.provisional_actor_keys.remove(&native_key);
     }
 
     pub fn set_root_thread_id(&mut self, native_thread_id: &str) {
@@ -310,6 +363,7 @@ impl CodexActivityTracker {
         }
         self.root_thread_id = Some(root_thread_id);
         self.actors_by_thread.clear();
+        self.provisional_actor_keys.clear();
         self.work_items_by_native_id.clear();
         self.seen_native_events = BoundedSeenSet::default();
         self.completed_delta_streams = BoundedSeenSet::default();
@@ -326,8 +380,9 @@ impl CodexActivityTracker {
 
     #[must_use]
     pub fn is_verified_child(&self, native_thread_id: &str) -> bool {
-        self.actors_by_thread
-            .contains_key(&thread_key(native_thread_id))
+        let native_key = thread_key(native_thread_id);
+        self.actors_by_thread.contains_key(&native_key)
+            && !self.provisional_actor_keys.contains(&native_key)
     }
 
     #[must_use]
@@ -454,7 +509,13 @@ impl CodexActivityTracker {
             return self.handle_collaboration(method, params, item, emitted_at_ms);
         }
         if item_type == "subAgentActivity" {
-            return self.handle_sub_agent_activity(thread_id, item);
+            return self.handle_sub_agent_activity(
+                thread_id,
+                item.get("agentThreadId").and_then(Value::as_str),
+                item.get("agentPath").and_then(Value::as_str),
+                item.get("kind").and_then(Value::as_str),
+                item_timestamp_ms(params, emitted_at_ms),
+            );
         }
         if matches!(
             item_type,
@@ -500,31 +561,98 @@ impl CodexActivityTracker {
     }
 
     fn handle_sub_agent_activity(
-        &self,
+        &mut self,
         owning_thread_id: &str,
-        item: &Map<String, Value>,
+        native_thread_id: Option<&str>,
+        agent_path: Option<&str>,
+        kind: Option<&str>,
+        timestamp_ms: u64,
     ) -> CodexActivityOutput {
-        let owning_thread_in_scope =
-            self.is_root_thread(owning_thread_id) || self.is_verified_child(owning_thread_id);
-        let valid_agent_thread_id = item
-            .get("agentThreadId")
-            .and_then(Value::as_str)
-            .is_some_and(|thread_id| !thread_id.trim().is_empty());
-        let valid_agent_path = item
-            .get("agentPath")
-            .and_then(Value::as_str)
-            .is_some_and(|path| !path.trim().is_empty());
-        let valid_kind = item
-            .get("kind")
-            .and_then(Value::as_str)
-            .is_some_and(|kind| matches!(kind, "started" | "interacted" | "interrupted"));
-        if !owning_thread_in_scope || !valid_agent_thread_id || !valid_agent_path || !valid_kind {
+        let Some(hint) =
+            self.validate_sub_agent_hint(owning_thread_id, native_thread_id, agent_path, kind)
+        else {
             return CodexActivityOutput::default();
+        };
+        if self.sub_agent_hint_projection == SubAgentHintProjection::ListTriggerOnly {
+            return CodexActivityOutput {
+                request_reconciliation: true,
+                ..CodexActivityOutput::default()
+            };
         }
-        CodexActivityOutput {
+        let parent_actor_id = self
+            .actors_by_thread
+            .get(&thread_key(owning_thread_id))
+            .map(|actor| actor.canonical_id.clone())
+            .filter(|_| !self.is_root_thread(owning_thread_id));
+        let provider_timestamp = checked_provider_timestamp_millis(timestamp_ms);
+        let timestamp = provider_timestamp
+            .clone()
+            .unwrap_or_else(|| unix_millis_to_timestamp(timestamp_ms));
+        let native_key = thread_key(hint.native_thread_id);
+        let existed = self.actors_by_thread.contains_key(&native_key);
+        let reopen_authority = if hint.status.is_terminal() {
+            ActorReopenAuthority::None
+        } else {
+            provider_timestamp.as_deref().map_or(
+                ActorReopenAuthority::None,
+                ActorReopenAuthority::ProviderTimestamp,
+            )
+        };
+        let Some(actor) = self.upsert_actor_state(
+            hint.native_thread_id,
+            parent_actor_id.as_deref(),
+            Some(&hint.fallback_name),
+            None,
+            hint.status,
+            None,
+            &timestamp,
+            false,
+            reopen_authority,
+        ) else {
+            return CodexActivityOutput::default();
+        };
+        if !existed {
+            self.provisional_actor_keys.insert(native_key);
+        }
+        let mut output = CodexActivityOutput {
             request_reconciliation: true,
             ..CodexActivityOutput::default()
+        };
+        output.push(ProviderActivityMutation::UpsertActor(actor));
+        output.push_hint(hint.native_thread_id);
+        output
+    }
+
+    fn validate_sub_agent_hint<'a>(
+        &self,
+        owning_thread_id: &str,
+        native_thread_id: Option<&'a str>,
+        agent_path: Option<&str>,
+        kind: Option<&str>,
+    ) -> Option<ValidatedSubAgentHint<'a>> {
+        if !self.is_root_thread(owning_thread_id) && !self.is_verified_child(owning_thread_id) {
+            return None;
         }
+        let native_thread_id = native_thread_id.filter(|id| usable_native_id(id))?;
+        if self.is_root_thread(native_thread_id)
+            || self.receiver_is_sender_or_ancestor(native_thread_id, owning_thread_id)
+        {
+            return None;
+        }
+        let fallback_name = agent_path?
+            .rsplit('/')
+            .map(str::trim)
+            .find(|segment| !segment.is_empty())?;
+        let status = match kind? {
+            "started" | "interacted" => ActivityLifecycle::Running,
+            "interrupted" => ActivityLifecycle::Interrupted,
+            _ => return None,
+        };
+        Some(ValidatedSubAgentHint {
+            native_thread_id,
+            fallback_name: bounded_label(fallback_name),
+            status,
+        })
     }
 
     fn handle_collaboration(
@@ -769,6 +897,42 @@ impl CodexActivityTracker {
         let summary = actor.to_summary()?;
         self.actors_by_thread.insert(native_key, actor);
         Some(summary)
+    }
+
+    fn materialize_provisional_actor(
+        &mut self,
+        native_key: &str,
+        parent_actor_id: Option<&str>,
+        name: Option<&str>,
+        role: Option<&str>,
+        created_at_ms: u64,
+        updated_at: &str,
+    ) -> Option<ActivityActorSummary> {
+        let existing = self.actors_by_thread.get_mut(native_key)?;
+        let mut candidate = existing.clone();
+        candidate.parent_actor_id = parent_actor_id.map(str::to_owned);
+        if let Some(name) = name {
+            candidate.name = bounded_label(name);
+        }
+        if let Some(role) = role {
+            candidate.role = Some(bounded_label(role));
+        }
+        candidate.started_at = unix_millis_to_timestamp(created_at_ms);
+        candidate.updated_at = latest_activity_timestamp([
+            candidate.started_at.as_str(),
+            existing.updated_at.as_str(),
+            updated_at,
+        ])?;
+        candidate.terminal_at = candidate
+            .status
+            .is_terminal()
+            .then(|| candidate.updated_at.clone());
+        let actor = candidate.to_summary()?;
+        candidate.started_at.clone_from(&actor.started_at);
+        candidate.updated_at.clone_from(&actor.updated_at);
+        candidate.terminal_at.clone_from(&actor.terminal_at);
+        *existing = candidate;
+        Some(actor)
     }
 
     fn handle_text_delta(
@@ -1063,6 +1227,7 @@ impl CodexActivityTracker {
             return CodexActivityOutput {
                 mutations: Vec::new(),
                 request_reconciliation: true,
+                hinted_descendant_ids: Vec::new(),
             };
         }
         if !self.seen_native_events.insert(entry_key.clone()) {
@@ -1127,6 +1292,7 @@ impl CodexActivityTracker {
         let mut output = CodexActivityOutput {
             mutations: Vec::new(),
             request_reconciliation: method == "turn/completed" && status.is_terminal(),
+            hinted_descendant_ids: Vec::new(),
         };
         let timestamp = unix_millis_to_timestamp(timestamp_ms);
         if !suppress_detail
@@ -1224,13 +1390,22 @@ impl CodexActivityTracker {
         &mut self,
         threads: &[ReconciliationThread],
     ) -> CodexDescendantReconciliation {
+        self.reconcile_descendants_with_projection_limit(threads, MAX_RECONCILED_DESCENDANTS)
+    }
+
+    pub(crate) fn reconcile_descendants_with_projection_limit(
+        &mut self,
+        threads: &[ReconciliationThread],
+        projection_limit: usize,
+    ) -> CodexDescendantReconciliation {
         let mut reconciliation = CodexDescendantReconciliation::default();
         let mut remaining = (0..threads.len()).collect::<Vec<_>>();
         let mut accepted_native_keys = HashSet::new();
+        let projection_limit = projection_limit.min(MAX_RECONCILED_DESCENDANTS);
         loop {
             let mut made_progress = false;
             remaining.retain(|index| {
-                if accepted_native_keys.len() == MAX_RECONCILED_DESCENDANTS {
+                if accepted_native_keys.len() == projection_limit {
                     return false;
                 }
                 let thread = &threads[*index];
@@ -1249,19 +1424,32 @@ impl CodexActivityTracker {
                     return false;
                 }
                 let parent_key = thread_key(parent_native_id);
+                let native_key = thread_key(native_thread_id);
+                if native_key == parent_key
+                    || self.receiver_is_sender_or_ancestor(native_thread_id, parent_native_id)
+                {
+                    return false;
+                }
                 let parent_actor_id = if self.root_thread_id.as_deref() == Some(parent_key.as_str())
                 {
                     None
-                } else if let Some(parent) = self.actors_by_thread.get(&parent_key) {
+                } else if let Some(parent) = self
+                    .actors_by_thread
+                    .get(&parent_key)
+                    .filter(|_| !self.provisional_actor_keys.contains(&parent_key))
+                {
                     Some(parent.canonical_id.clone())
                 } else {
                     return true;
                 };
-                let native_key = thread_key(native_thread_id);
                 if !accepted_native_keys.insert(native_key.clone()) {
                     return false;
                 }
                 let existed = self.actors_by_thread.contains_key(&native_key);
+                let was_provisional = self.provisional_actor_keys.contains(&native_key);
+                let provisional_before = was_provisional
+                    .then(|| self.actors_by_thread.get(&native_key).cloned())
+                    .flatten();
                 let updated_version = thread.updated_at.unwrap_or_default();
                 let status = thread
                     .status
@@ -1287,7 +1475,7 @@ impl CodexActivityTracker {
                 } else {
                     ActorReopenAuthority::None
                 };
-                if let Some(mut actor) = self.upsert_actor_state(
+                let mut actor_to_emit = self.upsert_actor_state(
                     native_thread_id,
                     parent_actor_id.as_deref(),
                     thread.agent_nickname.as_deref().or(thread.name.as_deref()),
@@ -1297,8 +1485,9 @@ impl CodexActivityTracker {
                     &timestamp,
                     true,
                     reopen_authority,
-                ) {
-                    if !existed {
+                );
+                if !existed {
+                    if let Some(actor) = actor_to_emit.as_mut() {
                         actor.started_at = unix_millis_to_timestamp(
                             thread.created_at.unwrap_or_default().saturating_mul(1_000),
                         );
@@ -1306,6 +1495,24 @@ impl CodexActivityTracker {
                             state.started_at.clone_from(&actor.started_at);
                         }
                     }
+                } else if was_provisional {
+                    actor_to_emit = self.materialize_provisional_actor(
+                        &native_key,
+                        parent_actor_id.as_deref(),
+                        thread.agent_nickname.as_deref().or(thread.name.as_deref()),
+                        thread.agent_role.as_deref(),
+                        thread.created_at.unwrap_or_default().saturating_mul(1_000),
+                        &timestamp,
+                    );
+                    if actor_to_emit.is_none() {
+                        if let Some(previous) = provisional_before {
+                            self.actors_by_thread.insert(native_key.clone(), previous);
+                        }
+                        accepted_native_keys.remove(&native_key);
+                        return false;
+                    }
+                }
+                if let Some(actor) = actor_to_emit {
                     reconciliation
                         .output
                         .push(ProviderActivityMutation::UpsertActor(actor));
@@ -1315,6 +1522,10 @@ impl CodexActivityTracker {
                         .threads_to_read
                         .push(native_thread_id.to_owned());
                 }
+                self.provisional_actor_keys.remove(&native_key);
+                reconciliation
+                    .accepted_thread_ids
+                    .push(native_thread_id.to_owned());
                 made_progress = true;
                 false
             });
@@ -1323,6 +1534,117 @@ impl CodexActivityTracker {
             }
         }
         reconciliation
+    }
+
+    #[allow(dead_code, reason = "used by the pending runtime hint integration")]
+    pub(crate) fn reconcile_sub_agent_hints(
+        &mut self,
+        thread: &ReconciliationThread,
+    ) -> CodexActivityOutput {
+        self.reconcile_sub_agent_hints_with_projection_limit(thread, MAX_RECONCILED_DESCENDANTS)
+    }
+
+    pub(crate) fn reconcile_sub_agent_hints_with_projection_limit(
+        &mut self,
+        thread: &ReconciliationThread,
+        projection_limit: usize,
+    ) -> CodexActivityOutput {
+        self.reconcile_sub_agent_hints_with_projection_limit_excluding(
+            thread,
+            projection_limit,
+            &HashSet::new(),
+        )
+    }
+
+    pub(crate) fn reconcile_sub_agent_hints_with_projection_limit_excluding(
+        &mut self,
+        thread: &ReconciliationThread,
+        projection_limit: usize,
+        excluded_native_thread_ids: &HashSet<String>,
+    ) -> CodexActivityOutput {
+        let Some(owning_thread_id) = thread.id.as_deref().filter(|id| usable_native_id(id)) else {
+            return CodexActivityOutput::default();
+        };
+        if !self.is_root_thread(owning_thread_id) && !self.is_verified_child(owning_thread_id) {
+            return CodexActivityOutput::default();
+        }
+        let recent_turns = thread
+            .turns
+            .iter()
+            .rev()
+            .take(MAX_RECONCILED_TURNS)
+            .collect::<Vec<_>>();
+        let mut output = CodexActivityOutput::default();
+        let mut normalized_hint_count = 0;
+        'turns: for turn in recent_turns.into_iter().rev() {
+            let timestamp_ms = turn
+                .completed_at
+                .or(turn.started_at)
+                .or(thread.updated_at)
+                .unwrap_or_default()
+                .saturating_mul(1_000);
+            for item in &turn.items {
+                let ReconciliationThreadItem::SubAgentActivity {
+                    agent_thread_id,
+                    agent_path,
+                    kind,
+                    ..
+                } = item
+                else {
+                    continue;
+                };
+                if normalized_hint_count == MAX_RECONCILED_ENTRIES
+                    || output.hinted_descendant_ids.len() == MAX_RECONCILED_DESCENDANTS
+                {
+                    break 'turns;
+                }
+                normalized_hint_count += 1;
+                let already_hinted = agent_thread_id.as_deref().is_some_and(|native_thread_id| {
+                    output
+                        .hinted_descendant_ids
+                        .iter()
+                        .any(|existing| existing == native_thread_id)
+                });
+                if already_hinted {
+                    continue;
+                }
+                if agent_thread_id.as_ref().is_some_and(|native_thread_id| {
+                    excluded_native_thread_ids.contains(native_thread_id)
+                }) {
+                    continue;
+                }
+                if output.hinted_descendant_ids.len() < projection_limit {
+                    let mut hint_output = self.handle_sub_agent_activity(
+                        owning_thread_id,
+                        agent_thread_id.as_deref(),
+                        agent_path.as_deref(),
+                        kind.as_deref(),
+                        timestamp_ms,
+                    );
+                    if hint_output.hinted_descendant_ids.is_empty()
+                        && let Some(hint) = self.validate_sub_agent_hint(
+                            owning_thread_id,
+                            agent_thread_id.as_deref(),
+                            agent_path.as_deref(),
+                            kind.as_deref(),
+                        )
+                    {
+                        hint_output.push_hint(hint.native_thread_id);
+                        hint_output.request_reconciliation = true;
+                    }
+                    output.merge(hint_output);
+                } else if let Some(hint) = self.validate_sub_agent_hint(
+                    owning_thread_id,
+                    agent_thread_id.as_deref(),
+                    agent_path.as_deref(),
+                    kind.as_deref(),
+                ) {
+                    output.push_hint(hint.native_thread_id);
+                    output.request_reconciliation = true;
+                }
+            }
+        }
+        output
     }
 
     pub(crate) fn reconcile_thread_history(
@@ -3049,48 +3371,268 @@ mod tests {
     }
 
     #[test]
-    fn sub_agent_activity_requests_reconciliation_for_root_and_verified_descendants() {
-        let mut tracker = CodexActivityTracker::new(Some("root-1"));
-        tracker.seed_actor("child-1");
+    fn sub_agent_activity_seeds_canonical_actor_and_read_hint() {
+        let mut tracker = CodexActivityTracker::new(Some("provider-root"));
+        tracker.seed_actor("provider-root");
 
-        for (index, (kind, owning_thread_id)) in [
-            ("started", "root-1"),
-            ("interacted", "child-1"),
-            ("interrupted", "root-1"),
-        ]
-        .into_iter()
-        .enumerate()
-        {
-            let params = serde_json::json!({
-                "threadId": owning_thread_id,
-                "turnId": format!("turn-{index}"),
+        let output = tracker.handle_notification(
+            "item/started",
+            &serde_json::json!({
+                "threadId": "provider-root",
+                "turnId": "root-turn",
                 "item": {
-                    "id": format!("sub-agent-{index}"),
+                    "id": "spawn-child",
                     "type": "subAgentActivity",
-                    "agentThreadId": format!("discovered-child-{index}"),
-                    "agentPath": format!("/root/child-{index}"),
+                    "agentThreadId": "child-1",
+                    "agentPath": "/root/reviewer",
+                    "kind": "started"
+                }
+            }),
+            2_000,
+            1,
+        );
+
+        assert!(matches!(
+            output.mutations.as_slice(),
+            [ProviderActivityMutation::UpsertActor(actor)]
+                if actor.id == "codex:thread:child-1"
+                    && actor.name == "reviewer"
+                    && actor.parent_actor_id.is_none()
+                    && actor.status == ActivityLifecycle::Running
+                    && actor.started_at == "1970-01-01T00:00:02.000000000Z"
+                    && actor.updated_at == "1970-01-01T00:00:02.000000000Z"
+                    && actor.terminal_at.is_none()
+        ));
+        assert_eq!(output.hinted_descendant_ids, ["child-1"]);
+        assert!(output.request_reconciliation);
+    }
+
+    #[test]
+    fn sub_agent_activity_preserves_topology_lifecycle_and_deduplicates() {
+        let valid_child = decode_thread_read_response(serde_json::json!({
+            "thread": {
+                "id": "child-1",
+                "parentThreadId": "provider-root",
+                "createdAt": 1,
+                "updatedAt": 1,
+                "status": {"type": "active", "activeFlags": []},
+                "turns": []
+            }
+        }))
+        .expect("valid child")
+        .thread;
+        let mut tracker = CodexActivityTracker::new(Some("provider-root"));
+        tracker.seed_actor("provider-root");
+        tracker.reconcile_descendants(&[valid_child]);
+
+        let nested = serde_json::json!({
+            "threadId": "child-1",
+            "turnId": "child-turn",
+            "item": {
+                "id": "spawn-nested",
+                "type": "subAgentActivity",
+                "agentThreadId": "child-nested",
+                "agentPath": "/root/reviewer/nested-reviewer",
+                "kind": "interacted"
+            }
+        });
+        let nested_output = tracker.handle_notification("item/started", &nested, 3_000, 2);
+        let nested_actor = nested_output
+            .mutations
+            .iter()
+            .find_map(|mutation| match mutation {
+                ProviderActivityMutation::UpsertActor(actor) => Some(actor),
+                _ => None,
+            })
+            .expect("nested provisional actor");
+        assert_eq!(
+            nested_actor.parent_actor_id.as_deref(),
+            Some("codex:thread:child-1")
+        );
+
+        let interrupted_output = tracker.handle_notification(
+            "item/completed",
+            &serde_json::json!({
+                "threadId": "provider-root",
+                "turnId": "root-turn",
+                "item": {
+                    "id": "interrupt-child",
+                    "type": "subAgentActivity",
+                    "agentThreadId": "interrupted-child",
+                    "agentPath": "/root/interrupted-child",
+                    "kind": "interrupted"
+                }
+            }),
+            4_000,
+            3,
+        );
+        let interrupted_actor = interrupted_output
+            .mutations
+            .iter()
+            .find_map(|mutation| match mutation {
+                ProviderActivityMutation::UpsertActor(actor) => Some(actor),
+                _ => None,
+            })
+            .expect("interrupted provisional actor");
+        assert_eq!(interrupted_actor.status, ActivityLifecycle::Interrupted);
+        assert_eq!(
+            interrupted_actor.terminal_at,
+            Some(interrupted_actor.updated_at.clone())
+        );
+
+        let duplicate = tracker.handle_notification("item/started", &nested, 3_000, 4);
+        assert!(duplicate.mutations.is_empty());
+        assert!(duplicate.hinted_descendant_ids.is_empty());
+        assert!(!duplicate.request_reconciliation);
+    }
+
+    #[test]
+    fn sub_agent_activity_without_provider_timestamp_cannot_reopen_interrupted_actor() {
+        let mut tracker = CodexActivityTracker::new(Some("provider-root"));
+        tracker.seed_actor("provider-root");
+        let hint = |kind: &str, id: &str| {
+            serde_json::json!({
+                "threadId": "provider-root",
+                "turnId": "root-turn",
+                "item": {
+                    "id": id,
+                    "type": "subAgentActivity",
+                    "agentThreadId": "child-1",
+                    "agentPath": "/root/reviewer",
                     "kind": kind
                 }
-            });
+            })
+        };
 
-            let output =
-                tracker.handle_notification("item/started", &params, 1_000 + index as u64, 0);
+        let interrupted = tracker.handle_notification(
+            "item/completed",
+            &hint("interrupted", "interrupt-child"),
+            0,
+            1,
+        );
+        assert!(matches!(
+            interrupted.mutations.as_slice(),
+            [ProviderActivityMutation::UpsertActor(actor)]
+                if actor.status == ActivityLifecycle::Interrupted
+        ));
 
-            assert!(
-                output.request_reconciliation,
-                "{kind} activity owned by {owning_thread_id} must request reconciliation"
-            );
-            assert!(
-                output.mutations.is_empty(),
-                "subAgentActivity is only a reconciliation hint"
-            );
-        }
+        let timestamp_less_reopen =
+            tracker.handle_notification("item/started", &hint("started", "restart-child"), 0, 2);
+        assert!(timestamp_less_reopen.mutations.is_empty());
+        assert!(timestamp_less_reopen.hinted_descendant_ids.is_empty());
+        assert!(!timestamp_less_reopen.request_reconciliation);
+        assert_eq!(
+            tracker
+                .actors_by_thread
+                .get(&thread_key("child-1"))
+                .map(|actor| actor.status),
+            Some(ActivityLifecycle::Interrupted)
+        );
+    }
+
+    #[test]
+    fn sub_agent_reconciliation_materializes_provisional_metadata_before_promotion() {
+        let thread =
+            |id: &str, parent_thread_id: &str, created_at: u64, updated_at: u64, status: Value| {
+                decode_thread_read_response(serde_json::json!({
+                    "thread": {
+                        "id": id,
+                        "parentThreadId": parent_thread_id,
+                        "agentNickname": "reviewer",
+                        "createdAt": created_at,
+                        "updatedAt": updated_at,
+                        "status": status,
+                        "turns": []
+                    }
+                }))
+                .expect("reconciliation thread")
+                .thread
+            };
+        let active = || serde_json::json!({"type": "active", "activeFlags": []});
+
+        let mut tracker = CodexActivityTracker::new(Some("provider-root"));
+        tracker.seed_actor("provider-root");
+        tracker.reconcile_descendants(&[thread("parent-1", "provider-root", 1, 1, active())]);
+        tracker.handle_notification(
+            "item/started",
+            &serde_json::json!({
+                "threadId": "parent-1",
+                "turnId": "parent-turn",
+                "item": {
+                    "id": "spawn-child",
+                    "type": "subAgentActivity",
+                    "agentThreadId": "child-1",
+                    "agentPath": "/root/parent/reviewer",
+                    "kind": "started"
+                }
+            }),
+            2_000,
+            1,
+        );
+
+        let authoritative =
+            tracker.reconcile_descendants(&[thread("child-1", "provider-root", 1, 3, active())]);
+        assert_eq!(authoritative.accepted_thread_ids, ["child-1"]);
+        assert!(matches!(
+            authoritative.output.mutations.as_slice(),
+            [ProviderActivityMutation::UpsertActor(actor)]
+                if actor.id == "codex:thread:child-1"
+                    && actor.parent_actor_id.is_none()
+                    && actor.status == ActivityLifecycle::Running
+                    && actor.started_at == "1970-01-01T00:00:01.000000000Z"
+                    && actor.updated_at == "1970-01-01T00:00:03.000000000Z"
+        ));
+        assert!(tracker.is_verified_child("child-1"));
+
+        let mut stale_tracker = CodexActivityTracker::new(Some("provider-root"));
+        stale_tracker.seed_actor("provider-root");
+        stale_tracker.handle_notification(
+            "item/completed",
+            &serde_json::json!({
+                "threadId": "provider-root",
+                "turnId": "root-turn",
+                "item": {
+                    "id": "interrupt-stale-child",
+                    "type": "subAgentActivity",
+                    "agentThreadId": "stale-child",
+                    "agentPath": "/root/reviewer",
+                    "kind": "interrupted"
+                }
+            }),
+            4_000,
+            1,
+        );
+        let stale = stale_tracker.reconcile_descendants(&[thread(
+            "stale-child",
+            "provider-root",
+            1,
+            2,
+            active(),
+        )]);
+        assert_eq!(stale.accepted_thread_ids, ["stale-child"]);
+        assert!(matches!(
+            stale.output.mutations.as_slice(),
+            [ProviderActivityMutation::UpsertActor(actor)]
+                if actor.id == "codex:thread:stale-child"
+                    && actor.status == ActivityLifecycle::Interrupted
+                    && actor.started_at == "1970-01-01T00:00:01.000000000Z"
+                    && actor.updated_at == "1970-01-01T00:00:04.000000000Z"
+                    && actor.terminal_at.as_deref()
+                        == Some("1970-01-01T00:00:04.000000000Z")
+        ));
+        assert!(stale_tracker.is_verified_child("stale-child"));
     }
 
     #[test]
     fn sub_agent_activity_rejects_malformed_unknown_and_foreign_hints() {
+        fn assert_default(output: CodexActivityOutput) {
+            assert!(output.mutations.is_empty());
+            assert!(output.hinted_descendant_ids.is_empty());
+            assert!(!output.request_reconciliation);
+        }
+
         let mut tracker = CodexActivityTracker::new(Some("root-1"));
-        tracker.seed_actor("child-1");
+        tracker.seed_actor("verified-child");
         let valid_item = serde_json::json!({
             "id": "sub-agent-1",
             "type": "subAgentActivity",
@@ -3113,7 +3655,29 @@ mod tests {
                 "threadId": "root-1",
                 "turnId": "turn-1",
                 "item": {
+                    "id": "sub-agent-thread-with-whitespace",
+                    "type": "subAgentActivity",
+                    "agentThreadId": "child one",
+                    "agentPath": "/root/discovered-child",
+                    "kind": "started"
+                }
+            }),
+            serde_json::json!({
+                "threadId": "root-1",
+                "turnId": "turn-1",
+                "item": {
                     "id": "sub-agent-empty-thread",
+                    "type": "subAgentActivity",
+                    "agentThreadId": "",
+                    "agentPath": "/root/discovered-child",
+                    "kind": "started"
+                }
+            }),
+            serde_json::json!({
+                "threadId": "root-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "sub-agent-whitespace-thread",
                     "type": "subAgentActivity",
                     "agentThreadId": " ",
                     "agentPath": "/root/discovered-child",
@@ -3137,6 +3701,17 @@ mod tests {
                     "id": "sub-agent-empty-path",
                     "type": "subAgentActivity",
                     "agentThreadId": "discovered-child",
+                    "agentPath": "",
+                    "kind": "started"
+                }
+            }),
+            serde_json::json!({
+                "threadId": "root-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "sub-agent-whitespace-path",
+                    "type": "subAgentActivity",
+                    "agentThreadId": "discovered-child",
                     "agentPath": " ",
                     "kind": "started"
                 }
@@ -3157,13 +3732,357 @@ mod tests {
                 "turnId": "turn-1",
                 "item": valid_item
             }),
+            serde_json::json!({
+                "threadId": "root-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": "sub-agent-root-self-link",
+                    "type": "subAgentActivity",
+                    "agentThreadId": "root-1",
+                    "agentPath": "/root",
+                    "kind": "started"
+                }
+            }),
         ];
 
         for params in invalid_params {
-            let output = tracker.handle_notification("item/completed", &params, 1_000, 0);
-            assert!(!output.request_reconciliation);
-            assert!(output.mutations.is_empty());
+            assert_default(tracker.handle_notification("item/completed", &params, 1_000, 0));
         }
+
+        let provisional = tracker.handle_notification(
+            "item/started",
+            &serde_json::json!({
+                "threadId": "root-1",
+                "turnId": "root-turn",
+                "item": {
+                    "id": "provisional-owner",
+                    "type": "subAgentActivity",
+                    "agentThreadId": "provisional-owner",
+                    "agentPath": "/root/provisional-owner",
+                    "kind": "started"
+                }
+            }),
+            2_000,
+            1,
+        );
+        assert_eq!(provisional.hinted_descendant_ids, ["provisional-owner"]);
+        assert_default(tracker.handle_notification(
+            "item/started",
+            &serde_json::json!({
+                "threadId": "provisional-owner",
+                "turnId": "provisional-turn",
+                "item": {
+                    "id": "unverified-owner-hint",
+                    "type": "subAgentActivity",
+                    "agentThreadId": "nested-unverified",
+                    "agentPath": "/root/provisional-owner/nested-unverified",
+                    "kind": "started"
+                }
+            }),
+            3_000,
+            2,
+        ));
+
+        let nested_thread = decode_thread_read_response(serde_json::json!({
+            "thread": {
+                "id": "nested-verified",
+                "parentThreadId": "verified-child",
+                "createdAt": 1,
+                "updatedAt": 1,
+                "turns": []
+            }
+        }))
+        .expect("nested verified child")
+        .thread;
+        tracker.reconcile_descendants(&[nested_thread]);
+        assert_default(tracker.handle_notification(
+            "item/started",
+            &serde_json::json!({
+                "threadId": "nested-verified",
+                "turnId": "nested-turn",
+                "item": {
+                    "id": "parent-cycle",
+                    "type": "subAgentActivity",
+                    "agentThreadId": "verified-child",
+                    "agentPath": "/root/verified-child",
+                    "kind": "started"
+                }
+            }),
+            4_000,
+            3,
+        ));
+    }
+
+    #[test]
+    fn sub_agent_history_recovers_bounded_root_and_nested_hints() {
+        let root = decode_thread_read_response(serde_json::json!({
+            "thread": {
+                "id": "provider-root",
+                "updatedAt": 30,
+                "turns": [{
+                    "id": "root-turn",
+                    "startedAt": 10,
+                    "completedAt": 20,
+                    "items": [{
+                        "id": "spawn-child",
+                        "type": "subAgentActivity",
+                        "agentThreadId": "child-1",
+                        "agentPath": "/root/reviewer",
+                        "kind": "started"
+                    }]
+                }]
+            }
+        }))
+        .expect("root history")
+        .thread;
+        let mut tracker = CodexActivityTracker::new(Some("provider-root"));
+        tracker.seed_actor("provider-root");
+        let root_output = tracker.reconcile_sub_agent_hints(&root);
+        assert_eq!(root_output.hinted_descendant_ids, ["child-1"]);
+        assert!(root_output.mutations.iter().any(|mutation| matches!(
+            mutation,
+            ProviderActivityMutation::UpsertActor(actor)
+                if actor.id == "codex:thread:child-1"
+                    && actor.updated_at == "1970-01-01T00:00:20.000000000Z"
+        )));
+
+        let mut child = root.clone();
+        child.id = Some("child-1".to_owned());
+        child.parent_thread_id = Some("provider-root".to_owned());
+        child.created_at = Some(10);
+        child.turns[0].items = serde_json::from_value(serde_json::json!([{
+            "id": "spawn-nested",
+            "type": "subAgentActivity",
+            "agentThreadId": "child-nested",
+            "agentPath": "/root/reviewer/nested-reviewer",
+            "kind": "interacted"
+        }]))
+        .expect("typed nested hint");
+        tracker.reconcile_descendants(std::slice::from_ref(&child));
+        let nested_output = tracker.reconcile_sub_agent_hints(&child);
+        assert_eq!(nested_output.hinted_descendant_ids, ["child-nested"]);
+        assert!(nested_output.mutations.iter().any(|mutation| matches!(
+            mutation,
+            ProviderActivityMutation::UpsertActor(actor)
+                if actor.id == "codex:thread:child-nested"
+                    && actor.parent_actor_id.as_deref() == Some("codex:thread:child-1")
+        )));
+
+        let turns = (0..21)
+            .map(|index| {
+                serde_json::json!({
+                    "id": format!("turn-{index}"),
+                    "startedAt": index + 1,
+                    "items": if index == 0 {
+                        serde_json::json!([{
+                            "id": "too-old",
+                            "type": "subAgentActivity",
+                            "agentThreadId": "too-old-child",
+                            "agentPath": "/root/too-old-child",
+                            "kind": "started"
+                        }])
+                    } else if index == 20 {
+                        serde_json::json!([{
+                            "id": "newest",
+                            "type": "subAgentActivity",
+                            "agentThreadId": "newest-child",
+                            "agentPath": "/root/newest-child",
+                            "kind": "started"
+                        }])
+                    } else {
+                        serde_json::json!([])
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let bounded = decode_thread_read_response(serde_json::json!({
+            "thread": {
+                "id": "provider-root",
+                "updatedAt": 30,
+                "turns": turns
+            }
+        }))
+        .expect("bounded root history")
+        .thread;
+        let mut bounded_tracker = CodexActivityTracker::new(Some("provider-root"));
+        bounded_tracker.seed_actor("provider-root");
+        let bounded_output = bounded_tracker.reconcile_sub_agent_hints(&bounded);
+        assert_eq!(bounded_output.hinted_descendant_ids, ["newest-child"]);
+        assert!(!bounded_tracker.is_verified_child("too-old-child"));
+
+        let bounded_hints = decode_thread_read_response(serde_json::json!({
+            "thread": {
+                "id": "provider-root",
+                "updatedAt": 30,
+                "turns": [{
+                    "id": "bounded-hints",
+                    "startedAt": 30,
+                    "items": (0..(MAX_RECONCILED_DESCENDANTS + 10))
+                        .map(|index| serde_json::json!({
+                            "id": format!("hint-{index}"),
+                            "type": "subAgentActivity",
+                            "agentThreadId": format!("bounded-child-{index}"),
+                            "agentPath": format!("/root/bounded-child-{index}"),
+                            "kind": "started"
+                        }))
+                        .collect::<Vec<_>>()
+                }]
+            }
+        }))
+        .expect("bounded historical hints")
+        .thread;
+        let mut hint_bound_tracker = CodexActivityTracker::new(Some("provider-root"));
+        hint_bound_tracker.seed_actor("provider-root");
+        let hint_bound_output = hint_bound_tracker.reconcile_sub_agent_hints(&bounded_hints);
+        assert_eq!(
+            hint_bound_output.hinted_descendant_ids.len(),
+            MAX_RECONCILED_DESCENDANTS
+        );
+        assert!(hint_bound_output.mutations.len() <= MAX_MUTATIONS_PER_OUTPUT);
+    }
+
+    #[test]
+    fn sub_agent_history_projection_limit_retains_deferred_read_hints_without_actor_mutations() {
+        let thread = decode_thread_read_response(serde_json::json!({
+            "thread": {
+                "id": "provider-root",
+                "updatedAt": 3,
+                "turns": [{
+                    "id": "root-turn",
+                    "startedAt": 1,
+                    "completedAt": 3,
+                    "items": (0..3)
+                        .map(|index| serde_json::json!({
+                            "id": format!("spawn-{index}"),
+                            "type": "subAgentActivity",
+                            "agentThreadId": format!("child-{index}"),
+                            "agentPath": format!("/root/child-{index}"),
+                            "kind": "started"
+                        }))
+                        .collect::<Vec<_>>()
+                }]
+            }
+        }))
+        .expect("root history")
+        .thread;
+        let mut tracker = CodexActivityTracker::new(Some("provider-root"));
+        tracker.seed_actor("provider-root");
+
+        let output = tracker.reconcile_sub_agent_hints_with_projection_limit(&thread, 1);
+
+        assert_eq!(
+            output.hinted_descendant_ids,
+            ["child-0", "child-1", "child-2"]
+        );
+        assert!(matches!(
+            output.mutations.as_slice(),
+            [ProviderActivityMutation::UpsertActor(actor)]
+                if actor.id == "codex:thread:child-0"
+        ));
+        assert!(!tracker.is_verified_child("child-1"));
+        assert!(!tracker.is_verified_child("child-2"));
+        assert_eq!(tracker.state_counts().actors, 2);
+    }
+
+    #[test]
+    fn sub_agent_history_excludes_only_already_reconciled_hint_ids() {
+        let thread = decode_thread_read_response(serde_json::json!({
+            "thread": {
+                "id": "provider-root",
+                "updatedAt": 3,
+                "turns": [{
+                    "id": "root-turn",
+                    "startedAt": 1,
+                    "completedAt": 3,
+                    "items": (0..3)
+                        .map(|index| serde_json::json!({
+                            "id": format!("spawn-{index}"),
+                            "type": "subAgentActivity",
+                            "agentThreadId": format!("child-{index}"),
+                            "agentPath": format!("/root/child-{index}"),
+                            "kind": "started"
+                        }))
+                        .collect::<Vec<_>>()
+                }]
+            }
+        }))
+        .expect("root history")
+        .thread;
+        let mut tracker = CodexActivityTracker::new(Some("provider-root"));
+        tracker.seed_actor("provider-root");
+        let excluded = HashSet::from(["child-0".to_owned()]);
+
+        let output = tracker
+            .reconcile_sub_agent_hints_with_projection_limit_excluding(&thread, 1, &excluded);
+
+        assert_eq!(output.hinted_descendant_ids, ["child-1", "child-2"]);
+        assert!(matches!(
+            output.mutations.as_slice(),
+            [ProviderActivityMutation::UpsertActor(actor)]
+                if actor.id == "codex:thread:child-1"
+        ));
+        assert_eq!(tracker.state_counts().actors, 2);
+    }
+
+    #[test]
+    fn sub_agent_descendant_reconciliation_reports_only_accepted_reads() {
+        let thread = |id: &str, parent_thread_id: &str| {
+            decode_thread_read_response(serde_json::json!({
+                "thread": {
+                    "id": id,
+                    "parentThreadId": parent_thread_id,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "turns": []
+                }
+            }))
+            .expect("descendant thread")
+            .thread
+        };
+
+        let mut tracker = CodexActivityTracker::new(Some("provider-root"));
+        tracker.seed_actor("provider-root");
+        let reconciliation = tracker.reconcile_descendants(&[thread("child-1", "provider-root")]);
+        assert_eq!(reconciliation.accepted_thread_ids, ["child-1"]);
+
+        let mut mismatched_tracker = CodexActivityTracker::new(Some("provider-root"));
+        mismatched_tracker.seed_actor("provider-root");
+        let mismatched = mismatched_tracker.reconcile_descendants(&[
+            thread("self-parent", "self-parent"),
+            thread("unresolved-parent", "foreign-parent"),
+        ]);
+        assert!(mismatched.accepted_thread_ids.is_empty());
+    }
+
+    #[test]
+    fn descendant_reconciliation_projection_limit_caps_only_accepted_rows() {
+        let thread = |id: &str, parent_thread_id: Option<&str>| {
+            decode_thread_read_response(serde_json::json!({
+                "thread": {
+                    "id": id,
+                    "parentThreadId": parent_thread_id,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "turns": []
+                }
+            }))
+            .expect("descendant thread")
+            .thread
+        };
+        let mut tracker = CodexActivityTracker::new(Some("provider-root"));
+
+        let reconciliation = tracker.reconcile_descendants_with_projection_limit(
+            &[
+                thread("invalid-child", None),
+                thread("accepted-child", Some("provider-root")),
+                thread("deferred-child", Some("provider-root")),
+            ],
+            1,
+        );
+
+        assert_eq!(reconciliation.accepted_thread_ids, ["accepted-child"]);
+        assert_eq!(reconciliation.threads_to_read, ["accepted-child"]);
+        assert!(!tracker.is_verified_child("deferred-child"));
     }
 
     #[test]

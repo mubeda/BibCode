@@ -1085,7 +1085,8 @@ const LiveCenterPanelWorkspace = memo(function LiveCenterPanelWorkspace({
               surface={surface}
               launchContext={centerTerminalLaunchContext}
               keybindings={keybindings}
-              focusRequestId={context.focused ? terminalFocusRequestId : 0}
+              focusRequestId={terminalFocusRequestId}
+              focusEligible={context.focused}
               onAddTerminalContext={onAddTerminalContext}
               onClose={() => onCloseSurface(context.groupId, surface)}
             />

@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet, VecDeque},
     sync::{Arc, Mutex as StdMutex, Weak},
     time::Duration,
 };
@@ -19,7 +19,10 @@ use crate::activity::{
 };
 
 use super::{
-    activity::{BackgroundSnapshotAuthority, CodexActivityTracker},
+    activity::{
+        BackgroundSnapshotAuthority, CodexActivityTracker, MAX_TRACKED_ACTORS,
+        MAX_TRACKED_WORK_ITEMS,
+    },
     mcp_status::{
         McpOpenCompletion, McpOpenReservation, McpStatusEffect, McpStatusHandle,
         mcp_server_status_from_notification, refresh_mcp_status_snapshot, run_actor,
@@ -40,10 +43,14 @@ const FIXED_EVENT_TIME: &str = "2026-07-10T00:00:00.000Z";
 const FATAL_STDERR_SNIPPETS: &[&str] = &["failed to connect to websocket"];
 const RECONCILIATION_HINT_CAPACITY: usize = 1;
 const RECONCILIATION_DESCENDANT_LIMIT: u16 = 50;
+const RECONCILIATION_HINT_FRESHNESS_LIMIT: usize = 256;
 const RECONCILIATION_DESCENDANT_PAGE_LIMIT: usize = 8;
 const RECONCILIATION_BACKGROUND_LIMIT: u16 = 128;
 const RECONCILIATION_BACKGROUND_PAGE_LIMIT: usize = 8;
 const RECONCILIATION_MUTATION_LIMIT: usize = 256;
+const RECONCILIATION_SCOPE_MUTATION_COUNT: usize = 2;
+const RECONCILIATION_PENDING_MUTATION_LIMIT: usize =
+    MAX_TRACKED_ACTORS * 3 + MAX_TRACKED_WORK_ITEMS * 3 + RECONCILIATION_MUTATION_LIMIT;
 const MCP_STATUS_PRE_ROOT_BUFFER_LIMIT: usize = 64;
 
 #[derive(Clone, Debug)]
@@ -194,6 +201,143 @@ struct RuntimeActivityState {
     capabilities: ActivityCapabilities,
     reconciliation_epoch: u64,
     reconciliation_pass_cancellation: CancellationToken,
+    pending_hinted_descendants: VecDeque<String>,
+    pending_hinted_descendant_ids: HashSet<String>,
+    resolved_hinted_descendant_ids: HashSet<String>,
+    hint_source_versions: HashMap<String, Option<u64>>,
+    pending_reconciliation_mutations: Vec<ProviderActivityMutation>,
+    pending_reconciliation_topology_valid: bool,
+}
+
+impl RuntimeActivityState {
+    fn refresh_history_recovery_capability(&mut self) {
+        self.capabilities.history_recovery =
+            history_recovery_for_support(self.thread_list_support, self.thread_read_support);
+    }
+
+    fn enqueue_hinted_descendants(&mut self, native_thread_ids: &[String]) {
+        if self.thread_read_support == ReconciliationMethodSupport::Unsupported {
+            return;
+        }
+        for native_thread_id in native_thread_ids {
+            if native_thread_id.is_empty()
+                || self
+                    .pending_hinted_descendant_ids
+                    .contains(native_thread_id)
+                || self.pending_hinted_descendants.len()
+                    == usize::from(RECONCILIATION_DESCENDANT_LIMIT)
+            {
+                continue;
+            }
+            self.pending_hinted_descendants
+                .push_back(native_thread_id.clone());
+            self.pending_hinted_descendant_ids
+                .insert(native_thread_id.clone());
+        }
+    }
+
+    fn resolved_hints_for_source(
+        &self,
+        source_thread_id: &str,
+        source_version: Option<u64>,
+    ) -> HashSet<String> {
+        if self.hint_source_versions.get(source_thread_id) == Some(&source_version) {
+            return self.resolved_hinted_descendant_ids.clone();
+        }
+        HashSet::new()
+    }
+
+    fn record_hint_source_version(
+        &mut self,
+        source_thread_id: &str,
+        source_version: Option<u64>,
+        hinted_descendant_ids: &[String],
+    ) {
+        if self.hint_source_versions.get(source_thread_id) != Some(&source_version) {
+            for native_thread_id in hinted_descendant_ids {
+                self.resolved_hinted_descendant_ids.remove(native_thread_id);
+            }
+        }
+        if !self.hint_source_versions.contains_key(source_thread_id)
+            && self.hint_source_versions.len() == RECONCILIATION_HINT_FRESHNESS_LIMIT
+        {
+            self.hint_source_versions.clear();
+        }
+        self.hint_source_versions
+            .insert(source_thread_id.to_owned(), source_version);
+    }
+
+    fn mark_hinted_descendant_resolved(&mut self, native_thread_id: &str) {
+        if self.resolved_hinted_descendant_ids.len() == RECONCILIATION_HINT_FRESHNESS_LIMIT
+            && !self
+                .resolved_hinted_descendant_ids
+                .contains(native_thread_id)
+        {
+            self.resolved_hinted_descendant_ids.clear();
+            self.hint_source_versions.clear();
+        }
+        self.resolved_hinted_descendant_ids
+            .insert(native_thread_id.to_owned());
+    }
+
+    fn pending_hinted_descendants_snapshot(&self) -> Vec<String> {
+        self.pending_hinted_descendants.iter().cloned().collect()
+    }
+
+    fn remove_pending_hinted_descendant(&mut self, native_thread_id: &str) {
+        if !self.pending_hinted_descendant_ids.remove(native_thread_id) {
+            return;
+        }
+        self.pending_hinted_descendants
+            .retain(|pending| pending != native_thread_id);
+    }
+
+    fn retain_retry_source(&mut self, native_thread_id: &str) {
+        if self
+            .pending_hinted_descendant_ids
+            .contains(native_thread_id)
+        {
+            return;
+        }
+        if self.pending_hinted_descendants.len() == usize::from(RECONCILIATION_DESCENDANT_LIMIT)
+            && let Some(displaced) = self.pending_hinted_descendants.pop_back()
+        {
+            self.pending_hinted_descendant_ids.remove(&displaced);
+        }
+        self.enqueue_hinted_descendants(&[native_thread_id.to_owned()]);
+    }
+
+    fn clear_pending_hinted_descendants(&mut self) {
+        self.pending_hinted_descendants.clear();
+        self.pending_hinted_descendant_ids.clear();
+    }
+
+    fn clear_hint_freshness(&mut self) {
+        self.resolved_hinted_descendant_ids.clear();
+        self.hint_source_versions.clear();
+    }
+
+    fn stage_reconciliation_mutations(
+        &mut self,
+        mutations: impl IntoIterator<Item = ProviderActivityMutation>,
+    ) {
+        self.pending_reconciliation_mutations.extend(mutations);
+        let pending = bounded_pending_reconciliation_mutations(std::mem::take(
+            &mut self.pending_reconciliation_mutations,
+        ));
+        self.pending_reconciliation_mutations = pending.mutations;
+        self.pending_reconciliation_topology_valid = pending.topology_valid;
+    }
+
+    fn install_root_thread_id(&mut self, native_thread_id: &str) {
+        if !self.tracker.is_root_thread(native_thread_id) {
+            self.clear_pending_hinted_descendants();
+            self.clear_hint_freshness();
+            self.pending_reconciliation_mutations.clear();
+            self.pending_reconciliation_topology_valid = true;
+        }
+        self.tracker.set_root_thread_id(native_thread_id);
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -201,6 +345,21 @@ enum ReconciliationMethodSupport {
     Unknown,
     Supported,
     Unsupported,
+}
+
+fn history_recovery_for_support(
+    list_support: ReconciliationMethodSupport,
+    read_support: ReconciliationMethodSupport,
+) -> ActivityHistoryRecovery {
+    match (list_support, read_support) {
+        (ReconciliationMethodSupport::Supported, ReconciliationMethodSupport::Supported) => {
+            ActivityHistoryRecovery::Full
+        }
+        (ReconciliationMethodSupport::Unsupported, ReconciliationMethodSupport::Unsupported) => {
+            ActivityHistoryRecovery::None
+        }
+        _ => ActivityHistoryRecovery::Bounded,
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -455,11 +614,17 @@ impl CodexSessionRuntime {
                     actors: true,
                     attributed_activity: true,
                     background_work: false,
-                    history_recovery: ActivityHistoryRecovery::None,
+                    history_recovery: ActivityHistoryRecovery::Bounded,
                     terminal_observation: false,
                 },
                 reconciliation_epoch: 0,
                 reconciliation_pass_cancellation: CancellationToken::new(),
+                pending_hinted_descendants: VecDeque::new(),
+                pending_hinted_descendant_ids: HashSet::new(),
+                resolved_hinted_descendant_ids: HashSet::new(),
+                hint_source_versions: HashMap::new(),
+                pending_reconciliation_mutations: Vec::new(),
+                pending_reconciliation_topology_valid: true,
             }),
         });
         let runtime = Self { inner };
@@ -498,6 +663,10 @@ impl CodexSessionRuntime {
             activity.reconciliation_pass_cancellation.cancel();
             activity.reconciliation_pass_cancellation = CancellationToken::new();
             activity.tracker = CodexActivityTracker::new(root_thread_id.as_deref());
+            activity.clear_pending_hinted_descendants();
+            activity.clear_hint_freshness();
+            activity.pending_reconciliation_mutations.clear();
+            activity.pending_reconciliation_topology_valid = true;
             if enabled {
                 activity.tracker.begin_detail_baseline();
             }
@@ -733,7 +902,7 @@ impl CodexSessionRuntime {
         drop(session);
         let mut activity = self.inner.activity.lock().await;
         if activity.agent_activity_enabled {
-            activity.tracker.set_root_thread_id(&provider_thread_id);
+            activity.install_root_thread_id(&provider_thread_id);
         }
         drop(activity);
 
@@ -778,6 +947,7 @@ impl CodexSessionRuntime {
             activity.reconciliation_epoch = activity.reconciliation_epoch.wrapping_add(1);
             activity.reconciliation_pass_cancellation.cancel();
             activity.reconciliation_pass_cancellation = CancellationToken::new();
+            activity.hint_source_versions.clear();
         }
         if let Some(previous) = self.detach_incoming() {
             let _ = previous.await;
@@ -1245,6 +1415,124 @@ impl CodexSessionRuntime {
             cancellation,
         };
         let connection = self.inner.connection.lock().await.clone();
+        let pending_hinted_descendants = self
+            .inner
+            .activity
+            .lock()
+            .await
+            .pending_hinted_descendants_snapshot();
+        let mut read_candidates = VecDeque::new();
+        let mut queued_read_candidate_ids = HashSet::new();
+        let mut deferred_read_candidates = false;
+        for thread_id in pending_hinted_descendants {
+            enqueue_reconciliation_candidate(
+                &mut read_candidates,
+                &mut queued_read_candidate_ids,
+                thread_id,
+            );
+        }
+        let root_read_enabled = self.inner.activity.lock().await.thread_read_support
+            != ReconciliationMethodSupport::Unsupported;
+        let mut read_succeeded = false;
+        let mut read_incompatible = false;
+        if root_read_enabled {
+            let params = serde_json::to_value(ThreadReadParams {
+                thread_id: &root_thread_id,
+                include_turns: true,
+            })
+            .expect("Codex root thread/read params serialize");
+            let response = match connection
+                .request_cancellable("thread/read", params, &pass.cancellation)
+                .await
+            {
+                Ok(response) => Some(response),
+                Err(error) if method_is_incompatible(&error) => {
+                    read_incompatible = true;
+                    None
+                }
+                Err(ProtocolError::Cancelled { .. }) => return,
+                Err(_) => {
+                    self.emit_reconciliation(&pass, ReconciliationEmission::Stale)
+                        .await;
+                    return;
+                }
+            };
+            if let Some(response) = response {
+                match decode_thread_read_response(response) {
+                    Ok(response)
+                        if response.thread.id.as_deref() == Some(root_thread_id.as_str()) =>
+                    {
+                        read_succeeded = true;
+                        let mut activity = self.inner.activity.lock().await;
+                        if !self.reconciliation_is_current_locked(&pass, &activity) {
+                            return;
+                        }
+                        let source_version = response.thread.updated_at;
+                        let excluded_hints =
+                            activity.resolved_hints_for_source(&root_thread_id, source_version);
+                        let hints = activity
+                            .tracker
+                            .reconcile_sub_agent_hints_with_projection_limit_excluding(
+                                &response.thread,
+                                usize::from(RECONCILIATION_DESCENDANT_LIMIT)
+                                    .saturating_sub(queued_read_candidate_ids.len()),
+                                &excluded_hints,
+                            );
+                        let hinted_descendant_ids = hints.hinted_descendant_ids.clone();
+                        activity.record_hint_source_version(
+                            &root_thread_id,
+                            source_version,
+                            &hinted_descendant_ids,
+                        );
+                        activity.enqueue_hinted_descendants(&hinted_descendant_ids);
+                        activity.stage_reconciliation_mutations(hints.mutations);
+                        drop(activity);
+                        for thread_id in hinted_descendant_ids {
+                            if !thread_id.is_empty()
+                                && !queued_read_candidate_ids.contains(&thread_id)
+                                && queued_read_candidate_ids.len()
+                                    == usize::from(RECONCILIATION_DESCENDANT_LIMIT)
+                            {
+                                deferred_read_candidates = true;
+                            }
+                            enqueue_reconciliation_candidate(
+                                &mut read_candidates,
+                                &mut queued_read_candidate_ids,
+                                thread_id,
+                            );
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(_) => read_incompatible = true,
+                }
+            }
+        }
+        if read_incompatible || read_succeeded {
+            let emit_read_warning = {
+                let mut activity = self.inner.activity.lock().await;
+                if !self.reconciliation_is_current_locked(&pass, &activity) {
+                    return;
+                }
+                if read_incompatible {
+                    activity.thread_read_support = ReconciliationMethodSupport::Unsupported;
+                    activity.clear_pending_hinted_descendants();
+                } else {
+                    activity.thread_read_support = ReconciliationMethodSupport::Supported;
+                }
+                activity.refresh_history_recovery_capability();
+                read_incompatible && activity.warned_incompatible_methods.insert("thread/read")
+            };
+            if emit_read_warning {
+                self.emit_reconciliation(
+                    &pass,
+                    ReconciliationEmission::Warning(
+                        "Codex activity method thread/read is unsupported",
+                    ),
+                )
+                .await;
+            }
+        }
+
         let mut listed_threads = Vec::new();
         let list_enabled = self.inner.activity.lock().await.thread_list_support
             != ReconciliationMethodSupport::Unsupported;
@@ -1311,6 +1599,7 @@ impl CodexSessionRuntime {
             } else if list_succeeded {
                 activity.thread_list_support = ReconciliationMethodSupport::Supported;
             }
+            activity.refresh_history_recovery_capability();
             let emit_warning =
                 list_incompatible && activity.warned_incompatible_methods.insert("thread/list");
             (activity.thread_list_support, emit_warning)
@@ -1328,16 +1617,29 @@ impl CodexSessionRuntime {
             if !self.reconciliation_is_current_locked(&pass, &activity) {
                 return;
             }
-            activity.tracker.reconcile_descendants(&listed_threads)
+            let mut descendants = activity
+                .tracker
+                .reconcile_descendants_with_projection_limit(
+                    &listed_threads,
+                    usize::from(RECONCILIATION_DESCENDANT_LIMIT)
+                        .saturating_sub(queued_read_candidate_ids.len()),
+                );
+            activity
+                .stage_reconciliation_mutations(std::mem::take(&mut descendants.output.mutations));
+            descendants
         };
-        let mut record_mutations = descendants.output.mutations;
-        let read_enabled = list_support != ReconciliationMethodSupport::Unsupported
+        let read_enabled = !read_incompatible
             && self.inner.activity.lock().await.thread_read_support
                 != ReconciliationMethodSupport::Unsupported;
-        let mut read_succeeded = false;
-        let mut read_incompatible = false;
+        for thread_id in descendants.threads_to_read {
+            enqueue_reconciliation_candidate(
+                &mut read_candidates,
+                &mut queued_read_candidate_ids,
+                thread_id,
+            );
+        }
         if read_enabled {
-            for thread_id in descendants.threads_to_read {
+            while let Some(thread_id) = read_candidates.pop_front() {
                 let params = serde_json::to_value(ThreadReadParams {
                     thread_id: &thread_id,
                     include_turns: true,
@@ -1367,19 +1669,88 @@ impl CodexSessionRuntime {
                     }
                 };
                 if response.thread.id.as_deref() != Some(thread_id.as_str()) {
+                    let mut activity = self.inner.activity.lock().await;
+                    if !self.reconciliation_is_current_locked(&pass, &activity) {
+                        return;
+                    }
+                    activity.remove_pending_hinted_descendant(&thread_id);
+                    activity.mark_hinted_descendant_resolved(&thread_id);
                     continue;
                 }
+                let nested_hinted_descendants = {
+                    let mut activity = self.inner.activity.lock().await;
+                    if !self.reconciliation_is_current_locked(&pass, &activity) {
+                        return;
+                    }
+                    let descendants = activity
+                        .tracker
+                        .reconcile_descendants(std::slice::from_ref(&response.thread));
+                    let accepted = descendants
+                        .accepted_thread_ids
+                        .iter()
+                        .any(|accepted| accepted == &thread_id);
+                    activity.stage_reconciliation_mutations(descendants.output.mutations);
+                    if !accepted {
+                        activity.remove_pending_hinted_descendant(&thread_id);
+                        activity.mark_hinted_descendant_resolved(&thread_id);
+                        continue;
+                    }
+                    let source_version = response.thread.updated_at;
+                    let excluded_hints =
+                        activity.resolved_hints_for_source(&thread_id, source_version);
+                    let hints = activity
+                        .tracker
+                        .reconcile_sub_agent_hints_with_projection_limit_excluding(
+                            &response.thread,
+                            usize::from(RECONCILIATION_DESCENDANT_LIMIT)
+                                .saturating_sub(queued_read_candidate_ids.len()),
+                            &excluded_hints,
+                        );
+                    let nested_hinted_descendants = hints.hinted_descendant_ids.clone();
+                    activity.remove_pending_hinted_descendant(&thread_id);
+                    activity.record_hint_source_version(
+                        &thread_id,
+                        source_version,
+                        &nested_hinted_descendants,
+                    );
+                    activity.enqueue_hinted_descendants(&nested_hinted_descendants);
+                    activity.stage_reconciliation_mutations(hints.mutations);
+                    let history = activity.tracker.reconcile_thread_history(&response.thread);
+                    activity.stage_reconciliation_mutations(history.mutations);
+                    nested_hinted_descendants
+                };
                 read_succeeded = true;
+                for nested_thread_id in &nested_hinted_descendants {
+                    if !nested_thread_id.is_empty()
+                        && !queued_read_candidate_ids.contains(nested_thread_id)
+                        && queued_read_candidate_ids.len()
+                            == usize::from(RECONCILIATION_DESCENDANT_LIMIT)
+                    {
+                        deferred_read_candidates = true;
+                    }
+                    enqueue_reconciliation_candidate(
+                        &mut read_candidates,
+                        &mut queued_read_candidate_ids,
+                        nested_thread_id.clone(),
+                    );
+                }
                 let mut activity = self.inner.activity.lock().await;
                 if !self.reconciliation_is_current_locked(&pass, &activity) {
                     return;
                 }
-                record_mutations.extend(
-                    activity
-                        .tracker
-                        .reconcile_thread_history(&response.thread)
-                        .mutations,
-                );
+                let all_nested_hints_retained =
+                    nested_hinted_descendants.iter().all(|nested_thread_id| {
+                        queued_read_candidate_ids.contains(nested_thread_id)
+                            || activity
+                                .pending_hinted_descendant_ids
+                                .contains(nested_thread_id)
+                    });
+                if all_nested_hints_retained {
+                    activity.mark_hinted_descendant_resolved(&thread_id);
+                } else {
+                    activity.retain_retry_source(&thread_id);
+                    deferred_read_candidates = true;
+                }
             }
         }
         let (read_support, emit_read_warning) = {
@@ -1389,9 +1760,11 @@ impl CodexSessionRuntime {
             }
             if read_incompatible {
                 activity.thread_read_support = ReconciliationMethodSupport::Unsupported;
+                activity.clear_pending_hinted_descendants();
             } else if read_succeeded {
                 activity.thread_read_support = ReconciliationMethodSupport::Supported;
             }
+            activity.refresh_history_recovery_capability();
             let emit_warning =
                 read_incompatible && activity.warned_incompatible_methods.insert("thread/read");
             (activity.thread_read_support, emit_warning)
@@ -1474,16 +1847,12 @@ impl CodexSessionRuntime {
             if !self.reconciliation_is_current_locked(&pass, &activity) {
                 return;
             }
-            record_mutations.extend(
-                activity
-                    .tracker
-                    .reconcile_background_terminals(
-                        &background_terminals,
-                        FIXED_EVENT_TIME,
-                        background_authority,
-                    )
-                    .mutations,
+            let background = activity.tracker.reconcile_background_terminals(
+                &background_terminals,
+                FIXED_EVENT_TIME,
+                background_authority,
             );
+            activity.stage_reconciliation_mutations(background.mutations);
         }
         let (background_support, emit_background_warning) = {
             let mut activity = self.inner.activity.lock().await;
@@ -1523,14 +1892,7 @@ impl CodexSessionRuntime {
             actors: true,
             attributed_activity: true,
             background_work: background_support == ReconciliationMethodSupport::Supported,
-            history_recovery: match (list_support, read_support) {
-                (ReconciliationMethodSupport::Unsupported, _) => ActivityHistoryRecovery::None,
-                (
-                    ReconciliationMethodSupport::Supported,
-                    ReconciliationMethodSupport::Supported,
-                ) => ActivityHistoryRecovery::Full,
-                _ => ActivityHistoryRecovery::Bounded,
-            },
+            history_recovery: history_recovery_for_support(list_support, read_support),
             terminal_observation: false,
         };
         let background_health = match background_support {
@@ -1552,15 +1914,17 @@ impl CodexSessionRuntime {
                 health: background_health,
             },
         ];
-        let mutations = bounded_reconciliation_mutations(scope_mutations, record_mutations);
         self.emit_reconciliation(
             &pass,
             ReconciliationEmission::Successful {
                 capabilities,
-                mutations,
+                mutations: scope_mutations,
             },
         )
         .await;
+        if deferred_read_candidates {
+            self.request_reconciliation(false).await;
+        }
     }
 
     async fn handle_incoming(&self, connection: JsonRpcConnection, event: IncomingEvent) {
@@ -1695,6 +2059,7 @@ impl CodexSessionRuntime {
                     emitted_at_ms,
                     receive_sequence,
                 );
+                state.enqueue_hinted_descendants(&output.hinted_descendant_ids);
                 let is_root = notification_thread_id
                     .is_some_and(|thread_id| state.tracker.is_root_thread(thread_id));
                 let is_verified_child = notification_thread_id
@@ -1735,7 +2100,7 @@ impl CodexSessionRuntime {
                         if !activity.agent_activity_enabled {
                             false
                         } else {
-                            activity.tracker.set_root_thread_id(thread_id);
+                            activity.install_root_thread_id(thread_id);
                             if activity.reconciled_root_thread_id.as_deref() == Some(thread_id) {
                                 false
                             } else {
@@ -2012,24 +2377,74 @@ impl CodexSessionRuntime {
         if !self.reconciliation_is_current_locked(pass, &activity_state) {
             return;
         }
-        let (event_type, payload, native_event_id, activity) = match emission {
-            ReconciliationEmission::Successful {
-                capabilities,
-                mutations,
-            } => {
+        if let ReconciliationEmission::Successful {
+            capabilities,
+            mutations,
+        } = emission
+        {
+            activity_state.capabilities = capabilities;
+            if !activity_state.pending_reconciliation_topology_valid {
+                *counter += 1;
+                let _ = self.inner.events_tx.send(RuntimeEvent {
+                    event_id: format!("evt-{}", *counter),
+                    provider: PROVIDER.to_owned(),
+                    created_at: FIXED_EVENT_TIME.to_owned(),
+                    event_type: "runtime.warning".to_owned(),
+                    thread_id: self.inner.options.thread_id.clone(),
+                    turn_id: None,
+                    request_id: None,
+                    payload: json!({
+                        "message": "Codex activity reconciliation cannot safely order staged topology"
+                    }),
+                    native_event_id: None,
+                    activity: Vec::new(),
+                });
+                return;
+            }
+            let mut scope_mutations = Some(mutations);
+            loop {
+                let prefix = scope_mutations.take().unwrap_or_default();
+                let record_capacity = RECONCILIATION_MUTATION_LIMIT - prefix.len();
+                let record_count =
+                    record_capacity.min(activity_state.pending_reconciliation_mutations.len());
+                let mut activity = prefix;
+                activity.extend(
+                    activity_state.pending_reconciliation_mutations[..record_count]
+                        .iter()
+                        .cloned(),
+                );
+
                 let sequence = activity_state.next_reconciliation_sequence;
                 let Some(next) = sequence.checked_add(1) else {
                     return;
                 };
-                activity_state.capabilities = capabilities;
                 activity_state.next_reconciliation_sequence = next;
-                (
-                    "activity.native",
-                    json!({}),
-                    Some(format!("codex:reconciliation:{sequence}")),
-                    mutations,
-                )
+                *counter += 1;
+                let event = RuntimeEvent {
+                    event_id: format!("evt-{}", *counter),
+                    provider: PROVIDER.to_owned(),
+                    created_at: FIXED_EVENT_TIME.to_owned(),
+                    event_type: "activity.native".to_owned(),
+                    thread_id: self.inner.options.thread_id.clone(),
+                    turn_id: None,
+                    request_id: None,
+                    payload: json!({}),
+                    native_event_id: Some(format!("codex:reconciliation:{sequence}")),
+                    activity,
+                };
+                if self.inner.events_tx.send(event).is_err() {
+                    return;
+                }
+                activity_state
+                    .pending_reconciliation_mutations
+                    .drain(..record_count);
+                if activity_state.pending_reconciliation_mutations.is_empty() {
+                    return;
+                }
             }
+        }
+        let (event_type, payload, native_event_id, activity) = match emission {
+            ReconciliationEmission::Successful { .. } => unreachable!("handled above"),
             ReconciliationEmission::Stale => {
                 let sequence = activity_state.next_reconciliation_sequence;
                 let Some(next) = sequence.checked_add(1) else {
@@ -2101,9 +2516,39 @@ fn merge_reconciliation_hints(
     }
 }
 
+fn enqueue_reconciliation_candidate(
+    candidates: &mut VecDeque<String>,
+    candidate_ids: &mut HashSet<String>,
+    native_thread_id: String,
+) {
+    if native_thread_id.is_empty()
+        || candidate_ids.len() == usize::from(RECONCILIATION_DESCENDANT_LIMIT)
+        || !candidate_ids.insert(native_thread_id.clone())
+    {
+        return;
+    }
+    candidates.push_back(native_thread_id);
+}
+
+#[cfg(test)]
 fn bounded_reconciliation_mutations(
     mut scope_mutations: Vec<ProviderActivityMutation>,
     record_mutations: Vec<ProviderActivityMutation>,
+) -> Vec<ProviderActivityMutation> {
+    let record_capacity = RECONCILIATION_MUTATION_LIMIT - scope_mutations.len();
+    scope_mutations.extend(bounded_record_reconciliation_mutations(
+        record_mutations,
+        record_capacity,
+        true,
+    ));
+    scope_mutations
+}
+
+#[cfg(test)]
+fn bounded_record_reconciliation_mutations(
+    record_mutations: Vec<ProviderActivityMutation>,
+    capacity: usize,
+    assert_structural_bound: bool,
 ) -> Vec<ProviderActivityMutation> {
     let mut structural_mutations = Vec::new();
     let mut history_entries = Vec::new();
@@ -2116,15 +2561,37 @@ fn bounded_reconciliation_mutations(
         }
     }
 
+    let mut retained_actor_upserts = HashMap::new();
+    structural_mutations = structural_mutations
+        .into_iter()
+        .rev()
+        .filter(|mutation| {
+            let ProviderActivityMutation::UpsertActor(actor) = mutation else {
+                return true;
+            };
+            let retained = retained_actor_upserts.entry(actor.id.clone()).or_insert(0);
+            if *retained == 2 {
+                return false;
+            }
+            *retained += 1;
+            true
+        })
+        .collect::<Vec<_>>();
+    structural_mutations.reverse();
+
     // Reconciliation admits at most 50 descendants and 128 background items.
-    // Keeping both the discovery and terminal actor upserts therefore leaves
-    // room for every structural mutation before history is considered.
-    let structural_count = scope_mutations.len() + structural_mutations.len();
-    assert!(
-        structural_count <= RECONCILIATION_MUTATION_LIMIT,
-        "bounded Codex reconciliation structural mutations"
-    );
-    let history_capacity = RECONCILIATION_MUTATION_LIMIT - structural_count;
+    // Root-history hints can add a provisional actor upsert before the existing
+    // discovery and terminal upserts. Retaining only the newest two states for
+    // each actor preserves the established structural budget and final state.
+    if assert_structural_bound {
+        assert!(
+            structural_mutations.len() <= capacity,
+            "bounded Codex reconciliation structural mutations"
+        );
+    } else if structural_mutations.len() > capacity {
+        structural_mutations.drain(..structural_mutations.len() - capacity);
+    }
+    let history_capacity = capacity - structural_mutations.len();
     history_entries.sort_by(|(left_index, left), (right_index, right)| {
         left.created_at
             .cmp(&right.created_at)
@@ -2132,14 +2599,326 @@ fn bounded_reconciliation_mutations(
     });
     let drop_count = history_entries.len().saturating_sub(history_capacity);
 
-    scope_mutations.extend(structural_mutations);
-    scope_mutations.extend(
+    structural_mutations.extend(
         history_entries
             .into_iter()
             .skip(drop_count)
             .map(|(_, entry)| ProviderActivityMutation::AppendEntry(entry)),
     );
-    scope_mutations
+    structural_mutations
+}
+
+struct BoundedPendingReconciliation {
+    mutations: Vec<ProviderActivityMutation>,
+    topology_valid: bool,
+}
+
+struct PendingActorOrdering {
+    mutations: Vec<ProviderActivityMutation>,
+    topology_valid: bool,
+}
+
+struct PendingActorMutationState {
+    original_index: usize,
+    actor: crate::activity::ActivityActorSummary,
+}
+
+fn bounded_pending_reconciliation_mutations(
+    mutations: Vec<ProviderActivityMutation>,
+) -> BoundedPendingReconciliation {
+    let mut actor_upserts = Vec::new();
+    let mut work_item_upserts = Vec::new();
+    let mut actor_removals = Vec::new();
+    let mut work_item_removals = Vec::new();
+    let mut history_entries = Vec::new();
+    let mut other_mutations = Vec::new();
+    for (index, mutation) in mutations.into_iter().enumerate() {
+        match mutation {
+            ProviderActivityMutation::UpsertActor(actor) => actor_upserts.push((index, actor)),
+            ProviderActivityMutation::UpsertWorkItem(work_item) => {
+                work_item_upserts.push((index, work_item));
+            }
+            ProviderActivityMutation::RemoveActor { actor_id } => {
+                actor_removals.push((index, actor_id));
+            }
+            ProviderActivityMutation::RemoveWorkItem { work_item_id } => {
+                work_item_removals.push((index, work_item_id));
+            }
+            ProviderActivityMutation::AppendEntry(entry) => history_entries.push((index, entry)),
+            mutation => other_mutations.push((index, mutation)),
+        }
+    }
+
+    let mut retained_actor_upserts = HashMap::new();
+    actor_upserts = actor_upserts
+        .into_iter()
+        .rev()
+        .filter(|(_, actor)| {
+            let retained = retained_actor_upserts.entry(actor.id.clone()).or_insert(0);
+            if *retained == 2 {
+                return false;
+            }
+            *retained += 1;
+            true
+        })
+        .collect();
+    actor_upserts.reverse();
+    let latest_actor_upsert = actor_upserts
+        .iter()
+        .map(|(index, actor)| (actor.id.clone(), *index))
+        .collect::<HashMap<_, _>>();
+
+    let mut retained_work_item_upserts = HashMap::new();
+    work_item_upserts = work_item_upserts
+        .into_iter()
+        .rev()
+        .filter(|(_, work_item)| {
+            let retained = retained_work_item_upserts
+                .entry(work_item.id.clone())
+                .or_insert(0);
+            if *retained == 2 {
+                return false;
+            }
+            *retained += 1;
+            true
+        })
+        .collect();
+    work_item_upserts.reverse();
+    let latest_work_item_upsert = work_item_upserts
+        .iter()
+        .map(|(index, work_item)| (work_item.id.clone(), *index))
+        .collect::<HashMap<_, _>>();
+
+    let mut retained_actor_removals = HashSet::new();
+    actor_removals = actor_removals
+        .into_iter()
+        .rev()
+        .filter(|(index, actor_id)| {
+            retained_actor_removals.insert(actor_id.clone())
+                && latest_actor_upsert
+                    .get(actor_id)
+                    .is_none_or(|upsert_index| index > upsert_index)
+        })
+        .collect();
+    actor_removals.reverse();
+    let mut retained_work_item_removals = HashSet::new();
+    work_item_removals = work_item_removals
+        .into_iter()
+        .rev()
+        .filter(|(index, work_item_id)| {
+            retained_work_item_removals.insert(work_item_id.clone())
+                && latest_work_item_upsert
+                    .get(work_item_id)
+                    .is_none_or(|upsert_index| index > upsert_index)
+        })
+        .collect();
+    work_item_removals.reverse();
+
+    let actor_upserts = topologically_order_pending_actor_upserts(actor_upserts);
+    other_mutations.sort_by_key(|(index, _)| *index);
+    work_item_upserts.sort_by_key(|(index, _)| *index);
+    work_item_removals.sort_by_key(|(index, _)| *index);
+    actor_removals.sort_by_key(|(index, _)| *index);
+    let structural_count = other_mutations.len()
+        + actor_upserts.mutations.len()
+        + work_item_upserts.len()
+        + work_item_removals.len()
+        + actor_removals.len();
+    assert!(
+        structural_count <= RECONCILIATION_PENDING_MUTATION_LIMIT,
+        "bounded Codex pending reconciliation structural mutations"
+    );
+
+    history_entries.sort_by(|(left_index, left), (right_index, right)| {
+        left.created_at
+            .cmp(&right.created_at)
+            .then_with(|| left_index.cmp(right_index))
+    });
+    let first_event_record_capacity =
+        RECONCILIATION_MUTATION_LIMIT - RECONCILIATION_SCOPE_MUTATION_COUNT;
+    let history_capacity = if structural_count <= first_event_record_capacity {
+        first_event_record_capacity - structural_count
+    } else {
+        RECONCILIATION_PENDING_MUTATION_LIMIT - structural_count
+    };
+    let drop_count = history_entries.len().saturating_sub(history_capacity);
+
+    let mutations = other_mutations
+        .into_iter()
+        .map(|(_, mutation)| mutation)
+        .chain(actor_upserts.mutations)
+        .chain(
+            work_item_upserts
+                .into_iter()
+                .map(|(_, work_item)| ProviderActivityMutation::UpsertWorkItem(work_item)),
+        )
+        .chain(
+            history_entries
+                .into_iter()
+                .skip(drop_count)
+                .map(|(_, entry)| ProviderActivityMutation::AppendEntry(entry)),
+        )
+        .chain(
+            work_item_removals
+                .into_iter()
+                .map(|(_, work_item_id)| ProviderActivityMutation::RemoveWorkItem { work_item_id }),
+        )
+        .chain(
+            actor_removals
+                .into_iter()
+                .map(|(_, actor_id)| ProviderActivityMutation::RemoveActor { actor_id }),
+        )
+        .collect();
+    BoundedPendingReconciliation {
+        mutations,
+        topology_valid: actor_upserts.topology_valid,
+    }
+}
+
+fn topologically_order_pending_actor_upserts(
+    actor_upserts: Vec<(usize, crate::activity::ActivityActorSummary)>,
+) -> PendingActorOrdering {
+    let states = actor_upserts
+        .into_iter()
+        .map(|(original_index, actor)| PendingActorMutationState {
+            original_index,
+            actor,
+        })
+        .collect::<Vec<_>>();
+    let fallback = || {
+        states
+            .iter()
+            .map(|state| ProviderActivityMutation::UpsertActor(state.actor.clone()))
+            .collect::<Vec<_>>()
+    };
+    let mut states_by_actor = HashMap::<String, Vec<usize>>::new();
+    for (state_index, state) in states.iter().enumerate() {
+        states_by_actor
+            .entry(state.actor.id.clone())
+            .or_default()
+            .push(state_index);
+    }
+
+    let mut outgoing = vec![Vec::<usize>::new(); states.len()];
+    let mut indegree = vec![0_usize; states.len()];
+    let mut add_edge = |from: usize, to: usize| {
+        if from != to && !outgoing[from].contains(&to) {
+            outgoing[from].push(to);
+            indegree[to] += 1;
+        }
+    };
+    for actor_states in states_by_actor.values() {
+        for pair in actor_states.windows(2) {
+            add_edge(pair[0], pair[1]);
+        }
+    }
+    for (state_index, state) in states.iter().enumerate() {
+        if state.actor.name.is_empty() {
+            continue;
+        }
+        let Some(parent_actor_id) = state.actor.parent_actor_id.as_ref() else {
+            continue;
+        };
+        let Some(parent_states) = states_by_actor.get(parent_actor_id) else {
+            continue;
+        };
+        let parent_state = parent_states
+            .iter()
+            .rev()
+            .copied()
+            .find(|parent_state| {
+                !states[*parent_state].actor.name.is_empty()
+                    && states[*parent_state].original_index <= state.original_index
+            })
+            .or_else(|| {
+                parent_states
+                    .iter()
+                    .copied()
+                    .find(|parent_state| !states[*parent_state].actor.name.is_empty())
+            });
+        if let Some(parent_state) = parent_state {
+            add_edge(parent_state, state_index);
+        }
+    }
+
+    let mut ready = states
+        .iter()
+        .enumerate()
+        .filter(|(state_index, _)| indegree[*state_index] == 0)
+        .map(|(state_index, state)| (state.original_index, state_index))
+        .collect::<BTreeSet<_>>();
+    let mut ordered_indexes = Vec::with_capacity(states.len());
+    while let Some((_, state_index)) = ready.pop_first() {
+        ordered_indexes.push(state_index);
+        for dependent in &outgoing[state_index] {
+            indegree[*dependent] -= 1;
+            if indegree[*dependent] == 0 {
+                ready.insert((states[*dependent].original_index, *dependent));
+            }
+        }
+    }
+    if ordered_indexes.len() != states.len()
+        || !pending_actor_transitions_are_valid(&states, &ordered_indexes)
+    {
+        return PendingActorOrdering {
+            mutations: fallback(),
+            topology_valid: false,
+        };
+    }
+    PendingActorOrdering {
+        mutations: ordered_indexes
+            .into_iter()
+            .map(|state_index| {
+                ProviderActivityMutation::UpsertActor(states[state_index].actor.clone())
+            })
+            .collect(),
+        topology_valid: true,
+    }
+}
+
+fn pending_actor_transitions_are_valid(
+    states: &[PendingActorMutationState],
+    ordered_indexes: &[usize],
+) -> bool {
+    let materializing_actor_ids = states
+        .iter()
+        .filter_map(|state| {
+            let actor = &state.actor;
+            (!actor.name.is_empty()).then(|| actor.id.clone())
+        })
+        .collect::<HashSet<_>>();
+    let mut materialized = HashSet::new();
+    let mut parents = HashMap::<String, Option<String>>::new();
+    for state_index in ordered_indexes {
+        let actor = &states[*state_index].actor;
+        if actor.name.is_empty() {
+            continue;
+        }
+        if actor
+            .parent_actor_id
+            .as_ref()
+            .is_some_and(|parent_actor_id| {
+                materializing_actor_ids.contains(parent_actor_id)
+                    && !materialized.contains(parent_actor_id)
+            })
+        {
+            return false;
+        }
+        parents.insert(actor.id.clone(), actor.parent_actor_id.clone());
+        materialized.insert(actor.id.clone());
+
+        let mut ancestry = HashSet::from([actor.id.as_str()]);
+        let mut cursor = actor.parent_actor_id.as_deref();
+        while let Some(parent_actor_id) = cursor {
+            if !ancestry.insert(parent_actor_id) {
+                return false;
+            }
+            cursor = parents
+                .get(parent_actor_id)
+                .and_then(|parent| parent.as_deref());
+        }
+    }
+    true
 }
 
 fn method_is_incompatible(error: &ProtocolError) -> bool {
@@ -2230,12 +3009,19 @@ mod tests {
     use std::{future::Future, task::Poll};
 
     use super::*;
-    use crate::provider::codex::{
-        mcp_status::{
-            MCP_STATUS_PAGE_LIMIT, MCP_STATUS_PAGE_SIZE, MCP_STATUS_REQUEST_TIMEOUT,
-            McpServerState, McpServerStatus,
+    use crate::{
+        activity::{
+            ActivityProjection, ActivityRecordKind, ActivityRecordSummary, ActivityRepository,
+            ActivityScopeRef, ActivityScopeSeed,
         },
-        protocol::ConnectionConfig,
+        persistence::{Database, run_migrations},
+        provider::codex::{
+            mcp_status::{
+                MCP_STATUS_PAGE_LIMIT, MCP_STATUS_PAGE_SIZE, MCP_STATUS_REQUEST_TIMEOUT,
+                McpServerState, McpServerStatus,
+            },
+            protocol::ConnectionConfig,
+        },
     };
     use tokio::{
         io::{
@@ -2443,6 +3229,35 @@ mod tests {
             warned_incompatible_methods,
             capabilities: state.capabilities.clone(),
             next_reconciliation_sequence: state.next_reconciliation_sequence,
+        }
+    }
+
+    #[test]
+    fn history_recovery_support_matrix_has_only_two_endpoint_combinations() {
+        let support_levels = [
+            ReconciliationMethodSupport::Unknown,
+            ReconciliationMethodSupport::Supported,
+            ReconciliationMethodSupport::Unsupported,
+        ];
+        for list_support in support_levels {
+            for read_support in support_levels {
+                let expected = match (list_support, read_support) {
+                    (
+                        ReconciliationMethodSupport::Supported,
+                        ReconciliationMethodSupport::Supported,
+                    ) => ActivityHistoryRecovery::Full,
+                    (
+                        ReconciliationMethodSupport::Unsupported,
+                        ReconciliationMethodSupport::Unsupported,
+                    ) => ActivityHistoryRecovery::None,
+                    _ => ActivityHistoryRecovery::Bounded,
+                };
+                assert_eq!(
+                    history_recovery_for_support(list_support, read_support),
+                    expected,
+                    "unexpected history recovery for {list_support:?}/{read_support:?}"
+                );
+            }
         }
     }
 
@@ -4526,6 +5341,25 @@ mod tests {
                 }),
             )
             .await;
+            let root_read = read_runtime_test_json(&mut reader).await;
+            assert_eq!(root_read["method"], "thread/read");
+            assert_eq!(root_read["params"]["threadId"], "old-root");
+            write_runtime_test_json(
+                &mut writer,
+                json!({
+                    "id": root_read["id"].clone(),
+                    "result": {
+                        "thread": {
+                            "id": "old-root",
+                            "createdAt": 1,
+                            "updatedAt": 2,
+                            "status": {"type": "idle"},
+                            "turns": []
+                        }
+                    }
+                }),
+            )
+            .await;
             let list = read_runtime_test_json(&mut reader).await;
             assert_eq!(list["method"], "thread/list");
             write_runtime_test_json(
@@ -4643,6 +5477,25 @@ mod tests {
                 json!({
                     "id": mcp_status["id"].clone(),
                     "result": { "data": [], "nextCursor": null }
+                }),
+            )
+            .await;
+            let root_read = read_runtime_test_json(&mut reader).await;
+            assert_eq!(root_read["method"], "thread/read");
+            assert_eq!(root_read["params"]["threadId"], "new-root");
+            write_runtime_test_json(
+                &mut writer,
+                json!({
+                    "id": root_read["id"].clone(),
+                    "result": {
+                        "thread": {
+                            "id": "new-root",
+                            "createdAt": 1,
+                            "updatedAt": 2,
+                            "status": {"type": "idle"},
+                            "turns": []
+                        }
+                    }
                 }),
             )
             .await;
@@ -4803,6 +5656,25 @@ mod tests {
             loop {
                 let request = read_runtime_test_json(&mut reader).await;
                 match request["method"].as_str().expect("request method") {
+                    "thread/read" => {
+                        assert_eq!(request["params"]["threadId"], "provider-root");
+                        write_runtime_test_json(
+                            &mut writer,
+                            json!({
+                                "id": request["id"].clone(),
+                                "result": {
+                                    "thread": {
+                                        "id": "provider-root",
+                                        "createdAt": 1,
+                                        "updatedAt": 2,
+                                        "status": {"type": "idle"},
+                                        "turns": []
+                                    }
+                                }
+                            }),
+                        )
+                        .await;
+                    }
                     "thread/list" => {
                         if let Some(list_seen_tx) = list_seen_tx.take() {
                             let _ = list_seen_tx.send(());
@@ -4853,6 +5725,786 @@ mod tests {
             immediate.is_ok(),
             "an immediate hint must replace a queued deferred hint without waiting 250ms"
         );
+    }
+
+    async fn configure_reconciliation_test_runtime(runtime: &CodexSessionRuntime) {
+        runtime.inner.session.lock().await.resume_cursor = Some("provider-root".to_owned());
+        let mut activity = runtime.inner.activity.lock().await;
+        activity.install_root_thread_id("provider-root");
+        activity.tracker.begin_detail_baseline();
+    }
+
+    fn root_reconciliation_response(request: &Value) -> Value {
+        json!({
+            "id": request["id"].clone(),
+            "result": {
+                "thread": {
+                    "id": "provider-root",
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": {"type": "idle"},
+                    "turns": []
+                }
+            }
+        })
+    }
+
+    fn child_list_reconciliation_response(request: &Value) -> Value {
+        json!({
+            "id": request["id"].clone(),
+            "result": {
+                "data": [{
+                    "id": "durable-child",
+                    "parentThreadId": "provider-root",
+                    "agentNickname": "Durable child",
+                    "createdAt": 3,
+                    "updatedAt": 4,
+                    "status": {"type": "active", "activeFlags": []}
+                }],
+                "nextCursor": null,
+                "backwardsCursor": null
+            }
+        })
+    }
+
+    fn child_read_reconciliation_response(request: &Value) -> Value {
+        json!({
+            "id": request["id"].clone(),
+            "result": {
+                "thread": {
+                    "id": "durable-child",
+                    "parentThreadId": "provider-root",
+                    "agentNickname": "Durable child",
+                    "createdAt": 3,
+                    "updatedAt": 4,
+                    "status": {"type": "active", "activeFlags": []},
+                    "turns": []
+                }
+            }
+        })
+    }
+
+    fn durable_child_actor_mutation_count(events: &[RuntimeEvent]) -> usize {
+        events
+            .iter()
+            .flat_map(|event| event.activity.iter())
+            .filter(|mutation| {
+                matches!(
+                    mutation,
+                    ProviderActivityMutation::UpsertActor(actor)
+                        if actor.name == "Durable child"
+                )
+            })
+            .count()
+    }
+
+    #[tokio::test]
+    async fn reconciliation_retries_unpublished_child_after_later_transient_failure() {
+        let (connection, incoming, peer_stdout, peer_stdin, _peer_stderr) =
+            runtime_test_connection();
+        let runtime = CodexSessionRuntime::new(reconciliation_test_options(), connection, incoming);
+        configure_reconciliation_test_runtime(&runtime).await;
+        let peer = tokio::spawn(async move {
+            let mut reader = BufReader::new(peer_stdin);
+            let mut writer = peer_stdout;
+            for pass in 0..2 {
+                let root_read = read_runtime_test_json(&mut reader).await;
+                assert_eq!(root_read["method"], "thread/read");
+                write_runtime_test_json(&mut writer, root_reconciliation_response(&root_read))
+                    .await;
+
+                let list = read_runtime_test_json(&mut reader).await;
+                assert_eq!(list["method"], "thread/list");
+                write_runtime_test_json(&mut writer, child_list_reconciliation_response(&list))
+                    .await;
+
+                if pass == 0 {
+                    let child_read = read_runtime_test_json(&mut reader).await;
+                    assert_eq!(child_read["method"], "thread/read");
+                    assert_eq!(child_read["params"]["threadId"], "durable-child");
+                    write_runtime_test_json(
+                        &mut writer,
+                        child_read_reconciliation_response(&child_read),
+                    )
+                    .await;
+                }
+
+                let background = read_runtime_test_json(&mut reader).await;
+                assert_eq!(background["method"], "thread/backgroundTerminals/list");
+                let response = if pass == 0 {
+                    json!({
+                        "id": background["id"].clone(),
+                        "error": {"code": -32000, "message": "temporary failure"}
+                    })
+                } else {
+                    json!({
+                        "id": background["id"].clone(),
+                        "result": {"data": [], "nextCursor": null}
+                    })
+                };
+                write_runtime_test_json(&mut writer, response).await;
+            }
+        });
+
+        runtime.reconcile_once().await;
+        runtime.reconcile_once().await;
+        peer.await.expect("reconciliation peer");
+
+        let events = drain_runtime_events(&runtime).await;
+        assert_eq!(
+            durable_child_actor_mutation_count(&events),
+            1,
+            "the unchanged recovery pass must publish the child mutation retained before the transient failure"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event
+                    .native_event_id
+                    .as_deref()
+                    .is_some_and(|id| { id.starts_with("codex:reconciliation:") }))
+                .count(),
+            2,
+            "the failed pass should publish only stale health and the recovery pass one current snapshot"
+        );
+    }
+
+    #[tokio::test]
+    async fn same_root_generation_replacement_retries_unpublished_child_without_old_pass_leakage() {
+        let (connection, incoming, peer_stdout, peer_stdin, _peer_stderr) =
+            runtime_test_connection();
+        let runtime = CodexSessionRuntime::new(reconciliation_test_options(), connection, incoming);
+        configure_reconciliation_test_runtime(&runtime).await;
+        let (background_seen_tx, background_seen_rx) = oneshot::channel();
+        let peer = tokio::spawn(async move {
+            let mut reader = BufReader::new(peer_stdin);
+            let mut writer = peer_stdout;
+
+            let root_read = read_runtime_test_json(&mut reader).await;
+            write_runtime_test_json(&mut writer, root_reconciliation_response(&root_read)).await;
+            let list = read_runtime_test_json(&mut reader).await;
+            write_runtime_test_json(&mut writer, child_list_reconciliation_response(&list)).await;
+            let child_read = read_runtime_test_json(&mut reader).await;
+            write_runtime_test_json(&mut writer, child_read_reconciliation_response(&child_read))
+                .await;
+            let cancelled_background = read_runtime_test_json(&mut reader).await;
+            assert_eq!(
+                cancelled_background["method"],
+                "thread/backgroundTerminals/list"
+            );
+            background_seen_tx
+                .send(())
+                .expect("report cancellable background request");
+
+            let root_read = read_runtime_test_json(&mut reader).await;
+            write_runtime_test_json(&mut writer, root_reconciliation_response(&root_read)).await;
+            let list = read_runtime_test_json(&mut reader).await;
+            write_runtime_test_json(&mut writer, child_list_reconciliation_response(&list)).await;
+            let background = read_runtime_test_json(&mut reader).await;
+            write_runtime_test_json(
+                &mut writer,
+                json!({
+                    "id": background["id"].clone(),
+                    "result": {"data": [], "nextCursor": null}
+                }),
+            )
+            .await;
+        });
+
+        let first_runtime = runtime.clone();
+        let first_pass = tokio::spawn(async move { first_runtime.reconcile_once().await });
+        background_seen_rx
+            .await
+            .expect("first pass reaches the final request after child processing");
+        {
+            let mut activity = runtime.inner.activity.lock().await;
+            activity.reconciliation_epoch = activity.reconciliation_epoch.wrapping_add(1);
+            activity.reconciliation_pass_cancellation.cancel();
+            activity.reconciliation_pass_cancellation = CancellationToken::new();
+            activity.hint_source_versions.clear();
+        }
+        first_pass.await.expect("cancelled reconciliation task");
+        assert!(
+            drain_runtime_events(&runtime).await.is_empty(),
+            "the cancelled old pass must not publish its staged child"
+        );
+
+        runtime.reconcile_once().await;
+        peer.await.expect("same-root recovery peer");
+        let events = drain_runtime_events(&runtime).await;
+        assert_eq!(durable_child_actor_mutation_count(&events), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event
+                    .native_event_id
+                    .as_deref()
+                    .is_some_and(|id| { id.starts_with("codex:reconciliation:") }))
+                .count(),
+            1,
+            "only the current generation may publish reconciliation data"
+        );
+    }
+
+    #[test]
+    fn bounded_reconciliation_discards_only_superseded_provisional_actor_upserts() {
+        let mut record_mutations = Vec::new();
+        for child_index in 0..usize::from(RECONCILIATION_DESCENDANT_LIMIT) {
+            let actor_id = format!("codex:thread:child-{child_index}");
+            for status in ["starting", "running", "completed"] {
+                record_mutations.push(
+                    ProviderActivityMutation::upsert_actor(
+                        actor_id.clone(),
+                        None,
+                        format!("Child {child_index}"),
+                        status,
+                    )
+                    .expect("valid actor mutation"),
+                );
+            }
+        }
+        for work_index in 0..usize::from(RECONCILIATION_BACKGROUND_LIMIT) {
+            record_mutations.push(
+                ProviderActivityMutation::remove_work_item(format!(
+                    "codex:item:background-{work_index}"
+                ))
+                .expect("valid work mutation"),
+            );
+        }
+        let scope_mutations = vec![
+            ProviderActivityMutation::remove_actor("codex:scope:one")
+                .expect("valid scope placeholder"),
+            ProviderActivityMutation::remove_actor("codex:scope:two")
+                .expect("valid scope placeholder"),
+        ];
+
+        let mutations = bounded_reconciliation_mutations(scope_mutations, record_mutations);
+
+        assert_eq!(mutations.len(), 230);
+        for child_index in 0..usize::from(RECONCILIATION_DESCENDANT_LIMIT) {
+            let actor_id = format!("codex:thread:child-{child_index}");
+            let actors = mutations
+                .iter()
+                .filter_map(|mutation| match mutation {
+                    ProviderActivityMutation::UpsertActor(actor) if actor.id == actor_id => {
+                        Some(actor)
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(actors.len(), 2);
+            assert_eq!(
+                actors[0].status,
+                crate::activity::ActivityLifecycle::Running
+            );
+            assert_eq!(
+                actors[1].status,
+                crate::activity::ActivityLifecycle::Completed
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_reconciliation_buffer_reserves_capacity_for_current_scope_health() {
+        let pending = (0..RECONCILIATION_MUTATION_LIMIT)
+            .map(|index| {
+                ProviderActivityMutation::upsert_actor(
+                    format!("codex:thread:pending-{index}"),
+                    None,
+                    format!("Pending {index}"),
+                    "running",
+                )
+                .expect("valid pending actor")
+            })
+            .collect::<Vec<_>>();
+        let (connection, incoming, _peer_stdout, _peer_stdin, _peer_stderr) =
+            runtime_test_connection();
+        let runtime = CodexSessionRuntime::new(reconciliation_test_options(), connection, incoming);
+        configure_reconciliation_test_runtime(&runtime).await;
+        runtime
+            .inner
+            .activity
+            .lock()
+            .await
+            .stage_reconciliation_mutations(pending);
+        let pass = {
+            let activity = runtime.inner.activity.lock().await;
+            ReconciliationPass {
+                epoch: activity.reconciliation_epoch,
+                root_thread_id: "provider-root".to_owned(),
+                cancellation: activity.reconciliation_pass_cancellation.clone(),
+            }
+        };
+        let capabilities = ActivityCapabilities::structured_full(false);
+        let scope = vec![
+            ProviderActivityMutation::SetScope {
+                capabilities: capabilities.clone(),
+                observation_state: ActivityObservationState::Live,
+            },
+            ProviderActivityMutation::SetSectionHealth {
+                section: ActivitySection::BackgroundTasks,
+                health: ActivitySectionHealth::live(),
+            },
+        ];
+        runtime
+            .emit_reconciliation(
+                &pass,
+                ReconciliationEmission::Successful {
+                    capabilities,
+                    mutations: scope,
+                },
+            )
+            .await;
+        let publications = drain_runtime_events(&runtime).await;
+
+        assert_eq!(publications.len(), 2);
+        assert_eq!(
+            publications[0].activity.len(),
+            RECONCILIATION_MUTATION_LIMIT
+        );
+        assert_eq!(publications[1].activity.len(), 2);
+        assert!(matches!(
+            publications[0].activity.first(),
+            Some(ProviderActivityMutation::SetScope { .. })
+        ));
+        assert!(matches!(
+            publications[0].activity.get(1),
+            Some(ProviderActivityMutation::SetSectionHealth { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn saturated_pending_reconciliation_preserves_actor_topology_across_published_batches() {
+        let (connection, incoming, _peer_stdout, _peer_stdin, _peer_stderr) =
+            runtime_test_connection();
+        let runtime = CodexSessionRuntime::new(reconciliation_test_options(), connection, incoming);
+        configure_reconciliation_test_runtime(&runtime).await;
+
+        let parent_id = "codex:thread:saturation-parent";
+        let child_id = "codex:thread:saturation-child";
+        let mut acknowledged = vec![
+            ProviderActivityMutation::upsert_actor(parent_id, None, "Saturation parent", "running")
+                .expect("valid parent actor"),
+        ];
+        acknowledged.extend((0..253).map(|index| {
+            ProviderActivityMutation::upsert_actor(
+                format!("codex:thread:saturation-filler-{index:03}"),
+                None,
+                format!("Saturation filler {index:03}"),
+                "running",
+            )
+            .expect("valid filler actor")
+        }));
+        acknowledged.push(
+            ProviderActivityMutation::upsert_actor(
+                child_id,
+                Some(parent_id),
+                "Saturation child",
+                "running",
+            )
+            .expect("valid child actor"),
+        );
+        {
+            let mut activity = runtime.inner.activity.lock().await;
+            activity.stage_reconciliation_mutations(acknowledged);
+        }
+        let pass = {
+            let activity = runtime.inner.activity.lock().await;
+            ReconciliationPass {
+                epoch: activity.reconciliation_epoch,
+                root_thread_id: "provider-root".to_owned(),
+                cancellation: activity.reconciliation_pass_cancellation.clone(),
+            }
+        };
+        let capabilities = ActivityCapabilities::structured_full(false);
+        runtime
+            .emit_reconciliation(
+                &pass,
+                ReconciliationEmission::Successful {
+                    capabilities: capabilities.clone(),
+                    mutations: vec![
+                        ProviderActivityMutation::SetScope {
+                            capabilities: capabilities.clone(),
+                            observation_state: ActivityObservationState::Live,
+                        },
+                        ProviderActivityMutation::SetSectionHealth {
+                            section: ActivitySection::BackgroundTasks,
+                            health: ActivitySectionHealth::live(),
+                        },
+                    ],
+                },
+            )
+            .await;
+
+        let events = drain_runtime_events(&runtime).await;
+        assert!(
+            !events.is_empty(),
+            "saturation must publish reconciliation data"
+        );
+        assert!(
+            events
+                .iter()
+                .all(|event| event.activity.len() <= RECONCILIATION_MUTATION_LIMIT),
+            "every published batch must stay within the repository limit"
+        );
+
+        let database = Database::open_in_memory().await.expect("activity database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("activity migrations");
+        let projection = ActivityProjection::new(ActivityRepository::new(database));
+        let scope = ActivityScopeSeed::thread(
+            "scope:codex:saturation",
+            "fixture-thread",
+            PROVIDER,
+            Some(PROVIDER),
+            capabilities,
+        )
+        .expect("valid activity scope");
+        projection
+            .ensure_scope(scope.clone())
+            .await
+            .expect("activity scope");
+        for event in &events {
+            projection
+                .apply(
+                    &scope.scope_id,
+                    event
+                        .native_event_id
+                        .clone()
+                        .expect("reconciliation event key"),
+                    event.activity.clone(),
+                    event.created_at.clone(),
+                )
+                .await
+                .expect("every published batch must be repository-valid");
+        }
+
+        let snapshot = projection
+            .snapshot(&ActivityScopeRef::Thread {
+                thread_id: "fixture-thread".to_owned(),
+            })
+            .await
+            .expect("projected activity snapshot");
+        assert_eq!(snapshot.counts.subagents.active, 255);
+        for (actor_id, expected_parent) in [(parent_id, None), (child_id, Some(parent_id))] {
+            let detail = projection
+                .list_detail(
+                    &scope.scope,
+                    &scope.scope_id,
+                    ActivityRecordKind::Actor,
+                    actor_id,
+                    None,
+                    1,
+                )
+                .await
+                .expect("acknowledged actor must be retained");
+            let ActivityRecordSummary::Actor(actor) = detail.record else {
+                panic!("actor detail returned a work item");
+            };
+            assert_eq!(actor.parent_actor_id.as_deref(), expected_parent);
+        }
+        assert!(
+            runtime
+                .inner
+                .activity
+                .lock()
+                .await
+                .pending_reconciliation_mutations
+                .is_empty(),
+            "successful publication must acknowledge every staged mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn saturated_pending_reconciliation_orders_each_retained_reparent_state() {
+        let (connection, incoming, _peer_stdout, _peer_stdin, _peer_stderr) =
+            runtime_test_connection();
+        let runtime = CodexSessionRuntime::new(reconciliation_test_options(), connection, incoming);
+        configure_reconciliation_test_runtime(&runtime).await;
+
+        let parent_one = "codex:thread:reparent-p1";
+        let child = "codex:thread:reparent-c";
+        let parent_two = "codex:thread:reparent-p2";
+        let grandparent = "codex:thread:reparent-d";
+        let mut acknowledged = vec![
+            ProviderActivityMutation::upsert_actor(parent_one, None, "Parent one", "running")
+                .expect("valid first parent state"),
+            ProviderActivityMutation::upsert_actor(
+                child,
+                Some(parent_one),
+                "Reparented child",
+                "running",
+            )
+            .expect("valid first child state"),
+            ProviderActivityMutation::upsert_actor(parent_two, None, "Parent two", "running")
+                .expect("valid second parent"),
+            ProviderActivityMutation::upsert_actor(
+                child,
+                Some(parent_two),
+                "Reparented child",
+                "waiting",
+            )
+            .expect("valid second child state"),
+            ProviderActivityMutation::upsert_actor(grandparent, None, "Grandparent", "running")
+                .expect("valid grandparent"),
+            ProviderActivityMutation::upsert_actor(
+                parent_one,
+                Some(grandparent),
+                "Parent one",
+                "waiting",
+            )
+            .expect("valid reparented first parent"),
+        ];
+        acknowledged.extend((0..249).map(|index| {
+            ProviderActivityMutation::upsert_actor(
+                format!("codex:thread:reparent-filler-{index:03}"),
+                None,
+                format!("Reparent filler {index:03}"),
+                "running",
+            )
+            .expect("valid filler actor")
+        }));
+        {
+            let mut activity = runtime.inner.activity.lock().await;
+            activity.stage_reconciliation_mutations(acknowledged);
+        }
+        let pass = {
+            let activity = runtime.inner.activity.lock().await;
+            ReconciliationPass {
+                epoch: activity.reconciliation_epoch,
+                root_thread_id: "provider-root".to_owned(),
+                cancellation: activity.reconciliation_pass_cancellation.clone(),
+            }
+        };
+        let capabilities = ActivityCapabilities::structured_full(false);
+        runtime
+            .emit_reconciliation(
+                &pass,
+                ReconciliationEmission::Successful {
+                    capabilities: capabilities.clone(),
+                    mutations: vec![
+                        ProviderActivityMutation::SetScope {
+                            capabilities: capabilities.clone(),
+                            observation_state: ActivityObservationState::Live,
+                        },
+                        ProviderActivityMutation::SetSectionHealth {
+                            section: ActivitySection::BackgroundTasks,
+                            health: ActivitySectionHealth::live(),
+                        },
+                    ],
+                },
+            )
+            .await;
+
+        let events = drain_runtime_events(&runtime).await;
+        assert_eq!(events.len(), 2, "saturation must exercise continuation");
+        assert!(
+            events
+                .iter()
+                .all(|event| event.activity.len() <= RECONCILIATION_MUTATION_LIMIT)
+        );
+        let retained_parents = |actor_id: &str| {
+            events
+                .iter()
+                .flat_map(|event| event.activity.iter())
+                .filter_map(|mutation| match mutation {
+                    ProviderActivityMutation::UpsertActor(actor) if actor.id == actor_id => {
+                        Some(actor.parent_actor_id.as_deref())
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            retained_parents(child),
+            [Some(parent_one), Some(parent_two)]
+        );
+        assert_eq!(retained_parents(parent_one), [None, Some(grandparent)]);
+
+        let database = Database::open_in_memory().await.expect("activity database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("activity migrations");
+        let projection = ActivityProjection::new(ActivityRepository::new(database));
+        let scope = ActivityScopeSeed::thread(
+            "scope:codex:reparent",
+            "fixture-thread",
+            PROVIDER,
+            Some(PROVIDER),
+            capabilities,
+        )
+        .expect("valid activity scope");
+        projection
+            .ensure_scope(scope.clone())
+            .await
+            .expect("activity scope");
+        for event in &events {
+            projection
+                .apply(
+                    &scope.scope_id,
+                    event
+                        .native_event_id
+                        .clone()
+                        .expect("reconciliation event key"),
+                    event.activity.clone(),
+                    event.created_at.clone(),
+                )
+                .await
+                .expect("every retained reparent state must be repository-valid");
+        }
+
+        let snapshot = projection
+            .snapshot(&scope.scope)
+            .await
+            .expect("projected activity snapshot");
+        assert_eq!(snapshot.counts.subagents.active, 253);
+        for (actor_id, expected_parent) in
+            [(child, Some(parent_two)), (parent_one, Some(grandparent))]
+        {
+            let detail = projection
+                .list_detail(
+                    &scope.scope,
+                    &scope.scope_id,
+                    ActivityRecordKind::Actor,
+                    actor_id,
+                    None,
+                    1,
+                )
+                .await
+                .expect("reparented actor detail");
+            let ActivityRecordSummary::Actor(actor) = detail.record else {
+                panic!("actor detail returned a work item");
+            };
+            assert_eq!(actor.parent_actor_id.as_deref(), expected_parent);
+        }
+    }
+
+    #[tokio::test]
+    async fn cyclic_pending_reconciliation_warns_without_acknowledging_staged_states() {
+        let (connection, incoming, _peer_stdout, _peer_stdin, _peer_stderr) =
+            runtime_test_connection();
+        let runtime = CodexSessionRuntime::new(reconciliation_test_options(), connection, incoming);
+        configure_reconciliation_test_runtime(&runtime).await;
+        let capabilities = ActivityCapabilities::structured_full(false);
+        let database = Database::open_in_memory().await.expect("activity database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("activity migrations");
+        let projection = ActivityProjection::new(ActivityRepository::new(database));
+        let scope = ActivityScopeSeed::thread(
+            "scope:codex:cycle",
+            "fixture-thread",
+            PROVIDER,
+            Some(PROVIDER),
+            capabilities.clone(),
+        )
+        .expect("valid activity scope");
+        projection
+            .ensure_scope(scope.clone())
+            .await
+            .expect("activity scope");
+        let snapshot_before = projection
+            .snapshot(&scope.scope)
+            .await
+            .expect("activity snapshot before cyclic reconciliation");
+        {
+            let mut activity = runtime.inner.activity.lock().await;
+            activity.stage_reconciliation_mutations([
+                ProviderActivityMutation::upsert_actor(
+                    "codex:thread:cycle-a",
+                    None,
+                    "Cycle A",
+                    "running",
+                )
+                .expect("valid initial actor"),
+                ProviderActivityMutation::upsert_actor(
+                    "codex:thread:cycle-b",
+                    Some("codex:thread:cycle-a"),
+                    "Cycle B",
+                    "running",
+                )
+                .expect("valid child actor"),
+                ProviderActivityMutation::upsert_actor(
+                    "codex:thread:cycle-a",
+                    Some("codex:thread:cycle-b"),
+                    "Cycle A",
+                    "waiting",
+                )
+                .expect("individually valid cyclic reparent"),
+            ]);
+            assert!(!activity.pending_reconciliation_topology_valid);
+        }
+        let pass = {
+            let activity = runtime.inner.activity.lock().await;
+            ReconciliationPass {
+                epoch: activity.reconciliation_epoch,
+                root_thread_id: "provider-root".to_owned(),
+                cancellation: activity.reconciliation_pass_cancellation.clone(),
+            }
+        };
+        runtime
+            .emit_reconciliation(
+                &pass,
+                ReconciliationEmission::Successful {
+                    capabilities: capabilities.clone(),
+                    mutations: vec![ProviderActivityMutation::SetScope {
+                        capabilities,
+                        observation_state: ActivityObservationState::Live,
+                    }],
+                },
+            )
+            .await;
+
+        let events = drain_runtime_events(&runtime).await;
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event_type, "runtime.warning");
+        assert!(events[0].activity.is_empty());
+        let mut applied_activity_batches = 0;
+        for event in &events {
+            if event.activity.is_empty() {
+                continue;
+            }
+            applied_activity_batches += 1;
+            projection
+                .apply(
+                    &scope.scope_id,
+                    event.native_event_id.clone().expect("activity event key"),
+                    event.activity.clone(),
+                    event.created_at.clone(),
+                )
+                .await
+                .expect("every emitted activity batch must be repository-valid");
+        }
+        assert_eq!(
+            applied_activity_batches, 0,
+            "unsafe topology must not emit an activity batch"
+        );
+        let snapshot_after = projection
+            .snapshot(&scope.scope)
+            .await
+            .expect("activity snapshot after cyclic reconciliation");
+        assert_eq!(
+            snapshot_after, snapshot_before,
+            "warning-only reconciliation must not mutate the repository scope or records"
+        );
+        assert!(snapshot_after.actors.is_empty());
+        assert!(snapshot_after.work_items.is_empty());
+        let activity = runtime.inner.activity.lock().await;
+        assert_eq!(activity.pending_reconciliation_mutations.len(), 3);
+        assert!(!activity.pending_reconciliation_topology_valid);
     }
 
     #[test]

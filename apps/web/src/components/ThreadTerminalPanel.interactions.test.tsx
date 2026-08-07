@@ -1833,6 +1833,24 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(terminal.focus).toHaveBeenCalledOnce();
   });
 
+  it("keeps an ineligible focus request outstanding until the pane becomes eligible", async () => {
+    const view = await mountViewport({ visible: true, autoFocus: false, focusRequestId: 7 });
+    const terminal = view.fakeTerminal!;
+
+    await view.flushFrame();
+    expect(terminal.focus).not.toHaveBeenCalled();
+
+    await view.setAutoFocus(true);
+    await view.flushFrame();
+    expect(terminal.focus).toHaveBeenCalledOnce();
+
+    terminal.focus.mockClear();
+    await view.setAutoFocus(false);
+    await view.setAutoFocus(true);
+    await view.flushFrame();
+    expect(terminal.focus).not.toHaveBeenCalled();
+  });
+
   it("does not steal focus for output, metadata, theme, or unrelated rerenders", async () => {
     const view = await mountViewport({ visible: true, autoFocus: true });
     const terminal = view.fakeTerminal!;
