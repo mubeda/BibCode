@@ -912,13 +912,13 @@ fn path_ownership_evidence(driver: &str, path: &str) -> PathOwnershipEvidence {
             None => PathOwnershipEvidence::Invalid,
         };
     }
-    if is_managed_shim_path(&components, &[".vite-plus", "bin"]) {
+    if is_user_home_shim_path(&components, &[".vite-plus", "bin"]) {
         return exact_ownership_evidence(
             exact_provider_basename(path, expected_binary),
             InstallationOwnership::VitePlus,
         );
     }
-    if is_managed_shim_path(&components, &[".bun", "bin"]) {
+    if is_user_home_shim_path(&components, &[".bun", "bin"]) {
         return exact_ownership_evidence(
             exact_provider_basename(path, expected_binary),
             InstallationOwnership::Bun,
@@ -984,12 +984,6 @@ fn contains_component(components: &[&str], expected: &str) -> bool {
     components.contains(&expected)
 }
 
-fn contains_component_sequence(components: &[&str], expected: &[&str]) -> bool {
-    components
-        .windows(expected.len())
-        .any(|window| window == expected)
-}
-
 fn exact_provider_basename(path: &str, expected: &str) -> bool {
     let Some(basename) = path.rsplit('/').next() else {
         return false;
@@ -1001,14 +995,35 @@ fn exact_provider_basename(path: &str, expected: &str) -> bool {
     stem == expected
 }
 
-fn is_managed_shim_path(components: &[&str], marker: &[&str]) -> bool {
+fn is_drive_component(component: &str) -> bool {
+    component.len() == 2
+        && component.as_bytes()[0].is_ascii_alphabetic()
+        && component.as_bytes()[1] == b':'
+}
+
+fn user_home_prefix_len(components: &[&str]) -> Option<usize> {
+    match components {
+        ["root", ..] => Some(1),
+        ["home" | "users", user, ..] if !user.is_empty() => Some(2),
+        [drive, "users", user, ..] if is_drive_component(drive) && !user.is_empty() => Some(3),
+        _ => None,
+    }
+}
+
+fn is_user_home_path(components: &[&str], suffix: &[&str]) -> bool {
+    user_home_prefix_len(components).is_some_and(|prefix| components.get(prefix..) == Some(suffix))
+}
+
+fn is_user_home_shim_path(components: &[&str], suffix: &[&str]) -> bool {
     components
-        .windows(marker.len())
-        .position(|window| window == marker)
-        .is_some_and(|index| index + marker.len() + 1 == components.len())
+        .split_last()
+        .is_some_and(|(_, root)| is_user_home_path(root, suffix))
 }
 
 fn is_pnpm_shim_path(components: &[&str]) -> bool {
+    let Some((_, root)) = components.split_last() else {
+        return false;
+    };
     [
         &[".local", "share", "pnpm"][..],
         &["local", "share", "pnpm"][..],
@@ -1017,12 +1032,15 @@ fn is_pnpm_shim_path(components: &[&str]) -> bool {
         &["appdata", "roaming", "pnpm"][..],
     ]
     .into_iter()
-    .any(|marker| is_managed_shim_path(components, marker))
+    .any(|suffix| is_user_home_path(root, suffix))
 }
 
 fn is_npm_shim_path(components: &[&str]) -> bool {
-    is_managed_shim_path(components, &["appdata", "roaming", "npm"])
-        || is_managed_shim_path(components, &[".npm-global", "bin"])
+    let Some((_, root)) = components.split_last() else {
+        return false;
+    };
+    is_user_home_path(root, &["appdata", "roaming", "npm"])
+        || root.ends_with(&[".npm-global", "bin"])
 }
 
 fn global_package_ownership(driver: &str, components: &[&str]) -> Option<InstallationOwnership> {
@@ -1040,16 +1058,44 @@ fn global_package_ownership(driver: &str, components: &[&str]) -> Option<Install
         return None;
     }
     let prefix = &components[..node_modules];
-    if contains_component_sequence(prefix, &[".bun", "install", "global"]) {
+    if is_user_home_path(prefix, &[".bun", "install", "global"]) {
         return Some(InstallationOwnership::Bun);
     }
-    if contains_component(prefix, "pnpm") && contains_component(prefix, "global") {
+    if is_pnpm_global_root(prefix) {
         return Some(InstallationOwnership::Pnpm);
     }
-    match prefix.last().copied() {
-        Some("lib" | "npm") => Some(InstallationOwnership::Npm),
-        _ => None,
-    }
+    is_npm_global_root(prefix).then_some(InstallationOwnership::Npm)
+}
+
+fn is_pnpm_global_root(components: &[&str]) -> bool {
+    let Some((&version, root)) = components.split_last() else {
+        return false;
+    };
+    let Some((&"global", root)) = root.split_last() else {
+        return false;
+    };
+    !version.is_empty()
+        && [
+            &[".local", "share", "pnpm"][..],
+            &["local", "share", "pnpm"][..],
+            &["library", "pnpm"][..],
+            &["appdata", "local", "pnpm"][..],
+            &["appdata", "roaming", "pnpm"][..],
+        ]
+        .into_iter()
+        .any(|suffix| is_user_home_path(root, suffix))
+}
+
+fn is_npm_global_root(components: &[&str]) -> bool {
+    matches!(
+        components,
+        ["usr", "local", "lib"]
+            | ["usr", "lib"]
+            | ["opt", "homebrew", "lib"]
+            | ["home", "linuxbrew", ".linuxbrew", "lib"]
+    ) || matches!(components, [drive, "npm"] if is_drive_component(drive))
+        || is_user_home_path(components, &["appdata", "roaming", "npm"])
+        || is_user_home_path(components, &[".npm-global", "lib"])
 }
 
 fn homebrew_ownership(
@@ -1063,24 +1109,30 @@ fn homebrew_ownership(
     {
         return None;
     }
-    let identity_after = |root: &str| {
-        components
-            .iter()
-            .position(|component| *component == root)
-            .and_then(|index| components.get(index + 1))
-            .copied()
+    let brew_root = [
+        (&["opt", "homebrew", "caskroom"][..], "caskroom"),
+        (&["usr", "local", "caskroom"][..], "caskroom"),
+        (&["opt", "homebrew", "cellar"][..], "cellar"),
+        (&["usr", "local", "cellar"][..], "cellar"),
+        (&["home", "linuxbrew", ".linuxbrew", "cellar"][..], "cellar"),
+    ]
+    .into_iter()
+    .find(|(root, _)| components.starts_with(root));
+    let Some((root, kind)) = brew_root else {
+        return None;
     };
+    let identity = components.get(root.len()).copied();
     match driver {
-        "codex" if identity_after("caskroom") == Some("codex") => {
+        "codex" if kind == "caskroom" && identity == Some("codex") => {
             Some(InstallationOwnership::Homebrew)
         }
-        "claudeAgent" if identity_after("caskroom") == Some("claude-code") => {
+        "claudeAgent" if kind == "caskroom" && identity == Some("claude-code") => {
             Some(InstallationOwnership::ClaudeStableCask)
         }
-        "claudeAgent" if identity_after("caskroom") == Some("claude-code@latest") => {
+        "claudeAgent" if kind == "caskroom" && identity == Some("claude-code@latest") => {
             Some(InstallationOwnership::ClaudeLatestCask)
         }
-        "opencode" if identity_after("cellar") == Some("opencode") => {
+        "opencode" if kind == "cellar" && identity == Some("opencode") => {
             Some(InstallationOwnership::Homebrew)
         }
         _ => None,
@@ -1088,31 +1140,60 @@ fn homebrew_ownership(
 }
 
 fn is_winget_location(components: &[&str]) -> bool {
-    is_managed_shim_path(components, &["microsoft", "winget", "links"])
-        || components
-            .windows(3)
-            .position(|window| window == ["microsoft", "winget", "packages"])
-            .is_some_and(|index| index + 5 == components.len())
+    let Some(prefix) = user_home_prefix_len(components) else {
+        return false;
+    };
+    matches!(
+        components.get(prefix..),
+        Some(["appdata", "local", "microsoft", "winget", "links", _])
+            | Some(["appdata", "local", "microsoft", "winget", "packages", _, _,])
+    )
 }
 
 fn winget_package_identity_is_claude(components: &[&str]) -> bool {
-    if contains_component_sequence(components, &["microsoft", "winget", "links"]) {
-        return true;
+    let Some(prefix) = user_home_prefix_len(components) else {
+        return false;
+    };
+    match components.get(prefix..) {
+        Some(["appdata", "local", "microsoft", "winget", "links", _]) => true,
+        Some(
+            [
+                "appdata",
+                "local",
+                "microsoft",
+                "winget",
+                "packages",
+                identity,
+                _,
+            ],
+        ) => identity.starts_with("anthropic.claudecode_"),
+        _ => false,
     }
-    components
-        .iter()
-        .position(|component| *component == "packages")
-        .and_then(|index| components.get(index + 1))
-        .is_some_and(|identity| identity.starts_with("anthropic.claudecode_"))
 }
 
 fn is_codex_standalone_path(path: &str, components: &[&str]) -> bool {
-    (contains_component_sequence(components, &[".codex", "packages", "standalone"])
-        || contains_component_sequence(
-            components,
-            &["appdata", "local", "programs", "openai", "codex", "bin"],
-        ))
-        && exact_provider_basename(path, "codex")
+    (is_user_home_path(
+        components,
+        &[
+            ".codex",
+            "packages",
+            "standalone",
+            "current",
+            "bin",
+            "codex",
+        ],
+    ) || is_user_home_path(
+        components,
+        &[
+            "appdata",
+            "local",
+            "programs",
+            "openai",
+            "codex",
+            "bin",
+            "codex.exe",
+        ],
+    )) && exact_provider_basename(path, "codex")
 }
 
 fn resolved_or_configured_binary(binary_path: &str, resolved: Option<&Path>) -> String {
@@ -1122,11 +1203,15 @@ fn resolved_or_configured_binary(binary_path: &str, resolved: Option<&Path>) -> 
 }
 
 fn is_claude_native_path(path: &str) -> bool {
-    path.ends_with("/.local/bin/claude") || path.ends_with("/.local/bin/claude.exe")
+    let components = path_components(path);
+    is_user_home_path(&components, &[".local", "bin", "claude"])
+        || is_user_home_path(&components, &[".local", "bin", "claude.exe"])
 }
 
 fn is_opencode_native_path(path: &str) -> bool {
-    path.ends_with("/.opencode/bin/opencode") || path.ends_with("/.opencode/bin/opencode.exe")
+    let components = path_components(path);
+    is_user_home_path(&components, &[".opencode", "bin", "opencode"])
+        || is_user_home_path(&components, &[".opencode", "bin", "opencode.exe"])
 }
 
 fn is_cursor_release_binary_path(path: &str) -> bool {

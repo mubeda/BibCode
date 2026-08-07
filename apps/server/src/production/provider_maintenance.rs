@@ -288,6 +288,101 @@ mod tests {
     }
 
     #[test]
+    fn rejects_arbitrary_lookalike_manager_and_native_roots() {
+        let cases = [
+            (
+                "npm lib lookalike",
+                "codex",
+                "/usr/local/bin/codex",
+                Some("/srv/lookalike/lib/node_modules/@openai/codex/bin/codex.js"),
+            ),
+            (
+                "unordered pnpm global lookalike",
+                "codex",
+                "/usr/bin/codex",
+                Some("/srv/global/cache/pnpm/node_modules/@openai/codex/bin/codex.js"),
+            ),
+            (
+                "pnpm shim lookalike",
+                "codex",
+                "/srv/lookalike/.local/share/pnpm/codex",
+                None,
+            ),
+            (
+                "Vite+ shim lookalike",
+                "codex",
+                "/srv/lookalike/.vite-plus/bin/codex",
+                None,
+            ),
+            (
+                "Bun shim lookalike",
+                "codex",
+                "/srv/lookalike/.bun/bin/codex",
+                None,
+            ),
+            (
+                "Bun global package lookalike",
+                "codex",
+                "/usr/bin/codex",
+                Some("/srv/lookalike/.bun/install/global/node_modules/@openai/codex/bin/codex.js"),
+            ),
+            (
+                "Homebrew cask lookalike",
+                "codex",
+                "/usr/bin/codex",
+                Some("/srv/lookalike/Caskroom/codex/1.0.0/codex"),
+            ),
+            (
+                "Claude native lookalike",
+                "claudeAgent",
+                "/srv/lookalike/.local/bin/claude",
+                None,
+            ),
+            (
+                "OpenCode native lookalike",
+                "opencode",
+                "/srv/lookalike/.opencode/bin/opencode",
+                None,
+            ),
+            (
+                "Codex standalone lookalike",
+                "codex",
+                "/srv/lookalike/.codex/packages/standalone/current/bin/codex",
+                None,
+            ),
+            (
+                "WinGet Links lookalike",
+                "claudeAgent",
+                "C:/scratch/Microsoft/WinGet/Links/claude.exe",
+                None,
+            ),
+            (
+                "WinGet Packages lookalike",
+                "claudeAgent",
+                "C:/scratch/Microsoft/WinGet/Packages/Anthropic.ClaudeCode_Microsoft.Winget.Source_8wekyb3d8bbwe/claude.exe",
+                None,
+            ),
+        ];
+
+        for (label, driver, resolved, canonical) in cases {
+            let binary = match driver {
+                "claudeAgent" => "claude",
+                value => value,
+            };
+            assert_eq!(
+                capabilities_for_paths(
+                    driver,
+                    binary,
+                    Some(Path::new(resolved)),
+                    canonical.map(Path::new),
+                ),
+                ProviderMaintenanceCapabilities::unknown(),
+                "{label}"
+            );
+        }
+    }
+
+    #[test]
     fn unknown_explicit_path_is_manual_only() {
         let capabilities = capabilities_for_paths(
             "codex",
@@ -958,6 +1053,60 @@ mod tests {
         assert_eq!(result.exit_code, 7);
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn update_command_applies_the_same_case_variant_path_used_for_resolution() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let root = tempfile::tempdir().expect("update PATH root");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::create_dir_all(&first).expect("first PATH directory");
+        std::fs::create_dir_all(&second).expect("second PATH directory");
+        for (directory, label) in [(&first, "first"), (&second, "second")] {
+            let executable = directory.join("manager");
+            std::fs::write(
+                &executable,
+                format!("#!/bin/sh\nprintf '%s:%s' '{label}' \"$PATH\" > \"$PATH_MARKER\"\n"),
+            )
+            .expect("write manager fixture");
+            let mut permissions = std::fs::metadata(&executable)
+                .expect("manager metadata")
+                .permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(&executable, permissions).expect("make manager executable");
+        }
+        let marker = root.path().join("effective-path");
+        let target = ProviderMaintenanceTarget {
+            instance_id: "cursor-work".to_owned(),
+            driver: "cursor".to_owned(),
+            binary_path: "cursor-agent".to_owned(),
+            environment: vec![
+                ("pAtH".into(), first.as_os_str().to_owned()),
+                ("PATH".into(), second.as_os_str().to_owned()),
+                ("PATH_MARKER".into(), marker.as_os_str().to_owned()),
+            ],
+        };
+        let update = ProviderUpdateCommand {
+            display: "manager update".to_owned(),
+            executable: "manager".to_owned(),
+            args: vec!["update".to_owned()],
+            lock_key: "test-manager",
+        };
+
+        let result = ProviderMaintenance::new()
+            .run_update_command(&target, &update, &CancellationToken::new())
+            .await
+            .expect("update command");
+
+        assert_eq!(result.exit_code, 0);
+        assert_eq!(
+            std::fs::read_to_string(marker).expect("PATH marker"),
+            format!("first:{}", first.to_string_lossy())
+        );
+    }
+
     #[tokio::test]
     async fn update_command_timeout_stops_the_child() {
         let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
@@ -1138,8 +1287,8 @@ mod tests {
     async fn maintenance_classifies_the_instance_path_executable_instead_of_ambient_path() {
         let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let root = tempfile::tempdir().expect("maintenance executable root");
-        let ambient = root.path().join("ambient/.npm-global/bin");
-        let instance = root.path().join("instance/.opencode/bin");
+        let ambient = root.path().join("ambient/.opencode/bin");
+        let instance = root.path().join("instance/.npm-global/bin");
         std::fs::create_dir_all(&ambient).expect("ambient executable directory");
         std::fs::create_dir_all(&instance).expect("instance executable directory");
         std::fs::write(ambient.join("opencode"), b"ambient").expect("ambient executable");
@@ -1166,13 +1315,12 @@ mod tests {
                 unsafe { std::env::remove_var("PATH") };
             }
         }
-        let expected = format!("{} upgrade", instance.join("opencode").to_string_lossy());
         assert_eq!(
             capabilities
                 .update
                 .as_ref()
                 .map(|update| update.display.as_str()),
-            Some(expected.as_str())
+            Some("npm install -g opencode-ai@latest")
         );
     }
 }
@@ -1195,7 +1343,8 @@ use latest::{LatestVersionFailure, LatestVersionSource};
 use crate::git::{OutputPolicy, ProcessRequest, ProcessRunner};
 
 use super::provider_runtime::{
-    prepare_provider_launch, resolve_provider_executable_with_environment,
+    normalize_provider_environment, prepare_provider_launch,
+    resolve_provider_executable_with_environment,
 };
 
 const CACHE_TTL: Duration = Duration::from_secs(60 * 60);
@@ -1646,10 +1795,15 @@ impl ProviderMaintenance {
         &self,
         target: &ProviderMaintenanceTarget,
     ) -> ProviderMaintenanceCapabilities {
-        let resolved = resolve_provider_executable_with_environment(
-            &target.binary_path,
+        let environment = normalize_provider_environment(
             target
                 .environment
+                .iter()
+                .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+        );
+        let resolved = resolve_provider_executable_with_environment(
+            &target.binary_path,
+            environment
                 .iter()
                 .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
         );
@@ -1688,10 +1842,15 @@ impl ProviderMaintenance {
         cancellation: &tokio_util::sync::CancellationToken,
         timeout: Duration,
     ) -> Result<ProviderUpdateCommandResult, String> {
-        let executable = resolve_provider_executable_with_environment(
-            &update.executable,
+        let environment = normalize_provider_environment(
             target
                 .environment
+                .iter()
+                .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+        );
+        let executable = resolve_provider_executable_with_environment(
+            &update.executable,
+            environment
                 .iter()
                 .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
         )
@@ -1706,7 +1865,7 @@ impl ProviderMaintenance {
                     command: launch.program,
                     args: launch.args,
                     cwd,
-                    env: target.environment.clone(),
+                    env: environment,
                     stdin: None,
                     timeout,
                     max_output_bytes: UPDATE_OUTPUT_LIMIT,

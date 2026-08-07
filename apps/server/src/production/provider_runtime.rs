@@ -1526,7 +1526,15 @@ async fn resolve_provider_route_settings(
         .into_iter()
         .flat_map(|value| value.environment.iter())
         .filter(|entry| !entry.name.trim().is_empty() && !entry.value_redacted)
-        .map(|entry| (entry.name.clone(), entry.value.clone()))
+        .map(|entry| (OsStr::new(entry.name.trim()), OsStr::new(&entry.value)));
+    let environment = normalize_provider_environment(environment)
+        .into_iter()
+        .map(|(name, value)| {
+            (
+                name.to_string_lossy().into_owned(),
+                value.to_string_lossy().into_owned(),
+            )
+        })
         .collect();
     let codex_home = (provider == "codex").then(|| {
         let config = instance.map(|value| &value.config);
@@ -3961,12 +3969,17 @@ fn spawn_child(
     attribution: ProcessAttributionRegistry,
 ) -> Result<Box<dyn ChildWrapper>, ProviderRuntimeError> {
     let provider = request.provider.clone();
-    let executable = resolve_provider_executable_with_environment(
-        &request.binary_path,
+    let environment = normalize_provider_environment(
         request
             .environment
             .iter()
             .map(|(name, value)| (OsStr::new(name), OsStr::new(value))),
+    );
+    let executable = resolve_provider_executable_with_environment(
+        &request.binary_path,
+        environment
+            .iter()
+            .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
     )
     .ok_or_else(|| ProviderRuntimeError::Spawn {
         provider: provider.clone(),
@@ -3995,7 +4008,7 @@ fn spawn_child(
             } else {
                 Stdio::null()
             });
-        command.envs(&request.environment);
+        command.envs(environment.iter().cloned());
         sanitize_provider_subprocess_environment(command);
     });
     configure_supervised_background_command_wrap(&mut command);
@@ -4033,11 +4046,30 @@ pub(crate) fn resolve_provider_executable(input: &str) -> Option<PathBuf> {
 pub(crate) fn effective_provider_search_path<'a>(
     environment: impl IntoIterator<Item = (&'a OsStr, &'a OsStr)>,
 ) -> Option<OsString> {
-    environment
+    normalize_provider_environment(environment)
         .into_iter()
-        .find(|(name, _)| name.to_string_lossy().eq_ignore_ascii_case("path"))
-        .map(|(_, value)| value.to_os_string())
+        .find(|(name, _)| name == "PATH")
+        .map(|(_, value)| value)
         .or_else(|| std::env::var_os("PATH"))
+}
+
+pub(crate) fn normalize_provider_environment<'a>(
+    environment: impl IntoIterator<Item = (&'a OsStr, &'a OsStr)>,
+) -> Vec<(OsString, OsString)> {
+    let mut normalized = Vec::new();
+    let mut path_seen = false;
+    for (name, value) in environment {
+        if name.to_string_lossy().eq_ignore_ascii_case("path") {
+            if path_seen {
+                continue;
+            }
+            path_seen = true;
+            normalized.push((OsString::from("PATH"), value.to_os_string()));
+        } else {
+            normalized.push((name.to_os_string(), value.to_os_string()));
+        }
+    }
+    normalized
 }
 
 pub(crate) fn resolve_provider_executable_with_environment<'a>(
@@ -9151,6 +9183,50 @@ done
         ));
     }
 
+    #[tokio::test]
+    async fn provider_route_normalizes_case_variant_path_before_map_collection() {
+        let temp = TempDir::new().expect("settings root");
+        let mut settings = ProviderSettingsState::default();
+        settings.provider_instances.insert(
+            "codex-work".to_owned(),
+            ProviderInstanceState {
+                driver: "codex".to_owned(),
+                enabled: true,
+                display_name: None,
+                environment: vec![
+                    ProviderEnvironmentVariableState {
+                        name: "pAtH".to_owned(),
+                        value: "/first".to_owned(),
+                        sensitive: false,
+                        value_redacted: false,
+                    },
+                    ProviderEnvironmentVariableState {
+                        name: "PATH".to_owned(),
+                        value: "/second".to_owned(),
+                        sensitive: false,
+                        value_redacted: false,
+                    },
+                ],
+                config: json!({ "binaryPath": "codex" }),
+            },
+        );
+        std::fs::write(
+            temp.path().join("settings.json"),
+            serde_json::to_vec(&settings).expect("settings JSON"),
+        )
+        .expect("write settings");
+
+        let route =
+            super::resolve_provider_route_settings(&temp.path().to_path_buf(), "codex-work", None)
+                .await
+                .expect("provider route");
+
+        assert_eq!(
+            route.environment,
+            std::collections::BTreeMap::from([("PATH".to_owned(), "/first".to_owned())])
+        );
+    }
+
     #[test]
     fn dropped_delivery_response_is_ambiguous_but_closed_queue_is_not_sent() {
         assert!(matches!(
@@ -10276,7 +10352,9 @@ done
             let executable = directory.join("provider-fixture");
             std::fs::write(
                 &executable,
-                format!("#!/bin/sh\nprintf '%s' '{value}' > \"$MARKER\"\n"),
+                format!(
+                    "#!/bin/sh\nprintf '%s' '{value}' > \"$MARKER\"\nprintf '%s' \"$PATH\" > \"$PATH_MARKER\"\n"
+                ),
             )
             .expect("write runtime executable");
             let mut permissions = std::fs::metadata(&executable)
@@ -10287,6 +10365,7 @@ done
                 .expect("make runtime fixture executable");
         }
         let marker = temp.path().join("launched");
+        let path_marker = temp.path().join("effective-path");
         let original_path = std::env::var_os("PATH");
         // SAFETY: process-global environment mutation is serialized by the shared test lock.
         unsafe { std::env::set_var("PATH", &ambient) };
@@ -10298,6 +10377,10 @@ done
         request
             .environment
             .insert("MARKER".to_owned(), marker.to_string_lossy().into_owned());
+        request.environment.insert(
+            "PATH_MARKER".to_owned(),
+            path_marker.to_string_lossy().into_owned(),
+        );
 
         let mut child = super::spawn_child(&request, &[], false, ProcessAttributionRegistry::new())
             .expect("spawn instance executable");
@@ -10316,6 +10399,10 @@ done
         assert_eq!(
             std::fs::read_to_string(marker).expect("launch marker"),
             "instance"
+        );
+        assert_eq!(
+            std::fs::read_to_string(path_marker).expect("effective PATH marker"),
+            instance.to_string_lossy()
         );
     }
 

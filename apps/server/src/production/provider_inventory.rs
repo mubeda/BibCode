@@ -17,8 +17,8 @@ use crate::{
     },
     production::provider_maintenance::{ProviderMaintenance, ProviderMaintenanceTarget},
     production::provider_runtime::{
-        prepare_provider_launch, resolve_provider_executable_with_environment,
-        sanitize_provider_subprocess_environment,
+        normalize_provider_environment, prepare_provider_launch,
+        resolve_provider_executable_with_environment, sanitize_provider_subprocess_environment,
     },
     provider::{claude, codex, cursor, grok, opencode},
 };
@@ -323,7 +323,7 @@ fn string_array(value: Option<&Value>, name: &str) -> Option<Vec<String>> {
 }
 
 fn provider_environment(instance: &Value) -> Vec<(OsString, OsString)> {
-    instance
+    let environment = instance
         .get("environment")
         .and_then(Value::as_array)
         .into_iter()
@@ -349,7 +349,12 @@ fn provider_environment(instance: &Value) -> Vec<(OsString, OsString)> {
                 ),
             ))
         })
-        .collect()
+        .collect::<Vec<_>>();
+    normalize_provider_environment(
+        environment
+            .iter()
+            .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+    )
 }
 
 async fn probe_one(
@@ -1123,6 +1128,11 @@ async fn run_command(
     environment: &[(OsString, OsString)],
 ) -> Option<CommandOutput> {
     let launch = prepare_provider_launch(executable, args).ok()?;
+    let environment = normalize_provider_environment(
+        environment
+            .iter()
+            .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+    );
     let output = ProcessRunner
         .run(
             ProcessRequest {
@@ -1130,7 +1140,7 @@ async fn run_command(
                 command: launch.program,
                 args: launch.args,
                 cwd: cwd.to_path_buf(),
-                env: environment.to_vec(),
+                env: environment,
                 stdin: None,
                 timeout: PROBE_TIMEOUT,
                 max_output_bytes: PROBE_OUTPUT_LIMIT,
@@ -1651,6 +1661,48 @@ mod tests {
         assert_eq!(providers[0].snapshot["version"], "2026.03.04-instance");
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn exact_target_probe_applies_the_same_case_variant_path_used_for_resolution() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let root = tempfile::tempdir().expect("inventory PATH root");
+        let first = root.path().join("first");
+        let second = root.path().join("second");
+        std::fs::create_dir_all(&first).expect("first PATH directory");
+        std::fs::create_dir_all(&second).expect("second PATH directory");
+        let executable = first.join("codex");
+        std::fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nif [ \"$PATH\" = '{}' ]; then printf '1.2.3\\n'; else printf '9.9.9\\n'; fi\n",
+                first.to_string_lossy()
+            ),
+        )
+        .expect("write version fixture");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("version fixture metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions)
+            .expect("make version fixture executable");
+        let target = ProviderMaintenanceTarget {
+            instance_id: "codex-work".to_owned(),
+            driver: "codex".to_owned(),
+            binary_path: "codex".to_owned(),
+            environment: vec![
+                ("pAtH".into(), first.as_os_str().to_owned()),
+                ("PATH".into(), second.as_os_str().to_owned()),
+            ],
+        };
+
+        assert_eq!(
+            probe_maintenance_target_version(&target, root.path()).await,
+            Some("1.2.3".to_owned())
+        );
+    }
+
     #[test]
     fn maintenance_target_rejects_mismatched_instance_driver_pairs() {
         let settings = json!({
@@ -1966,13 +2018,18 @@ mod tests {
         let instance = json!({
             "environment": [
                 { "name": "API_KEY", "value": "secret", "valueRedacted": false },
+                { "name": "pAtH", "value": "/first", "valueRedacted": false },
+                { "name": "PATH", "value": "/second", "valueRedacted": false },
                 { "name": "HIDDEN", "value": "redacted", "valueRedacted": true },
                 { "name": "", "value": "ignored", "valueRedacted": false }
             ]
         });
         assert_eq!(
             provider_environment(&instance),
-            vec![(OsString::from("API_KEY"), OsString::from("secret"))]
+            vec![
+                (OsString::from("API_KEY"), OsString::from("secret")),
+                (OsString::from("PATH"), OsString::from("/first"))
+            ]
         );
     }
 

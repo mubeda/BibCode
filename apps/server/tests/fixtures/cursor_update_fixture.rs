@@ -30,9 +30,24 @@ fn reported_version(exit_code: Option<i32>) -> String {
     }
 }
 
+fn pause_version_probe_if_configured() {
+    let pause = adjacent_file("version-pause");
+    if !pause.is_file() {
+        return;
+    }
+    fs::write(adjacent_file("version-entered"), b"entered")
+        .expect("write version probe marker");
+    while !adjacent_file("version-release").is_file() {
+        thread::sleep(Duration::from_millis(5));
+    }
+    let _ = fs::remove_file(pause);
+    let _ = fs::remove_file(adjacent_file("version-release"));
+}
+
 fn main() {
     match env::args().nth(1).as_deref() {
         Some("--version") => {
+            pause_version_probe_if_configured();
             let exit_code = configured_exit_code("version-exit-code");
             println!("cursor-agent {}", reported_version(exit_code));
             if let Some(exit_code) = exit_code {
@@ -51,6 +66,8 @@ fn main() {
             );
         }
         Some("update") => {
+            fs::write(adjacent_file("update-invoked"), b"invoked")
+                .expect("write update marker");
             if let Ok(milliseconds) = read_trimmed("update-sleep-ms").parse::<u64>() {
                 thread::sleep(Duration::from_millis(milliseconds));
             }
