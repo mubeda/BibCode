@@ -203,6 +203,22 @@
         "updatedAt": "2026-07-24T12:00:02Z",
         "terminalAt": "2026-07-24T12:00:02Z"
       }
+    },
+    {
+      "type": "upsertActor",
+      "actor": {
+        "_tag": "actor",
+        "id": "codex:thread:child-3",
+        "parentActorId": null,
+        "name": "[redacted agent path]",
+        "role": null,
+        "providerType": "codex",
+        "status": "running",
+        "summary": null,
+        "startedAt": "2026-07-24T12:00:03Z",
+        "updatedAt": "2026-07-24T12:00:03Z",
+        "terminalAt": null
+      }
     }
   ]
 }

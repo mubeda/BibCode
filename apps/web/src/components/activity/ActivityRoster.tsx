@@ -195,10 +195,11 @@ function ActivityRecordRow({
 
   return (
     <Button
-      className="h-auto w-full items-start justify-start gap-3 whitespace-normal px-3 py-2 text-left"
+      className="w-full items-start justify-start gap-3 whitespace-normal px-3 py-2 text-left"
       data-activity-row={record.id}
       onClick={() => onSelect(record)}
       ref={(element) => registerRow(record.id, element)}
+      size="content"
       variant="ghost"
     >
       <span className="mt-0.5 flex shrink-0 items-center -space-x-1">

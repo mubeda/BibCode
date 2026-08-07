@@ -107,12 +107,49 @@ RPC admission, generation fencing, projection, cleanup, and observer lifecycle
 are selected from the request scope; changing one gate does not transition the
 other. Legacy `enableAgentActivity` values migrate only to Chat.
 
+### Codex structured recovery
+
+Codex structured recovery merges validated, bounded live and root/child-history
+`subAgentActivity` hints with descendants returned by `thread/list`. Hinted
+child IDs are direct-read under the current activity generation. A read response
+is accepted only when its thread ID matches the requested child ID and its
+parent is the root or an already verified actor. Bounded root, live, list, and
+nested recovery repairs reconnect topology. An empty successful list neither
+erases known actors nor suppresses hinted actors and their direct reads.
+Malformed, out-of-scope, self-referential, or cyclic hints are ignored.
+
+Epoch and cancellation fences cancel recovery when activity is disabled, the
+root is replaced, or the runtime disconnects or shuts down; late results and
+old-root mutations are discarded. Mutations already accepted into the current
+root's tracker are staged under the same activity lock until a current
+reconciliation event is queued successfully, so a transient failure or
+same-root reconnect cannot acknowledge recovery data that was never published.
+The bounded staging buffer coalesces superseded actor and work-item states,
+preserves each actor's retained state order, and dependency-orders every
+retained parent state before the child or reparent state that needs it. Cyclic
+or otherwise unsortable staged topology remains pending and produces a runtime
+warning instead of an invalid activity event. Oversized valid recovery is
+published as repository-sized chunks. Scope and section health lead the first
+chunk; each chunk is removed from staging only after its event is queued, and
+remaining chunks are queued immediately without waiting for provider history to
+change.
+The staged buffer is cleared when activity or the root is replaced. History
+recovery is `full` only for
+`supported`/`supported`, `none` only for `unsupported`/`unsupported`, and
+`bounded` for every other list/read pair, including unknown or unproven pairs.
+These recovery downgrades do not disable ordinary Codex chat.
+
 | Provider | Structured chat activity                                                                                              | Provider-terminal observation                                                                                                              | Recovery and truthful downgrade                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | -------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Codex    | Supported: actors and attributed entries; background work is enabled only when its reconciliation method is accepted. | Supported when capability probes prove a Unix App Server listener and remote TUI.                                                          | Structured chat downgrades history/background capabilities when reconciliation methods are incompatible. The terminal path publishes only after root resume and keeps known data when an optional bounded reconciliation request has no usable response.                                                                                                                                                                                                                                       |
+| Codex    | Supported: actors and attributed entries; background work is enabled only when its reconciliation method is accepted. | Supported when capability probes prove a Unix App Server listener and remote TUI.                                                          | Structured recovery combines bounded validated hints, list discovery, and direct reads; the exact `full`/`bounded`/`none` guarantees are above. The terminal path publishes only after root resume and keeps known data when an optional bounded reconciliation request has no usable response.                                                                                                                                                                                                |
 | Claude   | Supported when the launch probe proves both hook-event switches; actors and attributed entries only.                  | Supported when settings composition, authenticated HTTP hooks, additive merge semantics, and a safe private executable pin are all proven. | No background-work capability. Recovery moves from `none` to `bounded` only after correlated transcript recovery; unproven hook support leaves activity unsupported.                                                                                                                                                                                                                                                                                                                           |
 | OpenCode | Supported after the child-session endpoint and root correlation are proven; actors and attributed entries only.       | Supported after authenticated serve/attach preparation and owned-root correlation.                                                         | Structured chat reports no activity when the child endpoint is unsupported, `bounded` recovery when child discovery works without both status and history, and `full` when all three work; transient fetch failure marks the scope stale while retrying. The terminal path instead publishes `full` after owned-root correlation and currently skips later child/status/message request failures without downgrading that capability. Failed correlation publishes no terminal activity scope. |
 | Cursor   | Unsupported in activity protocol v1; ordinary Cursor provider chat still works.                                       | Unsupported in v1.                                                                                                                         | No structured activity or activity dock is claimed.                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+
+Codex provider-terminal observation remains list-based. A terminal-scope
+`subAgentActivity` item can wake the bounded reconciliation pass, but it does
+not materialize a provisional actor or enqueue a direct hinted-child read; an
+actor is published there only after `thread/list` verifies its topology.
 
 The terminal supervisor validates the enabled provider instance and executable,
 then chooses only the Codex, Claude, or OpenCode observer factory. Before

@@ -2145,8 +2145,8 @@ fn validate_codex_activity_scenario(name: &str, fixture: &CodexActivityFixture) 
                     .iter()
                     .filter(|mutation| mutation["type"] == "upsertActor")
                     .count(),
-                5,
-                "the unknown item must add no activity mutation"
+                6,
+                "the known subAgentActivity item adds one provisional actor while the unknown item adds none"
             );
             let decoded_items = fixture
                 .inbound_messages
@@ -3044,11 +3044,16 @@ async fn disabled_agent_activity_pauses_tracking_and_resumes_with_authoritative_
     let (inflight_seen_tx, inflight_seen_rx) = tokio::sync::oneshot::channel();
     let (inflight_release_tx, inflight_release_rx) = tokio::sync::oneshot::channel();
     peer.expect_request(
-        "thread/list",
-        json!({"ancestorThreadId": "provider-root", "limit": 50}),
+        "thread/read",
+        json!({"threadId": "provider-root", "includeTurns": true}),
     )
     .pause_response(inflight_seen_tx, inflight_release_rx)
-    .respond(json!({"data": [], "nextCursor": null, "backwardsCursor": null}));
+    .respond(empty_root_thread_read_result());
+    peer.expect_request(
+        "thread/read",
+        json!({"threadId": "provider-root", "includeTurns": true}),
+    )
+    .respond(empty_root_thread_read_result());
     peer.expect_request(
         "thread/list",
         json!({"ancestorThreadId": "provider-root", "limit": 50}),
@@ -3111,6 +3116,11 @@ async fn disabled_agent_activity_pauses_tracking_and_resumes_with_authoritative_
         json!({"threadId": "provider-root", "limit": 128}),
     )
     .respond(json!({"data": [], "nextCursor": null}));
+    peer.expect_request(
+        "thread/read",
+        json!({"threadId": "provider-root", "includeTurns": true}),
+    )
+    .respond(empty_root_thread_read_result());
     peer.expect_request(
         "thread/list",
         json!({"ancestorThreadId": "provider-root", "limit": 50}),
@@ -3371,10 +3381,10 @@ async fn reconciliation_first_root_notification_requests_exact_descendant_scope(
         .await
         .expect("first root must schedule immediate reconciliation")
         .expect("reconciliation request");
-    assert_eq!(request["method"], "thread/list");
+    assert_eq!(request["method"], "thread/read");
     assert_eq!(
         request["params"],
-        json!({"ancestorThreadId": "provider-root", "limit": 50})
+        json!({"threadId": "provider-root", "includeTurns": true})
     );
 
     runtime.shutdown().await.expect("runtime shuts down");
@@ -3410,7 +3420,6 @@ async fn sub_agent_activity_debounces_follow_up_reconciliation_and_repairs_neste
     let peer_task = tokio::spawn(async move {
         let mut reader = BufReader::new(peer.stdin);
         let mut writer = peer.stdout;
-        let mut thread_list_count = 0_u8;
         loop {
             let message = read_scripted_message(&mut reader, &mut writer).await;
             let Some(method) = message.get("method").and_then(Value::as_str) else {
@@ -3430,42 +3439,33 @@ async fn sub_agent_activity_debounces_follow_up_reconciliation_and_repairs_neste
                     "cwd": "/tmp/project",
                     "model": "gpt-5.3-codex"
                 }),
-                "thread/list" => {
-                    thread_list_count += 1;
-                    match thread_list_count {
-                        1 => json!({
-                            "data": [],
-                            "nextCursor": null,
-                            "backwardsCursor": null
-                        }),
-                        2 => json!({
-                            "data": [
-                                {
-                                    "id": "child-direct",
-                                    "parentThreadId": "provider-root",
-                                    "agentNickname": "Direct child",
-                                    "agentRole": "worker",
-                                    "createdAt": 2,
-                                    "updatedAt": 3,
-                                    "status": {"type": "idle"}
-                                },
-                                {
-                                    "id": "child-nested",
-                                    "parentThreadId": "child-direct",
-                                    "agentNickname": "Nested child",
-                                    "agentRole": "worker",
-                                    "createdAt": 3,
-                                    "updatedAt": 4,
-                                    "status": {"type": "idle"}
-                                }
-                            ],
-                            "nextCursor": null,
-                            "backwardsCursor": null
-                        }),
-                        other => panic!("unexpected thread/list pass {other}"),
-                    }
-                }
+                "thread/list" => json!({
+                    "data": [],
+                    "nextCursor": null,
+                    "backwardsCursor": null
+                }),
                 "thread/read" => match message["params"]["threadId"].as_str() {
+                    Some("provider-root") => json!({
+                        "thread": {
+                            "id": "provider-root",
+                            "createdAt": 1,
+                            "updatedAt": 4,
+                            "status": {"type": "idle"},
+                            "turns": [{
+                                "id": "root-turn",
+                                "status": "completed",
+                                "startedAt": 1,
+                                "completedAt": 4,
+                                "items": [{
+                                    "id": "spawn-direct",
+                                    "type": "subAgentActivity",
+                                    "agentThreadId": "child-direct",
+                                    "agentPath": "/root/direct",
+                                    "kind": "started"
+                                }]
+                            }]
+                        }
+                    }),
                     Some("child-direct") => json!({
                         "thread": {
                             "id": "child-direct",
@@ -3473,20 +3473,27 @@ async fn sub_agent_activity_debounces_follow_up_reconciliation_and_repairs_neste
                             "agentNickname": "Direct child",
                             "agentRole": "worker",
                             "createdAt": 2,
-                            "updatedAt": 3,
-                            "status": {"type": "idle"},
+                            "updatedAt": 4,
+                            "status": {"type": "notLoaded"},
                             "turns": [{
                                 "id": "direct-turn",
                                 "status": "completed",
                                 "startedAt": 2,
-                                "completedAt": 3,
-                                "items": [{
-                                    "id": "nested-start",
-                                    "type": "subAgentActivity",
-                                    "agentThreadId": "child-nested",
-                                    "agentPath": "/root/direct/nested",
-                                    "kind": "started"
-                                }]
+                                "completedAt": 4,
+                                "items": [
+                                    {
+                                        "id": "spawn-nested",
+                                        "type": "subAgentActivity",
+                                        "agentThreadId": "child-nested",
+                                        "agentPath": "/root/direct/nested",
+                                        "kind": "started"
+                                    },
+                                    {
+                                        "id": "direct-result",
+                                        "type": "agentMessage",
+                                        "text": "Direct result"
+                                    }
+                                ]
                             }]
                         }
                     }),
@@ -3497,13 +3504,13 @@ async fn sub_agent_activity_debounces_follow_up_reconciliation_and_repairs_neste
                             "agentNickname": "Nested child",
                             "agentRole": "worker",
                             "createdAt": 3,
-                            "updatedAt": 4,
-                            "status": {"type": "idle"},
+                            "updatedAt": 5,
+                            "status": {"type": "notLoaded"},
                             "turns": [{
                                 "id": "nested-turn",
                                 "status": "completed",
                                 "startedAt": 3,
-                                "completedAt": 4,
+                                "completedAt": 5,
                                 "items": [{
                                     "id": "nested-result",
                                     "type": "agentMessage",
@@ -3533,29 +3540,6 @@ async fn sub_agent_activity_debounces_follow_up_reconciliation_and_repairs_neste
 
     runtime.start().await.expect("runtime starts");
     runtime.collect_events(2).await;
-    incoming_tx
-        .send(IncomingEvent::Notification {
-            method: "thread/started".to_owned(),
-            params: json!({"thread": {"id": "provider-root"}}),
-            emitted_at_ms: 1_000,
-        })
-        .expect("root notification");
-    timeout(Duration::from_secs(1), async {
-        loop {
-            let list_count = requests
-                .lock()
-                .expect("request log mutex")
-                .iter()
-                .filter(|request| request["method"] == "thread/list")
-                .count();
-            if list_count == 1 {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
-    })
-    .await
-    .expect("initial reconciliation");
 
     for (method, kind, emitted_at_ms) in [
         ("item/started", "started", 1_001),
@@ -3581,7 +3565,7 @@ async fn sub_agent_activity_debounces_follow_up_reconciliation_and_repairs_neste
     }
 
     let reconciliation = next_codex_event_matching(&runtime, |event| {
-        event.native_event_id.as_deref() == Some("codex:reconciliation:1")
+        event.native_event_id.as_deref() == Some("codex:reconciliation:0")
     })
     .await;
     assert!(reconciliation.activity.iter().any(|mutation| matches!(
@@ -3589,12 +3573,20 @@ async fn sub_agent_activity_debounces_follow_up_reconciliation_and_repairs_neste
         ProviderActivityMutation::UpsertActor(actor)
             if actor.id == "codex:thread:child-direct"
                 && actor.parent_actor_id.is_none()
+                && actor.status == ActivityLifecycle::Completed
     )));
     assert!(reconciliation.activity.iter().any(|mutation| matches!(
         mutation,
         ProviderActivityMutation::UpsertActor(actor)
             if actor.id == "codex:thread:child-nested"
                 && actor.parent_actor_id.as_deref() == Some("codex:thread:child-direct")
+                && actor.status == ActivityLifecycle::Completed
+    )));
+    assert!(reconciliation.activity.iter().any(|mutation| matches!(
+        mutation,
+        ProviderActivityMutation::AppendEntry(entry)
+            if entry.owner_id == "codex:thread:child-direct"
+                && entry.detail.as_deref() == Some("Direct result")
     )));
     assert!(reconciliation.activity.iter().any(|mutation| matches!(
         mutation,
@@ -3611,12 +3603,1267 @@ async fn sub_agent_activity_debounces_follow_up_reconciliation_and_repairs_neste
             .iter()
             .filter(|request| request["method"] == "thread/list")
             .count(),
-        2,
-        "the empty initial pass plus one coalesced sub-agent follow-up are expected"
+        1,
+        "only one coalesced sub-agent reconciliation pass is expected"
     );
 
     runtime.shutdown().await.expect("runtime shuts down");
     peer_task.await.expect("peer task");
+}
+
+#[tokio::test]
+async fn reconciliation_restart_recovers_child_from_root_history_when_lists_are_empty() {
+    let (connection, _protocol_incoming, mut peer) = scripted_peer();
+    let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+    let runtime = CodexSessionRuntime::new(
+        codex_activity_options(Some("provider-root")),
+        connection,
+        incoming_rx,
+    );
+    peer.expect_request("initialize", fixture("initialize-params.json"))
+        .respond(json!({}));
+    peer.expect_notification("initialized");
+    peer.expect_request(
+        "thread/resume",
+        json!({
+            "threadId": "provider-root",
+            "cwd": "/tmp/project",
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+            "model": "gpt-5.3-codex",
+            "serviceTier": null,
+        }),
+    )
+    .respond(json!({
+        "thread": {"id": "provider-root"},
+        "cwd": "/tmp/project",
+        "model": "gpt-5.3-codex"
+    }));
+    peer.expect_request(
+        "thread/read",
+        json!({"threadId": "provider-root", "includeTurns": true}),
+    )
+    .respond(json!({
+        "thread": {
+            "id": "provider-root",
+            "createdAt": 1,
+            "updatedAt": 3,
+            "status": {"type": "idle"},
+            "turns": [{
+                "id": "root-turn",
+                "status": "completed",
+                "startedAt": 1,
+                "completedAt": 3,
+                "items": [{
+                    "id": "spawn-recovered",
+                    "type": "subAgentActivity",
+                    "agentThreadId": "recovered-child",
+                    "agentPath": "/root/recovered",
+                    "kind": "started"
+                }]
+            }]
+        }
+    }));
+    peer.expect_request(
+        "thread/list",
+        json!({"ancestorThreadId": "provider-root", "limit": 50}),
+    )
+    .respond(empty_thread_list_result());
+    peer.expect_request(
+        "thread/read",
+        json!({"threadId": "recovered-child", "includeTurns": true}),
+    )
+    .respond(json!({
+        "thread": {
+            "id": "recovered-child",
+            "parentThreadId": "provider-root",
+            "agentNickname": "Recovered child",
+            "agentRole": "worker",
+            "createdAt": 2,
+            "updatedAt": 3,
+            "status": {"type": "notLoaded"},
+            "turns": [{
+                "id": "recovered-turn",
+                "status": "completed",
+                "startedAt": 2,
+                "completedAt": 3,
+                "items": [{
+                    "id": "recovered-result",
+                    "type": "agentMessage",
+                    "text": "Recovered result"
+                }]
+            }]
+        }
+    }));
+    peer.expect_request(
+        "thread/backgroundTerminals/list",
+        json!({"threadId": "provider-root", "limit": 128}),
+    )
+    .respond(empty_background_terminal_list_result());
+    peer.expect_request("shutdown", Value::Null)
+        .respond(Value::Null);
+    let peer_task = tokio::spawn(peer.run());
+
+    runtime.start().await.expect("restarted runtime starts");
+    runtime.collect_events(2).await;
+    incoming_tx
+        .send(IncomingEvent::Notification {
+            method: "thread/started".to_owned(),
+            params: json!({"thread": {"id": "provider-root"}}),
+            emitted_at_ms: 1_000,
+        })
+        .expect("restarted root notification");
+
+    let reconciliation = next_codex_event_matching(&runtime, |event| {
+        event.native_event_id.as_deref() == Some("codex:reconciliation:0")
+    })
+    .await;
+    assert!(reconciliation.activity.iter().any(|mutation| matches!(
+        mutation,
+        ProviderActivityMutation::UpsertActor(actor)
+            if actor.id == "codex:thread:recovered-child"
+                && actor.status == ActivityLifecycle::Completed
+    )));
+    assert!(reconciliation.activity.iter().any(|mutation| matches!(
+        mutation,
+        ProviderActivityMutation::AppendEntry(entry)
+            if entry.owner_id == "codex:thread:recovered-child"
+                && entry.detail.as_deref() == Some("Recovered result")
+    )));
+
+    runtime.shutdown().await.expect("runtime shuts down");
+    peer_task.await.expect("peer task");
+}
+
+#[tokio::test]
+async fn reconciliation_same_root_reconnect_refreshes_verified_child_with_empty_lists() {
+    let (connection_a, _protocol_incoming_a, mut peer_a) = scripted_peer();
+    let (incoming_tx_a, incoming_rx_a) = mpsc::unbounded_channel();
+    let runtime = CodexSessionRuntime::new(
+        codex_activity_options(Some("provider-root")),
+        connection_a,
+        incoming_rx_a,
+    );
+    peer_a
+        .expect_request("initialize", fixture("initialize-params.json"))
+        .respond(json!({}));
+    peer_a.expect_notification("initialized");
+    peer_a
+        .expect_request(
+            "thread/resume",
+            json!({
+                "threadId": "provider-root",
+                "cwd": "/tmp/project",
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+                "model": "gpt-5.3-codex",
+                "serviceTier": null,
+            }),
+        )
+        .respond(json!({
+            "thread": {"id": "provider-root"},
+            "cwd": "/tmp/project",
+            "model": "gpt-5.3-codex"
+        }));
+    peer_a
+        .expect_request(
+            "thread/read",
+            json!({"threadId": "provider-root", "includeTurns": true}),
+        )
+        .respond(json!({
+            "thread": {
+                "id": "provider-root",
+                "createdAt": 1,
+                "updatedAt": 2,
+                "status": {"type": "idle"},
+                "turns": [{
+                    "id": "root-turn",
+                    "status": "completed",
+                    "startedAt": 1,
+                    "completedAt": 2,
+                    "items": [{
+                        "id": "spawn-refresh-child",
+                        "type": "subAgentActivity",
+                        "agentThreadId": "refresh-child",
+                        "agentPath": "/root/refresh-child",
+                        "kind": "started"
+                    }]
+                }]
+            }
+        }));
+    peer_a
+        .expect_request(
+            "thread/list",
+            json!({"ancestorThreadId": "provider-root", "limit": 50}),
+        )
+        .respond(empty_thread_list_result());
+    peer_a
+        .expect_request(
+            "thread/read",
+            json!({"threadId": "refresh-child", "includeTurns": true}),
+        )
+        .respond(json!({
+            "thread": {
+                "id": "refresh-child",
+                "parentThreadId": "provider-root",
+                "createdAt": 2,
+                "updatedAt": 2,
+                "status": {"type": "notLoaded"},
+                "turns": [{
+                    "id": "refresh-turn-initial",
+                    "status": "completed",
+                    "startedAt": 2,
+                    "completedAt": 2,
+                    "items": [{
+                        "id": "refresh-result-initial",
+                        "type": "agentMessage",
+                        "text": "Initial refresh result"
+                    }]
+                }]
+            }
+        }));
+    peer_a
+        .expect_request(
+            "thread/backgroundTerminals/list",
+            json!({"threadId": "provider-root", "limit": 128}),
+        )
+        .respond(empty_background_terminal_list_result());
+    let peer_a_task = tokio::spawn(peer_a.run());
+
+    runtime.start().await.expect("runtime starts");
+    runtime.collect_events(2).await;
+    incoming_tx_a
+        .send(IncomingEvent::Notification {
+            method: "thread/started".to_owned(),
+            params: json!({"thread": {"id": "provider-root"}}),
+            emitted_at_ms: 1_000,
+        })
+        .expect("root notification");
+    let initial = next_codex_event_matching(&runtime, |event| {
+        event.native_event_id.as_deref() == Some("codex:reconciliation:0")
+    })
+    .await;
+    assert!(initial.activity.iter().any(|mutation| matches!(
+        mutation,
+        ProviderActivityMutation::AppendEntry(entry)
+            if entry.detail.as_deref() == Some("Initial refresh result")
+    )));
+    peer_a_task.await.expect("initial peer task");
+
+    let (connection_b, _protocol_incoming_b, mut peer_b) = scripted_peer();
+    let (_incoming_tx_b, incoming_rx_b) = mpsc::unbounded_channel();
+    peer_b
+        .expect_request("initialize", fixture("initialize-params.json"))
+        .respond(json!({}));
+    peer_b.expect_notification("initialized");
+    peer_b
+        .expect_request(
+            "thread/resume",
+            json!({
+                "threadId": "provider-root",
+                "cwd": "/tmp/project",
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+                "model": "gpt-5.3-codex",
+                "serviceTier": null,
+            }),
+        )
+        .respond(json!({
+            "thread": {"id": "provider-root"},
+            "cwd": "/tmp/project",
+            "model": "gpt-5.3-codex"
+        }));
+    peer_b
+        .expect_request(
+            "thread/read",
+            json!({"threadId": "provider-root", "includeTurns": true}),
+        )
+        .respond(json!({
+            "thread": {
+                "id": "provider-root",
+                "createdAt": 1,
+                "updatedAt": 4,
+                "status": {"type": "idle"},
+                "turns": [{
+                    "id": "root-turn",
+                    "status": "completed",
+                    "startedAt": 1,
+                    "completedAt": 4,
+                    "items": [{
+                        "id": "spawn-refresh-child",
+                        "type": "subAgentActivity",
+                        "agentThreadId": "refresh-child",
+                        "agentPath": "/root/refresh-child",
+                        "kind": "interacted"
+                    }]
+                }]
+            }
+        }));
+    peer_b
+        .expect_request(
+            "thread/list",
+            json!({"ancestorThreadId": "provider-root", "limit": 50}),
+        )
+        .respond(empty_thread_list_result());
+    peer_b
+        .expect_request(
+            "thread/read",
+            json!({"threadId": "refresh-child", "includeTurns": true}),
+        )
+        .respond(json!({
+            "thread": {
+                "id": "refresh-child",
+                "parentThreadId": "provider-root",
+                "createdAt": 2,
+                "updatedAt": 4,
+                "status": {"type": "notLoaded"},
+                "turns": [{
+                    "id": "refresh-turn-reconnected",
+                    "status": "completed",
+                    "startedAt": 3,
+                    "completedAt": 4,
+                    "items": [{
+                        "id": "refresh-result-reconnected",
+                        "type": "agentMessage",
+                        "text": "Reconnected refresh result"
+                    }]
+                }]
+            }
+        }));
+    peer_b
+        .expect_request(
+            "thread/backgroundTerminals/list",
+            json!({"threadId": "provider-root", "limit": 128}),
+        )
+        .respond(empty_background_terminal_list_result());
+    peer_b
+        .expect_request("shutdown", Value::Null)
+        .respond(Value::Null);
+    let peer_b_task = tokio::spawn(peer_b.run());
+
+    runtime
+        .reconnect(connection_b, incoming_rx_b)
+        .await
+        .expect("same-root runtime reconnects");
+    runtime.collect_events(2).await;
+    let refreshed = next_codex_event_matching(&runtime, |event| {
+        event.native_event_id.as_deref() == Some("codex:reconciliation:1")
+    })
+    .await;
+    assert!(refreshed.activity.iter().any(|mutation| matches!(
+        mutation,
+        ProviderActivityMutation::UpsertActor(actor)
+            if actor.id == "codex:thread:refresh-child"
+                && actor.status == ActivityLifecycle::Completed
+    )));
+    assert!(refreshed.activity.iter().any(|mutation| matches!(
+        mutation,
+        ProviderActivityMutation::AppendEntry(entry)
+            if entry.detail.as_deref() == Some("Reconnected refresh result")
+    )));
+
+    runtime.shutdown().await.expect("runtime shuts down");
+    peer_b_task.await.expect("reconnected peer task");
+}
+
+#[tokio::test]
+async fn reconciliation_deduplicates_root_and_live_hints_within_one_pass() {
+    let (connection, _protocol_incoming, peer) = scripted_peer();
+    let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+    let runtime = CodexSessionRuntime::new(codex_activity_options(None), connection, incoming_rx);
+    let child_read_count = Arc::new(StdMutex::new(0_usize));
+    let peer_child_read_count = child_read_count.clone();
+    let (root_read_seen_tx, root_read_seen_rx) = oneshot::channel();
+    let (release_root_read_tx, release_root_read_rx) = oneshot::channel();
+    let peer_task = tokio::spawn(async move {
+        let mut reader = BufReader::new(peer.stdin);
+        let mut writer = peer.stdout;
+        let mut root_read_seen_tx = Some(root_read_seen_tx);
+        let mut release_root_read_rx = Some(release_root_read_rx);
+        loop {
+            let message = read_scripted_message(&mut reader, &mut writer).await;
+            let Some(method) = message.get("method").and_then(Value::as_str) else {
+                continue;
+            };
+            if message.get("id").is_none() {
+                assert_eq!(method, "initialized");
+                continue;
+            }
+            let result = match method {
+                "initialize" => {
+                    assert_eq!(message["params"], fixture("initialize-params.json"));
+                    json!({})
+                }
+                "thread/start" => {
+                    assert_eq!(
+                        message["params"],
+                        json!({
+                            "cwd": "/tmp/project",
+                            "approvalPolicy": "never",
+                            "sandbox": "danger-full-access",
+                            "model": "gpt-5.3-codex",
+                            "serviceTier": null,
+                        })
+                    );
+                    json!({
+                        "thread": {"id": "provider-root"},
+                        "cwd": "/tmp/project",
+                        "model": "gpt-5.3-codex"
+                    })
+                }
+                "thread/read" => match message["params"]["threadId"].as_str() {
+                    Some("provider-root") => {
+                        assert_eq!(
+                            message["params"],
+                            json!({"threadId": "provider-root", "includeTurns": true})
+                        );
+                        if let Some(root_read_seen_tx) = root_read_seen_tx.take() {
+                            let _ = root_read_seen_tx.send(());
+                            release_root_read_rx
+                                .take()
+                                .expect("root read release receiver")
+                                .await
+                                .expect("root read release");
+                        }
+                        json!({
+                            "thread": {
+                                "id": "provider-root",
+                                "createdAt": 1,
+                                "updatedAt": 2,
+                                "status": {"type": "idle"},
+                                "turns": [{
+                                    "id": "root-turn",
+                                    "status": "completed",
+                                    "startedAt": 1,
+                                    "completedAt": 2,
+                                    "items": [{
+                                        "id": "root-spawn",
+                                        "type": "subAgentActivity",
+                                        "agentThreadId": "duplicate-child",
+                                        "agentPath": "/root/duplicate",
+                                        "kind": "started"
+                                    }]
+                                }]
+                            }
+                        })
+                    }
+                    Some("duplicate-child") => {
+                        assert_eq!(
+                            message["params"],
+                            json!({"threadId": "duplicate-child", "includeTurns": true})
+                        );
+                        *peer_child_read_count
+                            .lock()
+                            .expect("child read count mutex") += 1;
+                        json!({
+                            "thread": {
+                                "id": "duplicate-child",
+                                "parentThreadId": "provider-root",
+                                "createdAt": 2,
+                                "updatedAt": 2,
+                                "status": {"type": "notLoaded"},
+                                "turns": []
+                            }
+                        })
+                    }
+                    other => panic!("unexpected thread/read target {other:?}"),
+                },
+                "thread/list" => {
+                    assert_eq!(
+                        message["params"],
+                        json!({"ancestorThreadId": "provider-root", "limit": 50})
+                    );
+                    empty_thread_list_result()
+                }
+                "thread/backgroundTerminals/list" => {
+                    assert_eq!(
+                        message["params"],
+                        json!({"threadId": "provider-root", "limit": 128})
+                    );
+                    empty_background_terminal_list_result()
+                }
+                "shutdown" => {
+                    assert_eq!(message["params"], Value::Null);
+                    write_json(
+                        &mut writer,
+                        json!({"id": message["id"].clone(), "result": null}),
+                    )
+                    .await;
+                    break;
+                }
+                other => panic!("unexpected request in duplicate-hint test: {other}"),
+            };
+            write_json(
+                &mut writer,
+                json!({"id": message["id"].clone(), "result": result}),
+            )
+            .await;
+        }
+    });
+
+    runtime.start().await.expect("runtime starts");
+    runtime.collect_events(2).await;
+    incoming_tx
+        .send(IncomingEvent::Notification {
+            method: "thread/started".to_owned(),
+            params: json!({"thread": {"id": "provider-root"}}),
+            emitted_at_ms: 1_000,
+        })
+        .expect("root notification");
+    timeout(Duration::from_secs(1), root_read_seen_rx)
+        .await
+        .expect("root read begins")
+        .expect("root read signal");
+    incoming_tx
+        .send(IncomingEvent::Notification {
+            method: "item/started".to_owned(),
+            params: json!({
+                "threadId": "provider-root",
+                "turnId": "root-turn",
+                "item": {
+                    "id": "live-spawn",
+                    "type": "subAgentActivity",
+                    "agentThreadId": "duplicate-child",
+                    "agentPath": "/root/duplicate",
+                    "kind": "started"
+                }
+            }),
+            emitted_at_ms: 1_001,
+        })
+        .expect("duplicate live hint");
+    release_root_read_tx.send(()).expect("release root read");
+
+    next_codex_event_matching(&runtime, |event| {
+        event.native_event_id.as_deref() == Some("codex:reconciliation:0")
+    })
+    .await;
+    assert_eq!(*child_read_count.lock().expect("child read count mutex"), 1);
+
+    runtime.shutdown().await.expect("runtime shuts down");
+    peer_task.await.expect("peer task");
+}
+
+#[tokio::test]
+async fn reconciliation_defers_nested_hint_beyond_per_pass_descendant_limit() {
+    let (connection, _protocol_incoming, mut peer) = scripted_peer();
+    let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+    let runtime = CodexSessionRuntime::new(
+        codex_activity_options(Some("provider-root")),
+        connection,
+        incoming_rx,
+    );
+    peer.expect_request("initialize", fixture("initialize-params.json"))
+        .respond(json!({}));
+    peer.expect_notification("initialized");
+    peer.expect_request(
+        "thread/resume",
+        json!({
+            "threadId": "provider-root",
+            "cwd": "/tmp/project",
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+            "model": "gpt-5.3-codex",
+            "serviceTier": null,
+        }),
+    )
+    .respond(json!({
+        "thread": {"id": "provider-root"},
+        "cwd": "/tmp/project",
+        "model": "gpt-5.3-codex"
+    }));
+    let root_items = (0..50)
+        .map(|index| {
+            json!({
+                "id": format!("spawn-{index}"),
+                "type": "subAgentActivity",
+                "agentThreadId": format!("limited-child-{index}"),
+                "agentPath": format!("/root/limited-{index}"),
+                "kind": "started"
+            })
+        })
+        .collect::<Vec<_>>();
+    let root_read = json!({
+        "thread": {
+            "id": "provider-root",
+            "createdAt": 1,
+            "updatedAt": 3,
+            "status": {"type": "idle"},
+            "turns": [{
+                "id": "root-turn",
+                "status": "completed",
+                "startedAt": 1,
+                "completedAt": 3,
+                "items": root_items
+            }]
+        }
+    });
+    peer.expect_request(
+        "thread/read",
+        json!({"threadId": "provider-root", "includeTurns": true}),
+    )
+    .respond(root_read.clone());
+    peer.expect_request(
+        "thread/list",
+        json!({"ancestorThreadId": "provider-root", "limit": 50}),
+    )
+    .respond(empty_thread_list_result());
+    for index in 0..50 {
+        let thread_id = format!("limited-child-{index}");
+        let turns = if index == 0 {
+            vec![json!({
+                "id": "limited-child-turn",
+                "status": "completed",
+                "startedAt": 2,
+                "completedAt": 3,
+                "items": [{
+                    "id": "spawn-deferred-nested",
+                    "type": "subAgentActivity",
+                    "agentThreadId": "deferred-nested",
+                    "agentPath": "/root/limited-0/deferred-nested",
+                    "kind": "started"
+                }]
+            })]
+        } else {
+            Vec::new()
+        };
+        peer.expect_request(
+            "thread/read",
+            json!({"threadId": thread_id, "includeTurns": true}),
+        )
+        .respond(json!({
+            "thread": {
+                "id": thread_id,
+                "parentThreadId": "provider-root",
+                "createdAt": 2,
+                "updatedAt": 3,
+                "status": {"type": "notLoaded"},
+                "turns": turns
+            }
+        }));
+    }
+    peer.expect_request(
+        "thread/backgroundTerminals/list",
+        json!({"threadId": "provider-root", "limit": 128}),
+    )
+    .respond(empty_background_terminal_list_result());
+    peer.expect_request(
+        "thread/read",
+        json!({"threadId": "provider-root", "includeTurns": true}),
+    )
+    .respond(root_read);
+    peer.expect_request(
+        "thread/list",
+        json!({"ancestorThreadId": "provider-root", "limit": 50}),
+    )
+    .respond(empty_thread_list_result());
+    peer.expect_request(
+        "thread/read",
+        json!({"threadId": "deferred-nested", "includeTurns": true}),
+    )
+    .respond(json!({
+        "thread": {
+            "id": "deferred-nested",
+            "parentThreadId": "limited-child-0",
+            "createdAt": 3,
+            "updatedAt": 4,
+            "status": {"type": "notLoaded"},
+            "turns": [{
+                "id": "deferred-nested-turn",
+                "status": "completed",
+                "startedAt": 3,
+                "completedAt": 4,
+                "items": [{
+                    "id": "deferred-nested-result",
+                    "type": "agentMessage",
+                    "text": "Deferred nested result"
+                }]
+            }]
+        }
+    }));
+    peer.expect_request(
+        "thread/backgroundTerminals/list",
+        json!({"threadId": "provider-root", "limit": 128}),
+    )
+    .respond(empty_background_terminal_list_result());
+    peer.expect_request("shutdown", Value::Null)
+        .respond(Value::Null);
+    let peer_task = tokio::spawn(peer.run());
+
+    runtime.start().await.expect("runtime starts");
+    runtime.collect_events(2).await;
+    incoming_tx
+        .send(IncomingEvent::Notification {
+            method: "thread/started".to_owned(),
+            params: json!({"thread": {"id": "provider-root"}}),
+            emitted_at_ms: 1_000,
+        })
+        .expect("root notification");
+    let first_reconciliation = next_codex_event_matching(&runtime, |event| {
+        event.native_event_id.as_deref() == Some("codex:reconciliation:0")
+    })
+    .await;
+    assert!(
+        !first_reconciliation
+            .activity
+            .iter()
+            .any(|mutation| matches!(
+                mutation,
+                ProviderActivityMutation::AppendEntry(entry)
+                    if entry.detail.as_deref() == Some("Deferred nested result")
+            ))
+    );
+    let second_reconciliation = timeout(Duration::from_secs(2), async {
+        next_codex_event_matching(&runtime, |event| {
+            event.native_event_id.as_deref() == Some("codex:reconciliation:1")
+        })
+        .await
+    })
+    .await
+    .expect("deferred nested reconciliation");
+    assert!(
+        second_reconciliation
+            .activity
+            .iter()
+            .any(|mutation| matches!(
+                mutation,
+                ProviderActivityMutation::AppendEntry(entry)
+                    if entry.detail.as_deref() == Some("Deferred nested result")
+            ))
+    );
+
+    runtime.shutdown().await.expect("runtime shuts down");
+    peer_task.await.expect("peer task");
+}
+
+#[tokio::test]
+async fn reconciliation_shared_descendant_namespace_preserves_exact_structural_budget() {
+    let (connection, _protocol_incoming, peer) = scripted_peer();
+    let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+    let runtime = CodexSessionRuntime::new(
+        codex_activity_options(Some("provider-root")),
+        connection,
+        incoming_rx,
+    );
+    let peer_task = tokio::spawn(async move {
+        let mut reader = BufReader::new(peer.stdin);
+        let mut writer = peer.stdout;
+        loop {
+            let request = read_scripted_message(&mut reader, &mut writer).await;
+            let method = request["method"].as_str().expect("request method");
+            let result = match method {
+                "initialize" => json!({}),
+                "thread/resume" => {
+                    assert_eq!(
+                        request["params"],
+                        json!({
+                            "threadId": "provider-root",
+                            "cwd": "/tmp/project",
+                            "approvalPolicy": "never",
+                            "sandbox": "danger-full-access",
+                            "model": "gpt-5.3-codex",
+                            "serviceTier": null,
+                        })
+                    );
+                    json!({
+                        "thread": {"id": "provider-root"},
+                        "cwd": "/tmp/project",
+                        "model": "gpt-5.3-codex"
+                    })
+                }
+                "thread/read" => {
+                    assert_eq!(request["params"]["includeTurns"], true);
+                    let thread_id = request["params"]["threadId"]
+                        .as_str()
+                        .expect("thread/read target");
+                    if thread_id == "provider-root" {
+                        json!({
+                            "thread": {
+                                "id": "provider-root",
+                                "createdAt": 1,
+                                "updatedAt": 3,
+                                "status": {"type": "idle"},
+                                "turns": [{
+                                    "id": "root-turn",
+                                    "status": "completed",
+                                    "startedAt": 1,
+                                    "completedAt": 3,
+                                    "items": (0..50)
+                                        .map(|index| json!({
+                                            "id": format!("spawn-budget-root-{index}"),
+                                            "type": "subAgentActivity",
+                                            "agentThreadId": format!("budget-root-child-{index}"),
+                                            "agentPath": format!("/root/budget-root-child-{index}"),
+                                            "kind": "started"
+                                        }))
+                                        .collect::<Vec<_>>()
+                                }]
+                            }
+                        })
+                    } else if let Some(index) = thread_id.strip_prefix("budget-root-child-") {
+                        let turns = if index == "0" {
+                            vec![json!({
+                                "id": "budget-nested-source-turn",
+                                "status": "completed",
+                                "startedAt": 2,
+                                "completedAt": 3,
+                                "items": (0..50)
+                                    .map(|nested_index| json!({
+                                        "id": format!("spawn-budget-nested-{nested_index}"),
+                                        "type": "subAgentActivity",
+                                        "agentThreadId": format!("budget-nested-{nested_index}"),
+                                        "agentPath": format!(
+                                            "/root/budget-root-child-0/budget-nested-{nested_index}"
+                                        ),
+                                        "kind": "started"
+                                    }))
+                                    .collect::<Vec<_>>()
+                            })]
+                        } else {
+                            Vec::new()
+                        };
+                        json!({
+                            "thread": {
+                                "id": thread_id,
+                                "parentThreadId": "provider-root",
+                                "createdAt": 2,
+                                "updatedAt": 3,
+                                "status": {"type": "notLoaded"},
+                                "turns": turns
+                            }
+                        })
+                    } else if thread_id.starts_with("budget-nested-") {
+                        json!({
+                            "thread": {
+                                "id": thread_id,
+                                "parentThreadId": "budget-root-child-0",
+                                "createdAt": 3,
+                                "updatedAt": 4,
+                                "status": {"type": "notLoaded"},
+                                "turns": []
+                            }
+                        })
+                    } else {
+                        panic!("unexpected structural-budget read target {thread_id}");
+                    }
+                }
+                "thread/list" => {
+                    assert_eq!(
+                        request["params"],
+                        json!({"ancestorThreadId": "provider-root", "limit": 50})
+                    );
+                    empty_thread_list_result()
+                }
+                "thread/backgroundTerminals/list" => {
+                    assert_eq!(
+                        request["params"],
+                        json!({"threadId": "provider-root", "limit": 128})
+                    );
+                    json!({
+                        "data": (0..128)
+                            .map(|index| json!({
+                                "itemId": format!("budget-background-{index}"),
+                                "processId": format!("budget-process-{index}"),
+                                "command": format!("budget command {index}"),
+                                "cwd": "/tmp/project"
+                            }))
+                            .collect::<Vec<_>>(),
+                        "nextCursor": null
+                    })
+                }
+                "shutdown" => {
+                    write_json(
+                        &mut writer,
+                        json!({"id": request["id"].clone(), "result": null}),
+                    )
+                    .await;
+                    break;
+                }
+                "initialized" => continue,
+                other => panic!("unexpected structural-budget method {other}"),
+            };
+            write_json(
+                &mut writer,
+                json!({"id": request["id"].clone(), "result": result}),
+            )
+            .await;
+        }
+    });
+
+    runtime.start().await.expect("runtime starts");
+    runtime.collect_events(2).await;
+    incoming_tx
+        .send(IncomingEvent::Notification {
+            method: "thread/started".to_owned(),
+            params: json!({"thread": {"id": "provider-root"}}),
+            emitted_at_ms: 1_000,
+        })
+        .expect("root notification");
+    let reconciliation = timeout(Duration::from_secs(2), async {
+        next_codex_event_matching(&runtime, |event| {
+            event.native_event_id.as_deref() == Some("codex:reconciliation:0")
+        })
+        .await
+    })
+    .await
+    .expect("bounded reconciliation survives nested hint pressure");
+    let structural_count = reconciliation
+        .activity
+        .iter()
+        .filter(|mutation| !matches!(mutation, ProviderActivityMutation::AppendEntry(_)))
+        .count();
+    assert_eq!(structural_count, 230);
+    assert!(reconciliation.activity.len() <= 256);
+    assert!(!reconciliation.activity.iter().any(|mutation| matches!(
+        mutation,
+        ProviderActivityMutation::UpsertActor(actor)
+            if actor.id.starts_with("codex:thread:budget-nested-")
+    )));
+
+    runtime.shutdown().await.expect("runtime shuts down");
+    peer_task.await.expect("peer task");
+}
+
+#[tokio::test]
+async fn reconciliation_rejects_mismatched_and_foreign_parent_direct_reads() {
+    let (connection, _protocol_incoming, mut peer) = scripted_peer();
+    let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+    let runtime = CodexSessionRuntime::new(codex_activity_options(None), connection, incoming_rx);
+    peer.expect_request("initialize", fixture("initialize-params.json"))
+        .respond(json!({}));
+    peer.expect_notification("initialized");
+    peer.expect_request(
+        "thread/start",
+        json!({
+            "cwd": "/tmp/project",
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+            "model": "gpt-5.3-codex",
+            "serviceTier": null,
+        }),
+    )
+    .respond(json!({
+        "thread": {"id": "provider-root"},
+        "cwd": "/tmp/project",
+        "model": "gpt-5.3-codex"
+    }));
+    peer.expect_request(
+        "thread/read",
+        json!({"threadId": "provider-root", "includeTurns": true}),
+    )
+    .respond(json!({
+        "thread": {
+            "id": "provider-root",
+            "createdAt": 1,
+            "updatedAt": 3,
+            "status": {"type": "idle"},
+            "turns": [{
+                "id": "root-turn",
+                "status": "completed",
+                "startedAt": 1,
+                "completedAt": 3,
+                "items": [
+                    {
+                        "id": "spawn-mismatch",
+                        "type": "subAgentActivity",
+                        "agentThreadId": "mismatched-child",
+                        "agentPath": "/root/mismatch",
+                        "kind": "started"
+                    },
+                    {
+                        "id": "spawn-foreign",
+                        "type": "subAgentActivity",
+                        "agentThreadId": "foreign-parent-child",
+                        "agentPath": "/root/foreign",
+                        "kind": "started"
+                    }
+                ]
+            }]
+        }
+    }));
+    peer.expect_request(
+        "thread/list",
+        json!({"ancestorThreadId": "provider-root", "limit": 50}),
+    )
+    .respond(empty_thread_list_result());
+    peer.expect_request(
+        "thread/read",
+        json!({"threadId": "mismatched-child", "includeTurns": true}),
+    )
+    .respond(json!({
+        "thread": {
+            "id": "different-child",
+            "parentThreadId": "provider-root",
+            "createdAt": 2,
+            "updatedAt": 3,
+            "status": {"type": "notLoaded"},
+            "turns": [{
+                "id": "mismatched-turn",
+                "status": "completed",
+                "startedAt": 2,
+                "completedAt": 3,
+                "items": [{
+                    "id": "mismatched-result",
+                    "type": "agentMessage",
+                    "text": "foreign result"
+                }]
+            }]
+        }
+    }));
+    peer.expect_request(
+        "thread/read",
+        json!({"threadId": "foreign-parent-child", "includeTurns": true}),
+    )
+    .respond(json!({
+        "thread": {
+            "id": "foreign-parent-child",
+            "parentThreadId": "unrelated-root",
+            "createdAt": 2,
+            "updatedAt": 3,
+            "status": {"type": "notLoaded"},
+            "turns": [{
+                "id": "foreign-turn",
+                "status": "completed",
+                "startedAt": 2,
+                "completedAt": 3,
+                "items": [{
+                    "id": "foreign-result",
+                    "type": "agentMessage",
+                    "text": "foreign result"
+                }]
+            }]
+        }
+    }));
+    peer.expect_request(
+        "thread/backgroundTerminals/list",
+        json!({"threadId": "provider-root", "limit": 128}),
+    )
+    .respond(empty_background_terminal_list_result());
+    peer.expect_request("shutdown", Value::Null)
+        .respond(Value::Null);
+    let peer_task = tokio::spawn(peer.run());
+
+    runtime.start().await.expect("runtime starts");
+    runtime.collect_events(2).await;
+    incoming_tx
+        .send(IncomingEvent::Notification {
+            method: "thread/started".to_owned(),
+            params: json!({"thread": {"id": "provider-root"}}),
+            emitted_at_ms: 1_000,
+        })
+        .expect("root notification");
+    let reconciliation = next_codex_event_matching(&runtime, |event| {
+        event.native_event_id.as_deref() == Some("codex:reconciliation:0")
+    })
+    .await;
+    assert!(!reconciliation.activity.iter().any(|mutation| matches!(
+        mutation,
+        ProviderActivityMutation::AppendEntry(entry)
+            if entry.detail.as_deref() == Some("foreign result")
+    )));
+
+    runtime.shutdown().await.expect("runtime shuts down");
+    peer_task.await.expect("peer task");
+}
+
+#[tokio::test]
+async fn reconciliation_reconnect_fences_late_child_read_and_retries_pending_hint() {
+    let (connection_a, _protocol_incoming_a, mut peer_a) = scripted_peer();
+    let (incoming_tx_a, incoming_rx_a) = mpsc::unbounded_channel();
+    let runtime =
+        CodexSessionRuntime::new(codex_activity_options(None), connection_a, incoming_rx_a);
+    peer_a
+        .expect_request("initialize", fixture("initialize-params.json"))
+        .respond(json!({}));
+    peer_a.expect_notification("initialized");
+    peer_a
+        .expect_request(
+            "thread/start",
+            json!({
+                "cwd": "/tmp/project",
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+                "model": "gpt-5.3-codex",
+                "serviceTier": null,
+            }),
+        )
+        .respond(json!({
+            "thread": {"id": "provider-root"},
+            "cwd": "/tmp/project",
+            "model": "gpt-5.3-codex"
+        }));
+    peer_a
+        .expect_request(
+            "thread/read",
+            json!({"threadId": "provider-root", "includeTurns": true}),
+        )
+        .respond(json!({
+            "thread": {
+                "id": "provider-root",
+                "createdAt": 1,
+                "updatedAt": 2,
+                "status": {"type": "idle"},
+                "turns": [{
+                    "id": "root-turn",
+                    "status": "completed",
+                    "startedAt": 1,
+                    "completedAt": 2,
+                    "items": [{
+                        "id": "spawn-late",
+                        "type": "subAgentActivity",
+                        "agentThreadId": "late-child",
+                        "agentPath": "/root/late",
+                        "kind": "started"
+                    }]
+                }]
+            }
+        }));
+    peer_a
+        .expect_request(
+            "thread/list",
+            json!({"ancestorThreadId": "provider-root", "limit": 50}),
+        )
+        .respond(empty_thread_list_result());
+    let (late_read_seen_tx, late_read_seen_rx) = oneshot::channel();
+    let (release_late_read_tx, release_late_read_rx) = oneshot::channel();
+    peer_a
+        .expect_request(
+            "thread/read",
+            json!({"threadId": "late-child", "includeTurns": true}),
+        )
+        .pause_response(late_read_seen_tx, release_late_read_rx)
+        .respond(json!({
+            "thread": {
+                "id": "late-child",
+                "parentThreadId": "provider-root",
+                "createdAt": 2,
+                "updatedAt": 3,
+                "status": {"type": "notLoaded"},
+                "turns": [{
+                    "id": "late-turn",
+                    "status": "completed",
+                    "startedAt": 2,
+                    "completedAt": 3,
+                    "items": [{
+                        "id": "late-result",
+                        "type": "agentMessage",
+                        "text": "late stale result"
+                    }]
+                }]
+            }
+        }));
+    let old_peer_task = tokio::spawn(peer_a.run());
+
+    runtime.start().await.expect("initial runtime starts");
+    runtime.collect_events(2).await;
+    incoming_tx_a
+        .send(IncomingEvent::Notification {
+            method: "thread/started".to_owned(),
+            params: json!({"thread": {"id": "provider-root"}}),
+            emitted_at_ms: 1_000,
+        })
+        .expect("initial root notification");
+    timeout(Duration::from_secs(1), late_read_seen_rx)
+        .await
+        .expect("late child read begins")
+        .expect("late child read signal");
+
+    let (connection_b, _protocol_incoming_b, mut peer_b) = scripted_peer();
+    let (_incoming_tx_b, incoming_rx_b) = mpsc::unbounded_channel();
+    peer_b
+        .expect_request("initialize", fixture("initialize-params.json"))
+        .respond(json!({}));
+    peer_b.expect_notification("initialized");
+    peer_b
+        .expect_request(
+            "thread/resume",
+            json!({
+                "threadId": "provider-root",
+                "cwd": "/tmp/project",
+                "approvalPolicy": "never",
+                "sandbox": "danger-full-access",
+                "model": "gpt-5.3-codex",
+                "serviceTier": null,
+            }),
+        )
+        .respond(json!({
+            "thread": {"id": "provider-root"},
+            "cwd": "/tmp/project",
+            "model": "gpt-5.3-codex"
+        }));
+    peer_b
+        .expect_request(
+            "thread/read",
+            json!({"threadId": "provider-root", "includeTurns": true}),
+        )
+        .respond(empty_root_thread_read_result());
+    peer_b
+        .expect_request(
+            "thread/list",
+            json!({"ancestorThreadId": "provider-root", "limit": 50}),
+        )
+        .respond(empty_thread_list_result());
+    peer_b
+        .expect_request(
+            "thread/read",
+            json!({"threadId": "late-child", "includeTurns": true}),
+        )
+        .respond(json!({
+            "thread": {
+                "id": "late-child",
+                "parentThreadId": "provider-root",
+                "createdAt": 2,
+                "updatedAt": 4,
+                "status": {"type": "notLoaded"},
+                "turns": [{
+                    "id": "current-turn",
+                    "status": "completed",
+                    "startedAt": 2,
+                    "completedAt": 4,
+                    "items": [{
+                        "id": "current-result",
+                        "type": "agentMessage",
+                        "text": "current result"
+                    }]
+                }]
+            }
+        }));
+    peer_b
+        .expect_request(
+            "thread/backgroundTerminals/list",
+            json!({"threadId": "provider-root", "limit": 128}),
+        )
+        .respond(empty_background_terminal_list_result());
+    peer_b
+        .expect_request("shutdown", Value::Null)
+        .respond(Value::Null);
+    let new_peer_task = tokio::spawn(peer_b.run());
+
+    runtime
+        .reconnect(connection_b, incoming_rx_b)
+        .await
+        .expect("runtime reconnects");
+    runtime.collect_events(2).await;
+    release_late_read_tx
+        .send(())
+        .expect("release stale child response after epoch replacement");
+    let reconciliation = next_codex_event_matching(&runtime, |event| {
+        event.native_event_id.as_deref() == Some("codex:reconciliation:0")
+    })
+    .await;
+    assert!(reconciliation.activity.iter().any(|mutation| matches!(
+        mutation,
+        ProviderActivityMutation::AppendEntry(entry)
+            if entry.detail.as_deref() == Some("current result")
+    )));
+    assert!(!reconciliation.activity.iter().any(|mutation| matches!(
+        mutation,
+        ProviderActivityMutation::AppendEntry(entry)
+            if entry.detail.as_deref() == Some("late stale result")
+    )));
+
+    runtime.shutdown().await.expect("runtime shuts down");
+    old_peer_task.await.expect("old peer task");
+    new_peer_task.await.expect("new peer task");
 }
 
 #[tokio::test]
@@ -3707,6 +4954,13 @@ async fn root_turn_completion_dedupes_recovery_and_recovers_eventual_nested_desc
                     }
                 }
                 "thread/read" => match message["params"]["threadId"].as_str() {
+                    Some("provider-root") => {
+                        assert_eq!(
+                            message["params"],
+                            json!({"threadId": "provider-root", "includeTurns": true})
+                        );
+                        empty_root_thread_read_result()
+                    }
                     Some("child-direct") => {
                         direct_read_count += 1;
                         match direct_read_count {
@@ -3994,6 +5248,13 @@ async fn reconciliation_bursty_collaboration_hints_coalesce_into_one_debounced_p
                     "nextCursor": null,
                     "backwardsCursor": null
                 }),
+                "thread/read" => {
+                    assert_eq!(
+                        message["params"],
+                        json!({"threadId": "provider-root", "includeTurns": true})
+                    );
+                    empty_root_thread_read_result()
+                }
                 "thread/backgroundTerminals/list" => {
                     json!({"data": [], "nextCursor": null})
                 }
@@ -4131,6 +5392,11 @@ async fn reconciliation_repairs_missed_history_and_official_background_terminals
         "cwd": "/tmp/project",
         "model": "gpt-5.3-codex"
     }));
+    peer.expect_request(
+        "thread/read",
+        json!({"threadId": "provider-root", "includeTurns": true}),
+    )
+    .respond(empty_root_thread_read_result());
     peer.expect_request(
         "thread/list",
         json!({"ancestorThreadId": "provider-root", "limit": 50}),
@@ -4310,6 +5576,11 @@ async fn reconciliation_background_method_downgrade_isolated_and_warned_once() {
         "model": "gpt-5.3-codex"
     }));
     peer.expect_request(
+        "thread/read",
+        json!({"threadId": "provider-root", "includeTurns": true}),
+    )
+    .respond(empty_root_thread_read_result());
+    peer.expect_request(
         "thread/list",
         json!({"ancestorThreadId": "provider-root", "limit": 50}),
     )
@@ -4327,6 +5598,11 @@ async fn reconciliation_background_method_downgrade_isolated_and_warned_once() {
         "message": "Method not found",
         "data": null
     }));
+    peer.expect_request(
+        "thread/read",
+        json!({"threadId": "provider-root", "includeTurns": true}),
+    )
+    .respond(empty_root_thread_read_result());
     peer.expect_request(
         "thread/list",
         json!({"ancestorThreadId": "provider-root", "limit": 50}),
@@ -4383,7 +5659,7 @@ async fn reconciliation_background_method_downgrade_isolated_and_warned_once() {
                     && capabilities.attributed_activity
                     && !capabilities.background_work
                     && capabilities.history_recovery
-                        == bibcode_server::activity::ActivityHistoryRecovery::Bounded
+                        == bibcode_server::activity::ActivityHistoryRecovery::Full
             ))
     );
     assert!(
@@ -4493,6 +5769,19 @@ async fn reconciliation_never_advertises_full_before_thread_read_is_proven() {
         "model": "gpt-5.3-codex"
     }));
     peer.expect_request(
+        "thread/read",
+        json!({"threadId": "provider-root", "includeTurns": true}),
+    )
+    .respond(json!({
+        "thread": {
+            "id": "wrong-root",
+            "createdAt": 1,
+            "updatedAt": 1,
+            "status": {"type": "idle"},
+            "turns": []
+        }
+    }));
+    peer.expect_request(
         "thread/list",
         json!({"ancestorThreadId": "provider-root", "limit": 50}),
     )
@@ -4507,6 +5796,15 @@ async fn reconciliation_never_advertises_full_before_thread_read_is_proven() {
     )
     .respond(json!({"data": [], "nextCursor": null}));
     peer.expect_request(
+        "thread/read",
+        json!({"threadId": "provider-root", "includeTurns": true}),
+    )
+    .respond_error(json!({
+        "code": -32601,
+        "message": "Method not found",
+        "data": null
+    }));
+    peer.expect_request(
         "thread/list",
         json!({"ancestorThreadId": "provider-root", "limit": 50}),
     )
@@ -4520,15 +5818,6 @@ async fn reconciliation_never_advertises_full_before_thread_read_is_proven() {
         }],
         "nextCursor": null,
         "backwardsCursor": null
-    }));
-    peer.expect_request(
-        "thread/read",
-        json!({"threadId": "child-read-unsupported", "includeTurns": true}),
-    )
-    .respond_error(json!({
-        "code": -32601,
-        "message": "Method not found",
-        "data": null
     }));
     peer.expect_request(
         "thread/backgroundTerminals/list",
@@ -4670,6 +5959,24 @@ async fn reconciliation_wrong_thread_read_does_not_prove_support_or_apply_histor
             "Correct thread history",
         ),
     ] {
+        let root_response_thread_id = if response_thread_id == "different-child" {
+            "wrong-root"
+        } else {
+            "provider-root"
+        };
+        peer.expect_request(
+            "thread/read",
+            json!({"threadId": "provider-root", "includeTurns": true}),
+        )
+        .respond(json!({
+            "thread": {
+                "id": root_response_thread_id,
+                "createdAt": 1,
+                "updatedAt": 1,
+                "status": {"type": "idle"},
+                "turns": []
+            }
+        }));
         peer.expect_request(
             "thread/list",
             json!({"ancestorThreadId": "provider-root", "limit": 50}),
@@ -4867,6 +6174,13 @@ async fn reconciliation_read_schema_incompatibility_degrades_history_to_bounded(
         "model": "gpt-5.3-codex"
     }));
     for pass in 0..2 {
+        if pass == 0 {
+            peer.expect_request(
+                "thread/read",
+                json!({"threadId": "provider-root", "includeTurns": true}),
+            )
+            .respond(json!({"unexpected": "schema"}));
+        }
         peer.expect_request(
             "thread/list",
             json!({"ancestorThreadId": "provider-root", "limit": 50}),
@@ -4882,13 +6196,6 @@ async fn reconciliation_read_schema_incompatibility_degrades_history_to_bounded(
             "nextCursor": null,
             "backwardsCursor": null
         }));
-        if pass == 0 {
-            peer.expect_request(
-                "thread/read",
-                json!({"threadId": "child-schema", "includeTurns": true}),
-            )
-            .respond(json!({"unexpected": "schema"}));
-        }
         peer.expect_request(
             "thread/backgroundTerminals/list",
             json!({"threadId": "provider-root", "limit": 128}),
@@ -5000,7 +6307,7 @@ async fn reconciliation_read_schema_incompatibility_degrades_history_to_bounded(
 }
 
 #[tokio::test]
-async fn reconciliation_list_method_not_found_degrades_history_to_none_only() {
+async fn reconciliation_list_method_not_found_keeps_bounded_root_read_recovery() {
     let (connection, _protocol_incoming, mut peer) = scripted_peer();
     let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
     let runtime = CodexSessionRuntime::new(
@@ -5036,6 +6343,11 @@ async fn reconciliation_list_method_not_found_degrades_history_to_none_only() {
         "model": "gpt-5.3-codex"
     }));
     peer.expect_request(
+        "thread/read",
+        json!({"threadId": "provider-root", "includeTurns": true}),
+    )
+    .respond(empty_root_thread_read_result());
+    peer.expect_request(
         "thread/list",
         json!({"ancestorThreadId": "provider-root", "limit": 50}),
     )
@@ -5044,13 +6356,21 @@ async fn reconciliation_list_method_not_found_degrades_history_to_none_only() {
         "message": "Method not found",
         "data": null
     }));
-    for _ in 0..2 {
-        peer.expect_request(
-            "thread/backgroundTerminals/list",
-            json!({"threadId": "provider-root", "limit": 128}),
-        )
-        .respond(json!({"data": [], "nextCursor": null}));
-    }
+    peer.expect_request(
+        "thread/backgroundTerminals/list",
+        json!({"threadId": "provider-root", "limit": 128}),
+    )
+    .respond(json!({"data": [], "nextCursor": null}));
+    peer.expect_request(
+        "thread/read",
+        json!({"threadId": "provider-root", "includeTurns": true}),
+    )
+    .respond(empty_root_thread_read_result());
+    peer.expect_request(
+        "thread/backgroundTerminals/list",
+        json!({"threadId": "provider-root", "limit": 128}),
+    )
+    .respond(json!({"data": [], "nextCursor": null}));
     peer.expect_request("shutdown", Value::Null)
         .respond(Value::Null);
     let peer_task = tokio::spawn(peer.run());
@@ -5098,7 +6418,7 @@ async fn reconciliation_list_method_not_found_degrades_history_to_none_only() {
                     && capabilities.attributed_activity
                     && capabilities.background_work
                     && capabilities.history_recovery
-                        == bibcode_server::activity::ActivityHistoryRecovery::None
+                        == bibcode_server::activity::ActivityHistoryRecovery::Bounded
             ))
     );
 
@@ -5133,7 +6453,7 @@ async fn reconciliation_list_method_not_found_degrades_history_to_none_only() {
                 mutation,
                 ProviderActivityMutation::SetScope { capabilities, .. }
                     if capabilities.history_recovery
-                        == bibcode_server::activity::ActivityHistoryRecovery::None
+                        == bibcode_server::activity::ActivityHistoryRecovery::Bounded
             ))
     );
     assert!(
@@ -5192,8 +6512,8 @@ async fn reconciliation_reconnect_cancels_old_pass_and_runs_one_immediate_repair
             }),
         )
         .await;
-        let list = read_scripted_message(&mut reader, &mut writer).await;
-        let _ = old_list_tx.send(list);
+        let root_read = read_scripted_message(&mut reader, &mut writer).await;
+        let _ = old_list_tx.send(root_read);
         std::future::pending::<()>().await;
     });
 
@@ -5210,7 +6530,11 @@ async fn reconciliation_reconnect_cancels_old_pass_and_runs_one_immediate_repair
         .await
         .expect("old pass starts")
         .expect("old list request");
-    assert_eq!(old_list["method"], "thread/list");
+    assert_eq!(old_list["method"], "thread/read");
+    assert_eq!(
+        old_list["params"],
+        json!({"threadId": "provider-root", "includeTurns": true})
+    );
 
     let (connection_b, _protocol_incoming_b, mut peer_b) = scripted_peer();
     let (_incoming_tx_b, incoming_rx_b) = mpsc::unbounded_channel();
@@ -5235,6 +6559,12 @@ async fn reconciliation_reconnect_cancels_old_pass_and_runs_one_immediate_repair
             "cwd": "/tmp/project",
             "model": "gpt-5.3-codex"
         }));
+    peer_b
+        .expect_request(
+            "thread/read",
+            json!({"threadId": "provider-root", "includeTurns": true}),
+        )
+        .respond(empty_root_thread_read_result());
     peer_b
         .expect_request(
             "thread/list",
@@ -5271,7 +6601,7 @@ async fn reconciliation_reconnect_cancels_old_pass_and_runs_one_immediate_repair
             capabilities,
             observation_state: ActivityObservationState::Live,
         } if capabilities.history_recovery
-                == bibcode_server::activity::ActivityHistoryRecovery::Bounded
+                == bibcode_server::activity::ActivityHistoryRecovery::Full
             && capabilities.background_work
     )));
 
@@ -5279,6 +6609,222 @@ async fn reconciliation_reconnect_cancels_old_pass_and_runs_one_immediate_repair
     new_peer_task.await.expect("new peer task");
     old_peer_task.abort();
     let _ = old_peer_task.await;
+}
+
+#[tokio::test]
+async fn reconciliation_initial_transport_failure_publishes_bounded_history() {
+    let (connection, _protocol_incoming, peer) = scripted_peer();
+    let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+    let runtime = CodexSessionRuntime::new(
+        codex_activity_options(Some("provider-root")),
+        connection,
+        incoming_rx,
+    );
+    let peer_task = tokio::spawn(async move {
+        let mut reader = BufReader::new(peer.stdin);
+        let mut writer = peer.stdout;
+        let initialize = read_scripted_message(&mut reader, &mut writer).await;
+        assert_eq!(initialize["method"], "initialize");
+        write_json(
+            &mut writer,
+            json!({"id": initialize["id"].clone(), "result": {}}),
+        )
+        .await;
+        assert_eq!(
+            read_scripted_message(&mut reader, &mut writer).await["method"],
+            "initialized"
+        );
+        let resume = read_scripted_message(&mut reader, &mut writer).await;
+        assert_eq!(resume["method"], "thread/resume");
+        write_json(
+            &mut writer,
+            json!({
+                "id": resume["id"].clone(),
+                "result": {
+                    "thread": {"id": "provider-root"},
+                    "cwd": "/tmp/project",
+                    "model": "gpt-5.3-codex"
+                }
+            }),
+        )
+        .await;
+        let root_read = read_scripted_message(&mut reader, &mut writer).await;
+        assert_eq!(root_read["method"], "thread/read");
+        assert_eq!(
+            root_read["params"],
+            json!({"threadId": "provider-root", "includeTurns": true})
+        );
+        drop(writer);
+    });
+
+    runtime.start().await.expect("runtime starts");
+    runtime.collect_events(2).await;
+    incoming_tx
+        .send(IncomingEvent::Notification {
+            method: "thread/started".to_owned(),
+            params: json!({"thread": {"id": "provider-root"}}),
+            emitted_at_ms: 1_000,
+        })
+        .expect("root notification");
+    let stale = next_codex_event_matching(&runtime, |event| {
+        event.native_event_id.as_deref() == Some("codex:reconciliation:0")
+    })
+    .await;
+    assert!(stale.activity.iter().any(|mutation| matches!(
+        mutation,
+        ProviderActivityMutation::SetScope {
+            capabilities,
+            observation_state: ActivityObservationState::Stale,
+        } if capabilities.history_recovery
+            == bibcode_server::activity::ActivityHistoryRecovery::Bounded
+    )));
+
+    peer_task.await.expect("peer task");
+    let _ = runtime.shutdown().await;
+}
+
+#[tokio::test]
+async fn reconciliation_read_downgrade_before_transport_failure_publishes_bounded_history() {
+    let (connection, _protocol_incoming, peer) = scripted_peer();
+    let (incoming_tx, incoming_rx) = mpsc::unbounded_channel();
+    let runtime = CodexSessionRuntime::new(
+        codex_activity_options(Some("provider-root")),
+        connection,
+        incoming_rx,
+    );
+    let peer_task = tokio::spawn(async move {
+        let mut reader = BufReader::new(peer.stdin);
+        let mut writer = peer.stdout;
+        let initialize = read_scripted_message(&mut reader, &mut writer).await;
+        write_json(
+            &mut writer,
+            json!({"id": initialize["id"].clone(), "result": {}}),
+        )
+        .await;
+        assert_eq!(
+            read_scripted_message(&mut reader, &mut writer).await["method"],
+            "initialized"
+        );
+        let resume = read_scripted_message(&mut reader, &mut writer).await;
+        write_json(
+            &mut writer,
+            json!({
+                "id": resume["id"].clone(),
+                "result": {
+                    "thread": {"id": "provider-root"},
+                    "cwd": "/tmp/project",
+                    "model": "gpt-5.3-codex"
+                }
+            }),
+        )
+        .await;
+        let root_read = read_scripted_message(&mut reader, &mut writer).await;
+        assert_eq!(root_read["method"], "thread/read");
+        write_json(
+            &mut writer,
+            json!({
+                "id": root_read["id"].clone(),
+                "result": empty_root_thread_read_result()
+            }),
+        )
+        .await;
+        let list = read_scripted_message(&mut reader, &mut writer).await;
+        assert_eq!(list["method"], "thread/list");
+        write_json(
+            &mut writer,
+            json!({"id": list["id"].clone(), "result": empty_thread_list_result()}),
+        )
+        .await;
+        let background = read_scripted_message(&mut reader, &mut writer).await;
+        assert_eq!(background["method"], "thread/backgroundTerminals/list");
+        write_json(
+            &mut writer,
+            json!({
+                "id": background["id"].clone(),
+                "result": empty_background_terminal_list_result()
+            }),
+        )
+        .await;
+
+        let incompatible_read = read_scripted_message(&mut reader, &mut writer).await;
+        assert_eq!(incompatible_read["method"], "thread/read");
+        write_json(
+            &mut writer,
+            json!({
+                "id": incompatible_read["id"].clone(),
+                "error": {"code": -32601, "message": "Method not found", "data": null}
+            }),
+        )
+        .await;
+        let retry_list = read_scripted_message(&mut reader, &mut writer).await;
+        assert_eq!(retry_list["method"], "thread/list");
+        write_json(
+            &mut writer,
+            json!({"id": retry_list["id"].clone(), "result": empty_thread_list_result()}),
+        )
+        .await;
+        let failed_background = read_scripted_message(&mut reader, &mut writer).await;
+        assert_eq!(
+            failed_background["method"],
+            "thread/backgroundTerminals/list"
+        );
+        drop(writer);
+    });
+
+    runtime.start().await.expect("runtime starts");
+    runtime.collect_events(2).await;
+    incoming_tx
+        .send(IncomingEvent::Notification {
+            method: "thread/started".to_owned(),
+            params: json!({"thread": {"id": "provider-root"}}),
+            emitted_at_ms: 1_000,
+        })
+        .expect("root notification");
+    let initial = next_codex_event_matching(&runtime, |event| {
+        event.native_event_id.as_deref() == Some("codex:reconciliation:0")
+    })
+    .await;
+    assert!(initial.activity.iter().any(|mutation| matches!(
+        mutation,
+        ProviderActivityMutation::SetScope { capabilities, .. }
+            if capabilities.history_recovery
+                == bibcode_server::activity::ActivityHistoryRecovery::Full
+    )));
+
+    incoming_tx
+        .send(IncomingEvent::Notification {
+            method: "item/started".to_owned(),
+            params: json!({
+                "threadId": "provider-root",
+                "turnId": "root-turn",
+                "item": {
+                    "id": "capability-retry-hint",
+                    "type": "collabAgentToolCall",
+                    "tool": "wait",
+                    "status": "completed",
+                    "senderThreadId": "provider-root",
+                    "receiverThreadIds": ["capability-child"],
+                    "agentsStates": {}
+                }
+            }),
+            emitted_at_ms: 1_001,
+        })
+        .expect("follow-up reconciliation hint");
+    let stale = next_codex_event_matching(&runtime, |event| {
+        event.native_event_id.as_deref() == Some("codex:reconciliation:1")
+    })
+    .await;
+    assert!(stale.activity.iter().any(|mutation| matches!(
+        mutation,
+        ProviderActivityMutation::SetScope {
+            capabilities,
+            observation_state: ActivityObservationState::Stale,
+        } if capabilities.history_recovery
+            == bibcode_server::activity::ActivityHistoryRecovery::Bounded
+    )));
+
+    peer_task.await.expect("peer task");
+    let _ = runtime.shutdown().await;
 }
 
 #[tokio::test]
@@ -5325,6 +6871,20 @@ async fn reconciliation_transport_loss_marks_stale_and_preserves_capabilities_un
             }),
         )
         .await;
+        let root_read = read_scripted_message(&mut reader, &mut writer).await;
+        assert_eq!(root_read["method"], "thread/read");
+        assert_eq!(
+            root_read["params"],
+            json!({"threadId": "provider-root", "includeTurns": true})
+        );
+        write_json(
+            &mut writer,
+            json!({
+                "id": root_read["id"].clone(),
+                "result": empty_root_thread_read_result()
+            }),
+        )
+        .await;
         let first_list = read_scripted_message(&mut reader, &mut writer).await;
         assert_eq!(first_list["method"], "thread/list");
         write_json(
@@ -5346,6 +6906,20 @@ async fn reconciliation_transport_loss_marks_stale_and_preserves_capabilities_un
             json!({
                 "id": background["id"].clone(),
                 "result": {"data": [], "nextCursor": null}
+            }),
+        )
+        .await;
+        let retry_root_read = read_scripted_message(&mut reader, &mut writer).await;
+        assert_eq!(retry_root_read["method"], "thread/read");
+        assert_eq!(
+            retry_root_read["params"],
+            json!({"threadId": "provider-root", "includeTurns": true})
+        );
+        write_json(
+            &mut writer,
+            json!({
+                "id": retry_root_read["id"].clone(),
+                "result": empty_root_thread_read_result()
             }),
         )
         .await;
@@ -5376,7 +6950,7 @@ async fn reconciliation_transport_loss_marks_stale_and_preserves_capabilities_un
                 ProviderActivityMutation::SetScope { capabilities, .. }
                     if capabilities.background_work
                         && capabilities.history_recovery
-                            == bibcode_server::activity::ActivityHistoryRecovery::Bounded
+                            == bibcode_server::activity::ActivityHistoryRecovery::Full
             ))
     );
 
@@ -5410,7 +6984,7 @@ async fn reconciliation_transport_loss_marks_stale_and_preserves_capabilities_un
             observation_state: ActivityObservationState::Stale,
         } if capabilities.background_work
             && capabilities.history_recovery
-                == bibcode_server::activity::ActivityHistoryRecovery::Bounded
+                == bibcode_server::activity::ActivityHistoryRecovery::Full
     )));
     assert!(!stale.activity.iter().any(|mutation| matches!(
         mutation,
@@ -5442,6 +7016,12 @@ async fn reconciliation_transport_loss_marks_stale_and_preserves_capabilities_un
             "cwd": "/tmp/project",
             "model": "gpt-5.3-codex"
         }));
+    peer_b
+        .expect_request(
+            "thread/read",
+            json!({"threadId": "provider-root", "includeTurns": true}),
+        )
+        .respond(empty_root_thread_read_result());
     peer_b
         .expect_request(
             "thread/list",
@@ -5519,6 +7099,11 @@ async fn reconciliation_bounds_final_batch_and_retains_newest_multi_child_histor
         "cwd": "/tmp/project",
         "model": "gpt-5.3-codex"
     }));
+    peer.expect_request(
+        "thread/read",
+        json!({"threadId": "provider-root", "includeTurns": true}),
+    )
+    .respond(empty_root_thread_read_result());
     peer.expect_request(
         "thread/list",
         json!({"ancestorThreadId": "provider-root", "limit": 50}),
@@ -5821,6 +7406,13 @@ async fn reconciliation_page_ceiling_keeps_omitted_background_work_running() {
                     "cwd": "/tmp/project",
                     "model": "gpt-5.3-codex"
                 }),
+                "thread/read" => {
+                    assert_eq!(
+                        request["params"],
+                        json!({"threadId": "provider-root", "includeTurns": true})
+                    );
+                    empty_root_thread_read_result()
+                }
                 "thread/list" => {
                     let request_count = {
                         let mut counts = peer_request_counts.lock().expect("request counts");
@@ -6051,6 +7643,16 @@ async fn assert_partial_background_pages_preserve_running_work(
                         "model": "gpt-5.3-codex"
                     }
                 }),
+                "thread/read" => {
+                    assert_eq!(
+                        request["params"],
+                        json!({"threadId": "provider-root", "includeTurns": true})
+                    );
+                    json!({
+                        "id": request["id"].clone(),
+                        "result": empty_root_thread_read_result()
+                    })
+                }
                 "thread/list" => json!({
                     "id": request["id"].clone(),
                     "result": {
@@ -6298,9 +7900,15 @@ async fn reconciliation_invalid_rows_do_not_consume_accepted_record_budgets() {
                         })
                     }
                 }
-                "thread/read" => {
-                    assert_eq!(request["params"]["threadId"], "accepted-child");
-                    json!({
+                "thread/read" => match request["params"]["threadId"].as_str() {
+                    Some("provider-root") => {
+                        assert_eq!(
+                            request["params"],
+                            json!({"threadId": "provider-root", "includeTurns": true})
+                        );
+                        empty_root_thread_read_result()
+                    }
+                    Some("accepted-child") => json!({
                         "thread": {
                             "id": "accepted-child",
                             "parentThreadId": "provider-root",
@@ -6309,8 +7917,9 @@ async fn reconciliation_invalid_rows_do_not_consume_accepted_record_budgets() {
                             "status": {"type": "idle"},
                             "turns": []
                         }
-                    })
-                }
+                    }),
+                    other => panic!("unexpected accepted-budget read target {other:?}"),
+                },
                 "thread/backgroundTerminals/list" => {
                     let request_count = {
                         let mut counts = peer_request_counts.lock().expect("request counts");
@@ -6435,6 +8044,11 @@ async fn reconciliation_background_pagination_skips_empty_pages_and_stops_at_128
         "cwd": "/tmp/project",
         "model": "gpt-5.3-codex"
     }));
+    peer.expect_request(
+        "thread/read",
+        json!({"threadId": "provider-root", "includeTurns": true}),
+    )
+    .respond(empty_root_thread_read_result());
     peer.expect_request(
         "thread/list",
         json!({"ancestorThreadId": "provider-root", "limit": 50}),
@@ -6615,6 +8229,12 @@ async fn activity_runtime_reconnect_and_shutdown_drop_stale_incoming_work() {
         }));
     peer_b
         .expect_request(
+            "thread/read",
+            json!({"threadId": "provider-thread-1", "includeTurns": true}),
+        )
+        .respond(empty_thread_read_result("provider-thread-1"));
+    peer_b
+        .expect_request(
             "thread/list",
             json!({"ancestorThreadId": "provider-thread-1", "limit": 50}),
         )
@@ -6775,6 +8395,12 @@ async fn reconnect_resume_fallback_and_shutdown_stay_correlated() {
         .respond(reconnect_fixture["fallbackThreadStartResponse"].clone());
     peer_b
         .expect_request(
+            "thread/read",
+            json!({"threadId": "provider-thread-2", "includeTurns": true}),
+        )
+        .respond(empty_thread_read_result("provider-thread-2"));
+    peer_b
+        .expect_request(
             "thread/list",
             json!({"ancestorThreadId": "provider-thread-2", "limit": 50}),
         )
@@ -6912,6 +8538,11 @@ async fn codex_runtime_covers_auto_edit_resume_requests_and_stream_edges() {
         "method": "thread/started",
         "params": { "thread": { "id": "provider-updated" } }
     }));
+    peer.expect_request(
+        "thread/read",
+        json!({"threadId": "provider-updated", "includeTurns": true}),
+    )
+    .respond(empty_thread_read_result("provider-updated"));
     peer.expect_request(
         "thread/list",
         json!({"ancestorThreadId": "provider-updated", "limit": 50}),
@@ -7303,6 +8934,47 @@ fn codex_invalid_options(resume_cursor: Option<&str>) -> CodexSessionOptions {
         effort: None,
         resume_cursor: resume_cursor.map(str::to_owned),
     }
+}
+
+fn codex_activity_options(resume_cursor: Option<&str>) -> CodexSessionOptions {
+    CodexSessionOptions {
+        version: "0.1.1".to_owned(),
+        thread_id: "fixture-thread".to_owned(),
+        cwd: "/tmp/project".to_owned(),
+        runtime_mode: CodexRuntimeMode::FullAccess,
+        model: Some("gpt-5.3-codex".to_owned()),
+        service_tier: None,
+        effort: None,
+        resume_cursor: resume_cursor.map(str::to_owned),
+    }
+}
+
+fn empty_root_thread_read_result() -> Value {
+    empty_thread_read_result("provider-root")
+}
+
+fn empty_thread_read_result(thread_id: &str) -> Value {
+    json!({
+        "thread": {
+            "id": thread_id,
+            "createdAt": 1,
+            "updatedAt": 1,
+            "status": {"type": "idle"},
+            "turns": []
+        }
+    })
+}
+
+fn empty_thread_list_result() -> Value {
+    json!({
+        "data": [],
+        "nextCursor": null,
+        "backwardsCursor": null
+    })
+}
+
+fn empty_background_terminal_list_result() -> Value {
+    json!({"data": [], "nextCursor": null})
 }
 
 fn codex_edge_turn_params(provider_thread_id: &str, prompt: &str) -> Value {

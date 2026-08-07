@@ -1786,6 +1786,7 @@ interface ThreadTerminalPanelProps {
   terminalGroups: ThreadTerminalGroup[];
   activeTerminalGroupId: string;
   focusRequestId: number;
+  focusEligible?: boolean;
   onSplitTerminal?: (() => void) | undefined;
   onSplitTerminalVertical?: (() => void) | undefined;
   onNewTerminal?: (() => void) | undefined;
@@ -1847,6 +1848,7 @@ export default function ThreadTerminalPanel({
   terminalGroups,
   activeTerminalGroupId,
   focusRequestId,
+  focusEligible = true,
   onSplitTerminal,
   onSplitTerminalVertical,
   onNewTerminal,
@@ -2165,7 +2167,7 @@ export default function ThreadTerminalPanel({
                           onSessionExited={() => onCloseTerminal(terminalId)}
                           onAddTerminalContext={onAddTerminalContext}
                           focusRequestId={focusRequestId}
-                          autoFocus={terminalId === resolvedActiveTerminalId}
+                          autoFocus={focusEligible && terminalId === resolvedActiveTerminalId}
                           resizeEpoch={0}
                           keybindings={keybindings}
                         />
@@ -2197,7 +2199,7 @@ export default function ThreadTerminalPanel({
                   onSessionExited={() => onCloseTerminal(resolvedActiveTerminalId)}
                   onAddTerminalContext={onAddTerminalContext}
                   focusRequestId={focusRequestId}
-                  autoFocus
+                  autoFocus={focusEligible}
                   resizeEpoch={0}
                   keybindings={keybindings}
                 />

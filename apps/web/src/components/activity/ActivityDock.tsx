@@ -435,10 +435,10 @@ export function ActivityDock({
                 aria-label={`Open Subagents: ${subagentActive} active, ${subagentDone} done${
                   subagentSectionState === null ? "" : `. Status: ${subagentSectionState}`
                 }`}
-                className="h-auto min-h-9 w-full justify-start px-2 py-1.5 text-left"
+                className="w-full justify-start px-2 py-1.5 text-left"
                 data-activity-section="subagents"
                 onClick={() => openSection("subagents")}
-                size="sm"
+                size="content"
                 variant="ghost"
               >
                 <BotIcon aria-hidden="true" className="size-4" />
@@ -490,10 +490,10 @@ export function ActivityDock({
                 aria-label={`Open Background tasks: ${backgroundActive} active, ${backgroundDone} done${
                   backgroundSectionState === null ? "" : `. Status: ${backgroundSectionState}`
                 }`}
-                className="h-auto min-h-9 w-full justify-start px-2 py-1.5 text-left"
+                className="w-full justify-start px-2 py-1.5 text-left"
                 data-activity-section="backgroundTasks"
                 onClick={() => openSection("backgroundTasks")}
-                size="sm"
+                size="content"
                 variant="ghost"
               >
                 <ListTodoIcon aria-hidden="true" className="size-4" />

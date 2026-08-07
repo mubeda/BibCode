@@ -51,6 +51,10 @@ panel and are deleted when their tab closes.
 Tabs persist across reloads. The host chat remains mounted while another center
 tab is active, so its transcript, scroll state, and composer state are preserved.
 
+Only the focused center pane may programmatically focus its terminal. Moving
+focus to a chat pane leaves visible terminals mounted but prevents them from
+reclaiming keyboard input until the user explicitly activates a terminal again.
+
 Use `Cmd+J` on macOS or `Ctrl+J` elsewhere to create and focus a terminal tab in
 the focused center pane. When a center terminal owns focus, `Cmd/Ctrl+N` creates
 another terminal tab, `Cmd/Ctrl+D` creates a terminal in a new right-hand center
