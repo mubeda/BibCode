@@ -4,7 +4,7 @@ mod tests {
         path::Path,
         sync::{
             Arc,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -232,6 +232,75 @@ mod tests {
         )
     }
 
+    async fn mutable_npm_registry_fixture(
+        version: &str,
+    ) -> (Url, Arc<tokio::sync::RwLock<String>>, Arc<AtomicUsize>) {
+        let version = Arc::new(tokio::sync::RwLock::new(version.to_owned()));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let state = (version.clone(), requests.clone());
+        let app = Router::new()
+            .route(
+                "/{*path}",
+                get(
+                    |State((version, requests)): State<(
+                        Arc<tokio::sync::RwLock<String>>,
+                        Arc<AtomicUsize>,
+                    )>| async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        Json(json!({ "version": version.read().await.clone() }))
+                    },
+                ),
+            )
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("registry listener");
+        let address = listener.local_addr().expect("registry address");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("registry server") });
+        (
+            Url::parse(&format!("http://{address}/")).expect("registry URL"),
+            version,
+            requests,
+        )
+    }
+
+    async fn recovering_npm_registry_fixture(
+        version: &str,
+    ) -> (Url, Arc<AtomicBool>, Arc<AtomicUsize>) {
+        let failing = Arc::new(AtomicBool::new(true));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let state = (version.to_owned(), failing.clone(), requests.clone());
+        let app = Router::new()
+            .route(
+                "/{*path}",
+                get(
+                    |State((version, failing, requests)): State<(
+                        String,
+                        Arc<AtomicBool>,
+                        Arc<AtomicUsize>,
+                    )>| async move {
+                        requests.fetch_add(1, Ordering::SeqCst);
+                        if failing.load(Ordering::SeqCst) {
+                            (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})))
+                        } else {
+                            (StatusCode::OK, Json(json!({ "version": version })))
+                        }
+                    },
+                ),
+            )
+            .with_state(state);
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("registry listener");
+        let address = listener.local_addr().expect("registry address");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("registry server") });
+        (
+            Url::parse(&format!("http://{address}/")).expect("registry URL"),
+            failing,
+            requests,
+        )
+    }
+
     async fn delayed_npm_registry_fixture(version: &str) -> (Url, Arc<AtomicUsize>) {
         let concurrent_requests = Arc::new(AtomicUsize::new(0));
         let active_requests = Arc::new(AtomicUsize::new(0));
@@ -276,13 +345,70 @@ mod tests {
         let target = target("codex", "codex");
         let mut first = installed_snapshot("codex", "1.0.0");
         let mut second = installed_snapshot("codex", "1.0.0");
+        second["checkedAt"] = json!("2026-08-01T12:05:00Z");
         maintenance.enrich_snapshot(&target, &mut first, true).await;
         maintenance
             .enrich_snapshot(&target, &mut second, true)
             .await;
         assert_eq!(first["versionAdvisory"]["status"], "behind_latest");
         assert_eq!(first["versionAdvisory"]["latestVersion"], "9.9.9");
+        assert_eq!(
+            second["versionAdvisory"]["checkedAt"],
+            "2026-08-01T12:00:00Z"
+        );
         assert_eq!(requests.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn manual_refresh_observes_a_new_opencode_release() {
+        let (registry_url, registry_version, requests) =
+            mutable_npm_registry_fixture("1.18.11").await;
+        let maintenance = ProviderMaintenance::with_registry_base_url(registry_url);
+        let target = target("opencode", "opencode");
+        let mut startup = installed_snapshot("opencode", "1.18.11");
+        maintenance
+            .enrich_snapshot(&target, &mut startup, true)
+            .await;
+
+        *registry_version.write().await = "1.18.15".to_owned();
+        maintenance.begin_latest_version_refresh();
+        let mut manual = installed_snapshot("opencode", "1.18.11");
+        manual["checkedAt"] = json!("2026-08-01T12:05:00Z");
+        maintenance
+            .enrich_snapshot(&target, &mut manual, true)
+            .await;
+
+        assert_eq!(manual["versionAdvisory"]["status"], "behind_latest");
+        assert_eq!(manual["versionAdvisory"]["latestVersion"], "1.18.15");
+        assert_eq!(
+            manual["versionAdvisory"]["checkedAt"],
+            "2026-08-01T12:05:00Z"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_registry_lookup_is_retried_without_waiting_for_cache_expiry() {
+        let (registry_url, failing, requests) = recovering_npm_registry_fixture("1.18.15").await;
+        let maintenance = ProviderMaintenance::with_registry_base_url(registry_url);
+        let target = target("opencode", "opencode");
+        let mut failed = installed_snapshot("opencode", "1.18.11");
+        maintenance
+            .enrich_snapshot(&target, &mut failed, true)
+            .await;
+        assert_eq!(failed["versionAdvisory"]["status"], "unknown");
+        assert!(failed["versionAdvisory"]["message"].is_string());
+
+        failing.store(false, Ordering::SeqCst);
+        let mut recovered = installed_snapshot("opencode", "1.18.11");
+        recovered["checkedAt"] = json!("2026-08-01T12:01:00Z");
+        maintenance
+            .enrich_snapshot(&target, &mut recovered, true)
+            .await;
+
+        assert_eq!(recovered["versionAdvisory"]["status"], "behind_latest");
+        assert_eq!(recovered["versionAdvisory"]["latestVersion"], "1.18.15");
+        assert_eq!(requests.load(Ordering::SeqCst), 2);
     }
 
     #[tokio::test]
@@ -328,7 +454,9 @@ mod tests {
             "@openai/codex",
             VersionCacheEntry {
                 expires_at: tokio::time::Instant::now() - Duration::from_secs(1),
-                version: Some("1.0.0".to_owned()),
+                version: "1.0.0".to_owned(),
+                checked_at: Some("2026-08-01T11:00:00Z".to_owned()),
+                generation: 0,
             },
         );
         let mut snapshot = installed_snapshot("codex", "1.0.0");
@@ -559,7 +687,10 @@ use std::{
     collections::{HashMap, HashSet},
     ffi::OsString,
     path::Path,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
 
@@ -572,6 +703,8 @@ use super::provider_runtime::{prepare_provider_launch, resolve_provider_executab
 
 const CACHE_TTL: Duration = Duration::from_secs(60 * 60);
 const REGISTRY_TIMEOUT: Duration = Duration::from_secs(4);
+const UPDATE_CHECK_FAILED_MESSAGE: &str =
+    "Could not check for provider updates. Refresh provider status to try again.";
 const UPDATE_MESSAGE: &str = "Install the update now or review provider settings.";
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const UPDATE_OUTPUT_LIMIT: usize = 10_000;
@@ -644,7 +777,9 @@ pub(crate) struct ProviderUpdateCommandResult {
 struct ProviderMaintenanceInner {
     client: reqwest::Client,
     registry_base_url: Url,
+    latest_version_generation: AtomicU64,
     latest_versions: tokio::sync::Mutex<HashMap<&'static str, VersionCacheEntry>>,
+    latest_version_locks: Mutex<HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>>,
     updates: Arc<Mutex<ProviderUpdateCoordinator>>,
     command_locks: Mutex<HashMap<&'static str, Arc<tokio::sync::Mutex<()>>>>,
 }
@@ -687,7 +822,41 @@ struct PackageDefinition {
 #[derive(Clone, Debug)]
 struct VersionCacheEntry {
     expires_at: tokio::time::Instant,
-    version: Option<String>,
+    version: String,
+    checked_at: Option<String>,
+    generation: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum LatestVersionCheck {
+    Success {
+        version: String,
+        checked_at: Option<String>,
+    },
+    Failed {
+        checked_at: Option<String>,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LatestVersionFailure {
+    InvalidUrl,
+    Request,
+    HttpStatus,
+    InvalidJson,
+    MissingVersion,
+}
+
+impl LatestVersionFailure {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidUrl => "invalid_url",
+            Self::Request => "request",
+            Self::HttpStatus => "http_status",
+            Self::InvalidJson => "invalid_json",
+            Self::MissingVersion => "missing_version",
+        }
+    }
 }
 
 impl ProviderMaintenance {
@@ -712,11 +881,32 @@ impl ProviderMaintenance {
             inner: Arc::new(ProviderMaintenanceInner {
                 client: reqwest::Client::new(),
                 registry_base_url,
+                latest_version_generation: AtomicU64::new(0),
                 latest_versions: tokio::sync::Mutex::new(HashMap::new()),
+                latest_version_locks: Mutex::new(HashMap::new()),
                 updates: Arc::new(Mutex::new(ProviderUpdateCoordinator::default())),
                 command_locks: Mutex::new(HashMap::new()),
             }),
         }
+    }
+
+    pub(crate) fn begin_latest_version_refresh(&self) {
+        self.inner
+            .latest_version_generation
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |generation| {
+                generation.checked_add(1)
+            })
+            .expect("provider latest-version generations exhausted");
+    }
+
+    fn latest_version_lock(&self, package_name: &'static str) -> Arc<tokio::sync::Mutex<()>> {
+        self.inner
+            .latest_version_locks
+            .lock()
+            .expect("provider latest-version locks")
+            .entry(package_name)
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
     }
 
     pub(crate) fn reserve_target(
@@ -1014,14 +1204,33 @@ impl ProviderMaintenance {
             && snapshot.get("enabled").and_then(Value::as_bool) == Some(true)
             && snapshot.get("installed").and_then(Value::as_bool) == Some(true)
             && current.is_some();
-        let latest = match (should_check, capabilities.package_name) {
-            (true, Some(package_name)) => self.latest_version(package_name).await,
+        let probe_checked_at = snapshot
+            .get("checkedAt")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let latest_check = match (should_check, capabilities.package_name) {
+            (true, Some(package_name)) => {
+                Some(self.latest_version(package_name, probe_checked_at).await)
+            }
             _ => None,
+        };
+        let (latest, checked_at, check_failed) = match latest_check {
+            Some(LatestVersionCheck::Success {
+                version,
+                checked_at,
+            }) => (Some(version), checked_at, false),
+            Some(LatestVersionCheck::Failed { checked_at }) => (None, checked_at, true),
+            None => (None, None, false),
         };
         let status = if should_check {
             advisory_status(current, latest.as_deref())
         } else {
             "unknown"
+        };
+        let message = match status {
+            "behind_latest" => Some(UPDATE_MESSAGE),
+            _ if check_failed => Some(UPDATE_CHECK_FAILED_MESSAGE),
+            _ => None,
         };
         snapshot["versionAdvisory"] = json!({
             "status": status,
@@ -1029,50 +1238,96 @@ impl ProviderMaintenance {
             "latestVersion": latest,
             "updateCommand": capabilities.update.as_ref().map(|update| &update.display),
             "canUpdate": capabilities.update.is_some(),
-            "checkedAt": snapshot.get("checkedAt").cloned().unwrap_or(Value::Null),
-            "message": if status == "behind_latest" { Some(UPDATE_MESSAGE) } else { None::<&str> },
+            "checkedAt": checked_at,
+            "message": message,
         });
     }
 
-    async fn latest_version(&self, package_name: &'static str) -> Option<String> {
-        let cache = self.inner.latest_versions.lock().await;
-        if let Some(entry) = cache.get(package_name)
-            && entry.expires_at > tokio::time::Instant::now()
-        {
-            return entry.version.clone();
+    async fn latest_version(
+        &self,
+        package_name: &'static str,
+        checked_at: Option<String>,
+    ) -> LatestVersionCheck {
+        let lookup_lock = self.latest_version_lock(package_name);
+        let _lookup_guard = lookup_lock.lock().await;
+        let required_generation = self.inner.latest_version_generation.load(Ordering::Acquire);
+        let cached = self
+            .inner
+            .latest_versions
+            .lock()
+            .await
+            .get(package_name)
+            .filter(|entry| {
+                entry.expires_at > tokio::time::Instant::now()
+                    && entry.generation >= required_generation
+            })
+            .cloned();
+        if let Some(entry) = cached {
+            return LatestVersionCheck::Success {
+                version: entry.version,
+                checked_at: entry.checked_at,
+            };
         }
-        drop(cache);
-        let encoded: String =
-            url::form_urlencoded::byte_serialize(package_name.as_bytes()).collect();
-        let version = match self.inner.registry_base_url.join(&encoded) {
-            Ok(url) => match self
-                .inner
-                .client
-                .get(url)
-                .timeout(REGISTRY_TIMEOUT)
-                .send()
-                .await
-                .ok()
-                .and_then(|response| response.error_for_status().ok())
-            {
-                Some(response) => response.json::<Value>().await.ok().and_then(|body| {
-                    body.get("version")
-                        .and_then(Value::as_str)
-                        .filter(|value| !value.trim().is_empty())
-                        .map(str::to_owned)
-                }),
-                None => None,
-            },
-            Err(_) => None,
+
+        let result = self.fetch_latest_version(package_name).await;
+        let version = match result {
+            Ok(version) => version,
+            Err(failure) => {
+                tracing::warn!(
+                    registry_host = self.inner.registry_base_url.host_str().unwrap_or("unknown"),
+                    package_name,
+                    failure = failure.as_str(),
+                    "provider registry version check failed"
+                );
+                return LatestVersionCheck::Failed { checked_at };
+            }
         };
         self.inner.latest_versions.lock().await.insert(
             package_name,
             VersionCacheEntry {
                 expires_at: tokio::time::Instant::now() + CACHE_TTL,
                 version: version.clone(),
+                checked_at: checked_at.clone(),
+                generation: required_generation,
             },
         );
-        version
+        LatestVersionCheck::Success {
+            version,
+            checked_at,
+        }
+    }
+
+    async fn fetch_latest_version(
+        &self,
+        package_name: &'static str,
+    ) -> Result<String, LatestVersionFailure> {
+        let encoded: String =
+            url::form_urlencoded::byte_serialize(package_name.as_bytes()).collect();
+        let url = self
+            .inner
+            .registry_base_url
+            .join(&encoded)
+            .map_err(|_| LatestVersionFailure::InvalidUrl)?;
+        let response = self
+            .inner
+            .client
+            .get(url)
+            .timeout(REGISTRY_TIMEOUT)
+            .send()
+            .await
+            .map_err(|_| LatestVersionFailure::Request)?
+            .error_for_status()
+            .map_err(|_| LatestVersionFailure::HttpStatus)?;
+        let body = response
+            .json::<Value>()
+            .await
+            .map_err(|_| LatestVersionFailure::InvalidJson)?;
+        body.get("version")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+            .ok_or(LatestVersionFailure::MissingVersion)
     }
 }
 
