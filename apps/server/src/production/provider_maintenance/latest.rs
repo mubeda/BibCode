@@ -64,6 +64,57 @@ FINAL_DIR="$HOME/.local/share/cursor-agent/versions/2026.08.05-bbb9910""#;
             Ok("2.1.220".to_owned())
         );
     }
+
+    #[test]
+    fn rejects_invalid_npm_and_claude_semver_responses() {
+        assert_eq!(
+            parse_latest_response(
+                LatestVersionSource::Npm("@openai/codex"),
+                br#"{"version":"not-a-version"}"#,
+            ),
+            Err(LatestVersionFailure::InvalidVersion)
+        );
+        assert_eq!(
+            parse_latest_response(
+                LatestVersionSource::Claude(ClaudeReleaseChannel::Stable),
+                b"v2.1.220\n",
+            ),
+            Err(LatestVersionFailure::InvalidVersion)
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_utf8_json_and_missing_npm_version() {
+        assert_eq!(
+            parse_latest_response(LatestVersionSource::Npm("@openai/codex"), &[0xff]),
+            Err(LatestVersionFailure::InvalidUtf8)
+        );
+        assert_eq!(
+            parse_latest_response(
+                LatestVersionSource::Npm("@openai/codex"),
+                br#"{"version": "0.148.0""#,
+            ),
+            Err(LatestVersionFailure::InvalidJson)
+        );
+        assert_eq!(
+            parse_latest_response(LatestVersionSource::Npm("@openai/codex"), br#"{}"#),
+            Err(LatestVersionFailure::MissingVersion)
+        );
+    }
+
+    #[test]
+    fn rejects_cursor_installer_identifiers_with_malformed_dates_or_suffixes() {
+        for identifier in ["2026.08.04-", "2026.08.day-aaa8809", "2026.08-aaa8809"] {
+            let script = format!(
+                "DOWNLOAD_URL=\"https://downloads.cursor.com/lab/{identifier}/${{OS}}/${{ARCH}}/agent-cli-package.tar.gz\"\nFINAL_DIR=\"$HOME/.local/share/cursor-agent/versions/{identifier}\""
+            );
+            assert_eq!(
+                parse_latest_response(LatestVersionSource::CursorInstaller, script.as_bytes()),
+                Err(LatestVersionFailure::InvalidVersion),
+                "{identifier}"
+            );
+        }
+    }
 }
 use std::cmp::Ordering;
 
@@ -198,11 +249,7 @@ fn parse_cursor_installer_response(value: &str) -> Result<String, LatestVersionF
 }
 
 fn extract_identifier<'a>(value: &'a str, marker: &str) -> Option<&'a str> {
-    value
-        .split_once(marker)?
-        .1
-        .split(|character| matches!(character, '/' | '"'))
-        .next()
+    value.split_once(marker)?.1.split(['/', '"']).next()
 }
 
 struct CursorRelease {
