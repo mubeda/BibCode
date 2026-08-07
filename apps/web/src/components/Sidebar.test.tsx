@@ -1995,6 +1995,68 @@ staticDescribe("thread context menu", () => {
     expect(openCall.input.input.editor).toBe("vscode");
   });
 
+  it("opens a local worktree path in File Explorer", async () => {
+    baseScenario();
+    const openInFileManager = vi.fn(async () => {});
+    (globalThis.window as unknown as Record<string, unknown>)["desktopBridge"] = {
+      openInFileManager,
+    };
+    render(<Sidebar />);
+    fakeLocalApi();
+    h.spies.contextMenuShow.mockResolvedValue("open-in:file-explorer");
+    const row = mustFindProps(byTestId("thread-row-thread-active"), "active worktree row");
+
+    invoke(row, "onContextMenu", mouseEvent());
+    await flush();
+
+    expect(openInFileManager).toHaveBeenCalledWith("C:/wt/x", true);
+  });
+
+  it("omits File Explorer for a remote row", async () => {
+    const { remoteThread } = groupedScenario();
+    const openInFileManager = vi.fn(async () => {});
+    (globalThis.window as unknown as Record<string, unknown>)["desktopBridge"] = {
+      openInFileManager,
+    };
+    render(<Sidebar />);
+    fakeLocalApi();
+    let menuItems: Array<{ id: string; children?: Array<{ id: string }> }> = [];
+    h.spies.contextMenuShow.mockImplementation(
+      async (items: Array<{ id: string; children?: Array<{ id: string }> }>) => {
+        menuItems = items;
+        return null;
+      },
+    );
+    const row = mustFindProps(byTestId(`thread-row-${remoteThread.id}`), "remote row");
+
+    invoke(row, "onContextMenu", mouseEvent());
+    await flush();
+
+    const openIn = menuItems.find((item) => item.id === "open-in");
+    expect(openIn?.children?.some((item) => item.id === "open-in:file-explorer")).toBe(false);
+    expect(openInFileManager).not.toHaveBeenCalled();
+  });
+
+  it("omits File Explorer when the desktop bridge capability is unavailable", async () => {
+    baseScenario();
+    render(<Sidebar />);
+    fakeLocalApi();
+    let menuItems: Array<{ id: string; children?: Array<{ id: string }> }> = [];
+    h.spies.contextMenuShow.mockImplementation(
+      async (items: Array<{ id: string; children?: Array<{ id: string }> }>) => {
+        menuItems = items;
+        return null;
+      },
+    );
+    const row = mustFindProps(byTestId("thread-row-thread-active"), "active worktree row");
+
+    invoke(row, "onContextMenu", mouseEvent());
+    await flush();
+
+    const openIn = menuItems.find((item) => item.id === "open-in");
+    expect(openIn?.children?.map((item) => item.id)).toEqual(["open-in:vscode"]);
+  });
+
   it("toasts when opening an editor fails", async () => {
     const row = setupMenu("open-in:vscode");
     h.state.commandResults["shell.openInEditor"] = () => failureResult("no editor");
@@ -2355,6 +2417,40 @@ staticDescribe("primary row", () => {
     expect(h.state.commandCalls.map((call: { label: string }) => call.label)).toContain(
       "shell.openInEditor",
     );
+  });
+
+  it("opens the local primary checkout in File Explorer even when no editor is available", async () => {
+    baseScenario();
+    h.state.atomValues.primaryServerConfig = {
+      availableEditors: [],
+      environment: { serverVersion: "0.1.0" },
+    };
+    const openInFileManager = vi.fn(async () => {});
+    (globalThis.window as unknown as Record<string, unknown>)["desktopBridge"] = {
+      openInFileManager,
+    };
+    render(<Sidebar />);
+    fakeLocalApi();
+    const primaryRow = captured("SidebarMenuSubButton").find(
+      (entry) =>
+        entry.props["data-thread-item"] !== undefined && entry.props["render"] === undefined,
+    )!;
+    h.spies.contextMenuShow.mockImplementation(
+      async (
+        items: Array<{ id: string; disabled?: boolean; children?: Array<{ id: string }> }>,
+      ) => {
+        const openIn = items.find((item) => item.id === "open-in");
+        expect(openIn?.disabled).not.toBe(true);
+        expect(openIn?.children?.map((item) => item.id)).toEqual(["open-in:file-explorer"]);
+        return "open-in:file-explorer";
+      },
+    );
+
+    invoke(primaryRow.props, "onContextMenu", mouseEvent());
+    await flush();
+
+    expect(openInFileManager).toHaveBeenCalledOnce();
+    expect(openInFileManager).toHaveBeenCalledWith("C:/repo-a", true);
   });
 
   it("keeps the primary-row menu inert without a local API or a matching editor", async () => {

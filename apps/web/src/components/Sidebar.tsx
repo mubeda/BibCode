@@ -1383,6 +1383,13 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
   // belonging to a different (remote) environment may see an editor list that
   // doesn't match their actual backend. Acceptable simplification for now.
   const availableEditors = useAtomValue(primaryServerConfigAtom)?.availableEditors ?? [];
+  const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const openWorkspaceInFileManager = useCallback(async (path: string) => {
+    const bridge =
+      typeof window === "undefined" ? undefined : window.desktopBridge?.openInFileManager;
+    if (!bridge) return;
+    await bridge(path, true);
+  }, []);
   const updateSettings = useUpdateClientSettings();
   const sidebarThreadPreviewCount = useClientSettings<SidebarThreadPreviewCount>(
     (settings) => settings.sidebarThreadPreviewCount,
@@ -2424,18 +2431,22 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       // (that component renders its own React menu, so it can't be reused
       // as-is here).
       const openInEditorOptions = EDITORS.filter((editor) => availableEditors.includes(editor.id));
+      const canOpenInFileExplorer =
+        thread.environmentId === primaryEnvironmentId && typeof window !== "undefined"
+          ? window.desktopBridge?.openInFileManager !== undefined
+          : false;
+      const openInChildren = [
+        ...(canOpenInFileExplorer ? [{ id: "open-in:file-explorer", label: "File Explorer" }] : []),
+        ...openInEditorOptions.map((editor) => ({
+          id: `open-in:${editor.id}`,
+          label: editor.label,
+        })),
+      ];
       const clicked = await api.contextMenu.show(
         [
           { id: "update", label: "Update", disabled: !threadWorkspacePath },
-          openInEditorOptions.length > 0
-            ? {
-                id: "open-in",
-                label: "Open in",
-                children: openInEditorOptions.map((editor) => ({
-                  id: `open-in:${editor.id}`,
-                  label: editor.label,
-                })),
-              }
+          openInChildren.length > 0
+            ? { id: "open-in", label: "Open in", children: openInChildren }
             : { id: "open-in", label: "Open in", disabled: true },
           { id: "rename", label: "Rename thread" },
           isUnread
@@ -2477,6 +2488,12 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
           environmentId: thread.environmentId,
           input: { cwd: threadWorkspacePath },
         });
+        return;
+      }
+
+      if (clicked === "open-in:file-explorer") {
+        if (!threadWorkspacePath) return;
+        await openWorkspaceInFileManager(threadWorkspacePath);
         return;
       }
 
@@ -2572,7 +2589,9 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       markThreadRowUnread,
       memberProjectByScopedKey,
       openInEditorMutation,
+      openWorkspaceInFileManager,
       pinnedThreadKeys,
+      primaryEnvironmentId,
       project.workspaceRoot,
       pullWorkspaceRow,
       refreshVcsStatusAfterPull,
@@ -2600,18 +2619,24 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         const openInEditorOptions = EDITORS.filter((editor) =>
           availableEditors.includes(editor.id),
         );
+        const canOpenInFileExplorer =
+          project.environmentId === primaryEnvironmentId && typeof window !== "undefined"
+            ? window.desktopBridge?.openInFileManager !== undefined
+            : false;
+        const openInChildren = [
+          ...(canOpenInFileExplorer
+            ? [{ id: "open-in:file-explorer", label: "File Explorer" }]
+            : []),
+          ...openInEditorOptions.map((editor) => ({
+            id: `open-in:${editor.id}`,
+            label: editor.label,
+          })),
+        ];
         const clicked = await api.contextMenu.show(
           [
             { id: "update", label: "Update" },
-            openInEditorOptions.length > 0
-              ? {
-                  id: "open-in",
-                  label: "Open in",
-                  children: openInEditorOptions.map((editor) => ({
-                    id: `open-in:${editor.id}`,
-                    label: editor.label,
-                  })),
-                }
+            openInChildren.length > 0
+              ? { id: "open-in", label: "Open in", children: openInChildren }
               : { id: "open-in", label: "Open in", disabled: true },
             { id: "copy-path", label: "Copy Path" },
             ...(primaryThreadKey
@@ -2645,6 +2670,11 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
             return;
           }
           await refreshVcsStatusAfterPull({ environmentId: project.environmentId, input: { cwd } });
+          return;
+        }
+
+        if (clicked === "open-in:file-explorer") {
+          await openWorkspaceInFileManager(cwd);
           return;
         }
 
@@ -2694,7 +2724,9 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       markThreadRowRead,
       markThreadRowUnread,
       openInEditorMutation,
+      openWorkspaceInFileManager,
       pinnedThreadKeys,
+      primaryEnvironmentId,
       primaryThread,
       project,
       pullWorkspaceRow,
