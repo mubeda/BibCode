@@ -1086,10 +1086,36 @@ impl GitRepository {
             )
             .await
         {
+            let cleanup_token = CancellationToken::new();
+            let canonical_owned_path = tokio::fs::canonicalize(owned_path.path())
+                .await
+                .unwrap_or_else(|_| owned_path.path().to_path_buf());
+            let candidate_is_owned = match self.worktree_map(cwd, &cleanup_token).await {
+                Ok(worktrees) => worktrees.get(candidate).is_some_and(|registered| {
+                    same_worktree_path(registered, &canonical_owned_path)
+                }),
+                Err(inspection_error) => {
+                    error.detail = format!(
+                        "{}\nOwned worktree branch inspection also failed: {}",
+                        error.detail, inspection_error.detail
+                    )
+                    .into();
+                    false
+                }
+            };
             if let Err(cleanup_error) = self.cleanup_owned_worktree(cwd, owned_path).await {
                 error.detail = format!(
                     "{}\nOwned worktree cleanup also failed: {}",
                     error.detail, cleanup_error.detail
+                )
+                .into();
+            }
+            if candidate_is_owned
+                && let Err(rollback_error) = self.rollback_created_branch(cwd, candidate).await
+            {
+                error.detail = format!(
+                    "{}\nWorktree branch rollback also failed: {}",
+                    error.detail, rollback_error.detail
                 )
                 .into();
             }
@@ -2269,6 +2295,30 @@ mod worktree_ownership_tests {
                 .replace('\\', "/")
                 .contains(&display_path(&path))
         );
+    }
+
+    #[tokio::test]
+    async fn cancelled_branch_checkout_rolls_back_branch_claimed_by_owned_worktree() {
+        let repo = repository();
+        let parent = tempfile::tempdir().expect("worktree parent");
+        let path = parent.path().join("reserved");
+        let owned = OwnedWorktreePath::reserve(path.clone()).expect("reserve absent path");
+        let repository = GitRepository::default();
+        repository
+            .prepare_detached_owned_worktree(repo.path(), "main", &owned, &CancellationToken::new())
+            .await
+            .expect("prepare detached worktree");
+        git(&path, &["checkout", "-b", "main-2"]);
+        let cancelled = CancellationToken::new();
+        cancelled.cancel();
+
+        repository
+            .checkout_owned_suffixed_branch(repo.path(), &owned, "main-2", &cancelled)
+            .await
+            .expect_err("cancelled checkout fails");
+
+        assert!(!path.exists());
+        assert!(git(repo.path(), &["branch", "--list", "main-2"]).is_empty());
     }
 
     #[tokio::test]
