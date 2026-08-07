@@ -9,19 +9,24 @@ Before non-trivial diagnosis, design, or implementation:
 2. Run `git status --short`; preserve unrelated user changes.
 3. State the requested outcome, constraints, affected packages, and evidence
    that will prove completion.
-4. If the `codegraph` binary is available on `PATH`, attempt
-   `codegraph sync . --quiet` from the repository root. A CodeGraph graph is
-   usable only after the sync succeeds; successful sync may update ignored generated
-   `.codegraph/` data.
-5. If the binary is unavailable or CodeGraph sync fails, disclose that graph
-   data is unavailable, stale, or unusable and immediately continue with `rg`,
-   manifests, tests, and direct source inspection. Do not block the task.
+4. If the `codegraph` binary is available on `PATH`, run `codegraph sync .`
+   from the repository root so failures remain visible. If and only if it fails
+   because CodeGraph is not initialized in that repository or worktree, run
+   `codegraph init` there and then retry `codegraph sync . --quiet`. A CodeGraph
+   graph is usable only after the initial sync or the post-initialization retry
+   succeeds; successful commands may update ignored generated `.codegraph/`
+   data.
+5. If the binary is unavailable, initialization fails, or the initial/retried
+   sync fails for any other reason, disclose that graph data is unavailable,
+   stale, or unusable and immediately continue with `rg`, manifests, tests, and
+   direct source inspection. Do not block the task or repeatedly retry.
 
-Do not hand-edit, stage, or commit `.codegraph/` data. Do not install,
-initialize, unlock, repair, or fully re-index CodeGraph unless the user
-explicitly requests it. When and only when the graph is usable, use its
-relationship and impact queries for unfamiliar or cross-package code, then
-confirm critical findings in source and tests.
+Do not hand-edit, stage, or commit `.codegraph/` data. Apart from the narrowly
+scoped uninitialized-worktree fallback above, do not install, initialize,
+unlock, repair, or fully re-index CodeGraph unless the user explicitly requests
+it. When and only when the graph is usable, use its relationship and impact
+queries for unfamiliar or cross-package code, then confirm critical findings
+in source and tests.
 
 For non-trivial code work, read `docs/README.md`,
 `docs/architecture/overview.md`, `docs/reference/workspace-layout.md`, and
