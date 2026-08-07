@@ -119,20 +119,20 @@ FINAL_DIR="$HOME/.local/share/cursor-agent/versions/2026.08.05-bbb9910""#;
 use std::cmp::Ordering;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) enum ClaudeReleaseChannel {
+pub(crate) enum ClaudeReleaseChannel {
     Stable,
     Latest,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-pub(super) enum LatestVersionSource {
+pub(crate) enum LatestVersionSource {
     Npm(&'static str),
     Claude(ClaudeReleaseChannel),
     CursorInstaller,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(super) enum VersionScheme {
+pub(crate) enum VersionScheme {
     Semver,
     CursorRelease,
 }
