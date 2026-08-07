@@ -1050,6 +1050,19 @@ const UPDATE_MESSAGE: &str = "Install the update now or review provider settings
 const UPDATE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const UPDATE_OUTPUT_LIMIT: usize = 10_000;
 
+pub(crate) fn provider_version_advanced(
+    driver: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> bool {
+    let scheme = match driver {
+        "cursor" => latest::VersionScheme::CursorRelease,
+        "claudeAgent" | "codex" | "opencode" => latest::VersionScheme::Semver,
+        _ => return false,
+    };
+    latest::version_advanced(scheme, before, after)
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ProviderMaintenanceTarget {
     #[allow(dead_code)] // Used by Task 2 for per-provider update state.
