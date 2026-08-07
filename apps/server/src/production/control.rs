@@ -26,7 +26,7 @@ use crate::{
         keybindings, local_servers, provider_inventory,
         provider_maintenance::{
             ProviderMaintenance, ProviderMaintenanceTarget, ProviderUpdateLifecycleToken,
-            provider_version_advanced,
+            provider_version_advanced, provider_version_regressed,
         },
         server_terminal::{JsonFuture, JsonStream, ProductionServerControl},
     },
@@ -98,18 +98,16 @@ fn post_update_status(
     else {
         return "unchanged";
     };
+    let driver = provider["driver"].as_str().unwrap_or_default();
+    let after_version = provider["version"].as_str();
     match provider["versionAdvisory"]["status"].as_str() {
+        Some("current") if provider_version_regressed(driver, before_version, after_version) => {
+            "unchanged"
+        }
         Some("current") => "succeeded",
         Some("behind_latest") => "unchanged",
-        _ => {
-            let driver = provider["driver"].as_str().unwrap_or_default();
-            let after_version = provider["version"].as_str();
-            if provider_version_advanced(driver, before_version, after_version) {
-                "succeeded"
-            } else {
-                "unchanged"
-            }
-        }
+        _ if provider_version_advanced(driver, before_version, after_version) => "succeeded",
+        _ => "unchanged",
     }
 }
 
@@ -2007,12 +2005,12 @@ mod tests {
                 "versionAdvisory": { "status": status }
             })
         };
-        let cursor_unknown = |version: &str| {
+        let cursor = |status: &str, version: &str| {
             json!({
                 "instanceId": "cursor",
                 "driver": "cursor",
                 "version": version,
-                "versionAdvisory": { "status": "unknown" }
+                "versionAdvisory": { "status": status }
             })
         };
 
@@ -2038,7 +2036,7 @@ mod tests {
         );
         assert_eq!(
             post_update_status(
-                &[cursor_unknown("2026.08.04-aaa8809")],
+                &[cursor("unknown", "2026.08.04-aaa8809")],
                 "cursor",
                 Some("2026.06.19-653a7fb")
             ),
@@ -2046,7 +2044,7 @@ mod tests {
         );
         assert_eq!(
             post_update_status(
-                &[cursor_unknown("2026.08.04-bbbb")],
+                &[cursor("unknown", "2026.08.04-bbbb")],
                 "cursor",
                 Some("2026.08.04-aaaa")
             ),
@@ -2054,6 +2052,52 @@ mod tests {
         );
         assert_eq!(
             post_update_status(&[codex("unknown", "0.146.0")], "codex", Some("0.147.0")),
+            "unchanged"
+        );
+        assert_eq!(
+            post_update_status(&[codex("current", "0.147.0")], "codex", Some("0.147.0")),
+            "succeeded"
+        );
+        assert_eq!(
+            post_update_status(&[codex("current", "0.147.0")], "codex", None),
+            "succeeded"
+        );
+        assert_eq!(
+            post_update_status(
+                &[cursor("current", "2026.08.04-bbbb")],
+                "cursor",
+                Some("2026.08.04-aaaa")
+            ),
+            "succeeded"
+        );
+    }
+
+    #[test]
+    fn post_update_verification_rejects_semver_downgrades_despite_current_advisory() {
+        let downgraded = json!({
+            "instanceId": "codex",
+            "driver": "codex",
+            "version": "0.146.0",
+            "versionAdvisory": { "status": "current" }
+        });
+
+        assert_eq!(
+            post_update_status(&[downgraded], "codex", Some("0.147.0")),
+            "unchanged"
+        );
+    }
+
+    #[test]
+    fn post_update_verification_rejects_cursor_downgrades_despite_current_advisory() {
+        let downgraded = json!({
+            "instanceId": "cursor",
+            "driver": "cursor",
+            "version": "2026.06.19-653a7fb",
+            "versionAdvisory": { "status": "current" }
+        });
+
+        assert_eq!(
+            post_update_status(&[downgraded], "cursor", Some("2026.08.04-aaa8809")),
             "unchanged"
         );
     }

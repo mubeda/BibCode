@@ -1055,12 +1055,25 @@ pub(crate) fn provider_version_advanced(
     before: Option<&str>,
     after: Option<&str>,
 ) -> bool {
-    let scheme = match driver {
-        "cursor" => latest::VersionScheme::CursorRelease,
-        "claudeAgent" | "codex" | "opencode" => latest::VersionScheme::Semver,
-        _ => return false,
-    };
-    latest::version_advanced(scheme, before, after)
+    provider_version_scheme(driver)
+        .is_some_and(|scheme| latest::version_advanced(scheme, before, after))
+}
+
+pub(crate) fn provider_version_regressed(
+    driver: &str,
+    before: Option<&str>,
+    after: Option<&str>,
+) -> bool {
+    provider_version_scheme(driver)
+        .is_some_and(|scheme| latest::version_advanced(scheme, after, before))
+}
+
+fn provider_version_scheme(driver: &str) -> Option<latest::VersionScheme> {
+    match driver {
+        "cursor" => Some(latest::VersionScheme::CursorRelease),
+        "claudeAgent" | "codex" | "opencode" => Some(latest::VersionScheme::Semver),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Debug)]
