@@ -2058,74 +2058,107 @@ mod tests {
         );
     }
 
-    async fn write_cursor_update_fixture(directory: &Path) -> PathBuf {
+    #[test]
+    fn cursor_update_fixture_uses_official_binary_names() {
+        assert_eq!(cursor_update_fixture_executable_name(false), "cursor-agent");
+        assert_eq!(
+            cursor_update_fixture_executable_name(true),
+            "cursor-agent.exe"
+        );
+    }
+
+    fn cursor_update_fixture_executable_name(windows: bool) -> &'static str {
+        if windows {
+            "cursor-agent.exe"
+        } else {
+            "cursor-agent"
+        }
+    }
+
+    async fn compile_cursor_update_fixture(directory: &Path, version: &str) -> PathBuf {
         let release_directory =
             directory.join(".local/share/cursor-agent/versions/2026.06.19-653a7fb");
         tokio::fs::create_dir_all(&release_directory)
             .await
             .expect("create Cursor release directory");
-        #[cfg(windows)]
-        let (name, contents) = (
-            "cursor-agent.cmd",
-            "@echo off\r\nif \"%1\"==\"about\" (echo {\"cliVersion\":\"9.8.7\"}& exit /b 0)\r\necho cursor updated\r\n",
-        );
-        #[cfg(not(windows))]
-        let (name, contents) = (
-            "cursor-agent",
-            "#!/bin/sh\nif [ \"$1\" = \"about\" ]; then\n  echo '{\"cliVersion\":\"9.8.7\"}'\nelse\n  echo 'cursor updated'\nfi\n",
-        );
-        let path = release_directory.join(name);
-        tokio::fs::write(&path, contents)
+        tokio::fs::write(release_directory.join("version-state"), version)
             .await
-            .expect("write cursor fixture");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mut permissions = tokio::fs::metadata(&path)
-                .await
-                .expect("cursor fixture metadata")
-                .permissions();
-            permissions.set_mode(0o755);
-            tokio::fs::set_permissions(&path, permissions)
-                .await
-                .expect("make cursor fixture executable");
-        }
-        path
+            .expect("write Cursor version state");
+        let executable =
+            release_directory.join(cursor_update_fixture_executable_name(cfg!(windows)));
+        let source =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/cursor_update_fixture.rs");
+        let output = tokio::process::Command::new(
+            std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()),
+        )
+        .arg("--edition=2024")
+        .arg(source)
+        .arg("-o")
+        .arg(&executable)
+        .output()
+        .await
+        .expect("compile Cursor update fixture");
+        assert!(
+            output.status.success(),
+            "compile Cursor update fixture: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        executable
+    }
+
+    #[tokio::test]
+    async fn compiled_cursor_update_fixture_reports_and_advances_its_version() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("Cursor fixture directory");
+        let executable =
+            compile_cursor_update_fixture(directory.path(), "2026.06.19-653a7fb").await;
+        let release_directory = executable.parent().expect("Cursor release directory");
+        tokio::fs::write(release_directory.join("next-version"), "2026.08.04-aaa8809")
+            .await
+            .expect("write next Cursor version");
+
+        let before = tokio::process::Command::new(&executable)
+            .arg("about")
+            .output()
+            .await
+            .expect("run Cursor about before update");
+        assert_eq!(
+            String::from_utf8_lossy(&before.stdout).trim(),
+            r#"{"cliVersion":"2026.06.19-653a7fb"}"#
+        );
+        let update = tokio::process::Command::new(&executable)
+            .arg("update")
+            .output()
+            .await
+            .expect("run Cursor update");
+        assert!(update.status.success());
+        let after = tokio::process::Command::new(&executable)
+            .arg("about")
+            .output()
+            .await
+            .expect("run Cursor about after update");
+        assert_eq!(
+            String::from_utf8_lossy(&after.stdout).trim(),
+            r#"{"cliVersion":"2026.08.04-aaa8809"}"#
+        );
+    }
+
+    async fn write_cursor_update_fixture(directory: &Path) -> PathBuf {
+        compile_cursor_update_fixture(directory, "9.8.7").await
     }
 
     async fn write_slow_cursor_update_fixture(directory: &Path) -> PathBuf {
-        let release_directory =
-            directory.join(".local/share/cursor-agent/versions/2026.06.19-653a7fb");
-        tokio::fs::create_dir_all(&release_directory)
-            .await
-            .expect("create Cursor release directory");
-        #[cfg(windows)]
-        let (name, contents) = (
-            "cursor-agent.cmd",
-            "@echo off\r\nif \"%1\"==\"about\" (echo {\"cliVersion\":\"9.8.7\"}& exit /b 0)\r\npowershell.exe -NoProfile -NonInteractive -Command \"Start-Sleep -Seconds 2\"\r\n",
-        );
-        #[cfg(not(windows))]
-        let (name, contents) = (
-            "cursor-agent",
-            "#!/bin/sh\nif [ \"$1\" = \"about\" ]; then\n  echo '{\"cliVersion\":\"9.8.7\"}'\nelse\n  sleep 2\nfi\n",
-        );
-        let path = release_directory.join(name);
-        tokio::fs::write(&path, contents)
-            .await
-            .expect("write slow cursor fixture");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            let mut permissions = tokio::fs::metadata(&path)
-                .await
-                .expect("slow cursor fixture metadata")
-                .permissions();
-            permissions.set_mode(0o755);
-            tokio::fs::set_permissions(&path, permissions)
-                .await
-                .expect("make slow cursor fixture executable");
-        }
-        path
+        let executable = compile_cursor_update_fixture(directory, "9.8.7").await;
+        tokio::fs::write(
+            executable
+                .parent()
+                .expect("Cursor release directory")
+                .join("update-sleep-ms"),
+            "2000",
+        )
+        .await
+        .expect("write Cursor update delay");
+        executable
     }
 
     async fn control_with_cursor_update_fixture(executable: PathBuf) -> NativeServerControl {
@@ -2215,6 +2248,117 @@ mod tests {
             version,
             requests,
         )
+    }
+
+    async fn cursor_installer_registry() -> (Url, Arc<AtomicUsize>) {
+        let requests = Arc::new(AtomicUsize::new(0));
+        let app = Router::new()
+            .route(
+                "/",
+                get(|State(requests): State<Arc<AtomicUsize>>| async move {
+                    requests.fetch_add(1, Ordering::SeqCst);
+                    "DOWNLOAD_URL=\"https://downloads.cursor.com/lab/2026.08.04-aaa8809/${OS}/${ARCH}/agent-cli-package.tar.gz\"\nFINAL_DIR=\"$HOME/.local/share/cursor-agent/versions/2026.08.04-aaa8809\""
+                }),
+            )
+            .with_state(requests.clone());
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("Cursor installer registry listener");
+        let address = listener.local_addr().expect("Cursor installer address");
+        tokio::spawn(async move { axum::serve(listener, app).await.expect("registry server") });
+        (
+            Url::parse(&format!("http://{address}/")).expect("Cursor installer URL"),
+            requests,
+        )
+    }
+
+    #[tokio::test]
+    async fn provider_update_invalidates_latest_version_only_after_zero_exit() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("state directory");
+        let executable =
+            compile_cursor_update_fixture(directory.path(), "2026.06.19-653a7fb").await;
+        let config = ServerConfig::new(directory.path());
+        tokio::fs::create_dir_all(config.state_dir())
+            .await
+            .expect("state directory exists");
+        tokio::fs::write(
+            config.state_dir().join("settings.json"),
+            serde_json::to_vec(&json!({
+                "enableProviderUpdateChecks": true,
+                "providerInstances": {
+                    "cursor-work": {
+                        "driver": "cursor",
+                        "enabled": true,
+                        "config": { "binaryPath": executable }
+                    }
+                }
+            }))
+            .expect("settings JSON"),
+        )
+        .await
+        .expect("write settings");
+        let mut control = NativeServerControl::new(config, json!({})).await;
+        let (installer_url, requests) = cursor_installer_registry().await;
+        control.provider_maintenance =
+            ProviderMaintenance::with_cursor_installer_url(installer_url);
+
+        control
+            .refresh_providers(&json!({ "instanceId": "cursor-work" }))
+            .await;
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+
+        let release_directory = executable.parent().expect("Cursor release directory");
+        tokio::fs::write(release_directory.join("update-exit-code"), "7")
+            .await
+            .expect("write failing update exit code");
+        let failed = control
+            .update_provider(
+                &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("non-zero update returns snapshots");
+        let failed_provider = failed["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("failed Cursor provider");
+        assert_eq!(failed_provider["updateState"]["status"], "failed");
+        let (_, settings) = control.settings_snapshot().await;
+        let cwd = std::env::current_dir().unwrap_or_else(|_| control.config.base_dir.clone());
+        control
+            .probe_full_provider_snapshots(&settings, Some("cursor-work"), &cwd)
+            .await;
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "non-zero exit must preserve the primed latest-version generation"
+        );
+
+        tokio::fs::write(release_directory.join("update-exit-code"), "0")
+            .await
+            .expect("write successful update exit code");
+        let succeeded = control
+            .update_provider(
+                &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("zero-exit update returns snapshots");
+        let succeeded_provider = succeeded["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("successful Cursor provider");
+        assert_eq!(succeeded_provider["updateState"]["status"], "unchanged");
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            2,
+            "zero exit must invalidate before post-update verification"
+        );
     }
 
     #[tokio::test]

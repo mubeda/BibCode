@@ -108,7 +108,6 @@ async fn write_provider_fixture(directory: &TempDir) -> PathBuf {
     path
 }
 
-#[cfg(unix)]
 async fn write_updating_cursor_fixture(directory: &TempDir) -> PathBuf {
     let release_directory = directory
         .path()
@@ -120,23 +119,31 @@ async fn write_updating_cursor_fixture(directory: &TempDir) -> PathBuf {
     tokio::fs::write(&version_state, "2026.06.19-653a7fb")
         .await
         .expect("write Cursor version state");
-    let path = release_directory.join("cursor-agent");
-    let contents = "#!/bin/sh\nstate=\"$(dirname \"$0\")/version-state\"\nif [ \"$1\" = \"about\" ]; then\n  printf '{\"cliVersion\":\"%s\"}\\n' \"$(cat \"$state\")\"\nelif [ \"$1\" = \"update\" ]; then\n  printf '2026.08.04-aaa8809' > \"$state\"\n  echo 'cursor updated'\nelse\n  exit 1\nfi\n";
-    tokio::fs::write(&path, contents)
+    tokio::fs::write(release_directory.join("next-version"), "2026.08.04-aaa8809")
         .await
-        .expect("write Cursor fixture");
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let mut permissions = tokio::fs::metadata(&path)
+        .expect("write next Cursor version");
+    let executable = release_directory.join(if cfg!(windows) {
+        "cursor-agent.exe"
+    } else {
+        "cursor-agent"
+    });
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/fixtures/cursor_update_fixture.rs");
+    let output =
+        tokio::process::Command::new(std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into()))
+            .arg("--edition=2024")
+            .arg(source)
+            .arg("-o")
+            .arg(&executable)
+            .output()
             .await
-            .expect("Cursor fixture metadata")
-            .permissions();
-        permissions.set_mode(0o755);
-        tokio::fs::set_permissions(&path, permissions)
-            .await
-            .expect("make Cursor fixture executable");
-    }
-    path
+            .expect("compile Cursor update fixture");
+    assert!(
+        output.status.success(),
+        "compile Cursor update fixture: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    executable
 }
 
 async fn write_claude_fixture(directory: &TempDir, version: &str) -> PathBuf {
@@ -1038,7 +1045,6 @@ async fn refresh_providers_returns_version_advisories_without_registry_access() 
     assert!(codex["versionAdvisory"]["status"].is_string());
 }
 
-#[cfg(unix)]
 #[tokio::test]
 async fn provider_update_succeeds_when_cursor_installed_version_advances() {
     let directory = tempfile::tempdir().expect("temporary state directory");
