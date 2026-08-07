@@ -115,8 +115,29 @@ FINAL_DIR="$HOME/.local/share/cursor-agent/versions/2026.08.05-bbb9910""#;
             );
         }
     }
+
+    #[test]
+    fn cursor_release_dates_require_exact_widths_and_real_gregorian_dates() {
+        assert!(parse_cursor_release("2024.02.29-aaa8809").is_some());
+        for identifier in [
+            "26.08.04-aaa8809",
+            "2026.8.04-aaa8809",
+            "2026.08.4-aaa8809",
+            "2026.00.04-aaa8809",
+            "2026.13.04-aaa8809",
+            "2026.02.29-aaa8809",
+            "2026.04.31-aaa8809",
+        ] {
+            assert!(
+                parse_cursor_release(identifier).is_none(),
+                "accepted invalid Cursor release {identifier}"
+            );
+        }
+    }
 }
 use std::cmp::Ordering;
+
+use time::{Date, Month};
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub(crate) enum ClaudeReleaseChannel {
@@ -253,7 +274,7 @@ fn extract_identifier<'a>(value: &'a str, marker: &str) -> Option<&'a str> {
 }
 
 struct CursorRelease {
-    date: (u32, u32, u32),
+    date: Date,
 }
 
 fn parse_cursor_release(value: &str) -> Option<CursorRelease> {
@@ -261,12 +282,22 @@ fn parse_cursor_release(value: &str) -> Option<CursorRelease> {
     if suffix.is_empty() {
         return None;
     }
-    let mut date = date.split('.').map(str::parse::<u32>);
-    let year = date.next()?.ok()?;
-    let month = date.next()?.ok()?;
-    let day = date.next()?.ok()?;
-    date.next().is_none().then_some(CursorRelease {
-        date: (year, month, day),
+    let bytes = date.as_bytes();
+    if bytes.len() != 10
+        || bytes[4] != b'.'
+        || bytes[7] != b'.'
+        || bytes
+            .iter()
+            .enumerate()
+            .any(|(index, byte)| !matches!(index, 4 | 7) && !byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let year = date[0..4].parse::<i32>().ok()?;
+    let month = Month::try_from(date[5..7].parse::<u8>().ok()?).ok()?;
+    let day = date[8..10].parse::<u8>().ok()?;
+    Some(CursorRelease {
+        date: Date::from_calendar_date(year, month, day).ok()?,
     })
 }
 
