@@ -410,6 +410,7 @@ pub(crate) async fn probe_maintenance_target_version(
         &target.driver,
         version_output
             .as_ref()
+            .filter(|output| output.success)
             .and_then(|output| first_line(&output.stdout, &output.stderr)),
     );
     if target.driver != "cursor" {
@@ -417,6 +418,7 @@ pub(crate) async fn probe_maintenance_target_version(
     }
     let about = run_command(&executable, &["about"], cwd, &target.environment)
         .await
+        .filter(|output| output.success)
         .map(|output| cursor::parse_about_output(output.code, &output.stdout, &output.stderr));
     about.and_then(|about| about.version).or(version)
 }

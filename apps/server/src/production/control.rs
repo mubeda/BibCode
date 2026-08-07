@@ -2487,6 +2487,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_exact_target_probe_disables_unknown_advisory_advancement() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let directory = tempfile::tempdir().expect("state directory");
+        let executable =
+            compile_cursor_update_fixture(directory.path(), "2026.08.04-aaa8809").await;
+        let control = control_with_cursor_update_fixture(executable.clone()).await;
+        control
+            .refresh_providers(&json!({ "instanceId": "cursor-work" }))
+            .await;
+
+        let release_directory = executable.parent().expect("Cursor release directory");
+        tokio::fs::write(
+            release_directory.join("failed-version-state"),
+            "2026.06.19-653a7fb",
+        )
+        .await
+        .expect("write failed probe version");
+        tokio::fs::write(release_directory.join("version-exit-code"), "7")
+            .await
+            .expect("write version failure");
+        tokio::fs::write(release_directory.join("about-exit-code"), "7")
+            .await
+            .expect("write about failure");
+        let (_, settings) = control.settings_snapshot().await;
+        let target =
+            provider_inventory::maintenance_target(&settings, "cursor", Some("cursor-work"))
+                .expect("Cursor maintenance target");
+        let cwd = std::env::current_dir().unwrap_or_else(|_| control.config.base_dir.clone());
+        let failed_probe =
+            provider_inventory::probe_maintenance_target_version(&target, &cwd).await;
+
+        let result = control
+            .update_provider(
+                &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
+                CancellationToken::new(),
+            )
+            .await
+            .expect("no-op update returns snapshots");
+        let cursor = result["providers"]
+            .as_array()
+            .expect("providers")
+            .iter()
+            .find(|provider| provider["instanceId"] == "cursor-work")
+            .expect("updated Cursor provider");
+
+        assert_eq!(cursor["versionAdvisory"]["status"], "unknown");
+        assert_eq!(cursor["version"], "2026.08.04-aaa8809");
+        assert_eq!(cursor["updateState"]["status"], "unchanged");
+        assert_eq!(failed_probe, None);
+    }
+
+    #[tokio::test]
     async fn manual_provider_refresh_requires_a_new_registry_result() {
         let temp = tempfile::tempdir().expect("state directory");
         let mut control = scheduler_control(&temp).await;

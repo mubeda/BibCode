@@ -1017,7 +1017,7 @@ fn is_pnpm_shim_path(components: &[&str]) -> bool {
         &["appdata", "roaming", "pnpm"][..],
     ]
     .into_iter()
-    .any(|marker| contains_component_sequence(components, marker))
+    .any(|marker| is_managed_shim_path(components, marker))
 }
 
 fn is_npm_shim_path(components: &[&str]) -> bool {
@@ -1088,8 +1088,11 @@ fn homebrew_ownership(
 }
 
 fn is_winget_location(components: &[&str]) -> bool {
-    contains_component_sequence(components, &["microsoft", "winget", "links"])
-        || contains_component_sequence(components, &["microsoft", "winget", "packages"])
+    is_managed_shim_path(components, &["microsoft", "winget", "links"])
+        || components
+            .windows(3)
+            .position(|window| window == ["microsoft", "winget", "packages"])
+            .is_some_and(|index| index + 5 == components.len())
 }
 
 fn winget_package_identity_is_claude(components: &[&str]) -> bool {

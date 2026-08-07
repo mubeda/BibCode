@@ -87,6 +87,13 @@ mod tests {
             (
                 "codex",
                 "codex",
+                Some("C:/Users/me/AppData/Roaming/pnpm/codex.cmd"),
+                None,
+                Some("pnpm add -g @openai/codex@latest"),
+            ),
+            (
+                "codex",
+                "codex",
                 Some("/home/me/.vite-plus/bin/codex"),
                 None,
                 Some("vp i -g @openai/codex"),
@@ -215,6 +222,11 @@ mod tests {
                 None,
             ),
             (
+                "nested pnpm lookalike",
+                "/home/me/.local/share/pnpm/nested/codex",
+                None,
+            ),
+            (
                 "conflicting npm and Homebrew evidence",
                 "C:/Users/me/AppData/Roaming/npm/codex.cmd",
                 Some("/opt/homebrew/Caskroom/codex/0.148.0/codex"),
@@ -241,6 +253,16 @@ mod tests {
         let cases = [
             ("claudeAgent", "/srv/.local/bin/claude-wrapper", None),
             ("opencode", "/srv/.opencode/bin/opencode-backup", None),
+            (
+                "claudeAgent",
+                "C:/Users/me/AppData/Local/Microsoft/WinGet/Links/nested/claude.exe",
+                None,
+            ),
+            (
+                "claudeAgent",
+                "C:/Users/me/AppData/Local/Microsoft/WinGet/Packages/Anthropic.ClaudeCode_Microsoft.Winget.Source_8wekyb3d8bbwe/nested/claude.exe",
+                None,
+            ),
             (
                 "claudeAgent",
                 "C:/Users/me/.local/bin/claude.exe",
@@ -903,6 +925,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_command_captures_bounded_output() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let command = output_command(12_000);
         let result = ProviderMaintenance::new()
             .run_update_command(
@@ -923,6 +946,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_command_preserves_non_zero_exit_code() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let result = ProviderMaintenance::new()
             .run_update_command(
                 &target("cursor", "cursor-agent"),
@@ -936,6 +960,7 @@ mod tests {
 
     #[tokio::test]
     async fn update_command_timeout_stops_the_child() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let error = ProviderMaintenance::new()
             .run_update_command_with_timeout(
                 &target("cursor", "cursor-agent"),
