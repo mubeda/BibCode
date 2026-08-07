@@ -571,6 +571,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn enriches_cursor_snapshot_from_installer_metadata() {
+        let (endpoints, _) =
+            latest_version_endpoint_fixture(br#"{\"version\":\"0.148.0\"}"#.to_vec()).await;
+        let maintenance = ProviderMaintenance::with_version_endpoints(endpoints);
+        let directory = tempfile::tempdir().expect("Cursor release directory");
+        let binary = directory.path().join(
+            "home/.local/share/cursor-agent/versions/2026.06.19-20-24-33-653a7fb/cursor-agent",
+        );
+        std::fs::create_dir_all(binary.parent().expect("Cursor release parent"))
+            .expect("Cursor release parent");
+        std::fs::write(&binary, b"fixture").expect("Cursor release binary");
+        let binary_path = binary.to_string_lossy().into_owned();
+        let mut snapshot = installed_snapshot("cursor", "2026.06.19-20-24-33-653a7fb");
+
+        maintenance
+            .enrich_snapshot(&target("cursor", &binary_path), &mut snapshot, true)
+            .await;
+
+        assert_eq!(snapshot["versionAdvisory"]["status"], "behind_latest");
+        assert_eq!(
+            snapshot["versionAdvisory"]["latestVersion"],
+            "2026.08.04-aaa8809"
+        );
+        assert_eq!(
+            snapshot["versionAdvisory"]["updateCommand"],
+            format!("{binary_path} update")
+        );
+        assert_eq!(snapshot["versionAdvisory"]["canUpdate"], true);
+    }
+
+    #[tokio::test]
     async fn manual_refresh_observes_a_new_opencode_release() {
         let (registry_url, registry_version, requests) =
             mutable_npm_registry_fixture("1.18.11").await;
