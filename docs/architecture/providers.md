@@ -95,11 +95,12 @@ The advisory timestamp records the registry result or attempt; the provider's
 top-level `checkedAt` continues to record the executable and capability probe.
 
 After an update command exits zero, the server advances the latest-version
-generation and reprobes the target instance. `succeeded` means the fresh
-advisory is `current`, or (when that advisory cannot prove currency) the
-installed version provably advanced under that provider's version scheme. A
-still-`behind_latest` advisory, unchanged version, downgrade, missing snapshot,
-or ambiguous comparison remains `unchanged`; a zero exit alone is not success.
+generation and reprobes the target instance. A fresh `current` advisory means
+`succeeded` unless the version comparison proves a downgrade. A fresh
+`behind_latest` advisory, provable downgrade, or absent refreshed target is
+always `unchanged`. When the advisory cannot establish currency, only a
+provable installed-version advance succeeds; equal, ambiguous, or missing
+comparisons remain `unchanged`. A zero exit alone is not success.
 
 ## Activity support
 
