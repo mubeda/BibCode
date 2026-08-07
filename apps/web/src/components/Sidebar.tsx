@@ -1388,7 +1388,15 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     const bridge =
       typeof window === "undefined" ? undefined : window.desktopBridge?.openInFileManager;
     if (!bridge) return;
-    await bridge(path, true);
+    try {
+      await bridge(path, true);
+    } catch (error) {
+      toastManager.add({
+        type: "error",
+        title: "Unable to open File Explorer",
+        description: error instanceof Error ? error.message : "An unexpected error occurred.",
+      });
+    }
   }, []);
   const updateSettings = useUpdateClientSettings();
   const sidebarThreadPreviewCount = useClientSettings<SidebarThreadPreviewCount>(
