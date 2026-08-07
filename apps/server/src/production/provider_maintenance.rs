@@ -1199,6 +1199,13 @@ impl ProviderMaintenance {
     }
 
     #[cfg(test)]
+    pub(crate) fn with_cursor_installer_url(cursor_installer_url: Url) -> Self {
+        let mut endpoints = LatestVersionEndpoints::production();
+        endpoints.cursor_installer_url = cursor_installer_url;
+        Self::with_version_endpoints(endpoints)
+    }
+
+    #[cfg(test)]
     fn with_version_endpoints(version_endpoints: LatestVersionEndpoints) -> Self {
         Self::with_version_endpoints_inner(version_endpoints)
     }
