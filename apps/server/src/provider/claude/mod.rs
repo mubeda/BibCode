@@ -5,6 +5,7 @@ pub mod model;
 pub mod protocol;
 pub mod runtime;
 pub(crate) mod transcript;
+mod usage;
 
 #[doc(hidden)]
 pub use activity::{

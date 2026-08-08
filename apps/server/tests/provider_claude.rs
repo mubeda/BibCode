@@ -89,6 +89,16 @@ struct TraceFixture {
 
 #[derive(Debug, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct ContextUsageFixture {
+    message_delta: Value,
+    task_progress: Value,
+    compact_boundary: Value,
+    result: Value,
+    malformed: Value,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PermissionFixture {
     thread_id: String,
     turn_id: String,
@@ -1779,6 +1789,104 @@ fn control_requests_encode_interrupt_permission_mode_and_cancel_frames() {
         serde_json::to_value(ClaudeControlRequest::cancel_request(19, "approval:1001"))
             .expect("cancel json"),
         fixture.cancel_tool_call
+    );
+}
+
+#[test]
+fn claude_stream_usage_preserves_active_context_and_accumulated_total() {
+    let fixture: ContextUsageFixture = load_fixture("context-usage.json");
+    let mut runtime = ClaudeProviderRuntime::new("thread-1".to_owned(), "session-1".to_owned());
+    runtime.start_turn(TurnInput {
+        turn_id: "turn-1".to_owned(),
+        input: "measure context".to_owned(),
+    });
+
+    let message_delta = runtime.handle_raw_value(&fixture.message_delta, 1_000);
+    assert_eq!(message_delta.events.len(), 1);
+    assert_eq!(
+        message_delta.events[0].event_type,
+        "thread.token-usage.updated"
+    );
+    assert_eq!(
+        message_delta.events[0].payload["usage"]["usedTokens"],
+        1_550
+    );
+
+    let duplicate = runtime.handle_raw_value(&fixture.message_delta, 1_001);
+    assert!(duplicate.events.is_empty());
+
+    let mut child_delta = fixture.message_delta.clone();
+    child_delta["parent_tool_use_id"] = json!("child-tool");
+    child_delta["event"]["usage"]["input_tokens"] = json!(9_000);
+    let child = runtime.handle_raw_value(&child_delta, 1_002);
+    assert!(child.events.is_empty());
+
+    let task_progress = runtime.handle_raw_value(&fixture.task_progress, 2_000);
+    assert_eq!(task_progress.events.len(), 1);
+    assert_eq!(
+        task_progress.events[0].payload["usage"]["usedTokens"],
+        1_800
+    );
+    assert_eq!(task_progress.events[0].payload["usage"]["toolUses"], 4);
+
+    let compact = runtime.handle_raw_value(&fixture.compact_boundary, 3_000);
+    assert_eq!(compact.events.len(), 1);
+    assert_eq!(compact.events[0].payload["usage"]["usedTokens"], 24_000);
+    assert_eq!(
+        compact.events[0].payload["usage"]["lastUsedTokens"],
+        190_000
+    );
+
+    let result = runtime.handle_raw_value(&fixture.result, 4_000);
+    assert_eq!(result.events.len(), 2);
+    assert_eq!(result.events[0].event_type, "thread.token-usage.updated");
+    assert_eq!(result.events[0].payload["usage"]["usedTokens"], 24_000);
+    assert_eq!(
+        result.events[0].payload["usage"]["totalProcessedTokens"],
+        42_000
+    );
+    assert_eq!(result.events[0].payload["usage"]["maxTokens"], 200_000);
+    assert_eq!(
+        result.events.last().expect("completion").event_type,
+        "turn.completed"
+    );
+}
+
+#[test]
+fn malformed_claude_usage_cannot_clear_last_good_context() {
+    let fixture: ContextUsageFixture = load_fixture("context-usage.json");
+    let mut runtime = ClaudeProviderRuntime::new("thread-1".to_owned(), "session-1".to_owned());
+    runtime.start_turn(TurnInput {
+        turn_id: "turn-1".to_owned(),
+        input: "measure context".to_owned(),
+    });
+
+    let initial = runtime.handle_raw_value(&fixture.message_delta, 1_000);
+    assert_eq!(initial.events.len(), 1);
+
+    let mut malformed_stream = fixture.message_delta.clone();
+    malformed_stream["event"]["usage"] = json!({
+        "input_tokens": -1,
+        "cache_creation_input_tokens": 9_007_199_254_740_992_u64,
+        "output_tokens": "many",
+    });
+    let malformed = runtime.handle_raw_value(&malformed_stream, 2_000);
+    assert!(malformed.events.is_empty());
+    let malformed_response = runtime.handle_raw_value(&fixture.malformed, 2_500);
+    assert!(malformed_response.events.is_empty());
+    let empty = runtime.handle_raw_value(&json!({}), 3_000);
+    assert!(empty.events.is_empty());
+
+    let result = runtime.handle_raw_value(&fixture.result, 4_000);
+    assert_eq!(result.events[0].event_type, "thread.token-usage.updated");
+    assert_eq!(result.events[0].payload["usage"]["usedTokens"], 1_550);
+    assert_eq!(
+        result.events[0].payload["usage"]["totalProcessedTokens"],
+        42_000
+    );
+    assert_eq!(
+        result.events.last().expect("completion").event_type,
+        "turn.completed"
     );
 }
 
