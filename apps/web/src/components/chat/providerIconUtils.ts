@@ -14,7 +14,6 @@ function isAvailableProviderOption(option: (typeof PROVIDER_OPTIONS)[number]): o
   value: ProviderDriverKind;
   label: string;
   available: true;
-  pickerSidebarBadge?: "new" | "soon";
 } {
   return option.available;
 }
