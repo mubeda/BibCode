@@ -17,6 +17,44 @@ Binary path: claude
 BiBCode probes `claude auth status --json` and shows the reported account when
 available. Account text is blurred by default in Settings.
 
+## Local account and usage status
+
+The Claude CLI owns the local account and its credential lifecycle. BiBCode's
+server is a read-only observer: it does not exchange refresh tokens, rotate
+access tokens, rewrite `.credentials.json`, or update macOS Keychain items.
+The **Agents** authentication state remains the result of `claude auth status
+--json`; the status-bar usage request is a separate quota observation and does
+not replace that readiness probe.
+
+Every Claude usage fetch reads the current credential sources again. On macOS
+the order is:
+
+1. `Claude Code-credentials-<suffix>`, where `<suffix>` is the first eight
+   hexadecimal characters of SHA-256 over the exact UTF-8 Claude config
+   directory string;
+2. the legacy `Claude Code-credentials` Keychain service;
+3. `<config-directory>/.credentials.json`.
+
+The config directory is `CLAUDE_CONFIG_DIR` when set and otherwise
+`$HOME/.claude`. An explicit `CLAUDE_CONFIG_DIR` still participates in scoped
+Keychain lookup. A non-UTF-8 directory skips only the scoped service, and
+`BIBCODE_CLAUDE_KEYCHAIN_ACCESS=disabled` disables all Keychain reads while
+preserving file lookup. Other platforms use the credential file.
+
+BiBCode sends the current non-empty access token to Anthropic's usage endpoint
+even when the locally recorded `expiresAt` is in the past; the server response
+is authoritative. An HTTP 401 may try the next distinct credential source.
+Other HTTP, transport, and JSON failures are returned without switching
+credentials.
+
+Status-bar polling uses the normal throttled refresh. Clicking its refresh
+button is an explicit forced fetch and may overlap a background fetch. Enabling
+a previously disabled Claude provider in **Settings → Agents** waits for the
+settings update and readiness probe to succeed, then performs the same forced
+Claude-only usage refresh. After signing in with the Claude CLI, either action
+therefore observes the newly written local credentials without restarting
+BiBCode.
+
 ## Updates and version advisories
 
 BiBCode resolves the configured executable before selecting a release source

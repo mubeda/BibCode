@@ -28,6 +28,36 @@ Provider-specific events are normalized into shared orchestration contracts;
 provider wire payloads do not leak into React state. See
 [RPC and orchestration](./rpc-and-orchestration.md).
 
+## Provider usage and local credential ownership
+
+`ProviderUsageService` owns only bounded quota snapshots, refresh admission,
+staleness, and provider-specific usage requests. It does not own local provider
+accounts. Authentication readiness is part of provider inventory; quota usage
+is an independent observation and cannot make an instance authenticated.
+
+For Claude, the installed CLI is the sole credential writer and refresher.
+Each usage fetch rebuilds and rereads its credential sources rather than
+retaining a process-lifetime credential payload. On macOS the ordered sources
+are the config-scoped Keychain service, the legacy Keychain service, and the
+config directory's `.credentials.json`; elsewhere the file is used. The scoped
+service suffix is derived from the exact UTF-8 config-directory string in the
+same form used by Claude Code. `CLAUDE_CONFIG_DIR` replaces the default
+`$HOME/.claude`, and `BIBCODE_CLAUDE_KEYCHAIN_ACCESS=disabled` is the explicit
+Keychain-read opt-out.
+
+Local Claude expiry metadata is advisory for usage observation: BiBCode sends
+the current access token and lets the usage endpoint decide whether it remains
+valid. Only HTTP 401 permits trying the next distinct source. BiBCode never
+calls Claude's OAuth token endpoint and never writes the shared credential file
+or Keychain from this path. This keeps account rotation and Enterprise policy
+inside the provider CLI's trust boundary.
+
+Normal provider-usage refreshes remain throttled. A typed `force` request
+bypasses that throttle for explicit user actions and the successful
+disabled-to-enabled Claude transition. Background and manual UI requests have
+separate single-flight ownership so a click cannot silently join a stale
+polling request.
+
 ## Provider instances and terminals
 
 Enabled instances appear in the center-panel add menu. A ready instance can

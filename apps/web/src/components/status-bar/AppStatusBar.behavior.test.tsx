@@ -229,7 +229,7 @@ describe("status bar refresh guards", () => {
       refreshLocalProcessDiagnostics: refreshHistory,
       refreshResourceHistory: refreshHistory,
     };
-    await createStatusBarRefreshHandler(refreshInput)();
+    await createStatusBarRefreshHandler(refreshInput)(false);
     const resourceRefreshInput = {
       environmentId: null,
       refreshProcessDiagnostics: refreshDiagnostics,

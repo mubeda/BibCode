@@ -84,6 +84,22 @@ subsequent durable orchestration events. Streaming subscriptions can be
 re-established after reconnect from snapshots or replay methods rather than
 depending on connection-local push caches.
 
+## Provider usage refresh
+
+`server.getProviderUsage` reads the server's current provider-usage snapshots.
+`server.refreshProviderUsage` accepts an optional provider list and an optional
+boolean `force`. Omitting `force`, or sending `false`, uses the normal refresh
+throttle; `force: true` starts an explicit fetch even inside that interval.
+The default preserves compatibility for older clients.
+
+Forced refresh changes admission only. It does not authorize credential
+mutation or account management: provider usage fetchers remain observers of
+the local provider CLI's account. The client waits for the refresh command to
+settle before refreshing the query, so a committed snapshot is not displayed
+one cycle late. Background status-bar polling is single-flighted separately
+from a forced manual request; repeated manual activation still shares one
+manual request per environment.
+
 ## Invariants
 
 - Contracts define the wire; server and client fixtures guard compatibility.
