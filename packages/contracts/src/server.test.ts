@@ -62,6 +62,10 @@ describe("ServerProvider", () => {
   });
 
   it("keeps old snapshots compatible and decodes context-usage capability", () => {
+    expect(decodeServerProvider(baseProviderSnapshot).supportsMcpStatus).toBeUndefined();
+    expect(
+      decodeServerProvider({ ...baseProviderSnapshot, supportsMcpStatus: true }).supportsMcpStatus,
+    ).toBe(true);
     expect(decodeServerProvider(baseProviderSnapshot).supportsContextWindowUsage).toBeUndefined();
     expect(
       decodeServerProvider({
