@@ -129,15 +129,6 @@ interface CapturedRowProps {
   onToggleFavorite: () => void;
 }
 
-interface CapturedSidebarProps {
-  selectedInstanceId: string;
-  onSelectInstance: (instanceId: string) => void;
-  instanceEntries: ReadonlyArray<ProviderInstanceEntry>;
-  showFavorites?: boolean;
-  disabledInstanceIds?: ReadonlySet<string>;
-  getDisabledInstanceTooltip?: (entry: ProviderInstanceEntry) => string;
-}
-
 interface CapturedComboboxProps {
   items: string[];
   filteredItems: string[];
@@ -183,13 +174,11 @@ interface CapturedLegendProps {
 
 const captured = vi.hoisted(() => ({
   rows: [] as CapturedRowProps[],
-  sidebar: [] as CapturedSidebarProps[],
   combobox: [] as CapturedComboboxProps[],
   input: [] as CapturedInputProps[],
   legend: [] as CapturedLegendProps[],
   clear() {
     this.rows = [];
-    this.sidebar = [];
     this.combobox = [];
     this.input = [];
     this.legend = [];
@@ -244,22 +233,6 @@ vi.mock("./ModelListRow", () => ({
       >
         {props.model.name}
       </div>
-    );
-  },
-}));
-
-vi.mock("./ModelPickerSidebar", () => ({
-  ModelPickerSidebar: (props: CapturedSidebarProps) => {
-    captured.sidebar.push(props);
-    return (
-      <div
-        data-testid="sidebar"
-        data-selected-instance={String(props.selectedInstanceId)}
-        data-rail={props.instanceEntries.map((entry) => entry.instanceId).join(",")}
-        data-disabled-ids={
-          props.disabledInstanceIds ? [...props.disabledInstanceIds].join(",") : undefined
-        }
-      />
     );
   },
 }));
@@ -568,7 +541,6 @@ describe("ModelPickerContent", () => {
     const onInstanceModelChange = vi.fn();
     render(buildProps({ lockToActiveInstance: false, onInstanceModelChange }));
 
-    expect(captured.sidebar[0]?.selectedInstanceId).toBe("codex");
     captured.combobox[0]?.onValueChange("claude:opus");
     expect(onInstanceModelChange).toHaveBeenCalledWith("claude", "opus");
 
@@ -588,6 +560,13 @@ describe("ModelPickerContent", () => {
     expect(captured.combobox[0]?.filteredItems).toEqual([]);
   });
 
+  it("shows every ready provider in one unlocked model list without a provider rail", () => {
+    const markup = render(buildProps({ lockToActiveInstance: false, lockedProvider: null }));
+
+    expect(renderedRowKeys()).toEqual(["codex:gpt-5", "codex:gpt-5-codex", "claude:opus"]);
+    expect(markup).not.toContain('data-testid="sidebar"');
+  });
+
   it("follows active instance changes while the mounted picker is locked", () => {
     render(buildProps({ lockToActiveInstance: true }));
     expect(renderedRowKeys()).toEqual(["codex:gpt-5", "codex:gpt-5-codex"]);
@@ -605,26 +584,20 @@ describe("ModelPickerContent", () => {
     expect(renderedRowKeys()).toEqual(["claude:opus"]);
   });
 
-  it("preserves the user's sidebar selection when the unlocked active instance changes", () => {
+  it("keeps every ready provider visible when the unlocked active instance changes", () => {
     render(buildProps());
-    captured.sidebar[0]?.onSelectInstance("claude");
-    rerender();
-    expect(renderedRowKeys()).toEqual(["claude:opus"]);
+    expect(renderedRowKeys()).toEqual(["codex:gpt-5", "codex:gpt-5-codex", "claude:opus"]);
 
     render(buildProps({ activeInstanceId: id("gemini"), model: "flash" }));
-    hooks.runEffects();
-    rerender();
 
-    expect(captured.sidebar[0]?.selectedInstanceId).toBe("claude");
-    expect(renderedRowKeys()).toEqual(["claude:opus"]);
+    expect(renderedRowKeys()).toEqual(["codex:gpt-5", "codex:gpt-5-codex", "claude:opus"]);
   });
 
-  it("renders only ready instances' models for the active instance", () => {
+  it("renders models from every ready instance and excludes stale instances", () => {
     const markup = render(buildProps());
 
-    // Initial rail selection follows the active instance when no favorites exist.
-    expect(captured.sidebar[0]?.selectedInstanceId).toBe("codex");
-    expect(renderedRowKeys()).toEqual(["codex:gpt-5", "codex:gpt-5-codex"]);
+    expect(markup).not.toContain('data-testid="sidebar"');
+    expect(renderedRowKeys()).toEqual(["codex:gpt-5", "codex:gpt-5-codex", "claude:opus"]);
     // gemini (not ready) and ghost (no entry) never enter the flattened list.
     expect(captured.combobox[0]?.items).toEqual([
       "codex:gpt-5",
@@ -632,12 +605,6 @@ describe("ModelPickerContent", () => {
       "claude:opus",
     ]);
     expect(markup).toContain("No models found");
-    // Sidebar rail contains enabled entries only.
-    expect(captured.sidebar[0]?.instanceEntries.map((e) => e.instanceId)).toEqual([
-      "codex",
-      "claude",
-      "gemini",
-    ]);
     // The active model row is marked selected.
     const selected = captured.rows.find((row) => row.isSelected);
     expect(selected?.model.slug).toBe("gpt-5");
@@ -652,22 +619,11 @@ describe("ModelPickerContent", () => {
     expect(captured.legend[0]?.recycleItems).toBe(false);
   });
 
-  it("switches the model list when the sidebar selects another instance", () => {
-    render(buildProps());
-    captured.sidebar[0]?.onSelectInstance("claude");
-    expect(testState.inputHandle.focus).toHaveBeenCalledWith({ preventScroll: true });
-
-    rerender();
-    expect(renderedRowKeys()).toEqual(["claude:opus"]);
-    expect(captured.rows[0]?.providerDisplayName).toBe("Claude");
-  });
-
-  it("starts on the favorites rail when favorites exist and filters to them", () => {
+  it("groups favorites first without hiding other ready models", () => {
     testState.favorites = [{ provider: "claude", model: "opus" }];
     render(buildProps());
 
-    expect(captured.sidebar[0]?.selectedInstanceId).toBe("favorites");
-    expect(renderedRowKeys()).toEqual(["claude:opus"]);
+    expect(renderedRowKeys()).toEqual(["claude:opus", "codex:gpt-5", "codex:gpt-5-codex"]);
     expect(captured.rows[0]?.isFavorite).toBe(true);
   });
 
@@ -678,8 +634,6 @@ describe("ModelPickerContent", () => {
     captured.rows[0]?.onToggleFavorite();
     expect(testState.updateSettings).toHaveBeenCalledWith({ favorites: [] });
 
-    captured.sidebar[0]?.onSelectInstance("codex");
-    rerender();
     const gpt5Row = captured.rows.find((row) => row.model.slug === "gpt-5");
     gpt5Row?.onToggleFavorite();
     expect(testState.updateSettings).toHaveBeenLastCalledWith({
@@ -702,7 +656,7 @@ describe("ModelPickerContent", () => {
       displayName: "Codex",
       continuationGroupKey: "grp-a",
     });
-    render(
+    const markup = render(
       buildProps({
         lockedProvider: driver("codex"),
         lockedContinuationGroupKey: "grp-a",
@@ -715,42 +669,27 @@ describe("ModelPickerContent", () => {
       }),
     );
 
-    // When locked, the rail primes to the active instance.
-    expect(captured.sidebar[0]?.selectedInstanceId).toBe("codex");
-    // Available entries sort before locked-out ones.
-    expect(captured.sidebar[0]?.instanceEntries.map((e) => e.instanceId)).toEqual([
-      "codex",
-      "claude",
-      "codex_personal",
-    ]);
-    expect([...(captured.sidebar[0]?.disabledInstanceIds ?? [])].sort()).toEqual([
-      "claude",
-      "codex_personal",
-    ]);
-    expect(captured.sidebar[0]?.getDisabledInstanceTooltip?.(claudeEntry)).toBe(
-      "Claude is unavailable in this thread. Start a new thread to switch providers.",
-    );
+    expect(markup).not.toContain('data-testid="sidebar"');
     // Only the matching continuation group's models remain.
     expect(renderedRowKeys()).toEqual(["codex:gpt-5", "codex:gpt-5-codex"]);
     // Locked pickers render full model names rather than short names.
     expect(captured.rows[0]?.preferShortName).toBe(false);
   });
 
-  it("filters favorites through the locked provider", () => {
+  it("groups favorites first within the locked provider", () => {
     testState.favorites = [
       { provider: "codex", model: "gpt-5" },
       { provider: "claude", model: "opus" },
     ];
     render(buildProps({ lockedProvider: driver("codex") }));
 
-    captured.sidebar[0]?.onSelectInstance("favorites");
-    rerender();
-    expect(renderedRowKeys()).toEqual(["codex:gpt-5"]);
+    expect(renderedRowKeys()).toEqual(["codex:gpt-5", "codex:gpt-5-codex"]);
+    expect(captured.rows[0]?.isFavorite).toBe(true);
   });
 
-  it("ranks search matches across instances and hides the sidebar while searching", () => {
+  it("ranks search matches across instances without a provider rail", () => {
     const markup = render(buildProps());
-    expect(markup).toContain('data-testid="sidebar"');
+    expect(markup).not.toContain('data-testid="sidebar"');
 
     captured.input[0]?.onChange({ target: { value: "gpt" } });
     const searching = rerender();

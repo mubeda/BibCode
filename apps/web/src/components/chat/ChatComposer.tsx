@@ -881,7 +881,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
   );
   const selectedModelForPicker = selectedModel;
   // Instance-keyed option list so the picker can show each configured
-  // instance (built-in + custom) as a first-class sidebar entry. The
+  // instance (built-in + custom) in the unified model list. The
   // options are server-reported models plus that exact instance's
   // configured custom models; selected slugs are not injected into lists.
   const modelOptionsByInstance = useMemo<
