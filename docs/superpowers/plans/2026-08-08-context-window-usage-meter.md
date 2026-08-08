@@ -19,7 +19,7 @@
 - Keep at most one valid projected/live context activity per thread and turn; malformed rows cannot evict a valid row.
 - Do not add a production Node runtime, desktop bridge call, database schema migration, UI framework, icon dependency, or second usage cache.
 - Do not edit `.repos/` or `.codegraph/`; no dependency version changes are planned, so no vendored subtree sync is required.
-- When provider semantics or retention details become uncertain during execution, re-open the corresponding T3Code source under `/Users/admin/projects/t3code` before deciding, then confirm the result against BiBCode's boundary and the provider's authoritative protocol.
+- When provider semantics or retention details become uncertain during execution, re-open the corresponding external reference source before deciding, then confirm the result against BiBCode's boundary and the provider's authoritative protocol.
 - Keep raw prompts, provider responses, environment variables, and authentication material out of diagnostics.
 - Follow strict red-green-refactor: write each behavioral test first, run it and observe the expected failure, then write the minimum implementation.
 - The approved design is `docs/superpowers/specs/2026-08-08-context-window-usage-meter-design.md`.
@@ -514,7 +514,7 @@ impl ClaudeTokenUsageState {
 }
 ```
 
-Use named parsing helpers equivalent to T3Code's proven behavior:
+Use named parsing helpers equivalent to the reference application's proven behavior:
 
 ```rust
 fn non_negative_integer(value: Option<&Value>) -> Option<u64>;
@@ -958,7 +958,7 @@ Expected: valid rows are bounded per turn, malformed rows cannot evict, and exis
 
 - [ ] **Step 9: Write failing client reducer parity tests**
 
-Port T3Code's independently derived behavior cases into `threadReducer.test.ts`:
+Port the reference application's independently derived behavior cases into `threadReducer.test.ts`:
 
 ```ts
 expect(idsAfterValidReplacement).toEqual([
@@ -985,7 +985,7 @@ vp test packages/client-runtime/src/state/threadReducer.test.ts
 
 Expected: the new tests fail because the reducer removes only matching activity IDs.
 
-- [ ] **Step 11: Port the T3Code resolvable-context retention rule**
+- [ ] **Step 11: Port the reference application's resolvable-context retention rule**
 
 Add the exact validity helper:
 
