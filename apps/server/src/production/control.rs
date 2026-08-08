@@ -2651,41 +2651,50 @@ mod tests {
     }
 
     async fn wait_for_probe_after(control: &NativeServerControl, previous: u64) -> u64 {
-        for _ in 0..100 {
-            let current = control.next_provider_probe_sequence.load(Ordering::Acquire);
-            if current > previous {
-                return current;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let current = control.next_provider_probe_sequence.load(Ordering::Acquire);
+                if current > previous {
+                    return current;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-        panic!("provider check did not start");
+        })
+        .await
+        .expect("provider check did not start")
     }
 
     async fn wait_for_full_refresh_idle(control: &NativeServerControl) {
-        for _ in 0..100 {
-            if !control
-                .full_provider_refresh_running
-                .load(Ordering::Acquire)
-            {
-                return;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !control
+                    .full_provider_refresh_running
+                    .load(Ordering::Acquire)
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-        panic!("provider check did not finish");
+        })
+        .await
+        .expect("provider check did not finish");
     }
 
     async fn wait_for_scheduler_request_after(control: &NativeServerControl, previous: u64) {
-        for _ in 0..100 {
-            if control
-                .provider_update_refresh_attempts
-                .load(Ordering::Acquire)
-                > previous
-            {
-                return;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if control
+                    .provider_update_refresh_attempts
+                    .load(Ordering::Acquire)
+                    > previous
+                {
+                    return;
+                }
+                tokio::task::yield_now().await;
             }
-            tokio::task::yield_now().await;
-        }
-        panic!("provider update check did not request a refresh");
+        })
+        .await
+        .expect("provider update check did not request a refresh");
     }
 
     #[tokio::test(start_paused = true)]
