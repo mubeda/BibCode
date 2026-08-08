@@ -1,7 +1,8 @@
 # Context Window Usage Meter Design
 
 **Date:** 2026-08-08
-**Status:** Approved
+**Status:** Approved design; implementation plan:
+`docs/superpowers/plans/2026-08-08-context-window-usage-meter.md`
 
 ## Summary
 
