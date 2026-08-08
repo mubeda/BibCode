@@ -110,7 +110,7 @@ jobs:
         run: vp run test
 
       - name: Rust workspace tests
-        run: cargo test --workspace -j 2
+        run: cargo test --workspace -j 2 -- --test-threads=1
 
   release_smoke:
     name: Release Smoke

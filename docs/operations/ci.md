@@ -7,7 +7,9 @@ four job groups:
   `cargo fmt --all --check`, Clippy with warnings denied, and the complete
   desktop build pipeline on Ubuntu 24.04.
 - **Test** runs every workspace package `test` script with `vp run test`, then
-  runs `cargo test --workspace -j 2` explicitly on Ubuntu 24.04.
+  runs `cargo test --workspace -j 2 -- --test-threads=1` explicitly on Ubuntu
+  24.04. Rust test cases run serially because the process and Git integration
+  fixtures own process-global resources while each case executes.
 - **Release Smoke** runs `scripts/release-smoke.ts` to exercise release-only
   version rewriting, nightly metadata, and lockfile generation without
   publishing.
