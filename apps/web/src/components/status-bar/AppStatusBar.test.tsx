@@ -272,15 +272,20 @@ describe("AppStatusBarView", () => {
     };
     const handler = createStatusBarRefreshHandler(input);
 
-    await handler();
+    await handler(true);
+    await handler(false);
 
-    expect(refreshProviderUsage).toHaveBeenCalledWith({
+    expect(refreshProviderUsage).toHaveBeenNthCalledWith(1, {
       environmentId,
-      input: { providers: ["claude", "codex"] },
+      input: { providers: ["claude", "codex"], force: true },
     });
-    expect(refreshUsageQuery).toHaveBeenCalledTimes(1);
-    expect(refreshProcessDiagnostics).toHaveBeenCalledTimes(1);
-    expect(refreshLocalProcessDiagnostics).toHaveBeenCalledTimes(1);
+    expect(refreshProviderUsage).toHaveBeenNthCalledWith(2, {
+      environmentId,
+      input: { providers: ["claude", "codex"], force: false },
+    });
+    expect(refreshUsageQuery).toHaveBeenCalledTimes(2);
+    expect(refreshProcessDiagnostics).toHaveBeenCalledTimes(2);
+    expect(refreshLocalProcessDiagnostics).toHaveBeenCalledTimes(2);
     expect(refreshResourceHistory).not.toHaveBeenCalled();
   });
 
@@ -305,7 +310,7 @@ describe("AppStatusBarView", () => {
     };
     const handler = createStatusBarRefreshHandler(input);
 
-    const pending = handler();
+    const pending = handler(false);
     expect(refreshProviderUsage).toHaveBeenCalledTimes(1);
     expect(refreshUsageQuery).not.toHaveBeenCalled();
 
@@ -329,7 +334,7 @@ describe("AppStatusBarView", () => {
     };
     const handler = createStatusBarRefreshHandler(input);
 
-    await expect(handler()).rejects.toThrow("provider unavailable");
+    await expect(handler(false)).rejects.toThrow("provider unavailable");
     expect(refreshUsageQuery).toHaveBeenCalledTimes(1);
     expect(refreshProcessDiagnostics).toHaveBeenCalledTimes(1);
     expect(refreshLocalProcessDiagnostics).toHaveBeenCalledTimes(1);

@@ -627,6 +627,10 @@ describe("AppStatusBar real hook rerenders", () => {
     });
 
     expect(harness.refreshProviderUsage).toHaveBeenCalledTimes(1);
+    expect(harness.refreshProviderUsage).toHaveBeenCalledWith({
+      environmentId: remoteEnvironmentId,
+      input: { providers: ["claude", "codex"], force: true },
+    });
     expect(refreshButton.disabled).toBe(true);
 
     pendingRefresh.resolve({ _tag: "Success" });
@@ -635,6 +639,39 @@ describe("AppStatusBar real hook rerenders", () => {
       await Promise.resolve();
     });
     expect(refreshButton.disabled).toBe(false);
+  });
+
+  it("allows one forced manual refresh to overlap an automatic refresh", async () => {
+    harness.usageAtom = Atom.make(
+      AsyncResult.success<ServerProviderUsageResult, Error>(codexUsage(40)),
+    );
+    const pendingRefresh = deferred<{ _tag: "Success" }>();
+    harness.refreshProviderUsage.mockReturnValue(pendingRefresh.promise);
+
+    await renderStatusBar();
+    const refreshButton = container.querySelector<HTMLButtonElement>(
+      '[aria-label="Refresh provider usage"]',
+    );
+    if (refreshButton === null) throw new Error("Provider refresh button was not rendered.");
+    expect(harness.refreshProviderUsage).toHaveBeenNthCalledWith(1, {
+      environmentId: remoteEnvironmentId,
+      input: { providers: ["claude", "codex"], force: false },
+    });
+
+    act(() => {
+      refreshButton.click();
+    });
+
+    expect(harness.refreshProviderUsage).toHaveBeenNthCalledWith(2, {
+      environmentId: remoteEnvironmentId,
+      input: { providers: ["claude", "codex"], force: true },
+    });
+
+    pendingRefresh.resolve({ _tag: "Success" });
+    await act(async () => {
+      await pendingRefresh.promise;
+      await Promise.resolve();
+    });
   });
 
   it("keeps query hook order stable across browser/desktop and remote/local failures", async () => {

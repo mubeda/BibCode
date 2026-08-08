@@ -123,17 +123,20 @@ export function createStatusBarRefreshHandler(input: {
   readonly environmentId: EnvironmentId | null;
   readonly refreshProviderUsage: (value: {
     readonly environmentId: EnvironmentId;
-    readonly input: { readonly providers: readonly ["claude", "codex"] };
+    readonly input: {
+      readonly providers: readonly ["claude", "codex"];
+      readonly force: boolean;
+    };
   }) => Promise<unknown>;
   readonly refreshUsageQuery: () => void;
   readonly refreshProcessDiagnostics: () => void;
   readonly refreshLocalProcessDiagnostics: (() => void) | null;
 }) {
-  return async () => {
+  return async (force: boolean) => {
     if (input.environmentId === null) return;
     const providerRefresh = input.refreshProviderUsage({
       environmentId: input.environmentId,
-      input: { providers: ["claude", "codex"] },
+      input: { providers: ["claude", "codex"], force },
     });
     input.refreshProcessDiagnostics();
     input.refreshLocalProcessDiagnostics?.();
@@ -356,7 +359,7 @@ export function AppStatusBar() {
     const existing = refreshFlightsRef.current.get(environmentId);
     if (existing !== undefined) return existing;
 
-    const flight = performRefresh();
+    const flight = performRefresh(false);
     refreshFlightsRef.current.set(environmentId, flight);
     const finish = () => {
       if (refreshFlightsRef.current.get(environmentId) === flight) {
@@ -371,13 +374,13 @@ export function AppStatusBar() {
 
     manualRefreshPendingRef.current.add(environmentId);
     setManualRefreshVersion((current) => current + 1);
-    const flight = refresh();
+    const flight = performRefresh(true);
     const finish = () => {
       if (!manualRefreshPendingRef.current.delete(environmentId)) return;
       setManualRefreshVersion((current) => current + 1);
     };
     void flight.then(finish, finish);
-  }, [environmentId, refresh]);
+  }, [environmentId, performRefresh]);
   const resourceRefresh = useCallback(
     createStatusBarResourceRefreshHandler({
       environmentId,
