@@ -67,6 +67,7 @@ import {
   serverEnvironment,
 } from "../../state/server";
 import { usePrimaryEnvironment } from "../../state/environments";
+import { useEnvironmentQuery } from "../../state/query";
 import { useProjects } from "../../state/entities";
 import { useArchivedThreadSnapshots } from "../../lib/archivedThreadsState";
 import {
@@ -1258,6 +1259,17 @@ function EnvironmentScopedProviderSettingsPanel({
   const refreshServerProviders = useAtomCommand(serverEnvironment.refreshProviders, {
     reportFailure: false,
   });
+  const refreshProviderUsage = useAtomCommand(serverEnvironment.refreshProviderUsage, {
+    reportFailure: false,
+  });
+  const providerUsage = useEnvironmentQuery(
+    primaryEnvironment
+      ? serverEnvironment.providerUsage({
+          environmentId: primaryEnvironment.environmentId,
+          input: {},
+        })
+      : null,
+  );
   const updateProvider = useAtomCommand(serverEnvironment.updateProvider, {
     reportFailure: false,
   });
@@ -1349,6 +1361,21 @@ function EnvironmentScopedProviderSettingsPanel({
       }
     })();
   }, [primaryEnvironment, refreshServerProviders]);
+
+  const refreshClaudeUsage = useCallback(async () => {
+    if (!primaryEnvironment) return;
+    try {
+      await refreshProviderUsage({
+        environmentId: primaryEnvironment.environmentId,
+        input: { providers: ["claude"], force: true },
+      });
+    } catch {
+      // Command failures are represented by the command layer. Always re-read
+      // the query so the status bar observes any snapshot the server committed.
+    } finally {
+      providerUsage.refresh();
+    }
+  }, [primaryEnvironment, providerUsage.refresh, refreshProviderUsage]);
 
   const runProviderUpdate = useCallback(
     async (candidate: ProviderUpdateCandidate) => {
@@ -1482,6 +1509,7 @@ function EnvironmentScopedProviderSettingsPanel({
       readonly textGenerationModelSelection?: Parameters<
         typeof buildProviderInstanceUpdatePatch
       >[0]["textGenerationModelSelection"];
+      readonly onSuccess?: () => void | Promise<void>;
     },
   ) => {
     const submission = providerInstancesDraftRef.current.submit(row.instanceId, next);
@@ -1508,7 +1536,9 @@ function EnvironmentScopedProviderSettingsPanel({
     void Promise.resolve(updateResult).then((result) => {
       if (isSettingsUpdateFailure(result)) {
         applyRejectedSubmission();
+        return;
       }
+      void options?.onSuccess?.();
     }, applyRejectedSubmission);
   };
 
@@ -1711,15 +1741,20 @@ function EnvironmentScopedProviderSettingsPanel({
               onUpdate={(next) => {
                 const wasEnabled = row.instance.enabled ?? true;
                 const isDisabling = next.enabled === false && wasEnabled;
+                const isEnablingClaude =
+                  row.driver === "claudeAgent" &&
+                  wasEnabled === false &&
+                  (next.enabled ?? true) === true;
                 const shouldClearTextGen = isDisabling && textGenInstanceId === row.instanceId;
-                if (shouldClearTextGen) {
-                  updateProviderInstance(row, next, {
-                    textGenerationModelSelection:
-                      DEFAULT_UNIFIED_SETTINGS.textGenerationModelSelection,
-                  });
-                } else {
-                  updateProviderInstance(row, next);
-                }
+                updateProviderInstance(row, next, {
+                  ...(shouldClearTextGen
+                    ? {
+                        textGenerationModelSelection:
+                          DEFAULT_UNIFIED_SETTINGS.textGenerationModelSelection,
+                      }
+                    : {}),
+                  ...(isEnablingClaude ? { onSuccess: refreshClaudeUsage } : {}),
+                });
               }}
               onDelete={row.isDefault ? undefined : () => deleteProviderInstance(row.instanceId)}
               headerAction={headerAction}
