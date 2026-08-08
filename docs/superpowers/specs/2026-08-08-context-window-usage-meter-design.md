@@ -7,7 +7,7 @@
 ## Summary
 
 Add a context-window usage control to BiBCode's normal chat-composer toolbar,
-matching the supplied T3Code Alpha interaction: a compact circular usage meter
+matching the supplied reference interaction: a compact circular usage meter
 opens a popover with the current context, maximum context, percentage, total
 processed tokens when known, and automatic-compaction guidance.
 
@@ -24,7 +24,7 @@ otherwise alter that toolbar design.
 
 ## Reference Implementation Findings
 
-The T3Code implementation was traced across provider adapters, contracts,
+The external reference implementation was traced across provider adapters, contracts,
 server ingestion, client retention, derivation, and presentation rather than
 copying only its visual component:
 
@@ -40,7 +40,7 @@ copying only its visual component:
 - `ContextWindowMeter` and the pure `contextWindow` helper own presentation and
   derivation respectively.
 
-T3Code's first implementation landed in March 2026 and was followed by fixes
+The reference application's first implementation landed in March 2026 and was followed by fixes
 for ring presentation, hover behavior, and especially Codex/Claude usage
 semantics. BiBCode already contains the dormant contract, derivation helper,
 meter component, and composer integration imported by its earlier toolbar
@@ -75,7 +75,7 @@ therefore part of this feature, not optional follow-up work.
   policy, or provider authentication.
 - Persisting a second context-usage cache outside the orchestration activity
   projection.
-- Importing code from T3Code or from `.repos/`.
+- Importing code from the external reference application or from `.repos/`.
 
 ## Provider Capability Contract
 
