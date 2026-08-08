@@ -59,6 +59,7 @@ export type ServerProviderUsageResult = typeof ServerProviderUsageResult.Type;
 
 export const ServerProviderUsageRefreshInput = Schema.Struct({
   providers: Schema.optional(Schema.Array(ServerProviderUsageProvider)),
+  force: Schema.optional(Schema.Boolean),
 });
 export type ServerProviderUsageRefreshInput = typeof ServerProviderUsageRefreshInput.Type;
 

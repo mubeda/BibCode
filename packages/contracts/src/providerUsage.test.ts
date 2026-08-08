@@ -7,6 +7,7 @@ import {
   ConsumeCodexRateLimitResetInput,
   ConsumeCodexRateLimitResetResult,
   ServerProviderUsageResetCredits,
+  ServerProviderUsageRefreshInput,
   ServerProviderUsageResult,
   ServerProviderUsageSnapshot,
   ServerProviderUsageWindow,
@@ -25,6 +26,16 @@ function decodes<S extends Schema.Top>(schema: S, input: unknown): boolean {
 }
 
 describe("provider usage contracts", () => {
+  it("preserves an explicit forced provider usage refresh request", () => {
+    const decoded = Schema.decodeUnknownSync(ServerProviderUsageRefreshInput)({
+      providers: ["claude"],
+      force: true,
+    });
+
+    expect(decoded).toEqual({ providers: ["claude"], force: true });
+    expect(decodes(ServerProviderUsageRefreshInput, { force: "true" })).toBe(false);
+  });
+
   it("accepts Claude and Codex provider usage snapshots", () => {
     const resetAt = DateTime.makeUnsafe("2026-07-07T20:00:00.000Z");
     const updatedAt = DateTime.makeUnsafe("2026-07-07T18:00:00.000Z");

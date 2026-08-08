@@ -538,6 +538,47 @@ async fn throttles_refreshes_until_the_exact_manual_refresh_boundary() {
 }
 
 #[tokio::test]
+async fn forced_refresh_bypasses_the_background_refresh_throttle() {
+    let first = fixed_time();
+    let now = Arc::new(Mutex::new(first));
+    let calls = Arc::new(AtomicUsize::new(0));
+    let service = ProviderUsageService::new(
+        vec![fetcher(ProviderUsageProvider::Claude, {
+            let now = now.clone();
+            let calls = calls.clone();
+            move || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let updated_at = *now.lock().expect("now");
+                async move { Ok(snapshot(ProviderUsageProvider::Claude, updated_at)) }
+            }
+        })],
+        Arc::new({
+            let now = now.clone();
+            move || *now.lock().expect("now")
+        }),
+    );
+
+    service
+        .refresh(Some(vec![ProviderUsageProvider::Claude]))
+        .await;
+    *now.lock().expect("now") = first + Duration::milliseconds(1);
+    let refreshed = service
+        .refresh_forced(Some(vec![ProviderUsageProvider::Claude]))
+        .await;
+
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    assert_eq!(
+        refreshed
+            .providers
+            .iter()
+            .find(|provider| provider.provider == ProviderUsageProvider::Claude)
+            .expect("claude snapshot")
+            .updated_at,
+        first + Duration::milliseconds(1)
+    );
+}
+
+#[tokio::test]
 async fn keeps_a_snapshot_fresh_at_the_stale_threshold() {
     let first = fixed_time();
     let now = Arc::new(Mutex::new(first));
