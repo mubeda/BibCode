@@ -262,7 +262,12 @@ fn register_provider_usage_rpcs(registry: &mut RpcRegistry, services: &ServerTer
                             .collect::<Result<Vec<_>, Value>>()
                     })
                     .transpose()?;
-                Ok(provider_usage_to_wire(usage.refresh(providers).await))
+                let refreshed = if input.force {
+                    usage.refresh_forced(providers).await
+                } else {
+                    usage.refresh(providers).await
+                };
+                Ok(provider_usage_to_wire(refreshed))
             }
         },
     );
@@ -724,6 +729,8 @@ struct SignalProcessInput {
 #[derive(Deserialize)]
 struct RefreshProviderUsageInput {
     providers: Option<Vec<String>>,
+    #[serde(default)]
+    force: bool,
 }
 
 #[derive(Deserialize)]

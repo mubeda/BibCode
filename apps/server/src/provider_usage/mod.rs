@@ -311,6 +311,14 @@ impl ProviderUsageService {
             .await
     }
 
+    pub async fn refresh_forced(
+        &self,
+        selected_providers: Option<Vec<ProviderUsageProvider>>,
+    ) -> ProviderUsageResult {
+        self.refresh_with_policy(selected_providers, RefreshPolicy::Forced)
+            .await
+    }
+
     pub async fn consume_codex_rate_limit_reset(
         &self,
         request_id: &str,

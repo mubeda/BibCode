@@ -1,8 +1,11 @@
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     net::SocketAddr,
     panic::AssertUnwindSafe,
-    sync::{Arc, OnceLock},
+    sync::{
+        Arc, OnceLock,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -321,6 +324,89 @@ async fn registrar_serves_concrete_server_and_terminal_metadata_rpcs() {
                 ..
             }
         ));
+    })
+    .catch_unwind()
+    .await;
+
+    close_socket(&mut socket).await;
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+    if let Err(panic) = result {
+        std::panic::resume_unwind(panic);
+    }
+}
+
+#[tokio::test]
+async fn provider_usage_refresh_rpc_forces_a_fetch_only_when_requested() {
+    let _test_guard = terminal_rpc_test_lock().lock().await;
+    let temp = TempDir::new().expect("temporary directory");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let now = time::OffsetDateTime::now_utc();
+    let usage = provider_usage::ProviderUsageService::new(
+        vec![provider_usage::ProviderUsageFetcher {
+            provider: provider_usage::ProviderUsageProvider::Claude,
+            fetch: Arc::new({
+                let calls = calls.clone();
+                move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Box::pin(async move {
+                        Ok(provider_usage::ProviderUsageSnapshot {
+                            provider: provider_usage::ProviderUsageProvider::Claude,
+                            status: provider_usage::ProviderUsageStatus::Ok,
+                            session: None,
+                            weekly: None,
+                            fable_weekly: None,
+                            plan_type: None,
+                            rate_limit_reset_credits: None,
+                            updated_at: now,
+                            error: None,
+                            metadata: BTreeMap::new(),
+                        })
+                    })
+                }
+            }),
+        }],
+        Arc::new(move || now),
+    );
+    let mut registry = RpcRegistry::empty();
+    register_server_terminal_rpc(&mut registry, fixture_services_with_usage(usage));
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
+        .await
+        .expect("Rust server starts");
+    let mut socket = Some(open_socket(handle.local_addr()).await);
+
+    let result = AssertUnwindSafe(async {
+        let socket = socket.as_mut().expect("socket");
+        success_value(
+            request(
+                socket,
+                "1",
+                "server.refreshProviderUsage",
+                json!({ "providers": ["claude"] }),
+            )
+            .await,
+        );
+        success_value(
+            request(
+                socket,
+                "2",
+                "server.refreshProviderUsage",
+                json!({ "providers": ["claude"] }),
+            )
+            .await,
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        success_value(
+            request(
+                socket,
+                "3",
+                "server.refreshProviderUsage",
+                json!({ "providers": ["claude"], "force": true }),
+            )
+            .await,
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
     })
     .catch_unwind()
     .await;
@@ -1276,6 +1362,12 @@ fn fixture_services() -> ServerTerminalServices {
         Vec::new(),
         Arc::new(time::OffsetDateTime::now_utc),
     );
+    fixture_services_with_usage(usage)
+}
+
+fn fixture_services_with_usage(
+    usage: provider_usage::ProviderUsageService,
+) -> ServerTerminalServices {
     let sampler = Arc::new(diagnostics::NativeProcessSampler::default());
     let resource_sampler = Arc::new(diagnostics::NativeResourceSampler::new(
         sampler.clone(),
