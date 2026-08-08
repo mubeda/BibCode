@@ -2609,10 +2609,18 @@ mod tests {
         let (registry_url, registry_version, requests) = mutable_provider_registry("1.18.11").await;
         let maintenance = ProviderMaintenance::with_registry_base_url(registry_url);
         control.provider_maintenance = maintenance.clone();
+        let npm_bin = temp.path().join(".npm-global/bin");
+        std::fs::create_dir_all(&npm_bin).expect("global npm bin");
+        let binary = npm_bin.join(if cfg!(windows) {
+            "opencode.cmd"
+        } else {
+            "opencode"
+        });
+        std::fs::write(&binary, b"fixture").expect("global npm executable");
         let target = ProviderMaintenanceTarget {
             instance_id: "opencode".to_owned(),
             driver: "opencode".to_owned(),
-            binary_path: "opencode".to_owned(),
+            binary_path: binary.to_string_lossy().into_owned(),
             environment: Vec::new(),
         };
         let mut startup = json!({
