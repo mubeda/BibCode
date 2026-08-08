@@ -2770,6 +2770,129 @@ async fn session_runtime_matches_text_tool_and_approval_traces() {
 }
 
 #[tokio::test]
+async fn root_token_usage_notifications_are_normalized_and_child_usage_is_ignored() {
+    let (connection, incoming, mut peer) = scripted_peer();
+    let runtime = CodexSessionRuntime::new(
+        CodexSessionOptions {
+            version: "0.1.1".to_owned(),
+            thread_id: "fixture-thread".to_owned(),
+            cwd: "/tmp/project".to_owned(),
+            runtime_mode: CodexRuntimeMode::FullAccess,
+            model: Some("gpt-5.3-codex".to_owned()),
+            service_tier: None,
+            effort: None,
+            resume_cursor: None,
+        },
+        connection,
+        incoming,
+    );
+
+    peer.expect_request("initialize", fixture("initialize-params.json"))
+        .respond(json!({}));
+    peer.expect_notification("initialized");
+    peer.expect_request(
+        "thread/start",
+        json!({
+            "cwd": "/tmp/project",
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+            "model": "gpt-5.3-codex",
+            "serviceTier": null,
+        }),
+    )
+    .respond(json!({
+        "cwd": "/tmp/project",
+        "model": "gpt-5.3-codex",
+        "thread": { "id": "provider-thread-1" }
+    }));
+    peer.expect_request("turn/start", fixture("turn-start-text.json"))
+        .respond(json!({ "turn": { "id": "fixture-turn" } }))
+        .emit_notification(json!({
+            "method": "turn/started",
+            "params": {
+                "threadId": "provider-thread-1",
+                "turn": { "id": "fixture-turn" }
+            }
+        }))
+        .emit_notification(json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "provider-thread-1",
+                "turnId": "fixture-turn",
+                "tokenUsage": {
+                    "last": { "totalTokens": 1_075 },
+                    "total": { "totalTokens": 10_200 },
+                    "modelContextWindow": 258_400
+                }
+            }
+        }))
+        .emit_notification(json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "child-1",
+                "turnId": "child-turn",
+                "tokenUsage": {
+                    "last": { "totalTokens": 999_999 },
+                    "total": { "totalTokens": 999_999 },
+                    "modelContextWindow": 1_000_000
+                }
+            }
+        }))
+        .emit_notification(json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "provider-thread-1",
+                "turn": { "id": "fixture-turn", "status": "completed" }
+            }
+        }));
+
+    let peer_task = tokio::spawn(peer.run());
+    runtime.start().await.expect("runtime starts");
+    runtime.collect_events(3).await;
+    runtime
+        .send_turn(Some("Small text turn".to_owned()), vec![], None, None)
+        .await
+        .expect("turn starts");
+    let events = timeout(Duration::from_secs(2), runtime.collect_events(3))
+        .await
+        .expect("root usage and completion events");
+
+    let usage_events = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event.event_type == "thread.token-usage.updated")
+        .collect::<Vec<_>>();
+    assert_eq!(usage_events.len(), 1);
+    let (usage_index, usage_event) = usage_events[0];
+    assert_eq!(usage_event.turn_id.as_deref(), Some("fixture-turn"));
+    assert_eq!(
+        usage_event.payload,
+        json!({
+            "usage": {
+                "usedTokens": 1_075,
+                "totalProcessedTokens": 10_200,
+                "maxTokens": 258_400,
+                "lastUsedTokens": 1_075,
+                "compactsAutomatically": true
+            }
+        })
+    );
+    let completion_index = events
+        .iter()
+        .position(|event| event.event_type == "turn.completed")
+        .expect("turn completion event");
+    assert!(usage_index < completion_index);
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.payload.to_string().contains("999999")),
+        "child usage must not reach canonical payloads: {events:?}"
+    );
+
+    peer_task.await.expect("peer task");
+}
+
+#[tokio::test]
 async fn activity_runtime_routes_live_children_without_changing_root_events() {
     let (connection, incoming, mut peer) = scripted_peer();
     let runtime = CodexSessionRuntime::new(
