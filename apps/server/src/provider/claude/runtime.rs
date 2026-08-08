@@ -17,6 +17,7 @@ use super::transcript::{
     ClaudeRecoveredTranscript, ClaudeTranscriptRecoveryRequest,
     ClaudeTranscriptRecoveryRequestMetadata, records_at_or_after,
 };
+use super::usage::{ClaudeTokenUsageSnapshot, ClaudeTokenUsageState};
 use crate::activity::{
     ActivityCapabilities, ActivityHistoryRecovery, ActivityObservationState,
     ProviderActivityMutation,
@@ -218,6 +219,7 @@ pub struct ClaudeProviderRuntime {
     activity_generation: u64,
     activity_not_before_unix_nanos: i128,
     correlated_activity_enabled: bool,
+    token_usage: ClaudeTokenUsageState,
 }
 
 impl ClaudeProviderRuntime {
@@ -244,6 +246,7 @@ impl ClaudeProviderRuntime {
             activity_generation: 0,
             activity_not_before_unix_nanos: i128::MIN,
             correlated_activity_enabled: false,
+            token_usage: ClaudeTokenUsageState::default(),
         }
     }
 
@@ -350,6 +353,23 @@ impl ClaudeProviderRuntime {
         emitted_at_ms: u64,
         authenticated_hook: bool,
     ) -> ClaudeRuntimeOutput {
+        let token_usage = self.token_usage.observe_stream_value(value);
+        let turn_id = self.current_turn_id.clone();
+        let mut output = self.handle_non_usage_raw_value(value, emitted_at_ms, authenticated_hook);
+        if let (Some(turn_id), Some(usage)) = (turn_id, token_usage) {
+            output
+                .events
+                .insert(0, self.token_usage_event(turn_id, usage));
+        }
+        output
+    }
+
+    fn handle_non_usage_raw_value(
+        &mut self,
+        value: &Value,
+        emitted_at_ms: u64,
+        authenticated_hook: bool,
+    ) -> ClaudeRuntimeOutput {
         if value
             .get("hook_event_name")
             .and_then(Value::as_str)
@@ -426,6 +446,19 @@ impl ClaudeProviderRuntime {
             native_event_id: None,
             recovery_request: None,
         }
+    }
+
+    #[allow(
+        dead_code,
+        reason = "the response-correlated completion query is integrated by Task 4"
+    )]
+    pub(crate) fn apply_context_usage_response(
+        &mut self,
+        turn_id: &str,
+        response: &Value,
+    ) -> Option<CanonicalEvent> {
+        let usage = self.token_usage.observe_context_response(response)?;
+        Some(self.token_usage_event(turn_id.to_owned(), usage))
     }
 
     pub(crate) fn handle_recovered_transcript(
@@ -952,6 +985,20 @@ impl ClaudeProviderRuntime {
             provider_refs,
             payload,
         }
+    }
+
+    fn token_usage_event(
+        &self,
+        turn_id: String,
+        usage: ClaudeTokenUsageSnapshot,
+    ) -> CanonicalEvent {
+        self.event(
+            "thread.token-usage.updated",
+            Some(turn_id),
+            None,
+            None,
+            json!({ "usage": usage }),
+        )
     }
 }
 
