@@ -1,4 +1,4 @@
-import { fileURLToPath } from "node:url";
+import * as NodeURL from "node:url";
 import { build, normalizePath, type Rollup } from "vite";
 import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
 import { Window } from "happy-dom";
@@ -9,7 +9,7 @@ let originalDocument: Document | undefined;
 let originalGetComputedStyle: typeof getComputedStyle | undefined;
 let compiledStylesheet = "";
 const applicationStylesheetPath = normalizePath(
-  fileURLToPath(new URL("./index.css", import.meta.url)),
+  NodeURL.fileURLToPath(new URL("./index.css", import.meta.url)),
 );
 
 async function loadApplicationStylesheet(): Promise<string> {
