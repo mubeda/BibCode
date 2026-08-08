@@ -71,6 +71,8 @@ const h = vi.hoisted(() => {
     },
     localApi: undefined as unknown,
     refreshProvidersCommand: vi.fn(),
+    refreshProviderUsageCommand: vi.fn(),
+    providerUsageQueryRefresh: vi.fn(),
     updateProviderCommand: vi.fn(),
     genericCommand: vi.fn(),
     toastAdd: vi.fn(),
@@ -78,7 +80,9 @@ const h = vi.hoisted(() => {
     atoms: {
       observability: Symbol("primaryServerObservabilityAtom"),
       providers: Symbol("primaryServerProvidersAtom"),
+      providerUsage: Symbol("serverEnvironment.providerUsage"),
       refreshProviders: Symbol("serverEnvironment.refreshProviders"),
+      refreshProviderUsage: Symbol("serverEnvironment.refreshProviderUsage"),
       updateProvider: Symbol("serverEnvironment.updateProvider"),
     },
   };
@@ -124,14 +128,27 @@ vi.mock("../../state/server", () => ({
   primaryServerObservabilityAtom: h.atoms.observability,
   primaryServerProvidersAtom: h.atoms.providers,
   serverEnvironment: {
+    providerUsage: () => h.atoms.providerUsage,
     refreshProviders: h.atoms.refreshProviders,
+    refreshProviderUsage: h.atoms.refreshProviderUsage,
     updateProvider: h.atoms.updateProvider,
   },
+}));
+
+vi.mock("../../state/query", () => ({
+  useEnvironmentQuery: () => ({
+    data: null,
+    emission: { _tag: "Initial", waiting: false },
+    error: null,
+    isPending: false,
+    refresh: h.providerUsageQueryRefresh,
+  }),
 }));
 
 vi.mock("../../state/use-atom-command", () => ({
   useAtomCommand: (atom: unknown) => {
     if (atom === h.atoms.refreshProviders) return h.refreshProvidersCommand;
+    if (atom === h.atoms.refreshProviderUsage) return h.refreshProviderUsageCommand;
     if (atom === h.atoms.updateProvider) return h.updateProviderCommand;
     return h.genericCommand;
   },
@@ -585,6 +602,9 @@ beforeEach(() => {
   h.localApi = undefined;
   h.refreshProvidersCommand.mockReset();
   h.refreshProvidersCommand.mockResolvedValue({ _tag: "Success", value: { providers: [] } });
+  h.refreshProviderUsageCommand.mockReset();
+  h.refreshProviderUsageCommand.mockResolvedValue({ _tag: "Success", value: { providers: [] } });
+  h.providerUsageQueryRefresh.mockReset();
   h.updateProviderCommand.mockReset();
   h.updateProviderCommand.mockResolvedValue({ _tag: "Success", value: { providers: [] } });
   h.genericCommand.mockReset();
@@ -1671,6 +1691,120 @@ describe("ProviderSettingsPanel", () => {
           previousActEnvironment;
       }
     }
+  });
+
+  it("refreshes Claude usage only after a disabled Claude instance is enabled successfully", async () => {
+    const settings = baseProviderSettings();
+    const disabledClaude: ProviderInstanceConfig = {
+      driver: CLAUDE_DRIVER,
+      enabled: false,
+      config: { enabled: false },
+    };
+    h.settings = {
+      ...settings,
+      providerInstances: {
+        ...settings.providerInstances,
+        [ProviderInstanceId.make("claudeAgent")]: disabledClaude,
+      },
+    };
+    const mutation = deferred<unknown>();
+    const usageRefresh = deferred<unknown>();
+    h.updateSettings.mockReturnValue(mutation.promise);
+    h.refreshProviderUsageCommand.mockReturnValue(usageRefresh.promise);
+
+    render(<ProviderSettingsPanel />);
+    const claudeCard = h.instanceCards.find((card) => String(card.instanceId) === "claudeAgent")!;
+    (claudeCard.onUpdate as (next: ProviderInstanceConfig) => void)({
+      ...disabledClaude,
+      enabled: true,
+      config: { enabled: true },
+    });
+
+    expect(h.refreshProviderUsageCommand).not.toHaveBeenCalled();
+    expect(h.providerUsageQueryRefresh).not.toHaveBeenCalled();
+
+    mutation.resolve(AsyncResult.success(h.settings as UnifiedSettings));
+    await flush();
+
+    expect(h.refreshProviderUsageCommand).toHaveBeenCalledWith({
+      environmentId: ENVIRONMENT_ID,
+      input: { providers: ["claude"], force: true },
+    });
+    expect(h.providerUsageQueryRefresh).not.toHaveBeenCalled();
+
+    usageRefresh.resolve(AsyncResult.success({ providers: [] }));
+    await flush();
+
+    expect(h.providerUsageQueryRefresh).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not refresh Claude usage for failed or unrelated provider transitions", async () => {
+    const settings = baseProviderSettings();
+    const exercise = async ({
+      instanceId,
+      current,
+      next,
+      result,
+    }: {
+      readonly instanceId: string;
+      readonly current: ProviderInstanceConfig;
+      readonly next: ProviderInstanceConfig;
+      readonly result: unknown;
+    }) => {
+      h.settings = {
+        ...settings,
+        providerInstances: {
+          ...settings.providerInstances,
+          [ProviderInstanceId.make(instanceId)]: current,
+        },
+      };
+      h.updateSettings.mockReset().mockResolvedValue(result);
+      h.refreshProviderUsageCommand.mockClear();
+      h.providerUsageQueryRefresh.mockClear();
+      render(<ProviderSettingsPanel />);
+      const card = h.instanceCards.find(
+        (candidate) => String(candidate.instanceId) === instanceId,
+      )!;
+      (card.onUpdate as (updated: ProviderInstanceConfig) => void)(next);
+      await flush();
+      expect(h.refreshProviderUsageCommand).not.toHaveBeenCalled();
+      expect(h.providerUsageQueryRefresh).not.toHaveBeenCalled();
+    };
+    const disabledClaude: ProviderInstanceConfig = {
+      driver: CLAUDE_DRIVER,
+      enabled: false,
+      config: { enabled: false },
+    };
+    const enabledClaude: ProviderInstanceConfig = {
+      driver: CLAUDE_DRIVER,
+      enabled: true,
+      config: { enabled: true },
+    };
+
+    await exercise({
+      instanceId: "claudeAgent",
+      current: disabledClaude,
+      next: enabledClaude,
+      result: AsyncResult.failure(Cause.fail(new Error("settings rejected"))),
+    });
+    await exercise({
+      instanceId: "claudeAgent",
+      current: enabledClaude,
+      next: disabledClaude,
+      result: AsyncResult.success(h.settings as UnifiedSettings),
+    });
+    await exercise({
+      instanceId: "claudeAgent",
+      current: enabledClaude,
+      next: { ...enabledClaude, displayName: "Claude Enterprise" },
+      result: AsyncResult.success(h.settings as UnifiedSettings),
+    });
+    await exercise({
+      instanceId: "codex",
+      current: { driver: CODEX_DRIVER, enabled: false, config: { enabled: false } },
+      next: { driver: CODEX_DRIVER, enabled: true, config: { enabled: true } },
+      result: AsyncResult.success(h.settings as UnifiedSettings),
+    });
   });
 
   it("composes provider instance edits before the settings stream acknowledges them", () => {
