@@ -14,6 +14,7 @@ import {
 } from "./providerUsage.ts";
 
 const decodeProviderUsageSnapshot = Schema.decodeUnknownSync(ServerProviderUsageSnapshot);
+const decodeProviderUsageRefreshInput = Schema.decodeUnknownSync(ServerProviderUsageRefreshInput);
 const encodeProviderUsageSnapshot = Schema.encodeSync(ServerProviderUsageSnapshot);
 
 function decodes<S extends Schema.Top>(schema: S, input: unknown): boolean {
@@ -27,7 +28,7 @@ function decodes<S extends Schema.Top>(schema: S, input: unknown): boolean {
 
 describe("provider usage contracts", () => {
   it("preserves an explicit forced provider usage refresh request", () => {
-    const decoded = Schema.decodeUnknownSync(ServerProviderUsageRefreshInput)({
+    const decoded = decodeProviderUsageRefreshInput({
       providers: ["claude"],
       force: true,
     });
