@@ -714,11 +714,17 @@ async fn completes_a_refresh_when_a_provider_fetcher_never_returns() {
 #[tokio::test]
 async fn production_fetchers_handle_local_credentials_and_codex_rpc_responses() {
     let temporary = tempfile::tempdir().expect("temporary directory");
-    let _environment = EnvGuard::new(&["CLAUDE_CONFIG_DIR", "CODEX_HOME", "CODEX_BIN"]);
+    let _environment = EnvGuard::new(&[
+        "BIBCODE_CLAUDE_KEYCHAIN_ACCESS",
+        "CLAUDE_CONFIG_DIR",
+        "CODEX_HOME",
+        "CODEX_BIN",
+    ]);
     let claude_home = temporary.path().join("claude");
     let codex_home = temporary.path().join("codex");
     fs::create_dir_all(&codex_home).expect("codex home");
     EnvGuard::set("CLAUDE_CONFIG_DIR", &claude_home);
+    EnvGuard::set("BIBCODE_CLAUDE_KEYCHAIN_ACCESS", "disabled");
     EnvGuard::set("CODEX_HOME", &codex_home);
 
     let fetchers = production_fetchers();
