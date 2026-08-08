@@ -1,4 +1,5 @@
-import { build, type Rollup } from "vite";
+import { fileURLToPath } from "node:url";
+import { build, normalizePath, type Rollup } from "vite";
 import { afterAll, beforeAll, describe, expect, it } from "vite-plus/test";
 import { Window } from "happy-dom";
 import tailwindcss from "@tailwindcss/vite";
@@ -7,7 +8,9 @@ let windowInstance: Window;
 let originalDocument: Document | undefined;
 let originalGetComputedStyle: typeof getComputedStyle | undefined;
 let compiledStylesheet = "";
-const applicationStylesheetPath = new URL("./index.css", import.meta.url).pathname;
+const applicationStylesheetPath = normalizePath(
+  fileURLToPath(new URL("./index.css", import.meta.url)),
+);
 
 async function loadApplicationStylesheet(): Promise<string> {
   const buildResult = (await build({
