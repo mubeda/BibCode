@@ -1103,22 +1103,53 @@ function ProposedPlanTimelineRow({
   );
 }
 
+const WORKING_INDICATOR_DOTS = [
+  ["left-0.5 top-0.5", "0ms"],
+  ["left-[6.75px] top-0.5", "-980ms"],
+  ["right-0.5 top-0.5", "-840ms"],
+  ["right-0.5 top-[6.75px]", "-700ms"],
+  ["right-0.5 bottom-0.5", "-560ms"],
+  ["left-[6.75px] bottom-0.5", "-420ms"],
+  ["left-0.5 bottom-0.5", "-280ms"],
+  ["left-0.5 top-[6.75px]", "-140ms"],
+] as const;
+
+function WorkingIndicatorIcon() {
+  return (
+    <span
+      aria-hidden="true"
+      className="relative size-4 shrink-0"
+      data-working-indicator="reversed"
+    >
+      {WORKING_INDICATOR_DOTS.map(([position, animationDelay], index) => (
+        <span
+          key={position}
+          className={cn(
+            "working-indicator-dot absolute size-[2.5px] rounded-full bg-current",
+            position,
+          )}
+          data-working-indicator-dot={index + 1}
+          style={{ animationDelay }}
+        />
+      ))}
+    </span>
+  );
+}
+
 function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "working" }> }) {
   return (
     <div className="py-0.5 pl-1.5">
       <div className="flex items-center gap-2 pt-1 text-[11px] text-muted-foreground/70 tabular-nums">
-        <span className="inline-flex items-center gap-[3px]">
-          <span className="h-1 w-1 rounded-full bg-muted-foreground/30 animate-pulse" />
-          <span className="h-1 w-1 rounded-full bg-muted-foreground/30 animate-pulse [animation-delay:200ms]" />
-          <span className="h-1 w-1 rounded-full bg-muted-foreground/30 animate-pulse [animation-delay:400ms]" />
-        </span>
+        <WorkingIndicatorIcon />
         <span>
           {row.createdAt ? (
             <>
-              Working for <WorkingTimer createdAt={row.createdAt} />
+              Waiting for <WorkingTimer createdAt={row.createdAt} />
             </>
           ) : (
-            "Working..."
+            <>
+              Waiting for <span className="tabular-nums">0.0s</span>
+            </>
           )}
         </span>
       </div>
@@ -1131,7 +1162,7 @@ function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "workin
 // does not create a React commit every second while a response is streaming.
 // ---------------------------------------------------------------------------
 
-/** Live "Working for Xs" label. */
+/** Live elapsed label for the active waiting row. */
 function WorkingTimer({ createdAt }: { createdAt: string }) {
   const textRef = useRef<HTMLSpanElement>(null);
   const initialText = formatWorkingTimerNow(createdAt);
@@ -1143,7 +1174,7 @@ function WorkingTimer({ createdAt }: { createdAt: string }) {
       }
     };
     updateText();
-    const id = setInterval(updateText, 1000);
+    const id = setInterval(updateText, 100);
     return () => clearInterval(id);
   }, [createdAt]);
 
@@ -1758,24 +1789,21 @@ function formatWorkingTimer(startIso: string, endIso: string): string | null {
     return null;
   }
 
-  const elapsedSeconds = Math.max(0, Math.floor((endedAtMs - startedAtMs) / 1000));
-  if (elapsedSeconds < 60) {
-    return `${elapsedSeconds}s`;
-  }
-
-  const hours = Math.floor(elapsedSeconds / 3600);
-  const minutes = Math.floor((elapsedSeconds % 3600) / 60);
-  const seconds = elapsedSeconds % 60;
+  const elapsedTenths = Math.max(0, Math.floor((endedAtMs - startedAtMs) / 100));
+  const hours = Math.floor(elapsedTenths / 36_000);
+  const minutes = Math.floor((elapsedTenths % 36_000) / 600);
+  const seconds = (elapsedTenths % 600) / 10;
+  const secondsLabel = `${seconds.toFixed(1)}s`;
 
   if (hours > 0) {
-    return minutes > 0 ? `${hours}h ${minutes}m` : `${hours}h`;
+    return `${hours}h ${minutes}m ${secondsLabel}`;
   }
 
-  return seconds > 0 ? `${minutes}m ${seconds}s` : `${minutes}m`;
+  return minutes > 0 ? `${minutes}m ${secondsLabel}` : secondsLabel;
 }
 
 function formatWorkingTimerNow(startIso: string): string {
-  return formatWorkingTimer(startIso, new Date().toISOString()) ?? "0s";
+  return formatWorkingTimer(startIso, new Date().toISOString()) ?? "0.0s";
 }
 
 type WorkEntryIconName =
