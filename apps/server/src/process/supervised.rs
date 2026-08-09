@@ -72,6 +72,9 @@ pub(crate) async fn run_supervised(
     request: SupervisedRunRequest,
     cancellation: &CancellationToken,
 ) -> Result<SupervisedRunOutput, SupervisedRunError> {
+    if cancellation.is_cancelled() {
+        return Err(SupervisedRunError::Cancelled);
+    }
     let SupervisedRunRequest {
         command,
         stdin,
@@ -576,6 +579,27 @@ mod tests {
             max_output_bytes: 1024,
             overflow: SupervisedOverflow::Error,
         }
+    }
+
+    #[tokio::test]
+    async fn pre_cancelled_run_rejects_before_spawning_the_command() {
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        let error = run_supervised(
+            SupervisedRunRequest {
+                command: Command::new("bibcode-command-that-must-not-exist"),
+                stdin: None,
+                timeout: Duration::from_secs(5),
+                cleanup_timeout: PROCESS_CLEANUP_WAIT_TIMEOUT,
+                max_output_bytes: 1024,
+                overflow: SupervisedOverflow::Error,
+            },
+            &cancellation,
+        )
+        .await
+        .expect_err("pre-cancelled execution must not attempt to spawn");
+
+        assert!(matches!(error, SupervisedRunError::Cancelled));
     }
 
     #[tokio::test]
