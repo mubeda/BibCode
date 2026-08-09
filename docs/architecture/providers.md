@@ -1,9 +1,21 @@
 # Provider architecture
 
 BiBCode currently supports Codex, Claude, Cursor, and OpenCode. A provider
-instance binds a driver to its configured executable, options, and readiness
-state. Commands identify the instance rather than reconstructing driver state
-in the client.
+instance binds a driver to its configured executable, options, readiness state,
+and instance metadata. Commands identify the instance rather than
+reconstructing driver state in the client.
+
+`supportsContextWindowUsage` is provider-inventory metadata, not a UI guess or
+a property of an individual usage event. Codex and Claude are the only initial
+providers that advertise this capability; an absent capability means that the
+client must show the feature as unavailable even if stale activity exists for a
+thread. The capability does not change ordinary provider execution or activity
+support.
+
+`supportsMcpStatus` follows the same inventory-owned rule. Codex and Claude
+advertise it because their adapters publish canonical `mcp.status.updated`
+snapshots. Other providers leave it absent until their adapter implements an
+equivalent status source; clients keep the control visible but disabled.
 
 ## Execution path
 
@@ -27,6 +39,37 @@ protocol:
 Provider-specific events are normalized into shared orchestration contracts;
 provider wire payloads do not leak into React state. See
 [RPC and orchestration](./rpc-and-orchestration.md).
+
+The canonical `thread.token-usage.updated` event describes two distinct values:
+`usedTokens` is active context-window usage, while optional
+`totalProcessedTokens` is lifetime tokens processed by the provider. The latter
+is informational and never replaces the active value used to calculate context
+capacity. Provider-native usage is normalized and emitted as the canonical
+`thread.token-usage.updated` event by the server runtime; the typed
+orchestration path persists and publishes it. It does not cross a desktop bridge
+or create a client-owned provider channel.
+
+Claude context-window usage keeps stream-derived updates as its live fallback.
+After a successful turn completion, the driver sends the official correlated
+`get_context_usage` control request and waits for at most two seconds. A new
+valid authoritative snapshot is emitted before the deferred `turn.completed`;
+an unchanged snapshot, unsupported or malformed response, writer failure,
+cancellation, EOF, or timeout releases the completion immediately. Control
+responses are routed by their top-level request ID and never enter the normal
+provider-event stream, while timeout and shutdown paths remove all pending
+waiters. The response is applied only while that turn remains current, so a
+late response cannot overwrite a newer turn; failures remain nonfatal and the
+last valid stream-derived snapshot stays visible.
+
+Claude MCP status uses the CLI's native status surfaces rather than filesystem
+configuration guesses. The adapter normalizes the `system:init` `mcp_servers`
+snapshot and, after each successful turn, sends the correlated `mcp_status`
+control request concurrently with `get_context_usage`. Native `pending`,
+`failed`, and `disabled` states become canonical `starting`, `error`, and
+`disconnected` states. Malformed, timed-out, unsupported, cancelled, or failed
+queries are ignored; identical snapshots are suppressed and the last valid
+snapshot remains visible. Control responses retain the same request routing,
+cleanup, and nonfatal shutdown behavior as context queries.
 
 ## Provider usage and local credential ownership
 

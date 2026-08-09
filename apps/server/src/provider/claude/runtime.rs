@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -17,6 +17,7 @@ use super::transcript::{
     ClaudeRecoveredTranscript, ClaudeTranscriptRecoveryRequest,
     ClaudeTranscriptRecoveryRequestMetadata, records_at_or_after,
 };
+use super::usage::{ClaudeTokenUsageSnapshot, ClaudeTokenUsageState};
 use crate::activity::{
     ActivityCapabilities, ActivityHistoryRecovery, ActivityObservationState,
     ProviderActivityMutation,
@@ -76,8 +77,10 @@ pub struct LaunchRequest {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClaudeControlRequest {
-    pub sequence: u64,
-    pub request: ControlRequestBody,
+    #[serde(rename = "type")]
+    message_type: String,
+    request_id: String,
+    request: ControlRequestBody,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -86,30 +89,55 @@ pub enum ControlRequestBody {
     Interrupt,
     SetPermissionMode { mode: ClaudePermissionMode },
     CancelRequest { request_id: String },
+    GetContextUsage,
+    McpStatus,
 }
 
 impl ClaudeControlRequest {
     pub fn interrupt(sequence: u64) -> Self {
         Self {
-            sequence,
+            message_type: "control_request".to_owned(),
+            request_id: format!("bibcode-{sequence}"),
             request: ControlRequestBody::Interrupt,
         }
     }
 
     pub fn set_permission_mode(sequence: u64, mode: ClaudePermissionMode) -> Self {
         Self {
-            sequence,
+            message_type: "control_request".to_owned(),
+            request_id: format!("bibcode-{sequence}"),
             request: ControlRequestBody::SetPermissionMode { mode },
         }
     }
 
     pub fn cancel_request(sequence: u64, request_id: &str) -> Self {
         Self {
-            sequence,
+            message_type: "control_request".to_owned(),
+            request_id: format!("bibcode-{sequence}"),
             request: ControlRequestBody::CancelRequest {
                 request_id: request_id.to_owned(),
             },
         }
+    }
+
+    pub fn get_context_usage(sequence: u64) -> Self {
+        Self {
+            message_type: "control_request".to_owned(),
+            request_id: format!("bibcode-{sequence}"),
+            request: ControlRequestBody::GetContextUsage,
+        }
+    }
+
+    pub fn mcp_status(sequence: u64) -> Self {
+        Self {
+            message_type: "control_request".to_owned(),
+            request_id: format!("bibcode-{sequence}"),
+            request: ControlRequestBody::McpStatus,
+        }
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
     }
 }
 
@@ -218,6 +246,8 @@ pub struct ClaudeProviderRuntime {
     activity_generation: u64,
     activity_not_before_unix_nanos: i128,
     correlated_activity_enabled: bool,
+    token_usage: ClaudeTokenUsageState,
+    last_mcp_status: Option<Vec<Value>>,
 }
 
 impl ClaudeProviderRuntime {
@@ -244,6 +274,8 @@ impl ClaudeProviderRuntime {
             activity_generation: 0,
             activity_not_before_unix_nanos: i128::MIN,
             correlated_activity_enabled: false,
+            token_usage: ClaudeTokenUsageState::default(),
+            last_mcp_status: None,
         }
     }
 
@@ -312,6 +344,7 @@ impl ClaudeProviderRuntime {
     }
 
     pub fn start_turn(&mut self, input: TurnInput) -> Vec<CanonicalEvent> {
+        self.token_usage.start_turn();
         self.current_turn_id = Some(input.turn_id.clone());
         vec![self.event(
             "turn.started",
@@ -345,6 +378,23 @@ impl ClaudeProviderRuntime {
     }
 
     fn handle_raw_value_inner(
+        &mut self,
+        value: &Value,
+        emitted_at_ms: u64,
+        authenticated_hook: bool,
+    ) -> ClaudeRuntimeOutput {
+        let token_usage = self.token_usage.observe_stream_value(value);
+        let turn_id = self.current_turn_id.clone();
+        let mut output = self.handle_non_usage_raw_value(value, emitted_at_ms, authenticated_hook);
+        if let (Some(turn_id), Some(usage)) = (turn_id, token_usage) {
+            output
+                .events
+                .insert(0, self.token_usage_event(turn_id, usage));
+        }
+        output
+    }
+
+    fn handle_non_usage_raw_value(
         &mut self,
         value: &Value,
         emitted_at_ms: u64,
@@ -408,7 +458,19 @@ impl ClaudeProviderRuntime {
         }
 
         if value.get("type").and_then(Value::as_str) == Some("system") {
-            return ClaudeRuntimeOutput::default();
+            let events = if value.get("subtype").and_then(Value::as_str) == Some("init") {
+                value
+                    .get("mcp_servers")
+                    .and_then(|servers| self.mcp_status_event(servers))
+                    .into_iter()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            return ClaudeRuntimeOutput {
+                events,
+                ..ClaudeRuntimeOutput::default()
+            };
         }
         let Ok(message) = serde_json::from_value::<ClaudeMessage>(value.clone()) else {
             return ClaudeRuntimeOutput::default();
@@ -426,6 +488,39 @@ impl ClaudeProviderRuntime {
             native_event_id: None,
             recovery_request: None,
         }
+    }
+
+    pub(crate) fn apply_context_usage_response(
+        &mut self,
+        turn_id: &str,
+        response: &Value,
+    ) -> Option<CanonicalEvent> {
+        if self.current_turn_id.as_deref() != Some(turn_id) {
+            return None;
+        }
+        let usage = self.token_usage.observe_context_response(response)?;
+        Some(self.token_usage_event(turn_id.to_owned(), usage))
+    }
+
+    #[doc(hidden)]
+    pub fn apply_context_usage_response_for_test(
+        &mut self,
+        turn_id: &str,
+        response: &Value,
+    ) -> Option<CanonicalEvent> {
+        self.apply_context_usage_response(turn_id, response)
+    }
+
+    pub(crate) fn apply_mcp_status_response(&mut self, response: &Value) -> Option<CanonicalEvent> {
+        self.mcp_status_event(response.get("mcpServers")?)
+    }
+
+    #[doc(hidden)]
+    pub fn apply_mcp_status_response_for_test(
+        &mut self,
+        response: &Value,
+    ) -> Option<CanonicalEvent> {
+        self.apply_mcp_status_response(response)
     }
 
     pub(crate) fn handle_recovered_transcript(
@@ -823,23 +918,28 @@ impl ClaudeProviderRuntime {
     fn handle_result_message(&mut self, message: ResultMessage) -> Vec<CanonicalEvent> {
         let mut events = self.flush_incomplete_tools();
         let interrupted = is_interrupted_result(&message);
+        let failed = message.is_error && !interrupted;
         let stop_reason = message.stop_reason.unwrap_or_else(|| {
             if interrupted {
                 "interrupted".to_owned()
+            } else if failed {
+                "error".to_owned()
             } else {
                 "success".to_owned()
             }
         });
         let mut payload = json!({
-            "state": if interrupted { "interrupted" } else { "completed" },
+            "state": if interrupted { "interrupted" } else if failed { "failed" } else { "completed" },
             "stopReason": stop_reason,
         });
-        if interrupted {
-            let error_message = message
-                .errors
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "Claude runtime interrupted.".to_owned());
+        if interrupted || failed {
+            let error_message = message.errors.first().cloned().unwrap_or_else(|| {
+                if interrupted {
+                    "Claude runtime interrupted.".to_owned()
+                } else {
+                    "Claude turn failed.".to_owned()
+                }
+            });
             payload["errorMessage"] = json!(error_message);
         }
         events.push(self.event(
@@ -953,6 +1053,73 @@ impl ClaudeProviderRuntime {
             payload,
         }
     }
+
+    fn token_usage_event(
+        &self,
+        turn_id: String,
+        usage: ClaudeTokenUsageSnapshot,
+    ) -> CanonicalEvent {
+        self.event(
+            "thread.token-usage.updated",
+            Some(turn_id),
+            None,
+            None,
+            json!({ "usage": usage }),
+        )
+    }
+
+    fn mcp_status_event(&mut self, value: &Value) -> Option<CanonicalEvent> {
+        let servers = normalize_mcp_servers(value)?;
+        if self.last_mcp_status.as_ref() == Some(&servers) {
+            return None;
+        }
+        self.last_mcp_status = Some(servers.clone());
+        Some(self.event(
+            "mcp.status.updated",
+            None,
+            None,
+            None,
+            json!({ "servers": servers }),
+        ))
+    }
+}
+
+const MAX_MCP_SERVERS: usize = 256;
+
+fn normalize_mcp_servers(value: &Value) -> Option<Vec<Value>> {
+    let entries = value.as_array()?;
+    if entries.len() > MAX_MCP_SERVERS {
+        return None;
+    }
+    let mut names = HashSet::with_capacity(entries.len());
+    entries
+        .iter()
+        .map(|entry| {
+            let entry = entry.as_object()?;
+            let name = entry.get("name")?.as_str()?.trim();
+            if name.is_empty() || !names.insert(name.to_owned()) {
+                return None;
+            }
+            let state = match entry.get("status")?.as_str()? {
+                "connected" => "connected",
+                "pending" => "starting",
+                "needs-auth" => "needs-auth",
+                "disabled" => "disconnected",
+                "failed" => "error",
+                _ => return None,
+            };
+            let detail = entry
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|detail| !detail.is_empty());
+            let mut server = json!({ "name": name, "state": state });
+            if let Some(detail) = detail {
+                server["detail"] = json!(detail);
+            }
+            Some(server)
+        })
+        .collect()
 }
 
 fn current_unix_nanos() -> i128 {

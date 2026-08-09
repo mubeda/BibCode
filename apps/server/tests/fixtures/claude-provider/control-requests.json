@@ -1,22 +1,27 @@
 {
   "interrupt": {
-    "sequence": 17,
-    "request": {
-      "subtype": "interrupt"
-    }
+    "type": "control_request",
+    "request_id": "bibcode-17",
+    "request": { "subtype": "interrupt" }
   },
   "setPermissionMode": {
-    "sequence": 18,
-    "request": {
-      "subtype": "set_permission_mode",
-      "mode": "acceptEdits"
-    }
+    "type": "control_request",
+    "request_id": "bibcode-18",
+    "request": { "subtype": "set_permission_mode", "mode": "acceptEdits" }
   },
   "cancelToolCall": {
-    "sequence": 19,
-    "request": {
-      "subtype": "cancel_request",
-      "request_id": "approval:1001"
-    }
+    "type": "control_request",
+    "request_id": "bibcode-19",
+    "request": { "subtype": "cancel_request", "request_id": "approval:1001" }
+  },
+  "getContextUsage": {
+    "type": "control_request",
+    "request_id": "bibcode-20",
+    "request": { "subtype": "get_context_usage" }
+  },
+  "mcpStatus": {
+    "type": "control_request",
+    "request_id": "bibcode-21",
+    "request": { "subtype": "mcp_status" }
   }
 }

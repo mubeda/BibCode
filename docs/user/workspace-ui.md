@@ -72,6 +72,38 @@ idle center terminal when possible and otherwise open a new center terminal.
 The retired bottom terminal drawer and its bottom-toolbar toggle no longer
 exist.
 
+### Composer context window
+
+In the normal composer footer, controls remain visible in this order: MCP
+status, context-window usage, then send or stop. Both status controls are
+capability gated by the selected provider instance:
+
+| Provider         | MCP-status control | Context-window control |
+| ---------------- | ------------------ | ---------------------- |
+| Codex            | Supported          | Supported              |
+| Claude           | Supported          | Supported              |
+| Cursor           | Disabled           | Disabled               |
+| Grok             | Disabled           | Disabled               |
+| OpenCode         | Disabled           | Disabled               |
+| Other or unknown | Disabled           | Disabled               |
+
+Disabled providers still show the corresponding control with an unavailable
+tooltip, but the control cannot open a status popover. Stale activity does not
+override the selected provider's capability.
+
+For Claude, the MCP popover starts with the status reported during session
+initialization and refreshes after successful provider responses. It preserves
+the last valid snapshot if a refresh is unavailable.
+
+A supported provider with no valid reading shows an awaiting-data popover until
+the first provider response. Once measured, the meter's popover shows active
+usage, the maximum when known, and lifetime processed tokens when supplied.
+Usage above 90 percent is presented as a warning through the meter's red
+treatment. Automatic-compaction support is stated when the provider reports it.
+
+Question and approval composer footers retain their specialized controls and do
+not gain the normal context-window control.
+
 Center tabs can be arranged into as many as four visible split panes. Drag a tab
 within its strip to reorder it, into another pane to move it, or onto a pane edge
 to create a left, right, upper, or lower split. The tab context menu offers the

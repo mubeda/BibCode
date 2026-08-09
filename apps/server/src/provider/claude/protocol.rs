@@ -120,3 +120,17 @@ pub struct ResultMessage {
     pub session_id: String,
     pub uuid: String,
 }
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub(crate) struct ClaudeControlResponseFrame {
+    pub response: ClaudeControlResponse,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub(crate) struct ClaudeControlResponse {
+    pub subtype: String,
+    pub request_id: String,
+    #[serde(default)]
+    pub response: Value,
+    pub error: Option<String>,
+}

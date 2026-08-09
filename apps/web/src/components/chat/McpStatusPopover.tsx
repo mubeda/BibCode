@@ -4,6 +4,7 @@ import { CircleIcon, PlugIcon } from "lucide-react";
 import { cn } from "~/lib/utils";
 import { Button } from "../ui/button";
 import { Popover, PopoverPopup, PopoverTitle, PopoverTrigger } from "../ui/popover";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 
 type McpServerState = "connected" | "starting" | "needs-auth" | "disconnected" | "error";
 
@@ -84,7 +85,34 @@ const statusPresentation: Record<McpServerState, { label: string; className: str
   error: { label: "Error", className: "text-destructive" },
 };
 
-export function McpStatusPopover({ snapshot }: { snapshot: McpStatusSnapshot }) {
+export function McpStatusPopover({
+  supported,
+  snapshot,
+}: {
+  supported: boolean;
+  snapshot: McpStatusSnapshot;
+}) {
+  if (!supported) {
+    return (
+      <Tooltip>
+        <TooltipTrigger
+          render={
+            <Button
+              variant="ghost"
+              size="icon-sm"
+              type="button"
+              aria-disabled="true"
+              aria-label="MCP servers unavailable"
+            >
+              <PlugIcon />
+            </Button>
+          }
+        />
+        <TooltipPopup side="top">MCP status is not available for this provider.</TooltipPopup>
+      </Tooltip>
+    );
+  }
+
   return (
     <Popover>
       <PopoverTrigger

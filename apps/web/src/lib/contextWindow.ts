@@ -4,8 +4,12 @@ function asRecord(value: unknown): Record<string, unknown> | null {
   return value && typeof value === "object" ? (value as Record<string, unknown>) : null;
 }
 
-function asFiniteNumber(value: unknown): number | null {
-  return typeof value === "number" && Number.isFinite(value) ? value : null;
+function asNonNegativeFiniteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : null;
+}
+
+function asPositiveFiniteNumber(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : null;
 }
 
 function asBoolean(value: unknown): boolean | null {
@@ -57,36 +61,36 @@ export function deriveLatestContextWindowSnapshot(
     }
 
     const payload = asRecord(activity.payload);
-    const usedTokens = asFiniteNumber(payload?.usedTokens);
-    if (usedTokens === null || usedTokens < 0) {
+    const usedTokens = asNonNegativeFiniteNumber(payload?.usedTokens);
+    if (usedTokens === null) {
       continue;
     }
 
-    const maxTokens = asFiniteNumber(payload?.maxTokens);
+    const maxTokens = asPositiveFiniteNumber(payload?.maxTokens);
     const usedPercentage =
-      maxTokens !== null && maxTokens > 0 ? Math.min(100, (usedTokens / maxTokens) * 100) : null;
+      maxTokens !== null ? Math.min(100, (usedTokens / maxTokens) * 100) : null;
     const remainingTokens =
       maxTokens !== null ? Math.max(0, Math.round(maxTokens - usedTokens)) : null;
     const remainingPercentage = usedPercentage !== null ? Math.max(0, 100 - usedPercentage) : null;
 
     return {
       usedTokens,
-      totalProcessedTokens: asFiniteNumber(payload?.totalProcessedTokens),
+      totalProcessedTokens: asNonNegativeFiniteNumber(payload?.totalProcessedTokens),
       maxTokens,
       remainingTokens,
       usedPercentage,
       remainingPercentage,
-      inputTokens: asFiniteNumber(payload?.inputTokens),
-      cachedInputTokens: asFiniteNumber(payload?.cachedInputTokens),
-      outputTokens: asFiniteNumber(payload?.outputTokens),
-      reasoningOutputTokens: asFiniteNumber(payload?.reasoningOutputTokens),
-      lastUsedTokens: asFiniteNumber(payload?.lastUsedTokens),
-      lastInputTokens: asFiniteNumber(payload?.lastInputTokens),
-      lastCachedInputTokens: asFiniteNumber(payload?.lastCachedInputTokens),
-      lastOutputTokens: asFiniteNumber(payload?.lastOutputTokens),
-      lastReasoningOutputTokens: asFiniteNumber(payload?.lastReasoningOutputTokens),
-      toolUses: asFiniteNumber(payload?.toolUses),
-      durationMs: asFiniteNumber(payload?.durationMs),
+      inputTokens: asNonNegativeFiniteNumber(payload?.inputTokens),
+      cachedInputTokens: asNonNegativeFiniteNumber(payload?.cachedInputTokens),
+      outputTokens: asNonNegativeFiniteNumber(payload?.outputTokens),
+      reasoningOutputTokens: asNonNegativeFiniteNumber(payload?.reasoningOutputTokens),
+      lastUsedTokens: asNonNegativeFiniteNumber(payload?.lastUsedTokens),
+      lastInputTokens: asNonNegativeFiniteNumber(payload?.lastInputTokens),
+      lastCachedInputTokens: asNonNegativeFiniteNumber(payload?.lastCachedInputTokens),
+      lastOutputTokens: asNonNegativeFiniteNumber(payload?.lastOutputTokens),
+      lastReasoningOutputTokens: asNonNegativeFiniteNumber(payload?.lastReasoningOutputTokens),
+      toolUses: asNonNegativeFiniteNumber(payload?.toolUses),
+      durationMs: asNonNegativeFiniteNumber(payload?.durationMs),
       compactsAutomatically: asBoolean(payload?.compactsAutomatically) ?? false,
       updatedAt: activity.createdAt,
     };

@@ -1,0 +1,56 @@
+{
+  "messageDelta": {
+    "type": "stream_event",
+    "session_id": "session-1",
+    "uuid": "message-1",
+    "parent_tool_use_id": null,
+    "event": {
+      "type": "message_delta",
+      "delta": { "stop_reason": "end_turn" },
+      "usage": {
+        "input_tokens": 1000,
+        "cache_creation_input_tokens": 200,
+        "cache_read_input_tokens": 300,
+        "output_tokens": 50
+      }
+    }
+  },
+  "taskProgress": {
+    "type": "system",
+    "subtype": "task_progress",
+    "session_id": "session-1",
+    "task_id": "task-1",
+    "usage": { "total_tokens": 1800, "tool_uses": 4, "duration_ms": 900 }
+  },
+  "compactBoundary": {
+    "type": "system",
+    "subtype": "compact_boundary",
+    "session_id": "session-1",
+    "compact_metadata": { "pre_tokens": 190000, "post_tokens": 24000 }
+  },
+  "result": {
+    "type": "result",
+    "subtype": "success",
+    "is_error": false,
+    "errors": [],
+    "stop_reason": "end_turn",
+    "session_id": "session-1",
+    "uuid": "result-1",
+    "usage": { "total_tokens": 42000 },
+    "modelUsage": { "claude-sonnet": { "contextWindow": 200000 } }
+  },
+  "querySuccess": {
+    "totalTokens": 31251,
+    "maxTokens": 200000,
+    "rawMaxTokens": 200000,
+    "percentage": 15.6255,
+    "model": "claude-sonnet",
+    "isAutoCompactEnabled": true,
+    "categories": [],
+    "memoryFiles": [],
+    "mcpTools": [],
+    "agents": [],
+    "gridRows": []
+  },
+  "malformed": { "totalTokens": -1, "maxTokens": 0, "isAutoCompactEnabled": "yes" }
+}
