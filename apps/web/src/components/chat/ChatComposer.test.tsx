@@ -958,6 +958,18 @@ afterEach(() => {
 // ---------------------------------------------------------------------------
 
 describe("ChatComposer rendering", () => {
+  it("keeps the composer border neutral for focused descendants", () => {
+    renderComposer();
+    const surface = findHost(
+      (element) => element.props["data-chat-composer-mobile-collapsed"] !== undefined,
+    ).props;
+    const className = String(surface["className"]);
+
+    expect(className).toContain("border-border");
+    expect(className).not.toContain("has-focus-visible:border-ring");
+    expect(surface["onFocusCapture"]).toBeTypeOf("function");
+  });
+
   it("derives model-picker terminal context from supported terminal surfaces", () => {
     h.terminalSurfaceOpen = true;
 
