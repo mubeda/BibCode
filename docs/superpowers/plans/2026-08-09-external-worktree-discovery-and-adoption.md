@@ -396,6 +396,9 @@ Use a fake inventory source, fake probe, paused Tokio time, and a configurable s
 - four repositories scan concurrently while a fifth waits;
 - probes never exceed eight and time out to `unknown`;
 - mutation epoch rejects a stale in-flight result;
+- a mutation refresh queued behind that stale completion performs one fresh
+  current-epoch scan immediately, while repeated invalidations coalesce and
+  ordinary pre-mutation waiters retain the identical stale result;
 - watch subscribers receive the latest snapshot after lag;
 - polling inspects only common-Git shallow metadata and known paths;
 - a failed scan retains authoritative data;
@@ -428,6 +431,11 @@ physical mutation locks may use weak registry slots, but a held or awaited lock
 must retain strong ownership. Store only the last authoritative snapshot,
 current scan status, last coalesced result, shallow signature, subscriber
 count, suppression map, and task handles for each project view.
+The mutation-triggered owner may bypass exactly one coalesced
+`StaleGeneration` completion to scan the current epoch; this is not a general
+error retry, remains under the existing single-flight lock and subscriber
+cancellation, and lets repeated mutation tasks converge on the recovery
+result.
 Initialization is an idempotent project-view-owned task with latest-generation
 readiness, not work owned by whichever subscriber first reaches an await.
 Zero-to-one attachment advances a lifecycle epoch and creates fresh
