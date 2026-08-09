@@ -1116,11 +1116,7 @@ const WORKING_INDICATOR_DOTS = [
 
 function WorkingIndicatorIcon() {
   return (
-    <span
-      aria-hidden="true"
-      className="relative size-4 shrink-0"
-      data-working-indicator="reversed"
-    >
+    <span aria-hidden="true" className="relative size-4 shrink-0" data-working-indicator="reversed">
       {WORKING_INDICATOR_DOTS.map(([position, animationDelay], index) => (
         <span
           key={position}
