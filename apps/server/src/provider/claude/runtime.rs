@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -90,6 +90,7 @@ pub enum ControlRequestBody {
     SetPermissionMode { mode: ClaudePermissionMode },
     CancelRequest { request_id: String },
     GetContextUsage,
+    McpStatus,
 }
 
 impl ClaudeControlRequest {
@@ -124,6 +125,14 @@ impl ClaudeControlRequest {
             message_type: "control_request".to_owned(),
             request_id: format!("bibcode-{sequence}"),
             request: ControlRequestBody::GetContextUsage,
+        }
+    }
+
+    pub fn mcp_status(sequence: u64) -> Self {
+        Self {
+            message_type: "control_request".to_owned(),
+            request_id: format!("bibcode-{sequence}"),
+            request: ControlRequestBody::McpStatus,
         }
     }
 
@@ -238,6 +247,7 @@ pub struct ClaudeProviderRuntime {
     activity_not_before_unix_nanos: i128,
     correlated_activity_enabled: bool,
     token_usage: ClaudeTokenUsageState,
+    last_mcp_status: Option<Vec<Value>>,
 }
 
 impl ClaudeProviderRuntime {
@@ -265,6 +275,7 @@ impl ClaudeProviderRuntime {
             activity_not_before_unix_nanos: i128::MIN,
             correlated_activity_enabled: false,
             token_usage: ClaudeTokenUsageState::default(),
+            last_mcp_status: None,
         }
     }
 
@@ -447,7 +458,19 @@ impl ClaudeProviderRuntime {
         }
 
         if value.get("type").and_then(Value::as_str) == Some("system") {
-            return ClaudeRuntimeOutput::default();
+            let events = if value.get("subtype").and_then(Value::as_str) == Some("init") {
+                value
+                    .get("mcp_servers")
+                    .and_then(|servers| self.mcp_status_event(servers))
+                    .into_iter()
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            return ClaudeRuntimeOutput {
+                events,
+                ..ClaudeRuntimeOutput::default()
+            };
         }
         let Ok(message) = serde_json::from_value::<ClaudeMessage>(value.clone()) else {
             return ClaudeRuntimeOutput::default();
@@ -486,6 +509,18 @@ impl ClaudeProviderRuntime {
         response: &Value,
     ) -> Option<CanonicalEvent> {
         self.apply_context_usage_response(turn_id, response)
+    }
+
+    pub(crate) fn apply_mcp_status_response(&mut self, response: &Value) -> Option<CanonicalEvent> {
+        self.mcp_status_event(response.get("mcpServers")?)
+    }
+
+    #[doc(hidden)]
+    pub fn apply_mcp_status_response_for_test(
+        &mut self,
+        response: &Value,
+    ) -> Option<CanonicalEvent> {
+        self.apply_mcp_status_response(response)
     }
 
     pub(crate) fn handle_recovered_transcript(
@@ -1032,6 +1067,59 @@ impl ClaudeProviderRuntime {
             json!({ "usage": usage }),
         )
     }
+
+    fn mcp_status_event(&mut self, value: &Value) -> Option<CanonicalEvent> {
+        let servers = normalize_mcp_servers(value)?;
+        if self.last_mcp_status.as_ref() == Some(&servers) {
+            return None;
+        }
+        self.last_mcp_status = Some(servers.clone());
+        Some(self.event(
+            "mcp.status.updated",
+            None,
+            None,
+            None,
+            json!({ "servers": servers }),
+        ))
+    }
+}
+
+const MAX_MCP_SERVERS: usize = 256;
+
+fn normalize_mcp_servers(value: &Value) -> Option<Vec<Value>> {
+    let entries = value.as_array()?;
+    if entries.len() > MAX_MCP_SERVERS {
+        return None;
+    }
+    let mut names = HashSet::with_capacity(entries.len());
+    entries
+        .iter()
+        .map(|entry| {
+            let entry = entry.as_object()?;
+            let name = entry.get("name")?.as_str()?.trim();
+            if name.is_empty() || !names.insert(name.to_owned()) {
+                return None;
+            }
+            let state = match entry.get("status")?.as_str()? {
+                "connected" => "connected",
+                "pending" => "starting",
+                "needs-auth" => "needs-auth",
+                "disabled" => "disconnected",
+                "failed" => "error",
+                _ => return None,
+            };
+            let detail = entry
+                .get("error")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|detail| !detail.is_empty());
+            let mut server = json!({ "name": name, "state": state });
+            if let Some(detail) = detail {
+                server["detail"] = json!(detail);
+            }
+            Some(server)
+        })
+        .collect()
 }
 
 fn current_unix_nanos() -> i128 {

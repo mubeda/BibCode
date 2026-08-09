@@ -994,7 +994,7 @@ describe("ChatComposer rendering", () => {
     expect(pathSearch["query"]).toBeNull();
   });
 
-  it("shows MCP status only for the selected supported provider instance", () => {
+  it("shows MCP status for the selected provider instance and disables unsupported providers", () => {
     const activeThreadActivities = [
       {
         id: "activity-mcp" as Thread["activities"][number]["id"],
@@ -1015,8 +1015,11 @@ describe("ChatComposer rendering", () => {
       activeThreadActivities,
     });
 
-    expect(findCapture("McpStatusPopover")["snapshot"]).toEqual({
-      servers: [{ name: "context7", state: "connected", detail: null }],
+    expect(findCapture("McpStatusPopover")).toMatchObject({
+      supported: true,
+      snapshot: {
+        servers: [{ name: "context7", state: "connected", detail: null }],
+      },
     });
 
     h.captures.length = 0;
@@ -1046,7 +1049,8 @@ describe("ChatComposer rendering", () => {
 
     h.captures.length = 0;
     renderComposer({ providerStatuses: [codexProvider], activeThreadActivities });
-    expect(filterCaptures("McpStatusPopover")).toEqual([]);
+    expect(filterCaptures("McpStatusPopover")).toHaveLength(1);
+    expect(findCapture("McpStatusPopover")["supported"]).toBe(false);
   });
 
   it("uses a provider-family lock without fixing the active instance", () => {
@@ -1334,6 +1338,8 @@ describe("ChatComposer rendering", () => {
 
     expect(filterCaptures("ContextWindowMeter")).toHaveLength(1);
     expect(findCapture("ContextWindowMeter")).toMatchObject({ supported: false, usage: null });
+    expect(filterCaptures("McpStatusPopover")).toHaveLength(1);
+    expect(findCapture("McpStatusPopover")["supported"]).toBe(false);
   });
 
   it.each([
@@ -1349,6 +1355,7 @@ describe("ChatComposer rendering", () => {
           instanceId,
           driver: ProviderDriverKind.make(driver),
           supportsContextWindowUsage: true,
+          supportsMcpStatus: true,
         },
       ],
       activeProjectDefaultModelSelection: { instanceId, model: "gpt-5.4" },
@@ -1356,6 +1363,8 @@ describe("ChatComposer rendering", () => {
 
     expect(filterCaptures("ContextWindowMeter")).toHaveLength(1);
     expect(findCapture("ContextWindowMeter")).toMatchObject({ supported: true, usage: null });
+    expect(filterCaptures("McpStatusPopover")).toHaveLength(1);
+    expect(findCapture("McpStatusPopover")["supported"]).toBe(true);
   });
 
   it("keeps context usage unavailable when an unsupported selected provider has stale activity", () => {

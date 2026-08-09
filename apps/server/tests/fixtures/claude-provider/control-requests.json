@@ -18,5 +18,10 @@
     "type": "control_request",
     "request_id": "bibcode-20",
     "request": { "subtype": "get_context_usage" }
+  },
+  "mcpStatus": {
+    "type": "control_request",
+    "request_id": "bibcode-21",
+    "request": { "subtype": "mcp_status" }
   }
 }

@@ -12,6 +12,11 @@ client must show the feature as unavailable even if stale activity exists for a
 thread. The capability does not change ordinary provider execution or activity
 support.
 
+`supportsMcpStatus` follows the same inventory-owned rule. Codex and Claude
+advertise it because their adapters publish canonical `mcp.status.updated`
+snapshots. Other providers leave it absent until their adapter implements an
+equivalent status source; clients keep the control visible but disabled.
+
 ## Execution path
 
 The web app sends typed Effect RPC requests to the Rust server. New turns and
@@ -55,6 +60,16 @@ provider-event stream, while timeout and shutdown paths remove all pending
 waiters. The response is applied only while that turn remains current, so a
 late response cannot overwrite a newer turn; failures remain nonfatal and the
 last valid stream-derived snapshot stays visible.
+
+Claude MCP status uses the CLI's native status surfaces rather than filesystem
+configuration guesses. The adapter normalizes the `system:init` `mcp_servers`
+snapshot and, after each successful turn, sends the correlated `mcp_status`
+control request concurrently with `get_context_usage`. Native `pending`,
+`failed`, and `disabled` states become canonical `starting`, `error`, and
+`disconnected` states. Malformed, timed-out, unsupported, cancelled, or failed
+queries are ignored; identical snapshots are suppressed and the last valid
+snapshot remains visible. Control responses retain the same request routing,
+cleanup, and nonfatal shutdown behavior as context queries.
 
 ## Provider usage and local credential ownership
 

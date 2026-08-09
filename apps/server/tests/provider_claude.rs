@@ -69,6 +69,7 @@ struct ControlFixture {
     set_permission_mode: Value,
     cancel_tool_call: Value,
     get_context_usage: Value,
+    mcp_status: Value,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1796,6 +1797,69 @@ fn control_requests_encode_official_correlated_frames() {
         serde_json::to_value(ClaudeControlRequest::get_context_usage(20))
             .expect("context usage json"),
         fixture.get_context_usage
+    );
+    assert_eq!(
+        serde_json::to_value(ClaudeControlRequest::mcp_status(21)).expect("MCP status json"),
+        fixture.mcp_status
+    );
+}
+
+#[test]
+fn claude_system_init_and_status_query_normalize_mcp_servers() {
+    let mut runtime = ClaudeProviderRuntime::new("thread-1".to_owned(), "session-1".to_owned());
+    let initial = runtime.handle_raw_value(
+        &json!({
+            "type": "system",
+            "subtype": "init",
+            "mcp_servers": [
+                { "name": "connected", "status": "connected" },
+                { "name": "pending", "status": "pending" },
+                { "name": "auth", "status": "needs-auth" },
+                { "name": "failed", "status": "failed", "error": "Connection failed" },
+                { "name": "disabled", "status": "disabled" }
+            ]
+        }),
+        1_000,
+    );
+
+    assert_eq!(initial.events.len(), 1);
+    assert_eq!(initial.events[0].event_type, "mcp.status.updated");
+    assert_eq!(
+        initial.events[0].payload,
+        json!({
+            "servers": [
+                { "name": "connected", "state": "connected" },
+                { "name": "pending", "state": "starting" },
+                { "name": "auth", "state": "needs-auth" },
+                { "name": "failed", "state": "error", "detail": "Connection failed" },
+                { "name": "disabled", "state": "disconnected" }
+            ]
+        })
+    );
+
+    let refreshed = runtime
+        .apply_mcp_status_response_for_test(&json!({
+            "mcpServers": [
+                { "name": "connected", "status": "connected" },
+                { "name": "pending", "status": "failed", "error": "Timed out" }
+            ]
+        }))
+        .expect("valid MCP status response");
+    assert_eq!(
+        refreshed.payload,
+        json!({
+            "servers": [
+                { "name": "connected", "state": "connected" },
+                { "name": "pending", "state": "error", "detail": "Timed out" }
+            ]
+        })
+    );
+    assert!(
+        runtime
+            .apply_mcp_status_response_for_test(&json!({
+                "mcpServers": [{ "name": "unknown", "status": "surprising" }]
+            }))
+            .is_none()
     );
 }
 
