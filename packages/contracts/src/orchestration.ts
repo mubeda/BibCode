@@ -951,15 +951,7 @@ export const ProjectMetaUpdatedPayload = Schema.Struct({
   repositoryIdentity: Schema.optional(Schema.NullOr(RepositoryIdentity)),
   defaultModelSelection: Schema.optional(Schema.NullOr(ModelSelection)),
   scripts: Schema.optional(Schema.Array(ProjectScript)),
-  worktreeDiscovery: ProjectWorktreeDiscoveryPolicy.pipe(
-    Schema.withDecodingDefault(
-      Effect.succeed({
-        visibility: "hidden" as const,
-        initialPromptDismissedAt: null,
-        baselinePaths: [],
-      }),
-    ),
-  ),
+  worktreeDiscovery: Schema.optional(ProjectWorktreeDiscoveryPolicy),
   updatedAt: IsoDateTime,
 });
 
