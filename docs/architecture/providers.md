@@ -28,6 +28,16 @@ Provider-specific events are normalized into shared orchestration contracts;
 provider wire payloads do not leak into React state. See
 [RPC and orchestration](./rpc-and-orchestration.md).
 
+Claude context-window usage keeps stream-derived updates as its live fallback.
+After a successful turn completion, the driver sends the official correlated
+`get_context_usage` control request and waits for at most two seconds. A new
+valid authoritative snapshot is emitted before the deferred `turn.completed`;
+an unchanged snapshot, unsupported or malformed response, writer failure,
+cancellation, EOF, or timeout releases the completion immediately. Control
+responses are routed by their top-level request ID and never enter the normal
+provider-event stream, while timeout and shutdown paths remove all pending
+waiters.
+
 ## Provider usage and local credential ownership
 
 `ProviderUsageService` owns only bounded quota snapshots, refresh admission,

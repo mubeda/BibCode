@@ -77,8 +77,10 @@ pub struct LaunchRequest {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClaudeControlRequest {
-    pub sequence: u64,
-    pub request: ControlRequestBody,
+    #[serde(rename = "type")]
+    message_type: String,
+    request_id: String,
+    request: ControlRequestBody,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -87,30 +89,46 @@ pub enum ControlRequestBody {
     Interrupt,
     SetPermissionMode { mode: ClaudePermissionMode },
     CancelRequest { request_id: String },
+    GetContextUsage,
 }
 
 impl ClaudeControlRequest {
     pub fn interrupt(sequence: u64) -> Self {
         Self {
-            sequence,
+            message_type: "control_request".to_owned(),
+            request_id: format!("bibcode-{sequence}"),
             request: ControlRequestBody::Interrupt,
         }
     }
 
     pub fn set_permission_mode(sequence: u64, mode: ClaudePermissionMode) -> Self {
         Self {
-            sequence,
+            message_type: "control_request".to_owned(),
+            request_id: format!("bibcode-{sequence}"),
             request: ControlRequestBody::SetPermissionMode { mode },
         }
     }
 
     pub fn cancel_request(sequence: u64, request_id: &str) -> Self {
         Self {
-            sequence,
+            message_type: "control_request".to_owned(),
+            request_id: format!("bibcode-{sequence}"),
             request: ControlRequestBody::CancelRequest {
                 request_id: request_id.to_owned(),
             },
         }
+    }
+
+    pub fn get_context_usage(sequence: u64) -> Self {
+        Self {
+            message_type: "control_request".to_owned(),
+            request_id: format!("bibcode-{sequence}"),
+            request: ControlRequestBody::GetContextUsage,
+        }
+    }
+
+    pub fn request_id(&self) -> &str {
+        &self.request_id
     }
 }
 

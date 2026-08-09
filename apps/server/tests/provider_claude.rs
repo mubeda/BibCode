@@ -68,6 +68,7 @@ struct ControlFixture {
     interrupt: Value,
     set_permission_mode: Value,
     cancel_tool_call: Value,
+    get_context_usage: Value,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -1772,7 +1773,7 @@ fn launch_request_maps_runtime_modes_to_direct_cli_protocol_options() {
 }
 
 #[test]
-fn control_requests_encode_interrupt_permission_mode_and_cancel_frames() {
+fn control_requests_encode_official_correlated_frames() {
     let fixture: ControlFixture = load_fixture("control-requests.json");
     assert_eq!(
         serde_json::to_value(ClaudeControlRequest::interrupt(17)).expect("interrupt json"),
@@ -1790,6 +1791,11 @@ fn control_requests_encode_interrupt_permission_mode_and_cancel_frames() {
         serde_json::to_value(ClaudeControlRequest::cancel_request(19, "approval:1001"))
             .expect("cancel json"),
         fixture.cancel_tool_call
+    );
+    assert_eq!(
+        serde_json::to_value(ClaudeControlRequest::get_context_usage(20))
+            .expect("context usage json"),
+        fixture.get_context_usage
     );
 }
 
@@ -1955,7 +1961,7 @@ fn claude_usage_emission_and_observation_are_scoped_to_turns() {
 }
 
 #[test]
-fn claude_context_response_application_is_turn_scoped() {
+fn authoritative_context_query_is_deduplicated() {
     let fixture: ContextUsageFixture = load_fixture("context-usage.json");
     let mut runtime = ClaudeProviderRuntime::new("thread-1".to_owned(), "session-1".to_owned());
 
