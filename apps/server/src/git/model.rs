@@ -198,6 +198,25 @@ pub struct VcsCreateWorktreeResult {
     pub worktree: VcsWorktree,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitWorktreeRecord {
+    pub path: PathBuf,
+    pub head: Option<String>,
+    pub branch: Option<String>,
+    pub is_primary: bool,
+    pub is_bare: bool,
+    pub locked: bool,
+    pub lock_reason: Option<String>,
+    pub prunable_reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitWorktreeInventory {
+    pub common_dir: PathBuf,
+    pub records: Vec<GitWorktreeRecord>,
+    pub nul_delimited: bool,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VcsPullResult {

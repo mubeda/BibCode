@@ -1,0 +1,477 @@
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
+
+use thiserror::Error;
+
+use crate::crypto::sha256_hex;
+
+use super::GitWorktreeRecord;
+
+const MAX_WORKTREE_RECORDS: usize = 512;
+const WORKTREE_KEY_VERSION: &str = "bibcode.worktree.v1";
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostPathPlatform {
+    Posix,
+    Windows,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct WorktreeRepositoryKey(String);
+
+impl WorktreeRepositoryKey {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct WorktreeKey(String);
+
+impl WorktreeKey {
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+#[derive(Debug, Error, Eq, PartialEq)]
+pub enum WorktreeParseError {
+    #[error("Git worktree porcelain output is empty")]
+    Empty,
+    #[error("Git worktree porcelain output has an unterminated record")]
+    Unterminated,
+    #[error("Git worktree porcelain output contains an empty record")]
+    EmptyRecord,
+    #[error("Git worktree porcelain output contains more than {MAX_WORKTREE_RECORDS} records")]
+    TooManyRecords,
+    #[error("Git worktree porcelain record is missing its worktree path")]
+    MissingPath,
+    #[error("Git worktree porcelain record has duplicate {field} fields")]
+    DuplicateField { field: &'static str },
+    #[error("Git worktree porcelain record has an invalid {field} field")]
+    InvalidField { field: &'static str },
+}
+
+#[must_use]
+pub fn normalize_worktree_path_key(path: &Path, platform: HostPathPlatform) -> String {
+    let mut normalized = collapse_separators(&path.to_string_lossy().replace('\\', "/"));
+    while normalized.len() > minimum_path_length(&normalized, platform) && normalized.ends_with('/')
+    {
+        normalized.pop();
+    }
+    match platform {
+        HostPathPlatform::Posix => normalized,
+        HostPathPlatform::Windows => normalized.to_ascii_lowercase(),
+    }
+}
+
+fn collapse_separators(path: &str) -> String {
+    let preserve_unc_prefix = path.starts_with("//");
+    let mut normalized = String::with_capacity(path.len());
+    let mut previous_was_separator = false;
+    for (index, character) in path.char_indices() {
+        if character != '/' {
+            normalized.push(character);
+            previous_was_separator = false;
+            continue;
+        }
+        if !previous_was_separator || (preserve_unc_prefix && index == 1) {
+            normalized.push(character);
+        }
+        previous_was_separator = true;
+    }
+    normalized
+}
+
+#[must_use]
+pub fn worktree_repository_key(
+    common_dir: &Path,
+    platform: HostPathPlatform,
+) -> WorktreeRepositoryKey {
+    WorktreeRepositoryKey(opaque_key(
+        &normalize_worktree_path_key(common_dir, platform),
+        None,
+    ))
+}
+
+#[must_use]
+pub fn worktree_key(common_dir: &Path, path: &Path, platform: HostPathPlatform) -> WorktreeKey {
+    WorktreeKey(opaque_key(
+        &normalize_worktree_path_key(common_dir, platform),
+        Some(&normalize_worktree_path_key(path, platform)),
+    ))
+}
+
+pub async fn resolved_worktree_keys(
+    common_dir: &Path,
+    git_path: &Path,
+    platform: HostPathPlatform,
+) -> (WorktreeRepositoryKey, WorktreeKey) {
+    let common_dir = tokio::fs::canonicalize(common_dir)
+        .await
+        .unwrap_or_else(|_| common_dir.to_path_buf());
+    let git_path = tokio::fs::canonicalize(git_path)
+        .await
+        .unwrap_or_else(|_| git_path.to_path_buf());
+    (
+        worktree_repository_key(&common_dir, platform),
+        worktree_key(&common_dir, &git_path, platform),
+    )
+}
+
+pub fn parse_worktree_porcelain(
+    output: &str,
+    nul_delimited: bool,
+) -> Result<Vec<GitWorktreeRecord>, WorktreeParseError> {
+    let raw_records = if nul_delimited {
+        split_nul_records(output)?
+    } else {
+        split_legacy_records(output)?
+    };
+    if raw_records.is_empty() {
+        return Err(WorktreeParseError::Empty);
+    }
+    if raw_records.len() > MAX_WORKTREE_RECORDS {
+        return Err(WorktreeParseError::TooManyRecords);
+    }
+    raw_records
+        .into_iter()
+        .enumerate()
+        .map(|(index, fields)| parse_record(&fields, !nul_delimited, index == 0))
+        .collect()
+}
+
+fn minimum_path_length(path: &str, platform: HostPathPlatform) -> usize {
+    if path == "/" {
+        return 1;
+    }
+    if platform == HostPathPlatform::Windows
+        && path.len() >= 3
+        && path.as_bytes()[1] == b':'
+        && path.as_bytes()[2] == b'/'
+    {
+        return 3;
+    }
+    0
+}
+
+fn opaque_key(common_dir_key: &str, path_key: Option<&str>) -> String {
+    let mut input = Vec::with_capacity(
+        WORKTREE_KEY_VERSION.len() + common_dir_key.len() + path_key.map_or(0, str::len) + 2,
+    );
+    input.extend_from_slice(WORKTREE_KEY_VERSION.as_bytes());
+    input.push(b'\0');
+    input.extend_from_slice(common_dir_key.as_bytes());
+    if let Some(path_key) = path_key {
+        input.push(b'\0');
+        input.extend_from_slice(path_key.as_bytes());
+    }
+    sha256_hex(input)
+}
+
+fn split_nul_records(output: &str) -> Result<Vec<Vec<&str>>, WorktreeParseError> {
+    if output.is_empty() {
+        return Err(WorktreeParseError::Empty);
+    }
+    if !output.ends_with("\0\0") {
+        return Err(WorktreeParseError::Unterminated);
+    }
+    let mut records = Vec::new();
+    let mut fields = Vec::new();
+    for field in output.split_terminator('\0') {
+        if field.is_empty() {
+            if fields.is_empty() {
+                return Err(WorktreeParseError::EmptyRecord);
+            }
+            records.push(std::mem::take(&mut fields));
+        } else {
+            fields.push(field);
+        }
+    }
+    if !fields.is_empty() {
+        return Err(WorktreeParseError::Unterminated);
+    }
+    Ok(records)
+}
+
+fn split_legacy_records(output: &str) -> Result<Vec<Vec<&str>>, WorktreeParseError> {
+    if output.is_empty() {
+        return Err(WorktreeParseError::Empty);
+    }
+    if !output.ends_with("\n\n") {
+        return Err(WorktreeParseError::Unterminated);
+    }
+    let mut records = Vec::new();
+    for record in output[..output.len() - 1].split("\n\n") {
+        if record.is_empty() {
+            return Err(WorktreeParseError::EmptyRecord);
+        }
+        let fields: Vec<&str> = record.lines().collect();
+        if fields.is_empty() || fields.iter().any(|field| field.is_empty()) {
+            return Err(WorktreeParseError::EmptyRecord);
+        }
+        records.push(fields);
+    }
+    Ok(records)
+}
+
+fn parse_record(
+    fields: &[&str],
+    legacy: bool,
+    is_primary: bool,
+) -> Result<GitWorktreeRecord, WorktreeParseError> {
+    let mut seen = HashSet::new();
+    let mut path = None;
+    let mut head = None;
+    let mut branch = None;
+    let mut is_bare = false;
+    let mut locked = false;
+    let mut lock_reason = None;
+    let mut prunable_reason = None;
+    let mut detached = false;
+    let mut unborn = false;
+
+    for field in fields {
+        let (name, value) = split_field(field);
+        let singleton = match name {
+            "worktree" => Some("worktree"),
+            "HEAD" => Some("HEAD"),
+            "branch" => Some("branch"),
+            "bare" => Some("bare"),
+            "locked" => Some("locked"),
+            "prunable" => Some("prunable"),
+            "detached" => Some("detached"),
+            "unborn" => Some("unborn"),
+            _ => None,
+        };
+        if let Some(singleton) = singleton
+            && !seen.insert(singleton)
+        {
+            return Err(WorktreeParseError::DuplicateField { field: singleton });
+        }
+        match name {
+            "worktree" => {
+                let value = value.ok_or(WorktreeParseError::MissingPath)?;
+                if value.is_empty() {
+                    return Err(WorktreeParseError::MissingPath);
+                }
+                path = Some(PathBuf::from(if legacy {
+                    decode_c_style(value)?
+                } else {
+                    value.to_owned()
+                }));
+            }
+            "HEAD" => {
+                head = Some(
+                    value
+                        .filter(|value| !value.is_empty())
+                        .ok_or(WorktreeParseError::InvalidField { field: "HEAD" })?
+                        .to_owned(),
+                );
+            }
+            "branch" => {
+                let branch_ref = value
+                    .filter(|value| !value.is_empty())
+                    .ok_or(WorktreeParseError::InvalidField { field: "branch" })?;
+                branch = Some(
+                    branch_ref
+                        .strip_prefix("refs/heads/")
+                        .ok_or(WorktreeParseError::InvalidField { field: "branch" })?
+                        .to_owned(),
+                );
+            }
+            "bare" => {
+                if value.is_some() {
+                    return Err(WorktreeParseError::InvalidField { field: "bare" });
+                }
+                is_bare = true;
+            }
+            "locked" => {
+                locked = true;
+                lock_reason = value.map(str::to_owned).filter(|value| !value.is_empty());
+            }
+            "prunable" => {
+                prunable_reason = value.map(str::to_owned).filter(|value| !value.is_empty());
+            }
+            "detached" => {
+                if value.is_some() {
+                    return Err(WorktreeParseError::InvalidField { field: "detached" });
+                }
+                detached = true;
+            }
+            "unborn" => {
+                if value.is_some() {
+                    return Err(WorktreeParseError::InvalidField { field: "unborn" });
+                }
+                unborn = true;
+            }
+            _ => {}
+        }
+    }
+
+    let path = path.ok_or(WorktreeParseError::MissingPath)?;
+    Ok(GitWorktreeRecord {
+        path,
+        head,
+        branch: (!detached && !unborn).then_some(branch).flatten(),
+        is_primary,
+        is_bare,
+        locked,
+        lock_reason,
+        prunable_reason,
+    })
+}
+
+fn split_field(field: &str) -> (&str, Option<&str>) {
+    match field.split_once(' ') {
+        Some((name, value)) => (name, Some(value)),
+        None => (field, None),
+    }
+}
+
+fn decode_c_style(value: &str) -> Result<String, WorktreeParseError> {
+    if !value.starts_with('"') {
+        return Ok(value.to_owned());
+    }
+    if value.len() < 2 || !value.ends_with('"') {
+        return Err(WorktreeParseError::InvalidField { field: "worktree" });
+    }
+    let bytes = value.as_bytes();
+    let mut decoded = Vec::with_capacity(bytes.len());
+    let mut index = 1;
+    while index < bytes.len() - 1 {
+        let byte = bytes[index];
+        if byte != b'\\' {
+            decoded.push(byte);
+            index += 1;
+            continue;
+        }
+        index += 1;
+        let Some(escaped) = bytes.get(index).copied() else {
+            return Err(WorktreeParseError::InvalidField { field: "worktree" });
+        };
+        let value = match escaped {
+            b'a' => b'\x07',
+            b'b' => b'\x08',
+            b'f' => b'\x0c',
+            b'n' => b'\n',
+            b'r' => b'\r',
+            b't' => b'\t',
+            b'v' => b'\x0b',
+            b'\\' => b'\\',
+            b'"' => b'"',
+            b'0'..=b'7' => {
+                let digits = bytes
+                    .get(index..index + 3)
+                    .filter(|digits| digits.iter().all(|digit| matches!(digit, b'0'..=b'7')))
+                    .ok_or(WorktreeParseError::InvalidField { field: "worktree" })?;
+                index += 2;
+                (digits[0] - b'0') * 64 + (digits[1] - b'0') * 8 + (digits[2] - b'0')
+            }
+            _ => return Err(WorktreeParseError::InvalidField { field: "worktree" }),
+        };
+        decoded.push(value);
+        index += 1;
+    }
+    String::from_utf8(decoded).map_err(|_| WorktreeParseError::InvalidField { field: "worktree" })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::Path;
+
+    use super::{
+        HostPathPlatform, normalize_worktree_path_key, parse_worktree_porcelain, worktree_key,
+        worktree_repository_key,
+    };
+
+    #[test]
+    fn parses_nul_records_with_special_paths_and_state() {
+        let records = parse_worktree_porcelain(
+            "worktree /repo main\ncopy\0HEAD abc123\0branch refs/heads/feature/space\0locked maintenance\0\0worktree /repo linked\0HEAD def456\0detached\0prunable stale admin\0\0",
+            true,
+        )
+        .expect("NUL porcelain parses");
+
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].path, Path::new("/repo main\ncopy"));
+        assert_eq!(records[0].branch.as_deref(), Some("feature/space"));
+        assert!(records[0].locked);
+        assert_eq!(records[0].lock_reason.as_deref(), Some("maintenance"));
+        assert!(records[0].is_primary);
+        assert_eq!(records[1].branch, None);
+        assert_eq!(records[1].prunable_reason.as_deref(), Some("stale admin"));
+    }
+
+    #[test]
+    fn parses_legacy_c_quoted_paths_and_unborn_bare_records() {
+        let records = parse_worktree_porcelain(
+            "worktree \"/repo path\\nnext\"\nHEAD abc123\nbranch refs/heads/main\n\nworktree /bare\nbare\nbranch refs/heads/unborn\nunborn\n\n",
+            false,
+        )
+        .expect("legacy porcelain parses");
+
+        assert_eq!(records[0].path, Path::new("/repo path\nnext"));
+        assert_eq!(records[0].branch.as_deref(), Some("main"));
+        assert!(records[1].is_bare);
+        assert_eq!(records[1].branch, None);
+    }
+
+    #[test]
+    fn rejects_malformed_and_non_authoritative_records() {
+        for (porcelain, nul_delimited) in [
+            ("", false),
+            ("worktree /one\nworktree /two\n\n", false),
+            ("worktree /one\nbranch refs/heads/main", false),
+            ("HEAD abc\n\n", false),
+            ("worktree /one\0HEAD abc\0", true),
+        ] {
+            assert!(parse_worktree_porcelain(porcelain, nul_delimited).is_err());
+        }
+
+        let many = (0..513)
+            .map(|index| format!("worktree /repo/{index}\n\n"))
+            .collect::<String>();
+        assert!(parse_worktree_porcelain(&many, false).is_err());
+    }
+
+    #[test]
+    fn normalizes_host_path_keys_and_derives_stable_opaque_keys() {
+        assert_eq!(
+            normalize_worktree_path_key(Path::new(r"C:\\Repo\\Work\\"), HostPathPlatform::Windows),
+            "c:/repo/work"
+        );
+        assert_eq!(
+            normalize_worktree_path_key(
+                Path::new(r"\\\\Server\\Share\\Repo\\"),
+                HostPathPlatform::Windows
+            ),
+            "//server/share/repo"
+        );
+        assert_ne!(
+            normalize_worktree_path_key(Path::new("/Repo"), HostPathPlatform::Posix),
+            normalize_worktree_path_key(Path::new("/repo"), HostPathPlatform::Posix)
+        );
+
+        let repository = worktree_repository_key(Path::new("/repo/.git"), HostPathPlatform::Posix);
+        let worktree = worktree_key(
+            Path::new("/repo/.git"),
+            Path::new("/repo"),
+            HostPathPlatform::Posix,
+        );
+        assert_eq!(repository.as_str().len(), 64);
+        assert_eq!(worktree.as_str().len(), 64);
+        assert_eq!(
+            worktree,
+            worktree_key(
+                Path::new("/repo/.git/"),
+                Path::new("/repo/"),
+                HostPathPlatform::Posix,
+            )
+        );
+    }
+}

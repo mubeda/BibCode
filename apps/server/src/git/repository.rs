@@ -6,7 +6,7 @@ use std::{
     io,
     path::{Component, Path, PathBuf},
     pin::Pin,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -15,21 +15,30 @@ use tokio_util::sync::CancellationToken;
 use crate::diagnostics::redact_sensitive_text;
 
 use super::{
-    ChangeRequest, CreateWorktreeInput, GitCommandDiagnostics, GitCommandError, OutputPolicy,
-    ProcessError, ProcessOutput, ProcessRequest, ProcessRunner, ProviderKind, PullStatus,
-    SourceControlProviderInfo, VcsCommit, VcsCreateWorktreeResult, VcsListCommitsResult,
-    VcsListRefsResult, VcsPullResult, VcsRef, VcsStagingArea, VcsStatusLocalResult,
-    VcsStatusRemoteResult, VcsStatusResult, VcsWorkingTree, VcsWorkingTreeFile,
-    VcsWorkingTreeFileStatus, VcsWorktree, parse_numstat, parse_porcelain_v2_line,
+    ChangeRequest, CreateWorktreeInput, GitCommandDiagnostics, GitCommandError,
+    GitWorktreeInventory, OutputPolicy, ProcessError, ProcessOutput, ProcessRequest, ProcessRunner,
+    ProviderKind, PullStatus, SourceControlProviderInfo, VcsCommit, VcsCreateWorktreeResult,
+    VcsListCommitsResult, VcsListRefsResult, VcsPullResult, VcsRef, VcsStagingArea,
+    VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusResult, VcsWorkingTree,
+    VcsWorkingTreeFile, VcsWorkingTreeFileStatus, VcsWorktree, parse_numstat,
+    parse_porcelain_v2_line, parse_worktree_porcelain,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_OUTPUT_LIMIT: usize = 1_000_000;
+const WORKTREE_INVENTORY_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
 const COMMIT_FIELD_SEPARATOR: char = '\x1f';
 const CLONE_OPERATION: &str = "GitVcsDriver.clone";
 const MAX_AUTOMATIC_WORKTREE_SUFFIX_ATTEMPTS: usize = 100;
 const WORKTREE_REMOVE_RETRY_ATTEMPTS: usize = 20;
 const WORKTREE_REMOVE_RETRY_DELAY: Duration = Duration::from_millis(50);
+
+#[derive(Clone, Copy)]
+struct GitExecutionOptions {
+    allow_non_zero_exit: bool,
+    max_output_bytes: usize,
+    output_policy: OutputPolicy,
+}
 
 pub type BoxWorktreeBaseDirectoryFuture<'a> =
     Pin<Box<dyn Future<Output = Option<PathBuf>> + Send + 'a>>;
@@ -51,6 +60,7 @@ impl WorktreeBaseDirectoryProvider for DefaultWorktreeBaseDirectory {
 pub struct GitRepository {
     runner: ProcessRunner,
     worktree_settings: Arc<dyn WorktreeBaseDirectoryProvider>,
+    worktree_porcelain_z_supported: Arc<Mutex<Option<bool>>>,
 }
 
 impl Default for GitRepository {
@@ -58,6 +68,7 @@ impl Default for GitRepository {
         Self {
             runner: ProcessRunner,
             worktree_settings: Arc::new(DefaultWorktreeBaseDirectory),
+            worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
         }
     }
 }
@@ -148,6 +159,7 @@ impl GitRepository {
         Self {
             runner: ProcessRunner,
             worktree_settings,
+            worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -176,6 +188,28 @@ impl GitRepository {
         allow_non_zero_exit: bool,
         cancellation: &CancellationToken,
     ) -> Result<ProcessOutput, GitCommandError> {
+        self.execute_with_options(
+            operation,
+            cwd,
+            args,
+            GitExecutionOptions {
+                allow_non_zero_exit,
+                max_output_bytes: DEFAULT_OUTPUT_LIMIT,
+                output_policy: OutputPolicy::Truncate,
+            },
+            cancellation,
+        )
+        .await
+    }
+
+    async fn execute_with_options(
+        &self,
+        operation: &str,
+        cwd: &Path,
+        args: &[String],
+        options: GitExecutionOptions,
+        cancellation: &CancellationToken,
+    ) -> Result<ProcessOutput, GitCommandError> {
         self.runner
             .run(
                 ProcessRequest {
@@ -186,10 +220,10 @@ impl GitRepository {
                     env: git_environment(),
                     stdin: None,
                     timeout: DEFAULT_TIMEOUT,
-                    max_output_bytes: DEFAULT_OUTPUT_LIMIT,
-                    output_policy: OutputPolicy::Truncate,
+                    max_output_bytes: options.max_output_bytes,
+                    output_policy: options.output_policy,
                     append_truncation_marker: false,
-                    allow_non_zero_exit,
+                    allow_non_zero_exit: options.allow_non_zero_exit,
                 },
                 cancellation,
             )
@@ -242,6 +276,137 @@ impl GitRepository {
             )
             .await?;
         Ok(Some(PathBuf::from(output.stdout.trim())))
+    }
+
+    pub async fn worktree_inventory(
+        &self,
+        anchor: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<GitWorktreeInventory, GitCommandError> {
+        let common_dir_output = self
+            .execute_with_options(
+                "GitVcsDriver.worktreeInventory.commonDir",
+                anchor,
+                &strings(&["rev-parse", "--git-common-dir"]),
+                GitExecutionOptions {
+                    allow_non_zero_exit: false,
+                    max_output_bytes: WORKTREE_INVENTORY_OUTPUT_LIMIT,
+                    output_policy: OutputPolicy::Error,
+                },
+                cancellation,
+            )
+            .await?;
+        ensure_authoritative_inventory_output(
+            "GitVcsDriver.worktreeInventory.commonDir",
+            anchor,
+            &common_dir_output,
+        )?;
+        let common_dir_value = git_output_line(&common_dir_output.stdout).ok_or_else(|| {
+            simple_error(
+                "GitVcsDriver.worktreeInventory.commonDir",
+                anchor,
+                "Git reported an invalid common Git directory.",
+            )
+        })?;
+        if common_dir_value.is_empty() {
+            return Err(simple_error(
+                "GitVcsDriver.worktreeInventory.commonDir",
+                anchor,
+                "Git did not report a common Git directory.",
+            ));
+        }
+        let common_dir_path = PathBuf::from(common_dir_value);
+        let common_dir = if common_dir_path.is_absolute() {
+            common_dir_path
+        } else {
+            normalize_path_lexically(&anchor.join(common_dir_path))
+        };
+
+        let (output, nul_delimited) = self.worktree_porcelain_output(anchor, cancellation).await?;
+        ensure_authoritative_inventory_output(
+            "GitVcsDriver.worktreeInventory.list",
+            anchor,
+            &output,
+        )?;
+        let records = parse_worktree_porcelain(&output.stdout, nul_delimited).map_err(|error| {
+            simple_error(
+                "GitVcsDriver.worktreeInventory.parse",
+                anchor,
+                &format!("Git worktree inventory is malformed: {error}"),
+            )
+        })?;
+        Ok(GitWorktreeInventory {
+            common_dir,
+            records,
+            nul_delimited,
+        })
+    }
+
+    async fn worktree_porcelain_output(
+        &self,
+        anchor: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<(ProcessOutput, bool), GitCommandError> {
+        if self.worktree_porcelain_z_support() != Some(false) {
+            let args = strings(&["worktree", "list", "--porcelain", "-z"]);
+            let output = self
+                .execute_with_options(
+                    "GitVcsDriver.worktreeInventory.listZ",
+                    anchor,
+                    &args,
+                    GitExecutionOptions {
+                        allow_non_zero_exit: true,
+                        max_output_bytes: WORKTREE_INVENTORY_OUTPUT_LIMIT,
+                        output_policy: OutputPolicy::Error,
+                    },
+                    cancellation,
+                )
+                .await?;
+            if output.exit_code == 0 {
+                self.set_worktree_porcelain_z_support(true);
+                return Ok((output, true));
+            }
+            if !is_unsupported_porcelain_z_diagnostic(&output.stderr) {
+                return Err(command_output_error(
+                    "GitVcsDriver.worktreeInventory.listZ",
+                    anchor,
+                    args.len(),
+                    &output,
+                    &actionable_git_failure(&output.stderr, &output.stdout),
+                ));
+            }
+            self.set_worktree_porcelain_z_support(false);
+        }
+
+        let args = strings(&["worktree", "list", "--porcelain"]);
+        let output = self
+            .execute_with_options(
+                "GitVcsDriver.worktreeInventory.list",
+                anchor,
+                &args,
+                GitExecutionOptions {
+                    allow_non_zero_exit: false,
+                    max_output_bytes: WORKTREE_INVENTORY_OUTPUT_LIMIT,
+                    output_policy: OutputPolicy::Error,
+                },
+                cancellation,
+            )
+            .await?;
+        Ok((output, false))
+    }
+
+    fn worktree_porcelain_z_support(&self) -> Option<bool> {
+        self.worktree_porcelain_z_supported
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .to_owned()
+    }
+
+    fn set_worktree_porcelain_z_support(&self, supported: bool) {
+        *self
+            .worktree_porcelain_z_supported
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(supported);
     }
 
     pub async fn local_status(
@@ -1862,6 +2027,41 @@ fn same_worktree_path(registered: &str, path: &Path) -> bool {
     }
 }
 
+fn ensure_authoritative_inventory_output(
+    operation: &str,
+    cwd: &Path,
+    output: &ProcessOutput,
+) -> Result<(), GitCommandError> {
+    if output.stdout_truncated || output.stderr_truncated {
+        return Err(simple_error(
+            operation,
+            cwd,
+            "Git worktree inventory output was truncated and is not authoritative.",
+        ));
+    }
+    Ok(())
+}
+
+fn is_unsupported_porcelain_z_diagnostic(stderr: &str) -> bool {
+    let diagnostic = stderr.to_ascii_lowercase();
+    [
+        "unknown option `z'",
+        "unknown option 'z'",
+        "unknown option: -z",
+        "unknown switch `z'",
+        "unknown switch 'z'",
+        "unrecognized option '-z'",
+    ]
+    .into_iter()
+    .any(|needle| diagnostic.contains(needle))
+}
+
+fn git_output_line(output: &str) -> Option<&str> {
+    let line = output.strip_suffix('\n').unwrap_or(output);
+    let line = line.strip_suffix('\r').unwrap_or(line);
+    (!line.contains(['\n', '\r'])).then_some(line)
+}
+
 fn parse_branch_headers(stdout: &str) -> (Option<String>, Option<String>, u64, u64) {
     let mut branch = None;
     let mut upstream = None;
@@ -2148,7 +2348,9 @@ mod worktree_ownership_tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        CreateWorktreeInput, GitRepository, OwnedWorktreePath, display_path, parse_branch_headers,
+        CreateWorktreeInput, GitRepository, OwnedWorktreePath, ProcessOutput, display_path,
+        ensure_authoritative_inventory_output, git_output_line,
+        is_unsupported_porcelain_z_diagnostic, parse_branch_headers,
     };
 
     #[test]
@@ -2163,6 +2365,36 @@ mod worktree_ownership_tests {
             ),
             (Some("main".into()), Some("origin/main".into()), 0, 0)
         );
+    }
+
+    #[test]
+    fn inventory_rejects_truncated_output_and_only_falls_back_for_explicit_z_diagnostics() {
+        let output = ProcessOutput {
+            exit_code: 0,
+            stdout: "worktree /repo\0\0".to_owned(),
+            stderr: String::new(),
+            stdout_truncated: true,
+            stderr_truncated: false,
+        };
+        assert!(
+            ensure_authoritative_inventory_output(
+                "GitVcsDriver.worktreeInventory.list",
+                Path::new("/repo"),
+                &output,
+            )
+            .is_err()
+        );
+        assert!(is_unsupported_porcelain_z_diagnostic(
+            "error: unknown option `z'\nusage: git worktree list"
+        ));
+        assert!(!is_unsupported_porcelain_z_diagnostic(
+            "fatal: not a git repository"
+        ));
+        assert_eq!(
+            git_output_line(" /repo with space \n"),
+            Some(" /repo with space ")
+        );
+        assert_eq!(git_output_line("/one\n/two\n"), None);
     }
 
     fn git(cwd: &Path, args: &[&str]) -> String {
