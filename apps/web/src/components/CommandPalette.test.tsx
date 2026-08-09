@@ -355,6 +355,7 @@ function makeProject(
     repositoryIdentity: null,
     defaultModelSelection: null,
     scripts: [],
+    worktreeDiscovery: { visibility: "hidden", initialPromptDismissedAt: null, baselinePaths: [] },
     createdAt: iso(600),
     updatedAt: iso(60),
     environmentId: ENV_PRIMARY,

@@ -24,8 +24,22 @@
           "repositoryIdentity": null,
           "defaultModelSelection": null,
           "scripts": [],
-          "createdAt": "$",
-          "updatedAt": "ke"
+          "worktreeDiscovery": {
+            "visibility": "hidden",
+            "initialPromptDismissedAt": "W11,)Z3Gv^",
+            "baselinePaths": [
+              "M",
+              "!NV",
+              "7F_d_Zl<8OnN",
+              "[Z)PJ|tUwZ!<",
+              "Wo<",
+              "\"~itr",
+              "\"Jnm-(N",
+              ".-4E^2"
+            ]
+          },
+          "createdAt": "[",
+          "updatedAt": "wm0"
         }
       }
     }

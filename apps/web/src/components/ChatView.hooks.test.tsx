@@ -708,6 +708,7 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     repositoryIdentity: null,
     defaultModelSelection: { instanceId: codexInstanceId, model: "gpt-5.4" },
     scripts: [],
+    worktreeDiscovery: { visibility: "hidden", initialPromptDismissedAt: null, baselinePaths: [] },
     createdAt: now,
     updatedAt: now,
     ...overrides,

@@ -12,6 +12,8 @@ import {
   OrchestrationCommand,
   OrchestrationEvent,
   OrchestrationMessage,
+  OrchestrationProject,
+  OrchestrationProjectShell,
   OrchestrationGetFullThreadDiffInput,
   OrchestrationGetTurnDiffInput,
   OrchestrationLatestTurn,
@@ -43,6 +45,8 @@ const decodeOrchestrationLatestTurn = Schema.decodeUnknownEffect(OrchestrationLa
 const decodeOrchestrationProposedPlan = Schema.decodeUnknownEffect(OrchestrationProposedPlan);
 const decodeOrchestrationSession = Schema.decodeUnknownEffect(OrchestrationSession);
 const decodeDispatchResult = Schema.decodeUnknownEffect(DispatchResult);
+const decodeOrchestrationProject = Schema.decodeUnknownEffect(OrchestrationProject);
+const decodeOrchestrationProjectShell = Schema.decodeUnknownEffect(OrchestrationProjectShell);
 const encodeThreadCreatedPayload = Schema.encodeEffect(ThreadCreatedPayload);
 const decodeOrchestrationMessageSync = Schema.decodeUnknownSync(OrchestrationMessage);
 const decodeOrchestrationCommandSync = Schema.decodeUnknownSync(OrchestrationCommand);
@@ -404,6 +408,48 @@ it.effect("decodes historical project.created payloads with a default provider",
       updatedAt: "2026-01-01T00:00:00.000Z",
     });
     assert.strictEqual(parsed.defaultModelSelection?.instanceId, "codex");
+  }),
+);
+
+it.effect("defaults missing worktree discovery policy for legacy project representations", () =>
+  Effect.gen(function* () {
+    const legacyProject = {
+      id: "project-1",
+      title: "Project Title",
+      workspaceRoot: "/tmp/workspace",
+      defaultModelSelection: null,
+      scripts: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+      deletedAt: null,
+    };
+    const legacyCreated = {
+      projectId: "project-1",
+      title: "Project Title",
+      workspaceRoot: "/tmp/workspace",
+      defaultModelSelection: null,
+      scripts: [],
+      createdAt: "2026-01-01T00:00:00.000Z",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    };
+    const legacyMetaUpdated = {
+      projectId: "project-1",
+      updatedAt: "2026-01-01T00:00:00.000Z",
+    };
+
+    const decoded = yield* Effect.all([
+      decodeOrchestrationProject(legacyProject),
+      decodeOrchestrationProjectShell(legacyProject),
+      decodeProjectCreatedPayload(legacyCreated),
+      decodeProjectMetaUpdatedPayload(legacyMetaUpdated),
+    ]);
+    for (const project of decoded) {
+      assert.deepStrictEqual(project.worktreeDiscovery, {
+        visibility: "hidden",
+        initialPromptDismissedAt: null,
+        baselinePaths: [],
+      });
+    }
   }),
 );
 
