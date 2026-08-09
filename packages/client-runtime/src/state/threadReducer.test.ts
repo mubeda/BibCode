@@ -578,6 +578,154 @@ describe("applyThreadDetailEvent", () => {
         expect(result.thread.activities[0]?.id).toBe("activity-0");
       }
     });
+
+    it("replaces every earlier resolvable context-window update for the same turn", () => {
+      const result = applyThreadDetailEvent(
+        {
+          ...baseThread,
+          activities: [
+            {
+              id: EventId.make("activity-cw-valid"),
+              tone: "info",
+              kind: "context-window.updated",
+              summary: "Context window updated",
+              payload: { usedTokens: 1_000 },
+              turnId: TurnId.make("turn-1"),
+              sequence: 1,
+              createdAt: "2026-04-01T11:00:00.000Z",
+            },
+            {
+              id: EventId.make("activity-other-turn"),
+              tone: "info",
+              kind: "context-window.updated",
+              summary: "Context window updated",
+              payload: { usedTokens: 500 },
+              turnId: TurnId.make("turn-0"),
+              sequence: 2,
+              createdAt: "2026-04-01T11:01:00.000Z",
+            },
+            {
+              id: EventId.make("activity-cw-malformed"),
+              tone: "info",
+              kind: "context-window.updated",
+              summary: "Context window updated",
+              payload: {},
+              turnId: TurnId.make("turn-1"),
+              sequence: 3,
+              createdAt: "2026-04-01T11:02:00.000Z",
+            },
+            {
+              id: EventId.make("activity-cw-valid-second"),
+              tone: "info",
+              kind: "context-window.updated",
+              summary: "Context window updated",
+              payload: { usedTokens: 1_500 },
+              turnId: TurnId.make("turn-1"),
+              sequence: 4,
+              createdAt: "2026-04-01T11:03:00.000Z",
+            },
+          ],
+        },
+        event("thread.activity-appended", {
+          activity: {
+            id: EventId.make("activity-cw-latest"),
+            tone: "info",
+            kind: "context-window.updated",
+            summary: "Context window updated",
+            payload: { usedTokens: 2_000 },
+            turnId: TurnId.make("turn-1"),
+            sequence: 5,
+            createdAt: "2026-04-01T11:04:00.000Z",
+          },
+        }),
+      );
+
+      expect(result.kind).toBe("updated");
+      if (result.kind === "updated") {
+        const idsAfterValidReplacement = result.thread.activities.map((activity) => activity.id);
+        expect(idsAfterValidReplacement).toEqual([
+          "activity-other-turn",
+          "activity-cw-malformed",
+          "activity-cw-latest",
+        ]);
+      }
+    });
+
+    it("retains a resolvable context-window update when a malformed update arrives", () => {
+      const result = applyThreadDetailEvent(
+        {
+          ...baseThread,
+          activities: [
+            {
+              id: EventId.make("activity-cw-valid"),
+              tone: "info",
+              kind: "context-window.updated",
+              summary: "Context window updated",
+              payload: { usedTokens: 1_000 },
+              turnId: TurnId.make("turn-1"),
+              sequence: 1,
+              createdAt: "2026-04-01T11:00:00.000Z",
+            },
+          ],
+        },
+        event("thread.activity-appended", {
+          activity: {
+            id: EventId.make("activity-cw-malformed-new"),
+            tone: "info",
+            kind: "context-window.updated",
+            summary: "Context window updated",
+            payload: {},
+            turnId: TurnId.make("turn-1"),
+            sequence: 2,
+            createdAt: "2026-04-01T11:01:00.000Z",
+          },
+        }),
+      );
+
+      expect(result.kind).toBe("updated");
+      if (result.kind === "updated") {
+        const idsAfterMalformedUpdate = result.thread.activities.map((activity) => activity.id);
+        expect(idsAfterMalformedUpdate).toEqual(["activity-cw-valid", "activity-cw-malformed-new"]);
+      }
+    });
+
+    it("bounds an exact duplicate context-window update to one activity", () => {
+      const result = applyThreadDetailEvent(
+        {
+          ...baseThread,
+          activities: [
+            {
+              id: EventId.make("activity-cw-latest"),
+              tone: "info",
+              kind: "context-window.updated",
+              summary: "Context window updated",
+              payload: { usedTokens: 1_000 },
+              turnId: TurnId.make("turn-1"),
+              sequence: 1,
+              createdAt: "2026-04-01T11:00:00.000Z",
+            },
+          ],
+        },
+        event("thread.activity-appended", {
+          activity: {
+            id: EventId.make("activity-cw-latest"),
+            tone: "info",
+            kind: "context-window.updated",
+            summary: "Context window updated",
+            payload: { usedTokens: 2_000 },
+            turnId: TurnId.make("turn-1"),
+            sequence: 2,
+            createdAt: "2026-04-01T11:01:00.000Z",
+          },
+        }),
+      );
+
+      expect(result.kind).toBe("updated");
+      if (result.kind === "updated") {
+        const idsAfterExactDuplicate = result.thread.activities.map((activity) => activity.id);
+        expect(idsAfterExactDuplicate).toEqual(["activity-cw-latest"]);
+      }
+    });
   });
 
   describe("thread.turn-diff-completed", () => {

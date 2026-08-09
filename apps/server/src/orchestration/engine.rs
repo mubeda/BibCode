@@ -3095,6 +3095,25 @@ fn apply_activities_projector_tx(
     let activity = payload
         .get("activity")
         .ok_or_else(|| PersistenceError::Corrupt("missing activity payload".to_owned()))?;
+    let thread_id = required_str(payload, "threadId")?;
+    let turn_id = optional_string(activity.get("turnId"));
+    let kind = required_str(activity, "kind")?;
+    let replaces_context_window = kind == "context-window.updated"
+        && activity
+            .pointer("/payload/usedTokens")
+            .and_then(Value::as_f64)
+            .is_some_and(|used_tokens| used_tokens >= 0.0);
+    if replaces_context_window {
+        transaction.execute(
+            "DELETE FROM projection_thread_activities
+             WHERE thread_id = ?1
+               AND turn_id IS ?2
+               AND kind = 'context-window.updated'
+               AND json_type(payload_json, '$.usedTokens') IN ('integer', 'real')
+               AND json_extract(payload_json, '$.usedTokens') >= 0",
+            params![thread_id, turn_id],
+        )?;
+    }
     transaction.execute(
         "INSERT INTO projection_thread_activities (activity_id, thread_id, turn_id, tone, kind, summary, payload_json, sequence, created_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
@@ -3103,10 +3122,10 @@ fn apply_activities_projector_tx(
            summary = excluded.summary, payload_json = excluded.payload_json, sequence = excluded.sequence, created_at = excluded.created_at",
         params![
             required_str(activity, "id")?,
-            required_str(payload, "threadId")?,
-            optional_string(activity.get("turnId")),
+            thread_id,
+            turn_id,
             required_str(activity, "tone")?,
-            required_str(activity, "kind")?,
+            kind,
             required_str(activity, "summary")?,
             {
                 let activity_payload = activity.get("payload").cloned().unwrap_or(Value::Null);
@@ -4065,6 +4084,7 @@ mod tests {
         TurnDeliveryTransition, canonical_command_digest,
     };
     use crate::persistence::run_migrations;
+    use tempfile::TempDir;
 
     use super::*;
 
@@ -5504,6 +5524,161 @@ mod tests {
             })
             .await
             .expect("projector edges execute");
+    }
+
+    #[tokio::test]
+    async fn context_window_projection_keeps_latest_valid_per_turn() {
+        const CREATED_AT: &str = "2026-08-08T00:00:00.000Z";
+
+        let temp = TempDir::new().expect("temporary database directory");
+        let database_path = temp.path().join("context-window.sqlite");
+        let database = Database::open(&database_path).await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .expect("engine starts");
+        for command in [
+            json!({
+                "type":"project.create", "commandId":"context-project", "projectId":"p1",
+                "title":"Project", "workspaceRoot":"C:/repo", "createdAt":CREATED_AT
+            }),
+            json!({
+                "type":"thread.create", "commandId":"context-thread", "threadId":"t1",
+                "projectId":"p1", "title":"Thread", "kind":"workspace",
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access", "interactionMode":"default", "branch":null,
+                "worktreePath":null, "createdAt":CREATED_AT
+            }),
+            json!({
+                "type":"thread.turn.diff.complete", "commandId":"context-turn-0", "threadId":"t1",
+                "turnId":"turn-0", "checkpointTurnCount":1, "checkpointRef":"checkpoint-0",
+                "status":"ready", "files":[], "assistantMessageId":null,
+                "completedAt":CREATED_AT, "createdAt":CREATED_AT
+            }),
+            json!({
+                "type":"thread.turn.diff.complete", "commandId":"context-turn-1", "threadId":"t1",
+                "turnId":"turn-1", "checkpointTurnCount":2, "checkpointRef":"checkpoint-1",
+                "status":"ready", "files":[], "assistantMessageId":null,
+                "completedAt":CREATED_AT, "createdAt":CREATED_AT
+            }),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(command).expect("command decodes"))
+                .await
+                .expect("fixture command succeeds");
+        }
+
+        let database = engine.repositories().database().clone();
+        database
+            .call(|connection| {
+                let transaction = connection.transaction()?;
+                let activities = [
+                    json!({
+                        "id":"activity-cw-valid", "tone":"info",
+                        "kind":"context-window.updated", "summary":"Context window updated",
+                        "payload":{"usedTokens":1_000}, "turnId":"turn-1", "sequence":1,
+                        "createdAt":CREATED_AT
+                    }),
+                    json!({
+                        "id":"activity-cw-malformed", "tone":"info",
+                        "kind":"context-window.updated", "summary":"Context window updated",
+                        "payload":{}, "turnId":"turn-1", "sequence":2, "createdAt":CREATED_AT
+                    }),
+                    json!({
+                        "id":"activity-other-turn", "tone":"info",
+                        "kind":"context-window.updated", "summary":"Context window updated",
+                        "payload":{"usedTokens":500}, "turnId":"turn-0", "sequence":3,
+                        "createdAt":CREATED_AT
+                    }),
+                    json!({
+                        "id":"activity-cw-latest", "tone":"info",
+                        "kind":"context-window.updated", "summary":"Context window updated",
+                        "payload":{"usedTokens":2_000}, "turnId":"turn-1", "sequence":4,
+                        "createdAt":CREATED_AT
+                    }),
+                ];
+                let mut last_sequence = 0;
+                for activity in activities {
+                    let activity_id = required_str(&activity, "id")?;
+                    let saved = append_event_tx(
+                        &transaction,
+                        make_event(
+                            "thread.activity-appended",
+                            "thread",
+                            "t1",
+                            CREATED_AT,
+                            &format!("provider:{activity_id}"),
+                            json!({}),
+                            json!({"threadId":"t1", "activity":activity}),
+                        ),
+                    )?;
+                    apply_activities_projector_tx(&transaction, &saved)?;
+                    last_sequence = saved.sequence;
+                }
+                upsert_projection_state_tx(
+                    &transaction,
+                    "projection.thread-activities",
+                    last_sequence,
+                    CREATED_AT,
+                )?;
+                transaction.commit()?;
+                Ok(())
+            })
+            .await
+            .expect("activity projection transaction commits");
+        engine.shutdown().await;
+        drop(engine);
+        drop(database);
+
+        let reopened_database = Database::open(&database_path)
+            .await
+            .expect("database reopens");
+        let reopened = OrchestrationEngine::start(reopened_database, EngineOptions::default())
+            .await
+            .expect("engine restarts");
+        let snapshot = load_snapshot(&reopened.repositories())
+            .await
+            .expect("snapshot loads after restart");
+        assert_eq!(
+            snapshot
+                .activities
+                .iter()
+                .map(|activity| activity.activity_id.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "activity-cw-malformed",
+                "activity-other-turn",
+                "activity-cw-latest"
+            ]
+        );
+
+        reopened
+            .dispatch(OrchestrationCommand::ThreadRevertComplete {
+                command_id: "context-revert".to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_count: 1,
+                created_at: CREATED_AT.to_owned(),
+            })
+            .await
+            .expect("revert projects");
+        let snapshot = load_snapshot(&reopened.repositories())
+            .await
+            .expect("snapshot loads after revert");
+        assert_eq!(
+            snapshot
+                .activities
+                .iter()
+                .map(|activity| activity.activity_id.as_str())
+                .collect::<Vec<_>>(),
+            ["activity-other-turn"]
+        );
+        reopened.shutdown().await;
     }
 
     #[tokio::test]

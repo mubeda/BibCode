@@ -3463,6 +3463,26 @@ async fn project_provider_event(
                 created_at,
             }
         }
+        "thread.token-usage.updated" => {
+            let Some(payload) = context_window_activity_payload(&event.payload) else {
+                return Ok(());
+            };
+            OrchestrationCommand::ThreadActivityAppend {
+                command_id,
+                thread_id: event.thread_id,
+                activity: ActivityInput {
+                    id: format!("activity:{}", Uuid::new_v4()),
+                    tone: "info".to_owned(),
+                    kind: "context-window.updated".to_owned(),
+                    summary: "Context window updated".to_owned(),
+                    payload,
+                    turn_id: event.turn_id,
+                    sequence: None,
+                    created_at: created_at.clone(),
+                },
+                created_at,
+            }
+        }
         _ => {
             let (tone, kind) = if event.event_type == "turn.completed"
                 && event.payload.get("state").and_then(Value::as_str) == Some("failed")
@@ -3518,6 +3538,38 @@ async fn project_provider_event(
         .await
         .map(|_| ())
         .map_err(|error| ProviderRuntimeError::Orchestration(error.to_string()))
+}
+
+fn context_window_activity_payload(payload: &Value) -> Option<Value> {
+    let usage = payload.get("usage")?.as_object()?;
+    let used_tokens = usage.get("usedTokens")?.as_u64()?;
+    let mut sanitized = json!({ "usedTokens": used_tokens });
+    let sanitized_object = sanitized.as_object_mut()?;
+
+    if let Some(total_processed_tokens) = usage.get("totalProcessedTokens").and_then(Value::as_u64)
+    {
+        sanitized_object.insert(
+            "totalProcessedTokens".to_owned(),
+            Value::from(total_processed_tokens),
+        );
+    }
+    if let Some(max_tokens) = usage
+        .get("maxTokens")
+        .and_then(Value::as_u64)
+        .filter(|max_tokens| *max_tokens > 0)
+    {
+        sanitized_object.insert("maxTokens".to_owned(), Value::from(max_tokens));
+    }
+    if let Some(compacts_automatically) =
+        usage.get("compactsAutomatically").and_then(Value::as_bool)
+    {
+        sanitized_object.insert(
+            "compactsAutomatically".to_owned(),
+            Value::from(compacts_automatically),
+        );
+    }
+
+    Some(sanitized)
 }
 
 fn assistant_message_id(event: &ProviderEvent) -> String {
@@ -10804,6 +10856,82 @@ done
         ] {
             assert_eq!(super::event_activity_shape(event_type), expected);
         }
+    }
+
+    #[tokio::test]
+    async fn provider_projection_maps_context_usage() {
+        let engine = supervisor_engine().await;
+        let temp = TempDir::new().expect("temporary launch directory");
+        let mut launch = native_launch(&temp, "codex");
+        launch.thread_id = "t1".to_owned();
+
+        super::project_provider_event(
+            &engine,
+            &launch,
+            None,
+            None,
+            super::ProviderEvent {
+                native_event_id: None,
+                event_type: "thread.token-usage.updated".to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: Some("turn-1".to_owned()),
+                request_id: None,
+                payload: json!({
+                    "usage": {
+                        "usedTokens": 1_075,
+                        "totalProcessedTokens": 10_200,
+                        "maxTokens": 258_400,
+                        "compactsAutomatically": true
+                    }
+                }),
+                activity: Vec::new(),
+            },
+        )
+        .await
+        .expect("context usage projects");
+
+        let snapshot = load_snapshot(&engine.repositories())
+            .await
+            .expect("load projection snapshot");
+        let activity = snapshot.activities.last().expect("context window activity");
+        assert_eq!(activity.tone, "info");
+        assert_eq!(activity.kind, "context-window.updated");
+        assert_eq!(activity.summary, "Context window updated");
+        assert_eq!(activity.turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(
+            activity.payload,
+            json!({
+                "usedTokens": 1_075,
+                "totalProcessedTokens": 10_200,
+                "maxTokens": 258_400,
+                "compactsAutomatically": true
+            })
+        );
+
+        super::project_provider_event(
+            &engine,
+            &launch,
+            None,
+            None,
+            super::ProviderEvent {
+                native_event_id: None,
+                event_type: "thread.token-usage.updated".to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: Some("turn-1".to_owned()),
+                request_id: None,
+                payload: json!({ "usage": {} }),
+                activity: Vec::new(),
+            },
+        )
+        .await
+        .expect("malformed context usage is ignored");
+
+        let snapshot = load_snapshot(&engine.repositories())
+            .await
+            .expect("reload projection snapshot");
+        assert_eq!(snapshot.activities.len(), 1);
+        assert_eq!(snapshot.activities[0].kind, "context-window.updated");
+        engine.shutdown().await;
     }
 
     #[tokio::test]
