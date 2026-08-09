@@ -1007,14 +1007,14 @@
     {
       "key": "js:infra/relay:alchemy",
       "name": "alchemy",
-      "current": "https://pkg.ing/alchemy/cde008ab6b77783d3edbf5dc82750fbdfd279347",
-      "target": "custom-source beta.63",
-      "channel": "custom-source",
-      "source": "https://pkg.ing/alchemy",
+      "current": "2.0.0-beta.63",
+      "target": "2.0.0-beta.63",
+      "channel": "preview",
+      "source": "https://www.npmjs.com/package/alchemy",
       "cohort": "relay-preview",
       "platforms": ["linux", "macos", "windows"],
       "status": "green",
-      "notes": "Preserve the pkg.ing custom source while moving to the audited beta.63 build."
+      "notes": "Use the published npm artifact for the audited beta.63 build; its release tag resolves to the same cde008ab6b77783d3edbf5dc82750fbdfd279347 source revision."
     },
     {
       "key": "js:infra/relay:drizzle-kit",
