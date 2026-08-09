@@ -177,6 +177,7 @@ fn public_repository_api_inventory_is_explicit() {
         "list_provider_turn_deliveries",
         "list_referenced_attachment_ids",
         "list_threads_by_project",
+        "load_worktree_catalog_projection",
         "list_turns_by_thread",
         "max_event_sequence",
         "min_last_applied_sequence",
@@ -208,6 +209,49 @@ fn public_repository_api_inventory_is_explicit() {
     expected.sort();
 
     assert_eq!(methods, expected, "update repository execution coverage");
+}
+
+#[tokio::test]
+async fn worktree_catalog_projection_read_is_consistent_filtered_and_bounded() {
+    let repositories = migrated_repositories().await;
+    repositories
+        .upsert_project(project("project-catalog", T0))
+        .await
+        .expect("catalog project");
+    let mut first = thread("workspace-1", "project-catalog", T0);
+    first.kind = "workspace".to_owned();
+    let mut second = thread("workspace-2", "project-catalog", T1);
+    second.kind = "workspace".to_owned();
+    let mut third = thread("workspace-3", "project-catalog", T2);
+    third.kind = "workspace".to_owned();
+    let mut panel = thread("panel", "project-catalog", T2);
+    panel.kind = "panel".to_owned();
+    let mut deleted = thread("deleted", "project-catalog", T2);
+    deleted.kind = "workspace".to_owned();
+    deleted.deleted_at = Some(T2.to_owned());
+    for row in [first, second, third, panel, deleted] {
+        repositories
+            .upsert_thread(row)
+            .await
+            .expect("catalog thread");
+    }
+
+    let projection = repositories
+        .load_worktree_catalog_projection("project-catalog".to_owned(), 2)
+        .await
+        .expect("catalog projection read")
+        .expect("catalog project exists");
+
+    assert_eq!(projection.project.project_id, "project-catalog");
+    assert_eq!(
+        projection
+            .threads
+            .iter()
+            .map(|thread| thread.thread_id.as_str())
+            .collect::<Vec<_>>(),
+        ["workspace-1", "workspace-2"]
+    );
+    assert!(projection.truncated);
 }
 
 #[tokio::test]

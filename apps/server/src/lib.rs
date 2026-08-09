@@ -32,6 +32,7 @@ pub mod terminal;
 pub mod text_generation;
 pub mod vcs;
 pub mod workspace;
+pub mod worktree_catalog;
 
 use clap::Parser;
 use serde_json::json;
