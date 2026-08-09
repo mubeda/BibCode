@@ -50,6 +50,7 @@ const testState = vi.hoisted(() => ({
   toastAdds: [] as Array<Record<string, unknown>>,
   toastUpdates: [] as Array<{ id: unknown; config: unknown }>,
   toastCloses: [] as unknown[],
+  toastById: new Map<string, Record<string, unknown>>(),
   nextToastId: 0,
 }));
 
@@ -112,13 +113,24 @@ vi.mock("./ui/toast", () => ({
     add: (config: Record<string, unknown>) => {
       testState.toastAdds.push(config);
       testState.nextToastId += 1;
-      return `toast-${testState.nextToastId}`;
+      const toastId = `toast-${testState.nextToastId}`;
+      testState.toastById.set(toastId, config);
+      return toastId;
     },
     update: (id: unknown, config: unknown) => {
       testState.toastUpdates.push({ id, config });
+      const toastId = String(id);
+      const current = testState.toastById.get(toastId);
+      if (current && config && typeof config === "object") {
+        testState.toastById.set(toastId, {
+          ...current,
+          ...(config as Record<string, unknown>),
+        });
+      }
     },
     close: (id: unknown) => {
       testState.toastCloses.push(id);
+      testState.toastById.delete(String(id));
     },
   },
 }));
@@ -179,6 +191,7 @@ function render() {
   testState.toastAdds.length = 0;
   testState.toastUpdates.length = 0;
   testState.toastCloses.length = 0;
+  testState.toastById.clear();
   return renderToStaticMarkup(<ProviderUpdatePrimaryNotification />);
 }
 
@@ -353,6 +366,21 @@ describe("one-click update prompt", () => {
     runUpdates();
     await flush();
     expect(testState.updateProvider).not.toHaveBeenCalled();
+  });
+
+  it("removes the Update action while the update command is running", () => {
+    const latestVersion = uniqueLatestVersion();
+    const request = deferred<unknown>();
+    testState.updateProvider.mockReturnValue(request.promise);
+    renderPrompt(latestVersion);
+
+    const activePrompt = activeToastRef().current as { toastId: string };
+    const promptToast = testState.toastById.get(activePrompt.toastId)!;
+    expect((promptToast.actionProps as { children: string }).children).toBe("Update");
+
+    (promptToast.actionProps as { onClick: () => void }).onClick();
+
+    expect(testState.toastById.get(activePrompt.toastId)?.actionProps).toBeUndefined();
   });
 
   it("does not start an update until a primary environment is available", () => {
