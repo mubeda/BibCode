@@ -345,6 +345,87 @@ async fn project_worktree_discovery_policy_survives_metadata_updates_and_replay(
 }
 
 #[tokio::test]
+async fn omitted_worktree_discovery_metadata_update_preserves_custom_policy_through_replay() {
+    let repositories = migrated_repositories().await;
+    let engine =
+        OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
+            .await
+            .expect("engine starts");
+    let custom_policy = json!({
+        "visibility": "shown",
+        "initialPromptDismissedAt": "2026-08-09T00:00:00.000Z",
+        "baselinePaths": ["C:/custom-policy-worktree"]
+    });
+    engine
+        .dispatch(decode(json!({
+            "type": "project.create",
+            "commandId": "custom-policy-create",
+            "projectId": "custom-policy-project",
+            "title": "Custom policy project",
+            "workspaceRoot": "C:/custom-policy-project",
+            "defaultModelSelection": null,
+            "createdAt": CREATED_AT,
+        })))
+        .await
+        .expect("project creates");
+    engine
+        .dispatch(decode(json!({
+            "type": "project.meta.update",
+            "commandId": "custom-policy-update",
+            "projectId": "custom-policy-project",
+            "worktreeDiscovery": custom_policy,
+        })))
+        .await
+        .expect("custom policy persists");
+
+    let omitted_policy_update = decode(json!({
+        "type": "project.meta.update",
+        "commandId": "omitted-policy-update",
+        "projectId": "custom-policy-project",
+        "title": "Renamed custom policy project",
+    }));
+    engine
+        .dispatch(omitted_policy_update)
+        .await
+        .expect("omitted policy update persists");
+    assert_eq!(
+        load_snapshot(&engine.repositories())
+            .await
+            .expect("project projection")
+            .projects[0]
+            .worktree_discovery,
+        custom_policy
+    );
+    engine.shutdown().await;
+
+    repositories
+        .database()
+        .call(|connection| {
+            connection.execute("DELETE FROM projection_projects", [])?;
+            connection.execute(
+                "UPDATE projection_state SET last_applied_sequence = 0 WHERE projector = 'projection.projects'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("rewind project projection");
+    let restarted =
+        OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
+            .await
+            .expect("engine restarts");
+    assert_eq!(
+        load_snapshot(&restarted.repositories())
+            .await
+            .expect("replayed project projection")
+            .projects[0]
+            .worktree_discovery,
+        custom_policy
+    );
+    restarted.shutdown().await;
+}
+
+#[tokio::test]
 async fn default_thread_cannot_be_archived_or_deleted_directly() {
     let repositories = migrated_repositories().await;
     let engine =
