@@ -472,6 +472,9 @@ impl ClaudeProviderRuntime {
         turn_id: &str,
         response: &Value,
     ) -> Option<CanonicalEvent> {
+        if self.current_turn_id.as_deref() != Some(turn_id) {
+            return None;
+        }
         let usage = self.token_usage.observe_context_response(response)?;
         Some(self.token_usage_event(turn_id.to_owned(), usage))
     }
@@ -880,23 +883,28 @@ impl ClaudeProviderRuntime {
     fn handle_result_message(&mut self, message: ResultMessage) -> Vec<CanonicalEvent> {
         let mut events = self.flush_incomplete_tools();
         let interrupted = is_interrupted_result(&message);
+        let failed = message.is_error && !interrupted;
         let stop_reason = message.stop_reason.unwrap_or_else(|| {
             if interrupted {
                 "interrupted".to_owned()
+            } else if failed {
+                "error".to_owned()
             } else {
                 "success".to_owned()
             }
         });
         let mut payload = json!({
-            "state": if interrupted { "interrupted" } else { "completed" },
+            "state": if interrupted { "interrupted" } else if failed { "failed" } else { "completed" },
             "stopReason": stop_reason,
         });
-        if interrupted {
-            let error_message = message
-                .errors
-                .first()
-                .cloned()
-                .unwrap_or_else(|| "Claude runtime interrupted.".to_owned());
+        if interrupted || failed {
+            let error_message = message.errors.first().cloned().unwrap_or_else(|| {
+                if interrupted {
+                    "Claude runtime interrupted.".to_owned()
+                } else {
+                    "Claude turn failed.".to_owned()
+                }
+            });
             payload["errorMessage"] = json!(error_message);
         }
         events.push(self.event(

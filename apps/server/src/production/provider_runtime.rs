@@ -5527,10 +5527,11 @@ mod claude_control_response_tests {
 mod claude_context_query_tests {
     use super::{
         ClaudeControlResponseRouter, ProviderEvent, claude_completion_query_turn_id,
-        query_claude_context_usage,
+        claude_provider_event, query_claude_context_usage,
     };
+    use crate::provider::claude::{ClaudeProviderRuntime, TurnInput};
     use serde_json::{Value, json};
-    use std::time::Duration;
+    use std::{sync::Arc, time::Duration};
     use tokio::{
         io::{AsyncBufReadExt, AsyncWrite, BufReader},
         sync::Mutex,
@@ -5587,6 +5588,80 @@ mod claude_context_query_tests {
 
         assert_eq!(response.expect("context response")["totalTokens"], 31_251);
         assert_eq!(responses.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn late_context_response_cannot_mutate_a_new_turns_usage_state() {
+        let (writer_stream, reader_stream) = tokio::io::duplex(1_024);
+        let writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>> = Mutex::new(Box::new(writer_stream));
+        let responses = ClaudeControlResponseRouter::default();
+        let cancellation = CancellationToken::new();
+        let runtime = Arc::new(Mutex::new(ClaudeProviderRuntime::new(
+            "thread-1".to_owned(),
+            "session-1".to_owned(),
+        )));
+        runtime.lock().await.start_turn(TurnInput {
+            turn_id: "turn-1".to_owned(),
+            input: "first turn".to_owned(),
+        });
+
+        let responder = async {
+            let mut lines = BufReader::new(reader_stream).lines();
+            lines
+                .next_line()
+                .await
+                .expect("query read")
+                .expect("query line");
+            runtime.lock().await.start_turn(TurnInput {
+                turn_id: "turn-2".to_owned(),
+                input: "second turn".to_owned(),
+            });
+            assert!(responses.route(&json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": "bibcode-24",
+                    "response": {
+                        "totalTokens": 31251,
+                        "maxTokens": 200000,
+                        "isAutoCompactEnabled": true
+                    }
+                }
+            })));
+        };
+
+        let (response, ()) = tokio::join!(
+            query_claude_context_usage(
+                "claude",
+                &writer,
+                &responses,
+                &cancellation,
+                24,
+                Duration::from_secs(1),
+            ),
+            responder,
+        );
+
+        let mut runtime = runtime.lock().await;
+        assert!(
+            runtime
+                .apply_context_usage_response("turn-1", &response.expect("late context response"))
+                .is_none()
+        );
+        let current_turn = runtime.handle_raw_value(
+            &json!({
+                "type": "system",
+                "subtype": "compact_boundary",
+                "compact_metadata": { "pre_tokens": 31251, "post_tokens": 31251 }
+            }),
+            2_000,
+        );
+        assert_eq!(current_turn.events.len(), 1);
+        assert_eq!(current_turn.events[0].turn_id.as_deref(), Some("turn-2"));
+        assert_eq!(
+            current_turn.events[0].event_type,
+            "thread.token-usage.updated"
+        );
     }
 
     #[tokio::test]
@@ -5688,6 +5763,42 @@ mod claude_context_query_tests {
         let mut non_completion = completion("completed");
         non_completion.event_type = "item.completed".to_owned();
         assert_eq!(claude_completion_query_turn_id(&non_completion), None);
+    }
+
+    #[test]
+    fn actual_claude_error_result_is_non_success_before_query_policy() {
+        let mut runtime = ClaudeProviderRuntime::new("thread-1".to_owned(), "session-1".to_owned());
+        runtime.start_turn(TurnInput {
+            turn_id: "turn-1".to_owned(),
+            input: "exhaust the turn limit".to_owned(),
+        });
+
+        let output = runtime.handle_raw_value(
+            &json!({
+                "type": "result",
+                "subtype": "error_max_turns",
+                "is_error": true,
+                "errors": ["Reached the maximum number of turns."],
+                "stop_reason": null,
+                "session_id": "session-1",
+                "uuid": "result-error-1"
+            }),
+            1_000,
+        );
+        let completion = claude_provider_event(
+            output.events.into_iter().next().expect("completion event"),
+            None,
+            Vec::new(),
+        );
+
+        assert_eq!(completion.event_type, "turn.completed");
+        assert_eq!(completion.payload["state"], "failed");
+        assert_eq!(completion.payload["stopReason"], "error");
+        assert_eq!(
+            completion.payload["errorMessage"],
+            "Reached the maximum number of turns."
+        );
+        assert_eq!(claude_completion_query_turn_id(&completion), None);
     }
 }
 
