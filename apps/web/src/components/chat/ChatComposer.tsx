@@ -233,6 +233,7 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
 }) {
   const runtimeModeOption = runtimeModeConfig[props.runtimeMode];
   const RuntimeModeIcon = runtimeModeOption.icon;
+  const isFullAccess = props.runtimeMode === "full-access";
   const interactionModeTooltip =
     props.interactionMode === "plan" ? "Disable plan mode" : "Enable plan mode";
   const planSidebarTooltip = props.planSidebarOpen
@@ -293,7 +294,12 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
               <SelectTrigger
                 variant="ghost"
                 size="sm"
-                className="shrink-0 px-2 text-foreground/80 hover:text-foreground [&_[data-slot=select-icon]]:hidden [&_svg]:text-foreground/80"
+                className={cn(
+                  "shrink-0 px-2 text-foreground/80 hover:text-foreground [&_[data-slot=select-icon]]:hidden",
+                  isFullAccess
+                    ? "[&_svg]:text-destructive"
+                    : "[&_svg]:text-foreground/80",
+                )}
                 aria-label={runtimeModeOption.label}
               />
             }
@@ -308,7 +314,14 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
                 <SelectItem key={mode} value={mode} className="min-w-64 py-2">
                   <div className="grid min-w-0 gap-0.5">
                     <span className="inline-flex items-center gap-1.5 font-medium text-foreground">
-                      <OptionIcon className="size-3.5 shrink-0 text-muted-foreground" />
+                      <OptionIcon
+                        className={cn(
+                          "size-3.5 shrink-0",
+                          isFullAccess && mode === "full-access"
+                            ? "text-destructive"
+                            : "text-muted-foreground",
+                        )}
+                      />
                       {option.label}
                     </span>
                     <span className="text-muted-foreground text-xs leading-4">

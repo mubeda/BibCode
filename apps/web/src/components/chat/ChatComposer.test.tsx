@@ -1265,6 +1265,31 @@ describe("ChatComposer rendering", () => {
     expect(hidden.spies.toggleInteractionMode).not.toHaveBeenCalled();
   });
 
+  it("uses destructive icon treatment only while Full access is selected", () => {
+    const fullAccess = renderComposer({ runtimeMode: "full-access" });
+    const fullAccessTrigger = captureByLabel("SelectTrigger", "Full access");
+    const fullAccessItem = findCapture(
+      "SelectItem",
+      (props) => props["value"] === "full-access",
+    );
+
+    expect(String(fullAccessTrigger["className"])).toContain("[&_svg]:text-destructive");
+    expect(filterCaptures("SelectValue")).toHaveLength(0);
+    expect(String(fullAccessItem["className"])).not.toContain("text-destructive");
+    expect(fullAccess.markup).toContain("text-destructive");
+    expect(fullAccess.markup).toContain(
+      "inline-flex items-center gap-1.5 font-medium text-foreground",
+    );
+    expect(fullAccess.markup).toContain("Allow commands and edits without prompts.");
+
+    const supervised = renderComposer({ runtimeMode: "approval-required" });
+    const supervisedTrigger = captureByLabel("SelectTrigger", "Supervised");
+    expect(String(supervisedTrigger["className"])).not.toContain(
+      "[&_svg]:text-destructive",
+    );
+    expect(supervised.markup).not.toContain("text-destructive");
+  });
+
   it("keeps mode controls left and send actions fixed when the footer is compact", () => {
     h.stateSeeds.set(STATE.footerCompact, true);
     h.stateSeeds.set(STATE.primaryActionsCompact, true);
