@@ -55,6 +55,24 @@ Claude-only usage refresh. After signing in with the Claude CLI, either action
 therefore observes the newly written local credentials without restarting
 BiBCode.
 
+## Context-window usage
+
+Claude stream events provide the live context-usage fallback. After a successful
+turn result, BiBCode sends the official response-correlated
+`get_context_usage` control query and bounds the whole write-and-response
+operation to two seconds. A successful response supplies `totalTokens` as the
+active context usage, `maxTokens` as its maximum, and
+`isAutoCompactEnabled` as the automatic-compaction indicator. It is applied
+only while the completed turn is still current; late responses for an earlier
+turn are rejected.
+
+Unsupported, malformed, timed-out, cancelled, EOF, or write-failed control
+queries are nonfatal. They leave the last good stream/result-derived context
+usage in place and release completion without waiting longer. Pending control
+response waiters are removed on timeout and shutdown. Accumulated totals in
+Claude result messages are lifetime processed metadata only; they never replace
+active context-window usage.
+
 ## Updates and version advisories
 
 BiBCode resolves the configured executable before selecting a release source

@@ -101,6 +101,21 @@ variables** section. Mark API keys and tokens as **Sensitive**. BiBCode stores
 sensitive values as server secrets and does not send the value back to the app
 after saving.
 
+## Context-window usage
+
+Codex publishes token usage only for the root thread of the current provider
+session; child-thread notifications are ignored. In a normalized usage update,
+`tokenUsage.last.totalTokens` is active context-window usage and
+`tokenUsage.total.totalTokens` is lifetime processed usage. The optional
+`tokenUsage.modelContextWindow` is the maximum context-window size. Lifetime
+processed usage is displayed as context metadata and never substitutes for the
+active usage meter.
+
+Codex reports automatic context compaction with each valid usage update. The
+workspace meter can therefore explain that Codex compacts context automatically
+when needed, while still showing the current active usage and maximum
+independently.
+
 ## Activity observation
 
 Structured Codex chats run through `codex app-server`. BiBCode uses App Server
