@@ -355,13 +355,19 @@ impl WorktreeCatalogService {
 ```
 
 Migration 41, named `ProjectionProjectWorktreeRepositoryKey`, adds nullable
-`projection_projects.worktree_repository_key`. It is an identity/fencing pin,
-not cached live-worktree truth. A legacy null pin is established atomically
-only from an authoritative primary-checkout scan and is preserved by all
-ordinary projection writes. Once pinned, every primary, adopted, or
-lifetime-common-directory anchor must resolve to the same key. A same-repository
-adopted anchor may recover on cold start; a replacement repository at an old
-path must remain unavailable and must never re-pin the project.
+`projection_projects.worktree_repository_key` for upgrade compatibility.
+Migration 42, named `ProjectWorktreeRepositoryPins`, creates the durable
+`project_worktree_repository_pins` identity table outside rebuildable
+projection state and backfills any migration-41 pins. Project reads join the
+dedicated table. Generic project upserts and projection replay cannot establish
+or replace identity; only the authoritative-primary atomic pin operation can.
+The pin survives project-projection delete/rewind/replay and is identity/fencing
+metadata, not cached live-worktree truth. Once pinned, every primary, adopted,
+or lifetime-common-directory anchor must resolve to the same key. A
+same-repository adopted anchor may recover on cold start; a replacement
+repository at an old path must remain unavailable and must never re-pin the
+project. A warm mismatch degrades scan health while retaining the prior
+authoritative arrays.
 
 The internal runtime has project-specific catalog views plus repository
 observations keyed by canonical common-Git identity. A project-to-repository
@@ -422,6 +428,18 @@ physical mutation locks may use weak registry slots, but a held or awaited lock
 must retain strong ownership. Store only the last authoritative snapshot,
 current scan status, last coalesced result, shallow signature, subscriber
 count, suppression map, and task handles for each project view.
+Initialization is an idempotent project-view-owned task with latest-generation
+readiness, not work owned by whichever subscriber first reaches an await.
+Zero-to-one attachment advances a lifecycle epoch and creates fresh
+cancellation ownership for the project view and shared repository observation.
+Older lifecycle completions are fenced from the new stream and result slot.
+Mutation-stale leaders store and advance one explicit stale result so every
+already coalesced waiter observes the same error without starting a divergent
+refresh.
+Scope reusable repository observations to the same selected anchor path so an
+alias's valid observation cannot bypass validation of a different replacement
+anchor. Decrement project-view and repository subscriber ownership atomically
+under the entry-to-repository lock order before allowing reattachment.
 
 - [ ] **Step 3: Implement anchor resolution and directory probing**
 
