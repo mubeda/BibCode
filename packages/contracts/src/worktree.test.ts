@@ -2,6 +2,7 @@ import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  ProjectWorktreeDiscoveryPolicy,
   VcsAdoptedWorktreeStatus,
   VcsWorktreeCatalogSnapshot,
   VcsWorktreeDescriptor,
@@ -15,6 +16,7 @@ import {
 
 const decodeDescriptor = Schema.decodeUnknownSync(VcsWorktreeDescriptor);
 const encodeDescriptor = Schema.encodeSync(VcsWorktreeDescriptor);
+const decodeWorktreeDiscoveryPolicy = Schema.decodeUnknownSync(ProjectWorktreeDiscoveryPolicy);
 const decodeSnapshot = Schema.decodeUnknownSync(VcsWorktreeCatalogSnapshot);
 const encodeSnapshot = Schema.encodeSync(VcsWorktreeCatalogSnapshot);
 const decodeAdoptedWorkspace = Schema.decodeUnknownSync(VcsAdoptedWorktreeStatus);
@@ -134,6 +136,11 @@ describe("worktree catalog schemas", () => {
 
   it("rejects catalog and removal-plan arrays above their fixed bound", () => {
     expect(() =>
+      decodeWorktreeDiscoveryPolicy({
+        baselinePaths: Array.from({ length: 513 }, (_, index) => `/repo/worktree-${index}`),
+      }),
+    ).toThrow();
+    expect(() =>
       decodeSnapshot({
         repositoryKey: "repository-1",
         generation: 1,
@@ -142,6 +149,25 @@ describe("worktree catalog schemas", () => {
         scanStatus: { _tag: "ready" },
         worktrees: Array.from({ length: 513 }, () => baseDescriptor),
         adoptedWorkspaces: [],
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeSnapshot({
+        repositoryKey: "repository-1",
+        generation: 1,
+        authoritative: true,
+        observedAt: "2026-08-09T00:00:00.000Z",
+        scanStatus: { _tag: "ready" },
+        worktrees: [],
+        adoptedWorkspaces: Array.from({ length: 513 }, (_, index) => ({
+          threadId: `thread-${index}`,
+          worktreeKey: `worktree-${index}`,
+          path: `/repo/worktree-${index}`,
+          branch: null,
+          availability: "present",
+          registrationState: "registered",
+          locked: false,
+        })),
       }),
     ).toThrow();
     expect(() =>
