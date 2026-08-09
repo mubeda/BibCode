@@ -83,6 +83,7 @@ gated by the selected provider instance:
 | Codex            | Supported              |
 | Claude           | Supported              |
 | Cursor           | Disabled               |
+| Grok             | Disabled               |
 | OpenCode         | Disabled               |
 | Other or unknown | Disabled               |
 
