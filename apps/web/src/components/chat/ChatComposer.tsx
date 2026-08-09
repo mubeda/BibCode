@@ -364,6 +364,7 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
   activeContextWindow: ReturnType<typeof deriveLatestContextWindowSnapshot>;
   activeMcpStatus: McpStatusSnapshot | null;
   activeThreadProviderDisplayName: string | null;
+  supportsContextWindowUsage: boolean;
   isPreparingWorktree: boolean;
   pendingAction: {
     questionIndex: number;
@@ -407,16 +408,15 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
         </TooltipTrigger>
         <TooltipPopup side="top">Attach files</TooltipPopup>
       </Tooltip>
-      {props.activeContextWindow ? (
-        <ContextWindowMeter
-          usage={props.activeContextWindow}
-          providerDisplayName={props.activeThreadProviderDisplayName}
-        />
-      ) : null}
-      {props.activeMcpStatus ? <McpStatusPopover snapshot={props.activeMcpStatus} /> : null}
       {props.isPreparingWorktree ? (
         <span className="text-muted-foreground/70 text-xs">Preparing worktree...</span>
       ) : null}
+      {props.activeMcpStatus ? <McpStatusPopover snapshot={props.activeMcpStatus} /> : null}
+      <ContextWindowMeter
+        supported={props.supportsContextWindowUsage}
+        usage={props.activeContextWindow}
+        providerDisplayName={props.activeThreadProviderDisplayName}
+      />
       <ComposerPrimaryActions
         compact={props.compact}
         pendingAction={props.pendingAction}
@@ -907,6 +907,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     () => deriveLatestContextWindowSnapshot(activeThreadActivities ?? []),
     [activeThreadActivities],
   );
+  const supportsContextWindowUsage = selectedProviderStatus?.supportsContextWindowUsage === true;
   const activeMcpStatus = useMemo(
     () =>
       selectedProviderStatus?.supportsMcpStatus
@@ -2767,6 +2768,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   activeContextWindow={activeContextWindow}
                   activeMcpStatus={activeMcpStatus}
                   activeThreadProviderDisplayName={activeThreadProviderDisplayName}
+                  supportsContextWindowUsage={supportsContextWindowUsage}
                   pendingAction={pendingPrimaryAction}
                   isRunning={phase === "running"}
                   canCancelPendingSend={canCancelPendingSend}
