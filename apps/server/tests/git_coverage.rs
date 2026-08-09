@@ -990,6 +990,53 @@ async fn existing_branch_worktree_can_be_force_removed_when_dirty() {
     );
 }
 
+#[tokio::test]
+async fn worktree_inventory_returns_authoritative_primary_and_linked_records() {
+    if relaunch_with_isolated_git_config(
+        "worktree_inventory_returns_authoritative_primary_and_linked_records",
+    ) {
+        return;
+    }
+    let repo = init_repo();
+    commit_file(repo.path(), "README.md", "base\n", "initial");
+    let parent = tempfile::tempdir().expect("worktree parent");
+    let linked = parent.path().join("linked checkout");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/inventory",
+            "--",
+            &linked.to_string_lossy(),
+        ],
+    );
+
+    let inventory = GitRepository::default()
+        .worktree_inventory(repo.path(), &cancellation())
+        .await
+        .expect("worktree inventory");
+
+    assert!(inventory.nul_delimited);
+    assert_eq!(inventory.common_dir, repo.path().join(".git"));
+    assert_eq!(inventory.records.len(), 2);
+    assert!(inventory.records[0].is_primary);
+    assert_eq!(
+        inventory.records[0].path,
+        fs::canonicalize(repo.path()).expect("canonical primary worktree path")
+    );
+    assert!(!inventory.records[1].is_primary);
+    assert_eq!(
+        inventory.records[1].path,
+        fs::canonicalize(&linked).expect("canonical linked worktree path")
+    );
+    assert_eq!(
+        inventory.records[1].branch.as_deref(),
+        Some("feature/inventory")
+    );
+}
+
 #[cfg(windows)]
 #[tokio::test]
 async fn worktree_removal_finishes_after_windows_releases_a_file_handle() {
