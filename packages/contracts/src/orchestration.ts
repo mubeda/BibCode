@@ -21,6 +21,7 @@ import {
   TurnId,
 } from "./baseSchemas.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
+import { ProjectWorktreeDiscoveryPolicy } from "./worktree.ts";
 
 export const ORCHESTRATION_WS_METHODS = {
   dispatchCommand: "orchestration.dispatchCommand",
@@ -268,6 +269,15 @@ export const OrchestrationProject = Schema.Struct({
   repositoryIdentity: Schema.optional(Schema.NullOr(RepositoryIdentity)),
   defaultModelSelection: Schema.NullOr(ModelSelection),
   scripts: Schema.Array(ProjectScript),
+  worktreeDiscovery: ProjectWorktreeDiscoveryPolicy.pipe(
+    Schema.withDecodingDefault(
+      Effect.succeed({
+        visibility: "hidden" as const,
+        initialPromptDismissedAt: null,
+        baselinePaths: [],
+      }),
+    ),
+  ),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
   deletedAt: Schema.NullOr(IsoDateTime),
@@ -457,6 +467,15 @@ export const OrchestrationProjectShell = Schema.Struct({
   repositoryIdentity: Schema.optional(Schema.NullOr(RepositoryIdentity)),
   defaultModelSelection: Schema.NullOr(ModelSelection),
   scripts: Schema.Array(ProjectScript),
+  worktreeDiscovery: ProjectWorktreeDiscoveryPolicy.pipe(
+    Schema.withDecodingDefault(
+      Effect.succeed({
+        visibility: "hidden" as const,
+        initialPromptDismissedAt: null,
+        baselinePaths: [],
+      }),
+    ),
+  ),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -558,6 +577,7 @@ const ProjectMetaUpdateCommand = Schema.Struct({
   workspaceRoot: Schema.optional(TrimmedNonEmptyString),
   defaultModelSelection: Schema.optional(Schema.NullOr(ModelSelection)),
   scripts: Schema.optional(Schema.Array(ProjectScript)),
+  worktreeDiscovery: Schema.optional(ProjectWorktreeDiscoveryPolicy),
 });
 
 const ProjectDeleteCommand = Schema.Struct({
@@ -911,6 +931,15 @@ export const ProjectCreatedPayload = Schema.Struct({
   repositoryIdentity: Schema.optional(Schema.NullOr(RepositoryIdentity)),
   defaultModelSelection: Schema.NullOr(ModelSelection),
   scripts: Schema.Array(ProjectScript),
+  worktreeDiscovery: ProjectWorktreeDiscoveryPolicy.pipe(
+    Schema.withDecodingDefault(
+      Effect.succeed({
+        visibility: "hidden" as const,
+        initialPromptDismissedAt: null,
+        baselinePaths: [],
+      }),
+    ),
+  ),
   createdAt: IsoDateTime,
   updatedAt: IsoDateTime,
 });
@@ -922,6 +951,15 @@ export const ProjectMetaUpdatedPayload = Schema.Struct({
   repositoryIdentity: Schema.optional(Schema.NullOr(RepositoryIdentity)),
   defaultModelSelection: Schema.optional(Schema.NullOr(ModelSelection)),
   scripts: Schema.optional(Schema.Array(ProjectScript)),
+  worktreeDiscovery: ProjectWorktreeDiscoveryPolicy.pipe(
+    Schema.withDecodingDefault(
+      Effect.succeed({
+        visibility: "hidden" as const,
+        initialPromptDismissedAt: null,
+        baselinePaths: [],
+      }),
+    ),
+  ),
   updatedAt: IsoDateTime,
 });
 

@@ -118,6 +118,11 @@ const SNAPSHOT: OrchestrationShellSnapshot = {
       repositoryIdentity: null,
       defaultModelSelection: null,
       scripts: [],
+      worktreeDiscovery: {
+        visibility: "hidden",
+        initialPromptDismissedAt: null,
+        baselinePaths: [],
+      },
       createdAt: "2026-06-01T00:00:00.000Z",
       updatedAt: "2026-06-01T00:00:00.000Z",
     },
@@ -128,6 +133,11 @@ const SNAPSHOT: OrchestrationShellSnapshot = {
       repositoryIdentity: null,
       defaultModelSelection: null,
       scripts: [],
+      worktreeDiscovery: {
+        visibility: "hidden",
+        initialPromptDismissedAt: null,
+        baselinePaths: [],
+      },
       createdAt: "2026-06-01T00:00:00.000Z",
       updatedAt: "2026-06-01T00:00:00.000Z",
     },
