@@ -1575,8 +1575,11 @@ fn snapshot_owned_message(
     if let Some(message) = message {
         result["message"] = json!(message);
     }
-    if definition.driver == "codex" {
+    if matches!(definition.driver.as_str(), "codex" | "claudeAgent") {
         result["supportsMcpStatus"] = json!(true);
+    }
+    if matches!(definition.driver.as_str(), "codex" | "claudeAgent") {
+        result["supportsContextWindowUsage"] = json!(true);
     }
     result
 }
@@ -1861,44 +1864,40 @@ mod tests {
     }
 
     #[test]
-    fn only_codex_inventory_advertises_mcp_status() {
-        let definitions = definitions(&json!({
-            "providerInstances": {
-                "codex": { "driver": "codex", "enabled": true, "config": {} },
-                "claude": { "driver": "claudeAgent", "enabled": true, "config": {} }
-            }
-        }));
-        let codex = snapshot_owned_message(
-            definitions
-                .iter()
-                .find(|definition| definition.driver == "codex")
-                .expect("Codex definition"),
-            true,
-            None,
-            "ready",
-            json!({ "status": "authenticated" }),
-            Vec::new(),
-            ProviderCapabilities::default(),
-            None,
-            "2026-08-01T00:00:00.000Z".to_owned(),
-        );
-        let claude = snapshot_owned_message(
-            definitions
-                .iter()
-                .find(|definition| definition.driver == "claudeAgent")
-                .expect("Claude definition"),
-            true,
-            None,
-            "ready",
-            json!({ "status": "authenticated" }),
-            Vec::new(),
-            ProviderCapabilities::default(),
-            None,
-            "2026-08-01T00:00:00.000Z".to_owned(),
-        );
+    fn provider_inventory_advertises_measured_toolbar_capabilities() {
+        let definitions = definitions(&json!({}));
+        let snapshot_for = |driver| {
+            snapshot_owned_message(
+                definitions
+                    .iter()
+                    .find(|definition| definition.driver == driver)
+                    .expect("built-in provider definition"),
+                true,
+                None,
+                "ready",
+                json!({ "status": "authenticated" }),
+                Vec::new(),
+                ProviderCapabilities::default(),
+                None,
+                "2026-08-01T00:00:00.000Z".to_owned(),
+            )
+        };
+        let codex = snapshot_for("codex");
+        let claude = snapshot_for("claudeAgent");
+        let cursor = snapshot_for("cursor");
+        let grok = snapshot_for("grok");
+        let opencode = snapshot_for("opencode");
 
         assert_eq!(codex["supportsMcpStatus"], true);
-        assert!(claude.get("supportsMcpStatus").is_none());
+        assert_eq!(claude["supportsMcpStatus"], true);
+        assert!(cursor.get("supportsMcpStatus").is_none());
+        assert!(grok.get("supportsMcpStatus").is_none());
+        assert!(opencode.get("supportsMcpStatus").is_none());
+        assert_eq!(codex["supportsContextWindowUsage"], true);
+        assert_eq!(claude["supportsContextWindowUsage"], true);
+        assert!(cursor.get("supportsContextWindowUsage").is_none());
+        assert!(grok.get("supportsContextWindowUsage").is_none());
+        assert!(opencode.get("supportsContextWindowUsage").is_none());
     }
 
     #[test]

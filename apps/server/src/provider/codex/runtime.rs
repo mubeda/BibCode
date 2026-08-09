@@ -2129,6 +2129,16 @@ impl CodexSessionRuntime {
                         .await;
                 }
             }
+            "thread/tokenUsage/updated" => {
+                let root_thread_id = self.inner.session.lock().await.resume_cursor.clone();
+                if let Some(root_thread_id) = root_thread_id
+                    && let Some((turn_id, payload)) =
+                        normalize_token_usage_notification(&params, &root_thread_id)
+                {
+                    self.emit("thread.token-usage.updated", turn_id, None, payload)
+                        .await;
+                }
+            }
             "turn/completed" => {
                 let turn_id = params
                     .get("turn")
@@ -3002,6 +3012,69 @@ fn normalize_user_input_answers(value: Value) -> Value {
         }
     }
     Value::Object(normalized)
+}
+
+fn normalize_token_usage_notification(
+    params: &Value,
+    root_thread_id: &str,
+) -> Option<(Option<String>, Value)> {
+    if params.get("threadId").and_then(Value::as_str)? != root_thread_id {
+        return None;
+    }
+    let token_usage = params.get("tokenUsage")?;
+    let last = token_usage.get("last")?;
+    let used_tokens = last.get("totalTokens").and_then(Value::as_u64)?;
+    if used_tokens == 0 {
+        return None;
+    }
+
+    let mut usage = serde_json::Map::new();
+    usage.insert("usedTokens".to_owned(), json!(used_tokens));
+    usage.insert("lastUsedTokens".to_owned(), json!(used_tokens));
+
+    if let Some(total_processed_tokens) = token_usage
+        .get("total")
+        .and_then(|total| total.get("totalTokens"))
+        .and_then(Value::as_u64)
+    {
+        usage.insert(
+            "totalProcessedTokens".to_owned(),
+            json!(total_processed_tokens),
+        );
+    }
+    if let Some(max_tokens) = token_usage
+        .get("modelContextWindow")
+        .and_then(Value::as_u64)
+        .filter(|max_tokens| *max_tokens > 0)
+    {
+        usage.insert("maxTokens".to_owned(), json!(max_tokens));
+    }
+    for (source_key, usage_key, last_usage_key) in [
+        ("inputTokens", "inputTokens", "lastInputTokens"),
+        (
+            "cachedInputTokens",
+            "cachedInputTokens",
+            "lastCachedInputTokens",
+        ),
+        ("outputTokens", "outputTokens", "lastOutputTokens"),
+        (
+            "reasoningOutputTokens",
+            "reasoningOutputTokens",
+            "lastReasoningOutputTokens",
+        ),
+    ] {
+        if let Some(value) = last.get(source_key).and_then(Value::as_u64) {
+            usage.insert(usage_key.to_owned(), json!(value));
+            usage.insert(last_usage_key.to_owned(), json!(value));
+        }
+    }
+    usage.insert("compactsAutomatically".to_owned(), Value::Bool(true));
+
+    let turn_id = params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .map(str::to_owned);
+    Some((turn_id, json!({ "usage": usage })))
 }
 
 #[cfg(test)]
@@ -6537,5 +6610,131 @@ mod tests {
             json!({"choice":"A","multiple":["A","B"],"missing":[]})
         );
         assert_eq!(normalize_user_input_answers(Value::Null), json!({}));
+    }
+
+    #[test]
+    fn token_usage_normalization_separates_active_and_lifetime_totals() {
+        let params = json!({
+            "threadId": "root-1",
+            "turnId": "turn-1",
+            "tokenUsage": {
+                "last": {
+                    "inputTokens": 1_000,
+                    "cachedInputTokens": 500,
+                    "outputTokens": 50,
+                    "reasoningOutputTokens": 25,
+                    "totalTokens": 1_075
+                },
+                "total": {
+                    "inputTokens": 9_000,
+                    "cachedInputTokens": 5_000,
+                    "outputTokens": 800,
+                    "reasoningOutputTokens": 400,
+                    "totalTokens": 10_200
+                },
+                "modelContextWindow": 258_400
+            }
+        });
+
+        let (turn_id, payload) =
+            normalize_token_usage_notification(&params, "root-1").expect("valid root usage");
+        assert_eq!(turn_id.as_deref(), Some("turn-1"));
+        assert_eq!(
+            payload,
+            json!({
+                "usage": {
+                    "usedTokens": 1_075,
+                    "totalProcessedTokens": 10_200,
+                    "maxTokens": 258_400,
+                    "inputTokens": 1_000,
+                    "cachedInputTokens": 500,
+                    "outputTokens": 50,
+                    "reasoningOutputTokens": 25,
+                    "lastUsedTokens": 1_075,
+                    "lastInputTokens": 1_000,
+                    "lastCachedInputTokens": 500,
+                    "lastOutputTokens": 50,
+                    "lastReasoningOutputTokens": 25,
+                    "compactsAutomatically": true
+                }
+            })
+        );
+    }
+
+    #[test]
+    fn token_usage_normalization_rejects_non_root_or_invalid_active_usage() {
+        let cases = [
+            (
+                "child thread",
+                json!({
+                    "threadId": "child-1",
+                    "tokenUsage": { "last": { "totalTokens": 1 } }
+                }),
+            ),
+            (
+                "zero active usage",
+                json!({
+                    "threadId": "root-1",
+                    "tokenUsage": { "last": { "totalTokens": 0 } }
+                }),
+            ),
+            (
+                "missing active usage",
+                json!({
+                    "threadId": "root-1",
+                    "tokenUsage": { "last": {} }
+                }),
+            ),
+            (
+                "negative usage",
+                json!({
+                    "threadId": "root-1",
+                    "tokenUsage": { "last": { "totalTokens": -1 } }
+                }),
+            ),
+        ];
+
+        for (name, params) in cases {
+            assert!(
+                normalize_token_usage_notification(&params, "root-1").is_none(),
+                "{name} must be ignored"
+            );
+        }
+    }
+
+    #[test]
+    fn token_usage_normalization_omits_malformed_optional_categories() {
+        let params = json!({
+            "threadId": "root-1",
+            "turnId": "turn-1",
+            "tokenUsage": {
+                "last": {
+                    "totalTokens": 12,
+                    "inputTokens": "invalid",
+                    "cachedInputTokens": -1,
+                    "outputTokens": 0,
+                    "reasoningOutputTokens": 2
+                },
+                "total": { "totalTokens": "invalid" },
+                "modelContextWindow": 0
+            }
+        });
+
+        let (_, payload) =
+            normalize_token_usage_notification(&params, "root-1").expect("valid active usage");
+        assert_eq!(
+            payload,
+            json!({
+                "usage": {
+                    "usedTokens": 12,
+                    "outputTokens": 0,
+                    "reasoningOutputTokens": 2,
+                    "lastUsedTokens": 12,
+                    "lastOutputTokens": 0,
+                    "lastReasoningOutputTokens": 2,
+                    "compactsAutomatically": true
+                }
+            })
+        );
     }
 }

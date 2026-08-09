@@ -16,6 +16,12 @@ vi.mock("../ui/popover", () => ({
   PopoverTitle: ({ children }: { children: ReactNode }) => <h2 id="mcp-title">{children}</h2>,
 }));
 
+vi.mock("../ui/tooltip", () => ({
+  Tooltip: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  TooltipTrigger: ({ render }: { render: ReactNode }) => <>{render}</>,
+  TooltipPopup: ({ children }: { children: ReactNode }) => <section>{children}</section>,
+}));
+
 import { deriveMcpStatusSnapshot, McpStatusPopover } from "./McpStatusPopover";
 
 function activity(
@@ -160,6 +166,7 @@ describe("McpStatusPopover", () => {
   it("renders every MCP state with an accessible status and wrapped detail", () => {
     const markup = renderToStaticMarkup(
       <McpStatusPopover
+        supported
         snapshot={{
           servers: [
             { name: "connected", state: "connected", detail: null },
@@ -187,8 +194,20 @@ describe("McpStatusPopover", () => {
   });
 
   it("shows a neutral awaiting state before the first snapshot", () => {
-    expect(renderToStaticMarkup(<McpStatusPopover snapshot={{ servers: [] }} />)).toContain(
-      "Awaiting MCP status",
+    expect(
+      renderToStaticMarkup(<McpStatusPopover supported snapshot={{ servers: [] }} />),
+    ).toContain("Awaiting MCP status");
+  });
+
+  it("renders a disabled tooltip-only control when MCP status is unavailable", () => {
+    const markup = renderToStaticMarkup(
+      <McpStatusPopover supported={false} snapshot={{ servers: [] }} />,
     );
+
+    expect(markup).toContain('aria-disabled="true"');
+    expect(markup).toContain("MCP servers unavailable");
+    expect(markup).toContain("MCP status is not available for this provider.");
+    expect(markup).not.toContain('role="dialog"');
+    expect(markup).not.toContain("Awaiting MCP status");
   });
 });

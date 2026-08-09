@@ -362,8 +362,11 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
 const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(props: {
   compact: boolean;
   activeContextWindow: ReturnType<typeof deriveLatestContextWindowSnapshot>;
-  activeMcpStatus: McpStatusSnapshot | null;
+  activeMcpStatus: McpStatusSnapshot;
   activeThreadProviderDisplayName: string | null;
+  supportsMcpStatus: boolean;
+  supportsContextWindowUsage: boolean;
+  showContextWindowMeter: boolean;
   isPreparingWorktree: boolean;
   pendingAction: {
     questionIndex: number;
@@ -407,15 +410,16 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
         </TooltipTrigger>
         <TooltipPopup side="top">Attach files</TooltipPopup>
       </Tooltip>
-      {props.activeContextWindow ? (
+      {props.isPreparingWorktree ? (
+        <span className="text-muted-foreground/70 text-xs">Preparing worktree...</span>
+      ) : null}
+      <McpStatusPopover supported={props.supportsMcpStatus} snapshot={props.activeMcpStatus} />
+      {props.showContextWindowMeter ? (
         <ContextWindowMeter
+          supported={props.supportsContextWindowUsage}
           usage={props.activeContextWindow}
           providerDisplayName={props.activeThreadProviderDisplayName}
         />
-      ) : null}
-      {props.activeMcpStatus ? <McpStatusPopover snapshot={props.activeMcpStatus} /> : null}
-      {props.isPreparingWorktree ? (
-        <span className="text-muted-foreground/70 text-xs">Preparing worktree...</span>
       ) : null}
       <ComposerPrimaryActions
         compact={props.compact}
@@ -907,16 +911,16 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
     () => deriveLatestContextWindowSnapshot(activeThreadActivities ?? []),
     [activeThreadActivities],
   );
+  const supportsContextWindowUsage = selectedProviderStatus?.supportsContextWindowUsage === true;
+  const supportsMcpStatus = selectedProviderStatus?.supportsMcpStatus === true;
   const activeMcpStatus = useMemo(
     () =>
-      selectedProviderStatus?.supportsMcpStatus
-        ? deriveMcpStatusSnapshot(
-            activeThreadActivities ?? [],
-            selectedInstanceId,
-            phase === "ready" || phase === "running",
-          )
-        : null,
-    [activeThreadActivities, phase, selectedInstanceId, selectedProviderStatus?.supportsMcpStatus],
+      deriveMcpStatusSnapshot(
+        activeThreadActivities ?? [],
+        selectedInstanceId,
+        phase === "ready" || phase === "running",
+      ),
+    [activeThreadActivities, phase, selectedInstanceId],
   );
   const activeThreadProviderDisplayName = useMemo(() => {
     if (!activeThreadModelSelection) return null;
@@ -2767,6 +2771,9 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   activeContextWindow={activeContextWindow}
                   activeMcpStatus={activeMcpStatus}
                   activeThreadProviderDisplayName={activeThreadProviderDisplayName}
+                  supportsMcpStatus={supportsMcpStatus}
+                  supportsContextWindowUsage={supportsContextWindowUsage}
+                  showContextWindowMeter={pendingUserInputs.length === 0}
                   pendingAction={pendingPrimaryAction}
                   isRunning={phase === "running"}
                   canCancelPendingSend={canCancelPendingSend}

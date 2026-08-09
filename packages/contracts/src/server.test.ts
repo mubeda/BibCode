@@ -61,11 +61,24 @@ describe("ServerProvider", () => {
     expect(parsed.updateState).toBeUndefined();
   });
 
-  it("keeps old snapshots compatible and decodes Codex MCP-status capability", () => {
+  it("keeps old snapshots compatible and decodes context-usage capability", () => {
     expect(decodeServerProvider(baseProviderSnapshot).supportsMcpStatus).toBeUndefined();
     expect(
       decodeServerProvider({ ...baseProviderSnapshot, supportsMcpStatus: true }).supportsMcpStatus,
     ).toBe(true);
+    expect(decodeServerProvider(baseProviderSnapshot).supportsContextWindowUsage).toBeUndefined();
+    expect(
+      decodeServerProvider({
+        ...baseProviderSnapshot,
+        supportsContextWindowUsage: true,
+      }).supportsContextWindowUsage,
+    ).toBe(true);
+    expect(
+      decodeServerProvider({
+        ...baseProviderSnapshot,
+        supportsContextWindowUsage: false,
+      }).supportsContextWindowUsage,
+    ).toBe(false);
   });
 
   it("defaults one-click update support when decoding older advisory snapshots", () => {

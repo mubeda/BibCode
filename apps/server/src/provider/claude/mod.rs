@@ -5,6 +5,7 @@ pub mod model;
 pub mod protocol;
 pub mod runtime;
 pub(crate) mod transcript;
+mod usage;
 
 #[doc(hidden)]
 pub use activity::{
@@ -12,6 +13,7 @@ pub use activity::{
     ClaudeActivityStateCounts,
 };
 pub use canonical::{CanonicalEvent, CanonicalEventTrace};
+pub(crate) use protocol::ClaudeControlResponseFrame;
 pub use protocol::{AssistantMessage, ClaudeMessage};
 pub use runtime::{
     ClaudeControlRequest, ClaudePermissionMode, ClaudeProviderRuntime, Decision, LaunchRequest,

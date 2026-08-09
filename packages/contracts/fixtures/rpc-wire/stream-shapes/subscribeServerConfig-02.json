@@ -14,118 +14,64 @@
             "showInteractionModeToggle": false,
             "enabled": false,
             "installed": false,
-            "version": ".f7,mc%_2\"",
-            "status": "error",
+            "version": null,
+            "status": "warning",
             "auth": {
-              "status": "authenticated",
-              "type": "qw!46n",
-              "label": "+P/zDTE:r|"
+              "status": "authenticated"
             },
-            "checkedAt": "m]?\\7uw",
-            "availability": "unavailable",
-            "models": [
-              {
-                "slug": "TKN>BLw[C\\]",
-                "name": "K!'G",
-                "subProvider": "[H[zz[7m\"kT6",
-                "isCustom": true,
-                "capabilities": null
-              }
-            ],
+            "checkedAt": "0eQ}%",
+            "unavailableReason": "N",
+            "models": [],
             "slashCommands": [
               {
-                "name": "h26gL",
-                "description": "VF",
+                "name": "P/zDTE:",
+                "description": "!Qpm]?\\7",
                 "input": {
-                  "hint": "Kv"
+                  "hint": "Lnf\\6MdjT"
                 }
+              },
+              {
+                "name": "BLw[",
+                "description": "gK!'GSM)vd["
+              },
+              {
+                "name": "z[7m",
+                "description": "6b*",
+                "input": {
+                  "hint": "h26gL"
+                }
+              },
+              {
+                "name": "VF",
+                "description": "Kv"
               }
             ],
-            "skills": [
-              {
-                "name": "xjzL",
-                "path": ":lrw7)",
-                "enabled": true,
-                "displayName": "X*t5^:",
-                "shortDescription": "\\"
-              },
-              {
-                "name": "OcX8~5uTvV#{",
-                "path": "]wD5~ a@/d",
-                "scope": ".#IT0P|)",
-                "enabled": true,
-                "displayName": "VHb48)'{2P",
-                "shortDescription": "4iM",
-                "invocation": "slash"
-              },
-              {
-                "name": "[<",
-                "description": "?",
-                "path": "4[L5M]K%$!C",
-                "scope": "W",
-                "enabled": false,
-                "displayName": "*z]"
-              },
-              {
-                "name": "QQTZj",
-                "path": "nUKW,D>U",
-                "scope": "VM|Hkkk(",
-                "enabled": false,
-                "displayName": "@Z%I",
-                "shortDescription": "#Y",
-                "invocation": "dollar"
-              },
-              {
-                "name": "kk@D/{MR9",
-                "path": "\"Gv|OV61(3?",
-                "scope": "Q1%}fYHtS;b8",
-                "enabled": false,
-                "invocation": "prompt"
-              },
-              {
-                "name": "blF1kY.phvp^",
-                "description": "R5->v",
-                "path": ")Id(",
-                "scope": "|\"",
-                "enabled": true,
-                "displayName": "LU`swK9LM,Fc",
-                "shortDescription": "{",
-                "invocation": "prompt"
-              }
-            ],
+            "skills": [],
             "agents": [
               {
-                "name": "`M=1GPe"
+                "name": "zL4 #:lrw7)6",
+                "model": "X*t5^:",
+                "mode": "\\"
               },
               {
-                "name": "xVje.n",
-                "model": "G.9X"
-              },
-              {
-                "name": "N",
-                "model": "8",
-                "invocation": "mention"
-              },
-              {
-                "name": "jPFJ",
-                "description": "qgL3hcw?^/v"
+                "name": "OcX8~5uTvV#{"
               }
             ],
             "versionAdvisory": {
               "status": "unknown",
               "currentVersion": null,
-              "latestVersion": "O*Q\\dH4",
+              "latestVersion": "VI.#",
               "updateCommand": null,
               "canUpdate": false,
-              "checkedAt": null,
+              "checkedAt": "|",
               "message": null
             },
             "updateState": {
-              "status": "unchanged",
+              "status": "running",
               "startedAt": null,
-              "finishedAt": null,
-              "message": null,
-              "output": "6c3TG`1"
+              "finishedAt": "b48)'{2P/'",
+              "message": "iM!~j",
+              "output": "[<l| ?D4"
             }
           }
         ]
