@@ -7,7 +7,7 @@ use std::{
     process::Stdio,
     sync::{
         Arc, Mutex as StdMutex, OnceLock,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, SystemTime},
 };
@@ -51,7 +51,8 @@ use crate::{
             split_native_images_and_file_references,
         },
         claude::{
-            ClaudeControlRequest, ClaudeProviderRuntime, Decision,
+            CanonicalEvent as ClaudeCanonicalEvent, ClaudeControlRequest,
+            ClaudeControlResponseFrame, ClaudeProviderRuntime, Decision,
             RuntimeMode as ClaudeRuntimeMode,
             hook_sink::{
                 CLAUDE_HOOK_TOKEN_ENV, ClaudeHookSinkHandle, claude_hook_settings,
@@ -5266,11 +5267,437 @@ impl Drop for ClaudeAcknowledgementRegistration {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClaudeControlQueryError {
+    Remote,
+    Closed,
+}
+
+type ClaudeControlResponseWaiters =
+    Arc<StdMutex<HashMap<String, oneshot::Sender<Result<Value, ClaudeControlQueryError>>>>>;
+
+#[derive(Clone)]
+struct ClaudeControlResponseRouter {
+    pending: ClaudeControlResponseWaiters,
+    closed: Arc<AtomicBool>,
+}
+
+impl Default for ClaudeControlResponseRouter {
+    fn default() -> Self {
+        Self {
+            pending: Arc::new(StdMutex::new(HashMap::new())),
+            closed: Arc::new(AtomicBool::new(false)),
+        }
+    }
+}
+
+impl ClaudeControlResponseRouter {
+    fn register(&self, request_id: String) -> Option<ClaudeControlResponseRegistration> {
+        if self.closed.load(Ordering::Acquire) {
+            return None;
+        }
+        let (sender, receiver) = oneshot::channel();
+        let mut pending = self.pending.lock().expect("Claude control response lock");
+        if self.closed.load(Ordering::Acquire) || pending.contains_key(&request_id) {
+            return None;
+        }
+        pending.insert(request_id.clone(), sender);
+        Some(ClaudeControlResponseRegistration {
+            request_id,
+            pending: self.pending.clone(),
+            receiver: Some(receiver),
+        })
+    }
+
+    fn route(&self, value: &Value) -> bool {
+        if value.get("type").and_then(Value::as_str) != Some("control_response") {
+            return false;
+        }
+        let Ok(frame) = serde_json::from_value::<ClaudeControlResponseFrame>(value.clone()) else {
+            return false;
+        };
+        let response = frame.response;
+        let result = if response.subtype == "success" && response.error.is_none() {
+            Ok(response.response)
+        } else {
+            Err(ClaudeControlQueryError::Remote)
+        };
+        let mut pending = self.pending.lock().expect("Claude control response lock");
+        if let Some(sender) = pending.remove(&response.request_id) {
+            let _ = sender.send(result);
+        }
+        true
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+        let mut pending = self.pending.lock().expect("Claude control response lock");
+        for (_, sender) in pending.drain() {
+            let _ = sender.send(Err(ClaudeControlQueryError::Closed));
+        }
+    }
+
+    #[cfg(test)]
+    fn pending_count(&self) -> usize {
+        self.pending
+            .lock()
+            .expect("Claude control response lock")
+            .len()
+    }
+}
+
+struct ClaudeControlResponseRegistration {
+    request_id: String,
+    pending: ClaudeControlResponseWaiters,
+    receiver: Option<oneshot::Receiver<Result<Value, ClaudeControlQueryError>>>,
+}
+
+impl ClaudeControlResponseRegistration {
+    async fn receive(mut self) -> Result<Value, ClaudeControlQueryError> {
+        let result = self
+            .receiver
+            .as_mut()
+            .expect("Claude control response receiver")
+            .await
+            .unwrap_or(Err(ClaudeControlQueryError::Closed));
+        self.receiver = None;
+        result
+    }
+}
+
+impl Drop for ClaudeControlResponseRegistration {
+    fn drop(&mut self) {
+        let Some(receiver) = self.receiver.as_mut() else {
+            return;
+        };
+        let mut pending = self.pending.lock().expect("Claude control response lock");
+        if matches!(
+            receiver.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ) {
+            pending.remove(&self.request_id);
+        }
+    }
+}
+
+async fn query_claude_context_usage(
+    provider: &str,
+    writer: &Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
+    responses: &ClaudeControlResponseRouter,
+    cancellation: &CancellationToken,
+    sequence: u64,
+    timeout: Duration,
+) -> Option<Value> {
+    let query = async {
+        let request = ClaudeControlRequest::get_context_usage(sequence);
+        let registration = responses.register(request.request_id().to_owned())?;
+        let mut bytes = serde_json::to_vec(&request)
+            .map_err(provider_error(provider))
+            .ok()?;
+        bytes.push(b'\n');
+        {
+            let mut writer = writer.lock().await;
+            writer
+                .write_all(&bytes)
+                .await
+                .map_err(provider_error(provider))
+                .ok()?;
+            writer
+                .flush()
+                .await
+                .map_err(provider_error(provider))
+                .ok()?;
+        }
+        registration.receive().await.ok()
+    };
+
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => None,
+        result = tokio::time::timeout(timeout, query) => result.ok().flatten(),
+    }
+}
+
+fn claude_completion_query_turn_id(event: &ProviderEvent) -> Option<&str> {
+    if event.event_type == "turn.completed"
+        && event.payload.get("state").and_then(Value::as_str) == Some("completed")
+    {
+        event.turn_id.as_deref()
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod claude_control_response_tests {
+    use super::{ClaudeControlQueryError, ClaudeControlResponseRouter};
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn routes_only_the_matching_response_to_its_waiter() {
+        let router = ClaudeControlResponseRouter::default();
+        let registration = router
+            .register("bibcode-20".to_owned())
+            .expect("registration");
+
+        assert!(router.route(&json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": "other", "response": {} }
+        })));
+        assert_eq!(router.pending_count(), 1);
+        assert!(router.route(&json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "success",
+                "request_id": "bibcode-20",
+                "response": {
+                    "totalTokens": 31251,
+                    "maxTokens": 200000,
+                    "isAutoCompactEnabled": true
+                }
+            }
+        })));
+
+        assert_eq!(
+            registration.receive().await.expect("response")["totalTokens"],
+            31_251
+        );
+        assert_eq!(router.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn error_response_settles_the_matching_waiter_as_remote() {
+        let router = ClaudeControlResponseRouter::default();
+        let registration = router
+            .register("bibcode-21".to_owned())
+            .expect("registration");
+
+        assert!(router.route(&json!({
+            "type": "control_response",
+            "response": {
+                "subtype": "error",
+                "request_id": "bibcode-21",
+                "error": "get_context_usage is unsupported"
+            }
+        })));
+
+        assert_eq!(
+            registration.receive().await,
+            Err(ClaudeControlQueryError::Remote)
+        );
+        assert_eq!(router.pending_count(), 0);
+    }
+
+    #[test]
+    fn dropping_a_timed_out_registration_removes_only_its_waiter() {
+        let router = ClaudeControlResponseRouter::default();
+        let registration = router
+            .register("bibcode-22".to_owned())
+            .expect("registration");
+        assert!(router.register("bibcode-22".to_owned()).is_none());
+        assert_eq!(router.pending_count(), 1);
+
+        drop(registration);
+
+        assert_eq!(router.pending_count(), 0);
+        assert!(router.register("bibcode-22".to_owned()).is_some());
+    }
+
+    #[tokio::test]
+    async fn close_settles_and_removes_all_pending_waiters() {
+        let router = ClaudeControlResponseRouter::default();
+        let first = router
+            .register("bibcode-23".to_owned())
+            .expect("first registration");
+        let second = router
+            .register("bibcode-24".to_owned())
+            .expect("second registration");
+        assert_eq!(router.pending_count(), 2);
+
+        router.close();
+
+        assert_eq!(router.pending_count(), 0);
+        assert_eq!(first.receive().await, Err(ClaudeControlQueryError::Closed));
+        assert_eq!(second.receive().await, Err(ClaudeControlQueryError::Closed));
+        assert!(router.register("bibcode-25".to_owned()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod claude_context_query_tests {
+    use super::{
+        ClaudeControlResponseRouter, ProviderEvent, claude_completion_query_turn_id,
+        query_claude_context_usage,
+    };
+    use serde_json::{Value, json};
+    use std::time::Duration;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWrite, BufReader},
+        sync::Mutex,
+        time::timeout,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn writes_correlated_query_and_returns_matching_success_body() {
+        let (writer_stream, reader_stream) = tokio::io::duplex(1_024);
+        let writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>> = Mutex::new(Box::new(writer_stream));
+        let responses = ClaudeControlResponseRouter::default();
+        let cancellation = CancellationToken::new();
+        let responder = async {
+            let mut lines = BufReader::new(reader_stream).lines();
+            let line = lines
+                .next_line()
+                .await
+                .expect("query read")
+                .expect("query line");
+            assert_eq!(
+                serde_json::from_str::<Value>(&line).expect("query json"),
+                json!({
+                    "type": "control_request",
+                    "request_id": "bibcode-20",
+                    "request": { "subtype": "get_context_usage" }
+                })
+            );
+            assert!(responses.route(&json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": "bibcode-20",
+                    "response": {
+                        "totalTokens": 31251,
+                        "maxTokens": 200000,
+                        "isAutoCompactEnabled": true
+                    }
+                }
+            })));
+        };
+
+        let (response, ()) = tokio::join!(
+            query_claude_context_usage(
+                "claude",
+                &writer,
+                &responses,
+                &cancellation,
+                20,
+                Duration::from_secs(1),
+            ),
+            responder,
+        );
+
+        assert_eq!(response.expect("context response")["totalTokens"], 31_251);
+        assert_eq!(responses.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn timeout_returns_none_and_removes_the_pending_waiter() {
+        let (writer_stream, _reader_stream) = tokio::io::duplex(1_024);
+        let writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>> = Mutex::new(Box::new(writer_stream));
+        let responses = ClaudeControlResponseRouter::default();
+        let cancellation = CancellationToken::new();
+
+        let response = query_claude_context_usage(
+            "claude",
+            &writer,
+            &responses,
+            &cancellation,
+            21,
+            Duration::from_millis(10),
+        )
+        .await;
+
+        assert!(response.is_none());
+        assert_eq!(responses.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancellation_returns_none_without_writing_or_retaining_a_waiter() {
+        let (writer_stream, reader_stream) = tokio::io::duplex(1_024);
+        let writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>> = Mutex::new(Box::new(writer_stream));
+        let responses = ClaudeControlResponseRouter::default();
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+
+        assert!(
+            query_claude_context_usage(
+                "claude",
+                &writer,
+                &responses,
+                &cancellation,
+                22,
+                Duration::from_secs(1),
+            )
+            .await
+            .is_none()
+        );
+        assert_eq!(responses.pending_count(), 0);
+        let mut lines = BufReader::new(reader_stream).lines();
+        assert!(
+            timeout(Duration::from_millis(10), lines.next_line())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn writer_failure_returns_none_and_removes_the_pending_waiter() {
+        let (writer_stream, reader_stream) = tokio::io::duplex(1_024);
+        drop(reader_stream);
+        let writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>> = Mutex::new(Box::new(writer_stream));
+        let responses = ClaudeControlResponseRouter::default();
+        let cancellation = CancellationToken::new();
+
+        assert!(
+            query_claude_context_usage(
+                "claude",
+                &writer,
+                &responses,
+                &cancellation,
+                23,
+                Duration::from_secs(1),
+            )
+            .await
+            .is_none()
+        );
+        assert_eq!(responses.pending_count(), 0);
+    }
+
+    #[test]
+    fn only_successful_completion_enters_the_context_query_path() {
+        fn completion(state: &str) -> ProviderEvent {
+            ProviderEvent {
+                native_event_id: None,
+                event_type: "turn.completed".to_owned(),
+                thread_id: "thread-1".to_owned(),
+                turn_id: Some("turn-1".to_owned()),
+                request_id: None,
+                payload: json!({ "state": state }),
+                activity: Vec::new(),
+            }
+        }
+
+        assert_eq!(
+            claude_completion_query_turn_id(&completion("completed")),
+            Some("turn-1")
+        );
+        assert_eq!(claude_completion_query_turn_id(&completion("failed")), None);
+        assert_eq!(
+            claude_completion_query_turn_id(&completion("interrupted")),
+            None
+        );
+        let mut non_completion = completion("completed");
+        non_completion.event_type = "item.completed".to_owned();
+        assert_eq!(claude_completion_query_turn_id(&non_completion), None);
+    }
+}
+
 struct ClaudeDriver {
     provider: String,
     runtime: Arc<Mutex<ClaudeProviderRuntime>>,
     writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
     events: Mutex<mpsc::Receiver<ProviderEvent>>,
+    deferred_events: Mutex<VecDeque<ProviderEvent>>,
+    control_responses: ClaudeControlResponseRouter,
     child: SharedChild,
     session_id: String,
     runtime_mode: Mutex<ClaudeRuntimeMode>,
@@ -5300,6 +5727,7 @@ impl ClaudeOutputHandle {
 }
 
 const CLAUDE_ACTIVITY_PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+const CLAUDE_CONTEXT_QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 const CLAUDE_ACTIVITY_PROBE_OUTPUT_LIMIT: usize = 64 * 1024;
 const CLAUDE_ACTIVITY_PROBE_CACHE_CAPACITY: usize = 64;
 
@@ -5910,6 +6338,7 @@ impl ClaudeDriver {
             None => (None, None),
         };
         let pending_acknowledgement = ClaudeAcknowledgementSlot::default();
+        let control_responses = ClaudeControlResponseRouter::default();
         let output = spawn_claude_output(
             runtime.clone(),
             request.thread_id.clone(),
@@ -5919,12 +6348,15 @@ impl ClaudeDriver {
             hook_handle.clone(),
             events_tx,
             pending_acknowledgement.clone(),
+            control_responses.clone(),
         );
         Ok(Self {
             provider: request.provider,
             runtime,
             writer: Mutex::new(Box::new(stdin)),
             events: Mutex::new(events_rx),
+            deferred_events: Mutex::new(VecDeque::new()),
+            control_responses,
             child: Arc::new(Mutex::new(child)),
             session_id,
             runtime_mode: Mutex::new(mode),
@@ -5990,7 +6422,7 @@ impl ClaudeDriver {
             self.next_sequence().await,
             mode.permission_mode(),
         );
-        self.write_json(json!({"type":"control_request","request":request}))
+        self.write_json(serde_json::to_value(request).map_err(provider_error(&self.provider))?)
             .await
     }
 }
@@ -6127,7 +6559,7 @@ impl ProviderDriver for ClaudeDriver {
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
             let control = ClaudeControlRequest::interrupt(self.next_sequence().await);
-            self.write_json(json!({"type":"control_request","request":control}))
+            self.write_json(serde_json::to_value(control).map_err(provider_error(&self.provider))?)
                 .await
         })
     }
@@ -6213,10 +6645,43 @@ impl ProviderDriver for ClaudeDriver {
         unsupported("claude", "checkpoint rollback")
     }
     fn next_event(&self) -> BoxRuntimeFuture<'_, Option<ProviderEvent>> {
-        Box::pin(async move { self.events.lock().await.recv().await })
+        Box::pin(async move {
+            let mut deferred_events = self.deferred_events.lock().await;
+            if let Some(event) = deferred_events.pop_front() {
+                return Some(event);
+            }
+            let completion = self.events.lock().await.recv().await?;
+            let Some(turn_id) = claude_completion_query_turn_id(&completion).map(str::to_owned)
+            else {
+                return Some(completion);
+            };
+            let response = query_claude_context_usage(
+                &self.provider,
+                &self.writer,
+                &self.control_responses,
+                &self.output.cancellation,
+                self.next_sequence().await,
+                CLAUDE_CONTEXT_QUERY_TIMEOUT,
+            )
+            .await;
+            let Some(response) = response else {
+                return Some(completion);
+            };
+            let usage = self
+                .runtime
+                .lock()
+                .await
+                .apply_context_usage_response(&turn_id, &response);
+            let Some(usage) = usage else {
+                return Some(completion);
+            };
+            deferred_events.push_back(completion);
+            Some(claude_provider_event(usage, None, Vec::new()))
+        })
     }
     fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
+            self.control_responses.close();
             let _ = self.writer.lock().await.shutdown().await;
             kill_child(&self.child).await;
             if let Some(hook_sink) = self.hook_sink.as_ref() {
@@ -6315,6 +6780,7 @@ fn spawn_claude_output(
     hook_sink: Option<Arc<ClaudeHookSinkHandle>>,
     sender: mpsc::Sender<ProviderEvent>,
     pending_acknowledgement: ClaudeAcknowledgementSlot,
+    control_responses: ClaudeControlResponseRouter,
 ) -> Arc<ClaudeOutputHandle> {
     let cancellation = CancellationToken::new();
     let (recovery_sender, recovery_receiver) =
@@ -6333,6 +6799,7 @@ fn spawn_claude_output(
     let stdout_recovery_sender = recovery_sender.clone();
     let stdout_cancellation = cancellation.clone();
     let stdout_pending_acknowledgement = pending_acknowledgement.clone();
+    let stdout_control_responses = control_responses.clone();
     let stdout_task = tokio::spawn(async move {
         let mut lines = BufReader::new(stdout).lines();
         loop {
@@ -6347,6 +6814,9 @@ fn spawn_claude_output(
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
+            if stdout_control_responses.route(&value) {
+                continue;
+            }
             if !emit_claude_value(
                 &stdout_runtime,
                 &stdout_thread_id,
@@ -6362,6 +6832,7 @@ fn spawn_claude_output(
                 break;
             }
         }
+        stdout_control_responses.close();
         stdout_cancellation.cancel();
     });
     let hook_task = hook_receiver.map(|mut hook_receiver| {
@@ -6475,6 +6946,7 @@ pub async fn claude_output_shutdown_with_open_stream_for_test() -> bool {
         None,
         sender,
         ClaudeAcknowledgementSlot::default(),
+        ClaudeControlResponseRouter::default(),
     );
     let completed = tokio::time::timeout(Duration::from_millis(150), output.shutdown())
         .await
@@ -6783,6 +7255,22 @@ mod claude_recovery_worker_tests {
     }
 }
 
+fn claude_provider_event(
+    event: ClaudeCanonicalEvent,
+    native_event_id: Option<ProviderNativeEventId>,
+    activity: Vec<ProviderActivityMutation>,
+) -> ProviderEvent {
+    ProviderEvent {
+        native_event_id,
+        event_type: event.event_type,
+        thread_id: event.thread_id,
+        turn_id: event.turn_id,
+        request_id: event.request_id,
+        payload: event.payload,
+        activity,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn emit_claude_value(
     runtime: &Arc<Mutex<ClaudeProviderRuntime>>,
@@ -6841,15 +7329,11 @@ async fn emit_claude_value(
         if !send_claude_output(
             sender,
             cancellation,
-            ProviderEvent {
-                native_event_id: native_event_id.take(),
-                event_type: event.event_type,
-                thread_id: event.thread_id,
-                turn_id: event.turn_id,
-                request_id: event.request_id,
-                payload: event.payload,
-                activity: activity.take().unwrap_or_default(),
-            },
+            claude_provider_event(
+                event,
+                native_event_id.take(),
+                activity.take().unwrap_or_default(),
+            ),
         )
         .await
         {
@@ -7847,6 +8331,24 @@ printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
     #[cfg(windows)]
     const CLAUDE_DISCONNECT_FIXTURE: &str = "claude-disconnect";
 
+    #[cfg(unix)]
+    const CLAUDE_CONTEXT_QUERY_FIXTURE: &str = r#"#!/bin/sh
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
+  case "$line" in
+    *'"type":"user"'*)
+      printf '%s\n' "$line"
+      printf '%s\n' '{"type":"stream_event","session_id":"fixture-session","uuid":"usage-1","parent_tool_use_id":null,"event":{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"input_tokens":1000,"cache_creation_input_tokens":200,"cache_read_input_tokens":300,"output_tokens":50}}}'
+      printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"errors":[],"stop_reason":"end_turn","session_id":"fixture-session","uuid":"result-1"}'
+      ;;
+    *'"subtype":"get_context_usage"'*)
+      request_id=$(printf '%s\n' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"totalTokens":31251,"maxTokens":200000,"isAutoCompactEnabled":true}}}\n' "$request_id"
+      ;;
+  esac
+done
+"#;
+
     async fn claude_delivery_fixture(
         temp: &TempDir,
         name: &str,
@@ -8007,6 +8509,74 @@ printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
             outcome,
             super::ProviderDeliveryOutcome::Ambiguous { .. }
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_completion_query_orders_stream_then_authoritative_usage_then_completion() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let temp = TempDir::new().expect("provider fixture directory");
+        let capture_path = temp.path().join("claude-context-query.jsonl");
+        let driver = claude_delivery_fixture(
+            &temp,
+            "claude-context-query",
+            CLAUDE_CONTEXT_QUERY_FIXTURE,
+            &capture_path,
+            None,
+        )
+        .await;
+        driver.start().await.expect("Claude fixture should start");
+
+        let outcome = timeout(
+            std::time::Duration::from_secs(2),
+            driver.deliver(
+                "measure context".to_owned(),
+                Vec::new(),
+                "default".to_owned(),
+                "unused-no-id-key".to_owned(),
+            ),
+        )
+        .await
+        .expect("delivery timeout");
+        assert!(matches!(
+            outcome,
+            super::ProviderDeliveryOutcome::Accepted { .. }
+        ));
+
+        let stream_usage = timeout(std::time::Duration::from_secs(2), driver.next_event())
+            .await
+            .expect("stream usage timeout")
+            .expect("stream usage event");
+        let authoritative_usage = timeout(std::time::Duration::from_secs(2), driver.next_event())
+            .await
+            .expect("authoritative usage timeout")
+            .expect("authoritative usage event");
+        let completion = timeout(std::time::Duration::from_secs(2), driver.next_event())
+            .await
+            .expect("completion timeout")
+            .expect("completion event");
+
+        assert_eq!(stream_usage.event_type, "thread.token-usage.updated");
+        assert_eq!(stream_usage.payload["usage"]["usedTokens"], 1_550);
+        assert_eq!(authoritative_usage.event_type, "thread.token-usage.updated");
+        assert_eq!(authoritative_usage.payload["usage"]["usedTokens"], 31_251);
+        assert_eq!(completion.event_type, "turn.completed");
+        assert_eq!(completion.payload["state"], "completed");
+
+        let query = captured_request(&capture_path, |value| {
+            value["request"]["subtype"] == "get_context_usage"
+        })
+        .await;
+        assert_eq!(
+            query,
+            json!({
+                "type": "control_request",
+                "request_id": "bibcode-1",
+                "request": { "subtype": "get_context_usage" }
+            })
+        );
+
+        driver.shutdown().await.expect("Claude fixture shutdown");
     }
 
     #[test]
