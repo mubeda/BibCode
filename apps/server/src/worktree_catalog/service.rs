@@ -8,6 +8,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
@@ -154,6 +157,8 @@ struct Inner {
     registry: Mutex<Registry>,
     #[cfg(test)]
     final_release_pause: Mutex<Option<FinalReleasePause>>,
+    #[cfg(test)]
+    mutation_refresh_attempts: AtomicUsize,
 }
 
 #[cfg(test)]
@@ -309,6 +314,8 @@ impl WorktreeCatalogService {
                 registry: Mutex::new(Registry::default()),
                 #[cfg(test)]
                 final_release_pause: Mutex::new(None),
+                #[cfg(test)]
+                mutation_refresh_attempts: AtomicUsize::new(0),
             }),
         }
     }
@@ -400,6 +407,12 @@ impl WorktreeCatalogService {
                 subscriber_owned.then_some(state.lifecycle_epoch),
             )
         };
+        #[cfg(test)]
+        if trigger == CatalogRefreshTrigger::Mutation {
+            self.inner
+                .mutation_refresh_attempts
+                .fetch_add(1, Ordering::SeqCst);
+        }
         let guard = tokio::select! {
             _ = cancellation.cancelled() => return Err(cancelled_error()),
             guard = entry.refresh_lock.lock() => guard,
@@ -408,12 +421,20 @@ impl WorktreeCatalogService {
         {
             let state = lock(&entry.state);
             if state.completed_refreshes != completed_refreshes {
-                return state.last_refresh_result.clone().unwrap_or_else(|| {
+                let coalesced = state.last_refresh_result.clone().unwrap_or_else(|| {
                     Err(CatalogError::new(
                         CatalogErrorReason::Internal,
                         "A coalesced catalog refresh completed without a result.",
                     ))
                 });
+                let recover_after_stale = trigger == CatalogRefreshTrigger::Mutation
+                    && matches!(
+                        &coalesced,
+                        Err(error) if error.reason == CatalogErrorReason::StaleGeneration
+                    );
+                if !recover_after_stale {
+                    return coalesced;
+                }
             }
             if matches!(
                 trigger,
@@ -1585,6 +1606,11 @@ impl WorktreeCatalogService {
     #[cfg(test)]
     pub(crate) fn entry_count_for_test(&self) -> usize {
         lock(&self.inner.registry).entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mutation_refresh_attempt_count_for_test(&self) -> usize {
+        self.inner.mutation_refresh_attempts.load(Ordering::SeqCst)
     }
 
     #[cfg(test)]

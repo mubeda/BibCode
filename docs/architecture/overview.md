@@ -53,6 +53,10 @@ flowchart TB
   prior-lifecycle work from publishing into an immediate reattachment.
   Shared observations never bypass per-caller anchor validation, and final
   view/repository ownership release is atomic against concurrent attachment.
+  When a mutation-triggered refresh queues behind a pre-mutation scan, it alone
+  may recover from that scan's stored stale result with one current-epoch scan;
+  ordinary waiters still receive the identical stale error, repeated mutation
+  requests coalesce, and subscriber cancellation bounds the recovery.
 - **Contracts (`packages/contracts`)** contains Effect schemas and TypeScript
   contracts only. It defines persisted models, RPC methods, HTTP APIs, desktop
   bridge values, and provider events without application runtime logic.

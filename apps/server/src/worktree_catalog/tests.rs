@@ -680,6 +680,62 @@ async fn concurrent_refresh_waiters_receive_the_same_stale_generation_result() {
     assert_eq!(inventory.calls.load(Ordering::SeqCst), 2);
 }
 
+#[tokio::test]
+async fn repeated_mutation_invalidations_recover_after_a_coalesced_stale_completion() {
+    let inventory = Arc::new(PausingSecondInventorySource::new(inventory(
+        "/repo/common",
+        [record("/repo/main", true)],
+    )));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+    let mut subscription = service.subscribe("project-1").await.expect("subscription");
+    let old_refresh = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .refresh("project-1", CatalogRefreshTrigger::Explicit)
+                .await
+        })
+    };
+    wait_for_count(&inventory.calls, 2).await;
+
+    service.invalidate_after_mutation("project-1").await;
+    service.invalidate_after_mutation("project-1").await;
+    wait_for_mutation_refresh_attempt(&service, 2).await;
+    inventory.release.add_permits(1);
+
+    let stale = old_refresh
+        .await
+        .expect("old refresh task")
+        .expect_err("pre-mutation refresh is stale");
+    assert_eq!(stale.reason, super::CatalogErrorReason::StaleGeneration);
+    wait_for_count(&inventory.calls, 3).await;
+    inventory.release.add_permits(1);
+
+    let published = loop {
+        let snapshot = subscription.changed().await.expect("catalog publication");
+        if snapshot.authoritative && snapshot.generation == 2 {
+            break snapshot;
+        }
+    };
+    assert_eq!(published.generation, 2);
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    assert_eq!(inventory.calls.load(Ordering::SeqCst), 3);
+}
+
 #[tokio::test(start_paused = true)]
 async fn focus_refresh_uses_the_one_second_result_ttl() {
     let inventory =
@@ -2145,6 +2201,16 @@ async fn wait_for_count(value: &AtomicUsize, expected: usize) {
         tokio::task::yield_now().await;
     }
     panic!("counter did not reach {expected}");
+}
+
+async fn wait_for_mutation_refresh_attempt(service: &WorktreeCatalogService, expected: usize) {
+    for _ in 0..10_000 {
+        if service.mutation_refresh_attempt_count_for_test() >= expected {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("mutation refresh attempt count did not reach {expected}");
 }
 
 impl CatalogFileSystem for FakeFileSystem {

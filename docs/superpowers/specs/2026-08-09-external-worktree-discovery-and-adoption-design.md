@@ -374,6 +374,11 @@ initial subscription.
 - A stale pre-mutation leader records and advances one explicit stale result;
   every caller already coalesced behind it receives that identical result and
   no waiter silently starts a divergent refresh.
+- The mutation-triggered owner queued behind that leader recognizes only this
+  stored stale completion and performs one scan against the current mutation
+  epoch. Repeated invalidations remain coalesced behind the same recovery scan;
+  there is no retry loop, and final-subscriber cancellation interrupts it like
+  any other refresh.
 - The stream uses latest-value semantics. Slow subscribers receive the newest
   snapshot rather than an unbounded queue of intermediate refreshes.
 - Shared observations outlive one project-view cancellation while subscribers
