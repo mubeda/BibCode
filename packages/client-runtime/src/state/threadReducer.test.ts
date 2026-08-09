@@ -726,6 +726,40 @@ describe("applyThreadDetailEvent", () => {
         expect(idsAfterExactDuplicate).toEqual(["activity-cw-latest"]);
       }
     });
+
+    it("keeps a valid context-window activity when malformed delivery reuses its ID", () => {
+      const result = applyThreadDetailEvent(
+        {
+          ...baseThread,
+          activities: [
+            {
+              id: EventId.make("activity-cw-collision"),
+              tone: "info",
+              kind: "context-window.updated",
+              summary: "Context window updated",
+              payload: { usedTokens: 1_000 },
+              turnId: TurnId.make("turn-1"),
+              sequence: 1,
+              createdAt: "2026-04-01T11:00:00.000Z",
+            },
+          ],
+        },
+        event("thread.activity-appended", {
+          activity: {
+            id: EventId.make("activity-cw-collision"),
+            tone: "info",
+            kind: "context-window.updated",
+            summary: "Context window updated",
+            payload: {},
+            turnId: TurnId.make("turn-1"),
+            sequence: 2,
+            createdAt: "2026-04-01T11:01:00.000Z",
+          },
+        }),
+      );
+
+      expect(result).toEqual({ kind: "unchanged" });
+    });
   });
 
   describe("thread.turn-diff-completed", () => {
