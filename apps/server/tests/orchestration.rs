@@ -22,7 +22,7 @@ async fn migrated_repositories() -> Repositories {
 fn command_values() -> Vec<Value> {
     vec![
         json!({"type":"project.create","commandId":"c01","projectId":"p1","title":"Project","workspaceRoot":"C:/repo","createWorkspaceRootIfMissing":true,"defaultModelSelection":null,"createdAt":CREATED_AT}),
-        json!({"type":"project.meta.update","commandId":"c02","projectId":"p1","title":"Renamed","defaultModelSelection":{"instanceId":"codex","model":"gpt-5"},"scripts":[]}),
+        json!({"type":"project.meta.update","commandId":"c02","projectId":"p1","title":"Renamed","defaultModelSelection":{"instanceId":"codex","model":"gpt-5"},"scripts":[],"worktreeDiscovery":{"visibility":"shown","initialPromptDismissedAt":"2026-07-10T10:00:00.000Z","baselinePaths":["C:/repo-worktrees"]}}),
         json!({"type":"project.delete","commandId":"c23","projectId":"p1","force":true}),
         json!({"type":"thread.create","commandId":"c03","threadId":"t1","projectId":"p1","title":"Thread","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","branch":null,"worktreePath":null,"createdAt":CREATED_AT}),
         json!({"type":"thread.delete","commandId":"c22","threadId":"t1"}),
@@ -173,11 +173,23 @@ async fn all_contract_commands_persist_canonical_events_and_project_atomically()
     );
     assert_eq!(events[19].event.payload["activity"]["id"], "activity-1");
     assert_eq!(events[19].event.metadata["requestId"], "r3");
+    assert_eq!(
+        events[0].event.payload["worktreeDiscovery"],
+        json!({"visibility":"hidden","initialPromptDismissedAt":null,"baselinePaths":[]})
+    );
+    assert_eq!(
+        events[2].event.payload["worktreeDiscovery"],
+        json!({"visibility":"shown","initialPromptDismissedAt":"2026-07-10T10:00:00.000Z","baselinePaths":["C:/repo-worktrees"]})
+    );
 
     let snapshot = load_snapshot(&engine.repositories())
         .await
         .expect("snapshot");
     assert_eq!(snapshot.projects[0].title, "Renamed");
+    assert_eq!(
+        snapshot.projects[0].worktree_discovery,
+        json!({"visibility":"shown","initialPromptDismissedAt":"2026-07-10T10:00:00.000Z","baselinePaths":["C:/repo-worktrees"]})
+    );
     assert!(snapshot.projects[0].deleted_at.is_some());
     let thread = snapshot
         .threads
@@ -235,9 +247,100 @@ async fn all_contract_commands_persist_canonical_events_and_project_atomically()
     assert_eq!(restarted.read_events(0).await.unwrap().len(), 26);
     let replayed = load_snapshot(&restarted.repositories()).await.unwrap();
     assert_eq!(replayed.projects[0].title, "Renamed");
+    assert_eq!(
+        replayed.projects[0].worktree_discovery,
+        json!({"visibility":"shown","initialPromptDismissedAt":"2026-07-10T10:00:00.000Z","baselinePaths":["C:/repo-worktrees"]})
+    );
     assert!(replayed.projects[0].deleted_at.is_some());
     assert_eq!(replayed.messages.len(), 1);
     assert_eq!(replayed.messages[0].message_id, "m-user");
+    restarted.shutdown().await;
+}
+
+#[tokio::test]
+async fn project_worktree_discovery_policy_survives_metadata_updates_and_replay() {
+    let repositories = migrated_repositories().await;
+    let engine =
+        OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
+            .await
+            .expect("engine starts");
+    let policy = json!({
+        "visibility": "shown",
+        "initialPromptDismissedAt": "2026-07-10T10:00:00.000Z",
+        "baselinePaths": ["C:/policy-worktree"]
+    });
+    engine
+        .dispatch(decode(json!({
+            "type": "project.create",
+            "commandId": "policy-create",
+            "projectId": "policy-project",
+            "title": "Policy project",
+            "workspaceRoot": "C:/policy-project",
+            "defaultModelSelection": null,
+            "createdAt": CREATED_AT,
+        })))
+        .await
+        .expect("project creates");
+    engine
+        .dispatch(decode(json!({
+            "type": "project.meta.update",
+            "commandId": "policy-update",
+            "projectId": "policy-project",
+            "worktreeDiscovery": policy,
+        })))
+        .await
+        .expect("policy update persists");
+    engine
+        .dispatch(decode(json!({
+            "type": "project.meta.update",
+            "commandId": "policy-title-update",
+            "projectId": "policy-project",
+            "title": "Renamed policy project",
+        })))
+        .await
+        .expect("unrelated metadata update persists");
+
+    let events = engine.read_events(0).await.expect("events read");
+    assert_eq!(
+        events[0].event.payload["worktreeDiscovery"],
+        json!({"visibility":"hidden","initialPromptDismissedAt":null,"baselinePaths":[]})
+    );
+    assert_eq!(events[2].event.payload["worktreeDiscovery"], policy);
+    assert!(events[3].event.payload.get("worktreeDiscovery").is_none());
+    assert_eq!(
+        load_snapshot(&engine.repositories())
+            .await
+            .expect("snapshot")
+            .projects[0]
+            .worktree_discovery,
+        policy
+    );
+    engine.shutdown().await;
+
+    repositories
+        .database()
+        .call(|connection| {
+            connection.execute("DELETE FROM projection_projects", [])?;
+            connection.execute(
+                "UPDATE projection_state SET last_applied_sequence = 0 WHERE projector = 'projection.projects'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("rewind project projection");
+    let restarted =
+        OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
+            .await
+            .expect("engine restarts");
+    assert_eq!(
+        load_snapshot(&restarted.repositories())
+            .await
+            .expect("replayed snapshot")
+            .projects[0]
+            .worktree_discovery,
+        policy
+    );
     restarted.shutdown().await;
 }
 

@@ -49,6 +49,11 @@ fn project(id: &str, created_at: &str) -> ProjectionProject {
             "nested": { "reasoning": "high" }
         })),
         scripts: json!({"verify": "vp check\nvp run typecheck"}),
+        worktree_discovery: json!({
+            "visibility": "shown",
+            "initialPromptDismissedAt": "2026-08-09T00:00:00.000Z",
+            "baselinePaths": ["/workspace/project-a", "/workspace/project-a-feature"]
+        }),
         created_at: created_at.to_owned(),
         updated_at: created_at.to_owned(),
         deleted_at: None,
@@ -632,6 +637,11 @@ async fn runtime_project_and_thread_repositories_upsert_order_and_delete() {
         .expect("early project insert");
     project_late.title = "Updated title".to_owned();
     project_late.scripts = json!({"test": ["vp", "test"], "env": {"CI": true}});
+    project_late.worktree_discovery = json!({
+        "visibility": "hidden",
+        "initialPromptDismissedAt": null,
+        "baselinePaths": ["/workspace/project-b"]
+    });
     project_late.updated_at = TIME_3.to_owned();
     repositories
         .upsert_project(project_late.clone())
@@ -654,6 +664,31 @@ async fn runtime_project_and_thread_repositories_upsert_order_and_delete() {
             .map(|project| project.project_id.as_str())
             .collect::<Vec<_>>(),
         ["project-a", "project-b"]
+    );
+
+    repositories
+        .database()
+        .call(|connection| {
+            connection.execute(
+                "UPDATE projection_projects SET worktree_discovery_json = '{\"visibility\":\"not-a-visibility\",\"initialPromptDismissedAt\":null,\"baselinePaths\":[]}' WHERE project_id = 'project-b'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("malformed policy fixture persists without a repository fallback");
+    assert_eq!(
+        repositories
+            .get_project("project-b".to_owned())
+            .await
+            .expect("malformed policy remains readable JSON")
+            .expect("project exists")
+            .worktree_discovery,
+        json!({
+            "visibility": "not-a-visibility",
+            "initialPromptDismissedAt": null,
+            "baselinePaths": []
+        })
     );
 
     let thread_early = thread("thread-a", "project-b", T1);

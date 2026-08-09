@@ -233,23 +233,23 @@ impl Repositories {
     pub async fn upsert_project(&self, row: ProjectionProject) -> Result<()> {
         self.database.call(move |connection| {
             connection.execute(
-                "INSERT INTO projection_projects (project_id, title, workspace_root, default_model_selection_json, scripts_json, created_at, updated_at, deleted_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+                "INSERT INTO projection_projects (project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, created_at, updated_at, deleted_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT (project_id) DO UPDATE SET \
                    title=excluded.title, workspace_root=excluded.workspace_root, \
-                   default_model_selection_json=excluded.default_model_selection_json, scripts_json=excluded.scripts_json, \
+                   default_model_selection_json=excluded.default_model_selection_json, scripts_json=excluded.scripts_json, worktree_discovery_json=excluded.worktree_discovery_json, \
                    created_at=excluded.created_at, updated_at=excluded.updated_at, deleted_at=excluded.deleted_at",
-                params![row.project_id, row.title, row.workspace_root, optional_json(&row.default_model_selection)?, encode_json(&row.scripts)?, row.created_at, row.updated_at, row.deleted_at],
+                params![row.project_id, row.title, row.workspace_root, optional_json(&row.default_model_selection)?, encode_json(&row.scripts)?, encode_json(&row.worktree_discovery)?, row.created_at, row.updated_at, row.deleted_at],
             )?; Ok(())
         }).await
     }
 
     pub async fn get_project(&self, project_id: String) -> Result<Option<ProjectionProject>> {
-        self.database.call(move |connection| connection.query_row("SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, created_at, updated_at, deleted_at FROM projection_projects WHERE project_id = ?", [project_id], decode_project).optional().map_err(Into::into)).await
+        self.database.call(move |connection| connection.query_row("SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, created_at, updated_at, deleted_at FROM projection_projects WHERE project_id = ?", [project_id], decode_project).optional().map_err(Into::into)).await
     }
 
     pub async fn list_projects(&self) -> Result<Vec<ProjectionProject>> {
-        self.database.call(|connection| collect(connection, "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, created_at, updated_at, deleted_at FROM projection_projects ORDER BY created_at ASC, project_id ASC", [], decode_project)).await
+        self.database.call(|connection| collect(connection, "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, created_at, updated_at, deleted_at FROM projection_projects ORDER BY created_at ASC, project_id ASC", [], decode_project)).await
     }
 
     pub async fn delete_project(&self, project_id: String) -> Result<()> {
@@ -962,6 +962,7 @@ pub struct ProjectionProject {
     pub workspace_root: String,
     pub default_model_selection: Option<Value>,
     pub scripts: Value,
+    pub worktree_discovery: Value,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     pub deleted_at: Option<Timestamp>,
@@ -1264,9 +1265,10 @@ fn decode_project(row: &Row<'_>) -> rusqlite::Result<ProjectionProject> {
         workspace_root: row.get(2)?,
         default_model_selection: decode_optional_json(row.get(3)?, "default_model_selection_json")?,
         scripts: decode_json(row.get(4)?, "scripts_json")?,
-        created_at: row.get(5)?,
-        updated_at: row.get(6)?,
-        deleted_at: row.get(7)?,
+        worktree_discovery: decode_json(row.get(5)?, "worktree_discovery_json")?,
+        created_at: row.get(6)?,
+        updated_at: row.get(7)?,
+        deleted_at: row.get(8)?,
     })
 }
 fn decode_thread(row: &Row<'_>) -> rusqlite::Result<ProjectionThread> {

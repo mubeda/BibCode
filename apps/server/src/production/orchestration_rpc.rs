@@ -588,6 +588,7 @@ pub async fn shell_snapshot(engine: &OrchestrationEngine, archived: bool) -> Rpc
                 "workspaceRoot": project.workspace_root,
                 "defaultModelSelection": project.default_model_selection,
                 "scripts": project.scripts,
+                "worktreeDiscovery": project.worktree_discovery,
                 "createdAt": project.created_at,
                 "updatedAt": project.updated_at,
             })
