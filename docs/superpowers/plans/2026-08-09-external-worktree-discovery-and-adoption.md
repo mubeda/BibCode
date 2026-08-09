@@ -114,7 +114,7 @@ Expected before implementation: imports and project fields are missing.
 
 - [ ] **Step 2: Implement `worktree.ts` and add the optional project policy**
 
-Add `worktreeDiscovery: ProjectWorktreeDiscoveryPolicy` with a decoding default to `OrchestrationProject`, `OrchestrationProjectShell`, `ProjectCreatedPayload`, and `ProjectMetaUpdatedPayload`. Add optional `worktreeDiscovery` to `ProjectMetaUpdateCommand`. Export `worktree.ts` from the package index.
+Add `worktreeDiscovery: ProjectWorktreeDiscoveryPolicy` with a decoding default to `OrchestrationProject`, `OrchestrationProjectShell`, and `ProjectCreatedPayload`. Add optional `worktreeDiscovery` to `ProjectMetaUpdatedPayload` and `ProjectMetaUpdateCommand`; the incremental payload must have no decoding default so omission remains distinguishable from an explicit policy update. Export `worktree.ts` from the package index.
 
 - [ ] **Step 3: Run the focused contract tests**
 
@@ -157,6 +157,8 @@ DEFAULT '{"visibility":"hidden","initialPromptDismissedAt":null,"baselinePaths":
 ```
 
 `ProjectionProject` gains `worktree_discovery: Value`. Every project select, insert, upsert, decoder, snapshot serializer, projector, and fixture must preserve that JSON value. `project.created` writes the default object. `project.meta-updated` changes it only when the event contains `worktreeDiscovery`.
+
+For incremental `ProjectMetaUpdatedPayload` events, preserve omitted-versus-present semantics: `worktreeDiscovery` is optional and has no decoding default. Only complete project/shell representations and `ProjectCreatedPayload` decode missing policy fields to the hidden/null/empty default.
 
 - [ ] **Step 1: Add failing migration and repository tests**
 

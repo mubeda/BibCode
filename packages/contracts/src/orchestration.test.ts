@@ -437,19 +437,20 @@ it.effect("defaults missing worktree discovery policy for legacy project represe
       updatedAt: "2026-01-01T00:00:00.000Z",
     };
 
-    const decoded = yield* Effect.all([
+    const [decodedProject, decodedProjectShell, decodedCreated, metaUpdated] = yield* Effect.all([
       decodeOrchestrationProject(legacyProject),
       decodeOrchestrationProjectShell(legacyProject),
       decodeProjectCreatedPayload(legacyCreated),
       decodeProjectMetaUpdatedPayload(legacyMetaUpdated),
     ]);
-    for (const project of decoded) {
+    for (const project of [decodedProject, decodedProjectShell, decodedCreated]) {
       assert.deepStrictEqual(project.worktreeDiscovery, {
         visibility: "hidden",
         initialPromptDismissedAt: null,
         baselinePaths: [],
       });
     }
+    assert.strictEqual(Object.hasOwn(metaUpdated, "worktreeDiscovery"), false);
   }),
 );
 
