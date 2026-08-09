@@ -37,7 +37,11 @@ flowchart TB
 - **Server (`apps/server`)** is both a Rust library and the native `bibcode`
   binary. It owns HTTP/WebSocket RPC, authentication, SQLite persistence,
   orchestration, providers, terminals, Git, files, diagnostics, relay access,
-  and process supervision.
+  and process supervision. Its worktree catalog joins bounded live Git and
+  filesystem observations with durable project and canonical-thread
+  projections. Catalog entries use latest-value snapshots, retain the last
+  authoritative arrays through degraded observations, and stop polling after
+  their final subscriber before bounded idle eviction.
 - **Contracts (`packages/contracts`)** contains Effect schemas and TypeScript
   contracts only. It defines persisted models, RPC methods, HTTP APIs, desktop
   bridge values, and provider events without application runtime logic.
@@ -118,6 +122,9 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
 - `packages/contracts` remains schema-only.
 - Rust owns all production backend behavior. TypeScript is limited to clients,
   contracts, shared utilities, relay infrastructure, and development tooling.
+- Git worktree registration, directory availability, and path ownership are
+  resolved by the server catalog. Clients do not infer recovery from directory
+  existence or treat a degraded observation as an authoritative empty set.
 - Capability negotiation controls optional behavior such as activity and
   preview automation; clients must downgrade when a server cannot prove support.
 - Host WebView engines differ by platform, so optional browser APIs are

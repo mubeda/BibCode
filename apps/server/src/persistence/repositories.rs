@@ -304,6 +304,47 @@ impl Repositories {
             .await
     }
 
+    /// Reads the project and its canonical worktree-owning threads in one SQLite job.
+    ///
+    /// Panel and deleted threads cannot claim worktrees. The extra sentinel row reports
+    /// truncation without allowing the returned collection to exceed `limit`.
+    pub async fn load_worktree_catalog_projection(
+        &self,
+        project_id: String,
+        limit: usize,
+    ) -> Result<Option<WorktreeCatalogProjection>> {
+        let limit = min(limit, 512);
+        self.database
+            .call(move |connection| {
+                let Some(project) = connection
+                    .query_row(
+                        "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, created_at, updated_at, deleted_at FROM projection_projects WHERE project_id = ?",
+                        [&project_id],
+                        decode_project,
+                    )
+                    .optional()?
+                else {
+                    return Ok(None);
+                };
+                let sentinel_limit = i64::try_from(limit.saturating_add(1)).unwrap_or(i64::MAX);
+                let mut threads = collect(
+                    connection,
+                    &(THREAD_SELECT.to_owned()
+                        + " WHERE project_id = ? AND kind <> 'panel' AND deleted_at IS NULL ORDER BY created_at ASC, thread_id ASC LIMIT ?"),
+                    params![project_id, sentinel_limit],
+                    decode_thread,
+                )?;
+                let truncated = threads.len() > limit;
+                threads.truncate(limit);
+                Ok(Some(WorktreeCatalogProjection {
+                    project,
+                    threads,
+                    truncated,
+                }))
+            })
+            .await
+    }
+
     pub async fn delete_thread(&self, thread_id: String) -> Result<()> {
         self.delete(
             "DELETE FROM projection_threads WHERE thread_id = ?",
@@ -987,6 +1028,13 @@ pub struct ProjectionThread {
     pub pending_user_input_count: i64,
     pub has_actionable_proposed_plan: i64,
     pub deleted_at: Option<Timestamp>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WorktreeCatalogProjection {
+    pub project: ProjectionProject,
+    pub threads: Vec<ProjectionThread>,
+    pub truncated: bool,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectionThreadMessage {
