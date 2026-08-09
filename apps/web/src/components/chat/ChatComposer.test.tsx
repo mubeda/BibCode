@@ -979,7 +979,8 @@ describe("ChatComposer rendering", () => {
     expect(markup).toContain("Supervised");
     expect(markup).toContain("Auto-approve edits, ask before other actions.");
     expect(markup).not.toContain('data-mock="composer-command-menu"');
-    expect(markup).not.toContain('data-mock="ContextWindowMeter"');
+    expect(markup).toContain('data-mock="ContextWindowMeter"');
+    expect(findCapture("ContextWindowMeter")).toMatchObject({ supported: false, usage: null });
 
     const select = findCapture("Select");
     expect(select["value"]).toBe("approval-required");
@@ -1262,7 +1263,7 @@ describe("ChatComposer rendering", () => {
     expect(primary["compact"]).toBe(true);
   });
 
-  it("orders measured context and MCP between paperclip and primary actions", () => {
+  it("passes measured context capability and orders MCP before context and primary actions", () => {
     const activities = [
       {
         id: "activity-context" as Thread["activities"][number]["id"],
@@ -1285,10 +1286,13 @@ describe("ChatComposer rendering", () => {
     ] as Thread["activities"];
 
     renderComposer({
-      providerStatuses: [{ ...codexProvider, supportsMcpStatus: true }],
+      providerStatuses: [
+        { ...codexProvider, supportsMcpStatus: true, supportsContextWindowUsage: true },
+      ],
       activeThreadActivities: activities,
     });
 
+    expect(findCapture("ContextWindowMeter")["supported"]).toBe(true);
     expect(findCapture("ContextWindowMeter")["usage"]).toMatchObject({
       usedTokens: 50,
       maxTokens: 100,
@@ -1305,8 +1309,81 @@ describe("ChatComposer rendering", () => {
 
     expect(attachmentIndex).toBeGreaterThanOrEqual(0);
     expect(attachmentIndex).toBeLessThan(contextIndex);
-    expect(contextIndex).toBeLessThan(mcpIndex);
-    expect(mcpIndex).toBeLessThan(primaryIndex);
+    expect(mcpIndex).toBeLessThan(contextIndex);
+    expect(contextIndex).toBeLessThan(primaryIndex);
+  });
+
+  it.each([
+    ["Cursor", "cursor"],
+    ["Grok", "grok"],
+    ["OpenCode", "opencode"],
+  ])("passes an unavailable context meter for %s", (_displayName, driver) => {
+    const instanceId = ProviderInstanceId.make(driver);
+    renderComposer({
+      providerBindingInstanceId: instanceId,
+      providerStatuses: [
+        {
+          ...codexProvider,
+          instanceId,
+          driver: ProviderDriverKind.make(driver),
+        },
+      ],
+      activeProjectDefaultModelSelection: { instanceId, model: "gpt-5.4" },
+    });
+
+    expect(filterCaptures("ContextWindowMeter")).toHaveLength(1);
+    expect(findCapture("ContextWindowMeter")).toMatchObject({ supported: false, usage: null });
+  });
+
+  it.each([
+    ["Codex", "codex"],
+    ["Claude", "claudeAgent"],
+  ])("passes an awaiting context meter for %s", (_displayName, driver) => {
+    const instanceId = ProviderInstanceId.make(driver);
+    renderComposer({
+      providerBindingInstanceId: instanceId,
+      providerStatuses: [
+        {
+          ...codexProvider,
+          instanceId,
+          driver: ProviderDriverKind.make(driver),
+          supportsContextWindowUsage: true,
+        },
+      ],
+      activeProjectDefaultModelSelection: { instanceId, model: "gpt-5.4" },
+    });
+
+    expect(filterCaptures("ContextWindowMeter")).toHaveLength(1);
+    expect(findCapture("ContextWindowMeter")).toMatchObject({ supported: true, usage: null });
+  });
+
+  it("keeps context usage unavailable when an unsupported selected provider has stale activity", () => {
+    const cursorInstanceId = ProviderInstanceId.make("cursor");
+    renderComposer({
+      providerBindingInstanceId: cursorInstanceId,
+      providerStatuses: [
+        {
+          ...codexProvider,
+          instanceId: cursorInstanceId,
+          driver: ProviderDriverKind.make("cursor"),
+        },
+      ],
+      activeProjectDefaultModelSelection: { instanceId: cursorInstanceId, model: "gpt-5.4" },
+      activeThreadActivities: [
+        {
+          id: "stale-context" as Thread["activities"][number]["id"],
+          tone: "info",
+          kind: "context-window.updated",
+          summary: "context.window.updated",
+          payload: { usedTokens: 50, maxTokens: 100 },
+          turnId: null,
+          createdAt: now,
+        },
+      ],
+    });
+
+    expect(findCapture("ContextWindowMeter")["supported"]).toBe(false);
+    expect(findCapture("ContextWindowMeter")["usage"]).toMatchObject({ usedTokens: 50 });
   });
 
   it("shows the preparing worktree hint", () => {

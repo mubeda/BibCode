@@ -111,17 +111,19 @@ describe("contextWindow", () => {
   it("keeps usage when capacity and optional fields are invalid", () => {
     expect(
       deriveLatestContextWindowSnapshot([
-        makeActivity("activity", "context-window.updated", {
+        makeActivity("invalid-optional", "context-window.updated", {
           usedTokens: 5,
           maxTokens: 0,
+          totalProcessedTokens: -1,
           inputTokens: Number.NaN,
           compactsAutomatically: "yes",
         }),
       ]),
     ).toMatchObject({
       usedTokens: 5,
-      maxTokens: 0,
-      remainingTokens: 0,
+      maxTokens: null,
+      totalProcessedTokens: null,
+      remainingTokens: null,
       usedPercentage: null,
       remainingPercentage: null,
       inputTokens: null,
@@ -137,6 +139,15 @@ describe("contextWindow", () => {
       usedPercentage: null,
       remainingPercentage: null,
     });
+  });
+
+  it("keeps the latest valid snapshot when a newer usage activity is malformed", () => {
+    expect(
+      deriveLatestContextWindowSnapshot([
+        makeActivity("valid", "context-window.updated", { usedTokens: 5, maxTokens: 100 }),
+        makeActivity("malformed", "context-window.updated", { usedTokens: -1 }),
+      ]),
+    ).toMatchObject({ usedTokens: 5, maxTokens: 100 });
   });
 
   it("formats null, non-finite, million, and rounded token boundaries", () => {

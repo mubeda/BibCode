@@ -2,16 +2,30 @@ import { renderToStaticMarkup } from "react-dom/server";
 import { beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 const harness = vi.hoisted(() => ({
+  popovers: 0,
   triggers: [] as Array<Record<string, unknown>>,
+  tooltipTriggers: 0,
 }));
 
 vi.mock("../ui/popover", () => ({
-  Popover: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  Popover: ({ children }: { children: React.ReactNode }) => {
+    harness.popovers += 1;
+    return <div>{children}</div>;
+  },
   PopoverTrigger: (props: Record<string, unknown>) => {
     harness.triggers.push(props);
     return <>{props.render as React.ReactNode}</>;
   },
   PopoverPopup: ({ children }: { children: React.ReactNode }) => <section>{children}</section>,
+}));
+
+vi.mock("../ui/tooltip", () => ({
+  Tooltip: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+  TooltipTrigger: ({ render }: { render: React.ReactNode }) => {
+    harness.tooltipTriggers += 1;
+    return <>{render}</>;
+  },
+  TooltipPopup: ({ children }: { children: React.ReactNode }) => <section>{children}</section>,
 }));
 
 import { ContextWindowMeter } from "./ContextWindowMeter";
@@ -27,59 +41,109 @@ function usage(overrides: Record<string, unknown> = {}) {
   } as never;
 }
 
-function render(overrides: Record<string, unknown> = {}, providerDisplayName?: string | null) {
+function render({
+  supported = true,
+  contextWindowUsage = usage(),
+  providerDisplayName,
+}: {
+  supported?: boolean;
+  contextWindowUsage?: ReturnType<typeof usage> | null;
+  providerDisplayName?: string | null;
+} = {}) {
   return renderToStaticMarkup(
     <ContextWindowMeter
-      usage={usage(overrides)}
+      supported={supported}
+      usage={contextWindowUsage}
       {...(providerDisplayName !== undefined ? { providerDisplayName } : {})}
     />,
   );
 }
 
 beforeEach(() => {
+  harness.popovers = 0;
   harness.triggers.length = 0;
+  harness.tooltipTriggers = 0;
 });
 
 describe("ContextWindowMeter", () => {
+  it("renders a disabled tooltip-only control when context usage is unavailable", () => {
+    const markup = render({ supported: false, contextWindowUsage: null });
+
+    expect(markup).toContain('aria-disabled="true"');
+    expect(markup).toContain("Context window usage unavailable");
+    expect(markup).not.toContain("Awaiting context usage");
+    expect(markup).toContain("Context usage is not available for this provider.");
+    expect(harness.popovers).toBe(0);
+    expect(harness.triggers).toEqual([]);
+    expect(harness.tooltipTriggers).toBe(1);
+  });
+
+  it("renders a neutral popover when supported context usage is awaiting data", () => {
+    const markup = render({ supported: true, contextWindowUsage: null });
+
+    expect(markup).toContain("Context window usage awaiting data");
+    expect(markup).toContain("Awaiting context usage");
+    expect(markup).toContain("Usage will appear after the first provider response.");
+    expect(markup).not.toContain('role="progressbar"');
+    expect(harness.popovers).toBe(1);
+    expect(harness.triggers[0]).toMatchObject({ openOnHover: true, delay: 150, closeDelay: 0 });
+  });
+
   it("renders ordinary and low percentage formats", () => {
     expect(render()).toContain("Context window 50% used");
-    expect(render({ usedPercentage: 9 })).toContain("Context window 9% used");
-    expect(render({ usedPercentage: 9.25 })).toContain("Context window 9.3% used");
-    expect(render({ usedPercentage: 10.6 })).toContain("Context window 11% used");
+    expect(render({ contextWindowUsage: usage({ usedPercentage: 9 }) })).toContain(
+      "Context window 9% used",
+    );
+    expect(render({ contextWindowUsage: usage({ usedPercentage: 9.25 }) })).toContain(
+      "Context window 9.3% used",
+    );
+    expect(render({ contextWindowUsage: usage({ usedPercentage: 10.6 }) })).toContain(
+      "Context window 11% used",
+    );
     expect(harness.triggers[0]).toMatchObject({ openOnHover: true, delay: 150, closeDelay: 0 });
   });
 
   it("falls back to token labels for missing or invalid percentages", () => {
-    expect(render({ usedPercentage: null, maxTokens: null })).toContain(
-      "Context window 500 tokens used",
-    );
-    expect(render({ usedPercentage: Number.NaN, maxTokens: 1_000 })).toContain(
-      "Context window 500 tokens used",
-    );
+    expect(
+      render({ contextWindowUsage: usage({ usedPercentage: null, maxTokens: null }) }),
+    ).toContain("Context window 500 tokens used");
+    expect(
+      render({ contextWindowUsage: usage({ usedPercentage: Number.NaN, maxTokens: 1_000 }) }),
+    ).toContain("Context window 500 tokens used");
   });
 
   it("clamps progress widths and changes color above ninety percent", () => {
-    const negative = render({ usedPercentage: -5 });
+    const negative = render({ contextWindowUsage: usage({ usedPercentage: -5 }) });
     expect(negative).toContain("width:0%");
     expect(negative).toContain("var(--color-blue-500)");
 
-    const overloaded = render({ usedPercentage: 105 });
+    const overloaded = render({ contextWindowUsage: usage({ usedPercentage: 105 }) });
     expect(overloaded).toContain("width:100%");
     expect(overloaded).toContain("var(--color-red-500)");
     expect(overloaded).toContain('aria-valuenow="100"');
 
-    expect(render({ usedPercentage: null, maxTokens: 1_000 })).toContain("width:0%");
+    expect(
+      render({ contextWindowUsage: usage({ usedPercentage: null, maxTokens: 1_000 }) }),
+    ).toContain("width:0%");
   });
 
   it("shows processed totals only when positive", () => {
-    expect(render({ totalProcessedTokens: 12_500 })).toContain("Total processed");
-    expect(render({ totalProcessedTokens: 12_500 })).toContain("13k");
-    expect(render({ totalProcessedTokens: 0 })).not.toContain("Total processed");
-    expect(render({ totalProcessedTokens: null })).not.toContain("Total processed");
+    expect(render({ contextWindowUsage: usage({ totalProcessedTokens: 12_500 }) })).toContain(
+      "Total processed",
+    );
+    expect(render({ contextWindowUsage: usage({ totalProcessedTokens: 12_500 }) })).toContain(
+      "13k",
+    );
+    expect(render({ contextWindowUsage: usage({ totalProcessedTokens: 0 }) })).not.toContain(
+      "Total processed",
+    );
+    expect(render({ contextWindowUsage: usage({ totalProcessedTokens: null }) })).not.toContain(
+      "Total processed",
+    );
   });
 
   it("renders only measured context fields", () => {
-    const markup = render({ totalProcessedTokens: 12_500 });
+    const markup = render({ contextWindowUsage: usage({ totalProcessedTokens: 12_500 }) });
 
     expect(markup).not.toContain("Free space");
     expect(markup).not.toContain("MCP tools");
@@ -87,17 +151,30 @@ describe("ContextWindowMeter", () => {
   });
 
   it("explains automatic compaction with provider and fallback names", () => {
-    expect(render({ compactsAutomatically: true }, "Codex")).toContain(
-      "Codex automatically compacts",
-    );
-    expect(render({ compactsAutomatically: true }, null)).toContain("It automatically compacts");
-    expect(render({ compactsAutomatically: false }, "Codex")).not.toContain(
-      "automatically compacts",
-    );
+    expect(
+      render({
+        contextWindowUsage: usage({ compactsAutomatically: true }),
+        providerDisplayName: "Codex",
+      }),
+    ).toContain("Codex automatically compacts");
+    expect(
+      render({
+        contextWindowUsage: usage({ compactsAutomatically: true }),
+        providerDisplayName: null,
+      }),
+    ).toContain("It automatically compacts");
+    expect(
+      render({
+        contextWindowUsage: usage({ compactsAutomatically: false }),
+        providerDisplayName: "Codex",
+      }),
+    ).not.toContain("automatically compacts");
   });
 
   it("omits progress details when no maximum is known", () => {
-    const markup = render({ maxTokens: null, usedPercentage: null, usedTokens: 1_250 });
+    const markup = render({
+      contextWindowUsage: usage({ maxTokens: null, usedPercentage: null, usedTokens: 1_250 }),
+    });
     expect(markup).toContain("1.3k");
     expect(markup).not.toContain('role="progressbar"');
 
@@ -109,6 +186,6 @@ describe("ContextWindowMeter", () => {
         return reads === 3 ? null : 1_000;
       },
     });
-    renderToStaticMarkup(<ContextWindowMeter usage={changingUsage} />);
+    renderToStaticMarkup(<ContextWindowMeter supported usage={changingUsage} />);
   });
 });
