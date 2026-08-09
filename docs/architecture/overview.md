@@ -39,9 +39,14 @@ flowchart TB
   orchestration, providers, terminals, Git, files, diagnostics, relay access,
   and process supervision. Its worktree catalog joins bounded live Git and
   filesystem observations with durable project and canonical-thread
-  projections. Catalog entries use latest-value snapshots, retain the last
-  authoritative arrays through degraded observations, and stop polling after
-  their final subscriber before bounded idle eviction.
+  projections. A nullable project repository-key pin is established only by a
+  trusted primary-checkout scan and fences later fallback anchors; it is not a
+  persisted live catalog. Projects sharing a repository may share Git
+  observation, but retain isolated latest-value snapshots, streams, thread
+  joins, subscribers, suppressions, and mutation epochs. Catalog views retain
+  the last authoritative arrays through degraded observations and cancel
+  pending poll, Git, and probe work after their final subscriber before bounded
+  idle eviction.
 - **Contracts (`packages/contracts`)** contains Effect schemas and TypeScript
   contracts only. It defines persisted models, RPC methods, HTTP APIs, desktop
   bridge values, and provider events without application runtime logic.

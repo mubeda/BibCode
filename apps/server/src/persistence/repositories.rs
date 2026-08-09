@@ -233,23 +233,61 @@ impl Repositories {
     pub async fn upsert_project(&self, row: ProjectionProject) -> Result<()> {
         self.database.call(move |connection| {
             connection.execute(
-                "INSERT INTO projection_projects (project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, created_at, updated_at, deleted_at) \
-                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+                "INSERT INTO projection_projects (project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, worktree_repository_key, created_at, updated_at, deleted_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                  ON CONFLICT (project_id) DO UPDATE SET \
                    title=excluded.title, workspace_root=excluded.workspace_root, \
                    default_model_selection_json=excluded.default_model_selection_json, scripts_json=excluded.scripts_json, worktree_discovery_json=excluded.worktree_discovery_json, \
                    created_at=excluded.created_at, updated_at=excluded.updated_at, deleted_at=excluded.deleted_at",
-                params![row.project_id, row.title, row.workspace_root, optional_json(&row.default_model_selection)?, encode_json(&row.scripts)?, encode_json(&row.worktree_discovery)?, row.created_at, row.updated_at, row.deleted_at],
+                params![row.project_id, row.title, row.workspace_root, optional_json(&row.default_model_selection)?, encode_json(&row.scripts)?, encode_json(&row.worktree_discovery)?, row.worktree_repository_key, row.created_at, row.updated_at, row.deleted_at],
             )?; Ok(())
         }).await
     }
 
     pub async fn get_project(&self, project_id: String) -> Result<Option<ProjectionProject>> {
-        self.database.call(move |connection| connection.query_row("SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, created_at, updated_at, deleted_at FROM projection_projects WHERE project_id = ?", [project_id], decode_project).optional().map_err(Into::into)).await
+        self.database.call(move |connection| connection.query_row("SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, worktree_repository_key, created_at, updated_at, deleted_at FROM projection_projects WHERE project_id = ?", [project_id], decode_project).optional().map_err(Into::into)).await
     }
 
     pub async fn list_projects(&self) -> Result<Vec<ProjectionProject>> {
-        self.database.call(|connection| collect(connection, "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, created_at, updated_at, deleted_at FROM projection_projects ORDER BY created_at ASC, project_id ASC", [], decode_project)).await
+        self.database.call(|connection| collect(connection, "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, worktree_repository_key, created_at, updated_at, deleted_at FROM projection_projects ORDER BY created_at ASC, project_id ASC", [], decode_project)).await
+    }
+
+    /// Establishes the durable repository identity exactly once and then compares only.
+    pub async fn pin_project_worktree_repository_key(
+        &self,
+        project_id: String,
+        repository_key: String,
+    ) -> Result<Option<WorktreeRepositoryPinOutcome>> {
+        self.database
+            .call(move |connection| {
+                let updated = connection.execute(
+                    "UPDATE projection_projects SET worktree_repository_key = ? WHERE project_id = ? AND worktree_repository_key IS NULL",
+                    params![repository_key, project_id],
+                )?;
+                let pinned = connection
+                    .query_row(
+                        "SELECT worktree_repository_key FROM projection_projects WHERE project_id = ?",
+                        [&project_id],
+                        |row| row.get::<_, Option<String>>(0),
+                    )
+                    .optional()?;
+                let Some(pinned) = pinned else {
+                    return Ok(None);
+                };
+                let Some(pinned_repository_key) = pinned else {
+                    return Ok(None);
+                };
+                if updated == 1 {
+                    Ok(Some(WorktreeRepositoryPinOutcome::Established))
+                } else if pinned_repository_key == repository_key {
+                    Ok(Some(WorktreeRepositoryPinOutcome::Matched))
+                } else {
+                    Ok(Some(WorktreeRepositoryPinOutcome::Mismatch {
+                        pinned_repository_key,
+                    }))
+                }
+            })
+            .await
     }
 
     pub async fn delete_project(&self, project_id: String) -> Result<()> {
@@ -318,7 +356,7 @@ impl Repositories {
             .call(move |connection| {
                 let Some(project) = connection
                     .query_row(
-                        "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, created_at, updated_at, deleted_at FROM projection_projects WHERE project_id = ?",
+                        "SELECT project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, worktree_repository_key, created_at, updated_at, deleted_at FROM projection_projects WHERE project_id = ?",
                         [&project_id],
                         decode_project,
                     )
@@ -1004,9 +1042,17 @@ pub struct ProjectionProject {
     pub default_model_selection: Option<Value>,
     pub scripts: Value,
     pub worktree_discovery: Value,
+    pub worktree_repository_key: Option<String>,
     pub created_at: Timestamp,
     pub updated_at: Timestamp,
     pub deleted_at: Option<Timestamp>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum WorktreeRepositoryPinOutcome {
+    Established,
+    Matched,
+    Mismatch { pinned_repository_key: String },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct ProjectionThread {
@@ -1314,9 +1360,10 @@ fn decode_project(row: &Row<'_>) -> rusqlite::Result<ProjectionProject> {
         default_model_selection: decode_optional_json(row.get(3)?, "default_model_selection_json")?,
         scripts: decode_json(row.get(4)?, "scripts_json")?,
         worktree_discovery: decode_json(row.get(5)?, "worktree_discovery_json")?,
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
-        deleted_at: row.get(8)?,
+        worktree_repository_key: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
+        deleted_at: row.get(9)?,
     })
 }
 fn decode_thread(row: &Row<'_>) -> rusqlite::Result<ProjectionThread> {

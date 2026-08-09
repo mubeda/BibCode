@@ -4,7 +4,7 @@
 
 **Goal:** Discover Git worktrees created outside BiBCode, let the user adopt them as ordinary workspace threads, preserve adopted rows as actionable warnings when their directories disappear, and require an explicit detach-only versus destructive-removal choice.
 
-**Architecture:** Implement the approved server-owned Worktree Catalog described in [`docs/superpowers/specs/2026-08-09-external-worktree-discovery-and-adoption-design.md`](../specs/2026-08-09-external-worktree-discovery-and-adoption-design.md). Git and filesystem probes remain live truth; orchestration threads remain durable adoption truth; project metadata persists only discovery policy. The catalog publishes server-resolved worktree descriptors and adopted-workspace availability so clients never normalize or compare host paths. Dedicated application RPCs validate opaque keys and generations, serialize adoption/removal per physical project, and reuse the existing thread, provider, terminal, workspace, and Git boundaries.
+**Architecture:** Implement the approved server-owned Worktree Catalog described in [`docs/superpowers/specs/2026-08-09-external-worktree-discovery-and-adoption-design.md`](../specs/2026-08-09-external-worktree-discovery-and-adoption-design.md). Git and filesystem probes remain live truth; orchestration threads remain durable adoption truth; project metadata persists discovery policy plus a nullable repository-identity trust pin used only for fencing anchors. The catalog publishes server-resolved worktree descriptors and adopted-workspace availability so clients never normalize or compare host paths. Dedicated application RPCs validate opaque keys and generations, serialize adoption/removal per physical repository, and reuse the existing thread, provider, terminal, workspace, and Git boundaries.
 
 **Tech Stack:** Rust, Tokio, Axum WebSocket RPC, SQLite/rusqlite, Effect Schema, TypeScript, Effect Atom/Stream, React, Vite+, Tauri 2, Git CLI.
 
@@ -20,6 +20,9 @@
 - A degraded scan retains the last authoritative descriptor and availability set. Only an authoritative Git-list absence may create `missing-unregistered`, and only a `NotFound` probe of a still-registered path may create `missing-registered`.
 - Use these initial bounds and keep them named in one Rust options struct: 512 worktree records, 512 baseline paths, four concurrent repository scans, eight concurrent path probes, a one-second probe timeout, a two-second shallow poll interval, a one-second result TTL, a 60-second idle-entry TTL, and exponential failed-scan retry capped at 30 seconds.
 - Use `tokio::sync::watch` for latest-value catalog publication and per-repository single-flight refresh. Do not queue an unbounded history of snapshots.
+- Keep every project's joined snapshot, `watch` stream, subscribers, suppression state, and mutation epoch isolated even when multiple projects share one canonical repository observation.
+- Persist the nullable repository trust pin only after an authoritative primary-checkout scan. Every fallback anchor must match it; never infer or replace repository identity from directory existence or a fallback scan.
+- Subscriber reservation and idle eviction must be atomic and cancellation-safe. Final unsubscribe cancels pending poll sleeps, shallow signatures, Git scans, and directory probes without later publication.
 - Use a per-physical-project mutation lock for policy changes, adoption, and removal. Bulk adoption runs at concurrency four within one execution environment and never crosses environment boundaries in one server operation.
 - A BiBCode-created worktree may be suppressed from discovery for at most 30 seconds while its normal thread is created. If thread creation fails, the worktree becomes a candidate after that bounded grace period.
 - Adoption must not run `git worktree add`, switch branches, or invoke `runOnWorktreeCreate` scripts.
@@ -316,6 +319,9 @@ git commit -m "feat(git): inspect registered worktrees strictly"
 - Create: `apps/server/src/worktree_catalog/tests.rs`
 - Modify: `apps/server/src/lib.rs`
 - Modify: `apps/server/src/persistence/repositories.rs`
+- Modify: `apps/server/src/persistence/migrations.rs`
+- Modify: `apps/server/tests/repositories.rs`
+- Modify: `apps/server/tests/persistence_compat.rs`
 - Create: `apps/server/tests/worktree_catalog.rs`
 
 **Interfaces:**
@@ -348,7 +354,21 @@ impl WorktreeCatalogService {
 }
 ```
 
-The internal registry key is the canonical common Git directory key, while a project-to-repository alias map lets a subscription start from `projectId`. Snapshot joins follow these rules:
+Migration 41, named `ProjectionProjectWorktreeRepositoryKey`, adds nullable
+`projection_projects.worktree_repository_key`. It is an identity/fencing pin,
+not cached live-worktree truth. A legacy null pin is established atomically
+only from an authoritative primary-checkout scan and is preserved by all
+ordinary projection writes. Once pinned, every primary, adopted, or
+lifetime-common-directory anchor must resolve to the same key. A same-repository
+adopted anchor may recover on cold start; a replacement repository at an old
+path must remain unavailable and must never re-pin the project.
+
+The internal runtime has project-specific catalog views plus repository
+observations keyed by canonical common-Git identity. A project-to-repository
+alias map lets a subscription start from `projectId`; projects sharing a
+repository may coalesce Git observation but never share joined snapshots,
+streams, thread IDs, subscriber counts, suppressions, or mutation epochs.
+Snapshot joins follow these rules:
 
 - active and archived non-panel, non-deleted threads count as adopted;
 - panel threads never claim a worktree;
@@ -365,6 +385,8 @@ Use a fake inventory source, fake probe, paused Tokio time, and a configurable s
 
 - anchor preference is primary, then present adopted worktree, then lifetime common directory;
 - first subscribers share one scan;
+- projects sharing a repository receive isolated initial and concurrent
+  publications while sharing only Git observation;
 - four repositories scan concurrently while a fifth waits;
 - probes never exceed eight and time out to `unknown`;
 - mutation epoch rejects a stale in-flight result;
@@ -372,6 +394,13 @@ Use a fake inventory source, fake probe, paused Tokio time, and a configurable s
 - polling inspects only common-Git shallow metadata and known paths;
 - a failed scan retains authoritative data;
 - final unsubscription cancels polling and evicts after 60 seconds;
+- aborting subscribe at every await point releases its guarded reservation;
+- attachment at the idle deadline cannot join an evicted entry;
+- final unsubscribe interrupts pending shallow signature, Git, and probe work
+  and prevents a later publication;
+- a physical-repository mutation lock remains serialized across aliased
+  projects and project-view eviction;
+- coalesced callers receive the same explicit ownership-conflict result;
 - managed creation suppression expires after 30 seconds;
 - server joins active, archived, panel, deleted, missing, and conflicting threads correctly.
 
@@ -385,11 +414,18 @@ Expected before implementation: the service does not exist.
 
 - [ ] **Step 2: Implement model, registry, single-flight, and publication**
 
-Use `watch::Sender<Arc<WorktreeCatalogSnapshot>>`, a global `Semaphore`, one per-entry refresh mutex, a per-entry mutation epoch, and cancellation tokens owned by the entry. Store only the last authoritative snapshot, current scan status, shallow signature, subscriber count, suppression map, and task handles.
+Use `watch::Sender<Arc<WorktreeCatalogSnapshot>>`, a global `Semaphore`, a
+per-project-view refresh mutex and mutation epoch, a per-repository observation
+mutex, and cancellation tokens owned by their lifetimes. Use an RAII subscriber
+reservation and atomic registry/view validation. Repository observations and
+physical mutation locks may use weak registry slots, but a held or awaited lock
+must retain strong ownership. Store only the last authoritative snapshot,
+current scan status, last coalesced result, shallow signature, subscriber
+count, suppression map, and task handles for each project view.
 
 - [ ] **Step 3: Implement anchor resolution and directory probing**
 
-Use `tokio::fs::metadata` behind a one-second timeout. Only `ErrorKind::NotFound` becomes missing. Permission, I/O, and timeout become unknown. Canonicalize only present registered paths after common-directory membership is established.
+Use `tokio::fs::metadata` behind a one-second timeout. Only `ErrorKind::NotFound` becomes missing. Permission, I/O, and timeout become unknown. Canonicalize only present registered paths after common-directory membership is established. On a legacy null pin, require the primary anchor and persist its key only after the scan succeeds. On a pinned project, reject every mismatched primary, adopted, or lifetime anchor before joining or publishing.
 
 - [ ] **Step 4: Add failing real-repository integration tests**
 
@@ -415,7 +451,7 @@ cargo test -p bibcode-server --test worktree_catalog -- --nocapture
 - [ ] **Step 7: Commit the catalog service**
 
 ```sh
-git add apps/server/src/worktree_catalog apps/server/src/lib.rs apps/server/src/persistence/repositories.rs apps/server/tests/worktree_catalog.rs
+git add apps/server/src/worktree_catalog apps/server/src/lib.rs apps/server/src/persistence/migrations.rs apps/server/src/persistence/repositories.rs apps/server/src/production/orchestration_effects.rs apps/server/tests/repositories.rs apps/server/tests/persistence_compat.rs apps/server/tests/worktree_catalog.rs docs/superpowers/specs/2026-08-09-external-worktree-discovery-and-adoption-design.md docs/superpowers/plans/2026-08-09-external-worktree-discovery-and-adoption.md
 git commit -m "feat(server): add authoritative worktree catalog"
 ```
 

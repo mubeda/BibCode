@@ -3,12 +3,12 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::Duration,
 };
 
-use tokio::sync::Semaphore;
+use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
 use crate::git::{GitWorktreeInventory, GitWorktreeRecord};
@@ -117,6 +117,185 @@ async fn concurrent_first_subscribers_share_one_bootstrap_scan() {
         .expect("second subscriber");
     assert_eq!(inventory.calls.load(Ordering::SeqCst), 1);
     assert_eq!(first.latest().generation, second.latest().generation);
+}
+
+#[tokio::test]
+async fn projects_sharing_one_repository_receive_only_their_own_joined_threads() {
+    let inventory = Arc::new(FakeInventorySource::new((0..2).map(|_| {
+        inventory(
+            "/repo/common",
+            [
+                record("/repo/main", true),
+                record("/repo/a", false),
+                record("/repo/b", false),
+            ],
+        )
+    })));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([
+            project("project-a", "/repo/main", [thread("thread-a", "/repo/a")]),
+            project("project-b", "/repo/main", [thread("thread-b", "/repo/b")]),
+        ])),
+        inventory,
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/a", DirectoryProbeState::Present),
+            ("/repo/b", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+
+    let project_a = service.subscribe("project-a").await.expect("project A");
+    let project_b = service.subscribe("project-b").await.expect("project B");
+
+    assert_eq!(
+        project_a
+            .latest()
+            .adopted_workspaces
+            .iter()
+            .map(|workspace| workspace.thread_id.as_str())
+            .collect::<Vec<_>>(),
+        ["thread-a"]
+    );
+    assert_eq!(
+        project_b
+            .latest()
+            .adopted_workspaces
+            .iter()
+            .map(|workspace| workspace.thread_id.as_str())
+            .collect::<Vec<_>>(),
+        ["thread-b"]
+    );
+    assert_eq!(
+        project_a.latest().repository_key,
+        project_b.latest().repository_key
+    );
+}
+
+#[tokio::test]
+async fn concurrent_same_repository_refreshes_share_observation_without_crossing_streams() {
+    let inventory = Arc::new(PausingAfterTwoInventorySource::new(inventory(
+        "/repo/common",
+        [
+            record("/repo/main", true),
+            record("/repo/a", false),
+            record("/repo/b", false),
+        ],
+    )));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([
+            project("project-a", "/repo/main", [thread("thread-a", "/repo/a")]),
+            project("project-b", "/repo/main", [thread("thread-b", "/repo/b")]),
+        ])),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/a", DirectoryProbeState::Present),
+            ("/repo/b", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+    let project_a = service.subscribe("project-a").await.expect("project A");
+    let project_b = service.subscribe("project-b").await.expect("project B");
+    let refresh_a = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .refresh("project-a", CatalogRefreshTrigger::Explicit)
+                .await
+        })
+    };
+    let refresh_b = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .refresh("project-b", CatalogRefreshTrigger::Explicit)
+                .await
+        })
+    };
+    wait_for_count(&inventory.calls, 3).await;
+    inventory.release.add_permits(1);
+
+    let refreshed_a = refresh_a.await.expect("A task").expect("A refresh");
+    let refreshed_b = refresh_b.await.expect("B task").expect("B refresh");
+    assert_eq!(inventory.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(refreshed_a.adopted_workspaces[0].thread_id, "thread-a");
+    assert_eq!(refreshed_b.adopted_workspaces[0].thread_id, "thread-b");
+    assert_eq!(
+        project_a.latest().adopted_workspaces[0].thread_id,
+        "thread-a"
+    );
+    assert_eq!(
+        project_b.latest().adopted_workspaces[0].thread_id,
+        "thread-b"
+    );
+}
+
+#[tokio::test]
+async fn detached_project_stops_waiting_while_an_aliased_project_keeps_shared_observation_alive() {
+    let inventory = Arc::new(PausingAfterTwoInventorySource::new(inventory(
+        "/repo/common",
+        [record("/repo/main", true)],
+    )));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([
+            project("project-a", "/repo/main", []),
+            project("project-b", "/repo/main", []),
+        ])),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+    let project_a = service.subscribe("project-a").await.expect("project A");
+    let _project_b = service.subscribe("project-b").await.expect("project B");
+    let refresh_b = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .refresh("project-b", CatalogRefreshTrigger::Explicit)
+                .await
+        })
+    };
+    wait_for_count(&inventory.calls, 3).await;
+    let refresh_a = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .refresh("project-a", CatalogRefreshTrigger::Explicit)
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+
+    drop(project_a);
+    for _ in 0..100 {
+        if refresh_a.is_finished() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        refresh_a.is_finished(),
+        "detached view must stop waiting for the shared observation"
+    );
+    let error = refresh_a
+        .await
+        .expect("A refresh task")
+        .expect_err("detached A refresh is cancelled");
+    assert_eq!(
+        error.reason,
+        super::CatalogErrorReason::RepositoryUnavailable
+    );
+    assert_eq!(inventory.calls.load(Ordering::SeqCst), 3);
+    assert!(!refresh_b.is_finished());
+
+    inventory.release.add_permits(1);
+    refresh_b.await.expect("B task").expect("B refresh");
 }
 
 #[tokio::test]
@@ -488,6 +667,68 @@ async fn joins_active_archived_panel_deleted_missing_and_conflicting_threads_on_
 }
 
 #[tokio::test]
+async fn concurrent_refresh_waiters_receive_the_same_ownership_conflict() {
+    let projections = Arc::new(FakeProjectionSource::new([project(
+        "project-1",
+        "/repo/main",
+        [thread("owner", "/repo/external")],
+    )]));
+    let inventory = Arc::new(PausingSecondInventorySource::new(inventory(
+        "/repo/common",
+        [record("/repo/main", true), record("/repo/external", false)],
+    )));
+    let service = WorktreeCatalogService::with_dependencies(
+        projections.clone(),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/external", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+    let _subscription = service.subscribe("project-1").await.expect("subscription");
+    projections.set_project(project(
+        "project-1",
+        "/repo/main",
+        [
+            thread("owner", "/repo/external"),
+            thread("conflict", "/repo/external"),
+        ],
+    ));
+
+    let first = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .refresh("project-1", CatalogRefreshTrigger::Explicit)
+                .await
+        })
+    };
+    wait_for_count(&inventory.calls, 2).await;
+    let second = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .refresh("project-1", CatalogRefreshTrigger::Explicit)
+                .await
+        })
+    };
+    tokio::task::yield_now().await;
+    inventory.release.add_permits(1);
+
+    let first = first
+        .await
+        .expect("first refresh task")
+        .expect_err("first refresh must report the ownership conflict");
+    let second = second
+        .await
+        .expect("second refresh task")
+        .expect_err("coalesced refresh must report the same ownership conflict");
+    assert_eq!(second, first);
+}
+
+#[tokio::test]
 async fn filesystem_probe_only_reports_directories_as_present() {
     let root = tempfile::tempdir().expect("probe fixture");
     let directory = root.path().join("directory");
@@ -560,6 +801,294 @@ async fn polling_reads_only_shallow_common_git_metadata_and_known_paths_then_sto
     assert_eq!(service.entry_count_for_test(), 0);
 }
 
+#[tokio::test(start_paused = true)]
+async fn final_unsubscribe_interrupts_an_in_progress_shallow_signature() {
+    let filesystem = Arc::new(BlockingAfterFirstShallowFileSystem::new([
+        ("/repo/main", DirectoryProbeState::Present),
+        ("/repo/common", DirectoryProbeState::Present),
+    ]));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        Arc::new(FakeInventorySource::new([inventory(
+            "/repo/common",
+            [record("/repo/main", true)],
+        )])),
+        filesystem.clone(),
+        CatalogServiceOptions::default(),
+    );
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(2)).await;
+    wait_for_count(&filesystem.active, 1).await;
+    drop(subscription);
+    wait_for_count(&filesystem.interrupted, 1).await;
+
+    assert_eq!(service.active_poller_count_for_test(), 0);
+    assert_eq!(filesystem.active.load(Ordering::SeqCst), 0);
+    assert_eq!(filesystem.calls.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test]
+async fn final_unsubscribe_cancels_in_progress_git_without_publishing_a_result() {
+    let inventory = Arc::new(CancellationAwareInventorySource::new(inventory(
+        "/repo/common",
+        [record("/repo/main", true)],
+    )));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+    let refresh = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .refresh("project-1", CatalogRefreshTrigger::Explicit)
+                .await
+        })
+    };
+    wait_for_count(&inventory.calls, 2).await;
+
+    drop(subscription);
+    wait_for_count(&inventory.cancellations, 1).await;
+    let error = refresh
+        .await
+        .expect("refresh task")
+        .expect_err("cancelled refresh must not publish a result");
+
+    assert_eq!(
+        error.reason,
+        super::CatalogErrorReason::RepositoryUnavailable
+    );
+    assert_eq!(
+        service
+            .latest("project-1")
+            .await
+            .expect("latest")
+            .generation,
+        1
+    );
+
+    let recovered = service
+        .subscribe("project-1")
+        .await
+        .expect("a later subscriber restarts cancelled work");
+    assert!(recovered.latest().authoritative);
+    assert_eq!(recovered.latest().generation, 2);
+}
+
+#[tokio::test]
+async fn final_unsubscribe_interrupts_in_progress_directory_probes() {
+    let filesystem = Arc::new(SwitchableBlockingProbeFileSystem::new([
+        ("/repo/main", DirectoryProbeState::Present),
+        ("/repo/external", DirectoryProbeState::Present),
+        ("/repo/common", DirectoryProbeState::Present),
+    ]));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        Arc::new(FakeInventorySource::new((0..2).map(|_| {
+            inventory(
+                "/repo/common",
+                [record("/repo/main", true), record("/repo/external", false)],
+            )
+        }))),
+        filesystem.clone(),
+        CatalogServiceOptions::default(),
+    );
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+    filesystem.block.store(true, Ordering::SeqCst);
+    let refresh = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .refresh("project-1", CatalogRefreshTrigger::Explicit)
+                .await
+        })
+    };
+    wait_for_count(&filesystem.active, 1).await;
+
+    drop(subscription);
+    wait_for_count(&filesystem.interrupted, 1).await;
+    let error = refresh
+        .await
+        .expect("refresh task")
+        .expect_err("cancelled probes must not publish a result");
+
+    assert_eq!(
+        error.reason,
+        super::CatalogErrorReason::RepositoryUnavailable
+    );
+    assert_eq!(filesystem.active.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        service
+            .latest("project-1")
+            .await
+            .expect("latest")
+            .generation,
+        1
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn aborting_subscription_during_poller_initialization_releases_its_reservation() {
+    let filesystem = Arc::new(BlockingShallowFileSystem::new([
+        ("/repo/main", DirectoryProbeState::Present),
+        ("/repo/common", DirectoryProbeState::Present),
+    ]));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        Arc::new(FakeInventorySource::new([inventory(
+            "/repo/common",
+            [record("/repo/main", true)],
+        )])),
+        filesystem.clone(),
+        CatalogServiceOptions::default(),
+    );
+    let subscribing = {
+        let service = service.clone();
+        tokio::spawn(async move { service.subscribe("project-1").await })
+    };
+    wait_for_count(&filesystem.shallow_calls, 1).await;
+
+    subscribing.abort();
+    match subscribing.await {
+        Err(error) => assert!(error.is_cancelled()),
+        Ok(_) => panic!("subscription task must be aborted"),
+    }
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::task::yield_now().await;
+
+    assert_eq!(service.active_poller_count_for_test(), 0);
+    assert_eq!(service.entry_count_for_test(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn subscriber_attachment_at_the_idle_deadline_cannot_join_an_evicted_entry() {
+    let filesystem = Arc::new(BlockingAfterFirstShallowFileSystem::new([
+        ("/repo/main", DirectoryProbeState::Present),
+        ("/repo/common", DirectoryProbeState::Present),
+    ]));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        Arc::new(FakeInventorySource::new([inventory(
+            "/repo/common",
+            [record("/repo/main", true)],
+        )])),
+        filesystem.clone(),
+        CatalogServiceOptions::default(),
+    );
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+    drop(subscription);
+    tokio::time::advance(Duration::from_secs(59)).await;
+
+    let attaching = {
+        let service = service.clone();
+        tokio::spawn(async move { service.subscribe("project-1").await })
+    };
+    wait_for_count(&filesystem.active, 1).await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(service.entry_count_for_test(), 1);
+
+    attaching.abort();
+    match attaching.await {
+        Err(error) => assert!(error.is_cancelled()),
+        Ok(_) => panic!("attachment task must be aborted"),
+    }
+    wait_for_count(&filesystem.interrupted, 1).await;
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(service.entry_count_for_test(), 0);
+}
+
+#[tokio::test(start_paused = true)]
+async fn mutation_lock_survives_view_eviction_and_serializes_same_repository_projects() {
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([
+            project("project-a", "/repo/main", []),
+            project("project-b", "/repo/main", []),
+        ])),
+        Arc::new(FakeInventorySource::new((0..2).map(|_| {
+            inventory("/repo/common", [record("/repo/main", true)])
+        }))),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+    let project_a = service.subscribe("project-a").await.expect("project A");
+    let project_b = service.subscribe("project-b").await.expect("project B");
+    drop(project_a);
+    drop(project_b);
+
+    let first_entered = Arc::new(Notify::new());
+    let release_first = Arc::new(Notify::new());
+    let first = {
+        let service = service.clone();
+        let first_entered = Arc::clone(&first_entered);
+        let release_first = Arc::clone(&release_first);
+        tokio::spawn(async move {
+            service
+                .with_project_mutation_lock("project-a", || async move {
+                    first_entered.notify_one();
+                    release_first.notified().await;
+                })
+                .await;
+        })
+    };
+    first_entered.notified().await;
+    tokio::time::advance(Duration::from_secs(60)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(service.entry_count_for_test(), 0);
+
+    let second_entered = Arc::new(AtomicUsize::new(0));
+    let second = {
+        let service = service.clone();
+        let second_entered = Arc::clone(&second_entered);
+        tokio::spawn(async move {
+            service
+                .with_project_mutation_lock("project-b", || async move {
+                    second_entered.fetch_add(1, Ordering::SeqCst);
+                })
+                .await;
+        })
+    };
+    tokio::task::yield_now().await;
+    assert_eq!(second_entered.load(Ordering::SeqCst), 0);
+
+    release_first.notify_one();
+    first.await.expect("first mutation task");
+    second.await.expect("second mutation task");
+    assert_eq!(second_entered.load(Ordering::SeqCst), 1);
+}
+
 #[derive(Clone)]
 struct FakeProjectionSource {
     projects: Arc<Mutex<HashMap<String, CatalogProject>>>,
@@ -592,6 +1121,33 @@ impl CatalogProjectionSource for FakeProjectionSource {
             .get(&project_id)
             .cloned();
         Box::pin(async move { Ok(project) })
+    }
+
+    fn pin_repository_key(
+        &self,
+        project_id: String,
+        repository_key: String,
+    ) -> CatalogFuture<Result<Option<super::service::CatalogPinOutcome>, super::CatalogError>> {
+        let projects = Arc::clone(&self.projects);
+        Box::pin(async move {
+            let mut projects = projects.lock().expect("fake projects");
+            let Some(project) = projects.get_mut(&project_id) else {
+                return Ok(None);
+            };
+            let outcome = match project.repository_key.as_deref() {
+                None => {
+                    project.repository_key = Some(repository_key);
+                    super::service::CatalogPinOutcome::Established
+                }
+                Some(pinned) if pinned == repository_key => {
+                    super::service::CatalogPinOutcome::Matched
+                }
+                Some(pinned) => super::service::CatalogPinOutcome::Mismatch {
+                    pinned_repository_key: pinned.to_owned(),
+                },
+            };
+            Ok(Some(outcome))
+        })
     }
 }
 
@@ -693,6 +1249,45 @@ struct BlockingInventorySource {
     release: Arc<Semaphore>,
 }
 
+struct CancellationAwareInventorySource {
+    response: GitWorktreeInventory,
+    calls: Arc<AtomicUsize>,
+    cancellations: Arc<AtomicUsize>,
+}
+
+impl CancellationAwareInventorySource {
+    fn new(response: GitWorktreeInventory) -> Self {
+        Self {
+            response,
+            calls: Arc::new(AtomicUsize::new(0)),
+            cancellations: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl InventorySource for CancellationAwareInventorySource {
+    fn inventory(
+        &self,
+        _anchor: PathBuf,
+        cancellation: CancellationToken,
+    ) -> CatalogFuture<Result<GitWorktreeInventory, ScanFailure>> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let response = self.response.clone();
+        let cancellations = Arc::clone(&self.cancellations);
+        Box::pin(async move {
+            if call != 2 {
+                return Ok(response);
+            }
+            cancellation.cancelled().await;
+            cancellations.fetch_add(1, Ordering::SeqCst);
+            Err(ScanFailure {
+                reason: super::CatalogDegradedReason::GitFailed,
+                message: "inventory cancelled".to_owned(),
+            })
+        })
+    }
+}
+
 impl BlockingInventorySource {
     fn new(response: GitWorktreeInventory) -> Self {
         Self {
@@ -778,6 +1373,174 @@ struct BlockingProbeFileSystem {
     max_active: Arc<AtomicUsize>,
 }
 
+struct BlockingShallowFileSystem {
+    states: HashMap<PathBuf, DirectoryProbeState>,
+    shallow_calls: Arc<AtomicUsize>,
+}
+
+struct BlockingAfterFirstShallowFileSystem {
+    states: HashMap<PathBuf, DirectoryProbeState>,
+    calls: Arc<AtomicUsize>,
+    active: Arc<AtomicUsize>,
+    interrupted: Arc<AtomicUsize>,
+}
+
+impl BlockingAfterFirstShallowFileSystem {
+    fn new(states: impl IntoIterator<Item = (&'static str, DirectoryProbeState)>) -> Self {
+        Self {
+            states: states
+                .into_iter()
+                .map(|(path, state)| (PathBuf::from(path), state))
+                .collect(),
+            calls: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
+            interrupted: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+struct PendingOperationGuard {
+    active: Arc<AtomicUsize>,
+    interrupted: Arc<AtomicUsize>,
+}
+
+impl PendingOperationGuard {
+    fn new(active: Arc<AtomicUsize>, interrupted: Arc<AtomicUsize>) -> Self {
+        active.fetch_add(1, Ordering::SeqCst);
+        Self {
+            active,
+            interrupted,
+        }
+    }
+}
+
+impl Drop for PendingOperationGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+        self.interrupted.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+impl BlockingShallowFileSystem {
+    fn new(states: impl IntoIterator<Item = (&'static str, DirectoryProbeState)>) -> Self {
+        Self {
+            states: states
+                .into_iter()
+                .map(|(path, state)| (PathBuf::from(path), state))
+                .collect(),
+            shallow_calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl CatalogFileSystem for BlockingShallowFileSystem {
+    fn probe(&self, path: PathBuf) -> CatalogFuture<DirectoryProbeState> {
+        let state = self
+            .states
+            .get(&path)
+            .copied()
+            .unwrap_or(DirectoryProbeState::Missing);
+        Box::pin(async move { state })
+    }
+
+    fn canonicalize(&self, path: PathBuf) -> CatalogFuture<Result<PathBuf, std::io::Error>> {
+        Box::pin(async move { Ok(path) })
+    }
+
+    fn shallow_signature(
+        &self,
+        _common_dir: PathBuf,
+        _known_paths: Vec<PathBuf>,
+    ) -> CatalogFuture<CatalogShallowSignature> {
+        self.shallow_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(std::future::pending())
+    }
+}
+
+impl CatalogFileSystem for BlockingAfterFirstShallowFileSystem {
+    fn probe(&self, path: PathBuf) -> CatalogFuture<DirectoryProbeState> {
+        let state = self
+            .states
+            .get(&path)
+            .copied()
+            .unwrap_or(DirectoryProbeState::Missing);
+        Box::pin(async move { state })
+    }
+
+    fn canonicalize(&self, path: PathBuf) -> CatalogFuture<Result<PathBuf, std::io::Error>> {
+        Box::pin(async move { Ok(path) })
+    }
+
+    fn shallow_signature(
+        &self,
+        _common_dir: PathBuf,
+        _known_paths: Vec<PathBuf>,
+    ) -> CatalogFuture<CatalogShallowSignature> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        if call == 1 {
+            return Box::pin(async { CatalogShallowSignature::default() });
+        }
+        let active = Arc::clone(&self.active);
+        let interrupted = Arc::clone(&self.interrupted);
+        Box::pin(async move {
+            let _guard = PendingOperationGuard::new(active, interrupted);
+            std::future::pending().await
+        })
+    }
+}
+
+struct SwitchableBlockingProbeFileSystem {
+    states: HashMap<PathBuf, DirectoryProbeState>,
+    block: AtomicBool,
+    active: Arc<AtomicUsize>,
+    interrupted: Arc<AtomicUsize>,
+}
+
+impl SwitchableBlockingProbeFileSystem {
+    fn new(states: impl IntoIterator<Item = (&'static str, DirectoryProbeState)>) -> Self {
+        Self {
+            states: states
+                .into_iter()
+                .map(|(path, state)| (PathBuf::from(path), state))
+                .collect(),
+            block: AtomicBool::new(false),
+            active: Arc::new(AtomicUsize::new(0)),
+            interrupted: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl CatalogFileSystem for SwitchableBlockingProbeFileSystem {
+    fn probe(&self, path: PathBuf) -> CatalogFuture<DirectoryProbeState> {
+        let state = self
+            .states
+            .get(&path)
+            .copied()
+            .unwrap_or(DirectoryProbeState::Missing);
+        if !self.block.load(Ordering::SeqCst) || path == Path::new("/repo/main") {
+            return Box::pin(async move { state });
+        }
+        let active = Arc::clone(&self.active);
+        let interrupted = Arc::clone(&self.interrupted);
+        Box::pin(async move {
+            let _guard = PendingOperationGuard::new(active, interrupted);
+            std::future::pending().await
+        })
+    }
+
+    fn canonicalize(&self, path: PathBuf) -> CatalogFuture<Result<PathBuf, std::io::Error>> {
+        Box::pin(async move { Ok(path) })
+    }
+
+    fn shallow_signature(
+        &self,
+        _common_dir: PathBuf,
+        _known_paths: Vec<PathBuf>,
+    ) -> CatalogFuture<CatalogShallowSignature> {
+        Box::pin(async { CatalogShallowSignature::default() })
+    }
+}
+
 impl CatalogFileSystem for BlockingProbeFileSystem {
     fn probe(&self, path: PathBuf) -> CatalogFuture<DirectoryProbeState> {
         let active = Arc::clone(&self.active);
@@ -811,6 +1574,44 @@ struct PausingSecondInventorySource {
     response: GitWorktreeInventory,
     calls: Arc<AtomicUsize>,
     release: Arc<Semaphore>,
+}
+
+struct PausingAfterTwoInventorySource {
+    response: GitWorktreeInventory,
+    calls: Arc<AtomicUsize>,
+    release: Arc<Semaphore>,
+}
+
+impl PausingAfterTwoInventorySource {
+    fn new(response: GitWorktreeInventory) -> Self {
+        Self {
+            response,
+            calls: Arc::new(AtomicUsize::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+        }
+    }
+}
+
+impl InventorySource for PausingAfterTwoInventorySource {
+    fn inventory(
+        &self,
+        _anchor: PathBuf,
+        _cancellation: CancellationToken,
+    ) -> CatalogFuture<Result<GitWorktreeInventory, ScanFailure>> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let response = self.response.clone();
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            if call > 2 {
+                release
+                    .acquire()
+                    .await
+                    .expect("shared scan release")
+                    .forget();
+            }
+            Ok(response)
+        })
+    }
 }
 
 impl PausingSecondInventorySource {
@@ -895,6 +1696,7 @@ fn project(
             workspace_root: PathBuf::from(workspace_root),
             baseline_paths: Vec::new(),
             threads: threads.into_iter().collect(),
+            repository_key: None,
         },
     )
 }

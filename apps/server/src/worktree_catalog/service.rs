@@ -4,7 +4,7 @@ use std::{
     hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
     pin::Pin,
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Mutex, MutexGuard, Weak},
     time::Duration,
 };
 
@@ -22,7 +22,7 @@ use crate::{
         GitRepository, GitWorktreeInventory, HostPathPlatform, normalize_worktree_path_key,
         worktree_key, worktree_repository_key,
     },
-    persistence::{ProjectionThread, Repositories},
+    persistence::{ProjectionThread, Repositories, WorktreeRepositoryPinOutcome},
 };
 
 use super::model::{
@@ -39,6 +39,11 @@ pub(crate) trait CatalogProjectionSource: Send + Sync {
         &self,
         project_id: String,
     ) -> CatalogFuture<Result<Option<CatalogProject>, CatalogError>>;
+    fn pin_repository_key(
+        &self,
+        project_id: String,
+        repository_key: String,
+    ) -> CatalogFuture<Result<Option<CatalogPinOutcome>, CatalogError>>;
 }
 
 pub(crate) trait InventorySource: Send + Sync {
@@ -64,6 +69,14 @@ pub(crate) struct CatalogProject {
     pub workspace_root: PathBuf,
     pub baseline_paths: Vec<String>,
     pub threads: Vec<CatalogThread>,
+    pub repository_key: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum CatalogPinOutcome {
+    Established,
+    Matched,
+    Mismatch { pinned_repository_key: String },
 }
 
 #[derive(Clone, Debug)]
@@ -145,15 +158,40 @@ struct Inner {
 struct Registry {
     aliases: HashMap<String, String>,
     entries: HashMap<String, Arc<CatalogEntry>>,
+    repositories: HashMap<String, Weak<RepositoryEntry>>,
     bootstrap_locks: HashMap<String, Arc<AsyncMutex<()>>>,
-    mutation_locks: HashMap<String, Arc<AsyncMutex<()>>>,
+    mutation_locks: HashMap<String, Weak<AsyncMutex<()>>>,
 }
 
 struct CatalogEntry {
-    repository_key: String,
-    common_dir: PathBuf,
+    project_id: String,
+    repository: Arc<RepositoryEntry>,
     refresh_lock: AsyncMutex<()>,
     state: Mutex<EntryState>,
+}
+
+struct RepositoryEntry {
+    common_dir: PathBuf,
+    observation_lock: AsyncMutex<()>,
+    state: Mutex<RepositoryState>,
+}
+
+struct RepositoryState {
+    completed_observations: u64,
+    last_result: Option<Result<Arc<CompletedObservation>, ScanError>>,
+    subscribers: usize,
+    scan_cancellation: CancellationToken,
+}
+
+impl Default for RepositoryState {
+    fn default() -> Self {
+        Self {
+            completed_observations: 0,
+            last_result: None,
+            subscribers: 0,
+            scan_cancellation: CancellationToken::new(),
+        }
+    }
 }
 
 struct EntryState {
@@ -162,6 +200,7 @@ struct EntryState {
     sender: watch::Sender<Arc<WorktreeCatalogSnapshot>>,
     completed_at: Option<Instant>,
     completed_refreshes: u64,
+    last_refresh_result: Option<Result<Arc<WorktreeCatalogSnapshot>, CatalogError>>,
     mutation_epoch: u64,
     subscribers: usize,
     suppressions: HashMap<String, Instant>,
@@ -180,6 +219,14 @@ pub struct CatalogSubscription {
     released: bool,
 }
 
+struct SubscriptionReservation {
+    receiver: Option<watch::Receiver<Arc<WorktreeCatalogSnapshot>>>,
+    service: WorktreeCatalogService,
+    entry: Arc<CatalogEntry>,
+    first_subscriber: bool,
+    committed: bool,
+}
+
 struct OwnedTask {
     cancellation: CancellationToken,
     _handle: JoinHandle<()>,
@@ -191,14 +238,16 @@ impl Drop for OwnedTask {
     }
 }
 
+#[derive(Clone)]
 enum ScanError {
     Failure(ScanFailure),
     Catalog(CatalogError),
+    Cancelled,
 }
 
-enum ProjectLockKind {
-    Bootstrap,
-    Mutation,
+struct CatalogAnchor {
+    path: PathBuf,
+    is_primary: bool,
 }
 
 impl From<CatalogError> for ScanError {
@@ -240,35 +289,58 @@ impl WorktreeCatalogService {
     }
 
     pub async fn subscribe(&self, project_id: &str) -> Result<CatalogSubscription, CatalogError> {
-        let entry = self.ensure_entry(project_id).await?;
-        let (receiver, first_subscriber) = {
-            let mut state = lock(&entry.state);
-            if let Some(eviction) = state.eviction.take() {
-                eviction.cancellation.cancel();
+        let mut reservation = loop {
+            let entry = self.ensure_entry(project_id).await?;
+            if let Some(reservation) = self.reserve_subscription(project_id, entry) {
+                break reservation;
             }
-            let first_subscriber = state.subscribers == 0;
-            if first_subscriber && state.scan_cancellation.is_cancelled() {
-                state.scan_cancellation = CancellationToken::new();
-            }
-            state.subscribers += 1;
-            (state.sender.subscribe(), first_subscriber)
         };
-        if first_subscriber {
-            self.initialize_signature_and_start_poller(project_id, &entry)
+        if reservation.first_subscriber {
+            self.initialize_signature_and_start_poller(project_id, &reservation.entry)
                 .await;
-            if let Err(error) = self
-                .refresh(project_id, CatalogRefreshTrigger::FirstSubscriber)
-                .await
-            {
-                self.release(&entry);
-                return Err(error);
-            }
+            self.refresh(project_id, CatalogRefreshTrigger::FirstSubscriber)
+                .await?;
         }
-        Ok(CatalogSubscription {
-            receiver,
+        Ok(reservation.commit())
+    }
+
+    fn reserve_subscription(
+        &self,
+        project_id: &str,
+        entry: Arc<CatalogEntry>,
+    ) -> Option<SubscriptionReservation> {
+        let registry = lock(&self.inner.registry);
+        if !registry
+            .entries
+            .get(project_id)
+            .is_some_and(|candidate| Arc::ptr_eq(candidate, &entry))
+        {
+            return None;
+        }
+        let mut state = lock(&entry.state);
+        if let Some(eviction) = state.eviction.take() {
+            eviction.cancellation.cancel();
+        }
+        let first_subscriber = state.subscribers == 0;
+        if first_subscriber && state.scan_cancellation.is_cancelled() {
+            state.scan_cancellation = CancellationToken::new();
+        }
+        state.subscribers += 1;
+        let mut repository_state = lock(&entry.repository.state);
+        if repository_state.subscribers == 0 && repository_state.scan_cancellation.is_cancelled() {
+            repository_state.scan_cancellation = CancellationToken::new();
+        }
+        repository_state.subscribers += 1;
+        let receiver = state.sender.subscribe();
+        drop(repository_state);
+        drop(state);
+        drop(registry);
+        Some(SubscriptionReservation {
+            receiver: Some(receiver),
             service: self.clone(),
             entry,
-            released: false,
+            first_subscriber,
+            committed: false,
         })
     }
 
@@ -279,12 +351,30 @@ impl WorktreeCatalogService {
     ) -> Result<Arc<WorktreeCatalogSnapshot>, CatalogError> {
         let entry = self.ensure_entry(project_id).await?;
         let requested_at = Instant::now();
-        let completed_refreshes = lock(&entry.state).completed_refreshes;
-        let _guard = entry.refresh_lock.lock().await;
+        let (completed_refreshes, cancellation, subscriber_owned) = {
+            let state = lock(&entry.state);
+            let subscriber_owned = state.subscribers != 0;
+            let cancellation = if subscriber_owned {
+                state.scan_cancellation.clone()
+            } else {
+                CancellationToken::new()
+            };
+            (state.completed_refreshes, cancellation, subscriber_owned)
+        };
+        let guard = tokio::select! {
+            _ = cancellation.cancelled() => return Err(cancelled_error()),
+            guard = entry.refresh_lock.lock() => guard,
+        };
+        let _guard = guard;
         {
             let state = lock(&entry.state);
             if state.completed_refreshes != completed_refreshes {
-                return Ok(Arc::clone(&state.snapshot));
+                return state.last_refresh_result.clone().unwrap_or_else(|| {
+                    Err(CatalogError::new(
+                        CatalogErrorReason::Internal,
+                        "A coalesced catalog refresh completed without a result.",
+                    ))
+                });
             }
             if matches!(
                 trigger,
@@ -296,7 +386,10 @@ impl WorktreeCatalogService {
             }
         }
         let project = self.load_project(project_id).await?;
-        let (epoch, next_generation, suppressions, previous, scan_cancellation) = {
+        if cancellation.is_cancelled() {
+            return Err(cancelled_error());
+        }
+        let (epoch, next_generation, suppressions, previous) = {
             let mut state = lock(&entry.state);
             let now = Instant::now();
             state.suppressions.retain(|_, created_at| {
@@ -313,52 +406,81 @@ impl WorktreeCatalogService {
                 state.last_authoritative.generation + 1,
                 state.suppressions.keys().cloned().collect::<HashSet<_>>(),
                 Arc::clone(&state.last_authoritative),
-                if state.subscribers > 0 {
-                    state.scan_cancellation.clone()
-                } else {
-                    CancellationToken::new()
-                },
             )
         };
-        let Some(anchor) = self.select_anchor(&project, Some(&entry.common_dir)).await else {
-            return self.publish_failure(
-                &entry,
-                epoch,
-                ScanFailure {
-                    reason: CatalogDegradedReason::AnchorUnavailable,
-                    message: "No reachable Git catalog anchor is available.".to_owned(),
-                },
-            );
+        let anchor = match self
+            .select_anchor(&project, Some(&entry.repository.common_dir), &cancellation)
+            .await
+        {
+            Ok(Some(anchor)) => anchor,
+            Ok(None) => {
+                return self.publish_failure(
+                    &entry,
+                    epoch,
+                    ScanFailure {
+                        reason: CatalogDegradedReason::AnchorUnavailable,
+                        message: "No reachable Git catalog anchor is available.".to_owned(),
+                    },
+                );
+            }
+            Err(error) => return self.finish_scan_error(&entry, epoch, error),
         };
-        let scan = self
-            .scan(
+        let observation = self
+            .observe_repository(
+                &entry.repository,
+                anchor.path.clone(),
+                project.repository_key.as_deref(),
+                &cancellation,
+            )
+            .await;
+        let observation = match observation {
+            Ok(observation) => observation,
+            Err(error) => return self.finish_scan_error(&entry, epoch, error),
+        };
+        if cancellation.is_cancelled() {
+            return self.finish_cancelled(&entry, epoch);
+        }
+        if let Err(error) = self
+            .verify_or_establish_repository_key(
+                project_id,
                 &project,
-                anchor,
-                ScanRequest {
-                    expected_repository_key: Some(entry.repository_key.as_str()),
-                    generation: next_generation,
-                    previous: Some(&previous),
-                    suppressions: &suppressions,
-                    cancellation: scan_cancellation,
-                },
+                &anchor,
+                &observation.repository_key,
             )
-            .await;
-        let scan = match scan {
-            Ok(scan) => scan,
-            Err(ScanError::Failure(failure)) => {
-                return self.publish_failure(&entry, epoch, failure);
-            }
-            Err(ScanError::Catalog(error)) => {
-                self.restore_after_catalog_error(&entry, epoch);
-                return Err(error);
-            }
+            .await
+        {
+            self.restore_after_catalog_error(&entry, epoch, &error);
+            return Err(error);
+        }
+        let snapshot = match self
+            .snapshot_from_observation(
+                &project,
+                &observation,
+                next_generation,
+                Some(&previous),
+                &suppressions,
+                &cancellation,
+            )
+            .await
+        {
+            Ok(snapshot) => snapshot,
+            Err(error) => return self.finish_scan_error(&entry, epoch, error),
         };
-        let snapshot = scan.snapshot;
-        let signature = self
-            .signature_for_snapshot(&entry.common_dir, &snapshot)
-            .await;
+        let Some(signature) = self
+            .signature_for_snapshot(&entry.repository.common_dir, &snapshot, &cancellation)
+            .await
+        else {
+            return self.finish_cancelled(&entry, epoch);
+        };
         {
             let mut state = lock(&entry.state);
+            if subscriber_owned && (state.subscribers == 0 || cancellation.is_cancelled()) {
+                let error = cancelled_error();
+                state.completed_at = None;
+                state.completed_refreshes = state.completed_refreshes.wrapping_add(1);
+                state.last_refresh_result = Some(Err(error.clone()));
+                return Err(error);
+            }
             if state.mutation_epoch != epoch {
                 return Err(CatalogError::new(
                     CatalogErrorReason::StaleGeneration,
@@ -369,6 +491,7 @@ impl WorktreeCatalogService {
             state.last_authoritative = Arc::clone(&snapshot);
             state.completed_at = Some(Instant::now());
             state.completed_refreshes = state.completed_refreshes.wrapping_add(1);
+            state.last_refresh_result = Some(Ok(Arc::clone(&snapshot)));
             state.shallow_signature = Some(signature);
             state.failure_backoff = Duration::ZERO;
             state.next_failure_retry = None;
@@ -421,20 +544,32 @@ impl WorktreeCatalogService {
         F: FnOnce() -> Fut,
         Fut: Future<Output = T>,
     {
+        let lock_key = self
+            .load_project(project_id)
+            .await
+            .ok()
+            .and_then(|project| project.repository_key)
+            .or_else(|| lock(&self.inner.registry).aliases.get(project_id).cloned())
+            .unwrap_or_else(|| format!("unresolved-project:{project_id}"));
         let mutation_lock = {
             let mut registry = lock(&self.inner.registry);
-            Arc::clone(
-                registry
-                    .mutation_locks
-                    .entry(project_id.to_owned())
-                    .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
-            )
+            registry
+                .mutation_locks
+                .retain(|_, mutation_lock| mutation_lock.strong_count() > 0);
+            registry
+                .mutation_locks
+                .get(&lock_key)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| {
+                    let mutation_lock = Arc::new(AsyncMutex::new(()));
+                    registry
+                        .mutation_locks
+                        .insert(lock_key, Arc::downgrade(&mutation_lock));
+                    mutation_lock
+                })
         };
-        let guard = mutation_lock.lock().await;
-        let result = operation().await;
-        drop(guard);
-        self.remove_project_lock_if_idle(project_id, &mutation_lock, ProjectLockKind::Mutation);
-        result
+        let _guard = mutation_lock.lock().await;
+        operation().await
     }
 
     async fn ensure_entry(&self, project_id: &str) -> Result<Arc<CatalogEntry>, CatalogError> {
@@ -453,66 +588,89 @@ impl WorktreeCatalogService {
         let guard = bootstrap_lock.lock().await;
         if let Some(entry) = self.entry_for_project(project_id) {
             drop(guard);
-            self.remove_project_lock_if_idle(
-                project_id,
-                &bootstrap_lock,
-                ProjectLockKind::Bootstrap,
-            );
+            self.remove_bootstrap_lock_if_idle(project_id, &bootstrap_lock);
             return Ok(entry);
         }
         let result = async {
             let project = self.load_project(project_id).await?;
-            let anchor = self.select_anchor(&project, None).await.ok_or_else(|| {
-                CatalogError::new(
-                    CatalogErrorReason::RepositoryUnavailable,
-                    "No reachable Git catalog anchor is available.",
-                )
-            })?;
+            let cancellation = CancellationToken::new();
+            let anchor = self
+                .select_anchor(&project, None, &cancellation)
+                .await
+                .map_err(scan_error_for_bootstrap)?
+                .ok_or_else(|| {
+                    CatalogError::new(
+                        CatalogErrorReason::RepositoryUnavailable,
+                        "No reachable Git catalog anchor is available.",
+                    )
+                })?;
             let suppressions = HashSet::new();
             let scan = self
                 .scan(
                     &project,
-                    anchor,
+                    anchor.path.clone(),
                     ScanRequest {
-                        expected_repository_key: None,
+                        expected_repository_key: project.repository_key.as_deref(),
                         generation: 1,
                         previous: None,
                         suppressions: &suppressions,
-                        cancellation: CancellationToken::new(),
+                        cancellation,
                     },
                 )
                 .await
                 .map_err(scan_error_for_bootstrap)?;
+            self.verify_or_establish_repository_key(
+                project_id,
+                &project,
+                &anchor,
+                &scan.repository_key,
+            )
+            .await?;
             let mut registry = lock(&self.inner.registry);
-            let entry = Arc::clone(
-                registry
-                    .entries
-                    .entry(scan.repository_key.clone())
-                    .or_insert_with(|| {
-                        let (sender, _) = watch::channel(Arc::clone(&scan.snapshot));
-                        Arc::new(CatalogEntry {
-                            repository_key: scan.repository_key.clone(),
-                            common_dir: scan.common_dir.clone(),
-                            refresh_lock: AsyncMutex::new(()),
-                            state: Mutex::new(EntryState {
-                                snapshot: Arc::clone(&scan.snapshot),
-                                last_authoritative: Arc::clone(&scan.snapshot),
-                                sender,
-                                completed_at: Some(Instant::now()),
-                                completed_refreshes: 0,
-                                mutation_epoch: 0,
-                                subscribers: 0,
-                                suppressions: HashMap::new(),
-                                shallow_signature: None,
-                                poller: None,
-                                eviction: None,
-                                failure_backoff: Duration::ZERO,
-                                next_failure_retry: None,
-                                scan_cancellation: CancellationToken::new(),
-                            }),
-                        })
-                    }),
-            );
+            registry
+                .repositories
+                .retain(|_, repository| repository.strong_count() > 0);
+            let repository = registry
+                .repositories
+                .get(&scan.repository_key)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| {
+                    let repository = Arc::new(RepositoryEntry {
+                        common_dir: scan.common_dir.clone(),
+                        observation_lock: AsyncMutex::new(()),
+                        state: Mutex::new(RepositoryState::default()),
+                    });
+                    registry
+                        .repositories
+                        .insert(scan.repository_key.clone(), Arc::downgrade(&repository));
+                    repository
+                });
+            let (sender, _) = watch::channel(Arc::clone(&scan.snapshot));
+            let entry = Arc::new(CatalogEntry {
+                project_id: project_id.to_owned(),
+                repository,
+                refresh_lock: AsyncMutex::new(()),
+                state: Mutex::new(EntryState {
+                    snapshot: Arc::clone(&scan.snapshot),
+                    last_authoritative: Arc::clone(&scan.snapshot),
+                    sender,
+                    completed_at: Some(Instant::now()),
+                    completed_refreshes: 0,
+                    last_refresh_result: None,
+                    mutation_epoch: 0,
+                    subscribers: 0,
+                    suppressions: HashMap::new(),
+                    shallow_signature: None,
+                    poller: None,
+                    eviction: None,
+                    failure_backoff: Duration::ZERO,
+                    next_failure_retry: None,
+                    scan_cancellation: CancellationToken::new(),
+                }),
+            });
+            registry
+                .entries
+                .insert(project_id.to_owned(), Arc::clone(&entry));
             registry
                 .aliases
                 .insert(project_id.to_owned(), scan.repository_key);
@@ -520,7 +678,7 @@ impl WorktreeCatalogService {
         }
         .await;
         drop(guard);
-        self.remove_project_lock_if_idle(project_id, &bootstrap_lock, ProjectLockKind::Bootstrap);
+        self.remove_bootstrap_lock_if_idle(project_id, &bootstrap_lock);
         result
     }
 
@@ -545,17 +703,9 @@ impl WorktreeCatalogService {
         Ok(project)
     }
 
-    fn remove_project_lock_if_idle(
-        &self,
-        project_id: &str,
-        project_lock: &Arc<AsyncMutex<()>>,
-        kind: ProjectLockKind,
-    ) {
+    fn remove_bootstrap_lock_if_idle(&self, project_id: &str, project_lock: &Arc<AsyncMutex<()>>) {
         let mut registry = lock(&self.inner.registry);
-        let locks = match kind {
-            ProjectLockKind::Bootstrap => &mut registry.bootstrap_locks,
-            ProjectLockKind::Mutation => &mut registry.mutation_locks,
-        };
+        let locks = &mut registry.bootstrap_locks;
         if locks
             .get(project_id)
             .is_some_and(|candidate| Arc::ptr_eq(candidate, project_lock))
@@ -569,24 +719,78 @@ impl WorktreeCatalogService {
         &self,
         project: &CatalogProject,
         lifetime_common_dir: Option<&Path>,
-    ) -> Option<PathBuf> {
-        if self.probe(&project.workspace_root).await == DirectoryProbeState::Present {
-            return Some(project.workspace_root.clone());
+        cancellation: &CancellationToken,
+    ) -> Result<Option<CatalogAnchor>, ScanError> {
+        if self.probe(&project.workspace_root, cancellation).await? == DirectoryProbeState::Present
+        {
+            return Ok(Some(CatalogAnchor {
+                path: project.workspace_root.clone(),
+                is_primary: true,
+            }));
+        }
+        if project.repository_key.is_none() {
+            return Ok(None);
         }
         for thread in canonical_threads(project) {
             let Some(path) = &thread.worktree_path else {
                 continue;
             };
-            if self.probe(path).await == DirectoryProbeState::Present {
-                return Some(path.clone());
+            if self.probe(path, cancellation).await? == DirectoryProbeState::Present {
+                return Ok(Some(CatalogAnchor {
+                    path: path.clone(),
+                    is_primary: false,
+                }));
             }
         }
         if let Some(common_dir) = lifetime_common_dir
-            && self.probe(common_dir).await == DirectoryProbeState::Present
+            && self.probe(common_dir, cancellation).await? == DirectoryProbeState::Present
         {
-            return Some(common_dir.to_path_buf());
+            return Ok(Some(CatalogAnchor {
+                path: common_dir.to_path_buf(),
+                is_primary: false,
+            }));
         }
-        None
+        Ok(None)
+    }
+
+    async fn verify_or_establish_repository_key(
+        &self,
+        project_id: &str,
+        project: &CatalogProject,
+        anchor: &CatalogAnchor,
+        observed_repository_key: &str,
+    ) -> Result<(), CatalogError> {
+        if let Some(pinned_repository_key) = project.repository_key.as_deref() {
+            if pinned_repository_key == observed_repository_key {
+                return Ok(());
+            }
+            return Err(CatalogError::new(
+                CatalogErrorReason::RepositoryUnavailable,
+                "The scan anchor does not match the project's durable repository identity.",
+            ));
+        }
+        if !anchor.is_primary {
+            return Err(CatalogError::new(
+                CatalogErrorReason::RepositoryUnavailable,
+                "An unpinned project requires its primary checkout to establish repository identity.",
+            ));
+        }
+        match self
+            .inner
+            .projections
+            .pin_repository_key(project_id.to_owned(), observed_repository_key.to_owned())
+            .await?
+        {
+            Some(CatalogPinOutcome::Established | CatalogPinOutcome::Matched) => Ok(()),
+            Some(CatalogPinOutcome::Mismatch { .. }) => Err(CatalogError::new(
+                CatalogErrorReason::RepositoryUnavailable,
+                "The authoritative primary scan raced with a different durable repository identity.",
+            )),
+            None => Err(CatalogError::new(
+                CatalogErrorReason::ProjectNotFound,
+                format!("Project '{project_id}' was not found while pinning repository identity."),
+            )),
+        }
     }
 
     async fn scan(
@@ -602,34 +806,66 @@ impl WorktreeCatalogService {
             suppressions,
             cancellation,
         } = request;
-        let _permit = self.inner.scan_semaphore.acquire().await.map_err(|_| {
+        let observation = self
+            .observe(anchor, expected_repository_key, cancellation.clone())
+            .await?;
+        let snapshot = self
+            .snapshot_from_observation(
+                project,
+                &observation,
+                generation,
+                previous,
+                suppressions,
+                &cancellation,
+            )
+            .await?;
+        Ok(CompletedScan {
+            repository_key: observation.repository_key.clone(),
+            common_dir: observation.common_dir.clone(),
+            snapshot,
+        })
+    }
+
+    async fn observe(
+        &self,
+        anchor: PathBuf,
+        expected_repository_key: Option<&str>,
+        cancellation: CancellationToken,
+    ) -> Result<CompletedObservation, ScanError> {
+        let permit = tokio::select! {
+            _ = cancellation.cancelled() => return Err(ScanError::Cancelled),
+            permit = self.inner.scan_semaphore.acquire() => permit,
+        };
+        let _permit = permit.map_err(|_| {
             CatalogError::new(CatalogErrorReason::Internal, "Catalog is shutting down.")
         })?;
-        let inventory = self
+        let inventory_result = self
             .inner
             .inventory
-            .inventory(anchor, cancellation)
-            .await
-            .map_err(ScanError::Failure)?;
+            .inventory(anchor, cancellation.clone())
+            .await;
+        if cancellation.is_cancelled() {
+            return Err(ScanError::Cancelled);
+        }
+        let inventory = inventory_result.map_err(ScanError::Failure)?;
         if inventory.records.len() > self.inner.options.max_worktrees {
             return Err(ScanError::Failure(ScanFailure {
                 reason: CatalogDegradedReason::OutputLimit,
                 message: "Git reported more than 512 worktrees.".to_owned(),
             }));
         }
-        let common_dir = self
-            .inner
-            .filesystem
-            .canonicalize(inventory.common_dir.clone())
-            .await
-            .map_err(|error| {
-                ScanError::Failure(ScanFailure {
-                    reason: CatalogDegradedReason::AnchorUnavailable,
-                    message: bounded_message(format!(
-                        "The common Git directory could not be canonicalized: {error}"
-                    )),
-                })
-            })?;
+        let canonicalization = tokio::select! {
+            _ = cancellation.cancelled() => return Err(ScanError::Cancelled),
+            result = self.inner.filesystem.canonicalize(inventory.common_dir.clone()) => result,
+        };
+        let common_dir = canonicalization.map_err(|error| {
+            ScanError::Failure(ScanFailure {
+                reason: CatalogDegradedReason::AnchorUnavailable,
+                message: bounded_message(format!(
+                    "The common Git directory could not be canonicalized: {error}"
+                )),
+            })
+        })?;
         let platform = host_platform();
         let repository_key = worktree_repository_key(&common_dir, platform)
             .as_str()
@@ -640,25 +876,82 @@ impl WorktreeCatalogService {
                 "The scan anchor resolved to a different Git repository.",
             )));
         }
-        let snapshot = Arc::new(
+        Ok(CompletedObservation {
+            repository_key,
+            common_dir,
+            inventory,
+        })
+    }
+
+    async fn snapshot_from_observation(
+        &self,
+        project: &CatalogProject,
+        observation: &CompletedObservation,
+        generation: u64,
+        previous: Option<&WorktreeCatalogSnapshot>,
+        suppressions: &HashSet<String>,
+        cancellation: &CancellationToken,
+    ) -> Result<Arc<WorktreeCatalogSnapshot>, ScanError> {
+        Ok(Arc::new(
             self.join_snapshot(
                 project,
-                &inventory,
+                &observation.inventory,
                 SnapshotJoin {
-                    common_dir: &common_dir,
-                    repository_key: repository_key.clone(),
+                    common_dir: &observation.common_dir,
+                    repository_key: observation.repository_key.clone(),
                     generation,
                     previous,
                     suppressions,
+                    cancellation,
                 },
             )
             .await?,
-        );
-        Ok(CompletedScan {
-            repository_key,
-            common_dir,
-            snapshot,
-        })
+        ))
+    }
+
+    async fn observe_repository(
+        &self,
+        repository: &RepositoryEntry,
+        anchor: PathBuf,
+        expected_repository_key: Option<&str>,
+        caller_cancellation: &CancellationToken,
+    ) -> Result<Arc<CompletedObservation>, ScanError> {
+        let completed_observations = lock(&repository.state).completed_observations;
+        let guard = tokio::select! {
+            _ = caller_cancellation.cancelled() => return Err(ScanError::Cancelled),
+            guard = repository.observation_lock.lock() => guard,
+        };
+        let _guard = guard;
+        if caller_cancellation.is_cancelled() {
+            return Err(ScanError::Cancelled);
+        }
+        {
+            let state = lock(&repository.state);
+            if state.completed_observations != completed_observations {
+                return state.last_result.clone().unwrap_or_else(|| {
+                    Err(ScanError::Catalog(CatalogError::new(
+                        CatalogErrorReason::Internal,
+                        "A shared repository observation completed without a result.",
+                    )))
+                });
+            }
+        }
+        let cancellation = {
+            let state = lock(&repository.state);
+            if state.subscribers == 0 {
+                caller_cancellation.clone()
+            } else {
+                state.scan_cancellation.clone()
+            }
+        };
+        let result = self
+            .observe(anchor, expected_repository_key, cancellation)
+            .await
+            .map(Arc::new);
+        let mut state = lock(&repository.state);
+        state.completed_observations = state.completed_observations.wrapping_add(1);
+        state.last_result = Some(result.clone());
+        result
     }
 
     async fn join_snapshot(
@@ -666,13 +959,14 @@ impl WorktreeCatalogService {
         project: &CatalogProject,
         inventory: &GitWorktreeInventory,
         request: SnapshotJoin<'_>,
-    ) -> Result<WorktreeCatalogSnapshot, CatalogError> {
+    ) -> Result<WorktreeCatalogSnapshot, ScanError> {
         let SnapshotJoin {
             common_dir,
             repository_key,
             generation,
             previous,
             suppressions,
+            cancellation,
         } = request;
         let platform = host_platform();
         let mut thread_paths: HashMap<String, Vec<&CatalogThread>> = HashMap::new();
@@ -693,20 +987,21 @@ impl WorktreeCatalogService {
             .collect::<HashSet<_>>()
         {
             let service = self.clone();
+            let cancellation = cancellation.clone();
             pending_probes.push(async move {
-                let state = service.probe(&path).await;
+                let state = service.probe(&path, &cancellation).await;
                 (path, state)
             });
         }
         let mut directory_probes = HashMap::new();
         while let Some((path, state)) = pending_probes.next().await {
-            directory_probes.insert(path, state);
+            directory_probes.insert(path, state?);
         }
         if thread_paths.values().any(|threads| threads.len() > 1) {
-            return Err(CatalogError::new(
+            return Err(ScanError::Catalog(CatalogError::new(
                 CatalogErrorReason::Internal,
                 "Multiple canonical workspace threads claim the same worktree path.",
-            ));
+            )));
         }
 
         let mut worktrees = Vec::with_capacity(inventory.records.len());
@@ -850,10 +1145,10 @@ impl WorktreeCatalogService {
             adopted_workspaces.push(status);
         }
         if adopted_workspaces.len() > self.inner.options.max_worktrees {
-            return Err(CatalogError::new(
+            return Err(ScanError::Catalog(CatalogError::new(
                 CatalogErrorReason::Internal,
                 "More than 512 adopted workspaces belong to this project.",
-            ));
+            )));
         }
         Ok(WorktreeCatalogSnapshot {
             repository_key,
@@ -866,25 +1161,29 @@ impl WorktreeCatalogService {
         })
     }
 
-    async fn probe(&self, path: &Path) -> DirectoryProbeState {
-        let Ok(_permit) = self.inner.probe_semaphore.acquire().await else {
-            return DirectoryProbeState::Unknown;
+    async fn probe(
+        &self,
+        path: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<DirectoryProbeState, ScanError> {
+        let permit = tokio::select! {
+            _ = cancellation.cancelled() => return Err(ScanError::Cancelled),
+            permit = self.inner.probe_semaphore.acquire() => permit,
         };
-        match tokio::time::timeout(
-            self.inner.options.probe_timeout,
-            self.inner.filesystem.probe(path.to_path_buf()),
-        )
-        .await
-        {
-            Ok(state) => state,
-            Err(_) => DirectoryProbeState::Unknown,
+        let Ok(_permit) = permit else {
+            return Ok(DirectoryProbeState::Unknown);
+        };
+        tokio::select! {
+            _ = cancellation.cancelled() => Err(ScanError::Cancelled),
+            result = tokio::time::timeout(
+                self.inner.options.probe_timeout,
+                self.inner.filesystem.probe(path.to_path_buf()),
+            ) => Ok(result.unwrap_or(DirectoryProbeState::Unknown)),
         }
     }
 
     fn entry_for_project(&self, project_id: &str) -> Option<Arc<CatalogEntry>> {
-        let registry = lock(&self.inner.registry);
-        let key = registry.aliases.get(project_id)?;
-        registry.entries.get(key).cloned()
+        lock(&self.inner.registry).entries.get(project_id).cloned()
     }
 
     fn publish_failure(
@@ -922,11 +1221,12 @@ impl WorktreeCatalogService {
         state.completed_at = Some(Instant::now());
         state.completed_refreshes = state.completed_refreshes.wrapping_add(1);
         state.snapshot = Arc::clone(&snapshot);
+        state.last_refresh_result = Some(Ok(Arc::clone(&snapshot)));
         state.sender.send_replace(Arc::clone(&snapshot));
         Ok(snapshot)
     }
 
-    fn restore_after_catalog_error(&self, entry: &CatalogEntry, epoch: u64) {
+    fn restore_after_catalog_error(&self, entry: &CatalogEntry, epoch: u64, error: &CatalogError) {
         let mut state = lock(&entry.state);
         if state.mutation_epoch != epoch {
             return;
@@ -935,14 +1235,47 @@ impl WorktreeCatalogService {
         state.snapshot = Arc::clone(&restored);
         state.completed_at = Some(Instant::now());
         state.completed_refreshes = state.completed_refreshes.wrapping_add(1);
+        state.last_refresh_result = Some(Err(error.clone()));
         state.sender.send_replace(restored);
+    }
+
+    fn finish_cancelled(
+        &self,
+        entry: &CatalogEntry,
+        epoch: u64,
+    ) -> Result<Arc<WorktreeCatalogSnapshot>, CatalogError> {
+        let error = cancelled_error();
+        let mut state = lock(&entry.state);
+        if state.mutation_epoch == epoch {
+            state.completed_at = None;
+            state.completed_refreshes = state.completed_refreshes.wrapping_add(1);
+            state.last_refresh_result = Some(Err(error.clone()));
+        }
+        Err(error)
+    }
+
+    fn finish_scan_error(
+        &self,
+        entry: &CatalogEntry,
+        epoch: u64,
+        error: ScanError,
+    ) -> Result<Arc<WorktreeCatalogSnapshot>, CatalogError> {
+        match error {
+            ScanError::Failure(failure) => self.publish_failure(entry, epoch, failure),
+            ScanError::Catalog(error) => {
+                self.restore_after_catalog_error(entry, epoch, &error);
+                Err(error)
+            }
+            ScanError::Cancelled => self.finish_cancelled(entry, epoch),
+        }
     }
 
     async fn signature_for_snapshot(
         &self,
         common_dir: &Path,
         snapshot: &WorktreeCatalogSnapshot,
-    ) -> CatalogShallowSignature {
+        cancellation: &CancellationToken,
+    ) -> Option<CatalogShallowSignature> {
         let known_paths = snapshot
             .worktrees
             .iter()
@@ -954,10 +1287,13 @@ impl WorktreeCatalogService {
                     .map(|workspace| PathBuf::from(&workspace.path)),
             )
             .collect();
-        self.inner
-            .filesystem
-            .shallow_signature(common_dir.to_path_buf(), known_paths)
-            .await
+        tokio::select! {
+            _ = cancellation.cancelled() => None,
+            signature = self.inner.filesystem.shallow_signature(
+                common_dir.to_path_buf(),
+                known_paths,
+            ) => Some(signature),
+        }
     }
 
     async fn initialize_signature_and_start_poller(
@@ -965,10 +1301,19 @@ impl WorktreeCatalogService {
         project_id: &str,
         entry: &Arc<CatalogEntry>,
     ) {
-        let snapshot = Arc::clone(&lock(&entry.state).last_authoritative);
-        let signature = self
-            .signature_for_snapshot(&entry.common_dir, &snapshot)
-            .await;
+        let (snapshot, scan_cancellation) = {
+            let state = lock(&entry.state);
+            (
+                Arc::clone(&state.last_authoritative),
+                state.scan_cancellation.clone(),
+            )
+        };
+        let Some(signature) = self
+            .signature_for_snapshot(&entry.repository.common_dir, &snapshot, &scan_cancellation)
+            .await
+        else {
+            return;
+        };
         let cancellation = CancellationToken::new();
         let weak_inner = Arc::downgrade(&self.inner);
         let weak_entry = Arc::downgrade(entry);
@@ -987,9 +1332,16 @@ impl WorktreeCatalogService {
                 };
                 let service = WorktreeCatalogService { inner };
                 let snapshot = Arc::clone(&lock(&entry.state).last_authoritative);
-                let observed = service
-                    .signature_for_snapshot(&entry.common_dir, &snapshot)
-                    .await;
+                let Some(observed) = service
+                    .signature_for_snapshot(
+                        &entry.repository.common_dir,
+                        &snapshot,
+                        &task_cancellation,
+                    )
+                    .await
+                else {
+                    break;
+                };
                 let trigger = {
                     let mut state = lock(&entry.state);
                     let previous = state.shallow_signature.replace(observed);
@@ -1031,15 +1383,22 @@ impl WorktreeCatalogService {
                 return;
             }
             state.subscribers -= 1;
-            if state.subscribers != 0 {
-                return;
+            let final_subscriber = state.subscribers == 0;
+            if final_subscriber {
+                if let Some(poller) = state.poller.take() {
+                    poller.cancellation.cancel();
+                }
+                state.scan_cancellation.cancel();
             }
-            if let Some(poller) = state.poller.take() {
-                poller.cancellation.cancel();
-            }
-            state.scan_cancellation.cancel();
-            true
+            final_subscriber
         };
+        {
+            let mut repository_state = lock(&entry.repository.state);
+            repository_state.subscribers = repository_state.subscribers.saturating_sub(1);
+            if repository_state.subscribers == 0 {
+                repository_state.scan_cancellation.cancel();
+            }
+        }
         if !should_evict {
             return;
         }
@@ -1047,7 +1406,7 @@ impl WorktreeCatalogService {
         let task_cancellation = cancellation.clone();
         let weak_inner = Arc::downgrade(&self.inner);
         let weak_entry = Arc::downgrade(entry);
-        let repository_key = entry.repository_key.clone();
+        let project_id = entry.project_id.clone();
         let idle_eviction = self.inner.options.idle_eviction;
         let handle = tokio::spawn(async move {
             tokio::select! {
@@ -1057,27 +1416,18 @@ impl WorktreeCatalogService {
             let (Some(inner), Some(entry)) = (weak_inner.upgrade(), weak_entry.upgrade()) else {
                 return;
             };
-            if lock(&entry.state).subscribers != 0 {
-                return;
-            }
             let mut registry = lock(&inner.registry);
             if registry
                 .entries
-                .get(&repository_key)
+                .get(&project_id)
                 .is_some_and(|candidate| Arc::ptr_eq(candidate, &entry))
             {
-                registry.entries.remove(&repository_key);
-                let project_ids = registry
-                    .aliases
-                    .iter()
-                    .filter(|(_, key)| *key == &repository_key)
-                    .map(|(project_id, _)| project_id.clone())
-                    .collect::<Vec<_>>();
-                registry.aliases.retain(|_, key| key != &repository_key);
-                for project_id in project_ids {
-                    registry.bootstrap_locks.remove(&project_id);
-                    registry.mutation_locks.remove(&project_id);
+                if lock(&entry.state).subscribers != 0 {
+                    return;
                 }
+                registry.entries.remove(&project_id);
+                registry.aliases.remove(&project_id);
+                registry.bootstrap_locks.remove(&project_id);
             }
         });
         lock(&entry.state).eviction = Some(OwnedTask {
@@ -1098,6 +1448,29 @@ impl WorktreeCatalogService {
     #[cfg(test)]
     pub(crate) fn entry_count_for_test(&self) -> usize {
         lock(&self.inner.registry).entries.len()
+    }
+}
+
+impl SubscriptionReservation {
+    fn commit(&mut self) -> CatalogSubscription {
+        self.committed = true;
+        CatalogSubscription {
+            receiver: self
+                .receiver
+                .take()
+                .expect("subscription receiver reserved"),
+            service: self.service.clone(),
+            entry: Arc::clone(&self.entry),
+            released: false,
+        }
+    }
+}
+
+impl Drop for SubscriptionReservation {
+    fn drop(&mut self) {
+        if !self.committed {
+            self.service.release(&self.entry);
+        }
     }
 }
 
@@ -1128,6 +1501,12 @@ struct CompletedScan {
     snapshot: Arc<WorktreeCatalogSnapshot>,
 }
 
+struct CompletedObservation {
+    repository_key: String,
+    common_dir: PathBuf,
+    inventory: GitWorktreeInventory,
+}
+
 struct ScanRequest<'a> {
     expected_repository_key: Option<&'a str>,
     generation: u64,
@@ -1142,6 +1521,7 @@ struct SnapshotJoin<'a> {
     generation: u64,
     previous: Option<&'a WorktreeCatalogSnapshot>,
     suppressions: &'a HashSet<String>,
+    cancellation: &'a CancellationToken,
 }
 
 fn scan_error_for_bootstrap(error: ScanError) -> CatalogError {
@@ -1150,7 +1530,15 @@ fn scan_error_for_bootstrap(error: ScanError) -> CatalogError {
             CatalogError::new(CatalogErrorReason::RepositoryUnavailable, failure.message)
         }
         ScanError::Catalog(error) => error,
+        ScanError::Cancelled => cancelled_error(),
     }
+}
+
+fn cancelled_error() -> CatalogError {
+    CatalogError::new(
+        CatalogErrorReason::RepositoryUnavailable,
+        "Catalog work was cancelled after its final subscriber detached.",
+    )
 }
 
 fn retained_snapshot(
@@ -1251,7 +1639,33 @@ impl CatalogProjectionSource for RepositoriesProjectionSource {
                 workspace_root: PathBuf::from(project.workspace_root),
                 baseline_paths,
                 threads: projection.threads.into_iter().map(catalog_thread).collect(),
+                repository_key: project.worktree_repository_key,
             }))
+        })
+    }
+
+    fn pin_repository_key(
+        &self,
+        project_id: String,
+        repository_key: String,
+    ) -> CatalogFuture<Result<Option<CatalogPinOutcome>, CatalogError>> {
+        let repositories = Arc::clone(&self.repositories);
+        Box::pin(async move {
+            repositories
+                .pin_project_worktree_repository_key(project_id, repository_key)
+                .await
+                .map_err(persistence_error)
+                .map(|outcome| {
+                    outcome.map(|outcome| match outcome {
+                        WorktreeRepositoryPinOutcome::Established => CatalogPinOutcome::Established,
+                        WorktreeRepositoryPinOutcome::Matched => CatalogPinOutcome::Matched,
+                        WorktreeRepositoryPinOutcome::Mismatch {
+                            pinned_repository_key,
+                        } => CatalogPinOutcome::Mismatch {
+                            pinned_repository_key,
+                        },
+                    })
+                })
         })
     }
 }
