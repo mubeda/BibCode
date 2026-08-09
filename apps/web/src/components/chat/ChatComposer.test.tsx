@@ -1170,6 +1170,7 @@ describe("ChatComposer rendering", () => {
     });
 
     expect(markup).toContain('data-mock="ComposerPendingUserInputPanel"');
+    expect(markup).not.toContain('data-mock="ContextWindowMeter"');
     expect(editorProps()["value"]).toBe("my answer");
     expect(editorProps()["placeholder"]).toBe(
       "Type your own answer, or leave this blank to use the selected option",

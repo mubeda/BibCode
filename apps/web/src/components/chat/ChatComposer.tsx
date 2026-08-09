@@ -365,6 +365,7 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
   activeMcpStatus: McpStatusSnapshot | null;
   activeThreadProviderDisplayName: string | null;
   supportsContextWindowUsage: boolean;
+  showContextWindowMeter: boolean;
   isPreparingWorktree: boolean;
   pendingAction: {
     questionIndex: number;
@@ -412,11 +413,13 @@ const ComposerFooterPrimaryActions = memo(function ComposerFooterPrimaryActions(
         <span className="text-muted-foreground/70 text-xs">Preparing worktree...</span>
       ) : null}
       {props.activeMcpStatus ? <McpStatusPopover snapshot={props.activeMcpStatus} /> : null}
-      <ContextWindowMeter
-        supported={props.supportsContextWindowUsage}
-        usage={props.activeContextWindow}
-        providerDisplayName={props.activeThreadProviderDisplayName}
-      />
+      {props.showContextWindowMeter ? (
+        <ContextWindowMeter
+          supported={props.supportsContextWindowUsage}
+          usage={props.activeContextWindow}
+          providerDisplayName={props.activeThreadProviderDisplayName}
+        />
+      ) : null}
       <ComposerPrimaryActions
         compact={props.compact}
         pendingAction={props.pendingAction}
@@ -2769,6 +2772,7 @@ export const ChatComposer = memo(function ChatComposer(props: ChatComposerProps)
                   activeMcpStatus={activeMcpStatus}
                   activeThreadProviderDisplayName={activeThreadProviderDisplayName}
                   supportsContextWindowUsage={supportsContextWindowUsage}
+                  showContextWindowMeter={pendingUserInputs.length === 0}
                   pendingAction={pendingPrimaryAction}
                   isRunning={phase === "running"}
                   canCancelPendingSend={canCancelPendingSend}
