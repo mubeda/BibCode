@@ -31,9 +31,15 @@ pub(crate) struct ClaudeTokenUsageState {
     total_processed_tokens: Option<u64>,
     max_tokens: Option<u64>,
     last_emitted: Option<ClaudeTokenUsageSnapshot>,
+    active_observed_this_turn: bool,
 }
 
 impl ClaudeTokenUsageState {
+    pub(crate) fn start_turn(&mut self) {
+        self.last_emitted = None;
+        self.active_observed_this_turn = false;
+    }
+
     pub(crate) fn observe_stream_value(
         &mut self,
         value: &Value,
@@ -104,12 +110,12 @@ impl ClaudeTokenUsageState {
             .last_good
             .as_ref()
             .map_or(0, |last_good| last_good.used_tokens);
-        if total_tokens <= current_tokens {
+        if self.active_observed_this_turn && total_tokens <= current_tokens {
             return None;
         }
         self.update_total_processed_tokens(total_tokens);
         self.replace_active(ActiveUsage {
-            used_tokens: total_tokens,
+            used_tokens: total_tokens.max(current_tokens),
             input_tokens: None,
             output_tokens: None,
             last_used_tokens: None,
@@ -152,7 +158,11 @@ impl ClaudeTokenUsageState {
         if let Some(active) = usage.and_then(result_active_usage) {
             return self.replace_active(active);
         }
-        self.refresh_last_good()
+        if self.active_observed_this_turn {
+            self.refresh_last_good()
+        } else {
+            None
+        }
     }
 
     fn replace_active(&mut self, active: ActiveUsage) -> Option<ClaudeTokenUsageSnapshot> {
@@ -185,6 +195,7 @@ impl ClaudeTokenUsageState {
             compacts_automatically,
         };
         self.last_good = Some(snapshot.clone());
+        self.active_observed_this_turn = true;
         self.emit_if_changed(snapshot)
     }
 
@@ -259,6 +270,9 @@ fn usage_output_tokens(usage: &Map<String, Value>) -> u64 {
 }
 
 fn usage_total_tokens(usage: &Map<String, Value>) -> Option<u64> {
+    if !usage_token_fields_are_valid(usage) {
+        return None;
+    }
     if let Some(total_tokens) = positive_integer(usage.get("total_tokens")) {
         return Some(total_tokens);
     }
@@ -267,6 +281,18 @@ fn usage_total_tokens(usage: &Map<String, Value>) -> Option<u64> {
     input_tokens
         .checked_add(output_tokens)
         .filter(|total| *total > 0 && *total <= JAVASCRIPT_MAX_SAFE_INTEGER)
+}
+
+fn usage_token_fields_are_valid(usage: &Map<String, Value>) -> bool {
+    [
+        "total_tokens",
+        "input_tokens",
+        "cache_creation_input_tokens",
+        "cache_read_input_tokens",
+        "output_tokens",
+    ]
+    .into_iter()
+    .all(|field| !usage.contains_key(field) || non_negative_integer(usage.get(field)).is_some())
 }
 
 fn max_model_context_window(value: &Value) -> Option<u64> {
@@ -294,6 +320,9 @@ fn active_usage(usage: &Map<String, Value>) -> Option<ActiveUsage> {
 }
 
 fn result_active_usage(usage: &Map<String, Value>) -> Option<ActiveUsage> {
+    if !usage_token_fields_are_valid(usage) {
+        return None;
+    }
     if let Some(iteration) = usage
         .get("iterations")
         .and_then(Value::as_array)
