@@ -5,7 +5,7 @@ use bibcode_server::persistence::{
     ProjectionPendingTurnStart, ProjectionProject, ProjectionState, ProjectionThread,
     ProjectionThreadActivity, ProjectionThreadMessage, ProjectionThreadProposedPlan,
     ProjectionThreadSession, ProjectionTurnById, ProviderSessionRuntime, Repositories,
-    run_migrations,
+    WorktreeRepositoryPinOutcome, run_migrations,
 };
 use serde::Serialize;
 use serde_json::json;
@@ -54,10 +54,110 @@ fn project(id: &str, created_at: &str) -> ProjectionProject {
             "initialPromptDismissedAt": "2026-08-09T00:00:00.000Z",
             "baselinePaths": ["/workspace/project-a", "/workspace/project-a-feature"]
         }),
+        worktree_repository_key: None,
         created_at: created_at.to_owned(),
         updated_at: created_at.to_owned(),
         deleted_at: None,
     }
+}
+
+#[tokio::test]
+async fn worktree_repository_identity_pin_is_compare_and_set_and_cannot_be_replaced() {
+    let repositories = migrated_repositories().await;
+    repositories
+        .upsert_project(project("project-pin", T0))
+        .await
+        .expect("unpinned project");
+
+    assert_eq!(
+        repositories
+            .pin_project_worktree_repository_key(
+                "project-pin".to_owned(),
+                "repository-key-a".to_owned(),
+            )
+            .await
+            .expect("establish pin"),
+        Some(WorktreeRepositoryPinOutcome::Established)
+    );
+    let mut unrelated_projection_update = project("project-pin", T1);
+    unrelated_projection_update.title = "Updated without identity metadata".to_owned();
+    repositories
+        .upsert_project(unrelated_projection_update)
+        .await
+        .expect("ordinary projection update preserves pin");
+    assert_eq!(
+        repositories
+            .pin_project_worktree_repository_key(
+                "project-pin".to_owned(),
+                "repository-key-a".to_owned(),
+            )
+            .await
+            .expect("match pin"),
+        Some(WorktreeRepositoryPinOutcome::Matched)
+    );
+    assert_eq!(
+        repositories
+            .pin_project_worktree_repository_key(
+                "project-pin".to_owned(),
+                "repository-key-b".to_owned(),
+            )
+            .await
+            .expect("reject replacement pin"),
+        Some(WorktreeRepositoryPinOutcome::Mismatch {
+            pinned_repository_key: "repository-key-a".to_owned(),
+        })
+    );
+    let project = repositories
+        .get_project("project-pin".to_owned())
+        .await
+        .expect("read pinned project")
+        .expect("project exists");
+    assert_eq!(
+        project.worktree_repository_key.as_deref(),
+        Some("repository-key-a")
+    );
+}
+
+#[tokio::test]
+async fn worktree_repository_identity_pin_persists_across_database_restart() {
+    let root = tempfile::tempdir().expect("database directory");
+    let path = root.path().join("catalog.sqlite3");
+    let database = Database::open(&path).await.expect("database opens");
+    database
+        .call(|connection| {
+            run_migrations(connection, None)?;
+            Ok(())
+        })
+        .await
+        .expect("migrations apply");
+    let repositories = Repositories::new(database);
+    repositories
+        .upsert_project(project("project-restart-pin", T0))
+        .await
+        .expect("unpinned project");
+    assert_eq!(
+        repositories
+            .pin_project_worktree_repository_key(
+                "project-restart-pin".to_owned(),
+                "repository-key-durable".to_owned(),
+            )
+            .await
+            .expect("establish pin"),
+        Some(WorktreeRepositoryPinOutcome::Established)
+    );
+    drop(repositories);
+
+    let reopened = Repositories::new(Database::open(&path).await.expect("database reopens"));
+    let project = reopened
+        .get_project("project-restart-pin".to_owned())
+        .await
+        .expect("read project after restart")
+        .expect("project exists after restart");
+
+    assert_eq!(
+        project.worktree_repository_key.as_deref(),
+        Some("repository-key-durable")
+    );
 }
 
 fn thread(id: &str, project_id: &str, created_at: &str) -> ProjectionThread {
@@ -181,6 +281,7 @@ fn public_repository_api_inventory_is_explicit() {
         "list_turns_by_thread",
         "max_event_sequence",
         "min_last_applied_sequence",
+        "pin_project_worktree_repository_key",
         "new",
         "read_events_from_sequence",
         "replace_pending_provider_turn_payload",

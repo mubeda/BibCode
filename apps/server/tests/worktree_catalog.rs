@@ -19,6 +19,131 @@ use tempfile::TempDir;
 const NOW: &str = "2026-08-09T00:00:00.000Z";
 
 #[tokio::test]
+async fn legacy_unpinned_project_is_pinned_by_a_primary_authoritative_scan() {
+    let fixture = RepositoryFixture::new().await;
+    let service = fixture.service();
+
+    let subscription = service
+        .subscribe("project-1")
+        .await
+        .expect("trusted primary catalog");
+    let repository_key = subscription.latest().repository_key.clone();
+    let persisted = fixture
+        .repositories
+        .get_project("project-1".to_owned())
+        .await
+        .expect("read project")
+        .expect("project exists");
+
+    assert_eq!(
+        persisted.worktree_repository_key.as_deref(),
+        Some(repository_key.as_str())
+    );
+}
+
+#[tokio::test]
+async fn pinned_project_restarts_from_a_same_repository_adopted_anchor() {
+    let fixture = RepositoryFixture::new().await;
+    git(
+        &fixture.main,
+        &["worktree", "add", "-b", "feature/restart"],
+        Some(&fixture.external),
+    );
+    fixture
+        .repositories
+        .upsert_thread(workspace_thread(&fixture.external))
+        .await
+        .expect("adopted workspace");
+    let service = fixture.service();
+    let subscription = service.subscribe("project-1").await.expect("initial pin");
+    let repository_key = subscription.latest().repository_key.clone();
+    drop(subscription);
+    drop(service);
+
+    let mut unavailable_primary = project(&fixture.main);
+    unavailable_primary.workspace_root = fixture
+        .root
+        .path()
+        .join("missing-primary")
+        .to_string_lossy()
+        .into_owned();
+    fixture
+        .repositories
+        .upsert_project(unavailable_primary)
+        .await
+        .expect("primary becomes unavailable without clearing the pin");
+
+    let restarted = fixture.service();
+    let restarted_subscription = restarted
+        .subscribe("project-1")
+        .await
+        .expect("pinned adopted cold-start anchor");
+    assert_eq!(
+        restarted_subscription.latest().repository_key,
+        repository_key
+    );
+    assert_eq!(
+        adopted_status(&restarted_subscription.latest(), "thread-external").availability,
+        AdoptedWorktreeAvailability::Present
+    );
+}
+
+#[tokio::test]
+async fn pinned_project_rejects_a_replacement_repository_at_an_adopted_path() {
+    let fixture = RepositoryFixture::new().await;
+    git(
+        &fixture.main,
+        &["worktree", "add", "-b", "feature/replacement"],
+        Some(&fixture.external),
+    );
+    fixture
+        .repositories
+        .upsert_thread(workspace_thread(&fixture.external))
+        .await
+        .expect("adopted workspace");
+    let service = fixture.service();
+    let subscription = service.subscribe("project-1").await.expect("initial pin");
+    drop(subscription);
+    drop(service);
+
+    let external_argument = fixture.external.to_string_lossy().into_owned();
+    git(
+        &fixture.main,
+        &["worktree", "remove", "--force", &external_argument],
+        None,
+    );
+    fs::create_dir(&fixture.external).expect("replacement directory");
+    git(
+        &fixture.external,
+        &["init", "--initial-branch", "replacement"],
+        None,
+    );
+    let mut unavailable_primary = project(&fixture.main);
+    unavailable_primary.workspace_root = fixture
+        .root
+        .path()
+        .join("missing-primary")
+        .to_string_lossy()
+        .into_owned();
+    fixture
+        .repositories
+        .upsert_project(unavailable_primary)
+        .await
+        .expect("primary unavailable");
+
+    let restarted = fixture.service();
+    let error = match restarted.subscribe("project-1").await {
+        Err(error) => error,
+        Ok(_) => panic!("replacement repository must fail the durable identity pin"),
+    };
+    assert_eq!(
+        error.reason,
+        bibcode_server::worktree_catalog::CatalogErrorReason::RepositoryUnavailable
+    );
+    assert!(restarted.latest("project-1").await.is_none());
+}
+
+#[tokio::test]
 async fn real_repository_tracks_external_create_delete_prune_and_exact_path_recovery() {
     let fixture = RepositoryFixture::new().await;
     let service = fixture.service();
@@ -250,6 +375,7 @@ fn project(main: &Path) -> ProjectionProject {
             "initialPromptDismissedAt": null,
             "baselinePaths": []
         }),
+        worktree_repository_key: None,
         created_at: NOW.to_owned(),
         updated_at: NOW.to_owned(),
         deleted_at: None,

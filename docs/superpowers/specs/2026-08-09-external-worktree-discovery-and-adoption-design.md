@@ -160,10 +160,13 @@ Rejected alternatives were:
 | Whether a worktree is adopted into BibCode | A non-deleted canonical workspace thread with that `worktreePath` |
 | Conversations, agents, terminals, panels, and model settings | Existing orchestration thread |
 | Hidden/shown discovery intent and acknowledgement | Project orchestration metadata |
+| Repository identity fence | Nullable durable project `WorktreeRepositoryKey`, established only by a trusted authoritative primary-checkout scan |
 | Current scan health, cache, generations, and subscribers | In-memory Worktree Catalog runtime |
 
 The design does not persist a duplicate live worktree list. Catalog state is
-rebuilt from Git after server restart.
+rebuilt from Git after server restart. The durable repository identity is a
+trust pin, not an alternative source of live worktree, branch, registration,
+lock, or availability truth.
 
 ### Worktree descriptor
 
@@ -239,13 +242,27 @@ Policy and catalogs are scoped to each physical `(environmentId, projectId)`.
 A logical sidebar group may aggregate their presentation, but paths,
 authority, mutations, and failures remain host-specific.
 
+Project projection metadata also contains a nullable
+`worktreeRepositoryKey`. Legacy projects start unpinned. Only a successful,
+authoritative scan anchored at the persisted primary checkout may establish
+the pin, using an atomic establish-or-match persistence operation. Once set,
+ordinary project projection updates preserve it and no scan implicitly
+re-pins it. Every later primary, adopted-worktree, or lifetime-common-directory
+anchor must resolve to the same key; mismatch fails closed. This permits a
+cold-start adopted anchor only when it matches the durable pin and prevents a
+replacement repository at an old path from being reported as present.
+
 ## Worktree Catalog Service
 
 ### Registry and ownership
 
-`apps/server` owns a shared catalog registry keyed by the canonical Git common
-directory. Projects opened through the primary checkout or a linked worktree
-share one catalog entry on the same execution host.
+`apps/server` owns project-specific catalog views addressed by `projectId` and
+a shared repository-observation layer keyed by canonical Git common-directory
+identity. Projects that resolve to the same repository may share the bounded
+Git observation, but never share their joined snapshot, `watch` sender,
+subscriber count, suppression set, mutation epoch, or poll lifecycle. A
+project refresh can therefore neither overwrite another project's stream nor
+expose its thread IDs.
 
 Each entry retains only bounded runtime state:
 
@@ -260,21 +277,30 @@ pollerCancellation
 lastMetadataSignature
 ```
 
-Unsubscribed entries stop polling and are evicted after a bounded idle
-retention window. A global semaphore bounds simultaneous Git catalog scans,
-and each repository admits only one scan at a time.
+Unsubscribed project views stop polling and are evicted after a bounded idle
+retention window. Subscriber reservation and eviction are atomic: attachment
+validates the currently registered view while holding the registry lock, and
+an eviction cannot orphan a newly attached subscriber. Shared repository and
+mutation-lock registry slots are weak references; a held or awaited physical
+repository mutation lock remains strongly owned and cannot be removed and
+recreated concurrently. A global semaphore bounds simultaneous Git catalog
+scans, and each repository admits only one observation at a time.
 
 ### Scan anchor resolution
 
-The service selects a trustworthy Git command working directory in this
-order:
+For an already pinned project, the service selects a Git command working
+directory in this order:
 
 1. the persisted project primary checkout;
 2. any present adopted worktree for that project;
 3. a common Git directory resolved earlier in the current server lifetime.
 
-If no anchor is reachable, the catalog becomes degraded. It does not publish
-an authoritative empty set.
+For a legacy unpinned project, only the persisted primary checkout is eligible;
+adopted and lifetime-common-directory anchors cannot establish identity. Every
+selected anchor is scanned and compared with the durable pin before its result
+is accepted. If no anchor is reachable or the key mismatches, the catalog
+becomes degraded or unavailable. It does not publish an authoritative empty
+set and never treats directory existence as recovery for an unregistered path.
 
 ### Authoritative scan algorithm
 
@@ -319,7 +345,9 @@ initial subscription.
 
 ### Coalescing, backpressure, and stale scans
 
-- Concurrent refresh requests for the same catalog share one in-flight scan.
+- Concurrent refresh requests for the same project view share one in-flight
+  result, including the same explicit conflict error. Project views for the
+  same repository may share only the underlying repository observation.
 - A short result TTL absorbs renderer/query fan-out without masking explicit
   invalidation.
 - Each create/remove mutation increments `mutationEpoch` before invalidating
@@ -327,8 +355,12 @@ initial subscription.
 - A pre-mutation scan may finish but cannot publish over the newer epoch.
 - The stream uses latest-value semantics. Slow subscribers receive the newest
   snapshot rather than an unbounded queue of intermediate refreshes.
-- Shared scans outlive one caller cancellation while other subscribers still
-  need them. The poller and pending work stop when the final subscriber leaves.
+- Shared observations outlive one project-view cancellation while subscribers
+  to another view still need them. Subscription ownership uses a guarded RAII
+  reservation, so abort at any attachment await point releases both view and
+  repository counts. Poll sleep, shallow signatures, Git inventory, and
+  directory probes are cancellation-aware; the associated pending work stops
+  without later publication when the final subscriber leaves.
 - Directory probes and bulk adoption use bounded concurrency.
 
 ### Failure behavior
@@ -688,6 +720,9 @@ native file-manager behavior only for local environment paths.
 
 - Existing project records decode to hidden/pending/empty discovery policy; no
   eager rewrite is required.
+- Existing project records decode with a null repository-identity pin. The
+  first trusted primary-checkout scan establishes it; it then persists across
+  server restarts and fences every fallback anchor.
 - Existing worktree threads are matched to catalog entries by server path
   semantics.
 - Existing missing worktree threads become warning rows only after an
@@ -695,8 +730,8 @@ native file-manager behavior only for local environment paths.
 - Worktrees orphaned by an earlier create-thread failure become discovery
   candidates.
 - New clients capability-gate older remote servers.
-- The catalog is rebuilt on restart and never requires persisted cache
-  migration.
+- The catalog cache is rebuilt on restart; only the repository identity fence,
+  not a live catalog snapshot, is persisted.
 - No vendored dependency or production Node runtime is introduced.
 
 ## Observability
