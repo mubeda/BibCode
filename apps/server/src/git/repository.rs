@@ -40,6 +40,27 @@ struct GitExecutionOptions {
     output_policy: OutputPolicy,
 }
 
+type BoxGitProcessFuture<'a> =
+    Pin<Box<dyn Future<Output = Result<ProcessOutput, ProcessError>> + Send + 'a>>;
+
+trait GitProcessRunner: Send + Sync {
+    fn run<'a>(
+        &'a self,
+        request: ProcessRequest,
+        cancellation: &'a CancellationToken,
+    ) -> BoxGitProcessFuture<'a>;
+}
+
+impl GitProcessRunner for ProcessRunner {
+    fn run<'a>(
+        &'a self,
+        request: ProcessRequest,
+        cancellation: &'a CancellationToken,
+    ) -> BoxGitProcessFuture<'a> {
+        Box::pin(ProcessRunner::run(self, request, cancellation))
+    }
+}
+
 pub type BoxWorktreeBaseDirectoryFuture<'a> =
     Pin<Box<dyn Future<Output = Option<PathBuf>> + Send + 'a>>;
 
@@ -58,7 +79,7 @@ impl WorktreeBaseDirectoryProvider for DefaultWorktreeBaseDirectory {
 
 #[derive(Clone)]
 pub struct GitRepository {
-    runner: ProcessRunner,
+    runner: Arc<dyn GitProcessRunner>,
     worktree_settings: Arc<dyn WorktreeBaseDirectoryProvider>,
     worktree_porcelain_z_supported: Arc<Mutex<Option<bool>>>,
 }
@@ -66,7 +87,7 @@ pub struct GitRepository {
 impl Default for GitRepository {
     fn default() -> Self {
         Self {
-            runner: ProcessRunner,
+            runner: Arc::new(ProcessRunner),
             worktree_settings: Arc::new(DefaultWorktreeBaseDirectory),
             worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
         }
@@ -157,8 +178,17 @@ impl GitRepository {
         worktree_settings: Arc<dyn WorktreeBaseDirectoryProvider>,
     ) -> Self {
         Self {
-            runner: ProcessRunner,
+            runner: Arc::new(ProcessRunner),
             worktree_settings,
+            worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    #[cfg(test)]
+    fn with_runner_for_test(runner: Arc<dyn GitProcessRunner>) -> Self {
+        Self {
+            runner,
+            worktree_settings: Arc::new(DefaultWorktreeBaseDirectory),
             worktree_porcelain_z_supported: Arc::new(Mutex::new(None)),
         }
     }
@@ -2342,13 +2372,20 @@ fn display_path(path: &Path) -> String {
 
 #[cfg(test)]
 mod worktree_ownership_tests {
-    use std::{fs, path::Path, process::Command};
+    use std::{
+        collections::VecDeque,
+        fs,
+        path::Path,
+        process::Command,
+        sync::{Arc, Mutex},
+    };
 
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        CreateWorktreeInput, GitRepository, OwnedWorktreePath, ProcessOutput, display_path,
+        CreateWorktreeInput, GitProcessRunner, GitRepository, OutputPolicy, OwnedWorktreePath,
+        ProcessOutput, ProcessRequest, WORKTREE_INVENTORY_OUTPUT_LIMIT, display_path,
         ensure_authoritative_inventory_output, git_output_line,
         is_unsupported_porcelain_z_diagnostic, parse_branch_headers,
     };
@@ -2395,6 +2432,131 @@ mod worktree_ownership_tests {
             Some(" /repo with space ")
         );
         assert_eq!(git_output_line("/one\n/two\n"), None);
+    }
+
+    #[tokio::test]
+    async fn inventory_executes_legacy_fallback_once_and_caches_it_per_repository() {
+        let runner = Arc::new(FakeGitRunner::new([
+            process_output(0, ".git\n", ""),
+            process_output(129, "", "error: unknown switch `z'"),
+            process_output(
+                0,
+                "worktree /repo\nHEAD abc\nbranch refs/heads/main\n\n",
+                "",
+            ),
+            process_output(0, ".git\n", ""),
+            process_output(
+                0,
+                "worktree /repo\nHEAD abc\nbranch refs/heads/main\n\n",
+                "",
+            ),
+        ]));
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let anchor = tempfile::tempdir().expect("inventory anchor");
+        let token = CancellationToken::new();
+
+        for _ in 0..2 {
+            let inventory = repository
+                .worktree_inventory(anchor.path(), &token)
+                .await
+                .expect("legacy inventory");
+            assert!(!inventory.nul_delimited);
+        }
+
+        let requests = runner.requests();
+        let nul_request = requests
+            .iter()
+            .find(|request| request.args.iter().any(|argument| argument == "-z"))
+            .expect("one capability probe");
+        assert!(nul_request.allow_non_zero_exit);
+        assert_eq!(nul_request.output_policy, OutputPolicy::Error);
+        assert_eq!(
+            nul_request.max_output_bytes,
+            WORKTREE_INVENTORY_OUTPUT_LIMIT
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| request.args.iter().any(|argument| argument == "-z"))
+                .count(),
+            1
+        );
+        assert_eq!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request
+                        .args
+                        .iter()
+                        .any(|argument| argument == "--porcelain")
+                        && !request.args.iter().any(|argument| argument == "-z")
+                })
+                .count(),
+            2
+        );
+        assert!(
+            requests
+                .iter()
+                .filter(|request| {
+                    request
+                        .args
+                        .iter()
+                        .any(|argument| argument == "--porcelain")
+                        && !request.args.iter().any(|argument| argument == "-z")
+                })
+                .all(|request| !request.allow_non_zero_exit)
+        );
+    }
+
+    struct FakeGitRunner {
+        outputs: Mutex<VecDeque<ProcessOutput>>,
+        requests: Mutex<Vec<ProcessRequest>>,
+    }
+
+    impl FakeGitRunner {
+        fn new(outputs: impl IntoIterator<Item = ProcessOutput>) -> Self {
+            Self {
+                outputs: Mutex::new(outputs.into_iter().collect()),
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn requests(&self) -> Vec<ProcessRequest> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone()
+        }
+    }
+
+    impl GitProcessRunner for FakeGitRunner {
+        fn run<'a>(
+            &'a self,
+            request: ProcessRequest,
+            _cancellation: &'a CancellationToken,
+        ) -> super::BoxGitProcessFuture<'a> {
+            self.requests
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(request);
+            let output = self
+                .outputs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .pop_front()
+                .expect("fake output");
+            Box::pin(async move { Ok(output) })
+        }
+    }
+
+    fn process_output(exit_code: i32, stdout: &str, stderr: &str) -> ProcessOutput {
+        ProcessOutput {
+            exit_code,
+            stdout: stdout.to_owned(),
+            stderr: stderr.to_owned(),
+            stdout_truncated: false,
+            stderr_truncated: false,
+        }
     }
 
     fn git(cwd: &Path, args: &[&str]) -> String {

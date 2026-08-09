@@ -207,6 +207,7 @@ pub struct GitWorktreeRecord {
     pub is_bare: bool,
     pub locked: bool,
     pub lock_reason: Option<String>,
+    pub is_prunable: bool,
     pub prunable_reason: Option<String>,
 }
 
