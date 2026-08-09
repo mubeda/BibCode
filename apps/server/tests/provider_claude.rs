@@ -94,6 +94,7 @@ struct ContextUsageFixture {
     task_progress: Value,
     compact_boundary: Value,
     result: Value,
+    query_success: Value,
     malformed: Value,
 }
 
@@ -1864,6 +1865,30 @@ fn malformed_claude_usage_cannot_clear_last_good_context() {
     let initial = runtime.handle_raw_value(&fixture.message_delta, 1_000);
     assert_eq!(initial.events.len(), 1);
 
+    let mut partially_malformed_stream = fixture.message_delta.clone();
+    partially_malformed_stream["event"]["usage"] = json!({
+        "input_tokens": -1,
+        "output_tokens": 50,
+    });
+    let partially_malformed = runtime.handle_raw_value(&partially_malformed_stream, 1_500);
+    assert!(partially_malformed.events.is_empty());
+
+    let mut partially_malformed_result = fixture.result.clone();
+    partially_malformed_result["usage"] = json!({
+        "input_tokens": -1,
+        "output_tokens": 50,
+    });
+    partially_malformed_result["modelUsage"] = Value::Null;
+    let malformed_result = runtime.handle_raw_value(&partially_malformed_result, 1_750);
+    assert_eq!(
+        malformed_result
+            .events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        ["turn.completed"]
+    );
+
     let mut malformed_stream = fixture.message_delta.clone();
     malformed_stream["event"]["usage"] = json!({
         "input_tokens": -1,
@@ -1888,6 +1913,84 @@ fn malformed_claude_usage_cannot_clear_last_good_context() {
         result.events.last().expect("completion").event_type,
         "turn.completed"
     );
+}
+
+#[test]
+fn claude_usage_emission_and_observation_are_scoped_to_turns() {
+    let fixture: ContextUsageFixture = load_fixture("context-usage.json");
+    let mut runtime = ClaudeProviderRuntime::new("thread-1".to_owned(), "session-1".to_owned());
+
+    runtime.start_turn(TurnInput {
+        turn_id: "turn-1".to_owned(),
+        input: "first turn".to_owned(),
+    });
+    let first = runtime.handle_raw_value(&fixture.message_delta, 1_000);
+    assert_eq!(first.events.len(), 1);
+    assert_eq!(first.events[0].turn_id.as_deref(), Some("turn-1"));
+
+    runtime.start_turn(TurnInput {
+        turn_id: "turn-2".to_owned(),
+        input: "second turn".to_owned(),
+    });
+    let identical_next_turn = runtime.handle_raw_value(&fixture.message_delta, 2_000);
+    assert_eq!(identical_next_turn.events.len(), 1);
+    assert_eq!(
+        identical_next_turn.events[0].turn_id.as_deref(),
+        Some("turn-2")
+    );
+
+    runtime.start_turn(TurnInput {
+        turn_id: "turn-3".to_owned(),
+        input: "third turn".to_owned(),
+    });
+    let lifetime_only = runtime.handle_raw_value(&fixture.result, 3_000);
+    assert_eq!(
+        lifetime_only
+            .events
+            .iter()
+            .map(|event| event.event_type.as_str())
+            .collect::<Vec<_>>(),
+        ["turn.completed"]
+    );
+}
+
+#[test]
+fn claude_context_response_application_is_turn_scoped() {
+    let fixture: ContextUsageFixture = load_fixture("context-usage.json");
+    let mut runtime = ClaudeProviderRuntime::new("thread-1".to_owned(), "session-1".to_owned());
+
+    runtime.start_turn(TurnInput {
+        turn_id: "turn-1".to_owned(),
+        input: "first turn".to_owned(),
+    });
+    let first = runtime
+        .apply_context_usage_response_for_test("turn-1", &fixture.query_success)
+        .expect("first query usage");
+    assert_eq!(first.event_type, "thread.token-usage.updated");
+    assert_eq!(first.turn_id.as_deref(), Some("turn-1"));
+    assert_eq!(first.payload["usage"]["usedTokens"], 31_251);
+    assert_eq!(first.payload["usage"]["maxTokens"], 200_000);
+    assert_eq!(first.payload["usage"]["compactsAutomatically"], json!(true));
+    assert!(
+        runtime
+            .apply_context_usage_response_for_test("turn-1", &fixture.query_success)
+            .is_none()
+    );
+    assert!(
+        runtime
+            .apply_context_usage_response_for_test("turn-1", &fixture.malformed)
+            .is_none()
+    );
+
+    runtime.start_turn(TurnInput {
+        turn_id: "turn-2".to_owned(),
+        input: "second turn".to_owned(),
+    });
+    let second = runtime
+        .apply_context_usage_response_for_test("turn-2", &fixture.query_success)
+        .expect("same query usage in a new turn");
+    assert_eq!(second.turn_id.as_deref(), Some("turn-2"));
+    assert_eq!(second.payload["usage"]["usedTokens"], 31_251);
 }
 
 #[test]

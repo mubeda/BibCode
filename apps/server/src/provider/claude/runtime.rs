@@ -315,6 +315,7 @@ impl ClaudeProviderRuntime {
     }
 
     pub fn start_turn(&mut self, input: TurnInput) -> Vec<CanonicalEvent> {
+        self.token_usage.start_turn();
         self.current_turn_id = Some(input.turn_id.clone());
         vec![self.event(
             "turn.started",
@@ -448,10 +449,6 @@ impl ClaudeProviderRuntime {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "the response-correlated completion query is integrated by Task 4"
-    )]
     pub(crate) fn apply_context_usage_response(
         &mut self,
         turn_id: &str,
@@ -459,6 +456,15 @@ impl ClaudeProviderRuntime {
     ) -> Option<CanonicalEvent> {
         let usage = self.token_usage.observe_context_response(response)?;
         Some(self.token_usage_event(turn_id.to_owned(), usage))
+    }
+
+    #[doc(hidden)]
+    pub fn apply_context_usage_response_for_test(
+        &mut self,
+        turn_id: &str,
+        response: &Value,
+    ) -> Option<CanonicalEvent> {
+        self.apply_context_usage_response(turn_id, response)
     }
 
     pub(crate) fn handle_recovered_transcript(
