@@ -67,10 +67,10 @@ Also assert that the Full Access label and description retain their existing neu
 
 - [ ] **Step 2: Run the focused test and verify RED**
 
-Run:
+Run from `apps/web`:
 
 ```bash
-vp test run --project unit apps/web/src/components/chat/ChatComposer.test.tsx
+vp test run --project unit src/components/chat/ChatComposer.test.tsx
 ```
 
 Expected: FAIL because neither Full Access icon currently receives `text-destructive`.
@@ -92,7 +92,7 @@ const isFullAccess = props.runtimeMode === "full-access";
 <OptionIcon
   className={cn(
     "size-3.5 shrink-0",
-    mode === "full-access" ? "text-destructive" : "text-muted-foreground",
+    isFullAccess && mode === "full-access" ? "text-destructive" : "text-muted-foreground",
   )}
 />
 ```
@@ -182,8 +182,10 @@ Add a second highest descriptor/name assertion for Max so the test proves the po
 
 - [ ] **Step 2: Run the focused test and verify RED**
 
+Run from `apps/web`:
+
 ```bash
-vp test run --project unit apps/web/src/components/chat/TraitsPicker.test.tsx
+vp test run --project unit src/components/chat/TraitsPicker.test.tsx
 ```
 
 Expected: FAIL because highest values currently use the same neutral classes as lower values and no title marker exists.
@@ -305,8 +307,10 @@ Use the file's existing happy-dom mount cleanup conventions and restore real tim
 
 - [ ] **Step 3: Run the focused test and verify RED**
 
+Run from `apps/web`:
+
 ```bash
-vp test run --project unit apps/web/src/components/chat/MessagesTimeline.test.tsx
+vp test run --project unit src/components/chat/MessagesTimeline.test.tsx
 ```
 
 Expected: FAIL on `Working for`, three dots, whole seconds, and a 1000ms interval.
@@ -419,11 +423,13 @@ place. The animation respects reduced-motion preferences.
 
 - [ ] **Step 2: Run all three focused test files together**
 
+Run from `apps/web`:
+
 ```bash
 vp test run --project unit \
-  apps/web/src/components/chat/ChatComposer.test.tsx \
-  apps/web/src/components/chat/TraitsPicker.test.tsx \
-  apps/web/src/components/chat/MessagesTimeline.test.tsx
+  src/components/chat/ChatComposer.test.tsx \
+  src/components/chat/TraitsPicker.test.tsx \
+  src/components/chat/MessagesTimeline.test.tsx
 ```
 
 Expected: all tests pass with zero failures.
