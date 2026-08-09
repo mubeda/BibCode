@@ -4,7 +4,7 @@
 
 **Goal:** Make focused and unfocused center panes use the same neutral framing color in light and dark themes without changing focus behavior.
 
-**Architecture:** `apps/web/src/components/CenterPanelSplitLayout.tsx` owns center-pane chrome shared by browser and Tauri desktop modes. Preserve the existing `focusedGroupId` state flow and all event handlers, and remove only the focus-state Tailwind ring utilities that map through the orange global `--ring` token.
+**Architecture:** `apps/web/src/components/CenterPanelSplitLayout.tsx` owns center-pane chrome shared by browser and Tauri desktop modes. Preserve the existing `focusedGroupId` state flow and all event handlers, remove the focus-state Tailwind ring utilities that map through the orange global `--ring` token, and use `focus-visible:after:ring-border` for the existing keyboard-focus ring geometry.
 
 **Tech Stack:** React 19, TypeScript, Tailwind CSS 4, Vite+ unit tests, Tauri 2 desktop host.
 
@@ -15,6 +15,10 @@
 - Do not add contracts, persistence fields, RPCs, desktop bridge operations, dependencies, or Rust changes.
 - Verify the worktree-built Tauri desktop application in both actual light and dark themes.
 - Preserve unrelated user changes and do not edit `.codegraph/` or `.repos/` data.
+- Approved runtime-discovered amendment: retain `focus-visible:after:ring-2`,
+  but replace `focus-visible:after:ring-ring/70` with the neutral
+  `focus-visible:after:ring-border` on the pane region only. Do not alter
+  separator focus or hover colors.
 
 ---
 
@@ -50,6 +54,8 @@ it("uses the same framing for focused and unfocused panes", async () => {
   expect(focusedPane?.className).toBe(unfocusedPane?.className);
   expect(focusedPane?.className).not.toContain("data-[focused=true]:after:ring");
   expect(focusedPane?.className).toContain("focus-visible:after:ring-2");
+  expect(focusedPane?.className).toContain("focus-visible:after:ring-border");
+  expect(focusedPane?.className).not.toContain("focus-visible:after:ring-ring");
   expect(container.querySelectorAll("[data-center-panel-focused-actions]")).toHaveLength(1);
 });
 ```
@@ -63,10 +69,10 @@ cd apps/web
 vp test run --project unit src/components/CenterPanelSplitLayout.test.tsx
 ```
 
-Expected: FAIL only because the focused and unfocused class list still contains
-`data-[focused=true]:after:ring-1` or
-`data-[focused=true]:after:ring-ring/40`. The state and focused action assertions
-must already pass.
+Expected: FAIL only because the pane class list still contains
+`focus-visible:after:ring-ring/70` and lacks
+`focus-visible:after:ring-border`. The state and focused action assertions must
+already pass.
 
 - [ ] **Step 3: Remove only the focus-state ring utilities**
 
@@ -87,7 +93,7 @@ to:
 className={cn(
   "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-background outline-none",
   "after:pointer-events-none after:absolute after:inset-0 after:z-50 after:ring-inset after:content-['']",
-  "focus-visible:after:ring-2 focus-visible:after:ring-ring/70",
+  "focus-visible:after:ring-2 focus-visible:after:ring-border",
 )}
 ```
 

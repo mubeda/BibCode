@@ -229,6 +229,8 @@ describe("CenterPanelSplitLayout", () => {
     expect(focusedPane?.className).toBe(unfocusedPane?.className);
     expect(focusedPane?.className).not.toContain("data-[focused=true]:after:ring");
     expect(focusedPane?.className).toContain("focus-visible:after:ring-2");
+    expect(focusedPane?.className).toContain("focus-visible:after:ring-border");
+    expect(focusedPane?.className).not.toContain("focus-visible:after:ring-ring");
     expect(container.querySelectorAll("[data-center-panel-focused-actions]")).toHaveLength(1);
   });
 

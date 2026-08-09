@@ -218,7 +218,7 @@ function GroupLeaf(
       className={cn(
         "relative flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden bg-background outline-none",
         "after:pointer-events-none after:absolute after:inset-0 after:z-50 after:ring-inset after:content-['']",
-        "focus-visible:after:ring-2 focus-visible:after:ring-ring/70",
+        "focus-visible:after:ring-2 focus-visible:after:ring-border",
       )}
       onPointerDownCapture={focusGroup}
       onFocusCapture={handleFocusCapture}

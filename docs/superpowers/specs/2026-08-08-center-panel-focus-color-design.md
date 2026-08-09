@@ -24,9 +24,10 @@ provider behavior, or Rust code change.
 ## Implementation
 
 Remove the `data-[focused=true]` ring utilities from each center-pane region.
-Keep the existing keyboard `focus-visible` treatment unchanged because it is a
-separate accessibility affordance and is not the persistent focused-pane
-highlight shown in the reported state.
+Preserve the keyboard `focus-visible` ring geometry (`after:ring-2`) while
+changing its color from the orange global ring token to `after:ring-border`.
+This user-approved amendment keeps the accessibility affordance without an
+orange focused-pane perimeter.
 
 Do not change the global `--ring` token: it intentionally supplies the orange
 interaction color to controls throughout the application. Do not add a new
@@ -48,7 +49,7 @@ the existing unfocused appearance.
 
 - Changing the global ring token would alter focus styling across unrelated
   controls.
-- Replacing the orange pane ring with a neutral focus-only ring would still
-  make focused and unfocused panes visually different.
+- Removing keyboard focus-visible geometry would reduce the accessibility
+  affordance; the approved neutral `after:ring-border` color preserves it.
 - Adding a new pane token would duplicate an appearance already provided by
   the unfocused state.
