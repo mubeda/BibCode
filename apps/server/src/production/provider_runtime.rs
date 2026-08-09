@@ -5451,8 +5451,45 @@ async fn query_claude_context_usage(
     sequence: u64,
     timeout: Duration,
 ) -> Option<Value> {
+    query_claude_control(
+        provider,
+        writer,
+        responses,
+        cancellation,
+        ClaudeControlRequest::get_context_usage(sequence),
+        timeout,
+    )
+    .await
+}
+
+async fn query_claude_mcp_status(
+    provider: &str,
+    writer: &Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
+    responses: &ClaudeControlResponseRouter,
+    cancellation: &CancellationToken,
+    sequence: u64,
+    timeout: Duration,
+) -> Option<Value> {
+    query_claude_control(
+        provider,
+        writer,
+        responses,
+        cancellation,
+        ClaudeControlRequest::mcp_status(sequence),
+        timeout,
+    )
+    .await
+}
+
+async fn query_claude_control(
+    provider: &str,
+    writer: &Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
+    responses: &ClaudeControlResponseRouter,
+    cancellation: &CancellationToken,
+    request: ClaudeControlRequest,
+    timeout: Duration,
+) -> Option<Value> {
     let query = async {
-        let request = ClaudeControlRequest::get_context_usage(sequence);
         let registration = responses.register(request.request_id().to_owned())?;
         let mut bytes = serde_json::to_vec(&request)
             .map_err(provider_error(provider))
@@ -5590,7 +5627,7 @@ mod claude_control_response_tests {
 mod claude_context_query_tests {
     use super::{
         ClaudeControlResponseRouter, ProviderEvent, claude_completion_query_turn_id,
-        claude_provider_event, query_claude_context_usage,
+        claude_provider_event, query_claude_context_usage, query_claude_mcp_status,
     };
     use crate::provider::claude::{ClaudeProviderRuntime, TurnInput};
     use serde_json::{Value, json};
@@ -5650,6 +5687,58 @@ mod claude_context_query_tests {
         );
 
         assert_eq!(response.expect("context response")["totalTokens"], 31_251);
+        assert_eq!(responses.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn writes_correlated_mcp_status_query_and_returns_matching_success_body() {
+        let (writer_stream, reader_stream) = tokio::io::duplex(1_024);
+        let writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>> = Mutex::new(Box::new(writer_stream));
+        let responses = ClaudeControlResponseRouter::default();
+        let cancellation = CancellationToken::new();
+        let responder = async {
+            let mut lines = BufReader::new(reader_stream).lines();
+            let line = lines
+                .next_line()
+                .await
+                .expect("query read")
+                .expect("query line");
+            assert_eq!(
+                serde_json::from_str::<Value>(&line).expect("query json"),
+                json!({
+                    "type": "control_request",
+                    "request_id": "bibcode-21",
+                    "request": { "subtype": "mcp_status" }
+                })
+            );
+            assert!(responses.route(&json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": "bibcode-21",
+                    "response": {
+                        "mcpServers": [{ "name": "context7", "status": "connected" }]
+                    }
+                }
+            })));
+        };
+
+        let (response, ()) = tokio::join!(
+            query_claude_mcp_status(
+                "claude",
+                &writer,
+                &responses,
+                &cancellation,
+                21,
+                Duration::from_secs(1),
+            ),
+            responder,
+        );
+
+        assert_eq!(
+            response.expect("MCP response")["mcpServers"][0]["name"],
+            "context7"
+        );
         assert_eq!(responses.pending_count(), 0);
     }
 
@@ -6836,21 +6925,35 @@ impl ProviderDriver for ClaudeDriver {
                 &self.output.cancellation,
                 self.next_sequence().await,
                 CLAUDE_CONTEXT_QUERY_TIMEOUT,
-            )
-            .await;
-            let Some(response) = response else {
+            );
+            let mcp_status = query_claude_mcp_status(
+                &self.provider,
+                &self.writer,
+                &self.control_responses,
+                &self.output.cancellation,
+                self.next_sequence().await,
+                CLAUDE_CONTEXT_QUERY_TIMEOUT,
+            );
+            let (context_response, mcp_response) = tokio::join!(response, mcp_status);
+            let mut runtime = self.runtime.lock().await;
+            let mut updates = VecDeque::new();
+            if let Some(response) = context_response
+                && let Some(usage) = runtime.apply_context_usage_response(&turn_id, &response)
+            {
+                updates.push_back(claude_provider_event(usage, None, Vec::new()));
+            }
+            if let Some(response) = mcp_response
+                && let Some(status) = runtime.apply_mcp_status_response(&response)
+            {
+                updates.push_back(claude_provider_event(status, None, Vec::new()));
+            }
+            drop(runtime);
+            let Some(first) = updates.pop_front() else {
                 return Some(completion);
             };
-            let usage = self
-                .runtime
-                .lock()
-                .await
-                .apply_context_usage_response(&turn_id, &response);
-            let Some(usage) = usage else {
-                return Some(completion);
-            };
+            deferred_events.extend(updates);
             deferred_events.push_back(completion);
-            Some(claude_provider_event(usage, None, Vec::new()))
+            Some(first)
         })
     }
     fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
@@ -8519,6 +8622,10 @@ while IFS= read -r line; do
       request_id=$(printf '%s\n' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
       printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"totalTokens":31251,"maxTokens":200000,"isAutoCompactEnabled":true}}}\n' "$request_id"
       ;;
+    *'"subtype":"mcp_status"'*)
+      request_id=$(printf '%s\n' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+      printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{"mcpServers":[{"name":"context7","status":"connected"}]}}}\n' "$request_id"
+      ;;
   esac
 done
 "#;
@@ -8687,7 +8794,7 @@ done
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn claude_completion_query_orders_stream_then_authoritative_usage_then_completion() {
+    async fn claude_completion_queries_order_stream_usage_mcp_status_then_completion() {
         let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let capture_path = temp.path().join("claude-context-query.jsonl");
@@ -8725,6 +8832,10 @@ done
             .await
             .expect("authoritative usage timeout")
             .expect("authoritative usage event");
+        let mcp_status = timeout(std::time::Duration::from_secs(2), driver.next_event())
+            .await
+            .expect("MCP status timeout")
+            .expect("MCP status event");
         let completion = timeout(std::time::Duration::from_secs(2), driver.next_event())
             .await
             .expect("completion timeout")
@@ -8734,6 +8845,9 @@ done
         assert_eq!(stream_usage.payload["usage"]["usedTokens"], 1_550);
         assert_eq!(authoritative_usage.event_type, "thread.token-usage.updated");
         assert_eq!(authoritative_usage.payload["usage"]["usedTokens"], 31_251);
+        assert_eq!(mcp_status.event_type, "mcp.status.updated");
+        assert_eq!(mcp_status.payload["servers"][0]["name"], "context7");
+        assert_eq!(mcp_status.payload["servers"][0]["state"], "connected");
         assert_eq!(completion.event_type, "turn.completed");
         assert_eq!(completion.payload["state"], "completed");
 
@@ -8747,6 +8861,18 @@ done
                 "type": "control_request",
                 "request_id": "bibcode-1",
                 "request": { "subtype": "get_context_usage" }
+            })
+        );
+        let mcp_query = captured_request(&capture_path, |value| {
+            value["request"]["subtype"] == "mcp_status"
+        })
+        .await;
+        assert_eq!(
+            mcp_query,
+            json!({
+                "type": "control_request",
+                "request_id": "bibcode-2",
+                "request": { "subtype": "mcp_status" }
             })
         );
 

@@ -1575,7 +1575,7 @@ fn snapshot_owned_message(
     if let Some(message) = message {
         result["message"] = json!(message);
     }
-    if definition.driver == "codex" {
+    if matches!(definition.driver.as_str(), "codex" | "claudeAgent") {
         result["supportsMcpStatus"] = json!(true);
     }
     if matches!(definition.driver.as_str(), "codex" | "claudeAgent") {
@@ -1864,7 +1864,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_and_claude_inventory_advertise_context_usage() {
+    fn provider_inventory_advertises_measured_toolbar_capabilities() {
         let definitions = definitions(&json!({}));
         let snapshot_for = |driver| {
             snapshot_owned_message(
@@ -1889,7 +1889,10 @@ mod tests {
         let opencode = snapshot_for("opencode");
 
         assert_eq!(codex["supportsMcpStatus"], true);
-        assert!(claude.get("supportsMcpStatus").is_none());
+        assert_eq!(claude["supportsMcpStatus"], true);
+        assert!(cursor.get("supportsMcpStatus").is_none());
+        assert!(grok.get("supportsMcpStatus").is_none());
+        assert!(opencode.get("supportsMcpStatus").is_none());
         assert_eq!(codex["supportsContextWindowUsage"], true);
         assert_eq!(claude["supportsContextWindowUsage"], true);
         assert!(cursor.get("supportsContextWindowUsage").is_none());

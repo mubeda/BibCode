@@ -75,20 +75,25 @@ exist.
 ### Composer context window
 
 In the normal composer footer, controls remain visible in this order: MCP
-status, context-window usage, then send or stop. Context usage is capability
-gated by the selected provider instance:
+status, context-window usage, then send or stop. Both status controls are
+capability gated by the selected provider instance:
 
-| Provider         | Context-window control |
-| ---------------- | ---------------------- |
-| Codex            | Supported              |
-| Claude           | Supported              |
-| Cursor           | Disabled               |
-| Grok             | Disabled               |
-| OpenCode         | Disabled               |
-| Other or unknown | Disabled               |
+| Provider         | MCP-status control | Context-window control |
+| ---------------- | ------------------ | ---------------------- |
+| Codex            | Supported          | Supported              |
+| Claude           | Supported          | Supported              |
+| Cursor           | Disabled           | Disabled               |
+| Grok             | Disabled           | Disabled               |
+| OpenCode         | Disabled           | Disabled               |
+| Other or unknown | Disabled           | Disabled               |
 
-Disabled providers show the unavailable control with no context popover, even
-if the thread contains stale context activity.
+Disabled providers still show the corresponding control with an unavailable
+tooltip, but the control cannot open a status popover. Stale activity does not
+override the selected provider's capability.
+
+For Claude, the MCP popover starts with the status reported during session
+initialization and refreshes after successful provider responses. It preserves
+the last valid snapshot if a refresh is unavailable.
 
 A supported provider with no valid reading shows an awaiting-data popover until
 the first provider response. Once measured, the meter's popover shows active
