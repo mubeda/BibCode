@@ -3098,11 +3098,29 @@ fn apply_activities_projector_tx(
     let thread_id = required_str(payload, "threadId")?;
     let turn_id = optional_string(activity.get("turnId"));
     let kind = required_str(activity, "kind")?;
-    let replaces_context_window = kind == "context-window.updated"
+    let activity_id = required_str(activity, "id")?;
+    let is_context_window = kind == "context-window.updated";
+    let replaces_context_window = is_context_window
         && activity
             .pointer("/payload/usedTokens")
             .and_then(Value::as_f64)
             .is_some_and(|used_tokens| used_tokens >= 0.0);
+    if is_context_window && !replaces_context_window {
+        let conflicts_with_valid_context_window = transaction.query_row(
+            "SELECT EXISTS(
+               SELECT 1 FROM projection_thread_activities
+               WHERE activity_id = ?1
+                 AND kind = 'context-window.updated'
+                 AND json_type(payload_json, '$.usedTokens') IN ('integer', 'real')
+                 AND json_extract(payload_json, '$.usedTokens') >= 0
+             )",
+            [&activity_id],
+            |row| row.get::<_, bool>(0),
+        )?;
+        if conflicts_with_valid_context_window {
+            return Ok(());
+        }
+    }
     if replaces_context_window {
         transaction.execute(
             "DELETE FROM projection_thread_activities
@@ -3121,7 +3139,7 @@ fn apply_activities_projector_tx(
            thread_id = excluded.thread_id, turn_id = excluded.turn_id, tone = excluded.tone, kind = excluded.kind, \
            summary = excluded.summary, payload_json = excluded.payload_json, sequence = excluded.sequence, created_at = excluded.created_at",
         params![
-            required_str(activity, "id")?,
+            activity_id,
             thread_id,
             turn_id,
             required_str(activity, "tone")?,
@@ -5602,6 +5620,11 @@ mod tests {
                         "payload":{"usedTokens":2_000}, "turnId":"turn-1", "sequence":4,
                         "createdAt":CREATED_AT
                     }),
+                    json!({
+                        "id":"activity-cw-latest", "tone":"info",
+                        "kind":"context-window.updated", "summary":"Context window updated",
+                        "payload":{}, "turnId":"turn-1", "sequence":5, "createdAt":CREATED_AT
+                    }),
                 ];
                 let mut last_sequence = 0;
                 for activity in activities {
@@ -5657,6 +5680,13 @@ mod tests {
                 "activity-cw-latest"
             ]
         );
+        let latest = snapshot
+            .activities
+            .iter()
+            .find(|activity| activity.activity_id == "activity-cw-latest")
+            .expect("latest valid context activity survives");
+        assert_eq!(latest.payload, json!({"usedTokens":2_000}));
+        assert_eq!(latest.sequence, Some(4));
 
         reopened
             .dispatch(OrchestrationCommand::ThreadRevertComplete {

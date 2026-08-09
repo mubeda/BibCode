@@ -469,6 +469,15 @@ export function applyThreadDetailEvent(
     case "thread.activity-appended": {
       const activity = event.payload.activity;
       const supersedesContextWindow = isResolvableContextWindowActivity(activity);
+      if (
+        activity.kind === "context-window.updated" &&
+        !supersedesContextWindow &&
+        thread.activities.some(
+          (entry) => entry.id === activity.id && isResolvableContextWindowActivity(entry),
+        )
+      ) {
+        return { kind: "unchanged" };
+      }
       const activities = pipe(
         thread.activities,
         Arr.filter(
