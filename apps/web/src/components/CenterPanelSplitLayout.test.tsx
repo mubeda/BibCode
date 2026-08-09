@@ -214,6 +214,24 @@ function dispatchKey(target: Element, key: string): void {
 }
 
 describe("CenterPanelSplitLayout", () => {
+  it("uses the same framing for focused and unfocused panes", async () => {
+    await renderLayout(input());
+
+    const focusedPane = container.querySelector<HTMLElement>(
+      '[data-center-panel-group][data-focused="true"]',
+    );
+    const unfocusedPane = container.querySelector<HTMLElement>(
+      '[data-center-panel-group][data-focused="false"]',
+    );
+
+    expect(focusedPane).not.toBeNull();
+    expect(unfocusedPane).not.toBeNull();
+    expect(focusedPane?.className).toBe(unfocusedPane?.className);
+    expect(focusedPane?.className).not.toContain("data-[focused=true]:after:ring");
+    expect(focusedPane?.className).toContain("focus-visible:after:ring-2");
+    expect(container.querySelectorAll("[data-center-panel-focused-actions]")).toHaveLength(1);
+  });
+
   it("renders compact actions for a narrow focused pane", async () => {
     await renderLayout(input());
     emitHeaderWidth(420);
