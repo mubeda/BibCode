@@ -86,6 +86,32 @@ fn rust_migrations_match_typescript_for_every_golden_database_state() {
     }
 }
 
+#[test]
+fn migration_40_preserves_the_default_policy_for_a_version_39_project_projection() {
+    let mut connection = Connection::open_in_memory().expect("open in-memory database");
+    run_migrations(&mut connection, Some(39)).expect("migrate through version 39");
+    connection
+        .execute(
+            "INSERT INTO projection_projects (project_id, title, workspace_root, default_model_selection_json, scripts_json, created_at, updated_at, deleted_at) VALUES ('project-legacy', 'Legacy', 'C:/legacy', NULL, '[]', '2026-01-01T00:00:00.000Z', '2026-01-01T00:00:00.000Z', NULL)",
+            [],
+        )
+        .expect("insert version 39 projection");
+
+    run_migrations(&mut connection, None).expect("migrate version 39 projection to current");
+
+    let policy = connection
+        .query_row(
+            "SELECT worktree_discovery_json FROM projection_projects WHERE project_id = 'project-legacy'",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("read migrated policy");
+    assert_eq!(
+        policy,
+        r#"{"visibility":"hidden","initialPromptDismissedAt":null,"baselinePaths":[]}"#
+    );
+}
+
 fn fixture_root() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../packages/contracts/fixtures/persistence")
 }

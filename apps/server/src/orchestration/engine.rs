@@ -30,6 +30,8 @@ use crate::persistence::{
 };
 
 const TURN_UPSERT_SQL: &str = "INSERT INTO projection_turns (thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (thread_id, turn_id) DO UPDATE SET pending_message_id=excluded.pending_message_id, source_proposed_plan_thread_id=excluded.source_proposed_plan_thread_id, source_proposed_plan_id=excluded.source_proposed_plan_id, assistant_message_id=excluded.assistant_message_id, state=excluded.state, requested_at=excluded.requested_at, started_at=excluded.started_at, completed_at=excluded.completed_at, checkpoint_turn_count=excluded.checkpoint_turn_count, checkpoint_ref=excluded.checkpoint_ref, checkpoint_status=excluded.checkpoint_status, checkpoint_files_json=excluded.checkpoint_files_json";
+const DEFAULT_WORKTREE_DISCOVERY_JSON: &str =
+    r#"{"visibility":"hidden","initialPromptDismissedAt":null,"baselinePaths":[]}"#;
 const PROJECTOR_NAMES: [&str; 9] = [
     "projection.projects",
     "projection.thread-messages",
@@ -304,6 +306,12 @@ pub enum OrchestrationCommand {
         default_model_selection: OptionalNullable<Value>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         scripts: Option<Vec<Value>>,
+        #[serde(
+            rename = "worktreeDiscovery",
+            default,
+            skip_serializing_if = "Option::is_none"
+        )]
+        worktree_discovery: Option<Value>,
     },
     #[serde(rename = "project.delete")]
     ProjectDelete {
@@ -1548,7 +1556,7 @@ async fn plan_command(
                     created_at,
                     command_id,
                     metadata.clone(),
-                    json!({"projectId":project_id,"title":title,"workspaceRoot":workspace_root,"defaultModelSelection":project_selection,"scripts":[],"createdAt":created_at,"updatedAt":created_at}),
+                    json!({"projectId":project_id,"title":title,"workspaceRoot":workspace_root,"defaultModelSelection":project_selection,"scripts":[],"worktreeDiscovery":default_worktree_discovery(),"createdAt":created_at,"updatedAt":created_at}),
                 ),
                 make_event(
                     "thread.created",
@@ -1568,6 +1576,7 @@ async fn plan_command(
             workspace_root,
             default_model_selection,
             scripts,
+            worktree_discovery,
         } => {
             require_project(model, command, project_id)?;
             if let Some(workspace_root) = workspace_root
@@ -1601,6 +1610,11 @@ async fn plan_command(
                     .map(|value| value.cloned().unwrap_or(Value::Null)),
             );
             insert_optional(&mut payload, "scripts", scripts.as_ref().map(|v| json!(v)));
+            insert_optional(
+                &mut payload,
+                "worktreeDiscovery",
+                worktree_discovery.as_ref().map(|value| json!(value)),
+            );
             Ok(vec![make_event(
                 "project.meta-updated",
                 "project",
@@ -2868,11 +2882,11 @@ fn apply_projects_projector_tx(
     match event.event.event_type.as_str() {
         "project.created" => {
             transaction.execute(
-        "INSERT INTO projection_projects (project_id, title, workspace_root, default_model_selection_json, scripts_json, created_at, updated_at, deleted_at) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, NULL) \
+        "INSERT INTO projection_projects (project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, created_at, updated_at, deleted_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL) \
          ON CONFLICT (project_id) DO UPDATE SET \
            title = excluded.title, workspace_root = excluded.workspace_root, \
-           default_model_selection_json = excluded.default_model_selection_json, scripts_json = excluded.scripts_json, \
+           default_model_selection_json = excluded.default_model_selection_json, scripts_json = excluded.scripts_json, worktree_discovery_json = excluded.worktree_discovery_json, \
            created_at = excluded.created_at, updated_at = excluded.updated_at, deleted_at = excluded.deleted_at",
         params![
             required_str(payload, "projectId")?,
@@ -2886,6 +2900,12 @@ fn apply_projects_projector_tx(
                     .unwrap_or_else(|| Value::Array(Vec::new()));
                 json_string(&scripts)?
             },
+            json_string(
+                &payload
+                    .get("worktreeDiscovery")
+                    .cloned()
+                    .unwrap_or_else(default_worktree_discovery),
+            )?,
             required_str(payload, "createdAt")?,
             required_str(payload, "updatedAt")?,
         ],
@@ -2893,13 +2913,15 @@ fn apply_projects_projector_tx(
         }
         "project.meta-updated" => {
             transaction.execute(
-            "UPDATE projection_projects SET title = COALESCE(?, title), workspace_root = COALESCE(?, workspace_root), default_model_selection_json = CASE WHEN ? THEN ? ELSE default_model_selection_json END, scripts_json = COALESCE(?, scripts_json), updated_at = ? WHERE project_id = ?",
+            "UPDATE projection_projects SET title = COALESCE(?, title), workspace_root = COALESCE(?, workspace_root), default_model_selection_json = CASE WHEN ? THEN ? ELSE default_model_selection_json END, scripts_json = COALESCE(?, scripts_json), worktree_discovery_json = CASE WHEN ? THEN ? ELSE worktree_discovery_json END, updated_at = ? WHERE project_id = ?",
             params![
                 optional_string(payload.get("title")),
                 optional_string(payload.get("workspaceRoot")),
                 payload.get("defaultModelSelection").is_some(),
                 optional_json_string(payload.get("defaultModelSelection"))?,
                 payload.get("scripts").map(json_string).transpose()?,
+                payload.get("worktreeDiscovery").is_some(),
+                payload.get("worktreeDiscovery").map(json_string).transpose()?,
                 required_str(payload, "updatedAt")?,
                 required_str(payload, "projectId")?,
             ],
@@ -3696,6 +3718,11 @@ fn decode_event_row(row: &Row<'_>) -> rusqlite::Result<OrchestrationEvent> {
 
 fn json_string(value: &Value) -> Result<String, PersistenceError> {
     serde_json::to_string(value).map_err(to_corrupt_error)
+}
+
+fn default_worktree_discovery() -> Value {
+    serde_json::from_str(DEFAULT_WORKTREE_DISCOVERY_JSON)
+        .expect("default worktree discovery JSON is valid")
 }
 
 fn optional_json_string(value: Option<&Value>) -> Result<Option<String>, PersistenceError> {

@@ -1009,6 +1009,10 @@ async fn orchestration_lifecycle_and_query_rpcs_round_trip_real_state() {
         .await;
         assert!(archived_snapshot["snapshotSequence"].as_i64().unwrap() >= 9);
         assert_eq!(archived_snapshot["projects"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            archived_snapshot["projects"][0]["worktreeDiscovery"],
+            json!({"visibility":"hidden","initialPromptDismissedAt":null,"baselinePaths":[]})
+        );
         let archived_threads = archived_snapshot["threads"]
             .as_array()
             .expect("archived threads");

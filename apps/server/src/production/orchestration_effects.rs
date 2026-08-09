@@ -1421,6 +1421,7 @@ mod tests {
                     .into_owned(),
                 default_model_selection: None,
                 scripts: json!({"not":"an array"}),
+                worktree_discovery: json!({"visibility":"hidden","initialPromptDismissedAt":null,"baselinePaths":[]}),
                 created_at: "2026-07-16T00:00:00Z".to_owned(),
                 updated_at: "2026-07-16T00:00:00Z".to_owned(),
                 deleted_at: None,
@@ -1434,6 +1435,7 @@ mod tests {
                 workspace_root: parent.path().join("empty").to_string_lossy().into_owned(),
                 default_model_selection: None,
                 scripts: json!([]),
+                worktree_discovery: json!({"visibility":"hidden","initialPromptDismissedAt":null,"baselinePaths":[]}),
                 created_at: "2026-07-16T00:00:01Z".to_owned(),
                 updated_at: "2026-07-16T00:00:01Z".to_owned(),
                 deleted_at: None,
@@ -1452,6 +1454,7 @@ mod tests {
                     "command":"vp install",
                     "runOnWorktreeCreate":true
                 }]),
+                worktree_discovery: json!({"visibility":"hidden","initialPromptDismissedAt":null,"baselinePaths":[]}),
                 created_at: "2026-07-16T00:00:02Z".to_owned(),
                 updated_at: "2026-07-16T00:00:02Z".to_owned(),
                 deleted_at: None,
@@ -1645,6 +1648,7 @@ mod tests {
                     "command":"vp install",
                     "runOnWorktreeCreate":true
                 }]),
+                worktree_discovery: json!({"visibility":"hidden","initialPromptDismissedAt":null,"baselinePaths":[]}),
                 created_at: "2026-08-01T00:00:00Z".to_owned(),
                 updated_at: "2026-08-01T00:00:00Z".to_owned(),
                 deleted_at: None,
