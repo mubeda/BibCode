@@ -2021,10 +2021,13 @@ mod tests {
             .repositories()
             .pause_after_next_provider_turn_read_for_test();
         let routes = Arc::new(AtomicUsize::new(0));
+        let routed = Arc::new(Notify::new());
         let router: ProviderDeliveryRouter = Arc::new({
             let routes = routes.clone();
+            let routed = routed.clone();
             move |_command, _delivery_key| {
                 routes.fetch_add(1, Ordering::SeqCst);
+                routed.notify_one();
                 Box::pin(async { ProviderDeliveryOutcome::Accepted { turn_id: None } })
             }
         });
@@ -2047,13 +2050,12 @@ mod tests {
             "a restarted worker must honor the durable retry deadline"
         );
         tokio::time::advance(Duration::from_millis(99)).await;
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while routes.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("persisted backoff expires");
+        // Delivery crosses the real SQLite worker after the virtual retry timer fires.
+        // Resume real time so the completion timeout cannot outrun that I/O.
+        tokio::time::resume();
+        tokio::time::timeout(Duration::from_secs(1), routed.notified())
+            .await
+            .expect("persisted backoff expires");
         assert_eq!(routes.load(Ordering::SeqCst), 1);
 
         service.shutdown().await;
