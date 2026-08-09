@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    io,
     path::{Path, PathBuf},
 };
 
@@ -56,9 +57,30 @@ pub enum WorktreeParseError {
     InvalidField { field: &'static str },
 }
 
+#[derive(Debug, Error)]
+pub enum WorktreeIdentityError {
+    #[error("failed to canonicalize the common Git directory {path}")]
+    CommonDir {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to canonicalize the registered worktree path {path}")]
+    WorktreePath {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+}
+
 #[must_use]
 pub fn normalize_worktree_path_key(path: &Path, platform: HostPathPlatform) -> String {
-    let mut normalized = collapse_separators(&path.to_string_lossy().replace('\\', "/"));
+    let mut normalized = match platform {
+        HostPathPlatform::Posix => path.to_string_lossy().into_owned(),
+        HostPathPlatform::Windows => {
+            collapse_separators(&path.to_string_lossy().replace('\\', "/"))
+        }
+    };
     while normalized.len() > minimum_path_length(&normalized, platform) && normalized.ends_with('/')
     {
         normalized.pop();
@@ -110,17 +132,31 @@ pub async fn resolved_worktree_keys(
     common_dir: &Path,
     git_path: &Path,
     platform: HostPathPlatform,
-) -> (WorktreeRepositoryKey, WorktreeKey) {
-    let common_dir = tokio::fs::canonicalize(common_dir)
-        .await
-        .unwrap_or_else(|_| common_dir.to_path_buf());
-    let git_path = tokio::fs::canonicalize(git_path)
-        .await
-        .unwrap_or_else(|_| git_path.to_path_buf());
-    (
+) -> Result<(WorktreeRepositoryKey, WorktreeKey), WorktreeIdentityError> {
+    let common_dir = canonicalize_or_git_path(common_dir, true).await?;
+    let git_path = canonicalize_or_git_path(git_path, false).await?;
+    Ok((
         worktree_repository_key(&common_dir, platform),
         worktree_key(&common_dir, &git_path, platform),
-    )
+    ))
+}
+
+async fn canonicalize_or_git_path(
+    path: &Path,
+    common_dir: bool,
+) -> Result<PathBuf, WorktreeIdentityError> {
+    match tokio::fs::canonicalize(path).await {
+        Ok(path) => Ok(path),
+        Err(source) if source.kind() == io::ErrorKind::NotFound => Ok(path.to_path_buf()),
+        Err(source) if common_dir => Err(WorktreeIdentityError::CommonDir {
+            path: path.to_path_buf(),
+            source,
+        }),
+        Err(source) => Err(WorktreeIdentityError::WorktreePath {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
 }
 
 pub fn parse_worktree_porcelain(
@@ -231,6 +267,7 @@ fn parse_record(
     let mut is_bare = false;
     let mut locked = false;
     let mut lock_reason = None;
+    let mut is_prunable = false;
     let mut prunable_reason = None;
     let mut detached = false;
     let mut unborn = false;
@@ -295,6 +332,7 @@ fn parse_record(
                 lock_reason = value.map(str::to_owned).filter(|value| !value.is_empty());
             }
             "prunable" => {
+                is_prunable = true;
                 prunable_reason = value.map(str::to_owned).filter(|value| !value.is_empty());
             }
             "detached" => {
@@ -322,6 +360,7 @@ fn parse_record(
         is_bare,
         locked,
         lock_reason,
+        is_prunable,
         prunable_reason,
     })
 }
@@ -385,8 +424,8 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        HostPathPlatform, normalize_worktree_path_key, parse_worktree_porcelain, worktree_key,
-        worktree_repository_key,
+        HostPathPlatform, WorktreeIdentityError, normalize_worktree_path_key,
+        parse_worktree_porcelain, resolved_worktree_keys, worktree_key, worktree_repository_key,
     };
 
     #[test]
@@ -404,7 +443,29 @@ mod tests {
         assert_eq!(records[0].lock_reason.as_deref(), Some("maintenance"));
         assert!(records[0].is_primary);
         assert_eq!(records[1].branch, None);
+        assert!(records[1].is_prunable);
         assert_eq!(records[1].prunable_reason.as_deref(), Some("stale admin"));
+    }
+
+    #[test]
+    fn preserves_prunable_state_with_and_without_a_reason_and_ignores_unknown_fields() {
+        let records = parse_worktree_porcelain(
+            "worktree /prunable\nlocked\nprunable\nfuture-field preserved\n\nworktree /reasoned\nlocked maintenance\nprunable stale registration\n\n",
+            false,
+        )
+        .expect("legacy porcelain with forward-compatible fields parses");
+
+        assert!(records[0].locked);
+        assert_eq!(records[0].lock_reason, None);
+        assert!(records[0].is_prunable);
+        assert_eq!(records[0].prunable_reason, None);
+        assert!(records[1].locked);
+        assert_eq!(records[1].lock_reason.as_deref(), Some("maintenance"));
+        assert!(records[1].is_prunable);
+        assert_eq!(
+            records[1].prunable_reason.as_deref(),
+            Some("stale registration")
+        );
     }
 
     #[test]
@@ -442,12 +503,12 @@ mod tests {
     #[test]
     fn normalizes_host_path_keys_and_derives_stable_opaque_keys() {
         assert_eq!(
-            normalize_worktree_path_key(Path::new(r"C:\\Repo\\Work\\"), HostPathPlatform::Windows),
+            normalize_worktree_path_key(Path::new(r"C:\Repo\Work\"), HostPathPlatform::Windows),
             "c:/repo/work"
         );
         assert_eq!(
             normalize_worktree_path_key(
-                Path::new(r"\\\\Server\\Share\\Repo\\"),
+                Path::new(r"\\Server\Share\Repo\"),
                 HostPathPlatform::Windows
             ),
             "//server/share/repo"
@@ -456,6 +517,24 @@ mod tests {
             normalize_worktree_path_key(Path::new("/Repo"), HostPathPlatform::Posix),
             normalize_worktree_path_key(Path::new("/repo"), HostPathPlatform::Posix)
         );
+        assert_ne!(
+            normalize_worktree_path_key(Path::new(r"/repo\\name"), HostPathPlatform::Posix),
+            normalize_worktree_path_key(Path::new("/repo/name"), HostPathPlatform::Posix)
+        );
+        assert_eq!(
+            normalize_worktree_path_key(Path::new(r"C:\Repo\Work\"), HostPathPlatform::Windows),
+            normalize_worktree_path_key(Path::new("c:/repo/work"), HostPathPlatform::Windows)
+        );
+        assert_eq!(
+            normalize_worktree_path_key(
+                Path::new(r"\\Server\Share\Repo"),
+                HostPathPlatform::Windows
+            ),
+            normalize_worktree_path_key(
+                Path::new("//server/share/repo"),
+                HostPathPlatform::Windows
+            )
+        );
 
         let repository = worktree_repository_key(Path::new("/repo/.git"), HostPathPlatform::Posix);
         let worktree = worktree_key(
@@ -463,8 +542,14 @@ mod tests {
             Path::new("/repo"),
             HostPathPlatform::Posix,
         );
-        assert_eq!(repository.as_str().len(), 64);
-        assert_eq!(worktree.as_str().len(), 64);
+        assert_eq!(
+            repository.as_str(),
+            "645ba9aff325a5b317ca9f1e74cf2cb08fae039ffd44fce517bc46891d96343e"
+        );
+        assert_eq!(
+            worktree.as_str(),
+            "6ddf15a6da57b88326fff5d03a6f4e18c16682c3aac7e8a1c17232559d495294"
+        );
         assert_eq!(
             worktree,
             worktree_key(
@@ -473,5 +558,45 @@ mod tests {
                 HostPathPlatform::Posix,
             )
         );
+    }
+
+    #[tokio::test]
+    async fn canonical_key_resolution_distinguishes_missing_and_other_io_errors() {
+        let present = tempfile::tempdir().expect("present path fixture");
+        let missing = present.path().join("missing");
+        let invalid = Path::new("\0not-a-path");
+
+        let resolved =
+            resolved_worktree_keys(present.path(), present.path(), HostPathPlatform::Posix)
+                .await
+                .expect("present paths canonicalize");
+        let canonical_present = tokio::fs::canonicalize(present.path())
+            .await
+            .expect("canonical present fixture");
+        assert_eq!(
+            resolved.1,
+            worktree_key(
+                &canonical_present,
+                &canonical_present,
+                HostPathPlatform::Posix
+            )
+        );
+        assert!(
+            resolved_worktree_keys(present.path(), &missing, HostPathPlatform::Posix)
+                .await
+                .expect("missing worktree falls back to Git path")
+                .1
+                .as_str()
+                .len()
+                == 64
+        );
+        assert!(matches!(
+            resolved_worktree_keys(present.path(), invalid, HostPathPlatform::Posix).await,
+            Err(WorktreeIdentityError::WorktreePath { .. })
+        ));
+        assert!(matches!(
+            resolved_worktree_keys(invalid, present.path(), HostPathPlatform::Posix).await,
+            Err(WorktreeIdentityError::CommonDir { .. })
+        ));
     }
 }
