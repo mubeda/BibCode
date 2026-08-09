@@ -39,9 +39,10 @@ The canonical `thread.token-usage.updated` event describes two distinct values:
 `usedTokens` is active context-window usage, while optional
 `totalProcessedTokens` is lifetime tokens processed by the provider. The latter
 is informational and never replaces the active value used to calculate context
-capacity. Provider processes emit the canonical event; the server-owned native
-runtime and typed orchestration path normalize, persist, and publish it. It
-does not cross a desktop bridge or create a client-owned provider channel.
+capacity. Provider-native usage is normalized and emitted as the canonical
+`thread.token-usage.updated` event by the server runtime; the typed
+orchestration path persists and publishes it. It does not cross a desktop bridge
+or create a client-owned provider channel.
 
 Claude context-window usage keeps stream-derived updates as its live fallback.
 After a successful turn completion, the driver sends the official correlated
