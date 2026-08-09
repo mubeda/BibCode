@@ -296,9 +296,7 @@ const ComposerFooterModeControls = memo(function ComposerFooterModeControls(prop
                 size="sm"
                 className={cn(
                   "shrink-0 px-2 text-foreground/80 hover:text-foreground [&_[data-slot=select-icon]]:hidden",
-                  isFullAccess
-                    ? "[&_svg]:text-destructive"
-                    : "[&_svg]:text-foreground/80",
+                  isFullAccess ? "[&_svg]:text-destructive" : "[&_svg]:text-foreground/80",
                 )}
                 aria-label={runtimeModeOption.label}
               />

@@ -1268,10 +1268,7 @@ describe("ChatComposer rendering", () => {
   it("uses destructive icon treatment only while Full access is selected", () => {
     const fullAccess = renderComposer({ runtimeMode: "full-access" });
     const fullAccessTrigger = captureByLabel("SelectTrigger", "Full access");
-    const fullAccessItem = findCapture(
-      "SelectItem",
-      (props) => props["value"] === "full-access",
-    );
+    const fullAccessItem = findCapture("SelectItem", (props) => props["value"] === "full-access");
 
     expect(String(fullAccessTrigger["className"])).toContain("[&_svg]:text-destructive");
     expect(filterCaptures("SelectValue")).toHaveLength(0);
@@ -1284,9 +1281,7 @@ describe("ChatComposer rendering", () => {
 
     const supervised = renderComposer({ runtimeMode: "approval-required" });
     const supervisedTrigger = captureByLabel("SelectTrigger", "Supervised");
-    expect(String(supervisedTrigger["className"])).not.toContain(
-      "[&_svg]:text-destructive",
-    );
+    expect(String(supervisedTrigger["className"])).not.toContain("[&_svg]:text-destructive");
     expect(supervised.markup).not.toContain("text-destructive");
   });
 

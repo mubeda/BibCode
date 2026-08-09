@@ -479,16 +479,12 @@ export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
                   <MenuRadioItem
                     key={option.id}
                     value={option.id}
-                    disabled={
-                      isPending || (ultrathinkInBodyText && isPrimaryEffortDescriptor)
-                    }
+                    disabled={isPending || (ultrathinkInBodyText && isPrimaryEffortDescriptor)}
                   >
                     <span
                       data-effort-title={isPrimaryEffortDescriptor ? "true" : undefined}
                       className={cn(
-                        highestEffortSelected &&
-                          option.id === selectedValue &&
-                          "text-destructive",
+                        highestEffortSelected && option.id === selectedValue && "text-destructive",
                       )}
                     >
                       {option.label}
