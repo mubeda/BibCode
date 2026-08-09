@@ -74,7 +74,7 @@ sequenceDiagram
   RPC-->>UI: typed Exit
   Engine->>Delivery: admitted turn
   Delivery->>Provider: provider-native delivery
-  Provider->>Engine: normalized runtime events
+  Provider->>Engine: canonical runtime event
   Engine-->>UI: subscribeThread / subscribeShell chunks
 ```
 
@@ -83,6 +83,21 @@ will finish successfully. Provider delivery and completion are reflected by
 subsequent durable orchestration events. Streaming subscriptions can be
 re-established after reconnect from snapshots or replay methods rather than
 depending on connection-local push caches.
+
+### Context-window usage flow
+
+Provider-native usage data is normalized in the server runtime as canonical
+`thread.token-usage.updated`. `ProviderRuntimeSupervisor` maps that canonical
+event to an informational `context-window.updated` thread activity, which the
+`OrchestrationEngine` appends through the same durable event and typed
+subscription path as other provider activity.
+
+The append-only event log preserves every accepted context activity for audit
+and replay. Durable projections and client snapshots retain only the latest
+valid context-window activity for each turn, so a newer valid reading replaces
+the prior valid reading for that turn. A malformed row cannot evict a valid row,
+and reverting a turn removes only that turn's projected usage; neither behavior
+creates a separate usage cache.
 
 ## Provider usage refresh
 

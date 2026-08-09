@@ -1,9 +1,16 @@
 # Provider architecture
 
 BiBCode currently supports Codex, Claude, Cursor, and OpenCode. A provider
-instance binds a driver to its configured executable, options, and readiness
-state. Commands identify the instance rather than reconstructing driver state
-in the client.
+instance binds a driver to its configured executable, options, readiness state,
+and instance metadata. Commands identify the instance rather than
+reconstructing driver state in the client.
+
+`supportsContextWindowUsage` is provider-inventory metadata, not a UI guess or
+a property of an individual usage event. Codex and Claude are the only initial
+providers that advertise this capability; an absent capability means that the
+client must show the feature as unavailable even if stale activity exists for a
+thread. The capability does not change ordinary provider execution or activity
+support.
 
 ## Execution path
 
@@ -28,6 +35,14 @@ Provider-specific events are normalized into shared orchestration contracts;
 provider wire payloads do not leak into React state. See
 [RPC and orchestration](./rpc-and-orchestration.md).
 
+The canonical `thread.token-usage.updated` event describes two distinct values:
+`usedTokens` is active context-window usage, while optional
+`totalProcessedTokens` is lifetime tokens processed by the provider. The latter
+is informational and never replaces the active value used to calculate context
+capacity. Provider processes emit the canonical event; the server-owned native
+runtime and typed orchestration path normalize, persist, and publish it. It
+does not cross a desktop bridge or create a client-owned provider channel.
+
 Claude context-window usage keeps stream-derived updates as its live fallback.
 After a successful turn completion, the driver sends the official correlated
 `get_context_usage` control request and waits for at most two seconds. A new
@@ -36,7 +51,9 @@ an unchanged snapshot, unsupported or malformed response, writer failure,
 cancellation, EOF, or timeout releases the completion immediately. Control
 responses are routed by their top-level request ID and never enter the normal
 provider-event stream, while timeout and shutdown paths remove all pending
-waiters.
+waiters. The response is applied only while that turn remains current, so a
+late response cannot overwrite a newer turn; failures remain nonfatal and the
+last valid stream-derived snapshot stays visible.
 
 ## Provider usage and local credential ownership
 
