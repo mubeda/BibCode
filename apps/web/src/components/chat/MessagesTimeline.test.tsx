@@ -610,16 +610,17 @@ describe("MessagesTimeline", () => {
     expect(markup).not.toContain("legend-list");
   });
 
-  it("renders a plain working indicator when the active turn start is unknown", async () => {
+  it("renders a zeroed waiting timer when the active turn start is unknown", async () => {
     const { MessagesTimeline } = await import("./MessagesTimeline");
     const markup = renderToStaticMarkup(
       <MessagesTimeline {...buildProps()} isWorking timelineEntries={[]} />,
     );
 
-    expect(markup).toContain("Working...");
+    expect(markup).toContain("Waiting for");
+    expect(markup).toContain(">0.0s<");
   });
 
-  it("renders a self-ticking working timer in seconds for young turns", async () => {
+  it("renders the reversed dotted-square before a one-decimal waiting timer", async () => {
     const { MessagesTimeline } = await import("./MessagesTimeline");
     const startedAt = new Date(Date.now() - 30_000).toISOString();
     const markup = renderToStaticMarkup(
@@ -631,8 +632,14 @@ describe("MessagesTimeline", () => {
       />,
     );
 
-    expect(markup).toContain("Working for");
-    expect(markup).toMatch(/Working for <span[^>]*>(29|30|31)s</);
+    expect(markup).toContain('data-working-indicator="reversed"');
+    expect(markup.match(/data-working-indicator-dot=/g) ?? []).toHaveLength(8);
+    expect(markup.indexOf('data-working-indicator="reversed"')).toBeLessThan(
+      markup.indexOf("Waiting for"),
+    );
+    expect(markup).toContain('style="animation-delay:-980ms"');
+    expect(markup).toMatch(/Waiting for <span[^>]*>(29\.9|30\.0|30\.1)s</);
+    expect(markup).not.toContain("Working for");
   });
 
   it("formats the working timer with minutes and seconds", async () => {
@@ -647,10 +654,10 @@ describe("MessagesTimeline", () => {
       />,
     );
 
-    expect(markup).toMatch(/1m (29|30|31)s/);
+    expect(markup).toMatch(/1m (29\.9|30\.0|30\.1)s/);
   });
 
-  it("formats the working timer with hours and minutes", async () => {
+  it("formats the working timer with hours, minutes, and decimal seconds", async () => {
     const { MessagesTimeline } = await import("./MessagesTimeline");
     const startedAt = new Date(Date.now() - 3_690_000).toISOString();
     const markup = renderToStaticMarkup(
@@ -662,10 +669,10 @@ describe("MessagesTimeline", () => {
       />,
     );
 
-    expect(markup).toContain("1h 1m");
+    expect(markup).toMatch(/1h 1m (29\.9|30\.0|30\.1)s/);
   });
 
-  it("formats the working timer with hours only when minutes are zero", async () => {
+  it("retains zero minutes when an hour-scale timer includes decimal seconds", async () => {
     const { MessagesTimeline } = await import("./MessagesTimeline");
     const startedAt = new Date(Date.now() - 3_650_000).toISOString();
     const markup = renderToStaticMarkup(
@@ -677,8 +684,23 @@ describe("MessagesTimeline", () => {
       />,
     );
 
-    expect(markup).toMatch(/1h</);
-    expect(markup).not.toContain("1h 0m");
+    expect(markup).toMatch(/1h 0m (49\.9|50\.0|50\.1)s/);
+  });
+
+  it("updates the waiting timer every 100ms and clears the interval on unmount", async () => {
+    const intervalSpy = vi.spyOn(globalThis, "setInterval");
+    const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
+    await mountTimeline({
+      isWorking: true,
+      activeTurnStartedAt: new Date(Date.now() - 3_800).toISOString(),
+      timelineEntries: [],
+    });
+
+    expect(intervalSpy).toHaveBeenCalledWith(expect.any(Function), 100);
+    const mounted = mountedTrees.pop()!;
+    await act(async () => mounted.root.unmount());
+    mounted.container.remove();
+    expect(clearIntervalSpy).toHaveBeenCalled();
   });
 
   it("renders a failure marker for failed tool lifecycle entries", async () => {
@@ -1316,8 +1338,8 @@ describe("MessagesTimeline working timer resilience", () => {
       timelineEntries: [],
     });
 
-    expect(markup).toContain("Working for");
-    expect(markup).toContain(">0s<");
+    expect(markup).toContain("Waiting for");
+    expect(markup).toContain(">0.0s<");
   });
 });
 
