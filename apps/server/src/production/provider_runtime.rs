@@ -3546,12 +3546,23 @@ fn context_window_activity_payload(payload: &Value) -> Option<Value> {
     let mut sanitized = json!({ "usedTokens": used_tokens });
     let sanitized_object = sanitized.as_object_mut()?;
 
-    if let Some(total_processed_tokens) = usage.get("totalProcessedTokens").and_then(Value::as_u64)
-    {
-        sanitized_object.insert(
-            "totalProcessedTokens".to_owned(),
-            Value::from(total_processed_tokens),
-        );
+    for field in [
+        "totalProcessedTokens",
+        "inputTokens",
+        "cachedInputTokens",
+        "outputTokens",
+        "reasoningOutputTokens",
+        "lastUsedTokens",
+        "lastInputTokens",
+        "lastCachedInputTokens",
+        "lastOutputTokens",
+        "lastReasoningOutputTokens",
+        "toolUses",
+        "durationMs",
+    ] {
+        if let Some(value) = usage.get(field).and_then(Value::as_u64) {
+            sanitized_object.insert(field.to_owned(), Value::from(value));
+        }
     }
     if let Some(max_tokens) = usage
         .get("maxTokens")
@@ -10881,6 +10892,18 @@ done
                         "usedTokens": 1_075,
                         "totalProcessedTokens": 10_200,
                         "maxTokens": 258_400,
+                        "inputTokens": 1_000,
+                        "cachedInputTokens": 500,
+                        "outputTokens": 50,
+                        "reasoningOutputTokens": 25,
+                        "lastUsedTokens": 1_075,
+                        "lastInputTokens": 1_000,
+                        "lastCachedInputTokens": 500,
+                        "lastOutputTokens": 50,
+                        "lastReasoningOutputTokens": 25,
+                        "toolUses": 4,
+                        "durationMs": 900,
+                        "nativeUsageDetail": "must be dropped",
                         "compactsAutomatically": true
                     }
                 }),
@@ -10904,6 +10927,17 @@ done
                 "usedTokens": 1_075,
                 "totalProcessedTokens": 10_200,
                 "maxTokens": 258_400,
+                "inputTokens": 1_000,
+                "cachedInputTokens": 500,
+                "outputTokens": 50,
+                "reasoningOutputTokens": 25,
+                "lastUsedTokens": 1_075,
+                "lastInputTokens": 1_000,
+                "lastCachedInputTokens": 500,
+                "lastOutputTokens": 50,
+                "lastReasoningOutputTokens": 25,
+                "toolUses": 4,
+                "durationMs": 900,
                 "compactsAutomatically": true
             })
         );
