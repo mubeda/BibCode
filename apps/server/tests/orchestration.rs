@@ -345,6 +345,68 @@ async fn project_worktree_discovery_policy_survives_metadata_updates_and_replay(
 }
 
 #[tokio::test]
+async fn project_repository_identity_pin_survives_projection_rewind_and_replay() {
+    let repositories = migrated_repositories().await;
+    let engine =
+        OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
+            .await
+            .expect("engine starts");
+    engine
+        .dispatch(decode(json!({
+            "type": "project.create",
+            "commandId": "pin-replay-create",
+            "projectId": "pin-replay-project",
+            "title": "Pinned replay project",
+            "workspaceRoot": "C:/pin-replay-project",
+            "defaultModelSelection": null,
+            "createdAt": CREATED_AT,
+        })))
+        .await
+        .expect("project creates");
+    assert_eq!(
+        engine
+            .repositories()
+            .pin_project_worktree_repository_key(
+                "pin-replay-project".to_owned(),
+                "repository-key-durable".to_owned(),
+            )
+            .await
+            .expect("pin persists"),
+        Some(bibcode_server::persistence::WorktreeRepositoryPinOutcome::Established)
+    );
+    engine.shutdown().await;
+
+    repositories
+        .database()
+        .call(|connection| {
+            connection.execute("DELETE FROM projection_projects", [])?;
+            connection.execute(
+                "UPDATE projection_state SET last_applied_sequence = 0 WHERE projector = 'projection.projects'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("rewind project projection");
+    let restarted =
+        OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
+            .await
+            .expect("engine restarts");
+    let project = restarted
+        .repositories()
+        .get_project("pin-replay-project".to_owned())
+        .await
+        .expect("read replayed project")
+        .expect("project replayed");
+
+    assert_eq!(
+        project.worktree_repository_key.as_deref(),
+        Some("repository-key-durable")
+    );
+    restarted.shutdown().await;
+}
+
+#[tokio::test]
 async fn omitted_worktree_discovery_metadata_update_preserves_custom_policy_through_replay() {
     let repositories = migrated_repositories().await;
     let engine =

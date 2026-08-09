@@ -160,7 +160,7 @@ Rejected alternatives were:
 | Whether a worktree is adopted into BibCode | A non-deleted canonical workspace thread with that `worktreePath` |
 | Conversations, agents, terminals, panels, and model settings | Existing orchestration thread |
 | Hidden/shown discovery intent and acknowledgement | Project orchestration metadata |
-| Repository identity fence | Nullable durable project `WorktreeRepositoryKey`, established only by a trusted authoritative primary-checkout scan |
+| Repository identity fence | Nullable durable project `WorktreeRepositoryKey` stored outside rebuildable projections and established only by a trusted authoritative primary-checkout scan |
 | Current scan health, cache, generations, and subscribers | In-memory Worktree Catalog runtime |
 
 The design does not persist a duplicate live worktree list. Catalog state is
@@ -242,15 +242,19 @@ Policy and catalogs are scoped to each physical `(environmentId, projectId)`.
 A logical sidebar group may aggregate their presentation, but paths,
 authority, mutations, and failures remain host-specific.
 
-Project projection metadata also contains a nullable
-`worktreeRepositoryKey`. Legacy projects start unpinned. Only a successful,
-authoritative scan anchored at the persisted primary checkout may establish
-the pin, using an atomic establish-or-match persistence operation. Once set,
-ordinary project projection updates preserve it and no scan implicitly
-re-pins it. Every later primary, adopted-worktree, or lifetime-common-directory
-anchor must resolve to the same key; mismatch fails closed. This permits a
-cold-start adopted anchor only when it matches the durable pin and prevents a
-replacement repository at an old path from being reported as present.
+Project projection reads expose a nullable `worktreeRepositoryKey`, but the
+identity row is stored in a dedicated durable table outside the rebuildable
+project projection. Migration 42 backfills that table from migration 41's
+nullable projection column. Legacy projects start unpinned. Only a successful,
+authoritative scan anchored at the persisted primary checkout may call the
+atomic establish-or-match operation. Generic project upserts and event replay
+cannot establish or replace the pin. It therefore survives projection
+delete/rewind/replay, and no scan implicitly re-pins it. Every later primary,
+adopted-worktree, or lifetime-common-directory anchor must resolve to the same
+key; mismatch fails closed and a warm view publishes degraded scan health
+while retaining its prior authoritative arrays. This permits a cold-start
+adopted anchor only when it matches the durable pin and prevents a replacement
+repository at an old path from being reported as present.
 
 ## Worktree Catalog Service
 
@@ -271,6 +275,7 @@ lastAuthoritativeSnapshot
 scanStatus
 generation
 mutationEpoch
+lifecycleEpoch
 inFlightScan
 subscriberCount
 pollerCancellation
@@ -285,6 +290,19 @@ mutation-lock registry slots are weak references; a held or awaited physical
 repository mutation lock remains strongly owned and cannot be removed and
 recreated concurrently. A global semaphore bounds simultaneous Git catalog
 scans, and each repository admits only one observation at a time.
+Poll initialization is an idempotent project-view-owned task rather than an
+individual subscriber-owned future. All attaching subscribers await the same
+readiness generation, so aborting the subscriber that initiated initialization
+cannot strand later subscribers. Transitions from zero to one subscriber
+advance project-view and shared-repository lifecycle epochs and create fresh
+cancellation ownership; completions from an older epoch cannot publish or
+populate the new epoch's coalesced result.
+Repository observations are reusable only for callers that selected the same
+anchor path; a result from another alias's anchor cannot substitute for
+resolving and validating the current caller's primary, adopted, or lifetime
+anchor. Final view and repository subscriber decrements share the same
+entry-to-repository lock scope, so a reattachment cannot observe half-released
+ownership or skip the repository lifecycle transition.
 
 ### Scan anchor resolution
 
@@ -353,6 +371,9 @@ initial subscription.
 - Each create/remove mutation increments `mutationEpoch` before invalidating
   the catalog.
 - A pre-mutation scan may finish but cannot publish over the newer epoch.
+- A stale pre-mutation leader records and advances one explicit stale result;
+  every caller already coalesced behind it receives that identical result and
+  no waiter silently starts a divergent refresh.
 - The stream uses latest-value semantics. Slow subscribers receive the newest
   snapshot rather than an unbounded queue of intermediate refreshes.
 - Shared observations outlive one project-view cancellation while subscribers
@@ -722,7 +743,9 @@ native file-manager behavior only for local environment paths.
   eager rewrite is required.
 - Existing project records decode with a null repository-identity pin. The
   first trusted primary-checkout scan establishes it; it then persists across
-  server restarts and fences every fallback anchor.
+  server restarts and project-projection rewind/replay, and fences every
+  fallback anchor. Migration 42 backfills any migration-41 projection pin into
+  the dedicated durable identity table.
 - Existing worktree threads are matched to catalog entries by server path
   semantics.
 - Existing missing worktree threads become warning rows only after an

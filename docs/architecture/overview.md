@@ -39,14 +39,20 @@ flowchart TB
   orchestration, providers, terminals, Git, files, diagnostics, relay access,
   and process supervision. Its worktree catalog joins bounded live Git and
   filesystem observations with durable project and canonical-thread
-  projections. A nullable project repository-key pin is established only by a
-  trusted primary-checkout scan and fences later fallback anchors; it is not a
-  persisted live catalog. Projects sharing a repository may share Git
+  projections. A nullable project repository-key pin is stored outside the
+  rebuildable projection, established only by a trusted primary-checkout scan,
+  and joined into project reads; generic projection writes cannot change it,
+  and projection rewind/replay preserves it. It fences later fallback anchors
+  and is not a persisted live catalog. Projects sharing a repository may share Git
   observation, but retain isolated latest-value snapshots, streams, thread
   joins, subscribers, suppressions, and mutation epochs. Catalog views retain
   the last authoritative arrays through degraded observations and cancel
   pending poll, Git, and probe work after their final subscriber before bounded
-  idle eviction.
+  idle eviction. Project and repository lifecycle epochs make poller
+  initialization transferable across subscriber aborts and prevent canceled
+  prior-lifecycle work from publishing into an immediate reattachment.
+  Shared observations never bypass per-caller anchor validation, and final
+  view/repository ownership release is atomic against concurrent attachment.
 - **Contracts (`packages/contracts`)** contains Effect schemas and TypeScript
   contracts only. It defines persisted models, RPC methods, HTTP APIs, desktop
   bridge values, and provider events without application runtime logic.

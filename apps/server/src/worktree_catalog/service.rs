@@ -152,6 +152,14 @@ struct Inner {
     scan_semaphore: Arc<Semaphore>,
     probe_semaphore: Arc<Semaphore>,
     registry: Mutex<Registry>,
+    #[cfg(test)]
+    final_release_pause: Mutex<Option<FinalReleasePause>>,
+}
+
+#[cfg(test)]
+struct FinalReleasePause {
+    entered: Arc<std::sync::Barrier>,
+    resume: Arc<std::sync::Barrier>,
 }
 
 #[derive(Default)]
@@ -167,6 +175,7 @@ struct CatalogEntry {
     project_id: String,
     repository: Arc<RepositoryEntry>,
     refresh_lock: AsyncMutex<()>,
+    poller_ready: watch::Sender<u64>,
     state: Mutex<EntryState>,
 }
 
@@ -179,6 +188,9 @@ struct RepositoryEntry {
 struct RepositoryState {
     completed_observations: u64,
     last_result: Option<Result<Arc<CompletedObservation>, ScanError>>,
+    last_result_anchor: Option<PathBuf>,
+    last_result_lifecycle_epoch: Option<u64>,
+    lifecycle_epoch: u64,
     subscribers: usize,
     scan_cancellation: CancellationToken,
 }
@@ -188,6 +200,9 @@ impl Default for RepositoryState {
         Self {
             completed_observations: 0,
             last_result: None,
+            last_result_anchor: None,
+            last_result_lifecycle_epoch: None,
+            lifecycle_epoch: 0,
             subscribers: 0,
             scan_cancellation: CancellationToken::new(),
         }
@@ -202,6 +217,7 @@ struct EntryState {
     completed_refreshes: u64,
     last_refresh_result: Option<Result<Arc<WorktreeCatalogSnapshot>, CatalogError>>,
     mutation_epoch: u64,
+    lifecycle_epoch: u64,
     subscribers: usize,
     suppressions: HashMap<String, Instant>,
     shallow_signature: Option<CatalogShallowSignature>,
@@ -224,6 +240,7 @@ struct SubscriptionReservation {
     service: WorktreeCatalogService,
     entry: Arc<CatalogEntry>,
     first_subscriber: bool,
+    lifecycle_epoch: u64,
     committed: bool,
 }
 
@@ -248,6 +265,12 @@ enum ScanError {
 struct CatalogAnchor {
     path: PathBuf,
     is_primary: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RefreshFence {
+    mutation_epoch: u64,
+    lifecycle_epoch: Option<u64>,
 }
 
 impl From<CatalogError> for ScanError {
@@ -284,6 +307,8 @@ impl WorktreeCatalogService {
                 scan_semaphore: Arc::new(Semaphore::new(max_repository_scans)),
                 probe_semaphore: Arc::new(Semaphore::new(max_directory_probes)),
                 registry: Mutex::new(Registry::default()),
+                #[cfg(test)]
+                final_release_pause: Mutex::new(None),
             }),
         }
     }
@@ -295,9 +320,14 @@ impl WorktreeCatalogService {
                 break reservation;
             }
         };
+        self.ensure_poller_started(project_id, &reservation.entry, reservation.lifecycle_epoch);
+        if !self
+            .await_poller_ready(&reservation.entry, reservation.lifecycle_epoch)
+            .await
+        {
+            return Err(cancelled_error());
+        }
         if reservation.first_subscriber {
-            self.initialize_signature_and_start_poller(project_id, &reservation.entry)
-                .await;
             self.refresh(project_id, CatalogRefreshTrigger::FirstSubscriber)
                 .await?;
         }
@@ -322,12 +352,15 @@ impl WorktreeCatalogService {
             eviction.cancellation.cancel();
         }
         let first_subscriber = state.subscribers == 0;
-        if first_subscriber && state.scan_cancellation.is_cancelled() {
+        if first_subscriber {
+            state.lifecycle_epoch = state.lifecycle_epoch.wrapping_add(1);
             state.scan_cancellation = CancellationToken::new();
         }
+        let lifecycle_epoch = state.lifecycle_epoch;
         state.subscribers += 1;
         let mut repository_state = lock(&entry.repository.state);
-        if repository_state.subscribers == 0 && repository_state.scan_cancellation.is_cancelled() {
+        if repository_state.subscribers == 0 {
+            repository_state.lifecycle_epoch = repository_state.lifecycle_epoch.wrapping_add(1);
             repository_state.scan_cancellation = CancellationToken::new();
         }
         repository_state.subscribers += 1;
@@ -340,6 +373,7 @@ impl WorktreeCatalogService {
             service: self.clone(),
             entry,
             first_subscriber,
+            lifecycle_epoch,
             committed: false,
         })
     }
@@ -351,7 +385,7 @@ impl WorktreeCatalogService {
     ) -> Result<Arc<WorktreeCatalogSnapshot>, CatalogError> {
         let entry = self.ensure_entry(project_id).await?;
         let requested_at = Instant::now();
-        let (completed_refreshes, cancellation, subscriber_owned) = {
+        let (completed_refreshes, cancellation, subscriber_owned, lifecycle_epoch) = {
             let state = lock(&entry.state);
             let subscriber_owned = state.subscribers != 0;
             let cancellation = if subscriber_owned {
@@ -359,7 +393,12 @@ impl WorktreeCatalogService {
             } else {
                 CancellationToken::new()
             };
-            (state.completed_refreshes, cancellation, subscriber_owned)
+            (
+                state.completed_refreshes,
+                cancellation,
+                subscriber_owned,
+                subscriber_owned.then_some(state.lifecycle_epoch),
+            )
         };
         let guard = tokio::select! {
             _ = cancellation.cancelled() => return Err(cancelled_error()),
@@ -389,7 +428,7 @@ impl WorktreeCatalogService {
         if cancellation.is_cancelled() {
             return Err(cancelled_error());
         }
-        let (epoch, next_generation, suppressions, previous) = {
+        let (fence, next_generation, suppressions, previous) = {
             let mut state = lock(&entry.state);
             let now = Instant::now();
             state.suppressions.retain(|_, created_at| {
@@ -402,7 +441,10 @@ impl WorktreeCatalogService {
             state.snapshot = Arc::clone(&refreshing);
             state.sender.send_replace(refreshing);
             (
-                state.mutation_epoch,
+                RefreshFence {
+                    mutation_epoch: state.mutation_epoch,
+                    lifecycle_epoch,
+                },
                 state.last_authoritative.generation + 1,
                 state.suppressions.keys().cloned().collect::<HashSet<_>>(),
                 Arc::clone(&state.last_authoritative),
@@ -416,14 +458,14 @@ impl WorktreeCatalogService {
             Ok(None) => {
                 return self.publish_failure(
                     &entry,
-                    epoch,
+                    fence,
                     ScanFailure {
                         reason: CatalogDegradedReason::AnchorUnavailable,
                         message: "No reachable Git catalog anchor is available.".to_owned(),
                     },
                 );
             }
-            Err(error) => return self.finish_scan_error(&entry, epoch, error),
+            Err(error) => return self.finish_scan_error(&entry, fence, error),
         };
         let observation = self
             .observe_repository(
@@ -435,10 +477,10 @@ impl WorktreeCatalogService {
             .await;
         let observation = match observation {
             Ok(observation) => observation,
-            Err(error) => return self.finish_scan_error(&entry, epoch, error),
+            Err(error) => return self.finish_scan_error(&entry, fence, error),
         };
         if cancellation.is_cancelled() {
-            return self.finish_cancelled(&entry, epoch);
+            return self.finish_cancelled(&entry, fence);
         }
         if let Err(error) = self
             .verify_or_establish_repository_key(
@@ -449,7 +491,7 @@ impl WorktreeCatalogService {
             )
             .await
         {
-            self.restore_after_catalog_error(&entry, epoch, &error);
+            self.restore_after_catalog_error(&entry, fence, &error)?;
             return Err(error);
         }
         let snapshot = match self
@@ -464,28 +506,31 @@ impl WorktreeCatalogService {
             .await
         {
             Ok(snapshot) => snapshot,
-            Err(error) => return self.finish_scan_error(&entry, epoch, error),
+            Err(error) => return self.finish_scan_error(&entry, fence, error),
         };
         let Some(signature) = self
             .signature_for_snapshot(&entry.repository.common_dir, &snapshot, &cancellation)
             .await
         else {
-            return self.finish_cancelled(&entry, epoch);
+            return self.finish_cancelled(&entry, fence);
         };
         {
             let mut state = lock(&entry.state);
+            if fence
+                .lifecycle_epoch
+                .is_some_and(|epoch| epoch != state.lifecycle_epoch)
+            {
+                return Err(cancelled_error());
+            }
+            if state.mutation_epoch != fence.mutation_epoch {
+                return Self::complete_stale_generation(&mut state);
+            }
             if subscriber_owned && (state.subscribers == 0 || cancellation.is_cancelled()) {
                 let error = cancelled_error();
                 state.completed_at = None;
                 state.completed_refreshes = state.completed_refreshes.wrapping_add(1);
                 state.last_refresh_result = Some(Err(error.clone()));
                 return Err(error);
-            }
-            if state.mutation_epoch != epoch {
-                return Err(CatalogError::new(
-                    CatalogErrorReason::StaleGeneration,
-                    "A catalog mutation invalidated this in-flight refresh.",
-                ));
             }
             state.snapshot = Arc::clone(&snapshot);
             state.last_authoritative = Arc::clone(&snapshot);
@@ -646,10 +691,12 @@ impl WorktreeCatalogService {
                     repository
                 });
             let (sender, _) = watch::channel(Arc::clone(&scan.snapshot));
+            let (poller_ready, _) = watch::channel(0);
             let entry = Arc::new(CatalogEntry {
                 project_id: project_id.to_owned(),
                 repository,
                 refresh_lock: AsyncMutex::new(()),
+                poller_ready,
                 state: Mutex::new(EntryState {
                     snapshot: Arc::clone(&scan.snapshot),
                     last_authoritative: Arc::clone(&scan.snapshot),
@@ -658,6 +705,7 @@ impl WorktreeCatalogService {
                     completed_refreshes: 0,
                     last_refresh_result: None,
                     mutation_epoch: 0,
+                    lifecycle_epoch: 0,
                     subscribers: 0,
                     suppressions: HashMap::new(),
                     shallow_signature: None,
@@ -916,7 +964,10 @@ impl WorktreeCatalogService {
         expected_repository_key: Option<&str>,
         caller_cancellation: &CancellationToken,
     ) -> Result<Arc<CompletedObservation>, ScanError> {
-        let completed_observations = lock(&repository.state).completed_observations;
+        let (completed_observations, lifecycle_epoch) = {
+            let state = lock(&repository.state);
+            (state.completed_observations, state.lifecycle_epoch)
+        };
         let guard = tokio::select! {
             _ = caller_cancellation.cancelled() => return Err(ScanError::Cancelled),
             guard = repository.observation_lock.lock() => guard,
@@ -927,7 +978,13 @@ impl WorktreeCatalogService {
         }
         {
             let state = lock(&repository.state);
-            if state.completed_observations != completed_observations {
+            if state.lifecycle_epoch != lifecycle_epoch {
+                return Err(ScanError::Cancelled);
+            }
+            if state.completed_observations != completed_observations
+                && state.last_result_lifecycle_epoch == Some(lifecycle_epoch)
+                && state.last_result_anchor.as_ref() == Some(&anchor)
+            {
                 return state.last_result.clone().unwrap_or_else(|| {
                     Err(ScanError::Catalog(CatalogError::new(
                         CatalogErrorReason::Internal,
@@ -945,12 +1002,16 @@ impl WorktreeCatalogService {
             }
         };
         let result = self
-            .observe(anchor, expected_repository_key, cancellation)
+            .observe(anchor.clone(), expected_repository_key, cancellation)
             .await
             .map(Arc::new);
         let mut state = lock(&repository.state);
-        state.completed_observations = state.completed_observations.wrapping_add(1);
-        state.last_result = Some(result.clone());
+        if state.lifecycle_epoch == lifecycle_epoch {
+            state.completed_observations = state.completed_observations.wrapping_add(1);
+            state.last_result = Some(result.clone());
+            state.last_result_anchor = Some(anchor);
+            state.last_result_lifecycle_epoch = Some(lifecycle_epoch);
+        }
         result
     }
 
@@ -1189,15 +1250,18 @@ impl WorktreeCatalogService {
     fn publish_failure(
         &self,
         entry: &CatalogEntry,
-        epoch: u64,
+        fence: RefreshFence,
         failure: ScanFailure,
     ) -> Result<Arc<WorktreeCatalogSnapshot>, CatalogError> {
         let mut state = lock(&entry.state);
-        if state.mutation_epoch != epoch {
-            return Err(CatalogError::new(
-                CatalogErrorReason::StaleGeneration,
-                "A catalog mutation invalidated this in-flight refresh.",
-            ));
+        if fence
+            .lifecycle_epoch
+            .is_some_and(|epoch| epoch != state.lifecycle_epoch)
+        {
+            return Err(cancelled_error());
+        }
+        if state.mutation_epoch != fence.mutation_epoch {
+            return Self::complete_stale_generation(&mut state);
         }
         let failed_at = now_iso();
         let snapshot = Arc::new(retained_snapshot(
@@ -1226,48 +1290,92 @@ impl WorktreeCatalogService {
         Ok(snapshot)
     }
 
-    fn restore_after_catalog_error(&self, entry: &CatalogEntry, epoch: u64, error: &CatalogError) {
+    fn restore_after_catalog_error(
+        &self,
+        entry: &CatalogEntry,
+        fence: RefreshFence,
+        error: &CatalogError,
+    ) -> Result<(), CatalogError> {
         let mut state = lock(&entry.state);
-        if state.mutation_epoch != epoch {
-            return;
+        if fence
+            .lifecycle_epoch
+            .is_some_and(|epoch| epoch != state.lifecycle_epoch)
+        {
+            return Err(cancelled_error());
         }
-        let restored = Arc::clone(&state.last_authoritative);
+        if state.mutation_epoch != fence.mutation_epoch {
+            return Self::complete_stale_generation(&mut state).map(|_| ());
+        }
+        let restored = if error.reason == CatalogErrorReason::RepositoryUnavailable {
+            Arc::new(retained_snapshot(
+                &state.last_authoritative,
+                CatalogScanStatus::Degraded {
+                    reason: CatalogDegradedReason::AnchorUnavailable,
+                    message: error.message.clone(),
+                    failed_at: now_iso(),
+                    last_authoritative_at: Some(state.last_authoritative.observed_at.clone()),
+                },
+            ))
+        } else {
+            Arc::clone(&state.last_authoritative)
+        };
         state.snapshot = Arc::clone(&restored);
         state.completed_at = Some(Instant::now());
         state.completed_refreshes = state.completed_refreshes.wrapping_add(1);
         state.last_refresh_result = Some(Err(error.clone()));
         state.sender.send_replace(restored);
+        Ok(())
     }
 
     fn finish_cancelled(
         &self,
         entry: &CatalogEntry,
-        epoch: u64,
+        fence: RefreshFence,
     ) -> Result<Arc<WorktreeCatalogSnapshot>, CatalogError> {
         let error = cancelled_error();
         let mut state = lock(&entry.state);
-        if state.mutation_epoch == epoch {
-            state.completed_at = None;
-            state.completed_refreshes = state.completed_refreshes.wrapping_add(1);
-            state.last_refresh_result = Some(Err(error.clone()));
+        if fence
+            .lifecycle_epoch
+            .is_some_and(|epoch| epoch != state.lifecycle_epoch)
+        {
+            return Err(error);
         }
+        if state.mutation_epoch != fence.mutation_epoch {
+            return Self::complete_stale_generation(&mut state);
+        }
+        state.completed_at = None;
+        state.completed_refreshes = state.completed_refreshes.wrapping_add(1);
+        state.last_refresh_result = Some(Err(error.clone()));
         Err(error)
     }
 
     fn finish_scan_error(
         &self,
         entry: &CatalogEntry,
-        epoch: u64,
+        fence: RefreshFence,
         error: ScanError,
     ) -> Result<Arc<WorktreeCatalogSnapshot>, CatalogError> {
         match error {
-            ScanError::Failure(failure) => self.publish_failure(entry, epoch, failure),
+            ScanError::Failure(failure) => self.publish_failure(entry, fence, failure),
             ScanError::Catalog(error) => {
-                self.restore_after_catalog_error(entry, epoch, &error);
+                self.restore_after_catalog_error(entry, fence, &error)?;
                 Err(error)
             }
-            ScanError::Cancelled => self.finish_cancelled(entry, epoch),
+            ScanError::Cancelled => self.finish_cancelled(entry, fence),
         }
+    }
+
+    fn complete_stale_generation(
+        state: &mut EntryState,
+    ) -> Result<Arc<WorktreeCatalogSnapshot>, CatalogError> {
+        let error = CatalogError::new(
+            CatalogErrorReason::StaleGeneration,
+            "A catalog mutation invalidated this in-flight refresh.",
+        );
+        state.completed_at = None;
+        state.completed_refreshes = state.completed_refreshes.wrapping_add(1);
+        state.last_refresh_result = Some(Err(error.clone()));
+        Err(error)
     }
 
     async fn signature_for_snapshot(
@@ -1296,24 +1404,20 @@ impl WorktreeCatalogService {
         }
     }
 
-    async fn initialize_signature_and_start_poller(
+    fn ensure_poller_started(
         &self,
         project_id: &str,
         entry: &Arc<CatalogEntry>,
+        lifecycle_epoch: u64,
     ) {
-        let (snapshot, scan_cancellation) = {
-            let state = lock(&entry.state);
-            (
-                Arc::clone(&state.last_authoritative),
-                state.scan_cancellation.clone(),
-            )
-        };
-        let Some(signature) = self
-            .signature_for_snapshot(&entry.repository.common_dir, &snapshot, &scan_cancellation)
-            .await
-        else {
+        let mut state = lock(&entry.state);
+        if state.lifecycle_epoch != lifecycle_epoch
+            || state.subscribers == 0
+            || state.poller.is_some()
+        {
             return;
-        };
+        }
+        let snapshot = Arc::clone(&state.last_authoritative);
         let cancellation = CancellationToken::new();
         let weak_inner = Arc::downgrade(&self.inner);
         let weak_entry = Arc::downgrade(entry);
@@ -1321,16 +1425,32 @@ impl WorktreeCatalogService {
         let task_cancellation = cancellation.clone();
         let poll_interval = self.inner.options.poll_interval;
         let handle = tokio::spawn(async move {
+            let (Some(inner), Some(entry)) = (weak_inner.upgrade(), weak_entry.upgrade()) else {
+                return;
+            };
+            let service = WorktreeCatalogService { inner };
+            let Some(signature) = service
+                .signature_for_snapshot(&entry.repository.common_dir, &snapshot, &task_cancellation)
+                .await
+            else {
+                return;
+            };
+            {
+                let mut state = lock(&entry.state);
+                if state.lifecycle_epoch != lifecycle_epoch
+                    || state.subscribers == 0
+                    || task_cancellation.is_cancelled()
+                {
+                    return;
+                }
+                state.shallow_signature = Some(signature);
+            }
+            entry.poller_ready.send_replace(lifecycle_epoch);
             loop {
                 tokio::select! {
                     _ = task_cancellation.cancelled() => break,
                     _ = tokio::time::sleep(poll_interval) => {}
                 }
-                let (Some(inner), Some(entry)) = (weak_inner.upgrade(), weak_entry.upgrade())
-                else {
-                    break;
-                };
-                let service = WorktreeCatalogService { inner };
                 let snapshot = Arc::clone(&lock(&entry.state).last_authoritative);
                 let Some(observed) = service
                     .signature_for_snapshot(
@@ -1344,6 +1464,9 @@ impl WorktreeCatalogService {
                 };
                 let trigger = {
                     let mut state = lock(&entry.state);
+                    if state.lifecycle_epoch != lifecycle_epoch || state.subscribers == 0 {
+                        break;
+                    }
                     let previous = state.shallow_signature.replace(observed);
                     let retry_due = state
                         .next_failure_retry
@@ -1364,16 +1487,29 @@ impl WorktreeCatalogService {
                 }
             }
         });
-        let mut state = lock(&entry.state);
-        if state.subscribers == 0 || state.poller.is_some() {
-            cancellation.cancel();
-            return;
-        }
-        state.shallow_signature = Some(signature);
         state.poller = Some(OwnedTask {
             cancellation,
             _handle: handle,
         });
+    }
+
+    async fn await_poller_ready(&self, entry: &Arc<CatalogEntry>, lifecycle_epoch: u64) -> bool {
+        let mut ready = entry.poller_ready.subscribe();
+        loop {
+            if *ready.borrow() == lifecycle_epoch {
+                return true;
+            }
+            {
+                let state = lock(&entry.state);
+                if state.lifecycle_epoch != lifecycle_epoch || state.subscribers == 0 {
+                    return false;
+                }
+            }
+            self.ensure_poller_started(&entry.project_id, entry, lifecycle_epoch);
+            if ready.changed().await.is_err() {
+                return false;
+            }
+        }
     }
 
     fn release(&self, entry: &Arc<CatalogEntry>) {
@@ -1389,16 +1525,17 @@ impl WorktreeCatalogService {
                     poller.cancellation.cancel();
                 }
                 state.scan_cancellation.cancel();
+                state.completed_at = None;
             }
-            final_subscriber
-        };
-        {
+            #[cfg(test)]
+            self.pause_final_release_for_test(final_subscriber);
             let mut repository_state = lock(&entry.repository.state);
             repository_state.subscribers = repository_state.subscribers.saturating_sub(1);
             if repository_state.subscribers == 0 {
                 repository_state.scan_cancellation.cancel();
             }
-        }
+            final_subscriber
+        };
         if !should_evict {
             return;
         }
@@ -1448,6 +1585,31 @@ impl WorktreeCatalogService {
     #[cfg(test)]
     pub(crate) fn entry_count_for_test(&self) -> usize {
         lock(&self.inner.registry).entries.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_final_release_for_test(
+        &self,
+    ) -> (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>) {
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        *lock(&self.inner.final_release_pause) = Some(FinalReleasePause {
+            entered: Arc::clone(&entered),
+            resume: Arc::clone(&resume),
+        });
+        (entered, resume)
+    }
+
+    #[cfg(test)]
+    fn pause_final_release_for_test(&self, final_subscriber: bool) {
+        if !final_subscriber {
+            return;
+        }
+        let Some(pause) = lock(&self.inner.final_release_pause).take() else {
+            return;
+        };
+        pause.entered.wait();
+        pause.resume.wait();
     }
 }
 

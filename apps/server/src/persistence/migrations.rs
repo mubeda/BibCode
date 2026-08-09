@@ -73,6 +73,7 @@ pub const MIGRATIONS: &[Migration] = &[
     Migration::new(39, "DurableProviderTurnDelivery", migration_039),
     Migration::new(40, "ProjectionProjectWorktreeDiscovery", migration_040),
     Migration::new(41, "ProjectionProjectWorktreeRepositoryKey", migration_041),
+    Migration::new(42, "ProjectWorktreeRepositoryPins", migration_042),
 ];
 
 impl Migration {
@@ -1655,6 +1656,32 @@ fn migration_041(transaction: &Transaction<'_>) -> Result<()> {
     )
 }
 
+fn migration_042(transaction: &Transaction<'_>) -> Result<()> {
+    transaction.execute_batch(
+        r#"
+        CREATE TABLE IF NOT EXISTS project_worktree_repository_pins (
+          project_id TEXT PRIMARY KEY NOT NULL,
+          repository_key TEXT NOT NULL
+        );
+        "#,
+    )?;
+    if table_has_column(
+        transaction,
+        "projection_projects",
+        "worktree_repository_key",
+    )? {
+        transaction.execute_batch(
+            r#"
+            INSERT OR IGNORE INTO project_worktree_repository_pins (project_id, repository_key)
+            SELECT project_id, worktree_repository_key
+            FROM projection_projects
+            WHERE worktree_repository_key IS NOT NULL;
+            "#,
+        )?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{MIGRATIONS, Migration, migration_001, run_migrations};
@@ -1846,7 +1873,7 @@ mod tests {
             .map(|migration| migration.id)
             .collect::<Vec<_>>();
 
-        assert_eq!(ids, (1..=41).collect::<Vec<_>>());
+        assert_eq!(ids, (1..=42).collect::<Vec<_>>());
         assert_eq!(MIGRATIONS[0].name, "OrchestrationEvents");
         assert_eq!(MIGRATIONS[33].name, "ActivityProjection");
         assert_eq!(MIGRATIONS[34].name, "ActivityJournalEventKeyNamespace");
@@ -1859,6 +1886,7 @@ mod tests {
             MIGRATIONS[40].name,
             "ProjectionProjectWorktreeRepositoryKey"
         );
+        assert_eq!(MIGRATIONS[41].name, "ProjectWorktreeRepositoryPins");
 
         let migration = Migration::new(99, "RuntimeFixture", migration_001);
         assert_eq!(migration.id, 99);
@@ -1948,9 +1976,9 @@ mod tests {
         assert_eq!(first[15].id, 16);
 
         let second = run_migrations(&mut connection, None)?;
-        assert_eq!(second.len(), 25);
+        assert_eq!(second.len(), 26);
         assert_eq!(second[0].id, 17);
-        assert_eq!(second[24].id, 41);
+        assert_eq!(second[25].id, 42);
 
         let third = run_migrations(&mut connection, None)?;
         assert!(third.is_empty());
@@ -1962,7 +1990,7 @@ mod tests {
             [],
             |row| row.get::<_, u32>(0),
         )?;
-        assert_eq!(application_table_count, 24);
+        assert_eq!(application_table_count, 25);
         assert_delivery_schema(&connection)?;
 
         Ok(())
@@ -2057,7 +2085,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [40, 41]
+            [40, 41, 42]
         );
         let policy = connection.query_row(
             "SELECT worktree_discovery_json FROM projection_projects WHERE project_id = 'project-1'",
@@ -2094,7 +2122,7 @@ mod tests {
                 .iter()
                 .map(|migration| migration.id)
                 .collect::<Vec<_>>(),
-            [41]
+            [41, 42]
         );
         let pin = connection.query_row(
             "SELECT worktree_repository_key FROM projection_projects WHERE project_id = 'project-legacy'",
@@ -2102,6 +2130,34 @@ mod tests {
             |row| row.get::<_, Option<String>>(0),
         )?;
         assert_eq!(pin, None);
+        Ok(())
+    }
+
+    #[test]
+    fn migration_42_moves_existing_repository_identity_pins_outside_rebuildable_projections()
+    -> rusqlite::Result<()> {
+        let mut connection = rusqlite::Connection::open_in_memory()?;
+        run_migrations(&mut connection, Some(41))?;
+        connection.execute(
+            "INSERT INTO projection_projects (project_id, title, workspace_root, default_model_selection_json, scripts_json, worktree_discovery_json, worktree_repository_key, created_at, updated_at, deleted_at) VALUES ('project-pinned', 'Pinned', '/repo', NULL, '[]', '{}', 'repository-key-a', '2026-08-09T00:00:00Z', '2026-08-09T00:00:00Z', NULL)",
+            [],
+        )?;
+
+        let applied = run_migrations(&mut connection, None)?;
+
+        assert_eq!(
+            applied
+                .iter()
+                .map(|migration| migration.id)
+                .collect::<Vec<_>>(),
+            [42]
+        );
+        let pin = connection.query_row(
+            "SELECT repository_key FROM project_worktree_repository_pins WHERE project_id = 'project-pinned'",
+            [],
+            |row| row.get::<_, String>(0),
+        )?;
+        assert_eq!(pin, "repository-key-a");
         Ok(())
     }
 
@@ -2142,7 +2198,7 @@ mod tests {
         )?;
 
         let applied = run_migrations(&mut connection, None)?;
-        assert_eq!(applied.len(), 8);
+        assert_eq!(applied.len(), 9);
         assert_eq!(applied[0].id, 34);
         assert_eq!(applied[1].id, 35);
         assert_eq!(applied[2].id, 36);
@@ -2151,6 +2207,7 @@ mod tests {
         assert_eq!(applied[5].id, 39);
         assert_eq!(applied[6].id, 40);
         assert_eq!(applied[7].id, 41);
+        assert_eq!(applied[8].id, 42);
         let value = connection.query_row("SELECT value FROM legacy_user_data", [], |row| {
             row.get::<_, String>(0)
         })?;

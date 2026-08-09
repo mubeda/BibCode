@@ -119,6 +119,53 @@ async fn worktree_repository_identity_pin_is_compare_and_set_and_cannot_be_repla
 }
 
 #[tokio::test]
+async fn generic_project_upsert_cannot_establish_or_replace_repository_identity() {
+    let repositories = migrated_repositories().await;
+    let mut arbitrary = project("project-exclusive-pin", T0);
+    arbitrary.worktree_repository_key = Some("repository-key-arbitrary".to_owned());
+    repositories
+        .upsert_project(arbitrary)
+        .await
+        .expect("generic insert ignores arbitrary identity");
+    assert_eq!(
+        repositories
+            .get_project("project-exclusive-pin".to_owned())
+            .await
+            .expect("read unpinned project")
+            .expect("project exists")
+            .worktree_repository_key,
+        None
+    );
+
+    assert_eq!(
+        repositories
+            .pin_project_worktree_repository_key(
+                "project-exclusive-pin".to_owned(),
+                "repository-key-trusted".to_owned(),
+            )
+            .await
+            .expect("trusted operation establishes pin"),
+        Some(WorktreeRepositoryPinOutcome::Established)
+    );
+    let mut replacement = project("project-exclusive-pin", T1);
+    replacement.worktree_repository_key = Some("repository-key-replacement".to_owned());
+    repositories
+        .upsert_project(replacement)
+        .await
+        .expect("generic update ignores replacement identity");
+    assert_eq!(
+        repositories
+            .get_project("project-exclusive-pin".to_owned())
+            .await
+            .expect("read pinned project")
+            .expect("project exists")
+            .worktree_repository_key
+            .as_deref(),
+        Some("repository-key-trusted")
+    );
+}
+
+#[tokio::test]
 async fn worktree_repository_identity_pin_persists_across_database_restart() {
     let root = tempfile::tempdir().expect("database directory");
     let path = root.path().join("catalog.sqlite3");
