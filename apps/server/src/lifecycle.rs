@@ -7,6 +7,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     auth::{AuthService, SecretStore},
     config::{ServerConfig, ServerMode},
+    data_root::{DataRootError, ResolvedDataRoot, resolve_data_root},
     diagnostics::{
         DesktopUiProcessObserver, NotApplicableUiProcessObserver,
         UnavailableDesktopUiProcessObserver,
@@ -34,6 +35,7 @@ pub struct ServerRuntime;
 
 pub struct ServerHandle {
     local_addr: SocketAddr,
+    data_root: ResolvedDataRoot,
     startup_access: Option<StartupAccess>,
     _database: Database,
     _production_runtime: Option<Arc<ProductionRuntime>>,
@@ -50,6 +52,8 @@ pub struct StartupAccess {
 
 #[derive(Debug, Error)]
 pub enum ServerError {
+    #[error(transparent)]
+    DataRoot(#[from] DataRootError),
     #[error("failed to create the server base directory")]
     CreateBaseDirectory(#[source] std::io::Error),
     #[error("failed to initialize native server state files: {0}")]
@@ -94,10 +98,13 @@ impl ServerRuntime {
     }
 
     async fn start_internal(
-        config: ServerConfig,
+        mut config: ServerConfig,
         custom_registry: Option<RpcRegistry>,
         ui_process_observer: Arc<dyn DesktopUiProcessObserver>,
     ) -> Result<ServerHandle, ServerError> {
+        let resolved_data_root = resolve_data_root(config.data_root_request.clone())?;
+        config.base_dir = resolved_data_root.effective.clone();
+        config.resolved_data_root = Some(resolved_data_root.clone());
         tokio::fs::create_dir_all(&config.base_dir)
             .await
             .map_err(ServerError::CreateBaseDirectory)?;
@@ -282,6 +289,7 @@ impl ServerRuntime {
 
         Ok(ServerHandle {
             local_addr,
+            data_root: resolved_data_root,
             startup_access,
             _database: database,
             _production_runtime: production_runtime,
@@ -405,6 +413,11 @@ impl ServerHandle {
     }
 
     #[must_use]
+    pub fn data_root(&self) -> &ResolvedDataRoot {
+        &self.data_root
+    }
+
+    #[must_use]
     pub fn startup_access(&self) -> Option<&StartupAccess> {
         self.startup_access.as_ref()
     }
@@ -467,6 +480,16 @@ impl Drop for ServerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rejects_relative_programmatic_data_roots_before_creating_state() {
+        let error = match ServerRuntime::start(ServerConfig::new("relative/.bibcode")).await {
+            Ok(_) => panic!("relative data root must fail at runtime start"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ServerError::DataRoot(_)));
+    }
 
     #[tokio::test]
     async fn default_ui_observers_match_the_server_runtime_mode() {

@@ -2071,7 +2071,7 @@ fn decode_backend_desktop_settings(raw: Option<&str>) -> BackendDesktopSettings 
 }
 
 fn desktop_base_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
-    crate::config::base_dir(app)
+    crate::config::data_root(app).map(|resolved| resolved.effective)
 }
 
 #[cfg(test)]
