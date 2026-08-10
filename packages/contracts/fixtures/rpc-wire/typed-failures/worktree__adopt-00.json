@@ -8,7 +8,7 @@
         "_tag": "Fail",
         "error": {
           "_tag": "WorktreeAdoptionError",
-          "reason": "stale-generation",
+          "reason": "command-conflict",
           "message": "name"
         }
       }

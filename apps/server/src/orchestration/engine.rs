@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, VecDeque},
     future::Future,
+    path::Path,
     pin::Pin,
     sync::{
         Arc, Mutex as StdMutex,
@@ -20,13 +21,16 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use crate::checkpointing;
 use crate::orchestration::delivery::{CommandAdmission, TurnDeliveryState, TurnDeliveryTransition};
 use crate::persistence::{
     CheckpointDiffBlob, CommandReceipt, Database, NewOrchestrationEvent, OrchestrationEvent,
     PersistenceError, ProjectionPendingApproval, ProjectionProject, ProjectionState,
     ProjectionThread, ProjectionThreadActivity, ProjectionThreadMessage,
     ProjectionThreadProposedPlan, ProjectionThreadSession, ProjectionTurn, Repositories,
+};
+use crate::{
+    checkpointing,
+    git::{host_path_platform, normalize_worktree_path_key},
 };
 
 const TURN_UPSERT_SQL: &str = "INSERT INTO projection_turns (thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (thread_id, turn_id) DO UPDATE SET pending_message_id=excluded.pending_message_id, source_proposed_plan_thread_id=excluded.source_proposed_plan_thread_id, source_proposed_plan_id=excluded.source_proposed_plan_id, assistant_message_id=excluded.assistant_message_id, state=excluded.state, requested_at=excluded.requested_at, started_at=excluded.started_at, completed_at=excluded.completed_at, checkpoint_turn_count=excluded.checkpoint_turn_count, checkpoint_ref=excluded.checkpoint_ref, checkpoint_status=excluded.checkpoint_status, checkpoint_files_json=excluded.checkpoint_files_json";
@@ -828,6 +832,7 @@ struct ThreadState {
     interaction_mode: String,
     branch: Option<String>,
     worktree_path: Option<String>,
+    worktree_path_key: Option<String>,
     archived_at: Option<String>,
     deleted_at: Option<String>,
 }
@@ -844,12 +849,17 @@ fn canonical_worktree_owners<'a>(
     project_id: &'a str,
     path: &'a str,
 ) -> impl Iterator<Item = (&'a String, &'a ThreadState)> {
+    let path_key = normalized_worktree_path_key(path);
     model.threads.iter().filter(move |(_, thread)| {
         thread.project_id == project_id
             && thread.kind == "workspace"
             && thread.deleted_at.is_none()
-            && thread.worktree_path.as_deref() == Some(path)
+            && thread.worktree_path_key.as_deref() == Some(path_key.as_str())
     })
+}
+
+fn normalized_worktree_path_key(path: &str) -> String {
+    normalize_worktree_path_key(Path::new(path), host_path_platform())
 }
 
 fn worktree_adoption_result(
@@ -864,6 +874,9 @@ fn worktree_adoption_result(
         return None;
     };
     if let Some(events) = committed {
+        if let Some(result) = durable_worktree_adoption_result(events) {
+            return Some(result);
+        }
         if let Some(event) = events
             .iter()
             .find(|event| event.event.event_type == "thread.created")
@@ -882,6 +895,34 @@ fn worktree_adoption_result(
         .map(|(thread_id, _)| (thread_id.clone(), "existing".to_owned()))
 }
 
+fn durable_worktree_adoption_result(
+    events: &VecDeque<OrchestrationEvent>,
+) -> Option<(String, String)> {
+    events.iter().find_map(|event| {
+        let result = event.event.metadata.get("adoptionResult")?;
+        let thread_id = result.get("threadId")?.as_str()?;
+        let disposition = result.get("disposition")?.as_str()?;
+        matches!(disposition, "created" | "existing" | "restored")
+            .then(|| (thread_id.to_owned(), disposition.to_owned()))
+    })
+}
+
+async fn durable_replayed_worktree_adoption_result(
+    repositories: &Repositories,
+    command_id: &str,
+    result_sequence: i64,
+) -> Result<Option<(String, String)>, OrchestrationError> {
+    let from_sequence_exclusive = result_sequence.saturating_sub(2).max(0);
+    let command_events = repositories
+        .read_events_from_sequence(from_sequence_exclusive, 2)
+        .await
+        .map_err(wrap_persistence)?
+        .into_iter()
+        .filter(|event| event.event.command_id.as_deref() == Some(command_id))
+        .collect::<VecDeque<_>>();
+    Ok(durable_worktree_adoption_result(&command_events))
+}
+
 async fn replayed_worktree_adoption_result(
     repositories: &Repositories,
     model: &CommandModel,
@@ -890,6 +931,15 @@ async fn replayed_worktree_adoption_result(
 ) -> Result<Option<(String, String)>, OrchestrationError> {
     if !matches!(command, OrchestrationCommand::WorktreeAdoptResolved { .. }) {
         return Ok(None);
+    }
+    if let Some(result) = durable_replayed_worktree_adoption_result(
+        repositories,
+        command.command_id(),
+        result_sequence,
+    )
+    .await?
+    {
+        return Ok(Some(result));
     }
     let from_sequence_exclusive = result_sequence.saturating_sub(2).max(0);
     let command_events = repositories
@@ -972,6 +1022,50 @@ impl OrchestrationEngine {
         command: OrchestrationCommand,
     ) -> Result<DispatchResult, OrchestrationError> {
         self.dispatch_inner(command, None, None).await
+    }
+
+    pub(crate) async fn replay_admitted_worktree_adoption(
+        &self,
+        command_id: &str,
+        payload_digest: &str,
+    ) -> Result<Option<DispatchResult>, OrchestrationError> {
+        let Some(receipt) = self
+            .repositories
+            .get_command_receipt(command_id.to_owned())
+            .await
+            .map_err(wrap_persistence)?
+        else {
+            return Ok(None);
+        };
+        if receipt.payload_digest.as_deref() != Some(payload_digest) {
+            return Err(OrchestrationError::CommandConflict {
+                command_id: command_id.to_owned(),
+            });
+        }
+        if receipt.status != "accepted" {
+            return Err(OrchestrationError::PreviouslyRejected {
+                command_id: command_id.to_owned(),
+                detail: receipt
+                    .error
+                    .unwrap_or_else(|| "Previously rejected.".to_owned()),
+            });
+        }
+        let (thread_id, disposition) = durable_replayed_worktree_adoption_result(
+            &self.repositories,
+            command_id,
+            receipt.result_sequence,
+        )
+        .await?
+        .ok_or_else(|| OrchestrationError::Invariant {
+            command_type: "worktree.adopt".to_owned(),
+            detail: "Accepted adoption receipt has no durable adoption result.".to_owned(),
+        })?;
+        Ok(Some(DispatchResult {
+            sequence: receipt.result_sequence,
+            thread_id: Some(thread_id),
+            project_id: None,
+            disposition: Some(disposition),
+        }))
     }
 
     #[cfg(test)]
@@ -1820,7 +1914,7 @@ async fn plan_command(
                 });
             }
             let mut planned = Vec::with_capacity(2);
-            if let Some((thread_id, thread)) = owners.first() {
+            let adoption_result = if let Some((thread_id, thread)) = owners.first() {
                 if thread.archived_at.is_some() {
                     planned.push(make_event(
                         "thread.unarchived",
@@ -1831,6 +1925,9 @@ async fn plan_command(
                         json!({"worktreeKey":worktree_key}),
                         json!({"threadId":thread_id,"updatedAt":occurred_at}),
                     ));
+                    ((*thread_id).clone(), "restored")
+                } else {
+                    ((*thread_id).clone(), "existing")
                 }
             } else {
                 let thread_id = Uuid::new_v4().to_string();
@@ -1856,7 +1953,8 @@ async fn plan_command(
                         "updatedAt":occurred_at
                     }),
                 ));
-            }
+                (thread_id, "created")
+            };
             let policy = compact_adoption_policy(command, &project.worktree_discovery, path)?;
             planned.push(make_event(
                 "project.meta-updated",
@@ -1864,7 +1962,13 @@ async fn plan_command(
                 project_id,
                 occurred_at,
                 command_id,
-                json!({"worktreeKey":worktree_key}),
+                json!({
+                    "worktreeKey":worktree_key,
+                    "adoptionResult": {
+                        "threadId": adoption_result.0,
+                        "disposition": adoption_result.1
+                    }
+                }),
                 json!({
                     "projectId":project_id,
                     "worktreeDiscovery":policy,
@@ -2147,6 +2251,10 @@ async fn plan_command(
                             interaction_mode: create.interaction_mode.clone(),
                             branch: create.branch.clone(),
                             worktree_path: create.worktree_path.clone(),
+                            worktree_path_key: create
+                                .worktree_path
+                                .as_deref()
+                                .map(normalized_worktree_path_key),
                             archived_at: None,
                             deleted_at: None,
                         },
@@ -2941,6 +3049,10 @@ fn apply_to_model(model: &mut CommandModel, events: &VecDeque<OrchestrationEvent
                                 .get("worktreePath")
                                 .and_then(Value::as_str)
                                 .map(str::to_owned),
+                            worktree_path_key: payload
+                                .get("worktreePath")
+                                .and_then(Value::as_str)
+                                .map(normalized_worktree_path_key),
                             archived_at: None,
                             deleted_at: None,
                         },
@@ -2996,6 +3108,8 @@ fn apply_to_model(model: &mut CommandModel, events: &VecDeque<OrchestrationEvent
                     }
                     if let Some(worktree_path) = event.event.payload.get("worktreePath") {
                         thread.worktree_path = worktree_path.as_str().map(str::to_owned);
+                        thread.worktree_path_key =
+                            worktree_path.as_str().map(normalized_worktree_path_key);
                     }
                 }
             }
@@ -3101,6 +3215,10 @@ async fn load_command_model(
                     interaction_mode: thread.interaction_mode.clone(),
                     branch: thread.branch.clone(),
                     worktree_path: thread.worktree_path.clone(),
+                    worktree_path_key: thread
+                        .worktree_path
+                        .as_deref()
+                        .map(normalized_worktree_path_key),
                     archived_at: thread.archived_at.clone(),
                     deleted_at: thread.deleted_at.clone(),
                 },
@@ -4455,7 +4573,11 @@ mod tests {
         use super::*;
 
         const PROJECT_ID: &str = "adoption-project";
-        const PATH: &str = "/repo/external";
+        const PATH: &str = if cfg!(windows) {
+            r"C:\Repo\External"
+        } else {
+            "/repo/external"
+        };
 
         async fn adoption_engine(hooks: TestHooks) -> OrchestrationEngine {
             let database = Database::open_in_memory().await.expect("database");
@@ -4525,6 +4647,16 @@ mod tests {
             thread_id: &str,
             kind: &str,
         ) {
+            create_thread_at(engine, command_id, thread_id, kind, PATH).await;
+        }
+
+        async fn create_thread_at(
+            engine: &OrchestrationEngine,
+            command_id: &str,
+            thread_id: &str,
+            kind: &str,
+            worktree_path: &str,
+        ) {
             engine
                 .dispatch(OrchestrationCommand::ThreadCreate {
                     command_id: command_id.to_owned(),
@@ -4536,7 +4668,7 @@ mod tests {
                     runtime_mode: "full-access".to_owned(),
                     interaction_mode: "default".to_owned(),
                     branch: Some("old".to_owned()),
-                    worktree_path: Some(PATH.to_owned()),
+                    worktree_path: Some(worktree_path.to_owned()),
                     created_at: "2026-08-09T00:00:01Z".to_owned(),
                 })
                 .await
@@ -4601,15 +4733,219 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn restart_replay_finds_an_owner_with_an_equivalent_trailing_separator_path() {
+            let engine = adoption_engine(TestHooks::default()).await;
+            let persisted_path = format!("{PATH}{}", std::path::MAIN_SEPARATOR);
+            create_thread_at(
+                &engine,
+                "equivalent-owner-create",
+                "equivalent-owner",
+                "workspace",
+                &persisted_path,
+            )
+            .await;
+            let database = engine.repositories().database().clone();
+            engine.shutdown().await;
+
+            let restarted = OrchestrationEngine::start(database, EngineOptions::default())
+                .await
+                .expect("restart engine");
+            let result = restarted
+                .dispatch(adopt(
+                    "adopt-equivalent-owner",
+                    Some("feature/external"),
+                    Some("abc1234"),
+                ))
+                .await
+                .expect("equivalent owner adoption");
+
+            assert_eq!(result.thread_id.as_deref(), Some("equivalent-owner"));
+            assert_eq!(result.disposition.as_deref(), Some("existing"));
+            assert_eq!(
+                restarted
+                    .repositories()
+                    .list_threads_by_project(PROJECT_ID.to_owned())
+                    .await
+                    .expect("threads")
+                    .into_iter()
+                    .filter(|thread| thread.kind == "workspace" && thread.deleted_at.is_none())
+                    .count(),
+                1,
+                "equivalent persisted paths must retain one canonical owner"
+            );
+            assert_eq!(
+                restarted
+                    .read_events(0)
+                    .await
+                    .expect("events")
+                    .into_iter()
+                    .filter(|event| {
+                        event.event.command_id.as_deref() == Some("adopt-equivalent-owner")
+                    })
+                    .map(|event| event.event.event_type)
+                    .collect::<Vec<_>>(),
+                vec!["project.meta-updated"]
+            );
+            restarted
+                .dispatch(
+                    serde_json::from_value(json!({
+                        "type":"thread.meta.update",
+                        "commandId":"retarget-equivalent-owner",
+                        "threadId":"equivalent-owner",
+                        "worktreePath":format!("{PATH}-retargeted")
+                    }))
+                    .expect("retarget command"),
+                )
+                .await
+                .expect("retarget owner");
+            restarted
+                .dispatch(OrchestrationCommand::ProjectMetaUpdate {
+                    command_id: "restore-adoption-baseline".to_owned(),
+                    project_id: PROJECT_ID.to_owned(),
+                    title: None,
+                    workspace_root: None,
+                    default_model_selection: OptionalNullable::Missing,
+                    scripts: None,
+                    worktree_discovery: Some(json!({
+                        "visibility":"shown",
+                        "initialPromptDismissedAt":"2026-08-09T00:00:00Z",
+                        "baselinePaths":[PATH]
+                    })),
+                })
+                .await
+                .expect("restore baseline");
+            let after_retarget = restarted
+                .dispatch(adopt(
+                    "adopt-after-retarget",
+                    Some("feature/external"),
+                    Some("abc1234"),
+                ))
+                .await
+                .expect("adopt after retarget");
+            assert_eq!(after_retarget.disposition.as_deref(), Some("created"));
+            assert_ne!(
+                after_retarget.thread_id.as_deref(),
+                Some("equivalent-owner"),
+                "retargeting must release the old normalized ownership key"
+            );
+            restarted.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn concurrent_different_public_admissions_conflict_at_persist_time() {
+            let engine = adoption_engine(TestHooks::default()).await;
+            let first_payload = json!({
+                "commandId":"adopt-concurrent-conflict",
+                "projectId":PROJECT_ID,
+                "worktreeKey":"worktree-key",
+                "expectedGeneration":3,
+                "threadDefaults":{
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access",
+                    "interactionMode":"plan"
+                }
+            });
+            let mut second_payload = first_payload.clone();
+            second_payload["threadDefaults"]["interactionMode"] = json!("default");
+            let first_command = adopt(
+                "adopt-concurrent-conflict",
+                Some("feature/external"),
+                Some("abc1234"),
+            );
+            let mut second_command = first_command.clone();
+            if let OrchestrationCommand::WorktreeAdoptResolved {
+                interaction_mode, ..
+            } = &mut second_command
+            {
+                *interaction_mode = "default".to_owned();
+            }
+            let first_admission = CommandAdmission {
+                payload_digest: canonical_command_digest(&first_payload).expect("first digest"),
+                attachment_refs: Vec::new(),
+                provider_turn: None,
+            };
+            let second_admission = CommandAdmission {
+                payload_digest: canonical_command_digest(&second_payload).expect("second digest"),
+                attachment_refs: Vec::new(),
+                provider_turn: None,
+            };
+
+            let (first, second) = tokio::join!(
+                engine.dispatch_with_admission(first_command, first_admission, || {}),
+                engine.dispatch_with_admission(second_command, second_admission, || {})
+            );
+
+            assert_eq!(
+                [first.as_ref().is_ok(), second.as_ref().is_ok()]
+                    .into_iter()
+                    .filter(|accepted| *accepted)
+                    .count(),
+                1
+            );
+            assert_eq!(
+                [first.as_ref().err(), second.as_ref().err()]
+                    .into_iter()
+                    .filter(|error| {
+                        error.is_some_and(|error| {
+                            matches!(error, OrchestrationError::CommandConflict { .. })
+                        })
+                    })
+                    .count(),
+                1
+            );
+            assert_eq!(
+                engine
+                    .read_events(0)
+                    .await
+                    .expect("events")
+                    .into_iter()
+                    .filter(|event| {
+                        event.event.command_id.as_deref() == Some("adopt-concurrent-conflict")
+                    })
+                    .count(),
+                2,
+                "only the accepted adoption may append its transactional event pair"
+            );
+            engine.shutdown().await;
+        }
+
+        #[tokio::test]
         async fn returns_active_restores_archived_ignores_panels_and_rejects_conflicts() {
             let active = adoption_engine(TestHooks::default()).await;
             create_thread(&active, "active-create", "active-owner", "workspace").await;
+            let existing_command = adopt("adopt-existing", Some("feature/external"), None);
             let active_result = active
-                .dispatch(adopt("adopt-existing", Some("feature/external"), None))
+                .dispatch(existing_command.clone())
                 .await
                 .expect("existing");
             assert_eq!(active_result.thread_id.as_deref(), Some("active-owner"));
             assert_eq!(active_result.disposition.as_deref(), Some("existing"));
+            active
+                .dispatch(OrchestrationCommand::ThreadDelete {
+                    command_id: "delete-active-owner".to_owned(),
+                    thread_id: "active-owner".to_owned(),
+                })
+                .await
+                .expect("delete accepted owner");
+            let events_before_retry = active
+                .read_events(0)
+                .await
+                .expect("events before retry")
+                .len();
+            let replay = active
+                .dispatch(existing_command)
+                .await
+                .expect("accepted adoption replay");
+            assert_eq!(replay, active_result);
+            assert_eq!(
+                active
+                    .read_events(0)
+                    .await
+                    .expect("events after retry")
+                    .len(),
+                events_before_retry,
+                "an accepted replay must not emit replacement effects"
+            );
             active.shutdown().await;
 
             let archived = adoption_engine(TestHooks::default()).await;

@@ -12,9 +12,12 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     crypto::sha256_hex,
-    git::{GitRepository, HostPathPlatform, normalize_worktree_path_key, worktree_repository_key},
+    git::{
+        GitRepository, host_path_platform, normalize_worktree_path_key, worktree_repository_key,
+    },
     orchestration::{
-        OrchestrationCommand, OrchestrationEngine, OrchestrationError, engine::OptionalNullable,
+        CommandAdmission, OrchestrationCommand, OrchestrationEngine, OrchestrationError,
+        canonical_command_digest, engine::OptionalNullable,
     },
     persistence::Repositories,
     rpc::{RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk},
@@ -193,7 +196,7 @@ impl WorktreeCatalogMutationObserver {
                     inventory.common_dir.display()
                 )
             })?;
-        let repository_key = worktree_repository_key(&common_dir, host_platform())
+        let repository_key = worktree_repository_key(&common_dir, host_path_platform())
             .as_str()
             .to_owned();
         let mut verified_paths = HashSet::new();
@@ -296,15 +299,7 @@ async fn normalized_existing_path(path: &Path) -> String {
     let canonical = tokio::fs::canonicalize(path)
         .await
         .unwrap_or_else(|_| path.to_path_buf());
-    normalize_worktree_path_key(&canonical, host_platform())
-}
-
-fn host_platform() -> HostPathPlatform {
-    if cfg!(windows) {
-        HostPathPlatform::Windows
-    } else {
-        HostPathPlatform::Posix
-    }
+    normalize_worktree_path_key(&canonical, host_path_platform())
 }
 
 pub fn register_worktree_catalog_rpc(
@@ -350,11 +345,26 @@ pub fn register_worktree_catalog_rpc(
 
 async fn adopt_worktree(services: &WorktreeCatalogRpcServices, request: RpcRequest) -> RpcResult {
     let input = decode::<WorktreeAdoptInput>(request)?;
+    let payload_digest = canonical_command_digest(&input).map_err(|_| {
+        encode(adoption_error(
+            WorktreeAdoptionErrorReason::Internal,
+            "The adoption payload could not be admitted.",
+            None,
+        ))
+    })?;
+    if let Some(result) = services
+        .orchestration
+        .replay_admitted_worktree_adoption(&input.command_id, &payload_digest)
+        .await
+        .map_err(|error| encode(adoption_orchestration_error(error, None)))?
+    {
+        return adoption_dispatch_result(result, None);
+    }
     let project_id = input.project_id.clone();
     services
         .catalog
         .with_project_mutation_lock(&project_id, || async {
-            adopt_worktree_locked(services, input).await
+            adopt_worktree_locked(services, input, payload_digest).await
         })
         .await
 }
@@ -362,6 +372,7 @@ async fn adopt_worktree(services: &WorktreeCatalogRpcServices, request: RpcReque
 async fn adopt_worktree_locked(
     services: &WorktreeCatalogRpcServices,
     input: WorktreeAdoptInput,
+    payload_digest: String,
 ) -> RpcResult {
     let (mut snapshot, refreshed) = match services.catalog.latest(&input.project_id).await {
         Some(snapshot) => (snapshot, false),
@@ -420,53 +431,37 @@ async fn adopt_worktree_locked(
         .map_err(|error| encode(adoption_validation_error(error)))?;
     let result = services
         .orchestration
-        .dispatch(OrchestrationCommand::WorktreeAdoptResolved {
-            command_id: input.command_id,
-            project_id: input.project_id.clone(),
-            worktree_key: resolved.worktree_key,
-            path: resolved.path,
-            branch: resolved.branch,
-            head: resolved.head,
-            model_selection: input.thread_defaults.model_selection,
-            runtime_mode: input.thread_defaults.runtime_mode,
-            interaction_mode: input.thread_defaults.interaction_mode,
-        })
+        .dispatch_with_admission(
+            OrchestrationCommand::WorktreeAdoptResolved {
+                command_id: input.command_id,
+                project_id: input.project_id.clone(),
+                worktree_key: resolved.worktree_key,
+                path: resolved.path,
+                branch: resolved.branch,
+                head: resolved.head,
+                model_selection: input.thread_defaults.model_selection,
+                runtime_mode: input.thread_defaults.runtime_mode,
+                interaction_mode: input.thread_defaults.interaction_mode,
+            },
+            CommandAdmission {
+                payload_digest,
+                attachment_refs: Vec::new(),
+                provider_turn: None,
+            },
+            || {},
+        )
         .await
         .map_err(|error| {
-            let reason = match &error {
-                OrchestrationError::WorktreeOwnershipConflict { .. } => {
-                    WorktreeAdoptionErrorReason::OwnershipConflict
-                }
-                _ => WorktreeAdoptionErrorReason::OrchestrationFailed,
-            };
-            encode(adoption_error(
-                reason,
-                format!("Worktree adoption could not be persisted: {error}"),
+            encode(adoption_orchestration_error(
+                error,
                 Some(snapshot.generation),
             ))
         })?;
-    let thread_id = result.thread_id.ok_or_else(|| {
-        encode(adoption_error(
-            WorktreeAdoptionErrorReason::Internal,
-            "Worktree adoption completed without a thread result.",
-            Some(snapshot.generation),
-        ))
-    })?;
-    let disposition = result.disposition.ok_or_else(|| {
-        encode(adoption_error(
-            WorktreeAdoptionErrorReason::Internal,
-            "Worktree adoption completed without a disposition.",
-            Some(snapshot.generation),
-        ))
-    })?;
     services
         .catalog
         .invalidate_after_mutation(&input.project_id)
         .await;
-    Ok(encode(WorktreeAdoptResult {
-        thread_id,
-        disposition,
-    }))
+    adoption_dispatch_result(result, Some(snapshot.generation))
 }
 
 fn catalog_stream(
@@ -613,7 +608,7 @@ struct WorktreeCatalogInput {
     project_id: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorktreeAdoptInput {
     command_id: String,
@@ -623,7 +618,7 @@ struct WorktreeAdoptInput {
     thread_defaults: WorktreeAdoptThreadDefaults,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorktreeAdoptThreadDefaults {
     model_selection: Value,
@@ -649,6 +644,7 @@ enum WorktreeAdoptionErrorReason {
     WorkspaceMissing,
     RepositoryMismatch,
     OwnershipConflict,
+    CommandConflict,
     OrchestrationFailed,
     Internal,
 }
@@ -772,6 +768,53 @@ fn adoption_validation_error(error: AdoptionValidationError) -> WorktreeAdoption
         AdoptionValidationErrorReason::CatalogUnavailable => WorktreeAdoptionErrorReason::Internal,
     };
     adoption_error(reason, error.message, error.current_generation)
+}
+
+fn adoption_orchestration_error(
+    error: OrchestrationError,
+    current_generation: Option<u64>,
+) -> WorktreeAdoptionError {
+    match error {
+        OrchestrationError::CommandConflict { .. } => adoption_error(
+            WorktreeAdoptionErrorReason::CommandConflict,
+            "The command ID was already used with a different adoption payload.",
+            current_generation,
+        ),
+        OrchestrationError::WorktreeOwnershipConflict { .. } => adoption_error(
+            WorktreeAdoptionErrorReason::OwnershipConflict,
+            "Worktree adoption conflicts with canonical workspace ownership.",
+            current_generation,
+        ),
+        error => adoption_error(
+            WorktreeAdoptionErrorReason::OrchestrationFailed,
+            format!("Worktree adoption could not be persisted: {error}"),
+            current_generation,
+        ),
+    }
+}
+
+fn adoption_dispatch_result(
+    result: crate::orchestration::engine::DispatchResult,
+    current_generation: Option<u64>,
+) -> RpcResult {
+    let thread_id = result.thread_id.ok_or_else(|| {
+        encode(adoption_error(
+            WorktreeAdoptionErrorReason::Internal,
+            "Worktree adoption completed without a thread result.",
+            current_generation,
+        ))
+    })?;
+    let disposition = result.disposition.ok_or_else(|| {
+        encode(adoption_error(
+            WorktreeAdoptionErrorReason::Internal,
+            "Worktree adoption completed without a disposition.",
+            current_generation,
+        ))
+    })?;
+    Ok(encode(WorktreeAdoptResult {
+        thread_id,
+        disposition,
+    }))
 }
 
 fn stale_generation(expected: u64, current: Option<u64>) -> CatalogError {

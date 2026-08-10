@@ -82,7 +82,13 @@ aliases.
 `worktree.adopt` also requires `orchestration:operate`. Its public payload
 contains an opaque catalog key, expected generation, project ID, command ID,
 and ordinary thread defaults; it never accepts a checkout path. The handler
-holds the same stable project-then-physical-repository mutation locks. A stale
+digests that decoded public payload before server resolution. An existing
+receipt is checked before project/catalog lookup: an identical accepted retry
+returns its durable result, while reuse of the command ID with any different
+public field returns `command-conflict` without resolving or exposing a path.
+The final resolved dispatch carries the same admission digest, so concurrent
+preflight misses still conflict transactionally. The handler holds the same
+stable project-then-physical-repository mutation locks. A stale
 or non-authoritative generation forces one bounded refresh before the server
 rechecks current registration, directory presence, nonprimary/nonbare
 eligibility, canonical common-directory membership, and canonical thread
@@ -96,7 +102,12 @@ ordinary workspace thread, returns an existing active owner, or restores an
 archived owner while updating the discovery baseline in the same
 `persist_command` transaction. The public result is exactly the canonical
 thread ID plus `created`, `existing`, or `restored`; replay of an accepted
-command returns the original disposition. Resolved adoption and branch
+command returns the original disposition from immutable result metadata on
+the receipt-linked adoption event, without consulting a mutable thread
+projection. Canonical ownership compares the catalog-owned lexical host-path
+identity stored in the command model for create, metadata retarget, and
+restart/replay; it remains defined for missing paths and does not perform a
+second filesystem probe. Resolved adoption and branch
 reconciliation command variants are rejected by
 `orchestration.dispatchCommand` even though trusted server services may admit
 them directly.

@@ -19,6 +19,15 @@ pub enum HostPathPlatform {
     Windows,
 }
 
+#[must_use]
+pub const fn host_path_platform() -> HostPathPlatform {
+    if cfg!(windows) {
+        HostPathPlatform::Windows
+    } else {
+        HostPathPlatform::Posix
+    }
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Hash)]
 pub struct WorktreeRepositoryKey(String);
 
