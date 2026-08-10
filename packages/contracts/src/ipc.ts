@@ -306,6 +306,35 @@ export const DesktopUpdateCheckResultSchema = Schema.Struct({
 // importing brand machinery from the desktop package.
 export const PRIMARY_LOCAL_ENVIRONMENT_ID = "primary";
 
+export interface DesktopWslPrimaryUnavailableError {
+  kind: "wsl-primary-unavailable";
+  detail: string;
+}
+
+export const DesktopWslPrimaryUnavailableErrorSchema = Schema.Struct({
+  kind: Schema.Literal("wsl-primary-unavailable"),
+  detail: Schema.String,
+});
+
+export interface DesktopWslSecondaryUnavailableError {
+  kind: "wsl-secondary-unavailable";
+  detail: string;
+}
+
+export const DesktopWslSecondaryUnavailableErrorSchema = Schema.Struct({
+  kind: Schema.Literal("wsl-secondary-unavailable"),
+  detail: Schema.String,
+});
+
+export type DesktopWslPreflightError =
+  | DesktopWslPrimaryUnavailableError
+  | DesktopWslSecondaryUnavailableError;
+
+export const DesktopWslPreflightErrorSchema = Schema.Union([
+  DesktopWslPrimaryUnavailableErrorSchema,
+  DesktopWslSecondaryUnavailableErrorSchema,
+]);
+
 export interface DesktopEnvironmentBootstrap {
   // Stable backend instance id (e.g. "primary" or "wsl:ubuntu"). The
   // web env runtime keys local environments off this so projects
@@ -316,18 +345,26 @@ export interface DesktopEnvironmentBootstrap {
   // from id because a default-tracking instance keeps the stable
   // "wsl:default" IPC target while each run launches a specific distro.
   runningDistro?: string | null;
+  // The explicit distro whose desired registration this entry represents.
+  // null/absent means the stable default-tracking WSL registration.
+  configuredDistro?: string | null;
   httpBaseUrl: string | null;
   wsBaseUrl: string | null;
   bootstrapToken?: string;
+  // Present only when this desired WSL secondary could not be planned or
+  // started. Unavailable entries intentionally have no endpoint or token.
+  preflightError?: DesktopWslSecondaryUnavailableError | null;
 }
 
 export const DesktopEnvironmentBootstrapSchema = Schema.Struct({
   id: Schema.String,
   label: Schema.String,
   runningDistro: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  configuredDistro: Schema.optionalKey(Schema.NullOr(Schema.String)),
   httpBaseUrl: Schema.NullOr(Schema.String),
   wsBaseUrl: Schema.NullOr(Schema.String),
   bootstrapToken: Schema.optionalKey(Schema.String),
+  preflightError: Schema.optionalKey(Schema.NullOr(DesktopWslSecondaryUnavailableErrorSchema)),
 });
 
 export const DesktopSshEnvironmentTargetSchema = Schema.Struct({
@@ -493,16 +530,6 @@ export const DesktopWslDistroSchema = Schema.Struct({
   version: Schema.Literals([1, 2]),
 });
 
-export interface DesktopWslPreflightError {
-  kind: "wsl-primary-unavailable";
-  detail: string;
-}
-
-export const DesktopWslPreflightErrorSchema = Schema.Struct({
-  kind: Schema.Literal("wsl-primary-unavailable"),
-  detail: Schema.String,
-});
-
 export interface DesktopWslState {
   // True when the user has opted the WSL backend in; the actual backend
   // process is registered with the desktop pool independently of this
@@ -511,14 +538,15 @@ export interface DesktopWslState {
   // null means "track the current WSL default distro".
   distro: string | null;
   available: boolean;
-  // When true (and `enabled` is also true) the desktop runs only the
-  // WSL backend as the primary; the Windows-side Node backend is not
-  // started. Toggling this requires an app restart because the
+  // When true the desktop runs only the WSL backend as the primary and treats
+  // this intent as authoritative even if a persisted `enabled` flag is stale.
+  // The Windows-side backend is not started. Toggling this requires an app restart because the
   // primary backend's spec is captured once at layer init.
   wslOnly: boolean;
   distros: readonly DesktopWslDistro[];
-  // A structured WSL-primary planning failure. In this state no native
-  // Windows primary has been substituted. null means planning has not failed.
+  // A structured primary or secondary WSL failure. Primary failures never
+  // substitute Windows; secondary failures leave the Windows primary live.
+  // null means planning/startup has not failed.
   preflightError: DesktopWslPreflightError | null;
 }
 

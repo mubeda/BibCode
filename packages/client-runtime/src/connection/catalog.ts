@@ -8,6 +8,7 @@ import {
   RelayConnectionTarget,
   SshConnectionTarget,
   type ConnectionTarget,
+  UnavailableConnectionTarget,
 } from "./model.ts";
 
 const ConnectionProfileBase = {
@@ -82,6 +83,13 @@ export class SshConnectionRegistration extends Schema.TaggedClass<SshConnectionR
   },
 ) {}
 
+export class UnavailableConnectionRegistration extends Schema.TaggedClass<UnavailableConnectionRegistration>()(
+  "UnavailableConnectionRegistration",
+  {
+    target: UnavailableConnectionTarget,
+  },
+) {}
+
 export const ConnectionRegistration = Schema.Union([
   RelayConnectionRegistration,
   BearerConnectionRegistration,
@@ -101,21 +109,29 @@ export type ConnectionRegistration = typeof ConnectionRegistration.Type;
 export const PlatformConnectionRegistration = Schema.Union([
   PrimaryConnectionRegistration,
   BearerConnectionRegistration,
+  UnavailableConnectionRegistration,
 ]);
 export type PlatformConnectionRegistration = typeof PlatformConnectionRegistration.Type;
 
 export function connectionRegistrationTarget(
-  registration: ConnectionRegistration | PrimaryConnectionRegistration,
+  registration:
+    | ConnectionRegistration
+    | PrimaryConnectionRegistration
+    | UnavailableConnectionRegistration,
 ): ConnectionTarget {
   return registration.target;
 }
 
 export function connectionRegistrationCatalogEntry(
-  registration: ConnectionRegistration | PrimaryConnectionRegistration,
+  registration:
+    | ConnectionRegistration
+    | PrimaryConnectionRegistration
+    | UnavailableConnectionRegistration,
 ): ConnectionCatalogEntry {
   switch (registration._tag) {
     case "PrimaryConnectionRegistration":
     case "RelayConnectionRegistration":
+    case "UnavailableConnectionRegistration":
       return {
         target: registration.target,
         profile: Option.none(),

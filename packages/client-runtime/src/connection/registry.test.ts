@@ -2,6 +2,10 @@ import {
   type DesktopSshEnvironmentTarget,
   EnvironmentId,
   type OrchestrationShellSnapshot,
+  type OrchestrationThread,
+  ProjectId,
+  ProviderInstanceId,
+  ThreadId,
 } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
@@ -26,6 +30,7 @@ import {
   SshConnectionProfile,
   type ConnectionCredential,
   type ConnectionProfile,
+  UnavailableConnectionRegistration,
 } from "./catalog.ts";
 import * as Connectivity from "./connectivity.ts";
 import * as ConnectionCredentialStore from "./credentialStore.ts";
@@ -41,6 +46,7 @@ import {
   type ConnectionTarget,
   type PreparedConnection,
   type SupervisorConnectionState,
+  UnavailableConnectionTarget,
 } from "./model.ts";
 import * as Persistence from "../platform/persistence.ts";
 import * as ConnectionProfileStore from "./profileStore.ts";
@@ -128,6 +134,29 @@ const CACHED_SNAPSHOT: OrchestrationShellSnapshot = {
   threads: [],
   updatedAt: "2026-06-06T00:00:00.000Z",
 };
+const CACHED_THREAD: OrchestrationThread = {
+  id: ThreadId.make("thread-cached"),
+  projectId: ProjectId.make("project-cached"),
+  title: "Cached thread",
+  modelSelection: {
+    instanceId: ProviderInstanceId.make("codex"),
+    model: "gpt-5.4",
+  },
+  runtimeMode: "full-access",
+  interactionMode: "default",
+  branch: "main",
+  worktreePath: null,
+  latestTurn: null,
+  createdAt: "2026-04-01T00:00:00.000Z",
+  updatedAt: "2026-04-01T00:00:00.000Z",
+  archivedAt: null,
+  deletedAt: null,
+  messages: [],
+  proposedPlans: [],
+  activities: [],
+  checkpoints: [],
+  session: null,
+};
 
 interface SessionControl {
   readonly closed: Deferred.Deferred<never, ConnectionTransientError>;
@@ -156,6 +185,9 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     new Map(initialTargets.map((target) => [target.environmentId, target])),
   );
   const shellCache = yield* Ref.make(new Map([[TARGET.environmentId, CACHED_SNAPSHOT]]));
+  const threadCache = yield* Ref.make(
+    new Map([[TARGET.environmentId, new Map([[CACHED_THREAD.id, CACHED_THREAD]])]]),
+  );
   const cacheClears = yield* Ref.make<ReadonlyArray<EnvironmentId>>([]);
   const ownedDataClears = yield* Ref.make<ReadonlyArray<EnvironmentId>>([]);
   const sessions = yield* Ref.make<ReadonlyArray<SessionControl>>([]);
@@ -325,15 +357,39 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
         next.set(environmentId, snapshot);
         return next;
       }),
-    loadThread: (_environmentId, _threadId) => Effect.succeed(Option.none()),
-    saveThread: (_environmentId, _thread) => Effect.void,
-    removeThread: (_environmentId, _threadId) => Effect.void,
+    loadThread: (environmentId, threadId) =>
+      Ref.get(threadCache).pipe(
+        Effect.map((cache) => Option.fromUndefinedOr(cache.get(environmentId)?.get(threadId))),
+      ),
+    saveThread: (environmentId, thread) =>
+      Ref.update(threadCache, (current) => {
+        const next = new Map(current);
+        const threads = new Map(next.get(environmentId));
+        threads.set(thread.id, thread);
+        next.set(environmentId, threads);
+        return next;
+      }),
+    removeThread: (environmentId, threadId) =>
+      Ref.update(threadCache, (current) => {
+        const next = new Map(current);
+        const threads = new Map(next.get(environmentId));
+        threads.delete(threadId);
+        next.set(environmentId, threads);
+        return next;
+      }),
     clear: (environmentId) =>
       Ref.update(shellCache, (current) => {
         const next = new Map(current);
         next.delete(environmentId);
         return next;
       }).pipe(
+        Effect.andThen(
+          Ref.update(threadCache, (current) => {
+            const next = new Map(current);
+            next.delete(environmentId);
+            return next;
+          }),
+        ),
         Effect.andThen(
           Ref.update(cacheClears, (environmentIds) => [...environmentIds, environmentId]),
         ),
@@ -412,6 +468,12 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     connect: (entry, reportProgress) =>
       Effect.gen(function* () {
         const target = entry.target;
+        if (target._tag === "UnavailableConnectionTarget") {
+          return yield* new ConnectionTransientError({
+            reason: "endpoint-unavailable",
+            detail: target.detail,
+          });
+        }
         const prepared = {
           ...PREPARED,
           environmentId: target.environmentId,
@@ -466,6 +528,7 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     layer,
     storedTargets,
     shellCache,
+    threadCache,
     cacheClears,
     ownedDataClears,
     sessions,
@@ -1181,6 +1244,64 @@ describe("EnvironmentRegistry", () => {
         expect(yield* Ref.get(harness.sessions)).toHaveLength(1);
       }).pipe(Effect.provide(harness.layer), Effect.scoped);
     }),
+  );
+
+  it.effect(
+    "retains shell and thread caches for a desired unavailable platform environment until disable",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness(
+          [],
+          [],
+          [
+            [
+              "local:wsl:Ubuntu",
+              new BearerConnectionCredential({ token: "previous-live-session-token" }),
+            ],
+          ],
+        );
+        const unavailableTarget = new UnavailableConnectionTarget({
+          environmentId: TARGET.environmentId,
+          label: "WSL (Ubuntu)",
+          connectionId: "local:wsl:Ubuntu",
+          configuredDistro: "Ubuntu",
+          detail: "the configured WSL distribution could not start",
+        });
+        const unavailableRegistration = new UnavailableConnectionRegistration({
+          target: unavailableTarget,
+        });
+
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+
+          yield* registry.reconcilePlatform([unavailableRegistration]);
+          yield* awaitConnectionState(
+            registry,
+            TARGET.environmentId,
+            (state) => state.phase === "backoff",
+          );
+
+          expect(
+            (yield* SubscriptionRef.get(registry.entries)).get(TARGET.environmentId)?.target,
+          ).toEqual(unavailableTarget);
+          expect((yield* Ref.get(harness.shellCache)).get(TARGET.environmentId)).toEqual(
+            CACHED_SNAPSHOT,
+          );
+          expect(
+            (yield* Ref.get(harness.threadCache)).get(TARGET.environmentId)?.get(CACHED_THREAD.id),
+          ).toEqual(CACHED_THREAD);
+          expect(yield* Ref.get(harness.cacheClears)).toEqual([]);
+          expect((yield* Ref.get(harness.storedCredentials)).has("local:wsl:Ubuntu")).toBe(false);
+
+          yield* registry.reconcilePlatform([]);
+          expect((yield* Ref.get(harness.shellCache)).has(TARGET.environmentId)).toBe(false);
+          expect((yield* Ref.get(harness.threadCache)).has(TARGET.environmentId)).toBe(false);
+          expect(yield* Ref.get(harness.cacheClears)).toEqual([TARGET.environmentId]);
+
+          yield* registry.reconcilePlatform([]);
+          expect(yield* Ref.get(harness.cacheClears)).toEqual([TARGET.environmentId]);
+        }).pipe(Effect.provide(harness.layer), Effect.scoped);
+      }),
   );
 
   it.effect("removes all owned SSH state only on explicit removal", () =>

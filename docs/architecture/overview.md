@@ -126,13 +126,22 @@ environment shares the host process. SSH forwarding is owned by the Tauri host;
 provider, terminal, and managed relay processes are supervised by the server.
 Neither path introduces a production Node server or packaged helper sidecar.
 
-When WSL-only mode is selected, WSL planning and primary startup fail closed as
-a tagged `wsl-primary-unavailable` desktop state. The host does not substitute
-the native Windows backend or publish a fallback bootstrap. Retry and distro
-selection keep WSL as the primary target; **Switch to Windows** is an explicit
-settings transition followed by the normal backend restart. A failure of an
-optional secondary WSL backend remains non-blocking for a native Windows
-primary.
+When WSL-only mode is selected, that intent is authoritative even if an older
+persisted document has a stale disabled-backend flag. WSL planning and primary
+startup fail closed as a tagged `wsl-primary-unavailable` desktop state. The
+host does not substitute the native Windows backend or publish a fallback
+bootstrap. Retry and distro selection keep WSL as the primary target;
+**Switch to Windows** atomically clears the WSL-only/backend flags and follows
+the normal backend restart.
+
+A failure of an optional secondary WSL backend remains non-blocking for a
+native Windows primary, but does not remove that secondary from desired
+topology. The host publishes a stable configured identity and a tagged
+`wsl-secondary-unavailable` error with null endpoints and no credential. The
+renderer keeps the environment registration and cached shell/thread data while
+the resolver rejects connection attempts before creating a transport or
+session. Explicit disable or distro replacement is what removes that desired
+identity and clears its environment cache.
 
 The WebView engine is the operating system's, so it differs per platform:
 WKWebView on macOS, WebKitGTK on Linux, and WebView2 on Windows. Browser API
@@ -206,6 +215,9 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
 - WSL-only desktop startup never falls back to a native Windows backend.
   Planning and primary-start failures remain tagged through the desktop bridge;
   only an explicit settings action switches the primary runtime to Windows.
+- Configured secondary WSL planning/start failures remain desired, unavailable
+  topology with stable identity and no endpoint/session. They do not remove
+  cached project/thread state; explicit disable or distro replacement does.
 - Normal application traffic uses HTTP and WebSocket RPC in every host.
 - `packages/contracts` remains schema-only.
 - Rust owns all production backend behavior. TypeScript is limited to clients,

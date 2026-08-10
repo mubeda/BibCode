@@ -61,6 +61,7 @@ function connectionIdOf(target: ConnectionTarget): string | null {
       return null;
     case "BearerConnectionTarget":
     case "SshConnectionTarget":
+    case "UnavailableConnectionTarget":
       return target.connectionId;
   }
 }

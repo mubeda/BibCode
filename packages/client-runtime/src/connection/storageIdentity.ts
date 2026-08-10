@@ -33,6 +33,7 @@ export function storageIdentityTargetKey(target: ConnectionTarget): string {
     case "PrimaryConnectionTarget":
       return "platform:primary";
     case "BearerConnectionTarget":
+    case "UnavailableConnectionTarget":
       return `bearer:${target.connectionId}`;
     case "RelayConnectionTarget":
       return `relay:${target.environmentId}`;

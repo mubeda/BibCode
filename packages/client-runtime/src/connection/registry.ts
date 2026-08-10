@@ -441,6 +441,18 @@ export const make = Effect.gen(function* () {
                 }),
               ),
             );
+          } else if (registration._tag === "UnavailableConnectionRegistration") {
+            // A desired-but-unavailable desktop backend must not retain a
+            // credential from its previous live registration. Its typed
+            // target keeps identity/cache state without remaining usable.
+            yield* credentials.remove(registration.target.connectionId).pipe(
+              Effect.catch((error) =>
+                Effect.logWarning("Could not clear the unavailable platform credential.", {
+                  environmentId: target.environmentId,
+                  error,
+                }),
+              ),
+            );
           }
 
           const persistedTarget = (yield* Ref.get(persistedTargetsByEnvironment)).get(
@@ -494,7 +506,11 @@ export const make = Effect.gen(function* () {
             next.delete(environmentId);
             return next;
           });
-          if (entry !== undefined && entry.target._tag === "BearerConnectionTarget") {
+          if (
+            entry !== undefined &&
+            (entry.target._tag === "BearerConnectionTarget" ||
+              entry.target._tag === "UnavailableConnectionTarget")
+          ) {
             yield* credentials.remove(entry.target.connectionId).pipe(
               Effect.catch((error) =>
                 Effect.logWarning("Could not clear the platform bearer credential.", {
