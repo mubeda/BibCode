@@ -8,9 +8,10 @@ use std::{
 };
 
 use bibcode_server::git::{
-    CreateWorktreeInput, GitRepository, OutputPolicy, ProcessError, ProcessRequest, ProcessRunner,
-    ProviderKind, PullStatus, StatusBroadcaster, VcsStagingArea, VcsStatusStreamEvent,
-    VcsWorkingTreeFileStatus, parse_numstat, parse_porcelain_v2_line, resolve_numstat_new_path,
+    CreateWorktreeInput, GitRepository, GitWorktreeRecord, OutputPolicy, ProcessError,
+    ProcessRequest, ProcessRunner, ProviderKind, PullStatus, StatusBroadcaster, VcsStagingArea,
+    VcsStatusStreamEvent, VcsWorkingTreeFileStatus, git_worktree_prune_impact_digest,
+    normalize_worktree_path_key, parse_numstat, parse_porcelain_v2_line, resolve_numstat_new_path,
 };
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -168,6 +169,28 @@ fn commit_file(repo: &Path, relative: &str, contents: &str, message: &str) {
     fs::write(path, contents).expect("write fixture file");
     git(repo, &["add", "--", relative]);
     git(repo, &["commit", "-m", message]);
+}
+
+fn linked_worktree_record(
+    inventory: &bibcode_server::git::GitWorktreeInventory,
+    path: &Path,
+) -> GitWorktreeRecord {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    inventory
+        .records
+        .iter()
+        .find(|record| record.path == canonical)
+        .cloned()
+        .expect("linked worktree record")
+}
+
+fn has_registered_worktree(cwd: &Path, expected: &Path) -> bool {
+    let expected = fs::canonicalize(expected).unwrap_or_else(|_| expected.to_path_buf());
+    git(cwd, &["worktree", "list", "--porcelain"])
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .any(|path| fs::canonicalize(&path).unwrap_or(path) == expected)
 }
 
 fn local_file_url(path: &Path) -> String {
@@ -1035,6 +1058,565 @@ async fn worktree_inventory_returns_authoritative_primary_and_linked_records() {
         inventory.records[1].branch.as_deref(),
         Some("feature/inventory")
     );
+}
+
+#[tokio::test]
+async fn worktree_removal_inspection_counts_tracked_and_untracked_paths_separately() {
+    if relaunch_with_isolated_git_config(
+        "worktree_removal_inspection_counts_tracked_and_untracked_paths_separately",
+    ) {
+        return;
+    }
+    let repo = init_repo();
+    commit_file(repo.path(), "tracked.txt", "base\n", "initial");
+    let parent = tempfile::tempdir().expect("worktree parent");
+    let linked = parent.path().join("counted");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/counts",
+            "--",
+            &linked.to_string_lossy(),
+        ],
+    );
+    let repository = GitRepository::default();
+    let inventory = repository
+        .worktree_inventory(repo.path(), &cancellation())
+        .await
+        .expect("worktree inventory");
+    let record = linked_worktree_record(&inventory, &linked);
+
+    let clean = repository
+        .inspect_worktree_removal(repo.path(), &record, &cancellation())
+        .await
+        .expect("clean removal inspection");
+    assert_eq!(clean.tracked_change_count, 0);
+    assert_eq!(clean.untracked_file_count, 0);
+
+    fs::write(linked.join("tracked.txt"), "changed\n").expect("modify tracked file");
+    let tracked = repository
+        .inspect_worktree_removal(repo.path(), &record, &cancellation())
+        .await
+        .expect("tracked-dirty removal inspection");
+    assert_eq!(tracked.tracked_change_count, 1);
+    assert_eq!(tracked.untracked_file_count, 0);
+
+    fs::write(linked.join("untracked.txt"), "new\n").expect("write untracked file");
+    let both = repository
+        .inspect_worktree_removal(repo.path(), &record, &cancellation())
+        .await
+        .expect("combined removal inspection");
+    assert_eq!(both.tracked_change_count, 1);
+    assert_eq!(both.untracked_file_count, 1);
+
+    git(&linked, &["checkout", "--", "tracked.txt"]);
+    let untracked = repository
+        .inspect_worktree_removal(repo.path(), &record, &cancellation())
+        .await
+        .expect("untracked-dirty removal inspection");
+    assert_eq!(untracked.tracked_change_count, 0);
+    assert_eq!(untracked.untracked_file_count, 1);
+}
+
+#[tokio::test]
+async fn worktree_removal_rejects_primary_and_bare_records() {
+    if relaunch_with_isolated_git_config("worktree_removal_rejects_primary_and_bare_records") {
+        return;
+    }
+    let repo = init_repo();
+    commit_file(repo.path(), "README.md", "base\n", "initial");
+    let repository = GitRepository::default();
+    let primary = repository
+        .worktree_inventory(repo.path(), &cancellation())
+        .await
+        .expect("primary inventory")
+        .records
+        .into_iter()
+        .next()
+        .expect("primary record");
+    let primary_error = repository
+        .inspect_worktree_removal(repo.path(), &primary, &cancellation())
+        .await
+        .expect_err("primary worktree is protected");
+    assert!(
+        primary_error
+            .detail
+            .to_ascii_lowercase()
+            .contains("primary")
+    );
+
+    let bare_parent = tempfile::tempdir().expect("bare repository parent");
+    let bare = bare_parent.path().join("bare.git");
+    git(
+        bare_parent.path(),
+        &["init", "--bare", &bare.to_string_lossy()],
+    );
+    let bare_record = repository
+        .worktree_inventory(&bare, &cancellation())
+        .await
+        .expect("bare inventory")
+        .records
+        .into_iter()
+        .next()
+        .expect("bare record");
+    let bare_error = repository
+        .inspect_worktree_removal(&bare, &bare_record, &cancellation())
+        .await
+        .expect_err("bare worktree is protected");
+    assert!(bare_error.detail.to_ascii_lowercase().contains("bare"));
+}
+
+#[tokio::test]
+async fn worktree_removal_rejects_locked_record_with_its_reason() {
+    if relaunch_with_isolated_git_config("worktree_removal_rejects_locked_record_with_its_reason") {
+        return;
+    }
+    let repo = init_repo();
+    commit_file(repo.path(), "README.md", "base\n", "initial");
+    let parent = tempfile::tempdir().expect("worktree parent");
+    let linked = parent.path().join("locked");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/locked-removal",
+            "--",
+            &linked.to_string_lossy(),
+        ],
+    );
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            "keep for audit",
+            "--",
+            &linked.to_string_lossy(),
+        ],
+    );
+    let repository = GitRepository::default();
+    let inventory = repository
+        .worktree_inventory(repo.path(), &cancellation())
+        .await
+        .expect("locked inventory");
+    let record = linked_worktree_record(&inventory, &linked);
+
+    let error = repository
+        .remove_worktree_verified(repo.path(), &record, true, &cancellation())
+        .await
+        .expect_err("locked worktree removal fails closed");
+    assert!(error.detail.contains("keep for audit"));
+    assert!(has_registered_worktree(repo.path(), &linked));
+}
+
+#[tokio::test]
+async fn worktree_removal_rejects_repository_and_record_identity_drift() {
+    if relaunch_with_isolated_git_config(
+        "worktree_removal_rejects_repository_and_record_identity_drift",
+    ) {
+        return;
+    }
+    let repo = init_repo();
+    commit_file(repo.path(), "README.md", "base\n", "initial");
+    let other = init_repo();
+    commit_file(other.path(), "README.md", "other\n", "initial");
+    let parent = tempfile::tempdir().expect("worktree parent");
+    let linked = parent.path().join("identity");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/identity",
+            "--",
+            &linked.to_string_lossy(),
+        ],
+    );
+    let repository = GitRepository::default();
+    let inventory = repository
+        .worktree_inventory(repo.path(), &cancellation())
+        .await
+        .expect("worktree inventory");
+    let record = linked_worktree_record(&inventory, &linked);
+
+    let repository_error = repository
+        .inspect_worktree_removal(other.path(), &record, &cancellation())
+        .await
+        .expect_err("record from another repository is rejected");
+    assert!(
+        repository_error
+            .detail
+            .to_ascii_lowercase()
+            .contains("repository")
+    );
+
+    let mut changed = record.clone();
+    changed.path = repo.path().join("changed-identity");
+    let identity_error = repository
+        .inspect_worktree_removal(repo.path(), &changed, &cancellation())
+        .await
+        .expect_err("changed record path is rejected");
+    assert!(
+        identity_error
+            .detail
+            .to_ascii_lowercase()
+            .contains("record")
+    );
+}
+
+#[tokio::test]
+async fn worktree_removal_rejects_an_unregistered_replacement_directory() {
+    if relaunch_with_isolated_git_config(
+        "worktree_removal_rejects_an_unregistered_replacement_directory",
+    ) {
+        return;
+    }
+    let repo = init_repo();
+    commit_file(repo.path(), "README.md", "base\n", "initial");
+    let parent = tempfile::tempdir().expect("worktree parent");
+    let linked = parent.path().join("replacement");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/replacement",
+            "--",
+            &linked.to_string_lossy(),
+        ],
+    );
+    let repository = GitRepository::default();
+    let inventory = repository
+        .worktree_inventory(repo.path(), &cancellation())
+        .await
+        .expect("worktree inventory");
+    let record = linked_worktree_record(&inventory, &linked);
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            "--",
+            &linked.to_string_lossy(),
+        ],
+    );
+    fs::create_dir(&linked).expect("unrelated replacement directory");
+    fs::write(linked.join("keep.txt"), "unrelated\n").expect("replacement contents");
+
+    repository
+        .remove_worktree_verified(repo.path(), &record, true, &cancellation())
+        .await
+        .expect_err("unregistered replacement is never removed");
+    assert_eq!(
+        fs::read_to_string(linked.join("keep.txt")).expect("replacement survives"),
+        "unrelated\n"
+    );
+}
+
+#[tokio::test]
+async fn worktree_removal_rejects_a_registered_path_replaced_by_another_repository() {
+    if relaunch_with_isolated_git_config(
+        "worktree_removal_rejects_a_registered_path_replaced_by_another_repository",
+    ) {
+        return;
+    }
+    let repo = init_repo();
+    commit_file(repo.path(), "README.md", "base\n", "initial");
+    let parent = tempfile::tempdir().expect("worktree parent");
+    let linked = parent.path().join("replacement-repository");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/repository-replacement",
+            "--",
+            &linked.to_string_lossy(),
+        ],
+    );
+    let repository = GitRepository::default();
+    let inventory = repository
+        .worktree_inventory(repo.path(), &cancellation())
+        .await
+        .expect("worktree inventory");
+    let record = linked_worktree_record(&inventory, &linked);
+    fs::rename(&linked, parent.path().join("moved-original"))
+        .expect("move original registered checkout");
+    fs::create_dir(&linked).expect("create replacement repository root");
+    git(&linked, &["init", "-b", "unrelated"]);
+    commit_file(&linked, "KEEP", "unrelated\n", "unrelated repository");
+
+    let error = repository
+        .inspect_worktree_removal(repo.path(), &record, &cancellation())
+        .await
+        .expect_err("replacement repository cannot satisfy registered identity");
+    assert!(error.detail.to_ascii_lowercase().contains("repository"));
+    assert_eq!(
+        fs::read_to_string(linked.join("KEEP")).expect("replacement survives"),
+        "unrelated\n"
+    );
+    assert!(has_registered_worktree(repo.path(), &record.path));
+}
+
+#[tokio::test]
+async fn worktree_removal_requires_dirty_confirmation_and_preserves_the_branch() {
+    if relaunch_with_isolated_git_config(
+        "worktree_removal_requires_dirty_confirmation_and_preserves_the_branch",
+    ) {
+        return;
+    }
+    let repo = init_repo();
+    commit_file(repo.path(), "tracked.txt", "base\n", "initial");
+    let parent = tempfile::tempdir().expect("worktree parent");
+    let linked = parent.path().join("dirty");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/preserved",
+            "--",
+            &linked.to_string_lossy(),
+        ],
+    );
+    fs::write(linked.join("tracked.txt"), "dirty\n").expect("dirty tracked file");
+    let repository = GitRepository::default();
+    let inventory = repository
+        .worktree_inventory(repo.path(), &cancellation())
+        .await
+        .expect("worktree inventory");
+    let record = linked_worktree_record(&inventory, &linked);
+
+    let dirty_error = repository
+        .remove_worktree_verified(repo.path(), &record, false, &cancellation())
+        .await
+        .expect_err("dirty worktree requires confirmation");
+    assert!(dirty_error.detail.to_ascii_lowercase().contains("dirty"));
+    assert!(has_registered_worktree(repo.path(), &linked));
+
+    repository
+        .remove_worktree_verified(repo.path(), &record, true, &cancellation())
+        .await
+        .expect("confirmed dirty removal");
+    assert!(!linked.exists());
+    assert_eq!(
+        git(repo.path(), &["branch", "--list", "feature/preserved"]),
+        "feature/preserved"
+    );
+}
+
+#[tokio::test]
+async fn worktree_prune_preview_lists_every_affected_registration_in_normalized_order() {
+    if relaunch_with_isolated_git_config(
+        "worktree_prune_preview_lists_every_affected_registration_in_normalized_order",
+    ) {
+        return;
+    }
+    let repo = init_repo();
+    commit_file(repo.path(), "README.md", "base\n", "initial");
+    let parent = tempfile::tempdir().expect("worktree parent");
+    let second = parent.path().join("z-second");
+    let first = parent.path().join("a first");
+    for (path, branch) in [(&second, "feature/second"), (&first, "feature/first")] {
+        git(
+            repo.path(),
+            &[
+                "worktree",
+                "add",
+                "-b",
+                branch,
+                "--",
+                &path.to_string_lossy(),
+            ],
+        );
+    }
+    let repository = GitRepository::default();
+    let registered = repository
+        .worktree_inventory(repo.path(), &cancellation())
+        .await
+        .expect("registered inventory");
+    let first_record = linked_worktree_record(&registered, &first);
+    let second_record = linked_worktree_record(&registered, &second);
+    fs::rename(&first, parent.path().join("moved-first")).expect("make first registration stale");
+    fs::rename(&second, parent.path().join("moved-second"))
+        .expect("make second registration stale");
+
+    let impact = repository
+        .preview_worktree_prune(repo.path(), &cancellation())
+        .await
+        .expect("prune preview");
+    assert_eq!(impact.len(), 2);
+    assert!(impact.iter().all(|entry| !entry.locked));
+    assert!(impact.iter().all(|entry| entry.lock_reason.is_none()));
+    let keys = impact
+        .iter()
+        .map(|entry| {
+            normalize_worktree_path_key(&entry.path, bibcode_server::git::host_path_platform())
+        })
+        .collect::<Vec<_>>();
+    let mut expected = vec![first_record.path, second_record.path]
+        .into_iter()
+        .map(|path| normalize_worktree_path_key(&path, bibcode_server::git::host_path_platform()))
+        .collect::<Vec<_>>();
+    expected.sort();
+    assert_eq!(keys, expected);
+
+    let mut reversed = impact.clone();
+    reversed.reverse();
+    assert_eq!(
+        git_worktree_prune_impact_digest(&impact),
+        git_worktree_prune_impact_digest(&reversed),
+        "confirmed impact digest is independent of preview iteration order"
+    );
+}
+
+#[tokio::test]
+async fn worktree_prune_rejects_impact_drift_before_mutation_then_accepts_the_fresh_digest() {
+    if relaunch_with_isolated_git_config(
+        "worktree_prune_rejects_impact_drift_before_mutation_then_accepts_the_fresh_digest",
+    ) {
+        return;
+    }
+    let repo = init_repo();
+    commit_file(repo.path(), "README.md", "base\n", "initial");
+    let parent = tempfile::tempdir().expect("worktree parent");
+    let first = parent.path().join("first");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/prune-first",
+            "--",
+            &first.to_string_lossy(),
+        ],
+    );
+    let repository = GitRepository::default();
+    let registered = repository
+        .worktree_inventory(repo.path(), &cancellation())
+        .await
+        .expect("registered inventory");
+    let registered_first = linked_worktree_record(&registered, &first);
+    fs::rename(&first, parent.path().join("moved-first")).expect("make first registration stale");
+    let stale_inventory = repository
+        .worktree_inventory(repo.path(), &cancellation())
+        .await
+        .expect("stale inventory");
+    let target = linked_worktree_record(&stale_inventory, &registered_first.path);
+    let confirmed = repository
+        .preview_worktree_prune(repo.path(), &cancellation())
+        .await
+        .expect("initial prune preview");
+    let confirmed_digest = git_worktree_prune_impact_digest(&confirmed);
+
+    let second = parent.path().join("second");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/prune-second",
+            "--",
+            &second.to_string_lossy(),
+        ],
+    );
+    let registered_second = fs::canonicalize(&second).expect("canonical second registration");
+    fs::rename(&second, parent.path().join("moved-second"))
+        .expect("introduce a new stale registration");
+
+    let error = repository
+        .prune_worktrees_verified(repo.path(), &target, &confirmed_digest, &cancellation())
+        .await
+        .expect_err("impact drift rejects repository-wide prune");
+    assert!(error.detail.to_ascii_lowercase().contains("impact"));
+    assert!(has_registered_worktree(repo.path(), &registered_first.path));
+    assert!(has_registered_worktree(repo.path(), &registered_second));
+
+    let fresh_impact = repository
+        .preview_worktree_prune(repo.path(), &cancellation())
+        .await
+        .expect("fresh prune preview");
+    let fresh_digest = git_worktree_prune_impact_digest(&fresh_impact);
+    repository
+        .prune_worktrees_verified(repo.path(), &target, &fresh_digest, &cancellation())
+        .await
+        .expect("matching fresh impact permits prune");
+    assert!(!has_registered_worktree(
+        repo.path(),
+        &registered_first.path
+    ));
+    assert!(!has_registered_worktree(repo.path(), &registered_second));
+    assert_eq!(
+        git(repo.path(), &["branch", "--list", "feature/prune-first"]),
+        "feature/prune-first"
+    );
+    assert_eq!(
+        git(repo.path(), &["branch", "--list", "feature/prune-second"]),
+        "feature/prune-second"
+    );
+}
+
+#[tokio::test]
+async fn worktree_prune_rejects_a_locked_missing_registration_with_its_reason() {
+    if relaunch_with_isolated_git_config(
+        "worktree_prune_rejects_a_locked_missing_registration_with_its_reason",
+    ) {
+        return;
+    }
+    let repo = init_repo();
+    commit_file(repo.path(), "README.md", "base\n", "initial");
+    let parent = tempfile::tempdir().expect("worktree parent");
+    let linked = parent.path().join("locked-stale");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/locked-stale",
+            "--",
+            &linked.to_string_lossy(),
+        ],
+    );
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "lock",
+            "--reason",
+            "retained by operator",
+            "--",
+            &linked.to_string_lossy(),
+        ],
+    );
+    let repository = GitRepository::default();
+    let registered = repository
+        .worktree_inventory(repo.path(), &cancellation())
+        .await
+        .expect("locked inventory");
+    let target = linked_worktree_record(&registered, &linked);
+    fs::rename(&linked, parent.path().join("moved-locked"))
+        .expect("make locked registration missing");
+
+    let error = repository
+        .prune_worktrees_verified(repo.path(), &target, "untrusted", &cancellation())
+        .await
+        .expect_err("locked target is never pruned");
+    assert!(error.detail.contains("retained by operator"));
+    assert!(has_registered_worktree(repo.path(), &target.path));
 }
 
 #[cfg(windows)]
