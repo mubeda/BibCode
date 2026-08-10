@@ -209,6 +209,16 @@ loaded, contains at least one desired environment, and every desired
 environment is `live` with a snapshot. Missing snapshots may yield no project
 rows for rendering, but never establish an empty catalog.
 
+Shell authority is fenced to the exact supervisor session and connection
+generation. Connection-state and session publication are observed as one
+serialized projection, so either publication order starts the same subscription
+without letting a prior-session stream become current. Reconnect, blocked,
+backoff, session replacement, or generation change immediately retains the
+cached snapshot as non-authoritative and requires a new full snapshot. Deltas
+are ignored until that snapshot arrives; afterward only strictly newer deltas
+may update state or the persistence queue. Duplicate and stale deltas publish
+nothing.
+
 ## Data boundary
 
 A session becomes ready only after the socket connects and the initial
