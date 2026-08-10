@@ -71,6 +71,7 @@ export const ConnectionBlockedReason = Schema.Literals([
   "authentication",
   "configuration",
   "permission",
+  "recovery-required",
   "storage-changed",
   "unsupported",
 ]);

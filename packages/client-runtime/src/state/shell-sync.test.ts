@@ -14,6 +14,7 @@ import * as SubscriptionRef from "effect/SubscriptionRef";
 
 import {
   AVAILABLE_CONNECTION_STATE,
+  ConnectionStorageChangedError,
   PrimaryConnectionTarget,
   type PreparedConnection,
 } from "../connection/model.ts";
@@ -107,7 +108,7 @@ describe("environment shell synchronization", () => {
       for (let index = 0; index < 10; index += 1) {
         yield* Effect.yieldNow;
       }
-      expect((yield* SubscriptionRef.get(shellState)).status).toBe("empty");
+      expect((yield* SubscriptionRef.get(shellState)).status).toBe("unavailable");
       yield* SubscriptionRef.set(supervisorState, {
         desired: true,
         network: "online",
@@ -181,5 +182,118 @@ describe("environment shell synchronization", () => {
       expect(state.status).toBe("live");
       expect(Option.getOrThrow(state.snapshot).snapshotSequence).toBe(2);
     }),
+  );
+
+  it.effect(
+    "retains cached projects through a storage mismatch until an adopted live empty snapshot arrives",
+    () =>
+      Effect.gen(function* () {
+        const cachedSnapshot: OrchestrationShellSnapshot = {
+          snapshotSequence: 4,
+          projects: [
+            {
+              id: ProjectId.make("cached-project"),
+              title: "Cached project",
+              workspaceRoot: "/cached/project",
+              repositoryIdentity: null,
+              defaultModelSelection: null,
+              scripts: [],
+              createdAt: "2026-06-01T00:00:00.000Z",
+              updatedAt: "2026-06-01T00:00:00.000Z",
+            },
+          ],
+          threads: [],
+          updatedAt: "2026-06-01T00:00:00.000Z",
+        };
+        const events = yield* Queue.unbounded<OrchestrationShellStreamItem>();
+        const client = {
+          [ORCHESTRATION_WS_METHODS.subscribeShell]: () => Stream.fromQueue(events),
+        } as unknown as WsRpcProtocolClient;
+        const supervisorState = yield* SubscriptionRef.make(AVAILABLE_CONNECTION_STATE);
+        const activeSession = yield* SubscriptionRef.make<Option.Option<RpcSession.RpcSession>>(
+          Option.some(session(client)),
+        );
+        const supervisor = EnvironmentSupervisor.EnvironmentSupervisor.of({
+          target: TARGET,
+          state: supervisorState,
+          session: activeSession,
+          prepared: yield* SubscriptionRef.make(Option.none<PreparedConnection>()),
+          connect: Effect.void,
+          disconnect: Effect.void,
+          retryNow: Effect.void,
+        } satisfies EnvironmentSupervisor.EnvironmentSupervisor["Service"]);
+        const cache = Persistence.EnvironmentCacheStore.of({
+          loadShell: () => Effect.succeed(Option.some(cachedSnapshot)),
+          saveShell: () => Effect.void,
+          loadThread: () => Effect.succeed(Option.none()),
+          saveThread: () => Effect.void,
+          removeThread: () => Effect.void,
+          clear: () => Effect.void,
+        });
+        const shellState = yield* makeEnvironmentShellState().pipe(
+          Effect.provideService(EnvironmentSupervisor.EnvironmentSupervisor, supervisor),
+          Effect.provideService(Persistence.EnvironmentCacheStore, cache),
+        );
+
+        expect((yield* SubscriptionRef.get(shellState)).status).toBe("degraded");
+        yield* SubscriptionRef.set(supervisorState, {
+          desired: true,
+          network: "online",
+          phase: "blocked",
+          stage: null,
+          attempt: 1,
+          generation: 0,
+          lastFailure: new ConnectionStorageChangedError({
+            reason: "storage-changed",
+            detail: "The environment reported a different persistent store.",
+            targetKey: "platform:primary",
+            acceptedStorageInstanceId: "11111111-1111-4111-8111-111111111111",
+            reportedStorageInstanceId: "22222222-2222-4222-8222-222222222222",
+          }),
+          retryAt: null,
+        });
+        yield* Effect.yieldNow;
+        yield* Effect.yieldNow;
+        let current = yield* SubscriptionRef.get(shellState);
+        expect(current.status).toBe("storage-changed");
+        expect(
+          Option.getOrThrow(current.snapshot).projects.map((project) => project.title),
+        ).toEqual(["Cached project"]);
+
+        // Explicit adoption schedules the normal retry. The accepted cache is
+        // retained while that retry synchronizes the newly accepted store.
+        yield* SubscriptionRef.set(supervisorState, {
+          desired: true,
+          network: "online",
+          phase: "connecting",
+          stage: "synchronizing",
+          attempt: 2,
+          generation: 0,
+          lastFailure: null,
+          retryAt: null,
+        });
+        yield* Effect.yieldNow;
+        yield* Effect.yieldNow;
+        current = yield* SubscriptionRef.get(shellState);
+        expect(current.status).toBe("synchronizing");
+        expect(Option.getOrThrow(current.snapshot).projects).toHaveLength(1);
+
+        yield* Queue.offer(events, {
+          kind: "snapshot",
+          snapshot: {
+            snapshotSequence: 1,
+            projects: [],
+            threads: [],
+            updatedAt: "2026-06-07T00:00:00.000Z",
+          },
+        });
+        yield* SubscriptionRef.changes(shellState).pipe(
+          Stream.filter((state) => state.status === "live"),
+          Stream.runHead,
+        );
+        current = yield* SubscriptionRef.get(shellState);
+        expect(current.status).toBe("live");
+        expect(Option.getOrThrow(current.snapshot).projects).toEqual([]);
+      }),
   );
 });

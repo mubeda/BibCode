@@ -97,7 +97,16 @@ describe("shouldRedirectMissingRouteThread", () => {
   });
 
   it("never redirects while the shell is not live (backend flap/reconnect windows)", () => {
-    for (const shellStatus of ["cached", "synchronizing", "empty", null] as const) {
+    for (const shellStatus of [
+      "starting",
+      "synchronizing",
+      "degraded",
+      "storage-changed",
+      "recovery-required",
+      "unavailable",
+      "configuration-error",
+      null,
+    ] as const) {
       expect(
         shouldRedirectMissingRouteThread({
           shellStatus,

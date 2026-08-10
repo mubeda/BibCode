@@ -24,6 +24,9 @@ export function createEnvironmentProjectAtoms(input: {
   const environmentProjectsAtom = Atom.family((environmentId: EnvironmentId) =>
     Atom.make(
       (get): ReadonlyArray<OrchestrationProjectShell> =>
+        // This empty array is rendering-only. Missing snapshots never establish
+        // catalog authority; createEnvironmentShellSummaryAtom retains the
+        // environment's explicit availability reason for the global sidebar.
         get(input.snapshotAtom(environmentId))?.projects ?? EMPTY_PROJECTS,
     ).pipe(Atom.withLabel(`environment-projects:${environmentId}`)),
   );

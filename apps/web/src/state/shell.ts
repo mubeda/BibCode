@@ -4,6 +4,7 @@ import {
   createEnvironmentSnapshotAtom,
   createShellEnvironmentAtoms,
 } from "@bibcode/client-runtime/state/shell";
+import { useAtomValue } from "@effect/atom-react";
 
 import { environmentCatalog } from "../connection/catalog";
 import { connectionAtomRuntime } from "../connection/runtime";
@@ -15,3 +16,12 @@ export const environmentShellSummaryAtom = createEnvironmentShellSummaryAtom({
   catalogValueAtom: environmentCatalog.catalogValueAtom,
   shellStateValueAtom: environmentShell.stateValueAtom,
 });
+
+export const environmentAvailabilityCommands = {
+  retry: environmentCatalog.retryNow,
+  adoptStorage: environmentCatalog.acceptStorageIdentity,
+} as const;
+
+export function useEnvironmentShellSummary() {
+  return useAtomValue(environmentShellSummaryAtom);
+}

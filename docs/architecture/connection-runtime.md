@@ -197,6 +197,18 @@ supervisor. Disconnect and scope closure interrupt in-flight work.
 supervisor owns retry state, status, cancellation, and generation fencing, so a
 stale socket cannot silently become current.
 
+Shell projection keeps connection availability separate from project count.
+Each desired environment is `starting`, `synchronizing`, `live`, `degraded`,
+`storage-changed`, `recovery-required`, `unavailable`, or
+`configuration-error`. A cached snapshot remains the render source while an
+environment reconnects or is blocked, but it is not authoritative. Only a
+successful shell snapshot transitions the environment to `live`, including a
+successful snapshot containing zero projects. The global shell summary permits
+the genuine empty-project presentation only after the environment catalog is
+loaded, contains at least one desired environment, and every desired
+environment is `live` with a snapshot. Missing snapshots may yield no project
+rows for rendering, but never establish an empty catalog.
+
 ## Data boundary
 
 A session becomes ready only after the socket connects and the initial
