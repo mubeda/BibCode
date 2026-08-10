@@ -1,0 +1,146 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "repositoryKey": "Q",
+      "generation": 1905952812,
+      "authoritative": false,
+      "observedAt": "y!|%x!Y%",
+      "scanStatus": {
+        "_tag": "refreshing"
+      },
+      "worktrees": [
+        {
+          "worktreeKey": "40eq",
+          "path": "l,f",
+          "branch": null,
+          "head": null,
+          "isPrimary": true,
+          "isBare": true,
+          "locked": true,
+          "registrationState": "prunable",
+          "directoryState": "unknown",
+          "adoptionState": "none",
+          "eligibleForAdoption": false
+        },
+        {
+          "worktreeKey": "_,g\\b_",
+          "path": "73Dc}g3U'l",
+          "branch": null,
+          "head": "660#",
+          "isPrimary": true,
+          "isBare": true,
+          "locked": false,
+          "registrationState": "prunable",
+          "directoryState": "present",
+          "adoptionState": "active",
+          "adoptedThreadId": "7p{4I9l1jjMQ",
+          "eligibleForAdoption": false
+        },
+        {
+          "worktreeKey": "'PKm07[Y0}K!",
+          "path": "a|]WDX.",
+          "branch": "6%m>F|C_",
+          "head": "%.S",
+          "isPrimary": true,
+          "isBare": false,
+          "locked": true,
+          "lockReason": "lB$",
+          "registrationState": "prunable",
+          "directoryState": "present",
+          "adoptionState": "none",
+          "adoptedThreadId": "L6ch(-ZU|`",
+          "eligibleForAdoption": true
+        },
+        {
+          "worktreeKey": ",Z{/D(tfL$Z",
+          "path": "cLC\\&p*p",
+          "branch": null,
+          "head": null,
+          "isPrimary": false,
+          "isBare": true,
+          "locked": false,
+          "registrationState": "prunable",
+          "directoryState": "missing",
+          "adoptionState": "none",
+          "eligibleForAdoption": false
+        },
+        {
+          "worktreeKey": "jeg/>=_X",
+          "path": "JT(~x~g",
+          "branch": "\\y0~Od'%B0N$",
+          "head": "9'+wMh",
+          "isPrimary": true,
+          "isBare": false,
+          "locked": false,
+          "registrationState": "registered",
+          "directoryState": "unknown",
+          "adoptionState": "none",
+          "eligibleForAdoption": false
+        },
+        {
+          "worktreeKey": "<6$n",
+          "path": "m{t+3w;[>X=e",
+          "branch": "v2E",
+          "head": null,
+          "isPrimary": true,
+          "isBare": true,
+          "locked": true,
+          "lockReason": "1NQK1gR`",
+          "registrationState": "prunable",
+          "directoryState": "present",
+          "adoptionState": "archived",
+          "adoptedThreadId": "m",
+          "eligibleForAdoption": false
+        },
+        {
+          "worktreeKey": "q",
+          "path": "d]HYip$q",
+          "branch": null,
+          "head": null,
+          "isPrimary": true,
+          "isBare": false,
+          "locked": false,
+          "lockReason": "2:Pg",
+          "registrationState": "prunable",
+          "directoryState": "present",
+          "adoptionState": "none",
+          "adoptedThreadId": ":Hq}3A1GWE",
+          "eligibleForAdoption": true
+        },
+        {
+          "worktreeKey": ":$CtG@ut",
+          "path": "7U\\mrd",
+          "branch": null,
+          "head": null,
+          "isPrimary": false,
+          "isBare": false,
+          "locked": false,
+          "lockReason": "Hum!+",
+          "registrationState": "prunable",
+          "directoryState": "missing",
+          "adoptionState": "none",
+          "adoptedThreadId": "$6i1g",
+          "eligibleForAdoption": false
+        },
+        {
+          "worktreeKey": ".Y1v^WtISN",
+          "path": "yW\\r)",
+          "branch": "xW}Y[-'ln",
+          "head": "\\",
+          "isPrimary": true,
+          "isBare": false,
+          "locked": false,
+          "lockReason": ")Tn$=P5",
+          "registrationState": "registered",
+          "directoryState": "unknown",
+          "adoptionState": "none",
+          "adoptedThreadId": "l*d",
+          "eligibleForAdoption": false
+        }
+      ],
+      "adoptedWorkspaces": []
+    }
+  ]
+}

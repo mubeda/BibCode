@@ -12,6 +12,9 @@ import {
   WorktreeRemovalPlan,
   WorktreeRemovalResult,
   WorkspaceUnavailableError,
+  WorktreeCatalogInput,
+  WorktreeCatalogRefreshInput,
+  WorktreeDiscoveryPolicyUpdateInput,
 } from "./worktree.ts";
 
 const decodeDescriptor = Schema.decodeUnknownSync(VcsWorktreeDescriptor);
@@ -32,6 +35,11 @@ const decodeRemovalError = Schema.decodeUnknownSync(WorktreeRemovalError);
 const encodeRemovalError = Schema.encodeSync(WorktreeRemovalError);
 const decodeWorkspaceUnavailableError = Schema.decodeUnknownSync(WorkspaceUnavailableError);
 const encodeWorkspaceUnavailableError = Schema.encodeSync(WorkspaceUnavailableError);
+const decodeCatalogInput = Schema.decodeUnknownSync(WorktreeCatalogInput);
+const decodeCatalogRefreshInput = Schema.decodeUnknownSync(WorktreeCatalogRefreshInput);
+const decodeDiscoveryPolicyUpdateInput = Schema.decodeUnknownSync(
+  WorktreeDiscoveryPolicyUpdateInput,
+);
 
 const baseDescriptor = {
   worktreeKey: "worktree-primary",
@@ -48,6 +56,39 @@ const baseDescriptor = {
 } as const;
 
 describe("worktree catalog schemas", () => {
+  it("accepts project-scoped catalog reads without client-supplied paths", () => {
+    expect(decodeCatalogInput({ projectId: "project-1" })).toEqual({ projectId: "project-1" });
+    expect(decodeCatalogRefreshInput({ projectId: "project-1" })).toEqual({
+      projectId: "project-1",
+    });
+    expect(() => decodeCatalogInput({ projectId: "" })).toThrow();
+  });
+
+  it("accepts only server-compacted discovery policy update controls", () => {
+    expect(
+      decodeDiscoveryPolicyUpdateInput({
+        commandId: "command-1",
+        projectId: "project-1",
+        visibility: "shown",
+        acknowledgeGeneration: 7,
+        dismissInitialPrompt: true,
+      }),
+    ).toEqual({
+      commandId: "command-1",
+      projectId: "project-1",
+      visibility: "shown",
+      acknowledgeGeneration: 7,
+      dismissInitialPrompt: true,
+    });
+    expect(
+      decodeDiscoveryPolicyUpdateInput({
+        commandId: "command-1",
+        projectId: "project-1",
+        baselinePaths: ["/client-controlled"],
+      }),
+    ).toEqual({ commandId: "command-1", projectId: "project-1" });
+  });
+
   it("round-trips every descriptor state and a degraded retained snapshot", () => {
     const descriptors = [
       baseDescriptor,

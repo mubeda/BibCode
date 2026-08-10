@@ -58,6 +58,29 @@ authorization mapping is
 [`required_scope`](../../apps/server/src/auth/scope.rs); adding a live method
 without exactly one declared scope fails a server test.
 
+## Worktree catalog flow
+
+`subscribeWorktreeCatalog` publishes the server-owned latest catalog snapshot
+for one persisted project. `vcs.refreshWorktreeCatalog` requests an explicit
+bounded observation and returns the resulting snapshot. Both require
+`orchestration:read`; clients submit only `projectId`, never baseline or
+checkout paths.
+
+`worktree.updateDiscoveryPolicy` requires `orchestration:operate`. An
+acknowledgement must name the exact latest authoritative generation. The
+server derives the baseline from eligible normalized paths in that snapshot,
+deduplicates it, caps it at 512, and persists the complete policy through the
+durable `project.meta.update` command. Per-repository mutation serialization
+prevents concurrent visibility and prompt controls from overwriting each
+other.
+
+The production runtime owns one catalog service built from the same Git
+repository and orchestration repositories used by Git/VCS and project state.
+Successful legacy create/remove worktree RPCs notify that service after the
+Git mutation commits; observation failure is reported through catalog health
+and never changes a successful Git response into a failure. Runtime shutdown
+cancels catalog pollers, queued mutation refreshes, scans, and eviction work.
+
 ## Provider turn flow
 
 ```mermaid

@@ -187,6 +187,14 @@ import {
   SourceControlRepositoryLookupInput,
 } from "./sourceControl.ts";
 import { VcsError } from "./vcs.ts";
+import {
+  ProjectWorktreeDiscoveryPolicy,
+  VcsWorktreeCatalogSnapshot,
+  WorktreeCatalogError,
+  WorktreeCatalogInput,
+  WorktreeCatalogRefreshInput,
+  WorktreeDiscoveryPolicyUpdateInput,
+} from "./worktree.ts";
 
 export const WS_METHODS = {
   // Project registry methods
@@ -224,6 +232,8 @@ export const WS_METHODS = {
   vcsUnstageFiles: "vcs.unstageFiles",
   vcsDiscardFiles: "vcs.discardFiles",
   vcsGenerateCommitMessage: "vcs.generateCommitMessage",
+  vcsRefreshWorktreeCatalog: "vcs.refreshWorktreeCatalog",
+  worktreeUpdateDiscoveryPolicy: "worktree.updateDiscoveryPolicy",
 
   // Git workflow methods
   gitRunStackedAction: "git.runStackedAction",
@@ -295,6 +305,7 @@ export const WS_METHODS = {
   subscribeServerLifecycle: "subscribeServerLifecycle",
   subscribeAuthAccess: "subscribeAuthAccess",
   subscribeActivity: "subscribeActivity",
+  subscribeWorktreeCatalog: "subscribeWorktreeCatalog",
 } as const;
 
 export const WsServerUpsertKeybindingRpc = Rpc.make(WS_METHODS.serverUpsertKeybinding, {
@@ -608,6 +619,28 @@ export const WsVcsGenerateCommitMessageRpc = Rpc.make(WS_METHODS.vcsGenerateComm
   error: Schema.Union([GitManagerServiceError, EnvironmentAuthorizationError]),
 });
 
+export const WsSubscribeWorktreeCatalogRpc = Rpc.make(WS_METHODS.subscribeWorktreeCatalog, {
+  payload: WorktreeCatalogInput,
+  success: VcsWorktreeCatalogSnapshot,
+  error: Schema.Union([WorktreeCatalogError, EnvironmentAuthorizationError]),
+  stream: true,
+});
+
+export const WsVcsRefreshWorktreeCatalogRpc = Rpc.make(WS_METHODS.vcsRefreshWorktreeCatalog, {
+  payload: WorktreeCatalogRefreshInput,
+  success: VcsWorktreeCatalogSnapshot,
+  error: Schema.Union([WorktreeCatalogError, EnvironmentAuthorizationError]),
+});
+
+export const WsWorktreeUpdateDiscoveryPolicyRpc = Rpc.make(
+  WS_METHODS.worktreeUpdateDiscoveryPolicy,
+  {
+    payload: WorktreeDiscoveryPolicyUpdateInput,
+    success: ProjectWorktreeDiscoveryPolicy,
+    error: Schema.Union([WorktreeCatalogError, EnvironmentAuthorizationError]),
+  },
+);
+
 /**
  * Ephemeral live diff preview for compact/mobile surfaces.
  * Not the persisted BiBCode Review model. Future review sessions should use
@@ -897,6 +930,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsVcsUnstageFilesRpc,
   WsVcsDiscardFilesRpc,
   WsVcsGenerateCommitMessageRpc,
+  WsSubscribeWorktreeCatalogRpc,
+  WsVcsRefreshWorktreeCatalogRpc,
+  WsWorktreeUpdateDiscoveryPolicyRpc,
   WsReviewGetDiffPreviewRpc,
   WsTerminalOpenRpc,
   WsTerminalAttachRpc,

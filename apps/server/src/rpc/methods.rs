@@ -92,6 +92,7 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     stream("subscribeTerminalEvents"),
     stream("subscribeTerminalMetadata"),
     stream("subscribeVcsStatus"),
+    stream("subscribeWorktreeCatalog"),
     stream("terminal.attach"),
     unary("terminal.clear"),
     unary("terminal.close"),
@@ -109,10 +110,12 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     unary("vcs.listRefs"),
     unary("vcs.pull"),
     unary("vcs.refreshStatus"),
+    unary("vcs.refreshWorktreeCatalog"),
     unary("vcs.removeWorktree"),
     unary("vcs.stageFiles"),
     unary("vcs.switchRef"),
     unary("vcs.unstageFiles"),
+    unary("worktree.updateDiscoveryPolicy"),
 ];
 
 #[cfg(test)]

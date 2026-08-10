@@ -44,9 +44,11 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "subscribeServerConfig"
         | "subscribeServerLifecycle"
         | "subscribeVcsStatus"
+        | "subscribeWorktreeCatalog"
         | "vcs.listCommits"
         | "vcs.listRefs"
-        | "vcs.refreshStatus" => Some(SCOPE_ORCHESTRATION_READ),
+        | "vcs.refreshStatus"
+        | "vcs.refreshWorktreeCatalog" => Some(SCOPE_ORCHESTRATION_READ),
         "git.preparePullRequestThread"
         | "git.resolvePullRequest"
         | "git.runStackedAction"
@@ -87,6 +89,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "vcs.stageFiles"
         | "vcs.switchRef"
         | "vcs.unstageFiles" => Some(SCOPE_ORCHESTRATION_OPERATE),
+        "worktree.updateDiscoveryPolicy" => Some(SCOPE_ORCHESTRATION_OPERATE),
         "terminal.attach"
         | "terminal.clear"
         | "terminal.close"
@@ -156,6 +159,17 @@ mod tests {
                 "wrong activity RPC scope for {method}"
             );
         }
+        for method in ["subscribeWorktreeCatalog", "vcs.refreshWorktreeCatalog"] {
+            assert_eq!(
+                required_scope(method),
+                Some(SCOPE_ORCHESTRATION_READ),
+                "wrong worktree catalog read scope for {method}"
+            );
+        }
+        assert_eq!(
+            required_scope("worktree.updateDiscoveryPolicy"),
+            Some(SCOPE_ORCHESTRATION_OPERATE)
+        );
         assert_eq!(required_scope("unknown.method"), None);
     }
 }

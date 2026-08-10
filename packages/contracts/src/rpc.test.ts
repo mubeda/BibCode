@@ -24,7 +24,20 @@ import {
   WsSubscribeAuthAccessRpc,
   WsActivityGetSnapshotRpc,
   WsSubscribeActivityRpc,
+  WsSubscribeWorktreeCatalogRpc,
+  WsVcsRefreshWorktreeCatalogRpc,
+  WsWorktreeUpdateDiscoveryPolicyRpc,
 } from "./rpc.ts";
+
+const decodeSubscribeWorktreeCatalog = Schema.decodeUnknownSync(
+  WsSubscribeWorktreeCatalogRpc.payloadSchema,
+);
+const decodeRefreshWorktreeCatalog = Schema.decodeUnknownSync(
+  WsVcsRefreshWorktreeCatalogRpc.payloadSchema,
+);
+const decodeUpdateWorktreeDiscoveryPolicy = Schema.decodeUnknownSync(
+  WsWorktreeUpdateDiscoveryPolicyRpc.payloadSchema,
+);
 
 describe("WS_METHODS", () => {
   it("maps method identifiers to unique dotted wire names", () => {
@@ -47,6 +60,9 @@ describe("WS_METHODS", () => {
     expect(WS_METHODS.activityListRoster).toBe("activity.listRoster");
     expect(WS_METHODS.activityListDetail).toBe("activity.listDetail");
     expect(WS_METHODS.subscribeActivity).toBe("subscribeActivity");
+    expect(WS_METHODS.subscribeWorktreeCatalog).toBe("subscribeWorktreeCatalog");
+    expect(WS_METHODS.vcsRefreshWorktreeCatalog).toBe("vcs.refreshWorktreeCatalog");
+    expect(WS_METHODS.worktreeUpdateDiscoveryPolicy).toBe("worktree.updateDiscoveryPolicy");
   });
 });
 
@@ -68,6 +84,9 @@ describe("individual RPC definitions", () => {
     expect(WsProjectsReadFileRpc._tag).toBe(WS_METHODS.projectsReadFile);
     expect(WsActivityGetSnapshotRpc._tag).toBe(WS_METHODS.activityGetSnapshot);
     expect(WsSubscribeActivityRpc._tag).toBe(WS_METHODS.subscribeActivity);
+    expect(WsSubscribeWorktreeCatalogRpc._tag).toBe(WS_METHODS.subscribeWorktreeCatalog);
+    expect(WsVcsRefreshWorktreeCatalogRpc._tag).toBe(WS_METHODS.vcsRefreshWorktreeCatalog);
+    expect(WsWorktreeUpdateDiscoveryPolicyRpc._tag).toBe(WS_METHODS.worktreeUpdateDiscoveryPolicy);
   });
 
   it("carries payload/success/error schemas on unary RPCs", () => {
@@ -90,6 +109,7 @@ describe("individual RPC definitions", () => {
       WsCloudInstallRelayClientRpc,
       WsSubscribeAuthAccessRpc,
       WsOrchestrationSubscribeShellRpc,
+      WsSubscribeWorktreeCatalogRpc,
     ]) {
       expect(streamRpc.errorSchema).toBe(Schema.Never);
       expect(Schema.isSchema(streamRpc.successSchema)).toBe(true);
@@ -124,10 +144,38 @@ describe("WsRpcGroup", () => {
       WsOrchestrationDispatchCommandRpc,
       WsOrchestrationSubscribeShellRpc,
       WsSubscribeAuthAccessRpc,
+      WsSubscribeWorktreeCatalogRpc,
+      WsVcsRefreshWorktreeCatalogRpc,
+      WsWorktreeUpdateDiscoveryPolicyRpc,
     ];
     for (const rpc of members) {
       expect(WsRpcGroup.requests.get(rpc._tag)).toBe(rpc);
     }
+  });
+
+  it("keeps catalog reads project-scoped and discovery baselines server-owned", () => {
+    expect(decodeSubscribeWorktreeCatalog({ projectId: "project-1" })).toEqual({
+      projectId: "project-1",
+    });
+    expect(decodeRefreshWorktreeCatalog({ projectId: "project-1" })).toEqual({
+      projectId: "project-1",
+    });
+    expect(
+      decodeUpdateWorktreeDiscoveryPolicy({
+        commandId: "command-1",
+        projectId: "project-1",
+        visibility: "hidden",
+        acknowledgeGeneration: 9,
+        dismissInitialPrompt: true,
+        baselinePaths: ["/client-path"],
+      }),
+    ).toEqual({
+      commandId: "command-1",
+      projectId: "project-1",
+      visibility: "hidden",
+      acknowledgeGeneration: 9,
+      dismissInitialPrompt: true,
+    });
   });
 
   it("contains every RPC exactly once and covers the whole WS surface", () => {
