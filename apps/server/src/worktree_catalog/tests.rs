@@ -1986,6 +1986,203 @@ async fn shutdown_cancels_inflight_bootstrap_and_prevents_late_entry_insertion()
 }
 
 #[tokio::test]
+async fn shutdown_drains_a_blocked_repository_observation_without_a_late_result() {
+    let inventory = Arc::new(UncooperativeSecondInventorySource::new(inventory(
+        "/repo/common",
+        [record("/repo/main", true)],
+    )));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+    let _subscription = service.subscribe("project-1").await.expect("subscription");
+    let refreshing = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .refresh("project-1", CatalogRefreshTrigger::Explicit)
+                .await
+        })
+    };
+    wait_for_count(&inventory.active, 1).await;
+
+    service.shutdown().await;
+    let active_after_shutdown = inventory.active.load(Ordering::SeqCst);
+    inventory.release.add_permits(1);
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(active_after_shutdown, 0, "shutdown must drain the leader");
+    assert_eq!(
+        inventory.completed.load(Ordering::SeqCst),
+        0,
+        "a drained observation cannot publish a late private result"
+    );
+    assert_eq!(service.active_background_task_count_for_test(), 0);
+    assert!(refreshing.await.expect("refresh task").is_err());
+}
+
+#[tokio::test]
+async fn active_background_count_includes_repository_observation_leaders() {
+    let inventory = Arc::new(UncooperativeSecondInventorySource::new(inventory(
+        "/repo/common",
+        [record("/repo/main", true)],
+    )));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+    let before = service.active_background_task_count_for_test();
+    let refreshing = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .refresh("project-1", CatalogRefreshTrigger::Explicit)
+                .await
+        })
+    };
+    wait_for_count(&inventory.active, 1).await;
+
+    assert_eq!(
+        service.active_background_task_count_for_test(),
+        before + 1,
+        "the repository-owned leader must be visible to lifecycle accounting"
+    );
+
+    inventory.release.add_permits(1);
+    refreshing.await.expect("refresh task").expect("refresh");
+    drop(subscription);
+}
+
+#[tokio::test]
+async fn panicking_repository_observation_reports_internal_and_unregisters() {
+    let inventory = Arc::new(PanickingSecondInventorySource::new(inventory(
+        "/repo/common",
+        [record("/repo/main", true)],
+    )));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        inventory,
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+    let before = service.active_background_task_count_for_test();
+
+    let error = service
+        .refresh("project-1", CatalogRefreshTrigger::Explicit)
+        .await
+        .expect_err("panicking leader must fail the refresh");
+
+    assert_eq!(error.reason, super::CatalogErrorReason::Internal);
+    assert_eq!(service.active_background_task_count_for_test(), before);
+    drop(subscription);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn immediate_lifecycle_tasks_cannot_finish_before_registration() {
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([])),
+        Arc::new(FakeInventorySource::new([])),
+        Arc::new(FakeFileSystem::new([])),
+        CatalogServiceOptions::default(),
+    );
+
+    tokio::time::timeout(
+        Duration::from_secs(5),
+        service.complete_immediate_lifecycle_tasks_for_test(1_000),
+    )
+    .await
+    .expect("completed tasks must unregister without leaving shutdown-stalling handles");
+
+    assert_eq!(service.active_background_task_count_for_test(), 0);
+    service.shutdown().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn shutdown_serializes_with_final_release_eviction_registration() {
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        Arc::new(FakeInventorySource::new([inventory(
+            "/repo/common",
+            [record("/repo/main", true)],
+        )])),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+    let (entered, resume) = service.pause_next_eviction_registration_for_test();
+    let dropping = tokio::spawn(async move { drop(subscription) });
+    tokio::task::spawn_blocking(move || entered.wait())
+        .await
+        .expect("release reaches eviction registration");
+
+    let shutting_down = {
+        let service = service.clone();
+        tokio::spawn(async move { service.shutdown().await })
+    };
+    for _ in 0..10_000 {
+        if service.shutdown_started_for_test() {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        service.shutdown_started_for_test(),
+        "shutdown must reach its terminal transition before release resumes"
+    );
+    resume.wait();
+    dropping.await.expect("subscription drop task");
+    shutting_down.await.expect("shutdown task");
+    service.shutdown().await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(
+        service.eviction_task_registration_count_for_test(),
+        0,
+        "terminal shutdown must prevent a paused release from registering eviction"
+    );
+    assert_eq!(service.active_background_task_count_for_test(), 0);
+    assert_eq!(service.entry_count_for_test(), 0);
+}
+
+#[tokio::test]
 async fn shutdown_closes_live_subscriptions_is_idempotent_and_rejects_new_work() {
     let inventory = Arc::new(FakeInventorySource::new([inventory(
         "/repo/common",
@@ -2705,6 +2902,29 @@ struct PausingAfterTwoInventorySource {
     release: Arc<Semaphore>,
 }
 
+struct UncooperativeSecondInventorySource {
+    response: GitWorktreeInventory,
+    calls: Arc<AtomicUsize>,
+    active: Arc<AtomicUsize>,
+    completed: Arc<AtomicUsize>,
+    release: Arc<Semaphore>,
+}
+
+struct PanickingSecondInventorySource {
+    response: GitWorktreeInventory,
+    calls: AtomicUsize,
+}
+
+struct ActiveInventoryGuard {
+    active: Arc<AtomicUsize>,
+}
+
+impl Drop for ActiveInventoryGuard {
+    fn drop(&mut self) {
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
 struct PausingThirdAnchorInventorySource {
     calls: Arc<AtomicUsize>,
     release: Arc<Semaphore>,
@@ -2759,6 +2979,69 @@ impl PausingAfterTwoInventorySource {
             calls: Arc::new(AtomicUsize::new(0)),
             release: Arc::new(Semaphore::new(0)),
         }
+    }
+}
+
+impl UncooperativeSecondInventorySource {
+    fn new(response: GitWorktreeInventory) -> Self {
+        Self {
+            response,
+            calls: Arc::new(AtomicUsize::new(0)),
+            active: Arc::new(AtomicUsize::new(0)),
+            completed: Arc::new(AtomicUsize::new(0)),
+            release: Arc::new(Semaphore::new(0)),
+        }
+    }
+}
+
+impl PanickingSecondInventorySource {
+    fn new(response: GitWorktreeInventory) -> Self {
+        Self {
+            response,
+            calls: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl InventorySource for PanickingSecondInventorySource {
+    fn inventory(
+        &self,
+        _anchor: PathBuf,
+        _cancellation: CancellationToken,
+    ) -> CatalogFuture<Result<GitWorktreeInventory, ScanFailure>> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let response = self.response.clone();
+        Box::pin(async move {
+            assert!(call == 1, "injected repository observation panic");
+            Ok(response)
+        })
+    }
+}
+
+impl InventorySource for UncooperativeSecondInventorySource {
+    fn inventory(
+        &self,
+        _anchor: PathBuf,
+        _cancellation: CancellationToken,
+    ) -> CatalogFuture<Result<GitWorktreeInventory, ScanFailure>> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let response = self.response.clone();
+        let active = Arc::clone(&self.active);
+        let completed = Arc::clone(&self.completed);
+        let release = Arc::clone(&self.release);
+        Box::pin(async move {
+            if call > 1 {
+                active.fetch_add(1, Ordering::SeqCst);
+                let _active = ActiveInventoryGuard { active };
+                release
+                    .acquire()
+                    .await
+                    .expect("repository observation release")
+                    .forget();
+                completed.fetch_add(1, Ordering::SeqCst);
+            }
+            Ok(response)
+        })
     }
 }
 
