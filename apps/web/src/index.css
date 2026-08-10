@@ -774,6 +774,33 @@ label:has(> select#reasoning-effort) select {
   animation: provider-update-pill-countdown var(--provider-update-pill-dismiss-ms) linear forwards;
 }
 
+@keyframes working-indicator-paint {
+  0%,
+  18% {
+    opacity: 1;
+    transform: scale(1.15);
+  }
+  55% {
+    opacity: 0.42;
+    transform: scale(0.92);
+  }
+  100% {
+    opacity: 0.14;
+    transform: scale(0.72);
+  }
+}
+
+.working-indicator-dot {
+  animation: working-indicator-paint 1.15s linear infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .working-indicator-dot {
+    animation: none;
+    opacity: 0.65;
+  }
+}
+
 /* Diffs theme bridge (match diff surfaces to app palette) */
 .diff-panel-viewport {
   background: color-mix(in srgb, var(--background) 94%, var(--card));
