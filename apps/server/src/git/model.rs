@@ -218,6 +218,19 @@ pub struct GitWorktreeInventory {
     pub nul_delimited: bool,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct GitWorktreeRemovalInspection {
+    pub tracked_change_count: u64,
+    pub untracked_file_count: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct GitPrunableWorktree {
+    pub path: PathBuf,
+    pub locked: bool,
+    pub lock_reason: Option<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VcsPullResult {

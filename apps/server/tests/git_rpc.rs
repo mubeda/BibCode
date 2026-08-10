@@ -13,7 +13,8 @@ use std::{
 use git::{
     BoxWorktreeBaseDirectoryFuture, CreateWorktreeInput, GitRepository, OutputPolicy, ProcessError,
     ProcessRequest, ProcessRunner, StatusBroadcaster, VcsStagingArea, VcsStatusStreamEvent,
-    VcsWorkingTreeFileStatus, WorktreeBaseDirectoryProvider, parse_porcelain_v2_line,
+    VcsWorkingTreeFileStatus, WorktreeBaseDirectoryProvider, git_worktree_prune_impact_digest,
+    parse_porcelain_v2_line,
 };
 use tempfile::TempDir;
 use tokio_util::sync::CancellationToken;
@@ -428,6 +429,121 @@ async fn worktree_lifecycle_is_reflected_in_ref_listing() {
         .await
         .expect("remove worktree");
     assert!(!worktree_path.exists());
+}
+
+#[tokio::test]
+async fn worktree_verified_targeted_cleanup_removes_only_the_missing_registration() {
+    let repo = init_repo();
+    commit_file(repo.path(), "README.md", "hello\n", "initial");
+    let parent = tempfile::tempdir().expect("temporary worktree parent");
+    let worktree_path = parent.path().join("stale-target");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/stale-target",
+            "--",
+            &worktree_path.to_string_lossy(),
+        ],
+    );
+    let repository = GitRepository::default();
+    let registered = repository
+        .worktree_inventory(repo.path(), &cancellation())
+        .await
+        .expect("registered inventory");
+    let registered_path = fs::canonicalize(&worktree_path).expect("canonical registered path");
+    fs::rename(&worktree_path, parent.path().join("unrelated-moved-copy"))
+        .expect("make registration stale without deleting files");
+    let stale = repository
+        .worktree_inventory(repo.path(), &cancellation())
+        .await
+        .expect("stale inventory")
+        .records
+        .into_iter()
+        .find(|record| record.path == registered_path)
+        .expect("stale target record");
+    assert!(
+        registered
+            .records
+            .iter()
+            .any(|record| record.path == stale.path)
+    );
+
+    let inspection = repository
+        .inspect_worktree_removal(repo.path(), &stale, &cancellation())
+        .await
+        .expect("missing target skips dirty inspection");
+    assert_eq!(inspection.tracked_change_count, 0);
+    assert_eq!(inspection.untracked_file_count, 0);
+    repository
+        .remove_worktree_verified(repo.path(), &stale, false, &cancellation())
+        .await
+        .expect("targeted stale registration cleanup");
+
+    assert!(!has_registered_worktree(repo.path(), &registered_path));
+    assert_eq!(
+        git(repo.path(), &["branch", "--list", "feature/stale-target"]),
+        "feature/stale-target"
+    );
+    assert!(
+        parent
+            .path()
+            .join("unrelated-moved-copy/README.md")
+            .is_file()
+    );
+}
+
+#[tokio::test]
+async fn worktree_repository_wide_prune_requires_the_exact_public_preview_digest() {
+    let repo = init_repo();
+    commit_file(repo.path(), "README.md", "hello\n", "initial");
+    let parent = tempfile::tempdir().expect("temporary worktree parent");
+    let worktree_path = parent.path().join("stale-prune");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/stale-prune",
+            "--",
+            &worktree_path.to_string_lossy(),
+        ],
+    );
+    let repository = GitRepository::default();
+    let registered_path = fs::canonicalize(&worktree_path).expect("canonical registered path");
+    fs::rename(&worktree_path, parent.path().join("moved-prune-copy"))
+        .expect("make registration stale without deleting files");
+    let target = repository
+        .worktree_inventory(repo.path(), &cancellation())
+        .await
+        .expect("stale inventory")
+        .records
+        .into_iter()
+        .find(|record| record.path == registered_path)
+        .expect("stale target record");
+    let impact = repository
+        .preview_worktree_prune(repo.path(), &cancellation())
+        .await
+        .expect("public prune preview");
+
+    repository
+        .prune_worktrees_verified(repo.path(), &target, "wrong-digest", &cancellation())
+        .await
+        .expect_err("unconfirmed impact cannot prune");
+    assert!(has_registered_worktree(repo.path(), &registered_path));
+    repository
+        .prune_worktrees_verified(
+            repo.path(),
+            &target,
+            &git_worktree_prune_impact_digest(&impact),
+            &cancellation(),
+        )
+        .await
+        .expect("confirmed public preview permits prune");
+    assert!(!has_registered_worktree(repo.path(), &registered_path));
 }
 
 #[tokio::test]

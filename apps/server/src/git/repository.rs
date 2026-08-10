@@ -10,23 +10,30 @@ use std::{
     time::Duration,
 };
 
+use tokio::io::AsyncReadExt;
 use tokio_util::sync::CancellationToken;
 
 use crate::diagnostics::redact_sensitive_text;
 
+use super::worktree::{WorktreePruneDryRunRecord, parse_worktree_prune_dry_run};
 use super::{
     ChangeRequest, CreateWorktreeInput, GitCommandDiagnostics, GitCommandError,
-    GitWorktreeInventory, OutputPolicy, ProcessError, ProcessOutput, ProcessRequest, ProcessRunner,
-    ProviderKind, PullStatus, SourceControlProviderInfo, VcsCommit, VcsCreateWorktreeResult,
+    GitPrunableWorktree, GitWorktreeInventory, GitWorktreeRecord, GitWorktreeRemovalInspection,
+    OutputPolicy, ProcessError, ProcessOutput, ProcessRequest, ProcessRunner, ProviderKind,
+    PullStatus, SourceControlProviderInfo, VcsCommit, VcsCreateWorktreeResult,
     VcsListCommitsResult, VcsListRefsResult, VcsPullResult, VcsRef, VcsStagingArea,
     VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusResult, VcsWorkingTree,
-    VcsWorkingTreeFile, VcsWorkingTreeFileStatus, VcsWorktree, parse_numstat,
-    parse_porcelain_v2_line, parse_worktree_porcelain,
+    VcsWorkingTreeFile, VcsWorkingTreeFileStatus, VcsWorktree, git_worktree_prune_impact_digest,
+    host_path_platform, normalize_worktree_path_key, parse_numstat, parse_porcelain_v2_line,
+    parse_worktree_porcelain,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_OUTPUT_LIMIT: usize = 1_000_000;
 const WORKTREE_INVENTORY_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+const WORKTREE_REMOVAL_STATUS_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+const WORKTREE_PRUNE_OUTPUT_LIMIT: usize = 4 * 1024 * 1024;
+const WORKTREE_PRUNE_GITDIR_LIMIT: u64 = 64 * 1024;
 const COMMIT_FIELD_SEPARATOR: char = '\x1f';
 const CLONE_OPERATION: &str = "GitVcsDriver.clone";
 const MAX_AUTOMATIC_WORKTREE_SUFFIX_ATTEMPTS: usize = 100;
@@ -370,6 +377,315 @@ impl GitRepository {
             records,
             nul_delimited,
         })
+    }
+
+    pub async fn inspect_worktree_removal(
+        &self,
+        anchor: &Path,
+        record: &GitWorktreeRecord,
+        cancellation: &CancellationToken,
+    ) -> Result<GitWorktreeRemovalInspection, GitCommandError> {
+        validate_removable_worktree(anchor, record)?;
+        let inventory = self.worktree_inventory(anchor, cancellation).await?;
+        let fresh = exact_worktree_record(&inventory, record).ok_or_else(|| {
+            worktree_record_mismatch_error("GitVcsDriver.inspectWorktreeRemoval", anchor, record)
+        })?;
+        let inspection = match tokio::fs::symlink_metadata(&fresh.path).await {
+            Ok(_) => {
+                let target_inventory = self.worktree_inventory(&fresh.path, cancellation).await?;
+                let expected_common_dir = canonical_common_dir(
+                    "GitVcsDriver.inspectWorktreeRemoval",
+                    anchor,
+                    &inventory.common_dir,
+                )
+                .await?;
+                let target_common_dir = canonical_common_dir(
+                    "GitVcsDriver.inspectWorktreeRemoval",
+                    anchor,
+                    &target_inventory.common_dir,
+                )
+                .await?;
+                if normalized_worktree_path(&target_common_dir)
+                    != normalized_worktree_path(&expected_common_dir)
+                    || exact_worktree_record(&target_inventory, record).is_none()
+                {
+                    return Err(simple_error(
+                        "GitVcsDriver.inspectWorktreeRemoval",
+                        anchor,
+                        "The path currently belongs to a different repository than the registered worktree.",
+                    ));
+                }
+                let output = self
+                    .execute_with_options(
+                        "GitVcsDriver.inspectWorktreeRemoval.status",
+                        &fresh.path,
+                        &strings(&[
+                            "-c",
+                            "core.quotePath=false",
+                            "status",
+                            "--porcelain=v2",
+                            "-z",
+                            "--untracked-files=all",
+                            "--ignored=no",
+                        ]),
+                        GitExecutionOptions {
+                            allow_non_zero_exit: false,
+                            max_output_bytes: WORKTREE_REMOVAL_STATUS_OUTPUT_LIMIT,
+                            output_policy: OutputPolicy::Error,
+                        },
+                        cancellation,
+                    )
+                    .await?;
+                parse_worktree_removal_status(anchor, &output.stdout)?
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                GitWorktreeRemovalInspection::default()
+            }
+            Err(error) => {
+                return Err(simple_error(
+                    "GitVcsDriver.inspectWorktreeRemoval",
+                    anchor,
+                    &format!(
+                        "The registered worktree path '{}' could not be inspected: {error}",
+                        display_path(&fresh.path)
+                    ),
+                ));
+            }
+        };
+        let verified = self.worktree_inventory(anchor, cancellation).await?;
+        if exact_worktree_record(&verified, record).is_none() {
+            return Err(worktree_record_mismatch_error(
+                "GitVcsDriver.inspectWorktreeRemoval",
+                anchor,
+                record,
+            ));
+        }
+        Ok(inspection)
+    }
+
+    pub async fn remove_worktree_verified(
+        &self,
+        anchor: &Path,
+        record: &GitWorktreeRecord,
+        force_dirty: bool,
+        cancellation: &CancellationToken,
+    ) -> Result<(), GitCommandError> {
+        let inspection = self
+            .inspect_worktree_removal(anchor, record, cancellation)
+            .await?;
+        if !force_dirty
+            && (inspection.tracked_change_count != 0 || inspection.untracked_file_count != 0)
+        {
+            return Err(simple_error(
+                "GitVcsDriver.removeWorktreeVerified",
+                anchor,
+                "The worktree is dirty; explicit dirty-worktree confirmation is required.",
+            ));
+        }
+
+        let inventory = self.worktree_inventory(anchor, cancellation).await?;
+        let fresh = exact_worktree_record(&inventory, record).ok_or_else(|| {
+            worktree_record_mismatch_error("GitVcsDriver.removeWorktreeVerified", anchor, record)
+        })?;
+        let target_path = fresh.path.clone();
+        let args = vec![
+            "worktree".into(),
+            "remove".into(),
+            "--force".into(),
+            "--".into(),
+            display_path(&target_path),
+        ];
+        let mutation = self
+            .run(
+                "GitVcsDriver.removeWorktreeVerified",
+                anchor,
+                &args,
+                cancellation,
+            )
+            .await;
+        let verification = self
+            .worktree_inventory(anchor, &CancellationToken::new())
+            .await?;
+        if !inventory_contains_path(&verification, &target_path) {
+            return Ok(());
+        }
+        match mutation {
+            Ok(_) => Err(simple_error(
+                "GitVcsDriver.removeWorktreeVerified.verify",
+                anchor,
+                "Git reported successful worktree removal, but the exact target registration survived verification.",
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn preview_worktree_prune(
+        &self,
+        anchor: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<GitPrunableWorktree>, GitCommandError> {
+        let before = self.worktree_inventory(anchor, cancellation).await?;
+        let impact = self
+            .worktree_prune_impact(anchor, &before, cancellation)
+            .await?;
+        let after = self.worktree_inventory(anchor, cancellation).await?;
+        if sorted_prunable_records(&before) != sorted_prunable_records(&after) {
+            return Err(simple_error(
+                "GitVcsDriver.previewWorktreePrune.verify",
+                anchor,
+                "Git worktree registrations changed while the prune impact was being inspected.",
+            ));
+        }
+        Ok(impact)
+    }
+
+    pub async fn prune_worktrees_verified(
+        &self,
+        anchor: &Path,
+        target: &GitWorktreeRecord,
+        expected_impact_digest: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<(), GitCommandError> {
+        validate_removable_worktree(anchor, target)?;
+        let inventory = self.worktree_inventory(anchor, cancellation).await?;
+        let impact = self
+            .worktree_prune_impact(anchor, &inventory, cancellation)
+            .await?;
+        let fresh = exact_worktree_record(&inventory, target).ok_or_else(|| {
+            worktree_record_mismatch_error("GitVcsDriver.pruneWorktreesVerified", anchor, target)
+        })?;
+        if !fresh.is_prunable
+            || !impact.iter().any(|entry| {
+                normalized_worktree_path(&entry.path) == normalized_worktree_path(&fresh.path)
+            })
+        {
+            return Err(simple_error(
+                "GitVcsDriver.pruneWorktreesVerified",
+                anchor,
+                "The exact target registration is not part of Git's current prune impact.",
+            ));
+        }
+        if git_worktree_prune_impact_digest(&impact) != expected_impact_digest {
+            return Err(simple_error(
+                "GitVcsDriver.pruneWorktreesVerified",
+                anchor,
+                "Git's current prune impact does not match the caller-confirmed impact digest.",
+            ));
+        }
+
+        let target_path = fresh.path.clone();
+        let mutation = self
+            .run(
+                "GitVcsDriver.pruneWorktreesVerified",
+                anchor,
+                &strings(&["worktree", "prune", "--expire", "now"]),
+                cancellation,
+            )
+            .await;
+        let verification = self
+            .worktree_inventory(anchor, &CancellationToken::new())
+            .await?;
+        if !inventory_contains_path(&verification, &target_path) {
+            return Ok(());
+        }
+        match mutation {
+            Ok(_) => Err(simple_error(
+                "GitVcsDriver.pruneWorktreesVerified.verify",
+                anchor,
+                "Git reported successful worktree pruning, but the exact target registration survived verification.",
+            )),
+            Err(error) => Err(error),
+        }
+    }
+
+    async fn worktree_prune_impact(
+        &self,
+        anchor: &Path,
+        inventory: &GitWorktreeInventory,
+        cancellation: &CancellationToken,
+    ) -> Result<Vec<GitPrunableWorktree>, GitCommandError> {
+        let common_dir = canonical_common_dir(
+            "GitVcsDriver.previewWorktreePrune",
+            anchor,
+            &inventory.common_dir,
+        )
+        .await?;
+        let output = self
+            .execute_with_options(
+                "GitVcsDriver.previewWorktreePrune",
+                anchor,
+                &strings(&[
+                    "worktree",
+                    "prune",
+                    "--dry-run",
+                    "--verbose",
+                    "--expire",
+                    "now",
+                ]),
+                GitExecutionOptions {
+                    allow_non_zero_exit: false,
+                    max_output_bytes: WORKTREE_PRUNE_OUTPUT_LIMIT,
+                    output_policy: OutputPolicy::Error,
+                },
+                cancellation,
+            )
+            .await?;
+        if !output.stdout.is_empty() {
+            return Err(simple_error(
+                "GitVcsDriver.previewWorktreePrune.parse",
+                anchor,
+                "Git worktree prune preview produced unexpected standard output.",
+            ));
+        }
+        let dry_run_records = parse_worktree_prune_dry_run(&output.stderr).map_err(|error| {
+            simple_error(
+                "GitVcsDriver.previewWorktreePrune.parse",
+                anchor,
+                &format!("Git worktree prune preview is malformed: {error}"),
+            )
+        })?;
+        let resolved =
+            resolve_worktree_prune_paths(anchor, &common_dir, dry_run_records, cancellation)
+                .await?;
+        let mut records = sorted_prunable_records(inventory);
+        if resolved.len() != records.len() {
+            return Err(simple_error(
+                "GitVcsDriver.previewWorktreePrune.verify",
+                anchor,
+                "Git's dry-run path and reason impact does not match the authoritative worktree inventory.",
+            ));
+        }
+        let mut impact = Vec::with_capacity(resolved.len());
+        for (dry_run, path) in resolved {
+            let key = normalized_worktree_path(&path);
+            let Some(index) = records.iter().position(|record| {
+                normalized_worktree_path(&record.path) == key
+                    && record.prunable_reason.as_deref() == Some(dry_run.reason.as_str())
+            }) else {
+                return Err(simple_error(
+                    "GitVcsDriver.previewWorktreePrune.verify",
+                    anchor,
+                    "Git's dry-run path and reason impact does not match the authoritative worktree inventory.",
+                ));
+            };
+            let record = records.remove(index);
+            impact.push(GitPrunableWorktree {
+                path: record.path,
+                locked: record.locked,
+                lock_reason: record.lock_reason,
+            });
+        }
+        if !records.is_empty() {
+            return Err(simple_error(
+                "GitVcsDriver.previewWorktreePrune.verify",
+                anchor,
+                "Git's dry-run path and reason impact does not match the authoritative worktree inventory.",
+            ));
+        }
+        impact.sort_by(|left, right| {
+            normalized_worktree_path(&left.path).cmp(&normalized_worktree_path(&right.path))
+        });
+        Ok(impact)
     }
 
     async fn worktree_porcelain_output(
@@ -1998,6 +2314,8 @@ fn git_environment() -> Vec<(OsString, OsString)> {
         ("GIT_ASKPASS", ""),
         ("GIT_CONFIG_NOSYSTEM", "1"),
         ("GIT_TERMINAL_PROMPT", "0"),
+        ("LC_ALL", "C"),
+        ("LANG", "C"),
         ("SSH_ASKPASS", ""),
         ("SSH_ASKPASS_REQUIRE", "never"),
     ]
@@ -2055,6 +2373,370 @@ fn same_worktree_path(registered: &str, path: &Path) -> bool {
     } else {
         registered == candidate
     }
+}
+
+fn exact_worktree_record<'a>(
+    inventory: &'a GitWorktreeInventory,
+    expected: &GitWorktreeRecord,
+) -> Option<&'a GitWorktreeRecord> {
+    inventory.records.iter().find(|candidate| {
+        normalized_worktree_path(&candidate.path) == normalized_worktree_path(&expected.path)
+            && candidate.head == expected.head
+            && candidate.branch == expected.branch
+            && candidate.is_primary == expected.is_primary
+            && candidate.is_bare == expected.is_bare
+            && candidate.locked == expected.locked
+            && candidate.lock_reason == expected.lock_reason
+            && candidate.is_prunable == expected.is_prunable
+            && candidate.prunable_reason == expected.prunable_reason
+    })
+}
+
+fn inventory_contains_path(inventory: &GitWorktreeInventory, path: &Path) -> bool {
+    let expected = normalized_worktree_path(path);
+    inventory
+        .records
+        .iter()
+        .any(|candidate| normalized_worktree_path(&candidate.path) == expected)
+}
+
+fn sorted_prunable_records(inventory: &GitWorktreeInventory) -> Vec<GitWorktreeRecord> {
+    let mut records = inventory
+        .records
+        .iter()
+        .filter(|record| record.is_prunable && !record.locked)
+        .cloned()
+        .collect::<Vec<_>>();
+    records.sort_by(|left, right| {
+        normalized_worktree_path(&left.path).cmp(&normalized_worktree_path(&right.path))
+    });
+    records
+}
+
+fn normalized_worktree_path(path: &Path) -> String {
+    normalize_worktree_path_key(path, host_path_platform())
+}
+
+async fn canonical_common_dir(
+    operation: &str,
+    anchor: &Path,
+    common_dir: &Path,
+) -> Result<PathBuf, GitCommandError> {
+    tokio::fs::canonicalize(common_dir).await.map_err(|error| {
+        simple_error(
+            operation,
+            anchor,
+            &format!(
+                "The common Git directory '{}' could not be verified: {error}",
+                display_path(common_dir)
+            ),
+        )
+    })
+}
+
+async fn resolve_worktree_prune_paths(
+    anchor: &Path,
+    common_dir: &Path,
+    dry_run_records: Vec<WorktreePruneDryRunRecord>,
+    cancellation: &CancellationToken,
+) -> Result<Vec<(WorktreePruneDryRunRecord, PathBuf)>, GitCommandError> {
+    if dry_run_records.is_empty() {
+        return Ok(Vec::new());
+    }
+    let worktrees_dir = common_dir.join("worktrees");
+    verify_prune_directory(&worktrees_dir)
+        .await
+        .map_err(|error| {
+            prune_identity_error(
+                anchor,
+                &format!("Git's worktree administration directory could not be verified: {error}"),
+            )
+        })?;
+
+    let mut resolved = Vec::with_capacity(dry_run_records.len());
+    let mut path_keys = HashSet::with_capacity(dry_run_records.len());
+    for record in dry_run_records {
+        if cancellation.is_cancelled() {
+            return Err(prune_identity_error(
+                anchor,
+                "Git worktree prune impact verification was interrupted.",
+            ));
+        }
+        let path = resolve_worktree_prune_path(&worktrees_dir, &record.admin_id, cancellation)
+            .await
+            .map_err(|error| {
+                prune_identity_error(
+                    anchor,
+                    &format!(
+                        "Git's dry-run administration identity '{}' could not be verified: {error}",
+                        record.admin_id
+                    ),
+                )
+            })?;
+        if !path_keys.insert(normalized_worktree_path(&path)) {
+            return Err(prune_identity_error(
+                anchor,
+                "Git's dry-run contains duplicate normalized worktree paths.",
+            ));
+        }
+        resolved.push((record, path));
+    }
+    if cancellation.is_cancelled() {
+        return Err(prune_identity_error(
+            anchor,
+            "Git worktree prune impact verification was interrupted.",
+        ));
+    }
+    Ok(resolved)
+}
+
+async fn verify_prune_directory(path: &Path) -> io::Result<()> {
+    let metadata = tokio::fs::symlink_metadata(path).await?;
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected a non-symlink directory",
+        ));
+    }
+    if tokio::fs::canonicalize(path).await? != path {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "directory identity does not match its canonical path",
+        ));
+    }
+    Ok(())
+}
+
+async fn resolve_worktree_prune_path(
+    worktrees_dir: &Path,
+    admin_id: &str,
+    cancellation: &CancellationToken,
+) -> io::Result<PathBuf> {
+    let admin_dir = worktrees_dir.join(admin_id);
+    verify_prune_directory(&admin_dir).await?;
+    let gitdir_path = admin_dir.join("gitdir");
+    let before = tokio::fs::symlink_metadata(&gitdir_path).await?;
+    if !before.is_file() || before.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected a non-symlink gitdir file",
+        ));
+    }
+
+    let file = prune_gitdir_open_options().open(&gitdir_path).await?;
+    let opened = file.metadata().await?;
+    if !opened.is_file() || !same_prune_file_identity(&before, &opened) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gitdir identity changed while it was opened",
+        ));
+    }
+    let capacity = usize::try_from(opened.len())
+        .unwrap_or(usize::MAX)
+        .min(WORKTREE_PRUNE_GITDIR_LIMIT as usize);
+    let mut bytes = Vec::with_capacity(capacity);
+    let mut limited = file.take(WORKTREE_PRUNE_GITDIR_LIMIT + 1);
+    let read = limited.read_to_end(&mut bytes);
+    tokio::select! {
+        result = read => result?,
+        () = cancellation.cancelled() => {
+            return Err(io::Error::new(io::ErrorKind::Interrupted, "impact verification cancelled"));
+        }
+    };
+    if bytes.len() as u64 > WORKTREE_PRUNE_GITDIR_LIMIT {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gitdir identity exceeds its byte limit",
+        ));
+    }
+    let after = tokio::fs::symlink_metadata(&gitdir_path).await?;
+    if !after.is_file()
+        || after.file_type().is_symlink()
+        || !same_prune_file_identity(&opened, &after)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gitdir identity changed while it was read",
+        ));
+    }
+    verify_prune_directory(&admin_dir).await?;
+    parse_prune_gitdir_path(bytes)
+}
+
+fn prune_gitdir_open_options() -> tokio::fs::OpenOptions {
+    let mut options = tokio::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    #[cfg(windows)]
+    options.custom_flags(windows_sys::Win32::Storage::FileSystem::FILE_FLAG_OPEN_REPARSE_POINT);
+    options
+}
+
+#[cfg(unix)]
+fn same_prune_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+#[cfg(not(unix))]
+fn same_prune_file_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
+    left.file_type() == right.file_type()
+        && left.len() == right.len()
+        && left.modified().ok() == right.modified().ok()
+}
+
+fn parse_prune_gitdir_path(mut bytes: Vec<u8>) -> io::Result<PathBuf> {
+    if bytes.pop() != Some(b'\n') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gitdir identity is unterminated",
+        ));
+    }
+    if bytes.last() == Some(&b'\r') {
+        bytes.pop();
+    }
+    if bytes.is_empty() || bytes.contains(&b'\0') {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gitdir identity is empty or malformed",
+        ));
+    }
+    let value = String::from_utf8(bytes).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gitdir identity is not valid UTF-8",
+        )
+    })?;
+    let gitdir = PathBuf::from(value);
+    if !gitdir.is_absolute() || gitdir.file_name().is_none_or(|name| name != ".git") {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gitdir identity is not an absolute worktree .git path",
+        ));
+    }
+    gitdir.parent().map(Path::to_path_buf).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            "gitdir identity has no worktree parent",
+        )
+    })
+}
+
+fn prune_identity_error(anchor: &Path, detail: &str) -> GitCommandError {
+    simple_error("GitVcsDriver.previewWorktreePrune.verify", anchor, detail)
+}
+
+fn validate_removable_worktree(
+    anchor: &Path,
+    record: &GitWorktreeRecord,
+) -> Result<(), GitCommandError> {
+    if record.is_bare {
+        return Err(simple_error(
+            "GitVcsDriver.worktreeRemovalPreflight",
+            anchor,
+            "Bare worktrees are protected and cannot be removed.",
+        ));
+    }
+    if record.is_primary {
+        return Err(simple_error(
+            "GitVcsDriver.worktreeRemovalPreflight",
+            anchor,
+            "The primary worktree is protected and cannot be removed.",
+        ));
+    }
+    if record.locked {
+        let reason = record
+            .lock_reason
+            .as_deref()
+            .unwrap_or("Git did not provide a lock reason");
+        return Err(simple_error(
+            "GitVcsDriver.worktreeRemovalPreflight",
+            anchor,
+            &format!("The worktree registration is locked: {reason}"),
+        ));
+    }
+    Ok(())
+}
+
+fn worktree_record_mismatch_error(
+    operation: &str,
+    anchor: &Path,
+    record: &GitWorktreeRecord,
+) -> GitCommandError {
+    simple_error(
+        operation,
+        anchor,
+        &format!(
+            "The registered worktree record '{}' changed or does not belong to this repository.",
+            display_path(&record.path)
+        ),
+    )
+}
+
+fn parse_worktree_removal_status(
+    anchor: &Path,
+    output: &str,
+) -> Result<GitWorktreeRemovalInspection, GitCommandError> {
+    if output.is_empty() {
+        return Ok(GitWorktreeRemovalInspection::default());
+    }
+    if !output.ends_with('\0') {
+        return Err(simple_error(
+            "GitVcsDriver.inspectWorktreeRemoval.status",
+            anchor,
+            "Git returned an unterminated worktree status record.",
+        ));
+    }
+    let mut inspection = GitWorktreeRemovalInspection::default();
+    let mut records = output.split_terminator('\0');
+    while let Some(record) = records.next() {
+        if record.starts_with("? ") {
+            if parse_porcelain_v2_line(record).is_none() {
+                return Err(malformed_worktree_removal_status(anchor));
+            }
+            inspection.untracked_file_count = inspection
+                .untracked_file_count
+                .checked_add(1)
+                .ok_or_else(|| malformed_worktree_removal_status(anchor))?;
+            continue;
+        }
+        if record.starts_with("1 ") || record.starts_with("u ") {
+            if parse_porcelain_v2_line(record).is_none() {
+                return Err(malformed_worktree_removal_status(anchor));
+            }
+            inspection.tracked_change_count = inspection
+                .tracked_change_count
+                .checked_add(1)
+                .ok_or_else(|| malformed_worktree_removal_status(anchor))?;
+            continue;
+        }
+        if record.starts_with("2 ") {
+            if parse_porcelain_v2_line(record).is_none() || records.next().is_none_or(str::is_empty)
+            {
+                return Err(malformed_worktree_removal_status(anchor));
+            }
+            inspection.tracked_change_count = inspection
+                .tracked_change_count
+                .checked_add(1)
+                .ok_or_else(|| malformed_worktree_removal_status(anchor))?;
+            continue;
+        }
+        if record.starts_with("! ") {
+            continue;
+        }
+        return Err(malformed_worktree_removal_status(anchor));
+    }
+    Ok(inspection)
+}
+
+fn malformed_worktree_removal_status(anchor: &Path) -> GitCommandError {
+    simple_error(
+        "GitVcsDriver.inspectWorktreeRemoval.status",
+        anchor,
+        "Git returned a malformed worktree status record.",
+    )
 }
 
 fn ensure_authoritative_inventory_output(
@@ -2384,11 +3066,13 @@ mod worktree_ownership_tests {
     use tokio_util::sync::CancellationToken;
 
     use super::{
-        CreateWorktreeInput, GitProcessRunner, GitRepository, OutputPolicy, OwnedWorktreePath,
-        ProcessOutput, ProcessRequest, WORKTREE_INVENTORY_OUTPUT_LIMIT, display_path,
-        ensure_authoritative_inventory_output, git_output_line,
-        is_unsupported_porcelain_z_diagnostic, parse_branch_headers,
+        CreateWorktreeInput, GitProcessRunner, GitPrunableWorktree, GitRepository,
+        GitWorktreeRecord, OutputPolicy, OwnedWorktreePath, ProcessOutput, ProcessRequest,
+        WORKTREE_INVENTORY_OUTPUT_LIMIT, WORKTREE_PRUNE_GITDIR_LIMIT, WorktreePruneDryRunRecord,
+        display_path, ensure_authoritative_inventory_output, git_output_line,
+        is_unsupported_porcelain_z_diagnostic, parse_branch_headers, resolve_worktree_prune_paths,
     };
+    use crate::git::git_worktree_prune_impact_digest;
 
     #[test]
     fn branch_headers_require_an_actual_upstream_comparison() {
@@ -2508,9 +3192,229 @@ mod worktree_ownership_tests {
         );
     }
 
+    #[tokio::test]
+    async fn verified_prune_rejects_a_successful_exit_when_the_target_registration_survives() {
+        let fixture = tempfile::tempdir().expect("surviving target fixture");
+        let admin_dir = fixture.path().join(".git/worktrees/target");
+        fs::create_dir_all(&admin_dir).expect("worktree admin fixture");
+        let target_path = fixture.path().join("target");
+        fs::write(
+            admin_dir.join("gitdir"),
+            format!("{}/.git\n", display_path(&target_path)),
+        )
+        .expect("target admin identity");
+        let inventory = format!(
+            "worktree {}\0HEAD aaa\0branch refs/heads/main\0\0worktree {}\0HEAD bbb\0branch refs/heads/feature\0prunable stale\0\0",
+            display_path(fixture.path()),
+            display_path(&target_path),
+        );
+        let runner = Arc::new(FakeGitRunner::new([
+            process_output(0, ".git\n", ""),
+            process_output(0, &inventory, ""),
+            process_output(0, "", "Removing worktrees/target: stale\n"),
+            process_output(0, ".git\n", ""),
+            process_output(0, &inventory, ""),
+            process_output(0, ".git\n", ""),
+            process_output(0, &inventory, ""),
+            process_output(0, "", "Removing worktrees/target: stale\n"),
+            process_output(0, "", ""),
+            process_output(0, ".git\n", ""),
+            process_output(0, &inventory, ""),
+        ]));
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let target = GitWorktreeRecord {
+            path: target_path,
+            head: Some("bbb".into()),
+            branch: Some("feature".into()),
+            is_primary: false,
+            is_bare: false,
+            locked: false,
+            lock_reason: None,
+            is_prunable: true,
+            prunable_reason: Some("stale".into()),
+        };
+        let expected = repository
+            .preview_worktree_prune(fixture.path(), &CancellationToken::new())
+            .await
+            .expect("preview");
+        let digest = git_worktree_prune_impact_digest(&expected);
+
+        let error = repository
+            .prune_worktrees_verified(fixture.path(), &target, &digest, &CancellationToken::new())
+            .await
+            .expect_err("surviving target invalidates successful prune exit");
+        assert!(error.detail.to_ascii_lowercase().contains("survived"));
+        assert_eq!(
+            runner
+                .requests()
+                .iter()
+                .filter(|request| {
+                    request.args.iter().any(|argument| argument == "prune")
+                        && !request.args.iter().any(|argument| argument == "--dry-run")
+                })
+                .count(),
+            1
+        );
+        let requests = runner.requests();
+        let mutation_index = requests
+            .iter()
+            .position(|request| {
+                request.args.iter().any(|argument| argument == "prune")
+                    && !request.args.iter().any(|argument| argument == "--dry-run")
+            })
+            .expect("prune mutation request");
+        assert!(
+            mutation_index > 0
+                && requests[mutation_index - 1]
+                    .args
+                    .iter()
+                    .any(|argument| argument == "--dry-run"),
+            "the confirmed dry-run is the final Git command before prune mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_prune_rejects_a_same_reason_admin_identity_swap_before_mutation() {
+        let fixture = tempfile::tempdir().expect("prune identity fixture");
+        let common_dir = fixture.path().join(".git");
+        let admin_dir = common_dir.join("worktrees/target");
+        fs::create_dir_all(&admin_dir).expect("worktree admin fixture");
+        let old_path = fixture.path().join("old-target");
+        let new_path = fixture.path().join("new-target");
+        fs::write(
+            admin_dir.join("gitdir"),
+            format!("{}/.git\n", display_path(&old_path)),
+        )
+        .expect("old admin identity");
+        let inventory = format!(
+            "worktree {}\0HEAD aaa\0branch refs/heads/main\0\0worktree {}\0HEAD bbb\0branch refs/heads/feature\0prunable stale\0\0",
+            display_path(fixture.path()),
+            display_path(&old_path),
+        );
+        let after_prune = format!(
+            "worktree {}\0HEAD aaa\0branch refs/heads/main\0\0",
+            display_path(fixture.path()),
+        );
+        let replacement_gitdir = admin_dir.join("gitdir");
+        let replacement_path = new_path.clone();
+        let runner = Arc::new(FakeGitRunner::with_dry_run_action(
+            [
+                process_output(0, ".git\n", ""),
+                process_output(0, &inventory, ""),
+                process_output(0, "", "Removing worktrees/target: stale\n"),
+                process_output(0, "", ""),
+                process_output(0, ".git\n", ""),
+                process_output(0, &after_prune, ""),
+            ],
+            Arc::new(move || {
+                fs::write(
+                    &replacement_gitdir,
+                    format!("{}/.git\n", display_path(&replacement_path)),
+                )
+                .expect("swap admin identity");
+            }),
+        ));
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let target = GitWorktreeRecord {
+            path: old_path.clone(),
+            head: Some("bbb".into()),
+            branch: Some("feature".into()),
+            is_primary: false,
+            is_bare: false,
+            locked: false,
+            lock_reason: None,
+            is_prunable: true,
+            prunable_reason: Some("stale".into()),
+        };
+        let confirmed = [GitPrunableWorktree {
+            path: old_path,
+            locked: false,
+            lock_reason: None,
+        }];
+
+        repository
+            .prune_worktrees_verified(
+                fixture.path(),
+                &target,
+                &git_worktree_prune_impact_digest(&confirmed),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("same-reason replacement cannot inherit confirmed impact");
+        assert_eq!(
+            runner
+                .requests()
+                .iter()
+                .filter(|request| {
+                    request.args.iter().any(|argument| argument == "prune")
+                        && !request.args.iter().any(|argument| argument == "--dry-run")
+                })
+                .count(),
+            0,
+            "identity drift is rejected before repository-wide prune"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn prune_admin_identity_resolution_rejects_symlinks_oversize_and_cancellation() {
+        use std::os::unix::fs::symlink;
+
+        let fixture = tempfile::tempdir().expect("admin identity fixture");
+        let common_dir = fixture.path().join(".git");
+        let worktrees_dir = common_dir.join("worktrees");
+        let outside_admin = fixture.path().join("outside-admin");
+        fs::create_dir_all(&outside_admin).expect("outside admin fixture");
+        fs::create_dir_all(&worktrees_dir).expect("worktrees admin root");
+        let common_dir = fs::canonicalize(&common_dir).expect("canonical common directory");
+        fs::write(outside_admin.join("gitdir"), "/target/.git\n").expect("outside gitdir fixture");
+        symlink(&outside_admin, worktrees_dir.join("linked")).expect("symlinked admin fixture");
+        let record = |admin_id: &str| WorktreePruneDryRunRecord {
+            admin_id: admin_id.to_owned(),
+            reason: "stale".to_owned(),
+        };
+
+        resolve_worktree_prune_paths(
+            fixture.path(),
+            &common_dir,
+            vec![record("linked")],
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("symlinked admin directory is rejected");
+
+        let oversized_admin = worktrees_dir.join("oversized");
+        fs::create_dir(&oversized_admin).expect("oversized admin fixture");
+        fs::write(
+            oversized_admin.join("gitdir"),
+            vec![b'x'; WORKTREE_PRUNE_GITDIR_LIMIT as usize + 1],
+        )
+        .expect("oversized gitdir fixture");
+        resolve_worktree_prune_paths(
+            fixture.path(),
+            &common_dir,
+            vec![record("oversized")],
+            &CancellationToken::new(),
+        )
+        .await
+        .expect_err("oversized gitdir identity is rejected");
+
+        let cancellation = CancellationToken::new();
+        cancellation.cancel();
+        resolve_worktree_prune_paths(
+            fixture.path(),
+            &common_dir,
+            vec![record("oversized")],
+            &cancellation,
+        )
+        .await
+        .expect_err("cancelled identity resolution cannot approach mutation");
+    }
+
     struct FakeGitRunner {
         outputs: Mutex<VecDeque<ProcessOutput>>,
         requests: Mutex<Vec<ProcessRequest>>,
+        dry_run_action: Option<Arc<dyn Fn() + Send + Sync>>,
     }
 
     impl FakeGitRunner {
@@ -2518,6 +3422,18 @@ mod worktree_ownership_tests {
             Self {
                 outputs: Mutex::new(outputs.into_iter().collect()),
                 requests: Mutex::new(Vec::new()),
+                dry_run_action: None,
+            }
+        }
+
+        fn with_dry_run_action(
+            outputs: impl IntoIterator<Item = ProcessOutput>,
+            dry_run_action: Arc<dyn Fn() + Send + Sync>,
+        ) -> Self {
+            Self {
+                outputs: Mutex::new(outputs.into_iter().collect()),
+                requests: Mutex::new(Vec::new()),
+                dry_run_action: Some(dry_run_action),
             }
         }
 
@@ -2535,6 +3451,11 @@ mod worktree_ownership_tests {
             request: ProcessRequest,
             _cancellation: &'a CancellationToken,
         ) -> super::BoxGitProcessFuture<'a> {
+            if request.args.iter().any(|argument| argument == "--dry-run")
+                && let Some(action) = self.dry_run_action.as_ref()
+            {
+                action();
+            }
             self.requests
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())

@@ -12,6 +12,7 @@ use super::GitWorktreeRecord;
 
 const MAX_WORKTREE_RECORDS: usize = 512;
 const WORKTREE_KEY_VERSION: &str = "bibcode.worktree.v1";
+const WORKTREE_PRUNE_IMPACT_VERSION: &str = "bibcode.worktree-prune-impact.v1";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostPathPlatform {
@@ -64,6 +65,24 @@ pub enum WorktreeParseError {
     DuplicateField { field: &'static str },
     #[error("Git worktree porcelain record has an invalid {field} field")]
     InvalidField { field: &'static str },
+}
+
+#[derive(Debug, Error, Eq, PartialEq)]
+pub(crate) enum WorktreePruneParseError {
+    #[error("Git worktree prune dry-run output has an unterminated record")]
+    Unterminated,
+    #[error("Git worktree prune dry-run output contains more than {MAX_WORKTREE_RECORDS} records")]
+    TooManyRecords,
+    #[error("Git worktree prune dry-run output contains a malformed record")]
+    MalformedRecord,
+    #[error("Git worktree prune dry-run output contains a duplicate admin record")]
+    DuplicateRecord,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorktreePruneDryRunRecord {
+    pub admin_id: String,
+    pub reason: String,
 }
 
 #[derive(Debug, Error)]
@@ -230,6 +249,67 @@ pub fn parse_worktree_porcelain(
         .enumerate()
         .map(|(index, fields)| parse_record(&fields, !nul_delimited, index == 0))
         .collect()
+}
+
+pub(crate) fn parse_worktree_prune_dry_run(
+    output: &str,
+) -> Result<Vec<WorktreePruneDryRunRecord>, WorktreePruneParseError> {
+    if !output.is_empty() && !output.ends_with('\n') {
+        return Err(WorktreePruneParseError::Unterminated);
+    }
+    let mut admins = HashSet::new();
+    let mut reasons = Vec::new();
+    for line in output.lines() {
+        if reasons.len() == MAX_WORKTREE_RECORDS {
+            return Err(WorktreePruneParseError::TooManyRecords);
+        }
+        let Some(record) = line.strip_prefix("Removing worktrees/") else {
+            return Err(WorktreePruneParseError::MalformedRecord);
+        };
+        let Some((admin, reason)) = record.split_once(": ") else {
+            return Err(WorktreePruneParseError::MalformedRecord);
+        };
+        if admin.is_empty()
+            || reason.is_empty()
+            || admin.contains('\0')
+            || reason.contains('\0')
+            || !matches!(
+                Path::new(admin).components().collect::<Vec<_>>().as_slice(),
+                [std::path::Component::Normal(_)]
+            )
+        {
+            return Err(WorktreePruneParseError::MalformedRecord);
+        }
+        if !admins.insert(admin) {
+            return Err(WorktreePruneParseError::DuplicateRecord);
+        }
+        reasons.push(WorktreePruneDryRunRecord {
+            admin_id: admin.to_owned(),
+            reason: reason.to_owned(),
+        });
+    }
+    Ok(reasons)
+}
+
+#[must_use]
+pub fn git_worktree_prune_impact_digest(impact: &[super::GitPrunableWorktree]) -> String {
+    let mut keys = impact
+        .iter()
+        .map(|entry| normalize_worktree_path_key(&entry.path, host_path_platform()))
+        .collect::<Vec<_>>();
+    keys.sort();
+    let mut input = Vec::with_capacity(
+        WORKTREE_PRUNE_IMPACT_VERSION.len()
+            + keys.iter().map(String::len).sum::<usize>()
+            + keys.len()
+            + 1,
+    );
+    input.extend_from_slice(WORKTREE_PRUNE_IMPACT_VERSION.as_bytes());
+    for key in keys {
+        input.push(b'\0');
+        input.extend_from_slice(key.as_bytes());
+    }
+    sha256_hex(input)
 }
 
 fn opaque_key(common_dir_key: &str, path_key: Option<&str>) -> String {
@@ -462,7 +542,8 @@ mod tests {
 
     use super::{
         HostPathPlatform, WorktreeIdentityError, normalize_worktree_path_key,
-        parse_worktree_porcelain, resolved_worktree_keys, worktree_key, worktree_repository_key,
+        parse_worktree_porcelain, parse_worktree_prune_dry_run, resolved_worktree_keys,
+        worktree_key, worktree_repository_key,
     };
 
     #[test]
@@ -535,6 +616,38 @@ mod tests {
             .map(|index| format!("worktree /repo/{index}\n\n"))
             .collect::<String>();
         assert!(parse_worktree_porcelain(&many, false).is_err());
+    }
+
+    #[test]
+    fn parses_bounded_verbose_prune_output_and_rejects_unknown_records() {
+        assert_eq!(
+            parse_worktree_prune_dry_run(
+                "Removing worktrees/one: gitdir file points to non-existent location\nRemoving worktrees/two: stale admin\n"
+            )
+            .expect("bounded prune preview parses"),
+            vec![
+                super::WorktreePruneDryRunRecord {
+                    admin_id: "one".to_owned(),
+                    reason: "gitdir file points to non-existent location".to_owned(),
+                },
+                super::WorktreePruneDryRunRecord {
+                    admin_id: "two".to_owned(),
+                    reason: "stale admin".to_owned(),
+                },
+            ]
+        );
+        for output in [
+            "unexpected output\n".to_owned(),
+            "Removing worktrees/one: stale".to_owned(),
+            "Removing worktrees/: stale\n".to_owned(),
+            "Removing worktrees/../escape: stale\n".to_owned(),
+            "Removing worktrees/one: \n".to_owned(),
+            (0..513)
+                .map(|index| format!("Removing worktrees/{index}: stale\n"))
+                .collect::<String>(),
+        ] {
+            assert!(parse_worktree_prune_dry_run(&output).is_err());
+        }
     }
 
     #[test]

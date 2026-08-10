@@ -1004,6 +1004,7 @@ pub async fn prune_worktrees_verified(
     &self,
     anchor: &Path,
     target: &GitWorktreeRecord,
+    expected_impact_digest: &str,
     cancellation: &CancellationToken,
 ) -> Result<(), GitCommandError>;
 ```
@@ -1037,7 +1038,7 @@ cargo test -p bibcode-server --test git_rpc worktree -- --nocapture
 
 - [ ] **Step 4: Implement prune preview and verification**
 
-Parse `git worktree prune --dry-run --verbose --expire now` into bounded records and compare confirmed impacts by a digest over sorted normalized registration keys. Never prune a locked target.
+Parse `git worktree prune --dry-run --verbose --expire now` into bounded records and compare confirmed impacts by a digest over sorted normalized registration keys. The verified prune primitive owns the final TOCTOU fence: it reruns the bounded dry-run immediately before mutation and rejects unless that fresh digest exactly matches the caller-confirmed `expected_impact_digest`. Never prune a locked target.
 
 - [ ] **Step 5: Run Git removal tests**
 
