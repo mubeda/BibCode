@@ -862,56 +862,164 @@ fn normalized_worktree_path_key(path: &str) -> String {
     normalize_worktree_path_key(Path::new(path), host_path_platform())
 }
 
-fn worktree_adoption_result(
-    model: &CommandModel,
-    command: &OrchestrationCommand,
-    committed: Option<&VecDeque<OrchestrationEvent>>,
-) -> Option<(String, String)> {
-    let OrchestrationCommand::WorktreeAdoptResolved {
-        project_id, path, ..
-    } = command
-    else {
-        return None;
-    };
-    if let Some(events) = committed {
-        if let Some(result) = durable_worktree_adoption_result(events) {
-            return Some(result);
-        }
-        if let Some(event) = events
-            .iter()
-            .find(|event| event.event.event_type == "thread.created")
-        {
-            return Some((event.event.aggregate_id.clone(), "created".to_owned()));
-        }
-        if let Some(event) = events
-            .iter()
-            .find(|event| event.event.event_type == "thread.unarchived")
-        {
-            return Some((event.event.aggregate_id.clone(), "restored".to_owned()));
-        }
-    }
-    canonical_worktree_owners(model, project_id, path)
-        .next()
-        .map(|(thread_id, _)| (thread_id.clone(), "existing".to_owned()))
+enum DurableWorktreeAdoptionResult {
+    Absent,
+    Valid {
+        thread_id: String,
+        disposition: String,
+    },
+    Malformed {
+        detail: &'static str,
+    },
 }
 
 fn durable_worktree_adoption_result(
     events: &VecDeque<OrchestrationEvent>,
-) -> Option<(String, String)> {
-    events.iter().find_map(|event| {
-        let result = event.event.metadata.get("adoptionResult")?;
-        let thread_id = result.get("threadId")?.as_str()?;
-        let disposition = result.get("disposition")?.as_str()?;
-        matches!(disposition, "created" | "existing" | "restored")
-            .then(|| (thread_id.to_owned(), disposition.to_owned()))
-    })
+) -> DurableWorktreeAdoptionResult {
+    let mut result_events = events
+        .iter()
+        .filter(|event| event.event.metadata.get("adoptionResult").is_some());
+    let Some(event) = result_events.next() else {
+        return DurableWorktreeAdoptionResult::Absent;
+    };
+    if result_events.next().is_some() {
+        return DurableWorktreeAdoptionResult::Malformed {
+            detail: "Adoption receipt has multiple durable results.",
+        };
+    }
+    if event.event.event_type != "project.meta-updated" {
+        return DurableWorktreeAdoptionResult::Malformed {
+            detail: "Adoption result is attached to the wrong event type.",
+        };
+    }
+    let Some(result) = event
+        .event
+        .metadata
+        .get("adoptionResult")
+        .and_then(Value::as_object)
+    else {
+        return DurableWorktreeAdoptionResult::Malformed {
+            detail: "Adoption result must be an object.",
+        };
+    };
+    let Some(thread_id) = result.get("threadId").and_then(Value::as_str) else {
+        return DurableWorktreeAdoptionResult::Malformed {
+            detail: "Adoption result thread ID must be a string.",
+        };
+    };
+    if thread_id.trim().is_empty() {
+        return DurableWorktreeAdoptionResult::Malformed {
+            detail: "Adoption result thread ID must not be empty.",
+        };
+    }
+    let Some(disposition) = result.get("disposition").and_then(Value::as_str) else {
+        return DurableWorktreeAdoptionResult::Malformed {
+            detail: "Adoption result disposition must be a string.",
+        };
+    };
+    if !matches!(disposition, "created" | "existing" | "restored") {
+        return DurableWorktreeAdoptionResult::Malformed {
+            detail: "Adoption result disposition is unknown.",
+        };
+    }
+    let immutable_thread_result = match immutable_worktree_adoption_thread_result(events) {
+        Ok(result) => result,
+        Err(detail) => return DurableWorktreeAdoptionResult::Malformed { detail },
+    };
+    let consistent = match disposition {
+        "created" => immutable_thread_result
+            .as_ref()
+            .is_some_and(|result| result.0 == thread_id && result.1 == "created"),
+        "restored" => immutable_thread_result
+            .as_ref()
+            .is_some_and(|result| result.0 == thread_id && result.1 == "restored"),
+        "existing" => immutable_thread_result.is_none(),
+        _ => false,
+    };
+    if !consistent {
+        return DurableWorktreeAdoptionResult::Malformed {
+            detail: "Adoption result conflicts with immutable command events.",
+        };
+    }
+    DurableWorktreeAdoptionResult::Valid {
+        thread_id: thread_id.to_owned(),
+        disposition: disposition.to_owned(),
+    }
+}
+
+fn immutable_worktree_adoption_thread_result(
+    events: &VecDeque<OrchestrationEvent>,
+) -> Result<Option<(String, &'static str)>, &'static str> {
+    let mut thread_events = events.iter().filter(|event| {
+        matches!(
+            event.event.event_type.as_str(),
+            "thread.created" | "thread.unarchived"
+        )
+    });
+    let Some(event) = thread_events.next() else {
+        return Ok(None);
+    };
+    if thread_events.next().is_some() {
+        return Err("Adoption receipt has multiple immutable thread events.");
+    }
+    let thread_id = event.event.aggregate_id.as_str();
+    if thread_id.trim().is_empty()
+        || event.event.payload.get("threadId").and_then(Value::as_str) != Some(thread_id)
+    {
+        return Err("Adoption thread event has an invalid thread identity.");
+    }
+    let disposition = match event.event.event_type.as_str() {
+        "thread.created" => "created",
+        "thread.unarchived" => "restored",
+        _ => return Err("Adoption thread event type is invalid."),
+    };
+    Ok(Some((thread_id.to_owned(), disposition)))
+}
+
+fn replayable_worktree_adoption_result(
+    events: &VecDeque<OrchestrationEvent>,
+) -> Result<(String, String), OrchestrationError> {
+    match durable_worktree_adoption_result(events) {
+        DurableWorktreeAdoptionResult::Valid {
+            thread_id,
+            disposition,
+        } => Ok((thread_id, disposition)),
+        DurableWorktreeAdoptionResult::Malformed { detail } => Err(OrchestrationError::Invariant {
+            command_type: "worktree.adopt-resolved".to_owned(),
+            detail: detail.to_owned(),
+        }),
+        DurableWorktreeAdoptionResult::Absent => {
+            let Some((thread_id, disposition)) = immutable_worktree_adoption_thread_result(events)
+                .map_err(|detail| OrchestrationError::Invariant {
+                    command_type: "worktree.adopt-resolved".to_owned(),
+                    detail: detail.to_owned(),
+                })?
+            else {
+                return Err(OrchestrationError::Invariant {
+                    command_type: "worktree.adopt-resolved".to_owned(),
+                    detail: "Accepted adoption receipt has no immutable result.".to_owned(),
+                });
+            };
+            Ok((thread_id, disposition.to_owned()))
+        }
+    }
+}
+
+fn worktree_adoption_result(
+    command: &OrchestrationCommand,
+    committed: &VecDeque<OrchestrationEvent>,
+) -> Result<Option<(String, String)>, OrchestrationError> {
+    if !matches!(command, OrchestrationCommand::WorktreeAdoptResolved { .. }) {
+        return Ok(None);
+    }
+    replayable_worktree_adoption_result(committed).map(Some)
 }
 
 async fn durable_replayed_worktree_adoption_result(
     repositories: &Repositories,
     command_id: &str,
     result_sequence: i64,
-) -> Result<Option<(String, String)>, OrchestrationError> {
+) -> Result<(String, String), OrchestrationError> {
     let from_sequence_exclusive = result_sequence.saturating_sub(2).max(0);
     let command_events = repositories
         .read_events_from_sequence(from_sequence_exclusive, 2)
@@ -920,40 +1028,20 @@ async fn durable_replayed_worktree_adoption_result(
         .into_iter()
         .filter(|event| event.event.command_id.as_deref() == Some(command_id))
         .collect::<VecDeque<_>>();
-    Ok(durable_worktree_adoption_result(&command_events))
+    replayable_worktree_adoption_result(&command_events)
 }
 
 async fn replayed_worktree_adoption_result(
     repositories: &Repositories,
-    model: &CommandModel,
     command: &OrchestrationCommand,
     result_sequence: i64,
 ) -> Result<Option<(String, String)>, OrchestrationError> {
     if !matches!(command, OrchestrationCommand::WorktreeAdoptResolved { .. }) {
         return Ok(None);
     }
-    if let Some(result) = durable_replayed_worktree_adoption_result(
-        repositories,
-        command.command_id(),
-        result_sequence,
-    )
-    .await?
-    {
-        return Ok(Some(result));
-    }
-    let from_sequence_exclusive = result_sequence.saturating_sub(2).max(0);
-    let command_events = repositories
-        .read_events_from_sequence(from_sequence_exclusive, 2)
+    durable_replayed_worktree_adoption_result(repositories, command.command_id(), result_sequence)
         .await
-        .map_err(wrap_persistence)?
-        .into_iter()
-        .filter(|event| event.event.command_id.as_deref() == Some(command.command_id()))
-        .collect::<VecDeque<_>>();
-    Ok(worktree_adoption_result(
-        model,
-        command,
-        Some(&command_events),
-    ))
+        .map(Some)
 }
 
 struct CommandEnvelope {
@@ -1055,11 +1143,7 @@ impl OrchestrationEngine {
             command_id,
             receipt.result_sequence,
         )
-        .await?
-        .ok_or_else(|| OrchestrationError::Invariant {
-            command_type: "worktree.adopt".to_owned(),
-            detail: "Accepted adoption receipt has no durable adoption result.".to_owned(),
-        })?;
+        .await?;
         Ok(Some(DispatchResult {
             sequence: receipt.result_sequence,
             thread_id: Some(thread_id),
@@ -1378,13 +1462,9 @@ async fn process_envelope(
             return Err(OrchestrationError::CommandConflict { command_id });
         }
         if receipt.status == "accepted" {
-            let replay_adoption = replayed_worktree_adoption_result(
-                repositories,
-                model,
-                &command,
-                receipt.result_sequence,
-            )
-            .await?;
+            let replay_adoption =
+                replayed_worktree_adoption_result(repositories, &command, receipt.result_sequence)
+                    .await?;
             let project_id = requested_project_id.as_ref().map(|requested_id| {
                 if receipt.aggregate_kind == "project" {
                     receipt.aggregate_id.clone()
@@ -1592,7 +1672,7 @@ async fn process_envelope(
             detail: "Command produced no events.".to_owned(),
         })?;
     let project_id = project_create_identity.map(|(project_id, _)| project_id);
-    let adoption_result = worktree_adoption_result(model, &command, Some(&committed));
+    let adoption_result = worktree_adoption_result(&command, &committed)?;
     Ok(ProcessEnvelopeOutcome {
         result: DispatchResult {
             sequence: last_sequence,
@@ -4675,6 +4755,55 @@ mod tests {
                 .expect("thread");
         }
 
+        async fn replace_adoption_result_metadata(
+            engine: &OrchestrationEngine,
+            command_id: &str,
+            adoption_result: Option<Value>,
+        ) {
+            let command_id = command_id.to_owned();
+            engine
+                .repositories()
+                .database()
+                .call(move |connection| {
+                    let metadata_json = connection.query_row(
+                        "SELECT metadata_json FROM orchestration_events WHERE command_id = ? AND event_type = 'project.meta-updated'",
+                        [&command_id],
+                        |row| row.get::<_, String>(0),
+                    )?;
+                    let mut metadata = serde_json::from_str::<Value>(&metadata_json).map_err(
+                        |error| PersistenceError::Corrupt(format!("invalid test metadata: {error}")),
+                    )?;
+                    let object = metadata.as_object_mut().ok_or_else(|| {
+                        PersistenceError::Corrupt("test metadata is not an object".to_owned())
+                    })?;
+                    if let Some(adoption_result) = adoption_result {
+                        object.insert("adoptionResult".to_owned(), adoption_result);
+                    } else {
+                        object.remove("adoptionResult");
+                    }
+                    let changed = connection.execute(
+                        "UPDATE orchestration_events SET metadata_json = ? WHERE command_id = ? AND event_type = 'project.meta-updated'",
+                        params![metadata.to_string(), command_id],
+                    )?;
+                    if changed != 1 {
+                        return Err(PersistenceError::Corrupt(format!(
+                            "expected one adoption metadata row, changed {changed}"
+                        )));
+                    }
+                    Ok(())
+                })
+                .await
+                .expect("replace adoption result metadata");
+        }
+
+        fn assert_adoption_replay_invariant(result: Result<DispatchResult, OrchestrationError>) {
+            assert!(matches!(
+                result,
+                Err(OrchestrationError::Invariant { command_type, .. })
+                    if command_type == "worktree.adopt-resolved"
+            ));
+        }
+
         #[tokio::test]
         async fn creates_an_ordinary_workspace_and_compacts_policy_atomically() {
             let engine = adoption_engine(TestHooks::default()).await;
@@ -4730,6 +4859,217 @@ mod tests {
                 result
             );
             engine.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn malformed_adoption_result_metadata_never_falls_back_to_thread_events_or_owners() {
+            let engine = adoption_engine(TestHooks::default()).await;
+            let command = adopt(
+                "adopt-malformed-result",
+                Some("feature/external"),
+                Some("abc1234"),
+            );
+            let accepted = engine
+                .dispatch(command.clone())
+                .await
+                .expect("initial adoption");
+            let thread_id = accepted.thread_id.expect("created thread id");
+            let malformed = [
+                json!("not-an-object"),
+                json!({"disposition":"created"}),
+                json!({"threadId":thread_id,"disposition":"future"}),
+                json!({"threadId":"","disposition":"created"}),
+            ];
+
+            for adoption_result in malformed {
+                replace_adoption_result_metadata(
+                    &engine,
+                    "adopt-malformed-result",
+                    Some(adoption_result),
+                )
+                .await;
+                assert_adoption_replay_invariant(engine.dispatch(command.clone()).await);
+            }
+            engine.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn valid_adoption_result_metadata_must_match_immutable_thread_events() {
+            let created = adoption_engine(TestHooks::default()).await;
+            let created_command = adopt(
+                "adopt-created-inconsistent",
+                Some("feature/external"),
+                Some("abc1234"),
+            );
+            let created_result = created
+                .dispatch(created_command.clone())
+                .await
+                .expect("created adoption");
+            let created_thread_id = created_result.thread_id.expect("created thread id");
+            for inconsistent in [
+                json!({"threadId":"different-thread","disposition":"created"}),
+                json!({"threadId":created_thread_id,"disposition":"restored"}),
+                json!({"threadId":created_thread_id,"disposition":"existing"}),
+            ] {
+                replace_adoption_result_metadata(
+                    &created,
+                    "adopt-created-inconsistent",
+                    Some(inconsistent),
+                )
+                .await;
+                assert_adoption_replay_invariant(created.dispatch(created_command.clone()).await);
+            }
+            created.shutdown().await;
+
+            let restored = adoption_engine(TestHooks::default()).await;
+            create_thread(
+                &restored,
+                "restored-inconsistent-owner-create",
+                "restored-inconsistent-owner",
+                "workspace",
+            )
+            .await;
+            restored
+                .dispatch(OrchestrationCommand::ThreadArchive {
+                    command_id: "restored-inconsistent-owner-archive".to_owned(),
+                    thread_id: "restored-inconsistent-owner".to_owned(),
+                })
+                .await
+                .expect("archive owner");
+            let restored_command = adopt("adopt-restored-inconsistent", None, Some("abc1234"));
+            restored
+                .dispatch(restored_command.clone())
+                .await
+                .expect("restored adoption");
+            replace_adoption_result_metadata(
+                &restored,
+                "adopt-restored-inconsistent",
+                Some(json!({
+                    "threadId":"different-thread",
+                    "disposition":"restored"
+                })),
+            )
+            .await;
+            assert_adoption_replay_invariant(restored.dispatch(restored_command).await);
+            restored.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn absent_legacy_metadata_replays_only_created_and_restored_thread_evidence() {
+            let created = adoption_engine(TestHooks::default()).await;
+            let created_command = adopt(
+                "adopt-legacy-created",
+                Some("feature/external"),
+                Some("abc1234"),
+            );
+            let created_result = created
+                .dispatch(created_command.clone())
+                .await
+                .expect("created adoption");
+            replace_adoption_result_metadata(&created, "adopt-legacy-created", None).await;
+            created
+                .dispatch(OrchestrationCommand::ThreadDelete {
+                    command_id: "delete-legacy-created-owner".to_owned(),
+                    thread_id: created_result.thread_id.clone().expect("created thread id"),
+                })
+                .await
+                .expect("delete created owner");
+            assert_eq!(
+                created
+                    .dispatch(created_command)
+                    .await
+                    .expect("legacy created replay"),
+                created_result
+            );
+            created.shutdown().await;
+
+            let restored = adoption_engine(TestHooks::default()).await;
+            create_thread(
+                &restored,
+                "legacy-restored-owner-create",
+                "legacy-restored-owner",
+                "workspace",
+            )
+            .await;
+            restored
+                .dispatch(OrchestrationCommand::ThreadArchive {
+                    command_id: "legacy-restored-owner-archive".to_owned(),
+                    thread_id: "legacy-restored-owner".to_owned(),
+                })
+                .await
+                .expect("archive owner");
+            let restored_command = adopt("adopt-legacy-restored", None, Some("abc1234"));
+            let restored_result = restored
+                .dispatch(restored_command.clone())
+                .await
+                .expect("restored adoption");
+            replace_adoption_result_metadata(&restored, "adopt-legacy-restored", None).await;
+            restored
+                .dispatch(OrchestrationCommand::ThreadDelete {
+                    command_id: "delete-legacy-restored-owner".to_owned(),
+                    thread_id: "legacy-restored-owner".to_owned(),
+                })
+                .await
+                .expect("delete restored owner");
+            assert_eq!(
+                restored
+                    .dispatch(restored_command)
+                    .await
+                    .expect("legacy restored replay"),
+                restored_result
+            );
+            restored.shutdown().await;
+        }
+
+        #[tokio::test]
+        async fn absent_legacy_existing_metadata_never_infers_a_current_owner_after_restart() {
+            let engine = adoption_engine(TestHooks::default()).await;
+            create_thread(
+                &engine,
+                "legacy-existing-owner-create",
+                "legacy-existing-owner",
+                "workspace",
+            )
+            .await;
+            let command = adopt(
+                "adopt-legacy-existing",
+                Some("feature/external"),
+                Some("abc1234"),
+            );
+            let accepted = engine
+                .dispatch(command.clone())
+                .await
+                .expect("existing adoption");
+            assert_eq!(accepted.thread_id.as_deref(), Some("legacy-existing-owner"));
+            assert_eq!(accepted.disposition.as_deref(), Some("existing"));
+            replace_adoption_result_metadata(&engine, "adopt-legacy-existing", None).await;
+            engine
+                .dispatch(
+                    serde_json::from_value(json!({
+                        "type":"thread.meta.update",
+                        "commandId":"retarget-legacy-existing-owner",
+                        "threadId":"legacy-existing-owner",
+                        "worktreePath":format!("{PATH}-retargeted")
+                    }))
+                    .expect("retarget command"),
+                )
+                .await
+                .expect("retarget owner");
+            create_thread(
+                &engine,
+                "replacement-owner-create",
+                "replacement-owner",
+                "workspace",
+            )
+            .await;
+            let database = engine.repositories().database().clone();
+            engine.shutdown().await;
+
+            let restarted = OrchestrationEngine::start(database, EngineOptions::default())
+                .await
+                .expect("restart engine");
+            assert_adoption_replay_invariant(restarted.dispatch(command).await);
+            restarted.shutdown().await;
         }
 
         #[tokio::test]

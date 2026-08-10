@@ -785,6 +785,11 @@ fn adoption_orchestration_error(
             "Worktree adoption conflicts with canonical workspace ownership.",
             current_generation,
         ),
+        OrchestrationError::Invariant { .. } => adoption_error(
+            WorktreeAdoptionErrorReason::Internal,
+            "The durable worktree adoption result is invalid.",
+            current_generation,
+        ),
         error => adoption_error(
             WorktreeAdoptionErrorReason::OrchestrationFailed,
             format!("Worktree adoption could not be persisted: {error}"),
