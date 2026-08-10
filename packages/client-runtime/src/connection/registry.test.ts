@@ -252,12 +252,12 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
         });
       }),
   });
-  const acceptedStorageIdentityStore = Persistence.AcceptedStorageIdentityStore.of({
-    get: (targetKey) =>
+  const acceptedStorageIdentityService = {
+    get: (targetKey: string) =>
       Ref.get(acceptedStorageIdentities).pipe(
         Effect.map((current) => Option.fromUndefinedOr(current.get(targetKey))),
       ),
-    accept: (identity) =>
+    accept: (identity: Persistence.AcceptedStorageIdentity) =>
       Ref.update(acceptedStorageIdentities, (current) => {
         const next = new Map(current);
         next.set(identity.targetKey, identity.storageInstanceId);
@@ -268,7 +268,52 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
         ),
         Effect.andThen(options?.afterStorageIdentityAccept?.(identity) ?? Effect.void),
       ),
-  });
+    transition: <A>(
+      targetKey: string,
+      decide: (acceptedStorageInstanceId: string | null) => {
+        readonly result: A;
+        readonly mutation:
+          | { readonly _tag: "Keep" }
+          | { readonly _tag: "Set"; readonly storageInstanceId: string };
+      },
+    ) =>
+      Ref.modify(
+        acceptedStorageIdentities,
+        (
+          current,
+        ): readonly [
+          {
+            readonly result: A;
+            readonly identity: Persistence.AcceptedStorageIdentity | null;
+          },
+          Map<string, string>,
+        ] => {
+          const transition = decide(current.get(targetKey) ?? null);
+          if (transition.mutation._tag === "Keep") {
+            return [{ result: transition.result, identity: null }, current] as const;
+          }
+          const identity = {
+            targetKey,
+            storageInstanceId: transition.mutation.storageInstanceId,
+          };
+          const next = new Map(current);
+          next.set(targetKey, identity.storageInstanceId);
+          return [{ result: transition.result, identity }, next] as const;
+        },
+      ).pipe(
+        Effect.flatMap(({ result, identity }) =>
+          identity === null
+            ? Effect.succeed(result)
+            : Ref.update(acceptedStorageIdentityWrites, (current) => [...current, identity]).pipe(
+                Effect.andThen(options?.afterStorageIdentityAccept?.(identity) ?? Effect.void),
+                Effect.as(result),
+              ),
+        ),
+      ),
+  };
+  const acceptedStorageIdentityStore = Persistence.AcceptedStorageIdentityStore.of(
+    acceptedStorageIdentityService,
+  );
   const cacheStore = Persistence.EnvironmentCacheStore.of({
     loadShell: (environmentId) =>
       Ref.get(shellCache).pipe(
@@ -734,6 +779,10 @@ describe("EnvironmentRegistry", () => {
             `accept:${identity.targetKey}:${identity.storageInstanceId}`,
           ]),
       });
+      yield* Ref.set(
+        harness.acceptedStorageIdentities,
+        new Map([["structured:error-target", "store-a"]]),
+      );
 
       yield* Effect.gen(function* () {
         const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
@@ -766,6 +815,70 @@ describe("EnvironmentRegistry", () => {
           "accept:structured:error-target:store-b",
           "attempt:2",
         ]);
+        expect(yield* Ref.get(harness.cacheClears)).toEqual([]);
+        expect(yield* Ref.get(harness.ownedDataClears)).toEqual([]);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("rejects stale storage adoption without overwriting a newer accepted identity", () =>
+    Effect.gen(function* () {
+      const connectionAttempts = yield* Ref.make(0);
+      const firstAttemptStarted = yield* Deferred.make<void>();
+      const releaseFirstAttempt = yield* Deferred.make<void>();
+      const storageChanged = () =>
+        new ConnectionStorageChangedError({
+          reason: "storage-changed",
+          detail: "The environment reported a different persistent store.",
+          targetKey: "structured:error-target",
+          acceptedStorageInstanceId: "store-a",
+          reportedStorageInstanceId: "store-b",
+        });
+      const harness = yield* makeHarness([TARGET], [], [], {
+        beforeSessionConnect: () =>
+          Ref.updateAndGet(connectionAttempts, (count) => count + 1).pipe(
+            Effect.flatMap((attempt) =>
+              attempt === 1
+                ? Deferred.succeed(firstAttemptStarted, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseFirstAttempt)),
+                    Effect.andThen(Effect.fail(storageChanged())),
+                  )
+                : Effect.fail(storageChanged()),
+            ),
+          ),
+      });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.start;
+        yield* Deferred.await(firstAttemptStarted);
+        yield* Effect.yieldNow;
+        yield* Deferred.succeed(releaseFirstAttempt, undefined);
+        yield* awaitConnectionState(
+          registry,
+          TARGET.environmentId,
+          (state) => state.phase === "blocked",
+        );
+        yield* Ref.update(harness.acceptedStorageIdentities, (current) => {
+          const next = new Map(current);
+          next.set("structured:error-target", "store-c");
+          return next;
+        });
+
+        const result = yield* Effect.result(registry.acceptStorageIdentity(TARGET.environmentId));
+
+        expect(Result.isFailure(result)).toBe(true);
+        if (Result.isFailure(result)) {
+          expect(result.failure).toMatchObject({
+            _tag: "ConnectionPersistenceError",
+            operation: "accept-storage-identity",
+          });
+        }
+        expect(yield* Ref.get(harness.acceptedStorageIdentities)).toEqual(
+          new Map([["structured:error-target", "store-c"]]),
+        );
+        expect(yield* Ref.get(harness.acceptedStorageIdentityWrites)).toEqual([]);
+        expect(yield* Ref.get(connectionAttempts)).toBe(1);
         expect(yield* Ref.get(harness.cacheClears)).toEqual([]);
         expect(yield* Ref.get(harness.ownedDataClears)).toEqual([]);
       }).pipe(Effect.provide(harness.layer), Effect.scoped);

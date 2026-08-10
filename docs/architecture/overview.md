@@ -168,6 +168,11 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   calls. Legacy renderer migration preserves an existing valid IndexedDB
   winner and uses exact CAS before replacing corrupt IndexedDB bytes with the
   only valid legacy catalog.
+- Accepted storage-identity decisions are catalog CAS transitions: the decision
+  is recomputed after every conflict and returned only from the winning
+  revision. Both the prepared HTTP descriptor and the WebSocket session's
+  initial configuration must pass that owner before synchronization, live
+  publication, or cache consumption.
 - Desktop catalog capability is fail-closed and tri-state. Only bridge version
   2 with an explicit protected/unprotected flag may select native CAS or
   IndexedDB migration; rejected, older, or incomplete metadata performs no

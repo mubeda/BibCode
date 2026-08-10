@@ -662,10 +662,26 @@ export const make = Effect.gen(function* () {
               message: "The environment is not currently blocked by a persistent store change.",
             });
           }
-          yield* identities.accept({
-            targetKey: current.lastFailure.targetKey,
-            storageInstanceId: current.lastFailure.reportedStorageInstanceId,
-          });
+          const storageFailure = current.lastFailure;
+          const adopted = yield* identities.transition(
+            storageFailure.targetKey,
+            (acceptedStorageInstanceId) =>
+              acceptedStorageInstanceId === storageFailure.acceptedStorageInstanceId
+                ? {
+                    result: true,
+                    mutation: {
+                      _tag: "Set",
+                      storageInstanceId: storageFailure.reportedStorageInstanceId,
+                    },
+                  }
+                : { result: false, mutation: { _tag: "Keep" } },
+          );
+          if (!adopted) {
+            return yield* new Persistence.ConnectionPersistenceError({
+              operation: "accept-storage-identity",
+              message: "The accepted persistent store changed before it could be adopted.",
+            });
+          }
           yield* supervisor.retryNow;
         }),
       ),

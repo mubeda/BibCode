@@ -1,4 +1,4 @@
-import { EnvironmentId } from "@bibcode/contracts";
+import { EnvironmentId, type ServerConfig } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -226,7 +226,11 @@ const makeHarness = Effect.fn("TestConnectionHarness.make")(function* (options?:
 const makeStorageIdentityHarness = Effect.fn("TestStorageIdentityHarness.make")(function* (
   acceptedStorageInstanceId: string | null,
   reportedStorageInstanceId: string | null,
-  options?: { readonly failAcceptance?: boolean },
+  options?: {
+    readonly beforeInitialConfig?: Effect.Effect<void>;
+    readonly failAcceptance?: boolean;
+    readonly sessionReportedStorageInstanceId?: string | null;
+  },
 ) {
   const acceptedIdentities = yield* Ref.make<Map<string, string>>(
     new Map(
@@ -236,6 +240,7 @@ const makeStorageIdentityHarness = Effect.fn("TestStorageIdentityHarness.make")(
     ),
   );
   const sessionConnectCount = yield* Ref.make(0);
+  const sessionReleaseCount = yield* Ref.make(0);
   const identityAcceptCount = yield* Ref.make(0);
   const acceptedAtSessionConnect = yield* Ref.make<string | null>(null);
   const prepared: PreparedConnection = {
@@ -255,21 +260,36 @@ const makeStorageIdentityHarness = Effect.fn("TestStorageIdentityHarness.make")(
           Ref.set(acceptedAtSessionConnect, current.get("platform:primary") ?? null),
         ),
         Effect.andThen(Ref.update(sessionConnectCount, (count) => count + 1)),
-        Effect.as({
-          client: TEST_RPC_CLIENT,
-          initialConfig: Effect.die(new Error("Initial config is not used by supervisor tests.")),
-          ready: Effect.void,
-          probe: Effect.void,
-          closed: Effect.never,
-        } satisfies RpcSession.RpcSession),
+        Effect.andThen(
+          Effect.acquireRelease(
+            Effect.succeed({
+              client: TEST_RPC_CLIENT,
+              initialConfig: (options?.beforeInitialConfig ?? Effect.void).pipe(
+                Effect.as({
+                  environment: {
+                    ...prepared.descriptor,
+                    storageInstanceId:
+                      options?.sessionReportedStorageInstanceId === undefined
+                        ? reportedStorageInstanceId
+                        : options.sessionReportedStorageInstanceId,
+                  },
+                } as ServerConfig),
+              ),
+              ready: Effect.void,
+              probe: Effect.void,
+              closed: Effect.never,
+            } satisfies RpcSession.RpcSession),
+            () => Ref.update(sessionReleaseCount, (count) => count + 1),
+          ),
+        ),
       ),
   });
-  const identities = Persistence.AcceptedStorageIdentityStore.of({
-    get: (targetKey) =>
+  const identityService = {
+    get: (targetKey: string) =>
       Ref.get(acceptedIdentities).pipe(
         Effect.map((current) => Option.fromUndefinedOr(current.get(targetKey))),
       ),
-    accept: ({ targetKey, storageInstanceId }) =>
+    accept: ({ targetKey, storageInstanceId }: Persistence.AcceptedStorageIdentity) =>
       options?.failAcceptance === true
         ? Effect.fail(
             new Persistence.ConnectionPersistenceError({
@@ -282,7 +302,36 @@ const makeStorageIdentityHarness = Effect.fn("TestStorageIdentityHarness.make")(
             next.set(targetKey, storageInstanceId);
             return next;
           }).pipe(Effect.andThen(Ref.update(identityAcceptCount, (count) => count + 1))),
-  });
+    transition: <A>(
+      targetKey: string,
+      decide: (
+        acceptedStorageInstanceId: string | null,
+      ) => Persistence.AcceptedStorageIdentityTransition<A>,
+    ) =>
+      Ref.get(acceptedIdentities).pipe(
+        Effect.flatMap((current) => {
+          const transition = decide(current.get(targetKey) ?? null);
+          if (transition.mutation._tag === "Keep") {
+            return Effect.succeed(transition.result);
+          }
+          if (options?.failAcceptance === true) {
+            return Effect.fail(
+              new Persistence.ConnectionPersistenceError({
+                operation: "accept-storage-identity",
+                message: "Storage is unavailable.",
+              }),
+            );
+          }
+          const next = new Map(current);
+          next.set(targetKey, transition.mutation.storageInstanceId);
+          return Ref.set(acceptedIdentities, next).pipe(
+            Effect.andThen(Ref.update(identityAcceptCount, (count) => count + 1)),
+            Effect.as(transition.result),
+          );
+        }),
+      ),
+  };
+  const identities = Persistence.AcceptedStorageIdentityStore.of(identityService);
   const driver = yield* ConnectionDriver.make.pipe(
     Effect.provideService(ConnectionResolver.ConnectionResolver, resolver),
     Effect.provideService(RpcSession.RpcSessionFactory, sessions),
@@ -310,6 +359,7 @@ const makeStorageIdentityHarness = Effect.fn("TestStorageIdentityHarness.make")(
     dependencies,
     identityAcceptCount,
     sessionConnectCount,
+    sessionReleaseCount,
   };
 });
 
@@ -370,6 +420,51 @@ describe("EnvironmentSupervisor", () => {
 
       expect(yield* Ref.get(harness.sessionConnectCount)).toBe(1);
       expect(yield* Ref.get(harness.identityAcceptCount)).toBe(0);
+    }),
+  );
+
+  it.effect("blocks a session config store change without publishing or retrying the lease", () =>
+    Effect.gen(function* () {
+      const initialConfigStarted = yield* Deferred.make<void>();
+      const releaseInitialConfig = yield* Deferred.make<void>();
+      const harness = yield* makeStorageIdentityHarness("store-a", "store-a", {
+        beforeInitialConfig: Deferred.succeed(initialConfigStarted, undefined).pipe(
+          Effect.andThen(Deferred.await(releaseInitialConfig)),
+        ),
+        sessionReportedStorageInstanceId: "store-b",
+      });
+      const supervisor = yield* EnvironmentSupervisor.make(TARGET_ENTRY, {
+        initiallyDesired: true,
+      }).pipe(Effect.provide(harness.dependencies));
+
+      yield* Deferred.await(initialConfigStarted);
+      expect((yield* SubscriptionRef.get(supervisor.state)).stage).toBe("opening");
+      expect(Option.isNone(yield* SubscriptionRef.get(supervisor.prepared))).toBe(true);
+      expect(Option.isNone(yield* SubscriptionRef.get(supervisor.session))).toBe(true);
+      yield* Deferred.succeed(releaseInitialConfig, undefined);
+
+      const state = yield* eventuallyState(
+        supervisor.state,
+        (current) => current.phase === "blocked",
+      );
+      for (let iteration = 0; iteration < 100; iteration += 1) {
+        yield* Effect.yieldNow;
+      }
+
+      expect(state).toMatchObject({
+        phase: "blocked",
+        lastFailure: {
+          _tag: "ConnectionStorageChangedError",
+          acceptedStorageInstanceId: "store-a",
+          reportedStorageInstanceId: "store-b",
+        },
+      });
+      expect(yield* Ref.get(harness.sessionConnectCount)).toBe(1);
+      expect(yield* Ref.get(harness.sessionReleaseCount)).toBe(1);
+      expect(yield* Ref.get(harness.identityAcceptCount)).toBe(0);
+      expect(Option.isNone(yield* SubscriptionRef.get(supervisor.prepared))).toBe(true);
+      expect(Option.isNone(yield* SubscriptionRef.get(supervisor.session))).toBe(true);
+      expect((yield* SubscriptionRef.get(supervisor.state)).phase).toBe("blocked");
     }),
   );
 

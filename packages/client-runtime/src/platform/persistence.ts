@@ -59,6 +59,20 @@ export const AcceptedStorageIdentitySchema = Schema.Struct({
   storageInstanceId: Schema.String,
 });
 
+export type AcceptedStorageIdentityMutation =
+  | {
+      readonly _tag: "Keep";
+    }
+  | {
+      readonly _tag: "Set";
+      readonly storageInstanceId: string;
+    };
+
+export interface AcceptedStorageIdentityTransition<A> {
+  readonly result: A;
+  readonly mutation: AcceptedStorageIdentityMutation;
+}
+
 export class AcceptedStorageIdentityStore extends Context.Service<
   AcceptedStorageIdentityStore,
   {
@@ -68,6 +82,10 @@ export class AcceptedStorageIdentityStore extends Context.Service<
     readonly accept: (
       identity: AcceptedStorageIdentity,
     ) => Effect.Effect<void, ConnectionPersistenceError>;
+    readonly transition: <A>(
+      targetKey: string,
+      decide: (acceptedStorageInstanceId: string | null) => AcceptedStorageIdentityTransition<A>,
+    ) => Effect.Effect<A, ConnectionPersistenceError>;
   }
 >()("@bibcode/client-runtime/platform/persistence/AcceptedStorageIdentityStore") {}
 
