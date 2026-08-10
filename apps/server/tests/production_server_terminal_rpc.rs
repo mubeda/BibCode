@@ -320,7 +320,7 @@ async fn workspace_unavailable_quiesce_retains_transcript_for_read_only_attach()
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn workspace_loss_waits_for_inflight_terminal_publication_then_quiesces_the_pty() {
+async fn workspace_loss_fences_inflight_terminal_spawn_before_publication() {
     let _test_guard = terminal_rpc_test_lock().lock().await;
     let temp = TempDir::new().expect("temporary directory");
     let (started_tx, started_rx) = std::sync::mpsc::channel();
@@ -374,27 +374,29 @@ async fn workspace_loss_waits_for_inflight_terminal_publication_then_quiesces_th
         availability: AdoptedWorktreeAvailability::MissingRegistered,
     };
     assert!(availability.mark_unavailable(loss.clone()).await);
-    let drain_registry = availability.clone();
+    let cleanup_services = quiescer.clone();
     let cleanup = tokio::spawn(async move {
-        drain_registry.wait_for_transition_admissions(&loss).await;
-        quiescer
+        cleanup_services
             .quiesce_thread_terminals_for_workspace_loss("panel-racing")
             .await
-            .expect("published panel terminal quiesces");
+            .expect("visible panel terminals quiesce promptly");
     });
-    tokio::task::yield_now().await;
-    assert!(
-        !cleanup.is_finished(),
-        "loss waits for terminal publication"
-    );
+    cleanup
+        .await
+        .expect("loss cleanup finishes without admission drain");
     assert!(!process.killed.load(Ordering::Acquire));
 
     release_tx.send(()).expect("release terminal spawn");
-    assert_success(next_message(client).await);
-    cleanup.await.expect("loss cleanup finishes");
+    let error = failure_value(next_message(client).await);
+    assert_eq!(error["_tag"], "WorkspaceUnavailableError");
     assert!(
         process.killed.load(Ordering::Acquire),
-        "no PTY may remain after authoritative loss cleanup",
+        "the uncommitted PTY must be killed when spawn returns after loss",
+    );
+    assert!(
+        !quiescer
+            .terminal_exists("panel-racing", "terminal-racing")
+            .await
     );
 
     let error = failure_value(

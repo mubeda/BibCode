@@ -178,8 +178,15 @@ through durable command admission or external-process publication. Guard
 installation and lease admission are serialized, so loss either observes and
 quiesces work published by an earlier lease or rejects a later lease. Lease
 drop, including cancellation and error unwinding, releases every thread/path
-scope. Nested removal guards retain independent tokens; arbitrary drop order
-cannot reveal a pending missing workspace before the last removal completes.
+scope. Every lease also carries the exact loss error and a cancellation token.
+The turn RPC transfers its lease into the queued engine envelope, so client
+disconnect only stops the caller wait: an already-admitted command retains its
+existing durable-delivery semantics. Authoritative loss cancels that envelope
+before persistence and the worker drops the lease only after it has produced
+the dispatch result. Nested removal guards retain independent tokens;
+arbitrary drop order cannot reveal a pending missing workspace before the last
+removal completes, and removal cancels already-admitted matching work just like
+authoritative loss.
 
 The guard rejects a new turn before durable admission; terminal open, restart,
 write, and restart-on-attach; client Git status and mutations; and project
@@ -194,8 +201,12 @@ failure.
 Provider delivery and restart reconciliation repeat the persisted thread/path
 admission immediately before provider routing. This closes the gap between a
 durable turn commit and asynchronous delivery. Git process boundaries likewise
-hold a path lease through command execution or long-lived subscription
-publication.
+hold a path lease through command execution or the lifetime of a long-lived
+subscription. Loss cancels the operation child token and stream publication
+returns the same structured unavailable error. Terminal process publication
+checks its lease cancellation after spawn and again under the manager
+publication lock; a PTY that finishes spawning after loss is killed by its
+uncommitted-process owner and is never inserted as a live session.
 
 For each admitted loss transition, `WorktreeRuntime` resolves every live
 ordinary or panel thread in the same persisted project whose normalized path
@@ -208,17 +219,29 @@ snapshot with its bounded transcript; it does not use destructive terminal
 close. Conversation and thread rows are likewise retained. A warning-write
 failure is logged but cannot prevent process cleanup.
 
-The graceful cleanup bound is five seconds. Incomplete, failed, or panicked
-cleanup is marked as `orphanCleanupPending` and handed to the runtime-owned
-reaper. Its queue and active set are bounded to 64 jobs. One runtime-owned
-semaphore admits at most 16 cleanup attempts globally across overlapping
-catalog observers and reaper retries. A failed attempt retains its counted
-orphan ownership and is retried; only confirmed provider-and-terminal success
-clears that attempt's ownership. Saturation is logged without clearing the
-workspace guard or orphan marker, and dropping a saturated boxed future
-cancels it rather than detaching work. `ProductionRuntime` shuts down the
-catalog observer first, then cancels and drains the reaper's queued and active
-futures before stopping provider and terminal owners.
+The single graceful cleanup deadline starts when loss quiescence begins and is
+five seconds. Warning persistence and known canonical provider/terminal
+cleanup start immediately, in parallel with persisted alias resolution. Any
+resolved non-canonical aliases are cleaned under that same original deadline;
+a stuck resolver therefore cannot delay cleanup of the known owner. Active
+admissions are canceled rather than awaited without a bound.
+
+Incomplete, failed, or panicked cleanup is marked as
+`orphanCleanupPending` and handed to the runtime-owned reaper. Its queue and
+active set are bounded to 64 jobs. One runtime-owned semaphore admits at most
+16 cleanup attempts globally across overlapping catalog observers and reaper
+work. Each reaper job owns exactly one independently five-second-bounded
+attempt, including fresh alias resolution, and always releases its permit on
+success, error, timeout, recovery, or shutdown. Failure retains the marker for
+later explicit reconciliation; it does not loop and monopolize a permit. The
+ownership is keyed to the exact transition. Exact recovery or a newer loss
+transition cancels stale queued/active ownership before it can stop recovered
+or newer sessions, including ownership retained after queue saturation. Only
+confirmed provider-and-terminal success while ownership is still current
+clears the marker. Saturation is logged without clearing the workspace guard
+or orphan marker. `ProductionRuntime` shuts down the catalog observer first,
+then cancels and drains the reaper's queued and active futures before stopping
+provider and terminal owners.
 
 ## Provider turn flow
 

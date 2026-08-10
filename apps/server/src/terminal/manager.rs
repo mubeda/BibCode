@@ -145,6 +145,8 @@ impl Default for TerminalManagerOptions {
 pub enum TerminalError {
     #[error("terminal manager is shut down")]
     Shutdown,
+    #[error("terminal publication was cancelled")]
+    PublicationCancelled,
     #[error("terminal cwd does not exist: {0}")]
     CwdNotFound(String),
     #[error("terminal cwd is not a directory: {0}")]
@@ -1106,21 +1108,32 @@ impl TerminalManager {
         &self,
         input: TerminalOpenInput,
     ) -> Result<TerminalSessionSnapshot, TerminalError> {
-        self.open_inner(input, None).await
+        self.open_inner(input, None, CancellationToken::new()).await
     }
 
-    pub(crate) async fn open_with_initial_input(
+    pub(crate) async fn open_with_publication_cancellation(
+        &self,
+        input: TerminalOpenInput,
+        publication_cancellation: CancellationToken,
+    ) -> Result<TerminalSessionSnapshot, TerminalError> {
+        self.open_inner(input, None, publication_cancellation).await
+    }
+
+    pub(crate) async fn open_with_initial_input_and_publication_cancellation(
         &self,
         input: TerminalOpenInput,
         initial_input: String,
+        publication_cancellation: CancellationToken,
     ) -> Result<TerminalSessionSnapshot, TerminalError> {
-        self.open_inner(input, Some(initial_input)).await
+        self.open_inner(input, Some(initial_input), publication_cancellation)
+            .await
     }
 
     async fn open_inner(
         &self,
         input: TerminalOpenInput,
         initial_input: Option<String>,
+        publication_cancellation: CancellationToken,
     ) -> Result<TerminalSessionSnapshot, TerminalError> {
         let key = (input.thread_id.clone(), input.terminal_id.clone());
         let generation = {
@@ -1130,12 +1143,28 @@ impl TerminalManager {
             }
             self.inner.generations.current(&key)
         };
-        self.start(input, false, generation, initial_input).await
+        self.start(
+            input,
+            false,
+            generation,
+            initial_input,
+            publication_cancellation,
+        )
+        .await
     }
 
     pub async fn restart(
         &self,
         input: TerminalRestartInput,
+    ) -> Result<TerminalSessionSnapshot, TerminalError> {
+        self.restart_with_publication_cancellation(input, CancellationToken::new())
+            .await
+    }
+
+    pub(crate) async fn restart_with_publication_cancellation(
+        &self,
+        input: TerminalRestartInput,
+        publication_cancellation: CancellationToken,
     ) -> Result<TerminalSessionSnapshot, TerminalError> {
         let key = (input.thread_id.clone(), input.terminal_id.clone());
         if let Some(generation) = self.inner.generations.peek(&key) {
@@ -1190,7 +1219,10 @@ impl TerminalManager {
             )
             .await;
         log_terminal_cleanup("restart", &closed.report);
-        match self.start_inner(input, true, generation, None).await {
+        match self
+            .start_inner(input, true, generation, None, publication_cancellation)
+            .await
+        {
             Ok(snapshot) => Ok(snapshot),
             Err(error) => {
                 self.publish_closed_sessions(&closed.notifications);
@@ -1205,14 +1237,21 @@ impl TerminalManager {
         restarted: bool,
         generation: Arc<SessionGeneration>,
         initial_input: Option<String>,
+        publication_cancellation: CancellationToken,
     ) -> Result<TerminalSessionSnapshot, TerminalError> {
         let key = (input.thread_id.clone(), input.terminal_id.clone());
         let operation = self.inner.operations.for_key(&key);
         let _operation = operation.lock_owned().await;
         let startup = generation.startup.clone();
         let _startup = startup.lock().await;
-        self.start_inner(input, restarted, generation, initial_input)
-            .await
+        self.start_inner(
+            input,
+            restarted,
+            generation,
+            initial_input,
+            publication_cancellation,
+        )
+        .await
     }
 
     async fn start_inner(
@@ -1221,6 +1260,7 @@ impl TerminalManager {
         restarted: bool,
         generation: Arc<SessionGeneration>,
         initial_input: Option<String>,
+        publication_cancellation: CancellationToken,
     ) -> Result<TerminalSessionSnapshot, TerminalError> {
         if generation.is_invalidated() {
             return Err(invalidated_creation_error(&input));
@@ -1437,6 +1477,12 @@ impl TerminalManager {
             });
         };
         let mut uncommitted_process = UncommittedPtyProcess::new(process);
+        if publication_cancellation.is_cancelled() {
+            generation
+                .cancel_observer(TerminalObserverCancellationReason::GenerationInvalidated)
+                .await;
+            return Err(TerminalError::PublicationCancelled);
+        }
         if generation.is_invalidated() {
             generation
                 .cancel_observer(TerminalObserverCancellationReason::GenerationInvalidated)
@@ -1553,6 +1599,12 @@ impl TerminalManager {
         }));
         let _lifecycle = self.inner.lifecycle.lock().await;
         let _publication = generation.publication.lock().await;
+        if publication_cancellation.is_cancelled() {
+            generation
+                .cancel_observer(TerminalObserverCancellationReason::GenerationInvalidated)
+                .await;
+            return Err(TerminalError::PublicationCancelled);
+        }
         if self.inner.cancellation.is_cancelled() {
             generation
                 .cancel_observer(TerminalObserverCancellationReason::Shutdown)
@@ -1918,6 +1970,15 @@ impl TerminalManager {
         &self,
         input: TerminalAttachInput,
     ) -> Result<TerminalAttachment, TerminalError> {
+        self.attach_with_publication_cancellation(input, CancellationToken::new())
+            .await
+    }
+
+    pub(crate) async fn attach_with_publication_cancellation(
+        &self,
+        input: TerminalAttachInput,
+        publication_cancellation: CancellationToken,
+    ) -> Result<TerminalAttachment, TerminalError> {
         let events = self.inner.events.subscribe();
         let key = (input.thread_id.clone(), input.terminal_id.clone());
         let request_generation = {
@@ -1952,6 +2013,7 @@ impl TerminalManager {
                     false,
                     request_generation.clone(),
                     None,
+                    publication_cancellation,
                 )
                 .await?;
                 self.inner
@@ -3028,7 +3090,7 @@ mod tests {
         let manager = TerminalManager::new(backend.clone(), TerminalManagerOptions::default());
 
         manager
-            .open_with_initial_input(
+            .open_with_initial_input_and_publication_cancellation(
                 TerminalOpenInput::new(
                     "thread",
                     "setup-install",
@@ -3037,6 +3099,7 @@ mod tests {
                     30,
                 ),
                 "vp install\r".to_owned(),
+                CancellationToken::new(),
             )
             .await
             .expect("terminal opens only after setup input is submitted");
@@ -3044,6 +3107,55 @@ mod tests {
         assert_eq!(backend.latest().writes(), ["vp install\r"]);
         assert_eq!(manager.subscribe_metadata().await.initial.len(), 1);
         manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn setup_publication_cancellation_kills_the_uncommitted_process() {
+        let root = tempfile::tempdir().expect("terminal root");
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(backend.clone(), TerminalManagerOptions::default());
+        let generation = manager
+            .inner
+            .generations
+            .current(&("thread".to_owned(), "setup-cancelled".to_owned()));
+        let publication = generation.publication.lock().await;
+        let cancellation = CancellationToken::new();
+        let open_manager = manager.clone();
+        let open_cancellation = cancellation.clone();
+        let cwd = root.path().to_path_buf();
+        let open = tokio::spawn(async move {
+            open_manager
+                .open_with_initial_input_and_publication_cancellation(
+                    TerminalOpenInput::new("thread", "setup-cancelled", cwd, 120, 30),
+                    "vp install\r".to_owned(),
+                    open_cancellation,
+                )
+                .await
+        });
+        while backend.processes.lock().expect("processes").is_empty() {
+            tokio::task::yield_now().await;
+        }
+
+        cancellation.cancel();
+        drop(publication);
+        assert!(matches!(
+            open.await.expect("open task"),
+            Err(TerminalError::PublicationCancelled)
+        ));
+        let process = backend
+            .processes
+            .lock()
+            .expect("processes")
+            .first()
+            .cloned()
+            .expect("spawned process");
+        assert!(process.is_killed());
+        assert!(
+            manager
+                .require_session("thread", "setup-cancelled")
+                .await
+                .is_err()
+        );
     }
 
     #[derive(Debug)]
