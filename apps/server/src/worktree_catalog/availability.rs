@@ -5,7 +5,7 @@ use std::{
 };
 
 use serde::Serialize;
-use tokio::sync::Notify;
+use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -72,6 +72,7 @@ impl WorkspaceLossTransition {
 #[derive(Clone, Default)]
 pub struct WorkspaceAvailabilityRegistry {
     inner: Arc<Mutex<RegistryState>>,
+    transition_lock: Arc<AsyncMutex<()>>,
     admission_changed: Arc<Notify>,
     #[cfg(test)]
     finalization_rejection_pause: Arc<Mutex<Option<FinalizationRejectionPause>>>,
@@ -90,6 +91,7 @@ struct RegistryState {
     active_admissions: HashMap<u64, ActiveAdmission>,
     next_admission_id: u64,
     next_removal_id: u64,
+    reconciliation_active: bool,
 }
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
@@ -201,7 +203,8 @@ struct WorkspaceFinalizationPermit {
 
 #[derive(Clone, Default)]
 struct WorkspaceTerminalSignalGate {
-    inner: Arc<(Mutex<WorkspaceTerminalSignalState>, Condvar)>,
+    inner: Arc<Mutex<WorkspaceTerminalSignalState>>,
+    drained: Arc<Notify>,
     #[cfg(test)]
     invalidation_started: Arc<Notify>,
 }
@@ -210,10 +213,47 @@ struct WorkspaceTerminalSignalGate {
 struct WorkspaceTerminalSignalState {
     active_permits: usize,
     invalidated: bool,
+    reopen_when_drained: bool,
 }
 
 pub(crate) struct WorkspaceTerminalSignalPermit {
     gate: WorkspaceTerminalSignalGate,
+}
+
+#[derive(Clone)]
+struct WorkspaceTerminalSignalDrain {
+    gate: WorkspaceTerminalSignalGate,
+}
+
+enum WorkspaceAvailabilityAction {
+    MarkUnavailable {
+        transition: WorkspaceLossTransition,
+        skip_if_guarded: bool,
+    },
+    ClearRecovered {
+        thread_id: String,
+        path_key: String,
+        repository_key: Option<String>,
+    },
+    MarkRemoving {
+        thread_id: String,
+        path_key: String,
+        removal_id: u64,
+    },
+}
+
+struct ClosedTerminalSignalGate {
+    thread_id: String,
+    gate: WorkspaceTerminalSignalGate,
+}
+
+pub(crate) struct WorkspaceAvailabilityReconciliation {
+    registry: WorkspaceAvailabilityRegistry,
+    _transition_guard: Option<OwnedMutexGuard<()>>,
+    actions: Vec<WorkspaceAvailabilityAction>,
+    closed_gates: Vec<ClosedTerminalSignalGate>,
+    drains: Vec<WorkspaceTerminalSignalDrain>,
+    active: bool,
 }
 
 #[cfg(test)]
@@ -376,172 +416,36 @@ impl WorkspaceAvailabilityRegistry {
     }
 
     pub async fn mark_unavailable(&self, transition: WorkspaceLossTransition) -> bool {
-        self.mark_unavailable_sync(transition)
-    }
-
-    pub(crate) fn mark_unavailable_sync(&self, transition: WorkspaceLossTransition) -> bool {
-        let Some(guard_state) = transition.guard_state() else {
-            return false;
-        };
-        let path_key = normalized_path(&transition.path);
-        let path = path_key.clone();
-        let mut state = lock(&self.inner);
-        let watermark = state
-            .latest_loss
-            .entry(transition.thread_id.clone())
-            .or_insert_with(|| LossWatermark::new(transition.generation));
-        if !watermark.admit(transition.generation, guard_state) {
-            return false;
-        }
-        if let Some(entry) = state.entries.get(&transition.thread_id)
-            && entry.state != WorkspaceGuardState::Removing
-        {
-            entry.terminal_signal.invalidate_and_wait();
-        }
-        invalidate_thread_cleanups(&mut state, &transition.thread_id);
-
-        if let Some(entry) = state.entries.get_mut(&transition.thread_id)
-            && entry.state == WorkspaceGuardState::Removing
-        {
-            if (entry.repository_key.is_empty()
-                || entry.repository_key == transition.repository_key)
-                && entry.path_key == path_key
-            {
-                entry.repository_key = transition.repository_key.clone();
-                entry.pending_missing = Some(PendingMissing {
-                    repository_key: transition.repository_key,
-                    path_key,
-                    path,
-                    state: guard_state,
-                });
-            }
-            return false;
-        }
-
-        state.entries.insert(
-            transition.thread_id.clone(),
-            GuardEntry {
-                thread_id: transition.thread_id.clone(),
-                repository_key: transition.repository_key.clone(),
-                path_key: path_key.clone(),
-                path: path.clone(),
-                state: guard_state,
-                terminal_signal: WorkspaceTerminalSignalGate::default(),
-                pending_missing: None,
-                removal_ids: HashSet::new(),
-            },
-        );
-        let unavailable = state
-            .entries
-            .get(&transition.thread_id)
-            .map(unavailable)
-            .expect("inserted workspace guard");
-        let thread_scope = AdmissionScope::Thread(transition.thread_id);
-        let matching_admissions = state
-            .active_admissions
-            .values()
-            .filter(|admission| {
-                admission.scopes.iter().any(|scope| {
-                    scope == &thread_scope
-                        || matches!(scope, AdmissionScope::Path(candidate) if path_is_within(candidate, &path_key))
-                })
-            })
-            .map(|admission| {
-                (
-                    admission.finalization.clone(),
-                    admission.loss_cancellation.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        for (finalization, _) in &matching_admissions {
-            finalization.reject(unavailable.clone());
-        }
-        drop(state);
-        #[cfg(test)]
-        self.maybe_pause_after_finalization_rejection();
-        for (_, loss_cancellation) in matching_admissions {
-            loss_cancellation.cancel();
-        }
-        true
+        let expected = transition.clone();
+        let reconciliation = self
+            .prepare_reconciliation(vec![WorkspaceAvailabilityAction::MarkUnavailable {
+                transition,
+                skip_if_guarded: false,
+            }])
+            .await;
+        reconciliation.wait_for_drains().await;
+        reconciliation
+            .finalize()
+            .iter()
+            .any(|transition| transition == &expected)
     }
 
     pub async fn mark_removing(&self, thread_id: &str, path: &Path) -> RemovalGuard {
         let path_key = normalized_path(path);
-        let mut state = lock(&self.inner);
-        state.next_removal_id = state.next_removal_id.wrapping_add(1).max(1);
-        let removal_id = state.next_removal_id;
-        if let Some(entry) = state.entries.get_mut(thread_id)
-            && entry.state == WorkspaceGuardState::Removing
-        {
-            entry.removal_ids.insert(removal_id);
-            drop(state);
-            return RemovalGuard {
-                registry: self.clone(),
+        let removal_id = {
+            let mut state = lock(&self.inner);
+            state.next_removal_id = state.next_removal_id.wrapping_add(1).max(1);
+            state.next_removal_id
+        };
+        let reconciliation = self
+            .prepare_reconciliation(vec![WorkspaceAvailabilityAction::MarkRemoving {
                 thread_id: thread_id.to_owned(),
+                path_key,
                 removal_id,
-                released: false,
-            };
-        }
-        if let Some(entry) = state.entries.get(thread_id) {
-            entry.terminal_signal.invalidate_and_wait();
-        }
-        let previous = state.entries.remove(thread_id);
-        let pending_missing = previous.as_ref().and_then(|entry| {
-            (entry.state != WorkspaceGuardState::Removing).then(|| PendingMissing {
-                repository_key: entry.repository_key.clone(),
-                path_key: entry.path_key.clone(),
-                path: entry.path.clone(),
-                state: entry.state,
-            })
-        });
-        let repository_key = previous
-            .as_ref()
-            .map(|entry| entry.repository_key.clone())
-            .unwrap_or_default();
-        state.entries.insert(
-            thread_id.to_owned(),
-            GuardEntry {
-                thread_id: thread_id.to_owned(),
-                repository_key,
-                path: path_key.clone(),
-                path_key: path_key.clone(),
-                state: WorkspaceGuardState::Removing,
-                terminal_signal: WorkspaceTerminalSignalGate::default(),
-                pending_missing,
-                removal_ids: HashSet::from([removal_id]),
-            },
-        );
-        let unavailable = state
-            .entries
-            .get(thread_id)
-            .map(unavailable)
-            .expect("inserted removing guard");
-        let thread_scope = AdmissionScope::Thread(thread_id.to_owned());
-        let matching_admissions = state
-            .active_admissions
-            .values()
-            .filter(|admission| {
-                admission.scopes.iter().any(|scope| {
-                    scope == &thread_scope
-                        || matches!(scope, AdmissionScope::Path(candidate) if path_is_within(candidate, &path_key))
-                })
-            })
-            .map(|admission| {
-                (
-                    admission.finalization.clone(),
-                    admission.loss_cancellation.clone(),
-                )
-            })
-            .collect::<Vec<_>>();
-        for (finalization, _) in &matching_admissions {
-            finalization.reject(unavailable.clone());
-        }
-        drop(state);
-        #[cfg(test)]
-        self.maybe_pause_after_finalization_rejection();
-        for (_, loss_cancellation) in matching_admissions {
-            loss_cancellation.cancel();
-        }
+            }])
+            .await;
+        reconciliation.wait_for_drains().await;
+        reconciliation.finalize();
         RemovalGuard {
             registry: self.clone(),
             thread_id: thread_id.to_owned(),
@@ -551,7 +455,7 @@ impl WorkspaceAvailabilityRegistry {
     }
 
     pub async fn clear_recovered(&self, thread_id: &str, path: &Path) {
-        self.clear_matching(thread_id, path, None);
+        self.clear_matching(thread_id, path, None).await;
     }
 
     pub async fn clear_recovered_in_repository(
@@ -560,70 +464,43 @@ impl WorkspaceAvailabilityRegistry {
         path: &Path,
         repository_key: &str,
     ) {
-        self.clear_matching(thread_id, path, Some(repository_key));
+        self.clear_matching(thread_id, path, Some(repository_key))
+            .await;
     }
 
-    fn clear_matching(&self, thread_id: &str, path: &Path, repository_key: Option<&str>) {
-        let path_key = normalized_path(path);
-        let mut state = lock(&self.inner);
-        let Some(entry) = state.entries.get_mut(thread_id) else {
-            return;
-        };
-        if entry.path_key != path_key
-            || repository_key.is_some_and(|repository_key| entry.repository_key != repository_key)
-        {
-            return;
-        }
-        if entry.state == WorkspaceGuardState::Removing {
-            entry.pending_missing = None;
-        } else {
-            entry.terminal_signal.invalidate_and_wait();
-            state.entries.remove(thread_id);
-        }
-        invalidate_thread_cleanups(&mut state, thread_id);
+    async fn clear_matching(&self, thread_id: &str, path: &Path, repository_key: Option<&str>) {
+        let reconciliation = self
+            .prepare_reconciliation(vec![WorkspaceAvailabilityAction::ClearRecovered {
+                thread_id: thread_id.to_owned(),
+                path_key: normalized_path(path),
+                repository_key: repository_key.map(str::to_owned),
+            }])
+            .await;
+        reconciliation.wait_for_drains().await;
+        reconciliation.finalize();
     }
 
     pub async fn reconcile_snapshot(
         &self,
         snapshot: &WorktreeCatalogSnapshot,
     ) -> Vec<WorkspaceLossTransition> {
-        self.reconcile_snapshot_sync(snapshot)
+        let reconciliation = self.prepare_snapshot_reconciliation(snapshot).await;
+        reconciliation.wait_for_drains().await;
+        reconciliation.finalize()
     }
 
-    pub(crate) fn reconcile_snapshot_sync(
+    pub(crate) async fn prepare_snapshot_reconciliation(
         &self,
         snapshot: &WorktreeCatalogSnapshot,
-    ) -> Vec<WorkspaceLossTransition> {
+    ) -> WorkspaceAvailabilityReconciliation {
         if !snapshot.authoritative {
-            return Vec::new();
+            return self.prepare_reconciliation(Vec::new()).await;
         }
-        let mut admitted = Vec::new();
+        let mut actions = Vec::new();
         for workspace in &snapshot.adopted_workspaces {
             match workspace.availability {
                 AdoptedWorktreeAvailability::MissingRegistered
                 | AdoptedWorktreeAvailability::MissingUnregistered => {
-                    let guard_state = match workspace.availability {
-                        AdoptedWorktreeAvailability::MissingRegistered => {
-                            WorkspaceGuardState::MissingRegistered
-                        }
-                        AdoptedWorktreeAvailability::MissingUnregistered => {
-                            WorkspaceGuardState::MissingUnregistered
-                        }
-                        _ => unreachable!(),
-                    };
-                    let path_key = normalized_path(Path::new(&workspace.path));
-                    let already_guarded = lock(&self.inner)
-                        .entries
-                        .get(&workspace.thread_id)
-                        .is_some_and(|entry| {
-                            entry.repository_key == snapshot.repository_key
-                                && entry.path_key == path_key
-                                && (entry.state == guard_state
-                                    || entry.state == WorkspaceGuardState::Removing)
-                        });
-                    if already_guarded {
-                        continue;
-                    }
                     let transition = WorkspaceLossTransition {
                         thread_id: workspace.thread_id.clone(),
                         repository_key: snapshot.repository_key.clone(),
@@ -631,20 +508,129 @@ impl WorkspaceAvailabilityRegistry {
                         path: PathBuf::from(&workspace.path),
                         availability: workspace.availability,
                     };
-                    if self.mark_unavailable_sync(transition.clone()) {
-                        admitted.push(transition);
-                    }
+                    actions.push(WorkspaceAvailabilityAction::MarkUnavailable {
+                        transition,
+                        skip_if_guarded: true,
+                    });
                 }
-                AdoptedWorktreeAvailability::Present => self.clear_matching(
-                    &workspace.thread_id,
-                    Path::new(&workspace.path),
-                    Some(&snapshot.repository_key),
-                ),
+                AdoptedWorktreeAvailability::Present => {
+                    actions.push(WorkspaceAvailabilityAction::ClearRecovered {
+                        thread_id: workspace.thread_id.clone(),
+                        path_key: normalized_path(Path::new(&workspace.path)),
+                        repository_key: Some(snapshot.repository_key.clone()),
+                    });
+                }
                 AdoptedWorktreeAvailability::VerificationUnavailable
                 | AdoptedWorktreeAvailability::Removing => {}
             }
         }
-        admitted
+        self.prepare_reconciliation(actions).await
+    }
+
+    async fn prepare_reconciliation(
+        &self,
+        requested: Vec<WorkspaceAvailabilityAction>,
+    ) -> WorkspaceAvailabilityReconciliation {
+        let transition_guard = self.transition_lock.clone().lock_owned().await;
+        let mut state = lock(&self.inner);
+        debug_assert!(!state.reconciliation_active);
+        state.reconciliation_active = true;
+        let mut actions = Vec::with_capacity(requested.len());
+        let mut closed_gates = Vec::new();
+        let mut drains = Vec::new();
+
+        for action in requested {
+            match &action {
+                WorkspaceAvailabilityAction::MarkUnavailable {
+                    transition,
+                    skip_if_guarded,
+                } => {
+                    let Some(guard_state) = transition.guard_state() else {
+                        continue;
+                    };
+                    let path_key = normalized_path(&transition.path);
+                    if *skip_if_guarded
+                        && state
+                            .entries
+                            .get(&transition.thread_id)
+                            .is_some_and(|entry| {
+                                entry.repository_key == transition.repository_key
+                                    && entry.path_key == path_key
+                                    && (entry.state == guard_state
+                                        || entry.state == WorkspaceGuardState::Removing)
+                            })
+                    {
+                        continue;
+                    }
+                    let mut watermark = state
+                        .latest_loss
+                        .get(&transition.thread_id)
+                        .copied()
+                        .unwrap_or_else(|| LossWatermark::new(transition.generation));
+                    if !watermark.admit(transition.generation, guard_state) {
+                        continue;
+                    }
+                    if let Some(entry) = state.entries.get(&transition.thread_id)
+                        && entry.state != WorkspaceGuardState::Removing
+                    {
+                        close_terminal_signal_gate(
+                            &transition.thread_id,
+                            &entry.terminal_signal,
+                            &mut closed_gates,
+                            &mut drains,
+                        );
+                    }
+                    actions.push(action);
+                }
+                WorkspaceAvailabilityAction::ClearRecovered {
+                    thread_id,
+                    path_key,
+                    repository_key,
+                } => {
+                    let Some(entry) = state.entries.get(thread_id) else {
+                        continue;
+                    };
+                    if entry.path_key != *path_key
+                        || repository_key
+                            .as_deref()
+                            .is_some_and(|repository_key| entry.repository_key != repository_key)
+                    {
+                        continue;
+                    }
+                    if entry.state != WorkspaceGuardState::Removing {
+                        close_terminal_signal_gate(
+                            thread_id,
+                            &entry.terminal_signal,
+                            &mut closed_gates,
+                            &mut drains,
+                        );
+                    }
+                    actions.push(action);
+                }
+                WorkspaceAvailabilityAction::MarkRemoving { thread_id, .. } => {
+                    if let Some(entry) = state.entries.get(thread_id)
+                        && entry.state != WorkspaceGuardState::Removing
+                    {
+                        close_terminal_signal_gate(
+                            thread_id,
+                            &entry.terminal_signal,
+                            &mut closed_gates,
+                            &mut drains,
+                        );
+                    }
+                    actions.push(action);
+                }
+            }
+        }
+        drop(state);
+        WorkspaceAvailabilityReconciliation {
+            registry: self.clone(),
+            _transition_guard: Some(transition_guard),
+            actions,
+            closed_gates,
+            drains,
+            active: true,
+        }
     }
 
     pub fn begin_orphan_cleanup(
@@ -845,17 +831,8 @@ impl WorkspaceAvailabilityRegistry {
         {
             return;
         }
-        let Some(mut entry) = state.entries.remove(thread_id) else {
-            return;
-        };
-        if let Some(pending) = entry.pending_missing.take() {
-            entry.repository_key = pending.repository_key;
-            entry.path_key = pending.path_key;
-            entry.path = pending.path;
-            entry.state = pending.state;
-            entry.terminal_signal = WorkspaceTerminalSignalGate::default();
-            entry.removal_ids.clear();
-            state.entries.insert(thread_id.to_owned(), entry);
+        if !state.reconciliation_active {
+            complete_released_removal(&mut state, thread_id);
         }
     }
 
@@ -1014,8 +991,7 @@ impl WorkspaceFinalizationGate {
 
 impl WorkspaceTerminalSignalGate {
     fn begin(&self) -> Option<WorkspaceTerminalSignalPermit> {
-        let (state, _) = self.inner.as_ref();
-        let mut state = lock(state);
+        let mut state = lock(&self.inner);
         if state.invalidated {
             return None;
         }
@@ -1026,31 +1002,238 @@ impl WorkspaceTerminalSignalGate {
         Some(WorkspaceTerminalSignalPermit { gate: self.clone() })
     }
 
-    fn invalidate_and_wait(&self) {
-        let (state, changed) = self.inner.as_ref();
-        let mut state = lock(state);
+    fn invalidate(&self) -> WorkspaceTerminalSignalDrain {
+        let mut state = lock(&self.inner);
         state.invalidated = true;
+        state.reopen_when_drained = false;
         #[cfg(test)]
         self.invalidation_started.notify_one();
-        while state.active_permits > 0 {
-            state = changed
-                .wait(state)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        WorkspaceTerminalSignalDrain { gate: self.clone() }
+    }
+
+    fn is_same(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    fn cancel_invalidation(&self) {
+        let mut state = lock(&self.inner);
+        if state.active_permits == 0 {
+            state.invalidated = false;
+        } else {
+            state.reopen_when_drained = true;
         }
     }
 
     fn finish_signal(&self) {
-        let (state, changed) = self.inner.as_ref();
-        let mut state = lock(state);
+        let mut state = lock(&self.inner);
         state.active_permits = state
             .active_permits
             .checked_sub(1)
             .expect("workspace terminal signal permit underflow");
         let signal_drained = state.active_permits == 0;
+        if signal_drained && state.reopen_when_drained {
+            state.invalidated = false;
+            state.reopen_when_drained = false;
+        }
         drop(state);
         if signal_drained {
-            changed.notify_all();
+            self.drained.notify_waiters();
         }
+    }
+}
+
+impl WorkspaceTerminalSignalDrain {
+    async fn wait(&self) {
+        loop {
+            let notified = self.gate.drained.clone().notified_owned();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if lock(&self.gate.inner).active_permits == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+impl WorkspaceAvailabilityReconciliation {
+    pub(crate) async fn wait_for_drains(&self) {
+        for drain in &self.drains {
+            drain.wait().await;
+        }
+    }
+
+    pub(crate) fn finalize(mut self) -> Vec<WorkspaceLossTransition> {
+        let mut admitted = Vec::new();
+        let mut cancellations = Vec::new();
+        {
+            let mut state = lock(&self.registry.inner);
+            for action in self.actions.drain(..) {
+                match action {
+                    WorkspaceAvailabilityAction::MarkUnavailable { transition, .. } => {
+                        let Some(guard_state) = transition.guard_state() else {
+                            continue;
+                        };
+                        let watermark = state
+                            .latest_loss
+                            .entry(transition.thread_id.clone())
+                            .or_insert_with(|| LossWatermark::new(transition.generation));
+                        if !watermark.admit(transition.generation, guard_state) {
+                            continue;
+                        }
+                        let path_key = normalized_path(&transition.path);
+                        let path = path_key.clone();
+                        invalidate_thread_cleanups(&mut state, &transition.thread_id);
+                        if let Some(entry) = state.entries.get_mut(&transition.thread_id)
+                            && entry.state == WorkspaceGuardState::Removing
+                        {
+                            if (entry.repository_key.is_empty()
+                                || entry.repository_key == transition.repository_key)
+                                && entry.path_key == path_key
+                            {
+                                entry.repository_key = transition.repository_key.clone();
+                                entry.pending_missing = Some(PendingMissing {
+                                    repository_key: transition.repository_key,
+                                    path_key,
+                                    path,
+                                    state: guard_state,
+                                });
+                            }
+                            continue;
+                        }
+                        state.entries.insert(
+                            transition.thread_id.clone(),
+                            GuardEntry {
+                                thread_id: transition.thread_id.clone(),
+                                repository_key: transition.repository_key.clone(),
+                                path_key: path_key.clone(),
+                                path: path.clone(),
+                                state: guard_state,
+                                terminal_signal: WorkspaceTerminalSignalGate::default(),
+                                pending_missing: None,
+                                removal_ids: HashSet::new(),
+                            },
+                        );
+                        let unavailable = state
+                            .entries
+                            .get(&transition.thread_id)
+                            .map(unavailable)
+                            .expect("inserted workspace guard");
+                        cancellations.extend(reject_matching_admissions(
+                            &state,
+                            &transition.thread_id,
+                            &path_key,
+                            unavailable,
+                        ));
+                        admitted.push(transition);
+                    }
+                    WorkspaceAvailabilityAction::ClearRecovered {
+                        thread_id,
+                        path_key,
+                        repository_key,
+                    } => {
+                        let Some(entry) = state.entries.get_mut(&thread_id) else {
+                            continue;
+                        };
+                        if entry.path_key != path_key
+                            || repository_key.as_deref().is_some_and(|repository_key| {
+                                entry.repository_key != repository_key
+                            })
+                        {
+                            continue;
+                        }
+                        if entry.state == WorkspaceGuardState::Removing {
+                            entry.pending_missing = None;
+                        } else {
+                            state.entries.remove(&thread_id);
+                        }
+                        invalidate_thread_cleanups(&mut state, &thread_id);
+                    }
+                    WorkspaceAvailabilityAction::MarkRemoving {
+                        thread_id,
+                        path_key,
+                        removal_id,
+                    } => {
+                        if let Some(entry) = state.entries.get_mut(&thread_id)
+                            && entry.state == WorkspaceGuardState::Removing
+                        {
+                            entry.removal_ids.insert(removal_id);
+                            continue;
+                        }
+                        let previous = state.entries.remove(&thread_id);
+                        let pending_missing = previous.as_ref().and_then(|entry| {
+                            (entry.state != WorkspaceGuardState::Removing).then(|| PendingMissing {
+                                repository_key: entry.repository_key.clone(),
+                                path_key: entry.path_key.clone(),
+                                path: entry.path.clone(),
+                                state: entry.state,
+                            })
+                        });
+                        let repository_key = previous
+                            .as_ref()
+                            .map(|entry| entry.repository_key.clone())
+                            .unwrap_or_default();
+                        state.entries.insert(
+                            thread_id.clone(),
+                            GuardEntry {
+                                thread_id: thread_id.clone(),
+                                repository_key,
+                                path: path_key.clone(),
+                                path_key: path_key.clone(),
+                                state: WorkspaceGuardState::Removing,
+                                terminal_signal: WorkspaceTerminalSignalGate::default(),
+                                pending_missing,
+                                removal_ids: HashSet::from([removal_id]),
+                            },
+                        );
+                        let unavailable = state
+                            .entries
+                            .get(&thread_id)
+                            .map(unavailable)
+                            .expect("inserted removing guard");
+                        cancellations.extend(reject_matching_admissions(
+                            &state,
+                            &thread_id,
+                            &path_key,
+                            unavailable,
+                        ));
+                    }
+                }
+            }
+            finish_registry_reconciliation(&mut state);
+        }
+        self.active = false;
+        #[cfg(test)]
+        if !cancellations.is_empty() {
+            self.registry.maybe_pause_after_finalization_rejection();
+        }
+        for loss_cancellation in cancellations {
+            loss_cancellation.cancel();
+        }
+        self._transition_guard.take();
+        admitted
+    }
+
+    fn abort(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = lock(&self.registry.inner);
+        for closed in &self.closed_gates {
+            if let Some(entry) = state.entries.get(&closed.thread_id)
+                && entry.terminal_signal.is_same(&closed.gate)
+            {
+                closed.gate.cancel_invalidation();
+            }
+        }
+        finish_registry_reconciliation(&mut state);
+        self.active = false;
+    }
+}
+
+impl Drop for WorkspaceAvailabilityReconciliation {
+    fn drop(&mut self) {
+        self.abort();
     }
 }
 
@@ -1097,6 +1280,84 @@ impl Drop for RemovalGuard {
 impl Drop for WorkspaceAdmissionLease {
     fn drop(&mut self) {
         self.registry.release_admission(self.admission_id);
+    }
+}
+
+fn close_terminal_signal_gate(
+    thread_id: &str,
+    gate: &WorkspaceTerminalSignalGate,
+    closed_gates: &mut Vec<ClosedTerminalSignalGate>,
+    drains: &mut Vec<WorkspaceTerminalSignalDrain>,
+) {
+    if closed_gates.iter().any(|closed| closed.gate.is_same(gate)) {
+        return;
+    }
+    drains.push(gate.invalidate());
+    closed_gates.push(ClosedTerminalSignalGate {
+        thread_id: thread_id.to_owned(),
+        gate: gate.clone(),
+    });
+}
+
+fn reject_matching_admissions(
+    state: &RegistryState,
+    thread_id: &str,
+    path_key: &str,
+    unavailable: WorkspaceUnavailable,
+) -> Vec<WorkspaceAdmissionCancellation> {
+    let thread_scope = AdmissionScope::Thread(thread_id.to_owned());
+    let matching_admissions = state
+        .active_admissions
+        .values()
+        .filter(|admission| {
+            admission.scopes.iter().any(|scope| {
+                scope == &thread_scope
+                    || matches!(scope, AdmissionScope::Path(candidate) if path_is_within(candidate, path_key))
+            })
+        })
+        .map(|admission| {
+            (
+                admission.finalization.clone(),
+                admission.loss_cancellation.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    for (finalization, _) in &matching_admissions {
+        finalization.reject(unavailable.clone());
+    }
+    matching_admissions
+        .into_iter()
+        .map(|(_, cancellation)| cancellation)
+        .collect()
+}
+
+fn finish_registry_reconciliation(state: &mut RegistryState) {
+    state.reconciliation_active = false;
+    let released = state
+        .entries
+        .iter()
+        .filter(|(_, entry)| {
+            entry.state == WorkspaceGuardState::Removing && entry.removal_ids.is_empty()
+        })
+        .map(|(thread_id, _)| thread_id.clone())
+        .collect::<Vec<_>>();
+    for thread_id in released {
+        complete_released_removal(state, &thread_id);
+    }
+}
+
+fn complete_released_removal(state: &mut RegistryState, thread_id: &str) {
+    let Some(mut entry) = state.entries.remove(thread_id) else {
+        return;
+    };
+    if let Some(pending) = entry.pending_missing.take() {
+        entry.repository_key = pending.repository_key;
+        entry.path_key = pending.path_key;
+        entry.path = pending.path;
+        entry.state = pending.state;
+        entry.terminal_signal = WorkspaceTerminalSignalGate::default();
+        entry.removal_ids.clear();
+        state.entries.insert(thread_id.to_owned(), entry);
     }
 }
 
@@ -1155,7 +1416,12 @@ fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
+    use std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    };
+
+    use tokio::sync::Notify;
 
     use crate::worktree_catalog::{
         AdoptedWorktreeAvailability, AdoptedWorktreeStatus, CatalogScanStatus,
@@ -1501,8 +1767,8 @@ mod tests {
         assert!(!registry.orphan_cleanup_pending("thread-1"));
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn newer_loss_waits_for_all_current_terminal_signal_permits() {
+    #[tokio::test]
+    async fn newer_loss_drains_all_terminal_signal_permits_without_blocking_the_runtime() {
         let registry = WorkspaceAvailabilityRegistry::new();
         let older = transition(
             "repository-a",
@@ -1529,8 +1795,22 @@ mod tests {
         );
         let newer_registry = registry.clone();
         let newer_transition = newer.clone();
-        let newer_loss = tokio::task::spawn_blocking(move || {
-            newer_registry.mark_unavailable_sync(newer_transition)
+        let newer_loss =
+            tokio::spawn(async move { newer_registry.mark_unavailable(newer_transition).await });
+
+        let first_release = Arc::new(Notify::new());
+        let first_cleanup_release = first_release.clone();
+        let first_cleanup = tokio::spawn(async move {
+            first_cleanup_release.notified().await;
+            tokio::task::yield_now().await;
+            drop(first);
+        });
+        let second_release = Arc::new(Notify::new());
+        let second_cleanup_release = second_release.clone();
+        let second_cleanup = tokio::spawn(async move {
+            second_cleanup_release.notified().await;
+            tokio::task::yield_now().await;
+            drop(second);
         });
 
         tokio::time::timeout(
@@ -1539,12 +1819,14 @@ mod tests {
         )
         .await
         .expect("the newer transition invalidates the old signal gate");
-        drop(first);
+        first_release.notify_one();
+        first_cleanup.await.expect("first cleanup task");
         assert!(
             !newer_loss.is_finished(),
             "the newer transition waits for every current signal permit"
         );
-        drop(second);
+        second_release.notify_one();
+        second_cleanup.await.expect("second cleanup task");
         assert!(
             newer_loss.await.expect("newer loss task"),
             "the newer transition installs after terminal signaling finishes"
@@ -1555,6 +1837,161 @@ mod tests {
                 .begin_terminal_signal(&newer)
                 .await
                 .expect("new transition signal permit"),
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_drain_allows_cleanup_timeout_to_release_on_current_thread() {
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let loss = transition(
+            "repository-a",
+            18,
+            AdoptedWorktreeAvailability::MissingRegistered,
+        );
+        assert!(registry.mark_unavailable(loss.clone()).await);
+        let permit = registry
+            .begin_terminal_signal(&loss)
+            .await
+            .expect("terminal cleanup owns the missing transition");
+        let invalidation_started = registry
+            .terminal_signal_invalidation_notification(&loss)
+            .expect("current terminal signal gate");
+        let cleanup = tokio::spawn(async move {
+            let _permit = permit;
+            tokio::time::timeout(
+                std::time::Duration::from_millis(10),
+                std::future::pending::<()>(),
+            )
+            .await
+            .expect_err("cleanup reaches its deadline");
+            tokio::task::yield_now().await;
+        });
+        let recovery_registry = registry.clone();
+        let recovery = tokio::spawn(async move {
+            recovery_registry
+                .clear_recovered_in_repository(
+                    "thread-1",
+                    Path::new("/repo/worktrees/missing"),
+                    "repository-a",
+                )
+                .await;
+        });
+        invalidation_started.notified().await;
+
+        cleanup.await.expect("cleanup task");
+        tokio::time::timeout(std::time::Duration::from_secs(1), recovery)
+            .await
+            .expect("cleanup timeout can run while recovery drains")
+            .expect("recovery task");
+        assert_eq!(registry.guard_thread("thread-1").await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn cancelled_recovery_reopens_signaling_only_after_the_owned_permit_drains() {
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let loss = transition(
+            "repository-a",
+            19,
+            AdoptedWorktreeAvailability::MissingRegistered,
+        );
+        assert!(registry.mark_unavailable(loss.clone()).await);
+        let permit = registry
+            .begin_terminal_signal(&loss)
+            .await
+            .expect("terminal cleanup owns the missing transition");
+        let invalidation_started = registry
+            .terminal_signal_invalidation_notification(&loss)
+            .expect("current terminal signal gate");
+        let recovery_registry = registry.clone();
+        let recovery = tokio::spawn(async move {
+            recovery_registry
+                .clear_recovered_in_repository(
+                    "thread-1",
+                    Path::new("/repo/worktrees/missing"),
+                    "repository-a",
+                )
+                .await;
+        });
+        invalidation_started.notified().await;
+        recovery.abort();
+        assert!(
+            recovery
+                .await
+                .expect_err("recovery task was cancelled")
+                .is_cancelled()
+        );
+
+        assert!(
+            registry.begin_terminal_signal(&loss).await.is_none(),
+            "a cancelled transition stays closed until the old permit drains"
+        );
+        drop(permit);
+        let retry_permit = registry
+            .begin_terminal_signal(&loss)
+            .await
+            .expect("the retained missing transition reopens after drain");
+        drop(retry_permit);
+        registry
+            .clear_recovered_in_repository(
+                "thread-1",
+                Path::new("/repo/worktrees/missing"),
+                "repository-a",
+            )
+            .await;
+        assert_eq!(registry.guard_thread("thread-1").await, Ok(()));
+    }
+
+    #[tokio::test]
+    async fn removal_drains_terminal_signal_without_blocking_the_runtime() {
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let loss = transition(
+            "repository-a",
+            20,
+            AdoptedWorktreeAvailability::MissingRegistered,
+        );
+        assert!(registry.mark_unavailable(loss.clone()).await);
+        let permit = registry
+            .begin_terminal_signal(&loss)
+            .await
+            .expect("terminal cleanup owns the missing transition");
+        let invalidation_started = registry
+            .terminal_signal_invalidation_notification(&loss)
+            .expect("current terminal signal gate");
+        let cleanup_release = Arc::new(Notify::new());
+        let task_cleanup_release = cleanup_release.clone();
+        let cleanup = tokio::spawn(async move {
+            task_cleanup_release.notified().await;
+            tokio::task::yield_now().await;
+            drop(permit);
+        });
+        let removal_registry = registry.clone();
+        let removal = tokio::spawn(async move {
+            removal_registry
+                .mark_removing("thread-1", Path::new("/repo/worktrees/missing"))
+                .await
+        });
+        invalidation_started.notified().await;
+
+        assert!(!removal.is_finished());
+        cleanup_release.notify_one();
+        cleanup.await.expect("cleanup task");
+        let guard = removal.await.expect("removal task");
+        assert_eq!(
+            registry
+                .guard_thread("thread-1")
+                .await
+                .expect_err("removal remains guarded")
+                .availability,
+            AdoptedWorktreeAvailability::Removing
+        );
+        guard.release();
+        assert_eq!(
+            registry
+                .guard_thread("thread-1")
+                .await
+                .expect_err("the prior missing state is restored")
+                .availability,
+            AdoptedWorktreeAvailability::MissingRegistered
         );
     }
 
@@ -1677,10 +2114,11 @@ mod tests {
             AdoptedWorktreeAvailability::MissingRegistered,
         );
         let loss_registry = registry.clone();
+        let runtime = tokio::runtime::Handle::current();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let loss_task = tokio::task::spawn_blocking(move || {
             let _ = started_tx.send(());
-            loss_registry.mark_unavailable_sync(loss)
+            runtime.block_on(loss_registry.mark_unavailable(loss))
         });
         started_rx.await.expect("loss task starts");
         tokio::task::yield_now().await;

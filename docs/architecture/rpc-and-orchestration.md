@@ -159,14 +159,18 @@ aliases are checked when the requested path still exists. The public failure is
 the structured `WorkspaceUnavailableError`, including the thread ID, last-known
 path, and catalog availability.
 
-Only a healthy authoritative catalog snapshot may change this state. While the
-catalog publication lock is still held, it installs a missing guard before the
-new snapshot is visible or a runtime-loss callback can run. Degraded scans
-retain the prior state and perform no teardown. Loss work is admitted once per
-`(threadId, generation, availability)` transition. Exact recovery clears the
-guard only when the same normalized path is present again in the same physical
-repository; an active removal guard takes precedence over catalog loss and
-recovery.
+Only a healthy authoritative catalog snapshot may change this state. Catalog
+reconciliation synchronously closes every superseded terminal-signal gate, then
+drains already-owned permits asynchronously without retaining availability,
+catalog-entry, or catalog-registry locks. The refresh fence is revalidated after
+that drain. While the catalog publication lock is held again, reconciliation
+commits the guard change before the new snapshot becomes visible or a
+runtime-loss callback can run. Bootstrap follows the same close, unlocked
+drain, and commit-before-publication order. Degraded scans retain the prior
+state and perform no teardown. Loss work is admitted once per `(threadId,
+generation, availability)` transition. Exact recovery clears the guard only
+when the same normalized path is present again in the same physical repository;
+an active removal guard takes precedence over catalog loss and recovery.
 
 Missing-path identity also collapses duplicate separators plus lexical `.` and
 `..` components without escaping POSIX roots, Windows drive roots, or UNC share
@@ -244,15 +248,18 @@ process only while the loss transition is current, then acquires a counted
 terminal-signal permit owned by that exact guarded transition. Permit
 acquisition revalidates the transition after capture and is the linearization
 boundary with recovery or a newer loss. If invalidation wins, the stale cleanup
-cannot signal; if cleanup wins, invalidation waits while the permit covers the
-terminal lifecycle-lock identity check and process signal. Concurrent canonical
-and persisted-alias cleanup calls hold independent permits, so invalidation
-waits for every signal already authorized. Registry invalidation never takes a
-terminal lock, and permit release never re-enters the registry. A stale cleanup
-therefore skips both an unchanged recovered session and a recovered replacement
-published under the same terminal key. Exit finalization keeps its existing
-exact-generation check, so an older process result cannot overwrite replacement
-history.
+cannot signal; if cleanup wins, synchronous gate closure prevents later permits
+while an asynchronous, lost-wake-safe drain waits for the already-owned permit
+covering the terminal lifecycle-lock identity check and process signal.
+Concurrent canonical and persisted-alias cleanup calls hold independent
+permits, so the drain waits for every signal already authorized without parking
+a Tokio worker. Cancellation keeps the old gate closed until those permits
+drain, then reopens it only if the prepared catalog transition was not committed.
+Registry invalidation never takes a terminal lock, and permit release never
+re-enters the registry. A stale cleanup therefore skips both an unchanged
+recovered session and a recovered replacement published under the same terminal
+key. Exit finalization keeps its existing exact-generation check, so an older
+process result cannot overwrite replacement history.
 
 The single graceful cleanup deadline starts when loss quiescence begins and is
 five seconds. Warning persistence and known canonical provider/terminal

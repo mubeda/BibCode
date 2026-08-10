@@ -9,6 +9,64 @@ with the exact structured `WorkspaceUnavailableError`, and runs bounded
 provider/terminal quiescence without deleting conversation or terminal
 history.
 
+## Fix round 6 — nonblocking terminal-signal drains
+
+The sixth review follow-up removes the synchronous `Condvar` drain introduced
+in round 5. Gate closure remains synchronously linearized with exact permit
+acquisition, but already-owned permits now drain on Tokio without retaining the
+availability mutex, catalog-entry state, or the catalog registry:
+
+- a serialized two-phase availability reconciliation synchronously closes each
+  superseded exact gate and returns owned `Notify`-backed drains;
+- each drain enables its notification before inspecting the active-permit
+  predicate, and the final permit wakes every waiter, so a last release cannot
+  be lost between the predicate and await;
+- refresh and bootstrap release all availability/catalog locks while awaiting
+  drains, then refresh revalidates its lifecycle and mutation fence before
+  finalizing the guard under the catalog publication lock. Guard finalization
+  still precedes watch/entry publication and runtime-loss callbacks;
+- cancellation drops the prepared reconciliation without exposing recovered
+  state. Its exact old gate remains closed until active permits drain and only
+  then reopens if the transition was not committed. Removal-guard completion is
+  deferred across the same prepared interval, preventing a synchronous guard
+  drop from publishing a half-reconciled replacement;
+- recovery, removal, and newer loss therefore do not complete while an
+  already-authorized cleanup still owns a permit, while cleanup yields, timers,
+  the five-second outer deadline, cancellation, and RAII permit drop continue
+  to run even on a current-thread Tokio runtime.
+
+Strict RED was captured with a current-thread test whose newer-loss task closed
+the old gate while two async cleanup tasks owned permits. The former production
+implementation parked the only Tokio worker in `Condvar::wait`; an external
+20-second watchdog terminated the test with exit 142 before either cleanup
+could resume. The GREEN matrix adds current-thread cleanup timeout/yield,
+multiple-permit, cancellation/reopen, and removal coverage. Catalog tests prove
+`latest()` remains available while refresh/bootstrap wait, the old missing
+guard and watch value remain visible during the drain, and recovered state is
+published only after cleanup releases its permit. The real TerminalManager
+cleanup-wins test now runs on the default current-thread runtime instead of a
+two-worker runtime.
+
+Round 6 verification completed with the following evidence:
+
+- availability state owner: 17 passed;
+- catalog service lifecycle/publication: 48 passed;
+- WorktreeRuntime and reaper: 19 passed;
+- terminal preserving quiesce: 2 passed;
+- production orchestration RPC units: 15 passed;
+- real-Git worktree catalog: 9 passed;
+- workspace-unavailable orchestration and terminal integrations: 4 passed;
+- full server library: 1,047 passed;
+- `cargo test -p bibcode-server --tests`: the 1,047 library tests and every
+  server integration target passed, including all 97 provider-terminal cases;
+- `cargo fmt --all --check`, server all-targets Clippy with warnings denied,
+  `vp check` (1,775 format and 1,309 lint files), and `vp run typecheck` (11/11)
+  passed. Typecheck emitted only the repository's existing non-failing Effect
+  Schema finite-number suggestions.
+
+No wire schema, persisted shape, migration, dependency, provider identity,
+cleanup deadline, or terminal-history contract changed in this round.
+
 ## Fix round 5 — terminal-signal linearization
 
 The fifth review follow-up closes the remaining gap between WorktreeRuntime's
