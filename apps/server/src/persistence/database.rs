@@ -1,4 +1,6 @@
 use std::{
+    fs::File as StdFile,
+    fs::OpenOptions as StdOpenOptions,
     path::{Path, PathBuf},
     sync::{
         Arc, Mutex,
@@ -10,7 +12,7 @@ use std::{
 
 use rusqlite::{Connection, MAIN_DB, OpenFlags};
 use thiserror::Error;
-use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::sync::{Notify, mpsc, oneshot, watch};
 
 const DATABASE_QUEUE_CAPACITY: usize = 64;
 const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 64;
@@ -304,6 +306,12 @@ pub enum PersistenceError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to reserve new SQLite database path {path}")]
+    Reserve {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
     #[error("failed to open SQLite database {path}")]
     Open {
         path: PathBuf,
@@ -328,11 +336,31 @@ pub type Result<T> = std::result::Result<T, PersistenceError>;
 pub struct Database {
     sender: mpsc::Sender<DatabaseJob>,
     queue_diagnostics: Arc<DatabaseQueueDiagnostics>,
+    worker_closed: watch::Receiver<bool>,
 }
 
 impl Database {
-    pub async fn open(path: impl AsRef<Path>) -> Result<Self> {
+    pub async fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_inner(Some(path.as_ref().to_path_buf())).await
+    }
+
+    pub async fn create_new(path: impl AsRef<Path>) -> Result<Self> {
+        let path = path.as_ref().to_path_buf();
+        let reserved = StdOpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .map_err(|source| PersistenceError::Reserve {
+                path: path.clone(),
+                source,
+            })?;
+        match Self::open_inner(Some(path.clone())).await {
+            Ok(database) => Ok(database),
+            Err(error) => {
+                remove_reserved_file_if_empty(&path, &reserved);
+                Err(error)
+            }
+        }
     }
 
     pub async fn open_in_memory() -> Result<Self> {
@@ -343,23 +371,24 @@ impl Database {
         let (sender, mut receiver) = mpsc::channel::<DatabaseJob>(DATABASE_QUEUE_CAPACITY);
         let queue_diagnostics = Arc::new(DatabaseQueueDiagnostics::new());
         let (ready_sender, ready_receiver) = oneshot::channel();
+        let (worker_closed_sender, worker_closed) = watch::channel(false);
         thread::Builder::new()
             .name("bibcode-sqlite".to_owned())
             .spawn(move || {
                 let connection = open_connection(path.as_deref());
                 match connection {
                     Ok(mut connection) => {
-                        if ready_sender.send(Ok(())).is_err() {
-                            return;
-                        }
-                        while let Some(job) = receiver.blocking_recv() {
-                            job(&mut connection);
+                        if ready_sender.send(Ok(())).is_ok() {
+                            while let Some(job) = receiver.blocking_recv() {
+                                job(&mut connection);
+                            }
                         }
                     }
                     Err(error) => {
                         let _ = ready_sender.send(Err(error));
                     }
                 }
+                let _ = worker_closed_sender.send(true);
             })
             .map_err(PersistenceError::SpawnWorker)?;
 
@@ -369,7 +398,21 @@ impl Database {
         Ok(Self {
             sender,
             queue_diagnostics,
+            worker_closed,
         })
+    }
+
+    pub(crate) async fn close(self) {
+        let Self {
+            sender,
+            queue_diagnostics: _,
+            mut worker_closed,
+        } = self;
+        drop(sender);
+        let already_closed = *worker_closed.borrow();
+        if !already_closed {
+            let _ = worker_closed.changed().await;
+        }
     }
 
     pub async fn call<T, F>(&self, operation: F) -> Result<T>
@@ -454,26 +497,14 @@ impl Database {
 
 fn open_connection(path: Option<&Path>) -> Result<Connection> {
     let connection = match path {
-        Some(path) => {
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).map_err(|source| {
-                    PersistenceError::CreateDirectory {
-                        path: parent.to_path_buf(),
-                        source,
-                    }
-                })?;
-            }
-            Connection::open_with_flags(
-                path,
-                OpenFlags::SQLITE_OPEN_CREATE
-                    | OpenFlags::SQLITE_OPEN_READ_WRITE
-                    | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-            )
-            .map_err(|source| PersistenceError::Open {
-                path: path.to_path_buf(),
-                source,
-            })?
-        }
+        Some(path) => Connection::open_with_flags(
+            path,
+            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|source| PersistenceError::Open {
+            path: path.to_path_buf(),
+            source,
+        })?,
         None => Connection::open_in_memory().map_err(|source| PersistenceError::Open {
             path: PathBuf::from(":memory:"),
             source,
@@ -502,6 +533,34 @@ fn open_connection(path: Option<&Path>) -> Result<Connection> {
             .map_err(PersistenceError::Configure)?;
     }
     Ok(connection)
+}
+
+fn remove_reserved_file_if_empty(path: &Path, reserved: &StdFile) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+
+        let Ok(reserved_metadata) = reserved.metadata() else {
+            return;
+        };
+        let Ok(path_metadata) = std::fs::symlink_metadata(path) else {
+            return;
+        };
+        if reserved_metadata.len() == 0
+            && path_metadata.file_type().is_file()
+            && reserved_metadata.dev() == path_metadata.dev()
+            && reserved_metadata.ino() == path_metadata.ino()
+        {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        // Without a stable standard-library file identity, leaving the reserved file behind is
+        // safer than risking removal of a path replaced concurrently by another process.
+        let _ = (path, reserved);
+    }
 }
 
 #[cfg(test)]
@@ -608,7 +667,7 @@ mod tests {
     async fn serializes_concurrent_writers_and_enables_durable_pragmas() {
         let temp = TempDir::new().expect("temporary database directory");
         let database_path = temp.path().join("state.sqlite");
-        let database = Database::open(&database_path)
+        let database = Database::create_new(&database_path)
             .await
             .expect("database opens");
         database
@@ -665,7 +724,7 @@ mod tests {
         let database_path = temp.path().join("state.sqlite");
         std::fs::write(&database_path, b"not a sqlite database").expect("corrupt fixture");
 
-        let error = Database::open(&database_path)
+        let error = Database::open_existing(&database_path)
             .await
             .expect_err("corrupt database must fail");
 
@@ -684,7 +743,7 @@ mod tests {
         let temp = TempDir::new().expect("temporary database directory");
         let database_path = temp.path().join("state.sqlite");
         let backup_path = temp.path().join("backups/state.sqlite");
-        let database = Database::open(&database_path)
+        let database = Database::create_new(&database_path)
             .await
             .expect("database opens");
         database
@@ -704,7 +763,9 @@ mod tests {
             .expect("online backup");
         drop(database);
 
-        let reopened = Database::open(&backup_path).await.expect("backup reopens");
+        let reopened = Database::open_existing(&backup_path)
+            .await
+            .expect("backup reopens");
         let value = reopened
             .call(|connection| {
                 Ok(connection.query_row(
@@ -716,5 +777,53 @@ mod tests {
             .await
             .expect("backup query");
         assert_eq!(value, "preserved");
+    }
+
+    #[tokio::test]
+    async fn open_existing_never_creates_a_missing_database_or_parent() {
+        let temp = TempDir::new().expect("temporary database directory");
+        let database_path = temp.path().join("missing/state.sqlite");
+
+        Database::open_existing(&database_path)
+            .await
+            .expect_err("missing database must fail");
+
+        assert!(!database_path.exists());
+        assert!(!database_path.parent().expect("database parent").exists());
+    }
+
+    #[tokio::test]
+    async fn create_new_refuses_to_replace_an_existing_path() {
+        let temp = TempDir::new().expect("temporary database directory");
+        let database_path = temp.path().join("state.sqlite");
+        let original = b"preserve existing bytes";
+        std::fs::write(&database_path, original).expect("existing fixture");
+
+        Database::create_new(&database_path)
+            .await
+            .expect_err("existing path must block creation");
+
+        assert_eq!(
+            std::fs::read(&database_path).expect("existing bytes"),
+            original
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reserved_file_cleanup_never_removes_a_replacement_path() {
+        let temp = TempDir::new().expect("temporary database directory");
+        let database_path = temp.path().join("state.sqlite");
+        let reserved = StdOpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&database_path)
+            .expect("reserved database");
+        std::fs::remove_file(&database_path).expect("unlink reservation");
+        std::fs::write(&database_path, []).expect("replacement path");
+
+        remove_reserved_file_if_empty(&database_path, &reserved);
+
+        assert!(database_path.exists(), "replacement path must remain");
     }
 }

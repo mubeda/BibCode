@@ -1,7 +1,9 @@
 use std::{path::PathBuf, time::Duration};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
-use bibcode_server::{ROUTE_INVENTORY, RpcRegistry, ServerConfig, ServerHandle, ServerRuntime};
+use bibcode_server::{
+    ROUTE_INVENTORY, RpcRegistry, ServerConfig, ServerError, ServerHandle, ServerRuntime,
+};
 use futures_util::{SinkExt, StreamExt};
 use p256::ecdsa::{Signature, SigningKey, signature::hazmat::PrehashSigner};
 use reqwest::{Client, Response, StatusCode, header};
@@ -1234,7 +1236,7 @@ async fn sessions_pairings_consumption_and_revocation_survive_restarts() {
 }
 
 #[tokio::test]
-async fn session_revocation_is_immediate_across_live_server_processes() {
+async fn second_live_server_refuses_an_active_store_without_disrupting_its_owner() {
     let temp = TempDir::new().expect("temporary base directory");
     let client = Client::new();
     let first = start_desktop_server(&temp).await;
@@ -1260,62 +1262,39 @@ async fn session_revocation_is_immediate_across_live_server_processes() {
     .await;
     let paired_token = access_token(&paired).to_owned();
 
-    let second = start_desktop_server(&temp).await;
-    let accepted_by_second = get_json(
+    let second_config = ServerConfig::new(temp.path())
+        .with_bind("127.0.0.1", 0)
+        .with_desktop(DESKTOP_BOOTSTRAP)
+        .expect("valid desktop configuration");
+    let error = match ServerRuntime::start_with_registry(second_config, RpcRegistry::empty()).await
+    {
+        Ok(second) => {
+            shutdown(second).await;
+            panic!("active WAL store must block a second server");
+        }
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            error,
+            ServerError::PersistenceInitialize(ref message)
+                if message.contains("cannot be inspected without side effects")
+        ),
+        "unexpected second-server error: {error}"
+    );
+
+    let accepted_by_owner = get_json(
         client
-            .get(http_url(&second, "/api/auth/session"))
+            .get(http_url(&first, "/api/auth/session"))
             .bearer_auth(&paired_token)
             .send()
             .await
-            .expect("second server session request"),
+            .expect("owner session request after refused second start"),
         StatusCode::OK,
     )
     .await;
-    assert_eq!(accepted_by_second["authenticated"], true);
+    assert_eq!(accepted_by_owner["authenticated"], true);
 
-    let clients = get_json(
-        client
-            .get(http_url(&first, "/api/auth/clients"))
-            .bearer_auth(&administrator_token)
-            .send()
-            .await
-            .expect("first server client list"),
-        StatusCode::OK,
-    )
-    .await;
-    let paired_session_id = clients
-        .as_array()
-        .expect("client list")
-        .iter()
-        .find(|session| session["client"]["label"] == "Cross-process client")
-        .and_then(|session| session["sessionId"].as_str())
-        .expect("paired session id");
-    let revoked = get_json(
-        client
-            .post(http_url(&first, "/api/auth/clients/revoke"))
-            .bearer_auth(&administrator_token)
-            .json(&json!({ "sessionId": paired_session_id }))
-            .send()
-            .await
-            .expect("first server revocation"),
-        StatusCode::OK,
-    )
-    .await;
-    assert_eq!(revoked["revoked"], true);
-
-    let rejected_by_second = get_json(
-        client
-            .get(http_url(&second, "/api/auth/session"))
-            .bearer_auth(&paired_token)
-            .send()
-            .await
-            .expect("second server revoked-session request"),
-        StatusCode::OK,
-    )
-    .await;
-    assert_eq!(rejected_by_second["authenticated"], false);
-
-    shutdown(second).await;
     shutdown(first).await;
 }
 

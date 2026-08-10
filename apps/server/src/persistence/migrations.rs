@@ -1,6 +1,10 @@
+use std::path::{Path, PathBuf};
+
 use rusqlite::{
-    Connection, ErrorCode, OptionalExtension, Result, Transaction, params_from_iter, types::Value,
+    Connection, ErrorCode, OpenFlags, OptionalExtension, Result, Transaction, params_from_iter,
+    types::Value,
 };
+use thiserror::Error;
 
 const MIGRATIONS_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS effect_sql_migrations (
@@ -9,6 +13,178 @@ CREATE TABLE IF NOT EXISTS effect_sql_migrations (
   name VARCHAR(255) NOT NULL
 )
 "#;
+
+const CORE_TABLES: &[(u32, &str)] = &[
+    (1, "orchestration_events"),
+    (2, "orchestration_command_receipts"),
+    (3, "checkpoint_diff_blobs"),
+    (4, "provider_session_runtime"),
+    (5, "projection_projects"),
+    (5, "projection_threads"),
+    (5, "projection_thread_messages"),
+    (5, "projection_thread_activities"),
+    (5, "projection_thread_sessions"),
+    (5, "projection_turns"),
+    (5, "projection_pending_approvals"),
+    (5, "projection_state"),
+    (13, "projection_thread_proposed_plans"),
+    (20, "auth_pairing_links"),
+    (20, "auth_sessions"),
+    (34, "activity_scopes"),
+    (34, "activity_records"),
+    (34, "activity_entries"),
+    (34, "activity_journal"),
+    (36, "activity_event_idempotency"),
+    (37, "activity_entry_owners"),
+    (38, "activity_record_retention_counts"),
+    (39, "provider_turn_outbox"),
+    (39, "orchestration_attachment_refs"),
+];
+
+#[derive(Debug, Error)]
+pub(crate) enum ExistingStoreValidationError {
+    #[error("SQLite integrity validation failed for {path}: {detail}")]
+    Corrupt { path: PathBuf, detail: String },
+    #[error("SQLite store at {path} is not a recognized BiBCode store: {detail}")]
+    Unrecognized { path: PathBuf, detail: String },
+    #[error("SQLite store at {path} cannot be inspected without side effects: {detail}")]
+    Unsafe { path: PathBuf, detail: String },
+}
+
+pub(crate) fn validate_existing_bibcode_store(
+    path: &Path,
+) -> std::result::Result<(), ExistingStoreValidationError> {
+    reject_sqlite_sidecars(path)?;
+    let database_uri =
+        url::Url::from_file_path(path).map_err(|()| ExistingStoreValidationError::Unsafe {
+            path: path.to_path_buf(),
+            detail: "database path cannot be represented as a SQLite file URI".to_owned(),
+        })?;
+    let mut database_uri = database_uri.to_string();
+    database_uri.push_str("?immutable=1");
+    let connection = Connection::open_with_flags(
+        database_uri,
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|source| ExistingStoreValidationError::Corrupt {
+        path: path.to_path_buf(),
+        detail: source.to_string(),
+    })?;
+
+    let integrity = connection
+        .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+        .map_err(|source| ExistingStoreValidationError::Corrupt {
+            path: path.to_path_buf(),
+            detail: source.to_string(),
+        })?;
+    if integrity != "ok" {
+        return Err(ExistingStoreValidationError::Corrupt {
+            path: path.to_path_buf(),
+            detail: integrity,
+        });
+    }
+
+    if !table_exists(&connection, "effect_sql_migrations").map_err(|source| {
+        ExistingStoreValidationError::Unrecognized {
+            path: path.to_path_buf(),
+            detail: source.to_string(),
+        }
+    })? {
+        return Err(ExistingStoreValidationError::Unrecognized {
+            path: path.to_path_buf(),
+            detail: "migration ledger is missing".to_owned(),
+        });
+    }
+
+    let mut statement = connection
+        .prepare("SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id ASC")
+        .map_err(|source| ExistingStoreValidationError::Unrecognized {
+            path: path.to_path_buf(),
+            detail: source.to_string(),
+        })?;
+    let recorded = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+        })
+        .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+        .map_err(|source| ExistingStoreValidationError::Unrecognized {
+            path: path.to_path_buf(),
+            detail: source.to_string(),
+        })?;
+    if recorded.is_empty() {
+        return Err(ExistingStoreValidationError::Unrecognized {
+            path: path.to_path_buf(),
+            detail: "migration ledger is empty".to_owned(),
+        });
+    }
+    if recorded.len() > MIGRATIONS.len()
+        || recorded
+            .iter()
+            .zip(MIGRATIONS)
+            .any(|((id, name), expected)| *id != expected.id || name != expected.name)
+    {
+        return Err(ExistingStoreValidationError::Unrecognized {
+            path: path.to_path_buf(),
+            detail: "migration ledger is not an exact prefix of this binary".to_owned(),
+        });
+    }
+
+    let latest_migration_id = recorded.last().expect("non-empty ledger").0;
+    for (_, table) in CORE_TABLES
+        .iter()
+        .filter(|(migration_id, _)| *migration_id <= latest_migration_id)
+    {
+        if !table_exists(&connection, table).map_err(|source| {
+            ExistingStoreValidationError::Unrecognized {
+                path: path.to_path_buf(),
+                detail: source.to_string(),
+            }
+        })? {
+            return Err(ExistingStoreValidationError::Unrecognized {
+                path: path.to_path_buf(),
+                detail: format!("required table {table} is missing"),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn reject_sqlite_sidecars(path: &Path) -> std::result::Result<(), ExistingStoreValidationError> {
+    for suffix in ["-wal", "-shm"] {
+        let mut sidecar = path.as_os_str().to_os_string();
+        sidecar.push(suffix);
+        let sidecar = PathBuf::from(sidecar);
+        match std::fs::symlink_metadata(&sidecar) {
+            Ok(_) => {
+                return Err(ExistingStoreValidationError::Unsafe {
+                    path: path.to_path_buf(),
+                    detail: format!("SQLite sidecar {} is present", sidecar.display()),
+                });
+            }
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source) => {
+                return Err(ExistingStoreValidationError::Unsafe {
+                    path: path.to_path_buf(),
+                    detail: format!(
+                        "failed to inspect SQLite sidecar {}: {source}",
+                        sidecar.display()
+                    ),
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?)",
+        [table],
+        |row| row.get(0),
+    )
+}
 
 type MigrationFn = for<'connection> fn(&Transaction<'connection>) -> Result<()>;
 
