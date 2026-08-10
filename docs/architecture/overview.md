@@ -26,10 +26,12 @@ flowchart TB
   WSL and SSH launch, the desktop connection catalog, and backend lifecycle.
   Windows protects the catalog with DPAPI. Atomic compare-only and
   compare-and-write transitions cross privileged bridge commands and are
-  serialized by the native catalog owner across all WebViews in that host.
-  macOS and Linux advertise that native protection is unavailable and use the
-  renderer's transactional IndexedDB catalog instead; any legacy renderer value
-  is atomically migrated into that single source before it is cleared.
+  serialized by the native catalog owner across all WebViews in that host. A
+  protected bridge collapses a legacy renderer catalog into native storage
+  before publication, then uses native storage exclusively. macOS and Linux
+  advertise that native protection is unavailable and use the renderer's
+  transactional IndexedDB catalog instead; any legacy renderer value is
+  atomically migrated into that single source before it is cleared.
 - **React app (`apps/web`)** owns the user interface and client-side state. It
   uses hash history in desktop mode and browser history on the web. Preview
   content is hosted in Tauri child webviews; preview automation is brokered by
@@ -166,9 +168,12 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   document write. In browser and unprotected desktop modes each transition owns
   one IndexedDB `readwrite` transaction; on a protected desktop host both own
   the same native catalog-owner lock and are never emulated with separate
-  JavaScript bridge calls. Legacy renderer migration preserves an existing
-  valid IndexedDB winner and uses exact CAS before replacing corrupt IndexedDB
-  bytes with the only valid legacy catalog.
+  JavaScript bridge calls. Before protected bridge publication, a native-null
+  host adopts a non-blank legacy catalog by CAS and confirms the authoritative
+  native winner before clearing the renderer copy. A failure preserves both
+  sources and leaves catalog operations fail-closed. Unprotected legacy
+  migration preserves an existing valid IndexedDB winner and uses exact CAS
+  before replacing corrupt IndexedDB bytes with the only valid legacy catalog.
 - Accepted storage-identity decisions are atomic catalog transitions: the
   decision is recomputed after every conflict and returned only from the
   winning revision. Keep decisions compare without writing; Set decisions use
@@ -178,7 +183,8 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
 - Desktop catalog capability is fail-closed and tri-state. Only bridge version
   3 with an explicit protected/unprotected flag may select native compare-only,
   native CAS, or IndexedDB migration; rejected, older, or incomplete metadata
-  performs no catalog write, migration, or clear.
+  and failed protected-source collapse perform no IndexedDB write, native
+  overwrite, or renderer clear.
 - Normal application traffic uses HTTP and WebSocket RPC in every host.
 - `packages/contracts` remains schema-only.
 - Rust owns all production backend behavior. TypeScript is limited to clients,
