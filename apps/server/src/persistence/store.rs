@@ -5,6 +5,7 @@ use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use crate::config::ServerConfig;
@@ -154,7 +155,7 @@ async fn prepare_first_run(paths: StatePaths) -> Result<PreparedStore, StoreStar
 }
 
 async fn prepare_existing_unmarked(paths: StatePaths) -> Result<PreparedStore, StoreStartupError> {
-    validate(&paths.database)?;
+    validate(&paths.database).await?;
     let database = Database::open_existing(&paths.database)
         .await
         .map_err(|source| StoreStartupError::DatabaseOpen {
@@ -175,7 +176,7 @@ async fn prepare_existing(
     paths: StatePaths,
     storage_instance_id: StorageInstanceId,
 ) -> Result<PreparedStore, StoreStartupError> {
-    validate(&paths.database)?;
+    validate(&paths.database).await?;
     let database = Database::open_existing(&paths.database)
         .await
         .map_err(|source| StoreStartupError::DatabaseOpen {
@@ -191,8 +192,41 @@ async fn prepare_existing(
     })
 }
 
-fn validate(path: &std::path::Path) -> Result<(), StoreStartupError> {
-    validate_existing_bibcode_store(path).map_err(|error| match error {
+async fn validate(path: &std::path::Path) -> Result<(), StoreStartupError> {
+    validate_with_operation(path.to_path_buf(), |path, cancellation| {
+        validate_existing_bibcode_store(&path, &cancellation)
+    })
+    .await
+}
+
+async fn validate_with_operation<F>(path: PathBuf, operation: F) -> Result<(), StoreStartupError>
+where
+    F: FnOnce(PathBuf, CancellationToken) -> std::result::Result<(), ExistingStoreValidationError>
+        + Send
+        + 'static,
+{
+    let cancellation = CancellationToken::new();
+    let _cancel_on_drop = CancelValidationOnDrop(cancellation.clone());
+    let error_path = path.clone();
+    let result = tokio::task::spawn_blocking(move || operation(path, cancellation))
+        .await
+        .map_err(|source| StoreStartupError::UnsafeDatabaseState {
+            path: error_path,
+            detail: format!("validation blocking task failed: {source}"),
+        })?;
+    result.map_err(map_validation_error)
+}
+
+struct CancelValidationOnDrop(CancellationToken);
+
+impl Drop for CancelValidationOnDrop {
+    fn drop(&mut self) {
+        self.0.cancel();
+    }
+}
+
+fn map_validation_error(error: ExistingStoreValidationError) -> StoreStartupError {
+    match error {
         ExistingStoreValidationError::Corrupt { path, detail } => {
             StoreStartupError::CorruptDatabase { path, detail }
         }
@@ -202,7 +236,7 @@ fn validate(path: &std::path::Path) -> Result<(), StoreStartupError> {
         ExistingStoreValidationError::Unsafe { path, detail } => {
             StoreStartupError::UnsafeDatabaseState { path, detail }
         }
-    })
+    }
 }
 
 async fn migrate(database: &Database, path: &std::path::Path) -> Result<(), StoreStartupError> {
@@ -299,6 +333,8 @@ fn sync_state_directory(_path: &std::path::Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use tempfile::TempDir;
 
     use super::*;
@@ -333,6 +369,142 @@ mod tests {
                 .iter()
                 .all(|name| !name.to_string_lossy().ends_with(".tmp"))
         );
+    }
+
+    #[tokio::test]
+    async fn dropping_startup_validation_cancels_the_multibatch_worker_and_releases_writers() {
+        let root = TempDir::new().expect("temporary validation root");
+        let paths = StatePaths::from_config(&ServerConfig::new(root.path()));
+        paths
+            .ensure_directories_without_database_side_effects()
+            .await
+            .expect("state directories");
+        let marker_bytes = b"9ad2cc5c-0478-4dc7-850b-d6088ebba5a1\n";
+        std::fs::write(&paths.environment_id, marker_bytes).expect("fixture marker");
+        let mut setup = rusqlite::Connection::open(&paths.database).expect("fixture database");
+        setup
+            .pragma_update(None, "page_size", 512)
+            .expect("small fixture page size");
+        setup
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("WAL fixture");
+        setup
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("disable fixture checkpoint");
+        run_migrations(&mut setup, None).expect("fixture migrations");
+        setup
+            .execute_batch(
+                "CREATE TABLE validation_cancellation_fixture (
+                   singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                   revision INTEGER NOT NULL,
+                   payload BLOB NOT NULL
+                 );
+                 INSERT INTO validation_cancellation_fixture
+                   (singleton, revision, payload) VALUES (1, 0, zeroblob(262144));
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .expect("multi-batch cancellation fixture");
+        drop(setup);
+        let ledger_rows = rusqlite::Connection::open(&paths.database)
+            .expect("ledger reader")
+            .query_row("SELECT COUNT(*) FROM effect_sql_migrations", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("fixture ledger count");
+
+        let (step_tx, mut step_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+        let validation_path = paths.database.clone();
+        let validation = tokio::spawn(validate_with_operation(
+            validation_path,
+            move |path, cancellation| {
+                let mut first_step = Some((step_tx, release_rx));
+                let result =
+                    crate::persistence::migrations::validate_existing_bibcode_store_with_control(
+                        &path,
+                        &cancellation,
+                        Duration::from_secs(1),
+                        || Ok(()),
+                        |state, progress| {
+                            if let Some((step_tx, release_rx)) = first_step.take() {
+                                step_tx
+                                    .send((state, progress.remaining, progress.pagecount))
+                                    .expect("observe first backup batch");
+                                release_rx
+                                    .recv_timeout(Duration::from_secs(2))
+                                    .expect("release first backup batch");
+                            }
+                            Ok(())
+                        },
+                    );
+                let observed = match &result {
+                    Ok(()) => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                };
+                finished_tx.send(observed).expect("signal validation exit");
+                result
+            },
+        ));
+        let (state, remaining, pagecount) =
+            tokio::time::timeout(Duration::from_secs(2), step_rx.recv())
+                .await
+                .expect("observe in-progress backup promptly")
+                .expect("backup progress channel");
+        assert_eq!(state, rusqlite::backup::StepResult::More);
+        assert!(remaining > 0);
+        assert!(pagecount > remaining);
+
+        validation.abort();
+        assert!(
+            validation
+                .await
+                .expect_err("startup validation task must abort")
+                .is_cancelled()
+        );
+        let writer = rusqlite::Connection::open(&paths.database).expect("live writer");
+        writer
+            .execute(
+                "UPDATE validation_cancellation_fixture SET revision = 1 WHERE singleton = 1",
+                [],
+            )
+            .expect("writer commits while backup is between batches");
+        let busy = writer
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .expect("writer checkpoints while backup is between batches");
+        assert_eq!(
+            busy, 0,
+            "backup must release the source lock between batches"
+        );
+        release_tx.send(()).expect("release validation worker");
+        let worker_result =
+            tokio::task::spawn_blocking(move || finished_rx.recv_timeout(Duration::from_secs(1)))
+                .await
+                .expect("join worker-exit observer")
+                .expect("blocking validation worker exits promptly");
+        let error = worker_result.expect_err("blocking validation observes cancellation");
+        assert!(
+            error.contains("cancelled"),
+            "typed cancellation detail: {error}"
+        );
+
+        assert_eq!(
+            std::fs::read(&paths.environment_id).expect("marker remains"),
+            marker_bytes
+        );
+        let (revision, ledger_rows_after) = writer
+            .query_row(
+                "SELECT
+                   (SELECT revision FROM validation_cancellation_fixture WHERE singleton = 1),
+                   (SELECT COUNT(*) FROM effect_sql_migrations)",
+                [],
+                |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+            )
+            .expect("post-cancellation database content");
+        assert_eq!(revision, 1, "only the explicit writer mutation is present");
+        assert_eq!(ledger_rows_after, ledger_rows);
     }
 
     #[test]
