@@ -1,5 +1,5 @@
 import * as Effect from "effect/Effect";
-import * as Option from "effect/Option";
+import type { ExecutionEnvironmentDescriptor } from "@bibcode/contracts";
 
 import * as Persistence from "../platform/persistence.ts";
 import {
@@ -66,22 +66,26 @@ function identityPersistenceError(prepared: PreparedConnection): ConnectionBlock
 
 export const verifyPreparedStorageIdentity = Effect.fn("verifyPreparedStorageIdentity")(function* (
   prepared: PreparedConnection,
+  descriptor: ExecutionEnvironmentDescriptor = prepared.descriptor,
 ) {
   const identities = yield* Persistence.AcceptedStorageIdentityStore;
   const targetKey = storageIdentityTargetKey(prepared.target);
-  const accepted = yield* identities.get(targetKey).pipe(
-    Effect.map(Option.getOrNull),
-    Effect.mapError(() => identityPersistenceError(prepared)),
-  );
-  const reported = prepared.descriptor.storageInstanceId;
-  const decision = decideStorageIdentity(accepted, reported);
+  const reported = descriptor.storageInstanceId;
+  const decision = yield* identities
+    .transition(targetKey, (accepted) => {
+      const decision = decideStorageIdentity(accepted, reported);
+      return {
+        result: decision,
+        mutation:
+          decision._tag === "Bootstrap"
+            ? { _tag: "Set" as const, storageInstanceId: decision.reported }
+            : { _tag: "Keep" as const },
+      };
+    })
+    .pipe(Effect.mapError(() => identityPersistenceError(prepared)));
 
   switch (decision._tag) {
     case "Bootstrap":
-      yield* identities
-        .accept({ targetKey, storageInstanceId: decision.reported })
-        .pipe(Effect.mapError(() => identityPersistenceError(prepared)));
-      return;
     case "Accepted":
     case "Unverifiable":
       return;

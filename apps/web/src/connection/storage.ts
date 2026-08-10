@@ -395,6 +395,12 @@ interface CatalogStore {
   readonly update: (
     transform: (catalog: ConnectionCatalogDocumentType) => ConnectionCatalogDocumentType,
   ) => Effect.Effect<void, ConnectionTransientError>;
+  readonly modify: <A>(
+    transform: (catalog: ConnectionCatalogDocumentType) => {
+      readonly document: ConnectionCatalogDocumentType;
+      readonly result: A;
+    },
+  ) => Effect.Effect<A, ConnectionTransientError>;
 }
 
 export const makeCatalogStore = Effect.fn("web.connectionStorage.makeCatalogStore")(function (
@@ -452,20 +458,23 @@ export const makeCatalogStore = Effect.fn("web.connectionStorage.makeCatalogStor
   });
 
   const read = loadVersion().pipe(Effect.map(({ document }) => document));
-  const update: CatalogStore["update"] = Effect.fn("web.connectionStorage.updateCatalog")(
+  const modify: CatalogStore["modify"] = Effect.fn("web.connectionStorage.modifyCatalog")(
     function* (transform) {
       for (let attempt = 0; attempt < MAX_CATALOG_COMPARE_AND_SET_ATTEMPTS; attempt += 1) {
         const { raw, document } = yield* loadVersion();
-        const next = yield* encodeCatalog(transform(document));
+        const transition = transform(document);
+        const next = yield* encodeCatalog(transition.document);
         const updated = yield* Effect.uninterruptible(backend.compareAndSet(raw, next));
-        if (updated) return;
+        if (updated) return transition.result;
         yield* Effect.yieldNow;
       }
       return yield* catalogError("update", "The connection catalog changed too many times.");
     },
   );
+  const update: CatalogStore["update"] = (transform) =>
+    modify((document) => ({ document: transform(document), result: undefined }));
 
-  return Effect.succeed({ read, update } satisfies CatalogStore);
+  return Effect.succeed({ modify, read, update } satisfies CatalogStore);
 });
 
 export const connectionStorageLayer = Layer.effectContext(
@@ -594,6 +603,33 @@ export const connectionStorageLayer = Layer.effectContext(
               identity,
             ),
           }))
+          .pipe(Effect.mapError(() => storageIdentityPersistenceError("accept-storage-identity"))),
+      transition: (targetKey, decide) =>
+        catalog
+          .modify((document) => {
+            const acceptedStorageInstanceId =
+              document.acceptedStorageIdentities.find(
+                (identity) => identity.targetKey === targetKey,
+              )?.storageInstanceId ?? null;
+            const transition = decide(acceptedStorageInstanceId);
+            if (transition.mutation._tag === "Keep") {
+              return { document, result: transition.result };
+            }
+            return {
+              document: {
+                ...document,
+                acceptedStorageIdentities: replaceCatalogValue(
+                  document.acceptedStorageIdentities,
+                  (value) => value.targetKey,
+                  {
+                    targetKey,
+                    storageInstanceId: transition.mutation.storageInstanceId,
+                  },
+                ),
+              },
+              result: transition.result,
+            };
+          })
           .pipe(Effect.mapError(() => storageIdentityPersistenceError("accept-storage-identity"))),
     });
     const cacheStore = EnvironmentCacheStore.of({

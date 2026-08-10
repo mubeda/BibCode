@@ -3,9 +3,13 @@ import {
   BearerConnectionProfile,
   BearerConnectionRegistration,
   BearerConnectionTarget,
+  ConnectionStorageChangedError,
   ConnectionTransientError,
   CredentialStore,
+  PrimaryConnectionTarget,
   ProfileStore,
+  type PreparedConnection,
+  verifyPreparedStorageIdentity,
 } from "@bibcode/client-runtime/connection";
 import {
   AcceptedStorageIdentityStore,
@@ -30,7 +34,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import { IDBFactory } from "fake-indexeddb";
+import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
 import { afterEach, vi } from "vite-plus/test";
 
 import { connectionStorageLayer, makeCatalogBackend, makeCatalogStore } from "./storage";
@@ -883,6 +887,119 @@ describe("makeCatalogBackend (IndexedDB)", () => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe("connectionStorageLayer", () => {
+  it.effect("elects one bootstrap winner across two real IndexedDB storage layers", () => {
+    const factory = new IDBFactory();
+    vi.stubGlobal("indexedDB", factory);
+    vi.stubGlobal("IDBKeyRange", IDBKeyRange);
+    vi.stubGlobal("window", {});
+    let arrivals = 0;
+    let reportBothArrived = () => {};
+    let releaseBoth = () => {};
+    const bothArrived = new Promise<void>((resolve) => {
+      reportBothArrived = resolve;
+    });
+    const bothReleased = new Promise<void>((resolve) => {
+      releaseBoth = resolve;
+    });
+    const gate = Effect.promise(async () => {
+      arrivals += 1;
+      if (arrivals === 2) reportBothArrived();
+      await bothReleased;
+    });
+    const makePrepared = (suffix: string, storageInstanceId: string): PreparedConnection => {
+      const target = new PrimaryConnectionTarget({
+        environmentId: EnvironmentId.make(`environment-${suffix}`),
+        label: `Environment ${suffix}`,
+        httpBaseUrl: `https://${suffix}.example.test`,
+        wsBaseUrl: `wss://${suffix}.example.test`,
+      });
+      return {
+        environmentId: target.environmentId,
+        label: target.label,
+        descriptor: {
+          environmentId: target.environmentId,
+          label: target.label,
+          platform: { os: "linux", arch: "x64" },
+          serverVersion: "0.0.0-test",
+          storageInstanceId,
+          capabilities: { repositoryIdentity: true, activityProtocolVersion: null },
+        },
+        httpBaseUrl: target.httpBaseUrl,
+        socketUrl: `${target.wsBaseUrl}/ws`,
+        httpAuthorization: null,
+        target,
+      };
+    };
+    const verify = (prepared: PreparedConnection) =>
+      Effect.gen(function* () {
+        const base = yield* AcceptedStorageIdentityStore;
+        const atomicBase = base as typeof base & {
+          readonly transition: <A>(
+            targetKey: string,
+            decide: (acceptedStorageInstanceId: string | null) => {
+              readonly result: A;
+              readonly mutation:
+                | { readonly _tag: "Keep" }
+                | { readonly _tag: "Set"; readonly storageInstanceId: string };
+            },
+          ) => Effect.Effect<A>;
+        };
+        const gatedService = {
+          ...base,
+          get: (targetKey: string) => base.get(targetKey).pipe(Effect.tap(() => gate)),
+          transition: <A>(
+            targetKey: string,
+            decide: (acceptedStorageInstanceId: string | null) => {
+              readonly result: A;
+              readonly mutation:
+                | { readonly _tag: "Keep" }
+                | { readonly _tag: "Set"; readonly storageInstanceId: string };
+            },
+          ) => gate.pipe(Effect.andThen(atomicBase.transition(targetKey, decide))),
+        };
+        return yield* verifyPreparedStorageIdentity(prepared).pipe(
+          Effect.provideService(
+            AcceptedStorageIdentityStore,
+            AcceptedStorageIdentityStore.of(gatedService),
+          ),
+        );
+      }).pipe(Effect.provide(connectionStorageLayer), Effect.result);
+
+    return Effect.gen(function* () {
+      const first = yield* Effect.forkChild(verify(makePrepared("first", "store-a")), {
+        startImmediately: true,
+      });
+      const second = yield* Effect.forkChild(verify(makePrepared("second", "store-b")), {
+        startImmediately: true,
+      });
+      yield* Effect.promise(() => bothArrived);
+      releaseBoth();
+      const results = [yield* Fiber.join(first), yield* Fiber.join(second)];
+
+      expect(results.filter((result) => result._tag === "Success")).toHaveLength(1);
+      expect(results.filter((result) => result._tag === "Failure")).toHaveLength(1);
+      const failure = results.find((result) => result._tag === "Failure");
+      expect(failure?._tag === "Failure" ? failure.failure : null).toBeInstanceOf(
+        ConnectionStorageChangedError,
+      );
+      const accepted = yield* Effect.gen(function* () {
+        const identities = yield* AcceptedStorageIdentityStore;
+        return yield* identities.get("platform:primary");
+      }).pipe(Effect.provide(connectionStorageLayer));
+      expect(Option.isSome(accepted)).toBe(true);
+      if (Option.isSome(accepted)) {
+        expect(["store-a", "store-b"]).toContain(accepted.value);
+        if (
+          failure?._tag === "Failure" &&
+          failure.failure._tag === "ConnectionStorageChangedError"
+        ) {
+          expect(failure.failure.acceptedStorageInstanceId).toBe(accepted.value);
+          expect(failure.failure.reportedStorageInstanceId).not.toBe(accepted.value);
+        }
+      }
+    });
+  });
+
   it.effect(
     "migrates a non-Windows desktop fallback catalog and updates it atomically in IndexedDB",
     () => {

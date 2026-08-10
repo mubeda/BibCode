@@ -16,11 +16,13 @@ public package has no root export; callers use focused subpaths such as
 - Environment bootstrap decodes and retains the complete environment
   descriptor on `KnownEnvironment`, including its nullable
   `storageInstanceId`, rather than reducing it to a label and logical ID.
-- `ConnectionDriver` reports `preparing`, verifies and if necessary persists
-  the prepared descriptor's storage identity, then reports `opening` and
-  `synchronizing`, creates an `RpcSession`, and waits for its initial
-  configuration. A changed store therefore cannot be published as an opening
-  or live lease.
+- `ConnectionDriver` reports `preparing`, atomically verifies and if necessary
+  persists the prepared descriptor's storage identity, then reports `opening`
+  and creates an `RpcSession`. After the session is ready it verifies the
+  initial `server.getConfig` descriptor through the same identity owner. Only
+  then does it report `synchronizing` and return a live lease. A prepared
+  mismatch cannot open a socket, and a backend restart between HTTP preparation
+  and WebSocket configuration cannot publish synchronization or a live lease.
 - `EnvironmentSupervisor` owns desired state, connectivity, retries, the
   prepared connection, and the live RPC session for one environment.
 - `EnvironmentRegistry` owns catalog entries and their scoped supervisors. It
@@ -116,30 +118,39 @@ credentials, or local paths change:
 | SSH     | `ssh:<connectionId>`    |
 
 Keys never contain bearer/DPoP credentials, endpoint URLs, SSH host/profile
-data, or filesystem paths. `AcceptedStorageIdentityStore` exposes atomic
-lookup and acceptance over the shared catalog. First observation, equality,
-change, and a version-skewed `null` report are represented as `Bootstrap`,
-`Accepted`, `Changed`, and `Unverifiable`; an unverifiable report does not erase
-an existing baseline.
+data, or filesystem paths. `AcceptedStorageIdentityStore` exposes an atomic
+transition over the shared catalog in addition to direct catalog reads and
+writes. The transition callback receives the accepted identity from each fresh
+CAS revision and is re-evaluated after every conflict; only the result computed
+for the successful revision is returned. First observation, equality, change,
+and a version-skewed `null` report are represented as `Bootstrap`, `Accepted`,
+`Changed`, and `Unverifiable`; equality and unverifiable reports keep the
+current baseline, and an unverifiable report never erases it. When concurrent
+runtimes bootstrap the same target, the first CAS winner persists its identity
+and every loser re-decides against that winner before it can open a session.
 
 `ConnectionDriver` applies this decision table after descriptor preparation
 and before `RpcSessionFactory.connect`. Bootstrap persistence must complete
-before a socket opens. An accepted match continues normally, and an
-unverifiable `null` continues without deleting a prior baseline. A changed
-non-null identity fails with a structured `ConnectionStorageChangedError` that
-retains the target key plus both identities; the supervisor publishes it as a
-blocked state without publishing prepared/session state or consuming a new
-snapshot.
+before a socket opens. It applies the table again to the session's cached
+initial configuration after `session.ready` and before synchronization or
+lease publication, closing the session scope if the WebSocket reached a
+different store. An accepted match continues normally, and an unverifiable
+`null` continues without deleting a prior baseline. A changed non-null identity
+fails with a structured `ConnectionStorageChangedError` that retains the target
+key plus both identities; the supervisor publishes it as a blocked state
+without publishing prepared/session state or consuming a new snapshot.
 
 Adoption is an explicit `EnvironmentRegistry.acceptStorageIdentity` command.
 It is valid only while that environment's current supervisor state is blocked
-by the structured storage-change error. The registry persists exactly the
-error's target key and reported identity, then signals one normal retry. The
-operation is serialized with registration/removal for the logical environment
-and becomes uninterruptible once it owns that lease, so cancellation cannot
-commit the user decision without also scheduling the retry. Adoption neither
-clears environment caches nor reads, writes, copies, or merges either server
-database.
+by the structured storage-change error. The registry conditionally transitions
+exactly the error's accepted identity to its reported identity, then signals
+one normal retry. If another runtime has already changed the durable baseline,
+the transition fails without overwriting that newer value or scheduling the
+retry. The operation is serialized with registration/removal for the logical
+environment and becomes uninterruptible once it owns that lease, so
+cancellation cannot commit the user decision without also scheduling the
+retry. Adoption neither clears environment caches nor reads, writes, copies,
+or merges either server database.
 
 ## State and retry policy
 
@@ -181,9 +192,10 @@ descriptor. The descriptor decoder accepts an omitted field as `null` for
 older or third-party remote servers; it still validates any supplied value as
 a trimmed non-empty string. The connection catalog can retain the last
 explicitly accepted non-null value; an older descriptor reporting `null` never
-replaces it. Mismatch gating happens before session creation and initial
-synchronization; it is not inferred by the bootstrap helper or authorization
-token cache.
+replaces it. Prepared-descriptor mismatch gating happens before session
+creation, and initial-configuration mismatch gating happens before
+synchronization, lease publication, or cache consumption. Neither decision is
+inferred by the bootstrap helper or authorization token cache.
 
 See [Remote architecture](./remote.md) for access methods and
 [RPC and orchestration](./rpc-and-orchestration.md) for the wire boundary.

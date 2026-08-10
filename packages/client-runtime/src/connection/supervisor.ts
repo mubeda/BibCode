@@ -268,7 +268,7 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
     lastFailure: ConnectionAttemptError | null,
     progress: ConnectionDriver.ConnectionDriverProgress,
   ) {
-    if ("prepared" in progress) {
+    if ("prepared" in progress && progress.stage === "synchronizing") {
       yield* SubscriptionRef.set(prepared, Option.some(progress.prepared));
     }
     yield* setState(

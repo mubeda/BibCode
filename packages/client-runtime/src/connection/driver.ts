@@ -59,8 +59,12 @@ export const make = Effect.gen(function* () {
     );
     yield* reportProgress({ stage: "opening", prepared });
     const session = yield* sessions.connect(prepared);
-    yield* reportProgress({ stage: "synchronizing", prepared });
     yield* session.ready;
+    const initialConfig = yield* session.initialConfig;
+    yield* verifyPreparedStorageIdentity(prepared, initialConfig.environment).pipe(
+      Effect.provideService(Persistence.AcceptedStorageIdentityStore, identities),
+    );
+    yield* reportProgress({ stage: "synchronizing", prepared });
     return { prepared, session } satisfies EnvironmentConnectionLease;
   });
 
