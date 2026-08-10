@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     git::{
-        GitRepository, GitWorktreeInventory, HostPathPlatform, normalize_worktree_path_key,
+        GitRepository, GitWorktreeInventory, host_path_platform, normalize_worktree_path_key,
         worktree_key, worktree_repository_key,
     },
     persistence::{ProjectionThread, Repositories, WorktreeRepositoryPinOutcome},
@@ -909,7 +909,7 @@ impl WorktreeCatalogService {
                     Some(generation),
                 )
             })?;
-        let platform = host_platform();
+        let platform = host_path_platform();
         let mut resolved_record = None;
         for record in &observation.inventory.records {
             let Ok(canonical_record) = self
@@ -1176,7 +1176,7 @@ impl WorktreeCatalogService {
         let Some(entry) = self.entry_for_project(project_id) else {
             return;
         };
-        let path = normalize_worktree_path_key(path, host_platform());
+        let path = normalize_worktree_path_key(path, host_path_platform());
         lock(&entry.state).suppressions.insert(path, Instant::now());
     }
 
@@ -1550,7 +1550,7 @@ impl WorktreeCatalogService {
                 )),
             })
         })?;
-        let platform = host_platform();
+        let platform = host_path_platform();
         let repository_key = worktree_repository_key(&common_dir, platform)
             .as_str()
             .to_owned();
@@ -1704,7 +1704,7 @@ impl WorktreeCatalogService {
             suppressions,
             cancellation,
         } = request;
-        let platform = host_platform();
+        let platform = host_path_platform();
         let mut thread_paths: HashMap<String, Vec<&CatalogThread>> = HashMap::new();
         for thread in canonical_threads(project) {
             if let Some(path) = &thread.worktree_path {
@@ -2586,14 +2586,6 @@ fn canonical_threads(project: &CatalogProject) -> impl Iterator<Item = &CatalogT
         .threads
         .iter()
         .filter(|thread| thread.kind != "panel" && !thread.deleted)
-}
-
-fn host_platform() -> HostPathPlatform {
-    if cfg!(windows) {
-        HostPathPlatform::Windows
-    } else {
-        HostPathPlatform::Posix
-    }
 }
 
 fn now_iso() -> String {

@@ -241,6 +241,7 @@ export const WorktreeAdoptionErrorReason = Schema.Literals([
   "workspace-missing",
   "repository-mismatch",
   "ownership-conflict",
+  "command-conflict",
   "orchestration-failed",
   "internal",
 ]);

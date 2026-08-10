@@ -70,7 +70,10 @@ flowchart TB
   repository lifecycle. External-checkout adoption is serialized by stable
   project and physical-repository identity, revalidates live Git membership,
   and persists canonical ordinary workspace ownership atomically without
-  creating Git state. Only healthy authoritative catalog observations may
+  creating Git state. Ownership uses the catalog's host-path identity key, so
+  lexical aliases retain one owner across replay even when the checkout is
+  missing. Public adoption receipts bind the canonical opaque payload and an
+  immutable result. Only healthy authoritative catalog observations may
   reconcile durable adopted-thread branch metadata.
 - **Contracts (`packages/contracts`)** contains Effect schemas and TypeScript
   contracts only. It defines persisted models, RPC methods, HTTP APIs, desktop

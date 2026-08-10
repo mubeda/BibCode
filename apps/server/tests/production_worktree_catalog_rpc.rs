@@ -459,6 +459,132 @@ async fn adopt_race_converges_to_one_thread_without_creating_a_git_worktree() {
 }
 
 #[tokio::test]
+async fn adopt_public_admission_replays_exactly_and_conflicts_on_changed_payload() {
+    let mut fixture = CatalogRpcFixture::new(true).await;
+    request(
+        fixture.socket(),
+        "900",
+        "vcs.refreshWorktreeCatalog",
+        json!({"projectId":"project-1"}),
+    )
+    .await;
+    let snapshot = success_value(fixture.socket(), "900").await;
+    let candidate = eligible_candidate(&snapshot).clone();
+    request(
+        fixture.socket(),
+        "901",
+        "worktree.adopt",
+        adoption_payload("adopt-admission-owner", &candidate, &snapshot),
+    )
+    .await;
+    let owner = success_value(fixture.socket(), "901").await;
+    request(
+        fixture.socket(),
+        "902",
+        "vcs.refreshWorktreeCatalog",
+        json!({"projectId":"project-1"}),
+    )
+    .await;
+    let owned_snapshot = success_value(fixture.socket(), "902").await;
+    let owned_candidate = descriptor_for_key(&owned_snapshot, &candidate["worktreeKey"]);
+    let payload = adoption_payload("adopt-admitted", owned_candidate, &owned_snapshot);
+    request(fixture.socket(), "903", "worktree.adopt", payload.clone()).await;
+    let first = success_value(fixture.socket(), "903").await;
+    assert_eq!(first["threadId"], owner["threadId"]);
+    assert_eq!(first["disposition"], "existing");
+    fixture
+        .engine
+        .dispatch(OrchestrationCommand::ThreadDelete {
+            command_id: "delete-admitted-owner".to_owned(),
+            thread_id: first["threadId"].as_str().expect("thread id").to_owned(),
+        })
+        .await
+        .expect("delete accepted owner");
+    let event_count = fixture
+        .repositories
+        .read_events_from_sequence(0, 512)
+        .await
+        .expect("event read")
+        .len();
+
+    request(fixture.socket(), "904", "worktree.adopt", payload.clone()).await;
+    assert_eq!(
+        success_value(fixture.socket(), "904").await,
+        first,
+        "an identical public retry must replay the accepted result exactly"
+    );
+
+    let mut changed_project = payload.clone();
+    changed_project["projectId"] = json!("different-project");
+    let mut changed_key = payload.clone();
+    changed_key["worktreeKey"] = json!("different-worktree-key");
+    let mut changed_generation = payload.clone();
+    changed_generation["expectedGeneration"] = json!(
+        payload["expectedGeneration"]
+            .as_u64()
+            .expect("expected generation")
+            + 1
+    );
+    let mut changed_defaults = payload;
+    changed_defaults["threadDefaults"]["interactionMode"] = json!("plan");
+    let mutations = [
+        ("project", changed_project),
+        ("worktree-key", changed_key),
+        ("expected-generation", changed_generation),
+        ("thread-defaults", changed_defaults),
+    ];
+    let mut outcomes = Vec::new();
+    let external_path = canonical_string(&fixture.external);
+    for (index, (field, changed_payload)) in mutations.into_iter().enumerate() {
+        let request_id = (905 + index).to_string();
+        request(
+            fixture.socket(),
+            &request_id,
+            "worktree.adopt",
+            changed_payload,
+        )
+        .await;
+        let (outcome, wire_value) = adoption_outcome(fixture.socket(), &request_id).await;
+        assert!(
+            !wire_value.to_string().contains(&external_path),
+            "a command conflict must not expose the server-resolved checkout path"
+        );
+        outcomes.push((field, outcome));
+    }
+    assert_eq!(
+        outcomes,
+        vec![
+            ("project", "command-conflict".to_owned()),
+            ("worktree-key", "command-conflict".to_owned()),
+            ("expected-generation", "command-conflict".to_owned()),
+            ("thread-defaults", "command-conflict".to_owned()),
+        ]
+    );
+    assert_eq!(
+        fixture
+            .repositories
+            .read_events_from_sequence(0, 512)
+            .await
+            .expect("event read")
+            .len(),
+        event_count,
+        "replay and conflicting retries must not append orchestration effects"
+    );
+    assert!(
+        fixture
+            .repositories
+            .get_command_receipt("adopt-admitted".to_owned())
+            .await
+            .expect("receipt read")
+            .expect("receipt")
+            .payload_digest
+            .is_some(),
+        "the public adoption receipt must retain the canonical public payload digest"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn adopt_stale_generation_forces_refresh_then_revalidates() {
     let mut fixture = CatalogRpcFixture::new(true).await;
     request(
@@ -1329,6 +1455,37 @@ async fn assert_typed_adoption_failure(
                 && error["reason"] == expected_reason
                 && error["currentGeneration"].as_u64().is_some()
     )));
+}
+
+async fn adoption_outcome(socket: &mut TestSocket, request_id: &str) -> (String, Value) {
+    let message = next_server_message(socket).await;
+    let value = serde_json::to_value(&message).expect("server message value");
+    match message {
+        ServerMessage::Exit {
+            request_id: actual,
+            exit: RpcExit::Success { .. },
+        } => {
+            assert_eq!(actual.as_str(), request_id);
+            ("success".to_owned(), value)
+        }
+        ServerMessage::Exit {
+            request_id: actual,
+            exit: RpcExit::Failure { cause },
+        } => {
+            assert_eq!(actual.as_str(), request_id);
+            let reason = cause
+                .iter()
+                .find_map(|item| match item {
+                    CauseItem::Fail { error } if error["_tag"] == "WorktreeAdoptionError" => {
+                        error["reason"].as_str().map(str::to_owned)
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| "untyped-failure".to_owned());
+            (reason, value)
+        }
+        other => panic!("expected adoption exit: {other:?}"),
+    }
 }
 
 fn eligible_candidate(snapshot: &Value) -> &Value {

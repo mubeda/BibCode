@@ -116,6 +116,22 @@ describe("worktree catalog schemas", () => {
     ]);
   });
 
+  it("decodes a command conflict without a server-resolved path", () => {
+    expect(
+      decodeAdoptionError({
+        _tag: "WorktreeAdoptionError",
+        reason: "command-conflict",
+        message: "The command ID was already used with a different adoption payload.",
+        currentGeneration: 12,
+      }),
+    ).toMatchObject({
+      _tag: "WorktreeAdoptionError",
+      reason: "command-conflict",
+      message: "The command ID was already used with a different adoption payload.",
+      currentGeneration: 12,
+    });
+  });
+
   it("accepts project-scoped catalog reads without client-supplied paths", () => {
     expect(decodeCatalogInput({ projectId: "project-1" })).toEqual({ projectId: "project-1" });
     expect(decodeCatalogRefreshInput({ projectId: "project-1" })).toEqual({
