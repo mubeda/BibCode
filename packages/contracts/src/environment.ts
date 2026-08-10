@@ -22,6 +22,7 @@ export type ExecutionEnvironmentPlatform = typeof ExecutionEnvironmentPlatform.T
 
 export const ExecutionEnvironmentCapabilities = Schema.Struct({
   repositoryIdentity: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
+  worktreeCatalog: Schema.Boolean.pipe(Schema.withDecodingDefault(Effect.succeed(false))),
   activityProtocolVersion: Schema.NullOr(Schema.Literal(1)).pipe(
     Schema.withDecodingDefault(Effect.succeed(null)),
   ),

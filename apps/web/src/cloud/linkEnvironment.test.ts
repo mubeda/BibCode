@@ -260,7 +260,11 @@ describe("web cloud link environment client", () => {
       label: TARGET.label,
       platform: { os: "darwin", arch: "arm64" },
       serverVersion: "0.0.0-test",
-      capabilities: { repositoryIdentity: true, activityProtocolVersion: null },
+      capabilities: {
+        repositoryIdentity: true,
+        worktreeCatalog: false,
+        activityProtocolVersion: null,
+      },
     });
 
     expect(readPrimaryCloudLinkTarget()).toEqual({

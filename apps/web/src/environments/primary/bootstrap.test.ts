@@ -25,6 +25,7 @@ const BASE_ENVIRONMENT = {
   serverVersion: "0.0.0-test",
   capabilities: {
     repositoryIdentity: true,
+    worktreeCatalog: false,
     activityProtocolVersion: null,
   },
 } satisfies ExecutionEnvironmentDescriptor;
@@ -91,6 +92,7 @@ describe("environmentBootstrap", () => {
       serverVersion: "0.0.0-test",
       capabilities: {
         repositoryIdentity: true,
+        worktreeCatalog: false,
         activityProtocolVersion: null,
       },
     });

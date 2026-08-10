@@ -41,6 +41,15 @@ const legacyClientDecoders = {
 } as const;
 
 describe("execution environment contracts", () => {
+  it("defaults worktree catalog support to false for an old descriptor", () => {
+    expect(
+      decodeExecutionEnvironmentDescriptor({
+        ...descriptor,
+        capabilities: { repositoryIdentity: true },
+      }).capabilities.worktreeCatalog,
+    ).toBe(false);
+  });
+
   it("defaults the activity protocol version for an old descriptor", () => {
     expect(
       decodeExecutionEnvironmentDescriptor({
