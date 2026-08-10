@@ -296,6 +296,28 @@ async function setConnectionCatalog(catalog: string): Promise<boolean> {
   return stored;
 }
 
+async function compareAndSetConnectionCatalog(
+  expectedCatalog: string | null,
+  nextCatalog: string,
+): Promise<boolean> {
+  let stored = await tauriInvoke<boolean>("desktop_bridge_compare_and_set_connection_catalog", {
+    expectedCatalog,
+    nextCatalog,
+  });
+  if (
+    !stored &&
+    expectedCatalog !== null &&
+    readLocalStorageConnectionCatalog() === expectedCatalog
+  ) {
+    stored = await tauriInvoke<boolean>("desktop_bridge_compare_and_set_connection_catalog", {
+      expectedCatalog: null,
+      nextCatalog,
+    });
+  }
+  if (stored) clearLocalStorageConnectionCatalog();
+  return stored;
+}
+
 async function clearConnectionCatalog(): Promise<void> {
   await tauriInvokeOr(
     "desktop_bridge_clear_connection_catalog",
@@ -392,7 +414,10 @@ async function showTauriContextMenu<T extends string>(
   }
 }
 
-function createTauriDesktopBridge(previewSupported: boolean): DesktopBridge {
+function createTauriDesktopBridge(
+  previewSupported: boolean,
+  protectedConnectionCatalog: boolean,
+): DesktopBridge {
   const preview = previewSupported
     ? createTauriPreviewBridge({
         invoke: tauriInvoke,
@@ -415,8 +440,8 @@ function createTauriDesktopBridge(previewSupported: boolean): DesktopBridge {
         writeBrowserClientSettings(settings),
       ),
     getConnectionCatalog,
-    setConnectionCatalog,
     clearConnectionCatalog,
+    ...(protectedConnectionCatalog ? { setConnectionCatalog, compareAndSetConnectionCatalog } : {}),
     discoverSshHosts: () => tauriInvokeOr("desktop_bridge_discover_ssh_hosts", undefined, () => []),
     ensureSshEnvironment: (target, options) =>
       tauriInvokeDesktop("desktop_bridge_ensure_ssh_environment", { target, options }),
@@ -519,7 +544,10 @@ async function installTauriDesktopBridge(): Promise<void> {
     return;
   }
 
-  const bridge = createTauriDesktopBridge(metadata?.features.preview === true);
+  const bridge = createTauriDesktopBridge(
+    metadata?.features.preview === true,
+    metadata?.features.protectedConnectionCatalog === true,
+  );
   window.desktopBridge = bridge;
   const preview = bridge.preview;
   if (preview) startBrowserSurfaceSync(preview);

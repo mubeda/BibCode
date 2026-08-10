@@ -40,11 +40,17 @@ const defaultLocalEnvironmentBootstrap = {
 
 function installTauriHarness(options?: {
   readonly previewSupported?: boolean;
+  readonly protectedConnectionCatalog?: boolean;
   readonly rejectMetadata?: boolean;
   readonly contextMenuResult?: string | null;
   readonly rejectContextMenu?: unknown;
   readonly rejectSshProvisioning?: boolean;
   readonly localEnvironmentBootstraps?: readonly unknown[] | (() => readonly unknown[]);
+  readonly nativeConnectionCatalog?: string | null;
+  readonly compareAndSetConnectionCatalog?: (
+    expectedCatalog: string | null,
+    nextCatalog: string,
+  ) => boolean;
   readonly rejectFallbackCommands?: boolean;
   readonly rejectListeners?: boolean;
 }) {
@@ -59,7 +65,7 @@ function installTauriHarness(options?: {
         }
         return Promise.resolve({
           host: "tauri",
-          bridgeVersion: 1,
+          bridgeVersion: 2,
           features: {
             localBackend: true,
             localBearerToken: true,
@@ -68,6 +74,7 @@ function installTauriHarness(options?: {
             wslDiscovery: true,
             sshRemoteHttp: true,
             connectionCatalog: true,
+            protectedConnectionCatalog: options?.protectedConnectionCatalog ?? true,
             preview: options?.previewSupported ?? false,
             updater: false,
             menuEvents: true,
@@ -119,11 +126,26 @@ function installTauriHarness(options?: {
       case "desktop_bridge_get_connection_catalog":
         return options?.rejectFallbackCommands
           ? Promise.reject(new Error("native catalog unavailable"))
-          : Promise.resolve("native-catalog");
+          : Promise.resolve(
+              options !== undefined && "nativeConnectionCatalog" in options
+                ? options.nativeConnectionCatalog
+                : "native-catalog",
+            );
       case "desktop_bridge_set_connection_catalog":
         return options?.rejectFallbackCommands
           ? Promise.reject(new Error("native catalog unavailable"))
           : Promise.resolve(args?.catalog === "saved-catalog");
+      case "desktop_bridge_compare_and_set_connection_catalog":
+        return options?.rejectFallbackCommands
+          ? Promise.reject(new Error("native catalog unavailable"))
+          : Promise.resolve(
+              options?.compareAndSetConnectionCatalog?.(
+                (args?.expectedCatalog as string | null) ?? null,
+                args?.nextCatalog as string,
+              ) ??
+                (args?.expectedCatalog === "native-catalog" &&
+                  args?.nextCatalog === "saved-catalog"),
+            );
       case "desktop_bridge_clear_connection_catalog":
         return options?.rejectFallbackCommands
           ? Promise.reject(new Error("native catalog unavailable"))
@@ -304,7 +326,7 @@ describe("tauriDesktopBridge", () => {
 
     await expect(bridge.getHostMetadata?.()).resolves.toEqual({
       host: "tauri",
-      bridgeVersion: 1,
+      bridgeVersion: 2,
       features: {
         localBackend: true,
         localBearerToken: true,
@@ -313,6 +335,7 @@ describe("tauriDesktopBridge", () => {
         wslDiscovery: true,
         sshRemoteHttp: true,
         connectionCatalog: true,
+        protectedConnectionCatalog: true,
         preview: false,
         updater: false,
         menuEvents: true,
@@ -365,10 +388,14 @@ describe("tauriDesktopBridge", () => {
 
     expect(bridge.getConnectionCatalog).toBeDefined();
     expect(bridge.setConnectionCatalog).toBeDefined();
+    expect(bridge.compareAndSetConnectionCatalog).toBeDefined();
     expect(bridge.clearConnectionCatalog).toBeDefined();
 
     await expect(bridge.getConnectionCatalog!()).resolves.toBe("native-catalog");
     await expect(bridge.setConnectionCatalog!("saved-catalog")).resolves.toBe(true);
+    await expect(
+      bridge.compareAndSetConnectionCatalog!("native-catalog", "saved-catalog"),
+    ).resolves.toBe(true);
     await expect(bridge.clearConnectionCatalog!()).resolves.toBeUndefined();
 
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_get_connection_catalog", undefined);
@@ -376,9 +403,62 @@ describe("tauriDesktopBridge", () => {
       catalog: "saved-catalog",
     });
     expect(harness.invoke).toHaveBeenCalledWith(
+      "desktop_bridge_compare_and_set_connection_catalog",
+      {
+        expectedCatalog: "native-catalog",
+        nextCatalog: "saved-catalog",
+      },
+    );
+    expect(harness.invoke).toHaveBeenCalledWith(
       "desktop_bridge_clear_connection_catalog",
       undefined,
     );
+  });
+
+  it("atomically migrates a legacy browser catalog into native storage", async () => {
+    const storage = new Map<string, string>([["bibcode.connectionCatalog", "legacy-catalog"]]);
+    const localStorage = {
+      getItem: vi.fn((key: string) => storage.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storage.set(key, value)),
+      removeItem: vi.fn((key: string) => storage.delete(key)),
+    };
+    let nativeCatalog: string | null = null;
+    const harness = installTauriHarness({
+      nativeConnectionCatalog: null,
+      compareAndSetConnectionCatalog: (expected, next) => {
+        if (nativeCatalog !== expected) return false;
+        nativeCatalog = next;
+        return true;
+      },
+    });
+    Object.assign(window, { localStorage });
+    vi.stubGlobal("localStorage", localStorage);
+    const bridge = await installBridge();
+
+    await expect(bridge.getConnectionCatalog!()).resolves.toBe("legacy-catalog");
+    await expect(
+      bridge.compareAndSetConnectionCatalog!("legacy-catalog", "migrated-catalog"),
+    ).resolves.toBe(true);
+    expect(nativeCatalog).toBe("migrated-catalog");
+    expect(storage.has("bibcode.connectionCatalog")).toBe(false);
+    expect(harness.invoke).toHaveBeenCalledWith(
+      "desktop_bridge_compare_and_set_connection_catalog",
+      { expectedCatalog: "legacy-catalog", nextCatalog: "migrated-catalog" },
+    );
+    expect(harness.invoke).toHaveBeenCalledWith(
+      "desktop_bridge_compare_and_set_connection_catalog",
+      { expectedCatalog: null, nextCatalog: "migrated-catalog" },
+    );
+  });
+
+  it("omits native catalog mutation methods when protected CAS is unavailable", async () => {
+    installTauriHarness({ protectedConnectionCatalog: false });
+    const bridge = await installBridge();
+
+    expect(bridge.getConnectionCatalog).toBeDefined();
+    expect(bridge.clearConnectionCatalog).toBeDefined();
+    expect(bridge.setConnectionCatalog).toBeUndefined();
+    expect(bridge.compareAndSetConnectionCatalog).toBeUndefined();
   });
 
   it("normalizes structured unsupported errors returned by Tauri commands", async () => {
@@ -655,6 +735,9 @@ describe("tauriDesktopBridge", () => {
     await expect(bridge.getClientSettings()).resolves.toEqual(DEFAULT_CLIENT_SETTINGS);
     await expect(bridge.getConnectionCatalog!()).resolves.toBe("browser-catalog");
     await expect(bridge.setConnectionCatalog!("browser-catalog")).resolves.toBe(true);
+    await expect(
+      bridge.compareAndSetConnectionCatalog!("browser-catalog", "next-catalog"),
+    ).rejects.toThrow("native catalog unavailable");
     await expect(bridge.clearConnectionCatalog!()).resolves.toBeUndefined();
     await expect(bridge.discoverSshHosts()).resolves.toEqual([]);
     await expect(

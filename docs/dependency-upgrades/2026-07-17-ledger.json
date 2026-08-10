@@ -82,8 +82,8 @@
     }
   },
   "inventorySummary": {
-    "javascriptDirect": 79,
-    "javascriptLedger": 78,
+    "javascriptDirect": 80,
+    "javascriptLedger": 79,
     "rustRegistry": 77,
     "rustPath": 1,
     "actions": 9,
@@ -615,6 +615,18 @@
       "cohort": "javascript-current",
       "platforms": ["linux", "macos", "windows"],
       "status": "current"
+    },
+    {
+      "key": "js:apps/web:fake-indexeddb",
+      "name": "fake-indexeddb",
+      "current": "6.2.5",
+      "target": "6.2.5",
+      "channel": "stable",
+      "source": "https://www.npmjs.com/package/fake-indexeddb",
+      "cohort": "stable-javascript-tooling",
+      "platforms": ["linux", "macos", "windows"],
+      "status": "current",
+      "notes": "Development-only IndexedDB implementation used to verify atomic catalog transactions across independent browser connections."
     },
     {
       "key": "js:apps/web:fontkitten",

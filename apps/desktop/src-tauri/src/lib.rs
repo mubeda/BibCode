@@ -11,6 +11,7 @@ macro_rules! desktop_bridge_commands {
             desktop_bridge_set_client_settings,
             desktop_bridge_get_connection_catalog,
             desktop_bridge_set_connection_catalog,
+            desktop_bridge_compare_and_set_connection_catalog,
             desktop_bridge_clear_connection_catalog,
             desktop_bridge_discover_ssh_hosts,
             desktop_bridge_ensure_ssh_environment,
@@ -76,6 +77,7 @@ pub fn run() {
     let shell_path_hydration = shell_environment::hydrate_process_path();
     let builder = tauri::Builder::<bridge::DesktopRuntime>::new()
         .manage(backend::BackendSupervisor::new())
+        .manage(bridge::ConnectionCatalogCoordinator::new())
         .manage(context_menu::NativeContextMenuManager::new())
         .manage(ssh::SshEnvironmentManager::new())
         .manage(ssh::SshPasswordPromptManager::new())
@@ -121,6 +123,7 @@ pub fn run() {
         bridge::desktop_bridge_set_client_settings,
         bridge::desktop_bridge_get_connection_catalog,
         bridge::desktop_bridge_set_connection_catalog,
+        bridge::desktop_bridge_compare_and_set_connection_catalog,
         bridge::desktop_bridge_clear_connection_catalog,
         bridge::desktop_bridge_discover_ssh_hosts,
         bridge::desktop_bridge_ensure_ssh_environment,

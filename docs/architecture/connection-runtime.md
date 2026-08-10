@@ -49,9 +49,49 @@ without exposing secrets.
 
 The schema-v1 connection catalog additively stores accepted non-null storage
 identities without changing its schema version. Browser mode persists the whole
-catalog in IndexedDB. Desktop mode sends the same serialized catalog through
-the desktop bridge, which protects and restores it as one opaque value; neither
-path has a second storage-identity source.
+catalog in IndexedDB. A desktop host that advertises protected catalog support
+sends the same serialized catalog through the desktop bridge, which protects
+and restores it as one opaque value. Desktop hosts without that capability use
+the same IndexedDB backend as browser mode; neither path has a second ongoing
+storage-identity source.
+
+Catalog mutation is an exact-raw compare-and-set loop, not a renderer-owned
+document cache. Each lookup or update starts with a fresh backend read. An
+update decodes that revision, reapplies its transformation, and attempts to
+replace the exact serialized value it read. A conflict rereads and reapplies,
+with a bounded eight-attempt limit and a cooperative yield between conflicts.
+This preserves disjoint target, profile, credential, DPoP-token, and accepted-
+identity changes made by separately constructed stores. Corrupt-catalog
+recovery follows the same rule: it replaces the corrupt value only if those
+exact bytes remain current, otherwise it reads the concurrent winner.
+
+In browser mode, and in desktop mode when native catalog protection is
+unavailable, IndexedDB performs the comparison and conditional `put` in one
+`readwrite` transaction on the catalog key, so its transaction serialization
+coordinates independent stores, tabs, and WebViews. On a capable desktop host,
+`compareAndSetConnectionCatalog` is a privileged typed `DesktopBridge` command.
+The Rust catalog owner holds one process-wide mutex across the protected read,
+comparison, and write; legacy `get`, `set`, and `clear` commands use the same
+owner. Desktop bridge contract version 2 introduces this command and the
+`protectedConnectionCatalog` capability. The renderer never emulates CAS with
+separate bridge reads and writes. A host without protected CAS explicitly
+selects IndexedDB and atomically migrates any legacy renderer-local catalog
+into it before clearing the legacy value. A protected host migrates a legacy
+renderer-local catalog only by a native CAS from `null`, so neither migration
+can overwrite a value that appeared concurrently. During unprotected-host
+migration, an already-valid IndexedDB value is the exact canonical winner. If
+IndexedDB instead contains corrupt bytes and the legacy catalog is valid, the
+renderer replaces those exact corrupt bytes by CAS and quarantines them before
+clearing the only valid legacy copy. Migration uses the same eight-attempt
+bound as ordinary catalog updates.
+
+Once a CAS call is issued it is uninterruptible through transaction/command
+completion. There is no in-memory catalog publication afterward, so a caller
+interrupted around commit cannot leave stale renderer state that overwrites the
+durable winner on a later update. On protected hosts, the native mutex
+coordinates every WebView in one desktop host. Separate simultaneously running
+desktop processes are not yet coordinated by an OS/file lock and remain a
+documented residual risk.
 
 Accepted identities use target keys that remain stable when endpoints, labels,
 credentials, or local paths change:
