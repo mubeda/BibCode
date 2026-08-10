@@ -91,6 +91,8 @@ const ENVIRONMENT_ID = EnvironmentId.make("environment-main");
 const PROJECT_ID = ProjectId.make("project-main");
 const REMOTE_ENVIRONMENT_ID = EnvironmentId.make("environment-remote");
 const REMOTE_PROJECT_ID = ProjectId.make("project-remote");
+const LOCAL_ACCESSIBLE_SCOPE = `This device (environment ${ENVIRONMENT_ID}, project ${PROJECT_ID})`;
+const REMOTE_ACCESSIBLE_SCOPE = `Remote Box (environment ${REMOTE_ENVIRONMENT_ID}, project ${REMOTE_PROJECT_ID})`;
 
 function candidate(path: string, branch: string): VcsWorktreeDescriptor {
   return {
@@ -263,6 +265,83 @@ afterEach(async () => {
 });
 
 describe("WorktreeDiscoverySection", () => {
+  it("keeps identical labels, candidate names, and host paths unique by physical scope", async () => {
+    const sharedEnvironmentLabel = "Shared host";
+    const sharedPath = "/worktrees/shared";
+    const sharedBranch = "feature/shared";
+    testState.catalogs.set(
+      `${ENVIRONMENT_ID}:${PROJECT_ID}`,
+      snapshot([candidate(sharedPath, sharedBranch)]),
+    );
+    testState.catalogs.set(
+      `${REMOTE_ENVIRONMENT_ID}:${REMOTE_PROJECT_ID}`,
+      snapshot([candidate(sharedPath, sharedBranch)]),
+    );
+    const withSharedLabels = (snapshot: SidebarProjectSnapshot): SidebarProjectSnapshot => ({
+      ...snapshot,
+      memberProjects: snapshot.memberProjects.map((member) => ({
+        ...member,
+        environmentLabel: sharedEnvironmentLabel,
+      })),
+      remoteEnvironmentLabels: [sharedEnvironmentLabel],
+    });
+
+    await mount(
+      <WorktreeDiscoverySection
+        project={withSharedLabels(groupedProject("hidden", "hidden"))}
+        serverConfigs={groupedServerConfigs()}
+        onNavigateToThread={testState.navigate}
+      />,
+    );
+
+    const addNames = Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
+      .map((element) => element.getAttribute("aria-label"))
+      .filter((name): name is string => name?.startsWith("Add feature/shared from") === true);
+    expect(addNames).toEqual([
+      `Add feature/shared from Shared host (environment ${ENVIRONMENT_ID}, project ${PROJECT_ID}) at ${sharedPath} to BiBCode`,
+      `Add feature/shared from Shared host (environment ${REMOTE_ENVIRONMENT_ID}, project ${REMOTE_PROJECT_ID}) at ${sharedPath} to BiBCode`,
+    ]);
+    expect(new Set(addNames).size).toBe(2);
+
+    const pathTriggerNames = Array.from(document.querySelectorAll<HTMLElement>("[aria-label]"))
+      .map((element) => element.getAttribute("aria-label"))
+      .filter((name): name is string => name?.startsWith("Full worktree path for") === true);
+    expect(pathTriggerNames).toEqual([
+      `Full worktree path for feature/shared in Shared host (environment ${ENVIRONMENT_ID}, project ${PROJECT_ID}): ${sharedPath}`,
+      `Full worktree path for feature/shared in Shared host (environment ${REMOTE_ENVIRONMENT_ID}, project ${REMOTE_PROJECT_ID}): ${sharedPath}`,
+    ]);
+    expect(new Set(pathTriggerNames).size).toBe(2);
+    expect(document.body.textContent).toContain(sharedEnvironmentLabel);
+    expect(document.body.textContent).not.toContain(ENVIRONMENT_ID);
+    expect(document.body.textContent).not.toContain(REMOTE_ENVIRONMENT_ID);
+    expect(
+      Array.from(document.querySelectorAll<HTMLElement>("[data-mock='tooltip-popup']")).filter(
+        (element) => element.textContent === sharedPath,
+      ),
+    ).toHaveLength(2);
+
+    await unmountLastMountedTree();
+    await mount(
+      <WorktreeDiscoverySection
+        project={withSharedLabels(groupedProject("shown", "shown"))}
+        serverConfigs={groupedServerConfigs()}
+        onNavigateToThread={testState.navigate}
+      />,
+    );
+
+    const shownNames = Array.from(document.querySelectorAll<HTMLButtonElement>("button"))
+      .map((element) => element.getAttribute("aria-label"))
+      .filter(
+        (name): name is string =>
+          name?.startsWith("Add discovered worktree feature/shared") === true,
+      );
+    expect(shownNames).toEqual([
+      `Add discovered worktree feature/shared from Shared host (environment ${ENVIRONMENT_ID}, project ${PROJECT_ID}) at ${sharedPath} to BiBCode`,
+      `Add discovered worktree feature/shared from Shared host (environment ${REMOTE_ENVIRONMENT_ID}, project ${REMOTE_PROJECT_ID}) at ${sharedPath} to BiBCode`,
+    ]);
+    expect(new Set(shownNames).size).toBe(2);
+  });
+
   it("uniquely names same-branch actions and discloses exact paths on focus and hover", async () => {
     const localPath = '/worktrees/<script>alert("x")</script>/same';
     const remotePath = "R:\\worktrees\\same";
@@ -283,9 +362,13 @@ describe("WorktreeDiscoverySection", () => {
       />,
     );
 
-    expect(button(`Add feature/shared from This device at ${localPath} to BiBCode`)).toBeDefined();
     expect(
-      button(`Add discovered worktree feature/shared from Remote Box at ${remotePath} to BiBCode`),
+      button(`Add feature/shared from ${LOCAL_ACCESSIBLE_SCOPE} at ${localPath} to BiBCode`),
+    ).toBeDefined();
+    expect(
+      button(
+        `Add discovered worktree feature/shared from ${REMOTE_ACCESSIBLE_SCOPE} at ${remotePath} to BiBCode`,
+      ),
     ).toBeDefined();
 
     const localPathTrigger = Array.from(
@@ -293,7 +376,7 @@ describe("WorktreeDiscoverySection", () => {
     ).find(
       (element) =>
         element.getAttribute("aria-label") ===
-        `Full worktree path for feature/shared in This device: ${localPath}`,
+        `Full worktree path for feature/shared in ${LOCAL_ACCESSIBLE_SCOPE}: ${localPath}`,
     );
     expect(localPathTrigger).not.toBeNull();
     expect(localPathTrigger?.tabIndex).toBe(0);
@@ -320,7 +403,7 @@ describe("WorktreeDiscoverySection", () => {
     );
 
     await act(async () =>
-      button("Add feature/one from This device at /worktrees/one to BiBCode").click(),
+      button(`Add feature/one from ${LOCAL_ACCESSIBLE_SCOPE} at /worktrees/one to BiBCode`).click(),
     );
 
     expect(testState.commandCalls).toContainEqual({
@@ -417,7 +500,7 @@ describe("WorktreeDiscoverySection", () => {
     );
 
     await act(async () => {
-      button("Add feature/one from This device at /worktrees/one to BiBCode").click();
+      button(`Add feature/one from ${LOCAL_ACCESSIBLE_SCOPE} at /worktrees/one to BiBCode`).click();
       await Promise.resolve();
     });
     await act(async () => {
@@ -486,7 +569,9 @@ describe("WorktreeDiscoverySection", () => {
     );
 
     await act(async () => {
-      button("Add feature/only from This device at /worktrees/only to BiBCode").click();
+      button(
+        `Add feature/only from ${LOCAL_ACCESSIBLE_SCOPE} at /worktrees/only to BiBCode`,
+      ).click();
       await Promise.resolve();
     });
 
@@ -522,7 +607,9 @@ describe("WorktreeDiscoverySection", () => {
     );
 
     await act(async () => {
-      button("Add feature/delayed from This device at /worktrees/delayed to BiBCode").click();
+      button(
+        `Add feature/delayed from ${LOCAL_ACCESSIBLE_SCOPE} at /worktrees/delayed to BiBCode`,
+      ).click();
       await Promise.resolve();
     });
     await unmountLastMountedTree();
@@ -640,7 +727,7 @@ describe("WorktreeDiscoverySection", () => {
     expect(document.body.textContent).toContain("/worktrees/shown");
     await act(async () =>
       button(
-        "Add discovered worktree feature/shown from This device at /worktrees/shown to BiBCode",
+        `Add discovered worktree feature/shown from ${LOCAL_ACCESSIBLE_SCOPE} at /worktrees/shown to BiBCode`,
       ).click(),
     );
 
