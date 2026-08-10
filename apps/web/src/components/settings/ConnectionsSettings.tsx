@@ -2989,14 +2989,9 @@ export function ConnectionsSettings() {
     if (change.kind === "enable") return;
     setPendingWslChange(null);
     if (change.kind === "disable") {
-      void applyWslSettingChange(async () => {
-        const next = await desktopBridge.setWslBackendEnabled(false);
-        if (change.wasWslOnly) {
-          // Clearing wsl-only relaunches onto the Windows backend.
-          return await desktopBridge.setWslOnly(false);
-        }
-        return next;
-      });
+      // Disabling is atomic at the desktop bridge: it clears wsl-only and
+      // performs the single backend restart needed to return to Windows.
+      void applyWslSettingChange(() => desktopBridge.setWslBackendEnabled(false));
       return;
     }
     if (change.kind === "distro") {
