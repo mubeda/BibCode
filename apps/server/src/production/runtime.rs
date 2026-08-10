@@ -236,6 +236,7 @@ impl ProductionRuntime {
         .with_catalog_mutation_observer(Arc::new(WorktreeCatalogMutationObserver::new(
             worktree_catalog.clone(),
             repositories.clone(),
+            git_repository.clone(),
         )));
         let workspace = WorkspaceRpc::with_dependencies(
             WorkspaceService::default(),
@@ -448,7 +449,7 @@ impl ProductionRuntime {
     }
 
     pub async fn shutdown(&self) {
-        self._worktree_catalog.shutdown();
+        self._worktree_catalog.shutdown().await;
         self.provider_update_checks.shutdown().await;
         self.turn_delivery.shutdown().await;
         self.orchestration_effects.shutdown().await;

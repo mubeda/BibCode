@@ -154,6 +154,7 @@ struct Inner {
     options: CatalogServiceOptions,
     scan_semaphore: Arc<Semaphore>,
     probe_semaphore: Arc<Semaphore>,
+    shutdown: CancellationToken,
     registry: Mutex<Registry>,
     #[cfg(test)]
     final_release_pause: Mutex<Option<FinalReleasePause>>,
@@ -167,6 +168,8 @@ struct Inner {
     mutation_refresh_start_pause: Mutex<Option<MutationRefreshStartPause>>,
     #[cfg(test)]
     repository_observation_requests: AtomicUsize,
+    #[cfg(test)]
+    active_owned_tasks: AtomicUsize,
 }
 
 #[cfg(test)]
@@ -188,6 +191,18 @@ struct MutationRefreshWorkerGuard {
 }
 
 #[cfg(test)]
+struct OwnedTaskGuard {
+    inner: Arc<Inner>,
+}
+
+#[cfg(test)]
+impl Drop for OwnedTaskGuard {
+    fn drop(&mut self) {
+        self.inner.active_owned_tasks.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
 impl Drop for MutationRefreshWorkerGuard {
     fn drop(&mut self) {
         self.inner
@@ -202,7 +217,8 @@ struct Registry {
     entries: HashMap<String, Arc<CatalogEntry>>,
     repositories: HashMap<String, Weak<RepositoryEntry>>,
     bootstrap_locks: HashMap<String, Arc<AsyncMutex<()>>>,
-    mutation_locks: HashMap<String, Weak<AsyncMutex<()>>>,
+    project_mutation_locks: HashMap<String, Weak<AsyncMutex<()>>>,
+    repository_mutation_locks: HashMap<String, Weak<AsyncMutex<()>>>,
 }
 
 struct CatalogEntry {
@@ -283,7 +299,7 @@ struct SubscriptionReservation {
 
 struct OwnedTask {
     cancellation: CancellationToken,
-    _handle: JoinHandle<()>,
+    handle: JoinHandle<()>,
 }
 
 struct MutationRefreshTask {
@@ -302,6 +318,15 @@ struct RefreshOwnership {
 impl Drop for OwnedTask {
     fn drop(&mut self) {
         self.cancellation.cancel();
+        self.handle.abort();
+    }
+}
+
+impl OwnedTask {
+    async fn terminate(mut self) {
+        self.cancellation.cancel();
+        self.handle.abort();
+        let _ = (&mut self.handle).await;
     }
 }
 
@@ -311,6 +336,13 @@ impl MutationRefreshTask {
     }
 
     fn disarm(mut self) {
+        self.abort_on_drop = false;
+    }
+
+    async fn terminate(mut self) {
+        self.cancellation.cancel();
+        self.handle.abort();
+        let _ = (&mut self.handle).await;
         self.abort_on_drop = false;
     }
 }
@@ -375,6 +407,7 @@ impl WorktreeCatalogService {
                 options,
                 scan_semaphore: Arc::new(Semaphore::new(max_repository_scans)),
                 probe_semaphore: Arc::new(Semaphore::new(max_directory_probes)),
+                shutdown: CancellationToken::new(),
                 registry: Mutex::new(Registry::default()),
                 #[cfg(test)]
                 final_release_pause: Mutex::new(None),
@@ -388,11 +421,16 @@ impl WorktreeCatalogService {
                 mutation_refresh_start_pause: Mutex::new(None),
                 #[cfg(test)]
                 repository_observation_requests: AtomicUsize::new(0),
+                #[cfg(test)]
+                active_owned_tasks: AtomicUsize::new(0),
             }),
         }
     }
 
     pub async fn subscribe(&self, project_id: &str) -> Result<CatalogSubscription, CatalogError> {
+        if self.inner.shutdown.is_cancelled() {
+            return Err(shutdown_error());
+        }
         let mut reservation = loop {
             let entry = self.ensure_entry(project_id).await?;
             if let Some(reservation) = self.reserve_subscription(project_id, entry) {
@@ -410,6 +448,9 @@ impl WorktreeCatalogService {
             self.refresh(project_id, CatalogRefreshTrigger::FirstSubscriber)
                 .await?;
         }
+        if self.inner.shutdown.is_cancelled() {
+            return Err(shutdown_error());
+        }
         Ok(reservation.commit())
     }
 
@@ -419,6 +460,9 @@ impl WorktreeCatalogService {
         entry: Arc<CatalogEntry>,
     ) -> Option<SubscriptionReservation> {
         let registry = lock(&self.inner.registry);
+        if self.inner.shutdown.is_cancelled() {
+            return None;
+        }
         if !registry
             .entries
             .get(project_id)
@@ -433,14 +477,14 @@ impl WorktreeCatalogService {
         let first_subscriber = state.subscribers == 0;
         if first_subscriber {
             state.lifecycle_epoch = state.lifecycle_epoch.wrapping_add(1);
-            state.scan_cancellation = CancellationToken::new();
+            state.scan_cancellation = self.inner.shutdown.child_token();
         }
         let lifecycle_epoch = state.lifecycle_epoch;
         state.subscribers += 1;
         let mut repository_state = lock(&entry.repository.state);
         if repository_state.subscribers == 0 {
             repository_state.lifecycle_epoch = repository_state.lifecycle_epoch.wrapping_add(1);
-            repository_state.scan_cancellation = CancellationToken::new();
+            repository_state.scan_cancellation = self.inner.shutdown.child_token();
         }
         repository_state.subscribers += 1;
         let receiver = state.sender.subscribe();
@@ -462,6 +506,9 @@ impl WorktreeCatalogService {
         project_id: &str,
         trigger: CatalogRefreshTrigger,
     ) -> Result<Arc<WorktreeCatalogSnapshot>, CatalogError> {
+        if self.inner.shutdown.is_cancelled() {
+            return Err(shutdown_error());
+        }
         let entry = self.ensure_entry(project_id).await?;
         self.refresh_entry(project_id, &entry, trigger, None).await
     }
@@ -494,7 +541,7 @@ impl WorktreeCatalogService {
                 let cancellation = if subscriber_owned {
                     state.scan_cancellation.clone()
                 } else {
-                    CancellationToken::new()
+                    self.inner.shutdown.child_token()
                 };
                 (
                     state.completed_refreshes,
@@ -677,26 +724,47 @@ impl WorktreeCatalogService {
         Some(Arc::clone(&lock(&entry.state).snapshot))
     }
 
-    pub(crate) fn shutdown(&self) {
-        let mut registry = lock(&self.inner.registry);
-        for entry in registry.entries.values() {
-            let mut state = lock(&entry.state);
-            state.scan_cancellation.cancel();
-            state.poller.take();
-            state.eviction.take();
-            state.mutation_refresh_worker.take();
-            state.pending_mutation_refresh_epoch = None;
-            let repository_state = lock(&entry.repository.state);
-            repository_state.scan_cancellation.cancel();
+    pub(crate) async fn shutdown(&self) {
+        self.inner.shutdown.cancel();
+        let mut owned_tasks = Vec::new();
+        let mut mutation_tasks = Vec::new();
+        {
+            let mut registry = lock(&self.inner.registry);
+            for entry in registry.entries.values() {
+                let mut state = lock(&entry.state);
+                state.scan_cancellation.cancel();
+                owned_tasks.extend(state.poller.take());
+                owned_tasks.extend(state.eviction.take());
+                mutation_tasks.extend(state.mutation_refresh_worker.take());
+                state.pending_mutation_refresh_epoch = None;
+                state.subscribers = 0;
+                let mut repository_state = lock(&entry.repository.state);
+                repository_state.scan_cancellation.cancel();
+                repository_state.subscribers = 0;
+            }
+            registry.aliases.clear();
+            registry.entries.clear();
+            registry.repositories.clear();
+            registry.bootstrap_locks.clear();
+            registry.project_mutation_locks.clear();
+            registry.repository_mutation_locks.clear();
         }
-        registry.aliases.clear();
-        registry.entries.clear();
-        registry.repositories.clear();
-        registry.bootstrap_locks.clear();
-        registry.mutation_locks.clear();
+        for task in owned_tasks {
+            task.terminate().await;
+        }
+        for task in mutation_tasks {
+            task.terminate().await;
+        }
+        #[cfg(test)]
+        while self.active_background_task_count_for_test() != 0 {
+            tokio::task::yield_now().await;
+        }
     }
 
     pub async fn invalidate_after_mutation(&self, project_id: &str) {
+        if self.inner.shutdown.is_cancelled() {
+            return;
+        }
         let Some(entry) = self.entry_for_project(project_id) else {
             return;
         };
@@ -721,6 +789,9 @@ impl WorktreeCatalogService {
         entry: &Arc<CatalogEntry>,
         state: &mut EntryState,
     ) {
+        if self.inner.shutdown.is_cancelled() {
+            return;
+        }
         if let Some(worker) = state.mutation_refresh_worker.as_ref() {
             if !worker.is_finished() {
                 return;
@@ -835,6 +906,9 @@ impl WorktreeCatalogService {
     }
 
     pub async fn note_managed_creation(&self, project_id: &str, path: &Path) {
+        if self.inner.shutdown.is_cancelled() {
+            return;
+        }
         let Some(entry) = self.entry_for_project(project_id) else {
             return;
         };
@@ -847,35 +921,62 @@ impl WorktreeCatalogService {
         F: FnOnce() -> Fut,
         Fut: Future<Output = T>,
     {
-        let lock_key = self
-            .load_project(project_id)
-            .await
-            .ok()
-            .and_then(|project| project.repository_key)
-            .or_else(|| lock(&self.inner.registry).aliases.get(project_id).cloned())
-            .unwrap_or_else(|| format!("unresolved-project:{project_id}"));
-        let mutation_lock = {
+        // Always acquire the immutable project identity first. Repository identity may be
+        // established during bootstrap, so keying the only lock by the mutable pin would let
+        // one project enter two unrelated critical sections across that transition.
+        let project_lock = {
             let mut registry = lock(&self.inner.registry);
             registry
-                .mutation_locks
+                .project_mutation_locks
                 .retain(|_, mutation_lock| mutation_lock.strong_count() > 0);
             registry
-                .mutation_locks
-                .get(&lock_key)
+                .project_mutation_locks
+                .get(project_id)
                 .and_then(Weak::upgrade)
                 .unwrap_or_else(|| {
                     let mutation_lock = Arc::new(AsyncMutex::new(()));
                     registry
-                        .mutation_locks
-                        .insert(lock_key, Arc::downgrade(&mutation_lock));
+                        .project_mutation_locks
+                        .insert(project_id.to_owned(), Arc::downgrade(&mutation_lock));
                     mutation_lock
                 })
         };
-        let _guard = mutation_lock.lock().await;
+        let _project_guard = project_lock.lock().await;
+        let repository_key = self
+            .load_project(project_id)
+            .await
+            .ok()
+            .and_then(|project| project.repository_key)
+            .or_else(|| lock(&self.inner.registry).aliases.get(project_id).cloned());
+        let repository_lock = repository_key.map(|repository_key| {
+            let mut registry = lock(&self.inner.registry);
+            registry
+                .repository_mutation_locks
+                .retain(|_, mutation_lock| mutation_lock.strong_count() > 0);
+            registry
+                .repository_mutation_locks
+                .get(&repository_key)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| {
+                    let mutation_lock = Arc::new(AsyncMutex::new(()));
+                    registry
+                        .repository_mutation_locks
+                        .insert(repository_key, Arc::downgrade(&mutation_lock));
+                    mutation_lock
+                })
+        });
+        let _repository_guard = if let Some(repository_lock) = repository_lock.as_ref() {
+            Some(repository_lock.lock().await)
+        } else {
+            None
+        };
         operation().await
     }
 
     async fn ensure_entry(&self, project_id: &str) -> Result<Arc<CatalogEntry>, CatalogError> {
+        if self.inner.shutdown.is_cancelled() {
+            return Err(shutdown_error());
+        }
         if let Some(entry) = self.entry_for_project(project_id) {
             return Ok(entry);
         }
@@ -888,7 +989,10 @@ impl WorktreeCatalogService {
                     .or_insert_with(|| Arc::new(AsyncMutex::new(()))),
             )
         };
-        let guard = bootstrap_lock.lock().await;
+        let guard = tokio::select! {
+            _ = self.inner.shutdown.cancelled() => return Err(shutdown_error()),
+            guard = bootstrap_lock.lock() => guard,
+        };
         if let Some(entry) = self.entry_for_project(project_id) {
             drop(guard);
             self.remove_bootstrap_lock_if_idle(project_id, &bootstrap_lock);
@@ -896,7 +1000,7 @@ impl WorktreeCatalogService {
         }
         let result = async {
             let project = self.load_project(project_id).await?;
-            let cancellation = CancellationToken::new();
+            let cancellation = self.inner.shutdown.child_token();
             let anchor = self
                 .select_anchor(&project, None, &cancellation)
                 .await
@@ -930,6 +1034,9 @@ impl WorktreeCatalogService {
             )
             .await?;
             let mut registry = lock(&self.inner.registry);
+            if self.inner.shutdown.is_cancelled() {
+                return Err(shutdown_error());
+            }
             registry
                 .repositories
                 .retain(|_, repository| repository.strong_count() > 0);
@@ -974,7 +1081,7 @@ impl WorktreeCatalogService {
                     eviction: None,
                     failure_backoff: Duration::ZERO,
                     next_failure_retry: None,
-                    scan_cancellation: CancellationToken::new(),
+                    scan_cancellation: self.inner.shutdown.child_token(),
                 }),
             });
             registry
@@ -1696,6 +1803,9 @@ impl WorktreeCatalogService {
         entry: &Arc<CatalogEntry>,
         lifecycle_epoch: u64,
     ) {
+        if self.inner.shutdown.is_cancelled() {
+            return;
+        }
         let mut state = lock(&entry.state);
         if state.lifecycle_epoch != lifecycle_epoch
             || state.subscribers == 0
@@ -1704,13 +1814,21 @@ impl WorktreeCatalogService {
             return;
         }
         let snapshot = Arc::clone(&state.last_authoritative);
-        let cancellation = CancellationToken::new();
+        let cancellation = self.inner.shutdown.child_token();
         let weak_inner = Arc::downgrade(&self.inner);
         let weak_entry = Arc::downgrade(entry);
         let project_id = project_id.to_owned();
         let task_cancellation = cancellation.clone();
         let poll_interval = self.inner.options.poll_interval;
+        #[cfg(test)]
+        self.inner.active_owned_tasks.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        let task_guard = OwnedTaskGuard {
+            inner: Arc::clone(&self.inner),
+        };
         let handle = tokio::spawn(async move {
+            #[cfg(test)]
+            let _task = task_guard;
             let (Some(inner), Some(entry)) = (weak_inner.upgrade(), weak_entry.upgrade()) else {
                 return;
             };
@@ -1775,7 +1893,7 @@ impl WorktreeCatalogService {
         });
         state.poller = Some(OwnedTask {
             cancellation,
-            _handle: handle,
+            handle,
         });
     }
 
@@ -1792,8 +1910,13 @@ impl WorktreeCatalogService {
                 }
             }
             self.ensure_poller_started(&entry.project_id, entry, lifecycle_epoch);
-            if ready.changed().await.is_err() {
-                return false;
+            tokio::select! {
+                _ = self.inner.shutdown.cancelled() => return false,
+                result = ready.changed() => {
+                    if result.is_err() {
+                        return false;
+                    }
+                }
             }
         }
     }
@@ -1827,13 +1950,24 @@ impl WorktreeCatalogService {
         if !should_evict {
             return;
         }
-        let cancellation = CancellationToken::new();
+        if self.inner.shutdown.is_cancelled() {
+            return;
+        }
+        let cancellation = self.inner.shutdown.child_token();
         let task_cancellation = cancellation.clone();
         let weak_inner = Arc::downgrade(&self.inner);
         let weak_entry = Arc::downgrade(entry);
         let project_id = entry.project_id.clone();
         let idle_eviction = self.inner.options.idle_eviction;
+        #[cfg(test)]
+        self.inner.active_owned_tasks.fetch_add(1, Ordering::SeqCst);
+        #[cfg(test)]
+        let task_guard = OwnedTaskGuard {
+            inner: Arc::clone(&self.inner),
+        };
         let handle = tokio::spawn(async move {
+            #[cfg(test)]
+            let _task = task_guard;
             tokio::select! {
                 _ = task_cancellation.cancelled() => return,
                 _ = tokio::time::sleep(idle_eviction) => {}
@@ -1857,7 +1991,7 @@ impl WorktreeCatalogService {
         });
         lock(&entry.state).eviction = Some(OwnedTask {
             cancellation,
-            _handle: handle,
+            handle,
         });
     }
 
@@ -1868,6 +2002,15 @@ impl WorktreeCatalogService {
             .values()
             .filter(|entry| lock(&entry.state).poller.is_some())
             .count()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_background_task_count_for_test(&self) -> usize {
+        self.inner.active_owned_tasks.load(Ordering::SeqCst)
+            + self
+                .inner
+                .active_mutation_refresh_workers
+                .load(Ordering::SeqCst)
     }
 
     #[cfg(test)]
@@ -2003,8 +2146,16 @@ impl CatalogSubscription {
         Arc::clone(&self.receiver.borrow())
     }
 
+    #[must_use]
+    pub fn initial_latest(&mut self) -> Arc<WorktreeCatalogSnapshot> {
+        Arc::clone(&self.receiver.borrow_and_update())
+    }
+
     pub async fn changed(&mut self) -> Option<Arc<WorktreeCatalogSnapshot>> {
-        self.receiver.changed().await.ok()?;
+        tokio::select! {
+            _ = self.service.inner.shutdown.cancelled() => return None,
+            result = self.receiver.changed() => result.ok()?,
+        }
         Some(Arc::clone(&self.receiver.borrow_and_update()))
     }
 }
@@ -2061,6 +2212,13 @@ fn cancelled_error() -> CatalogError {
     CatalogError::new(
         CatalogErrorReason::RepositoryUnavailable,
         "Catalog work was cancelled after its final subscriber detached.",
+    )
+}
+
+fn shutdown_error() -> CatalogError {
+    CatalogError::new(
+        CatalogErrorReason::RepositoryUnavailable,
+        "The worktree catalog service is shut down.",
     )
 }
 

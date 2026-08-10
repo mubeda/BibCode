@@ -6,7 +6,11 @@ use std::{
 use axum::extract::ws::{Message, WebSocket};
 use futures_util::{FutureExt, SinkExt, StreamExt};
 use serde_json::{Value, json};
-use tokio::{sync::mpsc, task::JoinHandle, time::timeout};
+use tokio::{
+    sync::{mpsc, watch},
+    task::JoinHandle,
+    time::timeout,
+};
 use tokio_util::sync::CancellationToken;
 
 use super::{
@@ -31,6 +35,15 @@ type UnaryHandler =
     Arc<dyn Fn(RpcRequest, RpcSessionContext, CancellationToken) -> UnaryFuture + Send + Sync>;
 type StreamHandler = Arc<
     dyn Fn(RpcRequest, RpcSessionContext, CancellationToken) -> mpsc::Receiver<RpcStreamChunk>
+        + Send
+        + Sync,
+>;
+type LatestStreamHandler = Arc<
+    dyn Fn(
+            RpcRequest,
+            RpcSessionContext,
+            CancellationToken,
+        ) -> watch::Receiver<Option<RpcStreamChunk>>
         + Send
         + Sync,
 >;
@@ -106,6 +119,7 @@ impl RpcSessionContext {
 enum RpcMethod {
     Unary(UnaryHandler),
     Stream(StreamHandler),
+    LatestStream(LatestStreamHandler),
 }
 
 #[derive(Clone, Default)]
@@ -194,6 +208,21 @@ impl RpcRegistry {
         );
     }
 
+    pub fn register_latest_stream<F>(&mut self, name: impl Into<String>, handler: F)
+    where
+        F: Fn(RpcRequest, CancellationToken) -> watch::Receiver<Option<RpcStreamChunk>>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.methods.insert(
+            name.into(),
+            RpcMethod::LatestStream(Arc::new(move |request, _context, cancellation| {
+                handler(request, cancellation)
+            })),
+        );
+    }
+
     pub(crate) fn register_stream_with_context<F>(&mut self, name: impl Into<String>, handler: F)
     where
         F: Fn(RpcRequest, RpcSessionContext, CancellationToken) -> mpsc::Receiver<RpcStreamChunk>
@@ -214,7 +243,8 @@ impl RpcRegistry {
         for spec in ACTIVE_RPC_METHODS {
             match (spec.mode, self.methods.get(spec.name)) {
                 (MethodMode::Unary, Some(RpcMethod::Unary(_)))
-                | (MethodMode::Stream, Some(RpcMethod::Stream(_))) => {}
+                | (MethodMode::Stream, Some(RpcMethod::Stream(_) | RpcMethod::LatestStream(_))) => {
+                }
                 (_, None) => issues.push(format!("missing {}", spec.name)),
                 (expected, Some(_)) => {
                     issues.push(format!(
@@ -523,7 +553,7 @@ fn spawn_request(
     let session_shutdown = session_shutdown.clone();
     let (acknowledgements, acknowledgement_receiver) = match method {
         RpcMethod::Unary(_) => (None, None),
-        RpcMethod::Stream(_) => {
+        RpcMethod::Stream(_) | RpcMethod::LatestStream(_) => {
             let (sender, receiver) = mpsc::channel(1);
             (Some(sender), Some(receiver))
         }
@@ -550,6 +580,21 @@ fn spawn_request(
                         return;
                     };
                     run_stream(
+                        request,
+                        handler,
+                        context,
+                        request_cancellation,
+                        request_shutdown.clone(),
+                        acknowledgement_receiver,
+                        outbound,
+                    )
+                    .await;
+                }
+                RpcMethod::LatestStream(handler) => {
+                    let Some(acknowledgement_receiver) = acknowledgement_receiver else {
+                        return;
+                    };
+                    run_latest_stream(
                         request,
                         handler,
                         context,
@@ -719,6 +764,106 @@ async fn run_stream(
     }
 }
 
+async fn run_latest_stream(
+    request: RpcRequest,
+    handler: LatestStreamHandler,
+    context: RpcSessionContext,
+    cancellation: CancellationToken,
+    session_shutdown: CancellationToken,
+    mut acknowledgements: mpsc::Receiver<()>,
+    outbound: mpsc::Sender<ServerMessage>,
+) {
+    let request_id = request.id.clone();
+    let mut stream = handler(request, context, cancellation.clone());
+    loop {
+        let item = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => {
+                let _ = outbound.try_send(ServerMessage::interrupt(request_id));
+                return;
+            }
+            changed = stream.changed() => {
+                if changed.is_err() {
+                    let _ = send_latest_stream_message(
+                        &outbound,
+                        &session_shutdown,
+                        &cancellation,
+                        ServerMessage::success(request_id, None),
+                    ).await;
+                    return;
+                }
+                stream.borrow_and_update().clone()
+            }
+        };
+        let Some(item) = item else {
+            continue;
+        };
+        match item {
+            Err(error) => {
+                let _ = send_latest_stream_message(
+                    &outbound,
+                    &session_shutdown,
+                    &cancellation,
+                    ServerMessage::failure(request_id, error),
+                )
+                .await;
+                return;
+            }
+            Ok(values) => {
+                if values.is_empty() {
+                    let _ = send_latest_stream_message(
+                        &outbound,
+                        &session_shutdown,
+                        &cancellation,
+                        ServerMessage::connection_defect("RPC stream produced an empty Chunk"),
+                    )
+                    .await;
+                    return;
+                }
+                if send_latest_stream_message(
+                    &outbound,
+                    &session_shutdown,
+                    &cancellation,
+                    ServerMessage::Chunk {
+                        request_id: request_id.clone(),
+                        values,
+                    },
+                )
+                .await
+                .is_err()
+                {
+                    return;
+                }
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => {
+                        let _ = outbound.try_send(ServerMessage::interrupt(request_id));
+                        return;
+                    }
+                    acknowledgement = acknowledgements.recv() => {
+                        if acknowledgement.is_none() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn send_latest_stream_message(
+    outbound: &mpsc::Sender<ServerMessage>,
+    session_shutdown: &CancellationToken,
+    cancellation: &CancellationToken,
+    message: ServerMessage,
+) -> Result<(), ()> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(()),
+        result = send_server_message(outbound, session_shutdown, message) => result,
+    }
+}
+
 async fn send_server_message(
     outbound: &mpsc::Sender<ServerMessage>,
     session_shutdown: &CancellationToken,
@@ -789,6 +934,44 @@ mod tests {
         .await
         .expect("send observes cancellation")
         .expect_err("cancelled session rejects outbound messages");
+    }
+
+    #[tokio::test]
+    async fn latest_stream_request_cancellation_unblocks_a_full_outbound_queue() {
+        let handler: LatestStreamHandler = Arc::new(|_request, _context, _cancellation| {
+            let (sender, receiver) = watch::channel(None);
+            sender.send_replace(Some(Ok(vec![json!({ "generation": 1 })])));
+            receiver
+        });
+        let request = RpcRequest {
+            id: RequestId::try_from("1").expect("request id"),
+            tag: "subscribeWorktreeCatalog".to_owned(),
+            payload: json!({}),
+            headers: Vec::new(),
+            trace_id: None,
+            span_id: None,
+            sampled: None,
+        };
+        let (outbound, _outbound_receiver) = mpsc::channel(1);
+        outbound.try_send(ServerMessage::Pong).expect("fill queue");
+        let (_acknowledgements, acknowledgement_receiver) = mpsc::channel(1);
+        let cancellation = CancellationToken::new();
+        let task = tokio::spawn(run_latest_stream(
+            request,
+            handler,
+            RpcSessionContext::unauthenticated(),
+            cancellation.clone(),
+            CancellationToken::new(),
+            acknowledgement_receiver,
+            outbound,
+        ));
+        tokio::task::yield_now().await;
+        cancellation.cancel();
+
+        timeout(Duration::from_millis(100), task)
+            .await
+            .expect("request cancellation unblocks the outbound capacity wait")
+            .expect("latest stream task joins");
     }
 
     #[tokio::test]
