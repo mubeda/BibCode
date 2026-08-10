@@ -32,7 +32,11 @@ import type {
   RelayConnectionTarget,
   SshConnectionTarget,
 } from "./model.ts";
-import { ConnectionBlockedError, type ConnectionAttemptError } from "./model.ts";
+import {
+  ConnectionBlockedError,
+  ConnectionTransientError,
+  type ConnectionAttemptError,
+} from "./model.ts";
 import * as ConnectionProfileStore from "./profileStore.ts";
 
 export class ConnectionResolver extends Context.Service<
@@ -274,6 +278,11 @@ export const make = Effect.gen(function* () {
         return yield* relay(target);
       case "SshConnectionTarget":
         return yield* ssh({ ...entry, target });
+      case "UnavailableConnectionTarget":
+        return yield* new ConnectionTransientError({
+          reason: "endpoint-unavailable",
+          detail: target.detail,
+        });
     }
   });
 

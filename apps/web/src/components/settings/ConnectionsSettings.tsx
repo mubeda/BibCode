@@ -2875,7 +2875,12 @@ export function ConnectionsSettings() {
 
   const switchPrimaryToWindows = useCallback(() => {
     if (!desktopBridge || !desktopWslState?.wslOnly) return;
-    void applyWslSettingChange(() => desktopBridge.setWslOnly(false));
+    void applyWslSettingChange(() => desktopBridge.setWslBackendEnabled(false));
+  }, [applyWslSettingChange, desktopBridge, desktopWslState]);
+
+  const turnOffWslSecondary = useCallback(() => {
+    if (!desktopBridge || !desktopWslState?.enabled || desktopWslState.wslOnly) return;
+    void applyWslSettingChange(() => desktopBridge.setWslBackendEnabled(false));
   }, [applyWslSettingChange, desktopBridge, desktopWslState]);
 
   // True when a desktop-local WSL backend is currently registered as an
@@ -3032,15 +3037,29 @@ export function ConnectionsSettings() {
     // WSL went unavailable while the user still has the WSL backend persisted.
     // WSL-only mode stays failed closed: the desktop does not substitute a
     // Windows primary until the user explicitly chooses that recovery action.
-    if (!desktopWslState.available) {
+    if (
+      !desktopWslState.available ||
+      desktopWslState.preflightError?.kind === "wsl-secondary-unavailable"
+    ) {
       if (!desktopWslState.enabled && !desktopWslState.wslOnly) return null;
+      const isPrimaryWslFailure =
+        desktopWslState.wslOnly ||
+        desktopWslState.preflightError?.kind === "wsl-primary-unavailable";
       return (
         <SettingsRow
           title="WSL backend"
-          description="WSL is unavailable and no Windows backend was substituted. Retry WSL or explicitly switch primary execution to Windows."
+          description={
+            isPrimaryWslFailure
+              ? "WSL is unavailable and no Windows backend was substituted. Retry WSL or explicitly switch primary execution to Windows."
+              : "The Windows backend remains primary, but the configured WSL secondary is unavailable."
+          }
           status={
             desktopWslError ? (
               <span className="block text-destructive">{desktopWslError}</span>
+            ) : desktopWslState.preflightError ? (
+              <span className="block text-destructive">
+                WSL backend couldn't start: {desktopWslState.preflightError.detail}
+              </span>
             ) : null
           }
           control={
@@ -3060,9 +3079,9 @@ export function ConnectionsSettings() {
                 size="xs"
                 variant="outline"
                 disabled={isUpdatingWslBackend}
-                onClick={switchPrimaryToWindows}
+                onClick={isPrimaryWslFailure ? switchPrimaryToWindows : turnOffWslSecondary}
               >
-                Switch to Windows
+                {isPrimaryWslFailure ? "Switch to Windows" : "Turn off WSL"}
               </Button>
             </div>
           }

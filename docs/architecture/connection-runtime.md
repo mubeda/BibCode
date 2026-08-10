@@ -39,14 +39,17 @@ The composition root is
 Canonical targets are defined in
 [`connection/model.ts`](../../packages/client-runtime/src/connection/model.ts).
 
-| Target                    | Preparation                                                                                                                                        |
-| ------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `PrimaryConnectionTarget` | Uses the host-provided HTTP/WebSocket address and optional primary bearer credential. It is runtime-provided, not persisted as a saved connection. |
-| `BearerConnectionTarget`  | Loads a saved endpoint profile and bearer credential, validates the environment identity, then exchanges/uses authorization.                       |
-| `RelayConnectionTarget`   | Uses the Clerk session and relay to obtain a DPoP-bound environment bootstrap, then prepares direct HTTP/WSS access.                               |
-| `SshConnectionTarget`     | Asks the desktop SSH gateway to probe or launch the remote server and create local forwarding, then authorizes with the returned bootstrap.        |
+| Target                        | Preparation                                                                                                                                                     |
+| ----------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `PrimaryConnectionTarget`     | Uses the host-provided HTTP/WebSocket address and optional primary bearer credential. It is runtime-provided, not persisted as a saved connection.              |
+| `BearerConnectionTarget`      | Loads a saved endpoint profile and bearer credential, validates the environment identity, then exchanges/uses authorization.                                    |
+| `RelayConnectionTarget`       | Uses the Clerk session and relay to obtain a DPoP-bound environment bootstrap, then prepares direct HTTP/WSS access.                                            |
+| `SshConnectionTarget`         | Asks the desktop SSH gateway to probe or launch the remote server and create local forwarding, then authorizes with the returned bootstrap.                     |
+| `UnavailableConnectionTarget` | Retains a platform-owned desired environment and its cached projections without an endpoint or credential; preparation fails transiently before transport work. |
 
 Bearer, relay, and SSH targets may be persisted in the connection catalog.
+Unavailable targets are reconciled only from host topology and are never
+persisted as saved connections.
 Profiles and credentials remain separate so catalog metadata can be listed
 without exposing secrets.
 

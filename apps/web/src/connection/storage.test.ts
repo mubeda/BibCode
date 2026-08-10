@@ -668,6 +668,49 @@ describe("makeCatalogStore", () => {
     }),
   );
 
+  it.effect("finishes an interrupted reset by observing the durable compare-and-set winner", () =>
+    Effect.gen(function* () {
+      const winner = encodeCatalog({
+        ...emptyCatalog,
+        acceptedStorageIdentities: [
+          { targetKey: "platform:primary", storageInstanceId: "winner-store" },
+        ],
+      });
+      let durableCatalog = "{not-json";
+      const compareStarted = yield* Deferred.make<void>();
+      const releaseCompare = yield* Deferred.make<void>();
+      const store = yield* makeCatalogStore({
+        read: Effect.sync(() => durableCatalog),
+        compare: unusedCatalogCompare,
+        compareAndSet: (expected, next) =>
+          Effect.gen(function* () {
+            yield* Deferred.succeed(compareStarted, undefined);
+            yield* Deferred.await(releaseCompare);
+            if (durableCatalog !== expected) return false;
+            durableCatalog = next;
+            return true;
+          }),
+      });
+
+      yield* store.read;
+      const reset = yield* Effect.forkChild(store.reset, { startImmediately: true });
+      yield* Deferred.await(compareStarted);
+      durableCatalog = winner;
+      const interruption = yield* Effect.forkChild(Fiber.interrupt(reset), {
+        startImmediately: true,
+      });
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(releaseCompare, undefined);
+      yield* Fiber.join(interruption);
+
+      expect(durableCatalog).toBe(winner);
+      expect(yield* SubscriptionRef.get(store.health)).toEqual({ status: "ready" });
+      expect((yield* store.read).acceptedStorageIdentities).toEqual([
+        { targetKey: "platform:primary", storageInstanceId: "winner-store" },
+      ]);
+    }),
+  );
+
   it.effect("fails with a typed error after bounded compare-and-set conflicts", () =>
     Effect.gen(function* () {
       let attempts = 0;

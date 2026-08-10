@@ -72,6 +72,34 @@ describe("DesktopEnvironmentBootstrapSchema", () => {
       }).runningDistro,
     ).toBeNull();
   });
+
+  it("preserves a configured but unavailable WSL secondary as typed topology", () => {
+    expect(
+      decodeDesktopEnvironmentBootstrap({
+        id: "wsl:Ubuntu",
+        label: "WSL (Ubuntu)",
+        configuredDistro: "Ubuntu",
+        runningDistro: null,
+        httpBaseUrl: null,
+        wsBaseUrl: null,
+        preflightError: {
+          kind: "wsl-secondary-unavailable",
+          detail: "the configured distribution could not start",
+        },
+      }),
+    ).toEqual({
+      id: "wsl:Ubuntu",
+      label: "WSL (Ubuntu)",
+      configuredDistro: "Ubuntu",
+      runningDistro: null,
+      httpBaseUrl: null,
+      wsBaseUrl: null,
+      preflightError: {
+        kind: "wsl-secondary-unavailable",
+        detail: "the configured distribution could not start",
+      },
+    });
+  });
 });
 
 describe("ContextMenuItemSchema", () => {

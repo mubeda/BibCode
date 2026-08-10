@@ -25,9 +25,12 @@ export function desktopLocalConnectionId(backendId: string): string {
 
 export function isDesktopLocalConnectionTarget(
   target: ConnectionTarget,
-): target is Extract<ConnectionTarget, { readonly _tag: "BearerConnectionTarget" }> {
+): target is Extract<
+  ConnectionTarget,
+  { readonly _tag: "BearerConnectionTarget" | "UnavailableConnectionTarget" }
+> {
   return (
-    target._tag === "BearerConnectionTarget" &&
+    (target._tag === "BearerConnectionTarget" || target._tag === "UnavailableConnectionTarget") &&
     target.connectionId.startsWith(DESKTOP_LOCAL_CONNECTION_ID_PREFIX)
   );
 }

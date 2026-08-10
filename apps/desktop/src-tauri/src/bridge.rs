@@ -290,9 +290,11 @@ fn normalize_wsl_distro(value: Option<String>) -> Option<String> {
 }
 
 fn normalize_desktop_settings_document(document: DesktopSettingsDocument) -> DesktopSettings {
-    let wsl_backend_enabled = document
-        .wsl_backend_enabled
-        .unwrap_or_else(|| document.wsl_mode.as_deref() == Some("wsl"));
+    let wsl_only = document.wsl_only.unwrap_or(false);
+    let wsl_backend_enabled = wsl_only
+        || document
+            .wsl_backend_enabled
+            .unwrap_or_else(|| document.wsl_mode.as_deref() == Some("wsl"));
 
     DesktopSettings {
         server_exposure_mode: normalize_server_exposure_mode(
@@ -302,7 +304,7 @@ fn normalize_desktop_settings_document(document: DesktopSettingsDocument) -> Des
         tailscale_serve_port: normalize_tailscale_serve_port(document.tailscale_serve_port),
         wsl_backend_enabled,
         wsl_distro: normalize_wsl_distro(document.wsl_distro),
-        wsl_only: document.wsl_only.unwrap_or(false),
+        wsl_only,
     }
 }
 
@@ -868,7 +870,15 @@ fn wsl_state(settings: &DesktopSettings, backend: &BackendSupervisor) -> Value {
             "kind": "wsl-primary-unavailable",
             "detail": detail,
         })),
-        Some(BackendPlanError::Other { .. }) | None => None,
+        Some(BackendPlanError::Other { .. }) => None,
+        None => backend
+            .secondary_unavailable_environment()
+            .map(|unavailable| {
+                json!({
+                    "kind": "wsl-secondary-unavailable",
+                    "detail": unavailable.detail,
+                })
+            }),
     };
     json!({
         "enabled": settings.wsl_backend_enabled,
@@ -1444,6 +1454,7 @@ pub fn desktop_bridge_install_update(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::BackendUnavailableEnvironment;
     use std::future::Future;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
@@ -1949,6 +1960,48 @@ mod tests {
         assert!(backend.local_environment_bootstraps().is_empty());
     }
 
+    #[test]
+    fn wsl_state_exposes_a_tagged_secondary_failure_without_removing_it_from_topology() {
+        let settings = DesktopSettings {
+            wsl_backend_enabled: true,
+            wsl_only: false,
+            wsl_distro: Some("Ubuntu".to_string()),
+            ..default_desktop_settings()
+        };
+        let backend = BackendSupervisor::new();
+        backend.record_unavailable_environment(BackendUnavailableEnvironment {
+            environment_id: "wsl:Ubuntu".to_string(),
+            label: "WSL (Ubuntu)".to_string(),
+            configured_distro: Some("Ubuntu".to_string()),
+            detail: "the selected distribution could not start".to_string(),
+        });
+
+        let state = wsl_state(&settings, &backend);
+
+        assert_eq!(
+            state["preflightError"],
+            json!({
+                "kind": "wsl-secondary-unavailable",
+                "detail": "the selected distribution could not start",
+            })
+        );
+        assert_eq!(
+            backend.local_environment_bootstraps(),
+            vec![json!({
+                "id": "wsl:Ubuntu",
+                "label": "WSL (Ubuntu)",
+                "configuredDistro": "Ubuntu",
+                "runningDistro": null,
+                "httpBaseUrl": null,
+                "wsBaseUrl": null,
+                "preflightError": {
+                    "kind": "wsl-secondary-unavailable",
+                    "detail": "the selected distribution could not start",
+                },
+            })]
+        );
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     fn protects_connection_catalog_documents() {
@@ -2007,6 +2060,18 @@ mod tests {
                 wsl_only: true,
             }
         );
+    }
+
+    #[test]
+    fn persisted_wsl_only_intent_normalizes_the_backend_to_enabled() {
+        let settings = normalize_desktop_settings_document(DesktopSettingsDocument {
+            wsl_backend_enabled: Some(false),
+            wsl_only: Some(true),
+            ..DesktopSettingsDocument::default()
+        });
+
+        assert!(settings.wsl_only);
+        assert!(settings.wsl_backend_enabled);
     }
 
     #[test]

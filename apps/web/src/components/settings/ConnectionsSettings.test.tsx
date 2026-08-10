@@ -1832,6 +1832,8 @@ describe("ConnectionsSettings", () => {
     expect(bridge.setWslDistro).toHaveBeenCalledWith("Ubuntu");
     invoke(control("button", "Switch to Windows"), "onClick");
     await flush();
+    expect(bridge.setWslBackendEnabled).toHaveBeenCalledWith(false);
+    expect(bridge.setWslOnly).not.toHaveBeenCalled();
 
     // WSL unavailable and unused: the row disappears entirely.
     h.wslQuery.data = {
@@ -1871,6 +1873,39 @@ describe("ConnectionsSettings", () => {
     invoke(control("button", "Retry WSL"), "onClick");
     await flush();
     expect(bridge.setWslDistro).toHaveBeenCalledWith("Ubuntu");
+
+    invoke(control("button", "Switch to Windows"), "onClick");
+    await flush();
+    expect(bridge.setWslBackendEnabled).toHaveBeenCalledWith(false);
+    expect(bridge.setWslOnly).not.toHaveBeenCalled();
+  });
+
+  it("keeps Windows-primary secondary WSL failure distinct from WSL-only failure", async () => {
+    const bridge = stubDesktopWindow();
+    h.wslQuery.data = {
+      enabled: true,
+      distro: "Ubuntu",
+      available: true,
+      wslOnly: false,
+      distros: [],
+      preflightError: {
+        kind: "wsl-secondary-unavailable",
+        detail: "the configured WSL secondary could not start",
+      },
+    } as unknown as DesktopWslState;
+
+    const markup = render();
+
+    expect(markup).toContain("Windows backend remains primary");
+    expect(markup).toContain("the configured WSL secondary could not start");
+    expect(markup).not.toContain("no Windows backend was substituted");
+    expect(findControls("button", "Switch to Windows")).toHaveLength(0);
+    expect(findControls("button", "Turn off WSL")).toHaveLength(1);
+
+    invoke(control("button", "Turn off WSL"), "onClick");
+    await flush();
+    expect(bridge.setWslBackendEnabled).toHaveBeenCalledWith(false);
+    expect(bridge.setWslOnly).not.toHaveBeenCalled();
   });
 
   it("renders busy states with the endpoint rail expanded and SSH mode active", async () => {

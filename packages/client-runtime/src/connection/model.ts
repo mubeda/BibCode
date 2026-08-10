@@ -38,11 +38,27 @@ export class SshConnectionTarget extends Schema.TaggedClass<SshConnectionTarget>
   },
 ) {}
 
+/**
+ * A platform-owned environment that remains desired but currently has no
+ * usable endpoint. It is deliberately not persistable: the host topology is
+ * the sole owner and the resolver must fail before any transport/session work.
+ */
+export class UnavailableConnectionTarget extends Schema.TaggedClass<UnavailableConnectionTarget>()(
+  "UnavailableConnectionTarget",
+  {
+    ...ConnectionTargetBase,
+    connectionId: Schema.String,
+    configuredDistro: Schema.NullOr(Schema.String),
+    detail: Schema.String,
+  },
+) {}
+
 export const ConnectionTarget = Schema.Union([
   PrimaryConnectionTarget,
   BearerConnectionTarget,
   RelayConnectionTarget,
   SshConnectionTarget,
+  UnavailableConnectionTarget,
 ]);
 export type ConnectionTarget = typeof ConnectionTarget.Type;
 

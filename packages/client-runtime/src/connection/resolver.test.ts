@@ -31,6 +31,7 @@ import {
   RelayConnectionTarget,
   SshConnectionTarget,
   type ConnectionTarget,
+  UnavailableConnectionTarget,
 } from "./model.ts";
 import * as ConnectionProfileStore from "./profileStore.ts";
 
@@ -197,6 +198,28 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
 });
 
 describe("ConnectionResolver", () => {
+  it.effect("rejects an unavailable desired environment before resolving any endpoint", () =>
+    Effect.gen(function* () {
+      const brokerLayer = yield* makeDependencies();
+      const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(brokerLayer));
+      const target = new UnavailableConnectionTarget({
+        environmentId: ENVIRONMENT_ID,
+        label: "WSL (Ubuntu)",
+        connectionId: "local:wsl:Ubuntu",
+        configuredDistro: "Ubuntu",
+        detail: "the configured WSL distribution could not start",
+      });
+
+      const error = yield* broker.prepare(catalogEntry(target)).pipe(Effect.flip);
+
+      expect(error).toBeInstanceOf(ConnectionTransientError);
+      expect(error).toMatchObject({
+        reason: "endpoint-unavailable",
+        detail: "the configured WSL distribution could not start",
+      });
+    }),
+  );
+
   it.effect("prepares a primary environment without remote capabilities", () =>
     Effect.gen(function* () {
       const brokerLayer = yield* makeDependencies();
