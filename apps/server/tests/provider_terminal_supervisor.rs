@@ -21,7 +21,7 @@ use bibcode_server::{
         AgentActivityDisableReport, AgentActivitySource,
     },
     diagnostics::ProcessAttributionRegistry,
-    persistence::{Database, run_migrations},
+    persistence::{Database, StorageInstanceId, run_migrations},
     production::{
         agent_activity::{AgentActivitySettingsHandler, AgentActivityTransitionReport},
         control::NativeServerControl,
@@ -57,6 +57,7 @@ use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::sync::{broadcast, oneshot, watch};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
 
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
@@ -8291,11 +8292,11 @@ async fn agent_activity_hung_factory_does_not_block_terminal_disable_or_later_se
     let fixture = tempfile::tempdir().expect("fixture root");
     let configured = fixture.path().join("configured-codex");
     std::fs::write(&configured, b"configured").expect("configured binary");
-    let control = NativeServerControl::new(
-        ServerConfig::new(fixture.path()),
-        serde_json::json!({"policy":"test"}),
-    )
-    .await;
+    let mut config = ServerConfig::new(fixture.path());
+    config.storage_instance_id = Some(StorageInstanceId::from_uuid(Uuid::from_u128(
+        0x00000000000040008000000000000005,
+    )));
+    let control = NativeServerControl::new(config, serde_json::json!({"policy":"test"})).await;
     control
         .call(
             "server.updateSettings",

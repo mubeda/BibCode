@@ -74,9 +74,11 @@ server processes sharing that established store. Graceful server join still
 waits for the SQLite worker to close before returning.
 
 After store preparation succeeds, the runtime copies the marker's persistent
-UUID into runtime-only server configuration. Both the public
-`/.well-known/bibcode/environment` response and BiBCode Connect descriptors
-publish that UUID as `storageInstanceId`, so a clean restart of the same store
+UUID into runtime-only server configuration. Every current-server descriptor
+surface publishes that UUID as `storageInstanceId`: the public
+`/.well-known/bibcode/environment` response, `server.getConfig`, the initial
+`subscribeServerConfig` snapshot, lifecycle welcome and ready events, and
+BiBCode Connect descriptors. A clean restart of the same store therefore
 reports the same identity. New local servers always publish a UUID string;
 contract decoding maps the omitted field from an older or third-party remote
 server to `null`. Normal environment descriptors never include the requested

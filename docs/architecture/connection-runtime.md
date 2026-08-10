@@ -67,10 +67,13 @@ stale socket cannot silently become current.
 ## Data boundary
 
 A session becomes ready only after the socket connects and the initial
-`server.getConfig` call succeeds. Domain requests resolve the current scoped
-session through the registry; they fail or wait according to the domain API
-instead of retaining a global client. Removing a saved environment also removes
-its registration, profile, credential, supervisor scope, and environment-keyed
+`server.getConfig` call succeeds. Current servers publish the same prepared
+`storageInstanceId` through that configuration, the initial configuration
+subscription snapshot, and lifecycle welcome and ready events as through the
+well-known descriptor. Domain requests resolve the current scoped session
+through the registry; they fail or wait according to the domain API instead of
+retaining a global client. Removing a saved environment also removes its
+registration, profile, credential, supervisor scope, and environment-keyed
 client state.
 
 `environmentId` remains the logical routing identity. `storageInstanceId` is
