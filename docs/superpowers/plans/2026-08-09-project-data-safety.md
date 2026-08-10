@@ -222,8 +222,8 @@ Change desktop `base_dir` to call the exported resolver with the Tauri-resolved 
 ```bash
 cargo test -p bibcode-server --lib data_root::tests -- --nocapture
 cargo test -p bibcode-server --lib config::tests -- --nocapture
-cargo test -p bibcode-desktop-tauri config::tests -- --nocapture
-cargo test -p bibcode-desktop-tauri backend::tests::server_config_for_launch_uses_desktop_runtime_settings -- --nocapture
+cargo test -p bibcode-desktop config::tests -- --nocapture
+cargo test -p bibcode-desktop backend::tests::server_config_for_launch_uses_desktop_runtime_settings -- --nocapture
 cargo fmt --all --check
 ```
 
@@ -795,7 +795,7 @@ Add a Rust unit test that injects WSL primary planning failure and asserts `defa
 
 ```bash
 vp test apps/web/src/connection/storage.test.ts apps/web/src/components/settings/ConnectionsSettings.test.tsx
-cargo test -p bibcode-desktop-tauri backend::tests::wsl_only_planning_failure -- --nocapture
+cargo test -p bibcode-desktop backend::tests::wsl_only_planning_failure -- --nocapture
 ```
 
 Expected: catalog recovery writes an empty document and WSL-only planning returns the Windows plan.
@@ -838,8 +838,8 @@ Change Connections settings to say WSL is unavailable and no backend was substit
 - [ ] **Step 6: Run focused recovery tests**
 
 ```bash
-cargo test -p bibcode-desktop-tauri backend::tests -- --nocapture
-cargo test -p bibcode-desktop-tauri bridge::tests -- --nocapture
+cargo test -p bibcode-desktop backend::tests -- --nocapture
+cargo test -p bibcode-desktop bridge::tests -- --nocapture
 vp test apps/web/src/connection/storage.test.ts apps/web/src/state/desktopWslState.test.ts apps/web/src/components/settings/ConnectionsSettings.test.tsx apps/web/src/components/Sidebar.test.tsx
 vp run typecheck --filter=@bibcode/client-runtime --filter=@bibcode/web
 ```
@@ -1041,8 +1041,8 @@ Add desktop/web tests for primary failure, a secondary failure that requires exp
 
 ```bash
 cargo test -p bibcode-server --test production_maintenance -- --nocapture
-cargo test -p bibcode-desktop-tauri updates::tests -- --nocapture
-cargo test -p bibcode-desktop-tauri backend::tests -- --nocapture
+cargo test -p bibcode-desktop updates::tests -- --nocapture
+cargo test -p bibcode-desktop backend::tests -- --nocapture
 vp test packages/contracts/src/ipc.test.ts apps/web/src/state/desktopUpdate.test.ts apps/web/src/components/desktop/UpdateProtectionDialog.test.tsx
 ```
 
@@ -1116,8 +1116,8 @@ Make `installUpdate` asynchronous across the bridge so progress events render be
 ```bash
 cargo test -p bibcode-server --test production_maintenance -- --nocapture
 cargo test -p bibcode-server --test production_control -- --nocapture
-cargo test -p bibcode-desktop-tauri updates::tests -- --nocapture
-cargo test -p bibcode-desktop-tauri backend::tests -- --nocapture
+cargo test -p bibcode-desktop updates::tests -- --nocapture
+cargo test -p bibcode-desktop backend::tests -- --nocapture
 vp test packages/contracts/src/ipc.test.ts apps/web/src/state/desktopUpdate.test.ts apps/web/src/components/desktop/UpdateProtectionDialog.test.tsx apps/web/src/components/sidebar/SidebarUpdatePill.test.tsx apps/web/src/components/settings/SettingsPanels.test.tsx
 vp run typecheck --filter=@bibcode/contracts --filter=@bibcode/web
 ```
@@ -1272,8 +1272,8 @@ The WSL test must assert arguments as separate values and reject a crafted distr
 - [ ] **Step 2: Run focused tests and verify RED**
 
 ```bash
-cargo test -p bibcode-desktop-tauri data_safety::tests -- --nocapture
-cargo test -p bibcode-desktop-tauri bridge::tests -- --nocapture
+cargo test -p bibcode-desktop data_safety::tests -- --nocapture
+cargo test -p bibcode-desktop bridge::tests -- --nocapture
 vp test packages/contracts/src/ipc.test.ts apps/web/src/tauriDesktopBridge.test.ts apps/web/src/state/projectDataSafety.test.ts apps/web/src/components/desktop/ProjectDataRecoveryDialog.test.tsx apps/web/src/AppRoot.test.tsx
 ```
 
@@ -1330,9 +1330,9 @@ After successful restore, reconnect without adopting a different identity. After
 - [ ] **Step 7: Run focused cross-platform recovery validation**
 
 ```bash
-cargo test -p bibcode-desktop-tauri data_safety::tests -- --nocapture
-cargo test -p bibcode-desktop-tauri bridge::tests -- --nocapture
-cargo test -p bibcode-desktop-tauri backend::tests -- --nocapture
+cargo test -p bibcode-desktop data_safety::tests -- --nocapture
+cargo test -p bibcode-desktop bridge::tests -- --nocapture
+cargo test -p bibcode-desktop backend::tests -- --nocapture
 vp test packages/contracts/src/ipc.test.ts apps/web/src/tauriDesktopBridge.test.ts apps/web/src/state/projectDataSafety.test.ts apps/web/src/components/desktop/ProjectDataRecoveryDialog.test.tsx apps/web/src/AppRoot.test.tsx apps/web/src/components/Sidebar.test.tsx
 vp run typecheck --filter=@bibcode/contracts --filter=@bibcode/web
 ```
@@ -1523,8 +1523,8 @@ Run the focused project-data safety, connection runtime, web recovery, updater, 
 ```bash
 cargo fmt --all --check
 cargo test -p bibcode-server --all-targets
-cargo test -p bibcode-desktop-tauri --all-targets
-cargo clippy -p bibcode-server -p bibcode-desktop-tauri --all-targets -- -D warnings
+cargo test -p bibcode-desktop --all-targets
+cargo clippy -p bibcode-server -p bibcode-desktop --all-targets -- -D warnings
 ```
 
 Use `scripts/run-windows-cargo-target.mjs`/`run-msvc-x64` checks where required by repository scripts rather than pretending the macOS host executed Windows binaries.
