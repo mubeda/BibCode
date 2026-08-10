@@ -20,6 +20,8 @@ import {
   ProjectId,
   ProviderInstanceId,
   ThreadId,
+  WorktreeKey,
+  WorktreeRepositoryKey,
 } from "@bibcode/contracts";
 import { DEFAULT_CLIENT_SETTINGS } from "@bibcode/contracts/settings";
 import { createModelSelection } from "@bibcode/shared/model";
@@ -60,6 +62,9 @@ const h = vi.hoisted(() => {
     clientSettings: null,
     atomValues: {},
     vcsStatusByCwd: {},
+    worktreeCatalogs: new Map<string, unknown>(),
+    discoveryCatalogSubscriptions: [] as Array<unknown>,
+    discoveryFocusRefreshCalls: [] as Array<ReadonlyArray<unknown>>,
     runningTerminalIds: [],
     discoveredPortsByThreadId: {},
     desktopBootstraps: [],
@@ -341,8 +346,20 @@ vi.mock("../state/environments", () => ({
 }));
 
 vi.mock("../state/query", () => ({
-  useEnvironmentQuery: (atom: { args?: { input?: { cwd?: string } } } | null) => ({
-    data: atom ? (h.state.vcsStatusByCwd[atom.args?.input?.cwd ?? ""] ?? null) : null,
+  useEnvironmentQuery: (
+    atom: {
+      __q?: string;
+      args?: { environmentId?: string; input?: { cwd?: string; projectId?: string } };
+    } | null,
+  ) => ({
+    data:
+      atom?.__q === "worktree.catalog"
+        ? (h.state.worktreeCatalogs.get(
+            `${atom.args?.environmentId}:${atom.args?.input?.projectId}`,
+          ) ?? null)
+        : atom
+          ? (h.state.vcsStatusByCwd[atom.args?.input?.cwd ?? ""] ?? null)
+          : null,
     error: null,
     isPending: false,
     refresh: () => {},
@@ -408,7 +425,17 @@ vi.mock("../state/desktopUpdate", () => ({
 
 vi.mock("../state/worktrees", () => ({
   worktreeEnvironment: {
+    catalog: (args: unknown) => {
+      h.state.discoveryCatalogSubscriptions.push(args);
+      return { __q: "worktree.catalog", args };
+    },
+    refresh: { label: "worktree.refresh" },
     updatePolicy: { label: "worktree.updatePolicy" },
+    addOne: { label: "worktree.addOne" },
+    addAll: { label: "worktree.addAll" },
+  },
+  useWorktreeCatalogFocusRefresh: (projects: ReadonlyArray<unknown>) => {
+    h.state.discoveryFocusRefreshCalls.push([...projects]);
   },
 }));
 
@@ -547,21 +574,6 @@ vi.mock("./ThreadStatusIndicators", () => ({
 vi.mock("./ProjectFavicon", () => ({ ProjectFavicon: h.mk("ProjectFavicon", "span") }));
 vi.mock("./CreateWorktreeDialog", () => ({
   CreateWorktreeDialog: h.mk("CreateWorktreeDialog"),
-}));
-vi.mock("./WorktreeDiscoverySection", () => ({
-  WorktreeDiscoverySection: h.mk("WorktreeDiscoverySection"),
-  getSupportedWorktreeDiscoveryMembers: (
-    members: ReadonlyArray<{ environmentId: string }>,
-    serverConfigs: ReadonlyMap<
-      string,
-      { environment?: { capabilities?: { worktreeCatalog?: boolean } } }
-    >,
-  ) =>
-    members.filter(
-      (member) =>
-        serverConfigs.get(member.environmentId)?.environment?.capabilities?.worktreeCatalog ===
-        true,
-    ),
 }));
 vi.mock("./settings/SettingsSidebarNav", () => ({
   SettingsSidebarNav: h.mk("SettingsSidebarNav"),
@@ -970,6 +982,9 @@ beforeEach(() => {
     primaryServerKeybindings: {},
   };
   h.state.vcsStatusByCwd = {};
+  h.state.worktreeCatalogs = new Map();
+  h.state.discoveryCatalogSubscriptions = [];
+  h.state.discoveryFocusRefreshCalls = [];
   h.state.runningTerminalIds = [];
   h.state.discoveredPortsByThreadId = {};
   h.state.desktopBootstraps = [];
@@ -1902,37 +1917,113 @@ staticDescribe("project header context menu", () => {
 });
 
 staticDescribe("worktree discovery integration", () => {
-  it("mounts discovery immediately before the primary row without changing thread rows", () => {
+  function discoveredCatalog(path: string, branch: string) {
+    return {
+      repositoryKey: WorktreeRepositoryKey.make(`repository:${path}`),
+      generation: 42,
+      authoritative: true,
+      observedAt: "2026-08-09T12:00:00.000Z",
+      scanStatus: { _tag: "ready" },
+      worktrees: [
+        {
+          worktreeKey: WorktreeKey.make(`worktree:${path}`),
+          path,
+          branch,
+          head: "abcdef0123456789",
+          isPrimary: false,
+          isBare: false,
+          locked: false,
+          registrationState: "registered",
+          directoryState: "present",
+          adoptionState: "none",
+          eligibleForAdoption: true,
+        },
+      ],
+      adoptedWorkspaces: [],
+    };
+  }
+
+  it("subscribes only while the existing child panel is rendered and places discovery before primary", () => {
     baseScenario();
+    h.state.routeParams = {};
     h.state.serverConfigs = new Map([
       [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: true } } }],
     ]);
-    render(<Sidebar />);
-
-    const discoveryIndex = (h.state.captures as Array<{ name: string }>).findIndex(
-      (entry) => entry.name === "WorktreeDiscoverySection",
+    h.state.worktreeCatalogs.set(
+      `${ENV_MAIN}:${projectA.id}`,
+      discoveredCatalog("C:/worktrees/discovered", "feature/discovered"),
     );
-    const primaryCapture = captured("SidebarMenuSubButton").find((entry) => {
-      const elements: React.ReactElement[] = [];
-      collectElements(entry.props["children"], elements);
-      return elements.some(
-        (element) => (element.props as { children?: unknown }).children === "primary",
-      );
+    h.uiStore.setState({
+      projectExpandedById: { [derivePhysicalProjectKey(projectA)]: false },
     });
-    const primaryIndex = (h.state.captures as Array<unknown>).indexOf(primaryCapture);
+
+    const collapsedMarkup = render(<Sidebar />);
+    expect(collapsedMarkup).not.toContain("Discovered worktrees");
+    expect(collapsedMarkup).not.toContain("feature/discovered");
+    expect(h.state.discoveryCatalogSubscriptions).toEqual([]);
+    expect(h.state.discoveryFocusRefreshCalls).toEqual([]);
+
+    h.state.discoveryCatalogSubscriptions = [];
+    h.state.discoveryFocusRefreshCalls = [];
+    h.uiStore.setState({
+      projectExpandedById: { [derivePhysicalProjectKey(projectA)]: true },
+    });
+    const expandedMarkup = render(<Sidebar />);
+    const discoveryIndex = expandedMarkup.indexOf("Discovered worktrees");
+    const primaryIndex = expandedMarkup.indexOf(">primary<");
 
     expect(discoveryIndex).toBeGreaterThan(-1);
     expect(primaryIndex).toBeGreaterThan(discoveryIndex);
-    expect(captured("WorktreeDiscoverySection")[0]?.props).toEqual(
-      expect.objectContaining({
-        project: expect.objectContaining({ id: ProjectId.make("project-a") }),
-      }),
-    );
+    expect(h.state.discoveryCatalogSubscriptions).toEqual([
+      { environmentId: ENV_MAIN, input: { projectId: projectA.id } },
+    ]);
+    expect(h.state.discoveryFocusRefreshCalls).toEqual([
+      [{ environmentId: ENV_MAIN, projectId: projectA.id }],
+    ]);
     expect(
       captured("SidebarMenuSubButton").some(
         (entry) => entry.props["data-testid"] === "thread-row-thread-idle",
       ),
     ).toBe(true);
+
+    h.state.discoveryCatalogSubscriptions = [];
+    h.state.discoveryFocusRefreshCalls = [];
+    h.uiStore.setState({
+      projectExpandedById: { [derivePhysicalProjectKey(projectA)]: false },
+    });
+    const recollapsedMarkup = render(<Sidebar />);
+    expect(recollapsedMarkup).not.toContain("Discovered worktrees");
+    expect(h.state.discoveryCatalogSubscriptions).toEqual([]);
+    expect(h.state.discoveryFocusRefreshCalls).toEqual([]);
+  });
+
+  it("keeps grouped mixed-capability discovery at the supported physical boundary", () => {
+    groupedScenario();
+    h.state.routeParams = {};
+    const remoteProjectId = ProjectId.make("project-a-remote");
+    h.state.serverConfigs = new Map([
+      [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: true } } }],
+      [ENV_REMOTE, { environment: { capabilities: { worktreeCatalog: false } } }],
+    ]);
+    h.state.worktreeCatalogs.set(
+      `${ENV_MAIN}:${projectA.id}`,
+      discoveredCatalog("C:/local/discovered", "feature/local"),
+    );
+    h.state.worktreeCatalogs.set(
+      `${ENV_REMOTE}:${remoteProjectId}`,
+      discoveredCatalog("C:/remote/discovered", "feature/remote"),
+    );
+
+    const markup = render(<Sidebar />);
+
+    expect(markup).toContain("feature/local");
+    expect(markup).not.toContain("feature/remote");
+    expect(h.state.discoveryCatalogSubscriptions).toEqual([
+      { environmentId: ENV_MAIN, input: { projectId: projectA.id } },
+    ]);
+    expect(h.state.discoveryFocusRefreshCalls).toEqual([
+      [{ environmentId: ENV_MAIN, projectId: projectA.id }],
+    ]);
   });
 });
 

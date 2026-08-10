@@ -69,7 +69,9 @@ vi.mock("./ui/tooltip", () => ({
   Tooltip: ({ children }: { children: ReactNode }) => <>{children}</>,
   TooltipTrigger: ({ render, children }: { render: ReactElement; children?: ReactNode }) =>
     children === undefined ? render : cloneElement(render, undefined, children),
-  TooltipPopup: ({ children }: { children: ReactNode }) => <>{children}</>,
+  TooltipPopup: ({ children }: { children: ReactNode }) => (
+    <span data-mock="tooltip-popup">{children}</span>
+  ),
 }));
 
 vi.mock("./ui/button", () => ({
@@ -87,6 +89,8 @@ import { WorktreeDiscoverySection } from "./WorktreeDiscoverySection";
 
 const ENVIRONMENT_ID = EnvironmentId.make("environment-main");
 const PROJECT_ID = ProjectId.make("project-main");
+const REMOTE_ENVIRONMENT_ID = EnvironmentId.make("environment-remote");
+const REMOTE_PROJECT_ID = ProjectId.make("project-remote");
 
 function candidate(path: string, branch: string): VcsWorktreeDescriptor {
   return {
@@ -164,6 +168,49 @@ function serverConfigs(supported: boolean): ReadonlyMap<EnvironmentId, ServerCon
   ]);
 }
 
+function groupedProject(
+  localVisibility: "hidden" | "shown",
+  remoteVisibility: "hidden" | "shown",
+): SidebarProjectSnapshot {
+  const localProject = project(localVisibility);
+  const localMember = localProject.memberProjects[0]!;
+  const remoteMember = {
+    ...localMember,
+    id: REMOTE_PROJECT_ID,
+    workspaceRoot: "R:\\repo",
+    worktreeDiscovery: {
+      ...localMember.worktreeDiscovery,
+      visibility: remoteVisibility,
+    },
+    environmentId: REMOTE_ENVIRONMENT_ID,
+    physicalProjectKey: "environment-remote:R:\\repo",
+    environmentLabel: "Remote Box",
+  };
+  return {
+    ...localProject,
+    groupedProjectCount: 2,
+    environmentPresence: "mixed",
+    memberProjects: [localMember, remoteMember],
+    memberProjectRefs: [
+      { environmentId: ENVIRONMENT_ID, projectId: PROJECT_ID },
+      { environmentId: REMOTE_ENVIRONMENT_ID, projectId: REMOTE_PROJECT_ID },
+    ],
+    remoteEnvironmentLabels: ["Remote Box"],
+  };
+}
+
+function groupedServerConfigs(): ReadonlyMap<EnvironmentId, ServerConfig> {
+  const config = {
+    environment: { capabilities: { worktreeCatalog: true } },
+    settings: DEFAULT_SERVER_SETTINGS,
+    providers: [],
+  } as unknown as ServerConfig;
+  return new Map([
+    [ENVIRONMENT_ID, config],
+    [REMOTE_ENVIRONMENT_ID, config],
+  ]);
+}
+
 interface MountedTree {
   readonly container: HTMLDivElement;
   readonly root: Root;
@@ -178,6 +225,13 @@ async function mount(element: ReactElement): Promise<HTMLDivElement> {
   mountedTrees.push({ container, root });
   await act(async () => root.render(element));
   return container;
+}
+
+async function unmountLastMountedTree(): Promise<void> {
+  const mounted = mountedTrees.pop();
+  if (!mounted) throw new Error("No mounted tree to unmount");
+  await act(async () => mounted.root.unmount());
+  mounted.container.remove();
 }
 
 function button(name: string): HTMLButtonElement {
@@ -209,6 +263,48 @@ afterEach(async () => {
 });
 
 describe("WorktreeDiscoverySection", () => {
+  it("uniquely names same-branch actions and discloses exact paths on focus and hover", async () => {
+    const localPath = '/worktrees/<script>alert("x")</script>/same';
+    const remotePath = "R:\\worktrees\\same";
+    testState.catalogs.set(
+      `${ENVIRONMENT_ID}:${PROJECT_ID}`,
+      snapshot([candidate(localPath, "feature/shared")]),
+    );
+    testState.catalogs.set(
+      `${REMOTE_ENVIRONMENT_ID}:${REMOTE_PROJECT_ID}`,
+      snapshot([candidate(remotePath, "feature/shared")]),
+    );
+
+    await mount(
+      <WorktreeDiscoverySection
+        project={groupedProject("hidden", "shown")}
+        serverConfigs={groupedServerConfigs()}
+        onNavigateToThread={testState.navigate}
+      />,
+    );
+
+    expect(button(`Add feature/shared from This device at ${localPath} to BiBCode`)).toBeDefined();
+    expect(
+      button(`Add discovered worktree feature/shared from Remote Box at ${remotePath} to BiBCode`),
+    ).toBeDefined();
+
+    const localPathTrigger = Array.from(
+      document.querySelectorAll<HTMLElement>("[aria-label]"),
+    ).find(
+      (element) =>
+        element.getAttribute("aria-label") ===
+        `Full worktree path for feature/shared in This device: ${localPath}`,
+    );
+    expect(localPathTrigger).not.toBeNull();
+    expect(localPathTrigger?.tabIndex).toBe(0);
+    const tooltips = Array.from(
+      document.querySelectorAll<HTMLElement>("[data-mock='tooltip-popup']"),
+    ).map((element) => element.textContent);
+    expect(tooltips).toContain(localPath);
+    expect(tooltips).toContain(remotePath);
+    expect(document.querySelector("script")).toBeNull();
+  });
+
   it("adds one candidate and navigates to the returned scoped workspace", async () => {
     const discovered = candidate("/worktrees/one", "feature/one");
     testState.catalogs.set(`${ENVIRONMENT_ID}:${PROJECT_ID}`, snapshot([discovered]));
@@ -223,7 +319,9 @@ describe("WorktreeDiscoverySection", () => {
       />,
     );
 
-    await act(async () => button("Add feature/one to BiBCode").click());
+    await act(async () =>
+      button("Add feature/one from This device at /worktrees/one to BiBCode").click(),
+    );
 
     expect(testState.commandCalls).toContainEqual({
       label: "worktree.addOne",
@@ -292,6 +390,153 @@ describe("WorktreeDiscoverySection", () => {
       title: "Added 1 of 2 discovered worktrees",
       description: "1 worktree could not be added.",
     });
+  });
+
+  it("excludes an add-one key from add-all progress and summary", async () => {
+    const candidates = [
+      candidate("/worktrees/one", "feature/one"),
+      candidate("/worktrees/two", "feature/two"),
+    ];
+    testState.catalogs.set(`${ENVIRONMENT_ID}:${PROJECT_ID}`, snapshot(candidates));
+    let resolveAddOne!: (value: unknown) => void;
+    let resolveAddAll!: (value: unknown) => void;
+    testState.commandHandlers.set(
+      "worktree.addOne",
+      () => new Promise((resolve) => (resolveAddOne = resolve)),
+    );
+    testState.commandHandlers.set(
+      "worktree.addAll",
+      () => new Promise((resolve) => (resolveAddAll = resolve)),
+    );
+    await mount(
+      <WorktreeDiscoverySection
+        project={project()}
+        serverConfigs={serverConfigs(true)}
+        onNavigateToThread={testState.navigate}
+      />,
+    );
+
+    await act(async () => {
+      button("Add feature/one from This device at /worktrees/one to BiBCode").click();
+      await Promise.resolve();
+    });
+    await act(async () => {
+      button("Add all discovered worktrees").click();
+      await Promise.resolve();
+    });
+
+    expect(document.body.textContent).toContain("Adding 1 discovered worktree…");
+    const addAllCall = testState.commandCalls.find((entry) => entry.label === "worktree.addAll");
+    expect(addAllCall?.input).toEqual({
+      environmentId: ENVIRONMENT_ID,
+      input: {
+        candidates: [
+          expect.objectContaining({
+            worktreeKey: candidates[1]!.worktreeKey,
+            expectedGeneration: 42,
+          }),
+        ],
+      },
+    });
+    expect(testState.navigate).not.toHaveBeenCalled();
+
+    await act(async () =>
+      resolveAddAll(
+        AsyncResult.success({
+          results: [
+            {
+              _tag: "Success",
+              worktreeKey: candidates[1]!.worktreeKey,
+              result: { threadId: ThreadId.make("thread-two"), disposition: "created" },
+            },
+          ],
+        }),
+      ),
+    );
+    expect(testState.toastAdd).toHaveBeenCalledWith({
+      type: "success",
+      title: "Added 1 discovered worktree",
+      description: "All discovered worktrees were added to BiBCode.",
+    });
+
+    await act(async () =>
+      resolveAddOne(
+        AsyncResult.success({
+          threadId: ThreadId.make("thread-one"),
+          disposition: "created",
+        }),
+      ),
+    );
+  });
+
+  it("disables add-all when every candidate key already has an add-one pending", async () => {
+    const discovered = candidate("/worktrees/only", "feature/only");
+    testState.catalogs.set(`${ENVIRONMENT_ID}:${PROJECT_ID}`, snapshot([discovered]));
+    let resolveAddOne!: (value: unknown) => void;
+    testState.commandHandlers.set(
+      "worktree.addOne",
+      () => new Promise((resolve) => (resolveAddOne = resolve)),
+    );
+    await mount(
+      <WorktreeDiscoverySection
+        project={project()}
+        serverConfigs={serverConfigs(true)}
+        onNavigateToThread={testState.navigate}
+      />,
+    );
+
+    await act(async () => {
+      button("Add feature/only from This device at /worktrees/only to BiBCode").click();
+      await Promise.resolve();
+    });
+
+    const addAllButton = button("Add all discovered worktrees");
+    expect(addAllButton.disabled).toBe(true);
+    addAllButton.click();
+    expect(testState.commandCalls.some((entry) => entry.label === "worktree.addAll")).toBe(false);
+
+    await act(async () =>
+      resolveAddOne(
+        AsyncResult.success({
+          threadId: ThreadId.make("thread-only"),
+          disposition: "created",
+        }),
+      ),
+    );
+  });
+
+  it("ignores delayed adoption completion after the discovery subtree unmounts", async () => {
+    const discovered = candidate("/worktrees/delayed", "feature/delayed");
+    testState.catalogs.set(`${ENVIRONMENT_ID}:${PROJECT_ID}`, snapshot([discovered]));
+    let resolveAddOne!: (value: unknown) => void;
+    testState.commandHandlers.set(
+      "worktree.addOne",
+      () => new Promise((resolve) => (resolveAddOne = resolve)),
+    );
+    await mount(
+      <WorktreeDiscoverySection
+        project={project()}
+        serverConfigs={serverConfigs(true)}
+        onNavigateToThread={testState.navigate}
+      />,
+    );
+
+    await act(async () => {
+      button("Add feature/delayed from This device at /worktrees/delayed to BiBCode").click();
+      await Promise.resolve();
+    });
+    await unmountLastMountedTree();
+    await act(async () =>
+      resolveAddOne(
+        AsyncResult.success({
+          threadId: ThreadId.make("thread-delayed"),
+          disposition: "created",
+        }),
+      ),
+    );
+
+    expect(testState.navigate).not.toHaveBeenCalled();
+    expect(testState.toastAdd).not.toHaveBeenCalled();
   });
 
   it("acknowledges the exact generation, collapses, and can expand the hidden line", async () => {
@@ -393,7 +638,11 @@ describe("WorktreeDiscoverySection", () => {
 
     expect(document.body.textContent).toContain("Discovered");
     expect(document.body.textContent).toContain("/worktrees/shown");
-    await act(async () => button("Add discovered worktree feature/shown to BiBCode").click());
+    await act(async () =>
+      button(
+        "Add discovered worktree feature/shown from This device at /worktrees/shown to BiBCode",
+      ).click(),
+    );
 
     expect(testState.commandCalls.some((call) => call.label === "worktree.addOne")).toBe(true);
     expect(testState.navigate).toHaveBeenCalledWith({
