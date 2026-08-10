@@ -14,8 +14,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use futures_util::{StreamExt, stream::FuturesUnordered};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
-    sync::{Mutex as AsyncMutex, Semaphore, watch},
-    task::JoinHandle,
+    sync::{Mutex as AsyncMutex, Notify, Semaphore, oneshot, watch},
+    task::{AbortHandle, JoinHandle},
     time::Instant,
 };
 use tokio_util::sync::CancellationToken;
@@ -155,9 +155,15 @@ struct Inner {
     scan_semaphore: Arc<Semaphore>,
     probe_semaphore: Arc<Semaphore>,
     shutdown: CancellationToken,
+    lifecycle_tasks: Mutex<LifecycleTasks>,
+    lifecycle_tasks_changed: Notify,
     registry: Mutex<Registry>,
     #[cfg(test)]
     final_release_pause: Mutex<Option<FinalReleasePause>>,
+    #[cfg(test)]
+    eviction_registration_pause: Mutex<Option<FinalReleasePause>>,
+    #[cfg(test)]
+    eviction_task_registrations: AtomicUsize,
     #[cfg(test)]
     mutation_refresh_worker_starts: AtomicUsize,
     #[cfg(test)]
@@ -168,8 +174,13 @@ struct Inner {
     mutation_refresh_start_pause: Mutex<Option<MutationRefreshStartPause>>,
     #[cfg(test)]
     repository_observation_requests: AtomicUsize,
-    #[cfg(test)]
-    active_owned_tasks: AtomicUsize,
+}
+
+#[derive(Default)]
+struct LifecycleTasks {
+    terminal: bool,
+    next_id: u64,
+    active: HashMap<u64, AbortHandle>,
 }
 
 #[cfg(test)]
@@ -190,15 +201,18 @@ struct MutationRefreshWorkerGuard {
     inner: Arc<Inner>,
 }
 
-#[cfg(test)]
-struct OwnedTaskGuard {
-    inner: Arc<Inner>,
+struct LifecycleTaskGuard {
+    inner: Weak<Inner>,
+    task_id: u64,
 }
 
-#[cfg(test)]
-impl Drop for OwnedTaskGuard {
+impl Drop for LifecycleTaskGuard {
     fn drop(&mut self) {
-        self.inner.active_owned_tasks.fetch_sub(1, Ordering::SeqCst);
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        lock(&inner.lifecycle_tasks).active.remove(&self.task_id);
+        inner.lifecycle_tasks_changed.notify_waiters();
     }
 }
 
@@ -408,9 +422,15 @@ impl WorktreeCatalogService {
                 scan_semaphore: Arc::new(Semaphore::new(max_repository_scans)),
                 probe_semaphore: Arc::new(Semaphore::new(max_directory_probes)),
                 shutdown: CancellationToken::new(),
+                lifecycle_tasks: Mutex::new(LifecycleTasks::default()),
+                lifecycle_tasks_changed: Notify::new(),
                 registry: Mutex::new(Registry::default()),
                 #[cfg(test)]
                 final_release_pause: Mutex::new(None),
+                #[cfg(test)]
+                eviction_registration_pause: Mutex::new(None),
+                #[cfg(test)]
+                eviction_task_registrations: AtomicUsize::new(0),
                 #[cfg(test)]
                 mutation_refresh_worker_starts: AtomicUsize::new(0),
                 #[cfg(test)]
@@ -421,9 +441,53 @@ impl WorktreeCatalogService {
                 mutation_refresh_start_pause: Mutex::new(None),
                 #[cfg(test)]
                 repository_observation_requests: AtomicUsize::new(0),
-                #[cfg(test)]
-                active_owned_tasks: AtomicUsize::new(0),
             }),
+        }
+    }
+
+    fn register_lifecycle_task<F, R>(
+        &self,
+        future: F,
+        register: impl FnOnce(JoinHandle<()>) -> R,
+    ) -> Option<R>
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let mut lifecycle = lock(&self.inner.lifecycle_tasks);
+        if lifecycle.terminal {
+            return None;
+        }
+        let task_id = loop {
+            lifecycle.next_id = lifecycle.next_id.wrapping_add(1);
+            if !lifecycle.active.contains_key(&lifecycle.next_id) {
+                break lifecycle.next_id;
+            }
+        };
+        let task_guard = LifecycleTaskGuard {
+            inner: Arc::downgrade(&self.inner),
+            task_id,
+        };
+        let (start_sender, start_receiver) = oneshot::channel();
+        let handle = tokio::spawn(async move {
+            let _task = task_guard;
+            if start_receiver.await.is_err() {
+                return;
+            }
+            future.await;
+        });
+        lifecycle.active.insert(task_id, handle.abort_handle());
+        let registered = register(handle);
+        let _ = start_sender.send(());
+        Some(registered)
+    }
+
+    async fn await_lifecycle_tasks_drained(&self) {
+        loop {
+            let changed = self.inner.lifecycle_tasks_changed.notified();
+            if lock(&self.inner.lifecycle_tasks).active.is_empty() {
+                return;
+            }
+            changed.await;
         }
     }
 
@@ -725,7 +789,18 @@ impl WorktreeCatalogService {
     }
 
     pub(crate) async fn shutdown(&self) {
-        self.inner.shutdown.cancel();
+        // Registration runs while callers may already hold entry state. Make terminal state
+        // atomic with registration, but release this mutex before draining registry/entry/
+        // repository state to preserve the entry -> lifecycle lock order and avoid deadlock.
+        let abort_handles = {
+            let mut lifecycle = lock(&self.inner.lifecycle_tasks);
+            lifecycle.terminal = true;
+            self.inner.shutdown.cancel();
+            lifecycle.active.values().cloned().collect::<Vec<_>>()
+        };
+        for handle in abort_handles {
+            handle.abort();
+        }
         let mut owned_tasks = Vec::new();
         let mut mutation_tasks = Vec::new();
         {
@@ -755,10 +830,7 @@ impl WorktreeCatalogService {
         for task in mutation_tasks {
             task.terminate().await;
         }
-        #[cfg(test)]
-        while self.active_background_task_count_for_test() != 0 {
-            tokio::task::yield_now().await;
-        }
+        self.await_lifecycle_tasks_drained().await;
     }
 
     pub async fn invalidate_after_mutation(&self, project_id: &str) {
@@ -806,23 +878,32 @@ impl WorktreeCatalogService {
         let task_cancellation = cancellation.clone();
         let weak_inner = Arc::downgrade(&self.inner);
         let weak_entry = Arc::downgrade(entry);
-        let handle = tokio::spawn(async move {
-            let (Some(inner), Some(entry)) = (weak_inner.upgrade(), weak_entry.upgrade()) else {
-                return;
-            };
-            let service = WorktreeCatalogService { inner };
-            #[cfg(test)]
-            let _worker = service.begin_mutation_refresh_worker_for_test().await;
-            service
-                .run_mutation_refresh_worker(entry, worker_id, lifecycle_epoch, task_cancellation)
-                .await;
-        });
-        state.mutation_refresh_worker = Some(MutationRefreshTask {
-            id: worker_id,
-            cancellation,
-            handle,
-            abort_on_drop: true,
-        });
+        let worker = self.register_lifecycle_task(
+            async move {
+                let (Some(inner), Some(entry)) = (weak_inner.upgrade(), weak_entry.upgrade())
+                else {
+                    return;
+                };
+                let service = WorktreeCatalogService { inner };
+                #[cfg(test)]
+                let _worker = service.begin_mutation_refresh_worker_for_test().await;
+                service
+                    .run_mutation_refresh_worker(
+                        entry,
+                        worker_id,
+                        lifecycle_epoch,
+                        task_cancellation,
+                    )
+                    .await;
+            },
+            |handle| MutationRefreshTask {
+                id: worker_id,
+                cancellation,
+                handle,
+                abort_on_drop: true,
+            },
+        );
+        state.mutation_refresh_worker = worker;
     }
 
     async fn run_mutation_refresh_worker(
@@ -1381,6 +1462,10 @@ impl WorktreeCatalogService {
                 )
                 .await
                 .map(Arc::new);
+            let lifecycle = lock(&service.inner.lifecycle_tasks);
+            if lifecycle.terminal {
+                return Err(ScanError::Cancelled);
+            }
             let mut state = lock(&repository.state);
             if state.lifecycle_epoch == lifecycle_epoch {
                 state.completed_observations = state.completed_observations.wrapping_add(1);
@@ -1393,15 +1478,28 @@ impl WorktreeCatalogService {
         if !repository_owned {
             return observation.await;
         }
-        let mut task = tokio::spawn(observation);
+        let (sender, receiver) = oneshot::channel();
+        if self
+            .register_lifecycle_task(
+                async move {
+                    let _ = sender.send(observation.await);
+                },
+                drop,
+            )
+            .is_none()
+        {
+            return Err(ScanError::Cancelled);
+        }
         tokio::select! {
             _ = caller_cancellation.cancelled() => Err(ScanError::Cancelled),
-            result = &mut task => result.unwrap_or_else(|_| {
-                Err(ScanError::Catalog(CatalogError::new(
+            result = receiver => match result {
+                Ok(result) => result,
+                Err(_) if self.inner.shutdown.is_cancelled() => Err(ScanError::Cancelled),
+                Err(_) => Err(ScanError::Catalog(CatalogError::new(
                     CatalogErrorReason::Internal,
                     "A shared repository observation task failed.",
-                )))
-            }),
+                ))),
+            },
         }
     }
 
@@ -1820,43 +1918,14 @@ impl WorktreeCatalogService {
         let project_id = project_id.to_owned();
         let task_cancellation = cancellation.clone();
         let poll_interval = self.inner.options.poll_interval;
-        #[cfg(test)]
-        self.inner.active_owned_tasks.fetch_add(1, Ordering::SeqCst);
-        #[cfg(test)]
-        let task_guard = OwnedTaskGuard {
-            inner: Arc::clone(&self.inner),
-        };
-        let handle = tokio::spawn(async move {
-            #[cfg(test)]
-            let _task = task_guard;
-            let (Some(inner), Some(entry)) = (weak_inner.upgrade(), weak_entry.upgrade()) else {
-                return;
-            };
-            let service = WorktreeCatalogService { inner };
-            let Some(signature) = service
-                .signature_for_snapshot(&entry.repository.common_dir, &snapshot, &task_cancellation)
-                .await
-            else {
-                return;
-            };
-            {
-                let mut state = lock(&entry.state);
-                if state.lifecycle_epoch != lifecycle_epoch
-                    || state.subscribers == 0
-                    || task_cancellation.is_cancelled()
-                {
+        let poller = self.register_lifecycle_task(
+            async move {
+                let (Some(inner), Some(entry)) = (weak_inner.upgrade(), weak_entry.upgrade())
+                else {
                     return;
-                }
-                state.shallow_signature = Some(signature);
-            }
-            entry.poller_ready.send_replace(lifecycle_epoch);
-            loop {
-                tokio::select! {
-                    _ = task_cancellation.cancelled() => break,
-                    _ = tokio::time::sleep(poll_interval) => {}
-                }
-                let snapshot = Arc::clone(&lock(&entry.state).last_authoritative);
-                let Some(observed) = service
+                };
+                let service = WorktreeCatalogService { inner };
+                let Some(signature) = service
                     .signature_for_snapshot(
                         &entry.repository.common_dir,
                         &snapshot,
@@ -1864,37 +1933,66 @@ impl WorktreeCatalogService {
                     )
                     .await
                 else {
-                    break;
+                    return;
                 };
-                let trigger = {
+                {
                     let mut state = lock(&entry.state);
-                    if state.lifecycle_epoch != lifecycle_epoch || state.subscribers == 0 {
-                        break;
+                    if state.lifecycle_epoch != lifecycle_epoch
+                        || state.subscribers == 0
+                        || task_cancellation.is_cancelled()
+                    {
+                        return;
                     }
-                    let previous = state.shallow_signature.replace(observed);
-                    let retry_due = state
-                        .next_failure_retry
-                        .is_some_and(|deadline| Instant::now() >= deadline);
-                    match previous {
-                        Some(previous) if previous.metadata != observed.metadata => {
-                            Some(CatalogRefreshTrigger::MetadataChanged)
-                        }
-                        Some(previous) if previous.availability != observed.availability => {
-                            Some(CatalogRefreshTrigger::AvailabilityChanged)
-                        }
-                        _ if retry_due => Some(CatalogRefreshTrigger::MetadataChanged),
-                        _ => None,
-                    }
-                };
-                if let Some(trigger) = trigger {
-                    let _ = service.refresh(&project_id, trigger).await;
+                    state.shallow_signature = Some(signature);
                 }
-            }
-        });
-        state.poller = Some(OwnedTask {
-            cancellation,
-            handle,
-        });
+                entry.poller_ready.send_replace(lifecycle_epoch);
+                loop {
+                    tokio::select! {
+                        _ = task_cancellation.cancelled() => break,
+                        _ = tokio::time::sleep(poll_interval) => {}
+                    }
+                    let snapshot = Arc::clone(&lock(&entry.state).last_authoritative);
+                    let Some(observed) = service
+                        .signature_for_snapshot(
+                            &entry.repository.common_dir,
+                            &snapshot,
+                            &task_cancellation,
+                        )
+                        .await
+                    else {
+                        break;
+                    };
+                    let trigger = {
+                        let mut state = lock(&entry.state);
+                        if state.lifecycle_epoch != lifecycle_epoch || state.subscribers == 0 {
+                            break;
+                        }
+                        let previous = state.shallow_signature.replace(observed);
+                        let retry_due = state
+                            .next_failure_retry
+                            .is_some_and(|deadline| Instant::now() >= deadline);
+                        match previous {
+                            Some(previous) if previous.metadata != observed.metadata => {
+                                Some(CatalogRefreshTrigger::MetadataChanged)
+                            }
+                            Some(previous) if previous.availability != observed.availability => {
+                                Some(CatalogRefreshTrigger::AvailabilityChanged)
+                            }
+                            _ if retry_due => Some(CatalogRefreshTrigger::MetadataChanged),
+                            _ => None,
+                        }
+                    };
+                    if let Some(trigger) = trigger {
+                        let _ = service.refresh(&project_id, trigger).await;
+                    }
+                }
+            },
+            |handle| OwnedTask {
+                cancellation,
+                handle,
+            },
+        );
+        state.poller = poller;
     }
 
     async fn await_poller_ready(&self, entry: &Arc<CatalogEntry>, lifecycle_epoch: u64) -> bool {
@@ -1953,46 +2051,53 @@ impl WorktreeCatalogService {
         if self.inner.shutdown.is_cancelled() {
             return;
         }
+        #[cfg(test)]
+        self.pause_eviction_registration_for_test();
         let cancellation = self.inner.shutdown.child_token();
         let task_cancellation = cancellation.clone();
         let weak_inner = Arc::downgrade(&self.inner);
         let weak_entry = Arc::downgrade(entry);
         let project_id = entry.project_id.clone();
         let idle_eviction = self.inner.options.idle_eviction;
-        #[cfg(test)]
-        self.inner.active_owned_tasks.fetch_add(1, Ordering::SeqCst);
-        #[cfg(test)]
-        let task_guard = OwnedTaskGuard {
-            inner: Arc::clone(&self.inner),
-        };
-        let handle = tokio::spawn(async move {
-            #[cfg(test)]
-            let _task = task_guard;
-            tokio::select! {
-                _ = task_cancellation.cancelled() => return,
-                _ = tokio::time::sleep(idle_eviction) => {}
-            }
-            let (Some(inner), Some(entry)) = (weak_inner.upgrade(), weak_entry.upgrade()) else {
-                return;
-            };
-            let mut registry = lock(&inner.registry);
-            if registry
-                .entries
-                .get(&project_id)
-                .is_some_and(|candidate| Arc::ptr_eq(candidate, &entry))
-            {
-                if lock(&entry.state).subscribers != 0 {
-                    return;
+        let mut state = lock(&entry.state);
+        if state.subscribers != 0 {
+            return;
+        }
+        let _ = self.register_lifecycle_task(
+            async move {
+                tokio::select! {
+                    _ = task_cancellation.cancelled() => return,
+                    _ = tokio::time::sleep(idle_eviction) => {}
                 }
-                registry.entries.remove(&project_id);
-                registry.aliases.remove(&project_id);
-                registry.bootstrap_locks.remove(&project_id);
-            }
-        });
-        lock(&entry.state).eviction = Some(OwnedTask {
-            cancellation,
-            handle,
-        });
+                let (Some(inner), Some(entry)) = (weak_inner.upgrade(), weak_entry.upgrade())
+                else {
+                    return;
+                };
+                let mut registry = lock(&inner.registry);
+                if registry
+                    .entries
+                    .get(&project_id)
+                    .is_some_and(|candidate| Arc::ptr_eq(candidate, &entry))
+                {
+                    if lock(&entry.state).subscribers != 0 {
+                        return;
+                    }
+                    registry.entries.remove(&project_id);
+                    registry.aliases.remove(&project_id);
+                    registry.bootstrap_locks.remove(&project_id);
+                }
+            },
+            |handle| {
+                #[cfg(test)]
+                self.inner
+                    .eviction_task_registrations
+                    .fetch_add(1, Ordering::SeqCst);
+                state.eviction = Some(OwnedTask {
+                    cancellation,
+                    handle,
+                });
+            },
+        );
     }
 
     #[cfg(test)]
@@ -2006,11 +2111,41 @@ impl WorktreeCatalogService {
 
     #[cfg(test)]
     pub(crate) fn active_background_task_count_for_test(&self) -> usize {
-        self.inner.active_owned_tasks.load(Ordering::SeqCst)
-            + self
-                .inner
-                .active_mutation_refresh_workers
-                .load(Ordering::SeqCst)
+        lock(&self.inner.lifecycle_tasks).active.len()
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn complete_immediate_lifecycle_tasks_for_test(&self, count: usize) {
+        let mut completions = Vec::with_capacity(count);
+        for _ in 0..count {
+            let (completed, completion) = oneshot::channel();
+            self.register_lifecycle_task(
+                async move {
+                    let _ = completed.send(());
+                },
+                drop,
+            )
+            .expect("test task registration");
+            completions.push(completion);
+        }
+        for completion in completions {
+            completion.await.expect("test task completion");
+        }
+        while self.active_background_task_count_for_test() != 0 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn eviction_task_registration_count_for_test(&self) -> usize {
+        self.inner
+            .eviction_task_registrations
+            .load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shutdown_started_for_test(&self) -> bool {
+        self.inner.shutdown.is_cancelled()
     }
 
     #[cfg(test)]
@@ -2102,6 +2237,28 @@ impl WorktreeCatalogService {
             resume: Arc::clone(&resume),
         });
         (entered, resume)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_next_eviction_registration_for_test(
+        &self,
+    ) -> (Arc<std::sync::Barrier>, Arc<std::sync::Barrier>) {
+        let entered = Arc::new(std::sync::Barrier::new(2));
+        let resume = Arc::new(std::sync::Barrier::new(2));
+        *lock(&self.inner.eviction_registration_pause) = Some(FinalReleasePause {
+            entered: Arc::clone(&entered),
+            resume: Arc::clone(&resume),
+        });
+        (entered, resume)
+    }
+
+    #[cfg(test)]
+    fn pause_eviction_registration_for_test(&self) {
+        let Some(pause) = lock(&self.inner.eviction_registration_pause).take() else {
+            return;
+        };
+        pause.entered.wait();
+        pause.resume.wait();
     }
 
     #[cfg(test)]

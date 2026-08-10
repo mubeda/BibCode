@@ -87,9 +87,20 @@ paths, and notify every matching project view with a matching durable pin (or
 verified unpinned path), never an arbitrary first match. Pin mismatches and
 unverifiable identities fail observation closed. Observation failure never
 changes a successful Git response into a failure. Runtime shutdown permanently
-closes the service before draining pollers, queued mutation refreshes, scans,
-and eviction work; later subscribe, refresh, invalidation, and release paths
-cannot restart it.
+closes the service under one lifecycle-registration mutex before draining
+pollers, queued mutation refreshes, repository-observation leaders, scans, and
+eviction work. Every spawned task registers an abort handle under that mutex
+and removes it through a completion guard, so shutdown can abort and wait for
+the bounded active set, and a final release racing the terminal transition
+cannot register post-drain eviction. Ordinary view detach still permits an
+aliased subscribed view to keep an exact-anchor repository observation alive;
+terminal shutdown aborts and joins every such leader. Task registration takes
+entry state before the short-lived lifecycle mutex. Shutdown holds the
+lifecycle mutex only long enough to mark terminal and copy abort handles, then
+releases it before acquiring the main registry, entry, or repository locks.
+Observation result publication takes the lifecycle mutex before repository
+state and skips publication after terminal transition. Later subscribe,
+refresh, invalidation, and release paths cannot restart the service.
 
 ## Provider turn flow
 
