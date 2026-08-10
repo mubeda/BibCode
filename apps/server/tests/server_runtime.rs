@@ -549,8 +549,8 @@ async fn directory_at_database_path_returns_typed_persistence_error() {
                 "typed error identifies the classified database path: {message}"
             );
             assert!(
-                message.contains(" is corrupt:"),
-                "directory fixture is rejected during read-only validation: {message}"
+                message.contains("cannot be inspected without side effects"),
+                "directory fixture is rejected before private snapshot validation: {message}"
             );
         }
         other => panic!("expected PersistenceInitialize, got {other:?}"),
