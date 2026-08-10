@@ -29,6 +29,7 @@ use crate::{
         ResolvePullRequestInput, ResolvedPullRequest, SourceControlDiscovery,
     },
     workspace::{WorkspaceMutationFuture, WorkspaceMutationObserver},
+    worktree_catalog::WorkspaceAvailabilityRegistry,
 };
 
 use super::host_paths::resolve_host_directory;
@@ -86,6 +87,7 @@ pub struct GitVcsRpcServices {
     discovery: SourceControlDiscovery,
     pull_requests: PullRequestService,
     catalog_mutation_observer: Option<Arc<dyn CatalogMutationObserver>>,
+    availability_registry: Option<WorkspaceAvailabilityRegistry>,
 }
 
 impl Default for GitVcsRpcServices {
@@ -119,6 +121,7 @@ impl GitVcsRpcServices {
             discovery: SourceControlDiscovery::default(),
             pull_requests: PullRequestService::default(),
             catalog_mutation_observer: None,
+            availability_registry: None,
         }
     }
 
@@ -128,6 +131,15 @@ impl GitVcsRpcServices {
         observer: Arc<dyn CatalogMutationObserver>,
     ) -> Self {
         self.catalog_mutation_observer = Some(observer);
+        self
+    }
+
+    #[must_use]
+    pub fn with_availability_registry(
+        mut self,
+        availability_registry: WorkspaceAvailabilityRegistry,
+    ) -> Self {
+        self.availability_registry = Some(availability_registry);
         self
     }
 }
@@ -164,6 +176,7 @@ impl GitVcsRpcServices {
         request: RpcRequest,
         cancellation: CancellationToken,
     ) -> RpcResult {
+        self.guard_payload_cwd(&request.payload).await?;
         match request.tag.as_str() {
             "shell.openInEditor" => self.open_in_editor(request.payload).await,
             "vcs.pull" => {
@@ -401,6 +414,7 @@ impl GitVcsRpcServices {
         let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
         let broadcaster = self.broadcaster.clone();
         let pull_requests = self.pull_requests.clone();
+        let availability = self.availability_registry.clone();
         tokio::spawn(async move {
             let input = match decode::<CwdInput>(request.payload, "subscribeVcsStatus") {
                 Ok(input) => input,
@@ -409,6 +423,10 @@ impl GitVcsRpcServices {
                     return;
                 }
             };
+            if let Err(error) = guard_git_path(availability.as_ref(), &input.cwd).await {
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
             let mut subscription = match broadcaster
                 .subscribe(input.cwd.clone(), cancellation.clone())
                 .await
@@ -472,6 +490,7 @@ impl GitVcsRpcServices {
         let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
         let repository = Arc::clone(&self.repository);
         let pull_requests = self.pull_requests.clone();
+        let availability = self.availability_registry.clone();
         tokio::spawn(async move {
             let input = match decode::<StackedActionInput>(request.payload, "git.runStackedAction")
             {
@@ -481,6 +500,10 @@ impl GitVcsRpcServices {
                     return;
                 }
             };
+            if let Err(error) = guard_git_path(availability.as_ref(), &input.cwd).await {
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
             let phases = action_phases(&input.action, input.feature_branch.unwrap_or(false));
             if send_event(
                 &sender,
@@ -771,6 +794,25 @@ impl GitVcsRpcServices {
     async fn open_in_editor(&self, payload: Value) -> RpcResult {
         open_in_editor_with(payload, launch_editor)
     }
+
+    async fn guard_payload_cwd(&self, payload: &Value) -> Result<(), Value> {
+        let Some(cwd) = payload.get("cwd").and_then(Value::as_str) else {
+            return Ok(());
+        };
+        guard_git_path(self.availability_registry.as_ref(), Path::new(cwd)).await
+    }
+}
+
+async fn guard_git_path(
+    registry: Option<&WorkspaceAvailabilityRegistry>,
+    cwd: &Path,
+) -> Result<(), Value> {
+    let Some(registry) = registry else {
+        return Ok(());
+    };
+    registry.guard_path(cwd).await.map_err(|error| {
+        serde_json::to_value(error).expect("workspace unavailable error serializes")
+    })
 }
 
 fn open_in_editor_with(

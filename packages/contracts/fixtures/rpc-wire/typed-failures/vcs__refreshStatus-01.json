@@ -7,9 +7,12 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "EnvironmentAuthorizationError",
-          "message": "bi",
-          "requiredScope": "orchestration:read"
+          "_tag": "WorkspaceUnavailableError",
+          "reason": "workspace-unavailable",
+          "message": "toString",
+          "threadId": "!",
+          "path": "RWY65TRV:(;\"",
+          "availability": "missing-registered"
         }
       }
     ]

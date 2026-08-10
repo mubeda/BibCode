@@ -28,6 +28,7 @@ use crate::{
     persistence::{ProjectionThread, Repositories, WorktreeRepositoryPinOutcome},
 };
 
+use super::availability::{WorkspaceAvailabilityRegistry, WorkspaceLossTransition};
 use super::model::{
     AdoptedWorktreeAvailability, AdoptedWorktreeStatus, AdoptionValidationError,
     AdoptionValidationErrorReason, CatalogDegradedReason, CatalogError, CatalogErrorReason,
@@ -74,6 +75,10 @@ pub(crate) trait CatalogHealthySnapshotObserver: Send + Sync {
         project_id: String,
         snapshot: Arc<WorktreeCatalogSnapshot>,
     ) -> CatalogFuture<()>;
+}
+
+pub(crate) trait CatalogWorkspaceLossObserver: Send + Sync {
+    fn observe(&self, transitions: Vec<WorkspaceLossTransition>) -> CatalogFuture<()>;
 }
 
 #[derive(Clone, Debug)]
@@ -167,7 +172,9 @@ struct Inner {
     lifecycle_tasks: Mutex<LifecycleTasks>,
     lifecycle_tasks_changed: Notify,
     registry: Mutex<Registry>,
+    availability_registry: WorkspaceAvailabilityRegistry,
     healthy_snapshot_observer: Mutex<Option<Arc<dyn CatalogHealthySnapshotObserver>>>,
+    workspace_loss_observer: Mutex<Option<Arc<dyn CatalogWorkspaceLossObserver>>>,
     #[cfg(test)]
     final_release_pause: Mutex<Option<FinalReleasePause>>,
     #[cfg(test)]
@@ -407,19 +414,67 @@ impl From<CatalogError> for ScanError {
 impl WorktreeCatalogService {
     #[must_use]
     pub fn new(repositories: Arc<Repositories>, repository: Arc<GitRepository>) -> Self {
-        Self::with_dependencies(
+        Self::new_with_availability_registry(
+            repositories,
+            repository,
+            WorkspaceAvailabilityRegistry::new(),
+        )
+    }
+
+    #[must_use]
+    pub fn new_with_availability_registry(
+        repositories: Arc<Repositories>,
+        repository: Arc<GitRepository>,
+        availability_registry: WorkspaceAvailabilityRegistry,
+    ) -> Self {
+        Self::build(
             Arc::new(RepositoriesProjectionSource { repositories }),
             Arc::new(GitInventorySource { repository }),
             Arc::new(TokioCatalogFileSystem),
             CatalogServiceOptions::default(),
+            availability_registry,
         )
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_dependencies_and_availability(
+        projections: Arc<dyn CatalogProjectionSource>,
+        inventory: Arc<dyn InventorySource>,
+        filesystem: Arc<dyn CatalogFileSystem>,
+        options: CatalogServiceOptions,
+        availability_registry: WorkspaceAvailabilityRegistry,
+    ) -> Self {
+        Self::build(
+            projections,
+            inventory,
+            filesystem,
+            options,
+            availability_registry,
+        )
+    }
+
+    #[cfg(test)]
     pub(crate) fn with_dependencies(
         projections: Arc<dyn CatalogProjectionSource>,
         inventory: Arc<dyn InventorySource>,
         filesystem: Arc<dyn CatalogFileSystem>,
         options: CatalogServiceOptions,
+    ) -> Self {
+        Self::build(
+            projections,
+            inventory,
+            filesystem,
+            options,
+            WorkspaceAvailabilityRegistry::new(),
+        )
+    }
+
+    fn build(
+        projections: Arc<dyn CatalogProjectionSource>,
+        inventory: Arc<dyn InventorySource>,
+        filesystem: Arc<dyn CatalogFileSystem>,
+        options: CatalogServiceOptions,
+        availability_registry: WorkspaceAvailabilityRegistry,
     ) -> Self {
         let max_repository_scans = options.max_repository_scans.max(1);
         let max_directory_probes = options.max_directory_probes.max(1);
@@ -435,7 +490,9 @@ impl WorktreeCatalogService {
                 lifecycle_tasks: Mutex::new(LifecycleTasks::default()),
                 lifecycle_tasks_changed: Notify::new(),
                 registry: Mutex::new(Registry::default()),
+                availability_registry,
                 healthy_snapshot_observer: Mutex::new(None),
+                workspace_loss_observer: Mutex::new(None),
                 #[cfg(test)]
                 final_release_pause: Mutex::new(None),
                 #[cfg(test)]
@@ -595,6 +652,13 @@ impl WorktreeCatalogService {
         *lock(&self.inner.healthy_snapshot_observer) = Some(observer);
     }
 
+    pub(crate) fn set_workspace_loss_observer(
+        &self,
+        observer: Arc<dyn CatalogWorkspaceLossObserver>,
+    ) {
+        *lock(&self.inner.workspace_loss_observer) = Some(observer);
+    }
+
     async fn observe_healthy_snapshot(
         &self,
         project_id: &str,
@@ -603,6 +667,16 @@ impl WorktreeCatalogService {
         let observer = lock(&self.inner.healthy_snapshot_observer).clone();
         if let Some(observer) = observer {
             observer.observe(project_id.to_owned(), snapshot).await;
+        }
+    }
+
+    async fn observe_workspace_losses(&self, transitions: Vec<WorkspaceLossTransition>) {
+        if transitions.is_empty() {
+            return;
+        }
+        let observer = lock(&self.inner.workspace_loss_observer).clone();
+        if let Some(observer) = observer {
+            observer.observe(transitions).await;
         }
     }
 
@@ -780,7 +854,7 @@ impl WorktreeCatalogService {
         else {
             return self.finish_cancelled(entry, fence);
         };
-        {
+        let transitions = {
             let mut state = lock(&entry.state);
             if fence
                 .lifecycle_epoch
@@ -807,8 +881,14 @@ impl WorktreeCatalogService {
             state.shallow_signature = Some(signature);
             state.failure_backoff = Duration::ZERO;
             state.next_failure_retry = None;
+            let transitions = self
+                .inner
+                .availability_registry
+                .reconcile_snapshot_sync(&snapshot);
             state.sender.send_replace(Arc::clone(&snapshot));
-        }
+            transitions
+        };
+        self.observe_workspace_losses(transitions).await;
         self.observe_healthy_snapshot(project_id, Arc::clone(&snapshot))
             .await;
         Ok(snapshot)
@@ -1319,6 +1399,10 @@ impl WorktreeCatalogService {
                         .insert(scan.repository_key.clone(), Arc::downgrade(&repository));
                     repository
                 });
+            let transitions = self
+                .inner
+                .availability_registry
+                .reconcile_snapshot_sync(&scan.snapshot);
             let (sender, _) = watch::channel(Arc::clone(&scan.snapshot));
             let (poller_ready, _) = watch::channel(0);
             let entry = Arc::new(CatalogEntry {
@@ -1354,13 +1438,18 @@ impl WorktreeCatalogService {
             registry
                 .aliases
                 .insert(project_id.to_owned(), scan.repository_key);
-            Ok(entry)
+            Ok((entry, transitions))
         }
         .await;
-        if let Ok(entry) = &result {
-            let snapshot = Arc::clone(&lock(&entry.state).snapshot);
-            self.observe_healthy_snapshot(project_id, snapshot).await;
-        }
+        let result = match result {
+            Ok((entry, transitions)) => {
+                self.observe_workspace_losses(transitions).await;
+                let snapshot = Arc::clone(&lock(&entry.state).snapshot);
+                self.observe_healthy_snapshot(project_id, snapshot).await;
+                Ok(entry)
+            }
+            Err(error) => Err(error),
+        };
         drop(guard);
         self.remove_bootstrap_lock_if_idle(project_id, &bootstrap_lock);
         result

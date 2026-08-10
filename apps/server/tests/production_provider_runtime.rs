@@ -5884,6 +5884,52 @@ async fn routes_the_complete_live_session_lifecycle_and_stops_idempotently() {
     assert!(matches!(error, ProviderRuntimeError::Shutdown));
 }
 
+#[tokio::test]
+async fn workspace_loss_session_stop_shuts_driver_without_deleting_thread() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (_events_tx, events_rx) = mpsc::channel(1);
+    let factory = Arc::new(FakeFactory {
+        state: state.clone(),
+        events: StdMutex::new(VecDeque::from([events_rx])),
+    });
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        factory,
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    supervisor.launch(launch()).await.unwrap();
+
+    supervisor
+        .handle_orchestration(OrchestrationCommand::ThreadSessionStop {
+            command_id: "workspace-loss:t1:provider-stop".to_owned(),
+            thread_id: "t1".to_owned(),
+            created_at: NOW.to_owned(),
+        })
+        .await
+        .expect("workspace loss stops provider");
+
+    assert_eq!(state.lock().unwrap().shutdowns, 1);
+    assert!(
+        engine
+            .repositories()
+            .get_provider_session_runtime("t1".to_owned())
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        engine
+            .repositories()
+            .get_thread("t1".to_owned())
+            .await
+            .unwrap()
+            .is_some()
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn late_provider_events_after_thread_deletion_do_not_warn() {
     let capture = TraceCapture::default();

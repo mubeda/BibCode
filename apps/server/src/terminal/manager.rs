@@ -1709,7 +1709,7 @@ impl TerminalManager {
         tokio::spawn(async move {
             loop {
                 let observed_exit = exit.borrow().clone();
-                let Some(PtyExit { exit_code, signal }) = observed_exit else {
+                let Some(exit) = observed_exit else {
                     tokio::select! {
                         () = exit_cancel.cancelled() => return,
                         () = exit_generation.cancellation.cancelled() => return,
@@ -1721,51 +1721,8 @@ impl TerminalManager {
                     }
                     continue;
                 };
-                exit_generation.stop_output().await;
-                let _publication = exit_generation.publication.lock().await;
-                if exit_generation.is_invalidated() {
-                    return;
-                }
-                let registered = {
-                    let sessions = exit_inner.sessions.read().await;
-                    let session = exit_session.lock().await;
-                    sessions
-                        .get(&(session.thread_id.clone(), session.terminal_id.clone()))
-                        .is_some_and(|current| Arc::ptr_eq(current, &exit_session))
-                };
-                if !registered {
-                    return;
-                }
-                exit_generation
-                    .cancel_and_invalidate(TerminalObserverCancellationReason::ProcessExited)
+                Self::finalize_process_exit(&exit_inner, &exit_session, &exit_generation, exit)
                     .await;
-                let (event, summary) = {
-                    let mut session = exit_session.lock().await;
-                    session.status = TerminalStatus::Exited;
-                    session.attribution_registration.take();
-                    session.observer.take();
-                    session.pid = None;
-                    session.process = None;
-                    session.exit_code = exit_code;
-                    session.exit_signal = signal;
-                    session.has_running_subprocess = false;
-                    session.child_command_label = None;
-                    let sequence = session.advance();
-                    (
-                        TerminalEvent::Exited {
-                            thread_id: session.thread_id.clone(),
-                            terminal_id: session.terminal_id.clone(),
-                            sequence,
-                            exit_code,
-                            exit_signal: signal,
-                        },
-                        session.summary(),
-                    )
-                };
-                let _ = exit_inner.events.send(event);
-                let _ = exit_inner
-                    .metadata
-                    .send(TerminalMetadataEvent::Upsert { terminal: summary });
                 return;
             }
         });
@@ -1836,6 +1793,62 @@ impl TerminalManager {
                 }
             }
         });
+    }
+
+    async fn finalize_process_exit(
+        inner: &Arc<Inner>,
+        session: &SharedSession,
+        generation: &Arc<SessionGeneration>,
+        exit: PtyExit,
+    ) {
+        generation.stop_output().await;
+        let _publication = generation.publication.lock().await;
+        if generation.is_invalidated() {
+            return;
+        }
+        let registered = {
+            let sessions = inner.sessions.read().await;
+            let locked_session = session.lock().await;
+            sessions
+                .get(&(
+                    locked_session.thread_id.clone(),
+                    locked_session.terminal_id.clone(),
+                ))
+                .is_some_and(|current| Arc::ptr_eq(current, session))
+        };
+        if !registered {
+            return;
+        }
+        generation
+            .cancel_and_invalidate(TerminalObserverCancellationReason::ProcessExited)
+            .await;
+        let (event, summary) = {
+            let mut session = session.lock().await;
+            session.status = TerminalStatus::Exited;
+            session.attribution_registration.take();
+            session.observer.take();
+            session.pid = None;
+            session.process = None;
+            session.exit_code = exit.exit_code;
+            session.exit_signal = exit.signal;
+            session.has_running_subprocess = false;
+            session.child_command_label = None;
+            let sequence = session.advance();
+            (
+                TerminalEvent::Exited {
+                    thread_id: session.thread_id.clone(),
+                    terminal_id: session.terminal_id.clone(),
+                    sequence,
+                    exit_code: exit.exit_code,
+                    exit_signal: exit.signal,
+                },
+                session.summary(),
+            )
+        };
+        let _ = inner.events.send(event);
+        let _ = inner
+            .metadata
+            .send(TerminalMetadataEvent::Upsert { terminal: summary });
     }
 
     async fn publish_output_chunk(
@@ -2157,6 +2170,69 @@ impl TerminalManager {
             return Err(TerminalError::Close);
         }
         Ok(())
+    }
+
+    /// Stops every live terminal process for a thread while retaining the
+    /// exited session snapshots and their bounded transcript history.
+    pub async fn quiesce_thread_preserving_history(
+        &self,
+        thread_id: &str,
+    ) -> Result<(), TerminalError> {
+        let (targets, mut failed) = {
+            let _lifecycle = self.inner.lifecycle.lock().await;
+            let sessions = {
+                let sessions = self.inner.sessions.read().await;
+                sessions
+                    .iter()
+                    .filter(|((candidate_thread, _), _)| candidate_thread == thread_id)
+                    .map(|(_, session)| session.clone())
+                    .collect::<Vec<_>>()
+            };
+            let mut targets = Vec::with_capacity(sessions.len());
+            let mut failed = false;
+            for session in sessions {
+                let (generation, process) = {
+                    let session = session.lock().await;
+                    (session.generation.clone(), session.process.clone())
+                };
+                if let Some(process) = process {
+                    let exit = process.subscribe_exit();
+                    match process.kill() {
+                        Ok(()) => targets.push((session, generation, process, exit)),
+                        Err(error) => {
+                            failed = true;
+                            tracing::warn!(
+                                %thread_id,
+                                pid = process.pid(),
+                                %error,
+                                "failed to stop terminal for unavailable workspace"
+                            );
+                        }
+                    }
+                }
+            }
+            (targets, failed)
+        };
+        for (session, generation, process, exit) in targets {
+            let observed = exit.clone();
+            match wait_for_terminal_process_tree_exit(process, exit).await {
+                Ok(()) => {
+                    let observed_exit = observed.borrow().clone();
+                    if let Some(exit) = observed_exit {
+                        Self::finalize_process_exit(&self.inner, &session, &generation, exit).await;
+                    }
+                }
+                Err(error) => {
+                    failed = true;
+                    tracing::warn!(%thread_id, %error, "terminal quiesce did not finish cleanly");
+                }
+            }
+        }
+        if failed {
+            Err(TerminalError::Close)
+        } else {
+            Ok(())
+        }
     }
 
     async fn close_sessions(
@@ -4077,6 +4153,115 @@ mod tests {
         assert_eq!(restarted_session.lock().await.history.line_limit(), 2);
         assert_eq!(backend.processes.lock().expect("processes lock").len(), 2);
 
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn workspace_quiesce_stops_every_process_and_retains_session_history() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        for terminal_id in ["term-one", "term-two"] {
+            manager
+                .open(TerminalOpenInput::new(
+                    "thread-quiesce",
+                    terminal_id,
+                    root.path().to_path_buf(),
+                    80,
+                    24,
+                ))
+                .await
+                .unwrap();
+        }
+        let mut events = manager.subscribe_events();
+        for (process, transcript) in backend
+            .processes
+            .lock()
+            .expect("processes")
+            .iter()
+            .zip(["retained-one\n", "retained-two\n"])
+        {
+            process.emit(transcript);
+        }
+        for _ in 0..2 {
+            let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .expect("output timeout")
+                .expect("output event");
+            assert!(matches!(event, TerminalEvent::Output { .. }));
+        }
+
+        manager
+            .quiesce_thread_preserving_history("thread-quiesce")
+            .await
+            .expect("quiesce");
+
+        for (terminal_id, transcript) in [
+            ("term-one", "retained-one\n"),
+            ("term-two", "retained-two\n"),
+        ] {
+            let attachment = manager
+                .attach(TerminalAttachInput::existing("thread-quiesce", terminal_id))
+                .await
+                .expect("retained terminal attaches");
+            assert_eq!(attachment.initial.status, TerminalStatus::Exited);
+            assert_eq!(attachment.initial.history, transcript);
+        }
+        assert!(
+            backend
+                .processes
+                .lock()
+                .expect("processes")
+                .iter()
+                .all(|process| process.is_killed())
+        );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn workspace_quiesce_attempts_every_process_when_kills_fail() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        for terminal_id in ["term-one", "term-two"] {
+            manager
+                .open(TerminalOpenInput::new(
+                    "thread-quiesce-errors",
+                    terminal_id,
+                    root.path().to_path_buf(),
+                    80,
+                    24,
+                ))
+                .await
+                .unwrap();
+        }
+        let processes = backend.processes.lock().expect("processes").clone();
+        for process in &processes {
+            process.fail_kill("expected kill failure");
+        }
+
+        assert!(matches!(
+            manager
+                .quiesce_thread_preserving_history("thread-quiesce-errors")
+                .await,
+            Err(TerminalError::Close)
+        ));
+        assert!(
+            processes.iter().all(|process| process.is_killed()),
+            "one failed kill must not prevent later terminals from being signaled"
+        );
         manager.shutdown().await;
     }
 

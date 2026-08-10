@@ -24,6 +24,7 @@ use crate::{
     },
     rpc::{RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk},
     server_settings::ProviderSettingsStore,
+    worktree_catalog::WorkspaceAvailabilityRegistry,
 };
 
 use super::orchestration_effects::install_project_command_effects;
@@ -36,7 +37,15 @@ use super::turn_delivery::TurnDeliveryService;
 const STREAM_CAPACITY: usize = 16;
 
 pub fn register_orchestration_rpc(registry: &mut RpcRegistry, engine: OrchestrationEngine) {
-    register_orchestration_rpc_inner(registry, engine, None);
+    register_orchestration_rpc_inner(registry, engine, None, None);
+}
+
+pub fn register_orchestration_rpc_with_availability(
+    registry: &mut RpcRegistry,
+    engine: OrchestrationEngine,
+    availability: WorkspaceAvailabilityRegistry,
+) {
+    register_orchestration_rpc_inner(registry, engine, None, Some(availability));
 }
 
 pub fn register_orchestration_rpc_with_delivery(
@@ -56,6 +65,29 @@ pub fn register_orchestration_rpc_with_delivery(
             attachments,
             turn_delivery,
         }),
+        None,
+    );
+}
+
+pub fn register_orchestration_rpc_with_delivery_and_availability(
+    registry: &mut RpcRegistry,
+    engine: OrchestrationEngine,
+    provider: Arc<ProviderRuntimeSupervisor>,
+    settings_root: PathBuf,
+    turn_delivery: Arc<TurnDeliveryService>,
+    availability: WorkspaceAvailabilityRegistry,
+) {
+    let attachments = AttachmentMaterializer::new(settings_root.join("attachments"));
+    register_orchestration_rpc_inner(
+        registry,
+        engine,
+        Some(ProviderRegistration {
+            provider,
+            settings_root,
+            attachments,
+            turn_delivery,
+        }),
+        Some(availability),
     );
 }
 
@@ -71,12 +103,14 @@ fn register_orchestration_rpc_inner(
     registry: &mut RpcRegistry,
     engine: OrchestrationEngine,
     provider: Option<ProviderRegistration>,
+    availability: Option<WorkspaceAvailabilityRegistry>,
 ) {
     install_project_command_effects(&engine);
     let dispatch = engine.clone();
     registry.register_unary("orchestration.dispatchCommand", move |request, _| {
         let dispatch = dispatch.clone();
         let provider = provider.clone();
+        let availability = availability.clone();
         async move {
             let payload_digest = canonical_command_digest(&request.payload)
                 .map_err(|error| invalid_request(&request.tag, error))?;
@@ -88,7 +122,16 @@ fn register_orchestration_rpc_inner(
                     "server-internal orchestration commands cannot be dispatched by clients",
                 ));
             }
-            if matches!(command, OrchestrationCommand::ThreadTurnStart { .. }) {
+            if let OrchestrationCommand::ThreadTurnStart { thread_id, .. } = &command {
+                if let Some(availability) = &availability {
+                    availability
+                        .guard_thread(thread_id)
+                        .await
+                        .map_err(|error| {
+                            serde_json::to_value(error)
+                                .expect("workspace unavailable error serializes")
+                        })?;
+                }
                 let provider = provider.ok_or_else(|| {
                     invalid_request(
                         &request.tag,

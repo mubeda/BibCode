@@ -47,7 +47,7 @@ use crate::{
             BoxEffectFuture, EffectsOptions, OrchestrationEffectCallbacks, OrchestrationEffects,
             SetupScriptLaunch, process_compatible_path,
         },
-        orchestration_rpc::register_orchestration_rpc_with_delivery,
+        orchestration_rpc::register_orchestration_rpc_with_delivery_and_availability,
         provider_runtime::{
             NativeProviderDriverFactory, ProviderRuntimeSupervisor, SupervisorOptions,
             reconcile_abandoned_provider_sessions,
@@ -60,6 +60,7 @@ use crate::{
             WorktreeCatalogMutationObserver, WorktreeCatalogRpcServices,
             register_worktree_catalog_rpc,
         },
+        worktree_runtime::WorktreeRuntime,
     },
     provider::attachments::{AttachmentMaterializer, MAX_ATTACHMENT_BYTES},
     provider_terminal::{
@@ -76,7 +77,7 @@ use crate::{
     server_settings::ProviderSettingsStore,
     terminal::{PortablePtyBackend, TerminalManager, TerminalManagerOptions},
     workspace::{AssetContextResolver, WorkspaceRpc, WorkspaceRpcDependencies, WorkspaceService},
-    worktree_catalog::WorktreeCatalogService,
+    worktree_catalog::{WorkspaceAvailabilityRegistry, WorktreeCatalogService},
 };
 
 pub struct ProductionRuntime {
@@ -93,6 +94,7 @@ pub struct ProductionRuntime {
     orchestration_effects: OrchestrationEffects,
     diagnostic_bundle: DiagnosticBundleService,
     _worktree_catalog: WorktreeCatalogService,
+    worktree_runtime: WorktreeRuntime,
     _resource_sampler: Arc<NativeResourceSampler>,
 }
 
@@ -227,8 +229,12 @@ impl ProductionRuntime {
         ));
         let asset_access = AssetAccess::new(asset_secret, state_paths.attachments_dir.clone());
         let git_repository = Arc::new(GitRepository::with_worktree_settings(control.clone()));
-        let worktree_catalog =
-            WorktreeCatalogService::new(Arc::new(repositories.clone()), git_repository.clone());
+        let workspace_availability = WorkspaceAvailabilityRegistry::new();
+        let worktree_catalog = WorktreeCatalogService::new_with_availability_registry(
+            Arc::new(repositories.clone()),
+            git_repository.clone(),
+            workspace_availability.clone(),
+        );
         let git_vcs = GitVcsRpcServices::with_repository_and_automatic_fetch_interval(
             git_repository.clone(),
             control.automatic_git_fetch_interval_signal(),
@@ -237,7 +243,8 @@ impl ProductionRuntime {
             worktree_catalog.clone(),
             repositories.clone(),
             git_repository.clone(),
-        )));
+        )))
+        .with_availability_registry(workspace_availability.clone());
         let workspace = WorkspaceRpc::with_dependencies(
             WorkspaceService::default(),
             WorkspaceRpcDependencies {
@@ -248,7 +255,8 @@ impl ProductionRuntime {
                 review_service: Some(ReviewService::new(Arc::new(GitReviewBackend))),
                 mutation_observer: Some(Arc::new(git_vcs.clone())),
             },
-        );
+        )
+        .with_availability_registry(workspace_availability.clone());
         let workspace_for_effects = workspace.clone();
         let preview = PreviewManager::new();
         let preview_automation = PreviewAutomationBroker::new();
@@ -279,7 +287,15 @@ impl ProductionRuntime {
             provider_usage,
             relay,
             control.clone(),
+        )
+        .with_availability_registry(workspace_availability.clone());
+        let worktree_runtime = WorktreeRuntime::start(
+            orchestration.clone(),
+            provider_runtime.clone(),
+            terminal_services.clone(),
+            workspace_availability.clone(),
         );
+        worktree_catalog.set_workspace_loss_observer(Arc::new(worktree_runtime.clone()));
         let orchestration_effects = OrchestrationEffects::start(
             orchestration.clone(),
             git_repository.clone(),
@@ -302,12 +318,13 @@ impl ProductionRuntime {
         let mut registry = RpcRegistry::with_trace_diagnostics(trace_diagnostics.clone());
         crate::auth::register_rpc_handlers(&mut registry, auth);
         register_activity_rpc(&mut registry, activity_projections.clone());
-        register_orchestration_rpc_with_delivery(
+        register_orchestration_rpc_with_delivery_and_availability(
             &mut registry,
             orchestration.clone(),
             provider_runtime.clone(),
             config.state_dir(),
             turn_delivery.clone(),
+            workspace_availability.clone(),
         );
         register_workspace_preview_rpc(&mut registry, workspace_preview);
         register_git_vcs_rpc(&mut registry, git_vcs);
@@ -332,6 +349,7 @@ impl ProductionRuntime {
             orchestration_effects,
             diagnostic_bundle,
             _worktree_catalog: worktree_catalog,
+            worktree_runtime,
             _resource_sampler: resource_sampler,
         })
     }
@@ -450,6 +468,7 @@ impl ProductionRuntime {
 
     pub async fn shutdown(&self) {
         self._worktree_catalog.shutdown().await;
+        self.worktree_runtime.shutdown().await;
         self.provider_update_checks.shutdown().await;
         self.turn_delivery.shutdown().await;
         self.orchestration_effects.shutdown().await;

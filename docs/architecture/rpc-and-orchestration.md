@@ -147,6 +147,53 @@ Observation result publication takes the lifecycle mutex before repository
 state and skips publication after terminal transition. Later subscribe,
 refresh, invalidation, and release paths cannot restart the service.
 
+### Missing-workspace runtime guard
+
+The production runtime owns one `WorkspaceAvailabilityRegistry` and injects
+that same instance into the catalog, orchestration, terminal, Git/VCS, and
+workspace/file/search/review RPC owners. The registry is the server-side source
+of truth for whether an adopted workspace may begin new path-dependent work.
+It indexes both the durable thread ID and the host-platform-normalized workspace
+path. Path guards cover the workspace root and its descendants; canonical
+aliases are checked when the requested path still exists. The public failure is
+the structured `WorkspaceUnavailableError`, including the thread ID, last-known
+path, and catalog availability.
+
+Only a healthy authoritative catalog snapshot may change this state. While the
+catalog publication lock is still held, it installs a missing guard before the
+new snapshot is visible or a runtime-loss callback can run. Degraded scans
+retain the prior state and perform no teardown. Loss work is admitted once per
+`(threadId, generation, availability)` transition. Exact recovery clears the
+guard only when the same normalized path is present again in the same physical
+repository; an active removal guard takes precedence over catalog loss and
+recovery.
+
+The guard rejects a new turn before durable admission; terminal open, restart,
+write, and restart-on-attach; client Git status and mutations; and project
+file, search, mutation, editor, asset, and review operations. It intentionally
+allows catalog refresh, conversation/history reads, non-restarting terminal
+attach, terminal close, thread delete/detach, and direct internal cleanup Git
+operations. Guard checks occur before the affected owner starts durable or
+external side effects, so a path disappearing between client resolution and
+handler execution cannot fall through to a generic filesystem or process
+failure.
+
+For each admitted loss transition, `WorktreeRuntime` appends one warning
+activity with a deterministic transition-derived ID, requests the provider
+session to stop, and quiesces every terminal for the thread. Terminal quiesce
+signals all processes before waiting and retains each session as an exited
+snapshot with its bounded transcript; it does not use destructive terminal
+close. Conversation and thread rows are likewise retained. A warning-write
+failure is logged but cannot prevent process cleanup.
+
+The graceful cleanup bound is five seconds. Incomplete cleanup is marked as
+`orphanCleanupPending` and handed to the runtime-owned reaper. Its queue holds
+at most 64 jobs; initial loss handling admits at most 16 quiesces concurrently.
+Saturation is logged without clearing the workspace guard or orphan marker;
+dropping the cleanup task handle does not cancel the underlying Tokio task.
+`ProductionRuntime` owns and shuts down both the catalog observer and reaper,
+preventing post-shutdown loss work from being admitted.
+
 ## Provider turn flow
 
 ```mermaid

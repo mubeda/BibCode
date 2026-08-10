@@ -10,13 +10,74 @@ use bibcode_server::{
     persistence::{Database, ProjectionProject, ProjectionThread, Repositories, run_migrations},
     worktree_catalog::{
         AdoptedWorktreeAvailability, AdoptionValidationErrorReason, CatalogRefreshTrigger,
-        CatalogScanStatus, WorktreeCatalogService, WorktreeDirectoryState,
+        CatalogScanStatus, WorkspaceAvailabilityRegistry, WorktreeCatalogService,
+        WorktreeDirectoryState,
     },
 };
 use serde_json::json;
 use tempfile::TempDir;
 
 const NOW: &str = "2026-08-09T00:00:00.000Z";
+
+#[tokio::test]
+async fn runtime_loss_guards_real_missing_worktree_and_exact_recovery_clears_it() {
+    let fixture = RepositoryFixture::new().await;
+    git(
+        &fixture.main,
+        &["worktree", "add", "-b", "feature/runtime-loss"],
+        Some(&fixture.external),
+    );
+    fixture
+        .repositories
+        .upsert_thread(workspace_thread(&fixture.external))
+        .await
+        .expect("adopted workspace projection");
+    let availability = WorkspaceAvailabilityRegistry::new();
+    let service = fixture.service_with_availability(availability.clone());
+    let _subscription = service.subscribe("project-1").await.expect("catalog");
+    let external_path = canonical_string(&fixture.external);
+
+    fs::remove_dir_all(&fixture.external).expect("remove external checkout");
+    let missing = service
+        .refresh("project-1", CatalogRefreshTrigger::Explicit)
+        .await
+        .expect("missing refresh");
+    assert_eq!(
+        adopted_status(&missing, "thread-external").availability,
+        AdoptedWorktreeAvailability::MissingRegistered
+    );
+    let guarded = availability
+        .guard_thread("thread-external")
+        .await
+        .expect_err("authoritative loss installs a guard");
+    assert_eq!(guarded.path, external_path);
+
+    let external_argument = fixture.external.to_string_lossy().into_owned();
+    git(
+        &fixture.main,
+        &["worktree", "prune", "--expire", "now"],
+        None,
+    );
+    git(
+        &fixture.main,
+        &[
+            "worktree",
+            "add",
+            &external_argument,
+            "feature/runtime-loss",
+        ],
+        None,
+    );
+    let recovered = service
+        .refresh("project-1", CatalogRefreshTrigger::Explicit)
+        .await
+        .expect("recovery refresh");
+    assert_eq!(
+        adopted_status(&recovered, "thread-external").availability,
+        AdoptedWorktreeAvailability::Present
+    );
+    assert_eq!(availability.guard_thread("thread-external").await, Ok(()));
+}
 
 #[tokio::test]
 async fn legacy_unpinned_project_is_pinned_by_a_primary_authoritative_scan() {
@@ -434,6 +495,17 @@ impl RepositoryFixture {
         WorktreeCatalogService::new(
             Arc::clone(&self.repositories),
             Arc::new(GitRepository::default()),
+        )
+    }
+
+    fn service_with_availability(
+        &self,
+        availability: WorkspaceAvailabilityRegistry,
+    ) -> WorktreeCatalogService {
+        WorktreeCatalogService::new_with_availability_registry(
+            Arc::clone(&self.repositories),
+            Arc::new(GitRepository::default()),
+            availability,
         )
     }
 }

@@ -7,9 +7,12 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "EnvironmentAuthorizationError",
-          "message": "z$",
-          "requiredScope": "access:write"
+          "_tag": "WorkspaceUnavailableError",
+          "reason": "workspace-unavailable",
+          "message": "z$H\"\"%{",
+          "threadId": "re",
+          "path": "!~z|(#{!",
+          "availability": "removing"
         }
       }
     ]

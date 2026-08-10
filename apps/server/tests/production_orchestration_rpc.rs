@@ -5,12 +5,16 @@ use std::{
     time::Duration,
 };
 
+use bibcode_server::production::orchestration_rpc::register_orchestration_rpc_with_availability;
 use bibcode_server::{
     RpcExit, RpcRegistry, ServerConfig, ServerHandle, ServerMessage, ServerRuntime,
     orchestration::{EngineOptions, OrchestrationCommand, OrchestrationEngine, load_snapshot},
     persistence::{CheckpointDiffBlob, Database, NewOrchestrationEvent, run_migrations},
     production::{
         host_paths::process_compatible_path, orchestration_rpc::register_orchestration_rpc,
+    },
+    worktree_catalog::{
+        AdoptedWorktreeAvailability, WorkspaceAvailabilityRegistry, WorkspaceLossTransition,
     },
 };
 use futures_util::{FutureExt, SinkExt, StreamExt};
@@ -113,6 +117,103 @@ async fn harness() -> Harness {
         registry,
         handle,
     }
+}
+
+#[tokio::test]
+async fn workspace_unavailable_rejects_turn_before_durable_admission_but_allows_delete() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let workspace = temp.path().join("guarded-workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let database = Database::open_in_memory().await.expect("database");
+    database
+        .call(|connection| {
+            run_migrations(connection, None)?;
+            Ok(())
+        })
+        .await
+        .expect("migrations");
+    let engine = OrchestrationEngine::start(database, EngineOptions::default())
+        .await
+        .expect("engine starts");
+    engine
+        .dispatch(
+            serde_json::from_value(create_project(
+                "project-guarded",
+                &workspace.to_string_lossy(),
+            ))
+            .expect("project command"),
+        )
+        .await
+        .expect("project created");
+    engine
+        .dispatch(
+            serde_json::from_value(create_thread(
+                "thread-guarded",
+                "project-guarded",
+                "Guarded thread",
+            ))
+            .expect("thread command"),
+        )
+        .await
+        .expect("thread created");
+    let availability = WorkspaceAvailabilityRegistry::new();
+    assert!(
+        availability
+            .mark_unavailable(WorkspaceLossTransition {
+                thread_id: "thread-guarded".to_owned(),
+                repository_key: "repository-1".to_owned(),
+                generation: 5,
+                path: workspace,
+                availability: AdoptedWorktreeAvailability::MissingRegistered,
+            })
+            .await
+    );
+    let mut registry = RpcRegistry::empty();
+    register_orchestration_rpc_with_availability(&mut registry, engine.clone(), availability);
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
+        .await
+        .expect("server starts");
+    let mut socket = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("WebSocket connects")
+        .0;
+
+    rpc_request(&mut socket, "1", "orchestration.dispatchCommand", json!({
+        "type":"thread.turn.start",
+        "commandId":"blocked-turn",
+        "threadId":"thread-guarded",
+        "message":{"messageId":"message-1","role":"user","text":"must not persist","attachments":[]},
+        "runtimeMode":"full-access",
+        "interactionMode":"default",
+        "createdAt":CREATED_AT,
+    })).await;
+    let error = expect_failure(&mut socket, "1").await;
+    assert_eq!(error["_tag"], "WorkspaceUnavailableError");
+    assert!(
+        engine
+            .repositories()
+            .get_command_receipt("blocked-turn".to_owned())
+            .await
+            .expect("receipt query")
+            .is_none()
+    );
+
+    dispatch_command(
+        &mut socket,
+        "2",
+        json!({
+            "type":"thread.delete",
+            "commandId":"delete-guarded-thread",
+            "threadId":"thread-guarded",
+            "createdAt":CREATED_AT,
+        }),
+    )
+    .await;
+
+    socket.close(None).await.expect("close WebSocket");
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+    engine.shutdown().await;
 }
 
 async fn harness_with_historical_workspace() -> (Harness, PathBuf) {

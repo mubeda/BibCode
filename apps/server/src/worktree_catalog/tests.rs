@@ -18,7 +18,128 @@ use super::service::{
     CatalogServiceOptions, CatalogShallowSignature, CatalogThread, DirectoryProbeState,
     InventorySource, ScanFailure,
 };
-use super::{CatalogRefreshTrigger, WorktreeCatalogService};
+use super::{
+    CatalogRefreshTrigger, CatalogWorkspaceLossObserver, WorkspaceAvailabilityRegistry,
+    WorkspaceLossTransition, WorktreeCatalogService,
+};
+
+#[tokio::test]
+async fn authoritative_loss_installs_guard_before_the_quiesce_callback() {
+    let filesystem = Arc::new(FakeFileSystem::new([
+        ("/repo/main", DirectoryProbeState::Present),
+        ("/repo/adopted", DirectoryProbeState::Present),
+        ("/repo/common", DirectoryProbeState::Present),
+    ]));
+    let registry = WorkspaceAvailabilityRegistry::new();
+    let callback = Arc::new(GuardOrderingObserver {
+        registry: registry.clone(),
+        calls: Arc::new(AtomicUsize::new(0)),
+        guarded: Arc::new(AtomicBool::new(false)),
+    });
+    let service = WorktreeCatalogService::with_dependencies_and_availability(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [thread("thread-1", "/repo/adopted")],
+        )])),
+        Arc::new(FakeInventorySource::new([
+            inventory(
+                "/repo/common",
+                [record("/repo/main", true), record("/repo/adopted", false)],
+            ),
+            inventory(
+                "/repo/common",
+                [record("/repo/main", true), record("/repo/adopted", false)],
+            ),
+        ])),
+        filesystem.clone(),
+        CatalogServiceOptions::default(),
+        registry,
+    );
+    service.set_workspace_loss_observer(callback.clone());
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+
+    filesystem.set("/repo/adopted", DirectoryProbeState::Missing);
+    let missing = service
+        .refresh("project-1", CatalogRefreshTrigger::Explicit)
+        .await
+        .expect("authoritative missing refresh");
+
+    assert_eq!(
+        missing.adopted_workspaces[0].availability,
+        super::AdoptedWorktreeAvailability::MissingRegistered
+    );
+    assert_eq!(callback.calls.load(Ordering::SeqCst), 1);
+    assert!(callback.guarded.load(Ordering::SeqCst));
+    drop(subscription);
+}
+
+#[tokio::test]
+async fn initial_authoritative_missing_snapshot_installs_guard_before_subscription_returns() {
+    let registry = WorkspaceAvailabilityRegistry::new();
+    let callback = Arc::new(GuardOrderingObserver {
+        registry: registry.clone(),
+        calls: Arc::new(AtomicUsize::new(0)),
+        guarded: Arc::new(AtomicBool::new(false)),
+    });
+    let service = WorktreeCatalogService::with_dependencies_and_availability(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [thread("thread-1", "/repo/adopted")],
+        )])),
+        Arc::new(FakeInventorySource::new([inventory(
+            "/repo/common",
+            [record("/repo/main", true), record("/repo/adopted", false)],
+        )])),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/adopted", DirectoryProbeState::Missing),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+        registry,
+    );
+    service.set_workspace_loss_observer(callback.clone());
+
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+
+    assert_eq!(
+        subscription.latest().adopted_workspaces[0].availability,
+        super::AdoptedWorktreeAvailability::MissingRegistered
+    );
+    assert_eq!(callback.calls.load(Ordering::SeqCst), 1);
+    assert!(callback.guarded.load(Ordering::SeqCst));
+}
+
+struct GuardOrderingObserver {
+    registry: WorkspaceAvailabilityRegistry,
+    calls: Arc<AtomicUsize>,
+    guarded: Arc<AtomicBool>,
+}
+
+impl CatalogWorkspaceLossObserver for GuardOrderingObserver {
+    fn observe(&self, transitions: Vec<WorkspaceLossTransition>) -> CatalogFuture<()> {
+        assert_eq!(transitions.len(), 1);
+        let registry = self.registry.clone();
+        let calls = self.calls.fetch_add(1, Ordering::SeqCst);
+        assert_eq!(calls, 0, "one callback owns the loss transition");
+        let guarded = self.guarded.load(Ordering::SeqCst);
+        assert!(!guarded, "callback state starts unset");
+        let guarded_flag = self.guarded.clone();
+        Box::pin(async move {
+            let error = registry
+                .guard_thread("thread-1")
+                .await
+                .expect_err("guard must be visible before callback work starts");
+            assert_eq!(
+                error.availability,
+                super::AdoptedWorktreeAvailability::MissingRegistered
+            );
+            guarded_flag.store(true, Ordering::SeqCst);
+        })
+    }
+}
 
 #[tokio::test]
 async fn anchor_preference_is_primary_then_present_adopted_then_lifetime_common_directory() {

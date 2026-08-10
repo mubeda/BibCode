@@ -26,6 +26,7 @@ use crate::{
         TerminalAttachInput, TerminalError, TerminalLaunchCommand, TerminalManager,
         TerminalMetadataEvent, TerminalOpenInput,
     },
+    worktree_catalog::WorkspaceAvailabilityRegistry,
 };
 
 const PROCESS_DIAGNOSTIC_MESSAGE_MAX_SCALARS: usize = 160;
@@ -55,6 +56,7 @@ pub struct ServerTerminalServices {
     provider_usage: ProviderUsageService,
     relay: RelayClientService,
     control: Arc<dyn ProductionServerControl>,
+    availability_registry: Option<WorkspaceAvailabilityRegistry>,
 }
 
 impl ServerTerminalServices {
@@ -76,7 +78,17 @@ impl ServerTerminalServices {
             provider_usage,
             relay,
             control,
+            availability_registry: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_availability_registry(
+        mut self,
+        availability_registry: WorkspaceAvailabilityRegistry,
+    ) -> Self {
+        self.availability_registry = Some(availability_registry);
+        self
     }
 
     pub async fn shutdown(&self) {
@@ -117,6 +129,16 @@ impl ServerTerminalServices {
         let _ = self.terminal.close(thread_id, None).await;
     }
 
+    pub async fn quiesce_thread_terminals_for_workspace_loss(
+        &self,
+        thread_id: &str,
+    ) -> Result<(), String> {
+        self.terminal
+            .quiesce_thread_preserving_history(thread_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
     pub async fn terminal_exists(&self, thread_id: &str, terminal_id: &str) -> bool {
         self.terminal
             .subscribe_metadata()
@@ -127,6 +149,13 @@ impl ServerTerminalServices {
     }
 
     pub async fn launch_setup_script(&self, input: SetupScriptLaunch) -> Result<(), String> {
+        guard_terminal_start(
+            self.availability_registry.as_ref(),
+            &input.thread_id,
+            &input.cwd.to_string_lossy(),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         let mut terminal_input = TerminalOpenInput::new(
             input.thread_id.clone(),
             input.terminal_id.clone(),
@@ -335,10 +364,13 @@ fn register_cloud_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalServ
 
 fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalServices) {
     let terminal = services.terminal.clone();
+    let availability = services.availability_registry.clone();
     registry.register_unary("terminal.open", move |request, _cancellation| {
         let terminal = terminal.clone();
+        let availability = availability.clone();
         async move {
             let input: TerminalStartPayload = decode_payload(&request.payload)?;
+            guard_terminal_start(availability.as_ref(), &input.thread_id, &input.cwd).await?;
             terminal
                 .open(input.into_open(false)?)
                 .await
@@ -350,13 +382,21 @@ fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalS
     });
 
     let terminal = services.terminal.clone();
+    let availability = services.availability_registry.clone();
     registry.register_stream("terminal.attach", move |request, cancellation| {
         let terminal = terminal.clone();
+        let availability = availability.clone();
         spawn_stream(cancellation, move |sender, cancellation| async move {
             let input: TerminalAttachPayload = match decode_payload(&request.payload) {
                 Ok(input) => input,
                 Err(error) => { let _ = sender.send(Err(error)).await; return; }
             };
+            if input.restart_if_not_running
+                && let Err(error) = guard_terminal_attach(availability.as_ref(), &input).await
+            {
+                let _ = sender.send(Err(error)).await;
+                return;
+            }
             let input = match input.into_attach() {
                 Ok(input) => input,
                 Err(error) => { let _ = sender.send(Err(error)).await; return; }
@@ -383,21 +423,21 @@ fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalS
         })
     });
 
-    register_terminal_unary(
-        registry,
-        "terminal.write",
-        services.terminal.clone(),
-        |terminal, payload| {
-            Box::pin(async move {
-                let input: TerminalWritePayload = decode_payload(&payload)?;
-                terminal
-                    .write(&input.thread_id, &input.terminal_id, &input.data)
-                    .await
-                    .map_err(terminal_error)?;
-                Ok(Value::Null)
-            })
-        },
-    );
+    let terminal = services.terminal.clone();
+    let availability = services.availability_registry.clone();
+    registry.register_unary("terminal.write", move |request, _cancellation| {
+        let terminal = terminal.clone();
+        let availability = availability.clone();
+        async move {
+            let input: TerminalWritePayload = decode_payload(&request.payload)?;
+            guard_terminal_thread(availability.as_ref(), &input.thread_id).await?;
+            terminal
+                .write(&input.thread_id, &input.terminal_id, &input.data)
+                .await
+                .map_err(terminal_error)?;
+            Ok(Value::Null)
+        }
+    });
     register_terminal_unary(
         registry,
         "terminal.resize",
@@ -428,23 +468,23 @@ fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalS
             })
         },
     );
-    register_terminal_unary(
-        registry,
-        "terminal.restart",
-        services.terminal.clone(),
-        |terminal, payload| {
-            Box::pin(async move {
-                let input: TerminalStartPayload = decode_payload(&payload)?;
-                terminal
-                    .restart(input.into_open(true)?)
-                    .await
-                    .map(|snapshot| {
-                        serde_json::to_value(snapshot).expect("terminal snapshot serializes")
-                    })
-                    .map_err(terminal_error)
-            })
-        },
-    );
+    let terminal = services.terminal.clone();
+    let availability = services.availability_registry.clone();
+    registry.register_unary("terminal.restart", move |request, _cancellation| {
+        let terminal = terminal.clone();
+        let availability = availability.clone();
+        async move {
+            let input: TerminalStartPayload = decode_payload(&request.payload)?;
+            guard_terminal_start(availability.as_ref(), &input.thread_id, &input.cwd).await?;
+            terminal
+                .restart(input.into_open(true)?)
+                .await
+                .map(|snapshot| {
+                    serde_json::to_value(snapshot).expect("terminal snapshot serializes")
+                })
+                .map_err(terminal_error)
+        }
+    });
     register_terminal_unary(
         registry,
         "terminal.close",
@@ -497,6 +537,52 @@ fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalS
             }
         })
     });
+}
+
+async fn guard_terminal_start(
+    registry: Option<&WorkspaceAvailabilityRegistry>,
+    thread_id: &str,
+    cwd: &str,
+) -> Result<(), Value> {
+    guard_terminal_thread(registry, thread_id).await?;
+    let Some(registry) = registry else {
+        return Ok(());
+    };
+    registry
+        .guard_path(std::path::Path::new(cwd))
+        .await
+        .map_err(workspace_unavailable_error)
+}
+
+async fn guard_terminal_attach(
+    registry: Option<&WorkspaceAvailabilityRegistry>,
+    input: &TerminalAttachPayload,
+) -> Result<(), Value> {
+    guard_terminal_thread(registry, &input.thread_id).await?;
+    if let (Some(registry), Some(cwd)) = (registry, input.cwd.as_deref()) {
+        registry
+            .guard_path(std::path::Path::new(cwd))
+            .await
+            .map_err(workspace_unavailable_error)?;
+    }
+    Ok(())
+}
+
+async fn guard_terminal_thread(
+    registry: Option<&WorkspaceAvailabilityRegistry>,
+    thread_id: &str,
+) -> Result<(), Value> {
+    let Some(registry) = registry else {
+        return Ok(());
+    };
+    registry
+        .guard_thread(thread_id)
+        .await
+        .map_err(workspace_unavailable_error)
+}
+
+fn workspace_unavailable_error(error: crate::worktree_catalog::WorkspaceUnavailable) -> Value {
+    serde_json::to_value(error).expect("workspace unavailable error serializes")
 }
 
 type TerminalUnary = fn(TerminalManager, Value) -> JsonFuture;

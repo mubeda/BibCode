@@ -7,9 +7,12 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "EnvironmentAuthorizationError",
-          "message": "_aQ$?Q",
-          "requiredScope": "review:write"
+          "_tag": "WorkspaceUnavailableError",
+          "reason": "workspace-unavailable",
+          "message": "_aQ$?QV2jsBO",
+          "threadId": "V}x%sm%vp$",
+          "path": "ph#%D{z+y^",
+          "availability": "present"
         }
       }
     ]
