@@ -16,7 +16,8 @@ use bibcode_server::{
         GitWorktreeRecord, GitWorktreeRemovalInspection,
     },
     orchestration::{
-        EngineOptions, OrchestrationCommand, OrchestrationEngine, canonical_command_digest,
+        EngineOptions, OrchestrationCommand, OrchestrationEngine, OrchestrationError,
+        canonical_command_digest, engine::TestHooks,
     },
     persistence::{
         CommandReceipt, Database, OrchestrationEvent, ProjectionProject, ProjectionThread,
@@ -24,10 +25,11 @@ use bibcode_server::{
     },
     production::git_vcs::{CatalogMutationObserver, GitVcsRpcServices, register_git_vcs_rpc},
     production::worktree_catalog_rpc::{
-        WorktreeCatalogMutationObserver, WorktreeCatalogRpcServices, WorktreeRemovalGit,
-        WorktreeRemovalGitFuture, WorktreeRemovalQuiesceFuture, WorktreeRemovalQuiesceLease,
-        WorktreeRemovalQuiesceRequest, WorktreeRemovalQuiescer, compact_eligible_baseline,
-        register_worktree_catalog_rpc,
+        WorktreeCatalogMutationObserver, WorktreeCatalogRpcServices,
+        WorktreeRemovalCleanupAdmission, WorktreeRemovalCleanupAdmissionError,
+        WorktreeRemovalCleanupAdmissionFuture, WorktreeRemovalGit, WorktreeRemovalGitFuture,
+        WorktreeRemovalQuiesceFuture, WorktreeRemovalQuiesceLease, WorktreeRemovalQuiesceRequest,
+        WorktreeRemovalQuiescer, compact_eligible_baseline, register_worktree_catalog_rpc,
     },
     worktree_catalog::{
         CatalogScanStatus, WorktreeAdoptionState, WorktreeCatalogService, WorktreeCatalogSnapshot,
@@ -1425,6 +1427,347 @@ async fn removal_command_reservation_allows_only_one_cross_repository_git_mutati
 }
 
 #[tokio::test]
+async fn generic_command_cannot_overwrite_prepared_removal_receipt_after_git() {
+    let hooks = TestHooks::default();
+    let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+    let release = Arc::new(Semaphore::new(0));
+    let removal_git = Arc::new(BlockingRemovalGit {
+        inner: GitRepository::default(),
+        entered: entered_tx,
+        release: release.clone(),
+    });
+    let mut fixture = CatalogRpcFixture::new_with_engine_options_and_removal_git(
+        true,
+        removal_git,
+        EngineOptions {
+            queue_capacity: 16,
+            test_hooks: hooks.clone(),
+        },
+    )
+    .await;
+    let thread_id = adopt_external_for_removal(&mut fixture, "receipt-race-adopt").await;
+    let plan = removal_plan(&mut fixture, "project-1", &thread_id, "1266").await;
+    let removal = removal_payload(
+        "shared-generic-removal-command",
+        "project-1",
+        &thread_id,
+        &plan,
+    );
+    let generic: OrchestrationCommand = serde_json::from_value(json!({
+        "type":"thread.meta.update",
+        "commandId":"shared-generic-removal-command",
+        "threadId":thread_id,
+        "title":"must-roll-back"
+    }))
+    .expect("generic command");
+    let pause = hooks.pause_before_next_command_persist();
+    let engine = fixture.engine.clone();
+    let generic_task = tokio::spawn(async move { engine.dispatch(generic).await });
+    pause.wait_until_entered().await;
+
+    request(fixture.socket(), "1267", "worktree.remove", removal.clone()).await;
+    timeout(Duration::from_secs(5), entered_rx.recv())
+        .await
+        .expect("removal reaches Git")
+        .expect("Git boundary");
+    release.add_permits(1);
+    pause.release();
+
+    assert!(matches!(
+        generic_task.await.expect("generic join"),
+        Err(OrchestrationError::CommandConflict { .. })
+    ));
+    let result = success_value(fixture.socket(), "1267").await;
+    assert_eq!(result["gitOutcome"], "removed");
+    assert_eq!(result["threadRemoved"], true);
+    assert!(!fixture.external.exists());
+    let receipt = fixture
+        .repositories
+        .get_command_receipt("shared-generic-removal-command".to_owned())
+        .await
+        .expect("receipt read")
+        .expect("accepted receipt");
+    assert_eq!(receipt.status, "accepted");
+    assert_eq!(
+        receipt.payload_digest.as_deref(),
+        Some(
+            canonical_command_digest(&removal)
+                .expect("removal digest")
+                .as_str()
+        )
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn removal_fences_cross_project_owner_create_and_retarget_through_detach() {
+    let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+    let release = Arc::new(Semaphore::new(0));
+    let removal_git = Arc::new(BlockingRemovalGit {
+        inner: GitRepository::default(),
+        entered: entered_tx,
+        release: release.clone(),
+    });
+    let mut fixture = CatalogRpcFixture::new_with_removal_git(true, removal_git).await;
+    let thread_id = adopt_external_for_removal(&mut fixture, "ownership-fence-adopt").await;
+    let plan = removal_plan(&mut fixture, "project-1", &thread_id, "1268").await;
+    let second_root = fixture.root.path().join("ownership-project-two");
+    let previous_path = second_root.join("previous-worktree");
+    fs::create_dir(&second_root).expect("second project root");
+    fs::create_dir(&previous_path).expect("previous workspace path");
+    fixture
+        .engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"project.create",
+                "commandId":"ownership-project-two-create",
+                "projectId":"ownership-project-two",
+                "title":"Ownership Project Two",
+                "workspaceRoot":second_root,
+                "defaultModelSelection":null,
+                "createdAt":"2026-08-10T00:01:00Z"
+            }))
+            .expect("second project command"),
+        )
+        .await
+        .expect("second project");
+    fixture
+        .engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.create",
+                "commandId":"retarget-owner-create",
+                "threadId":"retarget-owner",
+                "projectId":"ownership-project-two",
+                "title":"Retarget Owner",
+                "kind":"workspace",
+                "modelSelection":{},
+                "runtimeMode":"full-access",
+                "interactionMode":"default",
+                "branch":null,
+                "worktreePath":previous_path,
+                "createdAt":"2026-08-10T00:01:01Z"
+            }))
+            .expect("retarget owner command"),
+        )
+        .await
+        .expect("retarget owner");
+
+    request(
+        fixture.socket(),
+        "1269",
+        "worktree.remove",
+        removal_payload("ownership-fence-remove", "project-1", &thread_id, &plan),
+    )
+    .await;
+    timeout(Duration::from_secs(5), entered_rx.recv())
+        .await
+        .expect("removal reaches Git")
+        .expect("Git boundary");
+
+    let create_engine = fixture.engine.clone();
+    let target = fixture.external.clone();
+    let mut create = tokio::spawn(async move {
+        create_engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.create",
+                    "commandId":"racing-owner-create-command",
+                    "threadId":"racing-owner-create",
+                    "projectId":"ownership-project-two",
+                    "title":"Racing Owner",
+                    "kind":"workspace",
+                    "modelSelection":{},
+                    "runtimeMode":"full-access",
+                    "interactionMode":"default",
+                    "branch":null,
+                    "worktreePath":target,
+                    "createdAt":"2026-08-10T00:01:02Z"
+                }))
+                .expect("racing create command"),
+            )
+            .await
+    });
+    let retarget_engine = fixture.engine.clone();
+    let target = fixture.external.clone();
+    let mut retarget = tokio::spawn(async move {
+        retarget_engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.meta.update",
+                    "commandId":"racing-owner-retarget-command",
+                    "threadId":"retarget-owner",
+                    "worktreePath":target
+                }))
+                .expect("racing retarget command"),
+            )
+            .await
+    });
+    let create_early = timeout(Duration::from_millis(100), &mut create).await;
+    let retarget_early = timeout(Duration::from_millis(100), &mut retarget).await;
+    let create_early_debug = format!("{create_early:?}");
+    let retarget_early_debug = format!("{retarget_early:?}");
+    let create_waited = create_early.is_err();
+    let retarget_waited = retarget_early.is_err();
+    release.add_permits(1);
+    let removal_result = success_value(fixture.socket(), "1269").await;
+    let create_result = match create_early {
+        Ok(joined) => joined.expect("create joins"),
+        Err(_) => create.await.expect("create joins after removal"),
+    };
+    let retarget_result = match retarget_early {
+        Ok(joined) => joined.expect("retarget joins"),
+        Err(_) => retarget.await.expect("retarget joins after removal"),
+    };
+
+    assert!(
+        create_waited,
+        "owner create must wait behind removal: {create_early_debug}"
+    );
+    assert!(
+        retarget_waited,
+        "owner retarget must wait behind removal: {retarget_early_debug}"
+    );
+    assert!(create_result.is_err(), "stale owner create must revalidate");
+    assert!(
+        retarget_result.is_err(),
+        "stale owner retarget must revalidate"
+    );
+    assert_eq!(removal_result["gitOutcome"], "removed");
+    assert!(
+        fixture
+            .repositories
+            .get_thread("racing-owner-create".to_owned())
+            .await
+            .expect("racing owner read")
+            .is_none()
+    );
+    let retargeted = fixture
+        .repositories
+        .get_thread("retarget-owner".to_owned())
+        .await
+        .expect("retarget owner read")
+        .expect("retarget owner remains");
+    assert_ne!(
+        retargeted.worktree_path.as_deref(),
+        Some(fixture.external.to_string_lossy().as_ref())
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn owner_mutation_that_wins_the_fence_invalidates_removal_before_git() {
+    let hooks = TestHooks::default();
+    let remove_calls = Arc::new(AtomicUsize::new(0));
+    let mut fixture = CatalogRpcFixture::new_with_engine_options_and_removal_git(
+        true,
+        Arc::new(CountingRemovalGit {
+            inner: GitRepository::default(),
+            remove_calls: remove_calls.clone(),
+        }),
+        EngineOptions {
+            queue_capacity: 16,
+            test_hooks: hooks.clone(),
+        },
+    )
+    .await;
+    let thread_id = adopt_external_for_removal(&mut fixture, "ownership-winner-adopt").await;
+    let plan = removal_plan(&mut fixture, "project-1", &thread_id, "1271").await;
+    let second_root = fixture.root.path().join("ownership-winner-project");
+    let previous_path = second_root.join("previous-worktree");
+    fs::create_dir(&second_root).expect("second project root");
+    fs::create_dir(&previous_path).expect("previous workspace path");
+    fixture
+        .engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"project.create",
+                "commandId":"ownership-winner-project-create",
+                "projectId":"ownership-winner-project",
+                "title":"Ownership Winner",
+                "workspaceRoot":second_root,
+                "defaultModelSelection":null,
+                "createdAt":"2026-08-10T00:02:00Z"
+            }))
+            .expect("second project command"),
+        )
+        .await
+        .expect("second project");
+    fixture
+        .engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.create",
+                "commandId":"ownership-winner-thread-create",
+                "threadId":"ownership-winner-thread",
+                "projectId":"ownership-winner-project",
+                "title":"Ownership Winner Thread",
+                "kind":"workspace",
+                "modelSelection":{},
+                "runtimeMode":"full-access",
+                "interactionMode":"default",
+                "branch":null,
+                "worktreePath":previous_path,
+                "createdAt":"2026-08-10T00:02:01Z"
+            }))
+            .expect("owner thread command"),
+        )
+        .await
+        .expect("owner thread");
+
+    let pause = hooks.pause_before_next_command_persist();
+    let engine = fixture.engine.clone();
+    let target = fixture.external.clone();
+    let mutation = tokio::spawn(async move {
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.meta.update",
+                    "commandId":"ownership-winner-retarget",
+                    "threadId":"ownership-winner-thread",
+                    "worktreePath":target
+                }))
+                .expect("retarget command"),
+            )
+            .await
+    });
+    pause.wait_until_entered().await;
+    request(
+        fixture.socket(),
+        "1272",
+        "worktree.remove",
+        removal_payload("ownership-loser-remove", "project-1", &thread_id, &plan),
+    )
+    .await;
+    assert!(
+        timeout(Duration::from_millis(100), fixture.socket().next())
+            .await
+            .is_err(),
+        "removal waits behind the owner mutation fence"
+    );
+    pause.release();
+    mutation
+        .await
+        .expect("owner mutation joins")
+        .expect("owner mutation wins");
+
+    assert_typed_removal_failure(fixture.socket(), "1272", "ownership-conflict").await;
+    assert_eq!(remove_calls.load(Ordering::SeqCst), 0);
+    assert!(fixture.external.exists());
+    assert!(
+        fixture
+            .repositories
+            .get_thread(thread_id)
+            .await
+            .expect("thread read")
+            .expect("thread")
+            .deleted_at
+            .is_none()
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn removal_dirty_requires_confirmation_and_detach_only_ignores_quiesce_outcome() {
     let quiescer = Arc::new(RecordingPendingQuiescer::default());
     let mut fixture = CatalogRpcFixture::new_with_quiescer(true, quiescer.clone()).await;
@@ -1900,6 +2243,83 @@ async fn removal_missing_targeted_and_prune_failure_detaches_with_bounded_failed
     fixture.shutdown().await;
 }
 
+#[tokio::test]
+async fn cleanup_capacity_rejection_has_no_removal_side_effects() {
+    let remove_calls = Arc::new(AtomicUsize::new(0));
+    let quiesce_calls = Arc::new(AtomicUsize::new(0));
+    let mut fixture = CatalogRpcFixture::new_with_removal_services(
+        true,
+        Arc::new(CapacityRejectingQuiescer {
+            quiesce_calls: quiesce_calls.clone(),
+        }),
+        Some(Arc::new(CountingRemovalGit {
+            inner: GitRepository::default(),
+            remove_calls: remove_calls.clone(),
+        })),
+    )
+    .await;
+    let thread_id = adopt_external_for_removal(&mut fixture, "capacity-adopt").await;
+    request(
+        fixture.socket(),
+        "1204",
+        "worktree.getRemovalPlan",
+        json!({"projectId":"project-1","threadId":thread_id}),
+    )
+    .await;
+    let plan = success_value(fixture.socket(), "1204").await;
+    request(
+        fixture.socket(),
+        "1205",
+        "worktree.remove",
+        removal_payload("capacity-remove", "project-1", &thread_id, &plan),
+    )
+    .await;
+    assert_typed_removal_failure(fixture.socket(), "1205", "cleanup-capacity").await;
+
+    assert_eq!(remove_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(quiesce_calls.load(Ordering::SeqCst), 0);
+    assert!(fixture.external.exists());
+    assert!(
+        fixture
+            .repositories
+            .get_command_receipt("capacity-remove".to_owned())
+            .await
+            .expect("receipt read")
+            .is_none(),
+        "capacity rejection must happen before durable reservation"
+    );
+    assert!(
+        fixture
+            .repositories
+            .get_thread(thread_id)
+            .await
+            .expect("thread read")
+            .expect("thread")
+            .deleted_at
+            .is_none()
+    );
+    fixture.shutdown().await;
+}
+
+struct CapacityRejectingQuiescer {
+    quiesce_calls: Arc<AtomicUsize>,
+}
+
+impl WorktreeRemovalQuiescer for CapacityRejectingQuiescer {
+    fn admit_cleanup(&self) -> WorktreeRemovalCleanupAdmissionFuture {
+        Box::pin(async { Err(WorktreeRemovalCleanupAdmissionError::Capacity) })
+    }
+
+    fn quiesce(
+        &self,
+        _admission: WorktreeRemovalCleanupAdmission,
+        _request: WorktreeRemovalQuiesceRequest,
+    ) -> WorktreeRemovalQuiesceFuture {
+        self.quiesce_calls.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { WorktreeRemovalQuiesceLease::complete() })
+    }
+}
+
 #[derive(Default)]
 struct RecordingPendingQuiescer {
     cancellations: std::sync::Mutex<Vec<CancellationToken>>,
@@ -1921,7 +2341,11 @@ impl RecordingPendingQuiescer {
 }
 
 impl WorktreeRemovalQuiescer for RecordingPendingQuiescer {
-    fn quiesce(&self, _request: WorktreeRemovalQuiesceRequest) -> WorktreeRemovalQuiesceFuture {
+    fn quiesce(
+        &self,
+        _admission: WorktreeRemovalCleanupAdmission,
+        _request: WorktreeRemovalQuiesceRequest,
+    ) -> WorktreeRemovalQuiesceFuture {
         let cancellation = CancellationToken::new();
         self.cancellations
             .lock()
@@ -1958,10 +2382,39 @@ impl CatalogRpcFixture {
         Self::new_with_removal_services(with_external, Arc::new(TestNoopQuiescer), Some(git)).await
     }
 
+    async fn new_with_engine_options_and_removal_git(
+        with_external: bool,
+        git: Arc<dyn WorktreeRemovalGit>,
+        options: EngineOptions,
+    ) -> Self {
+        Self::new_with_removal_services_and_options(
+            with_external,
+            Arc::new(TestNoopQuiescer),
+            Some(git),
+            options,
+        )
+        .await
+    }
+
     async fn new_with_removal_services(
         with_external: bool,
         quiescer: Arc<dyn WorktreeRemovalQuiescer>,
         removal_git: Option<Arc<dyn WorktreeRemovalGit>>,
+    ) -> Self {
+        Self::new_with_removal_services_and_options(
+            with_external,
+            quiescer,
+            removal_git,
+            EngineOptions::default(),
+        )
+        .await
+    }
+
+    async fn new_with_removal_services_and_options(
+        with_external: bool,
+        quiescer: Arc<dyn WorktreeRemovalQuiescer>,
+        removal_git: Option<Arc<dyn WorktreeRemovalGit>>,
+        engine_options: EngineOptions,
     ) -> Self {
         let root = tempfile::tempdir().expect("fixture root");
         let main = root.path().join("main");
@@ -1993,7 +2446,7 @@ impl CatalogRpcFixture {
             })
             .await
             .expect("migrations");
-        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+        let engine = OrchestrationEngine::start(database, engine_options)
             .await
             .expect("orchestration");
         engine
@@ -2137,7 +2590,11 @@ impl CatalogRpcFixture {
 struct TestNoopQuiescer;
 
 impl WorktreeRemovalQuiescer for TestNoopQuiescer {
-    fn quiesce(&self, _request: WorktreeRemovalQuiesceRequest) -> WorktreeRemovalQuiesceFuture {
+    fn quiesce(
+        &self,
+        _admission: WorktreeRemovalCleanupAdmission,
+        _request: WorktreeRemovalQuiesceRequest,
+    ) -> WorktreeRemovalQuiesceFuture {
         Box::pin(async { WorktreeRemovalQuiesceLease::complete() })
     }
 }

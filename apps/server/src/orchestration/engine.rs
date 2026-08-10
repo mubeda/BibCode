@@ -1,11 +1,11 @@
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, HashMap, VecDeque},
     future::Future,
     path::Path,
     pin::Pin,
     sync::{
-        Arc, Condvar, Mutex as StdMutex,
-        atomic::{AtomicUsize, Ordering},
+        Arc, Condvar, Mutex as StdMutex, Weak,
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::Duration,
 };
@@ -15,7 +15,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use serde_json::{Value, json};
 use thiserror::Error;
 use tokio::{
-    sync::{broadcast, mpsc, oneshot},
+    sync::{Mutex as AsyncMutex, OwnedMutexGuard, broadcast, mpsc, oneshot},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -27,10 +27,11 @@ use crate::persistence::{
     OrchestrationEvent, PersistenceError, ProjectionPendingApproval, ProjectionProject,
     ProjectionState, ProjectionThread, ProjectionThreadActivity, ProjectionThreadMessage,
     ProjectionThreadProposedPlan, ProjectionThreadSession, ProjectionTurn, Repositories,
+    finalize_command_receipt_on,
 };
 use crate::{
     checkpointing,
-    git::{host_path_platform, normalize_worktree_path_key},
+    git::{canonical_worktree_path_key, host_path_platform, normalize_worktree_path_key},
 };
 
 const TURN_UPSERT_SQL: &str = "INSERT INTO projection_turns (thread_id, turn_id, pending_message_id, source_proposed_plan_thread_id, source_proposed_plan_id, assistant_message_id, state, requested_at, started_at, completed_at, checkpoint_turn_count, checkpoint_ref, checkpoint_status, checkpoint_files_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) ON CONFLICT (thread_id, turn_id) DO UPDATE SET pending_message_id=excluded.pending_message_id, source_proposed_plan_thread_id=excluded.source_proposed_plan_thread_id, source_proposed_plan_id=excluded.source_proposed_plan_id, assistant_message_id=excluded.assistant_message_id, state=excluded.state, requested_at=excluded.requested_at, started_at=excluded.started_at, completed_at=excluded.completed_at, checkpoint_turn_count=excluded.checkpoint_turn_count, checkpoint_ref=excluded.checkpoint_ref, checkpoint_status=excluded.checkpoint_status, checkpoint_files_json=excluded.checkpoint_files_json";
@@ -908,6 +909,16 @@ pub enum OrchestrationError {
         project_id: String,
         owner_count: usize,
     },
+    #[error("workspace ownership changed while command was waiting ({command_id})")]
+    WorkspaceOwnershipChanged { command_id: String },
+    #[error(
+        "workspace ownership identity could not be resolved for {path} ({command_id}): {detail}"
+    )]
+    WorkspaceOwnershipIdentity {
+        command_id: String,
+        path: String,
+        detail: String,
+    },
     #[error("orchestration worker has already shut down")]
     WorkerClosed,
     #[error("orchestration worker cancelled")]
@@ -977,6 +988,105 @@ fn canonical_worktree_owners<'a>(
 
 fn normalized_worktree_path_key(path: &str) -> String {
     normalize_worktree_path_key(Path::new(path), host_path_platform())
+}
+
+async fn command_workspace_ownership_keys(
+    repositories: &Repositories,
+    command: &OrchestrationCommand,
+) -> Result<Vec<String>, OrchestrationError> {
+    let mut paths = Vec::new();
+    match command {
+        OrchestrationCommand::ProjectCreate { workspace_root, .. } => {
+            paths.push(workspace_root.clone());
+        }
+        OrchestrationCommand::ProjectMetaUpdate {
+            project_id,
+            workspace_root: Some(next_root),
+            ..
+        } => {
+            if let Some(project) = repositories
+                .get_project(project_id.clone())
+                .await
+                .map_err(wrap_persistence)?
+            {
+                paths.push(project.workspace_root);
+            }
+            paths.push(next_root.clone());
+        }
+        OrchestrationCommand::ProjectDelete { project_id, .. } => {
+            if let Some(project) = repositories
+                .get_project(project_id.clone())
+                .await
+                .map_err(wrap_persistence)?
+            {
+                paths.push(project.workspace_root);
+            }
+            paths.extend(
+                repositories
+                    .list_threads_by_project(project_id.clone())
+                    .await
+                    .map_err(wrap_persistence)?
+                    .into_iter()
+                    .filter(|thread| thread.kind == "workspace" && thread.deleted_at.is_none())
+                    .filter_map(|thread| thread.worktree_path),
+            );
+        }
+        OrchestrationCommand::WorktreeAdoptResolved { path, .. }
+        | OrchestrationCommand::WorktreeDetachResolved { path, .. } => paths.push(path.clone()),
+        OrchestrationCommand::ThreadCreate {
+            kind,
+            worktree_path: Some(path),
+            ..
+        } if kind.as_deref() == Some("workspace") => paths.push(path.clone()),
+        OrchestrationCommand::ThreadDelete { thread_id, .. } => {
+            if let Some(thread) = repositories
+                .get_thread(thread_id.clone())
+                .await
+                .map_err(wrap_persistence)?
+                && thread.kind == "workspace"
+                && thread.deleted_at.is_none()
+                && let Some(path) = thread.worktree_path
+            {
+                paths.push(path);
+            }
+        }
+        OrchestrationCommand::ThreadMetaUpdate {
+            thread_id,
+            worktree_path: OptionalNullable::Present(next_path),
+            ..
+        } => {
+            if let Some(thread) = repositories
+                .get_thread(thread_id.clone())
+                .await
+                .map_err(wrap_persistence)?
+                && thread.kind == "workspace"
+                && thread.deleted_at.is_none()
+            {
+                if let Some(path) = thread.worktree_path {
+                    paths.push(path);
+                }
+                if let Some(path) = next_path {
+                    paths.push(path.clone());
+                }
+            }
+        }
+        _ => {}
+    }
+    let mut keys = Vec::with_capacity(paths.len());
+    for path in paths {
+        keys.push(
+            canonical_worktree_path_key(Path::new(&path))
+                .await
+                .map_err(|error| OrchestrationError::WorkspaceOwnershipIdentity {
+                    command_id: command.command_id().to_owned(),
+                    path,
+                    detail: error.to_string(),
+                })?,
+        );
+    }
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
 }
 
 enum DurableWorktreeAdoptionResult {
@@ -1243,8 +1353,135 @@ struct CommandEnvelope {
     command: OrchestrationCommand,
     admission: Option<CommandAdmission>,
     lifetime: Option<CommandLifetimeGuard>,
+    ownership: Option<WorkspaceOwnershipLease>,
     response: oneshot::Sender<Result<DispatchResult, OrchestrationError>>,
     on_commit: Option<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+#[derive(Clone, Default)]
+struct WorkspaceOwnershipFence {
+    keys: Arc<StdMutex<HashMap<String, Weak<WorkspaceOwnershipKey>>>>,
+}
+
+struct WorkspaceOwnershipKey {
+    gate: Arc<AsyncMutex<()>>,
+    generation: AtomicU64,
+    last_removal_generation: AtomicU64,
+}
+
+struct WorkspaceOwnershipLeaseInner {
+    keys: Vec<(String, Arc<WorkspaceOwnershipKey>)>,
+    _guards: Vec<OwnedMutexGuard<()>>,
+    kind: WorkspaceOwnershipLeaseKind,
+    committed: AtomicBool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WorkspaceOwnershipLeaseKind {
+    Mutation,
+    Removal,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WorkspaceOwnershipAcquireError {
+    Revalidate,
+    Changed,
+}
+
+#[derive(Clone)]
+pub(crate) struct WorkspaceOwnershipLease {
+    inner: Arc<WorkspaceOwnershipLeaseInner>,
+}
+
+impl WorkspaceOwnershipFence {
+    async fn acquire(
+        &self,
+        mut keys: Vec<String>,
+        kind: WorkspaceOwnershipLeaseKind,
+    ) -> Result<WorkspaceOwnershipLease, WorkspaceOwnershipAcquireError> {
+        keys.sort();
+        keys.dedup();
+        let states = {
+            let mut registry = self
+                .keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.retain(|_, state| state.strong_count() > 0);
+            keys.iter()
+                .map(|key| {
+                    let state = registry
+                        .get(key)
+                        .and_then(Weak::upgrade)
+                        .unwrap_or_else(|| {
+                            let state = Arc::new(WorkspaceOwnershipKey {
+                                gate: Arc::new(AsyncMutex::new(())),
+                                generation: AtomicU64::new(0),
+                                last_removal_generation: AtomicU64::new(0),
+                            });
+                            registry.insert(key.clone(), Arc::downgrade(&state));
+                            state
+                        });
+                    (key.clone(), state)
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected = states
+            .iter()
+            .map(|(_, state)| state.generation.load(Ordering::SeqCst))
+            .collect::<Vec<_>>();
+        let mut guards = Vec::with_capacity(states.len());
+        for (_, state) in &states {
+            guards.push(state.gate.clone().lock_owned().await);
+        }
+        let changed = states
+            .iter()
+            .zip(&expected)
+            .filter(|((_, state), expected)| state.generation.load(Ordering::SeqCst) != **expected)
+            .collect::<Vec<_>>();
+        if !changed.is_empty() {
+            let invalidated_by_removal = changed.iter().any(|((_, state), expected)| {
+                state.last_removal_generation.load(Ordering::SeqCst) > **expected
+            });
+            drop(guards);
+            if kind == WorkspaceOwnershipLeaseKind::Removal || invalidated_by_removal {
+                return Err(WorkspaceOwnershipAcquireError::Changed);
+            }
+            return Err(WorkspaceOwnershipAcquireError::Revalidate);
+        }
+        Ok(WorkspaceOwnershipLease {
+            inner: Arc::new(WorkspaceOwnershipLeaseInner {
+                keys: states,
+                _guards: guards,
+                kind,
+                committed: AtomicBool::new(false),
+            }),
+        })
+    }
+}
+
+impl WorkspaceOwnershipLease {
+    fn covers(&self, keys: &[String]) -> bool {
+        keys.iter()
+            .all(|key| self.inner.keys.iter().any(|(held, _)| held == key))
+    }
+
+    fn commit(&self) {
+        if self
+            .inner
+            .committed
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_ok()
+        {
+            for (_, state) in &self.inner.keys {
+                let generation = state.generation.fetch_add(1, Ordering::SeqCst) + 1;
+                if self.inner.kind == WorkspaceOwnershipLeaseKind::Removal {
+                    state
+                        .last_removal_generation
+                        .store(generation, Ordering::SeqCst);
+                }
+            }
+        }
+    }
 }
 
 pub(crate) struct CommandLifetimeGuard {
@@ -1286,6 +1523,7 @@ pub struct OrchestrationEngine {
     worker: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
     bootstrap_effects: Arc<StdMutex<Option<Arc<dyn ThreadTurnBootstrapEffects>>>>,
     project_command_effects: Arc<StdMutex<Option<Arc<dyn ProjectCommandEffects>>>>,
+    workspace_ownership: WorkspaceOwnershipFence,
 }
 
 impl OrchestrationEngine {
@@ -1318,6 +1556,7 @@ impl OrchestrationEngine {
             worker: Arc::new(tokio::sync::Mutex::new(Some(worker))),
             bootstrap_effects: Arc::new(StdMutex::new(None)),
             project_command_effects,
+            workspace_ownership: WorkspaceOwnershipFence::default(),
         })
     }
 
@@ -1325,7 +1564,7 @@ impl OrchestrationEngine {
         &self,
         command: OrchestrationCommand,
     ) -> Result<DispatchResult, OrchestrationError> {
-        self.dispatch_inner(command, None, None, None).await
+        self.dispatch_inner(command, None, None, None, None).await
     }
 
     pub(crate) async fn replay_admitted_worktree_adoption(
@@ -1480,13 +1719,38 @@ impl OrchestrationEngine {
         }
     }
 
+    pub(crate) async fn verify_prepared_worktree_removal_admission(
+        &self,
+        command_id: &str,
+        project_id: &str,
+        payload_digest: &str,
+    ) -> Result<(), OrchestrationError> {
+        if self
+            .repositories
+            .verify_prepared_command_receipt(
+                command_id.to_owned(),
+                "project".to_owned(),
+                project_id.to_owned(),
+                payload_digest.to_owned(),
+            )
+            .await
+            .map_err(wrap_persistence)?
+        {
+            Ok(())
+        } else {
+            Err(OrchestrationError::CommandConflict {
+                command_id: command_id.to_owned(),
+            })
+        }
+    }
+
     #[cfg(test)]
     pub(crate) async fn dispatch_with_commit(
         &self,
         command: OrchestrationCommand,
         on_commit: impl FnOnce() + Send + 'static,
     ) -> Result<DispatchResult, OrchestrationError> {
-        self.dispatch_inner(command, None, None, Some(Box::new(on_commit)))
+        self.dispatch_inner(command, None, None, None, Some(Box::new(on_commit)))
             .await
     }
 
@@ -1496,8 +1760,31 @@ impl OrchestrationEngine {
         admission: CommandAdmission,
         on_commit: impl FnOnce() + Send + 'static,
     ) -> Result<DispatchResult, OrchestrationError> {
-        self.dispatch_inner(command, Some(admission), None, Some(Box::new(on_commit)))
-            .await
+        self.dispatch_inner(
+            command,
+            Some(admission),
+            None,
+            None,
+            Some(Box::new(on_commit)),
+        )
+        .await
+    }
+
+    pub(crate) async fn dispatch_with_admission_and_ownership(
+        &self,
+        command: OrchestrationCommand,
+        admission: CommandAdmission,
+        ownership: WorkspaceOwnershipLease,
+        on_commit: impl FnOnce() + Send + 'static,
+    ) -> Result<DispatchResult, OrchestrationError> {
+        self.dispatch_inner(
+            command,
+            Some(admission),
+            None,
+            Some(ownership),
+            Some(Box::new(on_commit)),
+        )
+        .await
     }
 
     pub(crate) async fn dispatch_with_admission_and_lifetime(
@@ -1511,6 +1798,7 @@ impl OrchestrationEngine {
             command,
             Some(admission),
             Some(lifetime),
+            None,
             Some(Box::new(on_commit)),
         )
         .await
@@ -1521,9 +1809,10 @@ impl OrchestrationEngine {
         command: OrchestrationCommand,
         admission: Option<CommandAdmission>,
         lifetime: Option<CommandLifetimeGuard>,
+        ownership: Option<WorkspaceOwnershipLease>,
         on_commit: Option<Box<dyn FnOnce() + Send + 'static>>,
     ) -> Result<DispatchResult, OrchestrationError> {
-        self.dispatch_plain_with_commit(command, admission, lifetime, on_commit)
+        self.dispatch_plain_with_commit(command, admission, lifetime, ownership, on_commit)
             .await
     }
 
@@ -1531,7 +1820,7 @@ impl OrchestrationEngine {
         &self,
         command: OrchestrationCommand,
     ) -> Result<DispatchResult, OrchestrationError> {
-        self.dispatch_plain_with_commit(command, None, None, None)
+        self.dispatch_plain_with_commit(command, None, None, None, None)
             .await
     }
 
@@ -1540,17 +1829,53 @@ impl OrchestrationEngine {
         command: OrchestrationCommand,
         admission: Option<CommandAdmission>,
         lifetime: Option<CommandLifetimeGuard>,
+        ownership: Option<WorkspaceOwnershipLease>,
         on_commit: Option<Box<dyn FnOnce() + Send + 'static>>,
     ) -> Result<DispatchResult, OrchestrationError> {
         if self.shutdown.is_cancelled() {
             return Err(OrchestrationError::Cancelled);
         }
+        let ownership = if let Some(ownership) = ownership {
+            let required_ownership_keys =
+                command_workspace_ownership_keys(&self.repositories, &command).await?;
+            if !ownership.covers(&required_ownership_keys) {
+                return Err(OrchestrationError::WorkspaceOwnershipChanged {
+                    command_id: command.command_id().to_owned(),
+                });
+            }
+            Some(ownership)
+        } else {
+            loop {
+                let required_ownership_keys =
+                    command_workspace_ownership_keys(&self.repositories, &command).await?;
+                if required_ownership_keys.is_empty() {
+                    break None;
+                }
+                match self
+                    .workspace_ownership
+                    .acquire(
+                        required_ownership_keys,
+                        WorkspaceOwnershipLeaseKind::Mutation,
+                    )
+                    .await
+                {
+                    Ok(ownership) => break Some(ownership),
+                    Err(WorkspaceOwnershipAcquireError::Revalidate) => continue,
+                    Err(WorkspaceOwnershipAcquireError::Changed) => {
+                        return Err(OrchestrationError::WorkspaceOwnershipChanged {
+                            command_id: command.command_id().to_owned(),
+                        });
+                    }
+                }
+            }
+        };
         let (response_tx, response_rx) = oneshot::channel();
         self.sender
             .send(WorkerEnvelope::Command(Box::new(CommandEnvelope {
                 command,
                 admission,
                 lifetime,
+                ownership,
                 response: response_tx,
                 on_commit,
             })))
@@ -1699,6 +2024,25 @@ impl OrchestrationEngine {
         self.repositories.clone()
     }
 
+    pub(crate) async fn acquire_workspace_removal_ownership(
+        &self,
+        path: &Path,
+    ) -> Result<WorkspaceOwnershipLease, OrchestrationError> {
+        let key = canonical_worktree_path_key(path).await.map_err(|error| {
+            OrchestrationError::WorkspaceOwnershipIdentity {
+                command_id: "worktree.remove".to_owned(),
+                path: path.to_string_lossy().into_owned(),
+                detail: error.to_string(),
+            }
+        })?;
+        self.workspace_ownership
+            .acquire(vec![key], WorkspaceOwnershipLeaseKind::Removal)
+            .await
+            .map_err(|_| OrchestrationError::WorkspaceOwnershipChanged {
+                command_id: "worktree.remove".to_owned(),
+            })
+    }
+
     pub(crate) async fn transition_turn_delivery(
         &self,
         transition: TurnDeliveryTransition,
@@ -1752,6 +2096,7 @@ fn spawn_worker(
                                 command,
                                 admission,
                                 lifetime,
+                                ownership,
                                 response,
                                 on_commit,
                             } = *envelope;
@@ -1781,15 +2126,20 @@ fn spawn_worker(
                             )
                             .await;
                             if result.as_ref().is_ok_and(|outcome| outcome.accepted_new)
-                                && let Some(on_commit) = on_commit
                             {
-                                on_commit();
-                                if has_admission {
-                                    hooks.maybe_pause_after_admission_commit().await;
+                                if let Some(ownership) = &ownership {
+                                    ownership.commit();
+                                }
+                                if let Some(on_commit) = on_commit {
+                                    on_commit();
+                                    if has_admission {
+                                        hooks.maybe_pause_after_admission_commit().await;
+                                    }
                                 }
                             }
                             let _ = response.send(result.map(|outcome| outcome.result));
                             drop(lifetime);
+                            drop(ownership);
                         }
                         WorkerEnvelope::DeliveryTransition(DeliveryTransitionEnvelope { transition, response }) => {
                             let result = persist_turn_delivery_transition(&repositories, &events, &hooks, transition).await;
@@ -1825,6 +2175,11 @@ async fn process_envelope(
     } = input;
     ensure_command_active(cancellation)?;
     let command_id = command.command_id().to_owned();
+    let requested_aggregate = command.aggregate_ref();
+    let requested_aggregate = (
+        requested_aggregate.0.to_owned(),
+        requested_aggregate.1.to_owned(),
+    );
     let requested_project_id = match &command {
         OrchestrationCommand::ProjectCreate { project_id, .. } => Some(project_id.clone()),
         _ => None,
@@ -1867,10 +2222,16 @@ async fn process_envelope(
                 accepted_new: false,
             });
         }
-        if matches!(receipt.status.as_str(), "reserved" | "prepared") && admission.is_some() {
-            // A side-effecting application service reserved this immutable command identity
-            // before crossing its external mutation boundary. Final persistence upgrades the
-            // same receipt atomically with its events.
+        if matches!(receipt.status.as_str(), "reserved" | "prepared") {
+            let requested_digest = admission
+                .as_ref()
+                .map(|admission| admission.payload_digest.as_str());
+            if receipt.payload_digest.as_deref() != requested_digest
+                || receipt.aggregate_kind != requested_aggregate.0
+                || receipt.aggregate_id != requested_aggregate.1
+            {
+                return Err(OrchestrationError::CommandConflict { command_id });
+            }
         } else {
             return Err(OrchestrationError::PreviouslyRejected {
                 command_id,
@@ -1924,7 +2285,7 @@ async fn process_envelope(
             "Message '{message_id}' does not have a cancellable, uncertain, or failed delivery on thread '{thread_id}'."
         );
         repositories
-            .upsert_command_receipt(CommandReceipt {
+            .finalize_command_receipt(CommandReceipt {
                 command_id: command_id.clone(),
                 aggregate_kind: "thread".to_owned(),
                 aggregate_id: thread_id.clone(),
@@ -1961,7 +2322,7 @@ async fn process_envelope(
         if let Some(existing_project_id) = existing_project_id {
             let sequence = current_max_sequence(repositories).await?;
             repositories
-                .upsert_command_receipt(CommandReceipt {
+                .finalize_command_receipt(CommandReceipt {
                     command_id: command_id.clone(),
                     aggregate_kind: "project".to_owned(),
                     aggregate_id: existing_project_id.clone(),
@@ -2037,6 +2398,14 @@ async fn process_envelope(
         ));
     }
 
+    reserve_project_create_side_effect(
+        repositories,
+        &command,
+        admission.as_ref(),
+        &occurred_at,
+        project_command_effects,
+    )
+    .await?;
     prepare_project_create(&command, project_command_effects).await?;
     hooks.maybe_pause_before_command_persist().await;
     ensure_command_active(cancellation)?;
@@ -2218,6 +2587,51 @@ async fn prepare_project_create(
         )
         .await
         .map_err(|detail| OrchestrationError::ProjectPreparation { detail })
+}
+
+async fn reserve_project_create_side_effect(
+    repositories: &Repositories,
+    command: &OrchestrationCommand,
+    admission: Option<&CommandAdmission>,
+    occurred_at: &str,
+    effects: Option<&dyn ProjectCommandEffects>,
+) -> Result<(), OrchestrationError> {
+    let (
+        Some(_),
+        OrchestrationCommand::ProjectCreate {
+            command_id,
+            project_id,
+            ..
+        },
+    ) = (effects, command)
+    else {
+        return Ok(());
+    };
+    let payload_digest = admission.map(|admission| admission.payload_digest.clone());
+    let (receipt, _) = repositories
+        .reserve_command_receipt(CommandReceipt {
+            command_id: command_id.clone(),
+            aggregate_kind: "project".to_owned(),
+            aggregate_id: project_id.clone(),
+            accepted_at: occurred_at.to_owned(),
+            result_sequence: current_max_sequence(repositories).await?,
+            status: "reserved".to_owned(),
+            error: None,
+            payload_digest: payload_digest.clone(),
+        })
+        .await
+        .map_err(wrap_persistence)?;
+    if receipt.status == "reserved"
+        && receipt.aggregate_kind == "project"
+        && receipt.aggregate_id == *project_id
+        && receipt.payload_digest == payload_digest
+    {
+        Ok(())
+    } else {
+        Err(OrchestrationError::CommandConflict {
+            command_id: command_id.clone(),
+        })
+    }
 }
 
 async fn plan_command(
@@ -4692,24 +5106,7 @@ fn upsert_command_receipt_tx(
     transaction: &Transaction<'_>,
     receipt: CommandReceipt,
 ) -> Result<(), PersistenceError> {
-    transaction.execute(
-        "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest) \
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
-         ON CONFLICT (command_id) DO UPDATE SET \
-           aggregate_kind = excluded.aggregate_kind, aggregate_id = excluded.aggregate_id, accepted_at = excluded.accepted_at, \
-           result_sequence = excluded.result_sequence, status = excluded.status, error = excluded.error, payload_digest = excluded.payload_digest",
-        params![
-            receipt.command_id,
-            receipt.aggregate_kind,
-            receipt.aggregate_id,
-            receipt.accepted_at,
-            receipt.result_sequence,
-            receipt.status,
-            receipt.error,
-            receipt.payload_digest
-        ],
-    )?;
-    Ok(())
+    finalize_command_receipt_on(transaction, receipt)
 }
 
 fn upsert_projection_state_tx(
@@ -4802,6 +5199,11 @@ fn to_sql_error(error: serde_json::Error) -> rusqlite::Error {
 fn wrap_persistence(error: PersistenceError) -> OrchestrationError {
     if matches!(error, PersistenceError::CommitRejected) {
         return OrchestrationError::Cancelled;
+    }
+    if let PersistenceError::CommandReceiptConflict(command_id) = &error {
+        return OrchestrationError::CommandConflict {
+            command_id: command_id.clone(),
+        };
     }
     if let PersistenceError::Corrupt(detail) = &error
         && let Some((projector, event_type)) = decode_projector_failure(detail)
@@ -6194,9 +6596,17 @@ mod tests {
     }
 
     fn project_create_command(command_id: &str, project_id: &str) -> OrchestrationCommand {
+        project_create_command_at(command_id, project_id, "C:/repo")
+    }
+
+    fn project_create_command_at(
+        command_id: &str,
+        project_id: &str,
+        workspace_root: &str,
+    ) -> OrchestrationCommand {
         serde_json::from_value(json!({
             "type":"project.create", "commandId":command_id, "projectId":project_id,
-            "title":"Project", "workspaceRoot":"C:/repo", "defaultModelSelection":null,
+            "title":"Project", "workspaceRoot":workspace_root, "defaultModelSelection":null,
             "createdAt":"2026-08-01T00:00:00Z"
         }))
         .expect("project command")
@@ -6875,7 +7285,7 @@ mod tests {
         let admitted = tokio::spawn(async move {
             admitted_engine
                 .dispatch_with_commit(
-                    project_create_command("admitted", "project-admitted"),
+                    project_create_command_at("admitted", "project-admitted", "C:/repo-admitted"),
                     move || {
                         admitted_commit.store(true, Ordering::SeqCst);
                         drop(admitted_probe);
@@ -6901,7 +7311,11 @@ mod tests {
         let queued_engine = engine.clone();
         let queued = tokio::spawn(async move {
             queued_engine
-                .dispatch(project_create_command("queued", "project-queued"))
+                .dispatch(project_create_command_at(
+                    "queued",
+                    "project-queued",
+                    "C:/repo-queued",
+                ))
                 .await
         });
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -6920,7 +7334,11 @@ mod tests {
         let pending = tokio::spawn(async move {
             pending_engine
                 .dispatch_with_commit(
-                    project_create_command("not-admitted", "project-not-admitted"),
+                    project_create_command_at(
+                        "not-admitted",
+                        "project-not-admitted",
+                        "C:/repo-not-admitted",
+                    ),
                     move || {
                         pending_commit.store(true, Ordering::SeqCst);
                         drop(pending_probe);
@@ -7165,7 +7583,11 @@ mod tests {
         let admitted_engine = engine.clone();
         let admitted = tokio::spawn(async move {
             admitted_engine
-                .dispatch(project_create_command("queue-admitted", "queue-admitted"))
+                .dispatch(project_create_command_at(
+                    "queue-admitted",
+                    "queue-admitted",
+                    "C:/queue-admitted",
+                ))
                 .await
         });
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -7182,7 +7604,11 @@ mod tests {
         let queued_engine = engine.clone();
         let queued = tokio::spawn(async move {
             queued_engine
-                .dispatch(project_create_command("queue-filled", "queue-filled"))
+                .dispatch(project_create_command_at(
+                    "queue-filled",
+                    "queue-filled",
+                    "C:/queue-filled",
+                ))
                 .await
         });
         tokio::time::timeout(Duration::from_secs(5), async {
@@ -7317,6 +7743,348 @@ mod tests {
         ) -> BoxProjectCommandFuture<'a, ()> {
             Box::pin(async { Ok(()) })
         }
+    }
+
+    #[derive(Default)]
+    struct PausedProjectCreateEffects {
+        canonicalize_entered: tokio::sync::Notify,
+        canonicalize_release: tokio::sync::Notify,
+        prepare_calls: AtomicUsize,
+    }
+
+    impl ProjectCommandEffects for PausedProjectCreateEffects {
+        fn normalize_workspace_root_lexically(&self, workspace_root: &str) -> String {
+            workspace_root.to_owned()
+        }
+
+        fn canonicalize_workspace_root<'a>(
+            &'a self,
+            workspace_root: &'a str,
+            _allow_missing: bool,
+        ) -> BoxProjectCommandFuture<'a, String> {
+            Box::pin(async move {
+                self.canonicalize_entered.notify_one();
+                self.canonicalize_release.notified().await;
+                Ok(workspace_root.to_owned())
+            })
+        }
+
+        fn prepare_project_create<'a>(
+            &'a self,
+            _workspace_root: &'a str,
+            _create_if_missing: bool,
+            _initialize_git: bool,
+        ) -> BoxProjectCommandFuture<'a, ()> {
+            self.prepare_calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[derive(Default)]
+    struct PausedPreparedProjectCreateEffects {
+        prepare_entered: tokio::sync::Notify,
+        prepare_release: tokio::sync::Notify,
+    }
+
+    impl ProjectCommandEffects for PausedPreparedProjectCreateEffects {
+        fn normalize_workspace_root_lexically(&self, workspace_root: &str) -> String {
+            workspace_root.to_owned()
+        }
+
+        fn canonicalize_workspace_root<'a>(
+            &'a self,
+            workspace_root: &'a str,
+            _allow_missing: bool,
+        ) -> BoxProjectCommandFuture<'a, String> {
+            Box::pin(async move { Ok(workspace_root.to_owned()) })
+        }
+
+        fn prepare_project_create<'a>(
+            &'a self,
+            _workspace_root: &'a str,
+            _create_if_missing: bool,
+            _initialize_git: bool,
+        ) -> BoxProjectCommandFuture<'a, ()> {
+            Box::pin(async move {
+                self.prepare_entered.notify_one();
+                self.prepare_release.notified().await;
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn project_create_arbitrates_command_identity_before_external_preparation() {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .expect("engine starts");
+        let effects = Arc::new(PausedProjectCreateEffects::default());
+        engine.set_project_command_effects(effects.clone());
+        let command: OrchestrationCommand = serde_json::from_value(json!({
+            "type":"project.create",
+            "commandId":"shared-side-effect-command",
+            "projectId":"project-side-effect",
+            "title":"Project",
+            "workspaceRoot":"/server/resolved/workspace",
+            "defaultModelSelection":null,
+            "createWorkspaceRootIfMissing":true,
+            "initializeGit":true,
+            "createdAt":"2026-08-10T00:00:00Z"
+        }))
+        .expect("project create");
+        let dispatch_engine = engine.clone();
+        let dispatch = tokio::spawn(async move {
+            dispatch_engine
+                .dispatch_with_admission(
+                    command,
+                    CommandAdmission {
+                        payload_digest: "generic-project-payload".to_owned(),
+                        attachment_refs: Vec::new(),
+                        provider_turn: None,
+                    },
+                    || {},
+                )
+                .await
+        });
+        effects.canonicalize_entered.notified().await;
+        let reserved = engine
+            .reserve_worktree_removal_admission(
+                "shared-side-effect-command",
+                "project-side-effect",
+                "removal-payload",
+            )
+            .await
+            .expect("removal reserves");
+        assert!(reserved.0.is_none());
+        effects.canonicalize_release.notify_one();
+
+        assert!(matches!(
+            dispatch.await.expect("dispatch joins"),
+            Err(OrchestrationError::CommandConflict { .. })
+        ));
+        assert_eq!(effects.prepare_calls.load(Ordering::SeqCst), 0);
+        let receipt = engine
+            .repositories()
+            .get_command_receipt("shared-side-effect-command".to_owned())
+            .await
+            .expect("receipt read")
+            .expect("receipt");
+        assert_eq!(receipt.status, "reserved");
+        assert_eq!(receipt.payload_digest.as_deref(), Some("removal-payload"));
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn removal_cannot_take_command_identity_after_generic_external_preparation_begins() {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .expect("engine starts");
+        let effects = Arc::new(PausedPreparedProjectCreateEffects::default());
+        engine.set_project_command_effects(effects.clone());
+        let command: OrchestrationCommand = serde_json::from_value(json!({
+            "type":"project.create",
+            "commandId":"generic-first-side-effect-command",
+            "projectId":"project-side-effect",
+            "title":"Project",
+            "workspaceRoot":"/server/resolved/generic-first-workspace",
+            "defaultModelSelection":null,
+            "createWorkspaceRootIfMissing":true,
+            "initializeGit":true,
+            "createdAt":"2026-08-10T00:00:00Z"
+        }))
+        .expect("project create");
+        let dispatch_engine = engine.clone();
+        let dispatch = tokio::spawn(async move {
+            dispatch_engine
+                .dispatch_with_admission(
+                    command,
+                    CommandAdmission {
+                        payload_digest: "generic-project-payload".to_owned(),
+                        attachment_refs: Vec::new(),
+                        provider_turn: None,
+                    },
+                    || {},
+                )
+                .await
+        });
+        effects.prepare_entered.notified().await;
+
+        assert!(matches!(
+            engine
+                .reserve_worktree_removal_admission(
+                    "generic-first-side-effect-command",
+                    "project-side-effect",
+                    "removal-payload",
+                )
+                .await,
+            Err(OrchestrationError::CommandConflict { .. })
+        ));
+        effects.prepare_release.notify_one();
+        dispatch
+            .await
+            .expect("dispatch joins")
+            .expect("generic command retains reservation");
+        let receipt = engine
+            .repositories()
+            .get_command_receipt("generic-first-side-effect-command".to_owned())
+            .await
+            .expect("receipt read")
+            .expect("receipt");
+        assert_eq!(receipt.status, "accepted");
+        assert_eq!(
+            receipt.payload_digest.as_deref(),
+            Some("generic-project-payload")
+        );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn owner_waiter_reloads_the_current_source_path_after_an_ordinary_owner_move() {
+        let temp = TempDir::new().expect("temporary workspace directory");
+        let project_root = temp.path().join("project");
+        let original = project_root.join("original");
+        let intermediate = project_root.join("intermediate");
+        let final_path = project_root.join("final");
+        for path in [&project_root, &original, &intermediate, &final_path] {
+            std::fs::create_dir_all(path).expect("workspace path");
+        }
+        let hooks = TestHooks::default();
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let engine = OrchestrationEngine::start(
+            database,
+            EngineOptions {
+                test_hooks: hooks.clone(),
+                ..EngineOptions::default()
+            },
+        )
+        .await
+        .expect("engine starts");
+        engine
+            .dispatch(project_create_command_at(
+                "owner-reload-project",
+                "owner-reload-project",
+                &project_root.to_string_lossy(),
+            ))
+            .await
+            .expect("project");
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.create",
+                    "commandId":"owner-reload-thread-create",
+                    "threadId":"owner-reload-thread",
+                    "projectId":"owner-reload-project",
+                    "title":"Owner",
+                    "kind":"workspace",
+                    "modelSelection":{},
+                    "runtimeMode":"full-access",
+                    "interactionMode":"default",
+                    "branch":null,
+                    "worktreePath":original,
+                    "createdAt":"2026-08-10T00:00:01Z"
+                }))
+                .expect("thread create"),
+            )
+            .await
+            .expect("thread");
+
+        let pause = hooks.pause_before_next_command_persist();
+        let first_engine = engine.clone();
+        let first_target = intermediate.clone();
+        let first = tokio::spawn(async move {
+            first_engine
+                .dispatch(
+                    serde_json::from_value(json!({
+                        "type":"thread.meta.update",
+                        "commandId":"owner-reload-first",
+                        "threadId":"owner-reload-thread",
+                        "worktreePath":first_target
+                    }))
+                    .expect("first retarget"),
+                )
+                .await
+        });
+        pause.wait_until_entered().await;
+
+        let final_blocker = engine
+            .acquire_workspace_removal_ownership(&final_path)
+            .await
+            .expect("block the second retarget before its first ownership validation");
+        let second_engine = engine.clone();
+        let second_target = final_path.clone();
+        let mut second = tokio::spawn(async move {
+            second_engine
+                .dispatch(
+                    serde_json::from_value(json!({
+                        "type":"thread.meta.update",
+                        "commandId":"owner-reload-second",
+                        "threadId":"owner-reload-thread",
+                        "worktreePath":second_target
+                    }))
+                    .expect("second retarget"),
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        pause.release();
+        first
+            .await
+            .expect("first retarget joins")
+            .expect("first retarget");
+        let removal_lease = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.acquire_workspace_removal_ownership(&intermediate),
+        )
+        .await
+        .expect("removal acquires the new owner path")
+        .expect("removal ownership");
+        drop(final_blocker);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut second)
+                .await
+                .is_err(),
+            "the stale waiter must reload and fence the newly current source path"
+        );
+        drop(removal_lease);
+        second
+            .await
+            .expect("second retarget joins")
+            .expect("second retarget");
+        assert_eq!(
+            engine
+                .repositories()
+                .get_thread("owner-reload-thread".to_owned())
+                .await
+                .expect("thread read")
+                .expect("thread")
+                .worktree_path
+                .as_deref(),
+            Some(final_path.to_string_lossy().as_ref())
+        );
+        engine.shutdown().await;
     }
 
     fn projector_event(event_type: &str, payload: Value, metadata: Value) -> OrchestrationEvent {

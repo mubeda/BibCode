@@ -261,6 +261,7 @@ export const WorktreeRemovalErrorReason = Schema.Literals([
   "thread-not-found",
   "environment-unsupported",
   "command-conflict",
+  "cleanup-capacity",
   "ownership-conflict",
   "stale-generation",
   "stale-plan",

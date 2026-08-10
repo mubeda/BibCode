@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    ffi::OsString,
     io,
     path::{Path, PathBuf},
 };
@@ -111,6 +112,56 @@ pub fn normalize_worktree_path_key(path: &Path, platform: HostPathPlatform) -> S
     match platform {
         HostPathPlatform::Posix => normalized,
         HostPathPlatform::Windows => normalized.to_ascii_lowercase(),
+    }
+}
+
+/// Resolves a worktree path through existing host ancestors before normalizing it.
+///
+/// The leaf may already have been removed. Resolving the nearest existing ancestor keeps
+/// aliases such as macOS `/var` and `/private/var` on one server-owned identity key.
+pub async fn canonical_worktree_path_key(path: &Path) -> io::Result<String> {
+    let lexical = PathBuf::from(normalize_worktree_path_key(path, host_path_platform()));
+    let absolute = if lexical.is_absolute() {
+        lexical
+    } else {
+        std::env::current_dir()?.join(lexical)
+    };
+    match tokio::fs::canonicalize(&absolute).await {
+        Ok(canonical) => {
+            return Ok(normalize_worktree_path_key(
+                &canonical,
+                host_path_platform(),
+            ));
+        }
+        Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error),
+        Err(_) => {}
+    }
+
+    let mut ancestor = absolute.as_path();
+    let mut missing = Vec::<OsString>::new();
+    loop {
+        match tokio::fs::canonicalize(ancestor).await {
+            Ok(mut canonical) => {
+                for component in missing.iter().rev() {
+                    canonical.push(component);
+                }
+                return Ok(normalize_worktree_path_key(
+                    &canonical,
+                    host_path_platform(),
+                ));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                let component = ancestor.file_name().ok_or(error)?;
+                missing.push(component.to_os_string());
+                ancestor = ancestor.parent().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::NotFound,
+                        "worktree path has no existing ancestor",
+                    )
+                })?;
+            }
+            Err(error) => return Err(error),
+        }
     }
 }
 

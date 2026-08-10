@@ -345,6 +345,8 @@ pub enum PersistenceError {
     Corrupt(String),
     #[error("transaction commit was rejected by its finalization fence")]
     CommitRejected,
+    #[error("command receipt ownership changed before finalization ({0})")]
+    CommandReceiptConflict(String),
     #[error("the SQLite worker is no longer available")]
     WorkerUnavailable,
     #[error("the SQLite worker dropped an operation response")]

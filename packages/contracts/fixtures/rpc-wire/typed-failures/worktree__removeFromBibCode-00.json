@@ -8,7 +8,7 @@
         "_tag": "Fail",
         "error": {
           "_tag": "WorktreeRemovalError",
-          "reason": "thread-not-found",
+          "reason": "prune-confirmation-required",
           "message": "j,TT@@7(R"
         }
       }

@@ -142,18 +142,36 @@ payload reuse conflicts. A present Git mutation or absence verification
 failure does not detach. The `worktreeCatalog` capability is advertised only
 with all three registered handlers, scopes, and wire fixtures.
 
-Before quiesce or Git side effects, removal atomically inserts an immutable
-generic command receipt in `reserved` state. A different payload or project for
-that command ID conflicts even when requests hold different physical-repository
-locks. After the fresh plan token and mode-specific preflight pass, the receipt
-advances to `prepared`; successful detach upgrades it to `accepted` in the same
-transaction as the events. Matching `reserved` work is safely re-preflighted,
-while matching `prepared` work may infer a prior verified Git success only when
-the exact target is now missing and unregistered. This makes a crash between Git
-and detach resumable without allowing an unvalidated request to claim success.
-Canonical normalized workspace ownership is also required to be unique before
-the receipt is prepared or Git can run, with detach checking it again as a
-defense.
+An already-accepted retry is replayed first. Every new removal must then acquire
+one finite runtime-cleanup lifetime slot before receipt reservation, `Removing`,
+quiesce, Git, or detach; saturation returns the retryable
+`cleanup-capacity` failure with no removal mutation. The slot follows the request
+through foreground cleanup, queued retry, retry backoff, cancellation, or
+shutdown. Once admitted, removal atomically inserts an immutable generic command
+receipt in `reserved` state. A different payload or project for that command ID
+conflicts even when requests hold different physical-repository locks. Generic
+commands finalize receipts with compare-and-set semantics: an intervening
+removal reservation/preparation cannot be overwritten, and project creation
+reserves its identity before directory or Git initialization. After the fresh
+plan token and mode-specific preflight pass, the receipt advances to `prepared`
+and is re-proved immediately before Git; successful detach upgrades it to
+`accepted` in the same transaction as the events. Matching `reserved` work is
+safely re-preflighted, while matching `prepared` work may infer a prior verified
+Git success only when the exact target is now missing and unregistered. This
+makes a crash between Git and detach resumable without allowing an unvalidated
+request to claim success.
+
+Canonical workspace ownership is protected by a server-owned global fence keyed
+by filesystem-resolved host identity, including nearest-existing-ancestor
+resolution for missing leaves. Owner create, delete, retarget, adopt, detach,
+and project-root mutations acquire deterministically ordered keys before worker
+enqueue. Removal discovers a server-owned candidate key, acquires it, then
+re-runs the authoritative unique-owner preflight and retains the lease through
+verified Git and detach publication. A mutation that waited behind a committed
+ordinary owner change re-resolves the current old/new ownership keys before it
+reacquires the fence. A committed removal invalidates the stale waiter instead
+of allowing it to publish ownership, and detach retains the transaction-time
+ownership check as a defense.
 
 Every healthy authoritative catalog publication also compares active adopted
 worktrees with durable thread branch metadata. A change dispatches one
@@ -259,11 +277,16 @@ lease so cleanup may finish after projections disappear; any preflight, Git,
 or orchestration failure drops the lease, cancels the queued retry, and releases
 its retained guard before it can affect a later session.
 
-The retry supervisor admits cleanup through a bounded async queue, so saturation
-does not block a Tokio worker or discard truthful pending ownership. Failed and
-timed-out jobs retain their exact Removing guard in a bounded scheduler, retry
-fairly, and re-resolve aliases on every attempt. The server seeds retries with
-preflight-known aliases so same-project panels remain cleanable after detach.
+The retry supervisor admits removals through the finite lifetime slots described
+above. Its nonblocking handoff can therefore contain no more removal jobs than
+there are slot holders, including foreground, queued, active, and retry-backoff
+work. A round-robin scheduler shares capacity among catalog-loss work, newly
+queued removals, and retries. Failed and timed-out removal jobs retain their
+exact `Removing` guard and slot, wait a cancellation-aware bounded backoff, and
+re-resolve aliases on every attempt instead of hot-looping. The server seeds
+retries with preflight-known aliases so same-project panels remain cleanable
+after detach. Shutdown cancels and drops active, queued, and backoff work,
+releasing both ownership and capacity.
 Destructive removal resolution additionally spans live projects durably pinned
 to the same repository identity and exact normalized checkout path; unrelated
 or unpinned repositories are excluded. A verified Git removal/cleanup
