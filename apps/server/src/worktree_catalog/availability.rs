@@ -1,10 +1,11 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, MutexGuard},
 };
 
 use serde::Serialize;
+use tokio::sync::Notify;
 
 use crate::git::{host_path_platform, normalize_worktree_path_key};
 
@@ -67,6 +68,7 @@ impl WorkspaceLossTransition {
 #[derive(Clone, Default)]
 pub struct WorkspaceAvailabilityRegistry {
     inner: Arc<Mutex<RegistryState>>,
+    admission_changed: Arc<Notify>,
 }
 
 #[derive(Default)]
@@ -74,7 +76,14 @@ struct RegistryState {
     entries: HashMap<String, GuardEntry>,
     latest_loss: HashMap<String, LossWatermark>,
     orphan_cleanups: HashMap<String, usize>,
+    active_admissions: HashMap<AdmissionScope, usize>,
     next_removal_id: u64,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum AdmissionScope {
+    Thread(String),
+    Path(String),
 }
 
 #[derive(Clone)]
@@ -85,7 +94,7 @@ struct GuardEntry {
     path: String,
     state: WorkspaceGuardState,
     pending_missing: Option<PendingMissing>,
-    removal_id: Option<u64>,
+    removal_ids: HashSet<u64>,
 }
 
 #[derive(Clone)]
@@ -139,6 +148,11 @@ pub struct RemovalGuard {
     released: bool,
 }
 
+pub struct WorkspaceAdmissionLease {
+    registry: WorkspaceAvailabilityRegistry,
+    scopes: Vec<AdmissionScope>,
+}
+
 impl WorkspaceAvailabilityRegistry {
     #[must_use]
     pub fn new() -> Self {
@@ -170,6 +184,84 @@ impl WorkspaceAvailabilityRegistry {
                         .is_some_and(|path| path_is_within(path, &entry.path_key))
             })
             .map_or(Ok(()), |entry| Err(unavailable(entry)))
+    }
+
+    pub async fn acquire_admission<'a>(
+        &self,
+        thread_id: &str,
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) -> Result<WorkspaceAdmissionLease, WorkspaceUnavailable> {
+        self.acquire_admission_inner(Some(thread_id), paths).await
+    }
+
+    pub async fn acquire_path_admission<'a>(
+        &self,
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) -> Result<WorkspaceAdmissionLease, WorkspaceUnavailable> {
+        self.acquire_admission_inner(None, paths).await
+    }
+
+    async fn acquire_admission_inner<'a>(
+        &self,
+        thread_id: Option<&str>,
+        paths: impl IntoIterator<Item = &'a Path>,
+    ) -> Result<WorkspaceAdmissionLease, WorkspaceUnavailable> {
+        let mut path_keys = HashSet::new();
+        for path in paths {
+            path_keys.insert(normalized_path(path));
+            if let Ok(canonical) = tokio::fs::canonicalize(path).await {
+                path_keys.insert(normalized_path(&canonical));
+            }
+        }
+        let mut state = lock(&self.inner);
+        if let Some(thread_id) = thread_id
+            && let Some(entry) = state.entries.get(thread_id)
+        {
+            return Err(unavailable(entry));
+        }
+        if let Some(entry) = state.entries.values().find(|entry| {
+            path_keys
+                .iter()
+                .any(|path| path_is_within(path, &entry.path_key))
+        }) {
+            return Err(unavailable(entry));
+        }
+
+        let mut scopes = Vec::with_capacity(path_keys.len() + usize::from(thread_id.is_some()));
+        scopes.extend(thread_id.map(|thread_id| AdmissionScope::Thread(thread_id.to_owned())));
+        scopes.extend(path_keys.into_iter().map(AdmissionScope::Path));
+        for scope in &scopes {
+            let count = state.active_admissions.entry(scope.clone()).or_default();
+            *count = count.saturating_add(1);
+        }
+        drop(state);
+        Ok(WorkspaceAdmissionLease {
+            registry: self.clone(),
+            scopes,
+        })
+    }
+
+    pub async fn wait_for_transition_admissions(&self, transition: &WorkspaceLossTransition) {
+        let thread = AdmissionScope::Thread(transition.thread_id.clone());
+        let path = normalized_path(&transition.path);
+        loop {
+            let notified = self.admission_changed.notified();
+            let active = {
+                let state = lock(&self.inner);
+                state
+                    .active_admissions
+                    .iter()
+                    .any(|(scope, count)| {
+                        *count > 0
+                            && (scope == &thread
+                                || matches!(scope, AdmissionScope::Path(candidate) if path_is_within(candidate, &path)))
+                    })
+            };
+            if !active {
+                return;
+            }
+            notified.await;
+        }
     }
 
     pub async fn mark_unavailable(&self, transition: WorkspaceLossTransition) -> bool {
@@ -218,7 +310,7 @@ impl WorkspaceAvailabilityRegistry {
                 path,
                 state: guard_state,
                 pending_missing: None,
-                removal_id: None,
+                removal_ids: HashSet::new(),
             },
         );
         true
@@ -229,6 +321,18 @@ impl WorkspaceAvailabilityRegistry {
         let mut state = lock(&self.inner);
         state.next_removal_id = state.next_removal_id.wrapping_add(1).max(1);
         let removal_id = state.next_removal_id;
+        if let Some(entry) = state.entries.get_mut(thread_id)
+            && entry.state == WorkspaceGuardState::Removing
+        {
+            entry.removal_ids.insert(removal_id);
+            drop(state);
+            return RemovalGuard {
+                registry: self.clone(),
+                thread_id: thread_id.to_owned(),
+                removal_id,
+                released: false,
+            };
+        }
         let previous = state.entries.remove(thread_id);
         let pending_missing = previous.as_ref().and_then(|entry| {
             (entry.state != WorkspaceGuardState::Removing).then(|| PendingMissing {
@@ -251,7 +355,7 @@ impl WorkspaceAvailabilityRegistry {
                 path_key,
                 state: WorkspaceGuardState::Removing,
                 pending_missing,
-                removal_id: Some(removal_id),
+                removal_ids: HashSet::from([removal_id]),
             },
         );
         drop(state);
@@ -386,21 +490,41 @@ impl WorkspaceAvailabilityRegistry {
 
     fn release_removal(&self, thread_id: &str, removal_id: u64) {
         let mut state = lock(&self.inner);
+        let Some(entry) = state.entries.get_mut(thread_id) else {
+            return;
+        };
+        if entry.state != WorkspaceGuardState::Removing
+            || !entry.removal_ids.remove(&removal_id)
+            || !entry.removal_ids.is_empty()
+        {
+            return;
+        }
         let Some(mut entry) = state.entries.remove(thread_id) else {
             return;
         };
-        if entry.removal_id != Some(removal_id) || entry.state != WorkspaceGuardState::Removing {
-            state.entries.insert(thread_id.to_owned(), entry);
-            return;
-        }
         if let Some(pending) = entry.pending_missing.take() {
             entry.repository_key = pending.repository_key;
             entry.path_key = pending.path_key;
             entry.path = pending.path;
             entry.state = pending.state;
-            entry.removal_id = None;
+            entry.removal_ids.clear();
             state.entries.insert(thread_id.to_owned(), entry);
         }
+    }
+
+    fn release_admission(&self, scopes: &[AdmissionScope]) {
+        let mut state = lock(&self.inner);
+        for scope in scopes {
+            let remove = state.active_admissions.get_mut(scope).is_some_and(|count| {
+                *count = count.saturating_sub(1);
+                *count == 0
+            });
+            if remove {
+                state.active_admissions.remove(scope);
+            }
+        }
+        drop(state);
+        self.admission_changed.notify_waiters();
     }
 }
 
@@ -418,6 +542,12 @@ impl Drop for RemovalGuard {
             self.registry
                 .release_removal(&self.thread_id, self.removal_id);
         }
+    }
+}
+
+impl Drop for WorkspaceAdmissionLease {
+    fn drop(&mut self) {
+        self.registry.release_admission(&self.scopes);
     }
 }
 
@@ -653,6 +783,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nested_removal_guards_preserve_missing_state_until_the_last_token_drops() {
+        let registry = WorkspaceAvailabilityRegistry::new();
+        assert!(
+            registry
+                .mark_unavailable(transition(
+                    "repository-a",
+                    10,
+                    AdoptedWorktreeAvailability::MissingRegistered,
+                ))
+                .await
+        );
+        let outer = registry
+            .mark_removing("thread-1", Path::new("/repo/worktrees/missing"))
+            .await;
+        let middle = registry
+            .mark_removing("thread-1", Path::new("/repo/worktrees/missing"))
+            .await;
+        let inner = registry
+            .mark_removing("thread-1", Path::new("/repo/worktrees/missing"))
+            .await;
+
+        drop(middle);
+        drop(outer);
+        assert_eq!(
+            registry
+                .guard_thread("thread-1")
+                .await
+                .expect_err("one live removal token retains removing precedence")
+                .state,
+            WorkspaceGuardState::Removing,
+        );
+
+        drop(inner);
+        assert_eq!(
+            registry
+                .guard_thread("thread-1")
+                .await
+                .expect_err("the final removal token restores the pending loss")
+                .state,
+            WorkspaceGuardState::MissingRegistered,
+        );
+    }
+
+    #[tokio::test]
     async fn degraded_snapshot_is_a_no_op_and_authoritative_recovery_clears_exact_guard() {
         let registry = WorkspaceAvailabilityRegistry::new();
 
@@ -704,5 +878,77 @@ mod tests {
 
         registry.set_orphan_cleanup_pending("thread-1", false).await;
         assert!(!registry.orphan_cleanup_pending("thread-1"));
+    }
+
+    #[tokio::test]
+    async fn loss_waits_for_an_earlier_path_admission_and_rejects_later_admission() {
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let lease = registry
+            .acquire_admission("panel-1", [Path::new("/repo/worktrees/missing/./src")])
+            .await
+            .expect("an available panel path is admitted");
+        let loss = transition(
+            "repository-a",
+            15,
+            AdoptedWorktreeAvailability::MissingRegistered,
+        );
+        assert!(registry.mark_unavailable(loss.clone()).await);
+
+        let waiter_registry = registry.clone();
+        let waiter_loss = loss.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_registry
+                .wait_for_transition_admissions(&waiter_loss)
+                .await;
+        });
+        tokio::task::yield_now().await;
+        assert!(
+            !waiter.is_finished(),
+            "loss cleanup cannot run before the earlier admission publishes"
+        );
+
+        drop(lease);
+        waiter.await.expect("admission drain finishes");
+        assert!(
+            registry
+                .acquire_admission("panel-1", [Path::new("/repo/worktrees/missing/src")],)
+                .await
+                .is_err(),
+            "the synchronously installed path guard rejects later panel admission",
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_admission_owner_releases_every_thread_and_path_scope() {
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let task_registry = registry.clone();
+        let (acquired_tx, acquired_rx) = tokio::sync::oneshot::channel();
+        let owner = tokio::spawn(async move {
+            let _lease = task_registry
+                .acquire_admission("panel-1", [Path::new("/repo/worktrees/missing/src")])
+                .await
+                .expect("admission");
+            acquired_tx.send(()).expect("announce admission");
+            std::future::pending::<()>().await;
+        });
+        acquired_rx.await.expect("admission acquired");
+        let loss = transition(
+            "repository-a",
+            16,
+            AdoptedWorktreeAvailability::MissingRegistered,
+        );
+        assert!(registry.mark_unavailable(loss.clone()).await);
+        let waiter_registry = registry.clone();
+        let waiter = tokio::spawn(async move {
+            waiter_registry.wait_for_transition_admissions(&loss).await;
+        });
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+
+        owner.abort();
+        assert!(owner.await.expect_err("owner was cancelled").is_cancelled());
+        waiter
+            .await
+            .expect("cancellation drops the admission lease");
     }
 }

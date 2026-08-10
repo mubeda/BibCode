@@ -216,6 +216,120 @@ async fn workspace_unavailable_rejects_turn_before_durable_admission_but_allows_
     engine.shutdown().await;
 }
 
+#[tokio::test]
+async fn workspace_unavailable_resolves_a_persisted_panel_path_before_turn_admission() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let workspace = temp.path().join("guarded-workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let database = Database::open_in_memory().await.expect("database");
+    database
+        .call(|connection| {
+            run_migrations(connection, None)?;
+            Ok(())
+        })
+        .await
+        .expect("migrations");
+    let engine = OrchestrationEngine::start(database, EngineOptions::default())
+        .await
+        .expect("engine starts");
+    engine
+        .dispatch(
+            serde_json::from_value(create_project(
+                "project-panel-guard",
+                &temp.path().to_string_lossy(),
+            ))
+            .expect("project command"),
+        )
+        .await
+        .expect("project created");
+    for (thread_id, kind, path) in [
+        (
+            "workspace-owner",
+            "workspace",
+            workspace.to_string_lossy().into_owned(),
+        ),
+        (
+            "panel-alias",
+            "panel",
+            workspace
+                .join(".")
+                .join("alias")
+                .join("..")
+                .to_string_lossy()
+                .into_owned(),
+        ),
+    ] {
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.create",
+                    "commandId":format!("create-{thread_id}"),
+                    "threadId":thread_id,
+                    "projectId":"project-panel-guard",
+                    "title":thread_id,
+                    "kind":kind,
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access",
+                    "interactionMode":"default",
+                    "branch":"feature/panel-guard",
+                    "worktreePath":path,
+                    "createdAt":CREATED_AT,
+                }))
+                .expect("thread command"),
+            )
+            .await
+            .expect("thread created");
+    }
+    let availability = WorkspaceAvailabilityRegistry::new();
+    assert!(
+        availability
+            .mark_unavailable(WorkspaceLossTransition {
+                thread_id: "workspace-owner".to_owned(),
+                repository_key: "repository-1".to_owned(),
+                generation: 6,
+                path: workspace,
+                availability: AdoptedWorktreeAvailability::MissingRegistered,
+            })
+            .await
+    );
+    let mut registry = RpcRegistry::empty();
+    register_orchestration_rpc_with_availability(&mut registry, engine.clone(), availability);
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
+        .await
+        .expect("server starts");
+    let mut socket = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("WebSocket connects")
+        .0;
+
+    rpc_request(&mut socket, "1", "orchestration.dispatchCommand", json!({
+        "type":"thread.turn.start",
+        "commandId":"blocked-panel-turn",
+        "threadId":"panel-alias",
+        "message":{"messageId":"panel-message","role":"user","text":"must not persist","attachments":[]},
+        "runtimeMode":"full-access",
+        "interactionMode":"default",
+        "createdAt":CREATED_AT,
+    })).await;
+    let error = expect_failure(&mut socket, "1").await;
+    assert_eq!(error["_tag"], "WorkspaceUnavailableError");
+    assert_eq!(error["threadId"], "workspace-owner");
+    assert!(
+        engine
+            .repositories()
+            .get_command_receipt("blocked-panel-turn".to_owned())
+            .await
+            .expect("receipt query")
+            .is_none(),
+        "panel loss must reject before durable turn admission",
+    );
+
+    socket.close(None).await.expect("close WebSocket");
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+    engine.shutdown().await;
+}
+
 async fn harness_with_historical_workspace() -> (Harness, PathBuf) {
     let temp = TempDir::new().expect("temporary base directory");
     let historical_workspace = temp.path().join("historical-workspace");

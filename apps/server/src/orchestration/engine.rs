@@ -5073,9 +5073,14 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn restart_replay_finds_an_owner_with_an_equivalent_trailing_separator_path() {
+        async fn restart_replay_finds_an_owner_with_an_equivalent_lexical_path() {
             let engine = adoption_engine(TestHooks::default()).await;
-            let persisted_path = format!("{PATH}{}", std::path::MAIN_SEPARATOR);
+            let persisted_path = Path::new(PATH)
+                .join(".")
+                .join("alias")
+                .join("..")
+                .to_string_lossy()
+                .into_owned();
             create_thread_at(
                 &engine,
                 "equivalent-owner-create",

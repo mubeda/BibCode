@@ -1,19 +1,28 @@
 use std::{
     future::Future,
+    panic::AssertUnwindSafe,
     pin::Pin,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
-use futures_util::{StreamExt, stream};
+use futures_util::{FutureExt, StreamExt, stream, stream::FuturesUnordered};
 use serde_json::json;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::{sync::mpsc, task::JoinHandle};
+use tokio::{
+    sync::{Semaphore, mpsc},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     crypto::sha256_hex,
+    git::{host_path_platform, normalize_worktree_path_key},
     orchestration::{OrchestrationCommand, OrchestrationEngine, engine::ActivityInput},
+    persistence::Repositories,
     production::{
         provider_runtime::{ProviderRuntimeError, ProviderRuntimeSupervisor},
         server_terminal::ServerTerminalServices,
@@ -27,10 +36,17 @@ use crate::{
 const PRODUCTION_REAPER_CAPACITY: usize = 64;
 const PRODUCTION_MAX_PARALLEL_QUIESCES: usize = 16;
 const PRODUCTION_GRACEFUL_TIMEOUT: Duration = Duration::from_secs(5);
+const REAPER_RETRY_DELAY: Duration = Duration::from_millis(100);
 
 pub(crate) type WorktreeRuntimeFuture<T> = Pin<Box<dyn Future<Output = T> + Send + 'static>>;
 
 pub(crate) trait WorktreeRuntimeActions: Send + Sync + 'static {
+    fn affected_thread_ids(
+        &self,
+        transition: WorkspaceLossTransition,
+    ) -> WorktreeRuntimeFuture<Result<Vec<String>, String>> {
+        Box::pin(async move { Ok(vec![transition.thread_id]) })
+    }
     fn stop_provider(&self, thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>>;
     fn close_terminals(&self, thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>>;
     fn append_warning(
@@ -66,14 +82,21 @@ struct Inner {
     registry: WorkspaceAvailabilityRegistry,
     options: WorktreeRuntimeOptions,
     reaper_sender: mpsc::Sender<ReaperJob>,
+    quiesce_permits: Arc<Semaphore>,
+    active_reaper_jobs: Arc<AtomicUsize>,
     shutdown: CancellationToken,
     reaper: Mutex<Option<JoinHandle<()>>>,
 }
 
 struct ReaperJob {
     thread_id: String,
-    cleanup: JoinHandle<CleanupResult>,
+    affected_thread_ids: Vec<String>,
+    actions: Arc<dyn WorktreeRuntimeActions>,
+    max_parallel: usize,
+    cleanup: CleanupFuture,
 }
+
+type CleanupFuture = WorktreeRuntimeFuture<Result<CleanupResult, String>>;
 
 struct CleanupResult {
     provider: Result<(), String>,
@@ -116,8 +139,20 @@ impl WorktreeRuntime {
         let shutdown = CancellationToken::new();
         let reaper_shutdown = shutdown.clone();
         let reaper_registry = registry.clone();
+        let quiesce_permits = Arc::new(Semaphore::new(options.max_parallel_quiesces.max(1)));
+        let reaper_permits = quiesce_permits.clone();
+        let active_reaper_jobs = Arc::new(AtomicUsize::new(0));
+        let reaper_active_jobs = active_reaper_jobs.clone();
         let reaper = tokio::spawn(async move {
-            run_reaper(reaper_receiver, reaper_registry, reaper_shutdown).await;
+            run_reaper(
+                reaper_receiver,
+                reaper_registry,
+                reaper_shutdown,
+                reaper_permits,
+                reaper_active_jobs,
+                options.reaper_capacity.max(1),
+            )
+            .await;
         });
         Self {
             inner: Arc::new(Inner {
@@ -125,6 +160,8 @@ impl WorktreeRuntime {
                 registry,
                 options,
                 reaper_sender,
+                quiesce_permits,
+                active_reaper_jobs,
                 shutdown,
                 reaper: Mutex::new(Some(reaper)),
             }),
@@ -135,29 +172,49 @@ impl WorktreeRuntime {
         stream::iter(transitions)
             .for_each_concurrent(
                 self.inner.options.max_parallel_quiesces.max(1),
-                |transition| self.quiesce(transition),
+                |transition| async move {
+                    let Ok(_permit) = self.inner.quiesce_permits.acquire().await else {
+                        return;
+                    };
+                    self.quiesce(transition).await;
+                },
             )
             .await;
     }
 
     async fn quiesce(&self, transition: WorkspaceLossTransition) {
         let thread_id = transition.thread_id.clone();
-        let deadline = tokio::time::Instant::now() + self.inner.options.graceful_timeout;
-        let actions = self.inner.actions.clone();
-        let cleanup_thread_id = thread_id.clone();
-        let mut cleanup = tokio::spawn(async move {
-            let (provider, terminals) = tokio::join!(
-                actions.stop_provider(cleanup_thread_id.clone()),
-                actions.close_terminals(cleanup_thread_id),
-            );
-            CleanupResult {
-                provider,
-                terminals,
-            }
-        });
-
-        match tokio::time::timeout_at(deadline, self.inner.actions.append_warning(transition)).await
+        self.inner
+            .registry
+            .wait_for_transition_admissions(&transition)
+            .await;
+        let mut affected_thread_ids = match self
+            .inner
+            .actions
+            .affected_thread_ids(transition.clone())
+            .await
         {
+            Ok(thread_ids) => thread_ids,
+            Err(error) => {
+                tracing::warn!(%thread_id, %error, "failed to resolve workspace thread aliases");
+                vec![thread_id.clone()]
+            }
+        };
+        affected_thread_ids.sort();
+        affected_thread_ids.dedup();
+        let deadline = tokio::time::Instant::now() + self.inner.options.graceful_timeout;
+        let max_parallel = self.inner.options.max_parallel_quiesces.max(1);
+        let mut cleanup = cleanup_attempt(
+            self.inner.actions.clone(),
+            affected_thread_ids.clone(),
+            max_parallel,
+        );
+
+        let (warning_result, cleanup_result) = tokio::join!(
+            tokio::time::timeout_at(deadline, self.inner.actions.append_warning(transition)),
+            tokio::time::timeout_at(deadline, &mut cleanup),
+        );
+        match warning_result {
             Ok(Ok(())) => {}
             Ok(Err(error)) => {
                 tracing::warn!(%thread_id, %error, "failed to append workspace-unavailable activity");
@@ -167,29 +224,68 @@ impl WorktreeRuntime {
             }
         }
 
-        match tokio::time::timeout_at(deadline, &mut cleanup).await {
-            Ok(Ok(result)) => log_cleanup_result(&thread_id, &result),
+        match cleanup_result {
+            Ok(Ok(result)) if cleanup_succeeded(&result) => log_cleanup_result(&thread_id, &result),
+            Ok(Ok(result)) => {
+                log_cleanup_result(&thread_id, &result);
+                self.enqueue_cleanup_retry(
+                    thread_id,
+                    affected_thread_ids.clone(),
+                    cleanup_attempt(
+                        self.inner.actions.clone(),
+                        affected_thread_ids,
+                        max_parallel,
+                    ),
+                    max_parallel,
+                )
+                .await;
+            }
             Ok(Err(error)) => {
                 tracing::warn!(%thread_id, %error, "workspace cleanup task failed");
+                self.enqueue_cleanup_retry(
+                    thread_id,
+                    affected_thread_ids.clone(),
+                    cleanup_attempt(
+                        self.inner.actions.clone(),
+                        affected_thread_ids,
+                        max_parallel,
+                    ),
+                    max_parallel,
+                )
+                .await;
             }
             Err(_) => {
-                self.inner
-                    .registry
-                    .set_orphan_cleanup_pending(&thread_id, true)
+                self.enqueue_cleanup_retry(thread_id, affected_thread_ids, cleanup, max_parallel)
                     .await;
-                let job = ReaperJob {
-                    thread_id: thread_id.clone(),
-                    cleanup,
-                };
-                if let Err(error) = self.inner.reaper_sender.try_send(job) {
-                    tracing::warn!(
-                        %thread_id,
-                        error = %error,
-                        capacity = self.inner.options.reaper_capacity,
-                        "workspace cleanup reaper is saturated; cleanup detached"
-                    );
-                }
             }
+        }
+    }
+
+    async fn enqueue_cleanup_retry(
+        &self,
+        thread_id: String,
+        affected_thread_ids: Vec<String>,
+        cleanup: CleanupFuture,
+        max_parallel: usize,
+    ) {
+        self.inner
+            .registry
+            .set_orphan_cleanup_pending(&thread_id, true)
+            .await;
+        let job = ReaperJob {
+            thread_id: thread_id.clone(),
+            affected_thread_ids,
+            actions: self.inner.actions.clone(),
+            max_parallel,
+            cleanup,
+        };
+        if let Err(error) = self.inner.reaper_sender.try_send(job) {
+            tracing::warn!(
+                %thread_id,
+                error = %error,
+                capacity = self.inner.options.reaper_capacity,
+                "workspace cleanup reaper is saturated; queued cleanup cancelled"
+            );
         }
     }
 
@@ -206,6 +302,12 @@ impl WorktreeRuntime {
         {
             tracing::warn!(%error, "workspace cleanup reaper task failed during shutdown");
         }
+        debug_assert_eq!(self.inner.active_reaper_jobs.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(test)]
+    fn active_reaper_jobs(&self) -> usize {
+        self.inner.active_reaper_jobs.load(Ordering::SeqCst)
     }
 }
 
@@ -222,29 +324,155 @@ async fn run_reaper(
     mut receiver: mpsc::Receiver<ReaperJob>,
     registry: WorkspaceAvailabilityRegistry,
     shutdown: CancellationToken,
+    permits: Arc<Semaphore>,
+    active_jobs: Arc<AtomicUsize>,
+    capacity: usize,
 ) {
+    let mut running = FuturesUnordered::new();
     loop {
-        let job = tokio::select! {
-            () = shutdown.cancelled() => return,
-            job = receiver.recv() => match job {
-                Some(job) => job,
-                None => return,
+        tokio::select! {
+            biased;
+            () = shutdown.cancelled() => {
+                receiver.close();
+                while receiver.try_recv().is_ok() {}
+                drop(running);
+                return;
+            }
+            _ = running.next(), if !running.is_empty() => {}
+            job = receiver.recv(), if running.len() < capacity => match job {
+                Some(job) => running.push(run_reaper_job(
+                    job,
+                    registry.clone(),
+                    shutdown.clone(),
+                    permits.clone(),
+                    active_jobs.clone(),
+                )),
+                None if running.is_empty() => return,
+                None => {}
             },
-        };
-        let cleanup = tokio::select! {
-            () = shutdown.cancelled() => return,
-            cleanup = job.cleanup => cleanup,
-        };
-        match cleanup {
-            Ok(result) => log_cleanup_result(&job.thread_id, &result),
-            Err(error) => {
-                tracing::warn!(thread_id = %job.thread_id, %error, "reaped workspace cleanup task failed");
+        }
+    }
+}
+
+fn run_reaper_job(
+    mut job: ReaperJob,
+    registry: WorkspaceAvailabilityRegistry,
+    shutdown: CancellationToken,
+    permits: Arc<Semaphore>,
+    active_jobs: Arc<AtomicUsize>,
+) -> WorktreeRuntimeFuture<()> {
+    Box::pin(async move {
+        let _active = ActiveReaperJob::new(active_jobs);
+        loop {
+            let permit = tokio::select! {
+                () = shutdown.cancelled() => return,
+                permit = permits.clone().acquire_owned() => match permit {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                },
+            };
+            let cleanup = tokio::select! {
+                () = shutdown.cancelled() => return,
+                cleanup = &mut job.cleanup => cleanup,
+            };
+            drop(permit);
+            match cleanup {
+                Ok(result) if cleanup_succeeded(&result) => {
+                    log_cleanup_result(&job.thread_id, &result);
+                    registry
+                        .set_orphan_cleanup_pending(&job.thread_id, false)
+                        .await;
+                    return;
+                }
+                Ok(result) => log_cleanup_result(&job.thread_id, &result),
+                Err(error) => tracing::warn!(
+                    thread_id = %job.thread_id,
+                    %error,
+                    "reaped workspace cleanup task failed"
+                ),
+            }
+            job.cleanup = cleanup_attempt(
+                job.actions.clone(),
+                job.affected_thread_ids.clone(),
+                job.max_parallel,
+            );
+            tokio::select! {
+                () = shutdown.cancelled() => return,
+                () = tokio::time::sleep(REAPER_RETRY_DELAY) => {}
             }
         }
-        registry
-            .set_orphan_cleanup_pending(&job.thread_id, false)
-            .await;
+    })
+}
+
+struct ActiveReaperJob {
+    active_jobs: Arc<AtomicUsize>,
+}
+
+impl ActiveReaperJob {
+    fn new(active_jobs: Arc<AtomicUsize>) -> Self {
+        active_jobs.fetch_add(1, Ordering::SeqCst);
+        Self { active_jobs }
     }
+}
+
+impl Drop for ActiveReaperJob {
+    fn drop(&mut self) {
+        self.active_jobs.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn cleanup_attempt(
+    actions: Arc<dyn WorktreeRuntimeActions>,
+    affected_thread_ids: Vec<String>,
+    max_parallel: usize,
+) -> CleanupFuture {
+    Box::pin(
+        AssertUnwindSafe(async move {
+            let results = stream::iter(affected_thread_ids)
+                .map(|affected_thread_id| {
+                    let actions = actions.clone();
+                    async move {
+                        let (provider, terminals) = tokio::join!(
+                            actions.stop_provider(affected_thread_id.clone()),
+                            actions.close_terminals(affected_thread_id.clone()),
+                        );
+                        (affected_thread_id, provider, terminals)
+                    }
+                })
+                .buffer_unordered(max_parallel.max(1))
+                .collect::<Vec<_>>()
+                .await;
+            let mut provider_errors = Vec::new();
+            let mut terminal_errors = Vec::new();
+            for (affected_thread_id, provider, terminals) in results {
+                if let Err(error) = provider {
+                    provider_errors.push(format!("{affected_thread_id}: {error}"));
+                }
+                if let Err(error) = terminals {
+                    terminal_errors.push(format!("{affected_thread_id}: {error}"));
+                }
+            }
+            CleanupResult {
+                provider: aggregate_cleanup_errors(provider_errors),
+                terminals: aggregate_cleanup_errors(terminal_errors),
+            }
+        })
+        .catch_unwind()
+        .map(|result| result.map_err(panic_message)),
+    )
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .copied()
+        .or_else(|| payload.downcast_ref::<String>().map(String::as_str))
+        .unwrap_or("workspace cleanup panicked")
+        .to_owned()
+}
+
+fn cleanup_succeeded(result: &CleanupResult) -> bool {
+    result.provider.is_ok() && result.terminals.is_ok()
 }
 
 fn log_cleanup_result(thread_id: &str, result: &CleanupResult) {
@@ -256,6 +484,14 @@ fn log_cleanup_result(thread_id: &str, result: &CleanupResult) {
     }
 }
 
+fn aggregate_cleanup_errors(errors: Vec<String>) -> Result<(), String> {
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
 struct ProductionWorktreeRuntimeActions {
     orchestration: OrchestrationEngine,
     provider: Arc<ProviderRuntimeSupervisor>,
@@ -263,6 +499,14 @@ struct ProductionWorktreeRuntimeActions {
 }
 
 impl WorktreeRuntimeActions for ProductionWorktreeRuntimeActions {
+    fn affected_thread_ids(
+        &self,
+        transition: WorkspaceLossTransition,
+    ) -> WorktreeRuntimeFuture<Result<Vec<String>, String>> {
+        let repositories = self.orchestration.repositories();
+        Box::pin(async move { workspace_thread_ids(repositories, &transition).await })
+    }
+
     fn stop_provider(&self, thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
         let provider = self.provider.clone();
         Box::pin(async move {
@@ -357,23 +601,76 @@ fn now_iso() -> String {
         .unwrap_or_else(|_| "1970-01-01T00:00:00Z".to_owned())
 }
 
+async fn workspace_thread_ids(
+    repositories: Repositories,
+    transition: &WorkspaceLossTransition,
+) -> Result<Vec<String>, String> {
+    let Some(owner) = repositories
+        .get_thread(transition.thread_id.clone())
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(vec![transition.thread_id.clone()]);
+    };
+    let project = repositories
+        .get_project(owner.project_id.clone())
+        .await
+        .map_err(|error| error.to_string())?;
+    if project
+        .as_ref()
+        .and_then(|project| project.worktree_repository_key.as_deref())
+        .is_some_and(|repository_key| repository_key != transition.repository_key)
+    {
+        return Err(
+            "workspace-loss repository identity no longer matches the persisted project".to_owned(),
+        );
+    }
+    let project_root = project.map(|project| project.workspace_root);
+    let transition_path = normalize_worktree_path_key(&transition.path, host_path_platform());
+    let mut thread_ids = repositories
+        .list_threads_by_project(owner.project_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|thread| thread.deleted_at.is_none())
+        .filter_map(|thread| {
+            let path = thread
+                .worktree_path
+                .as_deref()
+                .or(project_root.as_deref())?;
+            (normalize_worktree_path_key(std::path::Path::new(path), host_path_platform())
+                == transition_path)
+                .then_some(thread.thread_id)
+        })
+        .collect::<Vec<_>>();
+    if !thread_ids.contains(&transition.thread_id) {
+        thread_ids.push(transition.thread_id.clone());
+    }
+    thread_ids.sort();
+    thread_ids.dedup();
+    Ok(thread_ids)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
-        future::{pending, ready},
+        future::{Future, pending, ready},
         path::PathBuf,
+        pin::Pin,
         sync::{
             Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
+        task::{Context, Poll},
         time::Duration,
     };
 
     use serde_json::json;
+    use tokio::sync::Semaphore;
 
     use super::{
         WorktreeRuntime, WorktreeRuntimeActions, WorktreeRuntimeFuture, WorktreeRuntimeOptions,
-        append_workspace_warning, workspace_warning_activity_id,
+        append_workspace_warning, workspace_thread_ids, workspace_warning_activity_id,
     };
     use crate::worktree_catalog::{
         AdoptedWorktreeAvailability, WorkspaceAvailabilityRegistry, WorkspaceLossTransition,
@@ -388,6 +685,9 @@ mod tests {
         provider_calls: AtomicUsize,
         terminal_calls: AtomicUsize,
         warnings: Mutex<Vec<WorkspaceLossTransition>>,
+        affected_threads: Mutex<Option<Vec<String>>>,
+        provider_threads: Mutex<Vec<String>>,
+        terminal_threads: Mutex<Vec<String>>,
         cleanup_never_finishes: bool,
         warning_fails: bool,
         warning_never_finishes: bool,
@@ -417,8 +717,25 @@ mod tests {
     }
 
     impl WorktreeRuntimeActions for FakeActions {
-        fn stop_provider(&self, _thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+        fn affected_thread_ids(
+            &self,
+            transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<Vec<String>, String>> {
+            let threads = self
+                .affected_threads
+                .lock()
+                .expect("affected thread lock")
+                .clone()
+                .unwrap_or_else(|| vec![transition.thread_id]);
+            Box::pin(ready(Ok(threads)))
+        }
+
+        fn stop_provider(&self, thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
             self.provider_calls.fetch_add(1, Ordering::SeqCst);
+            self.provider_threads
+                .lock()
+                .expect("provider thread lock")
+                .push(thread_id);
             if self.cleanup_never_finishes {
                 Box::pin(pending())
             } else {
@@ -426,8 +743,12 @@ mod tests {
             }
         }
 
-        fn close_terminals(&self, _thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+        fn close_terminals(&self, thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
             self.terminal_calls.fetch_add(1, Ordering::SeqCst);
+            self.terminal_threads
+                .lock()
+                .expect("terminal thread lock")
+                .push(thread_id);
             if self.cleanup_never_finishes {
                 Box::pin(pending())
             } else {
@@ -447,6 +768,159 @@ mod tests {
             } else {
                 Box::pin(ready(Ok(())))
             }
+        }
+    }
+
+    struct ConcurrencyActions {
+        calls: AtomicUsize,
+        active: Arc<AtomicUsize>,
+        peak: Arc<AtomicUsize>,
+        started: Arc<Semaphore>,
+        release: Arc<Semaphore>,
+    }
+
+    impl WorktreeRuntimeActions for ConcurrencyActions {
+        fn stop_provider(&self, _thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
+            self.peak.fetch_max(active, Ordering::SeqCst);
+            self.started.add_permits(1);
+            let release = self.release.clone();
+            let active_count = self.active.clone();
+            Box::pin(async move {
+                let permit = release.acquire().await.expect("release semaphore");
+                permit.forget();
+                active_count.fetch_sub(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+
+        fn close_terminals(&self, _thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+            Box::pin(ready(Ok(())))
+        }
+
+        fn append_warning(
+            &self,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
+            Box::pin(ready(Ok(())))
+        }
+    }
+
+    struct RetryActions {
+        provider_calls: AtomicUsize,
+        retry_started: Arc<Semaphore>,
+        retry_release: Arc<Semaphore>,
+        panic_first: bool,
+    }
+
+    impl WorktreeRuntimeActions for RetryActions {
+        fn stop_provider(&self, _thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+            let attempt = self.provider_calls.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                if self.panic_first {
+                    return Box::pin(async { panic!("first provider cleanup panicked") });
+                }
+                return Box::pin(ready(Err("first provider cleanup failed".to_owned())));
+            }
+            self.retry_started.add_permits(1);
+            let release = self.retry_release.clone();
+            Box::pin(async move {
+                let permit = release.acquire().await.expect("retry release");
+                permit.forget();
+                Ok(())
+            })
+        }
+
+        fn close_terminals(&self, _thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+            Box::pin(ready(Ok(())))
+        }
+
+        fn append_warning(
+            &self,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
+            Box::pin(ready(Ok(())))
+        }
+    }
+
+    struct PendingDrop {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl Future for PendingDrop {
+        type Output = Result<(), String>;
+
+        fn poll(self: Pin<&mut Self>, _context: &mut Context<'_>) -> Poll<Self::Output> {
+            Poll::Pending
+        }
+    }
+
+    impl Drop for PendingDrop {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    struct ShutdownActions {
+        drops: Arc<AtomicUsize>,
+    }
+
+    impl WorktreeRuntimeActions for ShutdownActions {
+        fn stop_provider(&self, _thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+            Box::pin(PendingDrop {
+                drops: self.drops.clone(),
+            })
+        }
+
+        fn close_terminals(&self, _thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+            Box::pin(ready(Ok(())))
+        }
+
+        fn append_warning(
+            &self,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
+            Box::pin(ready(Ok(())))
+        }
+    }
+
+    struct PersistedAliasActions {
+        repositories: crate::persistence::Repositories,
+        provider_threads: Arc<Mutex<Vec<String>>>,
+        terminal_threads: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl WorktreeRuntimeActions for PersistedAliasActions {
+        fn affected_thread_ids(
+            &self,
+            transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<Vec<String>, String>> {
+            let repositories = self.repositories.clone();
+            Box::pin(async move { workspace_thread_ids(repositories, &transition).await })
+        }
+
+        fn stop_provider(&self, thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+            self.provider_threads
+                .lock()
+                .expect("provider thread lock")
+                .push(thread_id);
+            Box::pin(ready(Ok(())))
+        }
+
+        fn close_terminals(&self, thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+            self.terminal_threads
+                .lock()
+                .expect("terminal thread lock")
+                .push(thread_id);
+            Box::pin(ready(Ok(())))
+        }
+
+        fn append_warning(
+            &self,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
+            Box::pin(ready(Ok(())))
         }
     }
 
@@ -476,6 +950,144 @@ mod tests {
         assert_eq!(actions.terminal_calls.load(Ordering::SeqCst), 1);
         assert_eq!(actions.warnings.lock().expect("warning lock").len(), 1);
         assert!(!registry.orphan_cleanup_pending("thread-1"));
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn runtime_loss_quiesces_persisted_panel_aliases_and_preserves_histories() {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .expect("engine starts");
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"project.create","commandId":"create-project","projectId":"project-1",
+                    "title":"Project","workspaceRoot":"/repo","defaultModelSelection":null,
+                    "createdAt":"2026-08-10T00:00:00Z"
+                }))
+                .expect("project command"),
+            )
+            .await
+            .expect("project created");
+        for (thread_id, kind, path) in [
+            ("workspace", "workspace", "/repo/worktrees/missing-1"),
+            ("panel-a", "panel", "/repo/worktrees/missing-1/./alias/.."),
+            ("panel-other", "panel", "/repo/worktrees/other"),
+        ] {
+            engine
+                .dispatch(
+                    serde_json::from_value(json!({
+                        "type":"thread.create","commandId":format!("create-{thread_id}"),
+                        "threadId":thread_id,"projectId":"project-1","title":thread_id,
+                        "kind":kind,"modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                        "runtimeMode":"full-access","interactionMode":"default","branch":null,
+                        "worktreePath":path,"createdAt":"2026-08-10T00:00:00Z"
+                    }))
+                    .expect("thread command"),
+                )
+                .await
+                .expect("thread created");
+        }
+        for thread_id in ["workspace", "panel-a"] {
+            engine
+                .dispatch(
+                    serde_json::from_value(json!({
+                        "type":"thread.turn.start","commandId":format!("turn-{thread_id}"),
+                        "threadId":thread_id,
+                        "message":{"messageId":format!("message-{thread_id}"),"role":"user",
+                            "text":format!("retained history for {thread_id}"),"attachments":[]},
+                        "runtimeMode":"full-access","interactionMode":"default",
+                        "createdAt":"2026-08-10T00:00:00Z"
+                    }))
+                    .expect("turn command"),
+                )
+                .await
+                .expect("turn created");
+        }
+
+        let mut loss = transition(1);
+        loss.thread_id = "workspace".to_owned();
+        let provider_threads = Arc::new(Mutex::new(Vec::new()));
+        let terminal_threads = Arc::new(Mutex::new(Vec::new()));
+        let runtime = WorktreeRuntime::start_for_test(
+            Arc::new(PersistedAliasActions {
+                repositories: engine.repositories(),
+                provider_threads: provider_threads.clone(),
+                terminal_threads: terminal_threads.clone(),
+            }),
+            WorkspaceAvailabilityRegistry::new(),
+            WorktreeRuntimeOptions::default(),
+        );
+        runtime.observe(vec![loss]).await;
+
+        assert_eq!(
+            *provider_threads.lock().expect("provider thread lock"),
+            ["panel-a", "workspace"]
+        );
+        assert_eq!(
+            *terminal_threads.lock().expect("terminal thread lock"),
+            ["panel-a", "workspace"]
+        );
+        let snapshot = load_snapshot(&engine.repositories())
+            .await
+            .expect("snapshot");
+        for thread_id in ["workspace", "panel-a"] {
+            assert!(
+                snapshot
+                    .threads
+                    .iter()
+                    .any(|thread| { thread.thread_id == thread_id && thread.deleted_at.is_none() })
+            );
+            assert!(snapshot.messages.iter().any(|message| {
+                message.message_id == format!("message-{thread_id}")
+                    && message.text == format!("retained history for {thread_id}")
+            }));
+        }
+        runtime.shutdown().await;
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn quiesce_stops_every_deduplicated_persisted_workspace_alias() {
+        let actions = Arc::new(FakeActions::default());
+        *actions
+            .affected_threads
+            .lock()
+            .expect("affected thread lock") = Some(vec![
+            "workspace".to_owned(),
+            "panel-a".to_owned(),
+            "panel-a".to_owned(),
+        ]);
+        let runtime = WorktreeRuntime::start_for_test(
+            actions.clone(),
+            WorkspaceAvailabilityRegistry::new(),
+            WorktreeRuntimeOptions::default(),
+        );
+
+        runtime.observe(vec![transition(1)]).await;
+
+        let mut providers = actions
+            .provider_threads
+            .lock()
+            .expect("provider thread lock")
+            .clone();
+        providers.sort();
+        let mut terminals = actions
+            .terminal_threads
+            .lock()
+            .expect("terminal thread lock")
+            .clone();
+        terminals.sort();
+        assert_eq!(providers, ["panel-a", "workspace"]);
+        assert_eq!(terminals, ["panel-a", "workspace"]);
         runtime.shutdown().await;
     }
 
@@ -589,6 +1201,157 @@ mod tests {
             workspace_warning_activity_id(&loss)
         );
         engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn overlapping_observers_share_one_global_quiesce_bound() {
+        let started = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let actions = Arc::new(ConcurrencyActions {
+            calls: AtomicUsize::new(0),
+            active: Arc::new(AtomicUsize::new(0)),
+            peak: Arc::new(AtomicUsize::new(0)),
+            started: started.clone(),
+            release: release.clone(),
+        });
+        let runtime = WorktreeRuntime::start_for_test(
+            actions.clone(),
+            WorkspaceAvailabilityRegistry::new(),
+            WorktreeRuntimeOptions {
+                graceful_timeout: Duration::from_secs(60),
+                reaper_capacity: 4,
+                max_parallel_quiesces: 2,
+            },
+        );
+        let observer_a = runtime.clone();
+        let observer_b = runtime.clone();
+        let task_a = tokio::spawn(async move {
+            observer_a
+                .observe(vec![transition(1), transition(2), transition(3)])
+                .await;
+        });
+        let task_b = tokio::spawn(async move {
+            observer_b
+                .observe(vec![transition(4), transition(5), transition(6)])
+                .await;
+        });
+
+        for expected in [2, 4, 6] {
+            let permits = started
+                .acquire_many(2)
+                .await
+                .expect("two cleanup attempts started");
+            permits.forget();
+            tokio::task::yield_now().await;
+            assert_eq!(actions.calls.load(Ordering::SeqCst), expected);
+            assert_eq!(actions.active.load(Ordering::SeqCst), 2);
+            release.add_permits(2);
+        }
+        task_a.await.expect("first observer");
+        task_b.await.expect("second observer");
+
+        assert_eq!(actions.peak.load(Ordering::SeqCst), 2);
+        assert_eq!(actions.active.load(Ordering::SeqCst), 0);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_error_retains_orphan_marker_until_a_repeat_attempt_succeeds() {
+        let retry_started = Arc::new(Semaphore::new(0));
+        let retry_release = Arc::new(Semaphore::new(0));
+        let actions = Arc::new(RetryActions {
+            provider_calls: AtomicUsize::new(0),
+            retry_started: retry_started.clone(),
+            retry_release: retry_release.clone(),
+            panic_first: false,
+        });
+        let registry = WorkspaceAvailabilityRegistry::new();
+        assert!(registry.mark_unavailable(transition(1)).await);
+        let runtime = WorktreeRuntime::start_for_test(
+            actions.clone(),
+            registry.clone(),
+            WorktreeRuntimeOptions::default(),
+        );
+
+        runtime.observe(vec![transition(1)]).await;
+        let permit = retry_started.acquire().await.expect("retry started");
+        permit.forget();
+        assert!(registry.orphan_cleanup_pending("thread-1"));
+        assert_eq!(actions.provider_calls.load(Ordering::SeqCst), 2);
+
+        retry_release.add_permits(1);
+        while registry.orphan_cleanup_pending("thread-1") {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(actions.provider_calls.load(Ordering::SeqCst), 2);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cleanup_panic_retains_orphan_marker_until_a_repeat_attempt_succeeds() {
+        let retry_started = Arc::new(Semaphore::new(0));
+        let retry_release = Arc::new(Semaphore::new(0));
+        let actions = Arc::new(RetryActions {
+            provider_calls: AtomicUsize::new(0),
+            retry_started: retry_started.clone(),
+            retry_release: retry_release.clone(),
+            panic_first: true,
+        });
+        let registry = WorkspaceAvailabilityRegistry::new();
+        assert!(registry.mark_unavailable(transition(1)).await);
+        let runtime = WorktreeRuntime::start_for_test(
+            actions.clone(),
+            registry.clone(),
+            WorktreeRuntimeOptions::default(),
+        );
+
+        runtime.observe(vec![transition(1)]).await;
+        let permit = retry_started.acquire().await.expect("retry started");
+        permit.forget();
+        assert!(registry.orphan_cleanup_pending("thread-1"));
+        assert_eq!(actions.provider_calls.load(Ordering::SeqCst), 2);
+
+        retry_release.add_permits(1);
+        while registry.orphan_cleanup_pending("thread-1") {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(actions.provider_calls.load(Ordering::SeqCst), 2);
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn shutdown_cancels_and_joins_every_runtime_owned_reaper_cleanup() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let actions = Arc::new(ShutdownActions {
+            drops: drops.clone(),
+        });
+        let registry = WorkspaceAvailabilityRegistry::new();
+        assert!(registry.mark_unavailable(transition(1)).await);
+        let runtime = WorktreeRuntime::start_for_test(
+            actions,
+            registry.clone(),
+            WorktreeRuntimeOptions {
+                graceful_timeout: Duration::from_secs(5),
+                reaper_capacity: 1,
+                max_parallel_quiesces: 1,
+            },
+        );
+        let observer = runtime.clone();
+        let task = tokio::spawn(async move {
+            observer.observe(vec![transition(1)]).await;
+        });
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        task.await.expect("observer reaches reaper handoff");
+        while runtime.active_reaper_jobs() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        runtime.shutdown().await;
+
+        assert_eq!(runtime.active_reaper_jobs(), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
+        assert!(registry.orphan_cleanup_pending("thread-1"));
     }
 
     #[tokio::test(start_paused = true)]

@@ -9,6 +9,101 @@ with the exact structured `WorkspaceUnavailableError`, and runs bounded
 provider/terminal quiescence without deleting conversation or terminal
 history.
 
+## Fix round 1 — review closure
+
+The review follow-up closes five concurrency/identity gaps without changing the
+public error schema or regenerated RPC fixtures:
+
+- persisted thread projections now resolve catalog owners, ordinary threads,
+  and panels onto the same normalized physical path; loss deduplicates and
+  stops every matching provider session and terminal while retaining every
+  thread and message row;
+- the central registry owns cancellation-safe thread/path admission leases.
+  Turn admission, asynchronous provider delivery and reconciliation, terminal
+  open/restart/write/setup publication, and Git process publication hold the
+  appropriate lease. Guard installation sees the lease atomically, waits for
+  earlier publication, and rejects later admission;
+- path keys now collapse duplicate separators and lexical `.`/`..` for missing
+  paths while clamping absolute traversal at POSIX roots, Windows drive roots,
+  and UNC share roots. Relative leading `..` remains meaningful;
+- nested removal uses independent depth tokens, so arbitrary guard-drop order
+  preserves the latest pending missing state until the last token releases;
+- cleanup uses no detached Tokio task. Initial cleanup is a boxed cancellable
+  future, timeout transfers ownership to a bounded active/queued reaper, and
+  failures or captured panics create repeatable attempts. Counted orphan
+  ownership clears only after confirmed provider and terminal success;
+- one shared semaphore bounds all overlapping catalog observers and reaper
+  retries. Runtime shutdown cancels and drops queued/active cleanup futures,
+  joins the single reaper owner, and proves zero active jobs before provider and
+  terminal shutdown.
+
+Deterministic RED cases observed the old behavior directly: a persisted panel
+turn passed the catalog-owner-only guard; a terminal open paused between PTY
+spawn and manager publication escaped quiescence; the final nested removal
+guard restored availability instead of the pending loss; two concurrent
+observers exceeded a per-call concurrency budget; cleanup errors cleared their
+orphan signal without retry; and shutdown had no owned active-future count.
+All race coverage uses semaphores, channels, paused time, or task-state
+barriers—never timing sleeps.
+
+Fix-round focused results before broad validation:
+
+```text
+availability/admission/removal state machine             9 passed
+warning/panel-resolution/reaper/global-bound runtime    11 passed
+worktree path identity                                    6 passed
+real-Git catalog                                          9 passed
+orchestration owner/panel admission                       2 passed
+terminal guard/history/publication race                   3 passed
+provider session stop                                     1 passed
+provider delivery/reconciliation guard                    1 passed
+Git and workspace public boundaries                       2 passed
+lexical replay ownership                                  1 passed
+```
+
+The persistence-backed panel test creates a canonical workspace plus a panel
+using a lexical path alias, persists conversation history for both, runs the
+runtime loss observer, verifies provider and terminal cleanup for both IDs, and
+then reloads both retained threads and messages. The terminal integration test
+separately proves retained PTY transcript access after process quiescence; the
+provider integration test proves session shutdown without deleting its thread.
+
+Fix-round final gates:
+
+```text
+cargo test -p bibcode-server -j 2 -- --test-threads=1
+  library                                              1,022 passed
+  integrations before provider_terminal_supervisor       all passed
+  provider_terminal_supervisor                       96 passed, 1 failed
+
+cargo test -p bibcode-server -j 2 -- --test-threads=1 \
+  --skip agent_activity_hung_factory_does_not_block_terminal_disable_or_later_settings_updates
+  every non-skipped library/integration/doc target        passed
+
+cargo fmt --all --check                                  passed
+cargo clippy -p bibcode-server --all-targets -- -D warnings
+                                                         passed
+vp check                           1,775 format / 1,309 lint files passed
+vp run typecheck                                      11/11 tasks passed
+```
+
+The one unskipped broad failure is an unchanged pre-existing
+provider-terminal test at
+`apps/server/tests/provider_terminal_supervisor.rs:8399`. Its fixed two-second
+wrapper expires with `manager preparation timeout: Elapsed(())` while exercising
+an intentionally hung factory. The exact isolated test was rerun three times,
+including once on an otherwise idle test system, and remained red. Neither the
+test nor its `provider_terminal`/`terminal::manager` owners differ from base
+`c9d87a64`; the fix round did not modify that unrelated timeout. The explicit
+skip run demonstrates that every other server target passes and does not hide
+the isolated failure.
+
+No RPC error union, schema, manifest, or generated fixture changed in this fix
+round. The prior Task 9 corpus therefore remains stable at 89 methods, 16
+streams, 247 total fixtures, and 228 schema fingerprints; regeneration was not
+required. The typecheck gate printed only the repository's existing non-failing
+Effect finite-number suggestions.
+
 ## Ownership and lifecycle
 
 - `apps/server/src/worktree_catalog/availability.rs` owns the central
