@@ -29,8 +29,9 @@ use crate::{
 };
 
 use super::model::{
-    AdoptedWorktreeAvailability, AdoptedWorktreeStatus, CatalogDegradedReason, CatalogError,
-    CatalogErrorReason, CatalogRefreshTrigger, CatalogScanStatus, WorktreeAdoptionState,
+    AdoptedWorktreeAvailability, AdoptedWorktreeStatus, AdoptionValidationError,
+    AdoptionValidationErrorReason, CatalogDegradedReason, CatalogError, CatalogErrorReason,
+    CatalogRefreshTrigger, CatalogScanStatus, ResolvedAdoptionCandidate, WorktreeAdoptionState,
     WorktreeCatalogSnapshot, WorktreeDescriptor, WorktreeDirectoryState, WorktreeRegistrationState,
     bounded_message,
 };
@@ -65,6 +66,14 @@ pub(crate) trait CatalogFileSystem: Send + Sync {
         common_dir: PathBuf,
         known_paths: Vec<PathBuf>,
     ) -> CatalogFuture<CatalogShallowSignature>;
+}
+
+pub(crate) trait CatalogHealthySnapshotObserver: Send + Sync {
+    fn observe(
+        &self,
+        project_id: String,
+        snapshot: Arc<WorktreeCatalogSnapshot>,
+    ) -> CatalogFuture<()>;
 }
 
 #[derive(Clone, Debug)]
@@ -158,6 +167,7 @@ struct Inner {
     lifecycle_tasks: Mutex<LifecycleTasks>,
     lifecycle_tasks_changed: Notify,
     registry: Mutex<Registry>,
+    healthy_snapshot_observer: Mutex<Option<Arc<dyn CatalogHealthySnapshotObserver>>>,
     #[cfg(test)]
     final_release_pause: Mutex<Option<FinalReleasePause>>,
     #[cfg(test)]
@@ -425,6 +435,7 @@ impl WorktreeCatalogService {
                 lifecycle_tasks: Mutex::new(LifecycleTasks::default()),
                 lifecycle_tasks_changed: Notify::new(),
                 registry: Mutex::new(Registry::default()),
+                healthy_snapshot_observer: Mutex::new(None),
                 #[cfg(test)]
                 final_release_pause: Mutex::new(None),
                 #[cfg(test)]
@@ -575,6 +586,24 @@ impl WorktreeCatalogService {
         }
         let entry = self.ensure_entry(project_id).await?;
         self.refresh_entry(project_id, &entry, trigger, None).await
+    }
+
+    pub(crate) fn set_healthy_snapshot_observer(
+        &self,
+        observer: Arc<dyn CatalogHealthySnapshotObserver>,
+    ) {
+        *lock(&self.inner.healthy_snapshot_observer) = Some(observer);
+    }
+
+    async fn observe_healthy_snapshot(
+        &self,
+        project_id: &str,
+        snapshot: Arc<WorktreeCatalogSnapshot>,
+    ) {
+        let observer = lock(&self.inner.healthy_snapshot_observer).clone();
+        if let Some(observer) = observer {
+            observer.observe(project_id.to_owned(), snapshot).await;
+        }
     }
 
     async fn refresh_entry(
@@ -780,12 +809,166 @@ impl WorktreeCatalogService {
             state.next_failure_retry = None;
             state.sender.send_replace(Arc::clone(&snapshot));
         }
+        self.observe_healthy_snapshot(project_id, Arc::clone(&snapshot))
+            .await;
         Ok(snapshot)
     }
 
     pub async fn latest(&self, project_id: &str) -> Option<Arc<WorktreeCatalogSnapshot>> {
         let entry = self.entry_for_project(project_id)?;
         Some(Arc::clone(&lock(&entry.state).snapshot))
+    }
+
+    /// Revalidates a catalog candidate against live Git membership and filesystem presence.
+    ///
+    /// This is intentionally a read-only fence: adoption may persist an existing checkout, but
+    /// must never create or repair a Git worktree.
+    pub async fn resolve_adoption_candidate(
+        &self,
+        project_id: &str,
+        candidate_key: &str,
+    ) -> Result<ResolvedAdoptionCandidate, AdoptionValidationError> {
+        let entry = self.ensure_entry(project_id).await.map_err(|error| {
+            AdoptionValidationError::new(
+                AdoptionValidationErrorReason::CatalogUnavailable,
+                error.message,
+                None,
+            )
+        })?;
+        let snapshot = Arc::clone(&lock(&entry.state).snapshot);
+        let generation = snapshot.generation;
+        let descriptor = snapshot
+            .worktrees
+            .iter()
+            .find(|worktree| worktree.worktree_key == candidate_key)
+            .cloned()
+            .ok_or_else(|| {
+                AdoptionValidationError::new(
+                    AdoptionValidationErrorReason::WorktreeNotFound,
+                    "The selected worktree is not present in the current catalog.",
+                    Some(generation),
+                )
+            })?;
+        let adoptable_owner = matches!(
+            descriptor.adoption_state,
+            WorktreeAdoptionState::Active | WorktreeAdoptionState::Archived
+        );
+        if (!descriptor.eligible_for_adoption && !adoptable_owner)
+            || descriptor.is_primary
+            || descriptor.is_bare
+            || descriptor.registration_state != WorktreeRegistrationState::Registered
+        {
+            return Err(AdoptionValidationError::new(
+                AdoptionValidationErrorReason::Ineligible,
+                "The selected worktree is not eligible for adoption.",
+                Some(generation),
+            ));
+        }
+
+        let candidate_path = PathBuf::from(&descriptor.path);
+        match self
+            .probe(&candidate_path, &self.inner.shutdown.child_token())
+            .await
+        {
+            Ok(DirectoryProbeState::Present) => {}
+            Ok(DirectoryProbeState::Missing) => {
+                return Err(AdoptionValidationError::new(
+                    AdoptionValidationErrorReason::WorkspaceMissing,
+                    "The selected worktree directory is missing.",
+                    Some(generation),
+                ));
+            }
+            Ok(DirectoryProbeState::Unknown) | Err(ScanError::Cancelled) => {
+                return Err(AdoptionValidationError::new(
+                    AdoptionValidationErrorReason::CatalogUnavailable,
+                    "The selected worktree directory could not be verified.",
+                    Some(generation),
+                ));
+            }
+            Err(ScanError::Failure(_) | ScanError::Catalog(_)) => {
+                return Err(AdoptionValidationError::new(
+                    AdoptionValidationErrorReason::CatalogUnavailable,
+                    "The selected worktree directory could not be verified.",
+                    Some(generation),
+                ));
+            }
+        }
+        let cancellation = self.inner.shutdown.child_token();
+        let observation = self
+            .observe_repository(
+                &entry.repository,
+                candidate_path.clone(),
+                Some(&snapshot.repository_key),
+                &cancellation,
+            )
+            .await
+            .map_err(|_| {
+                AdoptionValidationError::new(
+                    AdoptionValidationErrorReason::RepositoryMismatch,
+                    "The selected path is not a member of the project's Git repository.",
+                    Some(generation),
+                )
+            })?;
+        let platform = host_platform();
+        let mut resolved_record = None;
+        for record in &observation.inventory.records {
+            let Ok(canonical_record) = self
+                .inner
+                .filesystem
+                .canonicalize(record.path.clone())
+                .await
+            else {
+                continue;
+            };
+            if worktree_key(&observation.common_dir, &canonical_record, platform).as_str()
+                == candidate_key
+            {
+                resolved_record = Some((record, canonical_record));
+                break;
+            }
+        }
+        let (record, canonical_record) = resolved_record.ok_or_else(|| {
+            AdoptionValidationError::new(
+                AdoptionValidationErrorReason::RepositoryMismatch,
+                "The selected path is not registered in the project's Git worktree inventory.",
+                Some(generation),
+            )
+        })?;
+        if record.is_primary || record.is_bare || record.is_prunable {
+            return Err(AdoptionValidationError::new(
+                AdoptionValidationErrorReason::Ineligible,
+                "The selected worktree is not eligible for adoption.",
+                Some(generation),
+            ));
+        }
+        let canonical_candidate = self
+            .inner
+            .filesystem
+            .canonicalize(candidate_path)
+            .await
+            .map_err(|_| {
+                AdoptionValidationError::new(
+                    AdoptionValidationErrorReason::WorkspaceMissing,
+                    "The selected worktree directory is no longer reachable.",
+                    Some(generation),
+                )
+            })?;
+        if normalize_worktree_path_key(&canonical_record, platform)
+            != normalize_worktree_path_key(&canonical_candidate, platform)
+        {
+            return Err(AdoptionValidationError::new(
+                AdoptionValidationErrorReason::RepositoryMismatch,
+                "The selected path no longer resolves to its registered worktree.",
+                Some(generation),
+            ));
+        }
+        Ok(ResolvedAdoptionCandidate {
+            worktree_key: candidate_key.to_owned(),
+            path: normalize_worktree_path_key(&canonical_record, platform),
+            branch: record.branch.clone(),
+            head: record.head.clone(),
+            generation,
+        })
     }
 
     pub(crate) async fn shutdown(&self) {
@@ -1174,6 +1357,10 @@ impl WorktreeCatalogService {
             Ok(entry)
         }
         .await;
+        if let Ok(entry) = &result {
+            let snapshot = Arc::clone(&lock(&entry.state).snapshot);
+            self.observe_healthy_snapshot(project_id, snapshot).await;
+        }
         drop(guard);
         self.remove_bootstrap_lock_if_idle(project_id, &bootstrap_lock);
         result

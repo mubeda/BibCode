@@ -82,6 +82,12 @@ fn register_orchestration_rpc_inner(
                 .map_err(|error| invalid_request(&request.tag, error))?;
             let command = serde_json::from_value::<OrchestrationCommand>(request.payload)
                 .map_err(|error| invalid_request(&request.tag, error.to_string()))?;
+            if command.is_server_internal() {
+                return Err(invalid_request(
+                    &request.tag,
+                    "server-internal orchestration commands cannot be dispatched by clients",
+                ));
+            }
             if matches!(command, OrchestrationCommand::ThreadTurnStart { .. }) {
                 let provider = provider.ok_or_else(|| {
                     invalid_request(

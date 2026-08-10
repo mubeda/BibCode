@@ -11,13 +11,18 @@ use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    crypto::sha256_hex,
     git::{GitRepository, HostPathPlatform, normalize_worktree_path_key, worktree_repository_key},
-    orchestration::{OrchestrationCommand, OrchestrationEngine, engine::OptionalNullable},
+    orchestration::{
+        OrchestrationCommand, OrchestrationEngine, OrchestrationError, engine::OptionalNullable,
+    },
     persistence::Repositories,
     rpc::{RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk},
     worktree_catalog::{
-        CatalogError, CatalogErrorReason, CatalogRefreshTrigger, WorktreeCatalogService,
-        WorktreeCatalogSnapshot,
+        AdoptionValidationError, AdoptionValidationErrorReason, CatalogError, CatalogErrorReason,
+        CatalogFuture, CatalogHealthySnapshotObserver, CatalogRefreshTrigger,
+        WorktreeAdoptionState, WorktreeCatalogService, WorktreeCatalogSnapshot,
+        WorktreeDirectoryState, WorktreeRegistrationState,
     },
 };
 
@@ -34,11 +39,118 @@ pub struct WorktreeCatalogRpcServices {
 impl WorktreeCatalogRpcServices {
     #[must_use]
     pub fn new(catalog: WorktreeCatalogService, orchestration: OrchestrationEngine) -> Self {
+        catalog.set_healthy_snapshot_observer(Arc::new(BranchReconciliationObserver {
+            orchestration: orchestration.clone(),
+        }));
         Self {
             catalog,
             orchestration,
         }
     }
+}
+
+#[derive(Clone)]
+struct BranchReconciliationObserver {
+    orchestration: OrchestrationEngine,
+}
+
+impl CatalogHealthySnapshotObserver for BranchReconciliationObserver {
+    fn observe(
+        &self,
+        project_id: String,
+        snapshot: Arc<WorktreeCatalogSnapshot>,
+    ) -> CatalogFuture<()> {
+        let observer = self.clone();
+        Box::pin(async move {
+            observer.reconcile(project_id, snapshot).await;
+        })
+    }
+}
+
+impl BranchReconciliationObserver {
+    async fn reconcile(&self, project_id: String, snapshot: Arc<WorktreeCatalogSnapshot>) {
+        if !snapshot.authoritative
+            || !matches!(
+                snapshot.scan_status,
+                crate::worktree_catalog::CatalogScanStatus::Ready
+            )
+        {
+            return;
+        }
+        let threads = match self
+            .orchestration
+            .repositories()
+            .list_threads_by_project(project_id.clone())
+            .await
+        {
+            Ok(threads) => threads,
+            Err(error) => {
+                tracing::warn!(project_id, %error, "could not load adopted threads for branch reconciliation");
+                return;
+            }
+        };
+        let mut candidates = snapshot
+            .worktrees
+            .iter()
+            .filter_map(|descriptor| {
+                (descriptor.adoption_state == WorktreeAdoptionState::Active)
+                    .then_some(descriptor.adopted_thread_id.as_deref())
+                    .flatten()
+                    .map(|thread_id| {
+                        (
+                            thread_id.to_owned(),
+                            descriptor.branch.clone(),
+                            descriptor.head.clone(),
+                        )
+                    })
+            })
+            .collect::<Vec<_>>();
+        candidates.sort_by(|left, right| left.0.cmp(&right.0));
+        candidates.dedup_by(|left, right| left.0 == right.0);
+        for (thread_id, branch, head) in candidates {
+            let Some(thread) = threads.iter().find(|thread| {
+                thread.thread_id == thread_id
+                    && thread.kind == "workspace"
+                    && thread.archived_at.is_none()
+                    && thread.deleted_at.is_none()
+                    && thread.worktree_path.is_some()
+            }) else {
+                continue;
+            };
+            if thread.branch == branch {
+                continue;
+            }
+            let command_id =
+                branch_reconciliation_command_id(&thread_id, branch.as_deref(), head.as_deref());
+            if let Err(error) = self
+                .orchestration
+                .dispatch(OrchestrationCommand::WorktreeBranchReconcileResolved {
+                    command_id,
+                    project_id: project_id.clone(),
+                    thread_id: thread_id.clone(),
+                    branch,
+                })
+                .await
+            {
+                tracing::warn!(project_id, thread_id, %error, "adopted worktree branch reconciliation failed");
+            }
+        }
+    }
+}
+
+fn branch_reconciliation_command_id(
+    thread_id: &str,
+    branch: Option<&str>,
+    head: Option<&str>,
+) -> String {
+    let mut identity = b"bibcode.worktree.branch-reconcile.v1\0".to_vec();
+    identity.extend_from_slice(branch.unwrap_or("<detached>").as_bytes());
+    identity.push(0);
+    identity.extend_from_slice(head.unwrap_or("<unknown>").as_bytes());
+    format!(
+        "worktree-branch-reconcile:{thread_id}:{}",
+        sha256_hex(identity)
+    )
 }
 
 #[derive(Clone)]
@@ -221,6 +333,12 @@ pub fn register_worktree_catalog_rpc(
         },
     );
 
+    let adoption_services = services.clone();
+    registry.register_unary("worktree.adopt", move |request, _cancellation| {
+        let services = adoption_services.clone();
+        async move { adopt_worktree(&services, request).await }
+    });
+
     registry.register_unary(
         "worktree.updateDiscoveryPolicy",
         move |request, _cancellation| {
@@ -228,6 +346,127 @@ pub fn register_worktree_catalog_rpc(
             async move { update_discovery_policy(&services, request).await }
         },
     );
+}
+
+async fn adopt_worktree(services: &WorktreeCatalogRpcServices, request: RpcRequest) -> RpcResult {
+    let input = decode::<WorktreeAdoptInput>(request)?;
+    let project_id = input.project_id.clone();
+    services
+        .catalog
+        .with_project_mutation_lock(&project_id, || async {
+            adopt_worktree_locked(services, input).await
+        })
+        .await
+}
+
+async fn adopt_worktree_locked(
+    services: &WorktreeCatalogRpcServices,
+    input: WorktreeAdoptInput,
+) -> RpcResult {
+    let (mut snapshot, refreshed) = match services.catalog.latest(&input.project_id).await {
+        Some(snapshot) => (snapshot, false),
+        None => services
+            .catalog
+            .refresh(&input.project_id, CatalogRefreshTrigger::Explicit)
+            .await
+            .map(|snapshot| (snapshot, true))
+            .map_err(|error| encode(adoption_catalog_error(error, None)))?,
+    };
+    if !refreshed && (!snapshot.authoritative || snapshot.generation != input.expected_generation) {
+        snapshot = services
+            .catalog
+            .refresh(&input.project_id, CatalogRefreshTrigger::Explicit)
+            .await
+            .map_err(|error| encode(adoption_catalog_error(error, Some(snapshot.generation))))?;
+    }
+    if !snapshot.authoritative || input.expected_generation > snapshot.generation {
+        return Err(encode(adoption_error(
+            WorktreeAdoptionErrorReason::StaleGeneration,
+            "The requested catalog generation is no longer usable for adoption.",
+            Some(snapshot.generation),
+        )));
+    }
+    let descriptor = snapshot
+        .worktrees
+        .iter()
+        .find(|worktree| worktree.worktree_key == input.worktree_key)
+        .ok_or_else(|| {
+            encode(adoption_error(
+                WorktreeAdoptionErrorReason::WorktreeNotFound,
+                "The selected worktree is not present in the current catalog.",
+                Some(snapshot.generation),
+            ))
+        })?;
+    let existing_owner = matches!(
+        descriptor.adoption_state,
+        WorktreeAdoptionState::Active | WorktreeAdoptionState::Archived
+    );
+    if (!descriptor.eligible_for_adoption && !existing_owner)
+        || descriptor.is_primary
+        || descriptor.is_bare
+        || descriptor.registration_state != WorktreeRegistrationState::Registered
+        || descriptor.directory_state != WorktreeDirectoryState::Present
+    {
+        return Err(encode(adoption_error(
+            WorktreeAdoptionErrorReason::Ineligible,
+            "The selected worktree is not currently eligible for adoption.",
+            Some(snapshot.generation),
+        )));
+    }
+    let resolved = services
+        .catalog
+        .resolve_adoption_candidate(&input.project_id, &input.worktree_key)
+        .await
+        .map_err(|error| encode(adoption_validation_error(error)))?;
+    let result = services
+        .orchestration
+        .dispatch(OrchestrationCommand::WorktreeAdoptResolved {
+            command_id: input.command_id,
+            project_id: input.project_id.clone(),
+            worktree_key: resolved.worktree_key,
+            path: resolved.path,
+            branch: resolved.branch,
+            head: resolved.head,
+            model_selection: input.thread_defaults.model_selection,
+            runtime_mode: input.thread_defaults.runtime_mode,
+            interaction_mode: input.thread_defaults.interaction_mode,
+        })
+        .await
+        .map_err(|error| {
+            let reason = match &error {
+                OrchestrationError::WorktreeOwnershipConflict { .. } => {
+                    WorktreeAdoptionErrorReason::OwnershipConflict
+                }
+                _ => WorktreeAdoptionErrorReason::OrchestrationFailed,
+            };
+            encode(adoption_error(
+                reason,
+                format!("Worktree adoption could not be persisted: {error}"),
+                Some(snapshot.generation),
+            ))
+        })?;
+    let thread_id = result.thread_id.ok_or_else(|| {
+        encode(adoption_error(
+            WorktreeAdoptionErrorReason::Internal,
+            "Worktree adoption completed without a thread result.",
+            Some(snapshot.generation),
+        ))
+    })?;
+    let disposition = result.disposition.ok_or_else(|| {
+        encode(adoption_error(
+            WorktreeAdoptionErrorReason::Internal,
+            "Worktree adoption completed without a disposition.",
+            Some(snapshot.generation),
+        ))
+    })?;
+    services
+        .catalog
+        .invalidate_after_mutation(&input.project_id)
+        .await;
+    Ok(encode(WorktreeAdoptResult {
+        thread_id,
+        disposition,
+    }))
 }
 
 fn catalog_stream(
@@ -376,6 +615,57 @@ struct WorktreeCatalogInput {
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct WorktreeAdoptInput {
+    command_id: String,
+    project_id: String,
+    worktree_key: String,
+    expected_generation: u64,
+    thread_defaults: WorktreeAdoptThreadDefaults,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeAdoptThreadDefaults {
+    model_selection: Value,
+    runtime_mode: String,
+    interaction_mode: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeAdoptResult {
+    thread_id: String,
+    disposition: String,
+}
+
+#[derive(Clone, Copy, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum WorktreeAdoptionErrorReason {
+    ProjectNotFound,
+    EnvironmentUnsupported,
+    WorktreeNotFound,
+    StaleGeneration,
+    Ineligible,
+    WorkspaceMissing,
+    RepositoryMismatch,
+    OwnershipConflict,
+    OrchestrationFailed,
+    Internal,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeAdoptionError {
+    #[serde(rename = "_tag")]
+    tag: &'static str,
+    reason: WorktreeAdoptionErrorReason,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_generation: Option<u64>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct WorktreeDiscoveryPolicyUpdateInput {
     command_id: String,
     project_id: String,
@@ -435,6 +725,53 @@ fn project_not_found() -> Value {
 
 fn policy_error(message: String) -> CatalogError {
     CatalogError::new(CatalogErrorReason::PolicyUpdateFailed, message)
+}
+
+fn adoption_error(
+    reason: WorktreeAdoptionErrorReason,
+    message: impl Into<String>,
+    current_generation: Option<u64>,
+) -> WorktreeAdoptionError {
+    WorktreeAdoptionError {
+        tag: "WorktreeAdoptionError",
+        reason,
+        message: crate::worktree_catalog::bounded_message(message.into()),
+        current_generation,
+    }
+}
+
+fn adoption_catalog_error(
+    error: CatalogError,
+    current_generation: Option<u64>,
+) -> WorktreeAdoptionError {
+    let reason = match error.reason {
+        CatalogErrorReason::ProjectNotFound => WorktreeAdoptionErrorReason::ProjectNotFound,
+        CatalogErrorReason::EnvironmentUnsupported => {
+            WorktreeAdoptionErrorReason::EnvironmentUnsupported
+        }
+        CatalogErrorReason::StaleGeneration => WorktreeAdoptionErrorReason::StaleGeneration,
+        CatalogErrorReason::RepositoryUnavailable
+        | CatalogErrorReason::PolicyUpdateFailed
+        | CatalogErrorReason::Internal => WorktreeAdoptionErrorReason::Internal,
+    };
+    adoption_error(reason, error.message, current_generation)
+}
+
+fn adoption_validation_error(error: AdoptionValidationError) -> WorktreeAdoptionError {
+    let reason = match error.reason {
+        AdoptionValidationErrorReason::WorktreeNotFound => {
+            WorktreeAdoptionErrorReason::WorktreeNotFound
+        }
+        AdoptionValidationErrorReason::Ineligible => WorktreeAdoptionErrorReason::Ineligible,
+        AdoptionValidationErrorReason::WorkspaceMissing => {
+            WorktreeAdoptionErrorReason::WorkspaceMissing
+        }
+        AdoptionValidationErrorReason::RepositoryMismatch => {
+            WorktreeAdoptionErrorReason::RepositoryMismatch
+        }
+        AdoptionValidationErrorReason::CatalogUnavailable => WorktreeAdoptionErrorReason::Internal,
+    };
+    adoption_error(reason, error.message, error.current_generation)
 }
 
 fn stale_generation(expected: u64, current: Option<u64>) -> CatalogError {

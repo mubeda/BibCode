@@ -54,6 +54,46 @@ pub struct WorktreeDescriptor {
     pub eligible_for_adoption: bool,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AdoptionValidationErrorReason {
+    WorktreeNotFound,
+    Ineligible,
+    WorkspaceMissing,
+    RepositoryMismatch,
+    CatalogUnavailable,
+}
+
+#[derive(Clone, Debug, Eq, Error, PartialEq)]
+#[error("{message}")]
+pub struct AdoptionValidationError {
+    pub reason: AdoptionValidationErrorReason,
+    pub message: String,
+    pub current_generation: Option<u64>,
+}
+
+impl AdoptionValidationError {
+    pub(crate) fn new(
+        reason: AdoptionValidationErrorReason,
+        message: impl Into<String>,
+        current_generation: Option<u64>,
+    ) -> Self {
+        Self {
+            reason,
+            message: bounded_message(message.into()),
+            current_generation,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ResolvedAdoptionCandidate {
+    pub worktree_key: String,
+    pub path: String,
+    pub branch: Option<String>,
+    pub head: Option<String>,
+    pub generation: u64,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdoptedWorktreeStatus {

@@ -79,6 +79,35 @@ That order prevents a project from switching mutexes while its durable trust
 pin is established while still serializing known cross-project repository
 aliases.
 
+`worktree.adopt` also requires `orchestration:operate`. Its public payload
+contains an opaque catalog key, expected generation, project ID, command ID,
+and ordinary thread defaults; it never accepts a checkout path. The handler
+holds the same stable project-then-physical-repository mutation locks. A stale
+or non-authoritative generation forces one bounded refresh before the server
+rechecks current registration, directory presence, nonprimary/nonbare
+eligibility, canonical common-directory membership, and canonical thread
+ownership. Present paths are canonicalized only after current Git membership
+is proven. Adoption is read-only with respect to Git: it never creates or
+repairs a worktree and never auto-runs a worktree-creation script.
+
+After resolution, the server dispatches internal
+`worktree.adopt-resolved` planning. The orchestration engine creates an
+ordinary workspace thread, returns an existing active owner, or restores an
+archived owner while updating the discovery baseline in the same
+`persist_command` transaction. The public result is exactly the canonical
+thread ID plus `created`, `existing`, or `restored`; replay of an accepted
+command returns the original disposition. Resolved adoption and branch
+reconciliation command variants are rejected by
+`orchestration.dispatchCommand` even though trusted server services may admit
+them directly.
+
+Every healthy authoritative catalog publication also compares active adopted
+worktrees with durable thread branch metadata. A change dispatches one
+idempotent `thread.meta-updated` command whose ID contains the thread ID plus a
+versioned hash of the observed branch and HEAD, never a path. Unchanged healthy
+observations emit nothing, and refreshing/degraded retained snapshots never
+reconcile branch state.
+
 The production runtime owns one catalog service built from the same Git
 repository and orchestration repositories used by Git/VCS and project state.
 Successful legacy create/remove worktree RPCs verify Git common-directory

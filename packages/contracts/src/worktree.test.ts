@@ -6,6 +6,7 @@ import {
   VcsAdoptedWorktreeStatus,
   VcsWorktreeCatalogSnapshot,
   VcsWorktreeDescriptor,
+  WorktreeAdoptResult,
   WorktreeAdoptionError,
   WorktreeCatalogError,
   WorktreeRemovalError,
@@ -16,6 +17,7 @@ import {
   WorktreeCatalogRefreshInput,
   WorktreeDiscoveryPolicyUpdateInput,
 } from "./worktree.ts";
+import { WorktreeAdoptInput } from "./rpc.ts";
 
 const decodeDescriptor = Schema.decodeUnknownSync(VcsWorktreeDescriptor);
 const encodeDescriptor = Schema.encodeSync(VcsWorktreeDescriptor);
@@ -36,6 +38,9 @@ const encodeRemovalError = Schema.encodeSync(WorktreeRemovalError);
 const decodeWorkspaceUnavailableError = Schema.decodeUnknownSync(WorkspaceUnavailableError);
 const encodeWorkspaceUnavailableError = Schema.encodeSync(WorkspaceUnavailableError);
 const decodeCatalogInput = Schema.decodeUnknownSync(WorktreeCatalogInput);
+const decodeAdoptInput = Schema.decodeUnknownSync(WorktreeAdoptInput);
+const encodeAdoptInput = Schema.encodeSync(WorktreeAdoptInput);
+const decodeAdoptResult = Schema.decodeUnknownSync(WorktreeAdoptResult);
 const decodeCatalogRefreshInput = Schema.decodeUnknownSync(WorktreeCatalogRefreshInput);
 const decodeDiscoveryPolicyUpdateInput = Schema.decodeUnknownSync(
   WorktreeDiscoveryPolicyUpdateInput,
@@ -56,6 +61,61 @@ const baseDescriptor = {
 } as const;
 
 describe("worktree catalog schemas", () => {
+  it("encodes adoption identity, generation, and ordinary thread defaults without a path", () => {
+    const decoded = decodeAdoptInput({
+      commandId: "command-adopt-1",
+      projectId: "project-1",
+      worktreeKey: "worktree-1",
+      expectedGeneration: 9,
+      threadDefaults: {
+        modelSelection: { instanceId: "codex", model: "gpt-5" },
+        runtimeMode: "full-access",
+        interactionMode: "plan",
+      },
+      path: "/client-controlled",
+    });
+
+    expect(encodeAdoptInput(decoded)).toEqual({
+      commandId: "command-adopt-1",
+      projectId: "project-1",
+      worktreeKey: "worktree-1",
+      expectedGeneration: 9,
+      threadDefaults: {
+        modelSelection: { instanceId: "codex", model: "gpt-5" },
+        runtimeMode: "full-access",
+        interactionMode: "plan",
+      },
+    });
+  });
+
+  it("decodes every adoption disposition", () => {
+    expect(
+      ["created", "existing", "restored"].map((disposition) =>
+        decodeAdoptResult({ threadId: "thread-1", disposition }),
+      ),
+    ).toEqual([
+      { threadId: "thread-1", disposition: "created" },
+      { threadId: "thread-1", disposition: "existing" },
+      { threadId: "thread-1", disposition: "restored" },
+    ]);
+  });
+
+  it("preserves the current generation on stale and ineligible adoption failures", () => {
+    expect(
+      ["stale-generation", "ineligible"].map((reason) =>
+        decodeAdoptionError({
+          _tag: "WorktreeAdoptionError",
+          reason,
+          message: "Adoption must be revalidated.",
+          currentGeneration: 12,
+        }),
+      ),
+    ).toMatchObject([
+      { reason: "stale-generation", currentGeneration: 12 },
+      { reason: "ineligible", currentGeneration: 12 },
+    ]);
+  });
+
   it("accepts project-scoped catalog reads without client-supplied paths", () => {
     expect(decodeCatalogInput({ projectId: "project-1" })).toEqual({ projectId: "project-1" });
     expect(decodeCatalogRefreshInput({ projectId: "project-1" })).toEqual({

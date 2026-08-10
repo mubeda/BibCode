@@ -67,7 +67,11 @@ flowchart TB
   refresh lock even if a dependency await is not cancellation-aware. A
   reattachment cannot inherit that project-view work or result, though it may
   coalesce with an exact-anchor observation still owned by an aliased
-  repository lifecycle.
+  repository lifecycle. External-checkout adoption is serialized by stable
+  project and physical-repository identity, revalidates live Git membership,
+  and persists canonical ordinary workspace ownership atomically without
+  creating Git state. Only healthy authoritative catalog observations may
+  reconcile durable adopted-thread branch metadata.
 - **Contracts (`packages/contracts`)** contains Effect schemas and TypeScript
   contracts only. It defines persisted models, RPC methods, HTTP APIs, desktop
   bridge values, and provider events without application runtime logic.
