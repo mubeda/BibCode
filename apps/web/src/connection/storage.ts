@@ -1,4 +1,5 @@
 import {
+  AcceptedStorageIdentityStore,
   ConnectionCatalogDocument,
   type ConnectionCatalogDocument as ConnectionCatalogDocumentType,
   ConnectionPersistenceError,
@@ -83,6 +84,18 @@ function persistenceError(
   return new ConnectionPersistenceError({
     operation,
     message: `Could not ${operation.replaceAll("-", " ")}: ${String(cause)}`,
+  });
+}
+
+function storageIdentityPersistenceError(
+  operation: "load-storage-identity" | "accept-storage-identity",
+) {
+  return new ConnectionPersistenceError({
+    operation,
+    message:
+      operation === "load-storage-identity"
+        ? "Could not load the accepted storage identity."
+        : "Could not accept the reported storage identity.",
   });
 }
 
@@ -424,6 +437,30 @@ export const connectionStorageLayer = Layer.effectContext(
           ),
         })),
     });
+    const acceptedStorageIdentityStore = AcceptedStorageIdentityStore.of({
+      get: (targetKey) =>
+        catalog.read.pipe(
+          Effect.map((document) =>
+            Option.fromUndefinedOr(
+              document.acceptedStorageIdentities.find(
+                (identity) => identity.targetKey === targetKey,
+              )?.storageInstanceId,
+            ),
+          ),
+          Effect.mapError(() => storageIdentityPersistenceError("load-storage-identity")),
+        ),
+      accept: (identity) =>
+        catalog
+          .update((document) => ({
+            ...document,
+            acceptedStorageIdentities: replaceCatalogValue(
+              document.acceptedStorageIdentities,
+              (value) => value.targetKey,
+              identity,
+            ),
+          }))
+          .pipe(Effect.mapError(() => storageIdentityPersistenceError("accept-storage-identity"))),
+    });
     const cacheStore = EnvironmentCacheStore.of({
       loadShell: (environmentId) =>
         readDatabaseValue(database, SHELL_STORE_NAME, environmentId).pipe(
@@ -532,6 +569,7 @@ export const connectionStorageLayer = Layer.effectContext(
       Context.add(ProfileStore.ConnectionProfileStore, profileStore),
       Context.add(CredentialStore.ConnectionCredentialStore, credentialStore),
       Context.add(TokenStore.RemoteDpopAccessTokenStore, remoteTokenStore),
+      Context.add(AcceptedStorageIdentityStore, acceptedStorageIdentityStore),
       Context.add(EnvironmentCacheStore, cacheStore),
     );
   }),

@@ -9,7 +9,10 @@ public package has no root export; callers use focused subpaths such as
 
 - `ConnectionResolver` converts a catalog entry into a `PreparedConnection`.
   It recovers profiles and credentials and performs bearer, DPoP, relay, or SSH
-  preparation as required by the target.
+  preparation as required by the target. Every prepared connection retains the
+  complete current `ExecutionEnvironmentDescriptor`; an unauthenticated primary
+  fetches the public descriptor, and bearer plus fresh or cached DPoP attempts
+  fetch it during every preparation rather than inferring it from a saved token.
 - Environment bootstrap decodes and retains the complete environment
   descriptor on `KnownEnvironment`, including its nullable
   `storageInstanceId`, rather than reducing it to a label and logical ID.
@@ -41,6 +44,35 @@ Canonical targets are defined in
 Bearer, relay, and SSH targets may be persisted in the connection catalog.
 Profiles and credentials remain separate so catalog metadata can be listed
 without exposing secrets.
+
+## Accepted storage identity
+
+The schema-v1 connection catalog additively stores accepted non-null storage
+identities without changing its schema version. Browser mode persists the whole
+catalog in IndexedDB. Desktop mode sends the same serialized catalog through
+the desktop bridge, which protects and restores it as one opaque value; neither
+path has a second storage-identity source.
+
+Accepted identities use target keys that remain stable when endpoints, labels,
+credentials, or local paths change:
+
+| Target  | Accepted-identity key   |
+| ------- | ----------------------- |
+| Primary | `platform:primary`      |
+| Bearer  | `bearer:<connectionId>` |
+| Relay   | `relay:<environmentId>` |
+| SSH     | `ssh:<connectionId>`    |
+
+Keys never contain bearer/DPoP credentials, endpoint URLs, SSH host/profile
+data, or filesystem paths. `AcceptedStorageIdentityStore` exposes atomic
+lookup and acceptance over the shared catalog. First observation, equality,
+change, and a version-skewed `null` report are represented as `Bootstrap`,
+`Accepted`, `Changed`, and `Unverifiable`; an unverifiable report does not erase
+an existing baseline.
+
+The current runtime provides persistence, comparison, and prepared-descriptor
+primitives. Connection supervision does not yet call them to block or adopt a
+changed store; that gating belongs at the pre-session synchronization boundary.
 
 ## State and retry policy
 
@@ -80,9 +112,11 @@ client state.
 the persistent-store UUID supplied by a current server on its initial
 descriptor. The descriptor decoder accepts an omitted field as `null` for
 older or third-party remote servers; it still validates any supplied value as
-a trimmed non-empty string. Store-acceptance persistence and mismatch policy
-are separate connection-supervision concerns and are not inferred by the
-bootstrap helper.
+a trimmed non-empty string. The connection catalog can retain the last
+explicitly accepted non-null value; an older descriptor reporting `null` never
+replaces it. Actual mismatch gating remains a separate connection-supervision
+concern and is not inferred by the bootstrap helper or authorization-token
+cache.
 
 See [Remote architecture](./remote.md) for access methods and
 [RPC and orchestration](./rpc-and-orchestration.md) for the wire boundary.

@@ -8,6 +8,7 @@ import {
   ProfileStore,
 } from "@bibcode/client-runtime/connection";
 import {
+  AcceptedStorageIdentityStore,
   ConnectionCatalogDocument,
   ConnectionRegistrationStore,
   ConnectionTargetStore,
@@ -36,6 +37,7 @@ const emptyCatalog = {
   profiles: [],
   credentials: [],
   remoteDpopTokens: [],
+  acceptedStorageIdentities: [],
 } as const;
 const decodeCatalog = Schema.decodeUnknownSync(Schema.fromJsonString(ConnectionCatalogDocument));
 const encodeCatalog = Schema.encodeSync(Schema.fromJsonString(ConnectionCatalogDocument));
@@ -528,6 +530,105 @@ describe("makeCatalogBackend (IndexedDB)", () => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe("connectionStorageLayer", () => {
+  it.effect("persists accepted identities through the desktop catalog bridge", () => {
+    installFakeIndexedDb();
+    let storedCatalog = encodeCatalog(emptyCatalog);
+    const setConnectionCatalog = vi.fn((raw: string) => {
+      storedCatalog = raw;
+      return Promise.resolve(true);
+    });
+    vi.stubGlobal("window", {
+      desktopBridge: {
+        getConnectionCatalog: vi.fn(() => Promise.resolve(storedCatalog)),
+        setConnectionCatalog,
+      },
+    });
+
+    return Effect.gen(function* () {
+      const identityStore = yield* AcceptedStorageIdentityStore;
+
+      yield* identityStore.accept({
+        targetKey: "platform:primary",
+        storageInstanceId: "store-desktop",
+      });
+
+      expect(yield* identityStore.get("platform:primary")).toEqual(Option.some("store-desktop"));
+      expect(decodeCatalog(storedCatalog).acceptedStorageIdentities).toEqual([
+        {
+          targetKey: "platform:primary",
+          storageInstanceId: "store-desktop",
+        },
+      ]);
+      expect(setConnectionCatalog).toHaveBeenCalledTimes(1);
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
+  it.effect("persists an accepted identity without altering catalog connection data", () => {
+    const handle = installFakeIndexedDb();
+    return Effect.gen(function* () {
+      const registrationStore = yield* ConnectionRegistrationStore;
+      const tokenStore = yield* TokenStore.RemoteDpopAccessTokenStore;
+      const identityStore = yield* AcceptedStorageIdentityStore;
+
+      yield* registrationStore.register(bearerRegistration());
+      yield* tokenStore.put(remoteToken);
+
+      const rawBefore = handle.stores.get("catalog")?.get("document");
+      expect(typeof rawBefore).toBe("string");
+      const before = decodeCatalog(rawBefore as string);
+
+      expect(Option.isNone(yield* identityStore.get("bearer:connection-1"))).toBe(true);
+      yield* identityStore.accept({
+        targetKey: "bearer:connection-1",
+        storageInstanceId: "store-a",
+      });
+
+      expect(yield* identityStore.get("bearer:connection-1")).toEqual(Option.some("store-a"));
+      const rawAfter = handle.stores.get("catalog")?.get("document");
+      expect(typeof rawAfter).toBe("string");
+      const after = decodeCatalog(rawAfter as string);
+      expect(after).toEqual({
+        ...before,
+        acceptedStorageIdentities: [
+          {
+            targetKey: "bearer:connection-1",
+            storageInstanceId: "store-a",
+          },
+        ],
+      });
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
+  it.effect("redacts identity persistence causes behind operation-specific errors", () => {
+    installFakeIndexedDb();
+    const leakedCause = "secret-token at /Users/alice/private/catalog.json";
+    vi.stubGlobal("window", {
+      desktopBridge: {
+        getConnectionCatalog: vi.fn().mockRejectedValue(new Error(leakedCause)),
+        setConnectionCatalog: vi.fn().mockRejectedValue(new Error(leakedCause)),
+      },
+    });
+
+    return Effect.gen(function* () {
+      const identityStore = yield* AcceptedStorageIdentityStore;
+
+      const loadError = yield* Effect.flip(identityStore.get("platform:primary"));
+      expect(loadError.operation).toBe("load-storage-identity");
+      expect(loadError.message).not.toContain("secret-token");
+      expect(loadError.message).not.toContain("/Users/alice");
+
+      const acceptError = yield* Effect.flip(
+        identityStore.accept({
+          targetKey: "platform:primary",
+          storageInstanceId: "store-a",
+        }),
+      );
+      expect(acceptError.operation).toBe("accept-storage-identity");
+      expect(acceptError.message).not.toContain("secret-token");
+      expect(acceptError.message).not.toContain("/Users/alice");
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
   it.effect("registers, reads, updates, and removes catalog-backed stores", () => {
     installFakeIndexedDb();
     return Effect.gen(function* () {
