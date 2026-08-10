@@ -617,10 +617,10 @@ describe("MessagesTimeline", () => {
     );
 
     expect(markup).toContain("Waiting for");
-    expect(markup).toContain(">0.0s<");
+    expect(markup).toContain(">0s<");
   });
 
-  it("renders the reversed dotted-square before a one-decimal waiting timer", async () => {
+  it("renders the reversed dotted-square before a whole-second waiting timer", async () => {
     const { MessagesTimeline } = await import("./MessagesTimeline");
     const startedAt = new Date(Date.now() - 30_000).toISOString();
     const markup = renderToStaticMarkup(
@@ -638,7 +638,7 @@ describe("MessagesTimeline", () => {
       markup.indexOf("Waiting for"),
     );
     expect(markup).toContain('style="animation-delay:-980ms"');
-    expect(markup).toMatch(/Waiting for <span[^>]*>(29\.9|30\.0|30\.1)s</);
+    expect(markup).toMatch(/Waiting for <span[^>]*>(29|30|31)s</);
     expect(markup).not.toContain("Working for");
   });
 
@@ -654,10 +654,10 @@ describe("MessagesTimeline", () => {
       />,
     );
 
-    expect(markup).toMatch(/1m (29\.9|30\.0|30\.1)s/);
+    expect(markup).toMatch(/1m (29|30|31)s/);
   });
 
-  it("formats the working timer with hours, minutes, and decimal seconds", async () => {
+  it("formats the working timer with hours, minutes, and whole seconds", async () => {
     const { MessagesTimeline } = await import("./MessagesTimeline");
     const startedAt = new Date(Date.now() - 3_690_000).toISOString();
     const markup = renderToStaticMarkup(
@@ -669,10 +669,10 @@ describe("MessagesTimeline", () => {
       />,
     );
 
-    expect(markup).toMatch(/1h 1m (29\.9|30\.0|30\.1)s/);
+    expect(markup).toMatch(/1h 1m (29|30|31)s/);
   });
 
-  it("retains zero minutes when an hour-scale timer includes decimal seconds", async () => {
+  it("retains zero minutes when an hour-scale timer includes seconds", async () => {
     const { MessagesTimeline } = await import("./MessagesTimeline");
     const startedAt = new Date(Date.now() - 3_650_000).toISOString();
     const markup = renderToStaticMarkup(
@@ -684,23 +684,86 @@ describe("MessagesTimeline", () => {
       />,
     );
 
-    expect(markup).toMatch(/1h 0m (49\.9|50\.0|50\.1)s/);
+    expect(markup).toMatch(/1h 0m (49|50|51)s/);
   });
 
-  it("updates the waiting timer every 100ms and clears the interval on unmount", async () => {
-    const intervalSpy = vi.spyOn(globalThis, "setInterval");
-    const clearIntervalSpy = vi.spyOn(globalThis, "clearInterval");
+  it("stops scheduling waiting timer paints after unmount", async () => {
+    const animationFrameHarness = installAnimationFrameHarness();
     await mountTimeline({
       isWorking: true,
       activeTurnStartedAt: new Date(Date.now() - 3_800).toISOString(),
       timelineEntries: [],
     });
 
-    expect(intervalSpy).toHaveBeenCalledWith(expect.any(Function), 100);
+    expect(animationFrameHarness.pendingCount()).toBeGreaterThan(0);
     const mounted = mountedTrees.pop()!;
     await act(async () => mounted.root.unmount());
     mounted.container.remove();
-    expect(clearIntervalSpy).toHaveBeenCalled();
+    expect(animationFrameHarness.pendingCount()).toBe(0);
+  });
+
+  it("advances the waiting timer on the next whole second when the source clock is ahead", async () => {
+    const animationFrameHarness = installAnimationFrameHarness();
+
+    const container = await mountTimeline({
+      isWorking: true,
+      activeTurnStartedAt: new Date(Date.now() + 2_000).toISOString(),
+      timelineEntries: [],
+    });
+    expect(container.textContent).toContain("Waiting for 0s");
+
+    await animationFrameHarness.advanceBy(120);
+    expect(container.textContent).toContain("Waiting for 0s");
+
+    await animationFrameHarness.advanceBy(900);
+
+    expect(container.textContent).toContain("Waiting for 1s");
+  });
+
+  it("starts advancing immediately while the turn start timestamp is still unknown", async () => {
+    const animationFrameHarness = installAnimationFrameHarness();
+
+    const container = await mountTimeline({
+      isWorking: true,
+      activeTurnStartedAt: null,
+      timelineEntries: [],
+    });
+    expect(container.textContent).toContain("Waiting for 0s");
+
+    await animationFrameHarness.advanceBy(120);
+    expect(container.textContent).toContain("Waiting for 0s");
+
+    await animationFrameHarness.advanceBy(900);
+
+    expect(container.textContent).toContain("Waiting for 1s");
+  });
+
+  it("does not move backward when the server replaces the local timer start", async () => {
+    const animationFrameHarness = installAnimationFrameHarness();
+    const MessagesTimeline = await loadMessagesTimeline();
+    const container = await mountTimeline({
+      isWorking: true,
+      activeTurnStartedAt: null,
+      timelineEntries: [],
+    });
+    await animationFrameHarness.advanceBy(1_250);
+    expect(container.textContent).toContain("Waiting for 1s");
+
+    const mounted = mountedTrees.at(-1)!;
+    await act(async () =>
+      mounted.root.render(
+        <MessagesTimeline
+          {...buildProps()}
+          isWorking
+          activeTurnStartedAt={new Date().toISOString()}
+          timelineEntries={[]}
+        />,
+      ),
+    );
+    expect(container.textContent).toContain("Waiting for 1s");
+
+    await animationFrameHarness.advanceBy(800);
+    expect(container.textContent).toContain("Waiting for 2s");
   });
 
   it("renders a failure marker for failed tool lifecycle entries", async () => {
@@ -795,6 +858,35 @@ async function mountTimeline(
   mountedTrees.push({ container, root });
   await act(async () => root.render(<MessagesTimeline {...buildProps()} {...props} />));
   return container;
+}
+
+function installAnimationFrameHarness(initialNowMs = 1_000) {
+  const animationFrames = new Map<number, FrameRequestCallback>();
+  let monotonicNowMs = initialNowMs;
+  let nextAnimationFrameId = 0;
+  vi.spyOn(globalThis.performance, "now").mockImplementation(() => monotonicNowMs);
+  vi.stubGlobal(
+    "requestAnimationFrame",
+    vi.fn((callback: FrameRequestCallback) => {
+      const id = ++nextAnimationFrameId;
+      animationFrames.set(id, callback);
+      return id;
+    }),
+  );
+  vi.stubGlobal(
+    "cancelAnimationFrame",
+    vi.fn((id: number) => animationFrames.delete(id)),
+  );
+
+  return {
+    pendingCount: () => animationFrames.size,
+    advanceBy: async (elapsedMs: number) => {
+      monotonicNowMs += elapsedMs;
+      const callbacks = [...animationFrames.values()];
+      animationFrames.clear();
+      await act(async () => callbacks.forEach((callback) => callback(monotonicNowMs)));
+    },
+  };
 }
 
 async function click(element: HTMLElement): Promise<void> {
@@ -1339,7 +1431,7 @@ describe("MessagesTimeline working timer resilience", () => {
     });
 
     expect(markup).toContain("Waiting for");
-    expect(markup).toContain(">0.0s<");
+    expect(markup).toContain(">0s<");
   });
 });
 
