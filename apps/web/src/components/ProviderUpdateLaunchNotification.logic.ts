@@ -271,6 +271,8 @@ export function getProviderUpdateProgressToastView(input: {
     (provider) => provider.updateState?.status === "unchanged",
   );
   if (unchangedProviders.length > 0) {
+    const unchangedMessage =
+      unchangedProviders.length === 1 ? unchangedProviders[0]?.updateState?.message : null;
     return {
       phase: "unchanged",
       type: "warning",
@@ -278,9 +280,11 @@ export function getProviderUpdateProgressToastView(input: {
         unchangedProviders.length === 1
           ? "Provider still needs an update"
           : "Providers still need updates",
-      description: `${formatProviderList(unchangedProviders)} ${
-        unchangedProviders.length === 1 ? "still appears" : "still appear"
-      } outdated. Check provider settings for details.`,
+      description:
+        unchangedMessage ??
+        `${formatProviderList(unchangedProviders)} ${
+          unchangedProviders.length === 1 ? "still appears" : "still appear"
+        } outdated. Check provider settings for details.`,
     };
   }
 
@@ -467,6 +471,8 @@ export function getProviderUpdateSidebarPillView(
     const unchangedProvider = unchangedProviders[0]!;
     const unchangedProviderName =
       PROVIDER_DISPLAY_NAMES[unchangedProvider.driver] ?? unchangedProvider.driver;
+    const unchangedMessage =
+      unchangedProviders.length === 1 ? unchangedProvider.updateState?.message : null;
     terminalCandidates.push({
       key: `unchanged:${unchangedProviders
         .map(
@@ -480,9 +486,11 @@ export function getProviderUpdateSidebarPillView(
         unchangedProviders.length === 1
           ? `${unchangedProviderName} still needs an update`
           : `${unchangedProviders.length} providers still need updates`,
-      description: `${formatProviderList(unchangedProviders)} ${
-        unchangedProviders.length === 1 ? "still appears" : "still appear"
-      } outdated. Review provider settings for details.`,
+      description:
+        unchangedMessage ??
+        `${formatProviderList(unchangedProviders)} ${
+          unchangedProviders.length === 1 ? "still appears" : "still appear"
+        } outdated. Review provider settings for details.`,
       dismissible: true,
     });
   }

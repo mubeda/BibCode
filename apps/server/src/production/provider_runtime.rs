@@ -1240,7 +1240,7 @@ pub async fn reconcile_abandoned_provider_sessions(
     engine: &OrchestrationEngine,
 ) -> Result<(), ProviderRuntimeError> {
     const RESTART_ERROR: &str =
-        "Provider session ended when BiBCode stopped. Start a new turn to reconnect.";
+        "Provider session ended when BiBCode stopped. Review delivery status before continuing.";
     let repositories = engine.repositories();
     let runtimes = repositories
         .list_provider_session_runtimes()
