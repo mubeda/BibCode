@@ -105,7 +105,9 @@ servers retain SQLite's supported multi-process read/write behavior. A
 read-only inspection connection determines the pending migration suffix without
 creating the migration ledger or changing persistent pragmas or user bytes. A
 genuinely new empty store applies its initial migrations without a redundant
-backup.
+backup. The reusable guard API also requires an explicit timeout and
+cancellation token; dropping a waiter cancels its blocking worker so it cannot
+become a hidden lock owner later.
 
 An existing store with pending migrations must publish a verified generation
 under
@@ -119,9 +121,21 @@ directories, atomically renames the generation, and reloads it for checksum and
 `quick_check` verification. Unix backup directories and files use `0700` and
 `0600`; Windows generations inherit the private data-root ACL. Only after that
 publication is verified may migration start or retention remove older verified
-generations. Retention keeps the newest three for the store and state kind;
-staging entries, symlinks, malformed manifests, location/identity mismatches,
-and failed verification are reported and never selected for deletion.
+generations. Every backup ancestor is identity-bound beneath the effective root,
+and symlink, junction, or reparse ancestors are rejected before generation
+writes. Verified generations contain exactly one singly-linked `state.sqlite`
+and one singly-linked `manifest.json`; their manifest ledger version must match
+an exact migration prefix recognized by the running binary, and their canonical
+UTC creation time must agree with the generation's filesystem publication time.
+Retention keeps the newest three for the store and state kind, ordered by that
+filesystem time with a backup-ID tie-break. It reopens and revalidates each
+expired generation, deletes only the two bound files, and removes the now-empty
+directory without recursive deletion. Staging entries, extra or linked content,
+malformed manifests, location or identity mismatches, future-schema ledgers,
+implausible timestamps, and failed verification are reported and never selected
+for deletion. Newly created backup ancestors and their parents are flushed
+before the next descendant is created on platforms that support directory
+syncing.
 
 ## Runtime topology
 

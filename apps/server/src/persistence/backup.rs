@@ -1,9 +1,10 @@
 use std::{
+    ffi::OsStr,
     fs::{self, File, OpenOptions},
     io::{Read, Write},
     path::{Path, PathBuf},
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime},
 };
 
 use rusqlite::{Connection, ErrorCode, OpenFlags};
@@ -14,7 +15,9 @@ use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
 use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
-use super::{Database, PersistenceError, PreparedStore, StateKind, StatePaths, StorageInstanceId};
+use super::{
+    Database, MIGRATIONS, PersistenceError, PreparedStore, StateKind, StatePaths, StorageInstanceId,
+};
 
 const BACKUP_FILE_NAME: &str = "state.sqlite";
 const MANIFEST_FILE_NAME: &str = "manifest.json";
@@ -24,6 +27,7 @@ const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(30);
 const LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
 const SQLITE_PROGRESS_OPS: i32 = 1_000;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
+const MAX_PUBLICATION_TIME_SKEW: Duration = Duration::from_secs(60);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -67,12 +71,52 @@ mod uuid_string {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    volume: u64,
+    file: u64,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PlainPathSnapshot {
+    identity: FileIdentity,
+    links: u64,
+    size: u64,
+    modified: SystemTime,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct VerifiedGenerationIdentity {
+    directory: FileIdentity,
+    database: FileIdentity,
+    manifest: FileIdentity,
+    publication_time: SystemTime,
+}
+
+#[derive(Clone, Debug)]
+struct BoundDirectory {
+    path: PathBuf,
+    canonical: PathBuf,
+    identity: FileIdentity,
+    volume: u64,
+}
+
+#[derive(Clone, Debug)]
+struct BackupStoreBoundary {
+    state_kind_value: StateKind,
+    root: BoundDirectory,
+    backups: BoundDirectory,
+    state_kind: BoundDirectory,
+    store: BoundDirectory,
+}
+
 #[derive(Clone, Debug)]
 pub struct VerifiedBackup {
     pub directory: PathBuf,
     pub database: PathBuf,
     pub manifest_path: PathBuf,
     pub manifest: BackupManifest,
+    identity: VerifiedGenerationIdentity,
 }
 
 impl VerifiedBackup {
@@ -169,55 +213,91 @@ pub enum BackupError {
     LockTimeout { path: PathBuf },
 }
 
+#[derive(Debug)]
 pub struct StoreOperationGuard {
     lock_file: File,
 }
 
 impl StoreOperationGuard {
-    pub fn acquire(effective_root: &Path) -> Result<Self, BackupError> {
+    pub async fn acquire(
+        effective_root: &Path,
+        cancellation: CancellationToken,
+        timeout: Duration,
+    ) -> Result<Self, BackupError> {
         let lock_path = effective_root.join(".bibcode-storage.lock");
-        let lock_file = open_private_lock_file(&lock_path)?;
-        lock_file.lock().map_err(|source| BackupError::Io {
-            path: lock_path,
-            source,
-        })?;
-        Ok(Self { lock_file })
-    }
-
-    pub(crate) async fn acquire_for_startup(paths: &StatePaths) -> Result<Self, BackupError> {
-        let lock_path = paths.operation_lock.clone();
-        let cancellation = CancellationToken::new();
-        let _cancel_on_drop = CancelOnDrop(cancellation.clone());
-        tokio::task::spawn_blocking(move || {
-            let lock_file = open_private_lock_file(&lock_path)?;
-            let deadline = Instant::now()
-                .checked_add(LOCK_WAIT_TIMEOUT)
+        let deadline =
+            Instant::now()
+                .checked_add(timeout)
                 .ok_or_else(|| BackupError::LockTimeout {
                     path: lock_path.clone(),
                 })?;
-            loop {
-                if cancellation.is_cancelled() {
-                    return Err(BackupError::Cancelled);
+        let abort = CancellationToken::new();
+        let _cancel_on_drop = CancelOnDrop(abort.clone());
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let worker = tokio::task::spawn_blocking(move || {
+            let result =
+                acquire_operation_lock_blocking(lock_path, &cancellation, &abort, deadline);
+            let _ = sender.send(result);
+        });
+        let result = receiver.await;
+        worker.await.map_err(BackupError::Worker)?;
+        result.map_err(|_| {
+            BackupError::Verification("operation-lock worker returned no result".to_owned())
+        })?
+    }
+
+    pub(crate) async fn acquire_for_startup(paths: &StatePaths) -> Result<Self, BackupError> {
+        Self::acquire(&paths.base_dir, CancellationToken::new(), LOCK_WAIT_TIMEOUT).await
+    }
+}
+
+fn acquire_operation_lock_blocking(
+    lock_path: PathBuf,
+    cancellation: &CancellationToken,
+    abort: &CancellationToken,
+    deadline: Instant,
+) -> Result<StoreOperationGuard, BackupError> {
+    let lock_file = open_private_lock_file(&lock_path)?;
+    loop {
+        ensure_lock_wait_active(&lock_path, cancellation, abort, deadline)?;
+        match lock_file.try_lock() {
+            Ok(()) => {
+                if let Err(error) =
+                    ensure_lock_wait_active(&lock_path, cancellation, abort, deadline)
+                {
+                    let _ = lock_file.unlock();
+                    return Err(error);
                 }
-                if Instant::now() >= deadline {
-                    return Err(BackupError::LockTimeout { path: lock_path });
-                }
-                match lock_file.try_lock() {
-                    Ok(()) => return Ok(Self { lock_file }),
-                    Err(std::fs::TryLockError::WouldBlock) => {
-                        thread::sleep(LOCK_RETRY_DELAY);
-                    }
-                    Err(std::fs::TryLockError::Error(source)) => {
-                        return Err(BackupError::Io {
-                            path: lock_path,
-                            source,
-                        });
-                    }
-                }
+                return Ok(StoreOperationGuard { lock_file });
             }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                thread::sleep(LOCK_RETRY_DELAY.min(remaining));
+            }
+            Err(std::fs::TryLockError::Error(source)) => {
+                return Err(BackupError::Io {
+                    path: lock_path,
+                    source,
+                });
+            }
+        }
+    }
+}
+
+fn ensure_lock_wait_active(
+    lock_path: &Path,
+    cancellation: &CancellationToken,
+    abort: &CancellationToken,
+    deadline: Instant,
+) -> Result<(), BackupError> {
+    if cancellation.is_cancelled() || abort.is_cancelled() {
+        Err(BackupError::Cancelled)
+    } else if Instant::now() >= deadline {
+        Err(BackupError::LockTimeout {
+            path: lock_path.to_path_buf(),
         })
-        .await
-        .map_err(BackupError::Worker)?
+    } else {
+        Ok(())
     }
 }
 
@@ -239,6 +319,12 @@ impl Drop for CancelOnDrop {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BackupFault {
     None,
+    BeforeBackupsDirectorySync,
+    BeforeBackupsParentSync,
+    BeforeStateKindDirectorySync,
+    BeforeStateKindParentSync,
+    BeforeStoreDirectorySync,
+    BeforeStoreParentSync,
     BeforeQuickCheck,
     BeforeHash,
     BeforeDatabaseSync,
@@ -289,13 +375,14 @@ pub async fn create_verified_backup(
                 backup_id,
                 &cancellation,
                 deadline,
+                BackupFault::None,
             )
         }
     })
     .await
     .map_err(BackupError::Worker)??;
 
-    let result = async {
+    async {
         database
             .backup_to_cancellable(&staging.database, cancellation.clone(), deadline)
             .await?;
@@ -321,15 +408,7 @@ pub async fn create_verified_backup(
         .map_err(BackupError::Worker)??;
         Ok(verified)
     }
-    .await;
-
-    if result.is_err() {
-        let staging_directory = paths
-            .backup_store_dir(storage_instance_id)
-            .join(format!(".{backup_id}.staging"));
-        let _ = tokio::task::spawn_blocking(move || fs::remove_dir_all(staging_directory)).await;
-    }
-    result
+    .await
 }
 
 pub async fn inventory_verified_backups(
@@ -354,9 +433,411 @@ pub async fn inventory_verified_backups(
     .map_err(BackupError::Worker)?
 }
 
+impl BackupStoreBoundary {
+    fn open_or_create(
+        paths: &StatePaths,
+        storage_instance_id: StorageInstanceId,
+        fault: BackupFault,
+    ) -> Result<Self, BackupError> {
+        let root = inspect_root_directory(&paths.base_dir)?;
+        let backups = ensure_backup_component(
+            &root,
+            &paths.backups_dir,
+            true,
+            fault,
+            BackupFault::BeforeBackupsDirectorySync,
+            BackupFault::BeforeBackupsParentSync,
+        )?
+        .expect("creating the backups directory returns a boundary");
+        let state_kind_path = paths.backups_dir.join(state_kind_name(paths.state_kind));
+        let state_kind = ensure_backup_component(
+            &backups,
+            &state_kind_path,
+            true,
+            fault,
+            BackupFault::BeforeStateKindDirectorySync,
+            BackupFault::BeforeStateKindParentSync,
+        )?
+        .expect("creating the state-kind directory returns a boundary");
+        let store_path = paths.backup_store_dir(storage_instance_id);
+        let store = ensure_backup_component(
+            &state_kind,
+            &store_path,
+            true,
+            fault,
+            BackupFault::BeforeStoreDirectorySync,
+            BackupFault::BeforeStoreParentSync,
+        )?
+        .expect("creating the backup-store directory returns a boundary");
+        let boundary = Self {
+            state_kind_value: paths.state_kind,
+            root,
+            backups,
+            state_kind,
+            store,
+        };
+        boundary.revalidate()?;
+        Ok(boundary)
+    }
+
+    fn open_existing(
+        paths: &StatePaths,
+        storage_instance_id: StorageInstanceId,
+    ) -> Result<Option<Self>, BackupError> {
+        let root = inspect_root_directory(&paths.base_dir)?;
+        let Some(backups) = ensure_backup_component(
+            &root,
+            &paths.backups_dir,
+            false,
+            BackupFault::None,
+            BackupFault::None,
+            BackupFault::None,
+        )?
+        else {
+            return Ok(None);
+        };
+        let state_kind_path = paths.backups_dir.join(state_kind_name(paths.state_kind));
+        let Some(state_kind) = ensure_backup_component(
+            &backups,
+            &state_kind_path,
+            false,
+            BackupFault::None,
+            BackupFault::None,
+            BackupFault::None,
+        )?
+        else {
+            return Ok(None);
+        };
+        let store_path = paths.backup_store_dir(storage_instance_id);
+        let Some(store) = ensure_backup_component(
+            &state_kind,
+            &store_path,
+            false,
+            BackupFault::None,
+            BackupFault::None,
+            BackupFault::None,
+        )?
+        else {
+            return Ok(None);
+        };
+        let boundary = Self {
+            state_kind_value: paths.state_kind,
+            root,
+            backups,
+            state_kind,
+            store,
+        };
+        boundary.revalidate()?;
+        Ok(Some(boundary))
+    }
+
+    fn revalidate(&self) -> Result<(), BackupError> {
+        self.root.revalidate(None)?;
+        self.backups.revalidate(Some(&self.root))?;
+        self.state_kind.revalidate(Some(&self.backups))?;
+        self.store.revalidate(Some(&self.state_kind))
+    }
+}
+
+impl BoundDirectory {
+    fn revalidate(&self, parent: Option<&Self>) -> Result<(), BackupError> {
+        let current = match parent {
+            Some(parent) => inspect_child_directory(parent, &self.path)?,
+            None => inspect_root_directory(&self.path)?,
+        };
+        if current.identity != self.identity
+            || current.canonical != self.canonical
+            || current.volume != self.volume
+        {
+            return Err(BackupError::Verification(format!(
+                "backup directory identity changed: {}",
+                self.path.display()
+            )));
+        }
+        Ok(())
+    }
+}
+
+fn state_kind_name(state_kind: StateKind) -> &'static str {
+    match state_kind {
+        StateKind::Userdata => "userdata",
+        StateKind::Dev => "dev",
+    }
+}
+
+fn ensure_backup_component(
+    parent: &BoundDirectory,
+    path: &Path,
+    create: bool,
+    fault: BackupFault,
+    before_directory_sync: BackupFault,
+    before_parent_sync: BackupFault,
+) -> Result<Option<BoundDirectory>, BackupError> {
+    parent.revalidate(None)?;
+    let created = match fs::symlink_metadata(path) {
+        Ok(_) => false,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound && create => {
+            create_private_directory(path)?;
+            true
+        }
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(BackupError::Io {
+                path: path.to_path_buf(),
+                source,
+            });
+        }
+    };
+    let mut directory = inspect_child_directory(parent, path)?;
+    if create {
+        set_private_directory_permissions(path)?;
+        directory = inspect_child_directory(parent, path)?;
+    }
+    if created {
+        fault.inject(before_directory_sync)?;
+        sync_directory(path)?;
+        fault.inject(before_parent_sync)?;
+        parent.revalidate(None)?;
+        sync_directory(&parent.path)?;
+        directory = inspect_child_directory(parent, path)?;
+    }
+    Ok(Some(directory))
+}
+
+fn path_parent(path: &Path) -> Result<&Path, BackupError> {
+    path.parent().ok_or_else(|| {
+        BackupError::Verification("backup component has no parent directory".to_owned())
+    })
+}
+
+fn inspect_root_directory(path: &Path) -> Result<BoundDirectory, BackupError> {
+    let snapshot = plain_path_snapshot(path, PlainPathKind::Directory)?;
+    let canonical = fs::canonicalize(path).map_err(|source| BackupError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let confirmed = plain_path_snapshot(path, PlainPathKind::Directory)?;
+    if confirmed.identity != snapshot.identity {
+        return Err(BackupError::Verification(
+            "backup directory identity changed during inspection".to_owned(),
+        ));
+    }
+    Ok(BoundDirectory {
+        path: path.to_path_buf(),
+        canonical,
+        identity: snapshot.identity,
+        volume: snapshot.identity.volume,
+    })
+}
+
+fn inspect_child_directory(
+    parent: &BoundDirectory,
+    path: &Path,
+) -> Result<BoundDirectory, BackupError> {
+    let named_parent = path_parent(path)?;
+    if named_parent != parent.path {
+        return Err(BackupError::Verification(
+            "backup directory is not the expected direct child".to_owned(),
+        ));
+    }
+    let snapshot = plain_path_snapshot(path, PlainPathKind::Directory)?;
+    if snapshot.identity.volume != parent.volume {
+        return Err(BackupError::Verification(
+            "backup directory crossed a filesystem boundary".to_owned(),
+        ));
+    }
+    let canonical = fs::canonicalize(path).map_err(|source| BackupError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let expected = parent.canonical.join(
+        path.file_name()
+            .ok_or_else(|| BackupError::Verification("backup child has no name".to_owned()))?,
+    );
+    if canonical != expected || !canonical.starts_with(&parent.canonical) {
+        return Err(BackupError::Verification(
+            "backup directory escapes its trusted parent".to_owned(),
+        ));
+    }
+    let confirmed = plain_path_snapshot(path, PlainPathKind::Directory)?;
+    if confirmed.identity != snapshot.identity {
+        return Err(BackupError::Verification(
+            "backup directory identity changed during inspection".to_owned(),
+        ));
+    }
+    Ok(BoundDirectory {
+        path: path.to_path_buf(),
+        canonical,
+        identity: snapshot.identity,
+        volume: parent.volume,
+    })
+}
+
+#[derive(Clone, Copy)]
+enum PlainPathKind {
+    Directory,
+    File,
+}
+
+fn plain_path_snapshot(path: &Path, kind: PlainPathKind) -> Result<PlainPathSnapshot, BackupError> {
+    let named = fs::symlink_metadata(path).map_err(|source| BackupError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let correct_named_type = match kind {
+        PlainPathKind::Directory => named.is_dir(),
+        PlainPathKind::File => named.is_file(),
+    };
+    if named.file_type().is_symlink() || is_reparse_point(&named) || !correct_named_type {
+        return Err(BackupError::Verification(format!(
+            "{} is not a plain {}",
+            path.display(),
+            match kind {
+                PlainPathKind::Directory => "directory",
+                PlainPathKind::File => "file",
+            }
+        )));
+    }
+    let file = open_path_without_following(path, kind).map_err(|source| BackupError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let metadata = file.metadata().map_err(|source| BackupError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let correct_opened_type = match kind {
+        PlainPathKind::Directory => metadata.is_dir(),
+        PlainPathKind::File => metadata.is_file(),
+    };
+    if is_reparse_point(&metadata) || !correct_opened_type {
+        return Err(BackupError::Verification(
+            "backup path changed type while it was opened".to_owned(),
+        ));
+    }
+    let snapshot = file_snapshot(&file, &metadata).map_err(|source| BackupError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    if matches!(kind, PlainPathKind::File) && snapshot.links != 1 {
+        return Err(BackupError::Verification(
+            "backup file has an untrusted hard-link count".to_owned(),
+        ));
+    }
+    Ok(snapshot)
+}
+
+#[cfg(unix)]
+fn open_path_without_following(path: &Path, kind: PlainPathKind) -> std::io::Result<File> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let directory_flag = if matches!(kind, PlainPathKind::Directory) {
+        libc::O_DIRECTORY
+    } else {
+        0
+    };
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | directory_flag)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_path_without_following(path: &Path, kind: PlainPathKind) -> std::io::Result<File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+        FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+    };
+
+    let directory_flag = if matches!(kind, PlainPathKind::Directory) {
+        FILE_FLAG_BACKUP_SEMANTICS
+    } else {
+        0
+    };
+    OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | directory_flag)
+        .open(path)
+}
+
+#[cfg(not(any(unix, windows)))]
+fn open_path_without_following(path: &Path, _kind: PlainPathKind) -> std::io::Result<File> {
+    File::open(path)
+}
+
+#[cfg(unix)]
+fn file_snapshot(_file: &File, metadata: &fs::Metadata) -> std::io::Result<PlainPathSnapshot> {
+    use std::os::unix::fs::MetadataExt;
+
+    Ok(PlainPathSnapshot {
+        identity: FileIdentity {
+            volume: metadata.dev(),
+            file: metadata.ino(),
+        },
+        links: metadata.nlink(),
+        size: metadata.len(),
+        modified: metadata.modified()?,
+    })
+}
+
+#[cfg(windows)]
+fn file_snapshot(file: &File, metadata: &fs::Metadata) -> std::io::Result<PlainPathSnapshot> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    let succeeded =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let information = unsafe { information.assume_init() };
+    Ok(PlainPathSnapshot {
+        identity: FileIdentity {
+            volume: u64::from(information.dwVolumeSerialNumber),
+            file: (u64::from(information.nFileIndexHigh) << 32)
+                | u64::from(information.nFileIndexLow),
+        },
+        links: u64::from(information.nNumberOfLinks),
+        size: metadata.len(),
+        modified: metadata.modified()?,
+    })
+}
+
+#[cfg(not(any(unix, windows)))]
+fn file_snapshot(_file: &File, metadata: &fs::Metadata) -> std::io::Result<PlainPathSnapshot> {
+    Ok(PlainPathSnapshot {
+        identity: FileIdentity { volume: 0, file: 0 },
+        links: 1,
+        size: metadata.len(),
+        modified: metadata.modified()?,
+    })
+}
+
+#[cfg(windows)]
+fn is_reparse_point(metadata: &fs::Metadata) -> bool {
+    use std::os::windows::fs::MetadataExt;
+
+    metadata.file_attributes() & 0x400 != 0
+}
+
+#[cfg(not(windows))]
+fn is_reparse_point(_metadata: &fs::Metadata) -> bool {
+    false
+}
+
+#[derive(Debug)]
 struct StagedBackup {
+    boundary: BackupStoreBoundary,
     directory: PathBuf,
+    directory_identity: FileIdentity,
     database: PathBuf,
+    database_identity: FileIdentity,
     database_reservation: File,
     manifest: PathBuf,
     final_directory: PathBuf,
@@ -368,24 +849,31 @@ fn prepare_staging_directory(
     backup_id: Uuid,
     cancellation: &CancellationToken,
     deadline: Instant,
+    fault: BackupFault,
 ) -> Result<StagedBackup, BackupError> {
     ensure_active(cancellation, Some(deadline))?;
-    let store_directory = paths.backup_store_dir(storage_instance_id);
-    let state_kind_directory = store_directory
-        .parent()
-        .expect("backup store directory has a state-kind parent");
-    for directory in [&paths.backups_dir, state_kind_directory, &store_directory] {
-        create_private_directories(directory)?;
-    }
-    let directory = store_directory.join(format!(".{backup_id}.staging"));
+    let boundary = BackupStoreBoundary::open_or_create(paths, storage_instance_id, fault)?;
+    boundary.revalidate()?;
+    let directory = boundary.store.path.join(format!(".{backup_id}.staging"));
     create_private_directory(&directory)?;
+    let staged_directory = inspect_child_directory(&boundary.store, &directory)?;
+    sync_directory(&directory)?;
+    sync_directory(&boundary.store.path)?;
     let database = directory.join(BACKUP_FILE_NAME);
     let database_reservation = private_create_new(&database)?;
+    let database_identity = plain_path_snapshot(&database, PlainPathKind::File)?.identity;
     Ok(StagedBackup {
+        boundary,
         database,
+        database_identity,
         database_reservation,
         manifest: directory.join(MANIFEST_FILE_NAME),
-        final_directory: store_directory.join(backup_id.to_string()),
+        final_directory: staged_directory
+            .path
+            .parent()
+            .expect("staging directory has a store parent")
+            .join(backup_id.to_string()),
+        directory_identity: staged_directory.identity,
         directory,
     })
 }
@@ -404,8 +892,14 @@ fn finish_and_publish_backup(
     fault: BackupFault,
 ) -> Result<VerifiedBackup, BackupError> {
     ensure_active(cancellation, Some(deadline))?;
+    let named_database = plain_path_snapshot(&staging.database, PlainPathKind::File)?;
+    if named_database.identity != staging.database_identity {
+        return Err(BackupError::Verification(
+            "staged database identity changed during online backup".to_owned(),
+        ));
+    }
+    set_private_open_file_permissions(&staging.database_reservation, &staging.database)?;
     drop(staging.database_reservation);
-    set_private_file_permissions(&staging.database)?;
     fault.inject(BackupFault::BeforeQuickCheck)?;
     let integrity = quick_check_database(&staging.database, Some(cancellation), Some(deadline))?;
     if integrity != "ok" {
@@ -414,7 +908,8 @@ fn finish_and_publish_backup(
             detail: integrity,
         });
     }
-    let schema_version = backup_schema_version(&staging.database, cancellation, deadline)?;
+    let schema_version =
+        backup_schema_version(&staging.database, Some(cancellation), Some(deadline))?;
     fault.inject(BackupFault::BeforeHash)?;
     let (database_size_bytes, sha256) =
         database_size_and_hash(&staging.database, Some(cancellation), Some(deadline))?;
@@ -436,23 +931,48 @@ fn finish_and_publish_backup(
     fault.inject(BackupFault::BeforeStagingSync)?;
     sync_directory(&staging.directory)?;
     ensure_active(cancellation, Some(deadline))?;
+    staging.boundary.revalidate()?;
+    let staged_directory = inspect_child_directory(&staging.boundary.store, &staging.directory)?;
+    if staged_directory.identity != staging.directory_identity {
+        return Err(BackupError::Verification(
+            "backup staging directory identity changed before publication".to_owned(),
+        ));
+    }
+    match fs::symlink_metadata(&staging.final_directory) {
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
+        Ok(_) => {
+            return Err(BackupError::Verification(
+                "backup generation destination already exists".to_owned(),
+            ));
+        }
+        Err(source) => {
+            return Err(BackupError::Io {
+                path: staging.final_directory.clone(),
+                source,
+            });
+        }
+    }
     fault.inject(BackupFault::BeforePublish)?;
     fs::rename(&staging.directory, &staging.final_directory).map_err(|source| BackupError::Io {
         path: staging.final_directory.clone(),
         source,
     })?;
-    let store_directory = staging
-        .final_directory
-        .parent()
-        .expect("backup generation has a parent");
+    staging.boundary.revalidate()?;
+    let published_directory =
+        inspect_child_directory(&staging.boundary.store, &staging.final_directory)?;
+    if published_directory.identity != staging.directory_identity {
+        return Err(BackupError::Verification(
+            "published backup directory identity differs from its stage".to_owned(),
+        ));
+    }
     fault.inject(BackupFault::BeforeParentSync)?;
-    sync_directory(store_directory)?;
+    sync_directory(&staging.boundary.store.path)?;
 
     fault.inject(BackupFault::BeforeReloadVerification)?;
     let verified = verify_generation(
+        &staging.boundary,
         &staging.final_directory,
         backup_id,
-        paths.state_kind,
         storage_instance_id,
         Some(cancellation),
         Some(deadline),
@@ -474,19 +994,15 @@ fn inventory_blocking(
     deadline: Option<Instant>,
 ) -> Result<BackupInventory, BackupError> {
     ensure_optional_active(cancellation, deadline)?;
-    let store_directory = paths.backup_store_dir(storage_instance_id);
-    let entries = match fs::read_dir(&store_directory) {
-        Ok(entries) => entries,
-        Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(BackupInventory::default());
-        }
-        Err(source) => {
-            return Err(BackupError::Io {
-                path: store_directory,
-                source,
-            });
-        }
+    let Some(boundary) = BackupStoreBoundary::open_existing(paths, storage_instance_id)? else {
+        return Ok(BackupInventory::default());
     };
+    boundary.revalidate()?;
+    let store_directory = boundary.store.path.clone();
+    let entries = fs::read_dir(&store_directory).map_err(|source| BackupError::Io {
+        path: store_directory.clone(),
+        source,
+    })?;
     let mut inventory = BackupInventory::default();
     for entry in entries {
         ensure_optional_active(cancellation, deadline)?;
@@ -520,9 +1036,9 @@ fn inventory_blocking(
             continue;
         }
         match verify_generation(
+            &boundary,
             &entry.path(),
             backup_id,
-            paths.state_kind,
             storage_instance_id,
             cancellation,
             deadline,
@@ -534,40 +1050,33 @@ fn inventory_blocking(
             }),
         }
     }
+    boundary.revalidate()?;
     inventory.verified.sort_by(|left, right| {
-        let left_created_at = OffsetDateTime::parse(&left.manifest.created_at, &Rfc3339)
-            .expect("verified backup has a parsed creation time");
-        let right_created_at = OffsetDateTime::parse(&right.manifest.created_at, &Rfc3339)
-            .expect("verified backup has a parsed creation time");
-        left_created_at
-            .cmp(&right_created_at)
+        left.identity
+            .publication_time
+            .cmp(&right.identity.publication_time)
             .then_with(|| left.manifest.backup_id.cmp(&right.manifest.backup_id))
     });
     Ok(inventory)
 }
 
 fn verify_generation(
+    boundary: &BackupStoreBoundary,
     directory: &Path,
     expected_backup_id: Uuid,
-    expected_state_kind: StateKind,
     expected_storage_instance_id: StorageInstanceId,
     cancellation: Option<&CancellationToken>,
     deadline: Option<Instant>,
 ) -> Result<VerifiedBackup, BackupError> {
     ensure_optional_active(cancellation, deadline)?;
-    let metadata = fs::symlink_metadata(directory).map_err(|source| BackupError::Io {
-        path: directory.to_path_buf(),
-        source,
-    })?;
-    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
-        return Err(BackupError::Verification(
-            "generation is not a plain directory".to_owned(),
-        ));
-    }
+    boundary.revalidate()?;
+    let generation = inspect_child_directory(&boundary.store, directory)?;
+    let directory_snapshot = plain_path_snapshot(directory, PlainPathKind::Directory)?;
+    ensure_exact_generation_entries(directory)?;
     let manifest_path = directory.join(MANIFEST_FILE_NAME);
     let database = directory.join(BACKUP_FILE_NAME);
-    ensure_plain_file(&manifest_path)?;
-    ensure_plain_file(&database)?;
+    let manifest_snapshot = inspect_plain_child_file(&generation, &manifest_path)?;
+    let database_snapshot = inspect_plain_child_file(&generation, &database)?;
     let manifest = serde_json::from_slice::<BackupManifest>(&read_manifest_bytes(&manifest_path)?)
         .map_err(|source| BackupError::ManifestDecode {
             path: manifest_path.clone(),
@@ -575,7 +1084,7 @@ fn verify_generation(
         })?;
     if manifest.backup_id != expected_backup_id
         || manifest.storage_instance_id != expected_storage_instance_id
-        || manifest.state_kind != expected_state_kind
+        || manifest.state_kind != boundary.state_kind_value
     {
         return Err(BackupError::Verification(
             "manifest identity does not match its trusted inventory location".to_owned(),
@@ -587,6 +1096,25 @@ fn verify_generation(
     if created_at.offset() != UtcOffset::UTC {
         return Err(BackupError::Verification(
             "manifest creation time is not RFC 3339 UTC".to_owned(),
+        ));
+    }
+    let canonical_created_at = created_at.format(&Rfc3339).map_err(|error| {
+        BackupError::Verification(format!(
+            "manifest UTC time could not be canonicalized: {error}"
+        ))
+    })?;
+    if canonical_created_at != manifest.created_at {
+        return Err(BackupError::Verification(
+            "manifest creation time is not canonical RFC 3339 UTC".to_owned(),
+        ));
+    }
+    let publication_time = OffsetDateTime::from(directory_snapshot.modified);
+    let time_skew = created_at
+        .unix_timestamp_nanos()
+        .abs_diff(publication_time.unix_timestamp_nanos());
+    if time_skew > MAX_PUBLICATION_TIME_SKEW.as_nanos() {
+        return Err(BackupError::Verification(
+            "manifest creation time does not match trusted publication time".to_owned(),
         ));
     }
     if manifest.sha256.len() != 64
@@ -605,6 +1133,12 @@ fn verify_generation(
             "manifest size or checksum does not match database".to_owned(),
         ));
     }
+    let schema_version = backup_schema_version(&database, cancellation, deadline)?;
+    if schema_version != manifest.schema_version {
+        return Err(BackupError::Verification(
+            "manifest schema version does not match the backup ledger".to_owned(),
+        ));
+    }
     let integrity = quick_check_database(&database, cancellation, deadline)?;
     if integrity != "ok" {
         return Err(BackupError::QuickCheck {
@@ -612,12 +1146,101 @@ fn verify_generation(
             detail: integrity,
         });
     }
+    boundary.revalidate()?;
+    ensure_exact_generation_entries(directory)?;
+    let confirmed_generation = inspect_child_directory(&boundary.store, directory)?;
+    let confirmed_directory = plain_path_snapshot(directory, PlainPathKind::Directory)?;
+    let confirmed_manifest = inspect_plain_child_file(&confirmed_generation, &manifest_path)?;
+    let confirmed_database = inspect_plain_child_file(&confirmed_generation, &database)?;
+    if confirmed_generation.identity != generation.identity
+        || confirmed_directory != directory_snapshot
+        || confirmed_manifest != manifest_snapshot
+        || confirmed_database != database_snapshot
+    {
+        return Err(BackupError::Verification(
+            "backup generation changed during verification".to_owned(),
+        ));
+    }
     Ok(VerifiedBackup {
         directory: directory.to_path_buf(),
         database,
         manifest_path,
         manifest,
+        identity: VerifiedGenerationIdentity {
+            directory: generation.identity,
+            database: database_snapshot.identity,
+            manifest: manifest_snapshot.identity,
+            publication_time: directory_snapshot.modified,
+        },
     })
+}
+
+fn ensure_exact_generation_entries(directory: &Path) -> Result<(), BackupError> {
+    let mut database = false;
+    let mut manifest = false;
+    let mut count = 0_usize;
+    for entry in fs::read_dir(directory).map_err(|source| BackupError::Io {
+        path: directory.to_path_buf(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| BackupError::Io {
+            path: directory.to_path_buf(),
+            source,
+        })?;
+        count += 1;
+        if entry.file_name() == OsStr::new(BACKUP_FILE_NAME) {
+            database = true;
+        } else if entry.file_name() == OsStr::new(MANIFEST_FILE_NAME) {
+            manifest = true;
+        } else {
+            return Err(BackupError::Verification(
+                "backup generation contains an unexpected entry".to_owned(),
+            ));
+        }
+    }
+    if count != 2 || !database || !manifest {
+        return Err(BackupError::Verification(
+            "backup generation must contain exactly state.sqlite and manifest.json".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn inspect_plain_child_file(
+    parent: &BoundDirectory,
+    path: &Path,
+) -> Result<PlainPathSnapshot, BackupError> {
+    if path_parent(path)? != parent.path {
+        return Err(BackupError::Verification(
+            "backup file is not the expected direct child".to_owned(),
+        ));
+    }
+    let snapshot = plain_path_snapshot(path, PlainPathKind::File)?;
+    if snapshot.identity.volume != parent.volume {
+        return Err(BackupError::Verification(
+            "backup file crossed a filesystem boundary".to_owned(),
+        ));
+    }
+    let canonical = fs::canonicalize(path).map_err(|source| BackupError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    let expected = parent.canonical.join(
+        path.file_name()
+            .ok_or_else(|| BackupError::Verification("backup file has no name".to_owned()))?,
+    );
+    if canonical != expected {
+        return Err(BackupError::Verification(
+            "backup file escapes its generation directory".to_owned(),
+        ));
+    }
+    let confirmed = plain_path_snapshot(path, PlainPathKind::File)?;
+    if confirmed != snapshot {
+        return Err(BackupError::Verification(
+            "backup file identity changed during inspection".to_owned(),
+        ));
+    }
+    Ok(snapshot)
 }
 
 fn apply_retention(
@@ -649,7 +1272,14 @@ fn apply_retention(
         if backup.manifest.backup_id == published_backup_id {
             continue;
         }
-        if let Err(error) = fs::remove_dir_all(&backup.directory) {
+        if let Err(error) = delete_verified_generation_inner(
+            paths,
+            storage_instance_id,
+            backup,
+            Some(cancellation),
+            Some(deadline),
+            || {},
+        ) {
             tracing::warn!(
                 backup_id = %backup.manifest.backup_id,
                 detail = %error,
@@ -660,20 +1290,167 @@ fn apply_retention(
     Ok(())
 }
 
+#[cfg(test)]
+fn delete_verified_generation_with_hook<F>(
+    paths: &StatePaths,
+    storage_instance_id: StorageInstanceId,
+    expected: &VerifiedBackup,
+    hook: F,
+) -> Result<(), BackupError>
+where
+    F: FnOnce(),
+{
+    delete_verified_generation_inner(paths, storage_instance_id, expected, None, None, hook)
+}
+
+fn delete_verified_generation_inner<F>(
+    paths: &StatePaths,
+    storage_instance_id: StorageInstanceId,
+    expected: &VerifiedBackup,
+    cancellation: Option<&CancellationToken>,
+    deadline: Option<Instant>,
+    hook: F,
+) -> Result<(), BackupError>
+where
+    F: FnOnce(),
+{
+    ensure_optional_active(cancellation, deadline)?;
+    let boundary = BackupStoreBoundary::open_existing(paths, storage_instance_id)?
+        .ok_or_else(|| BackupError::Verification("backup store disappeared".to_owned()))?;
+    boundary.revalidate()?;
+    let current = verify_generation(
+        &boundary,
+        &expected.directory,
+        expected.manifest.backup_id,
+        storage_instance_id,
+        cancellation,
+        deadline,
+    )?;
+    ensure_same_generation_identity(expected, &current)?;
+    hook();
+    ensure_optional_active(cancellation, deadline)?;
+    boundary.revalidate()?;
+    let current = verify_generation(
+        &boundary,
+        &expected.directory,
+        expected.manifest.backup_id,
+        storage_instance_id,
+        cancellation,
+        deadline,
+    )?;
+    ensure_same_generation_identity(expected, &current)?;
+
+    remove_verified_file(&current.manifest_path, current.identity.manifest)?;
+    boundary.revalidate()?;
+    remove_verified_file(&current.database, current.identity.database)?;
+    boundary.revalidate()?;
+    let directory = inspect_child_directory(&boundary.store, &current.directory)?;
+    if directory.identity != current.identity.directory {
+        return Err(BackupError::Verification(
+            "backup generation directory changed before deletion".to_owned(),
+        ));
+    }
+    fs::remove_dir(&current.directory).map_err(|source| BackupError::Io {
+        path: current.directory.clone(),
+        source,
+    })?;
+    sync_directory(&boundary.store.path)
+}
+
+fn ensure_same_generation_identity(
+    expected: &VerifiedBackup,
+    current: &VerifiedBackup,
+) -> Result<(), BackupError> {
+    if expected.identity != current.identity {
+        return Err(BackupError::Verification(
+            "backup generation identity changed before retention".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn remove_verified_file(path: &Path, expected: FileIdentity) -> Result<(), BackupError> {
+    let snapshot = plain_path_snapshot(path, PlainPathKind::File)?;
+    if snapshot.identity != expected {
+        return Err(BackupError::Verification(
+            "backup file identity changed before deletion".to_owned(),
+        ));
+    }
+    let confirmed = plain_path_snapshot(path, PlainPathKind::File)?;
+    if confirmed.identity != expected {
+        return Err(BackupError::Verification(
+            "backup file identity changed during deletion".to_owned(),
+        ));
+    }
+    fs::remove_file(path).map_err(|source| BackupError::Io {
+        path: path.to_path_buf(),
+        source,
+    })
+}
+
 fn backup_schema_version(
     database: &Path,
-    cancellation: &CancellationToken,
-    deadline: Instant,
+    cancellation: Option<&CancellationToken>,
+    deadline: Option<Instant>,
 ) -> Result<i64, BackupError> {
-    ensure_active(cancellation, Some(deadline))?;
+    ensure_optional_active(cancellation, deadline)?;
     let connection = open_read_only_database(database)?;
-    connection
-        .query_row(
-            "SELECT COALESCE(MAX(migration_id), 0) FROM effect_sql_migrations",
-            [],
-            |row| row.get(0),
+    if cancellation.is_some() || deadline.is_some() {
+        let cancellation = cancellation.cloned();
+        connection
+            .progress_handler(
+                SQLITE_PROGRESS_OPS,
+                Some(move || {
+                    cancellation
+                        .as_ref()
+                        .is_some_and(CancellationToken::is_cancelled)
+                        || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                }),
+            )
+            .map_err(|source| BackupError::Persistence(PersistenceError::Sql(source)))?;
+    }
+    let mut statement = connection
+        .prepare(
+            "SELECT migration_id, name \
+             FROM effect_sql_migrations \
+             ORDER BY migration_id ASC \
+             LIMIT ?1",
         )
-        .map_err(|source| BackupError::Persistence(PersistenceError::Sql(source)))
+        .map_err(|source| BackupError::Persistence(PersistenceError::Sql(source)))?;
+    let row_limit = i64::try_from(MIGRATIONS.len() + 1)
+        .map_err(|_| BackupError::Verification("migration count overflowed i64".to_owned()))?;
+    let recorded = statement
+        .query_map([row_limit], |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+        })
+        .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+        .map_err(|source| {
+            if source.sqlite_error_code() == Some(ErrorCode::OperationInterrupted) {
+                ensure_optional_active(cancellation, deadline)
+                    .err()
+                    .unwrap_or_else(|| BackupError::Persistence(PersistenceError::Sql(source)))
+            } else {
+                BackupError::Persistence(PersistenceError::Sql(source))
+            }
+        })?;
+    ensure_optional_active(cancellation, deadline)?;
+    if recorded.is_empty()
+        || recorded.len() > MIGRATIONS.len()
+        || recorded
+            .iter()
+            .zip(MIGRATIONS)
+            .any(|((id, name), expected)| *id != expected.id || name != expected.name)
+    {
+        return Err(BackupError::Verification(
+            "backup migration ledger is not an exact prefix of this binary".to_owned(),
+        ));
+    }
+    Ok(i64::from(
+        recorded
+            .last()
+            .expect("non-empty recognized migration ledger")
+            .0,
+    ))
 }
 
 fn quick_check_database(
@@ -824,36 +1601,26 @@ fn sync_directory(_path: &Path) -> Result<(), BackupError> {
 }
 
 fn ensure_plain_file(path: &Path) -> Result<(), BackupError> {
-    let metadata = fs::symlink_metadata(path).map_err(|source| BackupError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
-    if metadata.file_type().is_file() && !metadata.file_type().is_symlink() {
-        Ok(())
-    } else {
-        Err(BackupError::Verification(format!(
-            "{} is not a plain file",
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("backup entry")
-        )))
-    }
+    plain_path_snapshot(path, PlainPathKind::File).map(|_| ())
 }
 
-fn create_private_directories(path: &Path) -> Result<(), BackupError> {
-    fs::create_dir_all(path).map_err(|source| BackupError::Io {
-        path: path.to_path_buf(),
-        source,
-    })?;
+fn set_private_directory_permissions(path: &Path) -> Result<(), BackupError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).map_err(|source| {
-            BackupError::Io {
+        let directory =
+            open_path_without_following(path, PlainPathKind::Directory).map_err(|source| {
+                BackupError::Io {
+                    path: path.to_path_buf(),
+                    source,
+                }
+            })?;
+        directory
+            .set_permissions(fs::Permissions::from_mode(0o700))
+            .map_err(|source| BackupError::Io {
                 path: path.to_path_buf(),
                 source,
-            }
-        })?;
+            })?;
     }
     Ok(())
 }
@@ -938,16 +1705,15 @@ fn private_create_new(path: &Path) -> Result<File, BackupError> {
     }
 }
 
-fn set_private_file_permissions(path: &Path) -> Result<(), BackupError> {
+fn set_private_open_file_permissions(file: &File, path: &Path) -> Result<(), BackupError> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600)).map_err(|source| {
-            BackupError::Io {
+        file.set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|source| BackupError::Io {
                 path: path.to_path_buf(),
                 source,
-            }
-        })?;
+            })?;
     }
     Ok(())
 }
@@ -1038,6 +1804,7 @@ mod tests {
                 backup_id,
                 &cancellation,
                 deadline,
+                BackupFault::None,
             )
             .expect("staging directory");
             database
@@ -1158,6 +1925,102 @@ mod tests {
                 & 0o777;
             assert_eq!(mode, 0o600);
         }
+        drop(prepared);
+        database.close().await;
+    }
+
+    #[tokio::test]
+    async fn every_new_backup_ancestor_sync_failure_preserves_source_bytes_and_schema() {
+        for fault in [
+            BackupFault::BeforeBackupsDirectorySync,
+            BackupFault::BeforeBackupsParentSync,
+            BackupFault::BeforeStateKindDirectorySync,
+            BackupFault::BeforeStateKindParentSync,
+            BackupFault::BeforeStoreDirectorySync,
+            BackupFault::BeforeStoreParentSync,
+        ] {
+            let root = TempDir::new().expect("ancestor sync root");
+            let paths = StatePaths::from_config(&ServerConfig::new(root.path()));
+            fs::create_dir_all(&paths.state_dir).expect("state directory");
+            let mut setup = Connection::open(&paths.database).expect("source database");
+            run_migrations(&mut setup, Some(38)).expect("source schema");
+            drop(setup);
+            let source_bytes = fs::read(&paths.database).expect("source bytes");
+            let source_schema = schema_version(&paths.database);
+            let storage_instance_id = StorageInstanceId::from_uuid(Uuid::new_v4());
+            let cancellation = CancellationToken::new();
+
+            let error = prepare_staging_directory(
+                &paths,
+                storage_instance_id,
+                Uuid::new_v4(),
+                &cancellation,
+                Instant::now() + Duration::from_secs(5),
+                fault,
+            )
+            .expect_err("ancestor durability seam must fail");
+
+            assert!(matches!(error, BackupError::Verification(_)));
+            assert_eq!(
+                fs::read(&paths.database).expect("source remains"),
+                source_bytes,
+                "source bytes changed at {fault:?}"
+            );
+            assert_eq!(
+                schema_version(&paths.database),
+                source_schema,
+                "source schema changed at {fault:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retention_race_never_deletes_a_foreign_replacement_or_extra() {
+        let root = TempDir::new().expect("retention race root");
+        let paths = StatePaths::from_config(&ServerConfig::new(root.path()));
+        fs::create_dir_all(&paths.state_dir).expect("state directory");
+        let mut setup = Connection::open(&paths.database).expect("source database");
+        run_migrations(&mut setup, None).expect("source schema");
+        drop(setup);
+        let database = Database::open_existing_read_only(&paths.database)
+            .await
+            .expect("read-only source");
+        let storage_instance_id = StorageInstanceId::from_uuid(Uuid::new_v4());
+        let prepared = PreparedStore {
+            database: database.clone(),
+            storage_instance_id,
+            classification: crate::persistence::StoreClassification::Existing,
+            paths: paths.clone(),
+        };
+        let backup = create_verified_backup(
+            &database,
+            &prepared,
+            BackupTrigger::PreUpdate,
+            "retention-race-test",
+        )
+        .await
+        .expect("verified backup");
+        let foreign_manifest = b"foreign replacement";
+        let foreign_extra = backup.directory.join("foreign-extra");
+
+        let error =
+            delete_verified_generation_with_hook(&paths, storage_instance_id, &backup, || {
+                fs::remove_file(&backup.manifest_path).expect("remove owned manifest");
+                fs::write(&backup.manifest_path, foreign_manifest).expect("foreign manifest");
+                fs::write(&foreign_extra, b"foreign extra").expect("foreign extra");
+            })
+            .expect_err("identity replacement must stop deletion");
+
+        assert!(matches!(error, BackupError::Verification(_)));
+        assert_eq!(
+            fs::read(&backup.manifest_path).expect("foreign manifest remains"),
+            foreign_manifest
+        );
+        assert_eq!(
+            fs::read(&foreign_extra).expect("foreign extra remains"),
+            b"foreign extra"
+        );
+        assert!(backup.database.is_file(), "owned database is not deleted");
         drop(prepared);
         database.close().await;
     }
