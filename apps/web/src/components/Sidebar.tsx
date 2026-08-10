@@ -85,7 +85,7 @@ import { isDesktopHost } from "../env";
 import { APP_BASE_NAME, APP_STAGE_LABEL } from "../branding";
 import { useOpenPrLink } from "../lib/openPullRequestLink";
 import { isTerminalFocused } from "../lib/terminalFocus";
-import { cn, isMacPlatform, newThreadId } from "../lib/utils";
+import { cn, isMacPlatform, newCommandId, newThreadId } from "../lib/utils";
 import { resolveProviderSessionSelectionForInstance } from "../providerSessionSelection";
 import {
   selectIsPinned,
@@ -233,6 +233,12 @@ import {
   type SidebarProjectSnapshot,
 } from "../sidebarProjectGrouping";
 import { SidebarProviderUpdatePill } from "./sidebar/SidebarProviderUpdatePill";
+import {
+  getSupportedWorktreeDiscoveryMembers,
+  WorktreeDiscoverySection,
+} from "./WorktreeDiscoverySection";
+import { getDiscoveryVisibilityMenuLabel } from "./WorktreeDiscoverySection.logic";
+import { worktreeEnvironment } from "../state/worktrees";
 const SIDEBAR_SORT_LABELS: Record<SidebarProjectSortOrder, string> = {
   updated_at: "Last user message",
   created_at: "Created at",
@@ -1356,6 +1362,9 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
   const updateProject = useAtomCommand(projectEnvironment.update, {
     reportFailure: false,
   });
+  const updateWorktreeDiscoveryPolicy = useAtomCommand(worktreeEnvironment.updatePolicy, {
+    reportFailure: false,
+  });
   const updateThreadMetadata = useAtomCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
   });
@@ -1384,6 +1393,10 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
   // doesn't match their actual backend. Acceptable simplification for now.
   const availableEditors = useAtomValue(primaryServerConfigAtom)?.availableEditors ?? [];
   const primaryEnvironmentId = usePrimaryEnvironmentId();
+  const supportedWorktreeDiscoveryMembers = useMemo(
+    () => getSupportedWorktreeDiscoveryMembers(project.memberProjects, serverConfigs),
+    [project.memberProjects, serverConfigs],
+  );
   const openWorkspaceInFileManager = useCallback(async (path: string) => {
     const bridge =
       typeof window === "undefined" ? undefined : window.desktopBridge?.openInFileManager;
@@ -1918,6 +1931,42 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
           setOpenMobile(false);
           return router.navigate({ to: "/settings/archived" });
         });
+        const currentDiscoveryVisibility = supportedWorktreeDiscoveryMembers.some(
+          (member) => member.worktreeDiscovery.visibility === "shown",
+        )
+          ? "shown"
+          : "hidden";
+        const nextDiscoveryVisibility =
+          currentDiscoveryVisibility === "hidden" ? "shown" : "hidden";
+        if (supportedWorktreeDiscoveryMembers.length > 0) {
+          actionHandlers.set("worktree-discovery-visibility", async () => {
+            const results = await Promise.all(
+              supportedWorktreeDiscoveryMembers.map((member) =>
+                updateWorktreeDiscoveryPolicy({
+                  environmentId: member.environmentId,
+                  input: {
+                    commandId: newCommandId(),
+                    projectId: member.id,
+                    visibility: nextDiscoveryVisibility,
+                  },
+                }),
+              ),
+            );
+            for (const [index, result] of results.entries()) {
+              if (result._tag !== "Failure" || isAtomCommandInterrupted(result)) continue;
+              const member = supportedWorktreeDiscoveryMembers[index]!;
+              const error = squashAtomCommandFailure(result);
+              toastManager.add(
+                stackedThreadToast({
+                  type: "error",
+                  title: `Could not update worktree visibility for ${member.environmentLabel ?? member.title}`,
+                  description:
+                    error instanceof Error ? error.message : "An unexpected error occurred.",
+                }),
+              );
+            }
+          });
+        }
         const makeLeaf = (
           action: "rename" | "grouping" | "copy-path" | "delete",
           member: SidebarProjectGroupMember,
@@ -1989,6 +2038,14 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
             buildTargetedItem("rename", "Rename"),
             buildTargetedItem("grouping", "Group into..."),
             buildTargetedItem("copy-path", "Copy Path"),
+            ...(supportedWorktreeDiscoveryMembers.length > 0
+              ? [
+                  {
+                    id: "worktree-discovery-visibility",
+                    label: getDiscoveryVisibilityMenuLabel(currentDiscoveryVisibility),
+                  },
+                ]
+              : []),
             { id: "archive", label: "Archived threads" },
             buildTargetedItem("delete", "Remove", {
               destructive: true,
@@ -2017,6 +2074,8 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       router,
       setOpenMobile,
       suppressProjectClickForContextMenuRef,
+      supportedWorktreeDiscoveryMembers,
+      updateWorktreeDiscoveryPolicy,
     ],
   );
 
@@ -2866,19 +2925,29 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         </div>
       </div>
 
-      {shouldShowThreadPanel && (
+      {(shouldShowThreadPanel || supportedWorktreeDiscoveryMembers.length > 0) && (
         <SidebarMenuSub className="mx-0.5 my-0 w-full translate-x-0 gap-0.5 overflow-hidden px-1 py-0 sm:mx-1 sm:px-1.5">
-          <SidebarPrimaryRow
-            project={project}
-            primaryThread={primaryThread}
-            isActive={
-              primaryThread !== null &&
-              activeRouteThreadKey ===
-                scopedThreadKey(scopeThreadRef(primaryThread.environmentId, primaryThread.id))
-            }
-            onClick={handlePrimaryRowClick}
-            onContextMenu={handlePrimaryRowContextMenu}
-          />
+          {supportedWorktreeDiscoveryMembers.length > 0 ? (
+            <WorktreeDiscoverySection
+              project={project}
+              serverConfigs={serverConfigs}
+              primaryEnvironmentId={primaryEnvironmentId}
+              onNavigateToThread={navigateToThread}
+            />
+          ) : null}
+          {shouldShowThreadPanel ? (
+            <SidebarPrimaryRow
+              project={project}
+              primaryThread={primaryThread}
+              isActive={
+                primaryThread !== null &&
+                activeRouteThreadKey ===
+                  scopedThreadKey(scopeThreadRef(primaryThread.environmentId, primaryThread.id))
+              }
+              onClick={handlePrimaryRowClick}
+              onContextMenu={handlePrimaryRowContextMenu}
+            />
+          ) : null}
         </SidebarMenuSub>
       )}
 
