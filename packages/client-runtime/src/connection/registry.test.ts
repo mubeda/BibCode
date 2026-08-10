@@ -31,6 +31,8 @@ import * as Connectivity from "./connectivity.ts";
 import * as ConnectionCredentialStore from "./credentialStore.ts";
 import * as ConnectionDriver from "./driver.ts";
 import {
+  type ConnectionAttemptError,
+  ConnectionStorageChangedError,
   ConnectionTransientError,
   BearerConnectionTarget,
   PrimaryConnectionTarget,
@@ -136,13 +138,18 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
   initialProfiles: ReadonlyArray<ConnectionProfile> = [],
   initialCredentials: ReadonlyArray<readonly [string, ConnectionCredential]> = [],
   options?: {
-    readonly beforeSessionConnect?: (environmentId: EnvironmentId) => Effect.Effect<void>;
+    readonly beforeSessionConnect?: (
+      environmentId: EnvironmentId,
+    ) => Effect.Effect<void, ConnectionAttemptError>;
     readonly beforeRegistrationRegister?: (
       registration: ConnectionRegistration,
     ) => Effect.Effect<void, Persistence.ConnectionPersistenceError>;
     readonly beforeRegistrationRemove?: (
       target: ConnectionTarget,
     ) => Effect.Effect<void, Persistence.ConnectionPersistenceError>;
+    readonly afterStorageIdentityAccept?: (
+      identity: Persistence.AcceptedStorageIdentity,
+    ) => Effect.Effect<void>;
   },
 ) {
   const storedTargets = yield* Ref.make(
@@ -178,6 +185,10 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     ]),
   );
   const disconnectedSshTargets = yield* Ref.make<ReadonlyArray<DesktopSshEnvironmentTarget>>([]);
+  const acceptedStorageIdentities = yield* Ref.make(new Map<string, string>());
+  const acceptedStorageIdentityWrites = yield* Ref.make<
+    ReadonlyArray<Persistence.AcceptedStorageIdentity>
+  >([]);
 
   const targetStore = Persistence.ConnectionTargetStore.of({
     list: Ref.get(storedTargets).pipe(Effect.map((targets) => [...targets.values()])),
@@ -240,6 +251,23 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
           return next;
         });
       }),
+  });
+  const acceptedStorageIdentityStore = Persistence.AcceptedStorageIdentityStore.of({
+    get: (targetKey) =>
+      Ref.get(acceptedStorageIdentities).pipe(
+        Effect.map((current) => Option.fromUndefinedOr(current.get(targetKey))),
+      ),
+    accept: (identity) =>
+      Ref.update(acceptedStorageIdentities, (current) => {
+        const next = new Map(current);
+        next.set(identity.targetKey, identity.storageInstanceId);
+        return next;
+      }).pipe(
+        Effect.andThen(
+          Ref.update(acceptedStorageIdentityWrites, (current) => [...current, identity]),
+        ),
+        Effect.andThen(options?.afterStorageIdentityAccept?.(identity) ?? Effect.void),
+      ),
   });
   const cacheStore = Persistence.EnvironmentCacheStore.of({
     loadShell: (environmentId) =>
@@ -372,6 +400,7 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
       Layer.mergeAll(
         Layer.succeed(Persistence.ConnectionTargetStore, targetStore),
         Layer.succeed(Persistence.ConnectionRegistrationStore, registrationStore),
+        Layer.succeed(Persistence.AcceptedStorageIdentityStore, acceptedStorageIdentityStore),
         Layer.succeed(ConnectionProfileStore.ConnectionProfileStore, profileStore),
         Layer.succeed(ConnectionCredentialStore.ConnectionCredentialStore, credentialStore),
         Layer.succeed(TokenStore.RemoteDpopAccessTokenStore, tokenStore),
@@ -401,6 +430,8 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     storedCredentials,
     storedRemoteTokens,
     disconnectedSshTargets,
+    acceptedStorageIdentities,
+    acceptedStorageIdentityWrites,
     networkStatus,
   };
 });
@@ -662,6 +693,130 @@ describe("EnvironmentRegistry", () => {
       yield* Effect.gen(function* () {
         const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
         yield* registry.retryNow(EnvironmentId.make("removed-environment"));
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("adopts the current structured storage change and retries exactly once", () =>
+    Effect.gen(function* () {
+      const connectionAttempts = yield* Ref.make(0);
+      const adoptionOrder = yield* Ref.make<ReadonlyArray<string>>([]);
+      const firstAttemptStarted = yield* Deferred.make<void>();
+      const releaseFirstAttempt = yield* Deferred.make<void>();
+      const harness = yield* makeHarness([TARGET], [], [], {
+        beforeSessionConnect: () =>
+          Ref.updateAndGet(connectionAttempts, (count) => count + 1).pipe(
+            Effect.tap((attempt) =>
+              Ref.update(adoptionOrder, (current) => [...current, `attempt:${attempt}`]),
+            ),
+            Effect.flatMap((attempt) =>
+              attempt === 1
+                ? Deferred.succeed(firstAttemptStarted, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseFirstAttempt)),
+                    Effect.andThen(
+                      Effect.fail(
+                        new ConnectionStorageChangedError({
+                          reason: "storage-changed",
+                          detail: "The environment reported a different persistent store.",
+                          targetKey: "structured:error-target",
+                          acceptedStorageInstanceId: "store-a",
+                          reportedStorageInstanceId: "store-b",
+                        }),
+                      ),
+                    ),
+                  )
+                : Effect.void,
+            ),
+          ),
+        afterStorageIdentityAccept: (identity) =>
+          Ref.update(adoptionOrder, (current) => [
+            ...current,
+            `accept:${identity.targetKey}:${identity.storageInstanceId}`,
+          ]),
+      });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.start;
+        yield* Deferred.await(firstAttemptStarted);
+        yield* Effect.yieldNow;
+        yield* Deferred.succeed(releaseFirstAttempt, undefined);
+        yield* awaitConnectionState(
+          registry,
+          TARGET.environmentId,
+          (state) => state.phase === "blocked",
+        );
+
+        yield* registry.acceptStorageIdentity(TARGET.environmentId);
+        yield* awaitConnectionState(
+          registry,
+          TARGET.environmentId,
+          (state) => state.phase === "connected",
+        );
+
+        expect(yield* Ref.get(harness.acceptedStorageIdentityWrites)).toEqual([
+          {
+            targetKey: "structured:error-target",
+            storageInstanceId: "store-b",
+          },
+        ]);
+        expect(yield* Ref.get(connectionAttempts)).toBe(2);
+        expect(yield* Ref.get(adoptionOrder)).toEqual([
+          "attempt:1",
+          "accept:structured:error-target:store-b",
+          "attempt:2",
+        ]);
+        expect(yield* Ref.get(harness.cacheClears)).toEqual([]);
+        expect(yield* Ref.get(harness.ownedDataClears)).toEqual([]);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("refuses storage adoption unless the environment is currently storage-blocked", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([TARGET]);
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.start;
+        yield* awaitConnectionState(
+          registry,
+          TARGET.environmentId,
+          (state) => state.phase === "connected",
+        );
+
+        const error = yield* Effect.flip(registry.acceptStorageIdentity(TARGET.environmentId));
+
+        expect(error).toMatchObject({
+          _tag: "ConnectionPersistenceError",
+          operation: "accept-storage-identity",
+        });
+        expect(yield* Ref.get(harness.acceptedStorageIdentityWrites)).toEqual([]);
+        expect(yield* Ref.get(harness.sessions)).toHaveLength(1);
+        expect(yield* Ref.get(harness.cacheClears)).toEqual([]);
+        expect(yield* Ref.get(harness.ownedDataClears)).toEqual([]);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("does not start an unsupervised environment to evaluate storage adoption", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([TARGET]);
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+
+        const error = yield* Effect.flip(registry.acceptStorageIdentity(TARGET.environmentId));
+        for (let iteration = 0; iteration < 100; iteration += 1) {
+          yield* Effect.yieldNow;
+        }
+
+        expect(error).toMatchObject({
+          _tag: "ConnectionPersistenceError",
+          operation: "accept-storage-identity",
+        });
+        expect(yield* Ref.get(harness.sessions)).toEqual([]);
+        expect(yield* Ref.get(harness.acceptedStorageIdentityWrites)).toEqual([]);
       }).pipe(Effect.provide(harness.layer), Effect.scoped);
     }),
   );

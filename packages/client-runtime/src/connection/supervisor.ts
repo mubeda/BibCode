@@ -627,7 +627,10 @@ export const make = Effect.fn("EnvironmentSupervisor.make")(function* (
       const attemptSpan: Option.Option<Tracer.Span> = outcome.failure.attemptSpan;
       const error: ConnectionAttemptError = outcome.failure.error;
       latestFailure = error;
-      if (error._tag === "ConnectionBlockedError") {
+      if (
+        error._tag === "ConnectionBlockedError" ||
+        error._tag === "ConnectionStorageChangedError"
+      ) {
         const blockedIntent = yield* Ref.get(intent);
         yield* setState({
           desired: blockedIntent.desired,

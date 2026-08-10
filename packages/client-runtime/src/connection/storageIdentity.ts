@@ -1,4 +1,13 @@
-import type { ConnectionTarget } from "./model.ts";
+import * as Effect from "effect/Effect";
+import * as Option from "effect/Option";
+
+import * as Persistence from "../platform/persistence.ts";
+import {
+  ConnectionBlockedError,
+  ConnectionStorageChangedError,
+  type ConnectionTarget,
+  type PreparedConnection,
+} from "./model.ts";
 
 export type StorageIdentityDecision =
   | {
@@ -47,3 +56,42 @@ export function decideStorageIdentity(
   }
   return { _tag: "Changed", accepted, reported };
 }
+
+function identityPersistenceError(prepared: PreparedConnection): ConnectionBlockedError {
+  return new ConnectionBlockedError({
+    reason: "configuration",
+    detail: `${prepared.label} persistent storage identity could not be verified.`,
+  });
+}
+
+export const verifyPreparedStorageIdentity = Effect.fn("verifyPreparedStorageIdentity")(function* (
+  prepared: PreparedConnection,
+) {
+  const identities = yield* Persistence.AcceptedStorageIdentityStore;
+  const targetKey = storageIdentityTargetKey(prepared.target);
+  const accepted = yield* identities.get(targetKey).pipe(
+    Effect.map(Option.getOrNull),
+    Effect.mapError(() => identityPersistenceError(prepared)),
+  );
+  const reported = prepared.descriptor.storageInstanceId;
+  const decision = decideStorageIdentity(accepted, reported);
+
+  switch (decision._tag) {
+    case "Bootstrap":
+      yield* identities
+        .accept({ targetKey, storageInstanceId: decision.reported })
+        .pipe(Effect.mapError(() => identityPersistenceError(prepared)));
+      return;
+    case "Accepted":
+    case "Unverifiable":
+      return;
+    case "Changed":
+      return yield* new ConnectionStorageChangedError({
+        reason: "storage-changed",
+        detail: `${prepared.label} is reporting a different persistent store.`,
+        targetKey,
+        acceptedStorageInstanceId: decision.accepted,
+        reportedStorageInstanceId: decision.reported,
+      });
+  }
+});
