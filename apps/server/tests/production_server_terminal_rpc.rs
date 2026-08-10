@@ -24,6 +24,9 @@ use bibcode_server::production::server_terminal::{
 use bibcode_server::{
     CauseItem, RpcExit, RpcRegistry, ServerConfig, ServerMessage, ServerRuntime, cloud,
     diagnostics, provider_usage, terminal,
+    worktree_catalog::{
+        AdoptedWorktreeAvailability, WorkspaceAvailabilityRegistry, WorkspaceLossTransition,
+    },
 };
 
 #[derive(Debug)]
@@ -61,6 +64,187 @@ fn terminal_rpc_test_lock() -> &'static tokio::sync::Mutex<()> {
     // runtimes in the same integration binary can otherwise kill each other's PTYs.
     static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+#[tokio::test]
+async fn workspace_unavailable_rejects_terminal_starts_and_write_but_allows_close() {
+    let _test_guard = terminal_rpc_test_lock().lock().await;
+    let temp = TempDir::new().expect("temporary directory");
+    let registry = WorkspaceAvailabilityRegistry::new();
+    assert!(
+        registry
+            .mark_unavailable(WorkspaceLossTransition {
+                thread_id: "thread-guarded".to_owned(),
+                repository_key: "repository-1".to_owned(),
+                generation: 3,
+                path: temp.path().to_path_buf(),
+                availability: AdoptedWorktreeAvailability::MissingRegistered,
+            })
+            .await
+    );
+    let services = fixture_services().with_availability_registry(registry);
+    let mut rpc = RpcRegistry::empty();
+    register_server_terminal_rpc(&mut rpc, services);
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), rpc)
+        .await
+        .expect("server starts");
+    let mut socket = Some(open_socket(handle.local_addr()).await);
+    let client = socket.as_mut().expect("socket");
+    let start = json!({
+        "threadId":"thread-guarded",
+        "terminalId":"terminal-1",
+        "cwd":temp.path().to_string_lossy(),
+        "cols":80,
+        "rows":24,
+    });
+
+    for (id, method, payload) in [
+        ("1", "terminal.open", start.clone()),
+        ("2", "terminal.restart", start.clone()),
+        (
+            "3",
+            "terminal.write",
+            json!({
+                "threadId":"thread-guarded","terminalId":"terminal-1","data":"secret"
+            }),
+        ),
+        (
+            "4",
+            "terminal.attach",
+            json!({
+                "threadId":"thread-guarded",
+                "terminalId":"terminal-1",
+                "cwd":temp.path().to_string_lossy(),
+                "restartIfNotRunning":true,
+            }),
+        ),
+    ] {
+        let error = failure_value(request(client, id, method, payload).await);
+        assert_eq!(error["_tag"], "WorkspaceUnavailableError");
+        assert_eq!(error["threadId"], "thread-guarded");
+    }
+    assert_success(
+        request(
+            client,
+            "5",
+            "terminal.close",
+            json!({
+                "threadId":"thread-guarded","terminalId":"terminal-1"
+            }),
+        )
+        .await,
+    );
+
+    close_socket(&mut socket).await;
+    handle.shutdown();
+    handle.join().await.expect("server joins");
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn workspace_unavailable_quiesce_retains_transcript_for_read_only_attach() {
+    let _test_guard = terminal_rpc_test_lock().lock().await;
+    let temp = TempDir::new().expect("temporary directory");
+    let availability = WorkspaceAvailabilityRegistry::new();
+    let services = fixture_services().with_availability_registry(availability.clone());
+    let quiescer = services.clone();
+    let mut rpc = RpcRegistry::empty();
+    register_server_terminal_rpc(&mut rpc, services);
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), rpc)
+        .await
+        .expect("server starts");
+    let mut writer = Some(open_socket(handle.local_addr()).await);
+    let writer_socket = writer.as_mut().expect("writer");
+    assert_success(
+        request(
+            writer_socket,
+            "1",
+            "terminal.open",
+            json!({
+                "threadId":"thread-history",
+                "terminalId":"terminal-history",
+                "cwd":temp.path().to_string_lossy(),
+                "cols":80,
+                "rows":24,
+            }),
+        )
+        .await,
+    );
+
+    let mut reader = Some(open_socket(handle.local_addr()).await);
+    let reader_socket = reader.as_mut().expect("reader");
+    send_request(
+        reader_socket,
+        "1",
+        "terminal.attach",
+        json!({
+            "threadId":"thread-history","terminalId":"terminal-history"
+        }),
+    )
+    .await;
+    let _initial = next_chunk_and_ack(reader_socket, "1").await;
+    assert_success(
+        request(
+            writer_socket,
+            "2",
+            "terminal.write",
+            json!({
+                "threadId":"thread-history",
+                "terminalId":"terminal-history",
+                "data":"retained-history\r",
+            }),
+        )
+        .await,
+    );
+    let _output = next_terminal_event_and_ack(reader_socket, "1", "retained output", |value| {
+        value["type"] == "output"
+            && value["data"]
+                .as_str()
+                .is_some_and(|data| data.contains("retained-history"))
+    })
+    .await;
+
+    assert!(
+        availability
+            .mark_unavailable(WorkspaceLossTransition {
+                thread_id: "thread-history".to_owned(),
+                repository_key: "repository-1".to_owned(),
+                generation: 8,
+                path: temp.path().to_path_buf(),
+                availability: AdoptedWorktreeAvailability::MissingRegistered,
+            })
+            .await
+    );
+    quiescer
+        .quiesce_thread_terminals_for_workspace_loss("thread-history")
+        .await
+        .expect("thread terminal quiesce");
+
+    let mut history_reader = Some(open_socket(handle.local_addr()).await);
+    let history_socket = history_reader.as_mut().expect("history reader");
+    send_request(
+        history_socket,
+        "1",
+        "terminal.attach",
+        json!({
+            "threadId":"thread-history","terminalId":"terminal-history"
+        }),
+    )
+    .await;
+    let snapshot = next_chunk_and_ack(history_socket, "1").await;
+    assert_eq!(snapshot[0]["snapshot"]["status"], "exited");
+    assert!(
+        snapshot[0]["snapshot"]["history"]
+            .as_str()
+            .expect("history")
+            .contains("retained-history")
+    );
+
+    for socket in [&mut reader, &mut history_reader, &mut writer] {
+        close_socket(socket).await;
+    }
+    handle.shutdown();
+    handle.join().await.expect("server joins");
 }
 
 #[tokio::test]

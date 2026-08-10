@@ -7,9 +7,12 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "EnvironmentAuthorizationError",
-          "message": "con",
-          "requiredScope": "terminal:operate"
+          "_tag": "WorkspaceUnavailableError",
+          "reason": "workspace-unavailable",
+          "message": "cons",
+          "threadId": "5~\"Hb!}$\"",
+          "path": "iKDqf(gC",
+          "availability": "removing"
         }
       }
     ]

@@ -19,6 +19,7 @@ import {
   WsPreviewListRpc,
   WsSourceControlLookupRepositoryRpc,
   WsProjectsReadFileRpc,
+  WsReviewGetDiffPreviewRpc,
   WsOrchestrationDispatchCommandRpc,
   WsOrchestrationSubscribeShellRpc,
   WsSubscribeAuthAccessRpc,
@@ -72,6 +73,27 @@ describe("WS_METHODS", () => {
 });
 
 describe("individual RPC definitions", () => {
+  it("accepts workspace-unavailable failures at guarded unary boundaries", () => {
+    const unavailable = {
+      _tag: "WorkspaceUnavailableError",
+      reason: "workspace-unavailable",
+      message: "The workspace directory is missing.",
+      threadId: "thread-1",
+      path: "/repo/worktrees/missing",
+      availability: "missing-registered",
+    };
+    for (const rpc of [
+      WsOrchestrationDispatchCommandRpc,
+      WsTerminalOpenRpc,
+      WsTerminalWriteRpc,
+      WsVcsPullRpc,
+      WsProjectsReadFileRpc,
+      WsReviewGetDiffPreviewRpc,
+    ]) {
+      expect(() => Schema.decodeUnknownSync(rpc.errorSchema)(unavailable)).not.toThrow();
+    }
+  });
+
   it("tags each RPC with its wire method name", () => {
     expect(WsServerGetConfigRpc._tag).toBe(WS_METHODS.serverGetConfig);
     expect(WsServerConsumeCodexRateLimitResetRpc._tag).toBe(

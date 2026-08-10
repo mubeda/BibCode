@@ -7,9 +7,12 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "EnvironmentAuthorizationError",
-          "message": "sc1)WD",
-          "requiredScope": "relay:read"
+          "_tag": "WorkspaceUnavailableError",
+          "reason": "workspace-unavailable",
+          "message": "sc1)WDKV",
+          "threadId": "\"U",
+          "path": "zgKQ}-9r",
+          "availability": "verification-unavailable"
         }
       }
     ]

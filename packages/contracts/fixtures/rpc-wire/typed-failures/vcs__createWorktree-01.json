@@ -7,9 +7,12 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "EnvironmentAuthorizationError",
-          "message": "x",
-          "requiredScope": "access:read"
+          "_tag": "WorkspaceUnavailableError",
+          "reason": "workspace-unavailable",
+          "message": "x!",
+          "threadId": ";H^D.#DAU|",
+          "path": "[SU^9K{",
+          "availability": "missing-unregistered"
         }
       }
     ]

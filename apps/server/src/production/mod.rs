@@ -20,4 +20,5 @@ pub mod server_terminal;
 pub mod turn_delivery;
 pub mod workspace_preview;
 pub mod worktree_catalog_rpc;
+pub mod worktree_runtime;
 pub mod worktree_workspace;

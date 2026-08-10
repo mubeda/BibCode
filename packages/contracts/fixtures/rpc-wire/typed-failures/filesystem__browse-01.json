@@ -7,9 +7,12 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "EnvironmentAuthorizationError",
-          "message": "8r",
-          "requiredScope": "orchestration:read"
+          "_tag": "WorkspaceUnavailableError",
+          "reason": "workspace-unavailable",
+          "message": "8rImBF^",
+          "threadId": "~D",
+          "path": "fW",
+          "availability": "removing"
         }
       }
     ]

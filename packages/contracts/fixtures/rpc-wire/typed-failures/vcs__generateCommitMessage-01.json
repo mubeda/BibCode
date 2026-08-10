@@ -7,9 +7,12 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "EnvironmentAuthorizationError",
-          "message": "D5yQy/6g`",
-          "requiredScope": "access:write"
+          "_tag": "WorkspaceUnavailableError",
+          "reason": "workspace-unavailable",
+          "message": "D5yQy/6g",
+          "threadId": "D",
+          "path": "<#re\"lsW{__d",
+          "availability": "removing"
         }
       }
     ]

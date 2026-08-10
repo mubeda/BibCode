@@ -7,9 +7,12 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "EnvironmentAuthorizationError",
-          "message": "%fY:0,sG",
-          "requiredScope": "orchestration:operate"
+          "_tag": "WorkspaceUnavailableError",
+          "reason": "workspace-unavailable",
+          "message": "%fY",
+          "threadId": ",sG,E\"J-D",
+          "path": "m.!'j",
+          "availability": "missing-registered"
         }
       }
     ]

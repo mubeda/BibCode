@@ -8,6 +8,9 @@ use std::{
 
 use bibcode_server::{
     CauseItem, RequestId, RpcExit, RpcRegistry, ServerConfig, ServerMessage, ServerRuntime,
+    worktree_catalog::{
+        AdoptedWorktreeAvailability, WorkspaceAvailabilityRegistry, WorkspaceLossTransition,
+    },
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
@@ -73,6 +76,60 @@ type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 struct GitServerHarness {
     handle: Option<bibcode_server::ServerHandle>,
     socket: Option<TestSocket>,
+}
+
+#[tokio::test]
+async fn workspace_unavailable_rejects_git_status_and_mutation_before_process_launch() {
+    let temp = TempDir::new().expect("server state");
+    let workspace = TempDir::new().expect("guarded workspace");
+    let availability = WorkspaceAvailabilityRegistry::new();
+    assert!(
+        availability
+            .mark_unavailable(WorkspaceLossTransition {
+                thread_id: "thread-guarded".to_owned(),
+                repository_key: "repository-1".to_owned(),
+                generation: 4,
+                path: workspace.path().to_path_buf(),
+                availability: AdoptedWorktreeAvailability::MissingUnregistered,
+            })
+            .await
+    );
+    let services = GitVcsRpcServices::default().with_availability_registry(availability);
+    let mut registry = RpcRegistry::empty();
+    register_git_vcs_rpc(&mut registry, services);
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
+        .await
+        .expect("server starts");
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("WebSocket connects");
+
+    for (id, method, payload) in [
+        ("1", "vcs.refreshStatus", json!({"cwd":workspace.path()})),
+        (
+            "2",
+            "vcs.createRef",
+            json!({"cwd":workspace.path(),"name":"blocked"}),
+        ),
+        ("3", "subscribeVcsStatus", json!({"cwd":workspace.path()})),
+        (
+            "4",
+            "git.runStackedAction",
+            json!({
+                "actionId":"action-1","cwd":workspace.path(),"action":"sync"
+            }),
+        ),
+    ] {
+        request(&mut socket, id, method, payload).await;
+        let error = failure_value(&mut socket, id).await;
+        assert_eq!(error["_tag"], "WorkspaceUnavailableError");
+        assert_eq!(error["threadId"], "thread-guarded");
+        assert_eq!(error["availability"], "missing-unregistered");
+    }
+
+    socket.close(None).await.expect("close WebSocket");
+    handle.shutdown();
+    handle.join().await.expect("server joins");
 }
 
 impl GitServerHarness {

@@ -1,5 +1,10 @@
 use bibcode_server::{
-    assets, production::host_paths::process_compatible_path, project, review, workspace,
+    assets,
+    production::host_paths::process_compatible_path,
+    project, review, workspace,
+    worktree_catalog::{
+        AdoptedWorktreeAvailability, WorkspaceAvailabilityRegistry, WorkspaceLossTransition,
+    },
 };
 
 use std::path::{Path, PathBuf};
@@ -19,6 +24,49 @@ use workspace::{
 
 fn path_string(path: &Path) -> String {
     path.to_string_lossy().into_owned()
+}
+
+#[tokio::test]
+async fn workspace_unavailable_rejects_file_search_and_review_before_side_effects() {
+    let root = TempDir::new().expect("root");
+    let registry = WorkspaceAvailabilityRegistry::new();
+    assert!(
+        registry
+            .mark_unavailable(WorkspaceLossTransition {
+                thread_id: "thread-1".to_owned(),
+                repository_key: "repository-1".to_owned(),
+                generation: 9,
+                path: root.path().to_path_buf(),
+                availability: AdoptedWorktreeAvailability::MissingRegistered,
+            })
+            .await
+    );
+    let rpc = WorkspaceRpc::new(WorkspaceService::default()).with_availability_registry(registry);
+
+    for (method, payload) in [
+        (
+            "projects.readFile",
+            json!({"cwd":path_string(root.path()),"relativePath":"missing.txt"}),
+        ),
+        (
+            "projects.searchEntries",
+            json!({"cwd":path_string(root.path()),"query":"secret","limit":10}),
+        ),
+        (
+            "review.getDiffPreview",
+            json!({"cwd":path_string(root.path()),"baseRef":null}),
+        ),
+    ] {
+        let error = rpc
+            .handle(method, payload)
+            .await
+            .expect_err("guarded request must fail");
+        assert_eq!(error["_tag"], "WorkspaceUnavailableError");
+        assert_eq!(error["reason"], "workspace-unavailable");
+        assert_eq!(error["threadId"], "thread-1");
+        assert_eq!(error["path"], path_string(root.path()));
+        assert_eq!(error["availability"], "missing-registered");
+    }
 }
 
 async fn write(root: &Path, relative: &str, contents: &[u8]) {

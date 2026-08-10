@@ -7,9 +7,12 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "EnvironmentAuthorizationError",
-          "message": "xk",
-          "requiredScope": "orchestration:read"
+          "_tag": "WorkspaceUnavailableError",
+          "reason": "workspace-unavailable",
+          "message": "xkz",
+          "threadId": "sz]'~",
+          "path": "UKFh6vzu",
+          "availability": "verification-unavailable"
         }
       }
     ]

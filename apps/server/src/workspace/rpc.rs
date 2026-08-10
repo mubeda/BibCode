@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use crate::assets::{AssetAccess, AssetError, AssetIssueRequest, AssetResource};
 use crate::review::{ReviewDiffPreviewInput, ReviewError, ReviewService};
+use crate::worktree_catalog::WorkspaceAvailabilityRegistry;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::Mutex;
@@ -55,6 +56,7 @@ pub struct WorkspaceRpc {
     service: WorkspaceService,
     indexes: Arc<Mutex<HashMap<PathBuf, WorkspaceSearchIndex>>>,
     dependencies: WorkspaceRpcDependencies,
+    availability_registry: Option<WorkspaceAvailabilityRegistry>,
 }
 
 impl WorkspaceRpc {
@@ -70,13 +72,24 @@ impl WorkspaceRpc {
             service,
             indexes: Arc::new(Mutex::new(HashMap::new())),
             dependencies,
+            availability_registry: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_availability_registry(
+        mut self,
+        availability_registry: WorkspaceAvailabilityRegistry,
+    ) -> Self {
+        self.availability_registry = Some(availability_registry);
+        self
     }
 
     pub async fn handle(&self, method: &str, payload: Value) -> Result<Value, Value> {
         match method {
             "projects.readFile" => {
                 let input: PathInput = decode(payload)?;
+                self.guard_path(&input.cwd).await?;
                 self.service
                     .read_file(Path::new(&input.cwd), &input.relative_path)
                     .await
@@ -91,6 +104,7 @@ impl WorkspaceRpc {
             }
             "projects.writeFile" => {
                 let input: WriteInput = decode(payload)?;
+                self.guard_path(&input.cwd).await?;
                 let result = self
                     .service
                     .write_file(Path::new(&input.cwd), &input.relative_path, &input.contents)
@@ -112,6 +126,7 @@ impl WorkspaceRpc {
             }
             "projects.createEntry" => {
                 let input: CreateInput = decode(payload)?;
+                self.guard_path(&input.cwd).await?;
                 let result = self
                     .service
                     .create_entry(Path::new(&input.cwd), &input.relative_path, input.kind)
@@ -130,6 +145,7 @@ impl WorkspaceRpc {
             }
             "projects.renameEntry" => {
                 let input: RenameInput = decode(payload)?;
+                self.guard_path(&input.cwd).await?;
                 let result = self
                     .service
                     .rename_entry(
@@ -152,6 +168,7 @@ impl WorkspaceRpc {
             }
             "projects.deleteEntry" => {
                 let input: PathInput = decode(payload)?;
+                self.guard_path(&input.cwd).await?;
                 let result = self
                     .service
                     .delete_entry(Path::new(&input.cwd), &input.relative_path)
@@ -170,6 +187,7 @@ impl WorkspaceRpc {
             }
             "projects.duplicateEntry" => {
                 let input: PathInput = decode(payload)?;
+                self.guard_path(&input.cwd).await?;
                 let result = self
                     .service
                     .duplicate_entry(Path::new(&input.cwd), &input.relative_path)
@@ -188,6 +206,7 @@ impl WorkspaceRpc {
             }
             "projects.listEntries" => {
                 let input: ListInput = decode(payload)?;
+                self.guard_path(&input.cwd).await?;
                 let index = self.index(&input.cwd).await.map_err(|error| {
                     entries_wire_error("ProjectListEntriesError", &input.cwd, &error)
                 })?;
@@ -200,6 +219,7 @@ impl WorkspaceRpc {
             }
             "projects.searchEntries" => {
                 let input: SearchInput = decode(payload)?;
+                self.guard_path(&input.cwd).await?;
                 let index = self.index(&input.cwd).await.map_err(|error| {
                     entries_wire_error("ProjectSearchEntriesError", &input.cwd, &error)
                 })?;
@@ -214,6 +234,9 @@ impl WorkspaceRpc {
             }
             "filesystem.browse" => {
                 let input: BrowseInput = decode(payload)?;
+                if let Some(cwd) = &input.cwd {
+                    self.guard_path(cwd).await?;
+                }
                 self.service
                     .browse(
                         &input.partial_path,
@@ -230,6 +253,7 @@ impl WorkspaceRpc {
             }
             "review.getDiffPreview" => {
                 let input: ReviewDiffPreviewInput = decode(payload)?;
+                self.guard_path(&input.cwd).await?;
                 self.handle_review_get_diff_preview(input).await
             }
             _ => Err(json!({
@@ -244,6 +268,26 @@ impl WorkspaceRpc {
             return;
         };
         self.indexes.lock().await.remove(&canonical);
+    }
+
+    async fn guard_path(&self, cwd: &str) -> Result<(), Value> {
+        let Some(registry) = &self.availability_registry else {
+            return Ok(());
+        };
+        registry
+            .guard_path(Path::new(cwd))
+            .await
+            .map_err(workspace_unavailable_wire)
+    }
+
+    async fn guard_thread(&self, thread_id: &str) -> Result<(), Value> {
+        let Some(registry) = &self.availability_registry else {
+            return Ok(());
+        };
+        registry
+            .guard_thread(thread_id)
+            .await
+            .map_err(workspace_unavailable_wire)
     }
 
     async fn index(&self, cwd: &str) -> Result<WorkspaceSearchIndex, WorkspaceError> {
@@ -272,6 +316,7 @@ impl WorkspaceRpc {
             .ok_or_else(|| defect("assets.createUrl is not configured"))?;
         let workspace_root = match &input.resource {
             AssetResource::WorkspaceFile { thread_id, .. } => {
+                self.guard_thread(thread_id).await?;
                 let resolver = self
                     .dependencies
                     .asset_context_resolver
@@ -280,7 +325,10 @@ impl WorkspaceRpc {
                         defect("assets.createUrl requires a workspace context resolver")
                     })?;
                 match resolver.resolve_workspace_root(thread_id).await {
-                    Ok(Some(root)) => Some(root),
+                    Ok(Some(root)) => {
+                        self.guard_path(&root.to_string_lossy()).await?;
+                        Some(root)
+                    }
                     Ok(None) => {
                         return Err(asset_wire(
                             &input.resource,
@@ -298,7 +346,11 @@ impl WorkspaceRpc {
                     }
                 }
             }
-            _ => None,
+            AssetResource::ProjectFavicon { cwd } => {
+                self.guard_path(cwd).await?;
+                None
+            }
+            AssetResource::Attachment { .. } => None,
         };
         let issued = asset_access
             .issue(AssetIssueRequest {
@@ -334,6 +386,10 @@ fn decode<T: for<'de> Deserialize<'de>>(payload: Value) -> Result<T, Value> {
             "message": error.to_string(),
         })
     })
+}
+
+fn workspace_unavailable_wire(error: crate::worktree_catalog::WorkspaceUnavailable) -> Value {
+    serde_json::to_value(error).expect("workspace unavailable error serializes")
 }
 
 fn encode<T: serde::Serialize>(value: T) -> Result<Value, WorkspaceError> {
