@@ -73,6 +73,15 @@ succeeds, normal SQLite locking continues to support sequential or simultaneous
 server processes sharing that established store. Graceful server join still
 waits for the SQLite worker to close before returning.
 
+After store preparation succeeds, the runtime copies the marker's persistent
+UUID into runtime-only server configuration. Both the public
+`/.well-known/bibcode/environment` response and BiBCode Connect descriptors
+publish that UUID as `storageInstanceId`, so a clean restart of the same store
+reports the same identity. New local servers always publish a UUID string;
+contract decoding maps the omitted field from an older or third-party remote
+server to `null`. Normal environment descriptors never include the requested
+or effective data root, alias diagnostics, or any other local filesystem path.
+
 First-run creation initializes a randomized same-directory staged SQLite file,
 closes it without retained journal sidecars, and publishes it at `state.sqlite`
 with an atomic no-replace hard link. Platform file identity checks bind cleanup

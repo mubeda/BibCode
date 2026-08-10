@@ -221,6 +221,7 @@ struct EnvironmentDescriptor {
     label: String,
     platform: PlatformDescriptor,
     server_version: String,
+    storage_instance_id: String,
     capabilities: EnvironmentCapabilities,
 }
 
@@ -246,6 +247,10 @@ async fn environment_descriptor(State(state): State<AppState>) -> Json<Environme
             arch: platform_arch(),
         },
         server_version: config.server_version.clone(),
+        storage_instance_id: config
+            .storage_instance_id
+            .expect("a running server has a prepared persistent store")
+            .to_string(),
         capabilities: EnvironmentCapabilities {
             repository_identity: true,
         },

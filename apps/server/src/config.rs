@@ -13,6 +13,7 @@ use thiserror::Error;
 use url::Url;
 
 use crate::data_root::{DataRootError, DataRootRequest, DataRootSource, ResolvedDataRoot};
+use crate::persistence::StorageInstanceId;
 
 pub const DEFAULT_PORT: u16 = 3773;
 
@@ -48,6 +49,7 @@ pub struct ServerConfig {
     pub environment_id: String,
     pub environment_label: String,
     pub server_version: String,
+    pub storage_instance_id: Option<StorageInstanceId>,
 }
 
 impl ServerConfig {
@@ -72,6 +74,7 @@ impl ServerConfig {
             environment_id: "local".to_owned(),
             environment_label: "Local".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
+            storage_instance_id: None,
         }
     }
 

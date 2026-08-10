@@ -107,6 +107,7 @@ const SERVER_CONFIG: ServerConfigType = {
       arch: "arm64",
     },
     serverVersion: "0.0.0-test",
+    storageInstanceId: null,
     capabilities: {
       repositoryIdentity: true,
       activityProtocolVersion: null,
