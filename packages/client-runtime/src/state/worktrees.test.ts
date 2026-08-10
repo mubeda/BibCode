@@ -109,15 +109,11 @@ function session(client: WsRpcProtocolClient): RpcSession {
   };
 }
 
-const makeAtomHarness = Effect.fn("TestWorktrees.makeAtomHarness")(function* (
-  snapshotsByEnvironment: ReadonlyMap<EnvironmentId, ReadonlyArray<VcsWorktreeCatalogSnapshot>>,
+const makeAtomHarnessFromClients = Effect.fn("TestWorktrees.makeAtomHarnessFromClients")(function* (
+  clients: ReadonlyMap<EnvironmentId, WsRpcProtocolClient>,
 ) {
   const supervisors = new Map<EnvironmentId, EnvironmentSupervisor["Service"]>();
-  for (const [environmentId, snapshots] of snapshotsByEnvironment) {
-    const client = {
-      [WS_METHODS.subscribeWorktreeCatalog]: () =>
-        Stream.fromIterable(snapshots).pipe(Stream.concat(Stream.never)),
-    } as unknown as WsRpcProtocolClient;
+  for (const [environmentId, client] of clients) {
     const supervisorSession = yield* SubscriptionRef.make<Option.Option<RpcSession>>(
       Option.some(session(client)),
     );
@@ -136,7 +132,23 @@ const makeAtomHarness = Effect.fn("TestWorktrees.makeAtomHarness")(function* (
   const worktrees = createWorktreeEnvironmentAtoms(
     Atom.runtime(Layer.succeed(EnvironmentRegistry, environmentRegistry)),
   );
-  return { worktrees, atomRegistry: AtomRegistry.make() };
+  return { worktrees, atomRegistry: AtomRegistry.make(), supervisors };
+});
+
+const makeAtomHarness = Effect.fn("TestWorktrees.makeAtomHarness")(function* (
+  snapshotsByEnvironment: ReadonlyMap<EnvironmentId, ReadonlyArray<VcsWorktreeCatalogSnapshot>>,
+) {
+  return yield* makeAtomHarnessFromClients(
+    new Map(
+      [...snapshotsByEnvironment].map(([environmentId, snapshots]) => [
+        environmentId,
+        {
+          [WS_METHODS.subscribeWorktreeCatalog]: () =>
+            Stream.fromIterable(snapshots).pipe(Stream.concat(Stream.never)),
+        } as unknown as WsRpcProtocolClient,
+      ]),
+    ),
+  );
 });
 
 const makeCommandHarness = Effect.fn("TestWorktrees.makeCommandHarness")(function* (
@@ -312,6 +324,93 @@ describe("deriveWorktreeDiscoveryState", () => {
 });
 
 describe("worktree catalog atoms", () => {
+  it.effect("finalizes the live catalog across reconnect, final unmount, and remount", () =>
+    Effect.gen(function* () {
+      const subscriptions = { initial: 0, reconnected: 0 };
+      let active = 0;
+      let maximumActive = 0;
+      const finalizers = { initial: 0, reconnected: 0 };
+      const initial = snapshot({ worktrees: [descriptor("/repo-worktrees/live")] });
+      const reconnected = snapshot({
+        generation: 2,
+        worktrees: [descriptor("/repo-worktrees/live")],
+      });
+      const client = (kind: keyof typeof subscriptions, current: VcsWorktreeCatalogSnapshot) =>
+        ({
+          [WS_METHODS.subscribeWorktreeCatalog]: () =>
+            Stream.fromEffect(
+              Effect.sync(() => {
+                subscriptions[kind] += 1;
+                active += 1;
+                maximumActive = Math.max(maximumActive, active);
+                return current;
+              }),
+            ).pipe(
+              Stream.concat(Stream.never),
+              Stream.ensuring(
+                Effect.sync(() => {
+                  active -= 1;
+                  finalizers[kind] += 1;
+                }),
+              ),
+            ),
+        }) as unknown as WsRpcProtocolClient;
+      const harness = yield* makeAtomHarnessFromClients(
+        new Map([[ENVIRONMENT_ONE, client("initial", initial)]]),
+      );
+      const catalog = harness.worktrees.catalog({
+        environmentId: ENVIRONMENT_ONE,
+        input: { projectId: PROJECT_ID },
+      });
+
+      const unmountFirst = harness.atomRegistry.mount(catalog);
+      yield* readSnapshot(harness.atomRegistry, catalog, initial.generation);
+      expect({ subscriptions, active, maximumActive, finalizers }).toEqual({
+        subscriptions: { initial: 1, reconnected: 0 },
+        active: 1,
+        maximumActive: 1,
+        finalizers: { initial: 0, reconnected: 0 },
+      });
+
+      yield* SubscriptionRef.set(
+        harness.supervisors.get(ENVIRONMENT_ONE)!.session,
+        Option.some(session(client("reconnected", reconnected))),
+      );
+      yield* readSnapshot(harness.atomRegistry, catalog, reconnected.generation);
+      expect({ subscriptions, active, maximumActive, finalizers }).toEqual({
+        subscriptions: { initial: 1, reconnected: 1 },
+        active: 1,
+        maximumActive: 1,
+        finalizers: { initial: 1, reconnected: 0 },
+      });
+
+      unmountFirst();
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      expect({ active, finalizers }).toEqual({
+        active: 0,
+        finalizers: { initial: 1, reconnected: 1 },
+      });
+
+      const unmountSecond = harness.atomRegistry.mount(catalog);
+      yield* readSnapshot(harness.atomRegistry, catalog, reconnected.generation);
+      expect({ subscriptions, active, maximumActive }).toEqual({
+        subscriptions: { initial: 1, reconnected: 2 },
+        active: 1,
+        maximumActive: 1,
+      });
+
+      unmountSecond();
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+      expect({ active, finalizers }).toEqual({
+        active: 0,
+        finalizers: { initial: 1, reconnected: 2 },
+      });
+      harness.atomRegistry.dispose();
+    }),
+  );
+
   it.effect("retains last usable rows when a degraded snapshot arrives", () =>
     Effect.gen(function* () {
       const candidate = descriptor("/repo-worktrees/retained");
@@ -552,6 +651,104 @@ describe("worktree adoption commands", () => {
       expect(started.get(ENVIRONMENT_TWO)).toBe(5);
       harness.atomRegistry.dispose();
     }),
+  );
+
+  it.effect(
+    "interrupts active bulk adoption and never starts queued candidates after registry unmount",
+    () =>
+      Effect.gen(function* () {
+        const fourStarted = yield* Deferred.make<void>();
+        const fourFinalized = yield* Deferred.make<void>();
+        const gates = new Map<string, Deferred.Deferred<void>>();
+        for (let index = 0; index < 8; index += 1) {
+          gates.set(`key-${ENVIRONMENT_ONE}-${index}`, yield* Deferred.make<void>());
+        }
+        const started: string[] = [];
+        const finalized: string[] = [];
+        const completed: string[] = [];
+        let allowFresh = false;
+        const client = {
+          [WS_METHODS.worktreeAdopt]: (input: { worktreeKey: string }) => {
+            if (allowFresh) {
+              return Effect.succeed({
+                threadId: `thread-${input.worktreeKey}`,
+                disposition: "created" as const,
+              });
+            }
+            return Effect.acquireUseRelease(
+              Effect.sync(() => {
+                started.push(input.worktreeKey);
+                return started.length;
+              }).pipe(
+                Effect.tap((count) =>
+                  count === 4 ? Deferred.succeed(fourStarted, undefined) : Effect.void,
+                ),
+              ),
+              () => Deferred.await(gates.get(input.worktreeKey)!),
+              () =>
+                Effect.sync(() => {
+                  finalized.push(input.worktreeKey);
+                  return finalized.length;
+                }).pipe(
+                  Effect.tap((count) =>
+                    count === 4 ? Deferred.succeed(fourFinalized, undefined) : Effect.void,
+                  ),
+                ),
+            ).pipe(
+              Effect.tap(() =>
+                Effect.sync(() => {
+                  completed.push(input.worktreeKey);
+                }),
+              ),
+              Effect.as({
+                threadId: `thread-${input.worktreeKey}`,
+                disposition: "created" as const,
+              }),
+            );
+          },
+        } as unknown as WsRpcProtocolClient;
+        const harness = yield* makeCommandHarness(new Map([[ENVIRONMENT_ONE, client]]));
+        void harness.worktrees.addAll.run(harness.atomRegistry, addAllInput(ENVIRONMENT_ONE, 8));
+
+        yield* Deferred.await(fourStarted);
+        expect(started).toEqual([
+          `key-${ENVIRONMENT_ONE}-0`,
+          `key-${ENVIRONMENT_ONE}-1`,
+          `key-${ENVIRONMENT_ONE}-2`,
+          `key-${ENVIRONMENT_ONE}-3`,
+        ]);
+
+        harness.atomRegistry.reset();
+        yield* Deferred.await(fourFinalized);
+        expect(finalized.toSorted()).toEqual(started.toSorted());
+        expect(harness.atomRegistry.getNodes().size).toBe(0);
+
+        for (const gate of gates.values()) {
+          yield* Deferred.succeed(gate, undefined);
+        }
+        yield* Effect.yieldNow;
+        expect(started).toHaveLength(4);
+        expect(completed).toEqual([]);
+
+        allowFresh = true;
+        const freshResult = yield* Effect.promise(() =>
+          harness.worktrees.addAll.run(harness.atomRegistry, addAllInput(ENVIRONMENT_ONE, 1)),
+        );
+        expect(freshResult).toMatchObject({
+          _tag: "Success",
+          value: {
+            results: [
+              {
+                _tag: "Success",
+                worktreeKey: `key-${ENVIRONMENT_ONE}-0`,
+              },
+            ],
+          },
+        });
+        expect(started).toHaveLength(4);
+        expect(completed).toEqual([]);
+        harness.atomRegistry.dispose();
+      }),
   );
 
   it.effect("serializes candidates that share an environment and project", () =>

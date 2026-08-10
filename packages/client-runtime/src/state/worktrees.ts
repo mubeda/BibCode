@@ -13,16 +13,19 @@ import {
 } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import { Atom } from "effect/unstable/reactivity";
 
 import type { EnvironmentRegistry } from "../connection/registry.ts";
-import { subscribe, type EnvironmentRpcInput } from "../rpc/client.ts";
+import { request, subscribe, type EnvironmentRpcInput } from "../rpc/client.ts";
 import {
   createAtomCommandScheduler,
   createEnvironmentRpcCommand,
   createEnvironmentSubscriptionAtomFamily,
-  settlePromise,
+  createRuntimeCommand,
+  runInEnvironment,
 } from "./runtime.ts";
 
 export interface WorktreeDiscoveryStateInput {
@@ -116,11 +119,45 @@ function retainLastUsableWorktreeCatalogRows<E, R>(
   );
 }
 
+interface EffectMutexLane {
+  readonly semaphore: Semaphore.Semaphore;
+  users: number;
+}
+
+function createEffectMutexLanes() {
+  const lanes = new Map<string, EffectMutexLane>();
+
+  return <A, E, R>(key: string, effect: Effect.Effect<A, E, R>): Effect.Effect<A, E, R> =>
+    Effect.acquireUseRelease(
+      Effect.sync(() => {
+        const existing = lanes.get(key);
+        const lane = existing ?? {
+          semaphore: Semaphore.makeUnsafe(1),
+          users: 0,
+        };
+        lane.users += 1;
+        if (existing === undefined) {
+          lanes.set(key, lane);
+        }
+        return lane;
+      }),
+      (lane) => lane.semaphore.withPermit(effect),
+      (lane) =>
+        Effect.sync(() => {
+          lane.users -= 1;
+          if (lane.users === 0 && lanes.get(key) === lane) {
+            lanes.delete(key);
+          }
+        }),
+    );
+}
+
 export function createWorktreeEnvironmentAtoms<R, E>(
   runtime: Atom.AtomRuntime<EnvironmentRegistry | R, E>,
 ) {
-  const commandScheduler = createAtomCommandScheduler();
-  const bulkScheduler = createAtomCommandScheduler();
+  const refreshScheduler = createAtomCommandScheduler();
+  const withProjectMutationLane = createEffectMutexLanes();
+  const withEnvironmentBulkLane = createEffectMutexLanes();
   const projectKey = ({
     environmentId,
     input,
@@ -129,71 +166,86 @@ export function createWorktreeEnvironmentAtoms<R, E>(
     readonly input: { readonly projectId: string };
   }) => JSON.stringify([environmentId, input.projectId]);
 
-  const addOne = createEnvironmentRpcCommand(runtime, {
+  const executeAdoption = (target: {
+    readonly environmentId: EnvironmentId;
+    readonly input: WorktreeAdoptInput;
+  }) =>
+    withProjectMutationLane(
+      projectKey(target),
+      runInEnvironment(target.environmentId, request(WS_METHODS.worktreeAdopt, target.input)),
+    );
+  const addOne = createRuntimeCommand(runtime, {
     label: "environment-data:worktrees:add-one",
-    tag: WS_METHODS.worktreeAdopt,
-    scheduler: commandScheduler,
-    concurrency: { mode: "serial", key: projectKey },
+    execute: executeAdoption,
   });
-  const addAll = {
+  const adoptCandidate = Effect.fn("Worktrees.adoptCandidate")(function* (
+    environmentId: EnvironmentId,
+    candidate: WorktreeAdoptInput,
+  ) {
+    const result = yield* Effect.exit(
+      executeAdoption({
+        environmentId,
+        input: candidate,
+      }),
+    );
+    if (Exit.isSuccess(result)) {
+      return {
+        _tag: "Success",
+        worktreeKey: candidate.worktreeKey,
+        result: result.value,
+      } satisfies WorktreeAddAllItemResult;
+    }
+    if (Cause.hasInterruptsOnly(result.cause)) {
+      return yield* Effect.failCause(result.cause);
+    }
+    return {
+      _tag: "Failure",
+      worktreeKey: candidate.worktreeKey,
+      error: Cause.squash(result.cause),
+    } satisfies WorktreeAddAllItemResult;
+  });
+  const addAll = createRuntimeCommand(runtime, {
     label: "environment-data:worktrees:add-all",
-    run: (
-      registry: Parameters<typeof addOne.run>[0],
-      target: { readonly environmentId: EnvironmentId; readonly input: WorktreeAddAllInput },
-    ) =>
-      bulkScheduler.schedule(
-        registry,
-        { mode: "serial", key: ({ environmentId }) => environmentId },
-        target,
-        () =>
-          settlePromise(() => {
-            const adoptCandidate = Effect.fn("Worktrees.adoptCandidate")(function* (
-              candidate: WorktreeAdoptInput,
-            ) {
-              const result = yield* Effect.promise(() =>
-                addOne.run(registry, {
-                  environmentId: target.environmentId,
-                  input: candidate,
-                }),
-              );
-              return result._tag === "Success"
-                ? ({
-                    _tag: "Success",
-                    worktreeKey: candidate.worktreeKey,
-                    result: result.value,
-                  } satisfies WorktreeAddAllItemResult)
-                : ({
-                    _tag: "Failure",
-                    worktreeKey: candidate.worktreeKey,
-                    error: Cause.squash(result.cause),
-                  } satisfies WorktreeAddAllItemResult);
-            });
-            return Effect.runPromise(
-              Effect.forEach(target.input.candidates, adoptCandidate, { concurrency: 4 }).pipe(
-                Effect.map((results): WorktreeAddAllResult => ({ results })),
-              ),
-            );
-          }),
+    execute: (target: {
+      readonly environmentId: EnvironmentId;
+      readonly input: WorktreeAddAllInput;
+    }) =>
+      withEnvironmentBulkLane(
+        target.environmentId,
+        Effect.forEach(
+          target.input.candidates,
+          (candidate) => adoptCandidate(target.environmentId, candidate),
+          { concurrency: 4 },
+        ).pipe(Effect.map((results): WorktreeAddAllResult => ({ results }))),
       ),
-  };
+  });
 
   return {
     catalog: createEnvironmentSubscriptionAtomFamily(runtime, {
       label: "environment-data:worktrees:catalog",
+      idleTtlMs: 0,
       subscribe: (input: EnvironmentRpcInput<typeof WS_METHODS.subscribeWorktreeCatalog>) =>
         retainLastUsableWorktreeCatalogRows(subscribe(WS_METHODS.subscribeWorktreeCatalog, input)),
     }),
     refresh: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:worktrees:refresh",
       tag: WS_METHODS.vcsRefreshWorktreeCatalog,
-      scheduler: commandScheduler,
+      scheduler: refreshScheduler,
       concurrency: { mode: "singleFlight", key: projectKey },
     }),
-    updatePolicy: createEnvironmentRpcCommand(runtime, {
+    updatePolicy: createRuntimeCommand(runtime, {
       label: "environment-data:worktrees:update-policy",
-      tag: WS_METHODS.worktreeUpdateDiscoveryPolicy,
-      scheduler: commandScheduler,
-      concurrency: { mode: "serial", key: projectKey },
+      execute: (target: {
+        readonly environmentId: EnvironmentId;
+        readonly input: EnvironmentRpcInput<typeof WS_METHODS.worktreeUpdateDiscoveryPolicy>;
+      }) =>
+        withProjectMutationLane(
+          projectKey(target),
+          runInEnvironment(
+            target.environmentId,
+            request(WS_METHODS.worktreeUpdateDiscoveryPolicy, target.input),
+          ),
+        ),
     }),
     addOne,
     addAll,
