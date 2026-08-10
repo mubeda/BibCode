@@ -406,6 +406,12 @@ vi.mock("../state/desktopUpdate", () => ({
   useDesktopUpdateState: () => h.state.desktopUpdateState,
 }));
 
+vi.mock("../state/worktrees", () => ({
+  worktreeEnvironment: {
+    updatePolicy: { label: "worktree.updatePolicy" },
+  },
+}));
+
 vi.mock("./desktopUpdate.logic", () => ({
   isDesktopUpdateButtonDisabled: () => h.state.updateBtnDisabled,
   resolveDesktopUpdateButtonAction: () => h.state.updateBtnAction,
@@ -541,6 +547,21 @@ vi.mock("./ThreadStatusIndicators", () => ({
 vi.mock("./ProjectFavicon", () => ({ ProjectFavicon: h.mk("ProjectFavicon", "span") }));
 vi.mock("./CreateWorktreeDialog", () => ({
   CreateWorktreeDialog: h.mk("CreateWorktreeDialog"),
+}));
+vi.mock("./WorktreeDiscoverySection", () => ({
+  WorktreeDiscoverySection: h.mk("WorktreeDiscoverySection"),
+  getSupportedWorktreeDiscoveryMembers: (
+    members: ReadonlyArray<{ environmentId: string }>,
+    serverConfigs: ReadonlyMap<
+      string,
+      { environment?: { capabilities?: { worktreeCatalog?: boolean } } }
+    >,
+  ) =>
+    members.filter(
+      (member) =>
+        serverConfigs.get(member.environmentId)?.environment?.capabilities?.worktreeCatalog ===
+        true,
+    ),
 }));
 vi.mock("./settings/SettingsSidebarNav", () => ({
   SettingsSidebarNav: h.mk("SettingsSidebarNav"),
@@ -1699,6 +1720,76 @@ staticDescribe("project header context menu", () => {
     expect(h.spies.routerNavigate).toHaveBeenCalledWith({ to: "/settings/archived" });
   });
 
+  it("toggles hidden and shown discovered worktrees from the project menu", async () => {
+    baseScenario();
+    h.state.serverConfigs = new Map([
+      [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: true } } }],
+    ]);
+    fakeLocalApi();
+    h.spies.contextMenuShow.mockImplementation(
+      async (items: Array<{ id: string; label: string }>) => {
+        const visibility = items.find((item) => item.id === "worktree-discovery-visibility");
+        expect(visibility?.label).toBe("Show hidden worktrees");
+        return visibility!.id;
+      },
+    );
+    render(<Sidebar />);
+    const hiddenHeader = captured("SidebarMenuButton").find(
+      (entry) => typeof entry.props["onContextMenu"] === "function",
+    )!.props;
+
+    invoke(hiddenHeader, "onContextMenu", mouseEvent());
+    await flush();
+
+    expect(h.state.commandCalls).toContainEqual({
+      label: "worktree.updatePolicy",
+      input: {
+        environmentId: ENV_MAIN,
+        input: expect.objectContaining({
+          projectId: ProjectId.make("project-a"),
+          visibility: "shown",
+        }),
+      },
+    });
+
+    h.state.projects = [
+      makeProject("project-a", {
+        worktreeDiscovery: {
+          visibility: "shown",
+          initialPromptDismissedAt: null,
+          baselinePaths: [],
+        },
+      }),
+    ];
+    h.state.commandCalls = [];
+    h.state.captures.length = 0;
+    h.spies.contextMenuShow.mockImplementation(
+      async (items: Array<{ id: string; label: string }>) => {
+        const visibility = items.find((item) => item.id === "worktree-discovery-visibility");
+        expect(visibility?.label).toBe("Hide discovered worktrees");
+        return visibility!.id;
+      },
+    );
+    render(<Sidebar />);
+    const shownHeader = captured("SidebarMenuButton").find(
+      (entry) => typeof entry.props["onContextMenu"] === "function",
+    )!.props;
+
+    invoke(shownHeader, "onContextMenu", mouseEvent());
+    await flush();
+
+    expect(h.state.commandCalls).toContainEqual({
+      label: "worktree.updatePolicy",
+      input: {
+        environmentId: ENV_MAIN,
+        input: expect.objectContaining({
+          projectId: ProjectId.make("project-a"),
+          visibility: "hidden",
+        }),
+      },
+    });
+  });
+
   it("opens the rename and grouping dialogs from the menu", async () => {
     const header = projectHeaderProps();
     fakeLocalApi();
@@ -1807,6 +1898,41 @@ staticDescribe("project header context menu", () => {
     expect(h.state.commandCalls.map((call: { label: string }) => call.label)).toContain(
       "project.delete",
     );
+  });
+});
+
+staticDescribe("worktree discovery integration", () => {
+  it("mounts discovery immediately before the primary row without changing thread rows", () => {
+    baseScenario();
+    h.state.serverConfigs = new Map([
+      [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: true } } }],
+    ]);
+    render(<Sidebar />);
+
+    const discoveryIndex = (h.state.captures as Array<{ name: string }>).findIndex(
+      (entry) => entry.name === "WorktreeDiscoverySection",
+    );
+    const primaryCapture = captured("SidebarMenuSubButton").find((entry) => {
+      const elements: React.ReactElement[] = [];
+      collectElements(entry.props["children"], elements);
+      return elements.some(
+        (element) => (element.props as { children?: unknown }).children === "primary",
+      );
+    });
+    const primaryIndex = (h.state.captures as Array<unknown>).indexOf(primaryCapture);
+
+    expect(discoveryIndex).toBeGreaterThan(-1);
+    expect(primaryIndex).toBeGreaterThan(discoveryIndex);
+    expect(captured("WorktreeDiscoverySection")[0]?.props).toEqual(
+      expect.objectContaining({
+        project: expect.objectContaining({ id: ProjectId.make("project-a") }),
+      }),
+    );
+    expect(
+      captured("SidebarMenuSubButton").some(
+        (entry) => entry.props["data-testid"] === "thread-row-thread-idle",
+      ),
+    ).toBe(true);
   });
 });
 
