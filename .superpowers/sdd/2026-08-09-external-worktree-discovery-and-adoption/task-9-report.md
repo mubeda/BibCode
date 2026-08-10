@@ -9,6 +9,77 @@ with the exact structured `WorkspaceUnavailableError`, and runs bounded
 provider/terminal quiescence without deleting conversation or terminal
 history.
 
+## Fix round 4 — exact terminal cleanup and stable loss failures
+
+The fourth review follow-up closes the remaining terminal-selection and RPC
+error-ordering races without a wire-schema, persisted-shape, migration, or
+dependency change:
+
+- terminal cleanup now receives the exact workspace-loss transition. It
+  captures every live terminal's session, generation, and process only while
+  that transition is current, then rechecks the session-map pointer,
+  generation-registry pointer, and process pointer under the terminal
+  lifecycle lock before signaling. A recovered replacement published under
+  the same thread and terminal IDs is therefore not a target of stale initial
+  cleanup or a reaper retry;
+- exact terminal quiesce still signals all current captured sessions before
+  waiting, aggregates failures, and finalizes successful exits into their
+  retained bounded histories. The existing exact-generation exit guard remains
+  the second line of protection after target selection;
+- each admission finalization gate now owns its loss cancellation and publishes
+  the exact `WorkspaceUnavailableError` while holding the gate lock immediately
+  before changing the gate to rejected. Cancellation notification follows the
+  commit-order decision, but a SQLite `CommitRejected` result can no longer be
+  observed before its structured loss value;
+- turn RPC dispatch maps a generic engine cancellation back to that exact
+  published loss when database rejection wins the RPC select. Ordinary engine
+  cancellation remains unchanged when no workspace loss is attached.
+
+The terminal RED specified two-session identity capture, replacement, and
+resumed exact cleanup, and failed because the manager exposed only thread-wide
+selection at execution time. GREEN proves the replacement remains running,
+writable, attachable, and retains its transcript while the other captured
+session exits with history intact. Existing recovery/reaper coverage also
+asserts that an exact recovered transition cannot reach a fresh terminal
+cleanup attempt.
+
+The RPC RED paused accepted and rejected SQLite transactions before
+finalization, rejected the gate, then paused loss before cancellation
+notification. Releasing SQLite deterministically made the old code return
+`OrchestrationDispatchCommandError`; GREEN returns the exact structured
+`WorkspaceUnavailableError` in both persistence branches while preserving
+their rollback behavior. Existing commit-wins cases continue to prove that
+loss waits for accepted and rejected transaction finalization.
+
+Round 4 verification completed with the following focused and broad evidence:
+
+- availability state owner: 13 passed;
+- terminal manager: 29 passed, including the exact two-session replacement
+  regression;
+- worktree runtime and reaper: 16 passed;
+- production orchestration RPC units: 15 passed, including the forced accepted
+  and rejected persistence ordering matrix;
+- orchestration engine: 26 passed;
+- production orchestration RPC integration: 17 passed;
+- production server-terminal RPC integration: 12 passed;
+- provider exact-recovery regression: 1 passed;
+- full server library: 1,038 passed;
+- every server integration target passed. The known load-sensitive
+  `agent_activity_hung_factory_does_not_block_terminal_disable_or_later_settings_updates`
+  case was excluded from the combined provider-terminal run, which passed
+  96 tests, and then passed alone in 0.99 seconds;
+- `cargo fmt --all --check`, server all-targets Clippy with warnings denied,
+  `vp check`, and `vp run typecheck` passed. Typecheck emitted only the
+  repository's existing non-failing Effect Schema finite-number suggestions.
+
+Two verbose aggregate runs were interrupted after detached output handling and
+a back-to-back library invocation stalled around an unrelated production
+control test. A clean exact rerun of that control test passed in 0.53 seconds,
+the clean full library rerun passed all 1,038 tests in 55.99 seconds, and all
+integration targets then passed in separate fresh test processes. This keeps
+the final evidence complete without treating runner-output or repeated-suite
+state as an application failure.
+
 ## Fix round 3 — atomic SQLite finalization and exact provider cleanup
 
 The third review follow-up closes the two remaining ordering gaps without a

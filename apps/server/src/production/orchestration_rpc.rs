@@ -393,7 +393,16 @@ async fn dispatch_turn_command(
                     WorkspaceAdmissionError::Unavailable(unavailable),
                 ));
             }
-            result = &mut dispatch => result,
+            result = &mut dispatch => {
+                if matches!(result, Err(OrchestrationError::Cancelled))
+                    && let Some(unavailable) = loss.unavailable()
+                {
+                    return Err(workspace_admission_error(
+                        WorkspaceAdmissionError::Unavailable(unavailable),
+                    ));
+                }
+                result
+            },
         }
     } else {
         dispatch
@@ -1988,6 +1997,95 @@ mod tests {
         availability
             .clear_recovered_in_repository(&thread_id, state.path(), "loss-repository")
             .await;
+        for (suffix, generation, source_plan) in [
+            ("accepted", 2_u64, None),
+            ("rejected", 3_u64, Some("missing-forced-order-plan")),
+        ] {
+            let finalization_pause = hooks.pause_before_next_command_finalization();
+            let rejection_pause = availability.pause_after_next_finalization_rejection();
+            let mut payload = json!({
+                "type": "thread.turn.start",
+                "commandId": format!("forced-order-{suffix}-turn"),
+                "threadId": thread_id,
+                "message": {
+                    "messageId": format!("forced-order-{suffix}-message"),
+                    "role": "user",
+                    "text": "loss must retain its exact public error",
+                    "attachments": []
+                },
+                "modelSelection": {"instanceId": "codex", "model": "gpt-5"},
+                "createdAt": CREATED_AT
+            });
+            if let Some(plan_id) = source_plan {
+                payload["sourceProposedPlan"] = json!({
+                    "threadId": thread_id,
+                    "planId": plan_id,
+                });
+            }
+            let request = dispatch_registered_command(&mut socket, "12", payload);
+            tokio::pin!(request);
+            tokio::time::timeout(std::time::Duration::from_secs(5), async {
+                tokio::select! {
+                    () = finalization_pause.wait_until_entered() => {}
+                    result = &mut request => panic!("forced-order turn exited before finalization: {result:?}"),
+                }
+            })
+            .await
+            .expect("forced-order turn reaches pre-finalization barrier");
+
+            let forced_loss = WorkspaceLossTransition {
+                thread_id: thread_id.clone(),
+                repository_key: "loss-repository".to_owned(),
+                generation,
+                path: state.path().to_path_buf(),
+                availability: AdoptedWorktreeAvailability::MissingRegistered,
+            };
+            let loss_availability = availability.clone();
+            let loss_transition = forced_loss.clone();
+            let loss_task = tokio::task::spawn_blocking(move || {
+                loss_availability.mark_unavailable_sync(loss_transition)
+            });
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                rejection_pause.wait_until_entered(),
+            )
+            .await
+            .expect("loss rejects finalization before publishing cancellation");
+            finalization_pause.release();
+
+            let error = request
+                .await
+                .expect_err("loss-wins RPC returns a typed failure");
+            rejection_pause.release();
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_secs(5), loss_task)
+                    .await
+                    .expect("forced-order loss completes")
+                    .expect("forced-order loss joins")
+            );
+            assert_eq!(
+                error[0]["error"]["_tag"], "WorkspaceUnavailableError",
+                "accepted and rejected persistence must not expose generic cancellation"
+            );
+            assert_eq!(error[0]["error"]["threadId"], thread_id);
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                availability.wait_for_transition_admissions(&forced_loss),
+            )
+            .await
+            .expect("forced-order admission drains");
+            assert!(
+                engine
+                    .repositories()
+                    .get_command_receipt(format!("forced-order-{suffix}-turn"))
+                    .await
+                    .expect("forced-order receipt lookup")
+                    .is_none()
+            );
+            availability
+                .clear_recovered_in_repository(&thread_id, state.path(), "loss-repository")
+                .await;
+        }
         let commit_wins_pause = hooks.pause_after_next_command_finalization();
         socket
             .send(Message::Text(
@@ -2024,7 +2122,7 @@ mod tests {
         let commit_wins_loss = WorkspaceLossTransition {
             thread_id: thread_id.clone(),
             repository_key: "loss-repository".to_owned(),
-            generation: 2,
+            generation: 4,
             path: state.path().to_path_buf(),
             availability: AdoptedWorktreeAvailability::MissingRegistered,
         };
@@ -2116,7 +2214,7 @@ mod tests {
         let rejected_loss = WorkspaceLossTransition {
             thread_id: thread_id.clone(),
             repository_key: "loss-repository".to_owned(),
-            generation: 3,
+            generation: 5,
             path: state.path().to_path_buf(),
             availability: AdoptedWorktreeAvailability::MissingRegistered,
         };
@@ -2181,7 +2279,7 @@ mod tests {
         let rejected_commit_wins_loss = WorkspaceLossTransition {
             thread_id: thread_id.clone(),
             repository_key: "loss-repository".to_owned(),
-            generation: 4,
+            generation: 6,
             path: state.path().to_path_buf(),
             availability: AdoptedWorktreeAvailability::MissingRegistered,
         };
