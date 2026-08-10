@@ -9,8 +9,11 @@ use std::{
 use bibcode_server::{
     CauseItem, RpcExit, RpcRegistry, ServerConfig, ServerMessage, ServerRuntime,
     git::GitRepository,
-    orchestration::{EngineOptions, OrchestrationEngine},
-    persistence::{Database, ProjectionProject, ProjectionThread, Repositories, run_migrations},
+    orchestration::{EngineOptions, OrchestrationCommand, OrchestrationEngine},
+    persistence::{
+        Database, OrchestrationEvent, ProjectionProject, ProjectionThread, Repositories,
+        run_migrations,
+    },
     production::git_vcs::{CatalogMutationObserver, GitVcsRpcServices, register_git_vcs_rpc},
     production::worktree_catalog_rpc::{
         WorktreeCatalogMutationObserver, WorktreeCatalogRpcServices, compact_eligible_baseline,
@@ -23,6 +26,7 @@ use bibcode_server::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
+use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 use tokio::time::timeout;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
@@ -373,6 +377,349 @@ async fn concurrent_policy_controls_merge_without_losing_a_sibling_update() {
         .worktree_discovery;
     assert_eq!(persisted["visibility"], "shown");
     assert!(persisted["initialPromptDismissedAt"].as_str().is_some());
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn adopt_race_converges_to_one_thread_without_creating_a_git_worktree() {
+    let mut fixture = CatalogRpcFixture::new(true).await;
+    request(
+        fixture.socket(),
+        "90",
+        "vcs.refreshWorktreeCatalog",
+        json!({"projectId":"project-1"}),
+    )
+    .await;
+    let snapshot = success_value(fixture.socket(), "90").await;
+    let candidate = eligible_candidate(&snapshot);
+    let before_inventory = git_output(&fixture.main, &["worktree", "list", "--porcelain"]);
+    let payload = |command_id: &str| {
+        json!({
+            "commandId":command_id,
+            "projectId":"project-1",
+            "worktreeKey":candidate["worktreeKey"],
+            "expectedGeneration":snapshot["generation"],
+            "threadDefaults":{
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access",
+                "interactionMode":"plan"
+            }
+        })
+    };
+    send_json(
+        fixture.socket(),
+        json!([
+            {"_tag":"Request","id":"91","tag":"worktree.adopt","payload":payload("adopt-race-1"),"headers":[]},
+            {"_tag":"Request","id":"92","tag":"worktree.adopt","payload":payload("adopt-race-2"),"headers":[]}
+        ]),
+    )
+    .await;
+
+    let mut results = Vec::new();
+    for _ in 0..2 {
+        let message = next_server_message(fixture.socket()).await;
+        let ServerMessage::Exit {
+            exit: RpcExit::Success { value: Some(value) },
+            ..
+        } = message
+        else {
+            panic!("expected adoption success: {message:?}");
+        };
+        results.push(value);
+    }
+    assert_eq!(results[0]["threadId"], results[1]["threadId"]);
+    let mut dispositions = results
+        .iter()
+        .map(|result| result["disposition"].as_str().expect("disposition"))
+        .collect::<Vec<_>>();
+    dispositions.sort_unstable();
+    assert_eq!(dispositions, vec!["created", "existing"]);
+    let external_path = canonical_string(&fixture.external);
+    let threads = fixture
+        .repositories
+        .list_threads_by_project("project-1".to_owned())
+        .await
+        .expect("threads");
+    assert_eq!(
+        threads
+            .iter()
+            .filter(|thread| {
+                thread.kind == "workspace"
+                    && thread.deleted_at.is_none()
+                    && thread.worktree_path.as_deref() == Some(external_path.as_str())
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        git_output(&fixture.main, &["worktree", "list", "--porcelain"]),
+        before_inventory
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn adopt_stale_generation_forces_refresh_then_revalidates() {
+    let mut fixture = CatalogRpcFixture::new(true).await;
+    request(
+        fixture.socket(),
+        "93",
+        "vcs.refreshWorktreeCatalog",
+        json!({"projectId":"project-1"}),
+    )
+    .await;
+    let stale = success_value(fixture.socket(), "93").await;
+    let candidate = eligible_candidate(&stale).clone();
+    request(
+        fixture.socket(),
+        "94",
+        "vcs.refreshWorktreeCatalog",
+        json!({"projectId":"project-1"}),
+    )
+    .await;
+    let current = success_value(fixture.socket(), "94").await;
+    assert!(current["generation"].as_u64() > stale["generation"].as_u64());
+
+    request(
+        fixture.socket(),
+        "95",
+        "worktree.adopt",
+        adoption_payload("adopt-stale", &candidate, &stale),
+    )
+    .await;
+    let adopted = success_value(fixture.socket(), "95").await;
+    assert_eq!(adopted["disposition"], "created");
+    assert_eq!(
+        fixture
+            .catalog
+            .latest("project-1")
+            .await
+            .expect("latest")
+            .generation,
+        current["generation"].as_u64().expect("current generation") + 1,
+        "stale adoption must force exactly a fresh revalidation scan before mutating"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn adopt_external_disappearance_fails_without_creating_a_thread() {
+    let mut fixture = CatalogRpcFixture::new(true).await;
+    request(
+        fixture.socket(),
+        "96",
+        "vcs.refreshWorktreeCatalog",
+        json!({"projectId":"project-1"}),
+    )
+    .await;
+    let snapshot = success_value(fixture.socket(), "96").await;
+    let candidate = eligible_candidate(&snapshot).clone();
+    fs::remove_dir_all(&fixture.external).expect("external checkout disappears");
+
+    request(
+        fixture.socket(),
+        "97",
+        "worktree.adopt",
+        adoption_payload("adopt-missing", &candidate, &snapshot),
+    )
+    .await;
+    assert_typed_adoption_failure(fixture.socket(), "97", "workspace-missing").await;
+    let threads = fixture
+        .repositories
+        .list_threads_by_project("project-1".to_owned())
+        .await
+        .expect("threads");
+    assert!(threads.iter().all(|thread| thread.kind != "workspace"));
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn adopt_restores_archived_then_returns_the_active_thread() {
+    let mut fixture = CatalogRpcFixture::new(true).await;
+    request(
+        fixture.socket(),
+        "98",
+        "vcs.refreshWorktreeCatalog",
+        json!({"projectId":"project-1"}),
+    )
+    .await;
+    let initial = success_value(fixture.socket(), "98").await;
+    let candidate = eligible_candidate(&initial).clone();
+    request(
+        fixture.socket(),
+        "99",
+        "worktree.adopt",
+        adoption_payload("adopt-first", &candidate, &initial),
+    )
+    .await;
+    let created = success_value(fixture.socket(), "99").await;
+    let thread_id = created["threadId"].as_str().expect("thread id").to_owned();
+    fixture
+        .engine
+        .dispatch(OrchestrationCommand::ThreadArchive {
+            command_id: "archive-adopted".to_owned(),
+            thread_id: thread_id.clone(),
+        })
+        .await
+        .expect("archive");
+    request(
+        fixture.socket(),
+        "100",
+        "vcs.refreshWorktreeCatalog",
+        json!({"projectId":"project-1"}),
+    )
+    .await;
+    let archived = success_value(fixture.socket(), "100").await;
+    let archived_descriptor = descriptor_for_key(&archived, &candidate["worktreeKey"]);
+    assert_eq!(archived_descriptor["adoptionState"], "archived");
+    request(
+        fixture.socket(),
+        "101",
+        "worktree.adopt",
+        adoption_payload("adopt-restore", archived_descriptor, &archived),
+    )
+    .await;
+    let restored = success_value(fixture.socket(), "101").await;
+    assert_eq!(
+        restored,
+        json!({"threadId":thread_id,"disposition":"restored"})
+    );
+
+    request(
+        fixture.socket(),
+        "102",
+        "vcs.refreshWorktreeCatalog",
+        json!({"projectId":"project-1"}),
+    )
+    .await;
+    let active = success_value(fixture.socket(), "102").await;
+    let active_descriptor = descriptor_for_key(&active, &candidate["worktreeKey"]);
+    request(
+        fixture.socket(),
+        "103",
+        "worktree.adopt",
+        adoption_payload("adopt-existing", active_descriptor, &active),
+    )
+    .await;
+    let existing = success_value(fixture.socket(), "103").await;
+    assert_eq!(
+        existing,
+        json!({"threadId":thread_id,"disposition":"existing"})
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn adopted_branch_reconciliation_is_deterministic_and_healthy_only() {
+    let mut fixture = CatalogRpcFixture::new(true).await;
+    request(
+        fixture.socket(),
+        "104",
+        "vcs.refreshWorktreeCatalog",
+        json!({"projectId":"project-1"}),
+    )
+    .await;
+    let initial = success_value(fixture.socket(), "104").await;
+    let candidate = eligible_candidate(&initial).clone();
+    request(
+        fixture.socket(),
+        "105",
+        "worktree.adopt",
+        adoption_payload("adopt-for-branch-reconcile", &candidate, &initial),
+    )
+    .await;
+    let adopted = success_value(fixture.socket(), "105").await;
+    let thread_id = adopted["threadId"].as_str().expect("thread id").to_owned();
+
+    git(
+        &fixture.external,
+        &["checkout", "-b", "feature/reconciled"],
+        None,
+    );
+    let head = git_output(&fixture.external, &["rev-parse", "HEAD"])
+        .trim()
+        .to_owned();
+    request(
+        fixture.socket(),
+        "106",
+        "vcs.refreshWorktreeCatalog",
+        json!({"projectId":"project-1"}),
+    )
+    .await;
+    let refreshed = success_value(fixture.socket(), "106").await;
+    assert_eq!(
+        descriptor_for_key(&refreshed, &candidate["worktreeKey"])["branch"],
+        "feature/reconciled"
+    );
+    let durable = fixture
+        .repositories
+        .get_thread(thread_id.clone())
+        .await
+        .expect("thread read")
+        .expect("thread exists");
+    assert_eq!(durable.branch.as_deref(), Some("feature/reconciled"));
+    let reconciliation_events = branch_reconciliation_events(&fixture.repositories).await;
+    assert_eq!(reconciliation_events.len(), 1);
+    let expected_command_id =
+        branch_reconciliation_command_id(&thread_id, Some("feature/reconciled"), Some(&head));
+    assert_eq!(
+        reconciliation_events[0].event.command_id.as_deref(),
+        Some(expected_command_id.as_str())
+    );
+    assert!(!expected_command_id.contains(&canonical_string(&fixture.external)));
+
+    request(
+        fixture.socket(),
+        "107",
+        "vcs.refreshWorktreeCatalog",
+        json!({"projectId":"project-1"}),
+    )
+    .await;
+    let _unchanged = success_value(fixture.socket(), "107").await;
+    assert_eq!(
+        branch_reconciliation_events(&fixture.repositories)
+            .await
+            .len(),
+        1,
+        "an unchanged healthy snapshot must not dispatch a second command"
+    );
+
+    git(
+        &fixture.external,
+        &["checkout", "-b", "feature/degraded"],
+        None,
+    );
+    let common_dir = fixture.main.join(".git");
+    let unavailable = fixture.main.join(".git-unavailable");
+    fs::rename(&common_dir, &unavailable).expect("make Git metadata unavailable");
+    request(
+        fixture.socket(),
+        "108",
+        "vcs.refreshWorktreeCatalog",
+        json!({"projectId":"project-1"}),
+    )
+    .await;
+    let degraded = success_value(fixture.socket(), "108").await;
+    assert_eq!(degraded["authoritative"], false);
+    assert_eq!(
+        fixture
+            .repositories
+            .get_thread(thread_id)
+            .await
+            .expect("thread read")
+            .expect("thread exists")
+            .branch
+            .as_deref(),
+        Some("feature/reconciled")
+    );
+    assert_eq!(
+        branch_reconciliation_events(&fixture.repositories)
+            .await
+            .len(),
+        1,
+        "a degraded retained snapshot must never emit branch metadata"
+    );
+    fs::rename(&unavailable, &common_dir).expect("restore Git metadata");
     fixture.shutdown().await;
 }
 
@@ -961,6 +1308,95 @@ async fn assert_typed_catalog_failure(
     )));
 }
 
+async fn assert_typed_adoption_failure(
+    socket: &mut TestSocket,
+    request_id: &str,
+    expected_reason: &str,
+) {
+    let message = next_server_message(socket).await;
+    let ServerMessage::Exit {
+        request_id: actual,
+        exit: RpcExit::Failure { cause },
+    } = message
+    else {
+        panic!("expected typed adoption failure: {message:?}");
+    };
+    assert_eq!(actual.as_str(), request_id);
+    assert!(cause.iter().any(|item| matches!(
+        item,
+        CauseItem::Fail { error }
+            if error["_tag"] == "WorktreeAdoptionError"
+                && error["reason"] == expected_reason
+                && error["currentGeneration"].as_u64().is_some()
+    )));
+}
+
+fn eligible_candidate(snapshot: &Value) -> &Value {
+    snapshot["worktrees"]
+        .as_array()
+        .expect("worktrees")
+        .iter()
+        .find(|worktree| worktree["eligibleForAdoption"] == true)
+        .expect("eligible candidate")
+}
+
+fn descriptor_for_key<'a>(snapshot: &'a Value, key: &Value) -> &'a Value {
+    snapshot["worktrees"]
+        .as_array()
+        .expect("worktrees")
+        .iter()
+        .find(|worktree| worktree["worktreeKey"] == *key)
+        .expect("worktree descriptor")
+}
+
+fn adoption_payload(command_id: &str, descriptor: &Value, snapshot: &Value) -> Value {
+    json!({
+        "commandId":command_id,
+        "projectId":"project-1",
+        "worktreeKey":descriptor["worktreeKey"],
+        "expectedGeneration":snapshot["generation"],
+        "threadDefaults":{
+            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "runtimeMode":"full-access",
+            "interactionMode":"default"
+        }
+    })
+}
+
+async fn branch_reconciliation_events(repositories: &Repositories) -> Vec<OrchestrationEvent> {
+    repositories
+        .read_events_from_sequence(0, 512)
+        .await
+        .expect("event read")
+        .into_iter()
+        .filter(|event| {
+            event.event.event_type == "thread.meta-updated"
+                && event
+                    .event
+                    .command_id
+                    .as_deref()
+                    .is_some_and(|command_id| command_id.starts_with("worktree-branch-reconcile:"))
+        })
+        .collect()
+}
+
+fn branch_reconciliation_command_id(
+    thread_id: &str,
+    branch: Option<&str>,
+    head: Option<&str>,
+) -> String {
+    let mut identity = b"bibcode.worktree.branch-reconcile.v1\0".to_vec();
+    identity.extend_from_slice(branch.unwrap_or("<detached>").as_bytes());
+    identity.push(0);
+    identity.extend_from_slice(head.unwrap_or("<unknown>").as_bytes());
+    let hash = Sha256::digest(identity);
+    let hash = hash
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("worktree-branch-reconcile:{thread_id}:{hash}")
+}
+
 async fn wait_for_mutation_and_catalog_count(
     socket: &mut TestSocket,
     mutation_request_id: &str,
@@ -1014,4 +1450,19 @@ fn git(cwd: &Path, args: &[&str], final_path: Option<&Path>) {
         command,
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn git_output(cwd: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .current_dir(cwd)
+        .args(args)
+        .output()
+        .expect("run Git");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).expect("Git output is UTF-8")
 }

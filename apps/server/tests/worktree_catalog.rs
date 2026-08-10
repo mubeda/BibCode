@@ -9,8 +9,8 @@ use bibcode_server::{
     git::GitRepository,
     persistence::{Database, ProjectionProject, ProjectionThread, Repositories, run_migrations},
     worktree_catalog::{
-        AdoptedWorktreeAvailability, CatalogRefreshTrigger, CatalogScanStatus,
-        WorktreeCatalogService, WorktreeDirectoryState,
+        AdoptedWorktreeAvailability, AdoptionValidationErrorReason, CatalogRefreshTrigger,
+        CatalogScanStatus, WorktreeCatalogService, WorktreeDirectoryState,
     },
 };
 use serde_json::json;
@@ -308,6 +308,81 @@ async fn git_failure_retains_the_preceding_snapshot_until_recovery() {
     assert!(recovered.authoritative);
     assert!(matches!(recovered.scan_status, CatalogScanStatus::Ready));
     assert_eq!(recovered.generation, authoritative.generation + 1);
+}
+
+#[tokio::test]
+async fn adoption_revalidation_proves_presence_and_repository_membership_with_real_git() {
+    let fixture = RepositoryFixture::new().await;
+    git(
+        &fixture.main,
+        &["worktree", "add", "-b", "feature/adoption"],
+        Some(&fixture.external),
+    );
+    let service = fixture.service();
+    let subscription = service.subscribe("project-1").await.expect("catalog");
+    let snapshot = subscription.latest();
+    let candidate = snapshot
+        .worktrees
+        .iter()
+        .find(|worktree| worktree.eligible_for_adoption)
+        .expect("candidate");
+
+    let resolved = service
+        .resolve_adoption_candidate("project-1", &candidate.worktree_key)
+        .await
+        .expect("fresh candidate");
+    assert_eq!(resolved.path, canonical_string(&fixture.external));
+    assert_eq!(resolved.branch.as_deref(), Some("feature/adoption"));
+
+    fs::remove_dir_all(&fixture.external).expect("external checkout disappears");
+    let missing = service
+        .resolve_adoption_candidate("project-1", &candidate.worktree_key)
+        .await
+        .expect_err("missing directory fails closed");
+    assert_eq!(
+        missing.reason,
+        AdoptionValidationErrorReason::WorkspaceMissing
+    );
+}
+
+#[tokio::test]
+async fn adoption_revalidation_rejects_a_replacement_repository_at_the_registered_path() {
+    let fixture = RepositoryFixture::new().await;
+    git(
+        &fixture.main,
+        &["worktree", "add", "-b", "feature/adoption-replacement"],
+        Some(&fixture.external),
+    );
+    let service = fixture.service();
+    let subscription = service.subscribe("project-1").await.expect("catalog");
+    let snapshot = subscription.latest();
+    let candidate = snapshot
+        .worktrees
+        .iter()
+        .find(|worktree| worktree.eligible_for_adoption)
+        .expect("candidate");
+    let candidate_key = candidate.worktree_key.clone();
+    let external_argument = fixture.external.to_string_lossy().into_owned();
+    git(
+        &fixture.main,
+        &["worktree", "remove", "--force", &external_argument],
+        None,
+    );
+    fs::create_dir(&fixture.external).expect("replacement directory");
+    git(
+        &fixture.external,
+        &["init", "--initial-branch", "replacement"],
+        None,
+    );
+
+    let replacement = service
+        .resolve_adoption_candidate("project-1", &candidate_key)
+        .await
+        .expect_err("replacement repository fails membership fence");
+    assert_eq!(
+        replacement.reason,
+        AdoptionValidationErrorReason::RepositoryMismatch
+    );
 }
 
 struct RepositoryFixture {

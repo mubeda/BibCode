@@ -220,6 +220,64 @@ async fn orchestration_rpc_registration_has_the_contract_modes() {
 }
 
 #[tokio::test]
+async fn public_dispatch_rejects_server_resolved_worktree_commands() {
+    let harness = harness().await;
+    let outcome = AssertUnwindSafe(async {
+        let mut socket = harness.connect().await;
+        for (request_id, payload) in [
+            (
+                "61",
+                json!({
+                    "type": "worktree.adopt-resolved",
+                    "commandId": "internal-adopt",
+                    "projectId": "project-1",
+                    "worktreeKey": "worktree-key",
+                    "path": "/server/resolved",
+                    "branch": "main",
+                    "head": "abcdef1",
+                    "modelSelection": {"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode": "full-access",
+                    "interactionMode": "default"
+                }),
+            ),
+            (
+                "62",
+                json!({
+                    "type": "worktree.branch-reconcile-resolved",
+                    "commandId": "internal-reconcile",
+                    "projectId": "project-1",
+                    "threadId": "thread-1",
+                    "branch": "main"
+                }),
+            ),
+        ] {
+            rpc_request(
+                &mut socket,
+                request_id,
+                "orchestration.dispatchCommand",
+                payload,
+            )
+            .await;
+            let error = expect_failure(&mut socket, request_id).await;
+            assert_invalid_request(&error, "orchestration.dispatchCommand", "server-internal");
+        }
+        assert!(
+            harness
+                .engine
+                .repositories()
+                .get_command_receipt("internal-adopt".to_owned())
+                .await
+                .expect("receipt query")
+                .is_none()
+        );
+        socket.close(None).await.expect("close WebSocket");
+    })
+    .catch_unwind()
+    .await;
+    finish_test(harness, outcome).await;
+}
+
+#[tokio::test]
 async fn project_create_can_initialize_git_before_registration() {
     let harness = harness().await;
     let outcome = AssertUnwindSafe(async {

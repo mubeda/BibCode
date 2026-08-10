@@ -27,6 +27,7 @@ import {
   WsSubscribeWorktreeCatalogRpc,
   WsVcsRefreshWorktreeCatalogRpc,
   WsWorktreeUpdateDiscoveryPolicyRpc,
+  WsWorktreeAdoptRpc,
 } from "./rpc.ts";
 
 const decodeSubscribeWorktreeCatalog = Schema.decodeUnknownSync(
@@ -38,6 +39,9 @@ const decodeRefreshWorktreeCatalog = Schema.decodeUnknownSync(
 const decodeUpdateWorktreeDiscoveryPolicy = Schema.decodeUnknownSync(
   WsWorktreeUpdateDiscoveryPolicyRpc.payloadSchema,
 );
+const decodeWorktreeAdopt = Schema.decodeUnknownSync(WsWorktreeAdoptRpc.payloadSchema);
+const decodeWorktreeAdoptResult = Schema.decodeUnknownSync(WsWorktreeAdoptRpc.successSchema);
+const decodeWorktreeAdoptError = Schema.decodeUnknownSync(WsWorktreeAdoptRpc.errorSchema);
 
 describe("WS_METHODS", () => {
   it("maps method identifiers to unique dotted wire names", () => {
@@ -63,6 +67,7 @@ describe("WS_METHODS", () => {
     expect(WS_METHODS.subscribeWorktreeCatalog).toBe("subscribeWorktreeCatalog");
     expect(WS_METHODS.vcsRefreshWorktreeCatalog).toBe("vcs.refreshWorktreeCatalog");
     expect(WS_METHODS.worktreeUpdateDiscoveryPolicy).toBe("worktree.updateDiscoveryPolicy");
+    expect(WS_METHODS.worktreeAdopt).toBe("worktree.adopt");
   });
 });
 
@@ -87,6 +92,7 @@ describe("individual RPC definitions", () => {
     expect(WsSubscribeWorktreeCatalogRpc._tag).toBe(WS_METHODS.subscribeWorktreeCatalog);
     expect(WsVcsRefreshWorktreeCatalogRpc._tag).toBe(WS_METHODS.vcsRefreshWorktreeCatalog);
     expect(WsWorktreeUpdateDiscoveryPolicyRpc._tag).toBe(WS_METHODS.worktreeUpdateDiscoveryPolicy);
+    expect(WsWorktreeAdoptRpc._tag).toBe(WS_METHODS.worktreeAdopt);
   });
 
   it("carries payload/success/error schemas on unary RPCs", () => {
@@ -147,6 +153,7 @@ describe("WsRpcGroup", () => {
       WsSubscribeWorktreeCatalogRpc,
       WsVcsRefreshWorktreeCatalogRpc,
       WsWorktreeUpdateDiscoveryPolicyRpc,
+      WsWorktreeAdoptRpc,
     ];
     for (const rpc of members) {
       expect(WsRpcGroup.requests.get(rpc._tag)).toBe(rpc);
@@ -176,6 +183,41 @@ describe("WsRpcGroup", () => {
       acknowledgeGeneration: 9,
       dismissInitialPrompt: true,
     });
+  });
+
+  it("registers adoption with opaque server-resolved identity and typed outcomes", () => {
+    expect(
+      decodeWorktreeAdopt({
+        commandId: "command-adopt-1",
+        projectId: "project-1",
+        worktreeKey: "worktree-1",
+        expectedGeneration: 9,
+        threadDefaults: {
+          modelSelection: { instanceId: "codex", model: "gpt-5" },
+          runtimeMode: "approval-required",
+          interactionMode: "default",
+        },
+      }),
+    ).toMatchObject({
+      commandId: "command-adopt-1",
+      projectId: "project-1",
+      worktreeKey: "worktree-1",
+      expectedGeneration: 9,
+    });
+    expect(
+      ["created", "existing", "restored"].map((disposition) =>
+        decodeWorktreeAdoptResult({ threadId: "thread-1", disposition }),
+      ),
+    ).toHaveLength(3);
+    expect(
+      decodeWorktreeAdoptError({
+        _tag: "WorktreeAdoptionError",
+        reason: "stale-generation",
+        message: "Refresh required.",
+        currentGeneration: 10,
+      }),
+    ).toMatchObject({ reason: "stale-generation", currentGeneration: 10 });
+    expect(WsRpcGroup.requests.get(WS_METHODS.worktreeAdopt)).toBe(WsWorktreeAdoptRpc);
   });
 
   it("contains every RPC exactly once and covers the whole WS surface", () => {

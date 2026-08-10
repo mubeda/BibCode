@@ -89,7 +89,7 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "vcs.stageFiles"
         | "vcs.switchRef"
         | "vcs.unstageFiles" => Some(SCOPE_ORCHESTRATION_OPERATE),
-        "worktree.updateDiscoveryPolicy" => Some(SCOPE_ORCHESTRATION_OPERATE),
+        "worktree.adopt" | "worktree.updateDiscoveryPolicy" => Some(SCOPE_ORCHESTRATION_OPERATE),
         "terminal.attach"
         | "terminal.clear"
         | "terminal.close"
@@ -168,6 +168,10 @@ mod tests {
         }
         assert_eq!(
             required_scope("worktree.updateDiscoveryPolicy"),
+            Some(SCOPE_ORCHESTRATION_OPERATE)
+        );
+        assert_eq!(
+            required_scope("worktree.adopt"),
             Some(SCOPE_ORCHESTRATION_OPERATE)
         );
         assert_eq!(required_scope("unknown.method"), None);

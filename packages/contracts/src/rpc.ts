@@ -67,6 +67,7 @@ import {
 import { KeybindingsConfigError } from "./keybindings.ts";
 import {
   ClientOrchestrationCommand,
+  ModelSelection,
   ORCHESTRATION_WS_METHODS,
   OrchestrationDispatchCommandError,
   OrchestrationGetFullThreadDiffError,
@@ -77,7 +78,10 @@ import {
   OrchestrationReplayEventsError,
   OrchestrationReplayEventsInput,
   OrchestrationRpcSchemas,
+  ProviderInteractionMode,
+  RuntimeMode,
 } from "./orchestration.ts";
+import { CommandId, NonNegativeInt, ProjectId } from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
   RelayClientInstallFailedError,
@@ -194,7 +198,23 @@ import {
   WorktreeCatalogInput,
   WorktreeCatalogRefreshInput,
   WorktreeDiscoveryPolicyUpdateInput,
+  WorktreeAdoptResult,
+  WorktreeAdoptionError,
+  WorktreeKey,
 } from "./worktree.ts";
+
+export const WorktreeAdoptInput = Schema.Struct({
+  commandId: CommandId,
+  projectId: ProjectId,
+  worktreeKey: WorktreeKey,
+  expectedGeneration: NonNegativeInt,
+  threadDefaults: Schema.Struct({
+    modelSelection: ModelSelection,
+    runtimeMode: RuntimeMode,
+    interactionMode: ProviderInteractionMode,
+  }),
+});
+export type WorktreeAdoptInput = typeof WorktreeAdoptInput.Type;
 
 export const WS_METHODS = {
   // Project registry methods
@@ -234,6 +254,7 @@ export const WS_METHODS = {
   vcsGenerateCommitMessage: "vcs.generateCommitMessage",
   vcsRefreshWorktreeCatalog: "vcs.refreshWorktreeCatalog",
   worktreeUpdateDiscoveryPolicy: "worktree.updateDiscoveryPolicy",
+  worktreeAdopt: "worktree.adopt",
 
   // Git workflow methods
   gitRunStackedAction: "git.runStackedAction",
@@ -641,6 +662,12 @@ export const WsWorktreeUpdateDiscoveryPolicyRpc = Rpc.make(
   },
 );
 
+export const WsWorktreeAdoptRpc = Rpc.make(WS_METHODS.worktreeAdopt, {
+  payload: WorktreeAdoptInput,
+  success: WorktreeAdoptResult,
+  error: Schema.Union([WorktreeAdoptionError, EnvironmentAuthorizationError]),
+});
+
 /**
  * Ephemeral live diff preview for compact/mobile surfaces.
  * Not the persisted BiBCode Review model. Future review sessions should use
@@ -933,6 +960,7 @@ export const WsRpcGroup = RpcGroup.make(
   WsSubscribeWorktreeCatalogRpc,
   WsVcsRefreshWorktreeCatalogRpc,
   WsWorktreeUpdateDiscoveryPolicyRpc,
+  WsWorktreeAdoptRpc,
   WsReviewGetDiffPreviewRpc,
   WsTerminalOpenRpc,
   WsTerminalAttachRpc,

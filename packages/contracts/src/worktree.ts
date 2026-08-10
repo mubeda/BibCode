@@ -151,6 +151,12 @@ export type VcsWorktreeCatalogSnapshot = typeof VcsWorktreeCatalogSnapshot.Type;
 export const WorktreeAdoptionDisposition = Schema.Literals(["created", "existing", "restored"]);
 export type WorktreeAdoptionDisposition = typeof WorktreeAdoptionDisposition.Type;
 
+export const WorktreeAdoptResult = Schema.Struct({
+  threadId: ThreadId,
+  disposition: WorktreeAdoptionDisposition,
+});
+export type WorktreeAdoptResult = typeof WorktreeAdoptResult.Type;
+
 export const WorktreeRemovalMode = Schema.Literals([
   "delete-git-worktree",
   "cleanup-stale-registration",
