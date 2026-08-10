@@ -4,7 +4,7 @@ use std::{
     path::Path,
     pin::Pin,
     sync::{
-        Arc, Mutex as StdMutex,
+        Arc, Condvar, Mutex as StdMutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -23,9 +23,9 @@ use uuid::Uuid;
 
 use crate::orchestration::delivery::{CommandAdmission, TurnDeliveryState, TurnDeliveryTransition};
 use crate::persistence::{
-    CheckpointDiffBlob, CommandReceipt, Database, NewOrchestrationEvent, OrchestrationEvent,
-    PersistenceError, ProjectionPendingApproval, ProjectionProject, ProjectionState,
-    ProjectionThread, ProjectionThreadActivity, ProjectionThreadMessage,
+    CheckpointDiffBlob, CommandReceipt, CommitFence, Database, NewOrchestrationEvent,
+    OrchestrationEvent, PersistenceError, ProjectionPendingApproval, ProjectionProject,
+    ProjectionState, ProjectionThread, ProjectionThreadActivity, ProjectionThreadMessage,
     ProjectionThreadProposedPlan, ProjectionThreadSession, ProjectionTurn, Repositories,
 };
 use crate::{
@@ -662,6 +662,8 @@ pub struct TestHooks {
     fail_next_projector: Arc<StdMutex<Option<FailProjectorOnce>>>,
     pause_after_admission_commit: Arc<StdMutex<Option<AdmissionCommitPause>>>,
     pause_before_command_persist: Arc<StdMutex<Option<AdmissionCommitPause>>>,
+    pause_before_command_finalization: Arc<StdMutex<Option<PersistenceCommitPause>>>,
+    pause_after_command_finalization: Arc<StdMutex<Option<PersistenceCommitPause>>>,
     fail_delivery_transitions: Arc<AtomicUsize>,
     delivery_transition_attempts: Arc<AtomicUsize>,
 }
@@ -672,6 +674,12 @@ pub struct AdmissionCommitPause {
     release: Arc<tokio::sync::Notify>,
 }
 
+#[derive(Clone, Debug)]
+pub struct PersistenceCommitPause {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<(StdMutex<bool>, Condvar)>,
+}
+
 impl AdmissionCommitPause {
     pub async fn wait_until_entered(&self) {
         self.entered.notified().await;
@@ -679,6 +687,29 @@ impl AdmissionCommitPause {
 
     pub fn release(&self) {
         self.release.notify_one();
+    }
+}
+
+impl PersistenceCommitPause {
+    pub async fn wait_until_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    pub fn release(&self) {
+        let (released, changed) = self.release.as_ref();
+        *released.lock().expect("persistence pause mutex") = true;
+        changed.notify_one();
+    }
+
+    fn block_until_released(&self) {
+        self.entered.notify_one();
+        let (released, changed) = self.release.as_ref();
+        let mut released = released.lock().expect("persistence pause mutex");
+        while !*released {
+            released = changed
+                .wait(released)
+                .expect("persistence pause mutex after wait");
+        }
     }
 }
 
@@ -717,6 +748,30 @@ impl TestHooks {
             .pause_before_command_persist
             .lock()
             .expect("command persist pause mutex") = Some(pause.clone());
+        pause
+    }
+
+    pub fn pause_before_next_command_finalization(&self) -> PersistenceCommitPause {
+        let pause = PersistenceCommitPause {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new((StdMutex::new(false), Condvar::new())),
+        };
+        *self
+            .pause_before_command_finalization
+            .lock()
+            .expect("command finalization pause mutex") = Some(pause.clone());
+        pause
+    }
+
+    pub fn pause_after_next_command_finalization(&self) -> PersistenceCommitPause {
+        let pause = PersistenceCommitPause {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new((StdMutex::new(false), Condvar::new())),
+        };
+        *self
+            .pause_after_command_finalization
+            .lock()
+            .expect("post-finalization pause mutex") = Some(pause.clone());
         pause
     }
 
@@ -772,6 +827,28 @@ impl TestHooks {
         if let Some(pause) = pause {
             pause.entered.notify_one();
             pause.release.notified().await;
+        }
+    }
+
+    fn maybe_pause_before_command_finalization(&self) {
+        let pause = self
+            .pause_before_command_finalization
+            .lock()
+            .expect("command finalization pause mutex")
+            .take();
+        if let Some(pause) = pause {
+            pause.block_until_released();
+        }
+    }
+
+    fn maybe_pause_after_command_finalization(&self) {
+        let pause = self
+            .pause_after_command_finalization
+            .lock()
+            .expect("post-finalization pause mutex")
+            .take();
+        if let Some(pause) = pause {
+            pause.block_until_released();
         }
     }
 
@@ -1079,13 +1156,19 @@ struct CommandEnvelope {
 
 pub(crate) struct CommandLifetimeGuard {
     cancellation: CancellationToken,
+    commit_fence: CommitFence,
     _resource: Box<dyn Send + 'static>,
 }
 
 impl CommandLifetimeGuard {
-    pub(crate) fn new(resource: impl Send + 'static, cancellation: CancellationToken) -> Self {
+    pub(crate) fn new(
+        resource: impl Send + 'static,
+        cancellation: CancellationToken,
+        commit_fence: CommitFence,
+    ) -> Self {
         Self {
             cancellation,
+            commit_fence,
             _resource: Box::new(resource),
         }
     }
@@ -1471,6 +1554,9 @@ fn spawn_worker(
                             let cancellation = lifetime
                                 .as_ref()
                                 .map(|lifetime| lifetime.cancellation.clone());
+                            let commit_fence = lifetime
+                                .as_ref()
+                                .map(|lifetime| lifetime.commit_fence.clone());
                             let effects = project_command_effects
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1485,6 +1571,7 @@ fn spawn_worker(
                                     command,
                                     admission,
                                     cancellation: cancellation.as_ref(),
+                                    commit_fence,
                                 },
                             )
                             .await;
@@ -1514,6 +1601,7 @@ struct ProcessEnvelopeInput<'a> {
     command: OrchestrationCommand,
     admission: Option<CommandAdmission>,
     cancellation: Option<&'a CancellationToken>,
+    commit_fence: Option<CommitFence>,
 }
 
 async fn process_envelope(
@@ -1528,6 +1616,7 @@ async fn process_envelope(
         mut command,
         admission,
         cancellation,
+        commit_fence,
     } = input;
     ensure_command_active(cancellation)?;
     let command_id = command.command_id().to_owned();
@@ -1693,8 +1782,10 @@ async fn process_envelope(
         Err(error) => {
             ensure_command_active(cancellation)?;
             let aggregate = command.aggregate_ref();
-            repositories
-                .upsert_command_receipt(CommandReceipt {
+            persist_rejected_command(
+                repositories,
+                hooks,
+                CommandReceipt {
                     command_id: command.command_id().to_owned(),
                     aggregate_kind: aggregate.0.to_owned(),
                     aggregate_id: aggregate.1.to_owned(),
@@ -1705,9 +1796,10 @@ async fn process_envelope(
                     payload_digest: admission
                         .as_ref()
                         .map(|admission| admission.payload_digest.clone()),
-                })
-                .await
-                .map_err(wrap_persistence)?;
+                },
+                commit_fence,
+            )
+            .await?;
             return Err(error);
         }
     };
@@ -1743,9 +1835,9 @@ async fn process_envelope(
         hooks,
         &planned,
         &command_id,
-        aggregate.0,
-        aggregate.1,
+        aggregate,
         admission,
+        commit_fence,
     )
     .await?;
     apply_to_model(model, &committed);
@@ -2865,16 +2957,16 @@ async fn persist_command(
     hooks: &TestHooks,
     events: &[NewOrchestrationEvent],
     command_id: &str,
-    aggregate_kind: &str,
-    aggregate_id: &str,
+    aggregate: (&str, &str),
     admission: Option<CommandAdmission>,
+    commit_fence: Option<CommitFence>,
 ) -> Result<VecDeque<OrchestrationEvent>, OrchestrationError> {
     let repositories = repositories.clone();
     let hooks = hooks.clone();
     let event_list = events.to_vec();
     let command_id = command_id.to_owned();
-    let aggregate_kind = aggregate_kind.to_owned();
-    let aggregate_id = aggregate_id.to_owned();
+    let aggregate_kind = aggregate.0.to_owned();
+    let aggregate_id = aggregate.1.to_owned();
     let committed = repositories
         .database()
         .call(move |connection| {
@@ -2929,12 +3021,43 @@ async fn persist_command(
                     )?;
                 }
             }
+            hooks.maybe_pause_before_command_finalization();
+            let _commit_permit = commit_fence
+                .as_ref()
+                .map(CommitFence::acquire)
+                .transpose()?;
+            hooks.maybe_pause_after_command_finalization();
             transaction.commit()?;
             Ok(committed)
         })
         .await
         .map_err(wrap_persistence)?;
     Ok(committed)
+}
+
+async fn persist_rejected_command(
+    repositories: &Repositories,
+    hooks: &TestHooks,
+    receipt: CommandReceipt,
+    commit_fence: Option<CommitFence>,
+) -> Result<(), OrchestrationError> {
+    let database = repositories.database().clone();
+    let hooks = hooks.clone();
+    database
+        .call(move |connection| {
+            let transaction = connection.transaction()?;
+            upsert_command_receipt_tx(&transaction, receipt)?;
+            hooks.maybe_pause_before_command_finalization();
+            let _commit_permit = commit_fence
+                .as_ref()
+                .map(CommitFence::acquire)
+                .transpose()?;
+            hooks.maybe_pause_after_command_finalization();
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
+        .map_err(wrap_persistence)
 }
 
 async fn persist_turn_delivery_transition(
@@ -4355,6 +4478,9 @@ fn to_sql_error(error: serde_json::Error) -> rusqlite::Error {
 }
 
 fn wrap_persistence(error: PersistenceError) -> OrchestrationError {
+    if matches!(error, PersistenceError::CommitRejected) {
+        return OrchestrationError::Cancelled;
+    }
     if let PersistenceError::Corrupt(detail) = &error
         && let Some((projector, event_type)) = decode_projector_failure(detail)
     {

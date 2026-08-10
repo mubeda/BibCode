@@ -46,7 +46,11 @@ pub(crate) trait WorktreeRuntimeActions: Send + Sync + 'static {
     ) -> WorktreeRuntimeFuture<Result<Vec<String>, String>> {
         Box::pin(async move { Ok(vec![transition.thread_id]) })
     }
-    fn stop_provider(&self, thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>>;
+    fn stop_provider(
+        &self,
+        thread_id: String,
+        transition: WorkspaceLossTransition,
+    ) -> WorktreeRuntimeFuture<Result<(), String>>;
     fn close_terminals(&self, thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>>;
     fn append_warning(
         &self,
@@ -113,6 +117,7 @@ impl WorktreeRuntime {
                 orchestration,
                 provider,
                 terminals,
+                registry: registry.clone(),
             }),
             registry,
             WorktreeRuntimeOptions::default(),
@@ -191,6 +196,7 @@ impl WorktreeRuntime {
                 self.inner.actions.clone(),
                 vec![thread_id.clone()],
                 max_parallel,
+                transition.clone(),
             ),
         );
         let alias_cleanup = async {
@@ -220,6 +226,7 @@ impl WorktreeRuntime {
                 self.inner.actions.clone(),
                 affected_thread_ids,
                 max_parallel,
+                transition.clone(),
             );
             match tokio::time::timeout_at(deadline, cleanup).await {
                 Ok(result) => (true, result),
@@ -392,7 +399,13 @@ fn run_reaper_job(
                 .await?;
             affected_thread_ids.sort();
             affected_thread_ids.dedup();
-            cleanup_attempt(job.actions.clone(), affected_thread_ids, job.max_parallel).await
+            cleanup_attempt(
+                job.actions.clone(),
+                affected_thread_ids,
+                job.max_parallel,
+                job.transition.clone(),
+            )
+            .await
         };
         let result = tokio::select! {
             () = shutdown.cancelled() => return,
@@ -444,15 +457,17 @@ fn cleanup_attempt(
     actions: Arc<dyn WorktreeRuntimeActions>,
     affected_thread_ids: Vec<String>,
     max_parallel: usize,
+    transition: WorkspaceLossTransition,
 ) -> CleanupFuture {
     Box::pin(
         AssertUnwindSafe(async move {
             let results = stream::iter(affected_thread_ids)
                 .map(|affected_thread_id| {
                     let actions = actions.clone();
+                    let transition = transition.clone();
                     async move {
                         let (provider, terminals) = tokio::join!(
-                            actions.stop_provider(affected_thread_id.clone()),
+                            actions.stop_provider(affected_thread_id.clone(), transition),
                             actions.close_terminals(affected_thread_id.clone()),
                         );
                         (affected_thread_id, provider, terminals)
@@ -535,6 +550,7 @@ struct ProductionWorktreeRuntimeActions {
     orchestration: OrchestrationEngine,
     provider: Arc<ProviderRuntimeSupervisor>,
     terminals: ServerTerminalServices,
+    registry: WorkspaceAvailabilityRegistry,
 }
 
 impl WorktreeRuntimeActions for ProductionWorktreeRuntimeActions {
@@ -546,17 +562,29 @@ impl WorktreeRuntimeActions for ProductionWorktreeRuntimeActions {
         Box::pin(async move { workspace_thread_ids(repositories, &transition).await })
     }
 
-    fn stop_provider(&self, thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+    fn stop_provider(
+        &self,
+        thread_id: String,
+        transition: WorkspaceLossTransition,
+    ) -> WorktreeRuntimeFuture<Result<(), String>> {
         let provider = self.provider.clone();
+        let registry = self.registry.clone();
         Box::pin(async move {
-            match provider
-                .handle_orchestration(OrchestrationCommand::ThreadSessionStop {
-                    command_id: format!("workspace-loss:{thread_id}:provider-stop"),
-                    thread_id: thread_id.clone(),
-                    created_at: now_iso(),
-                })
-                .await
-            {
+            if !registry.transition_is_current(&transition) {
+                return Ok(());
+            }
+            let identity = match provider.capture_session_identity(&thread_id).await {
+                Ok(identity) => identity,
+                Err(ProviderRuntimeError::SessionNotFound { .. }) => None,
+                Err(error) => return Err(error.to_string()),
+            };
+            if !registry.transition_is_current(&transition) {
+                return Ok(());
+            }
+            let Some(identity) = identity else {
+                return Ok(());
+            };
+            match provider.stop_session_if_current(identity).await {
                 Ok(()) | Err(ProviderRuntimeError::SessionNotFound { .. }) => Ok(()),
                 Err(error) => Err(error.to_string()),
             }
@@ -769,7 +797,11 @@ mod tests {
             Box::pin(ready(Ok(threads)))
         }
 
-        fn stop_provider(&self, thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+        fn stop_provider(
+            &self,
+            thread_id: String,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
             self.provider_calls.fetch_add(1, Ordering::SeqCst);
             self.provider_threads
                 .lock()
@@ -819,7 +851,11 @@ mod tests {
     }
 
     impl WorktreeRuntimeActions for ConcurrencyActions {
-        fn stop_provider(&self, _thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+        fn stop_provider(
+            &self,
+            _thread_id: String,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(active, Ordering::SeqCst);
@@ -882,7 +918,11 @@ mod tests {
             Box::pin(pending())
         }
 
-        fn stop_provider(&self, _thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+        fn stop_provider(
+            &self,
+            _thread_id: String,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
             self.provider_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(ready(Ok(())))
         }
@@ -918,7 +958,11 @@ mod tests {
             }
         }
 
-        fn stop_provider(&self, _thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+        fn stop_provider(
+            &self,
+            _thread_id: String,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
             let attempt = self.provider_calls.fetch_add(1, Ordering::SeqCst);
             if attempt == 0 {
                 Box::pin(ready(Err("initial cleanup failed".to_owned())))
@@ -952,7 +996,11 @@ mod tests {
             }
         }
 
-        fn stop_provider(&self, thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+        fn stop_provider(
+            &self,
+            thread_id: String,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
             self.provider_threads
                 .lock()
                 .expect("provider thread lock")
@@ -982,7 +1030,11 @@ mod tests {
     }
 
     impl WorktreeRuntimeActions for RetryActions {
-        fn stop_provider(&self, _thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+        fn stop_provider(
+            &self,
+            _thread_id: String,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
             let attempt = self.provider_calls.fetch_add(1, Ordering::SeqCst);
             if attempt == 0 {
                 if self.panic_first {
@@ -1034,7 +1086,11 @@ mod tests {
     }
 
     impl WorktreeRuntimeActions for ShutdownActions {
-        fn stop_provider(&self, _thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+        fn stop_provider(
+            &self,
+            _thread_id: String,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
             Box::pin(PendingDrop {
                 drops: self.drops.clone(),
             })
@@ -1067,7 +1123,11 @@ mod tests {
             Box::pin(async move { workspace_thread_ids(repositories, &transition).await })
         }
 
-        fn stop_provider(&self, thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+        fn stop_provider(
+            &self,
+            thread_id: String,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
             self.provider_threads
                 .lock()
                 .expect("provider thread lock")

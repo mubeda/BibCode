@@ -20,6 +20,33 @@ const JOURNAL_SIZE_LIMIT_BYTES: i64 = 64 * 1024 * 1024;
 
 type DatabaseJob = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
 
+#[derive(Clone)]
+pub(crate) struct CommitFence {
+    acquire: Arc<dyn Fn() -> std::result::Result<Box<dyn Send + 'static>, ()> + Send + Sync>,
+}
+
+pub(crate) struct CommitPermit {
+    _resource: Box<dyn Send + 'static>,
+}
+
+impl CommitFence {
+    pub(crate) fn new(
+        acquire: impl Fn() -> std::result::Result<Box<dyn Send + 'static>, ()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            acquire: Arc::new(acquire),
+        }
+    }
+
+    pub(crate) fn acquire(&self) -> Result<CommitPermit> {
+        (self.acquire)()
+            .map(|resource| CommitPermit {
+                _resource: resource,
+            })
+            .map_err(|()| PersistenceError::CommitRejected)
+    }
+}
+
 /// Snapshot of the SQLite sender state for black-box queue-bound integration tests.
 ///
 /// This stays dormant unless explicitly enabled through [`Database`]'s doc-hidden test
@@ -316,6 +343,8 @@ pub enum PersistenceError {
     Sql(#[from] rusqlite::Error),
     #[error("SQLite integrity check failed: {0}")]
     Corrupt(String),
+    #[error("transaction commit was rejected by its finalization fence")]
+    CommitRejected,
     #[error("the SQLite worker is no longer available")]
     WorkerUnavailable,
     #[error("the SQLite worker dropped an operation response")]

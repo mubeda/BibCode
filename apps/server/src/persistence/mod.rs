@@ -3,6 +3,7 @@ mod migrations;
 mod repositories;
 mod state_files;
 
+pub(crate) use database::CommitFence;
 pub use database::{Database, PersistenceError, Result};
 pub use migrations::{MIGRATIONS, Migration, run_migrations};
 pub use repositories::*;

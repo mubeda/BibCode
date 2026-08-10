@@ -9,6 +9,77 @@ with the exact structured `WorkspaceUnavailableError`, and runs bounded
 provider/terminal quiescence without deleting conversation or terminal
 history.
 
+## Fix round 3 — atomic SQLite finalization and exact provider cleanup
+
+The third review follow-up closes the two remaining ordering gaps without a
+wire-schema, persisted-shape, or migration change:
+
+- every workspace-bound queued turn now carries a generic `CommitFence` with
+  its retained lifetime. The fence is acquired synchronously inside the real
+  SQLite transaction immediately before `COMMIT`, after the event, projection,
+  receipt, attachment-reference, and provider-outbox writes. Loss/removal and
+  final commit therefore have one deterministic order: a loss-owned fence
+  rejects finalization and the transaction rolls back, while a commit-owned
+  fence delays loss/guard publication until durable commit completes;
+- plan-error rejection receipts now use an explicit transaction and the same
+  finalization fence. They can no longer autocommit after a workspace loss that
+  already won admission finalization;
+- the finalization permit is owned rather than a borrowed mutex guard, so it is
+  safe on the blocking database thread. Every success, SQLite error, early
+  return, or unwind drops the permit, wakes synchronous loss, and leaves no
+  lock-order path back into the registry;
+- provider cleanup now captures the supervisor's exact active driver identity
+  only while the loss transition is current. `stop_session_if_current` checks
+  that identity inside the actor; an old stop resumed after exact recovery and
+  replacement is a no-op. Reaper retries re-resolve aliases and recapture
+  identities only for current ownership. The surrounding recovery/shutdown
+  cancellation still short-circuits the attempt;
+- terminal generation semantics were audited: cleanup snapshots the exact
+  generation/process under the lifecycle lock, and exit finalization already
+  ignores a replaced generation. No terminal change was required.
+
+Deterministic RED evidence covered both finalization orders for a successful
+turn and for a persisted rejection. With loss paused at the SQLite boundary,
+the old successful path still produced a receipt and outbox, increased events
+from 6 to 10, and projected the user message. Moving the commit-wins barrier
+before permit acquisition let loss finish before either successful or rejected
+commit. The provider RED failed because there was no exact-session capture or
+conditional-stop API; the prior thread-only stop could target whatever runtime
+was current when it eventually executed.
+
+GREEN coverage now proves loss-wins leaves no receipt, message, event, or
+outbox; commit-wins keeps loss blocked until all accepted-turn artifacts are
+durable; and the same two orderings respectively roll back or retain the exact
+rejected receipt without provider delivery. A direct permit-drop regression
+proves the error/unwind path wakes loss and rejects reuse. The provider recovery
+test captures the old identity, clears the exact guard, starts a replacement,
+resumes the stale stop, and proves the replacement remains routable.
+
+Fix-round-3 validation completed with the following focused matrix:
+
+```text
+availability/finalization state machine                 13 passed
+warning/quiesce/reaper runtime                          16 passed
+orchestration engine                                    26 passed
+orchestration RPC, including four commit orders         17 passed
+provider workspace loss and exact recovery               2 passed
+catalog service                                         46 passed
+real-Git catalog                                         9 passed
+terminal manager                                        28 passed
+production terminal RPC                                 12 passed
+turn-delivery subprocess recovery                        8 passed
+```
+
+The unfiltered full-server run passed all 1,037 library tests and every
+integration target reached before the repository's documented load-sensitive
+`agent_activity_hung_factory_does_not_block_terminal_disable_or_later_settings_updates`
+case timed out at its one-second manager-preparation deadline (96 sibling tests
+passed). That exact test passed immediately in isolation, 1/1 in 1.00 seconds.
+A second full-server run with only that exact test skipped then passed all
+1,037 library tests, all integration targets (including the eight subprocess
+recovery tests), and doc-tests; the supervisor target passed 96/96 with one
+filtered test.
+
 ## Fix round 2 — cancellation handoff and transition-scoped cleanup
 
 The second review follow-up closes the remaining cancellation/deadline gaps

@@ -58,6 +58,9 @@ use bibcode_server::{
         turn_delivery::TurnDeliveryService,
     },
     provider::{claude::ClaudeTranscriptReaderFixture, codex::resolve_codex_home_layout},
+    worktree_catalog::{
+        AdoptedWorktreeAvailability, WorkspaceAvailabilityRegistry, WorkspaceLossTransition,
+    },
 };
 use futures_util::{SinkExt, StreamExt, stream};
 use provider_runtime::{
@@ -5928,6 +5931,77 @@ async fn workspace_loss_session_stop_shuts_driver_without_deleting_thread() {
             .is_some()
     );
     supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn recovered_provider_replacement_survives_a_paused_old_workspace_loss_stop() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState {
+        set_mode_results: VecDeque::from([Err(ProviderRuntimeError::UnsupportedCapability {
+            provider: "codex".to_owned(),
+            capability: "post-start runtime mode changes",
+        })]),
+        ..DriverState::default()
+    }));
+    let (_old_events_tx, old_events_rx) = mpsc::channel(1);
+    let (_replacement_events_tx, replacement_events_rx) = mpsc::channel(1);
+    let factory = Arc::new(FakeFactory {
+        state: state.clone(),
+        events: StdMutex::new(VecDeque::from([old_events_rx, replacement_events_rx])),
+    });
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        factory,
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    supervisor.launch(launch()).await.unwrap();
+
+    let availability = WorkspaceAvailabilityRegistry::new();
+    let transition = WorkspaceLossTransition {
+        thread_id: "t1".to_owned(),
+        repository_key: "repository-1".to_owned(),
+        generation: 1,
+        path: PathBuf::from("/repo/worktrees/t1"),
+        availability: AdoptedWorktreeAvailability::MissingRegistered,
+    };
+    assert!(availability.mark_unavailable(transition).await);
+    let old_identity = supervisor
+        .capture_session_identity("t1")
+        .await
+        .expect("old provider identity capture")
+        .expect("old provider is active");
+
+    availability
+        .clear_recovered_in_repository("t1", Path::new("/repo/worktrees/t1"), "repository-1")
+        .await;
+    supervisor
+        .handle_orchestration(OrchestrationCommand::ThreadRuntimeModeSet {
+            command_id: "recovery-restarts-provider".to_owned(),
+            thread_id: "t1".to_owned(),
+            runtime_mode: "approval-required".to_owned(),
+            created_at: NOW.to_owned(),
+        })
+        .await
+        .expect("exact recovery starts a replacement provider");
+
+    supervisor
+        .stop_session_if_current(old_identity)
+        .await
+        .expect("paused old-session stop resumes as a no-op");
+    supervisor
+        .handle_orchestration(OrchestrationCommand::ThreadInteractionModeSet {
+            command_id: "replacement-remains-routable".to_owned(),
+            thread_id: "t1".to_owned(),
+            interaction_mode: "plan".to_owned(),
+            created_at: NOW.to_owned(),
+        })
+        .await
+        .expect("replacement provider remains active");
+    assert_eq!(state.lock().unwrap().shutdowns, 1);
+
+    supervisor.shutdown().await.unwrap();
+    assert_eq!(state.lock().unwrap().shutdowns, 2);
 }
 
 #[tokio::test(flavor = "current_thread")]

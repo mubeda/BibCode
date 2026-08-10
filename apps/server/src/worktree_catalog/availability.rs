@@ -1,14 +1,17 @@
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Condvar, Mutex, MutexGuard},
 };
 
 use serde::Serialize;
 use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
-use crate::git::{host_path_platform, normalize_worktree_path_key};
+use crate::{
+    git::{host_path_platform, normalize_worktree_path_key},
+    persistence::CommitFence,
+};
 
 use super::{AdoptedWorktreeAvailability, WorktreeCatalogSnapshot};
 
@@ -155,6 +158,7 @@ pub struct WorkspaceAdmissionLease {
     registry: WorkspaceAvailabilityRegistry,
     admission_id: u64,
     loss_cancellation: WorkspaceAdmissionCancellation,
+    finalization: WorkspaceFinalizationGate,
 }
 
 #[derive(Clone)]
@@ -166,6 +170,25 @@ pub struct WorkspaceAdmissionCancellation {
 struct ActiveAdmission {
     scopes: Vec<AdmissionScope>,
     loss_cancellation: WorkspaceAdmissionCancellation,
+    finalization: WorkspaceFinalizationGate,
+}
+
+#[derive(Clone, Default)]
+struct WorkspaceFinalizationGate {
+    inner: Arc<(Mutex<WorkspaceFinalizationState>, Condvar)>,
+}
+
+#[derive(Default)]
+enum WorkspaceFinalizationState {
+    #[default]
+    Open,
+    Finalizing,
+    Finalized,
+    Rejected,
+}
+
+struct WorkspaceFinalizationPermit {
+    gate: WorkspaceFinalizationGate,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -272,11 +295,13 @@ impl WorkspaceAvailabilityRegistry {
             token: CancellationToken::new(),
             unavailable: Arc::new(Mutex::new(None)),
         };
+        let finalization = WorkspaceFinalizationGate::default();
         state.active_admissions.insert(
             admission_id,
             ActiveAdmission {
                 scopes: scopes.clone(),
                 loss_cancellation: loss_cancellation.clone(),
+                finalization: finalization.clone(),
             },
         );
         drop(state);
@@ -284,6 +309,7 @@ impl WorkspaceAvailabilityRegistry {
             registry: self.clone(),
             admission_id,
             loss_cancellation,
+            finalization,
         })
     }
 
@@ -314,7 +340,7 @@ impl WorkspaceAvailabilityRegistry {
         self.mark_unavailable_sync(transition)
     }
 
-    fn mark_unavailable_sync(&self, transition: WorkspaceLossTransition) -> bool {
+    pub(crate) fn mark_unavailable_sync(&self, transition: WorkspaceLossTransition) -> bool {
         let Some(guard_state) = transition.guard_state() else {
             return false;
         };
@@ -366,13 +392,27 @@ impl WorkspaceAvailabilityRegistry {
             .map(unavailable)
             .expect("inserted workspace guard");
         let thread_scope = AdmissionScope::Thread(transition.thread_id);
-        for admission in state.active_admissions.values() {
-            if admission.scopes.iter().any(|scope| {
-                scope == &thread_scope
-                    || matches!(scope, AdmissionScope::Path(candidate) if path_is_within(candidate, &path_key))
-            }) {
-                admission.loss_cancellation.cancel(unavailable.clone());
-            }
+        let matching_admissions = state
+            .active_admissions
+            .values()
+            .filter(|admission| {
+                admission.scopes.iter().any(|scope| {
+                    scope == &thread_scope
+                        || matches!(scope, AdmissionScope::Path(candidate) if path_is_within(candidate, &path_key))
+                })
+            })
+            .map(|admission| {
+                (
+                    admission.finalization.clone(),
+                    admission.loss_cancellation.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (finalization, _) in &matching_admissions {
+            finalization.reject();
+        }
+        for (_, loss_cancellation) in matching_admissions {
+            loss_cancellation.cancel(unavailable.clone());
         }
         true
     }
@@ -425,13 +465,27 @@ impl WorkspaceAvailabilityRegistry {
             .map(unavailable)
             .expect("inserted removing guard");
         let thread_scope = AdmissionScope::Thread(thread_id.to_owned());
-        for admission in state.active_admissions.values() {
-            if admission.scopes.iter().any(|scope| {
-                scope == &thread_scope
-                    || matches!(scope, AdmissionScope::Path(candidate) if path_is_within(candidate, &path_key))
-            }) {
-                admission.loss_cancellation.cancel(unavailable.clone());
-            }
+        let matching_admissions = state
+            .active_admissions
+            .values()
+            .filter(|admission| {
+                admission.scopes.iter().any(|scope| {
+                    scope == &thread_scope
+                        || matches!(scope, AdmissionScope::Path(candidate) if path_is_within(candidate, &path_key))
+                })
+            })
+            .map(|admission| {
+                (
+                    admission.finalization.clone(),
+                    admission.loss_cancellation.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        for (finalization, _) in &matching_admissions {
+            finalization.reject();
+        }
+        for (_, loss_cancellation) in matching_admissions {
+            loss_cancellation.cancel(unavailable.clone());
         }
         drop(state);
         RemovalGuard {
@@ -577,6 +631,27 @@ impl WorkspaceAvailabilityRegistry {
         })
     }
 
+    #[must_use]
+    pub fn transition_is_current(&self, transition: &WorkspaceLossTransition) -> bool {
+        let Some(guard_state) = transition.guard_state() else {
+            return false;
+        };
+        let path_key = normalized_path(&transition.path);
+        let state = lock(&self.inner);
+        state
+            .entries
+            .get(&transition.thread_id)
+            .is_some_and(|entry| {
+                entry.repository_key == transition.repository_key
+                    && entry.path_key == path_key
+                    && entry.state == guard_state
+            })
+            && state
+                .latest_loss
+                .get(&transition.thread_id)
+                .is_some_and(|watermark| watermark.generation == transition.generation)
+    }
+
     pub fn complete_orphan_cleanup(&self, ownership: &WorkspaceCleanupOwnership) {
         let mut state = lock(&self.inner);
         if state
@@ -670,6 +745,63 @@ impl WorkspaceAdmissionLease {
     #[must_use]
     pub fn loss_cancellation(&self) -> WorkspaceAdmissionCancellation {
         self.loss_cancellation.clone()
+    }
+
+    #[must_use]
+    pub(crate) fn commit_fence(&self) -> CommitFence {
+        self.finalization.commit_fence()
+    }
+}
+
+impl WorkspaceFinalizationGate {
+    fn commit_fence(&self) -> CommitFence {
+        let gate = self.clone();
+        CommitFence::new(move || {
+            gate.begin_finalization()
+                .map(|permit| Box::new(permit) as Box<dyn Send + 'static>)
+        })
+    }
+
+    fn begin_finalization(&self) -> Result<WorkspaceFinalizationPermit, ()> {
+        let (state, changed) = self.inner.as_ref();
+        let mut state = lock(state);
+        while matches!(*state, WorkspaceFinalizationState::Finalizing) {
+            state = changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        if !matches!(*state, WorkspaceFinalizationState::Open) {
+            return Err(());
+        }
+        *state = WorkspaceFinalizationState::Finalizing;
+        Ok(WorkspaceFinalizationPermit { gate: self.clone() })
+    }
+
+    fn reject(&self) {
+        let (state, changed) = self.inner.as_ref();
+        let mut state = lock(state);
+        while matches!(*state, WorkspaceFinalizationState::Finalizing) {
+            state = changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+        *state = WorkspaceFinalizationState::Rejected;
+    }
+
+    fn finish_finalization(&self) {
+        let (state, changed) = self.inner.as_ref();
+        let mut state = lock(state);
+        if matches!(*state, WorkspaceFinalizationState::Finalizing) {
+            *state = WorkspaceFinalizationState::Finalized;
+        }
+        drop(state);
+        changed.notify_all();
+    }
+}
+
+impl Drop for WorkspaceFinalizationPermit {
+    fn drop(&mut self) {
+        self.gate.finish_finalization();
     }
 }
 
@@ -1210,5 +1342,46 @@ mod tests {
         waiter
             .await
             .expect("cancellation drops the admission lease");
+    }
+
+    #[tokio::test]
+    async fn dropping_a_finalization_permit_unblocks_loss_and_rejects_reuse() {
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let lease = registry
+            .acquire_admission("thread-1", [Path::new("/repo/worktrees/missing")])
+            .await
+            .expect("workspace admission");
+        let fence = lease.commit_fence();
+        let permit = fence.acquire().expect("finalization permit");
+        let loss = transition(
+            "repository-a",
+            17,
+            AdoptedWorktreeAvailability::MissingRegistered,
+        );
+        let loss_registry = registry.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let loss_task = tokio::task::spawn_blocking(move || {
+            let _ = started_tx.send(());
+            loss_registry.mark_unavailable_sync(loss)
+        });
+        started_rx.await.expect("loss task starts");
+        tokio::task::yield_now().await;
+        assert!(
+            !loss_task.is_finished(),
+            "loss waits while finalization owns the gate"
+        );
+
+        drop(permit);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), loss_task)
+                .await
+                .expect("loss unblocks after permit drop")
+                .expect("loss task joins")
+        );
+        assert!(
+            fence.acquire().is_err(),
+            "a dropped/error finalization cannot be retried after loss"
+        );
+        assert!(lease.loss_cancellation().is_cancelled());
     }
 }

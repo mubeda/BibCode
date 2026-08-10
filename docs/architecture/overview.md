@@ -162,8 +162,11 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   physical workspace, and short-lived server admission leases serialize new
   durable/process publication against authoritative loss and bounded cleanup.
   Loss cancellation remains attached to queued engine work after an RPC caller
-  disconnects, and the runtime starts canonical cleanup immediately under one
-  five-second deadline while resolving any persisted aliases in parallel.
+  disconnects. Each queued durable turn also carries an owned synchronous
+  finalization fence into the SQLite worker: authoritative loss either rejects
+  the transaction before commit or waits for the local commit to finish before
+  publishing the guard. The runtime starts canonical cleanup immediately under
+  one five-second deadline while resolving any persisted aliases in parallel.
 - Capability negotiation controls optional behavior such as activity and
   preview automation; clients must downgrade when a server cannot prove support.
 - Host WebView engines differ by platform, so optional browser APIs are
