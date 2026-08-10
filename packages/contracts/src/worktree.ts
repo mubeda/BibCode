@@ -260,6 +260,8 @@ export class WorktreeAdoptionError extends Schema.TaggedErrorClass<WorktreeAdopt
 export const WorktreeRemovalErrorReason = Schema.Literals([
   "thread-not-found",
   "environment-unsupported",
+  "command-conflict",
+  "ownership-conflict",
   "stale-generation",
   "stale-plan",
   "dirty-confirmation-required",

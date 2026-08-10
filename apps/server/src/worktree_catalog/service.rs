@@ -1143,6 +1143,31 @@ impl WorktreeCatalogService {
         let Some(entry) = self.entry_for_project(project_id) else {
             return;
         };
+        self.invalidate_entry_after_mutation(&entry);
+    }
+
+    pub async fn invalidate_repository_after_mutation(&self, project_id: &str) {
+        if self.inner.shutdown.is_cancelled() {
+            return;
+        }
+        let entries = {
+            let registry = lock(&self.inner.registry);
+            let Some(source) = registry.entries.get(project_id) else {
+                return;
+            };
+            registry
+                .entries
+                .values()
+                .filter(|entry| Arc::ptr_eq(&entry.repository, &source.repository))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        for entry in entries {
+            self.invalidate_entry_after_mutation(&entry);
+        }
+    }
+
+    fn invalidate_entry_after_mutation(&self, entry: &Arc<CatalogEntry>) {
         let mut state = lock(&entry.state);
         state.mutation_epoch = state.mutation_epoch.wrapping_add(1);
         state.completed_at = None;
@@ -1156,7 +1181,7 @@ impl WorktreeCatalogService {
             return;
         }
         state.pending_mutation_refresh_epoch = Some(state.mutation_epoch);
-        self.ensure_mutation_refresh_worker_started(&entry, &mut state);
+        self.ensure_mutation_refresh_worker_started(entry, &mut state);
     }
 
     fn ensure_mutation_refresh_worker_started(

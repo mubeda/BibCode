@@ -2,7 +2,10 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -12,28 +15,33 @@ use bibcode_server::{
         GitCommandError, GitPrunableWorktree, GitRepository, GitWorktreeInventory,
         GitWorktreeRecord, GitWorktreeRemovalInspection,
     },
-    orchestration::{EngineOptions, OrchestrationCommand, OrchestrationEngine},
+    orchestration::{
+        EngineOptions, OrchestrationCommand, OrchestrationEngine, canonical_command_digest,
+    },
     persistence::{
-        Database, OrchestrationEvent, ProjectionProject, ProjectionThread, Repositories,
-        run_migrations,
+        CommandReceipt, Database, OrchestrationEvent, ProjectionProject, ProjectionThread,
+        Repositories, run_migrations,
     },
     production::git_vcs::{CatalogMutationObserver, GitVcsRpcServices, register_git_vcs_rpc},
     production::worktree_catalog_rpc::{
         WorktreeCatalogMutationObserver, WorktreeCatalogRpcServices, WorktreeRemovalGit,
         WorktreeRemovalGitFuture, WorktreeRemovalQuiesceFuture, WorktreeRemovalQuiesceLease,
-        WorktreeRemovalQuiescer, compact_eligible_baseline, register_worktree_catalog_rpc,
+        WorktreeRemovalQuiesceRequest, WorktreeRemovalQuiescer, compact_eligible_baseline,
+        register_worktree_catalog_rpc,
     },
     worktree_catalog::{
-        CatalogScanStatus, WorkspaceRemovalIdentity, WorktreeAdoptionState, WorktreeCatalogService,
-        WorktreeCatalogSnapshot, WorktreeDescriptor, WorktreeDirectoryState,
-        WorktreeRegistrationState,
+        CatalogScanStatus, WorktreeAdoptionState, WorktreeCatalogService, WorktreeCatalogSnapshot,
+        WorktreeDescriptor, WorktreeDirectoryState, WorktreeRegistrationState,
     },
 };
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
-use tokio::time::timeout;
+use tokio::{
+    sync::{Semaphore, mpsc},
+    time::timeout,
+};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use tokio_util::sync::CancellationToken;
 
@@ -1245,7 +1253,174 @@ async fn removal_present_clean_is_verified_detached_branch_preserving_and_idempo
     let mut changed = payload;
     changed["forceDirty"] = json!(true);
     request(fixture.socket(), "1205", "worktree.remove", changed).await;
-    assert_typed_removal_failure(fixture.socket(), "1205", "orchestration-failed").await;
+    assert_typed_removal_failure(fixture.socket(), "1205", "command-conflict").await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn removal_command_reservation_allows_only_one_cross_repository_git_mutation() {
+    let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+    let release = Arc::new(Semaphore::new(0));
+    let removal_git = Arc::new(BlockingRemovalGit {
+        inner: GitRepository::default(),
+        entered: entered_tx,
+        release: release.clone(),
+    });
+    let mut fixture = CatalogRpcFixture::new_with_removal_git(true, removal_git).await;
+    let first_thread = adopt_external_for_removal(&mut fixture, "reserve-adopt-first").await;
+
+    let second_main = fixture.root.path().join("second-main");
+    let second_external = fixture.root.path().join("second-external");
+    fs::create_dir(&second_main).expect("second primary directory");
+    git(&second_main, &["init", "--initial-branch", "main"], None);
+    git(
+        &second_main,
+        &["config", "user.email", "rpc@example.invalid"],
+        None,
+    );
+    git(&second_main, &["config", "user.name", "RPC Test"], None);
+    fs::write(second_main.join("README.md"), "second fixture\n").expect("second fixture file");
+    git(&second_main, &["add", "README.md"], None);
+    git(&second_main, &["commit", "-m", "initial"], None);
+    git(
+        &second_main,
+        &["worktree", "add", "-b", "feature/second"],
+        Some(&second_external),
+    );
+    fixture
+        .engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"project.create",
+                "commandId":"reserve-project-second",
+                "projectId":"project-2",
+                "title":"Second Catalog RPC",
+                "workspaceRoot":second_main,
+                "defaultModelSelection":null,
+                "createdAt":"2026-08-09T00:01:00Z"
+            }))
+            .expect("second project command"),
+        )
+        .await
+        .expect("second project created");
+    let second_thread = adopt_project_worktree_for_removal(
+        &mut fixture,
+        "project-2",
+        "reserve-adopt-second",
+        "1260",
+    )
+    .await;
+
+    let first_plan = removal_plan(&mut fixture, "project-1", &first_thread, "1262").await;
+    let second_plan = removal_plan(&mut fixture, "project-2", &second_thread, "1263").await;
+    let address = fixture.handle.as_ref().expect("server handle").local_addr();
+    let mut first_socket = connect_async(format!("ws://{address}/ws"))
+        .await
+        .expect("first removal socket")
+        .0;
+    let mut second_socket = connect_async(format!("ws://{address}/ws"))
+        .await
+        .expect("second removal socket")
+        .0;
+    request(
+        &mut first_socket,
+        "1264",
+        "worktree.remove",
+        removal_payload(
+            "shared-removal-command",
+            "project-1",
+            &first_thread,
+            &first_plan,
+        ),
+    )
+    .await;
+    request(
+        &mut second_socket,
+        "1265",
+        "worktree.remove",
+        removal_payload(
+            "shared-removal-command",
+            "project-2",
+            &second_thread,
+            &second_plan,
+        ),
+    )
+    .await;
+
+    let first_boundary = timeout(Duration::from_secs(5), entered_rx.recv())
+        .await
+        .expect("one request reaches Git")
+        .expect("Git boundary channel");
+    let second_boundary = timeout(Duration::from_millis(200), entered_rx.recv()).await;
+    release.add_permits(2);
+    assert!(
+        second_boundary.is_err(),
+        "only one command payload may cross Git; first={first_boundary:?}, second={second_boundary:?}"
+    );
+
+    let first_exit = next_server_message(&mut first_socket).await;
+    let second_exit = next_server_message(&mut second_socket).await;
+    let (winner_project, winner_thread, winner_path, loser_thread, loser_path) =
+        match (&first_exit, &second_exit) {
+            (
+                ServerMessage::Exit {
+                    exit: RpcExit::Success { .. },
+                    ..
+                },
+                ServerMessage::Exit {
+                    exit: RpcExit::Failure { cause },
+                    ..
+                },
+            ) if removal_failure_has_reason(cause, "command-conflict") => (
+                "project-1",
+                first_thread.as_str(),
+                fixture.external.as_path(),
+                second_thread.as_str(),
+                second_external.as_path(),
+            ),
+            (
+                ServerMessage::Exit {
+                    exit: RpcExit::Failure { cause },
+                    ..
+                },
+                ServerMessage::Exit {
+                    exit: RpcExit::Success { .. },
+                    ..
+                },
+            ) if removal_failure_has_reason(cause, "command-conflict") => (
+                "project-2",
+                second_thread.as_str(),
+                second_external.as_path(),
+                first_thread.as_str(),
+                fixture.external.as_path(),
+            ),
+            exits => panic!("expected one success and one command conflict: {exits:?}"),
+        };
+    assert!(
+        !winner_path.exists(),
+        "winner {winner_project} must mutate Git"
+    );
+    assert!(loser_path.exists(), "loser must not mutate Git");
+    assert!(
+        fixture
+            .repositories
+            .get_thread(winner_thread.to_owned())
+            .await
+            .expect("winner read")
+            .expect("winner thread")
+            .deleted_at
+            .is_some()
+    );
+    assert!(
+        fixture
+            .repositories
+            .get_thread(loser_thread.to_owned())
+            .await
+            .expect("loser read")
+            .expect("loser thread")
+            .deleted_at
+            .is_none()
+    );
     fixture.shutdown().await;
 }
 
@@ -1281,7 +1456,7 @@ async fn removal_dirty_requires_confirmation_and_detach_only_ignores_quiesce_out
     )
     .await;
     assert_typed_removal_failure(fixture.socket(), "1203", "dirty-confirmation-required").await;
-    assert!(quiescer.last_cancellation().is_cancelled());
+    assert_eq!(quiescer.call_count(), 0);
     assert!(
         fixture
             .repositories
@@ -1311,7 +1486,7 @@ async fn removal_dirty_requires_confirmation_and_detach_only_ignores_quiesce_out
     )
     .await;
     assert_typed_removal_failure(fixture.socket(), "1204", "stale-plan").await;
-    assert!(quiescer.last_cancellation().is_cancelled());
+    assert_eq!(quiescer.call_count(), 0);
 
     request(
         fixture.socket(),
@@ -1370,6 +1545,52 @@ async fn removal_after_git_succeeded_before_detach_is_safe_missing_unregistered_
         success_value(fixture.socket(), "1203").await["gitOutcome"],
         "cleaned"
     );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn reserved_removal_resumes_after_git_succeeded_before_detach() {
+    let mut fixture = CatalogRpcFixture::new(true).await;
+    let thread_id = adopt_external_for_removal(&mut fixture, "remove-adopt-reserved-crash").await;
+    let plan = removal_plan(&mut fixture, "project-1", &thread_id, "1270").await;
+    let payload = removal_payload("remove-reserved-crash", "project-1", &thread_id, &plan);
+    fixture
+        .repositories
+        .reserve_command_receipt(CommandReceipt {
+            command_id: "remove-reserved-crash".to_owned(),
+            aggregate_kind: "project".to_owned(),
+            aggregate_id: "project-1".to_owned(),
+            accepted_at: "2026-08-09T00:02:00Z".to_owned(),
+            result_sequence: 0,
+            status: "prepared".to_owned(),
+            error: None,
+            payload_digest: Some(canonical_command_digest(&payload).expect("payload digest")),
+        })
+        .await
+        .expect("durable removal reservation");
+    git(
+        &fixture.main,
+        &["worktree", "remove"],
+        Some(&fixture.external),
+    );
+
+    request(fixture.socket(), "1271", "worktree.remove", payload.clone()).await;
+    let result = success_value(fixture.socket(), "1271").await;
+    assert_eq!(result["gitOutcome"], "removed");
+    assert_eq!(result["threadRemoved"], true);
+    assert!(
+        fixture
+            .repositories
+            .get_thread(thread_id)
+            .await
+            .expect("thread read")
+            .expect("thread")
+            .deleted_at
+            .is_some()
+    );
+
+    request(fixture.socket(), "1272", "worktree.remove", payload).await;
+    assert_eq!(success_value(fixture.socket(), "1272").await, result);
     fixture.shutdown().await;
 }
 
@@ -1559,6 +1780,72 @@ async fn removal_present_verified_mutation_failure_keeps_thread_and_worktree() {
 }
 
 #[tokio::test]
+async fn removal_duplicate_canonical_owner_conflicts_before_git_mutation() {
+    let remove_calls = Arc::new(AtomicUsize::new(0));
+    let git = Arc::new(CountingRemovalGit {
+        inner: GitRepository::default(),
+        remove_calls: remove_calls.clone(),
+    });
+    let mut fixture = CatalogRpcFixture::new_with_removal_git(true, git).await;
+    let thread_id = adopt_external_for_removal(&mut fixture, "remove-adopt-owner-conflict").await;
+    request(
+        fixture.socket(),
+        "1250",
+        "worktree.getRemovalPlan",
+        json!({"projectId":"project-1","threadId":thread_id}),
+    )
+    .await;
+    let plan = success_value(fixture.socket(), "1250").await;
+    let mut duplicate = fixture
+        .repositories
+        .get_thread(thread_id.clone())
+        .await
+        .expect("owner read")
+        .expect("canonical owner");
+    duplicate.thread_id = "duplicate-workspace-owner".to_owned();
+    duplicate.created_at = "2026-08-09T00:00:03Z".to_owned();
+    fixture
+        .repositories
+        .upsert_thread(duplicate)
+        .await
+        .expect("duplicate owner projection");
+
+    request(
+        fixture.socket(),
+        "1251",
+        "worktree.remove",
+        json!({
+            "commandId":"remove-owner-conflict",
+            "projectId":"project-1",
+            "threadId":thread_id,
+            "mode":"delete-git-worktree",
+            "expectedGeneration":plan["generation"],
+            "planToken":plan["planToken"],
+            "forceDirty":false,
+            "confirmRepositoryWidePrune":false
+        }),
+    )
+    .await;
+
+    assert_typed_removal_failure(fixture.socket(), "1251", "ownership-conflict").await;
+    assert_eq!(remove_calls.load(Ordering::SeqCst), 0);
+    assert!(fixture.external.exists());
+    for owner in [&thread_id, "duplicate-workspace-owner"] {
+        assert!(
+            fixture
+                .repositories
+                .get_thread(owner.to_owned())
+                .await
+                .expect("owner read")
+                .expect("owner projection")
+                .deleted_at
+                .is_none()
+        );
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn removal_missing_targeted_and_prune_failure_detaches_with_bounded_failed_outcome() {
     let mut fixture = CatalogRpcFixture::new_with_removal_git(
         true,
@@ -1619,6 +1906,10 @@ struct RecordingPendingQuiescer {
 }
 
 impl RecordingPendingQuiescer {
+    fn call_count(&self) -> usize {
+        self.cancellations.lock().expect("cancellation lock").len()
+    }
+
     fn last_cancellation(&self) -> CancellationToken {
         self.cancellations
             .lock()
@@ -1630,7 +1921,7 @@ impl RecordingPendingQuiescer {
 }
 
 impl WorktreeRemovalQuiescer for RecordingPendingQuiescer {
-    fn quiesce(&self, _identity: WorkspaceRemovalIdentity) -> WorktreeRemovalQuiesceFuture {
+    fn quiesce(&self, _request: WorktreeRemovalQuiesceRequest) -> WorktreeRemovalQuiesceFuture {
         let cancellation = CancellationToken::new();
         self.cancellations
             .lock()
@@ -1846,8 +2137,136 @@ impl CatalogRpcFixture {
 struct TestNoopQuiescer;
 
 impl WorktreeRemovalQuiescer for TestNoopQuiescer {
-    fn quiesce(&self, _identity: WorkspaceRemovalIdentity) -> WorktreeRemovalQuiesceFuture {
+    fn quiesce(&self, _request: WorktreeRemovalQuiesceRequest) -> WorktreeRemovalQuiesceFuture {
         Box::pin(async { WorktreeRemovalQuiesceLease::complete() })
+    }
+}
+
+#[derive(Clone)]
+struct BlockingRemovalGit {
+    inner: GitRepository,
+    entered: mpsc::UnboundedSender<PathBuf>,
+    release: Arc<Semaphore>,
+}
+
+impl WorktreeRemovalGit for BlockingRemovalGit {
+    fn inventory(
+        &self,
+        anchor: PathBuf,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<GitWorktreeInventory> {
+        WorktreeRemovalGit::inventory(&self.inner, anchor, cancellation)
+    }
+
+    fn inspect(
+        &self,
+        anchor: PathBuf,
+        record: GitWorktreeRecord,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<GitWorktreeRemovalInspection> {
+        WorktreeRemovalGit::inspect(&self.inner, anchor, record, cancellation)
+    }
+
+    fn preview_prune(
+        &self,
+        anchor: PathBuf,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<Vec<GitPrunableWorktree>> {
+        WorktreeRemovalGit::preview_prune(&self.inner, anchor, cancellation)
+    }
+
+    fn remove(
+        &self,
+        anchor: PathBuf,
+        record: GitWorktreeRecord,
+        force_dirty: bool,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<()> {
+        let inner = self.inner.clone();
+        let entered = self.entered.clone();
+        let release = self.release.clone();
+        Box::pin(async move {
+            entered.send(anchor.clone()).expect("Git boundary receiver");
+            let permit = release.acquire().await.expect("Git boundary release");
+            permit.forget();
+            WorktreeRemovalGit::remove(&inner, anchor, record, force_dirty, cancellation).await
+        })
+    }
+
+    fn prune(
+        &self,
+        anchor: PathBuf,
+        record: GitWorktreeRecord,
+        expected_impact_digest: String,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<()> {
+        WorktreeRemovalGit::prune(
+            &self.inner,
+            anchor,
+            record,
+            expected_impact_digest,
+            cancellation,
+        )
+    }
+}
+
+#[derive(Clone)]
+struct CountingRemovalGit {
+    inner: GitRepository,
+    remove_calls: Arc<AtomicUsize>,
+}
+
+impl WorktreeRemovalGit for CountingRemovalGit {
+    fn inventory(
+        &self,
+        anchor: PathBuf,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<GitWorktreeInventory> {
+        WorktreeRemovalGit::inventory(&self.inner, anchor, cancellation)
+    }
+
+    fn inspect(
+        &self,
+        anchor: PathBuf,
+        record: GitWorktreeRecord,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<GitWorktreeRemovalInspection> {
+        WorktreeRemovalGit::inspect(&self.inner, anchor, record, cancellation)
+    }
+
+    fn preview_prune(
+        &self,
+        anchor: PathBuf,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<Vec<GitPrunableWorktree>> {
+        WorktreeRemovalGit::preview_prune(&self.inner, anchor, cancellation)
+    }
+
+    fn remove(
+        &self,
+        anchor: PathBuf,
+        record: GitWorktreeRecord,
+        force_dirty: bool,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<()> {
+        self.remove_calls.fetch_add(1, Ordering::SeqCst);
+        WorktreeRemovalGit::remove(&self.inner, anchor, record, force_dirty, cancellation)
+    }
+
+    fn prune(
+        &self,
+        anchor: PathBuf,
+        record: GitWorktreeRecord,
+        expected_impact_digest: String,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<()> {
+        WorktreeRemovalGit::prune(
+            &self.inner,
+            anchor,
+            record,
+            expected_impact_digest,
+            cancellation,
+        )
     }
 }
 
@@ -2082,6 +2501,76 @@ async fn adopt_external_for_removal(fixture: &mut CatalogRpcFixture, command_id:
         .as_str()
         .expect("adopted thread ID")
         .to_owned()
+}
+
+async fn adopt_project_worktree_for_removal(
+    fixture: &mut CatalogRpcFixture,
+    project_id: &str,
+    command_id: &str,
+    request_id: &str,
+) -> String {
+    let adopt_request_id = (request_id.parse::<u64>().expect("numeric request ID") + 1).to_string();
+    request(
+        fixture.socket(),
+        request_id,
+        "vcs.refreshWorktreeCatalog",
+        json!({"projectId":project_id}),
+    )
+    .await;
+    let snapshot = success_value(fixture.socket(), request_id).await;
+    let candidate = eligible_candidate(&snapshot).clone();
+    let mut payload = adoption_payload(command_id, &candidate, &snapshot);
+    payload["projectId"] = json!(project_id);
+    request(
+        fixture.socket(),
+        &adopt_request_id,
+        "worktree.adopt",
+        payload,
+    )
+    .await;
+    success_value(fixture.socket(), &adopt_request_id).await["threadId"]
+        .as_str()
+        .expect("adopted thread ID")
+        .to_owned()
+}
+
+async fn removal_plan(
+    fixture: &mut CatalogRpcFixture,
+    project_id: &str,
+    thread_id: &str,
+    request_id: &str,
+) -> Value {
+    request(
+        fixture.socket(),
+        request_id,
+        "worktree.getRemovalPlan",
+        json!({"projectId":project_id,"threadId":thread_id}),
+    )
+    .await;
+    success_value(fixture.socket(), request_id).await
+}
+
+fn removal_payload(command_id: &str, project_id: &str, thread_id: &str, plan: &Value) -> Value {
+    json!({
+        "commandId":command_id,
+        "projectId":project_id,
+        "threadId":thread_id,
+        "mode":"delete-git-worktree",
+        "expectedGeneration":plan["generation"],
+        "planToken":plan["planToken"],
+        "forceDirty":false,
+        "confirmRepositoryWidePrune":false
+    })
+}
+
+fn removal_failure_has_reason(cause: &[CauseItem], expected_reason: &str) -> bool {
+    cause.iter().any(|item| {
+        matches!(
+            item,
+            CauseItem::Fail { error }
+                if error["_tag"] == "WorktreeRemovalError" && error["reason"] == expected_reason
+        )
+    })
 }
 
 async fn assert_typed_catalog_failure(

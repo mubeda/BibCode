@@ -294,6 +294,67 @@ impl Repositories {
             .await
     }
 
+    /// Atomically establishes an immutable command identity without overwriting an existing
+    /// receipt. A matching reserved receipt is intentionally resumable after interruption.
+    pub async fn reserve_command_receipt(
+        &self,
+        row: CommandReceipt,
+    ) -> Result<(CommandReceipt, bool)> {
+        self.database
+            .call(move |connection| {
+                let inserted = connection.execute(
+                    "INSERT OR IGNORE INTO orchestration_command_receipts (\
+                       command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest\
+                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    params![
+                        row.command_id,
+                        row.aggregate_kind,
+                        row.aggregate_id,
+                        row.accepted_at,
+                        row.result_sequence,
+                        row.status,
+                        row.error,
+                        row.payload_digest
+                    ],
+                )?;
+                let receipt = connection
+                    .query_row(
+                        "SELECT command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest \
+                         FROM orchestration_command_receipts WHERE command_id = ?",
+                        [&row.command_id],
+                        decode_command_receipt,
+                    )
+                    .map_err(crate::persistence::PersistenceError::from)?;
+                Ok((receipt, inserted == 1))
+            })
+            .await
+    }
+
+    pub async fn prepare_reserved_command_receipt(
+        &self,
+        command_id: String,
+        payload_digest: String,
+    ) -> Result<Option<CommandReceipt>> {
+        self.database
+            .call(move |connection| {
+                connection.execute(
+                    "UPDATE orchestration_command_receipts SET status = 'prepared' \
+                     WHERE command_id = ? AND payload_digest = ? AND status = 'reserved'",
+                    params![command_id, payload_digest],
+                )?;
+                connection
+                    .query_row(
+                        "SELECT command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest \
+                         FROM orchestration_command_receipts WHERE command_id = ?",
+                        [&command_id],
+                        decode_command_receipt,
+                    )
+                    .optional()
+                    .map_err(Into::into)
+            })
+            .await
+    }
+
     pub async fn delete_project(&self, project_id: String) -> Result<()> {
         self.delete(
             "DELETE FROM projection_projects WHERE project_id = ?",
