@@ -104,10 +104,15 @@ archived owner while updating the discovery baseline in the same
 thread ID plus `created`, `existing`, or `restored`; replay of an accepted
 command returns the original disposition from immutable result metadata on
 the receipt-linked adoption event, without consulting a mutable thread
-projection. Canonical ownership compares the catalog-owned lexical host-path
-identity stored in the command model for create, metadata retarget, and
-restart/replay; it remains defined for missing paths and does not perform a
-second filesystem probe. Resolved adoption and branch
+projection. Present but malformed metadata, or metadata inconsistent with the
+transaction's immutable thread event, fails closed as an internal error. A
+legacy receipt with no result metadata may recover `created` or `restored`
+only from its matching immutable `thread.created` or `thread.unarchived`
+event; a project-only legacy receipt cannot reconstruct `existing` from
+current ownership and also fails closed. Canonical ownership compares the
+catalog-owned lexical host-path identity stored in the command model for
+create, metadata retarget, and restart/replay; it remains defined for missing
+paths and does not perform a second filesystem probe. Resolved adoption and branch
 reconciliation command variants are rejected by
 `orchestration.dispatchCommand` even though trusted server services may admit
 them directly.

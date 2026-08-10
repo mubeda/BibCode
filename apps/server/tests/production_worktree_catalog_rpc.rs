@@ -525,7 +525,7 @@ async fn adopt_public_admission_replays_exactly_and_conflicts_on_changed_payload
             .expect("expected generation")
             + 1
     );
-    let mut changed_defaults = payload;
+    let mut changed_defaults = payload.clone();
     changed_defaults["threadDefaults"]["interactionMode"] = json!("plan");
     let mutations = [
         ("project", changed_project),
@@ -580,6 +580,32 @@ async fn adopt_public_admission_replays_exactly_and_conflicts_on_changed_payload
             .payload_digest
             .is_some(),
         "the public adoption receipt must retain the canonical public payload digest"
+    );
+    let changed = fixture
+        .repositories
+        .database()
+        .call(|connection| {
+            Ok(connection.execute(
+                "UPDATE orchestration_events SET metadata_json = '{\"worktreeKey\":\"corrupt\",\"adoptionResult\":\"malformed\"}' WHERE command_id = 'adopt-admitted' AND event_type = 'project.meta-updated'",
+                [],
+            )?)
+        })
+        .await
+        .expect("corrupt adoption receipt metadata");
+    assert_eq!(changed, 1);
+    request(fixture.socket(), "909", "worktree.adopt", payload).await;
+    let (outcome, wire_value) = adoption_outcome(fixture.socket(), "909").await;
+    assert_eq!(outcome, "internal");
+    assert!(!wire_value.to_string().contains(&external_path));
+    assert_eq!(
+        fixture
+            .repositories
+            .read_events_from_sequence(0, 512)
+            .await
+            .expect("event read")
+            .len(),
+        event_count,
+        "a malformed durable result must fail closed without replacement effects"
     );
     fixture.shutdown().await;
 }
