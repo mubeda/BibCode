@@ -131,7 +131,12 @@ identity after the mutation, canonicalize primary/canonical-thread and target
 paths, and notify every matching project view with a matching durable pin (or
 verified unpinned path), never an arbitrary first match. Pin mismatches and
 unverifiable identities fail observation closed. Observation failure never
-changes a successful Git response into a failure. Runtime shutdown permanently
+changes a successful Git response into a failure. Server-owned destructive Git
+primitives also re-read repository inventory before and after mutation and
+never accept a client path as authority. Repository-wide stale-registration
+cleanup binds confirmation to a versioned digest of every sorted normalized
+registration path and its exact dry-run prune reason; either kind of drift
+fails closed before mutation. Runtime shutdown permanently
 closes the service under one lifecycle-registration mutex before draining
 pollers, queued mutation refreshes, repository-observation leaders, scans, and
 eviction work. Every spawned task registers an abort handle under that mutex

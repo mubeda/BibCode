@@ -645,8 +645,10 @@ Cleanup follows this order:
 2. Strictly list worktrees and verify that the exact registration disappeared.
 3. If Git requires repository-wide prune, run
    `git worktree prune --dry-run --verbose --expire now` first.
-4. If the dry run affects other registrations, show those effects and require
-   explicit confirmation before `git worktree prune --expire now`.
+4. If the dry run affects other registrations, show every exact path and prune
+   reason and require explicit confirmation before `git worktree prune
+   --expire now`. Bind that confirmation to the sorted path-plus-reason impact
+   so either kind of drift invalidates it.
 5. Strictly verify the target registration again.
 
 Git command success without verification is insufficient. Git administrative

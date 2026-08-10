@@ -227,6 +227,7 @@ pub struct GitWorktreeRemovalInspection {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct GitPrunableWorktree {
     pub path: PathBuf,
+    pub prune_reason: String,
     pub locked: bool,
     pub lock_reason: Option<String>,
 }

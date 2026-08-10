@@ -1457,6 +1457,7 @@ async fn worktree_prune_preview_lists_every_affected_registration_in_normalized_
         .await
         .expect("prune preview");
     assert_eq!(impact.len(), 2);
+    assert!(impact.iter().all(|entry| !entry.prune_reason.is_empty()));
     assert!(impact.iter().all(|entry| !entry.locked));
     assert!(impact.iter().all(|entry| entry.lock_reason.is_none()));
     let keys = impact
@@ -1478,6 +1479,13 @@ async fn worktree_prune_preview_lists_every_affected_registration_in_normalized_
         git_worktree_prune_impact_digest(&impact),
         git_worktree_prune_impact_digest(&reversed),
         "confirmed impact digest is independent of preview iteration order"
+    );
+    let mut reason_changed = impact.clone();
+    reason_changed[0].prune_reason.push_str("-changed");
+    assert_ne!(
+        git_worktree_prune_impact_digest(&impact),
+        git_worktree_prune_impact_digest(&reason_changed),
+        "confirmed impact digest binds each path to its exact prune reason"
     );
 }
 
