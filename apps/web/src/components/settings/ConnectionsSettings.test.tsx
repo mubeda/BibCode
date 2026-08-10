@@ -1739,6 +1739,41 @@ describe("ConnectionsSettings", () => {
     );
   });
 
+  it("switches a confirmed WSL-only disable with one atomic bridge command", async () => {
+    const bridge = stubDesktopWindow();
+    h.environments = [
+      environment({
+        id: "environment-wsl",
+        label: "WSL Backend",
+        targetTag: "DesktopLocalConnectionTarget",
+      }),
+    ];
+    h.wslQuery.data = {
+      enabled: true,
+      distro: "Ubuntu",
+      available: true,
+      wslOnly: true,
+      distros: [{ name: "Ubuntu", isDefault: true, version: 2 }],
+      preflightError: null,
+    } satisfies DesktopWslState;
+
+    await mountConnections();
+    await act(async () => {
+      invoke(control("select", "Ubuntu"), "onValueChange", "backend:wsl-off");
+    });
+    const switchToWindows = findControls("button", "Switch to Windows").at(-1);
+    expect(switchToWindows).toBeDefined();
+    await act(async () => {
+      invoke(switchToWindows!, "onClick");
+      await flush();
+    });
+
+    expect(bridge.setWslBackendEnabled).toHaveBeenCalledTimes(1);
+    expect(bridge.setWslBackendEnabled).toHaveBeenCalledWith(false);
+    expect(bridge.setWslOnly).not.toHaveBeenCalled();
+    expect(h.refreshDesktopWslState).toHaveBeenCalledTimes(1);
+  });
+
   it("applies WSL changes directly when no WSL environment is registered", async () => {
     const bridge = stubDesktopWindow();
     h.environments = [];
