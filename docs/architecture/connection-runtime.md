@@ -86,23 +86,38 @@ compare-only command alongside protected compare-and-set and the
 `protectedConnectionCatalog` capability. The renderer never emulates either
 atomic transition with separate bridge calls. A host without protected CAS
 explicitly selects IndexedDB and atomically migrates any legacy renderer-local
-catalog into it before clearing the legacy value. A protected host migrates a legacy
-renderer-local catalog only by a native CAS from `null`, so neither migration
-can overwrite a value that appeared concurrently. During unprotected-host
-migration, an already-valid IndexedDB value is the exact canonical winner. If
-IndexedDB instead contains corrupt bytes and the legacy catalog is valid, the
-renderer replaces those exact corrupt bytes by CAS and quarantines them before
-clearing the only valid legacy copy. Migration uses the same eight-attempt
-bound as ordinary catalog updates.
+catalog into it before clearing the legacy value.
+
+Before exposing a protected version 3 bridge, the desktop adapter collapses a
+legacy renderer-local catalog into the native source. It first reads native
+storage. If native is absent and the legacy value is non-blank, it attempts one
+native CAS from `null` to that exact value, then rereads native whether it won
+or lost. An already-present or concurrent native value is authoritative and is
+never overwritten by the legacy copy. Only after an authoritative native read
+or post-CAS confirmation does the adapter clear the renderer copy. Absent and
+blank renderer values require no CAS. Once installed, protected `get`,
+compare-only, CAS, set, and clear operations use native storage exclusively;
+Keep never falls back to or rewrites renderer storage.
+
+If reading the renderer legacy source, reading native storage, adopting, or
+confirming fails, adapter installation preserves both sources and exposes the
+catalog capability as unknown. Catalog consumers then fail with a redacted
+typed persistence error without writing IndexedDB or clearing either source.
+During unprotected-host migration, an already-valid IndexedDB value is the
+exact canonical winner. If IndexedDB instead contains corrupt bytes and the
+legacy catalog is valid, the renderer replaces those exact corrupt bytes by
+CAS and quarantines them before clearing the only valid legacy copy. Migration
+uses the same eight-attempt bound as ordinary catalog updates.
 
 Catalog protection capability has three states. Only bridge contract version 3
 with an explicit `protectedConnectionCatalog: true` selects protected native
 compare-only/CAS, and only version 3 with an explicit `false` selects IndexedDB
 and legacy migration. Rejected metadata, older bridge contracts, and missing
-capability fields are `unknown`: catalog startup and mutation fail with a
-redacted typed error, without writing IndexedDB, invoking native clear, or
-deleting a legacy renderer copy. This prevents transient metadata failure or
-version skew from downgrading a Windows DPAPI catalog into renderer storage.
+capability fields, plus failed protected-source collapse, are `unknown`:
+catalog startup and mutation fail with a redacted typed error, without writing
+IndexedDB, invoking native clear, or deleting a legacy renderer copy. This
+prevents transient metadata failure, migration failure, or version skew from
+downgrading a Windows DPAPI catalog into renderer storage.
 
 Once a compare-only or CAS call is issued it is uninterruptible through
 transaction/command completion. There is no in-memory catalog publication

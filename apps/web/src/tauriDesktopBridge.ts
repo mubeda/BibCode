@@ -265,13 +265,9 @@ function readLocalStorageConnectionCatalog(): string | null {
   }
 }
 
-function writeLocalStorageConnectionCatalog(catalog: string): boolean {
-  try {
-    localStorage.setItem(CONNECTION_CATALOG_STORAGE_KEY, catalog);
-    return true;
-  } catch {
-    return false;
-  }
+function readProtectedLegacyConnectionCatalog(): string | null {
+  const storage = (window as Window & { readonly localStorage?: Storage }).localStorage;
+  return storage?.getItem(CONNECTION_CATALOG_STORAGE_KEY) ?? null;
 }
 
 function clearLocalStorageConnectionCatalog(): void {
@@ -289,42 +285,49 @@ async function getConnectionCatalog(): Promise<string | null> {
   return catalog ?? readLocalStorageConnectionCatalog();
 }
 
-async function setConnectionCatalog(catalog: string): Promise<boolean> {
-  const stored = await tauriInvokeOr<boolean>(
-    "desktop_bridge_set_connection_catalog",
-    { catalog },
-    () => writeLocalStorageConnectionCatalog(catalog),
-  );
-  if (stored) clearLocalStorageConnectionCatalog();
-  return stored;
+async function getNativeConnectionCatalog(): Promise<string | null> {
+  return tauriInvoke<string | null>("desktop_bridge_get_connection_catalog", undefined);
 }
 
-async function compareAndSetConnectionCatalog(
+async function setNativeConnectionCatalog(catalog: string): Promise<boolean> {
+  return tauriInvoke<boolean>("desktop_bridge_set_connection_catalog", { catalog });
+}
+
+async function compareAndSetNativeConnectionCatalog(
   expectedCatalog: string | null,
   nextCatalog: string,
 ): Promise<boolean> {
-  let stored = await tauriInvoke<boolean>("desktop_bridge_compare_and_set_connection_catalog", {
+  return tauriInvoke<boolean>("desktop_bridge_compare_and_set_connection_catalog", {
     expectedCatalog,
     nextCatalog,
   });
-  if (
-    !stored &&
-    expectedCatalog !== null &&
-    readLocalStorageConnectionCatalog() === expectedCatalog
-  ) {
-    stored = await tauriInvoke<boolean>("desktop_bridge_compare_and_set_connection_catalog", {
-      expectedCatalog: null,
-      nextCatalog,
-    });
-  }
-  if (stored) clearLocalStorageConnectionCatalog();
-  return stored;
 }
 
-async function compareConnectionCatalog(expectedCatalog: string | null): Promise<boolean> {
+async function compareNativeConnectionCatalog(expectedCatalog: string | null): Promise<boolean> {
   return tauriInvoke<boolean>("desktop_bridge_compare_connection_catalog", {
     expectedCatalog,
   });
+}
+
+async function clearNativeConnectionCatalog(): Promise<void> {
+  await tauriInvoke("desktop_bridge_clear_connection_catalog", undefined);
+}
+
+async function establishNativeConnectionCatalogSource(): Promise<void> {
+  const legacyCatalog = readProtectedLegacyConnectionCatalog();
+  let nativeCatalog = await getNativeConnectionCatalog();
+
+  if (nativeCatalog === null && legacyCatalog !== null && legacyCatalog.trim() !== "") {
+    await compareAndSetNativeConnectionCatalog(null, legacyCatalog);
+    nativeCatalog = await getNativeConnectionCatalog();
+    if (nativeCatalog === null) {
+      throw new Error("Protected connection catalog migration could not be confirmed.");
+    }
+  }
+
+  if (legacyCatalog !== null) {
+    clearLocalStorageConnectionCatalog();
+  }
 }
 
 async function clearConnectionCatalog(): Promise<void> {
@@ -456,11 +459,11 @@ function createTauriDesktopBridge(
   const connectionCatalog =
     connectionCatalogProtection === "protected"
       ? {
-          getConnectionCatalog,
-          setConnectionCatalog,
-          compareConnectionCatalog,
-          compareAndSetConnectionCatalog,
-          clearConnectionCatalog,
+          getConnectionCatalog: getNativeConnectionCatalog,
+          setConnectionCatalog: setNativeConnectionCatalog,
+          compareConnectionCatalog: compareNativeConnectionCatalog,
+          compareAndSetConnectionCatalog: compareAndSetNativeConnectionCatalog,
+          clearConnectionCatalog: clearNativeConnectionCatalog,
         }
       : connectionCatalogProtection === "unprotected"
         ? { getConnectionCatalog, clearConnectionCatalog }
@@ -586,9 +589,22 @@ async function installTauriDesktopBridge(): Promise<void> {
     return;
   }
 
+  const declaredConnectionCatalogProtection = connectionCatalogProtectionCapability(metadata);
+  const connectionCatalogProtection =
+    declaredConnectionCatalogProtection === "protected"
+      ? await establishNativeConnectionCatalogSource().then(
+          () => declaredConnectionCatalogProtection,
+          () => "unknown" as const,
+        )
+      : declaredConnectionCatalogProtection;
+
+  if (window.desktopBridge !== undefined) {
+    return;
+  }
+
   const bridge = createTauriDesktopBridge(
     metadata?.features?.preview === true,
-    connectionCatalogProtectionCapability(metadata),
+    connectionCatalogProtection,
   );
   window.desktopBridge = bridge;
   const preview = bridge.preview;
