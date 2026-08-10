@@ -14,8 +14,10 @@
             "arch": "x64"
           },
           "serverVersion": "0.1.1",
+          "storageInstanceId": "00000000-0000-4000-8000-000000000002",
           "capabilities": {
-            "repositoryIdentity": true
+            "repositoryIdentity": true,
+            "activityProtocolVersion": 1
           }
         },
         "auth": {

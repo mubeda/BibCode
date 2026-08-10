@@ -156,14 +156,16 @@ const orchestrationEventShapeCount = countSchemaShapes(OrchestrationEvent.ast);
 const schemaMembers = (ast: SchemaAST.AST): ReadonlyArray<SchemaAST.AST> =>
   ast._tag === "Union" ? ast.types : [ast];
 
+const fixtureEnvironmentDescriptor = {
+  environmentId: "fixture",
+  label: "Fixture",
+  platform: { os: "windows", arch: "x64" },
+  serverVersion: "0.1.1",
+  storageInstanceId: "00000000-0000-4000-8000-000000000002",
+  capabilities: { repositoryIdentity: true, activityProtocolVersion: 1 },
+} as const;
 const fixtureServerConfig = {
-  environment: {
-    environmentId: "fixture",
-    label: "Fixture",
-    platform: { os: "windows", arch: "x64" },
-    serverVersion: "0.1.1",
-    capabilities: { repositoryIdentity: true },
-  },
+  environment: fixtureEnvironmentDescriptor,
   auth: {
     policy: "loopback-browser",
     bootstrapMethods: ["one-time-token"],
@@ -368,6 +370,31 @@ const manualStreamSamples = new Map<string, unknown>([
       version: 1,
       type: "settingsUpdated",
       payload: { settings: DEFAULT_SERVER_SETTINGS },
+    },
+  ],
+  [
+    "subscribeServerLifecycle:0",
+    {
+      version: 1,
+      sequence: 1,
+      type: "welcome",
+      payload: {
+        environment: fixtureEnvironmentDescriptor,
+        cwd: "C:\\fixture",
+        projectName: "Fixture",
+      },
+    },
+  ],
+  [
+    "subscribeServerLifecycle:1",
+    {
+      version: 1,
+      sequence: 2,
+      type: "ready",
+      payload: {
+        at: "2026-01-01T00:00:00.000Z",
+        environment: fixtureEnvironmentDescriptor,
+      },
     },
   ],
   [

@@ -60,6 +60,36 @@ describe("execution environment contracts", () => {
     expect(decoded.storageInstanceId).toBe("0d93cbea-f237-4f37-8829-d816667be35f");
   });
 
+  it("accepts a non-UUID storage identity from a third-party server", () => {
+    const decoded = decodeExecutionEnvironmentDescriptor({
+      ...descriptor,
+      storageInstanceId: "third-party-store",
+      capabilities: { repositoryIdentity: true },
+    });
+
+    expect(decoded.storageInstanceId).toBe("third-party-store");
+  });
+
+  it("trims surrounding whitespace from a supplied storage identity", () => {
+    const decoded = decodeExecutionEnvironmentDescriptor({
+      ...descriptor,
+      storageInstanceId: "  third-party-store  ",
+      capabilities: { repositoryIdentity: true },
+    });
+
+    expect(decoded.storageInstanceId).toBe("third-party-store");
+  });
+
+  it("rejects a whitespace-only storage identity", () => {
+    expect(() =>
+      decodeExecutionEnvironmentDescriptor({
+        ...descriptor,
+        storageInstanceId: "   ",
+        capabilities: { repositoryIdentity: true },
+      }),
+    ).toThrow();
+  });
+
   it("defaults the activity protocol version for an old descriptor", () => {
     expect(
       decodeExecutionEnvironmentDescriptor({

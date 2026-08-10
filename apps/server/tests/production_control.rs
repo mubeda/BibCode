@@ -1,7 +1,11 @@
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use bibcode_server::{
     ACTIVE_RPC_METHODS, MethodMode, RpcRegistry, ServerConfig,
+    persistence::StorageInstanceId,
     production::{
         control::NativeServerControl, runtime::finalize_rpc_registry,
         server_terminal::ProductionServerControl,
@@ -12,6 +16,15 @@ use tempfile::TempDir;
 use tokio::time::timeout;
 use tokio::{net::TcpListener, sync::mpsc};
 use tokio_util::sync::CancellationToken;
+use uuid::Uuid;
+
+const TEST_STORAGE_INSTANCE_ID: Uuid = Uuid::from_u128(0x00000000000040008000000000000003);
+
+fn test_config(path: &Path) -> ServerConfig {
+    let mut config = ServerConfig::new(path);
+    config.storage_instance_id = Some(StorageInstanceId::from_uuid(TEST_STORAGE_INSTANCE_ID));
+    config
+}
 
 fn auth_descriptor() -> Value {
     json!({
@@ -50,7 +63,7 @@ fn complete_registry() -> RpcRegistry {
 
 async fn fixture() -> (TempDir, NativeServerControl) {
     let directory = tempfile::tempdir().expect("temporary state directory");
-    let mut config = ServerConfig::new(directory.path());
+    let mut config = test_config(directory.path());
     config.environment_id = "test-environment".into();
     config.environment_label = "Test Environment".into();
     let control = NativeServerControl::new(config, auth_descriptor()).await;
@@ -70,7 +83,7 @@ async fn fixture_with_state_file(
     tokio::fs::write(path, contents)
         .await
         .expect("write state fixture");
-    let mut config = ServerConfig::new(directory.path());
+    let mut config = test_config(directory.path());
     config.environment_id = "test-environment".into();
     config.environment_label = "Test Environment".into();
     let control = NativeServerControl::new(config, auth_descriptor()).await;
@@ -405,8 +418,7 @@ async fn missing_keybindings_file_uses_the_shipped_defaults() {
 #[tokio::test]
 async fn activity_protocol_cannot_be_advertised_before_registry_validation() {
     let directory = tempfile::tempdir().expect("temporary state directory");
-    let control =
-        NativeServerControl::new(ServerConfig::new(directory.path()), auth_descriptor()).await;
+    let control = NativeServerControl::new(test_config(directory.path()), auth_descriptor()).await;
 
     let before_registration = call(&control, "server.getConfig", json!({})).await;
     assert_eq!(
@@ -705,8 +717,7 @@ async fn provider_inventory_uses_provider_specific_status_and_configured_models(
     )
     .await
     .expect("write settings fixture");
-    let control =
-        NativeServerControl::new(ServerConfig::new(directory.path()), auth_descriptor()).await;
+    let control = NativeServerControl::new(test_config(directory.path()), auth_descriptor()).await;
 
     call(&control, "server.refreshProviders", json!({})).await;
     let config = call(&control, "server.getConfig", json!({})).await;
@@ -753,8 +764,7 @@ async fn claude_inventory_uses_authoritative_discovered_model_catalog() {
     tokio::fs::write(settings_path, serde_json::to_vec(&settings).unwrap())
         .await
         .expect("write settings fixture");
-    let control =
-        NativeServerControl::new(ServerConfig::new(directory.path()), auth_descriptor()).await;
+    let control = NativeServerControl::new(test_config(directory.path()), auth_descriptor()).await;
 
     call(&control, "server.refreshProviders", json!({})).await;
     let config = call(&control, "server.getConfig", json!({})).await;
@@ -810,8 +820,7 @@ async fn claude_inventory_keeps_discovered_models_when_skill_reload_is_invalid()
     tokio::fs::write(settings_path, serde_json::to_vec(&settings).unwrap())
         .await
         .expect("write settings fixture");
-    let control =
-        NativeServerControl::new(ServerConfig::new(directory.path()), auth_descriptor()).await;
+    let control = NativeServerControl::new(test_config(directory.path()), auth_descriptor()).await;
 
     call(&control, "server.refreshProviders", json!({})).await;
     let first_config = call(&control, "server.getConfig", json!({})).await;
@@ -863,8 +872,7 @@ async fn claude_inventory_hides_models_unsupported_by_the_installed_cli_version(
     tokio::fs::write(settings_path, serde_json::to_vec(&settings).unwrap())
         .await
         .expect("write settings fixture");
-    let control =
-        NativeServerControl::new(ServerConfig::new(directory.path()), auth_descriptor()).await;
+    let control = NativeServerControl::new(test_config(directory.path()), auth_descriptor()).await;
 
     call(&control, "server.refreshProviders", json!({})).await;
     let config = call(&control, "server.getConfig", json!({})).await;
@@ -1025,8 +1033,7 @@ async fn refresh_providers_returns_version_advisories_without_registry_access() 
     )
     .await
     .expect("write settings fixture");
-    let control =
-        NativeServerControl::new(ServerConfig::new(directory.path()), auth_descriptor()).await;
+    let control = NativeServerControl::new(test_config(directory.path()), auth_descriptor()).await;
 
     let refreshed = call(
         &control,
@@ -1069,8 +1076,7 @@ async fn provider_update_succeeds_when_cursor_installed_version_advances() {
     )
     .await
     .expect("write settings fixture");
-    let control =
-        NativeServerControl::new(ServerConfig::new(directory.path()), auth_descriptor()).await;
+    let control = NativeServerControl::new(test_config(directory.path()), auth_descriptor()).await;
     let initial = call(
         &control,
         "server.refreshProviders",
@@ -1141,8 +1147,7 @@ async fn provider_update_rejects_malformed_instance_ids_without_publishing_updat
     )
     .await
     .expect("write settings fixture");
-    let control =
-        NativeServerControl::new(ServerConfig::new(directory.path()), auth_descriptor()).await;
+    let control = NativeServerControl::new(test_config(directory.path()), auth_descriptor()).await;
 
     for instance_id in [Value::Null, json!(7), json!({}), json!("not a slug")] {
         let error = control
