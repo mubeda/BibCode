@@ -25,7 +25,7 @@ use crate::{
     rpc::{RpcRegistry, RpcResult, RpcStreamChunk},
     terminal::{
         TerminalAttachInput, TerminalError, TerminalLaunchCommand, TerminalManager,
-        TerminalMetadataEvent, TerminalOpenInput,
+        TerminalMetadataEvent, TerminalOpenInput, TerminalSessionIdentity,
     },
     worktree_catalog::{WorkspaceAdmissionLease, WorkspaceAvailabilityRegistry},
 };
@@ -153,6 +153,25 @@ impl ServerTerminalServices {
     ) -> Result<(), String> {
         self.terminal
             .quiesce_thread_preserving_history(thread_id)
+            .await
+            .map_err(|error| error.to_string())
+    }
+
+    pub(crate) async fn capture_thread_terminal_identities(
+        &self,
+        thread_id: &str,
+    ) -> Vec<TerminalSessionIdentity> {
+        self.terminal
+            .capture_thread_session_identities(thread_id)
+            .await
+    }
+
+    pub(crate) async fn quiesce_terminal_identities_for_workspace_loss(
+        &self,
+        identities: Vec<TerminalSessionIdentity>,
+    ) -> Result<(), String> {
+        self.terminal
+            .quiesce_sessions_preserving_history_if_current(identities)
             .await
             .map_err(|error| error.to_string())
     }

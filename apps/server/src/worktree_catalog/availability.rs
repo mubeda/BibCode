@@ -73,6 +73,8 @@ impl WorkspaceLossTransition {
 pub struct WorkspaceAvailabilityRegistry {
     inner: Arc<Mutex<RegistryState>>,
     admission_changed: Arc<Notify>,
+    #[cfg(test)]
+    finalization_rejection_pause: Arc<Mutex<Option<FinalizationRejectionPause>>>,
 }
 
 #[derive(Default)]
@@ -173,9 +175,10 @@ struct ActiveAdmission {
     finalization: WorkspaceFinalizationGate,
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone)]
 struct WorkspaceFinalizationGate {
     inner: Arc<(Mutex<WorkspaceFinalizationState>, Condvar)>,
+    loss_cancellation: WorkspaceAdmissionCancellation,
 }
 
 #[derive(Default)]
@@ -189,6 +192,13 @@ enum WorkspaceFinalizationState {
 
 struct WorkspaceFinalizationPermit {
     gate: WorkspaceFinalizationGate,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct FinalizationRejectionPause {
+    entered: Arc<Notify>,
+    release: Arc<(Mutex<bool>, Condvar)>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -295,7 +305,7 @@ impl WorkspaceAvailabilityRegistry {
             token: CancellationToken::new(),
             unavailable: Arc::new(Mutex::new(None)),
         };
-        let finalization = WorkspaceFinalizationGate::default();
+        let finalization = WorkspaceFinalizationGate::new(loss_cancellation.clone());
         state.active_admissions.insert(
             admission_id,
             ActiveAdmission {
@@ -409,10 +419,13 @@ impl WorkspaceAvailabilityRegistry {
             })
             .collect::<Vec<_>>();
         for (finalization, _) in &matching_admissions {
-            finalization.reject();
+            finalization.reject(unavailable.clone());
         }
+        drop(state);
+        #[cfg(test)]
+        self.maybe_pause_after_finalization_rejection();
         for (_, loss_cancellation) in matching_admissions {
-            loss_cancellation.cancel(unavailable.clone());
+            loss_cancellation.cancel();
         }
         true
     }
@@ -482,12 +495,14 @@ impl WorkspaceAvailabilityRegistry {
             })
             .collect::<Vec<_>>();
         for (finalization, _) in &matching_admissions {
-            finalization.reject();
-        }
-        for (_, loss_cancellation) in matching_admissions {
-            loss_cancellation.cancel(unavailable.clone());
+            finalization.reject(unavailable.clone());
         }
         drop(state);
+        #[cfg(test)]
+        self.maybe_pause_after_finalization_rejection();
+        for (_, loss_cancellation) in matching_admissions {
+            loss_cancellation.cancel();
+        }
         RemovalGuard {
             registry: self.clone(),
             thread_id: thread_id.to_owned(),
@@ -652,6 +667,24 @@ impl WorkspaceAvailabilityRegistry {
                 .is_some_and(|watermark| watermark.generation == transition.generation)
     }
 
+    #[cfg(test)]
+    pub(crate) fn pause_after_next_finalization_rejection(&self) -> FinalizationRejectionPause {
+        let pause = FinalizationRejectionPause {
+            entered: Arc::new(Notify::new()),
+            release: Arc::new((Mutex::new(false), Condvar::new())),
+        };
+        *lock(&self.finalization_rejection_pause) = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    fn maybe_pause_after_finalization_rejection(&self) {
+        let pause = lock(&self.finalization_rejection_pause).take();
+        if let Some(pause) = pause {
+            pause.block_until_released();
+        }
+    }
+
     pub fn complete_orphan_cleanup(&self, ownership: &WorkspaceCleanupOwnership) {
         let mut state = lock(&self.inner);
         if state
@@ -735,9 +768,37 @@ impl WorkspaceAdmissionCancellation {
         lock(&self.unavailable).clone()
     }
 
-    fn cancel(&self, unavailable: WorkspaceUnavailable) {
+    fn publish_unavailable(&self, unavailable: WorkspaceUnavailable) {
         *lock(&self.unavailable) = Some(unavailable);
+    }
+
+    fn cancel(&self) {
+        debug_assert!(lock(&self.unavailable).is_some());
         self.token.cancel();
+    }
+}
+
+#[cfg(test)]
+impl FinalizationRejectionPause {
+    pub(crate) async fn wait_until_entered(&self) {
+        self.entered.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        let (released, changed) = self.release.as_ref();
+        *lock(released) = true;
+        changed.notify_one();
+    }
+
+    fn block_until_released(&self) {
+        self.entered.notify_one();
+        let (released, changed) = self.release.as_ref();
+        let mut released = lock(released);
+        while !*released {
+            released = changed
+                .wait(released)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
     }
 }
 
@@ -754,6 +815,13 @@ impl WorkspaceAdmissionLease {
 }
 
 impl WorkspaceFinalizationGate {
+    fn new(loss_cancellation: WorkspaceAdmissionCancellation) -> Self {
+        Self {
+            inner: Arc::new((Mutex::new(WorkspaceFinalizationState::Open), Condvar::new())),
+            loss_cancellation,
+        }
+    }
+
     fn commit_fence(&self) -> CommitFence {
         let gate = self.clone();
         CommitFence::new(move || {
@@ -777,7 +845,7 @@ impl WorkspaceFinalizationGate {
         Ok(WorkspaceFinalizationPermit { gate: self.clone() })
     }
 
-    fn reject(&self) {
+    fn reject(&self, unavailable: WorkspaceUnavailable) {
         let (state, changed) = self.inner.as_ref();
         let mut state = lock(state);
         while matches!(*state, WorkspaceFinalizationState::Finalizing) {
@@ -785,6 +853,7 @@ impl WorkspaceFinalizationGate {
                 .wait(state)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
+        self.loss_cancellation.publish_unavailable(unavailable);
         *state = WorkspaceFinalizationState::Rejected;
     }
 

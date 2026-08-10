@@ -191,8 +191,12 @@ loss wins, permit acquisition is rejected and dropping the transaction rolls
 back its receipt, events, projections, attachment references, and provider
 outbox; if commit finalization wins, guard publication waits until the local
 commit has completed. Permit drop on success or error always wakes a waiting
-loss transition. The fence is persistence-generic; neither orchestration nor
-SQLite imports worktree availability policy. Nested removal guards retain independent tokens;
+loss transition. Gate rejection publishes the exact structured loss on the
+admission while holding that same gate, before the SQLite worker can observe
+rejection. The RPC therefore reports `WorkspaceUnavailableError` even when the
+rejected database result is ready before cancellation notification. The fence
+is persistence-generic; neither orchestration nor SQLite imports worktree
+availability policy. Nested removal guards retain independent tokens;
 arbitrary drop order cannot reveal a pending missing workspace before the last
 removal completes, and removal cancels already-admitted matching work just like
 authoritative loss.
@@ -234,10 +238,13 @@ that identity. The actor rechecks identity against its current thread session;
 an old cleanup that resumes after exact recovery and provider replacement is a
 no-op. Retry resolution repeats capture only while its transition ownership is
 current, and recovery/newer-loss cancellation still short-circuits the whole
-attempt. Terminal cleanup already snapshots each session's exact generation
-and process while holding the terminal lifecycle lock; exit finalization checks
-that generation before updating retained history, so an older process result
-cannot overwrite a replacement session.
+attempt. Terminal cleanup applies the same transition-scoped pattern to every
+session for the affected thread: it captures the exact session, generation, and
+process only while the loss transition is current, then rechecks all three
+under the terminal lifecycle lock before signaling that process. A stale
+cleanup therefore skips a recovered replacement, including one published under
+the same terminal key. Exit finalization keeps its existing exact-generation
+check, so an older process result cannot overwrite replacement history.
 
 The single graceful cleanup deadline starts when loss quiescence begins and is
 five seconds. Warning persistence and known canonical provider/terminal

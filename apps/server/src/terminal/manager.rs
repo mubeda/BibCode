@@ -201,6 +201,14 @@ type SessionKey = (String, String);
 type SharedSession = Arc<Mutex<Session>>;
 
 #[derive(Clone)]
+pub(crate) struct TerminalSessionIdentity {
+    key: SessionKey,
+    session: SharedSession,
+    generation: Arc<SessionGeneration>,
+    process: Arc<dyn PtyProcess>,
+}
+
+#[derive(Clone)]
 struct StreamingSecretRedactor {
     secrets: Arc<Vec<String>>,
     pending: String,
@@ -2240,42 +2248,99 @@ impl TerminalManager {
         &self,
         thread_id: &str,
     ) -> Result<(), TerminalError> {
+        let identities = self.capture_thread_session_identities(thread_id).await;
+        self.quiesce_sessions_preserving_history_if_current(identities)
+            .await
+    }
+
+    pub(crate) async fn capture_thread_session_identities(
+        &self,
+        thread_id: &str,
+    ) -> Vec<TerminalSessionIdentity> {
+        let _lifecycle = self.inner.lifecycle.lock().await;
+        let sessions = {
+            let sessions = self.inner.sessions.read().await;
+            sessions
+                .iter()
+                .filter(|((candidate_thread, _), _)| candidate_thread == thread_id)
+                .map(|(key, session)| (key.clone(), session.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut identities = Vec::with_capacity(sessions.len());
+        for (key, session) in sessions {
+            let (generation, process) = {
+                let session = session.lock().await;
+                (session.generation.clone(), session.process.clone())
+            };
+            if let Some(process) = process {
+                identities.push(TerminalSessionIdentity {
+                    key,
+                    session,
+                    generation,
+                    process,
+                });
+            }
+        }
+        identities
+    }
+
+    pub(crate) async fn quiesce_sessions_preserving_history_if_current(
+        &self,
+        identities: Vec<TerminalSessionIdentity>,
+    ) -> Result<(), TerminalError> {
         let (targets, mut failed) = {
             let _lifecycle = self.inner.lifecycle.lock().await;
-            let sessions = {
-                let sessions = self.inner.sessions.read().await;
-                sessions
-                    .iter()
-                    .filter(|((candidate_thread, _), _)| candidate_thread == thread_id)
-                    .map(|(_, session)| session.clone())
-                    .collect::<Vec<_>>()
-            };
-            let mut targets = Vec::with_capacity(sessions.len());
+            let mut targets = Vec::with_capacity(identities.len());
             let mut failed = false;
-            for session in sessions {
-                let (generation, process) = {
-                    let session = session.lock().await;
-                    (session.generation.clone(), session.process.clone())
+            for identity in identities {
+                let registered = {
+                    let sessions = self.inner.sessions.read().await;
+                    sessions
+                        .get(&identity.key)
+                        .is_some_and(|current| Arc::ptr_eq(current, &identity.session))
                 };
-                if let Some(process) = process {
-                    let exit = process.subscribe_exit();
-                    match process.kill() {
-                        Ok(()) => targets.push((session, generation, process, exit)),
-                        Err(error) => {
-                            failed = true;
-                            tracing::warn!(
-                                %thread_id,
-                                pid = process.pid(),
-                                %error,
-                                "failed to stop terminal for unavailable workspace"
-                            );
-                        }
+                let generation_is_current = self
+                    .inner
+                    .generations
+                    .peek(&identity.key)
+                    .is_some_and(|current| Arc::ptr_eq(&current, &identity.generation));
+                let process_is_current = if registered && generation_is_current {
+                    let session = identity.session.lock().await;
+                    Arc::ptr_eq(&session.generation, &identity.generation)
+                        && session
+                            .process
+                            .as_ref()
+                            .is_some_and(|current| Arc::ptr_eq(current, &identity.process))
+                } else {
+                    false
+                };
+                if !process_is_current {
+                    continue;
+                }
+                let exit = identity.process.subscribe_exit();
+                match identity.process.kill() {
+                    Ok(()) => targets.push((
+                        identity.key,
+                        identity.session,
+                        identity.generation,
+                        identity.process,
+                        exit,
+                    )),
+                    Err(error) => {
+                        failed = true;
+                        tracing::warn!(
+                            thread_id = %identity.key.0,
+                            terminal_id = %identity.key.1,
+                            pid = identity.process.pid(),
+                            %error,
+                            "failed to stop terminal for unavailable workspace"
+                        );
                     }
                 }
             }
             (targets, failed)
         };
-        for (session, generation, process, exit) in targets {
+        for (key, session, generation, process, exit) in targets {
             let observed = exit.clone();
             match wait_for_terminal_process_tree_exit(process, exit).await {
                 Ok(()) => {
@@ -2286,7 +2351,12 @@ impl TerminalManager {
                 }
                 Err(error) => {
                     failed = true;
-                    tracing::warn!(%thread_id, %error, "terminal quiesce did not finish cleanly");
+                    tracing::warn!(
+                        thread_id = %key.0,
+                        terminal_id = %key.1,
+                        %error,
+                        "terminal quiesce did not finish cleanly"
+                    );
                 }
             }
         }
@@ -4333,6 +4403,101 @@ mod tests {
                 .iter()
                 .all(|process| process.is_killed())
         );
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn exact_workspace_quiesce_skips_a_replacement_and_stops_other_captured_sessions() {
+        let root = tempfile::tempdir().unwrap();
+        let backend = Arc::new(HistoryTestBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        for terminal_id in ["term-replaced", "term-retained"] {
+            manager
+                .open(TerminalOpenInput::new(
+                    "thread-exact-quiesce",
+                    terminal_id,
+                    root.path().to_path_buf(),
+                    80,
+                    24,
+                ))
+                .await
+                .unwrap();
+        }
+        let captured = manager
+            .capture_thread_session_identities("thread-exact-quiesce")
+            .await;
+        assert_eq!(captured.len(), 2, "cleanup captures every live session");
+
+        manager
+            .restart(TerminalRestartInput {
+                thread_id: "thread-exact-quiesce".to_owned(),
+                terminal_id: "term-replaced".to_owned(),
+                cwd: root.path().to_path_buf(),
+                worktree_path: None,
+                cols: 80,
+                rows: 24,
+                env: std::collections::BTreeMap::new(),
+                command: None,
+            })
+            .await
+            .expect("recovered replacement starts");
+        let processes = backend.processes.lock().expect("processes").clone();
+        let replacement = processes.last().expect("replacement process").clone();
+        let mut events = manager.subscribe_events();
+        replacement.emit("replacement-history\n");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if matches!(events.recv().await, Ok(TerminalEvent::Output { data, .. }) if data == "replacement-history\n") {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("replacement output published");
+
+        manager
+            .quiesce_sessions_preserving_history_if_current(captured)
+            .await
+            .expect("stale exact cleanup");
+
+        assert!(
+            !replacement.is_killed(),
+            "stale cleanup must not kill the recovered replacement"
+        );
+        manager
+            .write("thread-exact-quiesce", "term-replaced", "still-usable")
+            .await
+            .expect("replacement remains writable");
+        let replacement_attachment = manager
+            .attach(TerminalAttachInput::existing(
+                "thread-exact-quiesce",
+                "term-replaced",
+            ))
+            .await
+            .expect("replacement remains attachable");
+        assert_eq!(
+            replacement_attachment.initial.status,
+            TerminalStatus::Running
+        );
+        assert_eq!(
+            replacement_attachment.initial.history,
+            "replacement-history\n"
+        );
+        let retained_attachment = manager
+            .attach(TerminalAttachInput::existing(
+                "thread-exact-quiesce",
+                "term-retained",
+            ))
+            .await
+            .expect("captured session history remains attachable");
+        assert_eq!(retained_attachment.initial.status, TerminalStatus::Exited);
+        assert!(processes[1].is_killed());
         manager.shutdown().await;
     }
 

@@ -51,7 +51,11 @@ pub(crate) trait WorktreeRuntimeActions: Send + Sync + 'static {
         thread_id: String,
         transition: WorkspaceLossTransition,
     ) -> WorktreeRuntimeFuture<Result<(), String>>;
-    fn close_terminals(&self, thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>>;
+    fn close_terminals(
+        &self,
+        thread_id: String,
+        transition: WorkspaceLossTransition,
+    ) -> WorktreeRuntimeFuture<Result<(), String>>;
     fn append_warning(
         &self,
         transition: WorkspaceLossTransition,
@@ -467,8 +471,8 @@ fn cleanup_attempt(
                     let transition = transition.clone();
                     async move {
                         let (provider, terminals) = tokio::join!(
-                            actions.stop_provider(affected_thread_id.clone(), transition),
-                            actions.close_terminals(affected_thread_id.clone()),
+                            actions.stop_provider(affected_thread_id.clone(), transition.clone()),
+                            actions.close_terminals(affected_thread_id.clone(), transition),
                         );
                         (affected_thread_id, provider, terminals)
                     }
@@ -591,11 +595,25 @@ impl WorktreeRuntimeActions for ProductionWorktreeRuntimeActions {
         })
     }
 
-    fn close_terminals(&self, thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+    fn close_terminals(
+        &self,
+        thread_id: String,
+        transition: WorkspaceLossTransition,
+    ) -> WorktreeRuntimeFuture<Result<(), String>> {
         let terminals = self.terminals.clone();
+        let registry = self.registry.clone();
         Box::pin(async move {
+            if !registry.transition_is_current(&transition) {
+                return Ok(());
+            }
+            let identities = terminals
+                .capture_thread_terminal_identities(&thread_id)
+                .await;
+            if !registry.transition_is_current(&transition) {
+                return Ok(());
+            }
             terminals
-                .quiesce_thread_terminals_for_workspace_loss(&thread_id)
+                .quiesce_terminal_identities_for_workspace_loss(identities)
                 .await
         })
     }
@@ -814,7 +832,11 @@ mod tests {
             }
         }
 
-        fn close_terminals(&self, thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+        fn close_terminals(
+            &self,
+            thread_id: String,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
             self.terminal_calls.fetch_add(1, Ordering::SeqCst);
             self.terminal_threads
                 .lock()
@@ -870,7 +892,11 @@ mod tests {
             })
         }
 
-        fn close_terminals(&self, _thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+        fn close_terminals(
+            &self,
+            _thread_id: String,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
             Box::pin(ready(Ok(())))
         }
 
@@ -900,6 +926,7 @@ mod tests {
     struct RecoveryRaceActions {
         resolver_calls: AtomicUsize,
         provider_calls: AtomicUsize,
+        terminal_calls: AtomicUsize,
         retry_resolver_started: Arc<Semaphore>,
         retry_resolver_release: Arc<Semaphore>,
     }
@@ -927,7 +954,11 @@ mod tests {
             Box::pin(ready(Ok(())))
         }
 
-        fn close_terminals(&self, _thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+        fn close_terminals(
+            &self,
+            _thread_id: String,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
             self.terminal_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(ready(Ok(())))
         }
@@ -971,7 +1002,12 @@ mod tests {
             }
         }
 
-        fn close_terminals(&self, _thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+        fn close_terminals(
+            &self,
+            _thread_id: String,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
+            self.terminal_calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(ready(Ok(())))
         }
 
@@ -1017,7 +1053,11 @@ mod tests {
             }
         }
 
-        fn close_terminals(&self, _thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+        fn close_terminals(
+            &self,
+            _thread_id: String,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
             Box::pin(ready(Ok(())))
         }
 
@@ -1051,7 +1091,11 @@ mod tests {
             })
         }
 
-        fn close_terminals(&self, _thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+        fn close_terminals(
+            &self,
+            _thread_id: String,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
             Box::pin(ready(Ok(())))
         }
 
@@ -1096,7 +1140,11 @@ mod tests {
             })
         }
 
-        fn close_terminals(&self, _thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+        fn close_terminals(
+            &self,
+            _thread_id: String,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
             Box::pin(ready(Ok(())))
         }
 
@@ -1135,7 +1183,11 @@ mod tests {
             Box::pin(ready(Ok(())))
         }
 
-        fn close_terminals(&self, thread_id: String) -> WorktreeRuntimeFuture<Result<(), String>> {
+        fn close_terminals(
+            &self,
+            thread_id: String,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
             self.terminal_threads
                 .lock()
                 .expect("terminal thread lock")
@@ -1658,6 +1710,7 @@ mod tests {
         let actions = Arc::new(RecoveryRaceActions {
             resolver_calls: AtomicUsize::new(0),
             provider_calls: AtomicUsize::new(0),
+            terminal_calls: AtomicUsize::new(0),
             retry_resolver_started: resolver_started.clone(),
             retry_resolver_release: resolver_release.clone(),
         });
@@ -1696,6 +1749,7 @@ mod tests {
         }
 
         assert_eq!(actions.provider_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(actions.terminal_calls.load(Ordering::SeqCst), 1);
         drop(replacement);
         runtime.shutdown().await;
     }
