@@ -2023,6 +2023,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
         "serverVersion": config.server_version,
         "capabilities": {
             "repositoryIdentity": true,
+            "worktreeCatalog": true,
             "activityProtocolVersion": activity_protocol_registered.then_some(1),
         },
     })
@@ -4820,6 +4821,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn environment_descriptor_advertises_complete_worktree_catalog_surface() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let config = ServerConfig::new(temp.path());
+        let descriptor = environment_descriptor(&config, false);
+        assert_eq!(descriptor["capabilities"]["repositoryIdentity"], true);
+        assert_eq!(descriptor["capabilities"]["worktreeCatalog"], true);
+    }
+
     #[tokio::test]
     async fn unit_build_covers_server_control_settings_keybindings_and_streams() {
         let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
@@ -4837,6 +4847,10 @@ mod tests {
         assert!(!platform_arch().is_empty());
         assert!(
             environment_descriptor(&config, false)["capabilities"]["repositoryIdentity"] == true
+        );
+        assert_eq!(
+            environment_descriptor(&config, false)["capabilities"]["worktreeCatalog"],
+            true
         );
         let _ = available_editors();
         assert!(!command_exists("definitely-not-a-bibcode-editor"));

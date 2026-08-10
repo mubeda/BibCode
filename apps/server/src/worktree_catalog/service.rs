@@ -173,6 +173,7 @@ struct Inner {
     lifecycle_tasks_changed: Notify,
     registry: Mutex<Registry>,
     availability_registry: WorkspaceAvailabilityRegistry,
+    git_repository: Option<Arc<GitRepository>>,
     healthy_snapshot_observer: Mutex<Option<Arc<dyn CatalogHealthySnapshotObserver>>>,
     workspace_loss_observer: Mutex<Option<Arc<dyn CatalogWorkspaceLossObserver>>>,
     #[cfg(test)]
@@ -429,10 +430,13 @@ impl WorktreeCatalogService {
     ) -> Self {
         Self::build(
             Arc::new(RepositoriesProjectionSource { repositories }),
-            Arc::new(GitInventorySource { repository }),
+            Arc::new(GitInventorySource {
+                repository: repository.clone(),
+            }),
             Arc::new(TokioCatalogFileSystem),
             CatalogServiceOptions::default(),
             availability_registry,
+            Some(repository),
         )
     }
 
@@ -450,6 +454,7 @@ impl WorktreeCatalogService {
             filesystem,
             options,
             availability_registry,
+            None,
         )
     }
 
@@ -466,6 +471,7 @@ impl WorktreeCatalogService {
             filesystem,
             options,
             WorkspaceAvailabilityRegistry::new(),
+            None,
         )
     }
 
@@ -475,6 +481,7 @@ impl WorktreeCatalogService {
         filesystem: Arc<dyn CatalogFileSystem>,
         options: CatalogServiceOptions,
         availability_registry: WorkspaceAvailabilityRegistry,
+        git_repository: Option<Arc<GitRepository>>,
     ) -> Self {
         let max_repository_scans = options.max_repository_scans.max(1);
         let max_directory_probes = options.max_directory_probes.max(1);
@@ -491,6 +498,7 @@ impl WorktreeCatalogService {
                 lifecycle_tasks_changed: Notify::new(),
                 registry: Mutex::new(Registry::default()),
                 availability_registry,
+                git_repository,
                 healthy_snapshot_observer: Mutex::new(None),
                 workspace_loss_observer: Mutex::new(None),
                 #[cfg(test)]
@@ -557,6 +565,16 @@ impl WorktreeCatalogService {
             }
             changed.await;
         }
+    }
+
+    #[must_use]
+    pub(crate) fn git_repository(&self) -> Option<Arc<GitRepository>> {
+        self.inner.git_repository.clone()
+    }
+
+    #[must_use]
+    pub(crate) fn availability_registry(&self) -> WorkspaceAvailabilityRegistry {
+        self.inner.availability_registry.clone()
     }
 
     pub async fn subscribe(&self, project_id: &str) -> Result<CatalogSubscription, CatalogError> {

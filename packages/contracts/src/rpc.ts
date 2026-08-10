@@ -81,7 +81,7 @@ import {
   ProviderInteractionMode,
   RuntimeMode,
 } from "./orchestration.ts";
-import { CommandId, NonNegativeInt, ProjectId } from "./baseSchemas.ts";
+import { CommandId, NonNegativeInt, ProjectId, ThreadId } from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
   RelayClientInstallFailedError,
@@ -201,6 +201,11 @@ import {
   WorktreeAdoptResult,
   WorktreeAdoptionError,
   WorktreeKey,
+  WorktreeRemovalError,
+  WorktreeRemovalMode,
+  WorktreeRemovalPlan,
+  WorktreeRemovalPlanToken,
+  WorktreeRemovalResult,
   WorkspaceUnavailableError,
 } from "./worktree.ts";
 
@@ -216,6 +221,31 @@ export const WorktreeAdoptInput = Schema.Struct({
   }),
 });
 export type WorktreeAdoptInput = typeof WorktreeAdoptInput.Type;
+
+export const WorktreeGetRemovalPlanInput = Schema.Struct({
+  projectId: ProjectId,
+  threadId: ThreadId,
+});
+export type WorktreeGetRemovalPlanInput = typeof WorktreeGetRemovalPlanInput.Type;
+
+export const WorktreeRemoveFromBibCodeInput = Schema.Struct({
+  commandId: CommandId,
+  projectId: ProjectId,
+  threadId: ThreadId,
+});
+export type WorktreeRemoveFromBibCodeInput = typeof WorktreeRemoveFromBibCodeInput.Type;
+
+export const WorktreeRemoveInput = Schema.Struct({
+  commandId: CommandId,
+  projectId: ProjectId,
+  threadId: ThreadId,
+  mode: WorktreeRemovalMode,
+  expectedGeneration: NonNegativeInt,
+  planToken: WorktreeRemovalPlanToken,
+  forceDirty: Schema.Boolean,
+  confirmRepositoryWidePrune: Schema.Boolean,
+});
+export type WorktreeRemoveInput = typeof WorktreeRemoveInput.Type;
 
 export const WS_METHODS = {
   // Project registry methods
@@ -256,6 +286,9 @@ export const WS_METHODS = {
   vcsRefreshWorktreeCatalog: "vcs.refreshWorktreeCatalog",
   worktreeUpdateDiscoveryPolicy: "worktree.updateDiscoveryPolicy",
   worktreeAdopt: "worktree.adopt",
+  worktreeGetRemovalPlan: "worktree.getRemovalPlan",
+  worktreeRemoveFromBibCode: "worktree.removeFromBibCode",
+  worktreeRemove: "worktree.remove",
 
   // Git workflow methods
   gitRunStackedAction: "git.runStackedAction",
@@ -741,6 +774,24 @@ export const WsWorktreeAdoptRpc = Rpc.make(WS_METHODS.worktreeAdopt, {
   error: Schema.Union([WorktreeAdoptionError, EnvironmentAuthorizationError]),
 });
 
+export const WsWorktreeGetRemovalPlanRpc = Rpc.make(WS_METHODS.worktreeGetRemovalPlan, {
+  payload: WorktreeGetRemovalPlanInput,
+  success: WorktreeRemovalPlan,
+  error: Schema.Union([WorktreeRemovalError, EnvironmentAuthorizationError]),
+});
+
+export const WsWorktreeRemoveFromBibCodeRpc = Rpc.make(WS_METHODS.worktreeRemoveFromBibCode, {
+  payload: WorktreeRemoveFromBibCodeInput,
+  success: WorktreeRemovalResult,
+  error: Schema.Union([WorktreeRemovalError, EnvironmentAuthorizationError]),
+});
+
+export const WsWorktreeRemoveRpc = Rpc.make(WS_METHODS.worktreeRemove, {
+  payload: WorktreeRemoveInput,
+  success: WorktreeRemovalResult,
+  error: Schema.Union([WorktreeRemovalError, EnvironmentAuthorizationError]),
+});
+
 /**
  * Ephemeral live diff preview for compact/mobile surfaces.
  * Not the persisted BiBCode Review model. Future review sessions should use
@@ -1042,6 +1093,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsVcsRefreshWorktreeCatalogRpc,
   WsWorktreeUpdateDiscoveryPolicyRpc,
   WsWorktreeAdoptRpc,
+  WsWorktreeGetRemovalPlanRpc,
+  WsWorktreeRemoveFromBibCodeRpc,
+  WsWorktreeRemoveRpc,
   WsReviewGetDiffPreviewRpc,
   WsTerminalOpenRpc,
   WsTerminalAttachRpc,

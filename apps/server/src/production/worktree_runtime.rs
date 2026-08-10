@@ -1,6 +1,7 @@
 use std::{
     future::Future,
     panic::AssertUnwindSafe,
+    path::Path,
     pin::Pin,
     sync::{
         Arc, Mutex,
@@ -26,10 +27,14 @@ use crate::{
     production::{
         provider_runtime::{ProviderRuntimeError, ProviderRuntimeSupervisor},
         server_terminal::ServerTerminalServices,
+        worktree_catalog_rpc::{
+            WorktreeRemovalQuiesceFuture, WorktreeRemovalQuiesceLease, WorktreeRemovalQuiescer,
+        },
     },
     worktree_catalog::{
-        AdoptedWorktreeAvailability, CatalogFuture, CatalogWorkspaceLossObserver,
+        AdoptedWorktreeAvailability, CatalogFuture, CatalogWorkspaceLossObserver, RemovalGuard,
         WorkspaceAvailabilityRegistry, WorkspaceCleanupOwnership, WorkspaceLossTransition,
+        WorkspaceRemovalIdentity,
     },
 };
 
@@ -60,6 +65,29 @@ pub(crate) trait WorktreeRuntimeActions: Send + Sync + 'static {
         &self,
         transition: WorkspaceLossTransition,
     ) -> WorktreeRuntimeFuture<Result<(), String>>;
+
+    fn affected_thread_ids_for_removal(
+        &self,
+        identity: WorkspaceRemovalIdentity,
+    ) -> WorktreeRuntimeFuture<Result<Vec<String>, String>> {
+        Box::pin(async move { Ok(vec![identity.thread_id().to_owned()]) })
+    }
+
+    fn stop_provider_for_removal(
+        &self,
+        _thread_id: String,
+        _identity: WorkspaceRemovalIdentity,
+    ) -> WorktreeRuntimeFuture<Result<(), String>> {
+        Box::pin(async { Err("removal provider quiesce is unavailable".to_owned()) })
+    }
+
+    fn close_terminals_for_removal(
+        &self,
+        _thread_id: String,
+        _identity: WorkspaceRemovalIdentity,
+    ) -> WorktreeRuntimeFuture<Result<(), String>> {
+        Box::pin(async { Err("removal terminal quiesce is unavailable".to_owned()) })
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -95,11 +123,25 @@ struct Inner {
     reaper: Mutex<Option<JoinHandle<()>>>,
 }
 
-struct ReaperJob {
+enum ReaperJob {
+    Loss(LossReaperJob),
+    Removal(RemovalReaperJob),
+}
+
+struct LossReaperJob {
     transition: WorkspaceLossTransition,
     actions: Arc<dyn WorktreeRuntimeActions>,
     max_parallel: usize,
     ownership: WorkspaceCleanupOwnership,
+}
+
+struct RemovalReaperJob {
+    identity: WorkspaceRemovalIdentity,
+    _guard: RemovalGuard,
+    actions: Arc<dyn WorktreeRuntimeActions>,
+    affected_thread_ids: Vec<String>,
+    max_parallel: usize,
+    cancellation: CancellationToken,
 }
 
 type CleanupFuture = WorktreeRuntimeFuture<Result<CleanupResult, String>>;
@@ -291,12 +333,12 @@ impl WorktreeRuntime {
         let Some(ownership) = self.inner.registry.begin_orphan_cleanup(&transition) else {
             return;
         };
-        let job = ReaperJob {
+        let job = ReaperJob::Loss(LossReaperJob {
             transition,
             actions: self.inner.actions.clone(),
             max_parallel,
             ownership,
-        };
+        });
         if let Err(error) = self.inner.reaper_sender.try_send(job) {
             tracing::warn!(
                 %thread_id,
@@ -338,6 +380,111 @@ impl CatalogWorkspaceLossObserver for WorktreeRuntime {
     }
 }
 
+impl WorktreeRemovalQuiescer for WorktreeRuntime {
+    fn quiesce(&self, identity: WorkspaceRemovalIdentity) -> WorktreeRemovalQuiesceFuture {
+        let runtime = self.clone();
+        Box::pin(async move { runtime.quiesce_removal(identity).await })
+    }
+}
+
+impl WorktreeRuntime {
+    async fn quiesce_removal(
+        &self,
+        identity: WorkspaceRemovalIdentity,
+    ) -> WorktreeRemovalQuiesceLease {
+        let deadline = tokio::time::Instant::now() + self.inner.options.graceful_timeout;
+        let permit =
+            match tokio::time::timeout_at(deadline, self.inner.quiesce_permits.acquire()).await {
+                Ok(Ok(permit)) => permit,
+                _ => return self.enqueue_removal_retry(identity, Vec::new()),
+            };
+        if !self.inner.registry.removal_is_current(&identity) {
+            return WorktreeRemovalQuiesceLease::complete();
+        }
+        let (mut affected, aliases_resolved) = match tokio::time::timeout_at(
+            deadline,
+            self.inner
+                .actions
+                .affected_thread_ids_for_removal(identity.clone()),
+        )
+        .await
+        {
+            Ok(Ok(mut affected)) => {
+                affected.push(identity.thread_id().to_owned());
+                affected.sort();
+                affected.dedup();
+                (affected, true)
+            }
+            _ => (vec![identity.thread_id().to_owned()], false),
+        };
+        affected.sort();
+        affected.dedup();
+        let cleanup = cleanup_removal_attempt(
+            self.inner.actions.clone(),
+            affected.clone(),
+            self.inner.options.max_parallel_quiesces.max(1),
+            identity.clone(),
+        );
+        let succeeded = matches!(
+            tokio::time::timeout_at(deadline, cleanup).await,
+            Ok(Ok(result)) if cleanup_succeeded(&result)
+        );
+        let admissions_drained =
+            if succeeded && self.inner.registry.has_removal_admissions(&identity) {
+                tokio::time::timeout_at(
+                    deadline,
+                    self.inner.registry.wait_for_removal_admissions(&identity),
+                )
+                .await
+                .is_ok()
+            } else {
+                true
+            };
+        drop(permit);
+        if aliases_resolved && succeeded && admissions_drained {
+            WorktreeRemovalQuiesceLease::complete()
+        } else {
+            self.enqueue_removal_retry(identity, affected)
+        }
+    }
+
+    fn enqueue_removal_retry(
+        &self,
+        identity: WorkspaceRemovalIdentity,
+        mut affected_thread_ids: Vec<String>,
+    ) -> WorktreeRemovalQuiesceLease {
+        if affected_thread_ids.is_empty() {
+            affected_thread_ids.push(identity.thread_id().to_owned());
+        }
+        affected_thread_ids.sort();
+        affected_thread_ids.dedup();
+        let Some(guard) = self.inner.registry.retain_removal(&identity) else {
+            return WorktreeRemovalQuiesceLease::complete();
+        };
+        let retry_identity = guard.identity();
+        let cancellation = CancellationToken::new();
+        let job = ReaperJob::Removal(RemovalReaperJob {
+            identity: retry_identity,
+            _guard: guard,
+            actions: self.inner.actions.clone(),
+            affected_thread_ids,
+            max_parallel: self.inner.options.max_parallel_quiesces.max(1),
+            cancellation: cancellation.clone(),
+        });
+        match self.inner.reaper_sender.try_send(job) {
+            Ok(()) => WorktreeRemovalQuiesceLease::pending(cancellation),
+            Err(error) => {
+                tracing::warn!(
+                    error = %error,
+                    capacity = self.inner.options.reaper_capacity,
+                    "workspace removal cleanup reaper is saturated"
+                );
+                WorktreeRemovalQuiesceLease::complete()
+            }
+        }
+    }
+}
+
 async fn run_reaper(
     mut receiver: mpsc::Receiver<ReaperJob>,
     registry: WorkspaceAvailabilityRegistry,
@@ -376,6 +523,29 @@ async fn run_reaper(
 
 fn run_reaper_job(
     job: ReaperJob,
+    registry: WorkspaceAvailabilityRegistry,
+    shutdown: CancellationToken,
+    permits: Arc<Semaphore>,
+    active_jobs: Arc<AtomicUsize>,
+    attempt_timeout: Duration,
+) -> WorktreeRuntimeFuture<()> {
+    match job {
+        ReaperJob::Loss(job) => run_loss_reaper_job(
+            job,
+            registry,
+            shutdown,
+            permits,
+            active_jobs,
+            attempt_timeout,
+        ),
+        ReaperJob::Removal(job) => {
+            run_removal_reaper_job(job, shutdown, permits, active_jobs, attempt_timeout)
+        }
+    }
+}
+
+fn run_loss_reaper_job(
+    job: LossReaperJob,
     registry: WorkspaceAvailabilityRegistry,
     shutdown: CancellationToken,
     permits: Arc<Semaphore>,
@@ -440,6 +610,49 @@ fn run_reaper_job(
     })
 }
 
+fn run_removal_reaper_job(
+    job: RemovalReaperJob,
+    shutdown: CancellationToken,
+    permits: Arc<Semaphore>,
+    active_jobs: Arc<AtomicUsize>,
+    attempt_timeout: Duration,
+) -> WorktreeRuntimeFuture<()> {
+    Box::pin(async move {
+        let _active = ActiveReaperJob::new(active_jobs);
+        let _permit = tokio::select! {
+            () = shutdown.cancelled() => return,
+            () = job.cancellation.cancelled() => return,
+            permit = permits.acquire_owned() => match permit {
+                Ok(permit) => permit,
+                Err(_) => return,
+            },
+        };
+        let cleanup = cleanup_removal_attempt(
+            job.actions,
+            job.affected_thread_ids,
+            job.max_parallel,
+            job.identity.clone(),
+        );
+        match tokio::select! {
+            () = shutdown.cancelled() => return,
+            () = job.cancellation.cancelled() => return,
+            result = tokio::time::timeout(attempt_timeout, cleanup) => result,
+        } {
+            Ok(Ok(result)) => log_cleanup_result(job.identity.thread_id(), &result),
+            Ok(Err(error)) => tracing::warn!(
+                thread_id = job.identity.thread_id(),
+                %error,
+                "reaped workspace removal cleanup failed"
+            ),
+            Err(_) => tracing::warn!(
+                thread_id = job.identity.thread_id(),
+                timeout_ms = attempt_timeout.as_millis(),
+                "reaped workspace removal cleanup timed out"
+            ),
+        }
+    })
+}
+
 struct ActiveReaperJob {
     active_jobs: Arc<AtomicUsize>,
 }
@@ -488,6 +701,53 @@ fn cleanup_attempt(
                 }
                 if let Err(error) = terminals {
                     terminal_errors.push(format!("{affected_thread_id}: {error}"));
+                }
+            }
+            CleanupResult {
+                provider: aggregate_cleanup_errors(provider_errors),
+                terminals: aggregate_cleanup_errors(terminal_errors),
+            }
+        })
+        .catch_unwind()
+        .map(|result| result.map_err(panic_message)),
+    )
+}
+
+fn cleanup_removal_attempt(
+    actions: Arc<dyn WorktreeRuntimeActions>,
+    affected_thread_ids: Vec<String>,
+    max_parallel: usize,
+    identity: WorkspaceRemovalIdentity,
+) -> CleanupFuture {
+    Box::pin(
+        AssertUnwindSafe(async move {
+            let results = stream::iter(affected_thread_ids)
+                .map(|affected_thread_id| {
+                    let actions = actions.clone();
+                    let identity = identity.clone();
+                    async move {
+                        let (provider, terminals) = tokio::join!(
+                            actions.stop_provider_for_removal(
+                                affected_thread_id.clone(),
+                                identity.clone(),
+                            ),
+                            actions
+                                .close_terminals_for_removal(affected_thread_id.clone(), identity,),
+                        );
+                        (affected_thread_id, provider, terminals)
+                    }
+                })
+                .buffer_unordered(max_parallel.max(1))
+                .collect::<Vec<_>>()
+                .await;
+            let mut provider_errors = Vec::new();
+            let mut terminal_errors = Vec::new();
+            for (thread_id, provider, terminals) in results {
+                if let Err(error) = provider {
+                    provider_errors.push(format!("{thread_id}: {error}"));
+                }
+                if let Err(error) = terminals {
+                    terminal_errors.push(format!("{thread_id}: {error}"));
                 }
             }
             CleanupResult {
@@ -613,6 +873,66 @@ impl WorktreeRuntimeActions for ProductionWorktreeRuntimeActions {
     ) -> WorktreeRuntimeFuture<Result<(), String>> {
         let orchestration = self.orchestration.clone();
         Box::pin(async move { append_workspace_warning(&orchestration, transition).await })
+    }
+
+    fn affected_thread_ids_for_removal(
+        &self,
+        identity: WorkspaceRemovalIdentity,
+    ) -> WorktreeRuntimeFuture<Result<Vec<String>, String>> {
+        let repositories = self.orchestration.repositories();
+        Box::pin(async move { removal_thread_ids(repositories, &identity).await })
+    }
+
+    fn stop_provider_for_removal(
+        &self,
+        thread_id: String,
+        identity: WorkspaceRemovalIdentity,
+    ) -> WorktreeRuntimeFuture<Result<(), String>> {
+        let provider = self.provider.clone();
+        let registry = self.registry.clone();
+        Box::pin(async move {
+            if !registry.removal_is_current(&identity) {
+                return Ok(());
+            }
+            let session = match provider.capture_session_identity(&thread_id).await {
+                Ok(session) => session,
+                Err(ProviderRuntimeError::SessionNotFound { .. }) => None,
+                Err(error) => return Err(error.to_string()),
+            };
+            if !registry.removal_is_current(&identity) {
+                return Ok(());
+            }
+            match session {
+                Some(session) => match provider.stop_session_if_current(session).await {
+                    Ok(()) | Err(ProviderRuntimeError::SessionNotFound { .. }) => Ok(()),
+                    Err(error) => Err(error.to_string()),
+                },
+                None => Ok(()),
+            }
+        })
+    }
+
+    fn close_terminals_for_removal(
+        &self,
+        thread_id: String,
+        identity: WorkspaceRemovalIdentity,
+    ) -> WorktreeRuntimeFuture<Result<(), String>> {
+        let terminals = self.terminals.clone();
+        let registry = self.registry.clone();
+        Box::pin(async move {
+            if !registry.removal_is_current(&identity) {
+                return Ok(());
+            }
+            let terminals_to_close = terminals
+                .capture_thread_terminal_identities(&thread_id)
+                .await;
+            let Some(_signal) = registry.begin_removal_terminal_signal(&identity).await else {
+                return Ok(());
+            };
+            terminals
+                .quiesce_terminal_identities_for_workspace_loss(terminals_to_close)
+                .await
+        })
     }
 }
 
@@ -745,11 +1065,54 @@ async fn workspace_thread_ids(
     Ok(thread_ids)
 }
 
+async fn removal_thread_ids(
+    repositories: Repositories,
+    identity: &WorkspaceRemovalIdentity,
+) -> Result<Vec<String>, String> {
+    let Some(owner) = repositories
+        .get_thread(identity.thread_id().to_owned())
+        .await
+        .map_err(|error| error.to_string())?
+    else {
+        return Ok(vec![identity.thread_id().to_owned()]);
+    };
+    let project_root = repositories
+        .get_project(owner.project_id.clone())
+        .await
+        .map_err(|error| error.to_string())?
+        .map(|project| project.workspace_root);
+    let mut thread_ids = repositories
+        .list_threads_by_project(owner.project_id)
+        .await
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .filter(|thread| thread.deleted_at.is_none())
+        .filter_map(|thread| {
+            let path = thread
+                .worktree_path
+                .as_deref()
+                .or(project_root.as_deref())?;
+            (normalize_worktree_path_key(Path::new(path), host_path_platform())
+                == identity.path_key())
+            .then_some(thread.thread_id)
+        })
+        .collect::<Vec<_>>();
+    if !thread_ids
+        .iter()
+        .any(|thread_id| thread_id == identity.thread_id())
+    {
+        thread_ids.push(identity.thread_id().to_owned());
+    }
+    thread_ids.sort();
+    thread_ids.dedup();
+    Ok(thread_ids)
+}
+
 #[cfg(test)]
 mod tests {
     use std::{
         future::{Future, pending, ready},
-        path::PathBuf,
+        path::{Path, PathBuf},
         pin::Pin,
         sync::{
             Arc, Mutex,
@@ -770,6 +1133,7 @@ mod tests {
     };
     use crate::worktree_catalog::{
         AdoptedWorktreeAvailability, WorkspaceAvailabilityRegistry, WorkspaceLossTransition,
+        WorkspaceRemovalIdentity,
     };
     use crate::{
         cloud::{RelayClientInstallEvent, RelayClientService, RelayClientStatus},
@@ -782,6 +1146,7 @@ mod tests {
         production::server_terminal::{
             JsonFuture, JsonStream, ProductionServerControl, ServerTerminalServices,
         },
+        production::worktree_catalog_rpc::WorktreeRemovalQuiescer,
         provider_usage::ProviderUsageService,
         rpc::{RpcResult, RpcStreamChunk},
         terminal::{
@@ -801,6 +1166,7 @@ mod tests {
         cleanup_never_finishes: bool,
         warning_fails: bool,
         warning_never_finishes: bool,
+        removal_failures_remaining: AtomicUsize,
     }
 
     impl FakeActions {
@@ -821,6 +1187,13 @@ mod tests {
         fn pending_warning() -> Self {
             Self {
                 warning_never_finishes: true,
+                ..Self::default()
+            }
+        }
+
+        fn removal_retry() -> Self {
+            Self {
+                removal_failures_remaining: AtomicUsize::new(2),
                 ..Self::default()
             }
         }
@@ -886,6 +1259,71 @@ mod tests {
             } else {
                 Box::pin(ready(Ok(())))
             }
+        }
+
+        fn affected_thread_ids_for_removal(
+            &self,
+            identity: WorkspaceRemovalIdentity,
+        ) -> WorktreeRuntimeFuture<Result<Vec<String>, String>> {
+            let threads = self
+                .affected_threads
+                .lock()
+                .expect("affected thread lock")
+                .clone()
+                .unwrap_or_else(|| vec![identity.thread_id().to_owned()]);
+            Box::pin(ready(Ok(threads)))
+        }
+
+        fn stop_provider_for_removal(
+            &self,
+            thread_id: String,
+            _identity: WorkspaceRemovalIdentity,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
+            self.provider_calls.fetch_add(1, Ordering::SeqCst);
+            self.provider_threads
+                .lock()
+                .expect("provider thread lock")
+                .push(thread_id);
+            if self.cleanup_never_finishes {
+                return Box::pin(pending());
+            }
+            let fails = self
+                .removal_failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
+            Box::pin(ready(if fails {
+                Err("injected removal provider failure".to_owned())
+            } else {
+                Ok(())
+            }))
+        }
+
+        fn close_terminals_for_removal(
+            &self,
+            thread_id: String,
+            _identity: WorkspaceRemovalIdentity,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
+            self.terminal_calls.fetch_add(1, Ordering::SeqCst);
+            self.terminal_threads
+                .lock()
+                .expect("terminal thread lock")
+                .push(thread_id);
+            if self.cleanup_never_finishes {
+                return Box::pin(pending());
+            }
+            let fails = self
+                .removal_failures_remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
+            Box::pin(ready(if fails {
+                Err("injected removal terminal failure".to_owned())
+            } else {
+                Ok(())
+            }))
         }
     }
 
@@ -1449,6 +1887,121 @@ mod tests {
             path: PathBuf::from(format!("/repo/worktrees/missing-{index}")),
             availability: AdoptedWorktreeAvailability::MissingRegistered,
         }
+    }
+
+    #[tokio::test]
+    async fn removal_failure_returns_pending_and_reaper_retries_under_retained_guard() {
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let caller_guard = registry
+            .mark_removing("thread-removal", Path::new("/repo/removal"))
+            .await;
+        let identity = caller_guard.identity();
+        let actions = Arc::new(FakeActions::removal_retry());
+        let runtime = WorktreeRuntime::start_for_test(
+            actions.clone(),
+            registry.clone(),
+            WorktreeRuntimeOptions {
+                graceful_timeout: Duration::from_millis(100),
+                reaper_capacity: 4,
+                max_parallel_quiesces: 2,
+            },
+        );
+
+        let lease = WorktreeRemovalQuiescer::quiesce(&runtime, identity).await;
+        assert!(lease.orphan_cleanup_pending());
+        lease.commit_detached();
+        drop(caller_guard);
+        assert!(
+            registry.guard_thread("thread-removal").await.is_err(),
+            "the reaper retains the exact Removing guard while cleanup is pending"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if actions.provider_calls.load(Ordering::SeqCst) >= 2
+                    && actions.terminal_calls.load(Ordering::SeqCst) >= 2
+                    && registry.guard_thread("thread-removal").await.is_ok()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("removal cleanup retry completes");
+        runtime.shutdown().await;
+        assert_eq!(runtime.active_reaper_jobs(), 0);
+    }
+
+    #[tokio::test]
+    async fn removal_timeout_is_owned_until_shutdown_cancels_and_releases_the_reaper_guard() {
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let caller_guard = registry
+            .mark_removing("thread-removal", Path::new("/repo/removal"))
+            .await;
+        let identity = caller_guard.identity();
+        let runtime = WorktreeRuntime::start_for_test(
+            Arc::new(FakeActions::pending()),
+            registry.clone(),
+            WorktreeRuntimeOptions {
+                graceful_timeout: Duration::from_millis(20),
+                reaper_capacity: 2,
+                max_parallel_quiesces: 1,
+            },
+        );
+
+        let lease = WorktreeRemovalQuiescer::quiesce(&runtime, identity).await;
+        assert!(lease.orphan_cleanup_pending());
+        lease.commit_detached();
+        drop(caller_guard);
+        assert!(registry.guard_thread("thread-removal").await.is_err());
+        runtime.shutdown().await;
+        assert_eq!(registry.guard_thread("thread-removal").await, Ok(()));
+        assert_eq!(runtime.active_reaper_jobs(), 0);
+    }
+
+    #[tokio::test]
+    async fn removal_abandonment_cancels_queued_retry_before_it_can_touch_runtime_resources() {
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let caller_guard = registry
+            .mark_removing("thread-removal", Path::new("/repo/removal"))
+            .await;
+        let identity = caller_guard.identity();
+        let actions = Arc::new(FakeActions::default());
+        let runtime = WorktreeRuntime::start_for_test(
+            actions.clone(),
+            registry.clone(),
+            WorktreeRuntimeOptions {
+                graceful_timeout: Duration::from_millis(20),
+                reaper_capacity: 2,
+                max_parallel_quiesces: 1,
+            },
+        );
+        let blocker = runtime
+            .inner
+            .quiesce_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("block cleanup permit");
+        let lease = WorktreeRemovalQuiescer::quiesce(&runtime, identity).await;
+        assert!(lease.orphan_cleanup_pending());
+
+        drop(lease);
+        drop(caller_guard);
+        drop(blocker);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if registry.guard_thread("thread-removal").await.is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("cancelled removal retry releases guard");
+        assert_eq!(actions.provider_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(actions.terminal_calls.load(Ordering::SeqCst), 0);
+        runtime.shutdown().await;
     }
 
     #[tokio::test(start_paused = true)]

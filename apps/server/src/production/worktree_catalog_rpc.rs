@@ -1,6 +1,8 @@
 use std::{
     collections::HashSet,
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::Arc,
 };
 
@@ -13,7 +15,9 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     crypto::sha256_hex,
     git::{
-        GitRepository, host_path_platform, normalize_worktree_path_key, worktree_repository_key,
+        GitCommandError, GitPrunableWorktree, GitRepository, GitWorktreeInventory,
+        GitWorktreeRecord, GitWorktreeRemovalInspection, git_worktree_prune_impact_digest,
+        host_path_platform, normalize_worktree_path_key, worktree_key, worktree_repository_key,
     },
     orchestration::{
         CommandAdmission, OrchestrationCommand, OrchestrationEngine, OrchestrationError,
@@ -24,8 +28,8 @@ use crate::{
     worktree_catalog::{
         AdoptionValidationError, AdoptionValidationErrorReason, CatalogError, CatalogErrorReason,
         CatalogFuture, CatalogHealthySnapshotObserver, CatalogRefreshTrigger,
-        WorktreeAdoptionState, WorktreeCatalogService, WorktreeCatalogSnapshot,
-        WorktreeDirectoryState, WorktreeRegistrationState,
+        WorkspaceRemovalIdentity, WorktreeAdoptionState, WorktreeCatalogService,
+        WorktreeCatalogSnapshot, WorktreeDirectoryState, WorktreeRegistrationState,
     },
 };
 
@@ -33,10 +37,175 @@ use super::git_vcs::{CatalogMutationFuture, CatalogMutationObserver};
 
 const MAX_BASELINE_PATHS: usize = 512;
 
+pub type WorktreeRemovalQuiesceFuture =
+    Pin<Box<dyn Future<Output = WorktreeRemovalQuiesceLease> + Send + 'static>>;
+
+pub struct WorktreeRemovalQuiesceLease {
+    orphan_cleanup_pending: bool,
+    cancellation: CancellationToken,
+    detached: bool,
+}
+
+impl WorktreeRemovalQuiesceLease {
+    #[must_use]
+    pub fn complete() -> Self {
+        Self {
+            orphan_cleanup_pending: false,
+            cancellation: CancellationToken::new(),
+            detached: false,
+        }
+    }
+
+    #[must_use]
+    pub fn pending(cancellation: CancellationToken) -> Self {
+        Self {
+            orphan_cleanup_pending: true,
+            cancellation,
+            detached: false,
+        }
+    }
+
+    #[must_use]
+    pub fn orphan_cleanup_pending(&self) -> bool {
+        self.orphan_cleanup_pending
+    }
+
+    pub fn commit_detached(mut self) {
+        self.detached = true;
+    }
+}
+
+impl Drop for WorktreeRemovalQuiesceLease {
+    fn drop(&mut self) {
+        if !self.detached {
+            self.cancellation.cancel();
+        }
+    }
+}
+
+pub trait WorktreeRemovalQuiescer: Send + Sync + 'static {
+    fn quiesce(&self, identity: WorkspaceRemovalIdentity) -> WorktreeRemovalQuiesceFuture;
+}
+
+pub type WorktreeRemovalGitFuture<T> =
+    Pin<Box<dyn Future<Output = Result<T, GitCommandError>> + Send + 'static>>;
+
+pub trait WorktreeRemovalGit: Send + Sync + 'static {
+    fn inventory(
+        &self,
+        anchor: PathBuf,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<GitWorktreeInventory>;
+    fn inspect(
+        &self,
+        anchor: PathBuf,
+        record: GitWorktreeRecord,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<GitWorktreeRemovalInspection>;
+    fn preview_prune(
+        &self,
+        anchor: PathBuf,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<Vec<GitPrunableWorktree>>;
+    fn remove(
+        &self,
+        anchor: PathBuf,
+        record: GitWorktreeRecord,
+        force_dirty: bool,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<()>;
+    fn prune(
+        &self,
+        anchor: PathBuf,
+        record: GitWorktreeRecord,
+        expected_impact_digest: String,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<()>;
+}
+
+impl WorktreeRemovalGit for GitRepository {
+    fn inventory(
+        &self,
+        anchor: PathBuf,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<GitWorktreeInventory> {
+        let repository = self.clone();
+        Box::pin(async move { repository.worktree_inventory(&anchor, &cancellation).await })
+    }
+
+    fn inspect(
+        &self,
+        anchor: PathBuf,
+        record: GitWorktreeRecord,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<GitWorktreeRemovalInspection> {
+        let repository = self.clone();
+        Box::pin(async move {
+            repository
+                .inspect_worktree_removal(&anchor, &record, &cancellation)
+                .await
+        })
+    }
+
+    fn preview_prune(
+        &self,
+        anchor: PathBuf,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<Vec<GitPrunableWorktree>> {
+        let repository = self.clone();
+        Box::pin(async move {
+            repository
+                .preview_worktree_prune(&anchor, &cancellation)
+                .await
+        })
+    }
+
+    fn remove(
+        &self,
+        anchor: PathBuf,
+        record: GitWorktreeRecord,
+        force_dirty: bool,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<()> {
+        let repository = self.clone();
+        Box::pin(async move {
+            repository
+                .remove_worktree_verified(&anchor, &record, force_dirty, &cancellation)
+                .await
+        })
+    }
+
+    fn prune(
+        &self,
+        anchor: PathBuf,
+        record: GitWorktreeRecord,
+        expected_impact_digest: String,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<()> {
+        let repository = self.clone();
+        Box::pin(async move {
+            repository
+                .prune_worktrees_verified(&anchor, &record, &expected_impact_digest, &cancellation)
+                .await
+        })
+    }
+}
+
+#[derive(Default)]
+struct NoopWorktreeRemovalQuiescer;
+
+impl WorktreeRemovalQuiescer for NoopWorktreeRemovalQuiescer {
+    fn quiesce(&self, _identity: WorkspaceRemovalIdentity) -> WorktreeRemovalQuiesceFuture {
+        Box::pin(async { WorktreeRemovalQuiesceLease::complete() })
+    }
+}
+
 #[derive(Clone)]
 pub struct WorktreeCatalogRpcServices {
     catalog: WorktreeCatalogService,
     orchestration: OrchestrationEngine,
+    removal_quiescer: Arc<dyn WorktreeRemovalQuiescer>,
+    removal_git: Option<Arc<dyn WorktreeRemovalGit>>,
 }
 
 impl WorktreeCatalogRpcServices {
@@ -45,10 +214,27 @@ impl WorktreeCatalogRpcServices {
         catalog.set_healthy_snapshot_observer(Arc::new(BranchReconciliationObserver {
             orchestration: orchestration.clone(),
         }));
+        let removal_git = catalog
+            .git_repository()
+            .map(|repository| repository as Arc<dyn WorktreeRemovalGit>);
         Self {
             catalog,
             orchestration,
+            removal_quiescer: Arc::new(NoopWorktreeRemovalQuiescer),
+            removal_git,
         }
+    }
+
+    #[must_use]
+    pub fn with_removal_quiescer(mut self, quiescer: Arc<dyn WorktreeRemovalQuiescer>) -> Self {
+        self.removal_quiescer = quiescer;
+        self
+    }
+
+    #[must_use]
+    pub fn with_removal_git(mut self, git: Arc<dyn WorktreeRemovalGit>) -> Self {
+        self.removal_git = Some(git);
+        self
     }
 }
 
@@ -334,6 +520,27 @@ pub fn register_worktree_catalog_rpc(
         async move { adopt_worktree(&services, request).await }
     });
 
+    let plan_services = services.clone();
+    registry.register_unary("worktree.getRemovalPlan", move |request, cancellation| {
+        let services = plan_services.clone();
+        async move { get_removal_plan(&services, request, cancellation).await }
+    });
+
+    let detach_services = services.clone();
+    registry.register_unary(
+        "worktree.removeFromBibCode",
+        move |request, _cancellation| {
+            let services = detach_services.clone();
+            async move { remove_from_bibcode(&services, request).await }
+        },
+    );
+
+    let removal_services = services.clone();
+    registry.register_unary("worktree.remove", move |request, cancellation| {
+        let services = removal_services.clone();
+        async move { remove_worktree(&services, request, cancellation).await }
+    });
+
     registry.register_unary(
         "worktree.updateDiscoveryPolicy",
         move |request, _cancellation| {
@@ -462,6 +669,727 @@ async fn adopt_worktree_locked(
         .invalidate_after_mutation(&input.project_id)
         .await;
     adoption_dispatch_result(result, Some(snapshot.generation))
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeRemoveFromBibCodeInput {
+    command_id: String,
+    project_id: String,
+    thread_id: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeRemoveInput {
+    command_id: String,
+    project_id: String,
+    thread_id: String,
+    mode: WorktreeRemovalMode,
+    expected_generation: u64,
+    plan_token: String,
+    force_dirty: bool,
+    confirm_repository_wide_prune: bool,
+}
+
+#[derive(Clone, Copy, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum WorktreeRemovalMode {
+    DeleteGitWorktree,
+    CleanupStaleRegistration,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeGetRemovalPlanInput {
+    project_id: String,
+    thread_id: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeRemovalPlan {
+    plan_token: String,
+    generation: u64,
+    availability: &'static str,
+    registered: bool,
+    locked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lock_reason: Option<String>,
+    tracked_change_count: u64,
+    untracked_file_count: u64,
+    prune_impact: Vec<WorktreePruneImpact>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreePruneImpact {
+    path: String,
+    prune_reason: String,
+    locked: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    lock_reason: Option<String>,
+}
+
+struct ResolvedRemovalPlan {
+    wire: WorktreeRemovalPlan,
+    anchor: PathBuf,
+    record: Option<GitWorktreeRecord>,
+    prune_impact: Vec<GitPrunableWorktree>,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeRemovalResult {
+    thread_removed: bool,
+    git_outcome: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<String>,
+    orphan_cleanup_pending: bool,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum WorktreeRemovalErrorReason {
+    ThreadNotFound,
+    EnvironmentUnsupported,
+    StaleGeneration,
+    StalePlan,
+    DirtyConfirmationRequired,
+    PruneConfirmationRequired,
+    ProtectedTarget,
+    Locked,
+    ReplacementConflict,
+    RepositoryMismatch,
+    GitFailed,
+    OrchestrationFailed,
+    Internal,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeRemovalError {
+    #[serde(rename = "_tag")]
+    tag: &'static str,
+    reason: WorktreeRemovalErrorReason,
+    message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    current_generation: Option<u64>,
+}
+
+async fn get_removal_plan(
+    services: &WorktreeCatalogRpcServices,
+    request: RpcRequest,
+    cancellation: CancellationToken,
+) -> RpcResult {
+    let input = decode::<WorktreeGetRemovalPlanInput>(request)?;
+    let plan = build_removal_plan(
+        services,
+        &input.project_id,
+        &input.thread_id,
+        None,
+        true,
+        &cancellation,
+    )
+    .await?;
+    Ok(encode(plan.wire))
+}
+
+async fn remove_from_bibcode(
+    services: &WorktreeCatalogRpcServices,
+    request: RpcRequest,
+) -> RpcResult {
+    let input = decode::<WorktreeRemoveFromBibCodeInput>(request)?;
+    let payload_digest = removal_payload_digest(&input)?;
+    if let Some(result) = replay_removal(services, &input.command_id, &payload_digest).await? {
+        return Ok(encode(result));
+    }
+    let project_id = input.project_id.clone();
+    services
+        .catalog
+        .with_project_mutation_lock(&project_id, || async {
+            if let Some(result) =
+                replay_removal(services, &input.command_id, &payload_digest).await?
+            {
+                return Ok(encode(result));
+            }
+            let (_, path) =
+                resolve_removal_thread(services, &input.project_id, &input.thread_id).await?;
+            let registry = services.catalog.availability_registry();
+            let guard = registry.mark_removing(&input.thread_id, &path).await;
+            let quiesce = services.removal_quiescer.quiesce(guard.identity()).await;
+            let orphan_cleanup_pending = quiesce.orphan_cleanup_pending();
+            let result = persist_detach(
+                services,
+                input.command_id,
+                input.project_id.clone(),
+                input.thread_id.clone(),
+                path.clone(),
+                payload_digest,
+                "not-requested",
+                None,
+                orphan_cleanup_pending,
+            )
+            .await?;
+            quiesce.commit_detached();
+            registry.clear_recovered(&input.thread_id, &path).await;
+            drop(guard);
+            services
+                .catalog
+                .invalidate_after_mutation(&input.project_id)
+                .await;
+            Ok(encode(result))
+        })
+        .await
+}
+
+async fn remove_worktree(
+    services: &WorktreeCatalogRpcServices,
+    request: RpcRequest,
+    cancellation: CancellationToken,
+) -> RpcResult {
+    let input = decode::<WorktreeRemoveInput>(request)?;
+    let payload_digest = removal_payload_digest(&input)?;
+    if let Some(result) = replay_removal(services, &input.command_id, &payload_digest).await? {
+        return Ok(encode(result));
+    }
+    let project_id = input.project_id.clone();
+    services
+        .catalog
+        .with_project_mutation_lock(&project_id, || async {
+            if let Some(result) =
+                replay_removal(services, &input.command_id, &payload_digest).await?
+            {
+                return Ok(encode(result));
+            }
+            let (_, path) =
+                resolve_removal_thread(services, &input.project_id, &input.thread_id).await?;
+            let registry = services.catalog.availability_registry();
+            let guard = registry.mark_removing(&input.thread_id, &path).await;
+            let quiesce = services.removal_quiescer.quiesce(guard.identity()).await;
+            let orphan_cleanup_pending = quiesce.orphan_cleanup_pending();
+            let plan = build_removal_plan(
+                services,
+                &input.project_id,
+                &input.thread_id,
+                Some(input.expected_generation),
+                false,
+                &cancellation,
+            )
+            .await?;
+            if plan.wire.plan_token != input.plan_token {
+                return Err(encode(removal_error(
+                    WorktreeRemovalErrorReason::StalePlan,
+                    "The removal impact changed after it was confirmed.",
+                    Some(plan.wire.generation),
+                )));
+            }
+            let git_result = apply_git_removal(services, &input, &plan, &cancellation).await;
+            let (git_outcome, detail) = match git_result {
+                Ok(outcome) => outcome,
+                Err(error)
+                    if matches!(input.mode, WorktreeRemovalMode::CleanupStaleRegistration)
+                        && error.reason == WorktreeRemovalErrorReason::GitFailed =>
+                {
+                    ("failed", Some(error.message))
+                }
+                Err(error) => return Err(encode(error)),
+            };
+            let result = persist_detach(
+                services,
+                input.command_id,
+                input.project_id.clone(),
+                input.thread_id.clone(),
+                path.clone(),
+                payload_digest,
+                git_outcome,
+                detail,
+                orphan_cleanup_pending,
+            )
+            .await?;
+            quiesce.commit_detached();
+            registry.clear_recovered(&input.thread_id, &path).await;
+            drop(guard);
+            services
+                .catalog
+                .invalidate_after_mutation(&input.project_id)
+                .await;
+            Ok(encode(result))
+        })
+        .await
+}
+
+async fn resolve_removal_thread(
+    services: &WorktreeCatalogRpcServices,
+    project_id: &str,
+    thread_id: &str,
+) -> Result<(PathBuf, PathBuf), Value> {
+    let repositories = services.orchestration.repositories();
+    let project = repositories
+        .get_project(project_id.to_owned())
+        .await
+        .map_err(|_| encode(removal_internal()))?
+        .filter(|project| project.deleted_at.is_none())
+        .ok_or_else(|| encode(removal_not_found()))?;
+    let thread = repositories
+        .get_thread(thread_id.to_owned())
+        .await
+        .map_err(|_| encode(removal_internal()))?
+        .filter(|thread| {
+            thread.project_id == project_id
+                && thread.kind == "workspace"
+                && thread.deleted_at.is_none()
+        })
+        .ok_or_else(|| encode(removal_not_found()))?;
+    let path = thread
+        .worktree_path
+        .filter(|path| !path.trim().is_empty())
+        .map(PathBuf::from)
+        .ok_or_else(|| encode(removal_not_found()))?;
+    Ok((PathBuf::from(project.workspace_root), path))
+}
+
+async fn build_removal_plan(
+    services: &WorktreeCatalogRpcServices,
+    project_id: &str,
+    thread_id: &str,
+    expected_generation: Option<u64>,
+    refresh: bool,
+    cancellation: &CancellationToken,
+) -> Result<ResolvedRemovalPlan, Value> {
+    let (anchor, path) = resolve_removal_thread(services, project_id, thread_id).await?;
+    let snapshot = if refresh {
+        services
+            .catalog
+            .refresh(project_id, CatalogRefreshTrigger::Explicit)
+            .await
+    } else {
+        services.catalog.latest(project_id).await.ok_or_else(|| {
+            CatalogError::new(CatalogErrorReason::StaleGeneration, "Removal plan expired.")
+        })
+    }
+    .map_err(|error| encode(removal_catalog_error(error, expected_generation)))?;
+    if !snapshot.authoritative {
+        return Err(encode(removal_error(
+            WorktreeRemovalErrorReason::RepositoryMismatch,
+            "The repository cannot be verified for removal.",
+            Some(snapshot.generation),
+        )));
+    }
+    if expected_generation.is_some_and(|expected| expected != snapshot.generation) {
+        return Err(encode(removal_error(
+            WorktreeRemovalErrorReason::StaleGeneration,
+            "The confirmed catalog generation is no longer current.",
+            Some(snapshot.generation),
+        )));
+    }
+    let repository = services.removal_git.clone().ok_or_else(|| {
+        encode(removal_error(
+            WorktreeRemovalErrorReason::EnvironmentUnsupported,
+            "Native Git removal is unavailable in this environment.",
+            Some(snapshot.generation),
+        ))
+    })?;
+    let inventory = repository
+        .inventory(anchor.clone(), cancellation.clone())
+        .await
+        .map_err(|_| encode(removal_git_failed(Some(snapshot.generation))))?;
+    let common_dir = tokio::fs::canonicalize(&inventory.common_dir)
+        .await
+        .map_err(|_| encode(removal_git_failed(Some(snapshot.generation))))?;
+    let observed_repository_key = worktree_repository_key(&common_dir, host_path_platform())
+        .as_str()
+        .to_owned();
+    if observed_repository_key != snapshot.repository_key {
+        return Err(encode(removal_error(
+            WorktreeRemovalErrorReason::RepositoryMismatch,
+            "The project repository identity changed during removal planning.",
+            Some(snapshot.generation),
+        )));
+    }
+    let path_key = normalize_worktree_path_key(&path, host_path_platform());
+    let record = inventory
+        .records
+        .iter()
+        .find(|record| normalize_worktree_path_key(&record.path, host_path_platform()) == path_key)
+        .cloned();
+    if record
+        .as_ref()
+        .is_some_and(|record| record.is_primary || record.is_bare)
+    {
+        return Err(encode(removal_error(
+            WorktreeRemovalErrorReason::ProtectedTarget,
+            "Primary and bare worktrees cannot be removed.",
+            Some(snapshot.generation),
+        )));
+    }
+    let directory_present = match tokio::fs::symlink_metadata(&path).await {
+        Ok(_) => true,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => false,
+        Err(_) => {
+            return Err(encode(removal_git_failed(Some(snapshot.generation))));
+        }
+    };
+    if record.is_none() && directory_present {
+        return Err(encode(removal_error(
+            WorktreeRemovalErrorReason::ReplacementConflict,
+            "An unregistered replacement exists at the workspace location.",
+            Some(snapshot.generation),
+        )));
+    }
+    let availability = match (&record, directory_present) {
+        (Some(_), true) => "present",
+        (Some(_), false) => "missing-registered",
+        (None, false) => "missing-unregistered",
+        (None, true) => unreachable!("replacement conflict returned above"),
+    };
+    let inspection = if availability == "present" {
+        repository
+            .inspect(
+                anchor.clone(),
+                record.as_ref().expect("present record").clone(),
+                cancellation.clone(),
+            )
+            .await
+            .map_err(|_| encode(removal_git_failed(Some(snapshot.generation))))?
+    } else {
+        Default::default()
+    };
+    let prune_impact = if record.as_ref().is_some_and(|record| record.is_prunable) {
+        repository
+            .preview_prune(anchor.clone(), cancellation.clone())
+            .await
+            .map_err(|_| encode(removal_git_failed(Some(snapshot.generation))))?
+    } else {
+        Vec::new()
+    };
+    let locked = record.as_ref().is_some_and(|record| record.locked);
+    let lock_reason = record
+        .as_ref()
+        .and_then(|record| record.lock_reason.clone());
+    let public_impact = prune_impact
+        .iter()
+        .map(|impact| WorktreePruneImpact {
+            path: normalize_worktree_path_key(&impact.path, host_path_platform()),
+            prune_reason: impact.prune_reason.clone(),
+            locked: impact.locked,
+            lock_reason: impact.lock_reason.clone(),
+        })
+        .collect::<Vec<_>>();
+    let mut wire = WorktreeRemovalPlan {
+        plan_token: String::new(),
+        generation: snapshot.generation,
+        availability,
+        registered: record.is_some(),
+        locked,
+        lock_reason,
+        tracked_change_count: inspection.tracked_change_count,
+        untracked_file_count: inspection.untracked_file_count,
+        prune_impact: public_impact,
+    };
+    wire.plan_token = removal_plan_token(
+        project_id,
+        thread_id,
+        &anchor,
+        &snapshot.repository_key,
+        record
+            .as_ref()
+            .map_or_else(
+                || format!("missing:{path_key}"),
+                |record| {
+                    worktree_key(&common_dir, &record.path, host_path_platform())
+                        .as_str()
+                        .to_owned()
+                },
+            )
+            .as_str(),
+        &wire,
+    );
+    Ok(ResolvedRemovalPlan {
+        wire,
+        anchor,
+        record,
+        prune_impact,
+    })
+}
+
+async fn apply_git_removal(
+    services: &WorktreeCatalogRpcServices,
+    input: &WorktreeRemoveInput,
+    plan: &ResolvedRemovalPlan,
+    cancellation: &CancellationToken,
+) -> Result<(&'static str, Option<String>), WorktreeRemovalError> {
+    let repository = services.removal_git.clone().ok_or_else(removal_internal)?;
+    match input.mode {
+        WorktreeRemovalMode::DeleteGitWorktree => {
+            if plan.wire.availability != "present" {
+                return Err(removal_error(
+                    WorktreeRemovalErrorReason::StalePlan,
+                    "The worktree is no longer present.",
+                    Some(plan.wire.generation),
+                ));
+            }
+            if plan.wire.locked {
+                return Err(removal_error(
+                    WorktreeRemovalErrorReason::Locked,
+                    "The Git worktree registration is locked.",
+                    Some(plan.wire.generation),
+                ));
+            }
+            if !input.force_dirty
+                && (plan.wire.tracked_change_count != 0 || plan.wire.untracked_file_count != 0)
+            {
+                return Err(removal_error(
+                    WorktreeRemovalErrorReason::DirtyConfirmationRequired,
+                    "Dirty worktree deletion requires explicit confirmation.",
+                    Some(plan.wire.generation),
+                ));
+            }
+            repository
+                .remove(
+                    plan.anchor.clone(),
+                    plan.record.as_ref().expect("present record").clone(),
+                    input.force_dirty,
+                    cancellation.clone(),
+                )
+                .await
+                .map_err(|_| removal_git_failed(Some(plan.wire.generation)))?;
+            Ok(("removed", None))
+        }
+        WorktreeRemovalMode::CleanupStaleRegistration => {
+            if plan.wire.availability == "present" {
+                return Err(removal_error(
+                    WorktreeRemovalErrorReason::ProtectedTarget,
+                    "A present worktree cannot be treated as stale registration cleanup.",
+                    Some(plan.wire.generation),
+                ));
+            }
+            let Some(record) = plan.record.as_ref() else {
+                return Ok(("cleaned", None));
+            };
+            if record.locked {
+                return Err(removal_error(
+                    WorktreeRemovalErrorReason::Locked,
+                    "The stale Git worktree registration is locked.",
+                    Some(plan.wire.generation),
+                ));
+            }
+            if repository
+                .remove(
+                    plan.anchor.clone(),
+                    record.clone(),
+                    false,
+                    cancellation.clone(),
+                )
+                .await
+                .is_ok()
+            {
+                return Ok(("cleaned", None));
+            }
+            if plan.prune_impact.is_empty() {
+                return Err(removal_git_failed(Some(plan.wire.generation)));
+            }
+            if !input.confirm_repository_wide_prune {
+                return Err(removal_error(
+                    WorktreeRemovalErrorReason::PruneConfirmationRequired,
+                    "Repository-wide prune impact requires explicit confirmation.",
+                    Some(plan.wire.generation),
+                ));
+            }
+            repository
+                .prune(
+                    plan.anchor.clone(),
+                    record.clone(),
+                    git_worktree_prune_impact_digest(&plan.prune_impact),
+                    cancellation.clone(),
+                )
+                .await
+                .map_err(|_| removal_git_failed(Some(plan.wire.generation)))?;
+            Ok(("cleaned", None))
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn persist_detach(
+    services: &WorktreeCatalogRpcServices,
+    command_id: String,
+    project_id: String,
+    thread_id: String,
+    path: PathBuf,
+    payload_digest: String,
+    git_outcome: &str,
+    detail: Option<String>,
+    orphan_cleanup_pending: bool,
+) -> Result<WorktreeRemovalResult, Value> {
+    services
+        .orchestration
+        .dispatch_with_admission(
+            OrchestrationCommand::WorktreeDetachResolved {
+                command_id,
+                project_id,
+                thread_id,
+                path: path.to_string_lossy().into_owned(),
+                git_outcome: git_outcome.to_owned(),
+                detail: detail.clone(),
+                orphan_cleanup_pending,
+            },
+            CommandAdmission {
+                payload_digest,
+                attachment_refs: Vec::new(),
+                provider_turn: None,
+            },
+            || {},
+        )
+        .await
+        .map_err(|error| encode(removal_orchestration_error(error)))?;
+    Ok(WorktreeRemovalResult {
+        thread_removed: true,
+        git_outcome: git_outcome.to_owned(),
+        detail,
+        orphan_cleanup_pending,
+    })
+}
+
+async fn replay_removal(
+    services: &WorktreeCatalogRpcServices,
+    command_id: &str,
+    payload_digest: &str,
+) -> Result<Option<WorktreeRemovalResult>, Value> {
+    services
+        .orchestration
+        .replay_admitted_worktree_removal(command_id, payload_digest)
+        .await
+        .map(|result| {
+            result.map(|result| WorktreeRemovalResult {
+                thread_removed: result.thread_removed,
+                git_outcome: result.git_outcome,
+                detail: result.detail,
+                orphan_cleanup_pending: result.orphan_cleanup_pending,
+            })
+        })
+        .map_err(|error| encode(removal_orchestration_error(error)))
+}
+
+fn removal_payload_digest(input: &impl Serialize) -> Result<String, Value> {
+    canonical_command_digest(input).map_err(|_| encode(removal_internal()))
+}
+
+fn removal_plan_token(
+    project_id: &str,
+    thread_id: &str,
+    anchor: &Path,
+    repository_key: &str,
+    path_key: &str,
+    plan: &WorktreeRemovalPlan,
+) -> String {
+    let mut fields = vec![
+        project_id.to_owned(),
+        thread_id.to_owned(),
+        normalize_worktree_path_key(anchor, host_path_platform()),
+        repository_key.to_owned(),
+        path_key.to_owned(),
+        plan.generation.to_string(),
+        plan.availability.to_owned(),
+        plan.registered.to_string(),
+        plan.locked.to_string(),
+        plan.lock_reason.clone().unwrap_or_default(),
+        plan.tracked_change_count.to_string(),
+        plan.untracked_file_count.to_string(),
+    ];
+    let mut impact = plan.prune_impact.clone();
+    impact.sort_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then_with(|| left.prune_reason.cmp(&right.prune_reason))
+    });
+    for entry in impact {
+        fields.push(entry.path);
+        fields.push(entry.prune_reason);
+    }
+    let mut input = b"bibcode.worktree.removal-plan.v1".to_vec();
+    input.extend_from_slice(&(fields.len() as u64).to_be_bytes());
+    for field in fields {
+        input.extend_from_slice(&(field.len() as u64).to_be_bytes());
+        input.extend_from_slice(field.as_bytes());
+    }
+    sha256_hex(input)
+}
+
+fn removal_error(
+    reason: WorktreeRemovalErrorReason,
+    message: impl Into<String>,
+    current_generation: Option<u64>,
+) -> WorktreeRemovalError {
+    WorktreeRemovalError {
+        tag: "WorktreeRemovalError",
+        reason,
+        message: crate::worktree_catalog::bounded_message(message.into()),
+        current_generation,
+    }
+}
+
+fn removal_not_found() -> WorktreeRemovalError {
+    removal_error(
+        WorktreeRemovalErrorReason::ThreadNotFound,
+        "The workspace thread was not found.",
+        None,
+    )
+}
+
+fn removal_internal() -> WorktreeRemovalError {
+    removal_error(
+        WorktreeRemovalErrorReason::Internal,
+        "The removal request could not be completed.",
+        None,
+    )
+}
+
+fn removal_git_failed(current_generation: Option<u64>) -> WorktreeRemovalError {
+    removal_error(
+        WorktreeRemovalErrorReason::GitFailed,
+        "Git could not verify the requested worktree mutation.",
+        current_generation,
+    )
+}
+
+fn removal_catalog_error(
+    error: CatalogError,
+    current_generation: Option<u64>,
+) -> WorktreeRemovalError {
+    let reason = match error.reason {
+        CatalogErrorReason::ProjectNotFound => WorktreeRemovalErrorReason::ThreadNotFound,
+        CatalogErrorReason::EnvironmentUnsupported => {
+            WorktreeRemovalErrorReason::EnvironmentUnsupported
+        }
+        CatalogErrorReason::StaleGeneration => WorktreeRemovalErrorReason::StaleGeneration,
+        CatalogErrorReason::RepositoryUnavailable => WorktreeRemovalErrorReason::RepositoryMismatch,
+        CatalogErrorReason::PolicyUpdateFailed | CatalogErrorReason::Internal => {
+            WorktreeRemovalErrorReason::Internal
+        }
+    };
+    removal_error(reason, error.message, current_generation)
+}
+
+fn removal_orchestration_error(error: OrchestrationError) -> WorktreeRemovalError {
+    match error {
+        OrchestrationError::CommandConflict { .. } => removal_error(
+            WorktreeRemovalErrorReason::OrchestrationFailed,
+            "The command ID was already used with a different removal payload.",
+            None,
+        ),
+        OrchestrationError::WorktreeOwnershipConflict { .. } => removal_error(
+            WorktreeRemovalErrorReason::OrchestrationFailed,
+            "Workspace ownership conflicts with removal.",
+            None,
+        ),
+        OrchestrationError::Invariant { .. } => removal_internal(),
+        error => removal_error(
+            WorktreeRemovalErrorReason::OrchestrationFailed,
+            format!("Workspace removal could not be persisted: {error}"),
+            None,
+        ),
+    }
 }
 
 fn catalog_stream(

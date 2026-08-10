@@ -2,7 +2,11 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
 };
 
 use bibcode_server::{
@@ -16,8 +20,58 @@ use bibcode_server::{
 };
 use serde_json::json;
 use tempfile::TempDir;
+use tokio::sync::Notify;
 
 const NOW: &str = "2026-08-09T00:00:00.000Z";
+
+#[tokio::test]
+async fn removal_mutation_lock_serializes_projects_in_the_same_physical_repository() {
+    let fixture = RepositoryFixture::new().await;
+    let mut alias = project(&fixture.main);
+    alias.project_id = "project-2".to_owned();
+    fixture
+        .repositories
+        .upsert_project(alias)
+        .await
+        .expect("alias project");
+    let service = fixture.service();
+    for project_id in ["project-1", "project-2"] {
+        service
+            .refresh(project_id, CatalogRefreshTrigger::Explicit)
+            .await
+            .expect("authoritative pin");
+    }
+    let entered = Arc::new(Notify::new());
+    let release = Arc::new(Notify::new());
+    let first_service = service.clone();
+    let first_entered = entered.clone();
+    let first_release = release.clone();
+    let first = tokio::spawn(async move {
+        first_service
+            .with_project_mutation_lock("project-1", || async move {
+                first_entered.notify_one();
+                first_release.notified().await;
+            })
+            .await;
+    });
+    entered.notified().await;
+    let second_entered = Arc::new(AtomicBool::new(false));
+    let second_service = service.clone();
+    let second_flag = second_entered.clone();
+    let second = tokio::spawn(async move {
+        second_service
+            .with_project_mutation_lock("project-2", || async move {
+                second_flag.store(true, Ordering::SeqCst);
+            })
+            .await;
+    });
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    assert!(!second_entered.load(Ordering::SeqCst));
+    release.notify_one();
+    first.await.expect("first mutation");
+    second.await.expect("second mutation");
+    assert!(second_entered.load(Ordering::SeqCst));
+}
 
 #[tokio::test]
 async fn runtime_loss_guards_real_missing_worktree_and_exact_recovery_clears_it() {

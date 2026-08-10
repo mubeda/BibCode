@@ -186,6 +186,7 @@ export type WorktreeRemovalPlanToken = typeof WorktreeRemovalPlanToken.Type;
 
 export const WorktreePruneImpact = Schema.Struct({
   path: NormalizedWorktreePath,
+  pruneReason: WorktreeMessage,
   locked: Schema.Boolean,
   lockReason: Schema.optional(WorktreeLockReason),
 });
