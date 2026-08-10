@@ -399,6 +399,11 @@ Use a fake inventory source, fake probe, paused Tokio time, and a configurable s
 - a mutation refresh queued behind that stale completion performs one fresh
   current-epoch scan immediately, while repeated invalidations coalesce and
   ordinary pre-mutation waiters retain the identical stale result;
+- a deliberately delayed repeated invalidation cannot start a second recovery
+  task or an unnecessary scan after the first recovery publishes;
+- final unsubscribe clears a pending mutation recovery before it can call Git
+  or publish, and immediate reattachment cannot inherit that old lifecycle's
+  pending worker or result;
 - watch subscribers receive the latest snapshot after lag;
 - polling inspects only common-Git shallow metadata and known paths;
 - a failed scan retains authoritative data;
@@ -430,12 +435,19 @@ reservation and atomic registry/view validation. Repository observations and
 physical mutation locks may use weak registry slots, but a held or awaited lock
 must retain strong ownership. Store only the last authoritative snapshot,
 current scan status, last coalesced result, shallow signature, subscriber
-count, suppression map, and task handles for each project view.
-The mutation-triggered owner may bypass exactly one coalesced
-`StaleGeneration` completion to scan the current epoch; this is not a general
-error retry, remains under the existing single-flight lock and subscriber
-cancellation, and lets repeated mutation tasks converge on the recovery
-result.
+count, suppression map, one pending mutation-refresh epoch, and lifecycle-owned
+task handles for each project view. Mutation invalidations overwrite that
+pending epoch and install at most one recovery worker under the entry-state
+lock. The worker may bypass exactly one coalesced `StaleGeneration` completion
+to scan the current epoch; this is not a general error retry and remains under
+the existing single-flight lock and subscriber cancellation. Invalidations
+before its scan fence coalesce into that scan. A mutation arriving during
+recovery leaves newer pending work and causes at most the next serialized step
+after an async yield. Final unsubscribe cancels and clears the worker and its
+pending epoch before releasing lifecycle ownership. It also aborts the task so
+a non-cancellation-aware dependency await cannot retain the project refresh
+lock or block a new lifecycle. Reattachment cannot inherit either the old
+worker or its result.
 Initialization is an idempotent project-view-owned task with latest-generation
 readiness, not work owned by whichever subscriber first reaches an await.
 Zero-to-one attachment advances a lifecycle epoch and creates fresh
@@ -447,7 +459,13 @@ refresh.
 Scope reusable repository observations to the same selected anchor path so an
 alias's valid observation cannot bypass validation of a different replacement
 anchor. Decrement project-view and repository subscriber ownership atomically
-under the entry-to-repository lock order before allowing reattachment.
+under the entry-to-repository lock order before allowing reattachment. Once a
+caller owns the repository observation lock, move that guard and scan into
+repository-lifecycle work and await it with the caller's view cancellation. A
+detached leader then releases its project refresh lock immediately while an
+alias may keep the exact-anchor repository observation alive; a new view never
+inherits the old project worker or result, but may coalesce with that still-live
+repository lifecycle.
 
 - [ ] **Step 3: Implement anchor resolution and directory probing**
 
