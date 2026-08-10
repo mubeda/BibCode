@@ -90,6 +90,12 @@ export class EnvironmentRegistry extends Context.Service<
       | PlatformEnvironmentRemovalError
     >;
     readonly retryNow: (environmentId: EnvironmentId) => Effect.Effect<void>;
+    readonly acceptStorageIdentity: (
+      environmentId: EnvironmentId,
+    ) => Effect.Effect<
+      void,
+      Persistence.ConnectionPersistenceError | EnvironmentNotRegisteredError
+    >;
     readonly state: (
       environmentId: EnvironmentId,
     ) => Effect.Effect<SupervisorConnectionState, EnvironmentNotRegisteredError>;
@@ -128,6 +134,7 @@ interface EnvironmentServiceScope {
 export const make = Effect.gen(function* () {
   const storage = yield* Persistence.ConnectionTargetStore;
   const registrations = yield* Persistence.ConnectionRegistrationStore;
+  const identities = yield* Persistence.AcceptedStorageIdentityStore;
   const cache = yield* Persistence.EnvironmentCacheStore;
   const ownedDataCleanup = yield* Persistence.EnvironmentOwnedDataCleanup;
   const profiles = yield* ConnectionProfileStore.ConnectionProfileStore;
@@ -628,6 +635,42 @@ export const make = Effect.gen(function* () {
       Effect.catchTag("EnvironmentNotRegisteredError", () => Effect.void),
       Effect.withSpan("EnvironmentRegistry.retryNow"),
     );
+  const acceptStorageIdentity = Effect.fn("EnvironmentRegistry.acceptStorageIdentity")(function* (
+    environmentId: EnvironmentId,
+  ) {
+    yield* withLeaseLock(
+      environmentId,
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          yield* getEntry(environmentId);
+          const supervisor = (yield* SubscriptionRef.get(serviceScopes)).get(
+            environmentId,
+          )?.supervisor;
+          if (supervisor === undefined) {
+            return yield* new Persistence.ConnectionPersistenceError({
+              operation: "accept-storage-identity",
+              message: "The environment is not currently blocked by a persistent store change.",
+            });
+          }
+          const current = yield* SubscriptionRef.get(supervisor.state);
+          if (
+            current.phase !== "blocked" ||
+            current.lastFailure?._tag !== "ConnectionStorageChangedError"
+          ) {
+            return yield* new Persistence.ConnectionPersistenceError({
+              operation: "accept-storage-identity",
+              message: "The environment is not currently blocked by a persistent store change.",
+            });
+          }
+          yield* identities.accept({
+            targetKey: current.lastFailure.targetKey,
+            storageInstanceId: current.lastFailure.reportedStorageInstanceId,
+          });
+          yield* supervisor.retryNow;
+        }),
+      ),
+    );
+  });
   const state = Effect.fn("EnvironmentRegistry.state")(function* (environmentId: EnvironmentId) {
     const supervisor = yield* acquireSupervisor(environmentId);
     return yield* SubscriptionRef.get(supervisor.state);
@@ -667,6 +710,7 @@ export const make = Effect.gen(function* () {
     remove,
     removeRelayEnvironments,
     retryNow,
+    acceptStorageIdentity,
     state,
     stateChanges,
     run,

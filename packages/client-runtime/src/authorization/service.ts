@@ -62,7 +62,9 @@ const TOKEN_EXPIRY_SAFETY_MARGIN_MS = 60_000;
 const CACHED_ENDPOINT_FAILURE_THRESHOLD = 2;
 
 function mapDpopSocketError(error: RemoteEnvironmentAuthError | ConnectionAttemptError) {
-  return error._tag === "ConnectionTransientError" || error._tag === "ConnectionBlockedError"
+  return error._tag === "ConnectionTransientError" ||
+    error._tag === "ConnectionBlockedError" ||
+    error._tag === "ConnectionStorageChangedError"
     ? error
     : mapRemoteEnvironmentError(error);
 }

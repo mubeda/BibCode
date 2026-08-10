@@ -4,6 +4,12 @@ import * as Option from "effect/Option";
 import type { ConnectionCatalogEntry } from "./catalog.ts";
 import type { NetworkStatus, SupervisorConnectionState } from "./model.ts";
 
+function failureTraceId(state: SupervisorConnectionState): string | null {
+  return state.lastFailure !== null && "traceId" in state.lastFailure
+    ? (state.lastFailure.traceId ?? null)
+    : null;
+}
+
 export type EnvironmentConnectionPhase =
   | "available"
   | "offline"
@@ -36,7 +42,7 @@ export function presentConnectionState(
       return {
         phase: state.attempt <= 1 && state.lastFailure === null ? "connecting" : "reconnecting",
         error: state.lastFailure?.message ?? null,
-        traceId: state.lastFailure?.traceId ?? null,
+        traceId: failureTraceId(state),
       };
     case "connected":
       return { phase: "connected", error: null, traceId: null };
@@ -44,13 +50,13 @@ export function presentConnectionState(
       return {
         phase: "reconnecting",
         error: state.lastFailure?.message ?? null,
-        traceId: state.lastFailure?.traceId ?? null,
+        traceId: failureTraceId(state),
       };
     case "blocked":
       return {
         phase: "error",
         error: state.lastFailure?.message ?? null,
-        traceId: state.lastFailure?.traceId ?? null,
+        traceId: failureTraceId(state),
       };
   }
 }

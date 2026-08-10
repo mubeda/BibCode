@@ -16,8 +16,11 @@ public package has no root export; callers use focused subpaths such as
 - Environment bootstrap decodes and retains the complete environment
   descriptor on `KnownEnvironment`, including its nullable
   `storageInstanceId`, rather than reducing it to a label and logical ID.
-- `ConnectionDriver` reports `preparing`, `opening`, and `synchronizing`
-  progress, creates an `RpcSession`, and waits for its initial configuration.
+- `ConnectionDriver` reports `preparing`, verifies and if necessary persists
+  the prepared descriptor's storage identity, then reports `opening` and
+  `synchronizing`, creates an `RpcSession`, and waits for its initial
+  configuration. A changed store therefore cannot be published as an opening
+  or live lease.
 - `EnvironmentSupervisor` owns desired state, connectivity, retries, the
   prepared connection, and the live RPC session for one environment.
 - `EnvironmentRegistry` owns catalog entries and their scoped supervisors. It
@@ -119,9 +122,24 @@ change, and a version-skewed `null` report are represented as `Bootstrap`,
 `Accepted`, `Changed`, and `Unverifiable`; an unverifiable report does not erase
 an existing baseline.
 
-The current runtime provides persistence, comparison, and prepared-descriptor
-primitives. Connection supervision does not yet call them to block or adopt a
-changed store; that gating belongs at the pre-session synchronization boundary.
+`ConnectionDriver` applies this decision table after descriptor preparation
+and before `RpcSessionFactory.connect`. Bootstrap persistence must complete
+before a socket opens. An accepted match continues normally, and an
+unverifiable `null` continues without deleting a prior baseline. A changed
+non-null identity fails with a structured `ConnectionStorageChangedError` that
+retains the target key plus both identities; the supervisor publishes it as a
+blocked state without publishing prepared/session state or consuming a new
+snapshot.
+
+Adoption is an explicit `EnvironmentRegistry.acceptStorageIdentity` command.
+It is valid only while that environment's current supervisor state is blocked
+by the structured storage-change error. The registry persists exactly the
+error's target key and reported identity, then signals one normal retry. The
+operation is serialized with registration/removal for the logical environment
+and becomes uninterruptible once it owns that lease, so cancellation cannot
+commit the user decision without also scheduling the retry. Adoption neither
+clears environment caches nor reads, writes, copies, or merges either server
+database.
 
 ## State and retry policy
 
@@ -132,8 +150,8 @@ The supervisor publishes these phases:
 - `connecting`: preparing, opening, or synchronizing;
 - `backoff`: a transient failure is waiting for retry;
 - `connected`: the WebSocket is open and `server.getConfig` succeeded;
-- `blocked`: configuration, authentication, permission, or capability requires
-  an explicit wakeup or user action.
+- `blocked`: configuration, authentication, permission, capability, or a
+  changed persistent store requires an explicit wakeup or user action.
 
 Transient failures retry after 1, 2, 4, 8, then 16 seconds, with 16 seconds as
 the cap. The sequence continues while the connection remains desired. A stable
@@ -163,9 +181,9 @@ descriptor. The descriptor decoder accepts an omitted field as `null` for
 older or third-party remote servers; it still validates any supplied value as
 a trimmed non-empty string. The connection catalog can retain the last
 explicitly accepted non-null value; an older descriptor reporting `null` never
-replaces it. Actual mismatch gating remains a separate connection-supervision
-concern and is not inferred by the bootstrap helper or authorization-token
-cache.
+replaces it. Mismatch gating happens before session creation and initial
+synchronization; it is not inferred by the bootstrap helper or authorization
+token cache.
 
 See [Remote architecture](./remote.md) for access methods and
 [RPC and orchestration](./rpc-and-orchestration.md) for the wire boundary.

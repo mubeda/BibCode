@@ -71,6 +71,7 @@ export const ConnectionBlockedReason = Schema.Literals([
   "authentication",
   "configuration",
   "permission",
+  "storage-changed",
   "unsupported",
 ]);
 export type ConnectionBlockedReason = typeof ConnectionBlockedReason.Type;
@@ -101,7 +102,25 @@ export class ConnectionBlockedError extends Schema.TaggedErrorClass<ConnectionBl
   }
 }
 
-export type ConnectionAttemptError = ConnectionTransientError | ConnectionBlockedError;
+export class ConnectionStorageChangedError extends Schema.TaggedErrorClass<ConnectionStorageChangedError>()(
+  "ConnectionStorageChangedError",
+  {
+    reason: Schema.Literal("storage-changed"),
+    detail: Schema.String,
+    targetKey: Schema.String,
+    acceptedStorageInstanceId: Schema.String,
+    reportedStorageInstanceId: Schema.String,
+  },
+) {
+  override get message(): string {
+    return this.detail;
+  }
+}
+
+export type ConnectionAttemptError =
+  | ConnectionTransientError
+  | ConnectionBlockedError
+  | ConnectionStorageChangedError;
 
 export type PreparedHttpAuthorization =
   | {
