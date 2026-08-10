@@ -118,6 +118,7 @@ impl ServerRuntime {
         let prepared_store = prepare_store(&config)
             .await
             .map_err(|error| ServerError::PersistenceInitialize(error.to_string()))?;
+        config.storage_instance_id = Some(prepared_store.storage_instance_id);
         let database = prepared_store.database;
         let listener = TcpListener::bind((config.host.as_str(), config.port))
             .await
@@ -228,6 +229,10 @@ impl ServerRuntime {
                     "label": config.environment_label,
                     "platform": { "os": std::env::consts::OS, "arch": std::env::consts::ARCH },
                     "serverVersion": config.server_version,
+                    "storageInstanceId": config
+                        .storage_instance_id
+                        .expect("a running server has a prepared persistent store")
+                        .to_string(),
                     "capabilities": { "repositoryIdentity": true },
                 });
                 let connect = Arc::new(

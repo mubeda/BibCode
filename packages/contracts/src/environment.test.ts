@@ -41,6 +41,25 @@ const legacyClientDecoders = {
 } as const;
 
 describe("execution environment contracts", () => {
+  it("defaults storage identity to null for an older remote descriptor", () => {
+    const decoded = decodeExecutionEnvironmentDescriptor({
+      ...descriptor,
+      capabilities: { repositoryIdentity: true },
+    });
+
+    expect(decoded.storageInstanceId).toBeNull();
+  });
+
+  it("decodes a new server storage identity", () => {
+    const decoded = decodeExecutionEnvironmentDescriptor({
+      ...descriptor,
+      storageInstanceId: "0d93cbea-f237-4f37-8829-d816667be35f",
+      capabilities: { repositoryIdentity: true },
+    });
+
+    expect(decoded.storageInstanceId).toBe("0d93cbea-f237-4f37-8829-d816667be35f");
+  });
+
   it("defaults the activity protocol version for an old descriptor", () => {
     expect(
       decodeExecutionEnvironmentDescriptor({
@@ -65,6 +84,7 @@ describe("execution environment contracts", () => {
   it("keeps a legacy non-activity client compatible with additive descriptors and conversation traffic", () => {
     const legacyDescriptor = decodeLegacyExecutionEnvironmentDescriptor({
       ...descriptor,
+      storageInstanceId: "0d93cbea-f237-4f37-8829-d816667be35f",
       capabilities: {
         repositoryIdentity: true,
         activityProtocolVersion: 1,
