@@ -9,6 +9,7 @@ commands.allow = [
   "desktop_bridge_set_client_settings",
   "desktop_bridge_get_connection_catalog",
   "desktop_bridge_set_connection_catalog",
+  "desktop_bridge_compare_connection_catalog",
   "desktop_bridge_compare_and_set_connection_catalog",
   "desktop_bridge_clear_connection_catalog",
   "desktop_bridge_discover_ssh_hosts",

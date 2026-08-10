@@ -60,28 +60,33 @@ and restores it as one opaque value. Desktop hosts without that capability use
 the same IndexedDB backend as browser mode; neither path has a second ongoing
 storage-identity source.
 
-Catalog mutation is an exact-raw compare-and-set loop, not a renderer-owned
-document cache. Each lookup or update starts with a fresh backend read. An
-update decodes that revision, reapplies its transformation, and attempts to
-replace the exact serialized value it read. A conflict rereads and reapplies,
-with a bounded eight-attempt limit and a cooperative yield between conflicts.
-This preserves disjoint target, profile, credential, DPoP-token, and accepted-
-identity changes made by separately constructed stores. Corrupt-catalog
-recovery follows the same rule: it replaces the corrupt value only if those
-exact bytes remain current, otherwise it reads the concurrent winner.
+Catalog transitions use exact raw revisions, not a renderer-owned document
+cache. Each lookup or transition starts with a fresh backend read. A mutating
+transition decodes that revision, reapplies its transformation, and attempts to
+replace the exact serialized value it read. A keep transition compares that
+same raw revision without encoding or writing a document. A conflict rereads
+and reapplies either transition, with a bounded eight-attempt limit and a
+cooperative yield between conflicts. This preserves disjoint target, profile,
+credential, DPoP-token, and accepted-identity changes made by separately
+constructed stores. Corrupt-catalog recovery follows the same rule: it replaces
+the corrupt value only if those exact bytes remain current, otherwise it reads
+the concurrent winner.
 
 In browser mode, and in desktop mode when native catalog protection is
-unavailable, IndexedDB performs the comparison and conditional `put` in one
-`readwrite` transaction on the catalog key, so its transaction serialization
-coordinates independent stores, tabs, and WebViews. On a capable desktop host,
-`compareAndSetConnectionCatalog` is a privileged typed `DesktopBridge` command.
-The Rust catalog owner holds one process-wide mutex across the protected read,
-comparison, and write; legacy `get`, `set`, and `clear` commands use the same
-owner. Desktop bridge contract version 2 introduces this command and the
-`protectedConnectionCatalog` capability. The renderer never emulates CAS with
-separate bridge reads and writes. A host without protected CAS explicitly
-selects IndexedDB and atomically migrates any legacy renderer-local catalog
-into it before clearing the legacy value. A protected host migrates a legacy
+unavailable, IndexedDB performs both compare-only and conditional `put`
+transitions in `readwrite` transactions on the catalog key, so its transaction
+serialization coordinates independent stores, tabs, and WebViews. The
+compare-only transaction performs a `get` but never a `put`, including for an
+absent catalog. On a capable desktop host, `compareConnectionCatalog` and
+`compareAndSetConnectionCatalog` are privileged typed `DesktopBridge` commands.
+The Rust catalog owner holds one process-wide mutex across compare-only reads,
+protected reads, comparison, and writes; legacy `get`, `set`, and `clear`
+commands use the same owner. Desktop bridge contract version 3 introduces the
+compare-only command alongside protected compare-and-set and the
+`protectedConnectionCatalog` capability. The renderer never emulates either
+atomic transition with separate bridge calls. A host without protected CAS
+explicitly selects IndexedDB and atomically migrates any legacy renderer-local
+catalog into it before clearing the legacy value. A protected host migrates a legacy
 renderer-local catalog only by a native CAS from `null`, so neither migration
 can overwrite a value that appeared concurrently. During unprotected-host
 migration, an already-valid IndexedDB value is the exact canonical winner. If
@@ -90,22 +95,22 @@ renderer replaces those exact corrupt bytes by CAS and quarantines them before
 clearing the only valid legacy copy. Migration uses the same eight-attempt
 bound as ordinary catalog updates.
 
-Catalog protection capability has three states. Only bridge contract version 2
+Catalog protection capability has three states. Only bridge contract version 3
 with an explicit `protectedConnectionCatalog: true` selects protected native
-CAS, and only version 2 with an explicit `false` selects IndexedDB and legacy
-migration. Rejected metadata, older bridge contracts, and missing capability
-fields are `unknown`: catalog startup and mutation fail with a redacted typed
-error, without writing IndexedDB, invoking native clear, or deleting a legacy
-renderer copy. This prevents transient metadata failure or version skew from
-downgrading a Windows DPAPI catalog into renderer storage.
+compare-only/CAS, and only version 3 with an explicit `false` selects IndexedDB
+and legacy migration. Rejected metadata, older bridge contracts, and missing
+capability fields are `unknown`: catalog startup and mutation fail with a
+redacted typed error, without writing IndexedDB, invoking native clear, or
+deleting a legacy renderer copy. This prevents transient metadata failure or
+version skew from downgrading a Windows DPAPI catalog into renderer storage.
 
-Once a CAS call is issued it is uninterruptible through transaction/command
-completion. There is no in-memory catalog publication afterward, so a caller
-interrupted around commit cannot leave stale renderer state that overwrites the
-durable winner on a later update. On protected hosts, the native mutex
-coordinates every WebView in one desktop host. Separate simultaneously running
-desktop processes are not yet coordinated by an OS/file lock and remain a
-documented residual risk.
+Once a compare-only or CAS call is issued it is uninterruptible through
+transaction/command completion. There is no in-memory catalog publication
+afterward, so a caller interrupted around commit cannot leave stale renderer
+state that overwrites the durable winner on a later update. On protected hosts,
+the native mutex coordinates every WebView in one desktop host. Separate
+simultaneously running desktop processes are not yet coordinated by an OS/file
+lock and remain a documented residual risk.
 
 Accepted identities use target keys that remain stable when endpoints, labels,
 credentials, or local paths change:
@@ -121,13 +126,16 @@ Keys never contain bearer/DPoP credentials, endpoint URLs, SSH host/profile
 data, or filesystem paths. `AcceptedStorageIdentityStore` exposes an atomic
 transition over the shared catalog in addition to direct catalog reads and
 writes. The transition callback receives the accepted identity from each fresh
-CAS revision and is re-evaluated after every conflict; only the result computed
-for the successful revision is returned. First observation, equality, change,
-and a version-skewed `null` report are represented as `Bootstrap`, `Accepted`,
-`Changed`, and `Unverifiable`; equality and unverifiable reports keep the
-current baseline, and an unverifiable report never erases it. When concurrent
-runtimes bootstrap the same target, the first CAS winner persists its identity
-and every loser re-decides against that winner before it can open a session.
+revision and is re-evaluated after every conflict; only the result computed for
+the successful revision is returned. First observation, equality, change, and
+a version-skewed `null` report are represented as `Bootstrap`, `Accepted`,
+`Changed`, and `Unverifiable`. Bootstrap uses CAS to persist the first non-null
+identity. Accepted, Changed, and Unverifiable decisions use compare-only and do
+not rewrite an existing catalog, create an absent catalog, or depend on the
+catalog writer. Equality and unverifiable reports keep the current baseline,
+and an unverifiable report never erases it. When concurrent runtimes bootstrap
+the same target, the first CAS winner persists its identity and every loser
+re-decides against that winner before it can open a session.
 
 `ConnectionDriver` applies this decision table after descriptor preparation
 and before `RpcSessionFactory.connect`. Bootstrap persistence must complete

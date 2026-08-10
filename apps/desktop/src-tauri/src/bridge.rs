@@ -51,7 +51,7 @@ const DEFAULT_TAILSCALE_SERVE_PORT: u16 = 443;
 const PRIMARY_LOCAL_ENVIRONMENT_ID: &str = "primary";
 const WSL_INSTANCE_ID_PREFIX: &str = "wsl:";
 const REMOTE_API_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const TAURI_DESKTOP_BRIDGE_VERSION: u16 = 2;
+const TAURI_DESKTOP_BRIDGE_VERSION: u16 = 3;
 const MAX_DIAGNOSTIC_ARCHIVE_BYTES: usize = 20 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -109,6 +109,14 @@ impl ConnectionCatalogCoordinator {
         read: impl FnOnce() -> Result<Option<String>, String>,
     ) -> Result<Option<String>, String> {
         self.with_lock(read)
+    }
+
+    fn compare_with(
+        &self,
+        expected: Option<&str>,
+        read: impl FnOnce() -> Result<Option<String>, String>,
+    ) -> Result<bool, String> {
+        self.with_lock(|| Ok(read()?.as_deref() == expected))
     }
 
     fn compare_and_set_with(
@@ -970,6 +978,21 @@ pub fn desktop_bridge_compare_and_set_connection_catalog(
 }
 
 #[tauri::command]
+pub fn desktop_bridge_compare_connection_catalog(
+    app: AppHandle<DesktopRuntime>,
+    catalogs: State<'_, ConnectionCatalogCoordinator>,
+    expected_catalog: Option<String>,
+) -> Result<bool, String> {
+    let path =
+        connection_catalog_path(&app).map_err(|_| connection_catalog_command_error("compare"))?;
+    catalogs
+        .compare_with(expected_catalog.as_deref(), || {
+            read_connection_catalog_document(&path)
+        })
+        .map_err(|_| connection_catalog_command_error("compare"))
+}
+
+#[tauri::command]
 pub fn desktop_bridge_clear_connection_catalog(
     app: AppHandle<DesktopRuntime>,
     catalogs: State<'_, ConnectionCatalogCoordinator>,
@@ -1683,6 +1706,92 @@ mod tests {
     }
 
     #[test]
+    fn connection_catalog_compare_only_matches_without_a_writer() {
+        let catalogs = ConnectionCatalogCoordinator::new();
+        let value = Mutex::new(Some("current".to_string()));
+
+        assert!(
+            catalogs
+                .compare_with(Some("current"), || {
+                    Ok(value.lock().expect("test catalog lock").clone())
+                })
+                .unwrap()
+        );
+        assert!(
+            !catalogs
+                .compare_with(Some("stale"), || {
+                    Ok(value.lock().expect("test catalog lock").clone())
+                })
+                .unwrap()
+        );
+        assert_eq!(
+            value.lock().expect("test catalog lock").as_deref(),
+            Some("current")
+        );
+
+        let missing = tempfile::tempdir().expect("tempdir");
+        let path = missing.path().join("catalog.json");
+        assert!(
+            catalogs
+                .compare_with(None, || read_connection_catalog_document(&path))
+                .unwrap()
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn connection_catalog_compare_only_holds_the_shared_writer_lock() {
+        let catalogs = Arc::new(ConnectionCatalogCoordinator::new());
+        let value = Arc::new(Mutex::new(Some("before".to_string())));
+        let (compare_entered, compare_entered_rx) = mpsc::channel();
+        let (release_compare, release_compare_rx) = mpsc::channel();
+        let compare_catalogs = Arc::clone(&catalogs);
+        let compare_value = Arc::clone(&value);
+        let comparison = std::thread::spawn(move || {
+            compare_catalogs.compare_with(Some("before"), || {
+                compare_entered
+                    .send(())
+                    .expect("comparison should report entry");
+                release_compare_rx
+                    .recv()
+                    .expect("comparison should be released");
+                Ok(compare_value.lock().expect("test catalog lock").clone())
+            })
+        });
+        compare_entered_rx
+            .recv()
+            .expect("comparison should enter the coordinator");
+
+        let writer_catalogs = Arc::clone(&catalogs);
+        let writer_value = Arc::clone(&value);
+        let (writer_done, writer_done_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let result =
+                compare_test_catalog(&writer_catalogs, &writer_value, Some("before"), "after");
+            writer_done
+                .send(())
+                .expect("writer should report completion");
+            result
+        });
+
+        assert!(
+            writer_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "writer must wait while compare-only owns the coordinator"
+        );
+        release_compare
+            .send(())
+            .expect("comparison should be released");
+        assert!(comparison.join().expect("comparison should join").unwrap());
+        assert!(writer.join().expect("writer should join").unwrap());
+        assert_eq!(
+            value.lock().expect("test catalog lock").as_deref(),
+            Some("after")
+        );
+    }
+
+    #[test]
     fn concurrent_connection_catalog_compare_and_set_has_exactly_one_winner() {
         let catalogs = Arc::new(ConnectionCatalogCoordinator::new());
         let value = Arc::new(Mutex::new(Some("before".to_string())));
@@ -2228,7 +2337,7 @@ mod tests {
         let metadata = desktop_bridge_get_bridge_metadata(base_app.handle().clone());
 
         assert_eq!(metadata["host"], "tauri");
-        assert_eq!(metadata["bridgeVersion"], 2);
+        assert_eq!(metadata["bridgeVersion"], 3);
         assert_eq!(metadata["features"]["localBackend"], true);
         assert_eq!(metadata["features"]["connectionCatalog"], true);
         assert_eq!(
@@ -2506,6 +2615,7 @@ mod tests {
                 desktop_bridge_set_client_settings,
                 desktop_bridge_get_connection_catalog,
                 desktop_bridge_set_connection_catalog,
+                desktop_bridge_compare_connection_catalog,
                 desktop_bridge_compare_and_set_connection_catalog,
                 desktop_bridge_clear_connection_catalog,
                 desktop_bridge_discover_ssh_hosts,
@@ -2579,6 +2689,14 @@ mod tests {
         assert!(client_settings.is_null() || client_settings.is_object());
         let catalog = invoke("desktop_bridge_get_connection_catalog", json!({})).unwrap();
         assert!(catalog.is_null() || catalog.is_string());
+        assert_eq!(
+            invoke(
+                "desktop_bridge_compare_connection_catalog",
+                json!({"expectedCatalog": catalog.clone()}),
+            )
+            .unwrap(),
+            true
+        );
         assert_eq!(
             invoke(
                 "desktop_bridge_compare_and_set_connection_catalog",

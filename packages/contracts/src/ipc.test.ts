@@ -29,6 +29,17 @@ describe("DesktopBridge connection catalog", () => {
     await expect(bridge.compareAndSetConnectionCatalog!("before", "after")).resolves.toBe(true);
     expect(catalog).toBe("after");
   });
+
+  it("exposes an exact-raw comparison without mutation", async () => {
+    const catalog: string | null = "current";
+    const bridge: Pick<DesktopBridge, "compareConnectionCatalog"> = {
+      compareConnectionCatalog: async (expected) => catalog === expected,
+    };
+
+    await expect(bridge.compareConnectionCatalog!("current")).resolves.toBe(true);
+    await expect(bridge.compareConnectionCatalog!("stale")).resolves.toBe(false);
+    expect(catalog).toBe("current");
+  });
 });
 
 describe("DesktopEnvironmentBootstrapSchema", () => {

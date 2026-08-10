@@ -61,6 +61,7 @@ function installTauriHarness(options?: {
     expectedCatalog: string | null,
     nextCatalog: string,
   ) => boolean;
+  readonly compareConnectionCatalog?: (expectedCatalog: string | null) => boolean;
   readonly clearConnectionCatalog?: () => void;
   readonly rejectFallbackCommands?: boolean;
   readonly rejectListeners?: boolean;
@@ -76,7 +77,7 @@ function installTauriHarness(options?: {
         }
         return Promise.resolve({
           host: "tauri",
-          bridgeVersion: options?.bridgeVersion ?? 2,
+          bridgeVersion: options?.bridgeVersion ?? 3,
           features: {
             localBackend: true,
             localBearerToken: true,
@@ -162,6 +163,14 @@ function installTauriHarness(options?: {
               ) ??
                 (args?.expectedCatalog === "native-catalog" &&
                   args?.nextCatalog === "saved-catalog"),
+            );
+      case "desktop_bridge_compare_connection_catalog":
+        return options?.rejectFallbackCommands
+          ? Promise.reject(new Error("native catalog unavailable"))
+          : Promise.resolve(
+              options?.compareConnectionCatalog?.(
+                (args?.expectedCatalog as string | null) ?? null,
+              ) ?? args?.expectedCatalog === "native-catalog",
             );
       case "desktop_bridge_clear_connection_catalog":
         if (options?.rejectFallbackCommands) {
@@ -416,7 +425,7 @@ describe("tauriDesktopBridge", () => {
 
     await expect(bridge.getHostMetadata?.()).resolves.toEqual({
       host: "tauri",
-      bridgeVersion: 2,
+      bridgeVersion: 3,
       features: {
         localBackend: true,
         localBearerToken: true,
@@ -479,6 +488,7 @@ describe("tauriDesktopBridge", () => {
     expect(bridge.getConnectionCatalog).toBeDefined();
     expect(bridge.setConnectionCatalog).toBeDefined();
     expect(bridge.compareAndSetConnectionCatalog).toBeDefined();
+    expect(bridge.compareConnectionCatalog).toBeDefined();
     expect(bridge.clearConnectionCatalog).toBeDefined();
 
     await expect(bridge.getConnectionCatalog!()).resolves.toBe("native-catalog");
@@ -486,6 +496,7 @@ describe("tauriDesktopBridge", () => {
     await expect(
       bridge.compareAndSetConnectionCatalog!("native-catalog", "saved-catalog"),
     ).resolves.toBe(true);
+    await expect(bridge.compareConnectionCatalog!("native-catalog")).resolves.toBe(true);
     await expect(bridge.clearConnectionCatalog!()).resolves.toBeUndefined();
 
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_get_connection_catalog", undefined);
@@ -499,6 +510,9 @@ describe("tauriDesktopBridge", () => {
         nextCatalog: "saved-catalog",
       },
     );
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_compare_connection_catalog", {
+      expectedCatalog: "native-catalog",
+    });
     expect(harness.invoke).toHaveBeenCalledWith(
       "desktop_bridge_clear_connection_catalog",
       undefined,
@@ -549,6 +563,7 @@ describe("tauriDesktopBridge", () => {
     expect(bridge.clearConnectionCatalog).toBeDefined();
     expect(bridge.setConnectionCatalog).toBeUndefined();
     expect(bridge.compareAndSetConnectionCatalog).toBeUndefined();
+    expect(bridge.compareConnectionCatalog).toBeUndefined();
   });
 
   effectIt.effect.each([
@@ -564,6 +579,10 @@ describe("tauriDesktopBridge", () => {
     {
       name: "the host reports bridge version 1",
       options: { bridgeVersion: 1 },
+    },
+    {
+      name: "the host reports bridge version 2 without compare-only support",
+      options: { bridgeVersion: 2 },
     },
     {
       name: "the protected-catalog feature is missing",
