@@ -161,11 +161,30 @@ Git success only when the exact target is now missing and unregistered. This
 makes a crash between Git and detach resumable without allowing an unvalidated
 request to claim success.
 
+RPC preparation that can change an external provider or publish attachment
+files follows the same durable arbitration rule. A model-changing
+`thread.meta.update` reserves the exact command aggregate and canonical payload
+digest before calling the provider. A turn start reserves that identity before
+attachment publication, provider identity lookup, or delivery-route freezing.
+An accepted replay performs none of those effects; a matching reserved receipt
+is restart-resumable, while a changed payload conflicts before external work.
+Provider failure leaves the matching metadata reservation resumable. Turn
+failures before worker enqueue release only the exact matching reserved receipt,
+and a failed or canceled worker command performs the same conditional release,
+so it cannot delete a replacement, accepted, or rejected receipt. Attachment
+publication remains rollback-owned until the command, references, and provider
+outbox commit atomically; startup scavenges a final file left by a process crash
+after reservation and publication but before that transaction.
+
 Canonical workspace ownership is protected by a server-owned global fence keyed
 by filesystem-resolved host identity, including nearest-existing-ancestor
 resolution for missing leaves. Owner create, delete, retarget, adopt, detach,
 and project-root mutations acquire deterministically ordered keys before worker
-enqueue. Removal discovers a server-owned candidate key, acquires it, then
+enqueue. An omitted `thread.create.kind` has the contract's persisted
+`workspace` default for fence discovery, and an absent-thread
+`thread.turn.start` bootstrap with a workspace path acquires the same canonical
+owner key, including lexical aliases. Removal discovers a server-owned
+candidate key, acquires it, then
 re-runs the authoritative unique-owner preflight and retains the lease through
 verified Git and detach publication. A mutation that waited behind a committed
 ordinary owner change re-resolves the current old/new ownership keys before it

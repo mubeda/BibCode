@@ -220,17 +220,29 @@ async fn dispatch_prepared_command(
         .get_command_receipt(command.command_id().to_owned())
         .await
         .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+    #[cfg(test)]
+    dispatch
+        .test_hooks()
+        .maybe_pause_after_command_receipt_preflight()
+        .await;
     let legacy_replay = existing_receipt
         .as_ref()
         .is_some_and(|receipt| receipt.payload_digest.is_none());
-    let route_before_admission = existing_receipt.is_none()
+    let route_before_admission = if !legacy_replay
         && matches!(
             &command,
             OrchestrationCommand::ThreadMetaUpdate {
                 model_selection: Some(_),
                 ..
             }
-        );
+        ) {
+        dispatch
+            .reserve_generic_command_admission(&command, &payload_digest)
+            .await
+            .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?
+    } else {
+        false
+    };
     if route_before_admission && let Some(provider) = provider.as_ref() {
         route_orchestration_command(
             &provider.provider,
@@ -332,6 +344,55 @@ async fn dispatch_turn_command(
         return replay;
     }
 
+    let prepare_external = dispatch
+        .reserve_generic_command_admission(&command, &payload_digest)
+        .await
+        .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+    if !prepare_external {
+        let result = dispatch
+            .dispatch_with_admission(
+                command,
+                CommandAdmission {
+                    payload_digest,
+                    attachment_refs: Vec::new(),
+                    provider_turn: None,
+                },
+                || {},
+            )
+            .await
+            .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+        return serde_json::to_value(result)
+            .map_err(|error| invalid_request(&request_tag, error.to_string()));
+    }
+
+    let reserved_command = command.clone();
+    let reserved_digest = payload_digest.clone();
+    let result = dispatch_reserved_turn_command(
+        dispatch.clone(),
+        provider,
+        command,
+        payload_digest,
+        request_tag.clone(),
+        workspace_admission,
+    )
+    .await;
+    if result.is_err() {
+        dispatch
+            .release_generic_command_admission(&reserved_command, &reserved_digest)
+            .await
+            .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+    }
+    result
+}
+
+async fn dispatch_reserved_turn_command(
+    dispatch: OrchestrationEngine,
+    provider: ProviderRegistration,
+    command: OrchestrationCommand,
+    payload_digest: String,
+    request_tag: String,
+    workspace_admission: Option<crate::worktree_catalog::WorkspaceAdmissionLease>,
+) -> RpcResult {
     let (command, prepared_batch) = prepare_attachments(&provider.attachments, command)
         .await
         .map_err(|error| invalid_request(&request_tag, error.to_string()))?;
@@ -419,12 +480,25 @@ async fn preflight_turn_replay(
     payload_digest: String,
     request_tag: &str,
 ) -> Result<Option<RpcResult>, Value> {
-    if let Some(receipt) = dispatch
+    let receipt = dispatch
         .repositories()
         .get_command_receipt(command.command_id().to_owned())
         .await
-        .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?
-    {
+        .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+    #[cfg(test)]
+    dispatch
+        .test_hooks()
+        .maybe_pause_after_command_receipt_preflight()
+        .await;
+    if let Some(receipt) = receipt {
+        let aggregate = command.aggregate_ref();
+        if receipt.status == "reserved"
+            && receipt.payload_digest.as_deref() == Some(payload_digest.as_str())
+            && receipt.aggregate_kind == aggregate.0
+            && receipt.aggregate_id == aggregate.1
+        {
+            return Ok(None);
+        }
         let result = if receipt.payload_digest.is_none() {
             dispatch.dispatch(command).await
         } else {
@@ -973,8 +1047,8 @@ mod tests {
         persistence::{Database, run_migrations},
         production::{
             provider_runtime::{
-                BoxRuntimeFuture, ProviderDriver, ProviderDriverFactory, ProviderLaunchRequest,
-                ProviderRuntimeError, SupervisorOptions,
+                BoxRuntimeFuture, ProviderDriver, ProviderDriverFactory, ProviderEvent,
+                ProviderLaunchRequest, ProviderRuntimeError, StartedSession, SupervisorOptions,
             },
             turn_delivery::DeliveryRouter,
         },
@@ -983,6 +1057,7 @@ mod tests {
         },
     };
     use futures_util::{SinkExt, StreamExt};
+    use std::sync::atomic::AtomicUsize;
     use tokio_tungstenite::tungstenite::Message;
 
     const CREATED_AT: &str = "2026-07-11T00:00:00.000Z";
@@ -999,6 +1074,114 @@ mod tests {
                     provider: request.provider,
                 })
             })
+        }
+    }
+
+    #[derive(Default)]
+    struct ModelMutationProbe {
+        set_model_calls: AtomicUsize,
+        fail_set_model_calls: AtomicUsize,
+    }
+
+    impl ProviderDriver for ModelMutationProbe {
+        fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>> {
+            Box::pin(async { Ok(StartedSession::default()) })
+        }
+
+        fn send(
+            &self,
+            _text: String,
+            _attachments: Vec<Value>,
+            _interaction_mode: String,
+        ) -> BoxRuntimeFuture<'_, Result<Option<String>, ProviderRuntimeError>> {
+            Box::pin(async { Ok(None) })
+        }
+
+        fn interrupt(
+            &self,
+            _turn_id: Option<String>,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn approve(
+            &self,
+            _request_id: String,
+            _decision: String,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn answer(
+            &self,
+            _request_id: String,
+            _answers: Value,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn set_mode(
+            &self,
+            _mode: String,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn set_model(
+            &self,
+            _model: String,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            self.set_model_calls.fetch_add(1, Ordering::SeqCst);
+            let fail = self
+                .fail_set_model_calls
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok();
+            Box::pin(async move {
+                if fail {
+                    Err(ProviderRuntimeError::Provider {
+                        provider: "probe".to_owned(),
+                        detail: "injected model mutation failure".to_owned(),
+                    })
+                } else {
+                    Ok(())
+                }
+            })
+        }
+
+        fn set_options(
+            &self,
+            _options: Vec<Value>,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn rollback(
+            &self,
+            _turn_count: i64,
+        ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn next_event(&self) -> BoxRuntimeFuture<'_, Option<ProviderEvent>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    struct ModelMutationProbeFactory(Arc<ModelMutationProbe>);
+
+    impl ProviderDriverFactory for ModelMutationProbeFactory {
+        fn create(
+            &self,
+            _request: ProviderLaunchRequest,
+        ) -> BoxRuntimeFuture<'_, Result<Arc<dyn ProviderDriver>, ProviderRuntimeError>> {
+            let probe: Arc<dyn ProviderDriver> = self.0.clone();
+            Box::pin(async move { Ok(probe) })
         }
     }
 
@@ -1523,6 +1706,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn losing_turn_admission_never_prepares_external_attachments() {
+        let hooks = TestHooks::default();
+        let (database, engine, thread_id) = delivery_engine(hooks.clone()).await;
+        let state = tempfile::tempdir().expect("provider state");
+        let delivery = Arc::new(TurnDeliveryService::start_with_router(
+            engine.clone(),
+            1,
+            Arc::new(|_| Box::pin(async { Ok(()) })),
+        ));
+        let (registration, provider) = provider_registration(
+            database,
+            &engine,
+            state.path().to_path_buf(),
+            delivery.clone(),
+        );
+        let command = decode_command(json!({
+            "type":"thread.turn.start",
+            "commandId":"attachment-admission-race",
+            "threadId":thread_id,
+            "message":{
+                "messageId":"attachment-admission-message",
+                "role":"user",
+                "text":"review",
+                "attachments":[{
+                    "type":"file",
+                    "id":"attachment-admission-file",
+                    "name":"notes.txt",
+                    "mimeType":"text/plain",
+                    "sizeBytes":5,
+                    "dataUrl":"data:text/plain;base64,bm90ZXM="
+                }]
+            },
+            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "createdAt":CREATED_AT
+        }));
+        let payload_digest = canonical_command_digest(&command).expect("turn digest");
+        let pause = hooks.pause_after_next_command_receipt_preflight();
+        let dispatch_engine = engine.clone();
+        let dispatch = tokio::spawn(async move {
+            dispatch_turn_command(
+                dispatch_engine,
+                registration,
+                command,
+                payload_digest,
+                "orchestration.dispatchCommand".to_owned(),
+                None,
+            )
+            .await
+        });
+        pause.wait_until_entered().await;
+        engine
+            .reserve_worktree_removal_admission(
+                "attachment-admission-race",
+                "removal-project",
+                "removal-payload",
+            )
+            .await
+            .expect("removal reserves the absent turn identity");
+        pause.release();
+
+        let error = dispatch
+            .await
+            .expect("turn dispatch joins")
+            .expect_err("losing turn conflicts");
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.to_ascii_lowercase().contains("conflict"))
+        );
+        assert!(
+            !state.path().join("attachments").exists(),
+            "losing admission must not initialize or publish the attachment store"
+        );
+
+        delivery.shutdown().await;
+        provider.shutdown().await.expect("provider shutdown");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn ordinary_rpc_receipts_store_and_validate_the_canonical_digest() {
         let engine = migrated_engine().await;
         let accepted = decode_command(json!({
@@ -1587,6 +1850,211 @@ mod tests {
                 .as_str()
                 .is_some_and(|message| message.to_ascii_lowercase().contains("conflict"))
         );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn losing_generic_admission_never_reaches_the_provider() {
+        let hooks = TestHooks::default();
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let engine = OrchestrationEngine::start(
+            database.clone(),
+            EngineOptions {
+                test_hooks: hooks.clone(),
+                ..EngineOptions::default()
+            },
+        )
+        .await
+        .expect("engine starts");
+        engine
+            .dispatch(decode_command(json!({
+                "type":"project.create",
+                "commandId":"provider-race-project-create",
+                "projectId":"provider-race-project",
+                "title":"Provider Race Project",
+                "workspaceRoot":"C:/provider-race-project",
+                "defaultModelSelection":null,
+                "createdAt":CREATED_AT
+            })))
+            .await
+            .expect("project created");
+        engine
+            .dispatch(decode_command(json!({
+                "type":"thread.create",
+                "commandId":"provider-race-thread-create",
+                "threadId":"provider-race-thread",
+                "projectId":"provider-race-project",
+                "title":"Provider Race Thread",
+                "kind":"workspace",
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access",
+                "interactionMode":"default",
+                "branch":null,
+                "worktreePath":null,
+                "createdAt":CREATED_AT
+            })))
+            .await
+            .expect("thread created");
+
+        let probe = Arc::new(ModelMutationProbe::default());
+        let provider = Arc::new(ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(ModelMutationProbeFactory(probe.clone())),
+            ActivityProjection::new(ActivityRepository::new(database)),
+            SupervisorOptions::default(),
+        ));
+        let state = tempfile::tempdir().expect("provider state");
+        provider
+            .launch(ProviderLaunchRequest {
+                thread_id: "provider-race-thread".to_owned(),
+                activity_causal_revision: 0,
+                provider: "codex".to_owned(),
+                provider_label: "Codex".to_owned(),
+                provider_instance_id: Some("codex".to_owned()),
+                binary_path: "probe".to_owned(),
+                cwd: state.path().to_path_buf(),
+                runtime_mode: "full-access".to_owned(),
+                interaction_mode: "default".to_owned(),
+                model: Some("gpt-5".to_owned()),
+                options: Vec::new(),
+                service_tier: None,
+                effort: None,
+                agent: None,
+                resume_cursor: None,
+                environment: Default::default(),
+                endpoint: None,
+                server_password: None,
+                mcp: None,
+                codex_home: None,
+            })
+            .await
+            .expect("provider launches");
+        let delivery = Arc::new(TurnDeliveryService::start_with_router(
+            engine.clone(),
+            1,
+            Arc::new(|_| Box::pin(async { Ok(()) })),
+        ));
+        let registration = ProviderRegistration {
+            provider: provider.clone(),
+            settings_root: state.path().to_path_buf(),
+            attachments: AttachmentMaterializer::new(state.path().join("attachments")),
+            turn_delivery: delivery.clone(),
+        };
+        let command = decode_command(json!({
+            "type":"thread.meta.update",
+            "commandId":"provider-race-command",
+            "threadId":"provider-race-thread",
+            "modelSelection":{"instanceId":"codex","model":"gpt-5.1"}
+        }));
+        let pause = hooks.pause_after_next_command_receipt_preflight();
+        let generic_engine = engine.clone();
+        let racing_registration = registration.clone();
+        let generic = tokio::spawn(async move {
+            dispatch_prepared_for_test(&generic_engine, Some(racing_registration), command).await
+        });
+        pause.wait_until_entered().await;
+        let reserved = engine
+            .reserve_worktree_removal_admission(
+                "provider-race-command",
+                "provider-race-project",
+                "removal-payload",
+            )
+            .await
+            .expect("removal reserves the absent command identity");
+        assert!(reserved.0.is_none());
+        pause.release();
+
+        let error = generic
+            .await
+            .expect("generic dispatch joins")
+            .expect_err("losing generic admission conflicts");
+        assert!(
+            error["message"]
+                .as_str()
+                .is_some_and(|message| message.to_ascii_lowercase().contains("conflict"))
+        );
+        assert_eq!(
+            probe.set_model_calls.load(Ordering::SeqCst),
+            0,
+            "a losing generic command must not mutate the provider"
+        );
+        let receipt = engine
+            .repositories()
+            .get_command_receipt("provider-race-command".to_owned())
+            .await
+            .expect("receipt read")
+            .expect("removal receipt");
+        assert_eq!(receipt.status, "reserved");
+        assert_eq!(receipt.payload_digest.as_deref(), Some("removal-payload"));
+
+        probe.fail_set_model_calls.store(1, Ordering::SeqCst);
+        let resumable = decode_command(json!({
+            "type":"thread.meta.update",
+            "commandId":"provider-resume-command",
+            "threadId":"provider-race-thread",
+            "modelSelection":{"instanceId":"codex","model":"gpt-5.1"}
+        }));
+        dispatch_prepared_for_test(&engine, Some(registration.clone()), resumable.clone())
+            .await
+            .expect_err("injected provider failure leaves exact admission resumable");
+        let calls_after_failure = probe.set_model_calls.load(Ordering::SeqCst);
+        assert!(calls_after_failure > 0);
+        let reserved = engine
+            .repositories()
+            .get_command_receipt("provider-resume-command".to_owned())
+            .await
+            .expect("resumable receipt read")
+            .expect("resumable receipt");
+        assert_eq!(reserved.status, "reserved");
+        assert_eq!(
+            reserved.payload_digest.as_deref(),
+            Some(
+                canonical_command_digest(&resumable)
+                    .expect("resume digest")
+                    .as_str()
+            )
+        );
+
+        let accepted =
+            dispatch_prepared_for_test(&engine, Some(registration.clone()), resumable.clone())
+                .await
+                .expect("same-digest retry resumes provider mutation and durable admission");
+        let calls_after_retry = probe.set_model_calls.load(Ordering::SeqCst);
+        assert!(calls_after_retry > calls_after_failure);
+        assert_eq!(
+            dispatch_prepared_for_test(&engine, Some(registration.clone()), resumable)
+                .await
+                .expect("accepted retry replays"),
+            accepted
+        );
+        assert_eq!(
+            probe.set_model_calls.load(Ordering::SeqCst),
+            calls_after_retry,
+            "accepted replay must not repeat provider mutation"
+        );
+        let changed = decode_command(json!({
+            "type":"thread.meta.update",
+            "commandId":"provider-resume-command",
+            "threadId":"provider-race-thread",
+            "modelSelection":{"instanceId":"codex","model":"gpt-5.2"}
+        }));
+        dispatch_prepared_for_test(&engine, Some(registration), changed)
+            .await
+            .expect_err("changed payload conflicts before provider mutation");
+        assert_eq!(
+            probe.set_model_calls.load(Ordering::SeqCst),
+            calls_after_retry
+        );
+
+        delivery.shutdown().await;
+        provider.shutdown().await.expect("provider shutdown");
         engine.shutdown().await;
     }
 

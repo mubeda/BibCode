@@ -338,6 +338,28 @@ impl Repositories {
             .await
     }
 
+    pub async fn release_reserved_command_receipt(
+        &self,
+        command_id: String,
+        aggregate_kind: String,
+        aggregate_id: String,
+        payload_digest: String,
+    ) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                connection
+                    .execute(
+                        "DELETE FROM orchestration_command_receipts \
+                         WHERE command_id = ? AND aggregate_kind = ? AND aggregate_id = ? \
+                           AND payload_digest = ? AND status = 'reserved'",
+                        params![command_id, aggregate_kind, aggregate_id, payload_digest],
+                    )
+                    .map(|deleted| deleted == 1)
+                    .map_err(Into::into)
+            })
+            .await
+    }
+
     pub async fn prepare_reserved_command_receipt(
         &self,
         command_id: String,
