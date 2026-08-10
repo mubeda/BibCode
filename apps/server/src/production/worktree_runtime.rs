@@ -603,18 +603,7 @@ impl WorktreeRuntimeActions for ProductionWorktreeRuntimeActions {
         let terminals = self.terminals.clone();
         let registry = self.registry.clone();
         Box::pin(async move {
-            if !registry.transition_is_current(&transition) {
-                return Ok(());
-            }
-            let identities = terminals
-                .capture_thread_terminal_identities(&thread_id)
-                .await;
-            if !registry.transition_is_current(&transition) {
-                return Ok(());
-            }
-            terminals
-                .quiesce_terminal_identities_for_workspace_loss(identities)
-                .await
+            quiesce_terminals_for_transition(&terminals, &registry, &thread_id, &transition).await
         })
     }
 
@@ -625,6 +614,26 @@ impl WorktreeRuntimeActions for ProductionWorktreeRuntimeActions {
         let orchestration = self.orchestration.clone();
         Box::pin(async move { append_workspace_warning(&orchestration, transition).await })
     }
+}
+
+async fn quiesce_terminals_for_transition(
+    terminals: &ServerTerminalServices,
+    registry: &WorkspaceAvailabilityRegistry,
+    thread_id: &str,
+    transition: &WorkspaceLossTransition,
+) -> Result<(), String> {
+    if !registry.transition_is_current(transition) {
+        return Ok(());
+    }
+    let identities = terminals
+        .capture_thread_terminal_identities(thread_id)
+        .await;
+    let Some(_signal_permit) = registry.begin_terminal_signal(transition).await else {
+        return Ok(());
+    };
+    terminals
+        .quiesce_terminal_identities_for_workspace_loss(identities)
+        .await
 }
 
 async fn append_workspace_warning(
@@ -744,25 +753,41 @@ mod tests {
         pin::Pin,
         sync::{
             Arc, Mutex,
-            atomic::{AtomicUsize, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         task::{Context, Poll},
         time::Duration,
     };
 
-    use serde_json::json;
-    use tokio::sync::Semaphore;
+    use serde_json::{Value, json};
+    use tokio::sync::{Semaphore, broadcast, mpsc, watch};
+    use tokio_util::sync::CancellationToken;
 
     use super::{
         WorktreeRuntime, WorktreeRuntimeActions, WorktreeRuntimeFuture, WorktreeRuntimeOptions,
-        append_workspace_warning, workspace_thread_ids, workspace_warning_activity_id,
+        append_workspace_warning, quiesce_terminals_for_transition, workspace_thread_ids,
+        workspace_warning_activity_id,
     };
     use crate::worktree_catalog::{
         AdoptedWorktreeAvailability, WorkspaceAvailabilityRegistry, WorkspaceLossTransition,
     };
     use crate::{
+        cloud::{RelayClientInstallEvent, RelayClientService, RelayClientStatus},
+        diagnostics::{
+            DiagnosticsMonitor, NativeProcessSampler, NativeResourceSampler,
+            NotApplicableUiProcessObserver, ProcessAttributionRegistry,
+        },
         orchestration::{EngineOptions, OrchestrationCommand, OrchestrationEngine, load_snapshot},
         persistence::{Database, run_migrations},
+        production::server_terminal::{
+            JsonFuture, JsonStream, ProductionServerControl, ServerTerminalServices,
+        },
+        provider_usage::ProviderUsageService,
+        rpc::{RpcResult, RpcStreamChunk},
+        terminal::{
+            PtyBackend, PtyExit, PtyProcess, PtySpawnInput, TerminalAttachInput, TerminalManager,
+            TerminalManagerOptions, TerminalOpenInput, TerminalRestartInput, TerminalStatus,
+        },
     };
 
     #[derive(Default)]
@@ -862,6 +887,219 @@ mod tests {
                 Box::pin(ready(Ok(())))
             }
         }
+    }
+
+    #[derive(Debug)]
+    struct RuntimeTestPty {
+        pid: u32,
+        killed: AtomicBool,
+        writes: Mutex<Vec<String>>,
+        output: broadcast::Sender<String>,
+        exit: watch::Sender<Option<PtyExit>>,
+    }
+
+    impl RuntimeTestPty {
+        fn new(pid: u32) -> Self {
+            let (output, _) = broadcast::channel(16);
+            let (exit, _) = watch::channel(None);
+            Self {
+                pid,
+                killed: AtomicBool::new(false),
+                writes: Mutex::new(Vec::new()),
+                output,
+                exit,
+            }
+        }
+
+        fn emit(&self, value: &str) {
+            self.output
+                .send(value.to_owned())
+                .expect("terminal output receiver");
+        }
+
+        fn is_killed(&self) -> bool {
+            self.killed.load(Ordering::Acquire)
+        }
+    }
+
+    impl PtyProcess for RuntimeTestPty {
+        fn pid(&self) -> u32 {
+            self.pid
+        }
+
+        fn write(&self, data: &str) -> Result<(), String> {
+            if self.is_killed() {
+                return Err("terminal process is killed".to_owned());
+            }
+            self.writes
+                .lock()
+                .expect("terminal writes lock")
+                .push(data.to_owned());
+            Ok(())
+        }
+
+        fn resize(&self, _cols: u16, _rows: u16) -> Result<(), String> {
+            Ok(())
+        }
+
+        fn kill(&self) -> Result<(), String> {
+            self.killed.store(true, Ordering::Release);
+            self.exit.send_replace(Some(PtyExit {
+                exit_code: None,
+                signal: None,
+            }));
+            Ok(())
+        }
+
+        fn wait_for_process_tree_exit(&self, _timeout: Duration) -> Result<Option<bool>, String> {
+            Ok(Some(true))
+        }
+
+        fn subscribe_output(&self) -> broadcast::Receiver<String> {
+            self.output.subscribe()
+        }
+
+        fn subscribe_exit(&self) -> watch::Receiver<Option<PtyExit>> {
+            self.exit.subscribe()
+        }
+    }
+
+    #[derive(Debug, Default)]
+    struct RuntimeTestPtyBackend {
+        processes: Mutex<Vec<Arc<RuntimeTestPty>>>,
+    }
+
+    impl RuntimeTestPtyBackend {
+        fn processes(&self) -> Vec<Arc<RuntimeTestPty>> {
+            self.processes.lock().expect("terminal processes").clone()
+        }
+    }
+
+    impl PtyBackend for RuntimeTestPtyBackend {
+        fn spawn(&self, _input: &PtySpawnInput) -> Result<Arc<dyn PtyProcess>, String> {
+            let mut processes = self.processes.lock().expect("terminal processes");
+            let process = Arc::new(RuntimeTestPty::new(processes.len() as u32 + 1));
+            processes.push(process.clone());
+            Ok(process)
+        }
+    }
+
+    #[derive(Debug)]
+    struct RuntimeTestControl;
+
+    impl ProductionServerControl for RuntimeTestControl {
+        fn call(
+            &self,
+            _method: &'static str,
+            _payload: Value,
+            _cancellation: CancellationToken,
+        ) -> JsonFuture {
+            Box::pin(async { Ok(Value::Null) as RpcResult })
+        }
+
+        fn subscribe(&self, _method: &'static str, _cancellation: CancellationToken) -> JsonStream {
+            let (_sender, receiver) = mpsc::channel::<RpcStreamChunk>(1);
+            receiver
+        }
+    }
+
+    fn runtime_terminal_services(manager: TerminalManager) -> ServerTerminalServices {
+        let sampler = Arc::new(NativeProcessSampler::default());
+        let resource_sampler = Arc::new(NativeResourceSampler::new(
+            sampler.clone(),
+            ProcessAttributionRegistry::new(),
+            Arc::new(NotApplicableUiProcessObserver),
+        ));
+        let monitor = Arc::new(DiagnosticsMonitor::new(
+            resource_sampler.clone(),
+            Duration::from_secs(60),
+        ));
+        let provider_usage =
+            ProviderUsageService::new(Vec::new(), Arc::new(time::OffsetDateTime::now_utc));
+        let relay = RelayClientService::new(
+            || async {
+                RelayClientStatus::Missing {
+                    version: "1.0.0".to_owned(),
+                }
+            },
+            |_report: Arc<dyn Fn(RelayClientInstallEvent) -> _ + Send + Sync>| async {
+                Ok(RelayClientStatus::Missing {
+                    version: "1.0.0".to_owned(),
+                })
+            },
+        );
+        ServerTerminalServices::new(
+            manager,
+            sampler,
+            resource_sampler,
+            monitor,
+            provider_usage,
+            relay,
+            Arc::new(RuntimeTestControl),
+        )
+    }
+
+    struct RuntimeTerminalActions {
+        registry: WorkspaceAvailabilityRegistry,
+        terminals: ServerTerminalServices,
+        terminal_attempts: AtomicUsize,
+        fail_first_terminal_attempt: bool,
+    }
+
+    impl WorktreeRuntimeActions for RuntimeTerminalActions {
+        fn stop_provider(
+            &self,
+            _thread_id: String,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
+            Box::pin(ready(Ok(())))
+        }
+
+        fn close_terminals(
+            &self,
+            thread_id: String,
+            transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
+            let attempt = self.terminal_attempts.fetch_add(1, Ordering::SeqCst);
+            if self.fail_first_terminal_attempt && attempt == 0 {
+                return Box::pin(ready(Err("initial terminal cleanup failed".to_owned())));
+            }
+            let terminals = self.terminals.clone();
+            let registry = self.registry.clone();
+            Box::pin(async move {
+                quiesce_terminals_for_transition(&terminals, &registry, &thread_id, &transition)
+                    .await
+            })
+        }
+
+        fn append_warning(
+            &self,
+            _transition: WorkspaceLossTransition,
+        ) -> WorktreeRuntimeFuture<Result<(), String>> {
+            Box::pin(ready(Ok(())))
+        }
+    }
+
+    async fn wait_for_terminal_history(
+        manager: &TerminalManager,
+        thread_id: &str,
+        terminal_id: &str,
+        expected: &str,
+    ) {
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let attachment = manager
+                    .attach(TerminalAttachInput::existing(thread_id, terminal_id))
+                    .await
+                    .expect("terminal attaches while waiting for history");
+                if attachment.initial.history == expected {
+                    return;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("terminal history is published");
     }
 
     struct ConcurrencyActions {
@@ -1701,6 +1939,300 @@ mod tests {
             tokio::task::yield_now().await;
         }
         runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn initial_terminal_cleanup_recovery_before_signal_keeps_the_unchanged_session_live() {
+        let root = tempfile::tempdir().expect("terminal root");
+        let backend = Arc::new(RuntimeTestPtyBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        manager
+            .open(TerminalOpenInput::new(
+                "thread-1",
+                "term-live",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .expect("terminal opens");
+        let process = backend.processes()[0].clone();
+        process.emit("history-before-recovery\n");
+        wait_for_terminal_history(
+            &manager,
+            "thread-1",
+            "term-live",
+            "history-before-recovery\n",
+        )
+        .await;
+
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let mut loss = transition(1);
+        loss.path = root.path().to_path_buf();
+        assert!(registry.mark_unavailable(loss.clone()).await);
+        let signal_pause = registry.pause_before_next_terminal_signal_permit();
+        let actions = Arc::new(RuntimeTerminalActions {
+            registry: registry.clone(),
+            terminals: runtime_terminal_services(manager.clone()),
+            terminal_attempts: AtomicUsize::new(0),
+            fail_first_terminal_attempt: false,
+        });
+        let runtime = WorktreeRuntime::start_for_test(
+            actions.clone(),
+            registry.clone(),
+            WorktreeRuntimeOptions::default(),
+        );
+        let observer = runtime.clone();
+        let observed_loss = loss.clone();
+        let observe = tokio::spawn(async move { observer.observe(vec![observed_loss]).await });
+        signal_pause.wait_until_entered().await;
+
+        registry
+            .clear_recovered_in_repository(
+                &loss.thread_id,
+                loss.path.as_path(),
+                &loss.repository_key,
+            )
+            .await;
+        let recovered_admission = registry
+            .acquire_admission(&loss.thread_id, [loss.path.as_path()])
+            .await
+            .expect("recovery admits new terminal work");
+        drop(recovered_admission);
+        signal_pause.release();
+        observe.await.expect("initial cleanup joins");
+
+        assert_eq!(actions.terminal_attempts.load(Ordering::SeqCst), 1);
+        assert!(
+            !process.is_killed(),
+            "stale initial cleanup must not signal"
+        );
+        manager
+            .write("thread-1", "term-live", "write-after-recovery")
+            .await
+            .expect("unchanged recovered terminal remains writable");
+        let attachment = manager
+            .attach(TerminalAttachInput::existing("thread-1", "term-live"))
+            .await
+            .expect("unchanged recovered terminal remains attachable");
+        assert_eq!(attachment.initial.status, TerminalStatus::Running);
+        assert_eq!(attachment.initial.history, "history-before-recovery\n");
+
+        runtime.shutdown().await;
+        manager.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn reaper_terminal_cleanup_recovery_before_signal_keeps_the_unchanged_session_live() {
+        let root = tempfile::tempdir().expect("terminal root");
+        let backend = Arc::new(RuntimeTestPtyBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        manager
+            .open(TerminalOpenInput::new(
+                "thread-1",
+                "term-reaper",
+                root.path().to_path_buf(),
+                80,
+                24,
+            ))
+            .await
+            .expect("terminal opens");
+        let process = backend.processes()[0].clone();
+        process.emit("reaper-history\n");
+        wait_for_terminal_history(&manager, "thread-1", "term-reaper", "reaper-history\n").await;
+
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let mut loss = transition(1);
+        loss.path = root.path().to_path_buf();
+        assert!(registry.mark_unavailable(loss.clone()).await);
+        let signal_pause = registry.pause_before_next_terminal_signal_permit();
+        let actions = Arc::new(RuntimeTerminalActions {
+            registry: registry.clone(),
+            terminals: runtime_terminal_services(manager.clone()),
+            terminal_attempts: AtomicUsize::new(0),
+            fail_first_terminal_attempt: true,
+        });
+        let runtime = WorktreeRuntime::start_for_test(
+            actions.clone(),
+            registry.clone(),
+            WorktreeRuntimeOptions::default(),
+        );
+
+        runtime.observe(vec![loss.clone()]).await;
+        signal_pause.wait_until_entered().await;
+        assert!(registry.orphan_cleanup_pending(&loss.thread_id));
+        registry
+            .clear_recovered_in_repository(
+                &loss.thread_id,
+                loss.path.as_path(),
+                &loss.repository_key,
+            )
+            .await;
+        signal_pause.release();
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while runtime.active_reaper_jobs() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("stale reaper cleanup finishes");
+
+        assert_eq!(actions.terminal_attempts.load(Ordering::SeqCst), 2);
+        assert!(!process.is_killed(), "stale reaper cleanup must not signal");
+        manager
+            .write("thread-1", "term-reaper", "write-after-reaper-recovery")
+            .await
+            .expect("recovered terminal remains writable after stale retry");
+        let attachment = manager
+            .attach(TerminalAttachInput::existing("thread-1", "term-reaper"))
+            .await
+            .expect("recovered terminal remains attachable after stale retry");
+        assert_eq!(attachment.initial.status, TerminalStatus::Running);
+        assert_eq!(attachment.initial.history, "reaper-history\n");
+
+        runtime.shutdown().await;
+        manager.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn terminal_signal_before_recovery_quiesces_all_exact_sessions_before_recovery_returns() {
+        let root = tempfile::tempdir().expect("terminal root");
+        let backend = Arc::new(RuntimeTestPtyBackend::default());
+        let manager = TerminalManager::new(
+            backend.clone(),
+            TerminalManagerOptions {
+                subprocess_poll_interval: Duration::ZERO,
+                ..TerminalManagerOptions::default()
+            },
+        );
+        for terminal_id in ["term-first", "term-second"] {
+            manager
+                .open(TerminalOpenInput::new(
+                    "thread-1",
+                    terminal_id,
+                    root.path().to_path_buf(),
+                    80,
+                    24,
+                ))
+                .await
+                .expect("terminal opens");
+        }
+        let old_processes = backend.processes();
+        for (process, history) in old_processes
+            .iter()
+            .zip(["first-history\n", "second-history\n"])
+        {
+            process.emit(history);
+        }
+        wait_for_terminal_history(&manager, "thread-1", "term-first", "first-history\n").await;
+        wait_for_terminal_history(&manager, "thread-1", "term-second", "second-history\n").await;
+
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let mut loss = transition(1);
+        loss.path = root.path().to_path_buf();
+        assert!(registry.mark_unavailable(loss.clone()).await);
+        let signal_pause = registry.pause_after_next_terminal_signal_permit();
+        let actions = Arc::new(RuntimeTerminalActions {
+            registry: registry.clone(),
+            terminals: runtime_terminal_services(manager.clone()),
+            terminal_attempts: AtomicUsize::new(0),
+            fail_first_terminal_attempt: false,
+        });
+        let runtime = WorktreeRuntime::start_for_test(
+            actions,
+            registry.clone(),
+            WorktreeRuntimeOptions::default(),
+        );
+        let observer = runtime.clone();
+        let observed_loss = loss.clone();
+        let observe = tokio::spawn(async move { observer.observe(vec![observed_loss]).await });
+        signal_pause.wait_until_entered().await;
+
+        let recovery_registry = registry.clone();
+        let recovery_loss = loss.clone();
+        let invalidation_started = registry
+            .terminal_signal_invalidation_notification(&loss)
+            .expect("current terminal signal gate");
+        let recovery = tokio::spawn(async move {
+            recovery_registry
+                .clear_recovered_in_repository(
+                    &recovery_loss.thread_id,
+                    recovery_loss.path.as_path(),
+                    &recovery_loss.repository_key,
+                )
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(1), invalidation_started.notified())
+            .await
+            .expect("recovery starts terminal signal invalidation");
+        assert!(
+            !recovery.is_finished(),
+            "recovery waits after terminal signaling owns the transition"
+        );
+        signal_pause.release();
+        observe.await.expect("cleanup joins");
+        recovery.await.expect("recovery joins after cleanup");
+
+        assert!(old_processes.iter().all(|process| process.is_killed()));
+        for (terminal_id, history) in [
+            ("term-first", "first-history\n"),
+            ("term-second", "second-history\n"),
+        ] {
+            let attachment = manager
+                .attach(TerminalAttachInput::existing("thread-1", terminal_id))
+                .await
+                .expect("quiesced history remains attachable");
+            assert_eq!(attachment.initial.status, TerminalStatus::Exited);
+            assert_eq!(attachment.initial.history, history);
+        }
+
+        manager
+            .restart(TerminalRestartInput {
+                thread_id: "thread-1".to_owned(),
+                terminal_id: "term-first".to_owned(),
+                cwd: root.path().to_path_buf(),
+                worktree_path: None,
+                cols: 80,
+                rows: 24,
+                env: std::collections::BTreeMap::new(),
+                command: None,
+            })
+            .await
+            .expect("post-recovery terminal starts");
+        let replacement = backend
+            .processes()
+            .last()
+            .cloned()
+            .expect("replacement process");
+        manager
+            .write("thread-1", "term-first", "post-recovery-write")
+            .await
+            .expect("post-recovery terminal remains writable");
+        assert!(!replacement.is_killed());
+        assert_eq!(
+            manager
+                .attach(TerminalAttachInput::existing("thread-1", "term-first"))
+                .await
+                .expect("replacement attaches")
+                .initial
+                .status,
+            TerminalStatus::Running
+        );
+
+        runtime.shutdown().await;
+        manager.shutdown().await;
     }
 
     #[tokio::test]
