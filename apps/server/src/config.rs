@@ -12,6 +12,8 @@ use serde::Deserialize;
 use thiserror::Error;
 use url::Url;
 
+use crate::data_root::{DataRootError, DataRootRequest, DataRootSource, ResolvedDataRoot};
+
 pub const DEFAULT_PORT: u16 = 3773;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -36,6 +38,8 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub base_dir: PathBuf,
+    pub data_root_request: DataRootRequest,
+    pub resolved_data_root: Option<ResolvedDataRoot>,
     pub static_dir: Option<PathBuf>,
     pub dev_url: Option<Url>,
     pub no_browser: bool,
@@ -48,11 +52,18 @@ pub struct ServerConfig {
 
 impl ServerConfig {
     pub fn new(base_dir: impl AsRef<Path>) -> Self {
+        let base_dir = base_dir.as_ref().to_path_buf();
         Self {
             mode: ServerMode::Web,
             host: "127.0.0.1".to_owned(),
             port: DEFAULT_PORT,
-            base_dir: base_dir.as_ref().to_path_buf(),
+            data_root_request: DataRootRequest::explicit(
+                DataRootSource::Cli,
+                base_dir.clone(),
+                dirs::home_dir().unwrap_or_default(),
+            ),
+            resolved_data_root: None,
+            base_dir,
             static_dir: None,
             dev_url: None,
             no_browser: false,
@@ -118,6 +129,8 @@ impl ServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_root::DataRootSource;
+    use clap::Parser;
 
     #[test]
     fn owned_builder_inputs_cover_desktop_and_static_configuration() {
@@ -138,6 +151,33 @@ mod tests {
                 .with_desktop(String::new())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn cli_base_dir_preserves_the_raw_cli_data_root_request() {
+        let config = Cli::try_parse_from(["bibcode", "serve", "--base-dir", "/var/lib/bibcode"])
+            .expect("parse CLI")
+            .into_server_config()
+            .expect("build server config");
+
+        assert_eq!(config.data_root_request.source, DataRootSource::Cli);
+        assert_eq!(
+            config.data_root_request.requested,
+            Some(PathBuf::from("/var/lib/bibcode"))
+        );
+    }
+
+    #[test]
+    fn environment_base_dir_preserves_the_raw_environment_data_root_request() {
+        let request = select_data_root_request(
+            None,
+            Some(std::ffi::OsString::from("/var/lib/bibcode")),
+            None,
+            PathBuf::from("/home/alice"),
+        );
+
+        assert_eq!(request.source, DataRootSource::Environment);
+        assert_eq!(request.requested, Some(PathBuf::from("/var/lib/bibcode")));
     }
 }
 
@@ -170,7 +210,7 @@ struct ServerArgs {
     #[arg(long, env = "BIBCODE_PORT", global = true)]
     port: Option<u16>,
 
-    #[arg(long, env = "BIBCODE_HOME", global = true)]
+    #[arg(long, global = true)]
     base_dir: Option<PathBuf>,
 
     #[arg(long, global = true)]
@@ -198,10 +238,8 @@ pub enum ConfigError {
     BootstrapDecode(#[source] serde_json::Error),
     #[error("desktop bootstrap token must not be empty")]
     EmptyDesktopBootstrapToken,
-    #[error("failed to resolve the default server base directory")]
-    CurrentDirectory(#[source] io::Error),
-    #[error("the current user's home directory is unavailable")]
-    HomeDirectoryUnavailable,
+    #[error(transparent)]
+    DataRoot(#[from] DataRootError),
 }
 
 #[derive(Debug, Deserialize)]
@@ -239,15 +277,15 @@ impl Cli {
                 })
             })
             .unwrap_or_default();
-        let raw_base_dir = args.base_dir.or_else(|| {
+        let home_dir = dirs::home_dir().ok_or(DataRootError::HomeDirectoryUnavailable)?;
+        let data_root_request = select_data_root_request(
+            args.base_dir,
+            bibcode_env_var("BIBCODE_HOME"),
             bootstrap
                 .as_ref()
-                .and_then(|value| value.bibcode_home.clone())
-        });
-        let base_dir = match raw_base_dir {
-            Some(path) => resolve_base_dir(path)?,
-            None => default_base_dir()?,
-        };
+                .and_then(|value| value.bibcode_home.clone()),
+            home_dir,
+        );
         let host = args
             .host
             .or_else(|| bootstrap.as_ref().map(|value| value.host.clone()))
@@ -257,7 +295,14 @@ impl Cli {
             .or_else(|| bootstrap.as_ref().map(|value| value.port))
             .unwrap_or(DEFAULT_PORT);
 
-        let mut config = ServerConfig::new(base_dir).with_bind(host, port);
+        let mut config = ServerConfig::new(
+            data_root_request
+                .requested
+                .clone()
+                .unwrap_or_else(|| data_root_request.home_dir.join(".bibcode")),
+        )
+        .with_bind(host, port);
+        config.data_root_request = data_root_request;
         config.mode = mode;
         config.static_dir = args.static_dir;
         config.dev_url = args.dev_url;
@@ -279,26 +324,26 @@ impl Cli {
     }
 }
 
-fn default_base_dir() -> Result<PathBuf, ConfigError> {
-    let home = dirs::home_dir().ok_or(ConfigError::HomeDirectoryUnavailable)?;
-    Ok(home.join(".bibcode"))
+fn bibcode_env_var(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name)
 }
 
-fn resolve_base_dir(path: PathBuf) -> Result<PathBuf, ConfigError> {
-    let path = match path.strip_prefix("~") {
-        Ok(relative) => dirs::home_dir()
-            .map(|home| home.join(relative))
-            .ok_or(ConfigError::HomeDirectoryUnavailable)?,
-        Err(_) => path,
-    };
-    let path = if path.is_absolute() {
-        path
-    } else {
-        std::env::current_dir()
-            .map(|directory| directory.join(path))
-            .map_err(ConfigError::CurrentDirectory)?
-    };
-    Ok(path)
+fn select_data_root_request(
+    cli_base_dir: Option<PathBuf>,
+    environment_base_dir: Option<std::ffi::OsString>,
+    desktop_bootstrap_base_dir: Option<PathBuf>,
+    home_dir: PathBuf,
+) -> DataRootRequest {
+    match (cli_base_dir, environment_base_dir) {
+        (Some(path), _) => DataRootRequest::explicit(DataRootSource::Cli, path, home_dir),
+        (None, Some(path)) => {
+            DataRootRequest::explicit(DataRootSource::Environment, PathBuf::from(path), home_dir)
+        }
+        (None, None) => match desktop_bootstrap_base_dir {
+            Some(path) => DataRootRequest::explicit(DataRootSource::Cli, path, home_dir),
+            None => DataRootRequest::default(home_dir),
+        },
+    }
 }
 
 fn read_bootstrap(fd: i32) -> Result<Option<DesktopBootstrap>, ConfigError> {

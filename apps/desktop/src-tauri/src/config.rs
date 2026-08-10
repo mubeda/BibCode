@@ -1,3 +1,4 @@
+use bibcode_server::{DataRootRequest, DataRootSource, ResolvedDataRoot, resolve_data_root};
 use serde_json::{Value, json};
 use std::{
     fs, io,
@@ -120,15 +121,28 @@ pub fn resolve_pick_folder_default_path<R: Runtime>(
     resolve_default_path_from_home(&home_directory, raw_options)
 }
 
-pub(crate) fn base_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
-    if let Some(value) = std::env::var_os("BIBCODE_HOME").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(value));
-    }
+fn resolve_data_root_from_home(
+    home_dir: PathBuf,
+    requested: Option<PathBuf>,
+) -> Result<ResolvedDataRoot, String> {
+    let request = match requested {
+        Some(path) => DataRootRequest::explicit(DataRootSource::Environment, path, home_dir),
+        None => DataRootRequest::default(home_dir),
+    };
+    resolve_data_root(request)
+        .map_err(|error| config_error("Could not resolve the BiBCode data root", error))
+}
+
+pub(crate) fn data_root<R: Runtime>(app: &AppHandle<R>) -> Result<ResolvedDataRoot, String> {
     let home = app
         .path()
         .home_dir()
         .map_err(|error| config_error("Could not resolve the home directory", error))?;
-    Ok(home.join(".bibcode"))
+    resolve_data_root_from_home(home, bibcode_env_var("BIBCODE_HOME").map(PathBuf::from))
+}
+
+pub(crate) fn base_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
+    data_root(app).map(|resolved| resolved.effective)
 }
 
 pub fn state_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
@@ -212,6 +226,19 @@ pub fn write_json_file(path: &Path, value: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rejects_relative_environment_data_root_before_desktop_uses_it() {
+        let temp = tempfile::tempdir().expect("temporary home directory");
+
+        let error = resolve_data_root_from_home(
+            temp.path().to_path_buf(),
+            Some(PathBuf::from("relative/.bibcode")),
+        )
+        .expect_err("relative environment root must fail");
+
+        assert!(error.contains("must be absolute"));
+    }
 
     #[test]
     fn detects_nightly_versions() {

@@ -7,6 +7,7 @@ pub mod checkpointing;
 pub mod cloud;
 mod config;
 mod crypto;
+pub mod data_root;
 pub mod diagnostic_bundle;
 pub mod diagnostics;
 mod environment_identity;
@@ -38,6 +39,9 @@ use serde_json::json;
 use thiserror::Error;
 
 pub use config::{Cli, ConfigError, ServerConfig, ServerMode};
+pub use data_root::{
+    DataRootError, DataRootRequest, DataRootSource, ResolvedDataRoot, resolve_data_root,
+};
 pub use http::{
     DESKTOP_SHUTDOWN_PATH, DESKTOP_SHUTDOWN_TOKEN_HEADER, ENVIRONMENT_DESCRIPTOR_PATH,
     ROUTE_INVENTORY, RouteMethod, RouteSpec,
