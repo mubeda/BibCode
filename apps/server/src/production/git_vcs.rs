@@ -176,7 +176,21 @@ impl GitVcsRpcServices {
         request: RpcRequest,
         cancellation: CancellationToken,
     ) -> RpcResult {
-        let _workspace_admission = self.guard_payload_cwd(&request.payload).await?;
+        let workspace_admission = self.guard_payload_cwd(&request.payload).await?;
+        let operation_cancellation = cancellation.child_token();
+        await_git_rpc_operation(
+            workspace_admission.as_ref(),
+            operation_cancellation.clone(),
+            self.handle_admitted_unary(request, operation_cancellation),
+        )
+        .await
+    }
+
+    async fn handle_admitted_unary(
+        &self,
+        request: RpcRequest,
+        cancellation: CancellationToken,
+    ) -> RpcResult {
         match request.tag.as_str() {
             "shell.openInEditor" => self.open_in_editor(request.payload).await,
             "vcs.pull" => {
@@ -423,7 +437,7 @@ impl GitVcsRpcServices {
                     return;
                 }
             };
-            let _workspace_admission = match guard_git_path(availability.as_ref(), &input.cwd).await
+            let workspace_admission = match guard_git_path(availability.as_ref(), &input.cwd).await
             {
                 Ok(admission) => admission,
                 Err(error) => {
@@ -431,20 +445,43 @@ impl GitVcsRpcServices {
                     return;
                 }
             };
-            let mut subscription = match broadcaster
-                .subscribe(input.cwd.clone(), cancellation.clone())
-                .await
+            let operation_cancellation = cancellation.child_token();
+            let loss = workspace_admission
+                .as_ref()
+                .map(WorkspaceAdmissionLease::loss_cancellation);
+            let loss_token = loss
+                .as_ref()
+                .map(|loss| loss.cancellation_token())
+                .unwrap_or_default();
+            let mut subscription = match await_git_rpc_operation(
+                workspace_admission.as_ref(),
+                operation_cancellation.clone(),
+                async {
+                    broadcaster
+                        .subscribe(input.cwd.clone(), operation_cancellation.clone())
+                        .await
+                        .map_err(serialize_error)
+                },
+            )
+            .await
             {
                 Ok(subscription) => subscription,
                 Err(error) => {
-                    let _ = sender.send(Err(serialize_error(error))).await;
+                    let _ = sender.send(Err(error)).await;
                     return;
                 }
             };
-            drop(_workspace_admission);
             let mut current_local = None;
             loop {
                 tokio::select! {
+                    biased;
+                    () = loss_token.cancelled() => {
+                        operation_cancellation.cancel();
+                        if let Some(error) = loss.as_ref().and_then(|loss| loss.unavailable()) {
+                            let _ = sender.send(Err(serialize_error(error))).await;
+                        }
+                        break;
+                    }
                     _ = cancellation.cancelled() => break,
                     event = subscription.recv() => {
                         let Some(mut event) = event else { break };
@@ -457,7 +494,7 @@ impl GitVcsRpcServices {
                                         &input.cwd,
                                         local,
                                         remote,
-                                        &cancellation,
+                                        &operation_cancellation,
                                     ).await;
                                 }
                             }
@@ -471,7 +508,7 @@ impl GitVcsRpcServices {
                                         &input.cwd,
                                         local,
                                         remote,
-                                        &cancellation,
+                                        &operation_cancellation,
                                     ).await;
                                 }
                             }
@@ -505,7 +542,7 @@ impl GitVcsRpcServices {
                     return;
                 }
             };
-            let _workspace_admission = match guard_git_path(availability.as_ref(), &input.cwd).await
+            let workspace_admission = match guard_git_path(availability.as_ref(), &input.cwd).await
             {
                 Ok(admission) => admission,
                 Err(error) => {
@@ -513,21 +550,42 @@ impl GitVcsRpcServices {
                     return;
                 }
             };
+            let operation_cancellation = cancellation.child_token();
             let phases = action_phases(&input.action, input.feature_branch.unwrap_or(false));
-            if send_event(
-                &sender,
-                json!({
-                    "actionId": input.action_id, "cwd": input.cwd, "action": input.action,
-                    "kind": "action_started", "phases": phases,
-                }),
+            let action_started = await_git_rpc_operation(
+                workspace_admission.as_ref(),
+                operation_cancellation.clone(),
+                async {
+                    send_event(
+                        &sender,
+                        json!({
+                            "actionId": input.action_id, "cwd": input.cwd, "action": input.action,
+                            "kind": "action_started", "phases": phases,
+                        }),
+                    )
+                    .await
+                    .map_err(|()| request_error("git.runStackedAction", "stream receiver closed"))
+                },
             )
-            .await
-            .is_err()
-            {
+            .await;
+            if let Err(error) = action_started {
+                if is_workspace_unavailable(&error) {
+                    let _ = sender.send(Err(error)).await;
+                }
                 return;
             }
-            let result =
-                run_stacked_action(&repository, &pull_requests, &input, &cancellation).await;
+            let result = await_git_rpc_operation(
+                workspace_admission.as_ref(),
+                operation_cancellation.clone(),
+                run_stacked_action(&repository, &pull_requests, &input, &operation_cancellation),
+            )
+            .await;
+            if let Err(error) = &result
+                && is_workspace_unavailable(error)
+            {
+                let _ = sender.send(Err(error.clone())).await;
+                return;
+            }
             let event = match result {
                 Ok(result) => json!({
                     "actionId": input.action_id, "cwd": input.cwd, "action": input.action,
@@ -539,7 +597,20 @@ impl GitVcsRpcServices {
                     "message": error.get("detail").and_then(Value::as_str).unwrap_or("Git action failed."),
                 }),
             };
-            let _ = send_event(&sender, event).await;
+            if let Err(error) = await_git_rpc_operation(
+                workspace_admission.as_ref(),
+                operation_cancellation,
+                async {
+                    send_event(&sender, event).await.map_err(|()| {
+                        request_error("git.runStackedAction", "stream receiver closed")
+                    })
+                },
+            )
+            .await
+                && is_workspace_unavailable(&error)
+            {
+                let _ = sender.send(Err(error)).await;
+            }
         });
         receiver
     }
@@ -829,6 +900,32 @@ async fn guard_git_path(
         .map_err(|error| {
             serde_json::to_value(error).expect("workspace unavailable error serializes")
         })
+}
+
+async fn await_git_rpc_operation<T>(
+    admission: Option<&WorkspaceAdmissionLease>,
+    operation_cancellation: CancellationToken,
+    operation: impl Future<Output = Result<T, Value>>,
+) -> Result<T, Value> {
+    let Some(admission) = admission else {
+        return operation.await;
+    };
+    let loss = admission.loss_cancellation();
+    tokio::select! {
+        biased;
+        () = loss.cancelled() => {
+            operation_cancellation.cancel();
+            Err(serialize_error(
+                loss.unavailable()
+                    .expect("workspace loss cancellation retains its exact error"),
+            ))
+        }
+        result = operation => result,
+    }
+}
+
+fn is_workspace_unavailable(error: &Value) -> bool {
+    error.get("_tag").and_then(Value::as_str) == Some("WorkspaceUnavailableError")
 }
 
 fn open_in_editor_with(
@@ -1673,6 +1770,86 @@ mod tests {
         services
             .handle_unary(rpc_request(tag, payload), CancellationToken::new())
             .await
+    }
+
+    #[tokio::test]
+    async fn workspace_loss_cancels_an_admitted_git_operation_with_the_exact_error() {
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let path = PathBuf::from("/repo/worktrees/git-guard");
+        let admission = registry
+            .acquire_path_admission([path.as_path()])
+            .await
+            .expect("Git operation should be admitted before loss");
+        let operation_cancellation = CancellationToken::new();
+        let operation_cancellation_probe = operation_cancellation.clone();
+        let task = tokio::spawn(async move {
+            await_git_rpc_operation(
+                Some(&admission),
+                operation_cancellation,
+                std::future::pending::<RpcResult>(),
+            )
+            .await
+        });
+
+        assert!(
+            registry
+                .mark_unavailable(crate::worktree_catalog::WorkspaceLossTransition {
+                    thread_id: "thread-git".to_owned(),
+                    repository_key: "repository-git".to_owned(),
+                    generation: 1,
+                    path: path.clone(),
+                    availability:
+                        crate::worktree_catalog::AdoptedWorktreeAvailability::MissingRegistered,
+                })
+                .await
+        );
+
+        let error = task
+            .await
+            .expect("Git admission task should join")
+            .expect_err("workspace loss must win over the admitted Git operation");
+        assert_eq!(error["_tag"], "WorkspaceUnavailableError");
+        assert_eq!(error["threadId"], "thread-git");
+        assert!(operation_cancellation_probe.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn workspace_loss_ends_an_admitted_status_stream_with_the_exact_error() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let temporary = tempfile::tempdir().expect("temporary Git repository");
+        git(temporary.path(), &["init", "-b", "main"]);
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let services = GitVcsRpcServices::default().with_availability_registry(registry.clone());
+        let mut stream = services.status_stream(
+            rpc_request("subscribeVcsStatus", json!({"cwd": temporary.path()})),
+            CancellationToken::new(),
+        );
+        stream
+            .recv()
+            .await
+            .expect("initial status chunk")
+            .expect("initial status snapshot");
+
+        assert!(
+            registry
+                .mark_unavailable(crate::worktree_catalog::WorkspaceLossTransition {
+                    thread_id: "thread-status".to_owned(),
+                    repository_key: "repository-status".to_owned(),
+                    generation: 1,
+                    path: temporary.path().to_path_buf(),
+                    availability:
+                        crate::worktree_catalog::AdoptedWorktreeAvailability::MissingRegistered,
+                })
+                .await
+        );
+
+        let error = stream
+            .recv()
+            .await
+            .expect("workspace loss error chunk")
+            .expect_err("workspace loss must end the admitted status stream");
+        assert_eq!(error["_tag"], "WorkspaceUnavailableError");
+        assert_eq!(error["threadId"], "thread-status");
     }
 
     #[tokio::test]

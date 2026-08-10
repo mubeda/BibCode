@@ -661,6 +661,7 @@ pub struct EngineOptions {
 pub struct TestHooks {
     fail_next_projector: Arc<StdMutex<Option<FailProjectorOnce>>>,
     pause_after_admission_commit: Arc<StdMutex<Option<AdmissionCommitPause>>>,
+    pause_before_command_persist: Arc<StdMutex<Option<AdmissionCommitPause>>>,
     fail_delivery_transitions: Arc<AtomicUsize>,
     delivery_transition_attempts: Arc<AtomicUsize>,
 }
@@ -707,6 +708,18 @@ impl TestHooks {
         pause
     }
 
+    pub fn pause_before_next_command_persist(&self) -> AdmissionCommitPause {
+        let pause = AdmissionCommitPause {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        *self
+            .pause_before_command_persist
+            .lock()
+            .expect("command persist pause mutex") = Some(pause.clone());
+        pause
+    }
+
     pub fn fail_next_delivery_transitions(&self, count: usize) {
         self.fail_delivery_transitions
             .store(count, Ordering::SeqCst);
@@ -743,6 +756,18 @@ impl TestHooks {
             .pause_after_admission_commit
             .lock()
             .expect("admission pause mutex")
+            .take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    async fn maybe_pause_before_command_persist(&self) {
+        let pause = self
+            .pause_before_command_persist
+            .lock()
+            .expect("command persist pause mutex")
             .take();
         if let Some(pause) = pause {
             pause.entered.notify_one();
@@ -1047,8 +1072,23 @@ async fn replayed_worktree_adoption_result(
 struct CommandEnvelope {
     command: OrchestrationCommand,
     admission: Option<CommandAdmission>,
+    lifetime: Option<CommandLifetimeGuard>,
     response: oneshot::Sender<Result<DispatchResult, OrchestrationError>>,
     on_commit: Option<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+pub(crate) struct CommandLifetimeGuard {
+    cancellation: CancellationToken,
+    _resource: Box<dyn Send + 'static>,
+}
+
+impl CommandLifetimeGuard {
+    pub(crate) fn new(resource: impl Send + 'static, cancellation: CancellationToken) -> Self {
+        Self {
+            cancellation,
+            _resource: Box::new(resource),
+        }
+    }
 }
 
 struct DeliveryTransitionEnvelope {
@@ -1109,7 +1149,7 @@ impl OrchestrationEngine {
         &self,
         command: OrchestrationCommand,
     ) -> Result<DispatchResult, OrchestrationError> {
-        self.dispatch_inner(command, None, None).await
+        self.dispatch_inner(command, None, None, None).await
     }
 
     pub(crate) async fn replay_admitted_worktree_adoption(
@@ -1158,7 +1198,7 @@ impl OrchestrationEngine {
         command: OrchestrationCommand,
         on_commit: impl FnOnce() + Send + 'static,
     ) -> Result<DispatchResult, OrchestrationError> {
-        self.dispatch_inner(command, None, Some(Box::new(on_commit)))
+        self.dispatch_inner(command, None, None, Some(Box::new(on_commit)))
             .await
     }
 
@@ -1168,17 +1208,34 @@ impl OrchestrationEngine {
         admission: CommandAdmission,
         on_commit: impl FnOnce() + Send + 'static,
     ) -> Result<DispatchResult, OrchestrationError> {
-        self.dispatch_inner(command, Some(admission), Some(Box::new(on_commit)))
+        self.dispatch_inner(command, Some(admission), None, Some(Box::new(on_commit)))
             .await
+    }
+
+    pub(crate) async fn dispatch_with_admission_and_lifetime(
+        &self,
+        command: OrchestrationCommand,
+        admission: CommandAdmission,
+        lifetime: CommandLifetimeGuard,
+        on_commit: impl FnOnce() + Send + 'static,
+    ) -> Result<DispatchResult, OrchestrationError> {
+        self.dispatch_inner(
+            command,
+            Some(admission),
+            Some(lifetime),
+            Some(Box::new(on_commit)),
+        )
+        .await
     }
 
     async fn dispatch_inner(
         &self,
         command: OrchestrationCommand,
         admission: Option<CommandAdmission>,
+        lifetime: Option<CommandLifetimeGuard>,
         on_commit: Option<Box<dyn FnOnce() + Send + 'static>>,
     ) -> Result<DispatchResult, OrchestrationError> {
-        self.dispatch_plain_with_commit(command, admission, on_commit)
+        self.dispatch_plain_with_commit(command, admission, lifetime, on_commit)
             .await
     }
 
@@ -1186,13 +1243,15 @@ impl OrchestrationEngine {
         &self,
         command: OrchestrationCommand,
     ) -> Result<DispatchResult, OrchestrationError> {
-        self.dispatch_plain_with_commit(command, None, None).await
+        self.dispatch_plain_with_commit(command, None, None, None)
+            .await
     }
 
     async fn dispatch_plain_with_commit(
         &self,
         command: OrchestrationCommand,
         admission: Option<CommandAdmission>,
+        lifetime: Option<CommandLifetimeGuard>,
         on_commit: Option<Box<dyn FnOnce() + Send + 'static>>,
     ) -> Result<DispatchResult, OrchestrationError> {
         if self.shutdown.is_cancelled() {
@@ -1203,6 +1262,7 @@ impl OrchestrationEngine {
             .send(WorkerEnvelope::Command(Box::new(CommandEnvelope {
                 command,
                 admission,
+                lifetime,
                 response: response_tx,
                 on_commit,
             })))
@@ -1400,8 +1460,17 @@ fn spawn_worker(
                     };
                     match envelope {
                         WorkerEnvelope::Command(envelope) => {
-                            let CommandEnvelope { command, admission, response, on_commit } = *envelope;
+                            let CommandEnvelope {
+                                command,
+                                admission,
+                                lifetime,
+                                response,
+                                on_commit,
+                            } = *envelope;
                             let has_admission = admission.is_some();
+                            let cancellation = lifetime
+                                .as_ref()
+                                .map(|lifetime| lifetime.cancellation.clone());
                             let effects = project_command_effects
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -1412,8 +1481,11 @@ fn spawn_worker(
                                 &events,
                                 &hooks,
                                 effects.as_deref(),
-                                command,
-                                admission,
+                                ProcessEnvelopeInput {
+                                    command,
+                                    admission,
+                                    cancellation: cancellation.as_ref(),
+                                },
                             )
                             .await;
                             if result.as_ref().is_ok_and(|outcome| outcome.accepted_new)
@@ -1425,6 +1497,7 @@ fn spawn_worker(
                                 }
                             }
                             let _ = response.send(result.map(|outcome| outcome.result));
+                            drop(lifetime);
                         }
                         WorkerEnvelope::DeliveryTransition(DeliveryTransitionEnvelope { transition, response }) => {
                             let result = persist_turn_delivery_transition(&repositories, &events, &hooks, transition).await;
@@ -1437,15 +1510,26 @@ fn spawn_worker(
     })
 }
 
+struct ProcessEnvelopeInput<'a> {
+    command: OrchestrationCommand,
+    admission: Option<CommandAdmission>,
+    cancellation: Option<&'a CancellationToken>,
+}
+
 async fn process_envelope(
     repositories: &Repositories,
     model: &mut CommandModel,
     events: &broadcast::Sender<OrchestrationEvent>,
     hooks: &TestHooks,
     project_command_effects: Option<&dyn ProjectCommandEffects>,
-    mut command: OrchestrationCommand,
-    admission: Option<CommandAdmission>,
+    input: ProcessEnvelopeInput<'_>,
 ) -> Result<ProcessEnvelopeOutcome, OrchestrationError> {
+    let ProcessEnvelopeInput {
+        mut command,
+        admission,
+        cancellation,
+    } = input;
+    ensure_command_active(cancellation)?;
     let command_id = command.command_id().to_owned();
     let requested_project_id = match &command {
         OrchestrationCommand::ProjectCreate { project_id, .. } => Some(project_id.clone()),
@@ -1603,9 +1687,11 @@ async fn process_envelope(
         }
     }
 
+    ensure_command_active(cancellation)?;
     let mut planned = match plan_command(repositories, model, &command, &occurred_at).await {
         Ok(planned) => planned,
         Err(error) => {
+            ensure_command_active(cancellation)?;
             let aggregate = command.aggregate_ref();
             repositories
                 .upsert_command_receipt(CommandReceipt {
@@ -1649,6 +1735,8 @@ async fn process_envelope(
     }
 
     prepare_project_create(&command, project_command_effects).await?;
+    hooks.maybe_pause_before_command_persist().await;
+    ensure_command_active(cancellation)?;
     let aggregate = command.aggregate_ref();
     let committed = persist_command(
         repositories,
@@ -1689,6 +1777,16 @@ async fn process_envelope(
         },
         accepted_new: true,
     })
+}
+
+fn ensure_command_active(
+    cancellation: Option<&CancellationToken>,
+) -> Result<(), OrchestrationError> {
+    if cancellation.is_some_and(CancellationToken::is_cancelled) {
+        Err(OrchestrationError::Cancelled)
+    } else {
+        Ok(())
+    }
 }
 
 struct ProcessEnvelopeOutcome {

@@ -15,7 +15,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     orchestration::{
         CommandAdmission, NewProviderTurnDelivery, OrchestrationCommand, OrchestrationEngine,
-        OrchestrationError, canonical_command_digest, engine::TurnDeliveryResolutionAction,
+        OrchestrationError, canonical_command_digest,
+        engine::{CommandLifetimeGuard, TurnDeliveryResolutionAction},
         load_snapshot,
     },
     persistence::{OrchestrationEvent, ProjectionThread},
@@ -126,7 +127,7 @@ fn register_orchestration_rpc_inner(
                 ));
             }
             if let OrchestrationCommand::ThreadTurnStart { thread_id, .. } = &command {
-                let _workspace_admission = if let Some(availability) = &availability {
+                let workspace_admission = if let Some(availability) = &availability {
                     Some(
                         availability
                             .acquire_thread(thread_id, std::iter::empty())
@@ -148,6 +149,7 @@ fn register_orchestration_rpc_inner(
                     command,
                     payload_digest,
                     request.tag,
+                    workspace_admission,
                 )
                 .await;
             }
@@ -317,6 +319,7 @@ async fn dispatch_turn_command(
     command: OrchestrationCommand,
     payload_digest: String,
     request_tag: String,
+    workspace_admission: Option<crate::worktree_catalog::WorkspaceAdmissionLease>,
 ) -> RpcResult {
     if let Some(replay) = preflight_turn_replay(
         &dispatch,
@@ -366,15 +369,36 @@ async fn dispatch_turn_command(
         }),
     };
     let turn_delivery = provider.turn_delivery.clone();
-    let result = dispatch
-        .dispatch_with_admission(command, admission, move || {
-            if let Some(batch) = prepared_batch {
-                batch.commit();
+    let on_commit = move || {
+        if let Some(batch) = prepared_batch {
+            batch.commit();
+        }
+        turn_delivery.wake();
+    };
+    let result = if let Some(workspace_admission) = workspace_admission {
+        let loss = workspace_admission.loss_cancellation();
+        let lifetime = CommandLifetimeGuard::new(workspace_admission, loss.cancellation_token());
+        let dispatch =
+            dispatch.dispatch_with_admission_and_lifetime(command, admission, lifetime, on_commit);
+        tokio::pin!(dispatch);
+        tokio::select! {
+            biased;
+            () = loss.cancelled() => {
+                let unavailable = loss
+                    .unavailable()
+                    .expect("workspace loss cancellation retains its error");
+                return Err(workspace_admission_error(
+                    WorkspaceAdmissionError::Unavailable(unavailable),
+                ));
             }
-            turn_delivery.wake();
-        })
-        .await
-        .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+            result = &mut dispatch => result,
+        }
+    } else {
+        dispatch
+            .dispatch_with_admission(command, admission, on_commit)
+            .await
+    }
+    .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
     serde_json::to_value(result).map_err(|error| invalid_request(&request_tag, error.to_string()))
 }
 
@@ -943,6 +967,9 @@ mod tests {
             },
             turn_delivery::DeliveryRouter,
         },
+        worktree_catalog::{
+            AdoptedWorktreeAvailability, WorkspaceAvailabilityRegistry, WorkspaceLossTransition,
+        },
     };
     use futures_util::{SinkExt, StreamExt};
     use tokio_tungstenite::tungstenite::Message;
@@ -1436,6 +1463,7 @@ mod tests {
             accepted,
             "ignored legacy digest".to_owned(),
             "orchestration.dispatchCommand".to_owned(),
+            None,
         )
         .await
         .expect("legacy accepted turn replays its stored result");
@@ -1449,6 +1477,7 @@ mod tests {
             rejected,
             "different ignored legacy digest".to_owned(),
             "orchestration.dispatchCommand".to_owned(),
+            None,
         )
         .await
         .expect_err("legacy rejected turn remains rejected");
@@ -1688,6 +1717,256 @@ mod tests {
             .expect("close registered RPC socket");
         handle.shutdown();
         handle.join().await.expect("registered RPC server joins");
+        delivery.shutdown().await;
+        provider.shutdown().await.expect("provider shutdown");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn interrupted_turn_cannot_commit_after_authoritative_workspace_loss() {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let hooks = TestHooks::default();
+        let engine = OrchestrationEngine::start(
+            database.clone(),
+            EngineOptions {
+                test_hooks: hooks.clone(),
+                ..EngineOptions::default()
+            },
+        )
+        .await
+        .expect("engine starts");
+        let state = tempfile::tempdir().expect("provider state");
+        engine
+            .dispatch(decode_command(json!({
+                "type": "project.create",
+                "commandId": "loss-project-create",
+                "projectId": "loss-project",
+                "title": "Loss project",
+                "workspaceRoot": state.path(),
+                "defaultModelSelection": {"instanceId": "codex", "model": "gpt-5"},
+                "createdAt": CREATED_AT,
+            })))
+            .await
+            .expect("project created");
+        let thread_id = load_snapshot(&engine.repositories())
+            .await
+            .expect("snapshot")
+            .threads
+            .into_iter()
+            .find(|thread| thread.kind == "default")
+            .expect("default thread")
+            .thread_id;
+        let provider = Arc::new(ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(NeverFactory),
+            ActivityProjection::new(ActivityRepository::new(database)),
+            SupervisorOptions::default(),
+        ));
+        let router: DeliveryRouter = Arc::new(|_| Box::pin(async { Ok(()) }));
+        let delivery = Arc::new(TurnDeliveryService::start_with_router(
+            engine.clone(),
+            1,
+            router,
+        ));
+        let availability = WorkspaceAvailabilityRegistry::new();
+        let mut registry = RpcRegistry::empty();
+        register_orchestration_rpc_with_delivery_and_availability(
+            &mut registry,
+            engine.clone(),
+            provider.clone(),
+            state.path().to_path_buf(),
+            delivery.clone(),
+            availability.clone(),
+        );
+        let handle = ServerRuntime::start_with_registry(
+            ServerConfig::new(state.path())
+                .with_bind("127.0.0.1", 0)
+                .with_unsafe_no_auth(),
+            registry,
+        )
+        .await
+        .expect("registered RPC server starts");
+        let (mut socket, _) =
+            tokio_tungstenite::connect_async(format!("ws://{}/ws", handle.local_addr()))
+                .await
+                .expect("registered RPC socket connects");
+        let durable_after_disconnect = json!({
+            "type": "thread.turn.start",
+            "commandId": "disconnect-only-turn",
+            "threadId": thread_id,
+            "message": {
+                "messageId": "disconnect-only-message",
+                "role": "user",
+                "text": "must retain durable handoff",
+                "attachments": []
+            },
+            "modelSelection": {"instanceId": "codex", "model": "gpt-5"},
+            "createdAt": CREATED_AT
+        });
+        let disconnect_pause = hooks.pause_before_next_command_persist();
+        socket
+            .send(Message::Text(
+                json!({
+                    "_tag": "Request",
+                    "id": "6",
+                    "tag": "orchestration.dispatchCommand",
+                    "payload": durable_after_disconnect,
+                    "headers": []
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send disconnect-only turn request");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            disconnect_pause.wait_until_entered(),
+        )
+        .await
+        .expect("disconnect-only turn reaches persistence");
+        socket
+            .send(Message::Text(
+                json!({"_tag": "Interrupt", "requestId": "6"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("interrupt disconnect-only request");
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("disconnect-only interrupt response timeout")
+            .expect("disconnect-only interrupt response")
+            .expect("disconnect-only interrupt frame");
+        disconnect_pause.release();
+        let disconnect_scope = WorkspaceLossTransition {
+            thread_id: thread_id.clone(),
+            repository_key: "loss-repository".to_owned(),
+            generation: 0,
+            path: state.path().to_path_buf(),
+            availability: AdoptedWorktreeAvailability::MissingRegistered,
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            availability.wait_for_transition_admissions(&disconnect_scope),
+        )
+        .await
+        .expect("queued command retains and then releases its admission lease");
+        assert!(
+            engine
+                .repositories()
+                .get_command_receipt("disconnect-only-turn".to_owned())
+                .await
+                .expect("disconnect-only receipt")
+                .is_some(),
+            "RPC interruption alone preserves durable command handoff"
+        );
+        dispatch_registered_command(&mut socket, "9", durable_after_disconnect)
+            .await
+            .expect("interrupted durable command replays exactly");
+
+        let pause = hooks.pause_before_next_command_persist();
+        socket
+            .send(Message::Text(
+                json!({
+                    "_tag": "Request",
+                    "id": "7",
+                    "tag": "orchestration.dispatchCommand",
+                    "payload": {
+                        "type": "thread.turn.start",
+                        "commandId": "loss-turn",
+                        "threadId": thread_id,
+                        "message": {
+                            "messageId": "loss-message",
+                            "role": "user",
+                            "text": "must not commit after loss",
+                            "attachments": []
+                        },
+                        "modelSelection": {"instanceId": "codex", "model": "gpt-5"},
+                        "createdAt": CREATED_AT
+                    },
+                    "headers": []
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send turn request");
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::select! {
+                () = pause.wait_until_entered() => {}
+                frame = socket.next() => panic!("turn exited before persistence: {frame:?}"),
+            }
+        })
+        .await
+        .expect("turn reaches the pre-persist barrier");
+        socket
+            .send(Message::Text(
+                json!({"_tag": "Interrupt", "requestId": "7"})
+                    .to_string()
+                    .into(),
+            ))
+            .await
+            .expect("interrupt turn request");
+        let interrupted = tokio::time::timeout(std::time::Duration::from_secs(5), socket.next())
+            .await
+            .expect("interrupt response timeout")
+            .expect("interrupt response")
+            .expect("interrupt frame");
+        assert!(matches!(interrupted, Message::Text(_)));
+
+        let loss = WorkspaceLossTransition {
+            thread_id: thread_id.clone(),
+            repository_key: "loss-repository".to_owned(),
+            generation: 1,
+            path: state.path().to_path_buf(),
+            availability: AdoptedWorktreeAvailability::MissingRegistered,
+        };
+        assert!(availability.mark_unavailable(loss.clone()).await);
+        pause.release();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            availability.wait_for_transition_admissions(&loss),
+        )
+        .await
+        .expect("workspace admission drains after the worker barrier releases");
+
+        assert!(
+            engine
+                .repositories()
+                .get_command_receipt("loss-turn".to_owned())
+                .await
+                .expect("receipt lookup")
+                .is_none(),
+            "loss cancellation before persistence cannot leave a durable receipt"
+        );
+        let messages = thread_snapshot(&engine, &thread_id)
+            .await
+            .expect("thread snapshot")["thread"]["messages"]
+            .as_array()
+            .expect("messages")
+            .clone();
+        assert!(
+            messages
+                .iter()
+                .any(|message| { message["id"] == "disconnect-only-message" })
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message["id"] == "loss-message"),
+            "loss cancellation before persistence cannot leave a durable message"
+        );
+
+        socket.close(None).await.expect("close socket");
+        handle.shutdown();
+        handle.join().await.expect("server joins");
         delivery.shutdown().await;
         provider.shutdown().await.expect("provider shutdown");
         engine.shutdown().await;

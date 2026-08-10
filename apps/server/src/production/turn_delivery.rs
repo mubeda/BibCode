@@ -289,7 +289,7 @@ fn guard_delivery_router(
                     };
                 }
             };
-            let _workspace_admission = match admission
+            let workspace_admission = match admission
                 .acquire_thread(thread_id, std::iter::empty())
                 .await
             {
@@ -300,7 +300,18 @@ fn guard_delivery_router(
                     };
                 }
             };
-            router(command, delivery_key).await
+            let loss = workspace_admission.loss_cancellation();
+            let route = router(command, delivery_key);
+            tokio::pin!(route);
+            tokio::select! {
+                biased;
+                () = loss.cancelled() => ProviderDeliveryOutcome::DefinitelyNotSent {
+                    detail: loss
+                        .unavailable()
+                        .map_or_else(|| "workspace became unavailable".to_owned(), |error| error.message),
+                },
+                outcome = &mut route => outcome,
+            }
         })
     })
 }
@@ -313,7 +324,7 @@ fn guard_delivery_reconciler(
         let admission = admission.clone();
         let reconciler = reconciler.clone();
         Box::pin(async move {
-            let _workspace_admission = match admission
+            let workspace_admission = match admission
                 .acquire_thread(&row.thread_id, std::iter::empty())
                 .await
             {
@@ -324,7 +335,18 @@ fn guard_delivery_reconciler(
                     };
                 }
             };
-            reconciler(row).await
+            let loss = workspace_admission.loss_cancellation();
+            let reconcile = reconciler(row);
+            tokio::pin!(reconcile);
+            tokio::select! {
+                biased;
+                () = loss.cancelled() => ProviderReconciliationOutcome::Unavailable {
+                    detail: loss
+                        .unavailable()
+                        .map_or_else(|| "workspace became unavailable".to_owned(), |error| error.message),
+                },
+                outcome = &mut reconcile => outcome,
+            }
         })
     })
 }
@@ -1236,6 +1258,81 @@ mod tests {
         ));
         assert_eq!(delivery_calls.load(Ordering::SeqCst), 0);
         assert_eq!(reconciliation_calls.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn workspace_loss_cancels_an_inflight_provider_route_before_publication() {
+        struct PendingRoute {
+            drops: Arc<AtomicUsize>,
+        }
+
+        impl Future for PendingRoute {
+            type Output = ProviderDeliveryOutcome;
+
+            fn poll(
+                self: Pin<&mut Self>,
+                _context: &mut std::task::Context<'_>,
+            ) -> std::task::Poll<Self::Output> {
+                std::task::Poll::Pending
+            }
+        }
+
+        impl Drop for PendingRoute {
+            fn drop(&mut self) {
+                self.drops.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let started = Arc::new(Semaphore::new(0));
+        let drops = Arc::new(AtomicUsize::new(0));
+        let router = guard_delivery_router(
+            WorkspaceAdmissionController::registry_only(registry.clone()),
+            Arc::new({
+                let started = started.clone();
+                let drops = drops.clone();
+                move |_command, _delivery_key| {
+                    started.add_permits(1);
+                    Box::pin(PendingRoute {
+                        drops: drops.clone(),
+                    })
+                }
+            }),
+        );
+        let command = serde_json::from_value(turn_payload("command-loss", "thread-loss"))
+            .expect("turn command");
+        let route = tokio::spawn(async move { router(command, "delivery-loss".to_owned()).await });
+        started
+            .acquire()
+            .await
+            .expect("provider route starts")
+            .forget();
+
+        assert!(
+            registry
+                .mark_unavailable(WorkspaceLossTransition {
+                    thread_id: "thread-loss".to_owned(),
+                    repository_key: "repository-a".to_owned(),
+                    generation: 1,
+                    path: PathBuf::from("/repo/worktrees/loss"),
+                    availability: AdoptedWorktreeAvailability::MissingRegistered,
+                })
+                .await
+        );
+        tokio::task::yield_now().await;
+        let finished = route.is_finished();
+        if !finished {
+            route.abort();
+        }
+        assert!(
+            finished,
+            "workspace loss must cancel the provider publication future"
+        );
+        assert!(matches!(
+            route.await.expect("guarded route task"),
+            ProviderDeliveryOutcome::DefinitelyNotSent { .. }
+        ));
+        assert_eq!(drops.load(Ordering::SeqCst), 1);
     }
 
     async fn seed_delivery(

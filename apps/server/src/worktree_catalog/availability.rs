@@ -6,6 +6,7 @@ use std::{
 
 use serde::Serialize;
 use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 use crate::git::{host_path_platform, normalize_worktree_path_key};
 
@@ -75,8 +76,10 @@ pub struct WorkspaceAvailabilityRegistry {
 struct RegistryState {
     entries: HashMap<String, GuardEntry>,
     latest_loss: HashMap<String, LossWatermark>,
-    orphan_cleanups: HashMap<String, usize>,
-    active_admissions: HashMap<AdmissionScope, usize>,
+    orphan_cleanups: HashMap<u64, CleanupRecord>,
+    next_cleanup_id: u64,
+    active_admissions: HashMap<u64, ActiveAdmission>,
+    next_admission_id: u64,
     next_removal_id: u64,
 }
 
@@ -150,7 +153,40 @@ pub struct RemovalGuard {
 
 pub struct WorkspaceAdmissionLease {
     registry: WorkspaceAvailabilityRegistry,
+    admission_id: u64,
+    loss_cancellation: WorkspaceAdmissionCancellation,
+}
+
+#[derive(Clone)]
+pub struct WorkspaceAdmissionCancellation {
+    token: CancellationToken,
+    unavailable: Arc<Mutex<Option<WorkspaceUnavailable>>>,
+}
+
+struct ActiveAdmission {
     scopes: Vec<AdmissionScope>,
+    loss_cancellation: WorkspaceAdmissionCancellation,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CleanupTransitionKey {
+    thread_id: String,
+    repository_key: String,
+    generation: u64,
+    path_key: String,
+    state: WorkspaceGuardState,
+}
+
+struct CleanupRecord {
+    transition: CleanupTransitionKey,
+    cancellation: CancellationToken,
+}
+
+#[derive(Clone)]
+pub struct WorkspaceCleanupOwnership {
+    id: u64,
+    transition: CleanupTransitionKey,
+    cancellation: CancellationToken,
 }
 
 impl WorkspaceAvailabilityRegistry {
@@ -230,38 +266,48 @@ impl WorkspaceAvailabilityRegistry {
         let mut scopes = Vec::with_capacity(path_keys.len() + usize::from(thread_id.is_some()));
         scopes.extend(thread_id.map(|thread_id| AdmissionScope::Thread(thread_id.to_owned())));
         scopes.extend(path_keys.into_iter().map(AdmissionScope::Path));
-        for scope in &scopes {
-            let count = state.active_admissions.entry(scope.clone()).or_default();
-            *count = count.saturating_add(1);
-        }
+        state.next_admission_id = state.next_admission_id.wrapping_add(1).max(1);
+        let admission_id = state.next_admission_id;
+        let loss_cancellation = WorkspaceAdmissionCancellation {
+            token: CancellationToken::new(),
+            unavailable: Arc::new(Mutex::new(None)),
+        };
+        state.active_admissions.insert(
+            admission_id,
+            ActiveAdmission {
+                scopes: scopes.clone(),
+                loss_cancellation: loss_cancellation.clone(),
+            },
+        );
         drop(state);
         Ok(WorkspaceAdmissionLease {
             registry: self.clone(),
-            scopes,
+            admission_id,
+            loss_cancellation,
         })
     }
 
     pub async fn wait_for_transition_admissions(&self, transition: &WorkspaceLossTransition) {
-        let thread = AdmissionScope::Thread(transition.thread_id.clone());
-        let path = normalized_path(&transition.path);
         loop {
             let notified = self.admission_changed.notified();
-            let active = {
-                let state = lock(&self.inner);
-                state
-                    .active_admissions
-                    .iter()
-                    .any(|(scope, count)| {
-                        *count > 0
-                            && (scope == &thread
-                                || matches!(scope, AdmissionScope::Path(candidate) if path_is_within(candidate, &path)))
-                    })
-            };
-            if !active {
+            if !self.has_transition_admissions(transition) {
                 return;
             }
             notified.await;
         }
+    }
+
+    #[must_use]
+    pub fn has_transition_admissions(&self, transition: &WorkspaceLossTransition) -> bool {
+        let thread = AdmissionScope::Thread(transition.thread_id.clone());
+        let path = normalized_path(&transition.path);
+        let state = lock(&self.inner);
+        state.active_admissions.values().any(|admission| {
+            admission.scopes.iter().any(|scope| {
+                scope == &thread
+                    || matches!(scope, AdmissionScope::Path(candidate) if path_is_within(candidate, &path))
+            })
+        })
     }
 
     pub async fn mark_unavailable(&self, transition: WorkspaceLossTransition) -> bool {
@@ -282,6 +328,7 @@ impl WorkspaceAvailabilityRegistry {
         if !watermark.admit(transition.generation, guard_state) {
             return false;
         }
+        invalidate_thread_cleanups(&mut state, &transition.thread_id);
 
         if let Some(entry) = state.entries.get_mut(&transition.thread_id)
             && entry.state == WorkspaceGuardState::Removing
@@ -304,15 +351,29 @@ impl WorkspaceAvailabilityRegistry {
         state.entries.insert(
             transition.thread_id.clone(),
             GuardEntry {
-                thread_id: transition.thread_id,
-                repository_key: transition.repository_key,
-                path_key,
-                path,
+                thread_id: transition.thread_id.clone(),
+                repository_key: transition.repository_key.clone(),
+                path_key: path_key.clone(),
+                path: path.clone(),
                 state: guard_state,
                 pending_missing: None,
                 removal_ids: HashSet::new(),
             },
         );
+        let unavailable = state
+            .entries
+            .get(&transition.thread_id)
+            .map(unavailable)
+            .expect("inserted workspace guard");
+        let thread_scope = AdmissionScope::Thread(transition.thread_id);
+        for admission in state.active_admissions.values() {
+            if admission.scopes.iter().any(|scope| {
+                scope == &thread_scope
+                    || matches!(scope, AdmissionScope::Path(candidate) if path_is_within(candidate, &path_key))
+            }) {
+                admission.loss_cancellation.cancel(unavailable.clone());
+            }
+        }
         true
     }
 
@@ -352,12 +413,26 @@ impl WorkspaceAvailabilityRegistry {
                 thread_id: thread_id.to_owned(),
                 repository_key,
                 path: path_key.clone(),
-                path_key,
+                path_key: path_key.clone(),
                 state: WorkspaceGuardState::Removing,
                 pending_missing,
                 removal_ids: HashSet::from([removal_id]),
             },
         );
+        let unavailable = state
+            .entries
+            .get(thread_id)
+            .map(unavailable)
+            .expect("inserted removing guard");
+        let thread_scope = AdmissionScope::Thread(thread_id.to_owned());
+        for admission in state.active_admissions.values() {
+            if admission.scopes.iter().any(|scope| {
+                scope == &thread_scope
+                    || matches!(scope, AdmissionScope::Path(candidate) if path_is_within(candidate, &path_key))
+            }) {
+                admission.loss_cancellation.cancel(unavailable.clone());
+            }
+        }
         drop(state);
         RemovalGuard {
             registry: self.clone(),
@@ -396,6 +471,7 @@ impl WorkspaceAvailabilityRegistry {
         } else {
             state.entries.remove(thread_id);
         }
+        invalidate_thread_cleanups(&mut state, thread_id);
     }
 
     pub async fn reconcile_snapshot(
@@ -462,20 +538,64 @@ impl WorkspaceAvailabilityRegistry {
         admitted
     }
 
-    pub async fn set_orphan_cleanup_pending(&self, thread_id: &str, pending: bool) {
+    pub fn begin_orphan_cleanup(
+        &self,
+        transition: &WorkspaceLossTransition,
+    ) -> Option<WorkspaceCleanupOwnership> {
+        let state_key = transition.guard_state()?;
+        let transition_key = CleanupTransitionKey {
+            thread_id: transition.thread_id.clone(),
+            repository_key: transition.repository_key.clone(),
+            generation: transition.generation,
+            path_key: normalized_path(&transition.path),
+            state: state_key,
+        };
         let mut state = lock(&self.inner);
-        if pending {
-            let count = state
-                .orphan_cleanups
-                .entry(thread_id.to_owned())
-                .or_default();
-            *count = count.saturating_add(1);
-        } else if let Some(count) = state.orphan_cleanups.get_mut(thread_id) {
-            *count = count.saturating_sub(1);
-            if *count == 0 {
-                state.orphan_cleanups.remove(thread_id);
-            }
+        let current = state.entries.get(&transition.thread_id)?;
+        let watermark = state.latest_loss.get(&transition.thread_id)?;
+        if current.repository_key != transition.repository_key
+            || current.path_key != transition_key.path_key
+            || current.state != state_key
+            || watermark.generation != transition.generation
+        {
+            return None;
         }
+        state.next_cleanup_id = state.next_cleanup_id.wrapping_add(1).max(1);
+        let id = state.next_cleanup_id;
+        let cancellation = CancellationToken::new();
+        state.orphan_cleanups.insert(
+            id,
+            CleanupRecord {
+                transition: transition_key.clone(),
+                cancellation: cancellation.clone(),
+            },
+        );
+        Some(WorkspaceCleanupOwnership {
+            id,
+            transition: transition_key,
+            cancellation,
+        })
+    }
+
+    pub fn complete_orphan_cleanup(&self, ownership: &WorkspaceCleanupOwnership) {
+        let mut state = lock(&self.inner);
+        if state
+            .orphan_cleanups
+            .get(&ownership.id)
+            .is_some_and(|record| record.transition == ownership.transition)
+        {
+            state.orphan_cleanups.remove(&ownership.id);
+        }
+    }
+
+    #[must_use]
+    pub fn cleanup_is_current(&self, ownership: &WorkspaceCleanupOwnership) -> bool {
+        let state = lock(&self.inner);
+        !ownership.cancellation.is_cancelled()
+            && state
+                .orphan_cleanups
+                .get(&ownership.id)
+                .is_some_and(|record| record.transition == ownership.transition)
     }
 
     #[must_use]
@@ -484,8 +604,8 @@ impl WorkspaceAvailabilityRegistry {
         state.entries.contains_key(thread_id)
             && state
                 .orphan_cleanups
-                .get(thread_id)
-                .is_some_and(|count| *count > 0)
+                .values()
+                .any(|record| record.transition.thread_id == thread_id)
     }
 
     fn release_removal(&self, thread_id: &str, removal_id: u64) {
@@ -512,19 +632,55 @@ impl WorkspaceAvailabilityRegistry {
         }
     }
 
-    fn release_admission(&self, scopes: &[AdmissionScope]) {
+    fn release_admission(&self, admission_id: u64) {
         let mut state = lock(&self.inner);
-        for scope in scopes {
-            let remove = state.active_admissions.get_mut(scope).is_some_and(|count| {
-                *count = count.saturating_sub(1);
-                *count == 0
-            });
-            if remove {
-                state.active_admissions.remove(scope);
-            }
-        }
+        state.active_admissions.remove(&admission_id);
         drop(state);
         self.admission_changed.notify_waiters();
+    }
+}
+
+impl WorkspaceAdmissionCancellation {
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.token.is_cancelled()
+    }
+
+    pub async fn cancelled(&self) {
+        self.token.cancelled().await;
+    }
+
+    #[must_use]
+    pub fn cancellation_token(&self) -> CancellationToken {
+        self.token.clone()
+    }
+
+    #[must_use]
+    pub fn unavailable(&self) -> Option<WorkspaceUnavailable> {
+        lock(&self.unavailable).clone()
+    }
+
+    fn cancel(&self, unavailable: WorkspaceUnavailable) {
+        *lock(&self.unavailable) = Some(unavailable);
+        self.token.cancel();
+    }
+}
+
+impl WorkspaceAdmissionLease {
+    #[must_use]
+    pub fn loss_cancellation(&self) -> WorkspaceAdmissionCancellation {
+        self.loss_cancellation.clone()
+    }
+}
+
+impl WorkspaceCleanupOwnership {
+    pub async fn cancelled(&self) {
+        self.cancellation.cancelled().await;
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancellation.is_cancelled()
     }
 }
 
@@ -547,7 +703,7 @@ impl Drop for RemovalGuard {
 
 impl Drop for WorkspaceAdmissionLease {
     fn drop(&mut self) {
-        self.registry.release_admission(&self.scopes);
+        self.registry.release_admission(self.admission_id);
     }
 }
 
@@ -571,6 +727,19 @@ fn unavailable(entry: &GuardEntry) -> WorkspaceUnavailable {
         path: entry.path.clone(),
         availability: entry.state.availability(),
         state: entry.state,
+    }
+}
+
+fn invalidate_thread_cleanups(state: &mut RegistryState, thread_id: &str) {
+    let ids = state
+        .orphan_cleanups
+        .iter()
+        .filter_map(|(id, record)| (record.transition.thread_id == thread_id).then_some(*id))
+        .collect::<Vec<_>>();
+    for id in ids {
+        if let Some(record) = state.orphan_cleanups.remove(&id) {
+            record.cancellation.cancel();
+        }
     }
 }
 
@@ -827,6 +996,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn removing_synchronously_cancels_an_existing_path_admission() {
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let lease = registry
+            .acquire_admission("panel-1", [Path::new("/repo/worktrees/missing/src")])
+            .await
+            .expect("panel admission");
+        let cancellation = lease.loss_cancellation();
+
+        let _removal = registry
+            .mark_removing("thread-1", Path::new("/repo/worktrees/missing"))
+            .await;
+
+        assert!(cancellation.is_cancelled());
+        assert_eq!(
+            cancellation.unavailable().expect("removing error").state,
+            WorkspaceGuardState::Removing
+        );
+    }
+
+    #[tokio::test]
     async fn degraded_snapshot_is_a_no_op_and_authoritative_recovery_clears_exact_guard() {
         let registry = WorkspaceAvailabilityRegistry::new();
 
@@ -870,13 +1059,52 @@ mod tests {
                 ))
                 .await
         );
-        registry.set_orphan_cleanup_pending("thread-1", true).await;
-        registry.set_orphan_cleanup_pending("thread-1", true).await;
+        let transition = transition(
+            "repository-a",
+            14,
+            AdoptedWorktreeAvailability::MissingRegistered,
+        );
+        let first = registry
+            .begin_orphan_cleanup(&transition)
+            .expect("first cleanup ownership");
+        let second = registry
+            .begin_orphan_cleanup(&transition)
+            .expect("second cleanup ownership");
 
-        registry.set_orphan_cleanup_pending("thread-1", false).await;
+        registry.complete_orphan_cleanup(&first);
         assert!(registry.orphan_cleanup_pending("thread-1"));
 
-        registry.set_orphan_cleanup_pending("thread-1", false).await;
+        registry.complete_orphan_cleanup(&second);
+        assert!(!registry.orphan_cleanup_pending("thread-1"));
+    }
+
+    #[tokio::test]
+    async fn newer_loss_invalidates_older_active_or_saturated_cleanup_ownership() {
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let older = transition(
+            "repository-a",
+            15,
+            AdoptedWorktreeAvailability::MissingRegistered,
+        );
+        assert!(registry.mark_unavailable(older.clone()).await);
+        let active = registry
+            .begin_orphan_cleanup(&older)
+            .expect("active ownership");
+        let saturated = registry
+            .begin_orphan_cleanup(&older)
+            .expect("saturated ownership remains registered without a job");
+
+        let newer = transition(
+            "repository-a",
+            16,
+            AdoptedWorktreeAvailability::MissingUnregistered,
+        );
+        assert!(registry.mark_unavailable(newer).await);
+
+        assert!(active.is_cancelled());
+        assert!(saturated.is_cancelled());
+        assert!(!registry.cleanup_is_current(&active));
+        assert!(!registry.cleanup_is_current(&saturated));
         assert!(!registry.orphan_cleanup_pending("thread-1"));
     }
 
@@ -915,6 +1143,38 @@ mod tests {
                 .await
                 .is_err(),
             "the synchronously installed path guard rejects later panel admission",
+        );
+    }
+
+    #[tokio::test]
+    async fn loss_synchronously_cancels_an_earlier_admission() {
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let lease = registry
+            .acquire_admission("panel-1", [Path::new("/repo/worktrees/missing/src")])
+            .await
+            .expect("an available panel path is admitted");
+        let cancellation = lease.loss_cancellation();
+
+        assert!(
+            registry
+                .mark_unavailable(transition(
+                    "repository-a",
+                    16,
+                    AdoptedWorktreeAvailability::MissingRegistered,
+                ))
+                .await
+        );
+
+        assert!(
+            cancellation.is_cancelled(),
+            "guard installation must cancel the admitted operation before returning"
+        );
+        assert_eq!(
+            cancellation
+                .unavailable()
+                .expect("loss cancellation retains the structured boundary error")
+                .thread_id,
+            "thread-1"
         );
     }
 

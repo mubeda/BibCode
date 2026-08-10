@@ -167,7 +167,7 @@ impl ServerTerminalServices {
     }
 
     pub async fn launch_setup_script(&self, input: SetupScriptLaunch) -> Result<(), String> {
-        let _workspace_admission = acquire_terminal_start(
+        let workspace_admission = acquire_terminal_start(
             self.workspace_admission.as_ref(),
             &input.thread_id,
             &input.cwd.to_string_lossy(),
@@ -183,10 +183,22 @@ impl ServerTerminalServices {
         );
         terminal_input.worktree_path = Some(input.worktree_path);
         terminal_input.env = input.env;
-        self.terminal
-            .open_with_initial_input(terminal_input, format!("{}\r", input.command))
-            .await
-            .map_err(|error| error.to_string())?;
+        let publication_cancellation = workspace_admission
+            .as_ref()
+            .map_or_else(CancellationToken::new, |admission| {
+                admission.loss_cancellation().cancellation_token()
+            });
+        await_terminal_publication(
+            workspace_admission,
+            self.terminal
+                .open_with_initial_input_and_publication_cancellation(
+                    terminal_input,
+                    format!("{}\r", input.command),
+                    publication_cancellation,
+                ),
+        )
+        .await
+        .map_err(|error| error.to_string())?;
         Ok(())
     }
 }
@@ -388,15 +400,22 @@ fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalS
         let availability = availability.clone();
         async move {
             let input: TerminalStartPayload = decode_payload(&request.payload)?;
-            let _workspace_admission =
+            let workspace_admission =
                 acquire_terminal_start(availability.as_ref(), &input.thread_id, &input.cwd).await?;
-            terminal
-                .open(input.into_open(false)?)
-                .await
-                .map(|snapshot| {
-                    serde_json::to_value(snapshot).expect("terminal snapshot serializes")
-                })
-                .map_err(terminal_error)
+            let publication_cancellation = workspace_admission
+                .as_ref()
+                .map_or_else(CancellationToken::new, |admission| {
+                    admission.loss_cancellation().cancellation_token()
+                });
+            await_terminal_publication(
+                workspace_admission,
+                terminal.open_with_publication_cancellation(
+                    input.into_open(false)?,
+                    publication_cancellation,
+                ),
+            )
+            .await
+            .map(|snapshot| serde_json::to_value(snapshot).expect("terminal snapshot serializes"))
         }
     });
 
@@ -420,11 +439,21 @@ fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalS
                 Ok(input) => input,
                 Err(error) => { let _ = sender.send(Err(error)).await; return; }
             };
-            let mut attachment = match terminal.attach(input).await {
+            let publication_cancellation = workspace_admission
+                .as_ref()
+                .map_or_else(CancellationToken::new, |admission| {
+                    admission.loss_cancellation().cancellation_token()
+                });
+            let mut attachment = match await_terminal_publication(
+                workspace_admission,
+                terminal.attach_with_publication_cancellation(
+                    input,
+                    publication_cancellation,
+                ),
+            ).await {
                 Ok(attachment) => attachment,
-                Err(error) => { let _ = sender.send(Err(terminal_error(error))).await; return; }
+                Err(error) => { let _ = sender.send(Err(error)).await; return; }
             };
-            drop(workspace_admission);
             if sender.send(Ok(vec![json!({
                 "type": "snapshot",
                 "snapshot": attachment.initial,
@@ -496,15 +525,22 @@ fn register_terminal_rpcs(registry: &mut RpcRegistry, services: &ServerTerminalS
         let availability = availability.clone();
         async move {
             let input: TerminalStartPayload = decode_payload(&request.payload)?;
-            let _workspace_admission =
+            let workspace_admission =
                 acquire_terminal_start(availability.as_ref(), &input.thread_id, &input.cwd).await?;
-            terminal
-                .restart(input.into_open(true)?)
-                .await
-                .map(|snapshot| {
-                    serde_json::to_value(snapshot).expect("terminal snapshot serializes")
-                })
-                .map_err(terminal_error)
+            let publication_cancellation = workspace_admission
+                .as_ref()
+                .map_or_else(CancellationToken::new, |admission| {
+                    admission.loss_cancellation().cancellation_token()
+                });
+            await_terminal_publication(
+                workspace_admission,
+                terminal.restart_with_publication_cancellation(
+                    input.into_open(true)?,
+                    publication_cancellation,
+                ),
+            )
+            .await
+            .map(|snapshot| serde_json::to_value(snapshot).expect("terminal snapshot serializes"))
         }
     });
     register_terminal_unary(
@@ -605,6 +641,42 @@ async fn acquire_terminal_thread(
         .await
         .map(Some)
         .map_err(workspace_admission_error)
+}
+
+async fn await_terminal_publication<T, F>(
+    admission: Option<WorkspaceAdmissionLease>,
+    operation: F,
+) -> Result<T, Value>
+where
+    F: Future<Output = Result<T, TerminalError>>,
+{
+    let loss = admission
+        .as_ref()
+        .map(WorkspaceAdmissionLease::loss_cancellation);
+    let result = if let Some(loss) = &loss {
+        tokio::pin!(operation);
+        tokio::select! {
+            biased;
+            () = loss.cancelled() => {
+                let unavailable = loss
+                    .unavailable()
+                    .expect("workspace loss cancellation retains its error");
+                return Err(serde_json::to_value(unavailable)
+                    .expect("workspace unavailable error serializes"));
+            }
+            result = &mut operation => result,
+        }
+    } else {
+        operation.await
+    };
+    if matches!(result, Err(TerminalError::PublicationCancelled))
+        && let Some(unavailable) = loss.and_then(|loss| loss.unavailable())
+    {
+        return Err(
+            serde_json::to_value(unavailable).expect("workspace unavailable error serializes")
+        );
+    }
+    result.map_err(terminal_error)
 }
 
 fn workspace_admission_error(error: WorkspaceAdmissionError) -> Value {
@@ -1193,7 +1265,7 @@ fn terminal_metadata_to_wire(event: TerminalMetadataEvent) -> Value {
 
 fn terminal_error(error: TerminalError) -> Value {
     match error {
-        TerminalError::Shutdown => json!({
+        TerminalError::Shutdown | TerminalError::PublicationCancelled => json!({
             "_tag": "TerminalSpawnError",
             "reason": "Terminal manager is shut down.",
         }),

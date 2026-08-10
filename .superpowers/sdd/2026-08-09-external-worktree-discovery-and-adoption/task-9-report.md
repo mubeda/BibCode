@@ -9,6 +9,101 @@ with the exact structured `WorkspaceUnavailableError`, and runs bounded
 provider/terminal quiescence without deleting conversation or terminal
 history.
 
+## Fix round 2 — cancellation handoff and transition-scoped cleanup
+
+The second review follow-up closes the remaining cancellation/deadline gaps
+without changing an RPC schema or persisted event shape:
+
+- turn admission now crosses the RPC/engine queue boundary in a type-erased
+  `CommandLifetimeGuard`. Dropping or interrupting the client wait does not
+  release the workspace lease or cancel an already-admitted durable command.
+  Authoritative loss cancels the retained worker token at deterministic checks
+  before planning and immediately before persistence, so the worker cannot
+  create a receipt, message, or outbox row after guard installation;
+- every active admission carries the exact structured loss and a cancellation
+  token. Loss and removal cancel matching thread/path leases synchronously.
+  Terminal open, setup, restart, and restart-on-attach propagate that token
+  through spawn and manager publication. A late spawn remains owned by
+  `UncommittedPtyProcess`, is killed, and is never published;
+- provider routing/reconciliation and Git unary, stacked-action, and status
+  stream work select the same loss token. Git uses a child request token, so
+  loss cancels external work while the exact `WorkspaceUnavailableError` wins
+  publication;
+- the one five-second graceful deadline now begins at quiesce entry. Known
+  canonical provider/terminal cleanup and warning persistence start
+  immediately while persisted aliases resolve in parallel. A never-returning
+  resolver cannot consume the deadline before canonical cleanup is polled;
+- orphan ownership is keyed to the exact thread/repository/generation/path/state
+  transition. Exact recovery or a newer loss cancels stale queued, active, or
+  saturated ownership before it can affect recovered/newer sessions. Resolver
+  failure cleans the canonical owner immediately and leaves one owned retry
+  that re-resolves every alias;
+- every reaper job owns one fresh attempt with its own five-second deadline.
+  Timeout/error releases the shared permit and retains the marker rather than
+  looping indefinitely. Queue capacity remains 64, the shared observer/reaper
+  concurrency bound remains 16, and runtime shutdown cancels and drains every
+  queued/active future before provider and terminal owners stop.
+
+Deterministic RED evidence included: an interrupted RPC released its lease and
+the engine persisted a post-loss message; a never-released publication lease
+could delay loss indefinitely; canonical cleanup call count remained zero
+while alias resolution consumed the deadline; resolver failure had no complete
+repeatable alias cleanup; stale retries survived recovery/newer transitions;
+hung reapers monopolized every shared permit; and an already-spawned PTY could
+publish after loss. The paired disconnect characterization proves that RPC
+disconnect without workspace loss still commits and replays exactly as before,
+whereas disconnect followed by loss creates neither receipt nor message.
+
+Fix-round-2 focused matrix after the final self-review:
+
+```text
+worktree catalog/registry, including removal             58 passed
+workspace runtime/panel/history/reaper/deadline          16 passed
+terminal manager lifecycle/publication/history           28 passed
+terminal production RPC                                  12 passed
+orchestration engine                                     26 passed
+orchestration production RPC/replay                      15 passed
+Git/VCS production boundary                               4 passed
+shared missing-path normalization                         1 passed
+provider route publication fence                          1 passed
+```
+
+The Round 2 changes add no public error union or contract field. The existing
+generated RPC corpus therefore remains unchanged; fixture generation/parity is
+covered by the broad repository gates below rather than a schema regeneration.
+
+Fix-round-2 final gates:
+
+```text
+cargo test -p bibcode-server -j 2 -- --test-threads=1
+  library                                             1,036 passed
+  integrations before provider_terminal_supervisor      all passed
+  provider_terminal_supervisor                       96 passed, 1 failed
+
+isolated known provider-terminal timeout                     1 passed
+
+cargo test -p bibcode-server -j 2 -- --test-threads=1 \
+  --skip agent_activity_hung_factory_does_not_block_terminal_disable_or_later_settings_updates
+  every non-skipped library/integration/doc target          passed
+
+cargo fmt --all --check                                    passed
+cargo clippy -p bibcode-server --all-targets -- -D warnings
+                                                           passed
+vp check                              1,775 format / 1,309 lint files passed
+vp run typecheck                                         11/11 tasks passed
+rpcRustParity + Rust fixture exporter parity              7/7 passed
+```
+
+The only unskipped broad failure is the same unchanged two-second
+provider-terminal timeout documented in Fix Round 1, at
+`apps/server/tests/provider_terminal_supervisor.rs:8399`. Under the full serial
+load it returned `manager preparation timeout: Elapsed(())`; the immediate
+isolated exact rerun passed in 0.98 seconds. No file in that test's owner changed
+in this round. The exact-skip run then proved every other server target, while
+the isolated pass records the load-sensitive nature rather than hiding the
+failure. Typecheck again printed only the repository's existing non-failing
+Effect finite-number suggestions.
+
 ## Fix round 1 — review closure
 
 The review follow-up closes five concurrency/identity gaps without changing the
@@ -118,10 +213,11 @@ Effect finite-number suggestions.
   matching thread, normalized path, and physical repository. `removing` owns
   precedence and retains the newest matching missing state for restoration if
   the removal guard is released.
-- Pending orphan cleanup is counted per thread rather than represented by a
-  last-writer-wins boolean. One older reaper completion therefore cannot clear
-  a newer transition's pending marker. Queue saturation deliberately retains
-  both the guard and pending count.
+- Pending orphan cleanup is an exact transition-owned record rather than a
+  last-writer-wins thread boolean. One older reaper completion therefore
+  cannot clear a newer transition's pending marker, while recovery/newer loss
+  can cancel that exact stale owner. Queue saturation deliberately retains both
+  the guard and transition marker.
 - `WorktreeCatalogService` reconciles availability while its publication state
   is still locked and before `watch::send_replace`. The same ordering is used
   during initial catalog bootstrap, before the catalog entry/watch channel is
@@ -129,10 +225,11 @@ Effect finite-number suggestions.
   asynchronous runtime-loss observer invoked.
 - `apps/server/src/production/worktree_runtime.rs` owns warning persistence,
   provider stop, terminal quiescence, the five-second shared deadline, at most
-  16 initial concurrent quiesces, and the bounded 64-entry reaper queue.
-  Warning persistence and cleanup begin together; a failed or stalled warning
-  cannot delay cleanup or extend the five-second bound. `ProductionRuntime`
-  shuts the catalog before the reaper, then the provider and terminal owners.
+  16 concurrent observer/reaper attempts, and the bounded 64-entry reaper
+  queue. Warning persistence, canonical cleanup, and alias resolution begin
+  together; a failed/stalled warning or resolver cannot delay canonical
+  cleanup or extend the five-second bound. `ProductionRuntime` shuts the
+  catalog before the reaper, then the provider and terminal owners.
 
 ## Runtime preservation
 

@@ -161,6 +161,9 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   Persisted thread projections resolve ordinary and panel aliases to the same
   physical workspace, and short-lived server admission leases serialize new
   durable/process publication against authoritative loss and bounded cleanup.
+  Loss cancellation remains attached to queued engine work after an RPC caller
+  disconnects, and the runtime starts canonical cleanup immediately under one
+  five-second deadline while resolving any persisted aliases in parallel.
 - Capability negotiation controls optional behavior such as activity and
   preview automation; clients must downgrade when a server cannot prove support.
 - Host WebView engines differ by platform, so optional browser APIs are
