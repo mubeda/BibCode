@@ -9,6 +9,69 @@ with the exact structured `WorkspaceUnavailableError`, and runs bounded
 provider/terminal quiescence without deleting conversation or terminal
 history.
 
+## Fix round 5 — terminal-signal linearization
+
+The fifth review follow-up closes the remaining gap between WorktreeRuntime's
+last transition-current check and the terminal manager lifecycle lock. Exact
+session identity remains the terminal target authority, and the availability
+registry now also owns a counted terminal-signal gate for each exact guarded
+transition:
+
+- cleanup captures every exact terminal identity, then acquires an owned signal
+  permit that atomically revalidates the repository, path, availability state,
+  and catalog generation against the current guard;
+- recovery, removal, and a newer admitted loss invalidate that exact gate while
+  holding registry state. If invalidation linearizes first, a cleanup paused
+  after capture cannot acquire a permit or signal. If cleanup linearizes first,
+  invalidation waits until exact identity validation, process signaling, and
+  retained-history finalization release the permit;
+- the gate counts concurrent canonical and persisted-alias cleanup calls, so
+  invalidation cannot return after only one already-authorized signal finishes;
+- registry invalidation does not acquire a terminal lock, terminal cleanup does
+  not retain the registry lock while acquiring its permit or manager lifecycle
+  lock, and permit drop never re-enters the registry. Cancellation, cleanup
+  failure, panic unwinding, and the existing five-second outer deadline all
+  drop owned permits without adding a detached task or a second deadline.
+
+The strict RED added real TerminalManager-backed initial-cleanup, fresh-reaper,
+and cleanup-wins scenarios before the gate API existed; it failed to compile on
+the missing transition signal methods and WorktreeRuntime integration. GREEN
+uses deterministic notifications immediately before permit acquisition and
+immediately after the permit is owned. Recovery-wins tests preserve the same
+unchanged live session with zero kill attempts, successful write and attach,
+running status, and intact history for both initial cleanup and a fresh reaper
+retry. The cleanup-wins test pauses before the terminal lifecycle acquisition,
+proves recovery has reached and is waiting on exact gate invalidation, then
+confirms two captured sessions are killed, finalized as exited, and retain
+their separate histories before recovery returns. A later replacement remains
+running, writable, and attachable. A registry test independently proves that a
+newer loss waits for both of two current permits and rejects the stale
+transition afterward.
+
+Round 5 verification completed with the following evidence:
+
+- availability state owner: 14 passed;
+- WorktreeRuntime and reaper: 19 passed;
+- terminal manager: 29 passed;
+- production orchestration RPC units: 15 passed;
+- orchestration engine: 26 passed;
+- production orchestration RPC integration: 17 passed;
+- production server-terminal RPC integration: 12 passed;
+- worktree catalog integration: 9 passed;
+- production worktree catalog RPC integration: 18 passed;
+- full serial server library: 1,042 passed;
+- every server integration target passed. The known load-sensitive
+  `agent_activity_hung_factory_does_not_block_terminal_disable_or_later_settings_updates`
+  case was excluded from the combined provider-terminal run, which passed 96
+  tests, and then passed alone in 1.07 seconds;
+- `cargo fmt --all --check`, server all-targets Clippy with warnings denied,
+  `vp check`, and `vp run typecheck` passed. Typecheck emitted only the
+  repository's existing non-failing Effect Schema finite-number suggestions.
+
+No wire schema, persisted shape, migration, dependency, commit-fence,
+provider-identity, exact loss-publication, disconnect, reaper, or terminal
+history contract changed in this round.
+
 ## Fix round 4 — exact terminal cleanup and stable loss failures
 
 The fourth review follow-up closes the remaining terminal-selection and RPC

@@ -75,6 +75,10 @@ pub struct WorkspaceAvailabilityRegistry {
     admission_changed: Arc<Notify>,
     #[cfg(test)]
     finalization_rejection_pause: Arc<Mutex<Option<FinalizationRejectionPause>>>,
+    #[cfg(test)]
+    terminal_signal_before_permit_pause: Arc<Mutex<Option<TerminalSignalPermitPause>>>,
+    #[cfg(test)]
+    terminal_signal_after_permit_pause: Arc<Mutex<Option<TerminalSignalPermitPause>>>,
 }
 
 #[derive(Default)]
@@ -101,6 +105,7 @@ struct GuardEntry {
     path_key: String,
     path: String,
     state: WorkspaceGuardState,
+    terminal_signal: WorkspaceTerminalSignalGate,
     pending_missing: Option<PendingMissing>,
     removal_ids: HashSet<u64>,
 }
@@ -194,11 +199,35 @@ struct WorkspaceFinalizationPermit {
     gate: WorkspaceFinalizationGate,
 }
 
+#[derive(Clone, Default)]
+struct WorkspaceTerminalSignalGate {
+    inner: Arc<(Mutex<WorkspaceTerminalSignalState>, Condvar)>,
+    #[cfg(test)]
+    invalidation_started: Arc<Notify>,
+}
+
+#[derive(Default)]
+struct WorkspaceTerminalSignalState {
+    active_permits: usize,
+    invalidated: bool,
+}
+
+pub(crate) struct WorkspaceTerminalSignalPermit {
+    gate: WorkspaceTerminalSignalGate,
+}
+
 #[cfg(test)]
 #[derive(Clone)]
 pub(crate) struct FinalizationRejectionPause {
     entered: Arc<Notify>,
     release: Arc<(Mutex<bool>, Condvar)>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(crate) struct TerminalSignalPermitPause {
+    entered: Arc<Notify>,
+    release: Arc<Notify>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -364,6 +393,11 @@ impl WorkspaceAvailabilityRegistry {
         if !watermark.admit(transition.generation, guard_state) {
             return false;
         }
+        if let Some(entry) = state.entries.get(&transition.thread_id)
+            && entry.state != WorkspaceGuardState::Removing
+        {
+            entry.terminal_signal.invalidate_and_wait();
+        }
         invalidate_thread_cleanups(&mut state, &transition.thread_id);
 
         if let Some(entry) = state.entries.get_mut(&transition.thread_id)
@@ -392,6 +426,7 @@ impl WorkspaceAvailabilityRegistry {
                 path_key: path_key.clone(),
                 path: path.clone(),
                 state: guard_state,
+                terminal_signal: WorkspaceTerminalSignalGate::default(),
                 pending_missing: None,
                 removal_ids: HashSet::new(),
             },
@@ -447,6 +482,9 @@ impl WorkspaceAvailabilityRegistry {
                 released: false,
             };
         }
+        if let Some(entry) = state.entries.get(thread_id) {
+            entry.terminal_signal.invalidate_and_wait();
+        }
         let previous = state.entries.remove(thread_id);
         let pending_missing = previous.as_ref().and_then(|entry| {
             (entry.state != WorkspaceGuardState::Removing).then(|| PendingMissing {
@@ -468,6 +506,7 @@ impl WorkspaceAvailabilityRegistry {
                 path: path_key.clone(),
                 path_key: path_key.clone(),
                 state: WorkspaceGuardState::Removing,
+                terminal_signal: WorkspaceTerminalSignalGate::default(),
                 pending_missing,
                 removal_ids: HashSet::from([removal_id]),
             },
@@ -538,6 +577,7 @@ impl WorkspaceAvailabilityRegistry {
         if entry.state == WorkspaceGuardState::Removing {
             entry.pending_missing = None;
         } else {
+            entry.terminal_signal.invalidate_and_wait();
             state.entries.remove(thread_id);
         }
         invalidate_thread_cleanups(&mut state, thread_id);
@@ -667,6 +707,35 @@ impl WorkspaceAvailabilityRegistry {
                 .is_some_and(|watermark| watermark.generation == transition.generation)
     }
 
+    pub(crate) async fn begin_terminal_signal(
+        &self,
+        transition: &WorkspaceLossTransition,
+    ) -> Option<WorkspaceTerminalSignalPermit> {
+        #[cfg(test)]
+        self.maybe_pause_before_terminal_signal_permit().await;
+        let guard_state = transition.guard_state()?;
+        let path_key = normalized_path(&transition.path);
+        let terminal_signal = {
+            let state = lock(&self.inner);
+            let entry = state.entries.get(&transition.thread_id)?;
+            if entry.repository_key != transition.repository_key
+                || entry.path_key != path_key
+                || entry.state != guard_state
+                || !state
+                    .latest_loss
+                    .get(&transition.thread_id)
+                    .is_some_and(|watermark| watermark.generation == transition.generation)
+            {
+                return None;
+            }
+            entry.terminal_signal.clone()
+        };
+        let permit = terminal_signal.begin()?;
+        #[cfg(test)]
+        self.maybe_pause_after_terminal_signal_permit().await;
+        Some(permit)
+    }
+
     #[cfg(test)]
     pub(crate) fn pause_after_next_finalization_rejection(&self) -> FinalizationRejectionPause {
         let pause = FinalizationRejectionPause {
@@ -682,6 +751,55 @@ impl WorkspaceAvailabilityRegistry {
         let pause = lock(&self.finalization_rejection_pause).take();
         if let Some(pause) = pause {
             pause.block_until_released();
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_before_next_terminal_signal_permit(&self) -> TerminalSignalPermitPause {
+        let pause = TerminalSignalPermitPause::new();
+        *lock(&self.terminal_signal_before_permit_pause) = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_after_next_terminal_signal_permit(&self) -> TerminalSignalPermitPause {
+        let pause = TerminalSignalPermitPause::new();
+        *lock(&self.terminal_signal_after_permit_pause) = Some(pause.clone());
+        pause
+    }
+
+    #[cfg(test)]
+    pub(crate) fn terminal_signal_invalidation_notification(
+        &self,
+        transition: &WorkspaceLossTransition,
+    ) -> Option<Arc<Notify>> {
+        let guard_state = transition.guard_state()?;
+        let path_key = normalized_path(&transition.path);
+        let state = lock(&self.inner);
+        let entry = state.entries.get(&transition.thread_id)?;
+        (entry.repository_key == transition.repository_key
+            && entry.path_key == path_key
+            && entry.state == guard_state
+            && state
+                .latest_loss
+                .get(&transition.thread_id)
+                .is_some_and(|watermark| watermark.generation == transition.generation))
+        .then(|| entry.terminal_signal.invalidation_started.clone())
+    }
+
+    #[cfg(test)]
+    async fn maybe_pause_before_terminal_signal_permit(&self) {
+        let pause = lock(&self.terminal_signal_before_permit_pause).take();
+        if let Some(pause) = pause {
+            pause.pause().await;
+        }
+    }
+
+    #[cfg(test)]
+    async fn maybe_pause_after_terminal_signal_permit(&self) {
+        let pause = lock(&self.terminal_signal_after_permit_pause).take();
+        if let Some(pause) = pause {
+            pause.pause().await;
         }
     }
 
@@ -735,6 +853,7 @@ impl WorkspaceAvailabilityRegistry {
             entry.path_key = pending.path_key;
             entry.path = pending.path;
             entry.state = pending.state;
+            entry.terminal_signal = WorkspaceTerminalSignalGate::default();
             entry.removal_ids.clear();
             state.entries.insert(thread_id.to_owned(), entry);
         }
@@ -799,6 +918,31 @@ impl FinalizationRejectionPause {
                 .wait(released)
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
         }
+    }
+}
+
+#[cfg(test)]
+impl TerminalSignalPermitPause {
+    fn new() -> Self {
+        Self {
+            entered: Arc::new(Notify::new()),
+            release: Arc::new(Notify::new()),
+        }
+    }
+
+    pub(crate) async fn wait_until_entered(&self) {
+        tokio::time::timeout(std::time::Duration::from_secs(1), self.entered.notified())
+            .await
+            .expect("terminal signal permit pause is entered");
+    }
+
+    pub(crate) fn release(&self) {
+        self.release.notify_one();
+    }
+
+    async fn pause(&self) {
+        self.entered.notify_one();
+        self.release.notified().await;
     }
 }
 
@@ -868,9 +1012,57 @@ impl WorkspaceFinalizationGate {
     }
 }
 
+impl WorkspaceTerminalSignalGate {
+    fn begin(&self) -> Option<WorkspaceTerminalSignalPermit> {
+        let (state, _) = self.inner.as_ref();
+        let mut state = lock(state);
+        if state.invalidated {
+            return None;
+        }
+        state.active_permits = state
+            .active_permits
+            .checked_add(1)
+            .expect("workspace terminal signal permit count overflow");
+        Some(WorkspaceTerminalSignalPermit { gate: self.clone() })
+    }
+
+    fn invalidate_and_wait(&self) {
+        let (state, changed) = self.inner.as_ref();
+        let mut state = lock(state);
+        state.invalidated = true;
+        #[cfg(test)]
+        self.invalidation_started.notify_one();
+        while state.active_permits > 0 {
+            state = changed
+                .wait(state)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+        }
+    }
+
+    fn finish_signal(&self) {
+        let (state, changed) = self.inner.as_ref();
+        let mut state = lock(state);
+        state.active_permits = state
+            .active_permits
+            .checked_sub(1)
+            .expect("workspace terminal signal permit underflow");
+        let signal_drained = state.active_permits == 0;
+        drop(state);
+        if signal_drained {
+            changed.notify_all();
+        }
+    }
+}
+
 impl Drop for WorkspaceFinalizationPermit {
     fn drop(&mut self) {
         self.gate.finish_finalization();
+    }
+}
+
+impl Drop for WorkspaceTerminalSignalPermit {
+    fn drop(&mut self) {
+        self.gate.finish_signal();
     }
 }
 
@@ -1307,6 +1499,63 @@ mod tests {
         assert!(!registry.cleanup_is_current(&active));
         assert!(!registry.cleanup_is_current(&saturated));
         assert!(!registry.orphan_cleanup_pending("thread-1"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn newer_loss_waits_for_all_current_terminal_signal_permits() {
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let older = transition(
+            "repository-a",
+            16,
+            AdoptedWorktreeAvailability::MissingRegistered,
+        );
+        assert!(registry.mark_unavailable(older.clone()).await);
+        let first = registry
+            .begin_terminal_signal(&older)
+            .await
+            .expect("first terminal signal permit");
+        let second = registry
+            .begin_terminal_signal(&older)
+            .await
+            .expect("second terminal signal permit");
+        let invalidation_started = registry
+            .terminal_signal_invalidation_notification(&older)
+            .expect("current terminal signal gate");
+
+        let newer = transition(
+            "repository-a",
+            17,
+            AdoptedWorktreeAvailability::MissingUnregistered,
+        );
+        let newer_registry = registry.clone();
+        let newer_transition = newer.clone();
+        let newer_loss = tokio::task::spawn_blocking(move || {
+            newer_registry.mark_unavailable_sync(newer_transition)
+        });
+
+        tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            invalidation_started.notified(),
+        )
+        .await
+        .expect("the newer transition invalidates the old signal gate");
+        drop(first);
+        assert!(
+            !newer_loss.is_finished(),
+            "the newer transition waits for every current signal permit"
+        );
+        drop(second);
+        assert!(
+            newer_loss.await.expect("newer loss task"),
+            "the newer transition installs after terminal signaling finishes"
+        );
+        assert!(registry.begin_terminal_signal(&older).await.is_none());
+        drop(
+            registry
+                .begin_terminal_signal(&newer)
+                .await
+                .expect("new transition signal permit"),
+        );
     }
 
     #[tokio::test]
