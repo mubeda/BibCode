@@ -19,7 +19,11 @@ import { EnvironmentRegistry } from "../connection/registry.ts";
 import type { SupervisorConnectionState } from "../connection/model.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import { safeErrorLogAttributes } from "../errors/safeLog.ts";
-import { EnvironmentCacheStore } from "../platform/persistence.ts";
+import {
+  type ConnectionCatalogHealth,
+  ConnectionCatalogHealthStore,
+  EnvironmentCacheStore,
+} from "../platform/persistence.ts";
 import { subscribeInSession } from "../rpc/client.ts";
 import type { RpcSession } from "../rpc/session.ts";
 import { applyShellStreamEvent } from "./shellReducer.ts";
@@ -311,6 +315,7 @@ export function shellStateChanges(environmentId: EnvironmentId) {
 }
 
 export interface EnvironmentShellSummary {
+  readonly catalogHealth: ConnectionCatalogHealth;
   readonly catalogReady: boolean;
   readonly desiredEnvironmentCount: number;
   readonly statuses: ReadonlyArray<EnvironmentShellAvailability>;
@@ -331,6 +336,7 @@ export interface EnvironmentShellAvailability {
 }
 
 const EMPTY_ENVIRONMENT_SHELL_SUMMARY: EnvironmentShellSummary = Object.freeze({
+  catalogHealth: Object.freeze({ status: "ready" }),
   catalogReady: false,
   desiredEnvironmentCount: 0,
   statuses: Object.freeze([]),
@@ -350,6 +356,10 @@ function shellSummariesEqual(
   right: EnvironmentShellSummary,
 ): boolean {
   return (
+    left.catalogHealth.status === right.catalogHealth.status &&
+    (left.catalogHealth.status === "ready" ||
+      (right.catalogHealth.status === "recovery-required" &&
+        left.catalogHealth.message === right.catalogHealth.message)) &&
     left.catalogReady === right.catalogReady &&
     left.desiredEnvironmentCount === right.desiredEnvironmentCount &&
     left.canShowEmptyProjects === right.canShowEmptyProjects &&
@@ -387,11 +397,16 @@ function mapsEqual<K, V>(left: ReadonlyMap<K, V>, right: ReadonlyMap<K, V>): boo
 
 export function createEnvironmentShellSummaryAtom(input: {
   readonly catalogValueAtom: Atom.Atom<EnvironmentCatalogState>;
+  readonly catalogHealthAtom?: Atom.Atom<ConnectionCatalogHealth>;
   readonly shellStateValueAtom: (environmentId: EnvironmentId) => Atom.Atom<EnvironmentShellState>;
 }) {
   let previousSummary = EMPTY_ENVIRONMENT_SHELL_SUMMARY;
   return Atom.make((get) => {
     const catalog = get(input.catalogValueAtom);
+    const catalogHealth =
+      input.catalogHealthAtom === undefined
+        ? ({ status: "ready" } as const)
+        : get(input.catalogHealthAtom);
     const statuses: EnvironmentShellAvailability[] = [];
     let hasSnapshot = false;
     let hasSynchronizingShell = false;
@@ -425,10 +440,12 @@ export function createEnvironmentShellSummaryAtom(input: {
     }
 
     const next: EnvironmentShellSummary = {
+      catalogHealth,
       catalogReady: catalog.isReady,
       desiredEnvironmentCount: catalog.entries.size,
       statuses,
       canShowEmptyProjects:
+        catalogHealth.status === "ready" &&
         catalog.isReady &&
         statuses.length > 0 &&
         statuses.every((status) => status.status === "live" && status.hasSnapshot),
@@ -445,6 +462,22 @@ export function createEnvironmentShellSummaryAtom(input: {
     previousSummary = next;
     return previousSummary;
   }).pipe(Atom.withLabel("environment-shell-summary"));
+}
+
+export function createConnectionCatalogHealthAtom<R, E>(
+  runtime: Atom.AtomRuntime<ConnectionCatalogHealthStore | R, E>,
+) {
+  const healthAtom = runtime.atom(
+    Stream.unwrap(
+      ConnectionCatalogHealthStore.pipe(
+        Effect.map((store) => SubscriptionRef.changes(store.state)),
+      ),
+    ),
+    { initialValue: { status: "ready" } as ConnectionCatalogHealth },
+  );
+  return Atom.make((get) =>
+    Option.getOrElse(AsyncResult.value(get(healthAtom)), () => ({ status: "ready" }) as const),
+  ).pipe(Atom.withLabel("connection-catalog-health-value"));
 }
 
 export function createEnvironmentServerConfigsAtom(input: {

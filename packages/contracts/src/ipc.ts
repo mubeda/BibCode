@@ -493,6 +493,16 @@ export const DesktopWslDistroSchema = Schema.Struct({
   version: Schema.Literals([1, 2]),
 });
 
+export interface DesktopWslPreflightError {
+  kind: "wsl-primary-unavailable";
+  detail: string;
+}
+
+export const DesktopWslPreflightErrorSchema = Schema.Struct({
+  kind: Schema.Literal("wsl-primary-unavailable"),
+  detail: Schema.String,
+});
+
 export interface DesktopWslState {
   // True when the user has opted the WSL backend in; the actual backend
   // process is registered with the desktop pool independently of this
@@ -507,11 +517,9 @@ export interface DesktopWslState {
   // primary backend's spec is captured once at layer init.
   wslOnly: boolean;
   distros: readonly DesktopWslDistro[];
-  // Reason the dual-mode WSL backend last failed preflight (no node, wrong
-  // version, missing build tools), or null. Surfaced inline in Connections
-  // settings. Always null in wsl-only mode — that path shows a dialog and
-  // falls back to Windows instead.
-  preflightError: string | null;
+  // A structured WSL-primary planning failure. In this state no native
+  // Windows primary has been substituted. null means planning has not failed.
+  preflightError: DesktopWslPreflightError | null;
 }
 
 export const DesktopWslStateSchema = Schema.Struct({
@@ -520,7 +528,7 @@ export const DesktopWslStateSchema = Schema.Struct({
   available: Schema.Boolean,
   wslOnly: Schema.Boolean,
   distros: Schema.Array(DesktopWslDistroSchema),
-  preflightError: Schema.NullOr(Schema.String),
+  preflightError: Schema.NullOr(DesktopWslPreflightErrorSchema),
 });
 
 /**

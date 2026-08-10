@@ -8,6 +8,7 @@ import {
   TriangleAlertIcon,
 } from "lucide-react";
 import { useAuth } from "@clerk/react";
+import { Link } from "@tanstack/react-router";
 import { type ReactNode, memo, useCallback, useEffect, useMemo, useState } from "react";
 import {
   AuthAccessReadScope,
@@ -2867,6 +2868,16 @@ export function ConnectionsSettings() {
     refreshDesktopWslState();
   }, []);
 
+  const retryWslPrimary = useCallback(() => {
+    if (!desktopBridge || !desktopWslState) return;
+    void applyWslSettingChange(() => desktopBridge.setWslDistro(desktopWslState.distro));
+  }, [applyWslSettingChange, desktopBridge, desktopWslState]);
+
+  const switchPrimaryToWindows = useCallback(() => {
+    if (!desktopBridge || !desktopWslState?.wslOnly) return;
+    void applyWslSettingChange(() => desktopBridge.setWslOnly(false));
+  }, [applyWslSettingChange, desktopBridge, desktopWslState]);
+
   // True when a desktop-local WSL backend is currently registered as an
   // environment on this machine. We use this as a proxy for "the user has work
   // that lives on the WSL side": if WSL has connected in a way that registered
@@ -3018,32 +3029,42 @@ export function ConnectionsSettings() {
       }
       return null;
     }
-    // WSL went unavailable while the user still has the WSL backend persisted
-    // (it may have been uninstalled or its distro removed). The desktop side
-    // falls back to the Windows backend, but the normal distro picker needs a
-    // live distro list it no longer has. Without a control here the user would
-    // be stranded on a WSL preference they can't clear, so render a recovery
-    // row that switches back to Windows. When WSL is unavailable AND unused,
-    // there's nothing to recover — keep the section hidden as before.
+    // WSL went unavailable while the user still has the WSL backend persisted.
+    // WSL-only mode stays failed closed: the desktop does not substitute a
+    // Windows primary until the user explicitly chooses that recovery action.
     if (!desktopWslState.available) {
       if (!desktopWslState.enabled && !desktopWslState.wslOnly) return null;
       return (
         <SettingsRow
           title="WSL backend"
-          description="WSL is no longer available, so the Windows backend is running instead. Switch off the WSL backend to clear this preference."
+          description="WSL is unavailable and no Windows backend was substituted. Retry WSL or explicitly switch primary execution to Windows."
           status={
             desktopWslError ? (
               <span className="block text-destructive">{desktopWslError}</span>
             ) : null
           }
           control={
-            <Button
-              variant="outline"
-              disabled={isUpdatingWslBackend}
-              onClick={() => handleSelectWslMode(BACKEND_VALUE_WSL_OFF)}
-            >
-              Switch to Windows
-            </Button>
+            <div className="flex flex-wrap justify-end gap-1">
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={isUpdatingWslBackend}
+                onClick={retryWslPrimary}
+              >
+                Retry WSL
+              </Button>
+              <Button render={<Link to="/settings/diagnostics" />} size="xs" variant="ghost">
+                View diagnostics
+              </Button>
+              <Button
+                size="xs"
+                variant="outline"
+                disabled={isUpdatingWslBackend}
+                onClick={switchPrimaryToWindows}
+              >
+                Switch to Windows
+              </Button>
+            </div>
           }
         />
       );
@@ -3067,13 +3088,17 @@ export function ConnectionsSettings() {
       <>
         <SettingsRow
           title="WSL backend"
-          description="Run a second backend inside a WSL distro alongside the Windows one. Pick a distro to start it; pick Off to stop it. Projects opened against the WSL backend live on the Linux side; Windows projects stay where they are."
+          description={
+            desktopWslState.preflightError?.kind === "wsl-primary-unavailable"
+              ? "WSL is unavailable and no Windows backend was substituted."
+              : "Run a second backend inside a WSL distro alongside the Windows one. Pick a distro to start it; pick Off to stop it. Projects opened against the WSL backend live on the Linux side; Windows projects stay where they are."
+          }
           status={
             desktopWslError ? (
               <span className="block text-destructive">{desktopWslError}</span>
-            ) : desktopWslState.preflightError ? (
+            ) : desktopWslState.preflightError?.kind === "wsl-primary-unavailable" ? (
               <span className="block text-destructive">
-                WSL backend couldn't start: {desktopWslState.preflightError}
+                WSL backend couldn't start: {desktopWslState.preflightError.detail}
               </span>
             ) : null
           }
@@ -3112,6 +3137,36 @@ export function ConnectionsSettings() {
             </Select>
           }
         />
+        {desktopWslState.preflightError?.kind === "wsl-primary-unavailable" ? (
+          <SettingsRow
+            title="WSL recovery"
+            description="Retry the selected distro, inspect diagnostics, or explicitly switch primary execution to Windows."
+            className="bg-muted/20 pl-7 sm:pl-8"
+            control={
+              <div className="flex flex-wrap justify-end gap-1">
+                <Button
+                  size="xs"
+                  variant="outline"
+                  disabled={isUpdatingWslBackend}
+                  onClick={retryWslPrimary}
+                >
+                  Retry WSL
+                </Button>
+                <Button render={<Link to="/settings/diagnostics" />} size="xs" variant="ghost">
+                  View diagnostics
+                </Button>
+                <Button
+                  size="xs"
+                  variant="outline"
+                  disabled={isUpdatingWslBackend}
+                  onClick={switchPrimaryToWindows}
+                >
+                  Switch to Windows
+                </Button>
+              </div>
+            }
+          />
+        ) : null}
         {desktopWslState.enabled ? (
           <SettingsRow
             title="WSL only"

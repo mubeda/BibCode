@@ -1,5 +1,7 @@
 import {
   AcceptedStorageIdentityStore,
+  type ConnectionCatalogHealth,
+  ConnectionCatalogHealthStore,
   ConnectionCatalogDocument,
   type ConnectionCatalogDocument as ConnectionCatalogDocumentType,
   ConnectionPersistenceError,
@@ -28,7 +30,9 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
+import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 
 const DATABASE_NAME = "bibcode:connection-runtime";
 const DATABASE_VERSION = 2;
@@ -37,6 +41,8 @@ const SHELL_STORE_NAME = "shell";
 const THREAD_STORE_NAME = "thread";
 const CATALOG_KEY = "document";
 const MAX_CATALOG_COMPARE_AND_SET_ATTEMPTS = 8;
+const CORRUPT_CATALOG_MESSAGE =
+  "The connection catalog is corrupt and must be reset before it can be changed.";
 const SHELL_SNAPSHOT_CACHE_SCHEMA_VERSION = 1;
 
 const StoredShellSnapshot = Schema.Struct({
@@ -95,6 +101,13 @@ function storageIdentityPersistenceError(
       operation === "load-storage-identity"
         ? "Could not load the accepted storage identity."
         : "Could not accept the reported storage identity.",
+  });
+}
+
+function catalogResetPersistenceError() {
+  return new ConnectionPersistenceError({
+    operation: "reset-connection-catalog",
+    message: "Could not reset the connection catalog.",
   });
 }
 
@@ -440,7 +453,9 @@ const migrateLegacyRendererCatalog = Effect.fn(
 });
 
 interface CatalogStore {
+  readonly health: SubscriptionRef.SubscriptionRef<ConnectionCatalogHealth>;
   readonly read: Effect.Effect<ConnectionCatalogDocumentType, ConnectionTransientError>;
+  readonly reset: Effect.Effect<void, ConnectionTransientError>;
   readonly update: (
     transform: (catalog: ConnectionCatalogDocumentType) => ConnectionCatalogDocumentType,
   ) => Effect.Effect<void, ConnectionTransientError>;
@@ -454,65 +469,79 @@ interface CatalogStore {
   ) => Effect.Effect<A, ConnectionTransientError>;
 }
 
-export const makeCatalogStore = Effect.fn("web.connectionStorage.makeCatalogStore")(function (
+export const makeCatalogStore = Effect.fn("web.connectionStorage.makeCatalogStore")(function* (
   backend: CatalogBackend,
 ) {
-  const loadVersion = Effect.fn("web.connectionStorage.loadCatalog")(function* () {
-    for (let attempt = 0; attempt < MAX_CATALOG_COMPARE_AND_SET_ATTEMPTS; attempt += 1) {
-      const raw = yield* backend.read;
-      if (raw === null || raw.trim() === "") {
-        return { raw, document: EMPTY_CONNECTION_CATALOG_DOCUMENT } as const;
-      }
+  const health = yield* SubscriptionRef.make<ConnectionCatalogHealth>({ status: "ready" });
+  const quarantinedRevision = yield* Ref.make<string | null>(null);
 
-      const decoded = yield* decodeCatalog(raw).pipe(
-        Effect.map(Option.some),
-        Effect.catch((error) =>
-          Effect.logWarning("Discarding a corrupt web connection catalog.", {
-            error: error.message,
-          }).pipe(Effect.as(Option.none<ConnectionCatalogDocumentType>())),
-        ),
-      );
-      if (Option.isSome(decoded)) {
-        return { raw, document: decoded.value } as const;
-      }
-
-      if (backend.quarantine !== undefined) {
-        yield* backend.quarantine(raw).pipe(
-          Effect.catch((cause) =>
-            Effect.logWarning("Could not quarantine the corrupt web connection catalog.", {
-              error: cause.message,
-            }),
+  const enterRecovery = Effect.fn("web.connectionStorage.enterCatalogRecovery")(function* (
+    raw: string,
+  ) {
+    const priorRevision = yield* Ref.get(quarantinedRevision);
+    if (priorRevision !== raw && backend.quarantine !== undefined) {
+      yield* backend
+        .quarantine(raw)
+        .pipe(
+          Effect.catch(() =>
+            Effect.logWarning("Could not quarantine the corrupt web connection catalog."),
           ),
         );
-      }
-      const recoveredRaw = yield* encodeCatalog(EMPTY_CONNECTION_CATALOG_DOCUMENT);
-      const recovered = yield* Effect.uninterruptible(
-        backend.compareAndSet(raw, recoveredRaw),
-      ).pipe(
-        Effect.map(Option.some),
-        Effect.catch((cause) =>
-          Effect.logWarning("Could not persist the recovered web connection catalog.", {
-            error: cause.message,
-          }).pipe(Effect.as(Option.none<boolean>())),
-        ),
-      );
-      if (Option.isNone(recovered)) {
-        return { raw, document: EMPTY_CONNECTION_CATALOG_DOCUMENT } as const;
-      }
-      if (recovered.value) {
-        return { raw: recoveredRaw, document: EMPTY_CONNECTION_CATALOG_DOCUMENT } as const;
-      }
-      yield* Effect.yieldNow;
+    }
+    yield* Ref.set(quarantinedRevision, raw);
+    yield* SubscriptionRef.set(health, {
+      status: "recovery-required",
+      message: CORRUPT_CATALOG_MESSAGE,
+    });
+  });
+
+  const leaveRecovery = Effect.gen(function* () {
+    yield* Ref.set(quarantinedRevision, null);
+    yield* SubscriptionRef.set(health, { status: "ready" });
+  });
+
+  const loadVersion = Effect.fn("web.connectionStorage.loadCatalog")(function* () {
+    const raw = yield* backend.read;
+    const currentHealth = yield* SubscriptionRef.get(health);
+    if (raw === null || raw.trim() === "") {
+      return {
+        raw,
+        document: EMPTY_CONNECTION_CATALOG_DOCUMENT,
+        recoveryRequired: currentHealth.status === "recovery-required",
+      } as const;
     }
 
-    return yield* catalogError("load", "The connection catalog changed too many times.");
+    const decoded = yield* decodeCatalog(raw).pipe(
+      Effect.map(Option.some),
+      Effect.catch(() =>
+        Effect.logWarning("The web connection catalog requires recovery.").pipe(
+          Effect.as(Option.none<ConnectionCatalogDocumentType>()),
+        ),
+      ),
+    );
+    if (Option.isSome(decoded)) {
+      if (currentHealth.status === "recovery-required") {
+        yield* leaveRecovery;
+      }
+      return { raw, document: decoded.value, recoveryRequired: false } as const;
+    }
+
+    yield* enterRecovery(raw);
+    return {
+      raw,
+      document: EMPTY_CONNECTION_CATALOG_DOCUMENT,
+      recoveryRequired: true,
+    } as const;
   });
 
   const read = loadVersion().pipe(Effect.map(({ document }) => document));
   const modify: CatalogStore["modify"] = Effect.fn("web.connectionStorage.modifyCatalog")(
     function* (transform) {
       for (let attempt = 0; attempt < MAX_CATALOG_COMPARE_AND_SET_ATTEMPTS; attempt += 1) {
-        const { raw, document } = yield* loadVersion();
+        const { raw, document, recoveryRequired } = yield* loadVersion();
+        if (recoveryRequired) {
+          return yield* catalogError("update", CORRUPT_CATALOG_MESSAGE);
+        }
         const transition = transform(document);
         const updated =
           transition.mutation._tag === "Keep"
@@ -534,7 +563,31 @@ export const makeCatalogStore = Effect.fn("web.connectionStorage.makeCatalogStor
       result: undefined,
     }));
 
-  return Effect.succeed({ modify, read, update } satisfies CatalogStore);
+  const reset = Effect.uninterruptible(
+    Effect.gen(function* () {
+      const emptyRaw = yield* encodeCatalog(EMPTY_CONNECTION_CATALOG_DOCUMENT);
+      for (let attempt = 0; attempt < MAX_CATALOG_COMPARE_AND_SET_ATTEMPTS; attempt += 1) {
+        const raw = yield* backend.read;
+        if (raw !== null && raw.trim() !== "") {
+          const decoded = yield* decodeCatalog(raw).pipe(Effect.option);
+          if (Option.isSome(decoded)) {
+            yield* leaveRecovery;
+            return;
+          }
+          yield* enterRecovery(raw);
+        }
+
+        if (yield* backend.compareAndSet(raw, emptyRaw)) {
+          yield* leaveRecovery;
+          return;
+        }
+        yield* Effect.yieldNow;
+      }
+      return yield* catalogError("reset", "The connection catalog changed too many times.");
+    }),
+  ).pipe(Effect.withSpan("web.connectionStorage.resetCatalog"));
+
+  return { health, modify, read, reset, update } satisfies CatalogStore;
 });
 
 export const connectionStorageLayer = Layer.effectContext(
@@ -545,6 +598,11 @@ export const connectionStorageLayer = Layer.effectContext(
     const backend = makeCatalogBackend(database);
     yield* migrateLegacyRendererCatalog(backend);
     const catalog = yield* makeCatalogStore(backend);
+
+    const catalogHealthStore = ConnectionCatalogHealthStore.of({
+      state: catalog.health,
+      reset: catalog.reset.pipe(Effect.mapError(catalogResetPersistenceError)),
+    });
 
     const targetStore = ConnectionTargetStore.of({
       list: catalog.read.pipe(
@@ -804,6 +862,7 @@ export const connectionStorageLayer = Layer.effectContext(
       Context.add(CredentialStore.ConnectionCredentialStore, credentialStore),
       Context.add(TokenStore.RemoteDpopAccessTokenStore, remoteTokenStore),
       Context.add(AcceptedStorageIdentityStore, acceptedStorageIdentityStore),
+      Context.add(ConnectionCatalogHealthStore, catalogHealthStore),
       Context.add(EnvironmentCacheStore, cacheStore),
     );
   }),

@@ -8,6 +8,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 
 import type { ConnectionRegistration } from "../connection/catalog.ts";
 import type { ConnectionTarget } from "../connection/model.ts";
@@ -27,6 +28,7 @@ export class ConnectionPersistenceError extends Schema.TaggedErrorClass<Connecti
       "clear-environment",
       "load-storage-identity",
       "accept-storage-identity",
+      "reset-connection-catalog",
     ]),
     message: Schema.String,
   },
@@ -88,6 +90,18 @@ export class AcceptedStorageIdentityStore extends Context.Service<
     ) => Effect.Effect<A, ConnectionPersistenceError>;
   }
 >()("@bibcode/client-runtime/platform/persistence/AcceptedStorageIdentityStore") {}
+
+export type ConnectionCatalogHealth =
+  | { readonly status: "ready" }
+  | { readonly status: "recovery-required"; readonly message: string };
+
+export class ConnectionCatalogHealthStore extends Context.Service<
+  ConnectionCatalogHealthStore,
+  {
+    readonly state: SubscriptionRef.SubscriptionRef<ConnectionCatalogHealth>;
+    readonly reset: Effect.Effect<void, ConnectionPersistenceError>;
+  }
+>()("@bibcode/client-runtime/platform/persistence/ConnectionCatalogHealthStore") {}
 
 export class EnvironmentCacheStore extends Context.Service<
   EnvironmentCacheStore,

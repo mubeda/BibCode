@@ -69,7 +69,10 @@ describe("desktopWslState", () => {
   it("replaces cached state with refreshed live desktop state", async () => {
     const refreshedState: DesktopWslState = {
       ...wslState,
-      preflightError: "WSL backend stopped unexpectedly.",
+      preflightError: {
+        kind: "wsl-primary-unavailable",
+        detail: "WSL backend stopped unexpectedly.",
+      },
     };
     let currentState = wslState;
     const getWslState = vi.fn(async () => currentState);

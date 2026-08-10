@@ -141,6 +141,14 @@ Verify a custom binary from Windows with:
 wsl.exe -d <distribution> -- /path/to/bibcode --version
 ```
 
+When **WSL only** is enabled, a missing distribution, binary, or failed WSL
+startup leaves the local backend unavailable; the desktop does not silently
+start the Windows backend. In **Settings → Connections**, choose another
+distribution or **Retry WSL** after correcting the prerequisite. Use
+**Diagnostics** to save diagnostic logs. **Switch to Windows** is the explicit
+way to make the native Windows backend primary; the normal restart and storage
+identity checks then apply.
+
 ## Security notes
 
 - Bind the server only to a trusted private address.

@@ -3744,9 +3744,10 @@ export default function Sidebar() {
       resolveSidebarProjectAvailability({
         projectCount: projects.length,
         catalogReady: shellSummary.catalogReady,
+        catalogHealth: shellSummary.catalogHealth,
         environments: shellSummary.statuses,
       }),
-    [projects.length, shellSummary.catalogReady, shellSummary.statuses],
+    [projects.length, shellSummary.catalogHealth, shellSummary.catalogReady, shellSummary.statuses],
   );
   const handleRetryProjectEnvironment = useCallback(
     (environmentId: EnvironmentId) => {

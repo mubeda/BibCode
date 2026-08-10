@@ -68,9 +68,12 @@ same raw revision without encoding or writing a document. A conflict rereads
 and reapplies either transition, with a bounded eight-attempt limit and a
 cooperative yield between conflicts. This preserves disjoint target, profile,
 credential, DPoP-token, and accepted-identity changes made by separately
-constructed stores. Corrupt-catalog recovery follows the same rule: it replaces
-the corrupt value only if those exact bytes remain current, otherwise it reads
-the concurrent winner.
+constructed stores. Corrupt-catalog recovery never replaces authoritative bytes
+implicitly. The catalog owner quarantines the exact corrupt revision when its
+backend supports quarantine, publishes structured `recovery-required` health,
+and rejects mutations while that revision remains authoritative. An explicit
+reset uses exact compare-and-set to install an empty catalog; a concurrent valid
+repair wins without being overwritten.
 
 In browser mode, and in desktop mode when native catalog protection is
 unavailable, IndexedDB performs both compare-only and conditional `put`
@@ -207,7 +210,10 @@ successful snapshot containing zero projects. The global shell summary permits
 the genuine empty-project presentation only after the environment catalog is
 loaded, contains at least one desired environment, and every desired
 environment is `live` with a snapshot. Missing snapshots may yield no project
-rows for rendering, but never establish an empty catalog.
+rows for rendering, but never establish an empty catalog. Catalog
+`recovery-required` health is a configuration error in this projection, so
+corrupt persisted bytes cannot be interpreted as a confirmed empty project
+list. Health messages are redacted and do not expose raw catalog contents.
 
 Shell authority is fenced to the exact supervisor session and connection
 generation. Connection-state and session publication are observed as one

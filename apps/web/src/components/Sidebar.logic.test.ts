@@ -63,6 +63,25 @@ function availabilityEnvironment(
 }
 
 describe("resolveSidebarProjectAvailability", () => {
+  it("renders corrupt catalog health as configuration recovery instead of empty", () => {
+    expect(
+      resolveSidebarProjectAvailability({
+        projectCount: 0,
+        catalogReady: true,
+        catalogHealth: {
+          status: "recovery-required",
+          message: "The connection catalog needs recovery.",
+        },
+        environments: [],
+      }),
+    ).toEqual({
+      kind: "configuration-error",
+      environmentId: null,
+      error: "The connection catalog needs recovery.",
+      hasCachedProjects: false,
+    });
+  });
+
   it.each([
     ["catalog-loading", false, []],
     ["starting", true, [availabilityEnvironment("starting")]],
