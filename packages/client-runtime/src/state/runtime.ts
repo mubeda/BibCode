@@ -299,15 +299,45 @@ export async function executeAtomQuery<A, E>(
   options: AtomCommandOptions = {},
   reporter: AtomCommandReporter = console,
 ): Promise<AtomCommandResult<A, E>> {
-  const query = Effect.scoped(
-    Effect.gen(function* () {
-      yield* AtomRegistry.mount(registry, atom);
-      return yield* AtomRegistry.getResult(registry, atom, {
-        suspendOnWaiting: true,
-      });
-    }),
+  const result = await settleAtomCommandResult(
+    () =>
+      new Promise<AtomCommandResult<A, E>>((resolve, reject) => {
+        let settled = false;
+        let unmount = () => {};
+        const settle = (result: AtomCommandResult<A, E>) => {
+          if (settled) return;
+          settled = true;
+          unmount();
+          resolve(result);
+        };
+        const observer = Atom.make((get) => {
+          get.addFinalizer(() => {
+            settle(AsyncResult.failure(Cause.interrupt()));
+          });
+          const initial = get.once(atom);
+          get.subscribe(atom, (result) => {
+            if (result._tag !== "Initial" && !result.waiting) {
+              settle(result);
+            }
+          });
+          return initial;
+        });
+
+        try {
+          unmount = registry.mount(observer);
+          const initial = registry.get(observer);
+          if (initial._tag !== "Initial" && !initial.waiting) {
+            settle(initial);
+          }
+        } catch (defect) {
+          settled = true;
+          unmount();
+          reject(defect);
+        }
+      }),
   );
-  return executeAtomCommand(() => Effect.runPromiseExit(query), options, reporter);
+  reportAtomCommandResult(result, options, reporter);
+  return result;
 }
 
 export function createRuntimeCommand<R, ER, W, A, E>(

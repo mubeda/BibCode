@@ -708,7 +708,14 @@ describe("worktree adoption commands", () => {
           },
         } as unknown as WsRpcProtocolClient;
         const harness = yield* makeCommandHarness(new Map([[ENVIRONMENT_ONE, client]]));
-        void harness.worktrees.addAll.run(harness.atomRegistry, addAllInput(ENVIRONMENT_ONE, 8));
+        const pending = harness.worktrees.addAll.run(
+          harness.atomRegistry,
+          addAllInput(ENVIRONMENT_ONE, 8),
+        );
+        const cancelled = yield* Deferred.make<Awaited<typeof pending>>();
+        void pending.then((result) => {
+          Deferred.doneUnsafe(cancelled, Effect.succeed(result));
+        });
 
         yield* Deferred.await(fourStarted);
         expect(started).toEqual([
@@ -720,6 +727,11 @@ describe("worktree adoption commands", () => {
 
         harness.atomRegistry.reset();
         yield* Deferred.await(fourFinalized);
+        const cancelledResult = yield* Deferred.await(cancelled);
+        expect(cancelledResult._tag).toBe("Failure");
+        if (cancelledResult._tag === "Failure") {
+          expect(Cause.hasInterruptsOnly(cancelledResult.cause)).toBe(true);
+        }
         expect(finalized.toSorted()).toEqual(started.toSorted());
         expect(harness.atomRegistry.getNodes().size).toBe(0);
 
