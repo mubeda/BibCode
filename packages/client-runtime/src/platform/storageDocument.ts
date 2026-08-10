@@ -1,3 +1,4 @@
+import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
 import {
@@ -7,6 +8,7 @@ import {
 } from "../connection/catalog.ts";
 import { type ConnectionTarget, PersistedConnectionTarget } from "../connection/model.ts";
 import * as TokenStore from "../authorization/tokenStore.ts";
+import { AcceptedStorageIdentitySchema } from "./persistence.ts";
 
 export const StoredConnectionCredential = Schema.Struct({
   connectionId: Schema.String,
@@ -20,6 +22,9 @@ export const ConnectionCatalogDocument = Schema.Struct({
   profiles: Schema.Array(ConnectionProfile),
   credentials: Schema.Array(StoredConnectionCredential),
   remoteDpopTokens: Schema.Array(TokenStore.RemoteDpopAccessToken),
+  acceptedStorageIdentities: Schema.Array(AcceptedStorageIdentitySchema).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
 });
 export type ConnectionCatalogDocument = typeof ConnectionCatalogDocument.Type;
 
@@ -29,6 +34,7 @@ export const EMPTY_CONNECTION_CATALOG_DOCUMENT: ConnectionCatalogDocument = Obje
   profiles: [],
   credentials: [],
   remoteDpopTokens: [],
+  acceptedStorageIdentities: [],
 });
 
 export function replaceCatalogValue<A>(

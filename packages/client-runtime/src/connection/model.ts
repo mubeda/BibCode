@@ -1,4 +1,4 @@
-import { EnvironmentId } from "@bibcode/contracts";
+import { EnvironmentId, type ExecutionEnvironmentDescriptor } from "@bibcode/contracts";
 import * as Schema from "effect/Schema";
 
 const ConnectionTargetBase = {
@@ -116,6 +116,7 @@ export type PreparedHttpAuthorization =
 export interface PreparedConnection {
   readonly environmentId: EnvironmentId;
   readonly label: string;
+  readonly descriptor: ExecutionEnvironmentDescriptor;
   readonly httpBaseUrl: string;
   readonly socketUrl: string;
   readonly httpAuthorization: PreparedHttpAuthorization | null;

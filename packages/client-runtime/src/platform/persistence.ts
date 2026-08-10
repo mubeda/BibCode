@@ -25,6 +25,8 @@ export class ConnectionPersistenceError extends Schema.TaggedErrorClass<Connecti
       "save-thread",
       "remove-thread",
       "clear-environment",
+      "load-storage-identity",
+      "accept-storage-identity",
     ]),
     message: Schema.String,
   },
@@ -46,6 +48,28 @@ export class ConnectionRegistrationStore extends Context.Service<
     readonly remove: (target: ConnectionTarget) => Effect.Effect<void, ConnectionPersistenceError>;
   }
 >()("@bibcode/client-runtime/platform/persistence/ConnectionRegistrationStore") {}
+
+export interface AcceptedStorageIdentity {
+  readonly targetKey: string;
+  readonly storageInstanceId: string;
+}
+
+export const AcceptedStorageIdentitySchema = Schema.Struct({
+  targetKey: Schema.String,
+  storageInstanceId: Schema.String,
+});
+
+export class AcceptedStorageIdentityStore extends Context.Service<
+  AcceptedStorageIdentityStore,
+  {
+    readonly get: (
+      targetKey: string,
+    ) => Effect.Effect<Option.Option<string>, ConnectionPersistenceError>;
+    readonly accept: (
+      identity: AcceptedStorageIdentity,
+    ) => Effect.Effect<void, ConnectionPersistenceError>;
+  }
+>()("@bibcode/client-runtime/platform/persistence/AcceptedStorageIdentityStore") {}
 
 export class EnvironmentCacheStore extends Context.Service<
   EnvironmentCacheStore,

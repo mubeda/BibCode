@@ -1,5 +1,6 @@
 import { EnvironmentId } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import * as Schema from "effect/Schema";
 
 import * as TokenStore from "../authorization/tokenStore.ts";
 import {
@@ -16,6 +17,7 @@ import {
   SshConnectionTarget,
 } from "../connection/model.ts";
 import {
+  ConnectionCatalogDocument,
   EMPTY_CONNECTION_CATALOG_DOCUMENT,
   registerConnectionInCatalog,
   removeConnectionFromCatalog,
@@ -50,11 +52,41 @@ const REMOTE_TOKEN = new TokenStore.RemoteDpopAccessToken({
   expiresAtEpochMs: 1_000_000,
   dpopThumbprint: "thumbprint",
 });
+const decodeConnectionCatalogDocument = Schema.decodeUnknownSync(ConnectionCatalogDocument);
 
 describe("ConnectionCatalogDocument", () => {
+  it("decodes a schema-v1 document without accepted storage identities", () => {
+    const oldDocument = {
+      schemaVersion: 1,
+      targets: [BEARER_TARGET],
+      profiles: [BEARER_PROFILE],
+      credentials: [
+        {
+          connectionId: BEARER_TARGET.connectionId,
+          credential: BEARER_CREDENTIAL,
+        },
+      ],
+      remoteDpopTokens: [REMOTE_TOKEN],
+    };
+
+    expect(decodeConnectionCatalogDocument(oldDocument)).toEqual({
+      ...oldDocument,
+      acceptedStorageIdentities: [],
+    });
+    expect(EMPTY_CONNECTION_CATALOG_DOCUMENT.acceptedStorageIdentities).toEqual([]);
+  });
+
   it("registers a bearer connection as one catalog mutation", () => {
     const document = registerConnectionInCatalog(
-      EMPTY_CONNECTION_CATALOG_DOCUMENT,
+      {
+        ...EMPTY_CONNECTION_CATALOG_DOCUMENT,
+        acceptedStorageIdentities: [
+          {
+            targetKey: "bearer:bearer-1",
+            storageInstanceId: "store-a",
+          },
+        ],
+      },
       new BearerConnectionRegistration({
         target: BEARER_TARGET,
         profile: BEARER_PROFILE,
@@ -68,6 +100,12 @@ describe("ConnectionCatalogDocument", () => {
       {
         connectionId: BEARER_TARGET.connectionId,
         credential: BEARER_CREDENTIAL,
+      },
+    ]);
+    expect(document.acceptedStorageIdentities).toEqual([
+      {
+        targetKey: "bearer:bearer-1",
+        storageInstanceId: "store-a",
       },
     ]);
   });

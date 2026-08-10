@@ -92,6 +92,14 @@ const TARGET = new PrimaryConnectionTarget({
 const PREPARED: PreparedConnection = {
   environmentId: TARGET.environmentId,
   label: TARGET.label,
+  descriptor: {
+    environmentId: TARGET.environmentId,
+    label: TARGET.label,
+    platform: { os: "linux", arch: "x64" },
+    serverVersion: "0.0.0-test",
+    storageInstanceId: "store-test",
+    capabilities: { repositoryIdentity: true, activityProtocolVersion: null },
+  },
   httpBaseUrl: TARGET.httpBaseUrl,
   socketUrl: "wss://environment.example.test/ws?wsTicket=test",
   httpAuthorization: null,
