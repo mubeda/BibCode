@@ -679,6 +679,16 @@ updater target:
    pre-update backup exists.
 8. Assert the application is not showing a first-run/empty state.
 
+For the first release containing this protection, CI uses two rollout lanes.
+The real previous-stable package proves that its seeded project survives the
+upgrade and is adopted as a recognized BiBCode store; that executable cannot
+retroactively emit a storage UUID, protection progress, or pre-update backup it
+was never built to support. A second package built from the protected source
+with only a lower test package version proves the new quiescence, identity, and
+pre-update-backup protocol. Once a protected release becomes the real previous
+stable, that lane must satisfy all eight assertions and the synthetic bootstrap
+lane can be removed explicitly.
+
 The matrix is:
 
 - Windows x64 NSIS;
