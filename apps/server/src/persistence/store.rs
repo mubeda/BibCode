@@ -1,5 +1,6 @@
 use std::{fmt, path::PathBuf};
 
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use thiserror::Error;
 use tokio::{
     fs::{self, OpenOptions},
@@ -11,8 +12,12 @@ use uuid::Uuid;
 use crate::config::ServerConfig;
 
 use super::{
-    Database, PersistenceError, StatePaths,
-    migrations::{ExistingStoreValidationError, run_migrations, validate_existing_bibcode_store},
+    BackupError, BackupTrigger, Database, Migration, PersistenceError, StatePaths,
+    StoreOperationGuard, create_verified_backup,
+    migrations::{
+        ExistingStoreValidationError, apply_migrations, pending_migrations, run_migrations,
+        validate_existing_bibcode_store,
+    },
 };
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -28,6 +33,27 @@ impl StorageInstanceId {
 impl fmt::Display for StorageInstanceId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.0.fmt(formatter)
+    }
+}
+
+impl Serialize for StorageInstanceId {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        serializer.serialize_str(&self.to_string())
+    }
+}
+
+impl<'de> Deserialize<'de> for StorageInstanceId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Uuid::parse_str(&value)
+            .map(Self)
+            .map_err(|_| de::Error::custom("storage instance ID must be a UUID"))
     }
 }
 
@@ -84,6 +110,8 @@ pub enum StoreStartupError {
         #[source]
         source: PersistenceError,
     },
+    #[error("failed to protect persistent storage before mutation")]
+    Backup(#[source] BackupError),
     #[error("failed to publish storage instance marker {path}")]
     MarkerPublish {
         path: PathBuf,
@@ -102,6 +130,9 @@ pub async fn prepare_store(config: &ServerConfig) -> Result<PreparedStore, Store
         .base_dir
         .clone_from(&resolved_data_root.effective);
     let paths = StatePaths::from_config(&resolved_config);
+    let _operation_guard = StoreOperationGuard::acquire_for_startup(&paths)
+        .await
+        .map_err(StoreStartupError::Backup)?;
     let database_exists = try_exists(&paths.database)?;
     let marker_exists = try_exists(&paths.environment_id)?;
     let marker = marker_exists
@@ -114,8 +145,10 @@ pub async fn prepare_store(config: &ServerConfig) -> Result<PreparedStore, Store
             database: paths.database,
             marker: paths.environment_id,
         }),
-        (true, None) => prepare_existing_unmarked(paths).await,
-        (true, Some(storage_instance_id)) => prepare_existing(paths, storage_instance_id).await,
+        (true, None) => prepare_existing_unmarked(paths, &resolved_config.server_version).await,
+        (true, Some(storage_instance_id)) => {
+            prepare_existing(paths, storage_instance_id, &resolved_config.server_version).await
+        }
     }
 }
 
@@ -161,40 +194,90 @@ async fn prepare_first_run(paths: StatePaths) -> Result<PreparedStore, StoreStar
     })
 }
 
-async fn prepare_existing_unmarked(paths: StatePaths) -> Result<PreparedStore, StoreStartupError> {
+async fn prepare_existing_unmarked(
+    paths: StatePaths,
+    app_version: &str,
+) -> Result<PreparedStore, StoreStartupError> {
     validate(&paths.database).await?;
-    let database = Database::open_existing(&paths.database)
-        .await
-        .map_err(|source| StoreStartupError::DatabaseOpen {
-            path: paths.database.clone(),
-            source,
-        })?;
     let storage_instance_id = publish_marker(&paths, StorageInstanceId(Uuid::new_v4())).await?;
-    migrate(&database, &paths.database).await?;
-    Ok(PreparedStore {
-        database,
-        storage_instance_id,
-        classification: StoreClassification::ExistingUnmarked,
+    prepare_existing_database(
         paths,
-    })
+        storage_instance_id,
+        StoreClassification::ExistingUnmarked,
+        app_version,
+    )
+    .await
 }
 
 async fn prepare_existing(
     paths: StatePaths,
     storage_instance_id: StorageInstanceId,
+    app_version: &str,
 ) -> Result<PreparedStore, StoreStartupError> {
     validate(&paths.database).await?;
+    prepare_existing_database(
+        paths,
+        storage_instance_id,
+        StoreClassification::Existing,
+        app_version,
+    )
+    .await
+}
+
+async fn prepare_existing_database(
+    paths: StatePaths,
+    storage_instance_id: StorageInstanceId,
+    classification: StoreClassification,
+    app_version: &str,
+) -> Result<PreparedStore, StoreStartupError> {
+    let inspection_database = Database::open_existing_read_only(&paths.database)
+        .await
+        .map_err(|source| StoreStartupError::DatabaseOpen {
+            path: paths.database.clone(),
+            source,
+        })?;
+    let pending = match inspect_pending_migrations(&inspection_database, &paths.database).await {
+        Ok(pending) => pending,
+        Err(error) => {
+            inspection_database.close().await;
+            return Err(error);
+        }
+    };
+    let backup_result = if pending.is_empty() {
+        Ok(())
+    } else {
+        let backup_context = PreparedStore {
+            database: inspection_database.clone(),
+            storage_instance_id,
+            classification,
+            paths: paths.clone(),
+        };
+        let result = create_verified_backup(
+            &inspection_database,
+            &backup_context,
+            BackupTrigger::PreMigration,
+            app_version,
+        )
+        .await
+        .map(|_| ())
+        .map_err(StoreStartupError::Backup);
+        drop(backup_context);
+        result
+    };
+    inspection_database.close().await;
+    backup_result?;
+
     let database = Database::open_existing(&paths.database)
         .await
         .map_err(|source| StoreStartupError::DatabaseOpen {
             path: paths.database.clone(),
             source,
         })?;
-    migrate(&database, &paths.database).await?;
+    apply_pending_migrations(&database, &paths.database, pending).await?;
     Ok(PreparedStore {
         database,
         storage_instance_id,
-        classification: StoreClassification::Existing,
+        classification,
         paths,
     })
 }
@@ -290,6 +373,36 @@ async fn migrate(database: &Database, path: &std::path::Path) -> Result<(), Stor
     database
         .call(|connection| {
             run_migrations(connection, None)?;
+            Ok(())
+        })
+        .await
+        .map_err(|source| StoreStartupError::Migration {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+async fn inspect_pending_migrations(
+    database: &Database,
+    path: &std::path::Path,
+) -> Result<Vec<Migration>, StoreStartupError> {
+    database
+        .call(|connection| Ok(pending_migrations(connection)?))
+        .await
+        .map_err(|source| StoreStartupError::Migration {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+async fn apply_pending_migrations(
+    database: &Database,
+    path: &std::path::Path,
+    pending: Vec<Migration>,
+) -> Result<(), StoreStartupError> {
+    database
+        .call(move |connection| {
+            apply_migrations(connection, &pending)?;
             Ok(())
         })
         .await
