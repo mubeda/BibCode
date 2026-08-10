@@ -205,16 +205,47 @@ where
         + Send
         + 'static,
 {
+    validate_with_operation_inner(path, operation, || {}).await
+}
+
+#[cfg(test)]
+async fn validate_with_operation_and_spawn_observer<F, O>(
+    path: PathBuf,
+    operation: F,
+    worker_submitted: O,
+) -> Result<(), StoreStartupError>
+where
+    F: FnOnce(PathBuf, CancellationToken) -> std::result::Result<(), ExistingStoreValidationError>
+        + Send
+        + 'static,
+    O: FnOnce(),
+{
+    validate_with_operation_inner(path, operation, worker_submitted).await
+}
+
+async fn validate_with_operation_inner<F, O>(
+    path: PathBuf,
+    operation: F,
+    worker_submitted: O,
+) -> Result<(), StoreStartupError>
+where
+    F: FnOnce(PathBuf, CancellationToken) -> std::result::Result<(), ExistingStoreValidationError>
+        + Send
+        + 'static,
+    O: FnOnce(),
+{
     let cancellation = CancellationToken::new();
     let _cancel_on_drop = CancelValidationOnDrop(cancellation.clone());
     let error_path = path.clone();
-    let result = tokio::task::spawn_blocking(move || operation(path, cancellation))
+    let worker = tokio::task::spawn_blocking(move || operation(path, cancellation));
+    worker_submitted();
+    let result = worker
         .await
         .map_err(|source| StoreStartupError::UnsafeDatabaseState {
             path: error_path,
             detail: format!("validation blocking task failed: {source}"),
         })?;
-    result.map_err(map_validation_error)
+    result.map_err(|error| map_validation_error(&error))
 }
 
 struct CancelValidationOnDrop(CancellationToken);
@@ -225,16 +256,25 @@ impl Drop for CancelValidationOnDrop {
     }
 }
 
-fn map_validation_error(error: ExistingStoreValidationError) -> StoreStartupError {
+fn map_validation_error(error: &ExistingStoreValidationError) -> StoreStartupError {
     match error {
         ExistingStoreValidationError::Corrupt { path, detail } => {
-            StoreStartupError::CorruptDatabase { path, detail }
+            StoreStartupError::CorruptDatabase {
+                path: path.clone(),
+                detail: detail.clone(),
+            }
         }
         ExistingStoreValidationError::Unrecognized { path, detail } => {
-            StoreStartupError::UnrecognizedStore { path, detail }
+            StoreStartupError::UnrecognizedStore {
+                path: path.clone(),
+                detail: detail.clone(),
+            }
         }
         ExistingStoreValidationError::Unsafe { path, detail } => {
-            StoreStartupError::UnsafeDatabaseState { path, detail }
+            StoreStartupError::UnsafeDatabaseState {
+                path: path.clone(),
+                detail: detail.clone(),
+            }
         }
     }
 }
@@ -507,6 +547,230 @@ mod tests {
         assert_eq!(ledger_rows_after, ledger_rows);
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn aborting_during_quick_check_cancels_the_worker_without_mutating_the_store() {
+        let root = TempDir::new().expect("temporary validation root");
+        let paths = StatePaths::from_config(&ServerConfig::new(root.path()));
+        paths
+            .ensure_directories_without_database_side_effects()
+            .await
+            .expect("state directories");
+        let marker_bytes = b"58e916d8-3e97-4f9e-bf11-3202b30b0c82\n";
+        std::fs::write(&paths.environment_id, marker_bytes).expect("fixture marker");
+        let mut setup = rusqlite::Connection::open(&paths.database).expect("fixture database");
+        run_migrations(&mut setup, None).expect("fixture migrations");
+        drop(setup);
+        let before = directory_snapshot(&paths.state_dir);
+
+        let (inspection_tx, mut inspection_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(0);
+        let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+        let validation_path = paths.database.clone();
+        let validation = tokio::spawn(validate_with_operation(
+            validation_path,
+            move |path, cancellation| {
+                let mut first_progress = Some((inspection_tx, release_rx));
+                let result = crate::persistence::migrations::validate_existing_bibcode_store_with_inspection_control(
+                    &path,
+                    &cancellation,
+                    Duration::from_secs(1),
+                    || Ok(()),
+                    |_, _| Ok(()),
+                    move || {
+                        if let Some((inspection_tx, release_rx)) = first_progress.take() {
+                            inspection_tx
+                                .send(())
+                                .expect("observe quick_check progress");
+                            release_rx
+                                .recv_timeout(Duration::from_secs(2))
+                                .expect("release quick_check progress");
+                        }
+                    },
+                );
+                let observation = result.as_ref().map_or_else(
+                    |error| {
+                        (
+                            matches!(
+                                error,
+                                ExistingStoreValidationError::Unsafe { detail, .. }
+                                    if detail.contains("cancelled")
+                                        && detail.contains("post-backup SQLite inspection")
+                            ),
+                            matches!(
+                                map_validation_error(error),
+                                StoreStartupError::UnsafeDatabaseState { ref detail, .. }
+                                    if detail.contains("cancelled")
+                                        && detail.contains("post-backup SQLite inspection")
+                            ),
+                        )
+                    },
+                    |()| (false, false),
+                );
+                finished_tx
+                    .send(observation)
+                    .expect("signal validation worker exit");
+                result
+            },
+        ));
+        tokio::time::timeout(Duration::from_secs(2), inspection_rx.recv())
+            .await
+            .expect("enter quick_check promptly")
+            .expect("quick_check progress channel");
+
+        validation.abort();
+        assert!(
+            validation
+                .await
+                .expect_err("startup validation task must abort")
+                .is_cancelled()
+        );
+        let worker_exit_started = std::time::Instant::now();
+        release_tx.send(()).expect("release quick_check worker");
+        let observation =
+            tokio::task::spawn_blocking(move || finished_rx.recv_timeout(Duration::from_secs(1)))
+                .await
+                .expect("join worker-exit observer")
+                .expect("blocking validation worker exits within one second");
+
+        assert!(observation.0, "inner validation reports typed cancellation");
+        assert!(
+            observation.1,
+            "store boundary maps cancellation to UnsafeDatabaseState"
+        );
+        assert!(worker_exit_started.elapsed() <= Duration::from_secs(1));
+        assert_eq!(directory_snapshot(&paths.state_dir), before);
+        assert_eq!(
+            std::fs::read(&paths.environment_id).expect("marker remains"),
+            marker_bytes
+        );
+    }
+
+    #[test]
+    fn queued_blocking_validation_observes_cancellation_before_source_open() {
+        let root = TempDir::new().expect("temporary validation root");
+        let paths = StatePaths::from_config(&ServerConfig::new(root.path()));
+        std::fs::create_dir_all(&paths.state_dir).expect("state directory");
+        let marker_bytes = b"14dd7d93-ff95-448b-8f54-a19492d92e4d\n";
+        std::fs::write(&paths.environment_id, marker_bytes).expect("fixture marker");
+
+        let source_database = root.path().join("source.sqlite");
+        let mut source = rusqlite::Connection::open(&source_database).expect("source database");
+        source
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("WAL source fixture");
+        source
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("disable source checkpoint");
+        run_migrations(&mut source, None).expect("fixture migrations");
+        std::fs::copy(&source_database, &paths.database).expect("copy stable main database");
+        std::fs::copy(
+            sqlite_sidecar(&source_database, "-wal"),
+            sqlite_sidecar(&paths.database, "-wal"),
+        )
+        .expect("copy stable WAL fixture");
+        drop(source);
+        assert!(!sqlite_sidecar(&paths.database, "-shm").exists());
+        let before = directory_snapshot(&paths.state_dir);
+
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .max_blocking_threads(1)
+            .enable_all()
+            .build()
+            .expect("single-slot blocking runtime");
+        runtime.block_on(async {
+            let (blocker_started_tx, blocker_started_rx) = std::sync::mpsc::sync_channel(1);
+            let (release_blocker_tx, release_blocker_rx) = std::sync::mpsc::sync_channel(0);
+            let blocker = tokio::task::spawn_blocking(move || {
+                blocker_started_tx.send(()).expect("signal blocker start");
+                release_blocker_rx
+                    .recv_timeout(Duration::from_secs(2))
+                    .expect("release blocking-pool slot");
+            });
+            blocker_started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("blocking-pool slot is saturated");
+
+            let (operation_started_tx, operation_started_rx) = std::sync::mpsc::sync_channel(1);
+            let (worker_submitted_tx, worker_submitted_rx) = std::sync::mpsc::sync_channel(1);
+            let (finished_tx, finished_rx) = std::sync::mpsc::sync_channel(1);
+            let validation = tokio::spawn(validate_with_operation_and_spawn_observer(
+                paths.database.clone(),
+                move |path, cancellation| {
+                    operation_started_tx
+                        .send(())
+                        .expect("signal queued operation start");
+                    let result = validate_existing_bibcode_store(&path, &cancellation);
+                    let observation = result.as_ref().map_or_else(
+                        |error| {
+                            (
+                                matches!(error, ExistingStoreValidationError::Unsafe { detail, .. } if detail.contains("cancelled")),
+                                matches!(
+                                    map_validation_error(error),
+                                    StoreStartupError::UnsafeDatabaseState { ref detail, .. }
+                                        if detail.contains("cancelled")
+                                ),
+                            )
+                        },
+                        |()| (false, false),
+                    );
+                    finished_tx
+                        .send(observation)
+                        .expect("signal queued validation exit");
+                    result
+                },
+                move || {
+                    worker_submitted_tx
+                        .send(())
+                        .expect("signal blocking worker submission");
+                },
+            ));
+            worker_submitted_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("validation job is queued in the blocking pool");
+            assert!(
+                matches!(
+                    operation_started_rx.try_recv(),
+                    Err(std::sync::mpsc::TryRecvError::Empty)
+                ),
+                "validation worker must remain queued behind the saturated slot"
+            );
+
+            validation.abort();
+            assert!(
+                validation
+                    .await
+                    .expect_err("queued startup validation task must abort")
+                    .is_cancelled()
+            );
+            release_blocker_tx
+                .send(())
+                .expect("release blocking-pool slot");
+            blocker.await.expect("blocking-pool blocker exits");
+            operation_started_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("queued validation worker runs after cancellation");
+            let observation = finished_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("queued validation worker exits promptly");
+            assert!(observation.0, "inner validation reports typed cancellation");
+            assert!(
+                observation.1,
+                "store boundary maps cancellation to UnsafeDatabaseState"
+            );
+        });
+
+        assert_eq!(directory_snapshot(&paths.state_dir), before);
+        assert!(
+            !sqlite_sidecar(&paths.database, "-shm").exists(),
+            "cancelled queued validation must not open the WAL source"
+        );
+        assert_eq!(
+            std::fs::read(&paths.environment_id).expect("marker remains"),
+            marker_bytes
+        );
+    }
+
     #[test]
     fn malformed_marker_bytes_are_never_replaced_during_decode() {
         let root = TempDir::new().expect("temporary marker root");
@@ -522,5 +786,28 @@ mod tests {
             std::fs::read(&paths.environment_id).expect("marker remains"),
             malformed
         );
+    }
+
+    fn directory_snapshot(path: &std::path::Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+        let mut entries = std::fs::read_dir(path)
+            .expect("snapshot directory")
+            .map(|entry| {
+                let entry = entry.expect("snapshot entry");
+                let bytes = if entry.file_type().expect("snapshot entry type").is_file() {
+                    std::fs::read(entry.path()).expect("snapshot entry bytes")
+                } else {
+                    Vec::new()
+                };
+                (entry.file_name(), bytes)
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    }
+
+    fn sqlite_sidecar(database: &std::path::Path, suffix: &str) -> PathBuf {
+        let mut path = database.as_os_str().to_os_string();
+        path.push(suffix);
+        PathBuf::from(path)
     }
 }

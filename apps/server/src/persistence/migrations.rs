@@ -14,8 +14,9 @@ use thiserror::Error;
 use tokio_util::sync::CancellationToken;
 
 const VALIDATION_BACKUP_PAGES_PER_STEP: i32 = 128;
-const VALIDATION_BACKUP_TIMEOUT: Duration = Duration::from_secs(5);
+const VALIDATION_TIMEOUT: Duration = Duration::from_secs(5);
 const VALIDATION_BACKUP_RETRY_DELAY: Duration = Duration::from_millis(2);
+const VALIDATION_INSPECTION_PROGRESS_OPS: i32 = 1_000;
 
 const MIGRATIONS_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS effect_sql_migrations (
@@ -69,9 +70,11 @@ pub(crate) fn validate_existing_bibcode_store(
     validate_existing_bibcode_store_inner(
         path,
         cancellation,
-        VALIDATION_BACKUP_TIMEOUT,
+        VALIDATION_TIMEOUT,
         || Ok(()),
         |_, _| Ok(()),
+        VALIDATION_INSPECTION_PROGRESS_OPS,
+        || {},
     )
 }
 
@@ -87,9 +90,11 @@ where
     validate_existing_bibcode_store_inner(
         path,
         cancellation,
-        VALIDATION_BACKUP_TIMEOUT,
+        VALIDATION_TIMEOUT,
         barrier,
         |_, _| Ok(()),
+        VALIDATION_INSPECTION_PROGRESS_OPS,
+        || {},
     )
 }
 
@@ -108,15 +113,25 @@ where
         rusqlite::backup::Progress,
     ) -> std::result::Result<(), ExistingStoreValidationError>,
 {
-    validate_existing_bibcode_store_inner(path, cancellation, timeout, barrier, after_step)
+    validate_existing_bibcode_store_inner(
+        path,
+        cancellation,
+        timeout,
+        barrier,
+        after_step,
+        VALIDATION_INSPECTION_PROGRESS_OPS,
+        || {},
+    )
 }
 
-fn validate_existing_bibcode_store_inner<F, G>(
+#[cfg(test)]
+pub(super) fn validate_existing_bibcode_store_with_inspection_control<F, G, H>(
     path: &Path,
     cancellation: &CancellationToken,
     timeout: Duration,
     barrier: F,
     after_step: G,
+    inspection_progress: H,
 ) -> std::result::Result<(), ExistingStoreValidationError>
 where
     F: FnOnce() -> std::result::Result<(), ExistingStoreValidationError>,
@@ -124,16 +139,67 @@ where
         StepResult,
         rusqlite::backup::Progress,
     ) -> std::result::Result<(), ExistingStoreValidationError>,
+    H: FnMut() + Send + 'static,
 {
-    let connection =
-        coherent_validation_snapshot(path, cancellation, timeout, barrier, after_step)?;
+    validate_existing_bibcode_store_inner(
+        path,
+        cancellation,
+        timeout,
+        barrier,
+        after_step,
+        1,
+        inspection_progress,
+    )
+}
 
+fn validate_existing_bibcode_store_inner<F, G, H>(
+    path: &Path,
+    cancellation: &CancellationToken,
+    timeout: Duration,
+    barrier: F,
+    after_step: G,
+    inspection_progress_ops: i32,
+    mut inspection_progress: H,
+) -> std::result::Result<(), ExistingStoreValidationError>
+where
+    F: FnOnce() -> std::result::Result<(), ExistingStoreValidationError>,
+    G: FnMut(
+        StepResult,
+        rusqlite::backup::Progress,
+    ) -> std::result::Result<(), ExistingStoreValidationError>,
+    H: FnMut() + Send + 'static,
+{
+    let started = Instant::now();
+    let deadline =
+        started
+            .checked_add(timeout)
+            .ok_or_else(|| ExistingStoreValidationError::Unsafe {
+                path: path.to_path_buf(),
+                detail: "SQLite store validation deadline exceeds the monotonic clock range"
+                    .to_owned(),
+            })?;
+    let connection =
+        coherent_validation_snapshot(path, cancellation, deadline, barrier, after_step)?;
+    ensure_validation_active(path, cancellation, deadline)?;
+    let inspection_cancellation = cancellation.clone();
+    connection
+        .progress_handler(
+            inspection_progress_ops,
+            Some(move || {
+                inspection_progress();
+                validation_stop_reason(&inspection_cancellation, deadline).is_some()
+            }),
+        )
+        .map_err(|source| ExistingStoreValidationError::Unsafe {
+            path: path.to_path_buf(),
+            detail: format!("failed to install SQLite validation progress handler: {source}"),
+        })?;
+
+    ensure_validation_active(path, cancellation, deadline)?;
     let integrity = connection
         .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
-        .map_err(|source| ExistingStoreValidationError::Corrupt {
-            path: path.to_path_buf(),
-            detail: source.to_string(),
-        })?;
+        .map_err(|source| map_corrupt_inspection_error(path, cancellation, deadline, source))?;
+    ensure_validation_active(path, cancellation, deadline)?;
     if integrity != "ok" {
         return Err(ExistingStoreValidationError::Corrupt {
             path: path.to_path_buf(),
@@ -141,33 +207,31 @@ where
         });
     }
 
-    if !table_exists(&connection, "effect_sql_migrations").map_err(|source| {
-        ExistingStoreValidationError::Unrecognized {
-            path: path.to_path_buf(),
-            detail: source.to_string(),
-        }
-    })? {
+    ensure_validation_active(path, cancellation, deadline)?;
+    if !table_exists(&connection, "effect_sql_migrations")
+        .map_err(|source| map_unrecognized_inspection_error(path, cancellation, deadline, source))?
+    {
         return Err(ExistingStoreValidationError::Unrecognized {
             path: path.to_path_buf(),
             detail: "migration ledger is missing".to_owned(),
         });
     }
 
+    ensure_validation_active(path, cancellation, deadline)?;
     let mut statement = connection
         .prepare("SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id ASC")
-        .map_err(|source| ExistingStoreValidationError::Unrecognized {
-            path: path.to_path_buf(),
-            detail: source.to_string(),
+        .map_err(|source| {
+            map_unrecognized_inspection_error(path, cancellation, deadline, source)
         })?;
     let recorded = statement
         .query_map([], |row| {
             Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
         })
         .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
-        .map_err(|source| ExistingStoreValidationError::Unrecognized {
-            path: path.to_path_buf(),
-            detail: source.to_string(),
+        .map_err(|source| {
+            map_unrecognized_inspection_error(path, cancellation, deadline, source)
         })?;
+    ensure_validation_active(path, cancellation, deadline)?;
     if recorded.is_empty() {
         return Err(ExistingStoreValidationError::Unrecognized {
             path: path.to_path_buf(),
@@ -191,11 +255,9 @@ where
         .iter()
         .filter(|(migration_id, _)| *migration_id <= latest_migration_id)
     {
+        ensure_validation_active(path, cancellation, deadline)?;
         if !table_exists(&connection, table).map_err(|source| {
-            ExistingStoreValidationError::Unrecognized {
-                path: path.to_path_buf(),
-                detail: source.to_string(),
-            }
+            map_unrecognized_inspection_error(path, cancellation, deadline, source)
         })? {
             return Err(ExistingStoreValidationError::Unrecognized {
                 path: path.to_path_buf(),
@@ -203,13 +265,14 @@ where
             });
         }
     }
+    ensure_validation_active(path, cancellation, deadline)?;
     Ok(())
 }
 
 fn coherent_validation_snapshot<F, G>(
     source_database: &Path,
     cancellation: &CancellationToken,
-    timeout: Duration,
+    deadline: Instant,
     barrier: F,
     mut after_step: G,
 ) -> std::result::Result<Connection, ExistingStoreValidationError>
@@ -220,7 +283,6 @@ where
         rusqlite::backup::Progress,
     ) -> std::result::Result<(), ExistingStoreValidationError>,
 {
-    let deadline = Instant::now() + timeout;
     ensure_validation_active(source_database, cancellation, deadline)?;
     let source = Connection::open_with_flags(
         source_database,
@@ -337,19 +399,95 @@ fn ensure_validation_active(
     cancellation: &CancellationToken,
     deadline: Instant,
 ) -> std::result::Result<(), ExistingStoreValidationError> {
-    if cancellation.is_cancelled() {
-        return Err(ExistingStoreValidationError::Unsafe {
-            path: source_database.to_path_buf(),
-            detail: "coherent SQLite backup was cancelled".to_owned(),
-        });
-    }
-    if Instant::now() >= deadline {
-        return Err(ExistingStoreValidationError::Unsafe {
-            path: source_database.to_path_buf(),
-            detail: "coherent SQLite backup deadline elapsed".to_owned(),
-        });
+    if let Some(reason) = validation_stop_reason(cancellation, deadline) {
+        return Err(validation_stopped_error(source_database, reason, None));
     }
     Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ValidationStopReason {
+    Cancelled,
+    DeadlineElapsed,
+}
+
+fn validation_stop_reason(
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Option<ValidationStopReason> {
+    if cancellation.is_cancelled() {
+        Some(ValidationStopReason::Cancelled)
+    } else if Instant::now() >= deadline {
+        Some(ValidationStopReason::DeadlineElapsed)
+    } else {
+        None
+    }
+}
+
+fn validation_stopped_error(
+    source_database: &Path,
+    reason: ValidationStopReason,
+    phase: Option<&str>,
+) -> ExistingStoreValidationError {
+    let reason = match reason {
+        ValidationStopReason::Cancelled => "was cancelled",
+        ValidationStopReason::DeadlineElapsed => "deadline elapsed",
+    };
+    let phase = phase.map_or_else(String::new, |phase| format!(" during {phase}"));
+    ExistingStoreValidationError::Unsafe {
+        path: source_database.to_path_buf(),
+        detail: format!("SQLite store validation {reason}{phase}"),
+    }
+}
+
+fn interrupted_inspection_error(
+    source_database: &Path,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+    source: &rusqlite::Error,
+) -> Option<ExistingStoreValidationError> {
+    if source.sqlite_error_code() != Some(ErrorCode::OperationInterrupted) {
+        return None;
+    }
+    Some(match validation_stop_reason(cancellation, deadline) {
+        Some(reason) => validation_stopped_error(
+            source_database,
+            reason,
+            Some("post-backup SQLite inspection"),
+        ),
+        None => ExistingStoreValidationError::Unsafe {
+            path: source_database.to_path_buf(),
+            detail: "post-backup SQLite inspection was interrupted unexpectedly".to_owned(),
+        },
+    })
+}
+
+fn map_corrupt_inspection_error(
+    source_database: &Path,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+    source: rusqlite::Error,
+) -> ExistingStoreValidationError {
+    interrupted_inspection_error(source_database, cancellation, deadline, &source).unwrap_or_else(
+        || ExistingStoreValidationError::Corrupt {
+            path: source_database.to_path_buf(),
+            detail: source.to_string(),
+        },
+    )
+}
+
+fn map_unrecognized_inspection_error(
+    source_database: &Path,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+    source: rusqlite::Error,
+) -> ExistingStoreValidationError {
+    interrupted_inspection_error(source_database, cancellation, deadline, &source).unwrap_or_else(
+        || ExistingStoreValidationError::Unrecognized {
+            path: source_database.to_path_buf(),
+            detail: source.to_string(),
+        },
+    )
 }
 
 #[cfg(test)]
@@ -1979,6 +2117,7 @@ mod tests {
         MIGRATIONS, Migration, migration_001, run_migrations, sqlite_sidecar,
         validate_existing_bibcode_store, validate_existing_bibcode_store_with_barrier,
         validate_existing_bibcode_store_with_control,
+        validate_existing_bibcode_store_with_inspection_control,
     };
     use tempfile::TempDir;
     use tokio_util::sync::CancellationToken;
@@ -2184,6 +2323,49 @@ mod tests {
         writer
             .execute_batch("ROLLBACK")
             .expect("release fixture lock");
+    }
+
+    #[test]
+    fn validation_deadline_interrupts_post_backup_inspection_without_mutation() {
+        let root = TempDir::new().expect("temporary validation root");
+        let database = root.path().join("state.sqlite");
+        let marker = root.path().join("environment-id");
+        let marker_bytes = b"b6b9080d-0544-4d79-9904-e265c6c1a8fd\n";
+        std::fs::write(&marker, marker_bytes).expect("fixture marker");
+        let mut connection = rusqlite::Connection::open(&database).expect("fixture database");
+        run_migrations(&mut connection, None).expect("fixture migrations");
+        drop(connection);
+        let before = persistent_directory_snapshot(root.path());
+        let entered_inspection = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let progress_entered = entered_inspection.clone();
+
+        let started = std::time::Instant::now();
+        let error = validate_existing_bibcode_store_with_inspection_control(
+            &database,
+            &CancellationToken::new(),
+            std::time::Duration::from_millis(250),
+            || Ok(()),
+            |_, _| Ok(()),
+            move || {
+                progress_entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            },
+        )
+        .expect_err("post-backup inspection must observe the absolute deadline");
+
+        assert!(entered_inspection.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(
+            error,
+            super::ExistingStoreValidationError::Unsafe { .. }
+        ));
+        let error_text = error.to_string();
+        assert!(
+            error_text.contains("deadline") && error_text.contains("post-backup SQLite inspection"),
+            "deadline interruption remains typed and diagnostic: {error}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(persistent_directory_snapshot(root.path()), before);
+        assert_eq!(std::fs::read(marker).expect("marker remains"), marker_bytes);
     }
 
     #[test]
