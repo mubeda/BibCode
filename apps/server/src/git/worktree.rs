@@ -12,7 +12,7 @@ use super::GitWorktreeRecord;
 
 const MAX_WORKTREE_RECORDS: usize = 512;
 const WORKTREE_KEY_VERSION: &str = "bibcode.worktree.v1";
-const WORKTREE_PRUNE_IMPACT_VERSION: &str = "bibcode.worktree-prune-impact.v1";
+const WORKTREE_PRUNE_IMPACT_VERSION: &str = "bibcode.worktree-prune-impact.v2";
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum HostPathPlatform {
@@ -293,23 +293,45 @@ pub(crate) fn parse_worktree_prune_dry_run(
 
 #[must_use]
 pub fn git_worktree_prune_impact_digest(impact: &[super::GitPrunableWorktree]) -> String {
-    let mut keys = impact
+    let mut entries = impact
         .iter()
-        .map(|entry| normalize_worktree_path_key(&entry.path, host_path_platform()))
+        .map(|entry| {
+            (
+                normalize_worktree_path_key(&entry.path, host_path_platform()),
+                entry.prune_reason.as_str(),
+            )
+        })
         .collect::<Vec<_>>();
-    keys.sort();
+    entries.sort_by(|(left_path, left_reason), (right_path, right_reason)| {
+        left_path
+            .cmp(right_path)
+            .then_with(|| left_reason.cmp(right_reason))
+    });
     let mut input = Vec::with_capacity(
         WORKTREE_PRUNE_IMPACT_VERSION.len()
-            + keys.iter().map(String::len).sum::<usize>()
-            + keys.len()
-            + 1,
+            + entries
+                .iter()
+                .map(|(path, reason)| path.len() + reason.len() + 16)
+                .sum::<usize>()
+            + 8,
     );
     input.extend_from_slice(WORKTREE_PRUNE_IMPACT_VERSION.as_bytes());
-    for key in keys {
-        input.push(b'\0');
-        input.extend_from_slice(key.as_bytes());
+    push_prune_digest_length(&mut input, entries.len());
+    for (path, reason) in entries {
+        push_prune_digest_field(&mut input, &path);
+        push_prune_digest_field(&mut input, reason);
     }
     sha256_hex(input)
+}
+
+fn push_prune_digest_field(input: &mut Vec<u8>, field: &str) {
+    push_prune_digest_length(input, field.len());
+    input.extend_from_slice(field.as_bytes());
+}
+
+fn push_prune_digest_length(input: &mut Vec<u8>, length: usize) {
+    let length = u64::try_from(length).expect("bounded prune impact length fits u64");
+    input.extend_from_slice(&length.to_be_bytes());
 }
 
 fn opaque_key(common_dir_key: &str, path_key: Option<&str>) -> String {

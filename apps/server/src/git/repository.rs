@@ -671,6 +671,7 @@ impl GitRepository {
             let record = records.remove(index);
             impact.push(GitPrunableWorktree {
                 path: record.path,
+                prune_reason: dry_run.reason,
                 locked: record.locked,
                 lock_reason: record.lock_reason,
             });
@@ -683,7 +684,9 @@ impl GitRepository {
             ));
         }
         impact.sort_by(|left, right| {
-            normalized_worktree_path(&left.path).cmp(&normalized_worktree_path(&right.path))
+            normalized_worktree_path(&left.path)
+                .cmp(&normalized_worktree_path(&right.path))
+                .then_with(|| left.prune_reason.cmp(&right.prune_reason))
         });
         Ok(impact)
     }
@@ -3328,6 +3331,7 @@ mod worktree_ownership_tests {
         };
         let confirmed = [GitPrunableWorktree {
             path: old_path,
+            prune_reason: "stale".into(),
             locked: false,
             lock_reason: None,
         }];
@@ -3352,6 +3356,98 @@ mod worktree_ownership_tests {
                 .count(),
             0,
             "identity drift is rejected before repository-wide prune"
+        );
+    }
+
+    #[tokio::test]
+    async fn verified_prune_rejects_same_path_reason_drift_before_mutation() {
+        let fixture = tempfile::tempdir().expect("prune reason fixture");
+        let common_dir = fixture.path().join(".git");
+        let target_admin = common_dir.join("worktrees/target");
+        let other_admin = common_dir.join("worktrees/other");
+        fs::create_dir_all(&target_admin).expect("target admin fixture");
+        fs::create_dir_all(&other_admin).expect("other admin fixture");
+        let target_path = fixture.path().join("target");
+        let other_path = fixture.path().join("other");
+        fs::write(
+            target_admin.join("gitdir"),
+            format!("{}/.git\n", display_path(&target_path)),
+        )
+        .expect("target admin identity");
+        fs::write(
+            other_admin.join("gitdir"),
+            format!("{}/.git\n", display_path(&other_path)),
+        )
+        .expect("other admin identity");
+        let inventory = format!(
+            "worktree {}\0HEAD aaa\0branch refs/heads/main\0\0worktree {}\0HEAD bbb\0branch refs/heads/target\0prunable stale\0\0worktree {}\0HEAD ccc\0branch refs/heads/other\0prunable reason-after-preview\0\0",
+            display_path(fixture.path()),
+            display_path(&target_path),
+            display_path(&other_path),
+        );
+        let after_prune = format!(
+            "worktree {}\0HEAD aaa\0branch refs/heads/main\0\0",
+            display_path(fixture.path()),
+        );
+        let runner = Arc::new(FakeGitRunner::new([
+            process_output(0, ".git\n", ""),
+            process_output(0, &inventory, ""),
+            process_output(
+                0,
+                "",
+                "Removing worktrees/target: stale\nRemoving worktrees/other: reason-after-preview\n",
+            ),
+            process_output(0, "", ""),
+            process_output(0, ".git\n", ""),
+            process_output(0, &after_prune, ""),
+        ]));
+        let repository = GitRepository::with_runner_for_test(runner.clone());
+        let target = GitWorktreeRecord {
+            path: target_path.clone(),
+            head: Some("bbb".into()),
+            branch: Some("target".into()),
+            is_primary: false,
+            is_bare: false,
+            locked: false,
+            lock_reason: None,
+            is_prunable: true,
+            prunable_reason: Some("stale".into()),
+        };
+        let confirmed = [
+            GitPrunableWorktree {
+                path: target_path,
+                prune_reason: "stale".into(),
+                locked: false,
+                lock_reason: None,
+            },
+            GitPrunableWorktree {
+                path: other_path,
+                prune_reason: "reason-before-preview".into(),
+                locked: false,
+                lock_reason: None,
+            },
+        ];
+
+        repository
+            .prune_worktrees_verified(
+                fixture.path(),
+                &target,
+                &git_worktree_prune_impact_digest(&confirmed),
+                &CancellationToken::new(),
+            )
+            .await
+            .expect_err("same-path reason drift invalidates confirmed impact");
+        assert_eq!(
+            runner
+                .requests()
+                .iter()
+                .filter(|request| {
+                    request.args.iter().any(|argument| argument == "prune")
+                        && !request.args.iter().any(|argument| argument == "--dry-run")
+                })
+                .count(),
+            0,
+            "reason drift is rejected before repository-wide prune"
         );
     }
 
