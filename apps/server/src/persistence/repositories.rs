@@ -11,7 +11,7 @@ use std::sync::{
     atomic::{AtomicBool, AtomicUsize, Ordering},
 };
 
-use rusqlite::{OptionalExtension, Row, params};
+use rusqlite::{Connection, OptionalExtension, Row, params};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -156,6 +156,14 @@ impl Repositories {
             )?;
             Ok(())
         }).await
+    }
+
+    /// Finalizes a command only when its identity is still absent or held by the exact matching
+    /// reservation. An accepted/rejected or differently owned receipt is never overwritten.
+    pub async fn finalize_command_receipt(&self, row: CommandReceipt) -> Result<()> {
+        self.database
+            .call(move |connection| finalize_command_receipt_on(connection, row))
+            .await
     }
 
     pub async fn get_command_receipt(&self, command_id: String) -> Result<Option<CommandReceipt>> {
@@ -350,6 +358,28 @@ impl Repositories {
                         decode_command_receipt,
                     )
                     .optional()
+                    .map_err(Into::into)
+            })
+            .await
+    }
+
+    pub async fn verify_prepared_command_receipt(
+        &self,
+        command_id: String,
+        aggregate_kind: String,
+        aggregate_id: String,
+        payload_digest: String,
+    ) -> Result<bool> {
+        self.database
+            .call(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT EXISTS(SELECT 1 FROM orchestration_command_receipts \
+                         WHERE command_id = ? AND aggregate_kind = ? AND aggregate_id = ? \
+                           AND payload_digest = ? AND status = 'prepared')",
+                        params![command_id, aggregate_kind, aggregate_id, payload_digest],
+                        |row| row.get(0),
+                    )
                     .map_err(Into::into)
             })
             .await
@@ -1078,6 +1108,39 @@ pub struct CommandReceipt {
     pub status: String,
     pub error: Option<String>,
     pub payload_digest: Option<String>,
+}
+
+pub(crate) fn finalize_command_receipt_on(
+    connection: &Connection,
+    receipt: CommandReceipt,
+) -> Result<()> {
+    let command_id = receipt.command_id.clone();
+    let changed = connection.execute(
+        "INSERT INTO orchestration_command_receipts (command_id, aggregate_kind, aggregate_id, accepted_at, result_sequence, status, error, payload_digest) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?) \
+         ON CONFLICT (command_id) DO UPDATE SET \
+           aggregate_kind = excluded.aggregate_kind, aggregate_id = excluded.aggregate_id, accepted_at = excluded.accepted_at, \
+           result_sequence = excluded.result_sequence, status = excluded.status, error = excluded.error, payload_digest = excluded.payload_digest \
+         WHERE orchestration_command_receipts.status IN ('reserved', 'prepared') \
+           AND orchestration_command_receipts.aggregate_kind = excluded.aggregate_kind \
+           AND orchestration_command_receipts.aggregate_id = excluded.aggregate_id \
+           AND orchestration_command_receipts.payload_digest IS excluded.payload_digest",
+        params![
+            receipt.command_id,
+            receipt.aggregate_kind,
+            receipt.aggregate_id,
+            receipt.accepted_at,
+            receipt.result_sequence,
+            receipt.status,
+            receipt.error,
+            receipt.payload_digest
+        ],
+    )?;
+    if changed == 1 {
+        Ok(())
+    } else {
+        Err(PersistenceError::CommandReceiptConflict(command_id))
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct CheckpointDiffBlob {

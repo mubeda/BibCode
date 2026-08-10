@@ -21,7 +21,8 @@ use crate::{
     },
     orchestration::{
         CommandAdmission, OrchestrationCommand, OrchestrationEngine, OrchestrationError,
-        canonical_command_digest, engine::OptionalNullable,
+        canonical_command_digest,
+        engine::{OptionalNullable, WorkspaceOwnershipLease},
     },
     persistence::Repositories,
     rpc::{RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk},
@@ -39,6 +40,40 @@ const MAX_BASELINE_PATHS: usize = 512;
 
 pub type WorktreeRemovalQuiesceFuture =
     Pin<Box<dyn Future<Output = WorktreeRemovalQuiesceLease> + Send + 'static>>;
+pub type WorktreeRemovalCleanupAdmissionFuture = Pin<
+    Box<
+        dyn Future<
+                Output = Result<
+                    WorktreeRemovalCleanupAdmission,
+                    WorktreeRemovalCleanupAdmissionError,
+                >,
+            > + Send
+            + 'static,
+    >,
+>;
+
+pub struct WorktreeRemovalCleanupAdmission {
+    _resource: Box<dyn Send + 'static>,
+}
+
+impl WorktreeRemovalCleanupAdmission {
+    fn unlimited() -> Self {
+        Self {
+            _resource: Box::new(()),
+        }
+    }
+
+    pub(crate) fn retaining(resource: impl Send + 'static) -> Self {
+        Self {
+            _resource: Box::new(resource),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum WorktreeRemovalCleanupAdmissionError {
+    Capacity,
+}
 
 pub struct WorktreeRemovalQuiesceLease {
     orphan_cleanup_pending: bool,
@@ -143,7 +178,15 @@ impl Drop for WorktreeRemovalQuiesceLease {
 }
 
 pub trait WorktreeRemovalQuiescer: Send + Sync + 'static {
-    fn quiesce(&self, request: WorktreeRemovalQuiesceRequest) -> WorktreeRemovalQuiesceFuture;
+    fn admit_cleanup(&self) -> WorktreeRemovalCleanupAdmissionFuture {
+        Box::pin(async { Ok(WorktreeRemovalCleanupAdmission::unlimited()) })
+    }
+
+    fn quiesce(
+        &self,
+        admission: WorktreeRemovalCleanupAdmission,
+        request: WorktreeRemovalQuiesceRequest,
+    ) -> WorktreeRemovalQuiesceFuture;
 }
 
 pub type WorktreeRemovalGitFuture<T> =
@@ -254,7 +297,11 @@ impl WorktreeRemovalGit for GitRepository {
 struct NoopWorktreeRemovalQuiescer;
 
 impl WorktreeRemovalQuiescer for NoopWorktreeRemovalQuiescer {
-    fn quiesce(&self, _request: WorktreeRemovalQuiesceRequest) -> WorktreeRemovalQuiesceFuture {
+    fn quiesce(
+        &self,
+        _admission: WorktreeRemovalCleanupAdmission,
+        _request: WorktreeRemovalQuiesceRequest,
+    ) -> WorktreeRemovalQuiesceFuture {
         Box::pin(async { WorktreeRemovalQuiesceLease::complete() })
     }
 }
@@ -820,6 +867,7 @@ enum WorktreeRemovalErrorReason {
     ThreadNotFound,
     EnvironmentUnsupported,
     CommandConflict,
+    CleanupCapacity,
     OwnershipConflict,
     StaleGeneration,
     StalePlan,
@@ -869,6 +917,10 @@ async fn remove_from_bibcode(
 ) -> RpcResult {
     let input = decode::<WorktreeRemoveFromBibCodeInput>(request)?;
     let payload_digest = removal_payload_digest(&input)?;
+    if let Some(result) = replay_removal(services, &input.command_id, &payload_digest).await? {
+        return Ok(encode(result));
+    }
+    let cleanup_admission = admit_removal_cleanup(services).await?;
     let reservation = reserve_removal(services, &input, &payload_digest).await?;
     if let Some(result) = reservation.result {
         return Ok(encode(result));
@@ -882,19 +934,26 @@ async fn remove_from_bibcode(
             {
                 return Ok(encode(result));
             }
-            let resolved =
-                resolve_removal_thread(services, &input.project_id, &input.thread_id).await?;
+            let (ownership, resolved) = resolve_removal_thread_with_ownership(
+                services,
+                &input.project_id,
+                &input.thread_id,
+            )
+            .await?;
             let registry = services.catalog.availability_registry();
             let guard = registry
                 .mark_removing(&input.thread_id, &resolved.path)
                 .await;
             let quiesce = services
                 .removal_quiescer
-                .quiesce(WorktreeRemovalQuiesceRequest::project(
-                    guard.identity(),
-                    input.project_id.clone(),
-                    resolved.known_thread_ids,
-                ))
+                .quiesce(
+                    cleanup_admission,
+                    WorktreeRemovalQuiesceRequest::project(
+                        guard.identity(),
+                        input.project_id.clone(),
+                        resolved.known_thread_ids,
+                    ),
+                )
                 .await;
             let orphan_cleanup_pending = quiesce.orphan_cleanup_pending();
             let result = persist_detach(
@@ -907,6 +966,7 @@ async fn remove_from_bibcode(
                 "not-requested",
                 None,
                 orphan_cleanup_pending,
+                ownership.clone(),
             )
             .await?;
             quiesce.commit_detached();
@@ -930,6 +990,10 @@ async fn remove_worktree(
 ) -> RpcResult {
     let input = decode::<WorktreeRemoveInput>(request)?;
     let payload_digest = removal_payload_digest(&input)?;
+    if let Some(result) = replay_removal(services, &input.command_id, &payload_digest).await? {
+        return Ok(encode(result));
+    }
+    let cleanup_admission = admit_removal_cleanup(services).await?;
     let reservation = reserve_removal(services, &input, &payload_digest).await?;
     if let Some(result) = reservation.result {
         return Ok(encode(result));
@@ -943,8 +1007,12 @@ async fn remove_worktree(
             {
                 return Ok(encode(result));
             }
-            let resolved =
-                resolve_removal_thread(services, &input.project_id, &input.thread_id).await?;
+            let (ownership, resolved) = resolve_removal_thread_with_ownership(
+                services,
+                &input.project_id,
+                &input.thread_id,
+            )
+            .await?;
             let registry = services.catalog.availability_registry();
             let guard = registry
                 .mark_removing(&input.thread_id, &resolved.path)
@@ -980,14 +1048,26 @@ async fn remove_worktree(
                 .map_err(|error| encode(removal_orchestration_error(error)))?;
             let quiesce = services
                 .removal_quiescer
-                .quiesce(WorktreeRemovalQuiesceRequest::repository(
-                    guard.identity(),
-                    input.project_id.clone(),
-                    plan.repository_key.clone(),
-                    resolved.known_thread_ids,
-                ))
+                .quiesce(
+                    cleanup_admission,
+                    WorktreeRemovalQuiesceRequest::repository(
+                        guard.identity(),
+                        input.project_id.clone(),
+                        plan.repository_key.clone(),
+                        resolved.known_thread_ids,
+                    ),
+                )
                 .await;
             let orphan_cleanup_pending = quiesce.orphan_cleanup_pending();
+            services
+                .orchestration
+                .verify_prepared_worktree_removal_admission(
+                    &input.command_id,
+                    &input.project_id,
+                    &payload_digest,
+                )
+                .await
+                .map_err(|error| encode(removal_orchestration_error(error)))?;
             let git_result = if resumed_git_success {
                 Ok(("removed", None))
             } else {
@@ -1013,6 +1093,7 @@ async fn remove_worktree(
                 git_outcome,
                 detail,
                 orphan_cleanup_pending,
+                ownership.clone(),
             )
             .await?;
             quiesce.commit_detached();
@@ -1113,6 +1194,32 @@ async fn resolve_removal_thread(
         path,
         known_thread_ids,
     })
+}
+
+async fn resolve_removal_thread_with_ownership(
+    services: &WorktreeCatalogRpcServices,
+    project_id: &str,
+    thread_id: &str,
+) -> Result<(WorkspaceOwnershipLease, ResolvedRemovalThread), Value> {
+    // The first read discovers a server-owned normalized key. The second read is the
+    // authoritative ownership preflight and remains protected through Git and detach.
+    let candidate = resolve_removal_thread(services, project_id, thread_id).await?;
+    let ownership = services
+        .orchestration
+        .acquire_workspace_removal_ownership(&candidate.path)
+        .await
+        .map_err(|error| encode(removal_orchestration_error(error)))?;
+    let resolved = resolve_removal_thread(services, project_id, thread_id).await?;
+    if normalize_worktree_path_key(&candidate.path, host_path_platform())
+        != normalize_worktree_path_key(&resolved.path, host_path_platform())
+    {
+        return Err(encode(removal_error(
+            WorktreeRemovalErrorReason::OwnershipConflict,
+            "Workspace ownership changed during removal preflight.",
+            None,
+        )));
+    }
+    Ok((ownership, resolved))
 }
 
 async fn build_removal_plan(
@@ -1441,10 +1548,11 @@ async fn persist_detach(
     git_outcome: &str,
     detail: Option<String>,
     orphan_cleanup_pending: bool,
+    ownership: WorkspaceOwnershipLease,
 ) -> Result<WorktreeRemovalResult, Value> {
     services
         .orchestration
-        .dispatch_with_admission(
+        .dispatch_with_admission_and_ownership(
             OrchestrationCommand::WorktreeDetachResolved {
                 command_id,
                 project_id,
@@ -1459,6 +1567,7 @@ async fn persist_detach(
                 attachment_refs: Vec::new(),
                 provider_turn: None,
             },
+            ownership,
             || {},
         )
         .await
@@ -1489,6 +1598,22 @@ async fn replay_removal(
             })
         })
         .map_err(|error| encode(removal_orchestration_error(error)))
+}
+
+async fn admit_removal_cleanup(
+    services: &WorktreeCatalogRpcServices,
+) -> Result<WorktreeRemovalCleanupAdmission, Value> {
+    services
+        .removal_quiescer
+        .admit_cleanup()
+        .await
+        .map_err(|error| match error {
+            WorktreeRemovalCleanupAdmissionError::Capacity => encode(removal_error(
+                WorktreeRemovalErrorReason::CleanupCapacity,
+                "Workspace cleanup capacity is busy; retry the removal.",
+                None,
+            )),
+        })
 }
 
 async fn reserve_removal(
@@ -1649,7 +1774,8 @@ fn removal_orchestration_error(error: OrchestrationError) -> WorktreeRemovalErro
             "The command ID was already used with a different removal payload.",
             None,
         ),
-        OrchestrationError::WorktreeOwnershipConflict { .. } => removal_error(
+        OrchestrationError::WorktreeOwnershipConflict { .. }
+        | OrchestrationError::WorkspaceOwnershipChanged { .. } => removal_error(
             WorktreeRemovalErrorReason::OwnershipConflict,
             "Workspace ownership conflicts with removal.",
             None,

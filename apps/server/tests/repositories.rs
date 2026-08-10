@@ -295,6 +295,7 @@ fn public_repository_api_inventory_is_explicit() {
         "delete_thread",
         "delete_thread_session",
         "delete_turns_by_thread",
+        "finalize_command_receipt",
         "freeze_provider_turn_session",
         "get_auth_pairing_link_by_credential",
         "get_auth_session",
@@ -352,6 +353,7 @@ fn public_repository_api_inventory_is_explicit() {
         "upsert_thread",
         "upsert_thread_session",
         "upsert_turn_by_id",
+        "verify_prepared_command_receipt",
     ]
     .into_iter()
     .map(str::to_owned)

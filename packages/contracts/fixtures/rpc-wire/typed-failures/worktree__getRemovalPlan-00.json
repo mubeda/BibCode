@@ -8,7 +8,7 @@
         "_tag": "Fail",
         "error": {
           "_tag": "WorktreeRemovalError",
-          "reason": "locked",
+          "reason": "replacement-conflict",
           "message": "cf`Y[s",
           "currentGeneration": 8
         }

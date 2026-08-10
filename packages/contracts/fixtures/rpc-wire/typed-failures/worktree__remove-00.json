@@ -8,7 +8,7 @@
         "_tag": "Fail",
         "error": {
           "_tag": "WorktreeRemovalError",
-          "reason": "dirty-confirmation-required",
+          "reason": "internal",
           "message": "%}9WB7`"
         }
       }
