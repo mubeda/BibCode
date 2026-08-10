@@ -10,6 +10,7 @@ import {
 import {
   AcceptedStorageIdentityStore,
   ConnectionCatalogDocument,
+  type ConnectionCatalogDocument as ConnectionCatalogDocumentType,
   ConnectionRegistrationStore,
   ConnectionTargetStore,
   EnvironmentCacheStore,
@@ -24,9 +25,12 @@ import {
   ThreadId,
 } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import { IDBFactory } from "fake-indexeddb";
 import { afterEach, vi } from "vite-plus/test";
 
 import { connectionStorageLayer, makeCatalogBackend, makeCatalogStore } from "./storage";
@@ -66,6 +70,7 @@ class FakeRequest {
 
 class FakeTransaction {
   error: unknown = null;
+  private completed = false;
   private readonly listeners = new Map<string, Array<() => void>>();
   constructor(
     private readonly store: Map<IDBValidKey, unknown>,
@@ -79,6 +84,11 @@ class FakeTransaction {
   fire(type: string): void {
     for (const handler of this.listeners.get(type) ?? []) handler();
   }
+  complete(): void {
+    if (this.completed) return;
+    this.completed = true;
+    this.fire("complete");
+  }
   objectStore(_name: string) {
     return {
       get: (key: IDBValidKey) => {
@@ -91,6 +101,7 @@ class FakeTransaction {
           }
           request.result = this.store.has(key) ? this.store.get(key) : undefined;
           request.fire("success");
+          queueMicrotask(() => this.complete());
         });
         return request;
       },
@@ -105,7 +116,7 @@ class FakeTransaction {
           this.store.set(key, value);
           request.result = key;
           request.fire("success");
-          this.fire("complete");
+          this.complete();
         });
         return request;
       },
@@ -119,7 +130,7 @@ class FakeTransaction {
           }
           this.store.delete(key);
           request.fire("success");
-          this.fire("complete");
+          this.complete();
         });
         return request;
       },
@@ -139,7 +150,7 @@ class FakeTransaction {
             if (index >= keys.length) {
               request.result = null;
               request.fire("success");
-              this.fire("complete");
+              this.complete();
               return;
             }
             const key = keys[index++]!;
@@ -224,6 +235,17 @@ function installFakeIndexedDb(
   return handle;
 }
 
+function openCatalogDatabase(factory: IDBFactory, databaseName: string): Promise<IDBDatabase> {
+  return new Promise((resolve, reject) => {
+    const request = factory.open(databaseName, 1);
+    request.addEventListener("upgradeneeded", () => {
+      request.result.createObjectStore("catalog");
+    });
+    request.addEventListener("success", () => resolve(request.result));
+    request.addEventListener("error", () => reject(request.error));
+  });
+}
+
 // ── Domain fixtures ──────────────────────────────────────────────────
 
 const environmentId = EnvironmentId.make("environment-1");
@@ -302,13 +324,271 @@ afterEach(() => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe("makeCatalogStore", () => {
+  it.effect("merges disjoint updates from independently constructed stores", () =>
+    Effect.gen(function* () {
+      let durableCatalog = encodeCatalog(emptyCatalog);
+      const bothReadsComplete = yield* Deferred.make<void>();
+      const releaseReads = yield* Deferred.make<void>();
+      let reads = 0;
+      const backend = {
+        read: Effect.gen(function* () {
+          const raw = durableCatalog;
+          reads += 1;
+          if (reads === 2) yield* Deferred.succeed(bothReadsComplete, undefined);
+          if (reads <= 2) yield* Deferred.await(releaseReads);
+          return raw;
+        }),
+        compareAndSet: (expected: string | null, raw: string) =>
+          Effect.sync(() => {
+            if (durableCatalog !== expected) return false;
+            durableCatalog = raw;
+            return true;
+          }),
+      };
+      const first = yield* makeCatalogStore(backend);
+      const second = yield* makeCatalogStore(backend);
+
+      const firstUpdate = yield* Effect.forkChild(
+        first.update((document) => ({
+          ...document,
+          acceptedStorageIdentities: [
+            { targetKey: "platform:primary", storageInstanceId: "store-primary" },
+          ],
+        })),
+        { startImmediately: true },
+      );
+      const secondUpdate = yield* Effect.forkChild(
+        second.update((document) => ({
+          ...document,
+          acceptedStorageIdentities: [
+            ...document.acceptedStorageIdentities,
+            { targetKey: "bearer:remote", storageInstanceId: "store-remote" },
+          ],
+        })),
+        { startImmediately: true },
+      );
+      yield* Deferred.await(bothReadsComplete);
+      yield* Deferred.succeed(releaseReads, undefined);
+      yield* Fiber.join(firstUpdate);
+      yield* Fiber.join(secondUpdate);
+
+      expect(decodeCatalog(durableCatalog).acceptedStorageIdentities).toEqual([
+        { targetKey: "platform:primary", storageInstanceId: "store-primary" },
+        { targetKey: "bearer:remote", storageInstanceId: "store-remote" },
+      ]);
+    }),
+  );
+
+  it.effect("reapplies the ordered winner for concurrent acceptance of the same target", () =>
+    Effect.gen(function* () {
+      const initial = encodeCatalog(emptyCatalog);
+      let durableCatalog = initial;
+      const firstAtCompare = yield* Deferred.make<void>();
+      const releaseFirst = yield* Deferred.make<void>();
+      const firstCommitted = yield* Deferred.make<void>();
+      const compare = (expected: string | null, raw: string) =>
+        Effect.gen(function* () {
+          const identity = decodeCatalog(raw).acceptedStorageIdentities[0]?.storageInstanceId;
+          if (expected === initial && identity === "store-first") {
+            yield* Deferred.succeed(firstAtCompare, undefined);
+            yield* Deferred.await(releaseFirst);
+          } else if (expected === initial && identity === "store-second") {
+            yield* Deferred.await(firstCommitted);
+          }
+          const updated = durableCatalog === expected;
+          if (updated) durableCatalog = raw;
+          if (identity === "store-first") yield* Deferred.succeed(firstCommitted, undefined);
+          return updated;
+        });
+      const backend = {
+        read: Effect.sync(() => durableCatalog),
+        compareAndSet: compare,
+      };
+      const first = yield* makeCatalogStore(backend);
+      const second = yield* makeCatalogStore(backend);
+      const accept = (storageInstanceId: string) => (document: ConnectionCatalogDocumentType) => ({
+        ...document,
+        acceptedStorageIdentities: [{ targetKey: "platform:primary", storageInstanceId }],
+      });
+
+      const firstUpdate = yield* Effect.forkChild(first.update(accept("store-first")), {
+        startImmediately: true,
+      });
+      yield* Deferred.await(firstAtCompare);
+      const secondUpdate = yield* Effect.forkChild(second.update(accept("store-second")), {
+        startImmediately: true,
+      });
+      yield* Deferred.succeed(releaseFirst, undefined);
+      yield* Fiber.join(firstUpdate);
+      yield* Fiber.join(secondUpdate);
+
+      expect(decodeCatalog(durableCatalog).acceptedStorageIdentities).toEqual([
+        { targetKey: "platform:primary", storageInstanceId: "store-second" },
+      ]);
+    }),
+  );
+
+  it.effect(
+    "preserves registration, profile, credential, and DPoP token fields across an acceptance race",
+    () =>
+      Effect.gen(function* () {
+        let durableCatalog = encodeCatalog(emptyCatalog);
+        const bothReadsComplete = yield* Deferred.make<void>();
+        const releaseReads = yield* Deferred.make<void>();
+        let reads = 0;
+        const backend = {
+          read: Effect.gen(function* () {
+            const raw = durableCatalog;
+            reads += 1;
+            if (reads === 2) yield* Deferred.succeed(bothReadsComplete, undefined);
+            if (reads <= 2) yield* Deferred.await(releaseReads);
+            return raw;
+          }),
+          compareAndSet: (expected: string | null, raw: string) =>
+            Effect.sync(() => {
+              if (durableCatalog !== expected) return false;
+              durableCatalog = raw;
+              return true;
+            }),
+        };
+        const identityStore = yield* makeCatalogStore(backend);
+        const connectionStore = yield* makeCatalogStore(backend);
+        const registration = bearerRegistration();
+        const identityUpdate = yield* Effect.forkChild(
+          identityStore.update((document) => ({
+            ...document,
+            acceptedStorageIdentities: [
+              { targetKey: "platform:primary", storageInstanceId: "store-primary" },
+            ],
+          })),
+          { startImmediately: true },
+        );
+        const connectionUpdate = yield* Effect.forkChild(
+          connectionStore.update((document) => ({
+            ...document,
+            targets: [registration.target],
+            profiles: [registration.profile],
+            credentials: [
+              {
+                connectionId: registration.profile.connectionId,
+                credential: registration.credential,
+              },
+            ],
+            remoteDpopTokens: [remoteToken],
+          })),
+          { startImmediately: true },
+        );
+        yield* Deferred.await(bothReadsComplete);
+        yield* Deferred.succeed(releaseReads, undefined);
+        yield* Fiber.join(identityUpdate);
+        yield* Fiber.join(connectionUpdate);
+
+        const document = decodeCatalog(durableCatalog);
+        expect(document.acceptedStorageIdentities).toHaveLength(1);
+        expect(document.targets).toEqual([registration.target]);
+        expect(document.profiles).toEqual([registration.profile]);
+        expect(document.credentials).toHaveLength(1);
+        expect(document.remoteDpopTokens).toEqual([remoteToken]);
+      }),
+  );
+
+  it.effect("rereads after a corrupt-catalog recovery loses a compare-and-set race", () =>
+    Effect.gen(function* () {
+      const newer = encodeCatalog({
+        ...emptyCatalog,
+        acceptedStorageIdentities: [
+          { targetKey: "platform:primary", storageInstanceId: "newer-store" },
+        ],
+      });
+      let durableCatalog = "{not-json";
+      const store = yield* makeCatalogStore({
+        read: Effect.sync(() => durableCatalog),
+        compareAndSet: (expected, _next) =>
+          Effect.sync(() => {
+            if (expected === "{not-json") durableCatalog = newer;
+            return false;
+          }),
+      });
+
+      expect((yield* store.read).acceptedStorageIdentities).toEqual([
+        { targetKey: "platform:primary", storageInstanceId: "newer-store" },
+      ]);
+    }),
+  );
+
+  it.effect("fails with a typed error after bounded compare-and-set conflicts", () =>
+    Effect.gen(function* () {
+      let attempts = 0;
+      const store = yield* makeCatalogStore({
+        read: Effect.succeed(encodeCatalog(emptyCatalog)),
+        compareAndSet: () =>
+          Effect.sync(() => {
+            attempts += 1;
+            return false;
+          }),
+      });
+
+      const error = yield* store.update((document) => document).pipe(Effect.flip);
+      expect(error).toBeInstanceOf(ConnectionTransientError);
+      expect(error.message).toContain("changed too many times");
+      expect(attempts).toBe(8);
+    }),
+  );
+
+  it.effect("reloads a durable commit when its updating fiber is interrupted", () =>
+    Effect.gen(function* () {
+      let durableCatalog = encodeCatalog(emptyCatalog);
+      const committed = yield* Deferred.make<void>();
+      const releaseCommit = yield* Deferred.make<void>();
+      const store = yield* makeCatalogStore({
+        read: Effect.sync(() => durableCatalog),
+        compareAndSet: (expected, raw) =>
+          Effect.sync(() => {
+            if (durableCatalog !== expected) return false;
+            durableCatalog = raw;
+            return true;
+          }).pipe(
+            Effect.tap(() => Deferred.succeed(committed, undefined)),
+            Effect.tap(() => Deferred.await(releaseCommit)),
+          ),
+      });
+
+      yield* store.read;
+      const update = yield* Effect.forkChild(
+        store.update((document) => ({
+          ...document,
+          acceptedStorageIdentities: [
+            { targetKey: "platform:primary", storageInstanceId: "store-primary" },
+          ],
+        })),
+        { startImmediately: true },
+      );
+      yield* Deferred.await(committed);
+      const interruption = yield* Effect.forkChild(Fiber.interrupt(update), {
+        startImmediately: true,
+      });
+      yield* Effect.yieldNow;
+      yield* Deferred.succeed(releaseCommit, undefined);
+      yield* Fiber.join(interruption);
+
+      expect(decodeCatalog(durableCatalog).acceptedStorageIdentities).toHaveLength(1);
+      expect((yield* store.read).acceptedStorageIdentities).toEqual([
+        { targetKey: "platform:primary", storageInstanceId: "store-primary" },
+      ]);
+    }),
+  );
+
   it.effect("quarantines malformed catalogs and starts from an empty document", () =>
     Effect.gen(function* () {
       const writes: string[] = [];
       const quarantined: string[] = [];
       const store = yield* makeCatalogStore({
         read: Effect.succeed("{not-json"),
-        write: (raw) => Effect.sync(() => writes.push(raw)),
+        compareAndSet: (_expected, raw) =>
+          Effect.sync(() => {
+            writes.push(raw);
+            return true;
+          }),
         quarantine: (raw) => Effect.sync(() => quarantined.push(raw)),
       });
 
@@ -331,7 +611,7 @@ describe("makeCatalogStore", () => {
       });
       const store = yield* makeCatalogStore({
         read: Effect.succeed("{not-json"),
-        write: () => Effect.fail(writeFailure),
+        compareAndSet: () => Effect.fail(writeFailure),
         quarantine: () => Effect.fail(quarantineFailure),
       });
 
@@ -348,7 +628,7 @@ describe("makeCatalogStore", () => {
       });
       const store = yield* makeCatalogStore({
         read: Effect.fail(failure),
-        write: () => Effect.void,
+        compareAndSet: () => Effect.succeed(true),
       });
 
       expect(yield* Effect.flip(store.read)).toBe(failure);
@@ -363,13 +643,12 @@ describe("makeCatalogStore", () => {
           reads += 1;
           return null;
         }),
-        write: () => Effect.void,
+        compareAndSet: () => Effect.succeed(true),
       });
 
       expect(yield* store.read).toEqual(emptyCatalog);
-      // The second read is served from the in-memory cache without re-reading.
       expect(yield* store.read).toEqual(emptyCatalog);
-      expect(reads).toBe(1);
+      expect(reads).toBe(2);
     }),
   );
 
@@ -377,19 +656,26 @@ describe("makeCatalogStore", () => {
     Effect.gen(function* () {
       const store = yield* makeCatalogStore({
         read: Effect.succeed("   "),
-        write: () => Effect.void,
+        compareAndSet: () => Effect.succeed(true),
       });
 
       expect(yield* store.read).toEqual(emptyCatalog);
     }),
   );
 
-  it.effect("update transforms, encodes, persists, and caches the next document", () =>
+  it.effect("update transforms, encodes, persists, and reloads the next document", () =>
     Effect.gen(function* () {
       const writes: string[] = [];
+      let durableCatalog: string | null = null;
       const store = yield* makeCatalogStore({
-        read: Effect.succeed(null),
-        write: (raw) => Effect.sync(() => writes.push(raw)),
+        read: Effect.sync(() => durableCatalog),
+        compareAndSet: (expected, raw) =>
+          Effect.sync(() => {
+            if (durableCatalog !== expected) return false;
+            durableCatalog = raw;
+            writes.push(raw);
+            return true;
+          }),
       });
 
       yield* store.update((document) => ({
@@ -400,13 +686,11 @@ describe("makeCatalogStore", () => {
       expect(writes).toHaveLength(1);
       const persisted = decodeCatalog(writes[0]!);
       expect(persisted.profiles).toHaveLength(1);
-      // The cached document reflects the update without another backend read.
-      const cached = yield* store.read;
-      expect(cached.profiles).toHaveLength(1);
+      expect((yield* store.read).profiles).toHaveLength(1);
     }),
   );
 
-  it.effect("decodes and caches a well-formed stored catalog", () => {
+  it.effect("decodes a fresh well-formed stored catalog on every read", () => {
     const encoded = encodeCatalog(emptyCatalog);
     return Effect.gen(function* () {
       let reads = 0;
@@ -415,12 +699,12 @@ describe("makeCatalogStore", () => {
           reads += 1;
           return encoded;
         }),
-        write: () => Effect.void,
+        compareAndSet: () => Effect.succeed(true),
       });
 
       expect(yield* store.read).toEqual(emptyCatalog);
       yield* store.read;
-      expect(reads).toBe(1);
+      expect(reads).toBe(2);
     });
   });
 });
@@ -430,20 +714,20 @@ describe("makeCatalogStore", () => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe("makeCatalogBackend (desktop bridge)", () => {
-  it.effect("reads and writes through the desktop bridge secure storage", () =>
+  it.effect("reads and compares through the desktop bridge secure storage", () =>
     Effect.gen(function* () {
-      const setConnectionCatalog = vi.fn().mockResolvedValue(true);
+      const compareAndSetConnectionCatalog = vi.fn().mockResolvedValue(true);
       vi.stubGlobal("window", {
         desktopBridge: {
           getConnectionCatalog: vi.fn().mockResolvedValue("stored-catalog"),
-          setConnectionCatalog,
+          compareAndSetConnectionCatalog,
         },
       });
       const backend = makeCatalogBackend({} as IDBDatabase);
 
       expect(yield* backend.read).toBe("stored-catalog");
-      yield* backend.write("payload");
-      expect(setConnectionCatalog).toHaveBeenCalledWith("payload");
+      expect(yield* backend.compareAndSet("stored-catalog", "payload")).toBe(true);
+      expect(compareAndSetConnectionCatalog).toHaveBeenCalledWith("stored-catalog", "payload");
       // The bridge backend does not expose a quarantine seam.
       expect(backend.quarantine).toBeUndefined();
     }),
@@ -454,7 +738,7 @@ describe("makeCatalogBackend (desktop bridge)", () => {
       vi.stubGlobal("window", {
         desktopBridge: {
           getConnectionCatalog: vi.fn().mockRejectedValue(new Error("locked")),
-          setConnectionCatalog: vi.fn().mockResolvedValue(true),
+          compareAndSetConnectionCatalog: vi.fn().mockResolvedValue(true),
         },
       });
       const backend = makeCatalogBackend({} as IDBDatabase);
@@ -465,8 +749,9 @@ describe("makeCatalogBackend (desktop bridge)", () => {
     }),
   );
 
-  it.effect("fails writes when desktop secure storage declines the catalog", () =>
+  it.effect("selects IndexedDB when the desktop bridge has no protected CAS capability", () =>
     Effect.gen(function* () {
+      const handle = installFakeIndexedDb();
       const setConnectionCatalog = vi.fn().mockResolvedValue(false);
       vi.stubGlobal("window", {
         desktopBridge: {
@@ -474,25 +759,93 @@ describe("makeCatalogBackend (desktop bridge)", () => {
           setConnectionCatalog,
         },
       });
-      const backend = makeCatalogBackend({} as IDBDatabase);
+      const backend = makeCatalogBackend(handle.db);
 
-      const error = yield* backend.write("{}").pipe(Effect.flip);
+      expect(yield* backend.compareAndSet(null, "{}")).toBe(true);
 
-      expect(error).toBeInstanceOf(ConnectionTransientError);
-      expect(error.message).toContain("Desktop secure storage is unavailable");
-      expect(setConnectionCatalog).toHaveBeenCalledWith("{}");
+      expect(yield* backend.read).toBe("{}");
+      expect(setConnectionCatalog).not.toHaveBeenCalled();
     }),
   );
 });
 
 describe("makeCatalogBackend (IndexedDB)", () => {
-  it.effect("reads null when the catalog store is empty, then round-trips a write", () =>
+  it.effect("atomically merges conflicting updates from two database connections", () =>
+    Effect.gen(function* () {
+      vi.stubGlobal("window", {});
+      const factory = new IDBFactory();
+      const firstDatabase = yield* Effect.promise(() =>
+        openCatalogDatabase(factory, "catalog-concurrency"),
+      );
+      const secondDatabase = yield* Effect.promise(() =>
+        openCatalogDatabase(factory, "catalog-concurrency"),
+      );
+      const firstBackend = makeCatalogBackend(firstDatabase);
+      const secondBackend = makeCatalogBackend(secondDatabase);
+      const initial = encodeCatalog(emptyCatalog);
+      expect(yield* firstBackend.compareAndSet(null, initial)).toBe(true);
+
+      const bothReadsComplete = yield* Deferred.make<void>();
+      const releaseReads = yield* Deferred.make<void>();
+      let reads = 0;
+      const gateInitialRead = (backend: typeof firstBackend) => ({
+        ...backend,
+        read: Effect.gen(function* () {
+          const raw = yield* backend.read;
+          reads += 1;
+          if (reads === 2) yield* Deferred.succeed(bothReadsComplete, undefined);
+          if (reads <= 2) yield* Deferred.await(releaseReads);
+          return raw;
+        }),
+      });
+      const firstStore = yield* makeCatalogStore(gateInitialRead(firstBackend));
+      const secondStore = yield* makeCatalogStore(gateInitialRead(secondBackend));
+      const firstUpdate = yield* Effect.forkChild(
+        firstStore.update((document) => ({
+          ...document,
+          acceptedStorageIdentities: [
+            ...document.acceptedStorageIdentities,
+            { targetKey: "platform:primary", storageInstanceId: "store-primary" },
+          ],
+        })),
+        { startImmediately: true },
+      );
+      const secondUpdate = yield* Effect.forkChild(
+        secondStore.update((document) => ({
+          ...document,
+          acceptedStorageIdentities: [
+            ...document.acceptedStorageIdentities,
+            { targetKey: "bearer:remote", storageInstanceId: "store-remote" },
+          ],
+        })),
+        { startImmediately: true },
+      );
+
+      yield* Deferred.await(bothReadsComplete);
+      yield* Deferred.succeed(releaseReads, undefined);
+      yield* Fiber.join(firstUpdate);
+      yield* Fiber.join(secondUpdate);
+
+      const raw = yield* firstBackend.read;
+      expect(decodeCatalog(raw!).acceptedStorageIdentities).toEqual(
+        expect.arrayContaining([
+          { targetKey: "platform:primary", storageInstanceId: "store-primary" },
+          { targetKey: "bearer:remote", storageInstanceId: "store-remote" },
+        ]),
+      );
+      expect(decodeCatalog(raw!).acceptedStorageIdentities).toHaveLength(2);
+      firstDatabase.close();
+      secondDatabase.close();
+    }),
+  );
+
+  it.effect("reads null when the catalog store is empty, then round-trips a compare-and-set", () =>
     Effect.gen(function* () {
       const handle = installFakeIndexedDb();
       const backend = makeCatalogBackend(handle.db);
 
       expect(yield* backend.read).toBeNull();
-      yield* backend.write("catalog-json");
+      expect(yield* backend.compareAndSet(null, "catalog-json")).toBe(true);
       expect(yield* backend.read).toBe("catalog-json");
 
       yield* backend.quarantine!("corrupt-json");
@@ -514,12 +867,12 @@ describe("makeCatalogBackend (IndexedDB)", () => {
     }),
   );
 
-  it.effect("maps IndexedDB write failures to a transient error", () =>
+  it.effect("maps IndexedDB compare-and-set failures to a transient error", () =>
     Effect.gen(function* () {
       const handle = installFakeIndexedDb({ fault: "put" });
       const backend = makeCatalogBackend(handle.db);
 
-      const error = yield* backend.write("payload").pipe(Effect.flip);
+      const error = yield* backend.compareAndSet(null, "payload").pipe(Effect.flip);
       expect(error).toBeInstanceOf(ConnectionTransientError);
     }),
   );
@@ -530,17 +883,201 @@ describe("makeCatalogBackend (IndexedDB)", () => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe("connectionStorageLayer", () => {
+  it.effect(
+    "migrates a non-Windows desktop fallback catalog and updates it atomically in IndexedDB",
+    () => {
+      const handle = installFakeIndexedDb();
+      const legacyCatalog = encodeCatalog(emptyCatalog);
+      const clearConnectionCatalog = vi.fn().mockResolvedValue(undefined);
+      vi.stubGlobal("window", {
+        desktopBridge: {
+          getConnectionCatalog: vi.fn().mockResolvedValue(legacyCatalog),
+          clearConnectionCatalog,
+        },
+      });
+
+      return Effect.gen(function* () {
+        const identityStore = yield* AcceptedStorageIdentityStore;
+        yield* identityStore.accept({
+          targetKey: "platform:primary",
+          storageInstanceId: "store-macos",
+        });
+
+        const raw = handle.stores.get("catalog")?.get("document");
+        expect(typeof raw).toBe("string");
+        expect(decodeCatalog(raw as string).acceptedStorageIdentities).toEqual([
+          { targetKey: "platform:primary", storageInstanceId: "store-macos" },
+        ]);
+        expect(clearConnectionCatalog).toHaveBeenCalledTimes(1);
+      }).pipe(Effect.provide(connectionStorageLayer));
+    },
+  );
+
+  it.effect(
+    "preserves the exact IndexedDB winner when legacy migration loses its compare-and-set",
+    () => {
+      const handle = installFakeIndexedDb();
+      const registration = bearerRegistration();
+      const indexedDbWinner = encodeCatalog({
+        ...emptyCatalog,
+        targets: [registration.target],
+        profiles: [registration.profile],
+        credentials: [
+          {
+            connectionId: registration.target.connectionId,
+            credential: registration.credential,
+          },
+        ],
+        remoteDpopTokens: [remoteToken],
+        acceptedStorageIdentities: [
+          { targetKey: "bearer:connection-1", storageInstanceId: "indexeddb-winner" },
+        ],
+      });
+      handle.stores.set("catalog", new Map([["document", indexedDbWinner]]));
+      const legacyCatalog = encodeCatalog({
+        ...emptyCatalog,
+        acceptedStorageIdentities: [
+          { targetKey: "platform:primary", storageInstanceId: "legacy-loser" },
+        ],
+      });
+      const clearConnectionCatalog = vi.fn().mockResolvedValue(undefined);
+      vi.stubGlobal("window", {
+        desktopBridge: {
+          getConnectionCatalog: vi.fn().mockResolvedValue(legacyCatalog),
+          clearConnectionCatalog,
+        },
+      });
+
+      return Effect.gen(function* () {
+        const identityStore = yield* AcceptedStorageIdentityStore;
+
+        expect(yield* identityStore.get("bearer:connection-1")).toEqual(
+          Option.some("indexeddb-winner"),
+        );
+        expect(handle.stores.get("catalog")?.get("document")).toBe(indexedDbWinner);
+        expect(clearConnectionCatalog).toHaveBeenCalledTimes(1);
+      }).pipe(Effect.provide(connectionStorageLayer));
+    },
+  );
+
+  it.effect(
+    "replaces a corrupt IndexedDB value with the only valid legacy catalog before clearing it",
+    () => {
+      const handle = installFakeIndexedDb();
+      const corruptIndexedDbCatalog = "{corrupt-indexeddb-catalog";
+      handle.stores.set("catalog", new Map([["document", corruptIndexedDbCatalog]]));
+      const legacyCatalog = encodeCatalog({
+        ...emptyCatalog,
+        acceptedStorageIdentities: [
+          { targetKey: "platform:primary", storageInstanceId: "valid-legacy" },
+        ],
+      });
+      const clearConnectionCatalog = vi.fn().mockResolvedValue(undefined);
+      vi.stubGlobal("window", {
+        desktopBridge: {
+          getConnectionCatalog: vi.fn().mockResolvedValue(legacyCatalog),
+          clearConnectionCatalog,
+        },
+      });
+
+      return Effect.gen(function* () {
+        const identityStore = yield* AcceptedStorageIdentityStore;
+
+        expect(yield* identityStore.get("platform:primary")).toEqual(Option.some("valid-legacy"));
+        expect(handle.stores.get("catalog")?.get("document")).toBe(legacyCatalog);
+        expect(
+          [...(handle.stores.get("catalog")?.entries() ?? [])].some(
+            ([key, value]) =>
+              typeof key === "string" &&
+              key.startsWith("document:corrupt:") &&
+              value === corruptIndexedDbCatalog,
+          ),
+        ).toBe(true);
+        expect(clearConnectionCatalog).toHaveBeenCalledTimes(1);
+      }).pipe(Effect.provide(connectionStorageLayer));
+    },
+  );
+
+  it.effect(
+    "merges mutations from two independent desktop storage layers through bridge CAS",
+    () => {
+      installFakeIndexedDb();
+      let storedCatalog = encodeCatalog(emptyCatalog);
+      let reads = 0;
+      let releaseReads = () => {};
+      let reportBothReads = () => {};
+      const bothReads = new Promise<void>((resolve) => {
+        reportBothReads = resolve;
+      });
+      const readsReleased = new Promise<void>((resolve) => {
+        releaseReads = resolve;
+      });
+      const compareAndSetConnectionCatalog = vi.fn(
+        async (expected: string | null, next: string) => {
+          if (storedCatalog !== expected) return false;
+          storedCatalog = next;
+          return true;
+        },
+      );
+      vi.stubGlobal("window", {
+        desktopBridge: {
+          getConnectionCatalog: vi.fn(async () => {
+            const raw = storedCatalog;
+            reads += 1;
+            if (reads === 2) reportBothReads();
+            if (reads <= 2) await readsReleased;
+            return raw;
+          }),
+          compareAndSetConnectionCatalog,
+        },
+      });
+
+      const acceptIdentity = Effect.gen(function* () {
+        const identityStore = yield* AcceptedStorageIdentityStore;
+        yield* identityStore.accept({
+          targetKey: "platform:primary",
+          storageInstanceId: "store-desktop",
+        });
+      }).pipe(Effect.provide(connectionStorageLayer));
+      const registerConnection = Effect.gen(function* () {
+        const registrationStore = yield* ConnectionRegistrationStore;
+        yield* registrationStore.register(bearerRegistration());
+      }).pipe(Effect.provide(connectionStorageLayer));
+
+      return Effect.gen(function* () {
+        const identityFiber = yield* Effect.forkChild(acceptIdentity, { startImmediately: true });
+        const registrationFiber = yield* Effect.forkChild(registerConnection, {
+          startImmediately: true,
+        });
+        yield* Effect.promise(() => bothReads);
+        releaseReads();
+        yield* Fiber.join(identityFiber);
+        yield* Fiber.join(registrationFiber);
+
+        const document = decodeCatalog(storedCatalog);
+        expect(document.acceptedStorageIdentities).toEqual([
+          { targetKey: "platform:primary", storageInstanceId: "store-desktop" },
+        ]);
+        expect(document.targets).toEqual([bearerRegistration().target]);
+        expect(document.profiles).toEqual([bearerRegistration().profile]);
+        expect(document.credentials).toHaveLength(1);
+        expect(compareAndSetConnectionCatalog).toHaveBeenCalledTimes(3);
+      });
+    },
+  );
+
   it.effect("persists accepted identities through the desktop catalog bridge", () => {
     installFakeIndexedDb();
     let storedCatalog = encodeCatalog(emptyCatalog);
-    const setConnectionCatalog = vi.fn((raw: string) => {
+    const compareAndSetConnectionCatalog = vi.fn((expected: string | null, raw: string) => {
+      if (storedCatalog !== expected) return Promise.resolve(false);
       storedCatalog = raw;
       return Promise.resolve(true);
     });
     vi.stubGlobal("window", {
       desktopBridge: {
         getConnectionCatalog: vi.fn(() => Promise.resolve(storedCatalog)),
-        setConnectionCatalog,
+        compareAndSetConnectionCatalog,
       },
     });
 
@@ -559,7 +1096,7 @@ describe("connectionStorageLayer", () => {
           storageInstanceId: "store-desktop",
         },
       ]);
-      expect(setConnectionCatalog).toHaveBeenCalledTimes(1);
+      expect(compareAndSetConnectionCatalog).toHaveBeenCalledTimes(1);
     }).pipe(Effect.provide(connectionStorageLayer));
   });
 
@@ -606,6 +1143,7 @@ describe("connectionStorageLayer", () => {
       desktopBridge: {
         getConnectionCatalog: vi.fn().mockRejectedValue(new Error(leakedCause)),
         setConnectionCatalog: vi.fn().mockRejectedValue(new Error(leakedCause)),
+        compareAndSetConnectionCatalog: vi.fn().mockRejectedValue(new Error(leakedCause)),
       },
     });
 

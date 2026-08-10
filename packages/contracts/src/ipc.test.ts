@@ -1,7 +1,11 @@
 import * as Schema from "effect/Schema";
 import { describe, expect, it } from "vite-plus/test";
 
-import { ContextMenuItemSchema, DesktopEnvironmentBootstrapSchema } from "./ipc.ts";
+import {
+  ContextMenuItemSchema,
+  type DesktopBridge,
+  DesktopEnvironmentBootstrapSchema,
+} from "./ipc.ts";
 import { expectDecodeFailure, expectEncodeFailure } from "./test/schemaAssertions.ts";
 
 const decodeContextMenuItem = Schema.decodeUnknownSync(ContextMenuItemSchema);
@@ -9,6 +13,23 @@ const encodeContextMenuItem = Schema.encodeSync(ContextMenuItemSchema);
 const decodeDesktopEnvironmentBootstrap = Schema.decodeUnknownSync(
   DesktopEnvironmentBootstrapSchema,
 );
+
+describe("DesktopBridge connection catalog", () => {
+  it("exposes an exact-raw compare-and-set operation", async () => {
+    let catalog: string | null = "before";
+    const bridge: Pick<DesktopBridge, "compareAndSetConnectionCatalog"> = {
+      compareAndSetConnectionCatalog: async (expected, next) => {
+        if (catalog !== expected) return false;
+        catalog = next;
+        return true;
+      },
+    };
+
+    await expect(bridge.compareAndSetConnectionCatalog!("stale", "ignored")).resolves.toBe(false);
+    await expect(bridge.compareAndSetConnectionCatalog!("before", "after")).resolves.toBe(true);
+    expect(catalog).toBe("after");
+  });
+});
 
 describe("DesktopEnvironmentBootstrapSchema", () => {
   it("preserves the concrete running distro separately from the backend id", () => {

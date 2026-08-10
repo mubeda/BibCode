@@ -5,6 +5,7 @@ use std::{
     fs, io,
     path::{Path, PathBuf},
     process::Command,
+    sync::Mutex,
     time::Duration,
 };
 use tauri::{AppHandle, Manager, Runtime, State};
@@ -50,7 +51,7 @@ const DEFAULT_TAILSCALE_SERVE_PORT: u16 = 443;
 const PRIMARY_LOCAL_ENVIRONMENT_ID: &str = "primary";
 const WSL_INSTANCE_ID_PREFIX: &str = "wsl:";
 const REMOTE_API_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const TAURI_DESKTOP_BRIDGE_VERSION: u16 = 1;
+const TAURI_DESKTOP_BRIDGE_VERSION: u16 = 2;
 const MAX_DIAGNOSTIC_ARCHIVE_BYTES: usize = 20 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +83,53 @@ struct ConnectionCatalogDocument {
     catalog: Option<String>,
     encrypted_catalog: Option<String>,
     protection: Option<String>,
+}
+
+pub(crate) struct ConnectionCatalogCoordinator {
+    catalog: Mutex<()>,
+}
+
+impl ConnectionCatalogCoordinator {
+    pub(crate) fn new() -> Self {
+        Self {
+            catalog: Mutex::new(()),
+        }
+    }
+
+    fn with_lock<T>(&self, operation: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let _guard = self
+            .catalog
+            .lock()
+            .map_err(|_| "The connection catalog coordinator is unavailable.".to_string())?;
+        operation()
+    }
+
+    fn read_with(
+        &self,
+        read: impl FnOnce() -> Result<Option<String>, String>,
+    ) -> Result<Option<String>, String> {
+        self.with_lock(read)
+    }
+
+    fn compare_and_set_with(
+        &self,
+        expected: Option<&str>,
+        next: &str,
+        read: impl FnOnce() -> Result<Option<String>, String>,
+        write: impl FnOnce(&str) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        self.with_lock(|| {
+            if read()?.as_deref() != expected {
+                return Ok(false);
+            }
+            write(next)?;
+            Ok(true)
+        })
+    }
+}
+
+fn connection_catalog_command_error(operation: &str) -> String {
+    format!("Could not {operation} the protected connection catalog.")
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -839,6 +887,7 @@ pub fn desktop_bridge_get_bridge_metadata(app: AppHandle<DesktopRuntime>) -> Val
             "wslDiscovery": true,
             "sshRemoteHttp": true,
             "connectionCatalog": true,
+            "protectedConnectionCatalog": cfg!(target_os = "windows"),
             "sshProvisioning": true,
             "preview": crate::preview::host::is_supported(),
             "updater": app.updater().is_ok(),
@@ -879,26 +928,57 @@ pub fn desktop_bridge_set_client_settings(
 #[tauri::command]
 pub fn desktop_bridge_get_connection_catalog(
     app: AppHandle<DesktopRuntime>,
+    catalogs: State<'_, ConnectionCatalogCoordinator>,
 ) -> Result<Option<String>, String> {
-    let path = connection_catalog_path(&app)?;
-    read_connection_catalog_document(&path)
+    let path =
+        connection_catalog_path(&app).map_err(|_| connection_catalog_command_error("load"))?;
+    catalogs
+        .read_with(|| read_connection_catalog_document(&path))
+        .map_err(|_| connection_catalog_command_error("load"))
 }
 
 #[tauri::command]
 pub fn desktop_bridge_set_connection_catalog(
     app: AppHandle<DesktopRuntime>,
+    catalogs: State<'_, ConnectionCatalogCoordinator>,
     catalog: String,
 ) -> Result<bool, String> {
-    let path = connection_catalog_path(&app)?;
-    write_connection_catalog_document(&path, &catalog)
+    let path =
+        connection_catalog_path(&app).map_err(|_| connection_catalog_command_error("save"))?;
+    catalogs
+        .with_lock(|| write_connection_catalog_document(&path, &catalog))
+        .map_err(|_| connection_catalog_command_error("save"))
+}
+
+#[tauri::command]
+pub fn desktop_bridge_compare_and_set_connection_catalog(
+    app: AppHandle<DesktopRuntime>,
+    catalogs: State<'_, ConnectionCatalogCoordinator>,
+    expected_catalog: Option<String>,
+    next_catalog: String,
+) -> Result<bool, String> {
+    let path =
+        connection_catalog_path(&app).map_err(|_| connection_catalog_command_error("update"))?;
+    catalogs
+        .compare_and_set_with(
+            expected_catalog.as_deref(),
+            &next_catalog,
+            || read_connection_catalog_document(&path),
+            |catalog| write_connection_catalog_document(&path, catalog).map(|_| ()),
+        )
+        .map_err(|_| connection_catalog_command_error("update"))
 }
 
 #[tauri::command]
 pub fn desktop_bridge_clear_connection_catalog(
     app: AppHandle<DesktopRuntime>,
+    catalogs: State<'_, ConnectionCatalogCoordinator>,
 ) -> Result<(), String> {
-    let path = connection_catalog_path(&app)?;
-    clear_connection_catalog_document(&path)
+    let path =
+        connection_catalog_path(&app).map_err(|_| connection_catalog_command_error("clear"))?;
+    catalogs
+        .with_lock(|| clear_connection_catalog_document(&path))
+        .map_err(|_| connection_catalog_command_error("clear"))
 }
 
 #[tauri::command]
@@ -1328,7 +1408,7 @@ mod tests {
     use std::future::Future;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::mpsc;
+    use std::sync::{Arc, Barrier, Mutex, mpsc};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1568,6 +1648,66 @@ mod tests {
             .expect("unsupported protected document should not be imported"),
             None
         );
+    }
+
+    fn compare_test_catalog(
+        catalogs: &ConnectionCatalogCoordinator,
+        value: &Mutex<Option<String>>,
+        expected: Option<&str>,
+        next: &str,
+    ) -> Result<bool, String> {
+        catalogs.compare_and_set_with(
+            expected,
+            next,
+            || Ok(value.lock().expect("test catalog lock").clone()),
+            |catalog| {
+                *value.lock().expect("test catalog lock") = Some(catalog.to_string());
+                Ok(())
+            },
+        )
+    }
+
+    #[test]
+    fn connection_catalog_compare_and_set_preserves_conflicting_values() {
+        let catalogs = ConnectionCatalogCoordinator::new();
+        let value = Mutex::new(Some("before".to_string()));
+
+        assert!(compare_test_catalog(&catalogs, &value, Some("before"), "winner").unwrap());
+        assert!(!compare_test_catalog(&catalogs, &value, Some("before"), "loser").unwrap());
+        assert_eq!(
+            catalogs
+                .read_with(|| Ok(value.lock().expect("test catalog lock").clone()))
+                .unwrap(),
+            Some("winner".to_string())
+        );
+    }
+
+    #[test]
+    fn concurrent_connection_catalog_compare_and_set_has_exactly_one_winner() {
+        let catalogs = Arc::new(ConnectionCatalogCoordinator::new());
+        let value = Arc::new(Mutex::new(Some("before".to_string())));
+        let start = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for next in ["first", "second"] {
+            let catalogs = Arc::clone(&catalogs);
+            let value = Arc::clone(&value);
+            let start = Arc::clone(&start);
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                compare_test_catalog(&catalogs, &value, Some("before"), next).unwrap()
+            }));
+        }
+        start.wait();
+
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("catalog worker should finish"))
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| **result).count(), 1);
+        assert!(matches!(
+            value.lock().expect("test catalog lock").as_deref(),
+            Some("first" | "second")
+        ));
     }
 
     #[test]
@@ -2088,9 +2228,13 @@ mod tests {
         let metadata = desktop_bridge_get_bridge_metadata(base_app.handle().clone());
 
         assert_eq!(metadata["host"], "tauri");
-        assert_eq!(metadata["bridgeVersion"], 1);
+        assert_eq!(metadata["bridgeVersion"], 2);
         assert_eq!(metadata["features"]["localBackend"], true);
         assert_eq!(metadata["features"]["connectionCatalog"], true);
+        assert_eq!(
+            metadata["features"]["protectedConnectionCatalog"],
+            cfg!(target_os = "windows")
+        );
         assert_eq!(
             metadata["features"]["preview"],
             crate::preview::host::is_supported()
@@ -2348,6 +2492,7 @@ mod tests {
             format!("com.bibcode.bridge-tests-{}", std::process::id());
         let app = mock_builder()
             .manage(BackendSupervisor::new())
+            .manage(ConnectionCatalogCoordinator::new())
             .manage(NativeContextMenuManager::new())
             .manage(SshEnvironmentManager::new())
             .manage(SshPasswordPromptManager::new())
@@ -2361,6 +2506,7 @@ mod tests {
                 desktop_bridge_set_client_settings,
                 desktop_bridge_get_connection_catalog,
                 desktop_bridge_set_connection_catalog,
+                desktop_bridge_compare_and_set_connection_catalog,
                 desktop_bridge_clear_connection_catalog,
                 desktop_bridge_discover_ssh_hosts,
                 desktop_bridge_ensure_ssh_environment,
@@ -2433,6 +2579,23 @@ mod tests {
         assert!(client_settings.is_null() || client_settings.is_object());
         let catalog = invoke("desktop_bridge_get_connection_catalog", json!({})).unwrap();
         assert!(catalog.is_null() || catalog.is_string());
+        assert_eq!(
+            invoke(
+                "desktop_bridge_compare_and_set_connection_catalog",
+                json!({"expectedCatalog":"stale-catalog","nextCatalog":"ignored-catalog"}),
+            )
+            .unwrap(),
+            false
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            invoke(
+                "desktop_bridge_compare_and_set_connection_catalog",
+                json!({"expectedCatalog":null,"nextCatalog":"must-not-persist"}),
+            )
+            .expect_err("unprotected native catalog writes must fail closed"),
+            "Could not update the protected connection catalog."
+        );
         let _ = invoke("desktop_bridge_discover_ssh_hosts", json!({}));
         assert!(invoke("desktop_bridge_get_wsl_state", json!({})).unwrap()["enabled"].is_boolean());
         assert!(
@@ -2496,10 +2659,32 @@ mod tests {
             json!({"catalog":"test-catalog"}),
         );
         #[cfg(target_os = "windows")]
-        assert_eq!(
-            set_catalog.expect("Windows DPAPI should protect the catalog"),
-            true
-        );
+        {
+            assert_eq!(
+                set_catalog.expect("Windows DPAPI should protect the catalog"),
+                true
+            );
+            assert_eq!(
+                invoke(
+                    "desktop_bridge_compare_and_set_connection_catalog",
+                    json!({"expectedCatalog":"test-catalog","nextCatalog":"winner-catalog"}),
+                )
+                .unwrap(),
+                true
+            );
+            assert_eq!(
+                invoke("desktop_bridge_get_connection_catalog", json!({})).unwrap(),
+                "winner-catalog"
+            );
+            assert_eq!(
+                invoke(
+                    "desktop_bridge_compare_and_set_connection_catalog",
+                    json!({"expectedCatalog":"test-catalog","nextCatalog":"loser-catalog"}),
+                )
+                .unwrap(),
+                false
+            );
+        }
         #[cfg(not(target_os = "windows"))]
         assert!(
             set_catalog.is_err(),

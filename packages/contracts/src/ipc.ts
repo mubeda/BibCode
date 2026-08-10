@@ -188,6 +188,7 @@ export interface DesktopBridgeFeatureFlags {
   wslDiscovery: boolean;
   sshRemoteHttp: boolean;
   connectionCatalog: boolean;
+  protectedConnectionCatalog: boolean;
   sshProvisioning: boolean;
   preview: boolean;
   updater: boolean;
@@ -202,6 +203,7 @@ export const DesktopBridgeFeatureFlagsSchema = Schema.Struct({
   wslDiscovery: Schema.Boolean,
   sshRemoteHttp: Schema.Boolean,
   connectionCatalog: Schema.Boolean,
+  protectedConnectionCatalog: Schema.Boolean,
   sshProvisioning: Schema.Boolean,
   preview: Schema.Boolean,
   updater: Schema.Boolean,
@@ -1014,6 +1016,10 @@ export interface DesktopBridge {
   setClientSettings: (settings: ClientSettings) => Promise<void>;
   getConnectionCatalog?: () => Promise<string | null>;
   setConnectionCatalog?: (catalog: string) => Promise<boolean>;
+  compareAndSetConnectionCatalog?: (
+    expectedCatalog: string | null,
+    nextCatalog: string,
+  ) => Promise<boolean>;
   clearConnectionCatalog?: () => Promise<void>;
   discoverSshHosts: () => Promise<readonly DesktopDiscoveredSshHost[]>;
   ensureSshEnvironment: (
