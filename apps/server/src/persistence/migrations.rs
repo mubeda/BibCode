@@ -1,11 +1,19 @@
-use std::path::{Path, PathBuf};
+use std::{
+    path::{Path, PathBuf},
+    thread,
+    time::{Duration, Instant},
+};
 
 use rusqlite::{
-    Connection, ErrorCode, OpenFlags, OptionalExtension, Result, Transaction, params_from_iter,
+    Connection, ErrorCode, OpenFlags, OptionalExtension, Result, Transaction,
+    backup::{Backup, StepResult},
+    params_from_iter,
     types::Value,
 };
 use thiserror::Error;
-use uuid::Uuid;
+
+const VALIDATION_BACKUP_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+const VALIDATION_BACKUP_RETRY_DELAY: Duration = Duration::from_millis(2);
 
 const MIGRATIONS_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS effect_sql_migrations (
@@ -55,15 +63,28 @@ pub(crate) enum ExistingStoreValidationError {
 pub(crate) fn validate_existing_bibcode_store(
     path: &Path,
 ) -> std::result::Result<(), ExistingStoreValidationError> {
-    let snapshot = ValidationSnapshot::create(path)?;
-    let connection = Connection::open_with_flags(
-        &snapshot.database,
-        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(|source| ExistingStoreValidationError::Corrupt {
-        path: path.to_path_buf(),
-        detail: source.to_string(),
-    })?;
+    validate_existing_bibcode_store_inner(path, || Ok(()))
+}
+
+#[cfg(test)]
+fn validate_existing_bibcode_store_with_barrier<F>(
+    path: &Path,
+    barrier: F,
+) -> std::result::Result<(), ExistingStoreValidationError>
+where
+    F: FnOnce() -> std::result::Result<(), ExistingStoreValidationError>,
+{
+    validate_existing_bibcode_store_inner(path, barrier)
+}
+
+fn validate_existing_bibcode_store_inner<F>(
+    path: &Path,
+    barrier: F,
+) -> std::result::Result<(), ExistingStoreValidationError>
+where
+    F: FnOnce() -> std::result::Result<(), ExistingStoreValidationError>,
+{
+    let connection = coherent_validation_snapshot(path, barrier)?;
 
     let integrity = connection
         .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
@@ -143,67 +164,67 @@ pub(crate) fn validate_existing_bibcode_store(
     Ok(())
 }
 
-struct ValidationSnapshot {
-    root: PathBuf,
-    database: PathBuf,
-}
+fn coherent_validation_snapshot<F>(
+    source_database: &Path,
+    barrier: F,
+) -> std::result::Result<Connection, ExistingStoreValidationError>
+where
+    F: FnOnce() -> std::result::Result<(), ExistingStoreValidationError>,
+{
+    let source = Connection::open_with_flags(
+        source_database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|source| ExistingStoreValidationError::Unsafe {
+        path: source_database.to_path_buf(),
+        detail: format!("failed to open source for coherent SQLite backup: {source}"),
+    })?;
+    barrier()?;
 
-impl ValidationSnapshot {
-    fn create(source_database: &Path) -> std::result::Result<Self, ExistingStoreValidationError> {
-        let source_path = source_database.to_path_buf();
-        let root = std::env::temp_dir().join(format!(
-            "bibcode-store-validation-{}",
-            Uuid::new_v4().as_simple()
-        ));
-        std::fs::create_dir(&root).map_err(|source| ExistingStoreValidationError::Unsafe {
-            path: source_path.clone(),
-            detail: format!("failed to create private validation snapshot: {source}"),
+    let mut snapshot =
+        Connection::open_in_memory().map_err(|source| ExistingStoreValidationError::Unsafe {
+            path: source_database.to_path_buf(),
+            detail: format!("failed to create in-memory validation snapshot: {source}"),
         })?;
-        let database = root.join("state.sqlite");
-        let snapshot = Self { root, database };
-        std::fs::copy(source_database, &snapshot.database).map_err(|source| {
-            ExistingStoreValidationError::Unsafe {
-                path: source_path.clone(),
-                detail: format!(
-                    "failed to copy database into private validation snapshot: {source}"
-                ),
+    let deadline = Instant::now() + VALIDATION_BACKUP_BUSY_TIMEOUT;
+    {
+        let backup = Backup::new(&source, &mut snapshot).map_err(|source| {
+            ExistingStoreValidationError::Corrupt {
+                path: source_database.to_path_buf(),
+                detail: format!("failed to initialize coherent SQLite backup: {source}"),
             }
         })?;
-
-        let source_wal = sqlite_sidecar(source_database, "-wal");
-        match std::fs::symlink_metadata(&source_wal) {
-            Ok(_) => {
-                let snapshot_wal = sqlite_sidecar(&snapshot.database, "-wal");
-                std::fs::copy(&source_wal, snapshot_wal).map_err(|source| {
-                    ExistingStoreValidationError::Unsafe {
-                        path: source_path,
-                        detail: format!(
-                            "failed to copy SQLite WAL into private validation snapshot: {source}"
-                        ),
-                    }
-                })?;
-            }
-            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
-            Err(source) => {
-                return Err(ExistingStoreValidationError::Unsafe {
-                    path: source_path,
-                    detail: format!(
-                        "failed to inspect SQLite WAL {}: {source}",
-                        source_wal.display()
-                    ),
-                });
+        loop {
+            match backup
+                .step(-1)
+                .map_err(|source| ExistingStoreValidationError::Corrupt {
+                    path: source_database.to_path_buf(),
+                    detail: format!("failed to read coherent SQLite backup: {source}"),
+                })? {
+                StepResult::Done => break,
+                StepResult::More => continue,
+                StepResult::Busy | StepResult::Locked if Instant::now() < deadline => {
+                    thread::sleep(VALIDATION_BACKUP_RETRY_DELAY);
+                }
+                StepResult::Busy | StepResult::Locked => {
+                    return Err(ExistingStoreValidationError::Unsafe {
+                        path: source_database.to_path_buf(),
+                        detail: "coherent SQLite backup remained busy".to_owned(),
+                    });
+                }
+                _ => {
+                    return Err(ExistingStoreValidationError::Unsafe {
+                        path: source_database.to_path_buf(),
+                        detail: "coherent SQLite backup returned an unsupported state".to_owned(),
+                    });
+                }
             }
         }
-        Ok(snapshot)
     }
+    Ok(snapshot)
 }
 
-impl Drop for ValidationSnapshot {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.root);
-    }
-}
-
+#[cfg(test)]
 fn sqlite_sidecar(database: &Path, suffix: &str) -> PathBuf {
     let mut path = database.as_os_str().to_os_string();
     path.push(suffix);
@@ -1828,14 +1849,14 @@ fn migration_039(transaction: &Transaction<'_>) -> Result<()> {
 mod tests {
     use super::{
         MIGRATIONS, Migration, migration_001, run_migrations, sqlite_sidecar,
-        validate_existing_bibcode_store,
+        validate_existing_bibcode_store, validate_existing_bibcode_store_with_barrier,
     };
     use tempfile::TempDir;
 
     type DeliveryColumn = (String, String, i64, Option<String>, i64);
 
     #[test]
-    fn validation_of_a_wal_store_preserves_every_source_entry_and_byte() {
+    fn validation_of_a_wal_store_preserves_persistent_source_entries_and_bytes() {
         let root = TempDir::new().expect("temporary validation root");
         let database = root.path().join("state.sqlite");
         let mut connection = rusqlite::Connection::open(&database).expect("fixture database");
@@ -1856,40 +1877,149 @@ mod tests {
                 [],
             )
             .expect("uncheckpointed fixture write");
-        let before = directory_snapshot(root.path());
+        let before = persistent_directory_snapshot(root.path());
 
         validate_existing_bibcode_store(&database).expect("valid WAL store");
 
-        assert_eq!(directory_snapshot(root.path()), before);
+        assert_eq!(persistent_directory_snapshot(root.path()), before);
 
-        let shared_memory = sqlite_sidecar(&database, "-shm");
-        std::fs::remove_file(&shared_memory).expect("remove source SHM fixture");
-        let without_shared_memory = directory_snapshot(root.path());
+        let crash_root = TempDir::new().expect("temporary crash-left validation root");
+        let crash_database = crash_root.path().join("state.sqlite");
+        std::fs::copy(&database, &crash_database).expect("copy stable main database fixture");
+        std::fs::copy(
+            sqlite_sidecar(&database, "-wal"),
+            sqlite_sidecar(&crash_database, "-wal"),
+        )
+        .expect("copy stable WAL fixture");
+        let without_shared_memory = persistent_directory_snapshot(crash_root.path());
 
-        validate_existing_bibcode_store(&database).expect("valid WAL store without source SHM");
+        validate_existing_bibcode_store(&crash_database)
+            .expect("valid crash-left WAL store without source SHM");
 
-        assert_eq!(directory_snapshot(root.path()), without_shared_memory);
+        assert_eq!(
+            persistent_directory_snapshot(crash_root.path()),
+            without_shared_memory
+        );
+        let entries = directory_entry_names(crash_root.path());
+        assert!(entries.contains(&std::ffi::OsString::from("state.sqlite")));
+        assert!(entries.contains(&std::ffi::OsString::from("state.sqlite-wal")));
         assert!(
-            !shared_memory.exists(),
-            "validation never creates source SHM"
+            entries.iter().all(|entry| {
+                entry == "state.sqlite"
+                    || entry == "state.sqlite-wal"
+                    || entry == "state.sqlite-shm"
+            }),
+            "validation may create only SQLite's volatile SHM coordination entry: {entries:?}"
         );
     }
 
-    fn directory_snapshot(path: &std::path::Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+    #[test]
+    fn validation_remains_coherent_when_wal_is_checkpointed_after_source_open() {
+        let root = TempDir::new().expect("temporary validation root");
+        let database = root.path().join("state.sqlite");
+        let mut writer = rusqlite::Connection::open(&database).expect("fixture database");
+        writer
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("WAL fixture");
+        writer
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("disable fixture checkpoint");
+        run_migrations(&mut writer, None).expect("fixture migrations remain in WAL");
+        assert!(
+            sqlite_sidecar(&database, "-wal")
+                .metadata()
+                .expect("fixture WAL")
+                .len()
+                > 0
+        );
+
+        validate_existing_bibcode_store_with_barrier(&database, || {
+            let checkpoint = writer
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .expect("checkpoint fixture WAL");
+            assert_eq!(checkpoint.0, 0, "checkpoint was not blocked");
+            Ok(())
+        })
+        .expect("valid store must remain recognizable across checkpoint reset");
+    }
+
+    #[test]
+    fn validation_never_materializes_store_bytes_in_global_temp() {
+        let root = TempDir::new().expect("temporary validation root");
+        let database = root.path().join("state.sqlite");
+        let mut connection = rusqlite::Connection::open(&database).expect("fixture database");
+        run_migrations(&mut connection, None).expect("fixture migrations");
+        drop(connection);
+        let artifacts_before = validation_artifacts();
+
+        let error = validate_existing_bibcode_store_with_barrier(&database, || {
+            if validation_artifacts() != artifacts_before {
+                return Err(super::ExistingStoreValidationError::Unsafe {
+                    path: database.clone(),
+                    detail: "validation materialized store bytes in global temp".to_owned(),
+                });
+            }
+            Err(super::ExistingStoreValidationError::Unsafe {
+                path: database.clone(),
+                detail: "forced validation cancellation".to_owned(),
+            })
+        })
+        .expect_err("forced validation cancellation");
+
+        assert!(
+            error.to_string().contains("forced validation cancellation"),
+            "validation must reach the forced in-memory cancellation seam: {error}"
+        );
+        assert_eq!(validation_artifacts(), artifacts_before);
+    }
+
+    fn persistent_directory_snapshot(path: &std::path::Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
         let mut entries = std::fs::read_dir(path)
             .expect("snapshot directory")
-            .map(|entry| {
+            .filter_map(|entry| {
                 let entry = entry.expect("snapshot entry");
+                if entry.file_name().to_string_lossy().ends_with("-shm") {
+                    return None;
+                }
                 let file_type = entry.file_type().expect("snapshot entry type");
                 let bytes = if file_type.is_file() {
                     std::fs::read(entry.path()).expect("snapshot entry bytes")
                 } else {
                     Vec::new()
                 };
-                (entry.file_name(), bytes)
+                Some((entry.file_name(), bytes))
             })
             .collect::<Vec<_>>();
         entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    }
+
+    fn directory_entry_names(path: &std::path::Path) -> Vec<std::ffi::OsString> {
+        let mut entries = std::fs::read_dir(path)
+            .expect("snapshot directory")
+            .map(|entry| entry.expect("snapshot entry").file_name())
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
+
+    fn validation_artifacts() -> Vec<std::ffi::OsString> {
+        let mut entries = std::fs::read_dir(std::env::temp_dir())
+            .expect("global temporary directory")
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name();
+                name.to_string_lossy()
+                    .starts_with("bibcode-store-validation-")
+                    .then_some(name)
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
         entries
     }
 

@@ -53,14 +53,17 @@ read/write traffic. The absence of both `state.sqlite` and its
 An existing unmarked database is adopted only after a read-only integrity,
 migration-ledger, and required-table check recognizes it as a BiBCode store;
 missing, malformed, corrupt, or unrelated state is preserved and startup fails
-closed without creating or replacing either file. Validation copies the main
-database and any WAL into a private temporary snapshot, reconstructs any SQLite
-shared-memory state only beside that copy, and inspects the snapshot. The live
-database, WAL, SHM, and state-directory entries therefore remain untouched by
-classification, including after an ungraceful process exit. Once validation
-succeeds, normal SQLite locking continues to support sequential or simultaneous
-server processes sharing that established store. Graceful server join still
-waits for the SQLite worker to close before returning.
+closed without creating or replacing either file. Validation opens the source
+read-only and uses SQLite's online-backup API to build a coherent in-memory
+snapshot, then inspects only that snapshot. This remains coherent while another
+server commits or checkpoints and never materializes a full store copy in a
+temporary directory. Classification does not mutate persistent database, WAL,
+or marker bytes and entries. SQLite may create or update `state.sqlite-shm` as
+volatile WAL-index coordination; SHM contains no database content and is not
+required for crash recovery. Once validation succeeds, normal SQLite locking
+continues to support sequential or simultaneous server processes sharing that
+established store. Graceful server join still waits for the SQLite worker to
+close before returning.
 
 First-run creation initializes a randomized same-directory staged SQLite file,
 closes it without retained journal sidecars, and publishes it at `state.sqlite`
