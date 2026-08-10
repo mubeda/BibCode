@@ -1,12 +1,17 @@
-use std::{collections::HashSet, path::Path};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::mpsc;
+use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 
 use crate::{
+    git::{GitRepository, HostPathPlatform, normalize_worktree_path_key, worktree_repository_key},
     orchestration::{OrchestrationCommand, OrchestrationEngine, engine::OptionalNullable},
     persistence::Repositories,
     rpc::{RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk},
@@ -18,7 +23,6 @@ use crate::{
 
 use super::git_vcs::{CatalogMutationFuture, CatalogMutationObserver};
 
-const STREAM_CAPACITY: usize = 8;
 const MAX_BASELINE_PATHS: usize = 512;
 
 #[derive(Clone)]
@@ -41,31 +45,109 @@ impl WorktreeCatalogRpcServices {
 pub struct WorktreeCatalogMutationObserver {
     catalog: WorktreeCatalogService,
     repositories: Repositories,
+    repository: Arc<GitRepository>,
 }
 
 impl WorktreeCatalogMutationObserver {
     #[must_use]
-    pub fn new(catalog: WorktreeCatalogService, repositories: Repositories) -> Self {
+    pub fn new(
+        catalog: WorktreeCatalogService,
+        repositories: Repositories,
+        repository: Arc<GitRepository>,
+    ) -> Self {
         Self {
             catalog,
             repositories,
+            repository,
         }
     }
 
-    async fn project_id_for_cwd(&self, cwd: &Path) -> Result<Option<String>, String> {
-        let cwd = cwd.to_string_lossy();
-        self.repositories
+    async fn project_ids_for_mutation(
+        &self,
+        cwd: &Path,
+        target: &Path,
+    ) -> Result<Vec<String>, String> {
+        let cancellation = CancellationToken::new();
+        let inventory = self
+            .repository
+            .worktree_inventory(cwd, &cancellation)
+            .await
+            .map_err(|error| error.to_string())?;
+        let common_dir = tokio::fs::canonicalize(&inventory.common_dir)
+            .await
+            .map_err(|error| {
+                format!(
+                    "failed to canonicalize verified Git common directory {}: {error}",
+                    inventory.common_dir.display()
+                )
+            })?;
+        let repository_key = worktree_repository_key(&common_dir, host_platform())
+            .as_str()
+            .to_owned();
+        let mut verified_paths = HashSet::new();
+        for record in inventory.records {
+            verified_paths.insert(normalized_existing_path(&record.path).await);
+        }
+        let mutation_paths = HashSet::from([
+            normalized_existing_path(cwd).await,
+            normalized_existing_path(target).await,
+        ]);
+        let projects = self
+            .repositories
             .list_projects()
             .await
-            .map_err(|error| error.to_string())
-            .map(|projects| {
-                projects
-                    .into_iter()
-                    .find(|project| {
-                        project.deleted_at.is_none() && project.workspace_root == cwd.as_ref()
-                    })
-                    .map(|project| project.project_id)
-            })
+            .map_err(|error| error.to_string())?;
+        let mut project_ids = Vec::new();
+        for project in projects {
+            if project.deleted_at.is_some() {
+                continue;
+            }
+            match project.worktree_repository_key.as_deref() {
+                Some(pinned) if pinned == repository_key => {
+                    project_ids.push(project.project_id);
+                    continue;
+                }
+                Some(_) => continue,
+                None => {}
+            }
+            let Some(projection) = self
+                .repositories
+                .load_worktree_catalog_projection(project.project_id.clone(), 512)
+                .await
+                .map_err(|error| error.to_string())?
+            else {
+                continue;
+            };
+            if projection.truncated {
+                return Err(format!(
+                    "project '{}' has too many canonical worktree paths to associate safely",
+                    project.project_id
+                ));
+            }
+            let persisted_paths = std::iter::once(PathBuf::from(project.workspace_root))
+                .chain(
+                    projection
+                        .threads
+                        .into_iter()
+                        .filter(|thread| thread.kind != "panel" && thread.deleted_at.is_none())
+                        .filter_map(|thread| thread.worktree_path.map(PathBuf::from)),
+                )
+                .collect::<Vec<_>>();
+            let mut associated = false;
+            for path in persisted_paths {
+                let path = normalized_existing_path(&path).await;
+                if verified_paths.contains(&path) || mutation_paths.contains(&path) {
+                    associated = true;
+                    break;
+                }
+            }
+            if associated {
+                project_ids.push(project.project_id);
+            }
+        }
+        project_ids.sort();
+        project_ids.dedup();
+        Ok(project_ids)
     }
 }
 
@@ -76,11 +158,10 @@ impl CatalogMutationObserver for WorktreeCatalogMutationObserver {
         path: &'a Path,
     ) -> CatalogMutationFuture<'a> {
         Box::pin(async move {
-            let Some(project_id) = self.project_id_for_cwd(cwd).await? else {
-                return Ok(());
-            };
-            self.catalog.note_managed_creation(&project_id, path).await;
-            self.catalog.invalidate_after_mutation(&project_id).await;
+            for project_id in self.project_ids_for_mutation(cwd, path).await? {
+                self.catalog.note_managed_creation(&project_id, path).await;
+                self.catalog.invalidate_after_mutation(&project_id).await;
+            }
             Ok(())
         })
     }
@@ -88,15 +169,29 @@ impl CatalogMutationObserver for WorktreeCatalogMutationObserver {
     fn invalidate_after_removal<'a>(
         &'a self,
         cwd: &'a Path,
-        _path: &'a Path,
+        path: &'a Path,
     ) -> CatalogMutationFuture<'a> {
         Box::pin(async move {
-            let Some(project_id) = self.project_id_for_cwd(cwd).await? else {
-                return Ok(());
-            };
-            self.catalog.invalidate_after_mutation(&project_id).await;
+            for project_id in self.project_ids_for_mutation(cwd, path).await? {
+                self.catalog.invalidate_after_mutation(&project_id).await;
+            }
             Ok(())
         })
+    }
+}
+
+async fn normalized_existing_path(path: &Path) -> String {
+    let canonical = tokio::fs::canonicalize(path)
+        .await
+        .unwrap_or_else(|_| path.to_path_buf());
+    normalize_worktree_path_key(&canonical, host_platform())
+}
+
+fn host_platform() -> HostPathPlatform {
+    if cfg!(windows) {
+        HostPathPlatform::Windows
+    } else {
+        HostPathPlatform::Posix
     }
 }
 
@@ -105,7 +200,7 @@ pub fn register_worktree_catalog_rpc(
     services: WorktreeCatalogRpcServices,
 ) {
     let stream_services = services.clone();
-    registry.register_stream("subscribeWorktreeCatalog", move |request, cancellation| {
+    registry.register_latest_stream("subscribeWorktreeCatalog", move |request, cancellation| {
         catalog_stream(stream_services.clone(), request, cancellation)
     });
 
@@ -139,38 +234,39 @@ fn catalog_stream(
     services: WorktreeCatalogRpcServices,
     request: RpcRequest,
     cancellation: CancellationToken,
-) -> mpsc::Receiver<RpcStreamChunk> {
-    let (sender, receiver) = mpsc::channel(STREAM_CAPACITY);
+) -> watch::Receiver<Option<RpcStreamChunk>> {
+    let (sender, receiver) = watch::channel(None);
     tokio::spawn(async move {
         let input = match decode::<WorktreeCatalogInput>(request) {
             Ok(input) => input,
             Err(error) => {
-                let _ = sender.send(Err(error)).await;
+                sender.send_replace(Some(Err(error)));
                 return;
             }
         };
-        let mut subscription = match services.catalog.subscribe(&input.project_id).await {
+        let subscription = tokio::select! {
+            _ = cancellation.cancelled() => return,
+            result = services.catalog.subscribe(&input.project_id) => result,
+        };
+        let mut subscription = match subscription {
             Ok(subscription) => subscription,
             Err(error) => {
-                let _ = sender.send(Err(encode(error))).await;
+                sender.send_replace(Some(Err(encode(error))));
                 return;
             }
         };
-        if sender
-            .send(Ok(vec![encode(subscription.latest().as_ref())]))
-            .await
-            .is_err()
-        {
+        if cancellation.is_cancelled() {
             return;
         }
+        sender.send_replace(Some(Ok(vec![encode(
+            subscription.initial_latest().as_ref(),
+        )])));
         loop {
             tokio::select! {
                 _ = cancellation.cancelled() => return,
                 snapshot = subscription.changed() => {
                     let Some(snapshot) = snapshot else { return };
-                    if sender.send(Ok(vec![encode(snapshot.as_ref())])).await.is_err() {
-                        return;
-                    }
+                    sender.send_replace(Some(Ok(vec![encode(snapshot.as_ref())])));
                 }
             }
         }

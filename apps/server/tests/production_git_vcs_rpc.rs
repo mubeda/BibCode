@@ -42,7 +42,7 @@ impl CatalogMutationObserver for RecordingCatalogMutationObserver {
                 .expect("creation records")
                 .push((cwd.to_path_buf(), path.to_path_buf()));
             if self.fail_observation {
-                Err("catalog creation observation failed".to_owned())
+                Err("Git repository identity could not be verified after creation".to_owned())
             } else {
                 Ok(())
             }
@@ -60,7 +60,7 @@ impl CatalogMutationObserver for RecordingCatalogMutationObserver {
                 .expect("removal records")
                 .push((cwd.to_path_buf(), path.to_path_buf()));
             if self.fail_observation {
-                Err("catalog removal observation failed".to_owned())
+                Err("Git repository identity could not be verified after removal".to_owned())
             } else {
                 Ok(())
             }
@@ -149,7 +149,7 @@ fn registrar_owns_the_complete_git_vcs_rpc_surface() {
 }
 
 #[tokio::test]
-async fn successful_create_and_remove_notify_catalog_without_reclassifying_observation_failure() {
+async fn unverifiable_catalog_identity_does_not_reclassify_successful_git_mutations() {
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     initialize_repository(&repository);

@@ -10,8 +10,8 @@ use bibcode_server::{
     CauseItem, RpcExit, RpcRegistry, ServerConfig, ServerMessage, ServerRuntime,
     git::GitRepository,
     orchestration::{EngineOptions, OrchestrationEngine},
-    persistence::{Database, Repositories, run_migrations},
-    production::git_vcs::{GitVcsRpcServices, register_git_vcs_rpc},
+    persistence::{Database, ProjectionProject, ProjectionThread, Repositories, run_migrations},
+    production::git_vcs::{CatalogMutationObserver, GitVcsRpcServices, register_git_vcs_rpc},
     production::worktree_catalog_rpc::{
         WorktreeCatalogMutationObserver, WorktreeCatalogRpcServices, compact_eligible_baseline,
         register_worktree_catalog_rpc,
@@ -143,6 +143,97 @@ async fn project_missing_is_a_typed_stream_and_refresh_failure() {
     )
     .await;
     assert_typed_catalog_failure(fixture.socket(), "11", "project-not-found").await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn stream_replaces_ack_lagged_updates_with_the_latest_catalog_generation() {
+    let mut fixture = CatalogRpcFixture::new(false).await;
+    request(
+        fixture.socket(),
+        "12",
+        "subscribeWorktreeCatalog",
+        json!({ "projectId": "project-1" }),
+    )
+    .await;
+    let initial = next_chunk(fixture.socket(), "12").await;
+    let initial_generation = initial["generation"].as_u64().expect("generation");
+
+    fixture.create_named_external_worktree("lag-one", "feature/lag-one");
+    request(
+        fixture.socket(),
+        "13",
+        "vcs.refreshWorktreeCatalog",
+        json!({ "projectId": "project-1" }),
+    )
+    .await;
+    let _first_refresh = success_value(fixture.socket(), "13").await;
+    fixture.create_named_external_worktree("lag-two", "feature/lag-two");
+    request(
+        fixture.socket(),
+        "14",
+        "vcs.refreshWorktreeCatalog",
+        json!({ "projectId": "project-1" }),
+    )
+    .await;
+    let latest_refresh = success_value(fixture.socket(), "14").await;
+
+    ack(fixture.socket(), "12").await;
+    let delivered = next_chunk(fixture.socket(), "12").await;
+    assert_eq!(delivered, latest_refresh);
+    assert_eq!(
+        delivered["generation"].as_u64().expect("generation"),
+        initial_generation + 2
+    );
+    assert_eq!(
+        delivered["worktrees"].as_array().expect("worktrees").len(),
+        3
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn interrupt_during_catalog_subscribe_bootstrap_exits_without_a_snapshot() {
+    let mut fixture = CatalogRpcFixture::new(false).await;
+    send_json(
+        fixture.socket(),
+        json!([
+            {
+                "_tag": "Request",
+                "id": "15",
+                "tag": "subscribeWorktreeCatalog",
+                "payload": { "projectId": "project-1" },
+                "headers": []
+            },
+            { "_tag": "Interrupt", "requestId": "15" }
+        ]),
+    )
+    .await;
+
+    let message = next_server_message(fixture.socket()).await;
+    let ServerMessage::Exit {
+        request_id,
+        exit: RpcExit::Failure { cause },
+    } = message
+    else {
+        panic!("expected interrupt exit");
+    };
+    assert_eq!(request_id.as_str(), "15");
+    assert!(
+        cause
+            .iter()
+            .any(|item| matches!(item, CauseItem::Interrupt { .. }))
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), fixture.socket().next())
+            .await
+            .is_err(),
+        "cancelled bootstrap must not publish a late snapshot"
+    );
+    assert!(
+        fixture.catalog.latest("project-1").await.is_none(),
+        "cancelled bootstrap must not leave a catalog entry behind"
+    );
     fixture.shutdown().await;
 }
 
@@ -329,6 +420,232 @@ async fn successful_legacy_git_mutations_suppress_and_invalidate_the_live_catalo
     fixture.shutdown().await;
 }
 
+#[tokio::test]
+async fn git_mutation_observation_updates_every_project_view_of_the_verified_repository() {
+    let mut fixture = CatalogRpcFixture::new(false).await;
+    #[cfg(unix)]
+    let alias_root = {
+        let alias_root = fixture.root.path().join("primary-symlink");
+        std::os::unix::fs::symlink(&fixture.main, &alias_root).expect("primary symlink");
+        alias_root
+    };
+    #[cfg(not(unix))]
+    let alias_root = fixture.main.join(".");
+    fixture
+        .create_project("project-alias", alias_root.clone())
+        .await;
+    for (request_id, project_id) in [("60", "project-1"), ("61", "project-alias")] {
+        request(
+            fixture.socket(),
+            request_id,
+            "subscribeWorktreeCatalog",
+            json!({ "projectId": project_id }),
+        )
+        .await;
+        let _initial = next_chunk(fixture.socket(), request_id).await;
+        ack(fixture.socket(), request_id).await;
+    }
+
+    let created_path = fixture.root.path().join("shared-managed");
+    let create_payload = json!({
+        "cwd": alias_root,
+        "refName": "main",
+        "newRefName": "feature/shared-managed",
+        "baseRefName": "main",
+        "path": created_path
+    });
+    request(fixture.socket(), "62", "vcs.createWorktree", create_payload).await;
+    let mut mutation_succeeded = false;
+    let mut updated = std::collections::HashMap::<String, usize>::new();
+    while !mutation_succeeded || updated.len() != 2 {
+        match next_server_message(fixture.socket()).await {
+            ServerMessage::Exit {
+                request_id,
+                exit: RpcExit::Success { .. },
+            } if request_id.as_str() == "62" => mutation_succeeded = true,
+            ServerMessage::Chunk { request_id, values }
+                if request_id.as_str() == "60" || request_id.as_str() == "61" =>
+            {
+                let value = values.into_iter().next().expect("catalog value");
+                ack(fixture.socket(), request_id.as_str()).await;
+                if value["authoritative"] == true
+                    && value["worktrees"]
+                        .as_array()
+                        .is_some_and(|worktrees| worktrees.len() == 2)
+                {
+                    let managed = value["worktrees"]
+                        .as_array()
+                        .expect("worktrees")
+                        .iter()
+                        .find(|worktree| worktree["path"] == canonical_string(&created_path))
+                        .expect("managed worktree");
+                    assert_eq!(managed["eligibleForAdoption"], false);
+                    *updated.entry(request_id.as_str().to_owned()).or_default() += 1;
+                }
+            }
+            other => panic!("unexpected alias observation message: {other:?}"),
+        }
+    }
+    assert_eq!(
+        updated,
+        std::collections::HashMap::from([("60".to_owned(), 1), ("61".to_owned(), 1),])
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn remove_observation_uses_adopted_cwd_and_removed_target_for_unpinned_association() {
+    let mut fixture = CatalogRpcFixture::new(false).await;
+    let adopted_cwd = fixture.create_named_external_worktree("adopted-cwd", "feature/adopted-cwd");
+    let removed_target =
+        fixture.create_named_external_worktree("removed-target", "feature/removed-target");
+    fixture
+        .create_project_with_thread(
+            "project-target",
+            removed_target.clone(),
+            removed_target.clone(),
+        )
+        .await;
+    let projection = fixture
+        .repositories
+        .load_worktree_catalog_projection("project-target".to_owned(), 512)
+        .await
+        .expect("projection read")
+        .expect("target project");
+    assert_eq!(
+        projection.threads[0].worktree_path.as_deref(),
+        Some(removed_target.to_string_lossy().as_ref())
+    );
+    request(
+        fixture.socket(),
+        "70",
+        "subscribeWorktreeCatalog",
+        json!({ "projectId": "project-target" }),
+    )
+    .await;
+    let initial = next_chunk(fixture.socket(), "70").await;
+    assert_eq!(initial["worktrees"].as_array().expect("worktrees").len(), 3);
+    ack(fixture.socket(), "70").await;
+    fixture
+        .create_project(
+            "project-target",
+            fixture.root.path().join("missing-primary"),
+        )
+        .await;
+    fixture
+        .repositories
+        .database()
+        .call(|connection| {
+            connection.execute(
+                "DELETE FROM project_worktree_repository_pins WHERE project_id = 'project-target'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("remove durable pin for target-only association");
+
+    request(
+        fixture.socket(),
+        "71",
+        "vcs.removeWorktree",
+        json!({ "cwd": adopted_cwd, "path": removed_target, "force": true }),
+    )
+    .await;
+    let mut mutation_succeeded = false;
+    let mut invalidated = false;
+    while !mutation_succeeded || !invalidated {
+        match next_server_message(fixture.socket()).await {
+            ServerMessage::Exit {
+                request_id,
+                exit: RpcExit::Success { .. },
+            } if request_id.as_str() == "71" => mutation_succeeded = true,
+            ServerMessage::Chunk { request_id, values } if request_id.as_str() == "70" => {
+                let value = values.into_iter().next().expect("catalog value");
+                ack(fixture.socket(), "70").await;
+                if value["scanStatus"]["_tag"] == "degraded" {
+                    invalidated = true;
+                }
+            }
+            other => panic!("unexpected remove association message: {other:?}"),
+        }
+    }
+    assert!(
+        !removed_target.exists(),
+        "the association must still use the remove target after Git deletes its directory"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn git_mutation_observation_excludes_a_pinned_unrelated_repository() {
+    let mut fixture = CatalogRpcFixture::new(false).await;
+    let unrelated = fixture.root.path().join("unrelated-main");
+    fs::create_dir(&unrelated).expect("unrelated directory");
+    git(&unrelated, &["init", "--initial-branch", "main"], None);
+    git(
+        &unrelated,
+        &["config", "user.email", "rpc@example.invalid"],
+        None,
+    );
+    git(&unrelated, &["config", "user.name", "RPC Test"], None);
+    fs::write(unrelated.join("README.md"), "unrelated\n").expect("unrelated file");
+    git(&unrelated, &["add", "README.md"], None);
+    git(&unrelated, &["commit", "-m", "initial"], None);
+    fixture
+        .create_project("project-unrelated", unrelated.clone())
+        .await;
+    for (request_id, project_id) in [("80", "project-1"), ("81", "project-unrelated")] {
+        request(
+            fixture.socket(),
+            request_id,
+            "subscribeWorktreeCatalog",
+            json!({ "projectId": project_id }),
+        )
+        .await;
+        let _initial = next_chunk(fixture.socket(), request_id).await;
+        ack(fixture.socket(), request_id).await;
+    }
+    let created_path = fixture.root.path().join("main-only-managed");
+    let payload = json!({
+        "cwd": fixture.main,
+        "refName": "main",
+        "newRefName": "feature/main-only",
+        "baseRefName": "main",
+        "path": created_path
+    });
+    request(fixture.socket(), "82", "vcs.createWorktree", payload).await;
+    let _updated = wait_for_mutation_and_catalog_count(fixture.socket(), "82", "80", 2).await;
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), fixture.socket().next())
+            .await
+            .is_err(),
+        "the unrelated pinned project must not be invalidated"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn unverifiable_git_identity_fails_observation_closed_without_notifying_a_project() {
+    let fixture = CatalogRpcFixture::new(false).await;
+    let observer = WorktreeCatalogMutationObserver::new(
+        fixture.catalog.clone(),
+        fixture.repositories.clone(),
+        Arc::new(GitRepository::default()),
+    );
+    let unrelated = fixture.root.path().join("not-a-repository");
+    fs::create_dir(&unrelated).expect("unrelated directory");
+
+    let error = observer
+        .note_managed_creation(&unrelated, &unrelated.join("target"))
+        .await
+        .expect_err("unverifiable identity must fail closed");
+
+    assert!(error.contains("Git"));
+    assert!(fixture.catalog.latest("project-1").await.is_none());
+    fixture.shutdown().await;
+}
+
 #[test]
 fn authoritative_baseline_compaction_filters_deduplicates_and_caps_exactly() {
     let mut worktrees = (0..514)
@@ -379,6 +696,7 @@ struct CatalogRpcFixture {
     main: PathBuf,
     external: PathBuf,
     repositories: Repositories,
+    catalog: WorktreeCatalogService,
     engine: OrchestrationEngine,
     handle: Option<bibcode_server::ServerHandle>,
     socket: Option<TestSocket>,
@@ -445,12 +763,12 @@ impl CatalogRpcFixture {
         );
         register_git_vcs_rpc(
             &mut registry,
-            GitVcsRpcServices::with_repository(git_repository).with_catalog_mutation_observer(
-                Arc::new(WorktreeCatalogMutationObserver::new(
+            GitVcsRpcServices::with_repository(git_repository.clone())
+                .with_catalog_mutation_observer(Arc::new(WorktreeCatalogMutationObserver::new(
                     catalog.clone(),
                     repositories.clone(),
-                )),
-            ),
+                    git_repository.clone(),
+                ))),
         );
         let server_state = root.path().join("server");
         let config = ServerConfig::new(server_state)
@@ -468,6 +786,7 @@ impl CatalogRpcFixture {
             main,
             external,
             repositories,
+            catalog,
             engine,
             handle: Some(handle),
             socket: Some(socket),
@@ -484,6 +803,62 @@ impl CatalogRpcFixture {
             &["worktree", "add", "-b", "feature/external"],
             Some(&self.external),
         );
+    }
+
+    async fn create_project(&self, project_id: &str, workspace_root: PathBuf) {
+        self.repositories
+            .upsert_project(ProjectionProject {
+                project_id: project_id.to_owned(),
+                title: project_id.to_owned(),
+                workspace_root: workspace_root.to_string_lossy().into_owned(),
+                default_model_selection: None,
+                scripts: json!([]),
+                worktree_discovery: json!({}),
+                worktree_repository_key: None,
+                created_at: "2026-08-09T00:00:01Z".to_owned(),
+                updated_at: "2026-08-09T00:00:01Z".to_owned(),
+                deleted_at: None,
+            })
+            .await
+            .expect("project projection created");
+    }
+
+    async fn create_project_with_thread(
+        &self,
+        project_id: &str,
+        workspace_root: PathBuf,
+        worktree_path: PathBuf,
+    ) {
+        self.create_project(project_id, workspace_root).await;
+        self.repositories
+            .upsert_thread(ProjectionThread {
+                thread_id: format!("thread-{project_id}"),
+                project_id: project_id.to_owned(),
+                title: project_id.to_owned(),
+                kind: "default".to_owned(),
+                model_selection: json!({"instanceId":"codex","model":"gpt-5.4"}),
+                runtime_mode: "full-access".to_owned(),
+                interaction_mode: "default".to_owned(),
+                branch: Some("feature/removed-target".to_owned()),
+                worktree_path: Some(worktree_path.to_string_lossy().into_owned()),
+                latest_turn_id: None,
+                created_at: "2026-08-09T00:00:02Z".to_owned(),
+                updated_at: "2026-08-09T00:00:02Z".to_owned(),
+                archived_at: None,
+                latest_user_message_at: None,
+                pending_approval_count: 0,
+                pending_user_input_count: 0,
+                has_actionable_proposed_plan: 0,
+                deleted_at: None,
+            })
+            .await
+            .expect("project thread projection created");
+    }
+
+    fn create_named_external_worktree(&self, directory: &str, branch: &str) -> PathBuf {
+        let path = self.root.path().join(directory);
+        git(&self.main, &["worktree", "add", "-b", branch], Some(&path));
+        path
     }
 
     async fn shutdown(mut self) {

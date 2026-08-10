@@ -61,7 +61,10 @@ without exactly one declared scope fails a server test.
 ## Worktree catalog flow
 
 `subscribeWorktreeCatalog` publishes the server-owned latest catalog snapshot
-for one persisted project. `vcs.refreshWorktreeCatalog` requests an explicit
+for one persisted project through a watch-backed RPC stream: the atomic initial
+read is marked seen, and acknowledgement lag replaces pending state instead of
+queueing stale generations. Request cancellation also cancels bootstrap before
+it can retain a catalog view. `vcs.refreshWorktreeCatalog` requests an explicit
 bounded observation and returns the resulting snapshot. Both require
 `orchestration:read`; clients submit only `projectId`, never baseline or
 checkout paths.
@@ -70,16 +73,23 @@ checkout paths.
 acknowledgement must name the exact latest authoritative generation. The
 server derives the baseline from eligible normalized paths in that snapshot,
 deduplicates it, caps it at 512, and persists the complete policy through the
-durable `project.meta.update` command. Per-repository mutation serialization
-prevents concurrent visibility and prompt controls from overwriting each
-other.
+durable `project.meta.update` command. Mutation serialization always acquires
+the stable project-identity lock before the optional physical-repository lock.
+That order prevents a project from switching mutexes while its durable trust
+pin is established while still serializing known cross-project repository
+aliases.
 
 The production runtime owns one catalog service built from the same Git
 repository and orchestration repositories used by Git/VCS and project state.
-Successful legacy create/remove worktree RPCs notify that service after the
-Git mutation commits; observation failure is reported through catalog health
-and never changes a successful Git response into a failure. Runtime shutdown
-cancels catalog pollers, queued mutation refreshes, scans, and eviction work.
+Successful legacy create/remove worktree RPCs verify Git common-directory
+identity after the mutation, canonicalize primary/canonical-thread and target
+paths, and notify every matching project view with a matching durable pin (or
+verified unpinned path), never an arbitrary first match. Pin mismatches and
+unverifiable identities fail observation closed. Observation failure never
+changes a successful Git response into a failure. Runtime shutdown permanently
+closes the service before draining pollers, queued mutation refreshes, scans,
+and eviction work; later subscribe, refresh, invalidation, and release paths
+cannot restart it.
 
 ## Provider turn flow
 

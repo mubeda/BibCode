@@ -120,6 +120,40 @@ async fn concurrent_first_subscribers_share_one_bootstrap_scan() {
 }
 
 #[tokio::test]
+async fn initial_latest_marks_a_first_subscriber_refresh_as_seen_exactly_once() {
+    let options = CatalogServiceOptions {
+        result_ttl: Duration::ZERO,
+        ..CatalogServiceOptions::default()
+    };
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        Arc::new(FakeInventorySource::new((0..2).map(|_| {
+            inventory("/repo/common", [record("/repo/main", true)])
+        }))),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        options,
+    );
+
+    let mut subscription = service.subscribe("project-1").await.expect("subscription");
+    let initial = subscription.initial_latest();
+
+    assert_eq!(initial.generation, 2);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), subscription.changed())
+            .await
+            .is_err(),
+        "the snapshot atomically returned by latest must already be marked seen"
+    );
+}
+
+#[tokio::test]
 async fn projects_sharing_one_repository_receive_only_their_own_joined_threads() {
     let inventory = Arc::new(FakeInventorySource::new((0..2).map(|_| {
         inventory(
@@ -1824,6 +1858,175 @@ async fn mutation_lock_survives_view_eviction_and_serializes_same_repository_pro
     assert_eq!(second_entered.load(Ordering::SeqCst), 1);
 }
 
+#[tokio::test]
+async fn project_mutation_lock_remains_stable_while_bootstrap_establishes_the_repository_pin() {
+    let projections = Arc::new(FakeProjectionSource::new([project(
+        "project-1",
+        "/repo/main",
+        [],
+    )]));
+    let service = WorktreeCatalogService::with_dependencies(
+        projections.clone(),
+        Arc::new(FakeInventorySource::new([inventory(
+            "/repo/common",
+            [record("/repo/main", true)],
+        )])),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+    let first_entered = Arc::new(Notify::new());
+    let release_first = Arc::new(Notify::new());
+    let active = Arc::new(AtomicUsize::new(0));
+    let max_active = Arc::new(AtomicUsize::new(0));
+    let first = {
+        let service = service.clone();
+        let first_entered = Arc::clone(&first_entered);
+        let release_first = Arc::clone(&release_first);
+        let active = Arc::clone(&active);
+        let max_active = Arc::clone(&max_active);
+        tokio::spawn(async move {
+            service
+                .with_project_mutation_lock("project-1", || async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(now, Ordering::SeqCst);
+                    first_entered.notify_one();
+                    release_first.notified().await;
+                    active.fetch_sub(1, Ordering::SeqCst);
+                })
+                .await;
+        })
+    };
+    first_entered.notified().await;
+
+    let subscription = service
+        .subscribe("project-1")
+        .await
+        .expect("bootstrap establishes pin");
+    assert!(
+        projections
+            .projects
+            .lock()
+            .expect("projects")
+            .get("project-1")
+            .and_then(|project| project.repository_key.as_ref())
+            .is_some(),
+        "bootstrap must establish the repository pin before request B"
+    );
+    let second_entered = Arc::new(Notify::new());
+    let second = {
+        let service = service.clone();
+        let second_entered = Arc::clone(&second_entered);
+        let active = Arc::clone(&active);
+        let max_active = Arc::clone(&max_active);
+        tokio::spawn(async move {
+            service
+                .with_project_mutation_lock("project-1", || async move {
+                    let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(now, Ordering::SeqCst);
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    second_entered.notify_one();
+                })
+                .await;
+        })
+    };
+    assert!(
+        tokio::time::timeout(Duration::from_millis(25), second_entered.notified())
+            .await
+            .is_err(),
+        "request B must wait on the same stable project lock"
+    );
+
+    release_first.notify_one();
+    first.await.expect("first request");
+    second.await.expect("second request");
+    assert_eq!(max_active.load(Ordering::SeqCst), 1);
+    drop(subscription);
+}
+
+#[tokio::test]
+async fn shutdown_cancels_inflight_bootstrap_and_prevents_late_entry_insertion() {
+    let inventory = Arc::new(ShutdownAwareInventorySource::new(inventory(
+        "/repo/common",
+        [record("/repo/main", true)],
+    )));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::new([(
+            "/repo/main",
+            DirectoryProbeState::Present,
+        )])),
+        CatalogServiceOptions::default(),
+    );
+    let subscribing = {
+        let service = service.clone();
+        tokio::spawn(async move { service.subscribe("project-1").await })
+    };
+    wait_for_count(&inventory.calls, 1).await;
+
+    service.shutdown().await;
+
+    let error = match subscribing.await.expect("subscription task") {
+        Ok(_) => panic!("shutdown must cancel bootstrap"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.reason,
+        super::CatalogErrorReason::RepositoryUnavailable
+    );
+    assert_eq!(inventory.cancelled.load(Ordering::SeqCst), 1);
+    assert_eq!(service.entry_count_for_test(), 0);
+}
+
+#[tokio::test]
+async fn shutdown_closes_live_subscriptions_is_idempotent_and_rejects_new_work() {
+    let inventory = Arc::new(FakeInventorySource::new([inventory(
+        "/repo/common",
+        [record("/repo/main", true)],
+    )]));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+    let mut subscription = service.subscribe("project-1").await.expect("subscription");
+
+    service.shutdown().await;
+    service.shutdown().await;
+
+    assert_eq!(subscription.changed().await, None);
+    drop(subscription);
+    assert_eq!(service.active_background_task_count_for_test(), 0);
+    assert!(service.subscribe("project-1").await.is_err());
+    assert!(
+        service
+            .refresh("project-1", CatalogRefreshTrigger::Explicit)
+            .await
+            .is_err()
+    );
+    service.invalidate_after_mutation("project-1").await;
+    service
+        .note_managed_creation("project-1", Path::new("/repo/new"))
+        .await;
+    assert_eq!(inventory.calls().len(), 1, "shutdown must be terminal");
+    assert_eq!(service.entry_count_for_test(), 0);
+}
+
 #[derive(Clone)]
 struct FakeProjectionSource {
     projects: Arc<Mutex<HashMap<String, CatalogProject>>>,
@@ -2028,6 +2231,46 @@ struct BlockingInventorySource {
     response: GitWorktreeInventory,
     calls: Arc<AtomicUsize>,
     release: Arc<Semaphore>,
+}
+
+struct ShutdownAwareInventorySource {
+    response: GitWorktreeInventory,
+    calls: Arc<AtomicUsize>,
+    cancelled: Arc<AtomicUsize>,
+}
+
+impl ShutdownAwareInventorySource {
+    fn new(response: GitWorktreeInventory) -> Self {
+        Self {
+            response,
+            calls: Arc::new(AtomicUsize::new(0)),
+            cancelled: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl InventorySource for ShutdownAwareInventorySource {
+    fn inventory(
+        &self,
+        _anchor: PathBuf,
+        cancellation: CancellationToken,
+    ) -> CatalogFuture<Result<GitWorktreeInventory, ScanFailure>> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let response = self.response.clone();
+        let cancelled = Arc::clone(&self.cancelled);
+        Box::pin(async move {
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    cancelled.fetch_add(1, Ordering::SeqCst);
+                    Err(ScanFailure {
+                        reason: super::CatalogDegradedReason::GitFailed,
+                        message: "shutdown cancelled inventory".to_owned(),
+                    })
+                }
+                () = std::future::pending() => Ok(response),
+            }
+        })
+    }
 }
 
 struct CancellationAwareInventorySource {
