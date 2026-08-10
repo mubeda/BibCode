@@ -134,7 +134,7 @@ function EnvironmentBadge(props: {
 function CandidateDetails(props: {
   readonly label: string;
   readonly path: string;
-  readonly environmentLabel: string;
+  readonly accessiblePhysicalScope: string;
   readonly discoveredBadge?: boolean;
   readonly pathTooltip: "self" | "parent";
 }) {
@@ -158,7 +158,7 @@ function CandidateDetails(props: {
           <TooltipTrigger
             render={
               <span
-                aria-label={`Full worktree path for ${props.label} in ${props.environmentLabel}: ${props.path}`}
+                aria-label={`Full worktree path for ${props.label} in ${props.accessiblePhysicalScope}: ${props.path}`}
                 className="max-w-full outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
                 tabIndex={0}
               />
@@ -243,6 +243,7 @@ function PhysicalWorktreeDiscoverySection(props: {
       locallyAcknowledgedGeneration === snapshot?.generation);
   const shownCandidates = discovery?.shownCandidates ?? [];
   const environmentLabel = member.environmentLabel ?? member.environmentId;
+  const accessiblePhysicalScope = `${environmentLabel} (environment ${member.environmentId}, project ${member.id})`;
   const isRemote = primaryEnvironmentId !== null && member.environmentId !== primaryEnvironmentId;
 
   const groupsFor = useCallback(
@@ -420,13 +421,13 @@ function PhysicalWorktreeDiscoverySection(props: {
                       className="flex min-w-0 items-center gap-1 rounded-md bg-background/65 px-1.5 py-1"
                     >
                       <CandidateDetails
-                        environmentLabel={environmentLabel}
+                        accessiblePhysicalScope={accessiblePhysicalScope}
                         label={label}
                         path={candidate.path}
                         pathTooltip="self"
                       />
                       <Button
-                        aria-label={`Add ${label} from ${environmentLabel} at ${candidate.path} to BiBCode`}
+                        aria-label={`Add ${label} from ${accessiblePhysicalScope} at ${candidate.path} to BiBCode`}
                         className="h-5 shrink-0 px-1.5 text-[9px]"
                         disabled={pending || addAllPendingCount > 0}
                         size="xs"
@@ -498,7 +499,7 @@ function PhysicalWorktreeDiscoverySection(props: {
                   <TooltipTrigger
                     render={
                       <Button
-                        aria-label={`Add discovered worktree ${label} from ${environmentLabel} at ${candidate.path} to BiBCode`}
+                        aria-label={`Add discovered worktree ${label} from ${accessiblePhysicalScope} at ${candidate.path} to BiBCode`}
                         className="h-auto w-full justify-start rounded-md border border-dashed border-info/25 bg-info/5 px-2 py-1.5"
                         disabled={pending || addAllPendingCount > 0}
                         size="content"
@@ -514,7 +515,7 @@ function PhysicalWorktreeDiscoverySection(props: {
                     )}
                     <CandidateDetails
                       discoveredBadge
-                      environmentLabel={environmentLabel}
+                      accessiblePhysicalScope={accessiblePhysicalScope}
                       label={label}
                       path={candidate.path}
                       pathTooltip="parent"
