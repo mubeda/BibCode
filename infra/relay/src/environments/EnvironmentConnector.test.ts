@@ -137,7 +137,11 @@ function signHealthResponse(
       label: "Connector Test Environment",
       platform: { os: "darwin", arch: "arm64" },
       serverVersion: "0.0.0-test",
-      capabilities: { repositoryIdentity: true, activityProtocolVersion: null },
+      capabilities: {
+        repositoryIdentity: true,
+        worktreeCatalog: false,
+        activityProtocolVersion: null,
+      },
     },
     checkedAt: DateTime.formatIso(DateTime.makeUnsafe(requestProof.iat * 1_000)),
     ...payloadOverrides,

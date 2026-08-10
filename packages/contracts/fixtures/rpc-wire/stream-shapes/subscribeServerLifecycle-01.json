@@ -18,7 +18,8 @@
           "serverVersion": "valueOf",
           "capabilities": {
             "repositoryIdentity": true,
-            "activityProtocolVersion": null
+            "worktreeCatalog": true,
+            "activityProtocolVersion": 1
           }
         }
       }

@@ -17,12 +17,12 @@
           "serverVersion": "v|}(%v",
           "capabilities": {
             "repositoryIdentity": false,
-            "activityProtocolVersion": 1
+            "worktreeCatalog": false,
+            "activityProtocolVersion": null
           }
         },
-        "cwd": "$ G",
-        "projectName": "_",
-        "bootstrapProjectId": "}!7PB_}5m"
+        "cwd": "DT$_",
+        "projectName": "Se"
       }
     }
   ]

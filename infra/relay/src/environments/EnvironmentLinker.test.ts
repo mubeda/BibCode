@@ -78,7 +78,11 @@ const makeRequestFor = (managedTunnelsEnabled: boolean) =>
         label: "Link Test Environment",
         platform: { os: "darwin", arch: "arm64" },
         serverVersion: "0.0.0-test",
-        capabilities: { repositoryIdentity: true, activityProtocolVersion: null },
+        capabilities: {
+          repositoryIdentity: true,
+          worktreeCatalog: false,
+          activityProtocolVersion: null,
+        },
       },
       environmentPublicKey: environmentKeyPair.publicKey.trim(),
       endpoint: {
