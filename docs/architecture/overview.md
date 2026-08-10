@@ -126,6 +126,14 @@ environment shares the host process. SSH forwarding is owned by the Tauri host;
 provider, terminal, and managed relay processes are supervised by the server.
 Neither path introduces a production Node server or packaged helper sidecar.
 
+When WSL-only mode is selected, WSL planning and primary startup fail closed as
+a tagged `wsl-primary-unavailable` desktop state. The host does not substitute
+the native Windows backend or publish a fallback bootstrap. Retry and distro
+selection keep WSL as the primary target; **Switch to Windows** is an explicit
+settings transition followed by the normal backend restart. A failure of an
+optional secondary WSL backend remains non-blocking for a native Windows
+primary.
+
 The WebView engine is the operating system's, so it differs per platform:
 WKWebView on macOS, WebKitGTK on Linux, and WebView2 on Windows. Browser API
 support therefore varies between desktop hosts, and between desktop and browser
@@ -174,6 +182,11 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   sources and leaves catalog operations fail-closed. Unprotected legacy
   migration preserves an existing valid IndexedDB winner and uses exact CAS
   before replacing corrupt IndexedDB bytes with the only valid legacy catalog.
+  Outside that migration, a corrupt authoritative catalog is never rewritten
+  as empty: it is quarantined when supported, publishes redacted
+  recovery-required health, blocks mutation, and requires an explicit
+  exact-revision reset. The shell cannot confirm an empty project list while
+  this health is active.
 - Accepted storage-identity decisions are atomic catalog transitions: the
   decision is recomputed after every conflict and returned only from the
   winning revision. Keep decisions compare without writing; Set decisions use
@@ -190,6 +203,9 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   native CAS, or IndexedDB migration; rejected, older, or incomplete metadata
   and failed protected-source collapse perform no IndexedDB write, native
   overwrite, or renderer clear.
+- WSL-only desktop startup never falls back to a native Windows backend.
+  Planning and primary-start failures remain tagged through the desktop bridge;
+  only an explicit settings action switches the primary runtime to Windows.
 - Normal application traffic uses HTTP and WebSocket RPC in every host.
 - `packages/contracts` remains schema-only.
 - Rust owns all production backend behavior. TypeScript is limited to clients,

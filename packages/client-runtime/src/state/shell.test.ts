@@ -12,6 +12,7 @@ import {
   type SupervisorConnectionState,
 } from "../connection/model.ts";
 import type { EnvironmentShellState } from "./shell.ts";
+import type { ConnectionCatalogHealth } from "../platform/persistence.ts";
 import {
   createEnvironmentServerConfigsAtom,
   createEnvironmentShellSummaryAtom,
@@ -98,6 +99,28 @@ function makeHarness() {
 }
 
 describe("environment shell projections", () => {
+  it("projects corrupt catalog health as a configuration error and never confirms empty", () => {
+    const catalogHealthAtom = Atom.make<ConnectionCatalogHealth>({
+      status: "recovery-required",
+      message: "The connection catalog needs recovery.",
+    });
+    const summaryAtom = createEnvironmentShellSummaryAtom({
+      catalogValueAtom: Atom.make({ isReady: true, entries: new Map() }),
+      catalogHealthAtom,
+      shellStateValueAtom: Atom.family((_environmentId: EnvironmentId) =>
+        Atom.make(shellState({ status: "live", updatedAt: "2026-07-01T00:00:00.000Z" })),
+      ),
+    });
+
+    expect(AtomRegistry.make().get(summaryAtom)).toMatchObject({
+      catalogHealth: {
+        status: "recovery-required",
+        message: "The connection catalog needs recovery.",
+      },
+      canShowEmptyProjects: false,
+    });
+  });
+
   it("maps structured supervisor failures without inspecting error text", () => {
     const blocked = (lastFailure: SupervisorConnectionState["lastFailure"]) => ({
       ...AVAILABLE_CONNECTION_STATE,
@@ -179,6 +202,7 @@ describe("environment shell projections", () => {
 
     expect(summary).toEqual({
       catalogReady: true,
+      catalogHealth: { status: "ready" },
       desiredEnvironmentCount: 2,
       statuses: [
         {

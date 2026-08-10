@@ -15,6 +15,7 @@ import {
 import {
   AcceptedStorageIdentityStore,
   ConnectionCatalogDocument,
+  ConnectionCatalogHealthStore,
   type ConnectionCatalogDocument as ConnectionCatalogDocumentType,
   ConnectionRegistrationStore,
   ConnectionTargetStore,
@@ -35,6 +36,7 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 import { IDBFactory, IDBKeyRange, IDBObjectStore } from "fake-indexeddb";
 import { afterEach, vi } from "vite-plus/test";
 
@@ -361,6 +363,68 @@ afterEach(() => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe("makeCatalogStore", () => {
+  it.effect("quarantines a corrupt catalog without replacing it or accepting mutations", () =>
+    Effect.gen(function* () {
+      const writes: string[] = [];
+      const quarantined: string[] = [];
+      let durableCatalog = "{malformed";
+      const store = yield* makeCatalogStore({
+        read: Effect.sync(() => durableCatalog),
+        compare: unusedCatalogCompare,
+        compareAndSet: (expected, next) =>
+          Effect.sync(() => {
+            if (durableCatalog !== expected) return false;
+            durableCatalog = next;
+            writes.push(next);
+            return true;
+          }),
+        quarantine: (raw) => Effect.sync(() => quarantined.push(raw)),
+      });
+
+      expect(yield* store.read).toEqual(emptyCatalog);
+      expect(yield* SubscriptionRef.get(store.health)).toEqual({
+        status: "recovery-required",
+        message: "The connection catalog is corrupt and must be reset before it can be changed.",
+      });
+      expect(quarantined).toEqual(["{malformed"]);
+      expect(writes).toEqual([]);
+      expect(durableCatalog).toBe("{malformed");
+
+      const error = yield* store.update((document) => document).pipe(Effect.flip);
+      expect(error).toBeInstanceOf(ConnectionTransientError);
+      expect(error.message).toContain("must be reset");
+      expect(writes).toEqual([]);
+      expect(durableCatalog).toBe("{malformed");
+    }),
+  );
+
+  it.effect("only replaces a corrupt catalog after an explicit reset", () =>
+    Effect.gen(function* () {
+      let durableCatalog = "{malformed";
+      const writes: string[] = [];
+      const store = yield* makeCatalogStore({
+        read: Effect.sync(() => durableCatalog),
+        compare: unusedCatalogCompare,
+        compareAndSet: (expected, next) =>
+          Effect.sync(() => {
+            if (durableCatalog !== expected) return false;
+            durableCatalog = next;
+            writes.push(next);
+            return true;
+          }),
+      });
+
+      yield* store.read;
+      expect(writes).toEqual([]);
+
+      yield* store.reset;
+
+      expect(writes).toHaveLength(1);
+      expect(decodeCatalog(durableCatalog)).toEqual(emptyCatalog);
+      expect(yield* SubscriptionRef.get(store.health)).toEqual({ status: "ready" });
+    }),
+  );
+
   it.effect("re-decides a compare-only transition after a conflicting revision", () =>
     Effect.gen(function* () {
       const firstCatalog = encodeCatalog({
@@ -577,7 +641,7 @@ describe("makeCatalogStore", () => {
       }),
   );
 
-  it.effect("rereads after a corrupt-catalog recovery loses a compare-and-set race", () =>
+  it.effect("rereads after an explicit corrupt-catalog reset loses a compare-and-set race", () =>
     Effect.gen(function* () {
       const newer = encodeCatalog({
         ...emptyCatalog,
@@ -596,6 +660,8 @@ describe("makeCatalogStore", () => {
           }),
       });
 
+      yield* store.read;
+      yield* store.reset;
       expect((yield* store.read).acceptedStorageIdentities).toEqual([
         { targetKey: "platform:primary", storageInstanceId: "newer-store" },
       ]);
@@ -666,7 +732,7 @@ describe("makeCatalogStore", () => {
     }),
   );
 
-  it.effect("quarantines malformed catalogs and starts from an empty document", () =>
+  it.effect("quarantines malformed catalogs and keeps only an in-memory empty document", () =>
     Effect.gen(function* () {
       const writes: string[] = [];
       const quarantined: string[] = [];
@@ -683,8 +749,7 @@ describe("makeCatalogStore", () => {
 
       expect(yield* store.read).toEqual(emptyCatalog);
       expect(quarantined).toEqual(["{not-json"]);
-      expect(writes).toHaveLength(1);
-      expect(decodeCatalog(writes[0]!)).toEqual(emptyCatalog);
+      expect(writes).toEqual([]);
     }),
   );
 
@@ -1116,6 +1181,29 @@ describe("makeCatalogBackend (IndexedDB)", () => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe("connectionStorageLayer", () => {
+  it.effect("publishes corrupt catalog health and resets only through the explicit service", () => {
+    const handle = installFakeIndexedDb();
+    handle.stores.set("catalog", new Map([["document", "{malformed"]]));
+
+    return Effect.gen(function* () {
+      const targets = yield* ConnectionTargetStore;
+      const health = yield* ConnectionCatalogHealthStore;
+
+      expect(yield* targets.list).toEqual([]);
+      expect(yield* SubscriptionRef.get(health.state)).toMatchObject({
+        status: "recovery-required",
+      });
+      expect(handle.stores.get("catalog")?.get("document")).toBe("{malformed");
+
+      yield* health.reset;
+
+      expect(yield* SubscriptionRef.get(health.state)).toEqual({ status: "ready" });
+      expect(decodeCatalog(handle.stores.get("catalog")?.get("document") as string)).toEqual(
+        emptyCatalog,
+      );
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
   it.effect("keeps an accepted identity without invoking the catalog writer", () => {
     installFakeIndexedDb();
     const storedCatalog = encodeCatalog({

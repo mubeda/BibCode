@@ -20,6 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Runtime};
+use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt},
     process::{Child, Command},
@@ -122,6 +123,14 @@ pub struct BackendLaunchPlan {
     pub target: BackendLaunchTarget,
     pub log_path: Option<PathBuf>,
     pub config: BackendRunConfig,
+}
+
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub(crate) enum BackendPlanError {
+    #[error("WSL primary is unavailable: {detail}")]
+    WslPrimaryUnavailable { detail: String },
+    #[error("desktop backend planning failed: {detail}")]
+    Other { detail: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -395,6 +404,7 @@ struct BackendSlotState {
     backend: Option<ManagedBackend>,
     pid: Option<u32>,
     last_error: Option<String>,
+    plan_error: Option<BackendPlanError>,
     restart_attempt: u32,
     restart_scheduled: bool,
 }
@@ -563,6 +573,32 @@ impl BackendSupervisor {
             .last_error = Some(error.into());
     }
 
+    pub(crate) fn record_planning_error(&self, error: BackendPlanError) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("backend supervisor mutex poisoned");
+        let slot = state
+            .slots
+            .entry(PRIMARY_LOCAL_ENVIRONMENT_ID.to_string())
+            .or_default();
+        slot.launch_plan = None;
+        slot.backend = None;
+        slot.pid = None;
+        slot.last_error = Some(error.to_string());
+        slot.plan_error = Some(error);
+        slot.restart_scheduled = false;
+    }
+
+    pub(crate) fn primary_plan_error(&self) -> Option<BackendPlanError> {
+        self.state
+            .lock()
+            .expect("backend supervisor mutex poisoned")
+            .slots
+            .get(PRIMARY_LOCAL_ENVIRONMENT_ID)
+            .and_then(|slot| slot.plan_error.clone())
+    }
+
     pub async fn start_default<R: Runtime>(
         &self,
         app: AppHandle<R>,
@@ -576,13 +612,28 @@ impl BackendSupervisor {
         reason: &'static str,
     ) -> Result<BackendRunConfig, String> {
         self.install_ui_process_observer(ui_process_observer::for_app(&app));
-        let mut plans = default_launch_plans(&app)?;
+        let mut plans = match default_launch_plans(&app) {
+            Ok(plans) => plans,
+            Err(error) => {
+                self.record_planning_error(error.clone());
+                return Err(error.to_string());
+            }
+        };
         let primary_index = plans
             .iter()
             .position(|plan| plan.config.environment_id == PRIMARY_LOCAL_ENVIRONMENT_ID)
             .unwrap_or(0);
         let primary_plan = plans.remove(primary_index);
-        let primary_config = self.start(primary_plan).await?;
+        let primary_config = match self.start(primary_plan.clone()).await {
+            Ok(config) => config,
+            Err(detail) => {
+                if let Some(error) = classify_primary_start_error(&primary_plan, &detail) {
+                    self.record_planning_error(error.clone());
+                    return Err(error.to_string());
+                }
+                return Err(detail);
+            }
+        };
 
         for plan in plans {
             if let Err(error) = self.start(plan.clone()).await {
@@ -608,10 +659,9 @@ impl BackendSupervisor {
                 .state
                 .lock()
                 .expect("backend supervisor mutex poisoned");
-            state
-                .slots
-                .values()
-                .any(|slot| slot.backend.is_some() || slot.launch_plan.is_some())
+            state.slots.values().any(|slot| {
+                slot.backend.is_some() || slot.launch_plan.is_some() || slot.last_error.is_some()
+            })
         };
         if !is_active {
             return Ok(None);
@@ -674,6 +724,7 @@ impl BackendSupervisor {
                 slot.launch_plan = Some(active_plan);
                 slot.pid = pid;
                 slot.last_error = None;
+                slot.plan_error = None;
                 slot.restart_scheduled = false;
                 if reset_restart_attempt {
                     slot.restart_attempt = 0;
@@ -1837,56 +1888,27 @@ fn resolve_wsl_secondary_launch_plan<R: Runtime>(
     )
 }
 
-fn default_launch_plans<R: Runtime>(app: &AppHandle<R>) -> Result<Vec<BackendLaunchPlan>, String> {
-    let data_root = crate::config::data_root(app)?;
-    let log_path = primary_backend_log_path(app)?;
-    let port = crate::config::bibcode_env_var("BIBCODE_PORT")
-        .and_then(|value| value.into_string().ok())
-        .and_then(|value| value.parse::<u16>().ok())
-        .or_else(select_desktop_backend_port)
-        .or_else(portpicker::pick_unused_port)
-        .unwrap_or(DEFAULT_BACKEND_PORT);
-    let settings = read_backend_desktop_settings(app)?;
-    let desktop_bootstrap_token = Uuid::new_v4().simple().to_string();
+fn select_default_launch_plans<NativePrimary, WslPrimary, WslSecondary>(
+    settings: &BackendDesktopSettings,
+    native_primary: NativePrimary,
+    wsl_primary: WslPrimary,
+    wsl_secondary: WslSecondary,
+) -> Result<Vec<BackendLaunchPlan>, BackendPlanError>
+where
+    NativePrimary: FnOnce() -> Result<BackendLaunchPlan, String>,
+    WslPrimary: FnOnce() -> Result<BackendLaunchPlan, String>,
+    WslSecondary: FnOnce() -> Result<BackendLaunchPlan, String>,
+{
     if settings.wsl_backend_enabled && settings.wsl_only {
-        match resolve_wsl_primary_launch_plan(
-            &settings,
-            port,
-            desktop_bootstrap_token.clone(),
-            log_path.clone(),
-        ) {
-            Ok(plan) => return Ok(vec![plan]),
-            Err(error) => {
-                tracing::warn!(
-                    target: "bibcode_desktop_tauri::backend",
-                    "falling back to Windows backend after WSL-only launch planning failed: {error}"
-                );
-            }
-        }
+        return wsl_primary()
+            .map(|plan| vec![plan])
+            .map_err(|detail| BackendPlanError::WslPrimaryUnavailable { detail });
     }
-    let exposure = resolve_backend_exposure(&settings, port);
-    let config = BackendRunConfig {
-        environment_id: PRIMARY_LOCAL_ENVIRONMENT_ID.to_string(),
-        label: "Local".to_string(),
-        running_distro: None,
-        port,
-        bind_host: exposure.bind_host,
-        local_host: DESKTOP_LOOPBACK_HOST.to_string(),
-        desktop_bootstrap_token,
-        server_exposure_mode: exposure.mode,
-        endpoint_url: exposure.endpoint_url,
-        advertised_host: exposure.advertised_host,
-        tailscale_serve_enabled: settings.tailscale_serve_enabled,
-        tailscale_serve_port: settings.tailscale_serve_port,
-    };
 
-    let primary_plan = BackendLaunchPlan::local(data_root.effective.clone(), config)
-        .with_data_root(data_root)
-        .with_log_path(log_path);
+    let primary_plan = native_primary().map_err(|detail| BackendPlanError::Other { detail })?;
     let mut plans = vec![primary_plan];
-
     if settings.wsl_backend_enabled {
-        match resolve_wsl_secondary_launch_plan(app, &settings, port) {
+        match wsl_secondary() {
             Ok(plan) => plans.push(plan),
             Err(error) => {
                 tracing::warn!(
@@ -1896,8 +1918,66 @@ fn default_launch_plans<R: Runtime>(app: &AppHandle<R>) -> Result<Vec<BackendLau
             }
         }
     }
-
     Ok(plans)
+}
+
+fn classify_primary_start_error(
+    plan: &BackendLaunchPlan,
+    detail: &str,
+) -> Option<BackendPlanError> {
+    matches!(
+        &plan.target,
+        BackendLaunchTarget::ExternalProcess { program, .. } if program == "wsl.exe"
+    )
+    .then(|| BackendPlanError::WslPrimaryUnavailable {
+        detail: detail.to_string(),
+    })
+}
+
+fn default_launch_plans<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Result<Vec<BackendLaunchPlan>, BackendPlanError> {
+    let settings =
+        read_backend_desktop_settings(app).map_err(|detail| BackendPlanError::Other { detail })?;
+    let log_path =
+        primary_backend_log_path(app).map_err(|detail| BackendPlanError::Other { detail })?;
+    let port = crate::config::bibcode_env_var("BIBCODE_PORT")
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.parse::<u16>().ok())
+        .or_else(select_desktop_backend_port)
+        .or_else(portpicker::pick_unused_port)
+        .unwrap_or(DEFAULT_BACKEND_PORT);
+    let desktop_bootstrap_token = Uuid::new_v4().simple().to_string();
+    let native_bootstrap_token = desktop_bootstrap_token.clone();
+    let native_log_path = log_path.clone();
+    select_default_launch_plans(
+        &settings,
+        || {
+            let data_root = crate::config::data_root(app)?;
+            let exposure = resolve_backend_exposure(&settings, port);
+            let config = BackendRunConfig {
+                environment_id: PRIMARY_LOCAL_ENVIRONMENT_ID.to_string(),
+                label: "Local".to_string(),
+                running_distro: None,
+                port,
+                bind_host: exposure.bind_host,
+                local_host: DESKTOP_LOOPBACK_HOST.to_string(),
+                desktop_bootstrap_token: native_bootstrap_token,
+                server_exposure_mode: exposure.mode,
+                endpoint_url: exposure.endpoint_url,
+                advertised_host: exposure.advertised_host,
+                tailscale_serve_enabled: settings.tailscale_serve_enabled,
+                tailscale_serve_port: settings.tailscale_serve_port,
+            };
+            Ok(
+                BackendLaunchPlan::local(data_root.effective.clone(), config)
+                    .with_data_root(data_root)
+                    .with_log_path(native_log_path),
+            )
+        },
+        || resolve_wsl_primary_launch_plan(&settings, port, desktop_bootstrap_token, log_path),
+        || resolve_wsl_secondary_launch_plan(app, &settings, port),
+    )
 }
 
 fn wsl_server_binary_candidates() -> Result<Vec<PathBuf>, String> {
@@ -3612,6 +3692,64 @@ exit /b 9
         );
         let _ = select_desktop_backend_port();
         let _ = resolve_lan_advertised_host();
+    }
+
+    #[test]
+    fn wsl_only_planning_failure_never_builds_a_windows_fallback() {
+        let settings = BackendDesktopSettings {
+            server_exposure_mode: "local-only".to_string(),
+            tailscale_serve_enabled: false,
+            tailscale_serve_port: 443,
+            wsl_backend_enabled: true,
+            wsl_only: true,
+            wsl_distro: Some("Unavailable".to_string()),
+        };
+        let native_planned = Cell::new(false);
+
+        let error = select_default_launch_plans(
+            &settings,
+            || {
+                native_planned.set(true);
+                panic!("native Windows planning must not run in WSL-only mode")
+            },
+            || Err("the selected distribution cannot start".to_string()),
+            || panic!("secondary WSL planning must not run in WSL-only mode"),
+        )
+        .expect_err("WSL-only planning must fail closed");
+
+        assert!(matches!(
+            error,
+            BackendPlanError::WslPrimaryUnavailable { detail }
+                if detail == "the selected distribution cannot start"
+        ));
+        assert!(!native_planned.get());
+    }
+
+    #[test]
+    fn wsl_primary_start_failure_remains_typed_and_has_no_bootstrap() {
+        let supervisor = BackendSupervisor::new();
+        let plan = BackendLaunchPlan::wsl(WslBackendLaunchPlanInput {
+            environment_id: PRIMARY_LOCAL_ENVIRONMENT_ID.to_string(),
+            label: "WSL (Ubuntu)".to_string(),
+            running_distro: "Ubuntu".to_string(),
+            port: 3773,
+            renderer_host: "172.27.0.1".to_string(),
+            desktop_bootstrap_token: "desktop-token".to_string(),
+            binary_path: "/usr/local/bin/bibcode".to_string(),
+        });
+        let error = classify_primary_start_error(&plan, "WSL process exited before readiness")
+            .expect("WSL primary startup failures must remain typed");
+
+        supervisor.record_planning_error(error.clone());
+
+        assert_eq!(
+            supervisor.primary_plan_error(),
+            Some(BackendPlanError::WslPrimaryUnavailable {
+                detail: "WSL process exited before readiness".to_string(),
+            })
+        );
+        assert!(supervisor.local_environment_bootstraps().is_empty());
+        assert_eq!(supervisor.current_run_config(), None);
     }
 
     #[test]

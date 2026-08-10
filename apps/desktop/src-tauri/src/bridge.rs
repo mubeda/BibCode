@@ -13,7 +13,7 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 
-use crate::backend::{BackendRunConfig, BackendSupervisor};
+use crate::backend::{BackendPlanError, BackendRunConfig, BackendSupervisor};
 use crate::config::{
     app_branding, read_json_file, resolve_pick_folder_default_path, state_dir, write_json_file,
 };
@@ -861,15 +861,22 @@ fn resolve_pick_folder_dialog_default_path<R: Runtime>(
     resolve_wsl_pick_folder_default_path(raw_options, target_distro.as_deref(), &distros, None)
 }
 
-fn wsl_state(settings: &DesktopSettings) -> Value {
+fn wsl_state(settings: &DesktopSettings, backend: &BackendSupervisor) -> Value {
     let (available, distros) = read_wsl_environment();
+    let preflight_error = match backend.primary_plan_error() {
+        Some(BackendPlanError::WslPrimaryUnavailable { detail }) => Some(json!({
+            "kind": "wsl-primary-unavailable",
+            "detail": detail,
+        })),
+        Some(BackendPlanError::Other { .. }) | None => None,
+    };
     json!({
         "enabled": settings.wsl_backend_enabled,
         "distro": &settings.wsl_distro,
         "available": available,
         "wslOnly": settings.wsl_only,
         "distros": distros,
-        "preflightError": null,
+        "preflightError": preflight_error,
     })
 }
 
@@ -1119,44 +1126,53 @@ pub async fn desktop_bridge_set_tailscale_serve_enabled(
 }
 
 #[tauri::command]
-pub fn desktop_bridge_get_wsl_state(app: AppHandle<DesktopRuntime>) -> Result<Value, String> {
-    read_desktop_settings(&app).map(|settings| wsl_state(&settings))
+pub fn desktop_bridge_get_wsl_state(
+    app: AppHandle<DesktopRuntime>,
+    backend: State<'_, BackendSupervisor>,
+) -> Result<Value, String> {
+    read_desktop_settings(&app).map(|settings| wsl_state(&settings, &backend))
 }
 
 #[tauri::command]
-pub fn desktop_bridge_set_wsl_backend_enabled(
+pub async fn desktop_bridge_set_wsl_backend_enabled(
     app: AppHandle<DesktopRuntime>,
+    backend: State<'_, BackendSupervisor>,
     enabled: bool,
 ) -> Result<Value, String> {
-    update_desktop_settings(&app, |settings| {
+    let settings = update_desktop_settings(&app, |settings| {
         settings.wsl_backend_enabled = enabled;
         if !enabled {
             settings.wsl_only = false;
         }
-    })
-    .map(|settings| wsl_state(&settings))
+    })?;
+    backend.restart_default_if_active(app.clone()).await?;
+    Ok(wsl_state(&settings, &backend))
 }
 
 #[tauri::command]
-pub fn desktop_bridge_set_wsl_distro(
+pub async fn desktop_bridge_set_wsl_distro(
     app: AppHandle<DesktopRuntime>,
+    backend: State<'_, BackendSupervisor>,
     distro: Option<String>,
 ) -> Result<Value, String> {
-    update_desktop_settings(&app, |settings| {
+    let settings = update_desktop_settings(&app, |settings| {
         settings.wsl_distro = normalize_wsl_distro(distro);
-    })
-    .map(|settings| wsl_state(&settings))
+    })?;
+    backend.restart_default_if_active(app.clone()).await?;
+    Ok(wsl_state(&settings, &backend))
 }
 
 #[tauri::command]
-pub fn desktop_bridge_set_wsl_only(
+pub async fn desktop_bridge_set_wsl_only(
     app: AppHandle<DesktopRuntime>,
+    backend: State<'_, BackendSupervisor>,
     enabled: bool,
 ) -> Result<Value, String> {
-    update_desktop_settings(&app, |settings| {
+    let settings = update_desktop_settings(&app, |settings| {
         settings.wsl_only = enabled;
-    })
-    .map(|settings| wsl_state(&settings))
+    })?;
+    backend.restart_default_if_active(app.clone()).await?;
+    Ok(wsl_state(&settings, &backend))
 }
 
 #[tauri::command]
@@ -1891,7 +1907,7 @@ mod tests {
     #[tokio::test]
     async fn platform_state_helpers_cover_non_wsl_and_disabled_tailscale_paths() {
         let settings = default_desktop_settings();
-        let state = wsl_state(&settings);
+        let state = wsl_state(&settings, &BackendSupervisor::new());
         if !cfg!(target_os = "windows") {
             assert_eq!(state["available"], false);
             assert_eq!(state["distros"], json!([]));
@@ -1906,6 +1922,31 @@ mod tests {
                 .expect("disabled Tailscale discovery should succeed")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn wsl_state_exposes_a_tagged_primary_failure_without_a_fallback_bootstrap() {
+        let settings = DesktopSettings {
+            wsl_backend_enabled: true,
+            wsl_only: true,
+            wsl_distro: Some("Ubuntu".to_string()),
+            ..default_desktop_settings()
+        };
+        let backend = BackendSupervisor::new();
+        backend.record_planning_error(BackendPlanError::WslPrimaryUnavailable {
+            detail: "the selected distribution could not start".to_string(),
+        });
+
+        let state = wsl_state(&settings, &backend);
+
+        assert_eq!(
+            state["preflightError"],
+            json!({
+                "kind": "wsl-primary-unavailable",
+                "detail": "the selected distribution could not start",
+            })
+        );
+        assert!(backend.local_environment_bootstraps().is_empty());
     }
 
     #[cfg(target_os = "windows")]

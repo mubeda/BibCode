@@ -1,6 +1,7 @@
 import * as React from "react";
 import type { SidebarProjectSortOrder, SidebarThreadSortOrder } from "@bibcode/contracts/settings";
 import type { EnvironmentShellAvailability } from "@bibcode/client-runtime/state/shell";
+import type { ConnectionCatalogHealth } from "@bibcode/client-runtime/platform";
 import type { EnvironmentId } from "@bibcode/contracts";
 import {
   getThreadSortTimestamp,
@@ -51,8 +52,17 @@ const SIDEBAR_PROJECT_AVAILABILITY_PRIORITY = [
 export function resolveSidebarProjectAvailability(input: {
   readonly projectCount: number;
   readonly catalogReady: boolean;
+  readonly catalogHealth?: ConnectionCatalogHealth;
   readonly environments: ReadonlyArray<EnvironmentShellAvailability>;
 }): SidebarProjectAvailabilityView {
+  if (input.catalogHealth?.status === "recovery-required") {
+    return {
+      kind: "configuration-error",
+      environmentId: null,
+      error: input.catalogHealth.message,
+      hasCachedProjects: input.projectCount > 0,
+    };
+  }
   if (!input.catalogReady) {
     return { kind: "loading", environmentId: null, error: null };
   }
