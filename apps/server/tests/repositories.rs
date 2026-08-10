@@ -333,6 +333,7 @@ fn public_repository_api_inventory_is_explicit() {
         "prepare_reserved_command_receipt",
         "new",
         "read_events_from_sequence",
+        "release_reserved_command_receipt",
         "reserve_command_receipt",
         "replace_pending_provider_turn_payload",
         "replace_pending_turn_start",

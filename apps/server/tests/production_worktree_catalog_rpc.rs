@@ -1565,6 +1565,50 @@ async fn removal_fences_cross_project_owner_create_and_retarget_through_detach()
         .expect("removal reaches Git")
         .expect("Git boundary");
 
+    let cancelled_engine = fixture.engine.clone();
+    let cancelled_target = fixture.external.clone();
+    let mut cancelled = tokio::spawn(async move {
+        cancelled_engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.create",
+                    "commandId":"cancelled-racing-owner-create-command",
+                    "threadId":"cancelled-racing-owner-create",
+                    "projectId":"ownership-project-two",
+                    "title":"Cancelled Racing Owner",
+                    "modelSelection":{},
+                    "runtimeMode":"full-access",
+                    "interactionMode":"default",
+                    "branch":null,
+                    "worktreePath":cancelled_target,
+                    "createdAt":"2026-08-10T00:01:02Z"
+                }))
+                .expect("cancelled racing create command"),
+            )
+            .await
+    });
+    assert!(
+        timeout(Duration::from_millis(100), &mut cancelled)
+            .await
+            .is_err(),
+        "cancelled owner create must first wait behind removal"
+    );
+    cancelled.abort();
+    assert!(
+        cancelled
+            .await
+            .expect_err("cancelled owner waiter stops")
+            .is_cancelled()
+    );
+    assert!(
+        fixture
+            .repositories
+            .get_thread("cancelled-racing-owner-create".to_owned())
+            .await
+            .expect("cancelled owner read")
+            .is_none()
+    );
+
     let create_engine = fixture.engine.clone();
     let target = fixture.external.clone();
     let mut create = tokio::spawn(async move {
@@ -1576,7 +1620,6 @@ async fn removal_fences_cross_project_owner_create_and_retarget_through_detach()
                     "threadId":"racing-owner-create",
                     "projectId":"ownership-project-two",
                     "title":"Racing Owner",
-                    "kind":"workspace",
                     "modelSelection":{},
                     "runtimeMode":"full-access",
                     "interactionMode":"default",
@@ -1603,12 +1646,57 @@ async fn removal_fences_cross_project_owner_create_and_retarget_through_detach()
             )
             .await
     });
+    let bootstrap_engine = fixture.engine.clone();
+    let alias_segment = fixture
+        .external
+        .parent()
+        .expect("external parent")
+        .join("canonical-alias-segment");
+    fs::create_dir(&alias_segment).expect("canonical alias segment");
+    let target_alias = alias_segment
+        .join("..")
+        .join(fixture.external.file_name().expect("external file name"));
+    let mut bootstrap = tokio::spawn(async move {
+        bootstrap_engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.turn.start",
+                    "commandId":"racing-bootstrap-owner-command",
+                    "threadId":"racing-bootstrap-owner",
+                    "message":{
+                        "messageId":"racing-bootstrap-message",
+                        "role":"user",
+                        "text":"bootstrap",
+                        "attachments":[]
+                    },
+                    "modelSelection":{},
+                    "runtimeMode":"full-access",
+                    "interactionMode":"default",
+                    "bootstrap":{"createThread":{
+                        "projectId":"ownership-project-two",
+                        "title":"Racing Bootstrap Owner",
+                        "modelSelection":{},
+                        "runtimeMode":"full-access",
+                        "interactionMode":"default",
+                        "branch":null,
+                        "worktreePath":target_alias,
+                        "createdAt":"2026-08-10T00:01:03Z"
+                    }},
+                    "createdAt":"2026-08-10T00:01:03Z"
+                }))
+                .expect("racing bootstrap command"),
+            )
+            .await
+    });
     let create_early = timeout(Duration::from_millis(100), &mut create).await;
     let retarget_early = timeout(Duration::from_millis(100), &mut retarget).await;
+    let bootstrap_early = timeout(Duration::from_millis(100), &mut bootstrap).await;
     let create_early_debug = format!("{create_early:?}");
     let retarget_early_debug = format!("{retarget_early:?}");
+    let bootstrap_early_debug = format!("{bootstrap_early:?}");
     let create_waited = create_early.is_err();
     let retarget_waited = retarget_early.is_err();
+    let bootstrap_waited = bootstrap_early.is_err();
     release.add_permits(1);
     let removal_result = success_value(fixture.socket(), "1269").await;
     let create_result = match create_early {
@@ -1619,6 +1707,10 @@ async fn removal_fences_cross_project_owner_create_and_retarget_through_detach()
         Ok(joined) => joined.expect("retarget joins"),
         Err(_) => retarget.await.expect("retarget joins after removal"),
     };
+    let bootstrap_result = match bootstrap_early {
+        Ok(joined) => joined.expect("bootstrap joins"),
+        Err(_) => bootstrap.await.expect("bootstrap joins after removal"),
+    };
 
     assert!(
         create_waited,
@@ -1628,10 +1720,18 @@ async fn removal_fences_cross_project_owner_create_and_retarget_through_detach()
         retarget_waited,
         "owner retarget must wait behind removal: {retarget_early_debug}"
     );
+    assert!(
+        bootstrap_waited,
+        "bootstrap owner create through a canonical alias must wait behind removal: {bootstrap_early_debug}"
+    );
     assert!(create_result.is_err(), "stale owner create must revalidate");
     assert!(
         retarget_result.is_err(),
         "stale owner retarget must revalidate"
+    );
+    assert!(
+        bootstrap_result.is_err(),
+        "stale bootstrap owner create must revalidate"
     );
     assert_eq!(removal_result["gitOutcome"], "removed");
     assert!(
@@ -1651,6 +1751,14 @@ async fn removal_fences_cross_project_owner_create_and_retarget_through_detach()
     assert_ne!(
         retargeted.worktree_path.as_deref(),
         Some(fixture.external.to_string_lossy().as_ref())
+    );
+    assert!(
+        fixture
+            .repositories
+            .get_thread("racing-bootstrap-owner".to_owned())
+            .await
+            .expect("bootstrap owner read")
+            .is_none()
     );
     fixture.shutdown().await;
 }
@@ -1765,6 +1873,155 @@ async fn owner_mutation_that_wins_the_fence_invalidates_removal_before_git() {
             .is_none()
     );
     fixture.shutdown().await;
+}
+
+#[derive(Clone, Copy)]
+enum RacingOwnerCreation {
+    OmittedKind,
+    TurnBootstrap,
+}
+
+async fn assert_owner_creation_that_wins_invalidates_removal(kind: RacingOwnerCreation) {
+    let hooks = TestHooks::default();
+    let remove_calls = Arc::new(AtomicUsize::new(0));
+    let mut fixture = CatalogRpcFixture::new_with_engine_options_and_removal_git(
+        true,
+        Arc::new(CountingRemovalGit {
+            inner: GitRepository::default(),
+            remove_calls: remove_calls.clone(),
+        }),
+        EngineOptions {
+            queue_capacity: 16,
+            test_hooks: hooks.clone(),
+        },
+    )
+    .await;
+    let thread_id = adopt_external_for_removal(&mut fixture, "creation-winner-adopt").await;
+    let plan = removal_plan(&mut fixture, "project-1", &thread_id, "1273").await;
+    let second_root = fixture.root.path().join("creation-winner-project");
+    fs::create_dir(&second_root).expect("second project root");
+    fixture
+        .engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"project.create",
+                "commandId":"creation-winner-project-create",
+                "projectId":"creation-winner-project",
+                "title":"Creation Winner",
+                "workspaceRoot":second_root,
+                "defaultModelSelection":null,
+                "createdAt":"2026-08-10T00:03:00Z"
+            }))
+            .expect("second project command"),
+        )
+        .await
+        .expect("second project");
+    let owner_id = match kind {
+        RacingOwnerCreation::OmittedKind => "creation-winner-omitted",
+        RacingOwnerCreation::TurnBootstrap => "creation-winner-bootstrap",
+    };
+    let target = match kind {
+        RacingOwnerCreation::OmittedKind => fixture.external.clone(),
+        RacingOwnerCreation::TurnBootstrap => {
+            let alias_segment = fixture
+                .external
+                .parent()
+                .expect("external parent")
+                .join("winner-alias-segment");
+            fs::create_dir(&alias_segment).expect("winner alias segment");
+            alias_segment
+                .join("..")
+                .join(fixture.external.file_name().expect("external file name"))
+        }
+    };
+    let command = match kind {
+        RacingOwnerCreation::OmittedKind => serde_json::from_value(json!({
+            "type":"thread.create",
+            "commandId":"creation-winner-omitted-command",
+            "threadId":owner_id,
+            "projectId":"creation-winner-project",
+            "title":"Omitted Kind Owner",
+            "modelSelection":{},
+            "runtimeMode":"full-access",
+            "interactionMode":"default",
+            "branch":null,
+            "worktreePath":target,
+            "createdAt":"2026-08-10T00:03:01Z"
+        })),
+        RacingOwnerCreation::TurnBootstrap => serde_json::from_value(json!({
+            "type":"thread.turn.start",
+            "commandId":"creation-winner-bootstrap-command",
+            "threadId":owner_id,
+            "message":{
+                "messageId":"creation-winner-bootstrap-message",
+                "role":"user",
+                "text":"bootstrap",
+                "attachments":[]
+            },
+            "modelSelection":{},
+            "runtimeMode":"full-access",
+            "interactionMode":"default",
+            "bootstrap":{"createThread":{
+                "projectId":"creation-winner-project",
+                "title":"Bootstrap Owner",
+                "modelSelection":{},
+                "runtimeMode":"full-access",
+                "interactionMode":"default",
+                "branch":null,
+                "worktreePath":target,
+                "createdAt":"2026-08-10T00:03:01Z"
+            }},
+            "createdAt":"2026-08-10T00:03:01Z"
+        })),
+    }
+    .expect("owner creation command");
+
+    let pause = hooks.pause_before_next_command_persist();
+    let engine = fixture.engine.clone();
+    let owner = tokio::spawn(async move { engine.dispatch(command).await });
+    pause.wait_until_entered().await;
+    request(
+        fixture.socket(),
+        "1274",
+        "worktree.remove",
+        removal_payload("creation-winner-remove", "project-1", &thread_id, &plan),
+    )
+    .await;
+    assert!(
+        timeout(Duration::from_millis(100), fixture.socket().next())
+            .await
+            .is_err(),
+        "removal must wait behind the owner creation fence"
+    );
+    assert_eq!(remove_calls.load(Ordering::SeqCst), 0);
+    pause.release();
+    owner
+        .await
+        .expect("owner creation joins")
+        .expect("owner creation wins");
+
+    assert_typed_removal_failure(fixture.socket(), "1274", "ownership-conflict").await;
+    assert_eq!(remove_calls.load(Ordering::SeqCst), 0);
+    assert!(fixture.external.exists());
+    let owner = fixture
+        .repositories
+        .get_thread(owner_id.to_owned())
+        .await
+        .expect("owner read")
+        .expect("owner persists after rejected removal");
+    assert_eq!(owner.kind, "workspace");
+    assert!(owner.deleted_at.is_none());
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn omitted_kind_owner_creation_that_wins_invalidates_removal_before_git() {
+    assert_owner_creation_that_wins_invalidates_removal(RacingOwnerCreation::OmittedKind).await;
+}
+
+#[tokio::test]
+async fn turn_bootstrap_owner_creation_that_wins_invalidates_removal_before_git() {
+    assert_owner_creation_that_wins_invalidates_removal(RacingOwnerCreation::TurnBootstrap).await;
 }
 
 #[tokio::test]

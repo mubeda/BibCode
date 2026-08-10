@@ -677,6 +677,8 @@ pub struct EngineOptions {
 pub struct TestHooks {
     fail_next_projector: Arc<StdMutex<Option<FailProjectorOnce>>>,
     pause_after_admission_commit: Arc<StdMutex<Option<AdmissionCommitPause>>>,
+    #[cfg(test)]
+    pause_after_command_receipt_preflight: Arc<StdMutex<Option<AdmissionCommitPause>>>,
     pause_before_command_persist: Arc<StdMutex<Option<AdmissionCommitPause>>>,
     pause_before_command_finalization: Arc<StdMutex<Option<PersistenceCommitPause>>>,
     pause_after_command_finalization: Arc<StdMutex<Option<PersistenceCommitPause>>>,
@@ -767,6 +769,19 @@ impl TestHooks {
         pause
     }
 
+    #[cfg(test)]
+    pub(crate) fn pause_after_next_command_receipt_preflight(&self) -> AdmissionCommitPause {
+        let pause = AdmissionCommitPause {
+            entered: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        *self
+            .pause_after_command_receipt_preflight
+            .lock()
+            .expect("command receipt preflight pause mutex") = Some(pause.clone());
+        pause
+    }
+
     pub fn pause_before_next_command_finalization(&self) -> PersistenceCommitPause {
         let pause = PersistenceCommitPause {
             entered: Arc::new(tokio::sync::Notify::new()),
@@ -827,6 +842,19 @@ impl TestHooks {
             .pause_after_admission_commit
             .lock()
             .expect("admission pause mutex")
+            .take();
+        if let Some(pause) = pause {
+            pause.entered.notify_one();
+            pause.release.notified().await;
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn maybe_pause_after_command_receipt_preflight(&self) {
+        let pause = self
+            .pause_after_command_receipt_preflight
+            .lock()
+            .expect("command receipt preflight pause mutex")
             .take();
         if let Some(pause) = pause {
             pause.entered.notify_one();
@@ -1037,7 +1065,7 @@ async fn command_workspace_ownership_keys(
             kind,
             worktree_path: Some(path),
             ..
-        } if kind.as_deref() == Some("workspace") => paths.push(path.clone()),
+        } if kind.as_deref().unwrap_or("workspace") == "workspace" => paths.push(path.clone()),
         OrchestrationCommand::ThreadDelete { thread_id, .. } => {
             if let Some(thread) = repositories
                 .get_thread(thread_id.clone())
@@ -1068,6 +1096,24 @@ async fn command_workspace_ownership_keys(
                 if let Some(path) = next_path {
                     paths.push(path.clone());
                 }
+            }
+        }
+        OrchestrationCommand::ThreadTurnStart {
+            thread_id,
+            bootstrap: Some(bootstrap),
+            ..
+        } => {
+            if repositories
+                .get_thread(thread_id.clone())
+                .await
+                .map_err(wrap_persistence)?
+                .is_none()
+                && let Some(path) = bootstrap
+                    .create_thread
+                    .as_ref()
+                    .and_then(|create| create.worktree_path.as_ref())
+            {
+                paths.push(path.clone());
             }
         }
         _ => {}
@@ -1524,6 +1570,8 @@ pub struct OrchestrationEngine {
     bootstrap_effects: Arc<StdMutex<Option<Arc<dyn ThreadTurnBootstrapEffects>>>>,
     project_command_effects: Arc<StdMutex<Option<Arc<dyn ProjectCommandEffects>>>>,
     workspace_ownership: WorkspaceOwnershipFence,
+    #[cfg(test)]
+    test_hooks: TestHooks,
 }
 
 impl OrchestrationEngine {
@@ -1557,6 +1605,8 @@ impl OrchestrationEngine {
             bootstrap_effects: Arc::new(StdMutex::new(None)),
             project_command_effects,
             workspace_ownership: WorkspaceOwnershipFence::default(),
+            #[cfg(test)]
+            test_hooks: options.test_hooks,
         })
     }
 
@@ -1646,6 +1696,64 @@ impl OrchestrationEngine {
             .filter(|event| event.event.command_id.as_deref() == Some(command_id))
             .collect::<VecDeque<_>>();
         durable_worktree_removal_result(&events).map(Some)
+    }
+
+    pub(crate) async fn reserve_generic_command_admission(
+        &self,
+        command: &OrchestrationCommand,
+        payload_digest: &str,
+    ) -> Result<bool, OrchestrationError> {
+        let command_id = command.command_id().to_owned();
+        let aggregate = command.aggregate_ref();
+        let accepted_at = current_timestamp(self.repositories.database()).await?;
+        let result_sequence = current_max_sequence(&self.repositories).await?;
+        let (receipt, _) = self
+            .repositories
+            .reserve_command_receipt(CommandReceipt {
+                command_id: command_id.clone(),
+                aggregate_kind: aggregate.0.to_owned(),
+                aggregate_id: aggregate.1.to_owned(),
+                accepted_at,
+                result_sequence,
+                status: "reserved".to_owned(),
+                error: None,
+                payload_digest: Some(payload_digest.to_owned()),
+            })
+            .await
+            .map_err(wrap_persistence)?;
+        if receipt.payload_digest.as_deref() != Some(payload_digest)
+            || receipt.aggregate_kind != aggregate.0
+            || receipt.aggregate_id != aggregate.1
+        {
+            return Err(OrchestrationError::CommandConflict { command_id });
+        }
+        match receipt.status.as_str() {
+            "reserved" => Ok(true),
+            "accepted" => Ok(false),
+            _ => Err(OrchestrationError::PreviouslyRejected {
+                command_id,
+                detail: receipt
+                    .error
+                    .unwrap_or_else(|| "Previously rejected.".to_owned()),
+            }),
+        }
+    }
+
+    pub(crate) async fn release_generic_command_admission(
+        &self,
+        command: &OrchestrationCommand,
+        payload_digest: &str,
+    ) -> Result<bool, OrchestrationError> {
+        let aggregate = command.aggregate_ref();
+        self.repositories
+            .release_reserved_command_receipt(
+                command.command_id().to_owned(),
+                aggregate.0.to_owned(),
+                aggregate.1.to_owned(),
+                payload_digest.to_owned(),
+            )
+            .await
+            .map_err(wrap_persistence)
     }
 
     pub(crate) async fn reserve_worktree_removal_admission(
@@ -1907,6 +2015,11 @@ impl OrchestrationEngine {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(effects);
     }
 
+    #[cfg(test)]
+    pub(crate) fn test_hooks(&self) -> TestHooks {
+        self.test_hooks.clone()
+    }
+
     pub(crate) async fn run_bootstrap_setup(
         &self,
         bootstrap_command_id: &str,
@@ -2101,6 +2214,17 @@ fn spawn_worker(
                                 on_commit,
                             } = *envelope;
                             let has_admission = admission.is_some();
+                            let failed_turn_reservation = admission
+                                .as_ref()
+                                .and_then(|admission| admission.provider_turn.as_ref().map(|_| {
+                                    let aggregate = command.aggregate_ref();
+                                    (
+                                        command.command_id().to_owned(),
+                                        aggregate.0.to_owned(),
+                                        aggregate.1.to_owned(),
+                                        admission.payload_digest.clone(),
+                                    )
+                                }));
                             let cancellation = lifetime
                                 .as_ref()
                                 .map(|lifetime| lifetime.cancellation.clone());
@@ -2111,7 +2235,7 @@ fn spawn_worker(
                                 .lock()
                                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                                 .clone();
-                            let result = process_envelope(
+                            let mut result = process_envelope(
                                 &repositories,
                                 &mut model,
                                 &events,
@@ -2125,6 +2249,20 @@ fn spawn_worker(
                                 },
                             )
                             .await;
+                            if result.is_err()
+                                && let Some((command_id, aggregate_kind, aggregate_id, digest)) =
+                                    failed_turn_reservation
+                                && let Err(error) = repositories
+                                    .release_reserved_command_receipt(
+                                        command_id,
+                                        aggregate_kind,
+                                        aggregate_id,
+                                        digest,
+                                    )
+                                    .await
+                            {
+                                result = Err(wrap_persistence(error));
+                            }
                             if result.as_ref().is_ok_and(|outcome| outcome.accepted_new)
                             {
                                 if let Some(ownership) = &ownership {
