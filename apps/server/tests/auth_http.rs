@@ -1365,11 +1365,13 @@ async fn server_starts_while_live_store_is_continuously_committed_and_checkpoint
         .execute_batch(
             "CREATE TABLE validation_startup_churn (
                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
-               revision INTEGER NOT NULL
+               revision INTEGER NOT NULL,
+               padding BLOB NOT NULL
              );
-             INSERT INTO validation_startup_churn (singleton, revision) VALUES (1, 0);",
+             INSERT INTO validation_startup_churn (singleton, revision, padding)
+               VALUES (1, 0, zeroblob(1048576));",
         )
-        .expect("live-store churn table");
+        .expect("multi-batch live-store churn table");
     drop(setup);
     let stop = Arc::new(AtomicBool::new(false));
     let writer_stop = Arc::clone(&stop);
