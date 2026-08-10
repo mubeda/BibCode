@@ -677,6 +677,25 @@ impl WorktreeCatalogService {
         Some(Arc::clone(&lock(&entry.state).snapshot))
     }
 
+    pub(crate) fn shutdown(&self) {
+        let mut registry = lock(&self.inner.registry);
+        for entry in registry.entries.values() {
+            let mut state = lock(&entry.state);
+            state.scan_cancellation.cancel();
+            state.poller.take();
+            state.eviction.take();
+            state.mutation_refresh_worker.take();
+            state.pending_mutation_refresh_epoch = None;
+            let repository_state = lock(&entry.repository.state);
+            repository_state.scan_cancellation.cancel();
+        }
+        registry.aliases.clear();
+        registry.entries.clear();
+        registry.repositories.clear();
+        registry.bootstrap_locks.clear();
+        registry.mutation_locks.clear();
+    }
+
     pub async fn invalidate_after_mutation(&self, project_id: &str) {
         let Some(entry) = self.entry_for_project(project_id) else {
             return;

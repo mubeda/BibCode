@@ -56,6 +56,10 @@ use crate::{
         server_terminal::{ServerTerminalServices, register_server_terminal_rpc},
         turn_delivery::TurnDeliveryService,
         workspace_preview::{WorkspacePreviewRpcServices, register_workspace_preview_rpc},
+        worktree_catalog_rpc::{
+            WorktreeCatalogMutationObserver, WorktreeCatalogRpcServices,
+            register_worktree_catalog_rpc,
+        },
     },
     provider::attachments::{AttachmentMaterializer, MAX_ATTACHMENT_BYTES},
     provider_terminal::{
@@ -72,6 +76,7 @@ use crate::{
     server_settings::ProviderSettingsStore,
     terminal::{PortablePtyBackend, TerminalManager, TerminalManagerOptions},
     workspace::{AssetContextResolver, WorkspaceRpc, WorkspaceRpcDependencies, WorkspaceService},
+    worktree_catalog::WorktreeCatalogService,
 };
 
 pub struct ProductionRuntime {
@@ -87,6 +92,7 @@ pub struct ProductionRuntime {
     provider_update_checks: ProviderUpdateCheckTask,
     orchestration_effects: OrchestrationEffects,
     diagnostic_bundle: DiagnosticBundleService,
+    _worktree_catalog: WorktreeCatalogService,
     _resource_sampler: Arc<NativeResourceSampler>,
 }
 
@@ -221,15 +227,23 @@ impl ProductionRuntime {
         ));
         let asset_access = AssetAccess::new(asset_secret, state_paths.attachments_dir.clone());
         let git_repository = Arc::new(GitRepository::with_worktree_settings(control.clone()));
+        let worktree_catalog =
+            WorktreeCatalogService::new(Arc::new(repositories.clone()), git_repository.clone());
         let git_vcs = GitVcsRpcServices::with_repository_and_automatic_fetch_interval(
             git_repository.clone(),
             control.automatic_git_fetch_interval_signal(),
-        );
+        )
+        .with_catalog_mutation_observer(Arc::new(WorktreeCatalogMutationObserver::new(
+            worktree_catalog.clone(),
+            repositories.clone(),
+        )));
         let workspace = WorkspaceRpc::with_dependencies(
             WorkspaceService::default(),
             WorkspaceRpcDependencies {
                 asset_access: Some(asset_access.clone()),
-                asset_context_resolver: Some(Arc::new(ProjectionAssetContext { repositories })),
+                asset_context_resolver: Some(Arc::new(ProjectionAssetContext {
+                    repositories: repositories.clone(),
+                })),
                 review_service: Some(ReviewService::new(Arc::new(GitReviewBackend))),
                 mutation_observer: Some(Arc::new(git_vcs.clone())),
             },
@@ -296,6 +310,10 @@ impl ProductionRuntime {
         );
         register_workspace_preview_rpc(&mut registry, workspace_preview);
         register_git_vcs_rpc(&mut registry, git_vcs);
+        register_worktree_catalog_rpc(
+            &mut registry,
+            WorktreeCatalogRpcServices::new(worktree_catalog.clone(), orchestration.clone()),
+        );
         register_server_terminal_rpc(&mut registry, terminal_services.clone());
         finalize_rpc_registry(&registry, &control)?;
 
@@ -312,6 +330,7 @@ impl ProductionRuntime {
             provider_update_checks,
             orchestration_effects,
             diagnostic_bundle,
+            _worktree_catalog: worktree_catalog,
             _resource_sampler: resource_sampler,
         })
     }
@@ -429,6 +448,7 @@ impl ProductionRuntime {
     }
 
     pub async fn shutdown(&self) {
+        self._worktree_catalog.shutdown();
         self.provider_update_checks.shutdown().await;
         self.turn_delivery.shutdown().await;
         self.orchestration_effects.shutdown().await;
@@ -1788,6 +1808,83 @@ mod tests {
             .expect("thread table should restore");
 
         runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn production_runtime_shutdown_cancels_owned_worktree_catalog_pollers() {
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let state = TempDir::new().expect("temporary state directory");
+        let repository = state.path().join("catalog-runtime-project");
+        std::fs::create_dir(&repository).expect("repository directory");
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&repository)
+                .env("GIT_AUTHOR_NAME", "BiBCode Test")
+                .env("GIT_AUTHOR_EMAIL", "bibcode@example.invalid")
+                .env("GIT_COMMITTER_NAME", "BiBCode Test")
+                .env("GIT_COMMITTER_EMAIL", "bibcode@example.invalid")
+                .output()
+                .expect("Git command");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet", "-b", "main"]);
+        std::fs::write(repository.join("README.md"), "runtime catalog\n")
+            .expect("repository fixture");
+        git(&["add", "README.md"]);
+        git(&["commit", "--quiet", "-m", "initial"]);
+
+        let config = ServerConfig::new(state.path())
+            .with_bind("127.0.0.1", 0)
+            .with_unsafe_no_auth();
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let runtime = ProductionRuntime::start(
+            &config,
+            database,
+            AuthService::new(&config, vec![7_u8; 32]),
+            vec![9_u8; 32],
+            Arc::new(crate::diagnostics::NotApplicableUiProcessObserver),
+        )
+        .await
+        .expect("production runtime");
+        runtime
+            .orchestration
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "project.create",
+                    "commandId": "catalog-runtime-project",
+                    "projectId": "catalog-runtime-project",
+                    "title": "Catalog runtime project",
+                    "workspaceRoot": repository,
+                    "defaultModelSelection": null,
+                    "createdAt": "2026-08-09T00:00:00Z"
+                }))
+                .expect("project command"),
+            )
+            .await
+            .expect("project creation");
+        let subscription = runtime
+            ._worktree_catalog
+            .subscribe("catalog-runtime-project")
+            .await
+            .expect("catalog subscription");
+        assert_eq!(runtime._worktree_catalog.active_poller_count_for_test(), 1);
+
+        runtime.shutdown().await;
+
+        assert_eq!(runtime._worktree_catalog.active_poller_count_for_test(), 0);
+        drop(subscription);
     }
 
     #[tokio::test]

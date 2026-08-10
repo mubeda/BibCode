@@ -629,16 +629,16 @@ for (const rpc of [...WsRpcGroup.requests.values()].toSorted((left, right) =>
   }
 }
 
-if (methods.length !== 85) {
-  throw new Error(`Expected 85 active RPC methods, found ${methods.length}.`);
+if (methods.length !== 88) {
+  throw new Error(`Expected 88 active RPC methods, found ${methods.length}.`);
 }
 const streamMethodCount = methods.filter(({ mode }) => mode === "stream").length;
-if (streamMethodCount !== 15) {
-  throw new Error(`Expected 15 streaming RPC methods, found ${streamMethodCount}.`);
+if (streamMethodCount !== 16) {
+  throw new Error(`Expected 16 streaming RPC methods, found ${streamMethodCount}.`);
 }
-if (topLevelStreamShapeCount !== 56) {
+if (topLevelStreamShapeCount !== 57) {
   throw new Error(
-    `Expected 56 top-level streaming item shapes, found ${topLevelStreamShapeCount}.`,
+    `Expected 57 top-level streaming item shapes, found ${topLevelStreamShapeCount}.`,
   );
 }
 if (streamShapeFixtures.length !== topLevelStreamShapeCount) {
@@ -646,8 +646,8 @@ if (streamShapeFixtures.length !== topLevelStreamShapeCount) {
     `Exported ${streamShapeFixtures.length} stream shape fixtures, expected ${topLevelStreamShapeCount}.`,
   );
 }
-if (typedFailureFixtures.length !== 131) {
-  throw new Error(`Expected 131 typed failure fixtures, found ${typedFailureFixtures.length}.`);
+if (typedFailureFixtures.length !== 135) {
+  throw new Error(`Expected 135 typed failure fixtures, found ${typedFailureFixtures.length}.`);
 }
 if (orchestrationEventShapeCount !== 23) {
   throw new Error(`Expected 23 orchestration event shapes, found ${orchestrationEventShapeCount}.`);

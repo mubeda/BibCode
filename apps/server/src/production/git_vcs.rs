@@ -1,6 +1,8 @@
 use std::{
     ffi::OsString,
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -61,12 +63,29 @@ pub const GIT_VCS_UNARY_METHODS: &[&str] = &[
 
 pub const GIT_VCS_STREAM_METHODS: &[&str] = &["subscribeVcsStatus", "git.runStackedAction"];
 
+pub type CatalogMutationFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+pub trait CatalogMutationObserver: Send + Sync {
+    fn note_managed_creation<'a>(
+        &'a self,
+        cwd: &'a Path,
+        path: &'a Path,
+    ) -> CatalogMutationFuture<'a>;
+
+    fn invalidate_after_removal<'a>(
+        &'a self,
+        cwd: &'a Path,
+        path: &'a Path,
+    ) -> CatalogMutationFuture<'a>;
+}
+
 #[derive(Clone)]
 pub struct GitVcsRpcServices {
     repository: Arc<GitRepository>,
     broadcaster: StatusBroadcaster,
     discovery: SourceControlDiscovery,
     pull_requests: PullRequestService,
+    catalog_mutation_observer: Option<Arc<dyn CatalogMutationObserver>>,
 }
 
 impl Default for GitVcsRpcServices {
@@ -99,7 +118,17 @@ impl GitVcsRpcServices {
             repository,
             discovery: SourceControlDiscovery::default(),
             pull_requests: PullRequestService::default(),
+            catalog_mutation_observer: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_catalog_mutation_observer(
+        mut self,
+        observer: Arc<dyn CatalogMutationObserver>,
+    ) -> Self {
+        self.catalog_mutation_observer = Some(observer);
+        self
     }
 }
 
@@ -194,33 +223,53 @@ impl GitVcsRpcServices {
             }
             "vcs.createWorktree" => {
                 let input: CreateWorktree = decode(request.payload, "vcs.createWorktree")?;
-                encode_result(
-                    self.repository
-                        .create_worktree(
-                            CreateWorktreeInput {
-                                cwd: input.cwd,
-                                ref_name: input.ref_name,
-                                new_ref_name: input.new_ref_name,
-                                base_ref_name: input.base_ref_name,
-                                path: input.path,
-                            },
-                            &cancellation,
-                        )
-                        .await,
-                )
+                let cwd = input.cwd.clone();
+                let result = self
+                    .repository
+                    .create_worktree(
+                        CreateWorktreeInput {
+                            cwd: input.cwd,
+                            ref_name: input.ref_name,
+                            new_ref_name: input.new_ref_name,
+                            base_ref_name: input.base_ref_name,
+                            path: input.path,
+                        },
+                        &cancellation,
+                    )
+                    .await;
+                match result {
+                    Ok(created) => {
+                        if let Some(observer) = &self.catalog_mutation_observer
+                            && let Err(error) = observer
+                                .note_managed_creation(&cwd, Path::new(&created.worktree.path))
+                                .await
+                        {
+                            tracing::warn!(%error, "catalog creation observation failed");
+                        }
+                        Ok(encode_value(created))
+                    }
+                    Err(error) => Err(serialize_error(error)),
+                }
             }
             "vcs.removeWorktree" => {
                 let input: RemoveWorktree = decode(request.payload, "vcs.removeWorktree")?;
-                encode_null(
-                    self.repository
-                        .remove_worktree(
-                            &input.cwd,
-                            &input.path,
-                            input.force.unwrap_or(false),
-                            &cancellation,
-                        )
-                        .await,
-                )
+                self.repository
+                    .remove_worktree(
+                        &input.cwd,
+                        &input.path,
+                        input.force.unwrap_or(false),
+                        &cancellation,
+                    )
+                    .await
+                    .map_err(serialize_error)?;
+                if let Some(observer) = &self.catalog_mutation_observer
+                    && let Err(error) = observer
+                        .invalidate_after_removal(&input.cwd, &input.path)
+                        .await
+                {
+                    tracing::warn!(%error, "catalog removal observation failed");
+                }
+                Ok(Value::Null)
             }
             "vcs.clone" => {
                 let input: CloneInput = decode(request.payload, "vcs.clone")?;

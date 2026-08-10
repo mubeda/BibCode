@@ -2,7 +2,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::Mutex,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -16,11 +16,57 @@ use tokio::time::timeout;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 use bibcode_server::production::git_vcs::{
-    GIT_VCS_STREAM_METHODS, GIT_VCS_UNARY_METHODS, GitVcsRpcServices, register_git_vcs_rpc,
+    CatalogMutationFuture, CatalogMutationObserver, GIT_VCS_STREAM_METHODS, GIT_VCS_UNARY_METHODS,
+    GitVcsRpcServices, register_git_vcs_rpc,
 };
 
 const ISOLATED_GIT_TEST: &str = "BIBCODE_PRODUCTION_GIT_VCS_RPC_ISOLATED";
 static ISOLATED_GIT_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[derive(Default)]
+struct RecordingCatalogMutationObserver {
+    creations: Mutex<Vec<(PathBuf, PathBuf)>>,
+    removals: Mutex<Vec<(PathBuf, PathBuf)>>,
+    fail_observation: bool,
+}
+
+impl CatalogMutationObserver for RecordingCatalogMutationObserver {
+    fn note_managed_creation<'a>(
+        &'a self,
+        cwd: &'a Path,
+        path: &'a Path,
+    ) -> CatalogMutationFuture<'a> {
+        Box::pin(async move {
+            self.creations
+                .lock()
+                .expect("creation records")
+                .push((cwd.to_path_buf(), path.to_path_buf()));
+            if self.fail_observation {
+                Err("catalog creation observation failed".to_owned())
+            } else {
+                Ok(())
+            }
+        })
+    }
+
+    fn invalidate_after_removal<'a>(
+        &'a self,
+        cwd: &'a Path,
+        path: &'a Path,
+    ) -> CatalogMutationFuture<'a> {
+        Box::pin(async move {
+            self.removals
+                .lock()
+                .expect("removal records")
+                .push((cwd.to_path_buf(), path.to_path_buf()));
+            if self.fail_observation {
+                Err("catalog removal observation failed".to_owned())
+            } else {
+                Ok(())
+            }
+        })
+    }
+}
 
 type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -100,6 +146,80 @@ fn registrar_owns_the_complete_git_vcs_rpc_surface() {
         GIT_VCS_STREAM_METHODS,
         ["subscribeVcsStatus", "git.runStackedAction"]
     );
+}
+
+#[tokio::test]
+async fn successful_create_and_remove_notify_catalog_without_reclassifying_observation_failure() {
+    let temp = TempDir::new().expect("temporary server directory");
+    let repository = TempDir::new().expect("temporary repository");
+    initialize_repository(&repository);
+    commit_file(
+        repository.path(),
+        "README.md",
+        "catalog observer\n",
+        "initial",
+    );
+    let worktree = repository.path().join("catalog-observed");
+    let observer = Arc::new(RecordingCatalogMutationObserver {
+        fail_observation: true,
+        ..RecordingCatalogMutationObserver::default()
+    });
+    let services =
+        GitVcsRpcServices::with_repository(Arc::new(bibcode_server::git::GitRepository::default()))
+            .with_catalog_mutation_observer(observer.clone());
+    let mut registry = RpcRegistry::empty();
+    register_git_vcs_rpc(&mut registry, services);
+    let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
+        .await
+        .expect("server starts");
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("WebSocket connects");
+
+    request(
+        &mut socket,
+        "901",
+        "vcs.createWorktree",
+        json!({
+            "cwd": repository.path(),
+            "refName": "main",
+            "newRefName": "feature/catalog-observed",
+            "baseRefName": "main",
+            "path": worktree,
+        }),
+    )
+    .await;
+    let created = success_value(&mut socket, "901").await;
+    let created_path = PathBuf::from(created["worktree"]["path"].as_str().expect("created path"));
+    assert_eq!(
+        observer
+            .creations
+            .lock()
+            .expect("creation records")
+            .as_slice(),
+        &[(repository.path().to_path_buf(), created_path)]
+    );
+
+    request(
+        &mut socket,
+        "902",
+        "vcs.removeWorktree",
+        json!({ "cwd": repository.path(), "path": worktree, "force": true }),
+    )
+    .await;
+    assert_success_eq(&mut socket, "902", Value::Null).await;
+    assert_eq!(
+        observer
+            .removals
+            .lock()
+            .expect("removal records")
+            .as_slice(),
+        &[(repository.path().to_path_buf(), worktree)]
+    );
+
+    socket.close(None).await.expect("close WebSocket");
+    handle.shutdown();
+    handle.join().await.expect("server joins");
 }
 
 #[tokio::test]

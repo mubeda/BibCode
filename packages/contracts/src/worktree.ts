@@ -1,7 +1,14 @@
 import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 
-import { IsoDateTime, NonNegativeInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import {
+  CommandId,
+  IsoDateTime,
+  NonNegativeInt,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
 
 const WORKTREE_MESSAGE_MAX_LENGTH = 2_048;
 const WORKTREE_CATALOG_MAX_ENTRIES = 512;
@@ -37,6 +44,25 @@ export const ProjectWorktreeDiscoveryPolicy = Schema.Struct({
     .pipe(Schema.withDecodingDefault(Effect.succeed([]))),
 });
 export type ProjectWorktreeDiscoveryPolicy = typeof ProjectWorktreeDiscoveryPolicy.Type;
+
+export const WorktreeCatalogInput = Schema.Struct({
+  projectId: ProjectId,
+});
+export type WorktreeCatalogInput = typeof WorktreeCatalogInput.Type;
+
+export const WorktreeCatalogRefreshInput = Schema.Struct({
+  projectId: ProjectId,
+});
+export type WorktreeCatalogRefreshInput = typeof WorktreeCatalogRefreshInput.Type;
+
+export const WorktreeDiscoveryPolicyUpdateInput = Schema.Struct({
+  commandId: CommandId,
+  projectId: ProjectId,
+  visibility: Schema.optional(WorktreeDiscoveryVisibility),
+  acknowledgeGeneration: Schema.optional(NonNegativeInt),
+  dismissInitialPrompt: Schema.optional(Schema.Boolean),
+});
+export type WorktreeDiscoveryPolicyUpdateInput = typeof WorktreeDiscoveryPolicyUpdateInput.Type;
 
 export const VcsWorktreeRegistrationState = Schema.Literals(["registered", "prunable"]);
 export type VcsWorktreeRegistrationState = typeof VcsWorktreeRegistrationState.Type;

@@ -258,6 +258,10 @@
       "mode": "stream"
     },
     {
+      "name": "subscribeWorktreeCatalog",
+      "mode": "stream"
+    },
+    {
       "name": "terminal.attach",
       "mode": "stream"
     },
@@ -326,6 +330,10 @@
       "mode": "unary"
     },
     {
+      "name": "vcs.refreshWorktreeCatalog",
+      "mode": "unary"
+    },
+    {
       "name": "vcs.removeWorktree",
       "mode": "unary"
     },
@@ -340,10 +348,14 @@
     {
       "name": "vcs.unstageFiles",
       "mode": "unary"
+    },
+    {
+      "name": "worktree.updateDiscoveryPolicy",
+      "mode": "unary"
     }
   ],
-  "streamMethodCount": 15,
-  "expectedTopLevelStreamShapes": 56,
+  "streamMethodCount": 16,
+  "expectedTopLevelStreamShapes": 57,
   "expectedOrchestrationEventShapes": 23,
   "streamShapeFixtures": [
     "stream-shapes/cloud__installRelayClient-00.json",
@@ -394,6 +406,7 @@
     "stream-shapes/subscribeVcsStatus-00.json",
     "stream-shapes/subscribeVcsStatus-01.json",
     "stream-shapes/subscribeVcsStatus-02.json",
+    "stream-shapes/subscribeWorktreeCatalog-00.json",
     "stream-shapes/terminal__attach-00.json",
     "stream-shapes/terminal__attach-01.json",
     "stream-shapes/terminal__attach-02.json",
@@ -527,6 +540,8 @@
     "typed-failures/vcs__pull-01.json",
     "typed-failures/vcs__refreshStatus-00.json",
     "typed-failures/vcs__refreshStatus-01.json",
+    "typed-failures/vcs__refreshWorktreeCatalog-00.json",
+    "typed-failures/vcs__refreshWorktreeCatalog-01.json",
     "typed-failures/vcs__removeWorktree-00.json",
     "typed-failures/vcs__removeWorktree-01.json",
     "typed-failures/vcs__stageFiles-00.json",
@@ -534,7 +549,9 @@
     "typed-failures/vcs__switchRef-00.json",
     "typed-failures/vcs__switchRef-01.json",
     "typed-failures/vcs__unstageFiles-00.json",
-    "typed-failures/vcs__unstageFiles-01.json"
+    "typed-failures/vcs__unstageFiles-01.json",
+    "typed-failures/worktree__updateDiscoveryPolicy-00.json",
+    "typed-failures/worktree__updateDiscoveryPolicy-01.json"
   ],
   "schemaFingerprints": {
     "typed-failures/activity__getSnapshot-00.json": "2c5037207ec2376804e02289d8244687d5adef37a2a9384550b25b0ab1c43b58",
@@ -574,7 +591,7 @@
     "stream-shapes/orchestration__subscribeShell-00.json": "b6904f289467238994f846ef03b5307d9346b35a2673a61264a33a4a58e9bfc3",
     "stream-shapes/orchestration__subscribeShell-01.json": "77eaf16d7c125dee6e808a1fdc7d32601b49611faa8571c0f56d4d7dbc35f976",
     "stream-shapes/orchestration__subscribeThread-00.json": "2b5c374face704e79b3dfa5f001e13deef199467e9593bc417aab9648c81e357",
-    "stream-shapes/orchestration__subscribeThread-01.json": "d8b16cd50427021b4ba677c2816da2f478a5639341c46904b8af5dcb73883df7",
+    "stream-shapes/orchestration__subscribeThread-01.json": "1692526229878747e820780545cd7990532a0eeca4ca9bd4ce60a57e82fd2aa7",
     "typed-failures/preview__close-00.json": "a6b1f011a12b82f4ea016c7cef5be0be8016f04e16271fc58695b1474c04e7e5",
     "typed-failures/preview__close-01.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
     "typed-failures/preview__list-00.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
@@ -676,6 +693,7 @@
     "stream-shapes/subscribeVcsStatus-00.json": "b2f588f1eec3052ea8b9ad2a1b414fb3955aed4deb49b672a72f94534e3d87c0",
     "stream-shapes/subscribeVcsStatus-01.json": "525e7f3dd60919dce125fcf48c14082db97066893ea10ce6f4350d07e7be8f61",
     "stream-shapes/subscribeVcsStatus-02.json": "ab193784ca575089ca11df4440e55f75d8ba471d5e542f05a2cb35d5df2954e7",
+    "stream-shapes/subscribeWorktreeCatalog-00.json": "986dea5e037444aec2d0d101595fd8478561f912149edd42725ee788d1b57b44",
     "stream-shapes/terminal__attach-00.json": "cc8eccd1c6e897ebfa72035540dcaec0b368af0fe98783f6ec63bfb47de1e9d9",
     "stream-shapes/terminal__attach-01.json": "ec331b9022afd407bc56c854bc6a59467c40589abcebe486195b986c8d1088cf",
     "stream-shapes/terminal__attach-02.json": "3ef5e8ec0240b47f7a42b606ea01aa7b10c0b34d2a404bb8cba69e1538621572",
@@ -716,6 +734,8 @@
     "typed-failures/vcs__pull-01.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
     "typed-failures/vcs__refreshStatus-00.json": "c6014c37c93460a18771726c108a1d15fe3e74f86f1de229ecbe999e1dbb6428",
     "typed-failures/vcs__refreshStatus-01.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
+    "typed-failures/vcs__refreshWorktreeCatalog-00.json": "09650e0ae7a286b501cfc9bd5bf5b467fe217454b87656c5040d9c3fc20c2370",
+    "typed-failures/vcs__refreshWorktreeCatalog-01.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
     "typed-failures/vcs__removeWorktree-00.json": "db4c9484fa03affcb35e463a516074a33a24d8c98d74bae227aa8015c6a5ecca",
     "typed-failures/vcs__removeWorktree-01.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
     "typed-failures/vcs__stageFiles-00.json": "db4c9484fa03affcb35e463a516074a33a24d8c98d74bae227aa8015c6a5ecca",
@@ -723,7 +743,9 @@
     "typed-failures/vcs__switchRef-00.json": "db4c9484fa03affcb35e463a516074a33a24d8c98d74bae227aa8015c6a5ecca",
     "typed-failures/vcs__switchRef-01.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
     "typed-failures/vcs__unstageFiles-00.json": "db4c9484fa03affcb35e463a516074a33a24d8c98d74bae227aa8015c6a5ecca",
-    "typed-failures/vcs__unstageFiles-01.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720"
+    "typed-failures/vcs__unstageFiles-01.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
+    "typed-failures/worktree__updateDiscoveryPolicy-00.json": "09650e0ae7a286b501cfc9bd5bf5b467fe217454b87656c5040d9c3fc20c2370",
+    "typed-failures/worktree__updateDiscoveryPolicy-01.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720"
   },
   "staleMethodIdentifiers": ["projects.add", "projects.list", "projects.remove"],
   "fixtures": [
@@ -794,6 +816,7 @@
     "stream-shapes/subscribeVcsStatus-00.json",
     "stream-shapes/subscribeVcsStatus-01.json",
     "stream-shapes/subscribeVcsStatus-02.json",
+    "stream-shapes/subscribeWorktreeCatalog-00.json",
     "stream-shapes/terminal__attach-00.json",
     "stream-shapes/terminal__attach-01.json",
     "stream-shapes/terminal__attach-02.json",
@@ -925,6 +948,8 @@
     "typed-failures/vcs__pull-01.json",
     "typed-failures/vcs__refreshStatus-00.json",
     "typed-failures/vcs__refreshStatus-01.json",
+    "typed-failures/vcs__refreshWorktreeCatalog-00.json",
+    "typed-failures/vcs__refreshWorktreeCatalog-01.json",
     "typed-failures/vcs__removeWorktree-00.json",
     "typed-failures/vcs__removeWorktree-01.json",
     "typed-failures/vcs__stageFiles-00.json",
@@ -932,6 +957,8 @@
     "typed-failures/vcs__switchRef-00.json",
     "typed-failures/vcs__switchRef-01.json",
     "typed-failures/vcs__unstageFiles-00.json",
-    "typed-failures/vcs__unstageFiles-01.json"
+    "typed-failures/vcs__unstageFiles-01.json",
+    "typed-failures/worktree__updateDiscoveryPolicy-00.json",
+    "typed-failures/worktree__updateDiscoveryPolicy-01.json"
   ]
 }

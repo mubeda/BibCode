@@ -1,0 +1,642 @@
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::Command,
+    sync::Arc,
+    time::Duration,
+};
+
+use bibcode_server::{
+    CauseItem, RpcExit, RpcRegistry, ServerConfig, ServerMessage, ServerRuntime,
+    git::GitRepository,
+    orchestration::{EngineOptions, OrchestrationEngine},
+    persistence::{Database, Repositories, run_migrations},
+    production::git_vcs::{GitVcsRpcServices, register_git_vcs_rpc},
+    production::worktree_catalog_rpc::{
+        WorktreeCatalogMutationObserver, WorktreeCatalogRpcServices, compact_eligible_baseline,
+        register_worktree_catalog_rpc,
+    },
+    worktree_catalog::{
+        CatalogScanStatus, WorktreeAdoptionState, WorktreeCatalogService, WorktreeCatalogSnapshot,
+        WorktreeDescriptor, WorktreeDirectoryState, WorktreeRegistrationState,
+    },
+};
+use futures_util::{SinkExt, StreamExt};
+use serde_json::{Value, json};
+use tempfile::TempDir;
+use tokio::time::timeout;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+
+type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+#[tokio::test]
+async fn stream_delivers_initial_and_latest_snapshots_refreshes_and_cancels() {
+    let mut fixture = CatalogRpcFixture::new(false).await;
+
+    request(
+        fixture.socket(),
+        "1",
+        "subscribeWorktreeCatalog",
+        json!({ "projectId": "project-1" }),
+    )
+    .await;
+    let initial = next_chunk(fixture.socket(), "1").await;
+    let initial_generation = initial["generation"].as_u64().expect("initial generation");
+    assert_eq!(initial["authoritative"], true);
+    assert_eq!(initial["worktrees"].as_array().expect("worktrees").len(), 1);
+    ack(fixture.socket(), "1").await;
+    assert!(
+        timeout(Duration::from_millis(100), fixture.socket().next())
+            .await
+            .is_err(),
+        "the initial latest value must not be emitted twice"
+    );
+
+    fixture.create_external_worktree();
+    request(
+        fixture.socket(),
+        "2",
+        "vcs.refreshWorktreeCatalog",
+        json!({ "projectId": "project-1" }),
+    )
+    .await;
+
+    let mut refreshed = None;
+    let mut refresh_result = None;
+    while refreshed.is_none() || refresh_result.is_none() {
+        match next_server_message(fixture.socket()).await {
+            ServerMessage::Chunk { request_id, values } if request_id.as_str() == "1" => {
+                let value = values.into_iter().next().expect("catalog value");
+                ack(fixture.socket(), "1").await;
+                if value["authoritative"] == true
+                    && value["generation"].as_u64().unwrap_or(0) > initial_generation
+                {
+                    refreshed = Some(value);
+                }
+            }
+            ServerMessage::Exit {
+                request_id,
+                exit: RpcExit::Success { value: Some(value) },
+            } if request_id.as_str() == "2" => refresh_result = Some(value),
+            other => panic!("unexpected catalog refresh message: {other:?}"),
+        }
+    }
+    let refreshed = refreshed.expect("latest replacement");
+    let refresh_result = refresh_result.expect("explicit refresh result");
+    assert_eq!(refreshed, refresh_result);
+    assert_eq!(
+        refreshed["worktrees"].as_array().expect("worktrees").len(),
+        2
+    );
+
+    send_json(
+        fixture.socket(),
+        json!({ "_tag": "Interrupt", "requestId": "1" }),
+    )
+    .await;
+    let exit = next_server_message(fixture.socket()).await;
+    assert!(matches!(
+        exit,
+        ServerMessage::Exit { request_id, .. } if request_id.as_str() == "1"
+    ));
+
+    request(
+        fixture.socket(),
+        "3",
+        "subscribeWorktreeCatalog",
+        json!({ "projectId": "project-1" }),
+    )
+    .await;
+    let resubscribed = next_chunk(fixture.socket(), "3").await;
+    assert!(
+        resubscribed["generation"].as_u64().expect("generation")
+            > refreshed["generation"].as_u64().expect("generation"),
+        "cancelling the stream must release the catalog subscription so the next subscriber performs a first-subscriber refresh"
+    );
+    send_json(
+        fixture.socket(),
+        json!({ "_tag": "Interrupt", "requestId": "3" }),
+    )
+    .await;
+    let _exit = next_server_message(fixture.socket()).await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn project_missing_is_a_typed_stream_and_refresh_failure() {
+    let mut fixture = CatalogRpcFixture::new(false).await;
+
+    request(
+        fixture.socket(),
+        "10",
+        "vcs.refreshWorktreeCatalog",
+        json!({ "projectId": "missing" }),
+    )
+    .await;
+    assert_typed_catalog_failure(fixture.socket(), "10", "project-not-found").await;
+
+    request(
+        fixture.socket(),
+        "11",
+        "subscribeWorktreeCatalog",
+        json!({ "projectId": "missing" }),
+    )
+    .await;
+    assert_typed_catalog_failure(fixture.socket(), "11", "project-not-found").await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn policy_rejects_stale_acknowledgement_and_persists_hidden_and_shown_controls() {
+    let mut fixture = CatalogRpcFixture::new(true).await;
+    request(
+        fixture.socket(),
+        "20",
+        "subscribeWorktreeCatalog",
+        json!({ "projectId": "project-1" }),
+    )
+    .await;
+    let snapshot = next_chunk(fixture.socket(), "20").await;
+    let generation = snapshot["generation"].as_u64().expect("generation");
+    let candidate_path = snapshot["worktrees"]
+        .as_array()
+        .expect("worktrees")
+        .iter()
+        .find(|worktree| worktree["eligibleForAdoption"] == true)
+        .and_then(|worktree| worktree["path"].as_str())
+        .expect("eligible path")
+        .to_owned();
+    ack(fixture.socket(), "20").await;
+
+    request(
+        fixture.socket(),
+        "21",
+        "worktree.updateDiscoveryPolicy",
+        json!({
+            "commandId": "policy-stale",
+            "projectId": "project-1",
+            "acknowledgeGeneration": generation.saturating_sub(1)
+        }),
+    )
+    .await;
+    assert_typed_catalog_failure(fixture.socket(), "21", "stale-generation").await;
+
+    request(
+        fixture.socket(),
+        "22",
+        "worktree.updateDiscoveryPolicy",
+        json!({
+            "commandId": "policy-shown",
+            "projectId": "project-1",
+            "visibility": "shown",
+            "acknowledgeGeneration": generation,
+            "dismissInitialPrompt": true
+        }),
+    )
+    .await;
+    let shown = success_value(fixture.socket(), "22").await;
+    assert_eq!(shown["visibility"], "shown");
+    assert!(shown["initialPromptDismissedAt"].as_str().is_some());
+    assert_eq!(shown["baselinePaths"], json!([candidate_path]));
+
+    request(
+        fixture.socket(),
+        "23",
+        "worktree.updateDiscoveryPolicy",
+        json!({
+            "commandId": "policy-hidden",
+            "projectId": "project-1",
+            "visibility": "hidden",
+            "dismissInitialPrompt": false
+        }),
+    )
+    .await;
+    let hidden = success_value(fixture.socket(), "23").await;
+    assert_eq!(hidden["visibility"], "hidden");
+    assert_eq!(hidden["initialPromptDismissedAt"], Value::Null);
+    assert_eq!(hidden["baselinePaths"], shown["baselinePaths"]);
+
+    let persisted = fixture
+        .repositories
+        .get_project("project-1".to_owned())
+        .await
+        .expect("project read")
+        .expect("project exists");
+    assert_eq!(persisted.worktree_discovery, hidden);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn concurrent_policy_controls_merge_without_losing_a_sibling_update() {
+    let mut fixture = CatalogRpcFixture::new(false).await;
+    send_json(
+        fixture.socket(),
+        json!([
+            {
+                "_tag": "Request",
+                "id": "30",
+                "tag": "worktree.updateDiscoveryPolicy",
+                "payload": {
+                    "commandId": "policy-concurrent-visibility",
+                    "projectId": "project-1",
+                    "visibility": "shown"
+                },
+                "headers": []
+            },
+            {
+                "_tag": "Request",
+                "id": "31",
+                "tag": "worktree.updateDiscoveryPolicy",
+                "payload": {
+                    "commandId": "policy-concurrent-dismiss",
+                    "projectId": "project-1",
+                    "dismissInitialPrompt": true
+                },
+                "headers": []
+            }
+        ]),
+    )
+    .await;
+    let mut responses = std::collections::HashMap::new();
+    for _ in 0..2 {
+        let message = next_server_message(fixture.socket()).await;
+        let ServerMessage::Exit {
+            request_id,
+            exit: RpcExit::Success { value: Some(value) },
+        } = message
+        else {
+            panic!("expected concurrent policy success: {message:?}");
+        };
+        responses.insert(request_id.as_str().to_owned(), value);
+    }
+    let first = responses.get("30").expect("visibility response");
+    let second = responses.get("31").expect("dismiss response");
+    assert!(first["visibility"] == "shown" || second["visibility"] == "shown");
+
+    let persisted = fixture
+        .repositories
+        .get_project("project-1".to_owned())
+        .await
+        .expect("project read")
+        .expect("project exists")
+        .worktree_discovery;
+    assert_eq!(persisted["visibility"], "shown");
+    assert!(persisted["initialPromptDismissedAt"].as_str().is_some());
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn successful_legacy_git_mutations_suppress_and_invalidate_the_live_catalog() {
+    let mut fixture = CatalogRpcFixture::new(false).await;
+    request(
+        fixture.socket(),
+        "40",
+        "subscribeWorktreeCatalog",
+        json!({ "projectId": "project-1" }),
+    )
+    .await;
+    let _initial = next_chunk(fixture.socket(), "40").await;
+    ack(fixture.socket(), "40").await;
+
+    let created_path = fixture.external.clone();
+    let create_payload = json!({
+        "cwd": fixture.main,
+        "refName": "main",
+        "newRefName": "feature/managed",
+        "baseRefName": "main",
+        "path": created_path
+    });
+    request(fixture.socket(), "41", "vcs.createWorktree", create_payload).await;
+    let created = wait_for_mutation_and_catalog_count(fixture.socket(), "41", "40", 2).await;
+    let managed = created["worktrees"]
+        .as_array()
+        .expect("created worktrees")
+        .iter()
+        .find(|worktree| worktree["path"] == canonical_string(&created_path))
+        .expect("managed worktree");
+    assert_eq!(managed["eligibleForAdoption"], false);
+
+    let remove_payload = json!({ "cwd": fixture.main, "path": created_path, "force": true });
+    request(fixture.socket(), "42", "vcs.removeWorktree", remove_payload).await;
+    let removed = wait_for_mutation_and_catalog_count(fixture.socket(), "42", "40", 1).await;
+    assert_eq!(
+        removed["worktrees"]
+            .as_array()
+            .expect("removed worktrees")
+            .len(),
+        1
+    );
+    fixture.shutdown().await;
+}
+
+#[test]
+fn authoritative_baseline_compaction_filters_deduplicates_and_caps_exactly() {
+    let mut worktrees = (0..514)
+        .map(|index| descriptor(format!("/repo/worktree-{index:03}"), true))
+        .collect::<Vec<_>>();
+    worktrees.insert(2, descriptor("/repo/worktree-001".to_owned(), true));
+    worktrees.insert(3, descriptor("/repo/ineligible".to_owned(), false));
+    let snapshot = WorktreeCatalogSnapshot {
+        repository_key: "repository-1".to_owned(),
+        generation: 9,
+        authoritative: true,
+        observed_at: "2026-08-09T00:00:00Z".to_owned(),
+        scan_status: CatalogScanStatus::Ready,
+        worktrees,
+        adopted_workspaces: Vec::new(),
+    };
+
+    let compacted = compact_eligible_baseline(&snapshot).expect("authoritative baseline");
+
+    assert_eq!(compacted.len(), 512);
+    assert_eq!(compacted[0], "/repo/worktree-000");
+    assert_eq!(compacted[1], "/repo/worktree-001");
+    assert_eq!(compacted[2], "/repo/worktree-002");
+    assert_eq!(compacted[511], "/repo/worktree-511");
+    assert!(!compacted.iter().any(|path| path == "/repo/ineligible"));
+}
+
+fn descriptor(path: String, eligible_for_adoption: bool) -> WorktreeDescriptor {
+    WorktreeDescriptor {
+        worktree_key: format!("key-{path}"),
+        path,
+        branch: Some("feature".to_owned()),
+        head: Some("abc123".to_owned()),
+        is_primary: false,
+        is_bare: false,
+        locked: false,
+        lock_reason: None,
+        registration_state: WorktreeRegistrationState::Registered,
+        directory_state: WorktreeDirectoryState::Present,
+        adoption_state: WorktreeAdoptionState::None,
+        adopted_thread_id: None,
+        eligible_for_adoption,
+    }
+}
+
+struct CatalogRpcFixture {
+    root: TempDir,
+    main: PathBuf,
+    external: PathBuf,
+    repositories: Repositories,
+    engine: OrchestrationEngine,
+    handle: Option<bibcode_server::ServerHandle>,
+    socket: Option<TestSocket>,
+}
+
+impl CatalogRpcFixture {
+    async fn new(with_external: bool) -> Self {
+        let root = tempfile::tempdir().expect("fixture root");
+        let main = root.path().join("main");
+        let external = root.path().join("external");
+        fs::create_dir(&main).expect("primary directory");
+        git(&main, &["init", "--initial-branch", "main"], None);
+        git(
+            &main,
+            &["config", "user.email", "rpc@example.invalid"],
+            None,
+        );
+        git(&main, &["config", "user.name", "RPC Test"], None);
+        fs::write(main.join("README.md"), "rpc fixture\n").expect("fixture file");
+        git(&main, &["add", "README.md"], None);
+        git(&main, &["commit", "-m", "initial"], None);
+        if with_external {
+            git(
+                &main,
+                &["worktree", "add", "-b", "feature/external"],
+                Some(&external),
+            );
+        }
+
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let engine = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .expect("orchestration");
+        engine
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type": "project.create",
+                    "commandId": "project-create",
+                    "projectId": "project-1",
+                    "title": "Catalog RPC",
+                    "workspaceRoot": main,
+                    "defaultModelSelection": null,
+                    "createdAt": "2026-08-09T00:00:00Z"
+                }))
+                .expect("project command"),
+            )
+            .await
+            .expect("project created");
+        let repositories = engine.repositories();
+        let git_repository = Arc::new(GitRepository::default());
+        let catalog =
+            WorktreeCatalogService::new(Arc::new(repositories.clone()), git_repository.clone());
+        let mut registry = RpcRegistry::empty();
+        register_worktree_catalog_rpc(
+            &mut registry,
+            WorktreeCatalogRpcServices::new(catalog.clone(), engine.clone()),
+        );
+        register_git_vcs_rpc(
+            &mut registry,
+            GitVcsRpcServices::with_repository(git_repository).with_catalog_mutation_observer(
+                Arc::new(WorktreeCatalogMutationObserver::new(
+                    catalog.clone(),
+                    repositories.clone(),
+                )),
+            ),
+        );
+        let server_state = root.path().join("server");
+        let config = ServerConfig::new(server_state)
+            .with_bind("127.0.0.1", 0)
+            .with_unsafe_no_auth();
+        let handle = ServerRuntime::start_with_registry(config, registry)
+            .await
+            .expect("server");
+        let socket = connect_async(format!("ws://{}/ws", handle.local_addr()))
+            .await
+            .expect("WebSocket")
+            .0;
+        Self {
+            root,
+            main,
+            external,
+            repositories,
+            engine,
+            handle: Some(handle),
+            socket: Some(socket),
+        }
+    }
+
+    fn socket(&mut self) -> &mut TestSocket {
+        self.socket.as_mut().expect("active socket")
+    }
+
+    fn create_external_worktree(&self) {
+        git(
+            &self.main,
+            &["worktree", "add", "-b", "feature/external"],
+            Some(&self.external),
+        );
+    }
+
+    async fn shutdown(mut self) {
+        if let Some(mut socket) = self.socket.take() {
+            let _ = socket.close(None).await;
+        }
+        if let Some(handle) = self.handle.take() {
+            handle.shutdown();
+            handle.join().await.expect("server shutdown");
+        }
+        self.engine.shutdown().await;
+    }
+}
+
+impl Drop for CatalogRpcFixture {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.as_ref() {
+            handle.shutdown();
+        }
+        let _ = &self.root;
+    }
+}
+
+async fn request(socket: &mut TestSocket, id: &str, tag: &str, payload: Value) {
+    send_json(
+        socket,
+        json!({ "_tag": "Request", "id": id, "tag": tag, "payload": payload, "headers": [] }),
+    )
+    .await;
+}
+
+async fn ack(socket: &mut TestSocket, request_id: &str) {
+    send_json(socket, json!({ "_tag": "Ack", "requestId": request_id })).await;
+}
+
+async fn send_json(socket: &mut TestSocket, value: Value) {
+    socket
+        .send(Message::Text(value.to_string().into()))
+        .await
+        .expect("send message");
+}
+
+async fn next_server_message(socket: &mut TestSocket) -> ServerMessage {
+    let message = timeout(Duration::from_secs(10), socket.next())
+        .await
+        .expect("server response timeout")
+        .expect("WebSocket open")
+        .expect("WebSocket frame");
+    let Message::Text(text) = message else {
+        panic!("expected text frame: {message:?}");
+    };
+    serde_json::from_str(&text).expect("server message")
+}
+
+async fn next_chunk(socket: &mut TestSocket, request_id: &str) -> Value {
+    let message = next_server_message(socket).await;
+    let ServerMessage::Chunk {
+        request_id: actual,
+        values,
+    } = message
+    else {
+        panic!("expected chunk: {message:?}");
+    };
+    assert_eq!(actual.as_str(), request_id);
+    values.into_iter().next().expect("chunk value")
+}
+
+async fn success_value(socket: &mut TestSocket, request_id: &str) -> Value {
+    let message = next_server_message(socket).await;
+    let ServerMessage::Exit {
+        request_id: actual,
+        exit: RpcExit::Success { value: Some(value) },
+    } = message
+    else {
+        panic!("expected unary success: {message:?}");
+    };
+    assert_eq!(actual.as_str(), request_id);
+    value
+}
+
+async fn assert_typed_catalog_failure(
+    socket: &mut TestSocket,
+    request_id: &str,
+    expected_reason: &str,
+) {
+    let message = next_server_message(socket).await;
+    let ServerMessage::Exit {
+        request_id: actual,
+        exit: RpcExit::Failure { cause },
+    } = message
+    else {
+        panic!("expected typed failure: {message:?}");
+    };
+    assert_eq!(actual.as_str(), request_id);
+    assert!(cause.iter().any(|item| matches!(
+        item,
+        CauseItem::Fail { error }
+            if error["_tag"] == "WorktreeCatalogError"
+                && error["reason"] == expected_reason
+    )));
+}
+
+async fn wait_for_mutation_and_catalog_count(
+    socket: &mut TestSocket,
+    mutation_request_id: &str,
+    stream_request_id: &str,
+    expected_count: usize,
+) -> Value {
+    let mut mutation_succeeded = false;
+    let mut catalog = None;
+    while !mutation_succeeded || catalog.is_none() {
+        match next_server_message(socket).await {
+            ServerMessage::Exit {
+                request_id,
+                exit: RpcExit::Success { .. },
+            } if request_id.as_str() == mutation_request_id => mutation_succeeded = true,
+            ServerMessage::Chunk { request_id, values }
+                if request_id.as_str() == stream_request_id =>
+            {
+                let value = values.into_iter().next().expect("catalog value");
+                ack(socket, stream_request_id).await;
+                if value["authoritative"] == true
+                    && value["worktrees"]
+                        .as_array()
+                        .is_some_and(|worktrees| worktrees.len() == expected_count)
+                {
+                    catalog = Some(value);
+                }
+            }
+            other => panic!("unexpected mutation/catalog message: {other:?}"),
+        }
+    }
+    catalog.expect("catalog mutation result")
+}
+
+fn canonical_string(path: &Path) -> String {
+    fs::canonicalize(path)
+        .expect("canonical path")
+        .to_string_lossy()
+        .into_owned()
+}
+
+fn git(cwd: &Path, args: &[&str], final_path: Option<&Path>) {
+    let mut command = Command::new("git");
+    command.current_dir(cwd).args(args);
+    if let Some(final_path) = final_path {
+        command.arg(final_path);
+    }
+    let output = command.output().expect("run Git");
+    assert!(
+        output.status.success(),
+        "git {:?} failed: {}",
+        command,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
