@@ -275,10 +275,12 @@ lastAuthoritativeSnapshot
 scanStatus
 generation
 mutationEpoch
+pendingMutationRefreshEpoch
 lifecycleEpoch
 inFlightScan
 subscriberCount
 pollerCancellation
+mutationRefreshWorkerCancellation
 lastMetadataSignature
 ```
 
@@ -374,19 +376,33 @@ initial subscription.
 - A stale pre-mutation leader records and advances one explicit stale result;
   every caller already coalesced behind it receives that identical result and
   no waiter silently starts a divergent refresh.
-- The mutation-triggered owner queued behind that leader recognizes only this
-  stored stale completion and performs one scan against the current mutation
-  epoch. Repeated invalidations remain coalesced behind the same recovery scan;
-  there is no retry loop, and final-subscriber cancellation interrupts it like
-  any other refresh.
+- Mutation invalidation atomically advances `mutationEpoch`, overwrites one
+  pending mutation-refresh epoch, and starts at most one lifecycle-owned worker
+  for the project view. The worker queued behind a stale leader recognizes only
+  that stored stale completion and performs a scan against the current epoch.
+  Invalidations captured before its refresh fence coalesce into that scan; an
+  invalidation arriving during recovery leaves a newer pending epoch and causes
+  at most the next serialized scan after an async yield. When mutations stop,
+  the worker clears its slot without a lost wake. Final unsubscribe atomically
+  clears the pending epoch, cancels the worker token, and aborts the worker
+  task. Even a non-cancellation-aware dependency await therefore releases the
+  project refresh lock, and a later lifecycle cannot inherit the old task or
+  result.
 - The stream uses latest-value semantics. Slow subscribers receive the newest
   snapshot rather than an unbounded queue of intermediate refreshes.
 - Shared observations outlive one project-view cancellation while subscribers
-  to another view still need them. Subscription ownership uses a guarded RAII
-  reservation, so abort at any attachment await point releases both view and
-  repository counts. Poll sleep, shallow signatures, Git inventory, and
-  directory probes are cancellation-aware; the associated pending work stops
-  without later publication when the final subscriber leaves.
+  to another view still need them. After a caller wins the repository
+  single-flight lock, the guard and observation run as repository-lifecycle
+  work; the project view awaits that result with its own cancellation. A
+  detached leader therefore releases its project refresh lock immediately,
+  while an alias or reattached view may coalesce only with the same live
+  repository lifecycle and exact anchor. This never carries the old
+  project-view worker or result into the new lifecycle. Subscription ownership
+  uses a guarded RAII reservation, so abort at any attachment await point
+  releases both view and repository counts. Poll sleep, shallow signatures,
+  Git inventory, directory probes, and the mutation-recovery worker are
+  cancellation-aware; the associated pending work stops without later
+  publication when the final subscriber leaves.
 - Directory probes and bulk adoption use bounded concurrency.
 
 ### Failure behavior

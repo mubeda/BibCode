@@ -361,6 +361,86 @@ async fn detached_project_stops_waiting_while_an_aliased_project_keeps_shared_ob
 }
 
 #[tokio::test]
+async fn active_mutation_worker_releases_its_view_while_an_alias_owns_the_shared_observation() {
+    let inventory = Arc::new(PausingAfterTwoInventorySource::new(inventory(
+        "/repo/common",
+        [record("/repo/main", true)],
+    )));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([
+            project("project-a", "/repo/main", []),
+            project("project-b", "/repo/main", []),
+        ])),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+    let project_a = service.subscribe("project-a").await.expect("project A");
+    let project_b = service.subscribe("project-b").await.expect("project B");
+    let observation_requests = service.repository_observation_request_count_for_test();
+
+    service.invalidate_after_mutation("project-a").await;
+    wait_for_mutation_refresh_worker_starts(&service, 1).await;
+    wait_for_repository_observation_requests(&service, observation_requests + 1).await;
+    wait_for_count(&inventory.calls, 3).await;
+    let refresh_b = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .refresh("project-b", CatalogRefreshTrigger::Explicit)
+                .await
+        })
+    };
+    wait_for_repository_observation_requests(&service, observation_requests + 2).await;
+
+    drop(project_a);
+    wait_for_active_mutation_refresh_workers(&service, 0).await;
+    let detached_snapshot = service
+        .latest("project-a")
+        .await
+        .expect("detached project A catalog");
+    let reattach_a = {
+        let service = service.clone();
+        tokio::spawn(async move { service.subscribe("project-a").await })
+    };
+    wait_for_repository_observation_requests(&service, observation_requests + 3).await;
+    assert_eq!(inventory.calls.load(Ordering::SeqCst), 3);
+    let awaiting_shared_observation = service
+        .latest("project-a")
+        .await
+        .expect("project A remains retained");
+    assert_eq!(awaiting_shared_observation.generation, 1);
+    assert!(!awaiting_shared_observation.authoritative);
+    assert_eq!(
+        awaiting_shared_observation.worktrees,
+        detached_snapshot.worktrees
+    );
+    assert_eq!(
+        awaiting_shared_observation.adopted_workspaces,
+        detached_snapshot.adopted_workspaces
+    );
+
+    inventory.release.add_permits(1);
+    let refreshed_b = refresh_b
+        .await
+        .expect("B refresh task")
+        .expect("B consumes the shared observation");
+    let reattached = reattach_a
+        .await
+        .expect("A reattach task")
+        .expect("fresh A lifecycle");
+
+    assert_eq!(refreshed_b.generation, 2);
+    assert_eq!(project_b.latest().generation, 2);
+    assert_eq!(reattached.latest().generation, 2);
+    assert_eq!(inventory.calls.load(Ordering::SeqCst), 3);
+    assert_eq!(service.mutation_refresh_worker_start_count_for_test(), 1);
+}
+
+#[tokio::test]
 async fn four_repository_scans_run_concurrently_while_a_fifth_waits() {
     let projects =
         (0..5).map(|index| project(&format!("project-{index}"), &format!("/repo-{index}"), []));
@@ -712,7 +792,7 @@ async fn repeated_mutation_invalidations_recover_after_a_coalesced_stale_complet
 
     service.invalidate_after_mutation("project-1").await;
     service.invalidate_after_mutation("project-1").await;
-    wait_for_mutation_refresh_attempt(&service, 2).await;
+    wait_for_mutation_refresh_worker_starts(&service, 1).await;
     inventory.release.add_permits(1);
 
     let stale = old_refresh
@@ -734,6 +814,260 @@ async fn repeated_mutation_invalidations_recover_after_a_coalesced_stale_complet
         tokio::task::yield_now().await;
     }
     assert_eq!(inventory.calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn delayed_mutation_invalidations_use_one_lifecycle_worker_and_one_recovery_scan() {
+    let inventory = Arc::new(PausingSecondInventorySource::new(inventory(
+        "/repo/common",
+        [record("/repo/main", true)],
+    )));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+    let mut subscription = service.subscribe("project-1").await.expect("subscription");
+    let old_refresh = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .refresh("project-1", CatalogRefreshTrigger::Explicit)
+                .await
+        })
+    };
+    wait_for_count(&inventory.calls, 2).await;
+    let delayed_worker_release = service.pause_mutation_refresh_starts_after_for_test(1);
+
+    service.invalidate_after_mutation("project-1").await;
+    wait_for_mutation_refresh_worker_starts(&service, 1).await;
+    service.invalidate_after_mutation("project-1").await;
+    for _ in 0..100 {
+        tokio::task::yield_now().await;
+    }
+    inventory.release.add_permits(1);
+
+    let stale = old_refresh
+        .await
+        .expect("old refresh task")
+        .expect_err("pre-mutation refresh is stale");
+    assert_eq!(stale.reason, super::CatalogErrorReason::StaleGeneration);
+    wait_for_count(&inventory.calls, 3).await;
+    inventory.release.add_permits(1);
+    let published = loop {
+        let snapshot = subscription.changed().await.expect("catalog publication");
+        if snapshot.authoritative && snapshot.generation == 2 {
+            break snapshot;
+        }
+    };
+    assert_eq!(published.generation, 2);
+
+    delayed_worker_release.add_permits(4);
+    inventory.release.add_permits(4);
+    wait_for_active_mutation_refresh_workers(&service, 0).await;
+
+    assert_eq!(service.mutation_refresh_worker_start_count_for_test(), 1);
+    assert_eq!(
+        service.max_active_mutation_refresh_worker_count_for_test(),
+        1
+    );
+    assert_eq!(inventory.calls.load(Ordering::SeqCst), 3);
+}
+
+#[tokio::test]
+async fn mutation_during_recovery_uses_one_worker_and_one_serialized_follow_up_scan() {
+    let inventory = Arc::new(PausingSecondInventorySource::new(inventory(
+        "/repo/common",
+        [record("/repo/main", true)],
+    )));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+    let mut subscription = service.subscribe("project-1").await.expect("subscription");
+    let old_refresh = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .refresh("project-1", CatalogRefreshTrigger::Explicit)
+                .await
+        })
+    };
+    wait_for_count(&inventory.calls, 2).await;
+
+    service.invalidate_after_mutation("project-1").await;
+    wait_for_mutation_refresh_worker_starts(&service, 1).await;
+    inventory.release.add_permits(1);
+    let stale = old_refresh
+        .await
+        .expect("old refresh task")
+        .expect_err("pre-mutation refresh is stale");
+    assert_eq!(stale.reason, super::CatalogErrorReason::StaleGeneration);
+    wait_for_count(&inventory.calls, 3).await;
+
+    service.invalidate_after_mutation("project-1").await;
+    assert_eq!(service.mutation_refresh_worker_start_count_for_test(), 1);
+    inventory.release.add_permits(1);
+    wait_for_count(&inventory.calls, 4).await;
+    inventory.release.add_permits(1);
+
+    let published = loop {
+        let snapshot = subscription.changed().await.expect("catalog publication");
+        if snapshot.authoritative && snapshot.generation == 2 {
+            break snapshot;
+        }
+    };
+    wait_for_active_mutation_refresh_workers(&service, 0).await;
+    assert_eq!(published.generation, 2);
+    assert_eq!(service.mutation_refresh_worker_start_count_for_test(), 1);
+    assert_eq!(
+        service.max_active_mutation_refresh_worker_count_for_test(),
+        1
+    );
+    assert_eq!(inventory.calls.load(Ordering::SeqCst), 4);
+}
+
+#[tokio::test]
+async fn final_unsubscribe_clears_a_pending_mutation_worker_before_it_can_scan_or_publish() {
+    let inventory =
+        Arc::new(FakeInventorySource::new((0..2).map(|_| {
+            inventory("/repo/common", [record("/repo/main", true)])
+        })));
+    let filesystem = Arc::new(FakeFileSystem::new([
+        ("/repo/main", DirectoryProbeState::Present),
+        ("/repo/common", DirectoryProbeState::Present),
+    ]));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        inventory.clone(),
+        filesystem.clone(),
+        CatalogServiceOptions::default(),
+    );
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+    let probe_calls = filesystem.probe_calls().len();
+    let worker_release = service.pause_mutation_refresh_starts_after_for_test(0);
+
+    service.invalidate_after_mutation("project-1").await;
+    wait_for_mutation_refresh_worker_starts(&service, 1).await;
+    drop(subscription);
+    worker_release.add_permits(1);
+    wait_for_active_mutation_refresh_workers(&service, 0).await;
+
+    assert_eq!(inventory.calls().len(), 1);
+    assert_eq!(filesystem.probe_calls().len(), probe_calls);
+    let latest = service.latest("project-1").await.expect("retained catalog");
+    assert!(latest.authoritative);
+    assert_eq!(latest.generation, 1);
+}
+
+#[tokio::test]
+async fn final_unsubscribe_aborts_a_mutation_worker_blocked_in_projection_before_reattach() {
+    let projections = Arc::new(PausingSecondProjectionSource::new([project(
+        "project-1",
+        "/repo/main",
+        [],
+    )]));
+    let inventory =
+        Arc::new(FakeInventorySource::new((0..2).map(|_| {
+            inventory("/repo/common", [record("/repo/main", true)])
+        })));
+    let filesystem = Arc::new(FakeFileSystem::new([
+        ("/repo/main", DirectoryProbeState::Present),
+        ("/repo/common", DirectoryProbeState::Present),
+    ]));
+    let service = WorktreeCatalogService::with_dependencies(
+        projections.clone(),
+        inventory.clone(),
+        filesystem.clone(),
+        CatalogServiceOptions::default(),
+    );
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+    let probe_calls = filesystem.probe_calls().len();
+
+    service.invalidate_after_mutation("project-1").await;
+    wait_for_mutation_refresh_worker_starts(&service, 1).await;
+    wait_for_count(&projections.calls, 2).await;
+    drop(subscription);
+
+    wait_for_active_mutation_refresh_workers(&service, 0).await;
+    assert_eq!(inventory.calls().len(), 1);
+    assert_eq!(filesystem.probe_calls().len(), probe_calls);
+
+    let reattach = {
+        let service = service.clone();
+        tokio::spawn(async move { service.subscribe("project-1").await })
+    };
+    wait_for_count(&projections.calls, 3).await;
+    let reattached = reattach
+        .await
+        .expect("reattach task")
+        .expect("fresh lifecycle does not wait on old projection work");
+
+    assert!(reattached.latest().authoritative);
+    assert_eq!(reattached.latest().generation, 2);
+    assert_eq!(inventory.calls().len(), 2);
+    assert_eq!(service.mutation_refresh_worker_start_count_for_test(), 1);
+}
+
+#[tokio::test]
+async fn reattach_does_not_inherit_a_pending_mutation_worker_from_the_old_lifecycle() {
+    let inventory =
+        Arc::new(FakeInventorySource::new((0..3).map(|_| {
+            inventory("/repo/common", [record("/repo/main", true)])
+        })));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+    let first = service
+        .subscribe("project-1")
+        .await
+        .expect("first lifecycle");
+    let old_worker_release = service.pause_mutation_refresh_starts_after_for_test(0);
+
+    service.invalidate_after_mutation("project-1").await;
+    wait_for_mutation_refresh_worker_starts(&service, 1).await;
+    drop(first);
+    let reattached = service.subscribe("project-1").await.expect("new lifecycle");
+    assert_eq!(reattached.latest().generation, 2);
+    assert_eq!(inventory.calls().len(), 2);
+
+    old_worker_release.add_permits(1);
+    wait_for_active_mutation_refresh_workers(&service, 0).await;
+
+    assert_eq!(inventory.calls().len(), 2);
+    assert_eq!(reattached.latest().generation, 2);
+    assert_eq!(service.mutation_refresh_worker_start_count_for_test(), 1);
 }
 
 #[tokio::test(start_paused = true)]
@@ -1552,6 +1886,45 @@ impl CatalogProjectionSource for FakeProjectionSource {
     }
 }
 
+#[derive(Clone)]
+struct PausingSecondProjectionSource {
+    inner: FakeProjectionSource,
+    calls: Arc<AtomicUsize>,
+}
+
+impl PausingSecondProjectionSource {
+    fn new(projects: impl IntoIterator<Item = (String, CatalogProject)>) -> Self {
+        Self {
+            inner: FakeProjectionSource::new(projects),
+            calls: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
+impl CatalogProjectionSource for PausingSecondProjectionSource {
+    fn load(
+        &self,
+        project_id: String,
+    ) -> CatalogFuture<Result<Option<CatalogProject>, super::CatalogError>> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
+        let load = self.inner.load(project_id);
+        Box::pin(async move {
+            if call == 2 {
+                std::future::pending::<()>().await;
+            }
+            load.await
+        })
+    }
+
+    fn pin_repository_key(
+        &self,
+        project_id: String,
+        repository_key: String,
+    ) -> CatalogFuture<Result<Option<super::service::CatalogPinOutcome>, super::CatalogError>> {
+        self.inner.pin_repository_key(project_id, repository_key)
+    }
+}
+
 struct FakeInventorySource {
     inventories: Mutex<VecDeque<Result<GitWorktreeInventory, ScanFailure>>>,
     calls: Mutex<Vec<PathBuf>>,
@@ -1599,6 +1972,7 @@ impl InventorySource for FakeInventorySource {
 #[derive(Clone)]
 struct FakeFileSystem {
     states: Arc<Mutex<HashMap<PathBuf, DirectoryProbeState>>>,
+    probe_calls: Arc<Mutex<Vec<PathBuf>>>,
     shallow_calls: Arc<Mutex<Vec<ShallowCall>>>,
 }
 
@@ -1613,6 +1987,7 @@ impl FakeFileSystem {
                     .map(|(path, state)| (PathBuf::from(path), state))
                     .collect(),
             )),
+            probe_calls: Arc::new(Mutex::new(Vec::new())),
             shallow_calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -1625,6 +2000,7 @@ impl FakeFileSystem {
                     .map(|(path, state)| (PathBuf::from(path), state))
                     .collect(),
             )),
+            probe_calls: Arc::new(Mutex::new(Vec::new())),
             shallow_calls: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -1641,6 +2017,10 @@ impl FakeFileSystem {
             .lock()
             .expect("shallow signature calls")
             .clone()
+    }
+
+    fn probe_calls(&self) -> Vec<PathBuf> {
+        self.probe_calls.lock().expect("probe calls").clone()
     }
 }
 
@@ -2203,18 +2583,51 @@ async fn wait_for_count(value: &AtomicUsize, expected: usize) {
     panic!("counter did not reach {expected}");
 }
 
-async fn wait_for_mutation_refresh_attempt(service: &WorktreeCatalogService, expected: usize) {
+async fn wait_for_mutation_refresh_worker_starts(
+    service: &WorktreeCatalogService,
+    expected: usize,
+) {
     for _ in 0..10_000 {
-        if service.mutation_refresh_attempt_count_for_test() >= expected {
+        if service.mutation_refresh_worker_start_count_for_test() >= expected {
             return;
         }
         tokio::task::yield_now().await;
     }
-    panic!("mutation refresh attempt count did not reach {expected}");
+    panic!("mutation refresh worker start count did not reach {expected}");
+}
+
+async fn wait_for_active_mutation_refresh_workers(
+    service: &WorktreeCatalogService,
+    expected: usize,
+) {
+    for _ in 0..10_000 {
+        if service.active_mutation_refresh_worker_count_for_test() == expected {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("active mutation refresh worker count did not reach {expected}");
+}
+
+async fn wait_for_repository_observation_requests(
+    service: &WorktreeCatalogService,
+    expected: usize,
+) {
+    for _ in 0..10_000 {
+        if service.repository_observation_request_count_for_test() >= expected {
+            return;
+        }
+        tokio::task::yield_now().await;
+    }
+    panic!("repository observation request count did not reach {expected}");
 }
 
 impl CatalogFileSystem for FakeFileSystem {
     fn probe(&self, path: PathBuf) -> CatalogFuture<DirectoryProbeState> {
+        self.probe_calls
+            .lock()
+            .expect("probe calls")
+            .push(path.clone());
         let state = self
             .states
             .lock()

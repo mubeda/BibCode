@@ -52,11 +52,22 @@ flowchart TB
   initialization transferable across subscriber aborts and prevent canceled
   prior-lifecycle work from publishing into an immediate reattachment.
   Shared observations never bypass per-caller anchor validation, and final
-  view/repository ownership release is atomic against concurrent attachment.
-  When a mutation-triggered refresh queues behind a pre-mutation scan, it alone
-  may recover from that scan's stored stale result with one current-epoch scan;
-  ordinary waiters still receive the identical stale error, repeated mutation
-  requests coalesce, and subscriber cancellation bounds the recovery.
+  view/repository ownership release is atomic against concurrent attachment. A
+  scan leader moves the repository single-flight guard into repository-owned
+  work, while its project-view caller waits with view cancellation. Detaching
+  that view therefore releases its refresh lock immediately; an alias may keep
+  the exact-anchor observation alive within the current repository lifecycle.
+  Mutation invalidations overwrite one per-view pending epoch and are drained
+  by at most one lifecycle-owned worker. When that worker queues behind a
+  pre-mutation scan, it alone may recover from the stored stale result with one
+  current-epoch scan; ordinary waiters still receive the identical stale error.
+  Invalidations before the recovery fence coalesce into that scan, while a
+  later mutation produces at most the next serialized recovery step. Final
+  detach cancels, aborts, and clears the worker slot, releasing its project
+  refresh lock even if a dependency await is not cancellation-aware. A
+  reattachment cannot inherit that project-view work or result, though it may
+  coalesce with an exact-anchor observation still owned by an aliased
+  repository lifecycle.
 - **Contracts (`packages/contracts`)** contains Effect schemas and TypeScript
   contracts only. It defines persisted models, RPC methods, HTTP APIs, desktop
   bridge values, and provider events without application runtime logic.

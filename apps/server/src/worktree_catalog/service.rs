@@ -158,13 +158,42 @@ struct Inner {
     #[cfg(test)]
     final_release_pause: Mutex<Option<FinalReleasePause>>,
     #[cfg(test)]
-    mutation_refresh_attempts: AtomicUsize,
+    mutation_refresh_worker_starts: AtomicUsize,
+    #[cfg(test)]
+    active_mutation_refresh_workers: AtomicUsize,
+    #[cfg(test)]
+    max_active_mutation_refresh_workers: AtomicUsize,
+    #[cfg(test)]
+    mutation_refresh_start_pause: Mutex<Option<MutationRefreshStartPause>>,
+    #[cfg(test)]
+    repository_observation_requests: AtomicUsize,
 }
 
 #[cfg(test)]
 struct FinalReleasePause {
     entered: Arc<std::sync::Barrier>,
     resume: Arc<std::sync::Barrier>,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct MutationRefreshStartPause {
+    starts_before_pause: usize,
+    release: Arc<Semaphore>,
+}
+
+#[cfg(test)]
+struct MutationRefreshWorkerGuard {
+    inner: Arc<Inner>,
+}
+
+#[cfg(test)]
+impl Drop for MutationRefreshWorkerGuard {
+    fn drop(&mut self) {
+        self.inner
+            .active_mutation_refresh_workers
+            .fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Default)]
@@ -186,7 +215,7 @@ struct CatalogEntry {
 
 struct RepositoryEntry {
     common_dir: PathBuf,
-    observation_lock: AsyncMutex<()>,
+    observation_lock: Arc<AsyncMutex<()>>,
     state: Mutex<RepositoryState>,
 }
 
@@ -222,6 +251,9 @@ struct EntryState {
     completed_refreshes: u64,
     last_refresh_result: Option<Result<Arc<WorktreeCatalogSnapshot>, CatalogError>>,
     mutation_epoch: u64,
+    pending_mutation_refresh_epoch: Option<u64>,
+    mutation_refresh_worker: Option<MutationRefreshTask>,
+    next_mutation_refresh_worker_id: u64,
     lifecycle_epoch: u64,
     subscribers: usize,
     suppressions: HashMap<String, Instant>,
@@ -254,9 +286,41 @@ struct OwnedTask {
     _handle: JoinHandle<()>,
 }
 
+struct MutationRefreshTask {
+    id: u64,
+    cancellation: CancellationToken,
+    handle: JoinHandle<()>,
+    abort_on_drop: bool,
+}
+
+#[derive(Clone)]
+struct RefreshOwnership {
+    lifecycle_epoch: u64,
+    cancellation: CancellationToken,
+}
+
 impl Drop for OwnedTask {
     fn drop(&mut self) {
         self.cancellation.cancel();
+    }
+}
+
+impl MutationRefreshTask {
+    fn is_finished(&self) -> bool {
+        self.handle.is_finished()
+    }
+
+    fn disarm(mut self) {
+        self.abort_on_drop = false;
+    }
+}
+
+impl Drop for MutationRefreshTask {
+    fn drop(&mut self) {
+        if self.abort_on_drop {
+            self.cancellation.cancel();
+            self.handle.abort();
+        }
     }
 }
 
@@ -315,7 +379,15 @@ impl WorktreeCatalogService {
                 #[cfg(test)]
                 final_release_pause: Mutex::new(None),
                 #[cfg(test)]
-                mutation_refresh_attempts: AtomicUsize::new(0),
+                mutation_refresh_worker_starts: AtomicUsize::new(0),
+                #[cfg(test)]
+                active_mutation_refresh_workers: AtomicUsize::new(0),
+                #[cfg(test)]
+                max_active_mutation_refresh_workers: AtomicUsize::new(0),
+                #[cfg(test)]
+                mutation_refresh_start_pause: Mutex::new(None),
+                #[cfg(test)]
+                repository_observation_requests: AtomicUsize::new(0),
             }),
         }
     }
@@ -391,35 +463,62 @@ impl WorktreeCatalogService {
         trigger: CatalogRefreshTrigger,
     ) -> Result<Arc<WorktreeCatalogSnapshot>, CatalogError> {
         let entry = self.ensure_entry(project_id).await?;
+        self.refresh_entry(project_id, &entry, trigger, None).await
+    }
+
+    async fn refresh_entry(
+        &self,
+        project_id: &str,
+        entry: &Arc<CatalogEntry>,
+        trigger: CatalogRefreshTrigger,
+        ownership: Option<RefreshOwnership>,
+    ) -> Result<Arc<WorktreeCatalogSnapshot>, CatalogError> {
         let requested_at = Instant::now();
         let (completed_refreshes, cancellation, subscriber_owned, lifecycle_epoch) = {
             let state = lock(&entry.state);
-            let subscriber_owned = state.subscribers != 0;
-            let cancellation = if subscriber_owned {
-                state.scan_cancellation.clone()
+            if let Some(ownership) = ownership.as_ref() {
+                if state.lifecycle_epoch != ownership.lifecycle_epoch
+                    || state.subscribers == 0
+                    || ownership.cancellation.is_cancelled()
+                {
+                    return Err(cancelled_error());
+                }
+                (
+                    state.completed_refreshes,
+                    ownership.cancellation.clone(),
+                    true,
+                    Some(ownership.lifecycle_epoch),
+                )
             } else {
-                CancellationToken::new()
-            };
-            (
-                state.completed_refreshes,
-                cancellation,
-                subscriber_owned,
-                subscriber_owned.then_some(state.lifecycle_epoch),
-            )
+                let subscriber_owned = state.subscribers != 0;
+                let cancellation = if subscriber_owned {
+                    state.scan_cancellation.clone()
+                } else {
+                    CancellationToken::new()
+                };
+                (
+                    state.completed_refreshes,
+                    cancellation,
+                    subscriber_owned,
+                    subscriber_owned.then_some(state.lifecycle_epoch),
+                )
+            }
         };
-        #[cfg(test)]
-        if trigger == CatalogRefreshTrigger::Mutation {
-            self.inner
-                .mutation_refresh_attempts
-                .fetch_add(1, Ordering::SeqCst);
-        }
         let guard = tokio::select! {
             _ = cancellation.cancelled() => return Err(cancelled_error()),
             guard = entry.refresh_lock.lock() => guard,
         };
         let _guard = guard;
+        if cancellation.is_cancelled() {
+            return Err(cancelled_error());
+        }
         {
             let state = lock(&entry.state);
+            if lifecycle_epoch
+                .is_some_and(|epoch| epoch != state.lifecycle_epoch || state.subscribers == 0)
+            {
+                return Err(cancelled_error());
+            }
             if state.completed_refreshes != completed_refreshes {
                 let coalesced = state.last_refresh_result.clone().unwrap_or_else(|| {
                     Err(CatalogError::new(
@@ -451,6 +550,12 @@ impl WorktreeCatalogService {
         }
         let (fence, next_generation, suppressions, previous) = {
             let mut state = lock(&entry.state);
+            if lifecycle_epoch
+                .is_some_and(|epoch| epoch != state.lifecycle_epoch || state.subscribers == 0)
+                || cancellation.is_cancelled()
+            {
+                return Err(cancelled_error());
+            }
             let now = Instant::now();
             state.suppressions.retain(|_, created_at| {
                 now.duration_since(*created_at) < self.inner.options.managed_creation_suppression
@@ -478,7 +583,7 @@ impl WorktreeCatalogService {
             Ok(Some(anchor)) => anchor,
             Ok(None) => {
                 return self.publish_failure(
-                    &entry,
+                    entry,
                     fence,
                     ScanFailure {
                         reason: CatalogDegradedReason::AnchorUnavailable,
@@ -486,7 +591,7 @@ impl WorktreeCatalogService {
                     },
                 );
             }
-            Err(error) => return self.finish_scan_error(&entry, fence, error),
+            Err(error) => return self.finish_scan_error(entry, fence, error),
         };
         let observation = self
             .observe_repository(
@@ -498,10 +603,10 @@ impl WorktreeCatalogService {
             .await;
         let observation = match observation {
             Ok(observation) => observation,
-            Err(error) => return self.finish_scan_error(&entry, fence, error),
+            Err(error) => return self.finish_scan_error(entry, fence, error),
         };
         if cancellation.is_cancelled() {
-            return self.finish_cancelled(&entry, fence);
+            return self.finish_cancelled(entry, fence);
         }
         if let Err(error) = self
             .verify_or_establish_repository_key(
@@ -512,7 +617,7 @@ impl WorktreeCatalogService {
             )
             .await
         {
-            self.restore_after_catalog_error(&entry, fence, &error)?;
+            self.restore_after_catalog_error(entry, fence, &error)?;
             return Err(error);
         }
         let snapshot = match self
@@ -527,19 +632,19 @@ impl WorktreeCatalogService {
             .await
         {
             Ok(snapshot) => snapshot,
-            Err(error) => return self.finish_scan_error(&entry, fence, error),
+            Err(error) => return self.finish_scan_error(entry, fence, error),
         };
         let Some(signature) = self
             .signature_for_snapshot(&entry.repository.common_dir, &snapshot, &cancellation)
             .await
         else {
-            return self.finish_cancelled(&entry, fence);
+            return self.finish_cancelled(entry, fence);
         };
         {
             let mut state = lock(&entry.state);
             if fence
                 .lifecycle_epoch
-                .is_some_and(|epoch| epoch != state.lifecycle_epoch)
+                .is_some_and(|epoch| epoch != state.lifecycle_epoch || state.subscribers == 0)
             {
                 return Err(cancelled_error());
             }
@@ -558,6 +663,7 @@ impl WorktreeCatalogService {
             state.completed_at = Some(Instant::now());
             state.completed_refreshes = state.completed_refreshes.wrapping_add(1);
             state.last_refresh_result = Some(Ok(Arc::clone(&snapshot)));
+            Self::clear_pending_mutation_refresh(&mut state, fence.mutation_epoch);
             state.shallow_signature = Some(signature);
             state.failure_backoff = Duration::ZERO;
             state.next_failure_retry = None;
@@ -575,25 +681,137 @@ impl WorktreeCatalogService {
         let Some(entry) = self.entry_for_project(project_id) else {
             return;
         };
-        let refresh = {
-            let mut state = lock(&entry.state);
-            state.mutation_epoch = state.mutation_epoch.wrapping_add(1);
-            state.completed_at = None;
-            if !state.snapshot.authoritative {
-                let restored = Arc::clone(&state.last_authoritative);
-                state.snapshot = Arc::clone(&restored);
-                state.sender.send_replace(restored);
+        let mut state = lock(&entry.state);
+        state.mutation_epoch = state.mutation_epoch.wrapping_add(1);
+        state.completed_at = None;
+        if !state.snapshot.authoritative {
+            let restored = Arc::clone(&state.last_authoritative);
+            state.snapshot = Arc::clone(&restored);
+            state.sender.send_replace(restored);
+        }
+        if state.subscribers == 0 {
+            state.pending_mutation_refresh_epoch = None;
+            return;
+        }
+        state.pending_mutation_refresh_epoch = Some(state.mutation_epoch);
+        self.ensure_mutation_refresh_worker_started(&entry, &mut state);
+    }
+
+    fn ensure_mutation_refresh_worker_started(
+        &self,
+        entry: &Arc<CatalogEntry>,
+        state: &mut EntryState,
+    ) {
+        if let Some(worker) = state.mutation_refresh_worker.as_ref() {
+            if !worker.is_finished() {
+                return;
             }
-            state.subscribers > 0
-        };
-        if refresh {
-            let service = self.clone();
-            let project_id = project_id.to_owned();
-            tokio::spawn(async move {
-                let _ = service
-                    .refresh(&project_id, CatalogRefreshTrigger::Mutation)
-                    .await;
-            });
+            state.mutation_refresh_worker.take();
+        }
+        state.next_mutation_refresh_worker_id =
+            state.next_mutation_refresh_worker_id.wrapping_add(1);
+        let worker_id = state.next_mutation_refresh_worker_id;
+        let lifecycle_epoch = state.lifecycle_epoch;
+        let cancellation = state.scan_cancellation.child_token();
+        let task_cancellation = cancellation.clone();
+        let weak_inner = Arc::downgrade(&self.inner);
+        let weak_entry = Arc::downgrade(entry);
+        let handle = tokio::spawn(async move {
+            let (Some(inner), Some(entry)) = (weak_inner.upgrade(), weak_entry.upgrade()) else {
+                return;
+            };
+            let service = WorktreeCatalogService { inner };
+            #[cfg(test)]
+            let _worker = service.begin_mutation_refresh_worker_for_test().await;
+            service
+                .run_mutation_refresh_worker(entry, worker_id, lifecycle_epoch, task_cancellation)
+                .await;
+        });
+        state.mutation_refresh_worker = Some(MutationRefreshTask {
+            id: worker_id,
+            cancellation,
+            handle,
+            abort_on_drop: true,
+        });
+    }
+
+    async fn run_mutation_refresh_worker(
+        &self,
+        entry: Arc<CatalogEntry>,
+        worker_id: u64,
+        lifecycle_epoch: u64,
+        cancellation: CancellationToken,
+    ) {
+        loop {
+            let requested_epoch = {
+                let mut state = lock(&entry.state);
+                if state.lifecycle_epoch != lifecycle_epoch
+                    || state.subscribers == 0
+                    || cancellation.is_cancelled()
+                {
+                    Self::clear_mutation_refresh_worker(&mut state, worker_id);
+                    return;
+                }
+                let Some(requested_epoch) = state.pending_mutation_refresh_epoch else {
+                    Self::clear_mutation_refresh_worker(&mut state, worker_id);
+                    return;
+                };
+                requested_epoch
+            };
+            let result = self
+                .refresh_entry(
+                    &entry.project_id,
+                    &entry,
+                    CatalogRefreshTrigger::Mutation,
+                    Some(RefreshOwnership {
+                        lifecycle_epoch,
+                        cancellation: cancellation.clone(),
+                    }),
+                )
+                .await;
+            let continue_refreshing = {
+                let mut state = lock(&entry.state);
+                if state.lifecycle_epoch != lifecycle_epoch
+                    || state.subscribers == 0
+                    || cancellation.is_cancelled()
+                {
+                    Self::clear_mutation_refresh_worker(&mut state, worker_id);
+                    return;
+                }
+                if !matches!(
+                    &result,
+                    Err(error) if error.reason == CatalogErrorReason::StaleGeneration
+                ) && state.pending_mutation_refresh_epoch == Some(requested_epoch)
+                {
+                    state.pending_mutation_refresh_epoch = None;
+                }
+                let continue_refreshing = state.pending_mutation_refresh_epoch.is_some();
+                if !continue_refreshing {
+                    Self::clear_mutation_refresh_worker(&mut state, worker_id);
+                }
+                continue_refreshing
+            };
+            if !continue_refreshing {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
+    fn clear_pending_mutation_refresh(state: &mut EntryState, completed_epoch: u64) {
+        if state.pending_mutation_refresh_epoch == Some(completed_epoch) {
+            state.pending_mutation_refresh_epoch = None;
+        }
+    }
+
+    fn clear_mutation_refresh_worker(state: &mut EntryState, worker_id: u64) {
+        if state
+            .mutation_refresh_worker
+            .as_ref()
+            .is_some_and(|worker| worker.id == worker_id)
+            && let Some(worker) = state.mutation_refresh_worker.take()
+        {
+            worker.disarm();
         }
     }
 
@@ -703,7 +921,7 @@ impl WorktreeCatalogService {
                 .unwrap_or_else(|| {
                     let repository = Arc::new(RepositoryEntry {
                         common_dir: scan.common_dir.clone(),
-                        observation_lock: AsyncMutex::new(()),
+                        observation_lock: Arc::new(AsyncMutex::new(())),
                         state: Mutex::new(RepositoryState::default()),
                     });
                     registry
@@ -726,6 +944,9 @@ impl WorktreeCatalogService {
                     completed_refreshes: 0,
                     last_refresh_result: None,
                     mutation_epoch: 0,
+                    pending_mutation_refresh_epoch: None,
+                    mutation_refresh_worker: None,
+                    next_mutation_refresh_worker_id: 0,
                     lifecycle_epoch: 0,
                     subscribers: 0,
                     suppressions: HashMap::new(),
@@ -980,7 +1201,7 @@ impl WorktreeCatalogService {
 
     async fn observe_repository(
         &self,
-        repository: &RepositoryEntry,
+        repository: &Arc<RepositoryEntry>,
         anchor: PathBuf,
         expected_repository_key: Option<&str>,
         caller_cancellation: &CancellationToken,
@@ -989,15 +1210,19 @@ impl WorktreeCatalogService {
             let state = lock(&repository.state);
             (state.completed_observations, state.lifecycle_epoch)
         };
+        #[cfg(test)]
+        self.inner
+            .repository_observation_requests
+            .fetch_add(1, Ordering::SeqCst);
+        let observation_lock = Arc::clone(&repository.observation_lock);
         let guard = tokio::select! {
             _ = caller_cancellation.cancelled() => return Err(ScanError::Cancelled),
-            guard = repository.observation_lock.lock() => guard,
+            guard = observation_lock.lock_owned() => guard,
         };
-        let _guard = guard;
         if caller_cancellation.is_cancelled() {
             return Err(ScanError::Cancelled);
         }
-        {
+        let repository_cancellation = {
             let state = lock(&repository.state);
             if state.lifecycle_epoch != lifecycle_epoch {
                 return Err(ScanError::Cancelled);
@@ -1013,27 +1238,45 @@ impl WorktreeCatalogService {
                     )))
                 });
             }
-        }
-        let cancellation = {
-            let state = lock(&repository.state);
-            if state.subscribers == 0 {
-                caller_cancellation.clone()
-            } else {
-                state.scan_cancellation.clone()
-            }
+            (state.subscribers != 0).then(|| state.scan_cancellation.clone())
         };
-        let result = self
-            .observe(anchor.clone(), expected_repository_key, cancellation)
-            .await
-            .map(Arc::new);
-        let mut state = lock(&repository.state);
-        if state.lifecycle_epoch == lifecycle_epoch {
-            state.completed_observations = state.completed_observations.wrapping_add(1);
-            state.last_result = Some(result.clone());
-            state.last_result_anchor = Some(anchor);
-            state.last_result_lifecycle_epoch = Some(lifecycle_epoch);
+        let repository_owned = repository_cancellation.is_some();
+        let cancellation = repository_cancellation.unwrap_or_else(|| caller_cancellation.clone());
+        let service = self.clone();
+        let repository = Arc::clone(repository);
+        let expected_repository_key = expected_repository_key.map(str::to_owned);
+        let observation = async move {
+            let _guard = guard;
+            let result = service
+                .observe(
+                    anchor.clone(),
+                    expected_repository_key.as_deref(),
+                    cancellation,
+                )
+                .await
+                .map(Arc::new);
+            let mut state = lock(&repository.state);
+            if state.lifecycle_epoch == lifecycle_epoch {
+                state.completed_observations = state.completed_observations.wrapping_add(1);
+                state.last_result = Some(result.clone());
+                state.last_result_anchor = Some(anchor);
+                state.last_result_lifecycle_epoch = Some(lifecycle_epoch);
+            }
+            result
+        };
+        if !repository_owned {
+            return observation.await;
         }
-        result
+        let mut task = tokio::spawn(observation);
+        tokio::select! {
+            _ = caller_cancellation.cancelled() => Err(ScanError::Cancelled),
+            result = &mut task => result.unwrap_or_else(|_| {
+                Err(ScanError::Catalog(CatalogError::new(
+                    CatalogErrorReason::Internal,
+                    "A shared repository observation task failed.",
+                )))
+            }),
+        }
     }
 
     async fn join_snapshot(
@@ -1277,7 +1520,7 @@ impl WorktreeCatalogService {
         let mut state = lock(&entry.state);
         if fence
             .lifecycle_epoch
-            .is_some_and(|epoch| epoch != state.lifecycle_epoch)
+            .is_some_and(|epoch| epoch != state.lifecycle_epoch || state.subscribers == 0)
         {
             return Err(cancelled_error());
         }
@@ -1307,6 +1550,7 @@ impl WorktreeCatalogService {
         state.completed_refreshes = state.completed_refreshes.wrapping_add(1);
         state.snapshot = Arc::clone(&snapshot);
         state.last_refresh_result = Some(Ok(Arc::clone(&snapshot)));
+        Self::clear_pending_mutation_refresh(&mut state, fence.mutation_epoch);
         state.sender.send_replace(Arc::clone(&snapshot));
         Ok(snapshot)
     }
@@ -1320,7 +1564,7 @@ impl WorktreeCatalogService {
         let mut state = lock(&entry.state);
         if fence
             .lifecycle_epoch
-            .is_some_and(|epoch| epoch != state.lifecycle_epoch)
+            .is_some_and(|epoch| epoch != state.lifecycle_epoch || state.subscribers == 0)
         {
             return Err(cancelled_error());
         }
@@ -1344,6 +1588,7 @@ impl WorktreeCatalogService {
         state.completed_at = Some(Instant::now());
         state.completed_refreshes = state.completed_refreshes.wrapping_add(1);
         state.last_refresh_result = Some(Err(error.clone()));
+        Self::clear_pending_mutation_refresh(&mut state, fence.mutation_epoch);
         state.sender.send_replace(restored);
         Ok(())
     }
@@ -1357,7 +1602,7 @@ impl WorktreeCatalogService {
         let mut state = lock(&entry.state);
         if fence
             .lifecycle_epoch
-            .is_some_and(|epoch| epoch != state.lifecycle_epoch)
+            .is_some_and(|epoch| epoch != state.lifecycle_epoch || state.subscribers == 0)
         {
             return Err(error);
         }
@@ -1367,6 +1612,7 @@ impl WorktreeCatalogService {
         state.completed_at = None;
         state.completed_refreshes = state.completed_refreshes.wrapping_add(1);
         state.last_refresh_result = Some(Err(error.clone()));
+        Self::clear_pending_mutation_refresh(&mut state, fence.mutation_epoch);
         Err(error)
     }
 
@@ -1545,6 +1791,8 @@ impl WorktreeCatalogService {
                 if let Some(poller) = state.poller.take() {
                     poller.cancellation.cancel();
                 }
+                state.pending_mutation_refresh_epoch = None;
+                state.mutation_refresh_worker.take();
                 state.scan_cancellation.cancel();
                 state.completed_at = None;
             }
@@ -1609,8 +1857,76 @@ impl WorktreeCatalogService {
     }
 
     #[cfg(test)]
-    pub(crate) fn mutation_refresh_attempt_count_for_test(&self) -> usize {
-        self.inner.mutation_refresh_attempts.load(Ordering::SeqCst)
+    pub(crate) fn mutation_refresh_worker_start_count_for_test(&self) -> usize {
+        self.inner
+            .mutation_refresh_worker_starts
+            .load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn max_active_mutation_refresh_worker_count_for_test(&self) -> usize {
+        self.inner
+            .max_active_mutation_refresh_workers
+            .load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn active_mutation_refresh_worker_count_for_test(&self) -> usize {
+        self.inner
+            .active_mutation_refresh_workers
+            .load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn repository_observation_request_count_for_test(&self) -> usize {
+        self.inner
+            .repository_observation_requests
+            .load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn pause_mutation_refresh_starts_after_for_test(
+        &self,
+        starts_before_pause: usize,
+    ) -> Arc<Semaphore> {
+        let release = Arc::new(Semaphore::new(0));
+        *lock(&self.inner.mutation_refresh_start_pause) = Some(MutationRefreshStartPause {
+            starts_before_pause,
+            release: Arc::clone(&release),
+        });
+        release
+    }
+
+    #[cfg(test)]
+    async fn begin_mutation_refresh_worker_for_test(&self) -> MutationRefreshWorkerGuard {
+        let start = self
+            .inner
+            .mutation_refresh_worker_starts
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
+        let active = self
+            .inner
+            .active_mutation_refresh_workers
+            .fetch_add(1, Ordering::SeqCst)
+            + 1;
+        self.inner
+            .max_active_mutation_refresh_workers
+            .fetch_max(active, Ordering::SeqCst);
+        let guard = MutationRefreshWorkerGuard {
+            inner: Arc::clone(&self.inner),
+        };
+        let pause = lock(&self.inner.mutation_refresh_start_pause).clone();
+        if let Some(pause) = pause
+            && start > pause.starts_before_pause
+        {
+            pause
+                .release
+                .acquire()
+                .await
+                .expect("mutation refresh start release")
+                .forget();
+        }
+        guard
     }
 
     #[cfg(test)]
