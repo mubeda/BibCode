@@ -28,7 +28,7 @@ import {
   MonitorIcon,
   PlusIcon,
 } from "lucide-react";
-import { useCallback, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { newCommandId } from "../lib/utils";
 import { resolveProviderSessionSelectionForInstance } from "../providerSessionSelection";
@@ -134,8 +134,15 @@ function EnvironmentBadge(props: {
 function CandidateDetails(props: {
   readonly label: string;
   readonly path: string;
+  readonly environmentLabel: string;
   readonly discoveredBadge?: boolean;
+  readonly pathTooltip: "self" | "parent";
 }) {
+  const pathText = (
+    <span className="max-w-full truncate font-mono text-[9px] text-muted-foreground/75">
+      {props.path}
+    </span>
+  );
   return (
     <span className="flex min-w-0 flex-1 flex-col items-start gap-0.5 text-left">
       <span className="flex min-w-0 max-w-full items-center gap-1.5">
@@ -146,9 +153,26 @@ function CandidateDetails(props: {
           </span>
         ) : null}
       </span>
-      <span className="max-w-full truncate font-mono text-[9px] text-muted-foreground/75">
-        {props.path}
-      </span>
+      {props.pathTooltip === "self" ? (
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <span
+                aria-label={`Full worktree path for ${props.label} in ${props.environmentLabel}: ${props.path}`}
+                className="max-w-full outline-hidden focus-visible:ring-1 focus-visible:ring-ring"
+                tabIndex={0}
+              />
+            }
+          >
+            {pathText}
+          </TooltipTrigger>
+          <TooltipPopup side="top">
+            <span className="font-mono">{props.path}</span>
+          </TooltipPopup>
+        </Tooltip>
+      ) : (
+        pathText
+      )}
     </span>
   );
 }
@@ -177,6 +201,16 @@ function PhysicalWorktreeDiscoverySection(props: {
     () => new Set(),
   );
   const [addAllPendingCount, setAddAllPendingCount] = useState(0);
+  const pendingWorktreeKeysRef = useRef(new Set<string>());
+  const addAllPendingRef = useRef(false);
+  const mountedRef = useRef(false);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   const snapshot = catalog.data;
   const discovery = useMemo(
@@ -225,7 +259,7 @@ function PhysicalWorktreeDiscoverySection(props: {
   );
 
   const reportCommandFailure = useCallback((title: string, result: AtomCommandFailureResult) => {
-    if (isAtomCommandInterrupted(result)) return;
+    if (!mountedRef.current || isAtomCommandInterrupted(result)) return;
     const error = squashAtomCommandFailure(result);
     toastManager.add(
       stackedThreadToast({
@@ -238,8 +272,15 @@ function PhysicalWorktreeDiscoverySection(props: {
 
   const handleAddOne = useCallback(
     async (candidate: VcsWorktreeDescriptor) => {
-      if (snapshot === null) return;
-      setPendingWorktreeKeys((current) => new Set(current).add(candidate.worktreeKey));
+      if (
+        snapshot === null ||
+        addAllPendingRef.current ||
+        pendingWorktreeKeysRef.current.has(candidate.worktreeKey)
+      ) {
+        return;
+      }
+      pendingWorktreeKeysRef.current.add(candidate.worktreeKey);
+      setPendingWorktreeKeys(new Set(pendingWorktreeKeysRef.current));
       try {
         const result = await addOne({
           environmentId: member.environmentId,
@@ -254,26 +295,32 @@ function PhysicalWorktreeDiscoverySection(props: {
           reportCommandFailure(`Could not add ${candidate.branch ?? "detached worktree"}`, result);
           return;
         }
-        onNavigateToThread(scopeThreadRef(member.environmentId, result.value.threadId));
+        if (mountedRef.current) {
+          onNavigateToThread(scopeThreadRef(member.environmentId, result.value.threadId));
+        }
       } finally {
-        setPendingWorktreeKeys((current) => {
-          const next = new Set(current);
-          next.delete(candidate.worktreeKey);
-          return next;
-        });
+        pendingWorktreeKeysRef.current.delete(candidate.worktreeKey);
+        if (mountedRef.current) {
+          setPendingWorktreeKeys(new Set(pendingWorktreeKeysRef.current));
+        }
       }
     },
     [addOne, member, onNavigateToThread, reportCommandFailure, serverConfig, snapshot],
   );
 
   const handleAddAll = useCallback(async () => {
-    if (snapshot === null || cardCandidates.length === 0) return;
-    setAddAllPendingCount(cardCandidates.length);
+    if (snapshot === null || addAllPendingRef.current) return;
+    const candidatesToAdd = cardCandidates.filter(
+      (candidate) => !pendingWorktreeKeysRef.current.has(candidate.worktreeKey),
+    );
+    if (candidatesToAdd.length === 0) return;
+    addAllPendingRef.current = true;
+    setAddAllPendingCount(candidatesToAdd.length);
     try {
       const result = await addAll({
         environmentId: member.environmentId,
         input: {
-          candidates: cardCandidates.map((candidate) =>
+          candidates: candidatesToAdd.map((candidate) =>
             candidateInput({
               member,
               candidate,
@@ -288,16 +335,25 @@ function PhysicalWorktreeDiscoverySection(props: {
         return;
       }
       const successCount = result.value.results.filter((item) => item._tag === "Success").length;
-      toastManager.add(
-        formatWorktreeAddAllSummary({
-          successCount,
-          failureCount: result.value.results.length - successCount,
-        }),
-      );
+      if (mountedRef.current) {
+        toastManager.add(
+          formatWorktreeAddAllSummary({
+            successCount,
+            failureCount: result.value.results.length - successCount,
+          }),
+        );
+      }
     } finally {
-      setAddAllPendingCount(0);
+      addAllPendingRef.current = false;
+      if (mountedRef.current) {
+        setAddAllPendingCount(0);
+      }
     }
   }, [addAll, cardCandidates, member, reportCommandFailure, serverConfig, snapshot]);
+
+  const addAllCandidateCount = cardCandidates.filter(
+    (candidate) => !pendingWorktreeKeys.has(candidate.worktreeKey),
+  ).length;
 
   const handleKeepHidden = useCallback(async () => {
     if (snapshot === null) return;
@@ -314,8 +370,10 @@ function PhysicalWorktreeDiscoverySection(props: {
       reportCommandFailure("Could not hide discovered worktrees", result);
       return;
     }
-    setLocallyAcknowledgedGeneration(snapshot.generation);
-    setManuallyExpanded(false);
+    if (mountedRef.current) {
+      setLocallyAcknowledgedGeneration(snapshot.generation);
+      setManuallyExpanded(false);
+    }
   }, [member.environmentId, member.id, reportCommandFailure, snapshot, updatePolicy]);
 
   if (snapshot === null || discovery === null || allCandidates.length === 0) {
@@ -361,9 +419,14 @@ function PhysicalWorktreeDiscoverySection(props: {
                       key={candidate.worktreeKey}
                       className="flex min-w-0 items-center gap-1 rounded-md bg-background/65 px-1.5 py-1"
                     >
-                      <CandidateDetails label={label} path={candidate.path} />
+                      <CandidateDetails
+                        environmentLabel={environmentLabel}
+                        label={label}
+                        path={candidate.path}
+                        pathTooltip="self"
+                      />
                       <Button
-                        aria-label={`Add ${label} to BiBCode`}
+                        aria-label={`Add ${label} from ${environmentLabel} at ${candidate.path} to BiBCode`}
                         className="h-5 shrink-0 px-1.5 text-[9px]"
                         disabled={pending || addAllPendingCount > 0}
                         size="xs"
@@ -394,7 +457,7 @@ function PhysicalWorktreeDiscoverySection(props: {
             <Button
               aria-label="Add all discovered worktrees"
               className="h-5 px-1.5 text-[9px]"
-              disabled={addAllPendingCount > 0}
+              disabled={addAllPendingCount > 0 || addAllCandidateCount === 0}
               size="xs"
               variant="secondary"
               onClick={() => void handleAddAll()}
@@ -431,23 +494,37 @@ function PhysicalWorktreeDiscoverySection(props: {
             parentGroup.candidates.map(({ candidate, label }) => {
               const pending = pendingWorktreeKeys.has(candidate.worktreeKey);
               return (
-                <Button
-                  key={candidate.worktreeKey}
-                  aria-label={`Add discovered worktree ${label} to BiBCode`}
-                  className="h-auto w-full justify-start rounded-md border border-dashed border-info/25 bg-info/5 px-2 py-1.5"
-                  disabled={pending || addAllPendingCount > 0}
-                  size="content"
-                  variant="ghost"
-                  onClick={() => void handleAddOne(candidate)}
-                >
-                  {pending ? (
-                    <LoaderIcon className="size-3 shrink-0 animate-spin" />
-                  ) : (
-                    <PlusIcon className="size-3 shrink-0 text-info" />
-                  )}
-                  <CandidateDetails discoveredBadge label={label} path={candidate.path} />
-                  <EnvironmentBadge environmentLabel={environmentLabel} isRemote={isRemote} />
-                </Button>
+                <Tooltip key={candidate.worktreeKey}>
+                  <TooltipTrigger
+                    render={
+                      <Button
+                        aria-label={`Add discovered worktree ${label} from ${environmentLabel} at ${candidate.path} to BiBCode`}
+                        className="h-auto w-full justify-start rounded-md border border-dashed border-info/25 bg-info/5 px-2 py-1.5"
+                        disabled={pending || addAllPendingCount > 0}
+                        size="content"
+                        variant="ghost"
+                        onClick={() => void handleAddOne(candidate)}
+                      />
+                    }
+                  >
+                    {pending ? (
+                      <LoaderIcon className="size-3 shrink-0 animate-spin" />
+                    ) : (
+                      <PlusIcon className="size-3 shrink-0 text-info" />
+                    )}
+                    <CandidateDetails
+                      discoveredBadge
+                      environmentLabel={environmentLabel}
+                      label={label}
+                      path={candidate.path}
+                      pathTooltip="parent"
+                    />
+                    <EnvironmentBadge environmentLabel={environmentLabel} isRemote={isRemote} />
+                  </TooltipTrigger>
+                  <TooltipPopup side="top">
+                    <span className="font-mono">{candidate.path}</span>
+                  </TooltipPopup>
+                </Tooltip>
               );
             }),
           )

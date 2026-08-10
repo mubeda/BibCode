@@ -2925,7 +2925,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         </div>
       </div>
 
-      {(shouldShowThreadPanel || supportedWorktreeDiscoveryMembers.length > 0) && (
+      {shouldShowThreadPanel && (
         <SidebarMenuSub className="mx-0.5 my-0 w-full translate-x-0 gap-0.5 overflow-hidden px-1 py-0 sm:mx-1 sm:px-1.5">
           {supportedWorktreeDiscoveryMembers.length > 0 ? (
             <WorktreeDiscoverySection
@@ -2935,19 +2935,17 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
               onNavigateToThread={navigateToThread}
             />
           ) : null}
-          {shouldShowThreadPanel ? (
-            <SidebarPrimaryRow
-              project={project}
-              primaryThread={primaryThread}
-              isActive={
-                primaryThread !== null &&
-                activeRouteThreadKey ===
-                  scopedThreadKey(scopeThreadRef(primaryThread.environmentId, primaryThread.id))
-              }
-              onClick={handlePrimaryRowClick}
-              onContextMenu={handlePrimaryRowContextMenu}
-            />
-          ) : null}
+          <SidebarPrimaryRow
+            project={project}
+            primaryThread={primaryThread}
+            isActive={
+              primaryThread !== null &&
+              activeRouteThreadKey ===
+                scopedThreadKey(scopeThreadRef(primaryThread.environmentId, primaryThread.id))
+            }
+            onClick={handlePrimaryRowClick}
+            onContextMenu={handlePrimaryRowContextMenu}
+          />
         </SidebarMenuSub>
       )}
 
