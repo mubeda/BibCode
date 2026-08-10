@@ -1020,6 +1020,7 @@ export interface DesktopBridge {
     expectedCatalog: string | null,
     nextCatalog: string,
   ) => Promise<boolean>;
+  compareConnectionCatalog?: (expectedCatalog: string | null) => Promise<boolean>;
   clearConnectionCatalog?: () => Promise<void>;
   discoverSshHosts: () => Promise<readonly DesktopDiscoveredSshHost[]>;
   ensureSshEnvironment: (

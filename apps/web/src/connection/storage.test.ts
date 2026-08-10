@@ -6,6 +6,7 @@ import {
   ConnectionStorageChangedError,
   ConnectionTransientError,
   CredentialStore,
+  decideStorageIdentity,
   PrimaryConnectionTarget,
   ProfileStore,
   type PreparedConnection,
@@ -34,10 +35,15 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
-import { IDBFactory, IDBKeyRange } from "fake-indexeddb";
+import { IDBFactory, IDBKeyRange, IDBObjectStore } from "fake-indexeddb";
 import { afterEach, vi } from "vite-plus/test";
 
-import { connectionStorageLayer, makeCatalogBackend, makeCatalogStore } from "./storage";
+import {
+  type CatalogBackend,
+  connectionStorageLayer,
+  makeCatalogBackend,
+  makeCatalogStore,
+} from "./storage";
 
 const emptyCatalog = {
   schemaVersion: 1,
@@ -50,6 +56,8 @@ const emptyCatalog = {
 const decodeCatalog = Schema.decodeUnknownSync(Schema.fromJsonString(ConnectionCatalogDocument));
 const encodeCatalog = Schema.encodeSync(Schema.fromJsonString(ConnectionCatalogDocument));
 const encodeUnknownJson = Schema.encodeUnknownSync(Schema.UnknownFromJsonString);
+const unusedCatalogCompare: CatalogBackend["compare"] = () =>
+  Effect.die(new Error("Catalog comparison is not used by this test."));
 
 // ── In-memory IndexedDB fake ─────────────────────────────────────────
 // The production storage code attaches listeners *then* triggers the op, so
@@ -278,6 +286,31 @@ function bearerRegistration(): BearerConnectionRegistration {
   });
 }
 
+function primaryPrepared(storageInstanceId: string | null): PreparedConnection {
+  const target = new PrimaryConnectionTarget({
+    environmentId,
+    label: "Primary environment",
+    httpBaseUrl: "https://primary.example.test",
+    wsBaseUrl: "wss://primary.example.test",
+  });
+  return {
+    environmentId: target.environmentId,
+    label: target.label,
+    descriptor: {
+      environmentId: target.environmentId,
+      label: target.label,
+      platform: { os: "linux", arch: "x64" },
+      serverVersion: "0.0.0-test",
+      storageInstanceId,
+      capabilities: { repositoryIdentity: true, activityProtocolVersion: null },
+    },
+    httpBaseUrl: target.httpBaseUrl,
+    socketUrl: `${target.wsBaseUrl}/ws`,
+    httpAuthorization: null,
+    target,
+  };
+}
+
 function shellSnapshot(): OrchestrationShellSnapshot {
   return { snapshotSequence: 0, projects: [], threads: [], updatedAt: now };
 }
@@ -328,6 +361,51 @@ afterEach(() => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe("makeCatalogStore", () => {
+  it.effect("re-decides a compare-only transition after a conflicting revision", () =>
+    Effect.gen(function* () {
+      const firstCatalog = encodeCatalog({
+        ...emptyCatalog,
+        acceptedStorageIdentities: [
+          { targetKey: "platform:primary", storageInstanceId: "store-a" },
+        ],
+      });
+      const winningCatalog = encodeCatalog({
+        ...emptyCatalog,
+        acceptedStorageIdentities: [
+          { targetKey: "platform:primary", storageInstanceId: "store-b" },
+        ],
+      });
+      let durableCatalog = firstCatalog;
+      let comparisons = 0;
+      const writes = vi.fn(() => Effect.die(new Error("writer must not be called")));
+      const store = yield* makeCatalogStore({
+        read: Effect.sync(() => durableCatalog),
+        compare: (expected) =>
+          Effect.sync(() => {
+            comparisons += 1;
+            if (comparisons === 1) {
+              durableCatalog = winningCatalog;
+              return false;
+            }
+            return durableCatalog === expected;
+          }),
+        compareAndSet: writes,
+      });
+      const observed: string[] = [];
+
+      const result = yield* store.modify((document) => {
+        const storageInstanceId = document.acceptedStorageIdentities[0]?.storageInstanceId ?? null;
+        observed.push(storageInstanceId ?? "null");
+        return { mutation: { _tag: "Keep" }, result: storageInstanceId };
+      });
+
+      expect(result).toBe("store-b");
+      expect(observed).toEqual(["store-a", "store-b"]);
+      expect(comparisons).toBe(2);
+      expect(writes).not.toHaveBeenCalled();
+    }),
+  );
+
   it.effect("merges disjoint updates from independently constructed stores", () =>
     Effect.gen(function* () {
       let durableCatalog = encodeCatalog(emptyCatalog);
@@ -342,6 +420,7 @@ describe("makeCatalogStore", () => {
           if (reads <= 2) yield* Deferred.await(releaseReads);
           return raw;
         }),
+        compare: unusedCatalogCompare,
         compareAndSet: (expected: string | null, raw: string) =>
           Effect.sync(() => {
             if (durableCatalog !== expected) return false;
@@ -406,6 +485,7 @@ describe("makeCatalogStore", () => {
         });
       const backend = {
         read: Effect.sync(() => durableCatalog),
+        compare: unusedCatalogCompare,
         compareAndSet: compare,
       };
       const first = yield* makeCatalogStore(backend);
@@ -448,6 +528,7 @@ describe("makeCatalogStore", () => {
             if (reads <= 2) yield* Deferred.await(releaseReads);
             return raw;
           }),
+          compare: unusedCatalogCompare,
           compareAndSet: (expected: string | null, raw: string) =>
             Effect.sync(() => {
               if (durableCatalog !== expected) return false;
@@ -507,6 +588,7 @@ describe("makeCatalogStore", () => {
       let durableCatalog = "{not-json";
       const store = yield* makeCatalogStore({
         read: Effect.sync(() => durableCatalog),
+        compare: unusedCatalogCompare,
         compareAndSet: (expected, _next) =>
           Effect.sync(() => {
             if (expected === "{not-json") durableCatalog = newer;
@@ -525,6 +607,7 @@ describe("makeCatalogStore", () => {
       let attempts = 0;
       const store = yield* makeCatalogStore({
         read: Effect.succeed(encodeCatalog(emptyCatalog)),
+        compare: unusedCatalogCompare,
         compareAndSet: () =>
           Effect.sync(() => {
             attempts += 1;
@@ -546,6 +629,7 @@ describe("makeCatalogStore", () => {
       const releaseCommit = yield* Deferred.make<void>();
       const store = yield* makeCatalogStore({
         read: Effect.sync(() => durableCatalog),
+        compare: unusedCatalogCompare,
         compareAndSet: (expected, raw) =>
           Effect.sync(() => {
             if (durableCatalog !== expected) return false;
@@ -588,6 +672,7 @@ describe("makeCatalogStore", () => {
       const quarantined: string[] = [];
       const store = yield* makeCatalogStore({
         read: Effect.succeed("{not-json"),
+        compare: unusedCatalogCompare,
         compareAndSet: (_expected, raw) =>
           Effect.sync(() => {
             writes.push(raw);
@@ -615,6 +700,7 @@ describe("makeCatalogStore", () => {
       });
       const store = yield* makeCatalogStore({
         read: Effect.succeed("{not-json"),
+        compare: unusedCatalogCompare,
         compareAndSet: () => Effect.fail(writeFailure),
         quarantine: () => Effect.fail(quarantineFailure),
       });
@@ -632,6 +718,7 @@ describe("makeCatalogStore", () => {
       });
       const store = yield* makeCatalogStore({
         read: Effect.fail(failure),
+        compare: unusedCatalogCompare,
         compareAndSet: () => Effect.succeed(true),
       });
 
@@ -647,6 +734,7 @@ describe("makeCatalogStore", () => {
           reads += 1;
           return null;
         }),
+        compare: unusedCatalogCompare,
         compareAndSet: () => Effect.succeed(true),
       });
 
@@ -660,6 +748,7 @@ describe("makeCatalogStore", () => {
     Effect.gen(function* () {
       const store = yield* makeCatalogStore({
         read: Effect.succeed("   "),
+        compare: unusedCatalogCompare,
         compareAndSet: () => Effect.succeed(true),
       });
 
@@ -673,6 +762,7 @@ describe("makeCatalogStore", () => {
       let durableCatalog: string | null = null;
       const store = yield* makeCatalogStore({
         read: Effect.sync(() => durableCatalog),
+        compare: unusedCatalogCompare,
         compareAndSet: (expected, raw) =>
           Effect.sync(() => {
             if (durableCatalog !== expected) return false;
@@ -703,6 +793,7 @@ describe("makeCatalogStore", () => {
           reads += 1;
           return encoded;
         }),
+        compare: unusedCatalogCompare,
         compareAndSet: () => Effect.succeed(true),
       });
 
@@ -720,6 +811,29 @@ describe("makeCatalogStore", () => {
 describe("makeCatalogBackend (desktop bridge)", () => {
   it.effect("reads and compares through the desktop bridge secure storage", () =>
     Effect.gen(function* () {
+      const compareConnectionCatalog = vi.fn().mockResolvedValue(true);
+      const compareAndSetConnectionCatalog = vi.fn().mockResolvedValue(true);
+      vi.stubGlobal("window", {
+        desktopBridge: {
+          getConnectionCatalog: vi.fn().mockResolvedValue("stored-catalog"),
+          compareConnectionCatalog,
+          compareAndSetConnectionCatalog,
+        },
+      });
+      const backend = makeCatalogBackend({} as IDBDatabase);
+
+      expect(yield* backend.read).toBe("stored-catalog");
+      expect(yield* backend.compare("stored-catalog")).toBe(true);
+      expect(yield* backend.compareAndSet("stored-catalog", "payload")).toBe(true);
+      expect(compareConnectionCatalog).toHaveBeenCalledWith("stored-catalog");
+      expect(compareAndSetConnectionCatalog).toHaveBeenCalledWith("stored-catalog", "payload");
+      // The bridge backend does not expose a quarantine seam.
+      expect(backend.quarantine).toBeUndefined();
+    }),
+  );
+
+  it.effect("fails comparison closed when a protected bridge lacks compare-only support", () =>
+    Effect.gen(function* () {
       const compareAndSetConnectionCatalog = vi.fn().mockResolvedValue(true);
       vi.stubGlobal("window", {
         desktopBridge: {
@@ -729,11 +843,11 @@ describe("makeCatalogBackend (desktop bridge)", () => {
       });
       const backend = makeCatalogBackend({} as IDBDatabase);
 
-      expect(yield* backend.read).toBe("stored-catalog");
-      expect(yield* backend.compareAndSet("stored-catalog", "payload")).toBe(true);
-      expect(compareAndSetConnectionCatalog).toHaveBeenCalledWith("stored-catalog", "payload");
-      // The bridge backend does not expose a quarantine seam.
-      expect(backend.quarantine).toBeUndefined();
+      const error = yield* Effect.flip(backend.compare("stored-catalog"));
+
+      expect(error).toBeInstanceOf(ConnectionTransientError);
+      expect(error.message).toContain("comparison is unavailable");
+      expect(compareAndSetConnectionCatalog).not.toHaveBeenCalled();
     }),
   );
 
@@ -774,6 +888,121 @@ describe("makeCatalogBackend (desktop bridge)", () => {
 });
 
 describe("makeCatalogBackend (IndexedDB)", () => {
+  it.effect("compares existing and absent revisions without putting a document", () =>
+    Effect.gen(function* () {
+      vi.stubGlobal("window", {});
+      const factory = new IDBFactory();
+      const existingDatabase = yield* Effect.promise(() =>
+        openCatalogDatabase(factory, "catalog-compare-existing"),
+      );
+      const absentDatabase = yield* Effect.promise(() =>
+        openCatalogDatabase(factory, "catalog-compare-absent"),
+      );
+      const existingBackend = makeCatalogBackend(existingDatabase);
+      const absentBackend = makeCatalogBackend(absentDatabase);
+      const existingRaw = encodeCatalog({
+        ...emptyCatalog,
+        acceptedStorageIdentities: [
+          { targetKey: "platform:primary", storageInstanceId: "store-a" },
+        ],
+      });
+      expect(yield* existingBackend.compareAndSet(null, existingRaw)).toBe(true);
+      const put = vi.spyOn(IDBObjectStore.prototype, "put");
+      const existingStore = yield* makeCatalogStore(existingBackend);
+      const absentStore = yield* makeCatalogStore(absentBackend);
+
+      expect(
+        yield* existingStore.modify((document) => ({
+          mutation: { _tag: "Keep" },
+          result: document.acceptedStorageIdentities[0]?.storageInstanceId ?? null,
+        })),
+      ).toBe("store-a");
+      expect(
+        yield* absentStore.modify(() => ({
+          mutation: { _tag: "Keep" },
+          result: "absent",
+        })),
+      ).toBe("absent");
+
+      expect(put).not.toHaveBeenCalled();
+      expect(yield* existingBackend.read).toBe(existingRaw);
+      expect(yield* absentBackend.read).toBeNull();
+      existingDatabase.close();
+      absentDatabase.close();
+    }),
+  );
+
+  it.effect("re-decides compare-only state after a concurrent IndexedDB writer", () =>
+    Effect.gen(function* () {
+      vi.stubGlobal("window", {});
+      const factory = new IDBFactory();
+      const firstDatabase = yield* Effect.promise(() =>
+        openCatalogDatabase(factory, "catalog-compare-race"),
+      );
+      const secondDatabase = yield* Effect.promise(() =>
+        openCatalogDatabase(factory, "catalog-compare-race"),
+      );
+      const firstBackend = makeCatalogBackend(firstDatabase);
+      const secondBackend = makeCatalogBackend(secondDatabase);
+      const initial = encodeCatalog({
+        ...emptyCatalog,
+        acceptedStorageIdentities: [
+          { targetKey: "platform:primary", storageInstanceId: "store-a" },
+        ],
+      });
+      expect(yield* firstBackend.compareAndSet(null, initial)).toBe(true);
+      const compareStarted = yield* Deferred.make<void>();
+      const releaseCompare = yield* Deferred.make<void>();
+      let comparisons = 0;
+      const compareBackend = {
+        ...firstBackend,
+        compare: (expected: string | null) =>
+          Effect.sync(() => {
+            comparisons += 1;
+            return comparisons;
+          }).pipe(
+            Effect.flatMap((attempt) =>
+              attempt === 1
+                ? Deferred.succeed(compareStarted, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseCompare)),
+                  )
+                : Effect.void,
+            ),
+            Effect.andThen(firstBackend.compare(expected)),
+          ),
+      };
+      const compareStore = yield* makeCatalogStore(compareBackend);
+      const writerStore = yield* makeCatalogStore(secondBackend);
+      const observed: string[] = [];
+      const put = vi.spyOn(IDBObjectStore.prototype, "put");
+      const comparison = yield* Effect.forkChild(
+        compareStore.modify((document) => {
+          const storageInstanceId =
+            document.acceptedStorageIdentities[0]?.storageInstanceId ?? null;
+          observed.push(storageInstanceId ?? "null");
+          return { mutation: { _tag: "Keep" }, result: storageInstanceId };
+        }),
+        { startImmediately: true },
+      );
+      yield* Deferred.await(compareStarted);
+
+      yield* writerStore.update((document) => ({
+        ...document,
+        acceptedStorageIdentities: [
+          { targetKey: "platform:primary", storageInstanceId: "store-b" },
+        ],
+      }));
+      yield* Deferred.succeed(releaseCompare, undefined);
+
+      expect(yield* Fiber.join(comparison)).toBe("store-b");
+      expect(observed).toEqual(["store-a", "store-b"]);
+      expect(comparisons).toBe(2);
+      expect(put).toHaveBeenCalledTimes(1);
+      firstDatabase.close();
+      secondDatabase.close();
+    }),
+  );
+
   it.effect("atomically merges conflicting updates from two database connections", () =>
     Effect.gen(function* () {
       vi.stubGlobal("window", {});
@@ -887,6 +1116,112 @@ describe("makeCatalogBackend (IndexedDB)", () => {
 // ─────────────────────────────────────────────────────────────────────
 
 describe("connectionStorageLayer", () => {
+  it.effect("keeps an accepted identity without invoking the catalog writer", () => {
+    installFakeIndexedDb();
+    const storedCatalog = encodeCatalog({
+      ...emptyCatalog,
+      acceptedStorageIdentities: [{ targetKey: "platform:primary", storageInstanceId: "store-a" }],
+    });
+    const compareConnectionCatalog = vi.fn((expected: string | null) =>
+      Promise.resolve(expected === storedCatalog),
+    );
+    const compareAndSetConnectionCatalog = vi.fn(() =>
+      Promise.reject(new Error("writer must not be called")),
+    );
+    vi.stubGlobal("window", {
+      desktopBridge: {
+        getConnectionCatalog: vi.fn(() => Promise.resolve(storedCatalog)),
+        compareConnectionCatalog,
+        compareAndSetConnectionCatalog,
+      },
+    });
+
+    return Effect.gen(function* () {
+      const identities = yield* AcceptedStorageIdentityStore;
+      const decision = yield* identities.transition("platform:primary", (accepted) => ({
+        result: decideStorageIdentity(accepted, "store-a"),
+        mutation: { _tag: "Keep" },
+      }));
+
+      expect(decision).toEqual({ _tag: "Accepted", value: "store-a" });
+      expect(compareConnectionCatalog).toHaveBeenCalledWith(storedCatalog);
+      expect(compareAndSetConnectionCatalog).not.toHaveBeenCalled();
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
+  it.effect("reports a changed identity when the catalog writer is unavailable", () => {
+    installFakeIndexedDb();
+    const storedCatalog = encodeCatalog({
+      ...emptyCatalog,
+      acceptedStorageIdentities: [{ targetKey: "platform:primary", storageInstanceId: "store-a" }],
+    });
+    const compareAndSetConnectionCatalog = vi.fn(() =>
+      Promise.reject(new Error("writer must not be called")),
+    );
+    vi.stubGlobal("window", {
+      desktopBridge: {
+        getConnectionCatalog: vi.fn(() => Promise.resolve(storedCatalog)),
+        compareConnectionCatalog: vi.fn((expected: string | null) =>
+          Promise.resolve(expected === storedCatalog),
+        ),
+        compareAndSetConnectionCatalog,
+      },
+    });
+
+    return Effect.gen(function* () {
+      const result = yield* verifyPreparedStorageIdentity(primaryPrepared("store-b")).pipe(
+        Effect.result,
+      );
+
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(result.failure).toMatchObject({
+          _tag: "ConnectionStorageChangedError",
+          acceptedStorageInstanceId: "store-a",
+          reportedStorageInstanceId: "store-b",
+        });
+      }
+      expect(compareAndSetConnectionCatalog).not.toHaveBeenCalled();
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
+  it.effect("keeps nullable reports without creating or rewriting a catalog", () => {
+    const indexedDb = installFakeIndexedDb();
+    let storedCatalog: string | null = encodeCatalog({
+      ...emptyCatalog,
+      acceptedStorageIdentities: [{ targetKey: "platform:primary", storageInstanceId: "store-a" }],
+    });
+    const compareAndSetConnectionCatalog = vi.fn(() =>
+      Promise.reject(new Error("writer must not be called")),
+    );
+    vi.stubGlobal("window", {
+      desktopBridge: {
+        getConnectionCatalog: vi.fn(() => Promise.resolve(storedCatalog)),
+        compareConnectionCatalog: vi.fn((expected: string | null) =>
+          Promise.resolve(expected === storedCatalog),
+        ),
+        compareAndSetConnectionCatalog,
+      },
+    });
+
+    return Effect.gen(function* () {
+      const identities = yield* AcceptedStorageIdentityStore;
+      const keepNullable = (accepted: string | null) => ({
+        result: decideStorageIdentity(accepted, null),
+        mutation: { _tag: "Keep" as const },
+      });
+
+      const existingDecision = yield* identities.transition("platform:primary", keepNullable);
+      storedCatalog = null;
+      const absentDecision = yield* identities.transition("platform:primary", keepNullable);
+
+      expect(existingDecision).toEqual({ _tag: "Unverifiable", accepted: "store-a" });
+      expect(absentDecision).toEqual({ _tag: "Unverifiable", accepted: null });
+      expect(compareAndSetConnectionCatalog).not.toHaveBeenCalled();
+      expect(indexedDb.stores.get("catalog")?.has("document") ?? false).toBe(false);
+    }).pipe(Effect.provide(connectionStorageLayer));
+  });
+
   it.effect("elects one bootstrap winner across two real IndexedDB storage layers", () => {
     const factory = new IDBFactory();
     vi.stubGlobal("indexedDB", factory);

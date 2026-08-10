@@ -24,12 +24,12 @@ flowchart TB
 
 - **Tauri host (`apps/desktop`)** owns native windows, menus, dialogs, updates,
   WSL and SSH launch, the desktop connection catalog, and backend lifecycle.
-  Windows protects the catalog with DPAPI. Atomic catalog comparison and write
-  cross one privileged bridge command and are serialized by the native catalog
-  owner across all WebViews in that host. macOS and Linux advertise that native
-  protection is unavailable and use the renderer's transactional IndexedDB
-  catalog instead; any legacy renderer value is atomically migrated into that
-  single source before it is cleared.
+  Windows protects the catalog with DPAPI. Atomic compare-only and
+  compare-and-write transitions cross privileged bridge commands and are
+  serialized by the native catalog owner across all WebViews in that host.
+  macOS and Linux advertise that native protection is unavailable and use the
+  renderer's transactional IndexedDB catalog instead; any legacy renderer value
+  is atomically migrated into that single source before it is cleared.
 - **React app (`apps/web`)** owns the user interface and client-side state. It
   uses hash history in desktop mode and browser history on the web. Preview
   content is hosted in Tauri child webviews; preview automation is brokered by
@@ -161,22 +161,24 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
 
 - React does not import Rust or native-host implementation details.
 - Privileged desktop behavior crosses `DesktopBridge` commands and events.
-- Whole-catalog renderer updates use fresh reads and exact compare-and-set. In
-  browser and unprotected desktop modes the comparison and write share one
-  IndexedDB transaction; on a protected desktop host they share one native
-  catalog-owner lock and are never emulated with separate JavaScript bridge
-  calls. Legacy renderer migration preserves an existing valid IndexedDB
-  winner and uses exact CAS before replacing corrupt IndexedDB bytes with the
-  only valid legacy catalog.
-- Accepted storage-identity decisions are catalog CAS transitions: the decision
-  is recomputed after every conflict and returned only from the winning
-  revision. Both the prepared HTTP descriptor and the WebSocket session's
+- Whole-catalog renderer updates use fresh reads and exact compare-and-set.
+  Compare-only transitions validate the same fresh raw revision without a
+  document write. In browser and unprotected desktop modes each transition owns
+  one IndexedDB `readwrite` transaction; on a protected desktop host both own
+  the same native catalog-owner lock and are never emulated with separate
+  JavaScript bridge calls. Legacy renderer migration preserves an existing
+  valid IndexedDB winner and uses exact CAS before replacing corrupt IndexedDB
+  bytes with the only valid legacy catalog.
+- Accepted storage-identity decisions are atomic catalog transitions: the
+  decision is recomputed after every conflict and returned only from the
+  winning revision. Keep decisions compare without writing; Set decisions use
+  CAS. Both the prepared HTTP descriptor and the WebSocket session's
   initial configuration must pass that owner before synchronization, live
   publication, or cache consumption.
 - Desktop catalog capability is fail-closed and tri-state. Only bridge version
-  2 with an explicit protected/unprotected flag may select native CAS or
-  IndexedDB migration; rejected, older, or incomplete metadata performs no
-  catalog write, migration, or clear.
+  3 with an explicit protected/unprotected flag may select native compare-only,
+  native CAS, or IndexedDB migration; rejected, older, or incomplete metadata
+  performs no catalog write, migration, or clear.
 - Normal application traffic uses HTTP and WebSocket RPC in every host.
 - `packages/contracts` remains schema-only.
 - Rust owns all production backend behavior. TypeScript is limited to clients,

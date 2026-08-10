@@ -37,7 +37,7 @@ const SSH_PASSWORD_PROMPT_EVENT = "desktop:ssh-password-prompt";
 const UPDATE_STATE_EVENT = "desktop:update-state";
 const LOCAL_ENVIRONMENT_BOOTSTRAP_TIMEOUT_MS = 15_000;
 const LOCAL_ENVIRONMENT_BOOTSTRAP_RETRY_MS = 50;
-const PROTECTED_CONNECTION_CATALOG_BRIDGE_VERSION = 2;
+const PROTECTED_CONNECTION_CATALOG_BRIDGE_VERSION = 3;
 
 type ConnectionCatalogProtectionCapability = "protected" | "unprotected" | "unknown";
 
@@ -321,6 +321,12 @@ async function compareAndSetConnectionCatalog(
   return stored;
 }
 
+async function compareConnectionCatalog(expectedCatalog: string | null): Promise<boolean> {
+  return tauriInvoke<boolean>("desktop_bridge_compare_connection_catalog", {
+    expectedCatalog,
+  });
+}
+
 async function clearConnectionCatalog(): Promise<void> {
   await tauriInvokeOr(
     "desktop_bridge_clear_connection_catalog",
@@ -452,6 +458,7 @@ function createTauriDesktopBridge(
       ? {
           getConnectionCatalog,
           setConnectionCatalog,
+          compareConnectionCatalog,
           compareAndSetConnectionCatalog,
           clearConnectionCatalog,
         }

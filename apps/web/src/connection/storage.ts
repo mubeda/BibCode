@@ -206,6 +206,41 @@ function compareAndSetDatabaseValue(
   }).pipe(Effect.withSpan("web.connectionStorage.compareAndSetDatabaseValue"));
 }
 
+function compareDatabaseValue(
+  database: IDBDatabase,
+  storeName: string,
+  key: IDBValidKey,
+  expected: string | null,
+) {
+  return Effect.callback<boolean, ConnectionTransientError>((resume) => {
+    const transaction = database.transaction(storeName, "readwrite");
+    let matched = false;
+    transaction.addEventListener("error", () => {
+      resume(
+        Effect.fail(
+          catalogError("compare", transaction.error ?? "Unknown IndexedDB transaction error"),
+        ),
+      );
+    });
+    transaction.addEventListener("abort", () => {
+      resume(
+        Effect.fail(
+          catalogError("compare", transaction.error ?? "Unknown IndexedDB transaction abort"),
+        ),
+      );
+    });
+    transaction.addEventListener("complete", () => {
+      resume(Effect.succeed(matched));
+    });
+
+    const request = transaction.objectStore(storeName).get(key);
+    request.addEventListener("success", () => {
+      const current = typeof request.result === "string" ? request.result : null;
+      matched = current === expected;
+    });
+  }).pipe(Effect.withSpan("web.connectionStorage.compareDatabaseValue"));
+}
+
 function removeDatabaseValue(database: IDBDatabase, storeName: string, key: IDBValidKey) {
   return Effect.callback<void, ConnectionTransientError>((resume) => {
     const transaction = database.transaction(storeName, "readwrite");
@@ -269,6 +304,7 @@ const encodeCatalog = Effect.fn("web.connectionStorage.encodeCatalog")(function*
 
 export interface CatalogBackend {
   readonly read: Effect.Effect<string | null, ConnectionTransientError>;
+  readonly compare: (expected: string | null) => Effect.Effect<boolean, ConnectionTransientError>;
   readonly compareAndSet: (
     expected: string | null,
     next: string,
@@ -287,6 +323,17 @@ export function makeCatalogBackend(database: IDBDatabase): CatalogBackend {
         try: () => bridge.getConnectionCatalog!(),
         catch: (cause) => catalogError("load", cause),
       }),
+      compare: (expected) => {
+        if (bridge.compareConnectionCatalog === undefined) {
+          return Effect.fail(
+            catalogError("compare", "Desktop connection catalog comparison is unavailable."),
+          );
+        }
+        return Effect.tryPromise({
+          try: () => bridge.compareConnectionCatalog!(expected),
+          catch: (cause) => catalogError("compare", cause),
+        });
+      },
       compareAndSet: (expected, next) => {
         if (bridge.compareAndSetConnectionCatalog === undefined) {
           return Effect.fail(
@@ -308,6 +355,8 @@ export function makeCatalogBackend(database: IDBDatabase): CatalogBackend {
     read: readDatabaseValue(database, CATALOG_STORE_NAME, CATALOG_KEY).pipe(
       Effect.map((value) => (typeof value === "string" ? value : null)),
     ),
+    compare: (expected) =>
+      compareDatabaseValue(database, CATALOG_STORE_NAME, CATALOG_KEY, expected),
     compareAndSet: (expected, next) =>
       compareAndSetDatabaseValue(database, CATALOG_STORE_NAME, CATALOG_KEY, expected, next),
     quarantine: (raw) =>
@@ -397,7 +446,9 @@ interface CatalogStore {
   ) => Effect.Effect<void, ConnectionTransientError>;
   readonly modify: <A>(
     transform: (catalog: ConnectionCatalogDocumentType) => {
-      readonly document: ConnectionCatalogDocumentType;
+      readonly mutation:
+        | { readonly _tag: "Keep" }
+        | { readonly _tag: "Set"; readonly document: ConnectionCatalogDocumentType };
       readonly result: A;
     },
   ) => Effect.Effect<A, ConnectionTransientError>;
@@ -463,8 +514,14 @@ export const makeCatalogStore = Effect.fn("web.connectionStorage.makeCatalogStor
       for (let attempt = 0; attempt < MAX_CATALOG_COMPARE_AND_SET_ATTEMPTS; attempt += 1) {
         const { raw, document } = yield* loadVersion();
         const transition = transform(document);
-        const next = yield* encodeCatalog(transition.document);
-        const updated = yield* Effect.uninterruptible(backend.compareAndSet(raw, next));
+        const updated =
+          transition.mutation._tag === "Keep"
+            ? yield* Effect.uninterruptible(backend.compare(raw))
+            : yield* Effect.uninterruptible(
+                encodeCatalog(transition.mutation.document).pipe(
+                  Effect.flatMap((next) => backend.compareAndSet(raw, next)),
+                ),
+              );
         if (updated) return transition.result;
         yield* Effect.yieldNow;
       }
@@ -472,7 +529,10 @@ export const makeCatalogStore = Effect.fn("web.connectionStorage.makeCatalogStor
     },
   );
   const update: CatalogStore["update"] = (transform) =>
-    modify((document) => ({ document: transform(document), result: undefined }));
+    modify((document) => ({
+      mutation: { _tag: "Set", document: transform(document) },
+      result: undefined,
+    }));
 
   return Effect.succeed({ modify, read, update } satisfies CatalogStore);
 });
@@ -613,19 +673,22 @@ export const connectionStorageLayer = Layer.effectContext(
               )?.storageInstanceId ?? null;
             const transition = decide(acceptedStorageInstanceId);
             if (transition.mutation._tag === "Keep") {
-              return { document, result: transition.result };
+              return { mutation: { _tag: "Keep" }, result: transition.result };
             }
             return {
-              document: {
-                ...document,
-                acceptedStorageIdentities: replaceCatalogValue(
-                  document.acceptedStorageIdentities,
-                  (value) => value.targetKey,
-                  {
-                    targetKey,
-                    storageInstanceId: transition.mutation.storageInstanceId,
-                  },
-                ),
+              mutation: {
+                _tag: "Set",
+                document: {
+                  ...document,
+                  acceptedStorageIdentities: replaceCatalogValue(
+                    document.acceptedStorageIdentities,
+                    (value) => value.targetKey,
+                    {
+                      targetKey,
+                      storageInstanceId: transition.mutation.storageInstanceId,
+                    },
+                  ),
+                },
               },
               result: transition.result,
             };

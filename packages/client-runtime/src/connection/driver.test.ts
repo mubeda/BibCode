@@ -86,6 +86,7 @@ const makeBarrier = Effect.fn("TestConnectionDriver.makeBarrier")(function* (par
 const makeIdentityStore = Effect.fn("TestConnectionDriver.makeIdentityStore")(function* (
   initial: ReadonlyMap<string, string>,
   beforeReadOrTransition: Effect.Effect<void> = Effect.void,
+  options?: { readonly failMutation?: boolean },
 ) {
   const accepted = yield* Ref.make(new Map(initial));
   const writes = yield* Ref.make<ReadonlyArray<Persistence.AcceptedStorageIdentity>>([]);
@@ -96,26 +97,47 @@ const makeIdentityStore = Effect.fn("TestConnectionDriver.makeIdentityStore")(fu
         Effect.flatMap((snapshot) => beforeReadOrTransition.pipe(Effect.as(snapshot))),
       ),
     accept: (identity: Persistence.AcceptedStorageIdentity) =>
-      Ref.update(accepted, (current) => {
-        const next = new Map(current);
-        next.set(identity.targetKey, identity.storageInstanceId);
-        return next;
-      }).pipe(Effect.andThen(Ref.update(writes, (current) => [...current, identity]))),
+      options?.failMutation === true
+        ? Effect.fail(
+            new Persistence.ConnectionPersistenceError({
+              operation: "accept-storage-identity",
+              message: "Catalog writer is unavailable.",
+            }),
+          )
+        : Ref.update(accepted, (current) => {
+            const next = new Map(current);
+            next.set(identity.targetKey, identity.storageInstanceId);
+            return next;
+          }).pipe(Effect.andThen(Ref.update(writes, (current) => [...current, identity]))),
     transition: <A>(
       targetKey: string,
       decide: (acceptedStorageInstanceId: string | null) => IdentityTransition<A>,
     ) =>
       beforeReadOrTransition.pipe(
         Effect.andThen(
-          Ref.modify(accepted, (current) => {
-            const transition = decide(current.get(targetKey) ?? null);
-            if (transition.mutation._tag === "Keep") {
-              return [transition.result, current] as const;
-            }
-            const next = new Map(current);
-            next.set(targetKey, transition.mutation.storageInstanceId);
-            return [transition.result, next] as const;
-          }),
+          options?.failMutation === true
+            ? Ref.get(accepted).pipe(
+                Effect.flatMap((current) => {
+                  const transition = decide(current.get(targetKey) ?? null);
+                  return transition.mutation._tag === "Keep"
+                    ? Effect.succeed(transition.result)
+                    : Effect.fail(
+                        new Persistence.ConnectionPersistenceError({
+                          operation: "accept-storage-identity",
+                          message: "Catalog writer is unavailable.",
+                        }),
+                      );
+                }),
+              )
+            : Ref.modify(accepted, (current) => {
+                const transition = decide(current.get(targetKey) ?? null);
+                if (transition.mutation._tag === "Keep") {
+                  return [transition.result, current] as const;
+                }
+                const next = new Map(current);
+                next.set(targetKey, transition.mutation.storageInstanceId);
+                return [transition.result, next] as const;
+              }),
         ),
       ),
   };
@@ -277,6 +299,72 @@ describe("ConnectionDriver storage identity", () => {
       ]);
       expect(yield* Ref.get(harness.sessionCount)).toBe(1);
       expect(yield* Ref.get(harness.sessionReleaseCount)).toBe(1);
+    }),
+  );
+
+  it.effect("connects accepted and nullable stores when identity mutation is unavailable", () =>
+    Effect.gen(function* () {
+      const acceptedTarget = target("accepted-read-only");
+      const nullableTarget = target("nullable-read-only");
+      const store = yield* makeIdentityStore(
+        new Map([["platform:primary", "store-a"]]),
+        Effect.void,
+        { failMutation: true },
+      );
+
+      const accepted = yield* makeDriver(
+        new Map([[acceptedTarget.environmentId, "store-a"]]),
+        new Map([[acceptedTarget.environmentId, "store-a"]]),
+        store.identities,
+      );
+      const acceptedResult = yield* Effect.scoped(
+        accepted.driver.connect(entry(acceptedTarget), () => Effect.void).pipe(Effect.result),
+      );
+      expect(Result.isSuccess(acceptedResult)).toBe(true);
+      expect(yield* Ref.get(accepted.sessionCount)).toBe(1);
+
+      const nullable = yield* makeDriver(
+        new Map([[nullableTarget.environmentId, null]]),
+        new Map([[nullableTarget.environmentId, null]]),
+        store.identities,
+      );
+      const nullableResult = yield* Effect.scoped(
+        nullable.driver.connect(entry(nullableTarget), () => Effect.void).pipe(Effect.result),
+      );
+      expect(Result.isSuccess(nullableResult)).toBe(true);
+      expect(yield* Ref.get(nullable.sessionCount)).toBe(1);
+      expect(yield* Ref.get(store.writes)).toEqual([]);
+    }),
+  );
+
+  it.effect("keeps a changed-store error structured when identity mutation is unavailable", () =>
+    Effect.gen(function* () {
+      const connectionTarget = target("changed-read-only");
+      const store = yield* makeIdentityStore(
+        new Map([["platform:primary", "store-a"]]),
+        Effect.void,
+        { failMutation: true },
+      );
+      const harness = yield* makeDriver(
+        new Map([[connectionTarget.environmentId, "store-b"]]),
+        new Map([[connectionTarget.environmentId, "store-b"]]),
+        store.identities,
+      );
+
+      const result = yield* Effect.scoped(
+        harness.driver.connect(entry(connectionTarget), () => Effect.void).pipe(Effect.result),
+      );
+
+      expect(Result.isFailure(result)).toBe(true);
+      if (Result.isFailure(result)) {
+        expect(result.failure).toMatchObject({
+          _tag: "ConnectionStorageChangedError",
+          acceptedStorageInstanceId: "store-a",
+          reportedStorageInstanceId: "store-b",
+        });
+      }
+      expect(yield* Ref.get(harness.sessionCount)).toBe(0);
+      expect(yield* Ref.get(store.writes)).toEqual([]);
     }),
   );
 });
