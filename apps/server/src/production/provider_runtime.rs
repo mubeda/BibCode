@@ -374,6 +374,12 @@ pub struct ProviderRuntimeSupervisor {
     connect_mcp: Arc<RwLock<Option<Arc<ConnectMcpService>>>>,
 }
 
+#[derive(Clone)]
+pub struct ProviderSessionIdentity {
+    thread_id: String,
+    driver: Arc<dyn ProviderDriver>,
+}
+
 enum SupervisorMessage {
     Launch {
         request: Box<ProviderLaunchRequest>,
@@ -381,6 +387,14 @@ enum SupervisorMessage {
     },
     Handle {
         command: Box<OrchestrationCommand>,
+        response: oneshot::Sender<Result<(), ProviderRuntimeError>>,
+    },
+    CaptureSessionIdentity {
+        thread_id: String,
+        response: oneshot::Sender<Result<Option<ProviderSessionIdentity>, ProviderRuntimeError>>,
+    },
+    StopSessionIfCurrent {
+        identity: ProviderSessionIdentity,
         response: oneshot::Sender<Result<(), ProviderRuntimeError>>,
     },
     Deliver {
@@ -660,6 +674,46 @@ impl ProviderRuntimeSupervisor {
             response,
         })
         .await
+    }
+
+    pub async fn capture_session_identity(
+        &self,
+        thread_id: &str,
+    ) -> Result<Option<ProviderSessionIdentity>, ProviderRuntimeError> {
+        if self.stopped.is_cancelled() {
+            return Err(ProviderRuntimeError::Shutdown);
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(SupervisorMessage::CaptureSessionIdentity {
+                thread_id: thread_id.to_owned(),
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| ProviderRuntimeError::QueueClosed)?;
+        response_rx
+            .await
+            .map_err(|_| ProviderRuntimeError::ResponseDropped)?
+    }
+
+    pub async fn stop_session_if_current(
+        &self,
+        identity: ProviderSessionIdentity,
+    ) -> Result<(), ProviderRuntimeError> {
+        if self.stopped.is_cancelled() {
+            return Err(ProviderRuntimeError::Shutdown);
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(SupervisorMessage::StopSessionIfCurrent {
+                identity,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| ProviderRuntimeError::QueueClosed)?;
+        response_rx
+            .await
+            .map_err(|_| ProviderRuntimeError::ResponseDropped)?
     }
 
     pub async fn deliver_turn(
@@ -1843,6 +1897,35 @@ async fn run_supervisor(
                     operational_log.as_ref(),
                 )
                 .await;
+                let _ = response.send(result);
+            }
+            SupervisorMessage::CaptureSessionIdentity {
+                thread_id,
+                response,
+            } => {
+                let identity = sessions
+                    .get(&thread_id)
+                    .map(|entry| ProviderSessionIdentity {
+                        thread_id,
+                        driver: entry.driver.clone(),
+                    });
+                let _ = response.send(Ok(identity));
+            }
+            SupervisorMessage::StopSessionIfCurrent { identity, response } => {
+                let is_current = sessions
+                    .get(&identity.thread_id)
+                    .is_some_and(|entry| Arc::ptr_eq(&entry.driver, &identity.driver));
+                let result = if is_current {
+                    stop_session(
+                        &engine.repositories(),
+                        &activity,
+                        &mut sessions,
+                        &identity.thread_id,
+                    )
+                    .await
+                } else {
+                    Ok(())
+                };
                 let _ = response.send(result);
             }
             SupervisorMessage::Deliver {

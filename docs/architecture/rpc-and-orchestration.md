@@ -183,7 +183,16 @@ The turn RPC transfers its lease into the queued engine envelope, so client
 disconnect only stops the caller wait: an already-admitted command retains its
 existing durable-delivery semantics. Authoritative loss cancels that envelope
 before persistence and the worker drops the lease only after it has produced
-the dispatch result. Nested removal guards retain independent tokens;
+the dispatch result. The same envelope carries a generic commit fence into the
+blocking SQLite worker for both accepted commands and persisted plan-error
+rejections. Immediately before the real transaction commit, the worker takes
+an owned finalization permit. Loss and removal serialize with that permit: if
+loss wins, permit acquisition is rejected and dropping the transaction rolls
+back its receipt, events, projections, attachment references, and provider
+outbox; if commit finalization wins, guard publication waits until the local
+commit has completed. Permit drop on success or error always wakes a waiting
+loss transition. The fence is persistence-generic; neither orchestration nor
+SQLite imports worktree availability policy. Nested removal guards retain independent tokens;
 arbitrary drop order cannot reveal a pending missing workspace before the last
 removal completes, and removal cancels already-admitted matching work just like
 authoritative loss.
@@ -218,6 +227,17 @@ signals all processes before waiting and retains each session as an exited
 snapshot with its bounded transcript; it does not use destructive terminal
 close. Conversation and thread rows are likewise retained. A warning-write
 failure is logged but cannot prevent process cleanup.
+
+Provider cleanup captures the supervisor's exact active runtime identity only
+while the loss transition remains current, then asks the supervisor to stop
+that identity. The actor rechecks identity against its current thread session;
+an old cleanup that resumes after exact recovery and provider replacement is a
+no-op. Retry resolution repeats capture only while its transition ownership is
+current, and recovery/newer-loss cancellation still short-circuits the whole
+attempt. Terminal cleanup already snapshots each session's exact generation
+and process while holding the terminal lifecycle lock; exit finalization checks
+that generation before updating retained history, so an older process result
+cannot overwrite a replacement session.
 
 The single graceful cleanup deadline starts when loss quiescence begins and is
 five seconds. Warning persistence and known canonical provider/terminal

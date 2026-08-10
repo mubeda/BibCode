@@ -377,7 +377,9 @@ async fn dispatch_turn_command(
     };
     let result = if let Some(workspace_admission) = workspace_admission {
         let loss = workspace_admission.loss_cancellation();
-        let lifetime = CommandLifetimeGuard::new(workspace_admission, loss.cancellation_token());
+        let commit_fence = workspace_admission.commit_fence();
+        let lifetime =
+            CommandLifetimeGuard::new(workspace_admission, loss.cancellation_token(), commit_fence);
         let dispatch =
             dispatch.dispatch_with_admission_and_lifetime(command, admission, lifetime, on_commit);
         tokio::pin!(dispatch);
@@ -1870,8 +1872,13 @@ mod tests {
         dispatch_registered_command(&mut socket, "9", durable_after_disconnect)
             .await
             .expect("interrupted durable command replays exactly");
+        let event_count_before_loss_turn = engine
+            .read_events(0)
+            .await
+            .expect("events before loss turn")
+            .len();
 
-        let pause = hooks.pause_before_next_command_persist();
+        let pause = hooks.pause_before_next_command_finalization();
         socket
             .send(Message::Text(
                 json!({
@@ -1905,7 +1912,7 @@ mod tests {
             }
         })
         .await
-        .expect("turn reaches the pre-persist barrier");
+        .expect("turn reaches the SQLite pre-finalization barrier");
         socket
             .send(Message::Text(
                 json!({"_tag": "Interrupt", "requestId": "7"})
@@ -1935,17 +1942,23 @@ mod tests {
             availability.wait_for_transition_admissions(&loss),
         )
         .await
-        .expect("workspace admission drains after the worker barrier releases");
+        .expect("workspace admission drains after the SQLite barrier releases");
 
-        assert!(
-            engine
-                .repositories()
-                .get_command_receipt("loss-turn".to_owned())
-                .await
-                .expect("receipt lookup")
-                .is_none(),
-            "loss cancellation before persistence cannot leave a durable receipt"
-        );
+        let receipt = engine
+            .repositories()
+            .get_command_receipt("loss-turn".to_owned())
+            .await
+            .expect("receipt lookup");
+        let outbox = engine
+            .repositories()
+            .get_provider_turn_delivery("loss-turn".to_owned())
+            .await
+            .expect("outbox lookup");
+        let event_count_after_loss_turn = engine
+            .read_events(0)
+            .await
+            .expect("events after loss turn")
+            .len();
         let messages = thread_snapshot(&engine, &thread_id)
             .await
             .expect("thread snapshot")["thread"]["messages"]
@@ -1958,10 +1971,263 @@ mod tests {
                 .any(|message| { message["id"] == "disconnect-only-message" })
         );
         assert!(
-            !messages
+            receipt.is_none()
+                && outbox.is_none()
+                && event_count_after_loss_turn == event_count_before_loss_turn
+                && !messages
+                    .iter()
+                    .any(|message| message["id"] == "loss-message"),
+            "loss-before-finalization must roll back every artifact; receipt={}, outbox={}, events_before={event_count_before_loss_turn}, events_after={event_count_after_loss_turn}, message={} ",
+            receipt.is_some(),
+            outbox.is_some(),
+            messages
                 .iter()
                 .any(|message| message["id"] == "loss-message"),
-            "loss cancellation before persistence cannot leave a durable message"
+        );
+
+        availability
+            .clear_recovered_in_repository(&thread_id, state.path(), "loss-repository")
+            .await;
+        let commit_wins_pause = hooks.pause_after_next_command_finalization();
+        socket
+            .send(Message::Text(
+                json!({
+                    "_tag": "Request",
+                    "id": "8",
+                    "tag": "orchestration.dispatchCommand",
+                    "payload": {
+                        "type": "thread.turn.start",
+                        "commandId": "commit-wins-turn",
+                        "threadId": thread_id,
+                        "message": {
+                            "messageId": "commit-wins-message",
+                            "role": "user",
+                            "text": "commit finalization wins before loss",
+                            "attachments": []
+                        },
+                        "modelSelection": {"instanceId": "codex", "model": "gpt-5"},
+                        "createdAt": CREATED_AT
+                    },
+                    "headers": []
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send commit-wins turn request");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            commit_wins_pause.wait_until_entered(),
+        )
+        .await
+        .expect("turn acquires finalization fence before SQLite commit");
+        let commit_wins_loss = WorkspaceLossTransition {
+            thread_id: thread_id.clone(),
+            repository_key: "loss-repository".to_owned(),
+            generation: 2,
+            path: state.path().to_path_buf(),
+            availability: AdoptedWorktreeAvailability::MissingRegistered,
+        };
+        let (loss_started_tx, loss_started_rx) = tokio::sync::oneshot::channel();
+        let commit_wins_availability = availability.clone();
+        let commit_wins_transition = commit_wins_loss.clone();
+        let loss_task = tokio::task::spawn_blocking(move || {
+            let _ = loss_started_tx.send(());
+            commit_wins_availability.mark_unavailable_sync(commit_wins_transition)
+        });
+        loss_started_rx.await.expect("loss task starts");
+        tokio::task::yield_now().await;
+        assert!(
+            !loss_task.is_finished(),
+            "loss cannot linearize while the SQLite commit permit is held"
+        );
+        commit_wins_pause.release();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), loss_task)
+                .await
+                .expect("loss completes after commit")
+                .expect("loss task joins")
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            availability.wait_for_transition_admissions(&commit_wins_loss),
+        )
+        .await
+        .expect("commit-wins admission drains");
+        assert!(
+            engine
+                .repositories()
+                .get_command_receipt("commit-wins-turn".to_owned())
+                .await
+                .expect("commit-wins receipt lookup")
+                .is_some(),
+            "a command that owns finalization must commit before loss"
+        );
+        assert!(
+            engine
+                .repositories()
+                .get_provider_turn_delivery("commit-wins-turn".to_owned())
+                .await
+                .expect("commit-wins outbox lookup")
+                .is_some(),
+            "the provider outbox commits in the same transaction"
+        );
+
+        availability
+            .clear_recovered_in_repository(&thread_id, state.path(), "loss-repository")
+            .await;
+        let rejected_loss_wins_pause = hooks.pause_before_next_command_finalization();
+        socket
+            .send(Message::Text(
+                json!({
+                    "_tag": "Request",
+                    "id": "10",
+                    "tag": "orchestration.dispatchCommand",
+                    "payload": {
+                        "type": "thread.turn.start",
+                        "commandId": "rejected-loss-wins-turn",
+                        "threadId": thread_id,
+                        "message": {
+                            "messageId": "rejected-loss-wins-message",
+                            "role": "user",
+                            "text": "missing source plan must reject",
+                            "attachments": []
+                        },
+                        "sourceProposedPlan": {
+                            "threadId": thread_id,
+                            "planId": "missing-plan"
+                        },
+                        "modelSelection": {"instanceId": "codex", "model": "gpt-5"},
+                        "createdAt": CREATED_AT
+                    },
+                    "headers": []
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send rejected loss-wins request");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rejected_loss_wins_pause.wait_until_entered(),
+        )
+        .await
+        .expect("rejection reaches the SQLite pre-finalization barrier");
+        let rejected_loss = WorkspaceLossTransition {
+            thread_id: thread_id.clone(),
+            repository_key: "loss-repository".to_owned(),
+            generation: 3,
+            path: state.path().to_path_buf(),
+            availability: AdoptedWorktreeAvailability::MissingRegistered,
+        };
+        assert!(availability.mark_unavailable(rejected_loss.clone()).await);
+        rejected_loss_wins_pause.release();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            availability.wait_for_transition_admissions(&rejected_loss),
+        )
+        .await
+        .expect("rejected loss-wins admission drains");
+        assert!(
+            engine
+                .repositories()
+                .get_command_receipt("rejected-loss-wins-turn".to_owned())
+                .await
+                .expect("rejected loss-wins receipt lookup")
+                .is_none(),
+            "loss-before-finalization must roll back a rejected receipt"
+        );
+
+        availability
+            .clear_recovered_in_repository(&thread_id, state.path(), "loss-repository")
+            .await;
+        let rejected_commit_wins_pause = hooks.pause_after_next_command_finalization();
+        socket
+            .send(Message::Text(
+                json!({
+                    "_tag": "Request",
+                    "id": "11",
+                    "tag": "orchestration.dispatchCommand",
+                    "payload": {
+                        "type": "thread.turn.start",
+                        "commandId": "rejected-commit-wins-turn",
+                        "threadId": thread_id,
+                        "message": {
+                            "messageId": "rejected-commit-wins-message",
+                            "role": "user",
+                            "text": "rejection finalization wins before loss",
+                            "attachments": []
+                        },
+                        "sourceProposedPlan": {
+                            "threadId": thread_id,
+                            "planId": "still-missing-plan"
+                        },
+                        "modelSelection": {"instanceId": "codex", "model": "gpt-5"},
+                        "createdAt": CREATED_AT
+                    },
+                    "headers": []
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send rejected commit-wins request");
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            rejected_commit_wins_pause.wait_until_entered(),
+        )
+        .await
+        .expect("rejection owns finalization before SQLite commit");
+        let rejected_commit_wins_loss = WorkspaceLossTransition {
+            thread_id: thread_id.clone(),
+            repository_key: "loss-repository".to_owned(),
+            generation: 4,
+            path: state.path().to_path_buf(),
+            availability: AdoptedWorktreeAvailability::MissingRegistered,
+        };
+        let (rejected_loss_started_tx, rejected_loss_started_rx) = tokio::sync::oneshot::channel();
+        let rejected_commit_wins_availability = availability.clone();
+        let rejected_commit_wins_transition = rejected_commit_wins_loss.clone();
+        let rejected_loss_task = tokio::task::spawn_blocking(move || {
+            let _ = rejected_loss_started_tx.send(());
+            rejected_commit_wins_availability.mark_unavailable_sync(rejected_commit_wins_transition)
+        });
+        rejected_loss_started_rx
+            .await
+            .expect("rejected loss task starts");
+        tokio::task::yield_now().await;
+        assert!(
+            !rejected_loss_task.is_finished(),
+            "loss cannot linearize while rejected-receipt finalization is held"
+        );
+        rejected_commit_wins_pause.release();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(5), rejected_loss_task,)
+                .await
+                .expect("rejected loss completes after commit")
+                .expect("rejected loss task joins")
+        );
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            availability.wait_for_transition_admissions(&rejected_commit_wins_loss),
+        )
+        .await
+        .expect("rejected commit-wins admission drains");
+        let rejected_receipt = engine
+            .repositories()
+            .get_command_receipt("rejected-commit-wins-turn".to_owned())
+            .await
+            .expect("rejected commit-wins receipt lookup")
+            .expect("rejected receipt commits before loss");
+        assert_eq!(rejected_receipt.status, "rejected");
+        assert!(
+            engine
+                .repositories()
+                .get_provider_turn_delivery("rejected-commit-wins-turn".to_owned())
+                .await
+                .expect("rejected commit-wins outbox lookup")
+                .is_none(),
+            "a rejected turn cannot create provider delivery"
         );
 
         socket.close(None).await.expect("close socket");
