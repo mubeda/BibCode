@@ -541,9 +541,16 @@ async fn directory_at_database_path_returns_typed_persistence_error() {
     match error {
         ServerError::PersistenceInitialize(message) => {
             assert!(database_path.is_dir(), "deliberate database fixture");
-            assert_eq!(
-                message,
-                format!("failed to open SQLite database {}", database_path.display())
+            let canonical_database_path = database_path
+                .canonicalize()
+                .expect("canonical database fixture");
+            assert!(
+                message.contains(&canonical_database_path.display().to_string()),
+                "typed error identifies the classified database path: {message}"
+            );
+            assert!(
+                message.contains(" is corrupt:"),
+                "directory fixture is rejected during read-only validation: {message}"
             );
         }
         other => panic!("expected PersistenceInitialize, got {other:?}"),

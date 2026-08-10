@@ -13,7 +13,7 @@ use crate::{
         UnavailableDesktopUiProcessObserver,
     },
     http, logging,
-    persistence::{Database, Repositories, StatePaths, run_migrations},
+    persistence::{Database, Repositories, StatePaths, prepare_store},
     production::http_routes::{HttpRouteError, HttpRoutesState},
     production::runtime::ProductionRuntime,
     production::{
@@ -37,7 +37,7 @@ pub struct ServerHandle {
     local_addr: SocketAddr,
     data_root: ResolvedDataRoot,
     startup_access: Option<StartupAccess>,
-    _database: Database,
+    database: Option<Database>,
     _production_runtime: Option<Arc<ProductionRuntime>>,
     shutdown: CancellationToken,
     task: Option<JoinHandle<Result<(), std::io::Error>>>,
@@ -110,21 +110,15 @@ impl ServerRuntime {
             .map_err(ServerError::CreateBaseDirectory)?;
         let state_paths = StatePaths::from_config(&config);
         state_paths
-            .ensure_directories()
+            .ensure_directories_without_database_side_effects()
             .await
             .map_err(|error| ServerError::StateFiles(error.to_string()))?;
         logging::initialize(&state_paths.server_log)
             .map_err(|error| ServerError::Logging(error.to_string()))?;
-        let database = Database::open(config.database_path())
+        let prepared_store = prepare_store(&config)
             .await
             .map_err(|error| ServerError::PersistenceInitialize(error.to_string()))?;
-        database
-            .call(|connection| {
-                run_migrations(connection, None)?;
-                Ok(())
-            })
-            .await
-            .map_err(|error| ServerError::PersistenceInitialize(error.to_string()))?;
+        let database = prepared_store.database;
         let listener = TcpListener::bind((config.host.as_str(), config.port))
             .await
             .map_err(ServerError::Bind)?;
@@ -291,7 +285,7 @@ impl ServerRuntime {
             local_addr,
             data_root: resolved_data_root,
             startup_access,
-            _database: database,
+            database: Some(database),
             _production_runtime: production_runtime,
             shutdown,
             task: Some(task),
@@ -432,9 +426,15 @@ impl ServerHandle {
 
     pub async fn join(mut self) -> Result<(), ServerError> {
         let task = self.task.take().ok_or(ServerError::AlreadyJoined)?;
-        task.await
-            .map_err(ServerError::Join)?
-            .map_err(ServerError::Serve)
+        let result = match task.await {
+            Ok(result) => result.map_err(ServerError::Serve),
+            Err(error) => Err(ServerError::Join(error)),
+        };
+        drop(self._production_runtime.take());
+        if let Some(database) = self.database.take() {
+            database.close().await;
+        }
+        result
     }
 }
 

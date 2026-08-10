@@ -47,6 +47,21 @@ flowchart TB
 - **Shared runtime (`packages/shared`)** contains runtime utilities used by
   multiple packages through explicit subpath exports.
 
+The server classifies its persistent SQLite store before opening it for normal
+read/write traffic. The absence of both `state.sqlite` and its
+`environment-id` storage-instance marker is the only automatic first-run case.
+An existing unmarked database is adopted only after a read-only integrity,
+migration-ledger, and required-table check recognizes it as a BiBCode store;
+missing, malformed, corrupt, or unrelated state is preserved and startup fails
+closed without creating or replacing either file. Validation uses immutable
+SQLite inspection and rejects pre-existing WAL or SHM sidecars, because normal
+read-only SQLite access can otherwise create or mutate shared-memory state
+before classification. Recovery of such interrupted SQLite state is an
+explicit recovery operation, never automatic startup adoption.
+Graceful server join waits for the SQLite worker to close before returning, so
+an immediate restart can classify the store after its WAL sidecars are removed;
+a second live server pointed at the same data root is refused.
+
 ## Runtime topology
 
 The desktop WebView loads the bundled `apps/web` build (`frontendDist`) or the

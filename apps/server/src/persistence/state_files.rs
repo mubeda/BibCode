@@ -58,7 +58,7 @@ impl StatePaths {
         }
     }
 
-    pub async fn ensure_directories(&self) -> Result<()> {
+    pub async fn ensure_directories_without_database_side_effects(&self) -> Result<()> {
         for directory in [
             &self.state_dir,
             &self.provider_status_cache_dir,
@@ -389,17 +389,20 @@ mod tests {
         let paths = StatePaths::from_config(&ServerConfig::new(temp.path()));
 
         paths
-            .ensure_directories()
+            .ensure_directories_without_database_side_effects()
             .await
             .expect("state directories are created");
 
         assert!(paths.logs_dir.is_dir());
         assert!(paths.server_log.is_file());
+        assert!(!paths.database.exists());
 
         fs::remove_file(&paths.server_log).await.unwrap();
         fs::create_dir(&paths.server_log).await.unwrap();
         assert!(matches!(
-            paths.ensure_directories().await,
+            paths
+                .ensure_directories_without_database_side_effects()
+                .await,
             Err(StateFileError::Persist { .. })
         ));
     }
