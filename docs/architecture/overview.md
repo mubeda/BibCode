@@ -168,6 +168,10 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   calls. Legacy renderer migration preserves an existing valid IndexedDB
   winner and uses exact CAS before replacing corrupt IndexedDB bytes with the
   only valid legacy catalog.
+- Desktop catalog capability is fail-closed and tri-state. Only bridge version
+  2 with an explicit protected/unprotected flag may select native CAS or
+  IndexedDB migration; rejected, older, or incomplete metadata performs no
+  catalog write, migration, or clear.
 - Normal application traffic uses HTTP and WebSocket RPC in every host.
 - `packages/contracts` remains schema-only.
 - Rust owns all production backend behavior. TypeScript is limited to clients,

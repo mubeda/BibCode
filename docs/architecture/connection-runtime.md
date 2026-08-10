@@ -85,6 +85,15 @@ renderer replaces those exact corrupt bytes by CAS and quarantines them before
 clearing the only valid legacy copy. Migration uses the same eight-attempt
 bound as ordinary catalog updates.
 
+Catalog protection capability has three states. Only bridge contract version 2
+with an explicit `protectedConnectionCatalog: true` selects protected native
+CAS, and only version 2 with an explicit `false` selects IndexedDB and legacy
+migration. Rejected metadata, older bridge contracts, and missing capability
+fields are `unknown`: catalog startup and mutation fail with a redacted typed
+error, without writing IndexedDB, invoking native clear, or deleting a legacy
+renderer copy. This prevents transient metadata failure or version skew from
+downgrading a Windows DPAPI catalog into renderer storage.
+
 Once a CAS call is issued it is uninterruptible through transaction/command
 completion. There is no in-memory catalog publication afterward, so a caller
 interrupted around commit cannot leave stale renderer state that overwrites the
