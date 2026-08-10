@@ -2,8 +2,8 @@ use bibcode_server::diagnostics::{DesktopUiProcessObserver, UnavailableDesktopUi
 use bibcode_server::process::{configure_background_command, configure_background_std_command};
 use bibcode_server::{
     DESKTOP_SHUTDOWN_PATH as SERVER_BACKEND_SHUTDOWN_PATH,
-    DESKTOP_SHUTDOWN_TOKEN_HEADER as SERVER_BACKEND_SHUTDOWN_TOKEN_HEADER, ServerConfig,
-    ServerRuntime,
+    DESKTOP_SHUTDOWN_TOKEN_HEADER as SERVER_BACKEND_SHUTDOWN_TOKEN_HEADER, DataRootRequest,
+    DataRootSource, ResolvedDataRoot, ServerConfig, ServerRuntime,
 };
 use serde_json::{Value, json};
 use std::{
@@ -128,6 +128,7 @@ pub struct BackendLaunchPlan {
 pub enum BackendLaunchTarget {
     InProcess {
         base_dir: PathBuf,
+        data_root: ResolvedDataRoot,
     },
     ExternalProcess {
         program: String,
@@ -149,11 +150,32 @@ pub struct WslBackendLaunchPlanInput {
 
 impl BackendLaunchPlan {
     pub fn local(base_dir: PathBuf, config: BackendRunConfig) -> Self {
+        let data_root = ResolvedDataRoot {
+            source: DataRootSource::Cli,
+            requested: base_dir.clone(),
+            effective: base_dir.clone(),
+            is_filesystem_alias: false,
+        };
         Self {
-            target: BackendLaunchTarget::InProcess { base_dir },
+            target: BackendLaunchTarget::InProcess {
+                base_dir,
+                data_root,
+            },
             log_path: None,
             config,
         }
+    }
+
+    fn with_data_root(mut self, data_root: ResolvedDataRoot) -> Self {
+        if let BackendLaunchTarget::InProcess {
+            base_dir,
+            data_root: target_data_root,
+        } = &mut self.target
+        {
+            *base_dir = data_root.effective.clone();
+            *target_data_root = data_root;
+        }
+        self
     }
 
     pub fn with_log_path(mut self, log_path: PathBuf) -> Self {
@@ -1101,8 +1123,8 @@ async fn start_managed_backend(
     run_id: u64,
 ) -> Result<(BackendRunConfig, ManagedBackend, Option<u32>), String> {
     match &plan.target {
-        BackendLaunchTarget::InProcess { base_dir } => {
-            let server_config = server_config_for_launch(base_dir.clone(), &plan.config);
+        BackendLaunchTarget::InProcess { data_root, .. } => {
+            let server_config = server_config_for_launch(data_root.clone(), &plan.config);
             let handle =
                 ServerRuntime::start_with_ui_process_observer(server_config, ui_process_observer)
                     .await
@@ -1170,8 +1192,18 @@ async fn start_managed_backend(
     }
 }
 
-fn server_config_for_launch(base_dir: PathBuf, config: &BackendRunConfig) -> ServerConfig {
-    let mut server_config = ServerConfig::new(base_dir).with_bind(&config.bind_host, config.port);
+fn server_config_for_launch(
+    data_root: ResolvedDataRoot,
+    config: &BackendRunConfig,
+) -> ServerConfig {
+    let mut server_config =
+        ServerConfig::new(data_root.effective.clone()).with_bind(&config.bind_host, config.port);
+    server_config.data_root_request = DataRootRequest::explicit(
+        data_root.source,
+        data_root.requested.clone(),
+        PathBuf::new(),
+    );
+    server_config.resolved_data_root = Some(data_root);
     server_config.mode = bibcode_server::ServerMode::Desktop;
     server_config.no_browser = true;
     server_config.desktop_bootstrap_token = Some(config.desktop_bootstrap_token.clone());
@@ -1806,7 +1838,7 @@ fn resolve_wsl_secondary_launch_plan<R: Runtime>(
 }
 
 fn default_launch_plans<R: Runtime>(app: &AppHandle<R>) -> Result<Vec<BackendLaunchPlan>, String> {
-    let base_dir = desktop_base_dir(app)?;
+    let data_root = crate::config::data_root(app)?;
     let log_path = primary_backend_log_path(app)?;
     let port = crate::config::bibcode_env_var("BIBCODE_PORT")
         .and_then(|value| value.into_string().ok())
@@ -1848,7 +1880,9 @@ fn default_launch_plans<R: Runtime>(app: &AppHandle<R>) -> Result<Vec<BackendLau
         tailscale_serve_port: settings.tailscale_serve_port,
     };
 
-    let primary_plan = BackendLaunchPlan::local(base_dir.clone(), config).with_log_path(log_path);
+    let primary_plan = BackendLaunchPlan::local(data_root.effective.clone(), config)
+        .with_data_root(data_root)
+        .with_log_path(log_path);
     let mut plans = vec![primary_plan];
 
     if settings.wsl_backend_enabled {
@@ -2080,7 +2114,9 @@ mod tests {
     use bibcode_server::diagnostics::{
         DesktopUiObservation, ProcessIdentity, UiCoverage, UiCoverageStatus,
     };
-    use bibcode_server::{RpcExit, ServerMessage};
+    use bibcode_server::{
+        DataRootRequest, DataRootSource, RpcExit, ServerMessage, resolve_data_root,
+    };
     use futures_util::{SinkExt, StreamExt};
     use std::{
         cell::Cell,
@@ -2345,14 +2381,25 @@ mod tests {
         format!("'{}'", path.to_string_lossy().replace('\'', "''"))
     }
 
+    fn test_cli_data_root(base_dir: &Path) -> ResolvedDataRoot {
+        ResolvedDataRoot {
+            source: DataRootSource::Cli,
+            requested: base_dir.to_path_buf(),
+            effective: base_dir.to_path_buf(),
+            is_filesystem_alias: false,
+        }
+    }
+
     async fn start_test_server(
         base_dir: &Path,
     ) -> (bibcode_server::ServerHandle, BackendRunConfig) {
         let mut config = local_test_config(0);
-        let handle =
-            ServerRuntime::start(server_config_for_launch(base_dir.to_path_buf(), &config))
-                .await
-                .expect("test server should start");
+        let handle = ServerRuntime::start(server_config_for_launch(
+            test_cli_data_root(base_dir),
+            &config,
+        ))
+        .await
+        .expect("test server should start");
         config.port = handle.local_addr().port();
         (handle, config)
     }
@@ -2362,7 +2409,7 @@ mod tests {
     ) -> (bibcode_server::ServerHandle, BackendRunConfig) {
         let mut config = local_test_config(0);
         let server_config =
-            server_config_for_launch(base_dir.to_path_buf(), &config).with_unsafe_no_auth();
+            server_config_for_launch(test_cli_data_root(base_dir), &config).with_unsafe_no_auth();
         let handle = ServerRuntime::start(server_config)
             .await
             .expect("RPC test server should start");
@@ -2566,7 +2613,7 @@ mod tests {
         assert_eq!(plan.log_path, None);
         assert!(matches!(
             plan.target,
-            BackendLaunchTarget::InProcess { ref base_dir } if base_dir == &PathBuf::from("C:/Users/mauro/.bibcode")
+            BackendLaunchTarget::InProcess { ref base_dir, .. } if base_dir == &PathBuf::from("C:/Users/mauro/.bibcode")
         ));
 
         let logged_plan = plan.with_log_path(PathBuf::from(
@@ -2583,8 +2630,15 @@ mod tests {
     #[test]
     fn server_config_for_launch_uses_desktop_runtime_settings() {
         let config = local_test_config(3773);
-        let server_config =
-            server_config_for_launch(PathBuf::from("C:/Users/mauro/.bibcode"), &config);
+        let server_config = server_config_for_launch(
+            ResolvedDataRoot {
+                source: DataRootSource::Cli,
+                requested: PathBuf::from("C:/Users/mauro/.bibcode"),
+                effective: PathBuf::from("C:/Users/mauro/.bibcode"),
+                is_filesystem_alias: false,
+            },
+            &config,
+        );
 
         assert_eq!(server_config.host, "127.0.0.1");
         assert_eq!(server_config.port, 3773);
@@ -2598,6 +2652,32 @@ mod tests {
         );
         assert_eq!(server_config.environment_id, "primary");
         assert_eq!(server_config.environment_label, "Local");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn server_config_for_launch_preserves_environment_alias_diagnostics() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).expect("target directory");
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&target, &alias).expect("alias symlink");
+        let data_root = resolve_data_root(DataRootRequest::explicit(
+            DataRootSource::Environment,
+            alias.clone(),
+            temp.path().to_path_buf(),
+        ))
+        .expect("resolve environment alias");
+
+        let server_config = server_config_for_launch(data_root.clone(), &local_test_config(0));
+
+        assert_eq!(
+            server_config.data_root_request.source,
+            DataRootSource::Environment
+        );
+        assert_eq!(server_config.data_root_request.requested, Some(alias));
+        assert_eq!(server_config.base_dir, data_root.effective);
+        assert_eq!(server_config.resolved_data_root, Some(data_root));
     }
 
     #[test]
