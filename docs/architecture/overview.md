@@ -96,6 +96,33 @@ with an atomic no-replace hard link. Platform file identity checks bind cleanup
 and the final reopen to that staged filesystem object, so a competing or
 replacement final path is never configured, migrated, removed, or overwritten.
 
+Every startup acquires the effective root's cross-process
+`.bibcode-storage.lock` on a bounded blocking worker before store
+classification. The guard remains held through validation, non-mutating
+migration inspection, any required backup, the migration transaction, and the
+normal database open. It is released when preparation returns, so established
+servers retain SQLite's supported multi-process read/write behavior. A
+read-only inspection connection determines the pending migration suffix without
+creating the migration ledger or changing persistent pragmas or user bytes. A
+genuinely new empty store applies its initial migrations without a redundant
+backup.
+
+An existing store with pending migrations must publish a verified generation
+under
+`<effective-root>/backups/<userdata-or-dev>/<storage-instance-id>/<backup-id>/`
+before the migration transaction begins. SQLite's online backup API copies the
+live connection, including committed WAL data, in bounded cancellable page
+batches into a same-filesystem staging directory. The server then closes and
+checks the staged database, records its pre-migration ledger version, hashes it
+with SHA-256, writes a path-free manifest, flushes both files and supported
+directories, atomically renames the generation, and reloads it for checksum and
+`quick_check` verification. Unix backup directories and files use `0700` and
+`0600`; Windows generations inherit the private data-root ACL. Only after that
+publication is verified may migration start or retention remove older verified
+generations. Retention keeps the newest three for the store and state kind;
+staging entries, symlinks, malformed manifests, location/identity mismatches,
+and failed verification are reported and never selected for deletion.
+
 ## Runtime topology
 
 The desktop WebView loads the bundled `apps/web` build (`frontendDist`) or the

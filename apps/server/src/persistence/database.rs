@@ -8,12 +8,16 @@ use std::{
         atomic::{AtomicUsize, Ordering},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
-use rusqlite::{Connection, MAIN_DB, OpenFlags};
+use rusqlite::{
+    Connection, ErrorCode, MAIN_DB, OpenFlags,
+    backup::{Backup, StepResult},
+};
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 const DATABASE_QUEUE_CAPACITY: usize = 64;
@@ -334,6 +338,8 @@ pub enum PersistenceError {
     Sql(#[from] rusqlite::Error),
     #[error("SQLite integrity check failed: {0}")]
     Corrupt(String),
+    #[error("SQLite online backup {0}")]
+    BackupStopped(String),
     #[error("the SQLite worker is no longer available")]
     WorkerUnavailable,
     #[error("the SQLite worker dropped an operation response")]
@@ -352,6 +358,10 @@ pub struct Database {
 impl Database {
     pub async fn open_existing(path: impl AsRef<Path>) -> Result<Self> {
         Self::open_inner(Some(path.as_ref().to_path_buf())).await
+    }
+
+    pub(crate) async fn open_existing_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        Self::open_inner_with_identity(Some(path.as_ref().to_path_buf()), None, true).await
     }
 
     pub async fn create_new(path: impl AsRef<Path>) -> Result<Self> {
@@ -384,6 +394,7 @@ impl Database {
         let staged_database = match Self::open_inner_with_identity(
             Some(staging_path.clone()),
             Some(reservation.identity),
+            false,
         )
         .await
         {
@@ -430,7 +441,9 @@ impl Database {
             return Err(PersistenceError::OwnershipChanged { path });
         }
 
-        match Self::open_inner_with_identity(Some(path.clone()), Some(reservation.identity)).await {
+        match Self::open_inner_with_identity(Some(path.clone()), Some(reservation.identity), false)
+            .await
+        {
             Ok(database) => {
                 reservation.cleanup();
                 Ok(database)
@@ -448,12 +461,13 @@ impl Database {
     }
 
     async fn open_inner(path: Option<PathBuf>) -> Result<Self> {
-        Self::open_inner_with_identity(path, None).await
+        Self::open_inner_with_identity(path, None, false).await
     }
 
     async fn open_inner_with_identity(
         path: Option<PathBuf>,
         expected_identity: Option<FileIdentity>,
+        read_only: bool,
     ) -> Result<Self> {
         let (sender, mut receiver) = mpsc::channel::<DatabaseJob>(DATABASE_QUEUE_CAPACITY);
         let queue_diagnostics = Arc::new(DatabaseQueueDiagnostics::new());
@@ -462,7 +476,7 @@ impl Database {
         thread::Builder::new()
             .name("bibcode-sqlite".to_owned())
             .spawn(move || {
-                let connection = open_connection(path.as_deref(), expected_identity);
+                let connection = open_connection(path.as_deref(), expected_identity, read_only);
                 match connection {
                     Ok(mut connection) => {
                         if ready_sender.send(Ok(())).is_ok() {
@@ -568,6 +582,69 @@ impl Database {
         .await
     }
 
+    pub(crate) async fn backup_to_cancellable(
+        &self,
+        destination: impl AsRef<Path>,
+        cancellation: CancellationToken,
+        deadline: Instant,
+    ) -> Result<()> {
+        const PAGES_PER_STEP: i32 = 128;
+        const RETRY_DELAY: Duration = Duration::from_millis(2);
+
+        let destination = destination.as_ref().to_path_buf();
+        self.call(move |source| {
+            ensure_backup_active(&cancellation, deadline)?;
+            let mut target = Connection::open_with_flags(
+                &destination,
+                OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+            )
+            .map_err(|source| PersistenceError::Open {
+                path: destination.clone(),
+                source,
+            })?;
+            target
+                .busy_timeout(Duration::ZERO)
+                .map_err(PersistenceError::Configure)?;
+            let backup = Backup::new(source, &mut target)?;
+            loop {
+                ensure_backup_active(&cancellation, deadline)?;
+                let state = match backup.step(PAGES_PER_STEP) {
+                    Ok(state) => state,
+                    Err(error)
+                        if matches!(
+                            error.sqlite_error_code(),
+                            Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+                        ) =>
+                    {
+                        thread::sleep(RETRY_DELAY);
+                        continue;
+                    }
+                    Err(error) => return Err(error.into()),
+                };
+                ensure_backup_active(&cancellation, deadline)?;
+                match state {
+                    StepResult::Done => break,
+                    StepResult::More => thread::yield_now(),
+                    StepResult::Busy | StepResult::Locked => thread::sleep(RETRY_DELAY),
+                    _ => {
+                        return Err(PersistenceError::BackupStopped(
+                            "reported an unsupported state".to_owned(),
+                        ));
+                    }
+                }
+            }
+            drop(backup);
+            target
+                .execute_batch("PRAGMA journal_mode = DELETE")
+                .map_err(PersistenceError::Sql)?;
+            target
+                .close()
+                .map_err(|(_, source)| PersistenceError::Sql(source))?;
+            Ok(())
+        })
+        .await
+    }
+
     pub async fn quick_check(&self) -> Result<()> {
         self.call(|connection| {
             let result =
@@ -582,18 +659,35 @@ impl Database {
     }
 }
 
+fn ensure_backup_active(cancellation: &CancellationToken, deadline: Instant) -> Result<()> {
+    if cancellation.is_cancelled() {
+        Err(PersistenceError::BackupStopped("was cancelled".to_owned()))
+    } else if Instant::now() >= deadline {
+        Err(PersistenceError::BackupStopped(
+            "deadline elapsed".to_owned(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
 fn open_connection(
     path: Option<&Path>,
     expected_identity: Option<FileIdentity>,
+    read_only: bool,
 ) -> Result<Connection> {
     if let (Some(path), Some(expected_identity)) = (path, expected_identity) {
         ensure_path_identity(path, expected_identity)?;
     }
     let connection = match path {
-        Some(path) => Connection::open_with_flags(
-            path,
-            OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
+        Some(path) => Connection::open_with_flags(path, {
+            let access = if read_only {
+                OpenFlags::SQLITE_OPEN_READ_ONLY
+            } else {
+                OpenFlags::SQLITE_OPEN_READ_WRITE
+            };
+            access | OpenFlags::SQLITE_OPEN_NO_MUTEX
+        })
         .map_err(|source| PersistenceError::Open {
             path: path.to_path_buf(),
             source,
@@ -611,6 +705,9 @@ fn open_connection(
     connection
         .busy_timeout(BUSY_TIMEOUT)
         .map_err(PersistenceError::Configure)?;
+    if read_only {
+        return Ok(connection);
+    }
     connection
         .pragma_update(None, "foreign_keys", true)
         .map_err(PersistenceError::Configure)?;

@@ -574,15 +574,54 @@ impl Migration {
     }
 }
 
-/// Runs pending migrations through `through_id`, or all migrations when it is `None`.
+/// Inspects all migrations that have not been recorded by this database.
 ///
-/// The ledger shape and ordering match Effect's SQL migrator. Pending ledger rows and
-/// migration bodies share one transaction, so a failed body leaves neither schema nor
-/// ledger changes behind.
-pub fn run_migrations(
-    connection: &mut Connection,
+/// This function is deliberately read-only. In particular, a database without an Effect
+/// migration ledger is reported as needing every migration without creating that ledger.
+pub fn pending_migrations(connection: &Connection) -> Result<Vec<Migration>> {
+    pending_migrations_through(connection, None)
+}
+
+fn pending_migrations_through(
+    connection: &Connection,
     through_id: Option<u32>,
 ) -> Result<Vec<Migration>> {
+    let ledger_exists = table_exists(connection, "effect_sql_migrations")?;
+    let latest_id = if ledger_exists {
+        connection
+            .query_row(
+                "SELECT migration_id FROM effect_sql_migrations ORDER BY migration_id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    Ok(MIGRATIONS
+        .iter()
+        .copied()
+        .filter(|migration| {
+            i64::from(migration.id) > latest_id
+                && through_id.is_none_or(|through_id| migration.id <= through_id)
+        })
+        .collect())
+}
+
+/// Applies an already inspected migration suffix transactionally.
+///
+/// Ledger rows and migration bodies share one transaction, so a failed body leaves neither
+/// schema nor ledger changes behind. The suffix is rechecked against the live ledger to retain
+/// the former concurrent-run behavior for direct callers that do not own the store-operation
+/// lock.
+pub fn apply_migrations(
+    connection: &mut Connection,
+    pending: &[Migration],
+) -> Result<Vec<Migration>> {
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
     connection.execute_batch(MIGRATIONS_TABLE_SQL)?;
 
     let transaction = connection.transaction()?;
@@ -594,13 +633,10 @@ pub fn run_migrations(
         )
         .optional()?
         .unwrap_or(0);
-    let required = MIGRATIONS
+    let required = pending
         .iter()
         .copied()
-        .filter(|migration| {
-            i64::from(migration.id) > latest_id
-                && through_id.is_none_or(|through_id| migration.id <= through_id)
-        })
+        .filter(|migration| i64::from(migration.id) > latest_id)
         .collect::<Vec<_>>();
 
     if required.is_empty() {
@@ -622,6 +658,15 @@ pub fn run_migrations(
 
     transaction.commit()?;
     Ok(required)
+}
+
+/// Runs pending migrations through `through_id`, or all migrations when it is `None`.
+pub fn run_migrations(
+    connection: &mut Connection,
+    through_id: Option<u32>,
+) -> Result<Vec<Migration>> {
+    let pending = pending_migrations_through(connection, through_id)?;
+    apply_migrations(connection, &pending)
 }
 
 fn insert_ledger_rows(transaction: &Transaction<'_>, migrations: &[Migration]) -> Result<()> {
