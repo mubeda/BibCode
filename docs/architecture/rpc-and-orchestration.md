@@ -117,6 +117,31 @@ reconciliation command variants are rejected by
 `orchestration.dispatchCommand` even though trusted server services may admit
 them directly.
 
+Worktree removal is a server-resolved three-method flow. The read-scoped
+`worktree.getRemovalPlan` accepts only project and thread IDs and returns a
+fresh catalog generation plus an opaque, versioned SHA-256 token. The token
+length-frames the physical project, thread, repository identity, current
+worktree key or missing-path identity, availability, dirty counts, target lock
+state, and sorted normalized `(registration path, exact prune reason)` impact.
+The operate-scoped `worktree.remove` accepts that token, generation, one of the
+two explicit modes, and explicit dirty/prune confirmations; it never accepts a
+path. Under the stable project-then-repository mutation locks, the server
+re-resolves the persisted path, installs `Removing`, reruns Git preflight, and
+rejects any token drift before mutation. Present deletion uses verified Git
+removal and preserves the local branch. Missing cleanup uses the verified
+target/prune owners; locked registrations and replacement directories fail
+closed, while an attempted cleanup that fails may detach with a bounded
+`failed` outcome. `worktree.removeFromBibCode` performs the same atomic detach
+without requesting a Git mutation.
+
+After any successful Git decision, internal `worktree.detach-resolved` deletes
+same-path panels, the canonical workspace thread, and its discovery baseline
+entry in one orchestration transaction. Accepted-command result metadata makes
+identical retries exact even after the thread projection is deleted; changed
+payload reuse conflicts. A present Git mutation or absence verification
+failure does not detach. The `worktreeCatalog` capability is advertised only
+with all three registered handlers, scopes, and wire fixtures.
+
 Every healthy authoritative catalog publication also compares active adopted
 worktrees with durable thread branch metadata. A change dispatches one
 idempotent `thread.meta-updated` command whose ID contains the thread ID plus a
@@ -209,6 +234,17 @@ availability policy. Nested removal guards retain independent tokens;
 arbitrary drop order cannot reveal a pending missing workspace before the last
 removal completes, and removal cancels already-admitted matching work just like
 authoritative loss.
+
+Removal quiesce uses an exact identity minted by its `RemovalGuard`, not a
+synthetic catalog-loss generation. Provider and terminal cleanup resolve
+same-path aliases while projections still exist and run under the existing
+five-second deadline, global concurrency cap, bounded reaper queue, and runtime
+shutdown owner. A failed or timed-out attempt returns
+`orphanCleanupPending: true` only after the reaper has retained a distinct
+exact removal token and the resolved alias IDs. Durable detach commits that
+lease so cleanup may finish after projections disappear; any preflight, Git,
+or orchestration failure drops the lease, cancels the queued retry, and releases
+its retained guard before it can affect a later session.
 
 The guard rejects a new turn before durable admission; terminal open, restart,
 write, and restart-on-attach; client Git status and mutations; and project

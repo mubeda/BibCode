@@ -17,7 +17,12 @@ import {
   WorktreeCatalogRefreshInput,
   WorktreeDiscoveryPolicyUpdateInput,
 } from "./worktree.ts";
-import { WorktreeAdoptInput } from "./rpc.ts";
+import {
+  WorktreeAdoptInput,
+  WorktreeGetRemovalPlanInput,
+  WorktreeRemoveFromBibCodeInput,
+  WorktreeRemoveInput,
+} from "./rpc.ts";
 
 const decodeDescriptor = Schema.decodeUnknownSync(VcsWorktreeDescriptor);
 const encodeDescriptor = Schema.encodeSync(VcsWorktreeDescriptor);
@@ -41,6 +46,12 @@ const decodeCatalogInput = Schema.decodeUnknownSync(WorktreeCatalogInput);
 const decodeAdoptInput = Schema.decodeUnknownSync(WorktreeAdoptInput);
 const encodeAdoptInput = Schema.encodeSync(WorktreeAdoptInput);
 const decodeAdoptResult = Schema.decodeUnknownSync(WorktreeAdoptResult);
+const decodeGetRemovalPlanInput = Schema.decodeUnknownSync(WorktreeGetRemovalPlanInput);
+const decodeRemoveFromBibCodeInput = Schema.decodeUnknownSync(WorktreeRemoveFromBibCodeInput);
+const decodeRemoveInput = Schema.decodeUnknownSync(WorktreeRemoveInput);
+const encodeGetRemovalPlanInput = Schema.encodeSync(WorktreeGetRemovalPlanInput);
+const encodeRemoveFromBibCodeInput = Schema.encodeSync(WorktreeRemoveFromBibCodeInput);
+const encodeRemoveInput = Schema.encodeSync(WorktreeRemoveInput);
 const decodeCatalogRefreshInput = Schema.decodeUnknownSync(WorktreeCatalogRefreshInput);
 const decodeDiscoveryPolicyUpdateInput = Schema.decodeUnknownSync(
   WorktreeDiscoveryPolicyUpdateInput,
@@ -61,6 +72,70 @@ const baseDescriptor = {
 } as const;
 
 describe("worktree catalog schemas", () => {
+  it("keeps removal planning and detach-only inputs free of client path authority", () => {
+    expect(
+      encodeGetRemovalPlanInput(
+        decodeGetRemovalPlanInput({
+          projectId: "project-1",
+          threadId: "thread-1",
+          path: "/client-controlled",
+        }),
+      ),
+    ).toEqual({ projectId: "project-1", threadId: "thread-1" });
+    expect(
+      encodeRemoveFromBibCodeInput(
+        decodeRemoveFromBibCodeInput({
+          commandId: "detach-command-1",
+          projectId: "project-1",
+          threadId: "thread-1",
+          expectedGeneration: 9,
+          planToken: "client-token",
+          path: "/client-controlled",
+        }),
+      ),
+    ).toEqual({
+      commandId: "detach-command-1",
+      projectId: "project-1",
+      threadId: "thread-1",
+    });
+  });
+
+  it("requires every destructive removal choice and still strips client paths", () => {
+    const input = {
+      commandId: "remove-command-1",
+      projectId: "project-1",
+      threadId: "thread-1",
+      mode: "delete-git-worktree",
+      expectedGeneration: 9,
+      planToken: "plan-token-1",
+      forceDirty: false,
+      confirmRepositoryWidePrune: false,
+      path: "/client-controlled",
+    } as const;
+
+    expect(encodeRemoveInput(decodeRemoveInput(input))).toEqual({
+      commandId: "remove-command-1",
+      projectId: "project-1",
+      threadId: "thread-1",
+      mode: "delete-git-worktree",
+      expectedGeneration: 9,
+      planToken: "plan-token-1",
+      forceDirty: false,
+      confirmRepositoryWidePrune: false,
+    });
+    for (const field of [
+      "mode",
+      "expectedGeneration",
+      "planToken",
+      "forceDirty",
+      "confirmRepositoryWidePrune",
+    ] as const) {
+      const incomplete = { ...input } as Record<string, unknown>;
+      delete incomplete[field];
+      expect(() => decodeRemoveInput(incomplete)).toThrow();
+    }
+  });
+
   it("encodes adoption identity, generation, and ordinary thread defaults without a path", () => {
     const decoded = decodeAdoptInput({
       commandId: "command-adopt-1",
@@ -296,9 +371,40 @@ describe("worktree catalog schemas", () => {
         locked: false,
         trackedChangeCount: 0,
         untrackedFileCount: 0,
-        pruneImpact: Array.from({ length: 513 }, () => ({ path: "/repo/missing", locked: false })),
+        pruneImpact: Array.from({ length: 513 }, () => ({
+          path: "/repo/missing",
+          pruneReason: "gitdir file points to non-existent location",
+          locked: false,
+        })),
       }),
     ).toThrow();
+  });
+
+  it("retains each exact prune reason in removal plans", () => {
+    expect(
+      decodeRemovalPlan({
+        planToken: "plan-1",
+        generation: 1,
+        availability: "missing-registered",
+        registered: true,
+        locked: false,
+        trackedChangeCount: 0,
+        untrackedFileCount: 0,
+        pruneImpact: [
+          {
+            path: "/repo/missing",
+            pruneReason: "gitdir file points to non-existent location",
+            locked: false,
+          },
+        ],
+      }).pruneImpact,
+    ).toEqual([
+      {
+        path: "/repo/missing",
+        pruneReason: "gitdir file points to non-existent location",
+        locked: false,
+      },
+    ]);
   });
 
   it("keeps nullable descriptor and availability fields distinct from omitted lock reasons", () => {
@@ -380,5 +486,37 @@ describe("worktree catalog schemas", () => {
         decodeRemovalResult(encodeRemovalResult(decodeRemovalResult(result))),
       ),
     ).toEqual(results);
+  });
+
+  it("decodes every removal outcome and actionable error reason", () => {
+    expect(
+      ["not-requested", "removed", "cleaned", "failed"].map((gitOutcome) =>
+        decodeRemovalResult({
+          threadRemoved: true,
+          gitOutcome,
+          orphanCleanupPending: false,
+        }),
+      ),
+    ).toHaveLength(4);
+
+    const reasons = [
+      "stale-plan",
+      "dirty-confirmation-required",
+      "protected-target",
+      "locked",
+      "replacement-conflict",
+      "git-failed",
+      "repository-mismatch",
+    ] as const;
+    expect(
+      reasons.map((reason) =>
+        decodeRemovalError({
+          _tag: "WorktreeRemovalError",
+          reason,
+          message: "Removal was rejected.",
+          currentGeneration: 12,
+        }),
+      ),
+    ).toMatchObject(reasons.map((reason) => ({ reason, currentGeneration: 12 })));
   });
 });

@@ -50,6 +50,15 @@ describe("execution environment contracts", () => {
     ).toBe(false);
   });
 
+  it("decodes an advertised complete worktree catalog surface", () => {
+    expect(
+      decodeExecutionEnvironmentDescriptor({
+        ...descriptor,
+        capabilities: { repositoryIdentity: true, worktreeCatalog: true },
+      }).capabilities.worktreeCatalog,
+    ).toBe(true);
+  });
+
   it("defaults the activity protocol version for an old descriptor", () => {
     expect(
       decodeExecutionEnvironmentDescriptor({

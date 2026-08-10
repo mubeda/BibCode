@@ -8,7 +8,10 @@ use std::{
 
 use bibcode_server::{
     CauseItem, RpcExit, RpcRegistry, ServerConfig, ServerMessage, ServerRuntime,
-    git::GitRepository,
+    git::{
+        GitCommandError, GitPrunableWorktree, GitRepository, GitWorktreeInventory,
+        GitWorktreeRecord, GitWorktreeRemovalInspection,
+    },
     orchestration::{EngineOptions, OrchestrationCommand, OrchestrationEngine},
     persistence::{
         Database, OrchestrationEvent, ProjectionProject, ProjectionThread, Repositories,
@@ -16,12 +19,14 @@ use bibcode_server::{
     },
     production::git_vcs::{CatalogMutationObserver, GitVcsRpcServices, register_git_vcs_rpc},
     production::worktree_catalog_rpc::{
-        WorktreeCatalogMutationObserver, WorktreeCatalogRpcServices, compact_eligible_baseline,
-        register_worktree_catalog_rpc,
+        WorktreeCatalogMutationObserver, WorktreeCatalogRpcServices, WorktreeRemovalGit,
+        WorktreeRemovalGitFuture, WorktreeRemovalQuiesceFuture, WorktreeRemovalQuiesceLease,
+        WorktreeRemovalQuiescer, compact_eligible_baseline, register_worktree_catalog_rpc,
     },
     worktree_catalog::{
-        CatalogScanStatus, WorktreeAdoptionState, WorktreeCatalogService, WorktreeCatalogSnapshot,
-        WorktreeDescriptor, WorktreeDirectoryState, WorktreeRegistrationState,
+        CatalogScanStatus, WorkspaceRemovalIdentity, WorktreeAdoptionState, WorktreeCatalogService,
+        WorktreeCatalogSnapshot, WorktreeDescriptor, WorktreeDirectoryState,
+        WorktreeRegistrationState,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -30,6 +35,7 @@ use sha2::{Digest as _, Sha256};
 use tempfile::TempDir;
 use tokio::time::timeout;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
+use tokio_util::sync::CancellationToken;
 
 type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -1190,6 +1196,450 @@ fn descriptor(path: String, eligible_for_adoption: bool) -> WorktreeDescriptor {
     }
 }
 
+#[tokio::test]
+async fn removal_present_clean_is_verified_detached_branch_preserving_and_idempotent() {
+    let mut fixture = CatalogRpcFixture::new(true).await;
+    let thread_id = adopt_external_for_removal(&mut fixture, "remove-adopt-clean").await;
+    request(
+        fixture.socket(),
+        "1202",
+        "worktree.getRemovalPlan",
+        json!({"projectId":"project-1","threadId":thread_id}),
+    )
+    .await;
+    let plan = success_value(fixture.socket(), "1202").await;
+    assert_eq!(plan["availability"], "present");
+    assert_eq!(plan["trackedChangeCount"], 0);
+    assert_eq!(plan["untrackedFileCount"], 0);
+    let payload = json!({
+        "commandId":"remove-clean",
+        "projectId":"project-1",
+        "threadId":thread_id,
+        "mode":"delete-git-worktree",
+        "expectedGeneration":plan["generation"],
+        "planToken":plan["planToken"],
+        "forceDirty":false,
+        "confirmRepositoryWidePrune":false
+    });
+    request(fixture.socket(), "1203", "worktree.remove", payload.clone()).await;
+    let result = success_value(fixture.socket(), "1203").await;
+    assert_eq!(result["threadRemoved"], true);
+    assert_eq!(result["gitOutcome"], "removed");
+    assert_eq!(result["orphanCleanupPending"], false);
+    assert!(!fixture.external.exists());
+    assert!(
+        git_output(&fixture.main, &["branch", "--list", "feature/external"])
+            .contains("feature/external"),
+        "removal preserves the local branch"
+    );
+    let thread = fixture
+        .repositories
+        .get_thread(thread_id.clone())
+        .await
+        .expect("thread read")
+        .expect("thread projection");
+    assert!(thread.deleted_at.is_some());
+
+    request(fixture.socket(), "1204", "worktree.remove", payload.clone()).await;
+    assert_eq!(success_value(fixture.socket(), "1204").await, result);
+    let mut changed = payload;
+    changed["forceDirty"] = json!(true);
+    request(fixture.socket(), "1205", "worktree.remove", changed).await;
+    assert_typed_removal_failure(fixture.socket(), "1205", "orchestration-failed").await;
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn removal_dirty_requires_confirmation_and_detach_only_ignores_quiesce_outcome() {
+    let quiescer = Arc::new(RecordingPendingQuiescer::default());
+    let mut fixture = CatalogRpcFixture::new_with_quiescer(true, quiescer.clone()).await;
+    let thread_id = adopt_external_for_removal(&mut fixture, "remove-adopt-dirty").await;
+    fs::write(fixture.external.join("dirty.txt"), "dirty\n").expect("dirty file");
+    request(
+        fixture.socket(),
+        "1202",
+        "worktree.getRemovalPlan",
+        json!({"projectId":"project-1","threadId":thread_id}),
+    )
+    .await;
+    let plan = success_value(fixture.socket(), "1202").await;
+    assert_eq!(plan["untrackedFileCount"], 1);
+    request(
+        fixture.socket(),
+        "1203",
+        "worktree.remove",
+        json!({
+            "commandId":"remove-dirty",
+            "projectId":"project-1",
+            "threadId":thread_id,
+            "mode":"delete-git-worktree",
+            "expectedGeneration":plan["generation"],
+            "planToken":plan["planToken"],
+            "forceDirty":false,
+            "confirmRepositoryWidePrune":false
+        }),
+    )
+    .await;
+    assert_typed_removal_failure(fixture.socket(), "1203", "dirty-confirmation-required").await;
+    assert!(quiescer.last_cancellation().is_cancelled());
+    assert!(
+        fixture
+            .repositories
+            .get_thread(thread_id.clone())
+            .await
+            .expect("thread read")
+            .expect("thread")
+            .deleted_at
+            .is_none()
+    );
+
+    fs::write(fixture.external.join("drift.txt"), "drift\n").expect("plan drift file");
+    request(
+        fixture.socket(),
+        "1204",
+        "worktree.remove",
+        json!({
+            "commandId":"remove-dirty-drifted",
+            "projectId":"project-1",
+            "threadId":thread_id,
+            "mode":"delete-git-worktree",
+            "expectedGeneration":plan["generation"],
+            "planToken":plan["planToken"],
+            "forceDirty":true,
+            "confirmRepositoryWidePrune":false
+        }),
+    )
+    .await;
+    assert_typed_removal_failure(fixture.socket(), "1204", "stale-plan").await;
+    assert!(quiescer.last_cancellation().is_cancelled());
+
+    request(
+        fixture.socket(),
+        "1205",
+        "worktree.removeFromBibCode",
+        json!({
+            "commandId":"remove-detach-only",
+            "projectId":"project-1",
+            "threadId":thread_id
+        }),
+    )
+    .await;
+    let result = success_value(fixture.socket(), "1205").await;
+    assert_eq!(result["gitOutcome"], "not-requested");
+    assert_eq!(result["orphanCleanupPending"], true);
+    assert!(!quiescer.last_cancellation().is_cancelled());
+    assert!(fixture.external.exists());
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn removal_after_git_succeeded_before_detach_is_safe_missing_unregistered_cleanup() {
+    let mut fixture = CatalogRpcFixture::new(true).await;
+    let thread_id = adopt_external_for_removal(&mut fixture, "remove-adopt-crash").await;
+    git(
+        &fixture.main,
+        &["worktree", "remove", "--force", "--"],
+        Some(&fixture.external),
+    );
+    request(
+        fixture.socket(),
+        "1202",
+        "worktree.getRemovalPlan",
+        json!({"projectId":"project-1","threadId":thread_id}),
+    )
+    .await;
+    let plan = success_value(fixture.socket(), "1202").await;
+    assert_eq!(plan["availability"], "missing-unregistered");
+    request(
+        fixture.socket(),
+        "1203",
+        "worktree.remove",
+        json!({
+            "commandId":"remove-after-crash",
+            "projectId":"project-1",
+            "threadId":thread_id,
+            "mode":"cleanup-stale-registration",
+            "expectedGeneration":plan["generation"],
+            "planToken":plan["planToken"],
+            "forceDirty":false,
+            "confirmRepositoryWidePrune":false
+        }),
+    )
+    .await;
+    assert_eq!(
+        success_value(fixture.socket(), "1203").await["gitOutcome"],
+        "cleaned"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn removal_missing_registration_targeted_cleanup_succeeds_without_repository_prune() {
+    let mut fixture = CatalogRpcFixture::new(true).await;
+    let thread_id = adopt_external_for_removal(&mut fixture, "remove-adopt-missing").await;
+    fs::remove_dir_all(&fixture.external).expect("simulate missing worktree directory");
+    request(
+        fixture.socket(),
+        "1202",
+        "worktree.getRemovalPlan",
+        json!({"projectId":"project-1","threadId":thread_id}),
+    )
+    .await;
+    let plan = success_value(fixture.socket(), "1202").await;
+    assert_eq!(plan["availability"], "missing-registered");
+    assert!(
+        plan["pruneImpact"]
+            .as_array()
+            .is_some_and(|impact| !impact.is_empty())
+    );
+    let payload = json!({
+        "commandId":"remove-missing-unconfirmed",
+        "projectId":"project-1",
+        "threadId":thread_id,
+        "mode":"cleanup-stale-registration",
+        "expectedGeneration":plan["generation"],
+        "planToken":plan["planToken"],
+        "forceDirty":false,
+        "confirmRepositoryWidePrune":false
+    });
+    request(fixture.socket(), "1203", "worktree.remove", payload).await;
+    let result = success_value(fixture.socket(), "1203").await;
+    assert_eq!(result["gitOutcome"], "cleaned");
+    assert!(
+        fixture
+            .repositories
+            .get_thread(thread_id)
+            .await
+            .expect("thread read")
+            .expect("thread")
+            .deleted_at
+            .is_some()
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn removal_missing_fallback_prune_requires_confirmation_then_cleans() {
+    let mut fixture = CatalogRpcFixture::new_with_removal_git(
+        true,
+        Arc::new(TargetedFailingGit {
+            inner: GitRepository::default(),
+        }),
+    )
+    .await;
+    let thread_id = adopt_external_for_removal(&mut fixture, "remove-adopt-prune").await;
+    fs::remove_dir_all(&fixture.external).expect("simulate missing worktree directory");
+    request(
+        fixture.socket(),
+        "1202",
+        "worktree.getRemovalPlan",
+        json!({"projectId":"project-1","threadId":thread_id}),
+    )
+    .await;
+    let plan = success_value(fixture.socket(), "1202").await;
+    let mut payload = json!({
+        "commandId":"remove-prune-unconfirmed",
+        "projectId":"project-1",
+        "threadId":thread_id,
+        "mode":"cleanup-stale-registration",
+        "expectedGeneration":plan["generation"],
+        "planToken":plan["planToken"],
+        "forceDirty":false,
+        "confirmRepositoryWidePrune":false
+    });
+    request(fixture.socket(), "1203", "worktree.remove", payload.clone()).await;
+    assert_typed_removal_failure(fixture.socket(), "1203", "prune-confirmation-required").await;
+    payload["commandId"] = json!("remove-prune-confirmed");
+    payload["confirmRepositoryWidePrune"] = json!(true);
+    request(fixture.socket(), "1204", "worktree.remove", payload).await;
+    assert_eq!(
+        success_value(fixture.socket(), "1204").await["gitOutcome"],
+        "cleaned"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn removal_locked_missing_registration_is_protected_but_detach_only_remains_available() {
+    let mut fixture = CatalogRpcFixture::new(true).await;
+    let thread_id = adopt_external_for_removal(&mut fixture, "remove-adopt-locked").await;
+    git(
+        &fixture.main,
+        &["worktree", "lock", "--reason", "keep", "--"],
+        Some(&fixture.external),
+    );
+    fs::remove_dir_all(&fixture.external).expect("simulate missing locked worktree directory");
+    request(
+        fixture.socket(),
+        "1202",
+        "worktree.getRemovalPlan",
+        json!({"projectId":"project-1","threadId":thread_id}),
+    )
+    .await;
+    let plan = success_value(fixture.socket(), "1202").await;
+    assert_eq!(plan["locked"], true);
+    request(
+        fixture.socket(),
+        "1203",
+        "worktree.remove",
+        json!({
+            "commandId":"remove-locked",
+            "projectId":"project-1",
+            "threadId":thread_id,
+            "mode":"cleanup-stale-registration",
+            "expectedGeneration":plan["generation"],
+            "planToken":plan["planToken"],
+            "forceDirty":false,
+            "confirmRepositoryWidePrune":true
+        }),
+    )
+    .await;
+    assert_typed_removal_failure(fixture.socket(), "1203", "locked").await;
+    request(
+        fixture.socket(),
+        "1204",
+        "worktree.removeFromBibCode",
+        json!({"commandId":"detach-locked","projectId":"project-1","threadId":thread_id}),
+    )
+    .await;
+    assert_eq!(
+        success_value(fixture.socket(), "1204").await["gitOutcome"],
+        "not-requested"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn removal_present_verified_mutation_failure_keeps_thread_and_worktree() {
+    let mut fixture = CatalogRpcFixture::new_with_removal_git(
+        true,
+        Arc::new(FailingMutationGit {
+            inner: GitRepository::default(),
+        }),
+    )
+    .await;
+    let thread_id = adopt_external_for_removal(&mut fixture, "remove-adopt-fail-present").await;
+    request(
+        fixture.socket(),
+        "1202",
+        "worktree.getRemovalPlan",
+        json!({"projectId":"project-1","threadId":thread_id}),
+    )
+    .await;
+    let plan = success_value(fixture.socket(), "1202").await;
+    request(
+        fixture.socket(),
+        "1203",
+        "worktree.remove",
+        json!({
+            "commandId":"remove-fail-present",
+            "projectId":"project-1",
+            "threadId":thread_id,
+            "mode":"delete-git-worktree",
+            "expectedGeneration":plan["generation"],
+            "planToken":plan["planToken"],
+            "forceDirty":false,
+            "confirmRepositoryWidePrune":false
+        }),
+    )
+    .await;
+    assert_typed_removal_failure(fixture.socket(), "1203", "git-failed").await;
+    assert!(fixture.external.exists());
+    assert!(
+        fixture
+            .repositories
+            .get_thread(thread_id)
+            .await
+            .expect("thread read")
+            .expect("thread")
+            .deleted_at
+            .is_none()
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn removal_missing_targeted_and_prune_failure_detaches_with_bounded_failed_outcome() {
+    let mut fixture = CatalogRpcFixture::new_with_removal_git(
+        true,
+        Arc::new(FailingMutationGit {
+            inner: GitRepository::default(),
+        }),
+    )
+    .await;
+    let thread_id = adopt_external_for_removal(&mut fixture, "remove-adopt-fail-missing").await;
+    fs::remove_dir_all(&fixture.external).expect("simulate missing worktree");
+    request(
+        fixture.socket(),
+        "1202",
+        "worktree.getRemovalPlan",
+        json!({"projectId":"project-1","threadId":thread_id}),
+    )
+    .await;
+    let plan = success_value(fixture.socket(), "1202").await;
+    request(
+        fixture.socket(),
+        "1203",
+        "worktree.remove",
+        json!({
+            "commandId":"remove-fail-missing",
+            "projectId":"project-1",
+            "threadId":thread_id,
+            "mode":"cleanup-stale-registration",
+            "expectedGeneration":plan["generation"],
+            "planToken":plan["planToken"],
+            "forceDirty":false,
+            "confirmRepositoryWidePrune":true
+        }),
+    )
+    .await;
+    let result = success_value(fixture.socket(), "1203").await;
+    assert_eq!(result["gitOutcome"], "failed");
+    assert!(
+        result["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.len() <= 2_048)
+    );
+    assert!(
+        fixture
+            .repositories
+            .get_thread(thread_id)
+            .await
+            .expect("thread read")
+            .expect("thread")
+            .deleted_at
+            .is_some()
+    );
+    fixture.shutdown().await;
+}
+
+#[derive(Default)]
+struct RecordingPendingQuiescer {
+    cancellations: std::sync::Mutex<Vec<CancellationToken>>,
+}
+
+impl RecordingPendingQuiescer {
+    fn last_cancellation(&self) -> CancellationToken {
+        self.cancellations
+            .lock()
+            .expect("cancellation lock")
+            .last()
+            .expect("quiesce cancellation")
+            .clone()
+    }
+}
+
+impl WorktreeRemovalQuiescer for RecordingPendingQuiescer {
+    fn quiesce(&self, _identity: WorkspaceRemovalIdentity) -> WorktreeRemovalQuiesceFuture {
+        let cancellation = CancellationToken::new();
+        self.cancellations
+            .lock()
+            .expect("cancellation lock")
+            .push(cancellation.clone());
+        Box::pin(async { WorktreeRemovalQuiesceLease::pending(cancellation) })
+    }
+}
+
 struct CatalogRpcFixture {
     root: TempDir,
     main: PathBuf,
@@ -1203,6 +1653,25 @@ struct CatalogRpcFixture {
 
 impl CatalogRpcFixture {
     async fn new(with_external: bool) -> Self {
+        Self::new_with_removal_services(with_external, Arc::new(TestNoopQuiescer), None).await
+    }
+
+    async fn new_with_quiescer(
+        with_external: bool,
+        quiescer: Arc<dyn WorktreeRemovalQuiescer>,
+    ) -> Self {
+        Self::new_with_removal_services(with_external, quiescer, None).await
+    }
+
+    async fn new_with_removal_git(with_external: bool, git: Arc<dyn WorktreeRemovalGit>) -> Self {
+        Self::new_with_removal_services(with_external, Arc::new(TestNoopQuiescer), Some(git)).await
+    }
+
+    async fn new_with_removal_services(
+        with_external: bool,
+        quiescer: Arc<dyn WorktreeRemovalQuiescer>,
+        removal_git: Option<Arc<dyn WorktreeRemovalGit>>,
+    ) -> Self {
         let root = tempfile::tempdir().expect("fixture root");
         let main = root.path().join("main");
         let external = root.path().join("external");
@@ -1256,10 +1725,12 @@ impl CatalogRpcFixture {
         let catalog =
             WorktreeCatalogService::new(Arc::new(repositories.clone()), git_repository.clone());
         let mut registry = RpcRegistry::empty();
-        register_worktree_catalog_rpc(
-            &mut registry,
-            WorktreeCatalogRpcServices::new(catalog.clone(), engine.clone()),
-        );
+        let removal_services = WorktreeCatalogRpcServices::new(catalog.clone(), engine.clone())
+            .with_removal_quiescer(quiescer);
+        let removal_services = removal_git.map_or(removal_services.clone(), |git| {
+            removal_services.with_removal_git(git)
+        });
+        register_worktree_catalog_rpc(&mut registry, removal_services);
         register_git_vcs_rpc(
             &mut registry,
             GitVcsRpcServices::with_repository(git_repository.clone())
@@ -1372,6 +1843,137 @@ impl CatalogRpcFixture {
     }
 }
 
+struct TestNoopQuiescer;
+
+impl WorktreeRemovalQuiescer for TestNoopQuiescer {
+    fn quiesce(&self, _identity: WorkspaceRemovalIdentity) -> WorktreeRemovalQuiesceFuture {
+        Box::pin(async { WorktreeRemovalQuiesceLease::complete() })
+    }
+}
+
+#[derive(Clone)]
+struct FailingMutationGit {
+    inner: GitRepository,
+}
+
+impl FailingMutationGit {
+    fn error(operation: &str) -> GitCommandError {
+        GitCommandError {
+            tag: "GitCommandError",
+            operation: operation.into(),
+            command: "git worktree mutation".into(),
+            cwd: "<server-resolved>".into(),
+            diagnostics: None,
+            detail: "Git reported success but the exact registration survived verification.".into(),
+        }
+    }
+}
+
+impl WorktreeRemovalGit for FailingMutationGit {
+    fn inventory(
+        &self,
+        anchor: PathBuf,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<GitWorktreeInventory> {
+        WorktreeRemovalGit::inventory(&self.inner, anchor, cancellation)
+    }
+
+    fn inspect(
+        &self,
+        anchor: PathBuf,
+        record: GitWorktreeRecord,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<GitWorktreeRemovalInspection> {
+        WorktreeRemovalGit::inspect(&self.inner, anchor, record, cancellation)
+    }
+
+    fn preview_prune(
+        &self,
+        anchor: PathBuf,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<Vec<GitPrunableWorktree>> {
+        WorktreeRemovalGit::preview_prune(&self.inner, anchor, cancellation)
+    }
+
+    fn remove(
+        &self,
+        _anchor: PathBuf,
+        _record: GitWorktreeRecord,
+        _force_dirty: bool,
+        _cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<()> {
+        Box::pin(async { Err(Self::error("GitVcsDriver.removeWorktreeVerified.verify")) })
+    }
+
+    fn prune(
+        &self,
+        _anchor: PathBuf,
+        _record: GitWorktreeRecord,
+        _expected_impact_digest: String,
+        _cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<()> {
+        Box::pin(async { Err(Self::error("GitVcsDriver.pruneWorktreesVerified.verify")) })
+    }
+}
+
+#[derive(Clone)]
+struct TargetedFailingGit {
+    inner: GitRepository,
+}
+
+impl WorktreeRemovalGit for TargetedFailingGit {
+    fn inventory(
+        &self,
+        anchor: PathBuf,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<GitWorktreeInventory> {
+        WorktreeRemovalGit::inventory(&self.inner, anchor, cancellation)
+    }
+
+    fn inspect(
+        &self,
+        anchor: PathBuf,
+        record: GitWorktreeRecord,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<GitWorktreeRemovalInspection> {
+        WorktreeRemovalGit::inspect(&self.inner, anchor, record, cancellation)
+    }
+
+    fn preview_prune(
+        &self,
+        anchor: PathBuf,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<Vec<GitPrunableWorktree>> {
+        WorktreeRemovalGit::preview_prune(&self.inner, anchor, cancellation)
+    }
+
+    fn remove(
+        &self,
+        _anchor: PathBuf,
+        _record: GitWorktreeRecord,
+        _force_dirty: bool,
+        _cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<()> {
+        Box::pin(async { Err(FailingMutationGit::error("targeted-cleanup")) })
+    }
+
+    fn prune(
+        &self,
+        anchor: PathBuf,
+        record: GitWorktreeRecord,
+        expected_impact_digest: String,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<()> {
+        WorktreeRemovalGit::prune(
+            &self.inner,
+            anchor,
+            record,
+            expected_impact_digest,
+            cancellation,
+        )
+    }
+}
+
 impl Drop for CatalogRpcFixture {
     fn drop(&mut self) {
         if let Some(handle) = self.handle.as_ref() {
@@ -1436,6 +2038,50 @@ async fn success_value(socket: &mut TestSocket, request_id: &str) -> Value {
     };
     assert_eq!(actual.as_str(), request_id);
     value
+}
+
+async fn assert_typed_removal_failure(
+    socket: &mut TestSocket,
+    request_id: &str,
+    expected_reason: &str,
+) {
+    let message = next_server_message(socket).await;
+    let ServerMessage::Exit {
+        request_id: actual,
+        exit: RpcExit::Failure { cause },
+    } = message
+    else {
+        panic!("expected typed removal failure: {message:?}");
+    };
+    assert_eq!(actual.as_str(), request_id);
+    assert!(cause.iter().any(|item| matches!(
+        item,
+        CauseItem::Fail { error }
+            if error["_tag"] == "WorktreeRemovalError" && error["reason"] == expected_reason
+    )));
+}
+
+async fn adopt_external_for_removal(fixture: &mut CatalogRpcFixture, command_id: &str) -> String {
+    request(
+        fixture.socket(),
+        "1200",
+        "vcs.refreshWorktreeCatalog",
+        json!({"projectId":"project-1"}),
+    )
+    .await;
+    let snapshot = success_value(fixture.socket(), "1200").await;
+    let candidate = eligible_candidate(&snapshot).clone();
+    request(
+        fixture.socket(),
+        "1201",
+        "worktree.adopt",
+        adoption_payload(command_id, &candidate, &snapshot),
+    )
+    .await;
+    success_value(fixture.socket(), "1201").await["threadId"]
+        .as_str()
+        .expect("adopted thread ID")
+        .to_owned()
 }
 
 async fn assert_typed_catalog_failure(

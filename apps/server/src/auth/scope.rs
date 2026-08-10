@@ -48,7 +48,8 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "vcs.listCommits"
         | "vcs.listRefs"
         | "vcs.refreshStatus"
-        | "vcs.refreshWorktreeCatalog" => Some(SCOPE_ORCHESTRATION_READ),
+        | "vcs.refreshWorktreeCatalog"
+        | "worktree.getRemovalPlan" => Some(SCOPE_ORCHESTRATION_READ),
         "git.preparePullRequestThread"
         | "git.resolvePullRequest"
         | "git.runStackedAction"
@@ -89,7 +90,10 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "vcs.stageFiles"
         | "vcs.switchRef"
         | "vcs.unstageFiles" => Some(SCOPE_ORCHESTRATION_OPERATE),
-        "worktree.adopt" | "worktree.updateDiscoveryPolicy" => Some(SCOPE_ORCHESTRATION_OPERATE),
+        "worktree.adopt"
+        | "worktree.remove"
+        | "worktree.removeFromBibCode"
+        | "worktree.updateDiscoveryPolicy" => Some(SCOPE_ORCHESTRATION_OPERATE),
         "terminal.attach"
         | "terminal.clear"
         | "terminal.close"
@@ -159,7 +163,11 @@ mod tests {
                 "wrong activity RPC scope for {method}"
             );
         }
-        for method in ["subscribeWorktreeCatalog", "vcs.refreshWorktreeCatalog"] {
+        for method in [
+            "subscribeWorktreeCatalog",
+            "vcs.refreshWorktreeCatalog",
+            "worktree.getRemovalPlan",
+        ] {
             assert_eq!(
                 required_scope(method),
                 Some(SCOPE_ORCHESTRATION_READ),
@@ -174,6 +182,9 @@ mod tests {
             required_scope("worktree.adopt"),
             Some(SCOPE_ORCHESTRATION_OPERATE)
         );
+        for method in ["worktree.remove", "worktree.removeFromBibCode"] {
+            assert_eq!(required_scope(method), Some(SCOPE_ORCHESTRATION_OPERATE));
+        }
         assert_eq!(required_scope("unknown.method"), None);
     }
 }

@@ -331,7 +331,8 @@ impl ProductionRuntime {
         register_git_vcs_rpc(&mut registry, git_vcs);
         register_worktree_catalog_rpc(
             &mut registry,
-            WorktreeCatalogRpcServices::new(worktree_catalog.clone(), orchestration.clone()),
+            WorktreeCatalogRpcServices::new(worktree_catalog.clone(), orchestration.clone())
+                .with_removal_quiescer(Arc::new(worktree_runtime.clone())),
         );
         register_server_terminal_rpc(&mut registry, terminal_services.clone());
         finalize_rpc_registry(&registry, &control)?;

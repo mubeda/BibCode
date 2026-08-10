@@ -29,6 +29,9 @@ import {
   WsVcsRefreshWorktreeCatalogRpc,
   WsWorktreeUpdateDiscoveryPolicyRpc,
   WsWorktreeAdoptRpc,
+  WsWorktreeGetRemovalPlanRpc,
+  WsWorktreeRemoveFromBibCodeRpc,
+  WsWorktreeRemoveRpc,
 } from "./rpc.ts";
 
 const decodeSubscribeWorktreeCatalog = Schema.decodeUnknownSync(
@@ -43,6 +46,13 @@ const decodeUpdateWorktreeDiscoveryPolicy = Schema.decodeUnknownSync(
 const decodeWorktreeAdopt = Schema.decodeUnknownSync(WsWorktreeAdoptRpc.payloadSchema);
 const decodeWorktreeAdoptResult = Schema.decodeUnknownSync(WsWorktreeAdoptRpc.successSchema);
 const decodeWorktreeAdoptError = Schema.decodeUnknownSync(WsWorktreeAdoptRpc.errorSchema);
+const decodeWorktreeRemovalPlan = Schema.decodeUnknownSync(
+  WsWorktreeGetRemovalPlanRpc.successSchema,
+);
+const decodeWorktreeRemovalResult = Schema.decodeUnknownSync(
+  WsWorktreeRemoveFromBibCodeRpc.successSchema,
+);
+const decodeWorktreeRemovalError = Schema.decodeUnknownSync(WsWorktreeRemoveRpc.errorSchema);
 
 describe("WS_METHODS", () => {
   it("maps method identifiers to unique dotted wire names", () => {
@@ -69,6 +79,9 @@ describe("WS_METHODS", () => {
     expect(WS_METHODS.vcsRefreshWorktreeCatalog).toBe("vcs.refreshWorktreeCatalog");
     expect(WS_METHODS.worktreeUpdateDiscoveryPolicy).toBe("worktree.updateDiscoveryPolicy");
     expect(WS_METHODS.worktreeAdopt).toBe("worktree.adopt");
+    expect(WS_METHODS.worktreeGetRemovalPlan).toBe("worktree.getRemovalPlan");
+    expect(WS_METHODS.worktreeRemoveFromBibCode).toBe("worktree.removeFromBibCode");
+    expect(WS_METHODS.worktreeRemove).toBe("worktree.remove");
   });
 });
 
@@ -115,6 +128,9 @@ describe("individual RPC definitions", () => {
     expect(WsVcsRefreshWorktreeCatalogRpc._tag).toBe(WS_METHODS.vcsRefreshWorktreeCatalog);
     expect(WsWorktreeUpdateDiscoveryPolicyRpc._tag).toBe(WS_METHODS.worktreeUpdateDiscoveryPolicy);
     expect(WsWorktreeAdoptRpc._tag).toBe(WS_METHODS.worktreeAdopt);
+    expect(WsWorktreeGetRemovalPlanRpc._tag).toBe(WS_METHODS.worktreeGetRemovalPlan);
+    expect(WsWorktreeRemoveFromBibCodeRpc._tag).toBe(WS_METHODS.worktreeRemoveFromBibCode);
+    expect(WsWorktreeRemoveRpc._tag).toBe(WS_METHODS.worktreeRemove);
   });
 
   it("carries payload/success/error schemas on unary RPCs", () => {
@@ -176,6 +192,9 @@ describe("WsRpcGroup", () => {
       WsVcsRefreshWorktreeCatalogRpc,
       WsWorktreeUpdateDiscoveryPolicyRpc,
       WsWorktreeAdoptRpc,
+      WsWorktreeGetRemovalPlanRpc,
+      WsWorktreeRemoveFromBibCodeRpc,
+      WsWorktreeRemoveRpc,
     ];
     for (const rpc of members) {
       expect(WsRpcGroup.requests.get(rpc._tag)).toBe(rpc);
@@ -240,6 +259,42 @@ describe("WsRpcGroup", () => {
       }),
     ).toMatchObject({ reason: "stale-generation", currentGeneration: 10 });
     expect(WsRpcGroup.requests.get(WS_METHODS.worktreeAdopt)).toBe(WsWorktreeAdoptRpc);
+  });
+
+  it("registers typed removal planning, detach-only, and destructive RPCs", () => {
+    expect(
+      decodeWorktreeRemovalPlan({
+        planToken: "plan-1",
+        generation: 4,
+        availability: "missing-registered",
+        registered: true,
+        locked: false,
+        trackedChangeCount: 0,
+        untrackedFileCount: 0,
+        pruneImpact: [{ path: "/repo/missing", pruneReason: "stale gitdir", locked: false }],
+      }).pruneImpact[0]?.pruneReason,
+    ).toBe("stale gitdir");
+    expect(
+      decodeWorktreeRemovalResult({
+        threadRemoved: true,
+        gitOutcome: "not-requested",
+        orphanCleanupPending: false,
+      }).threadRemoved,
+    ).toBe(true);
+    expect(
+      decodeWorktreeRemovalError({
+        _tag: "WorktreeRemovalError",
+        reason: "git-failed",
+        message: "Git removal failed.",
+      }),
+    ).toMatchObject({ _tag: "WorktreeRemovalError", reason: "git-failed" });
+    expect(WsRpcGroup.requests.get(WS_METHODS.worktreeGetRemovalPlan)).toBe(
+      WsWorktreeGetRemovalPlanRpc,
+    );
+    expect(WsRpcGroup.requests.get(WS_METHODS.worktreeRemoveFromBibCode)).toBe(
+      WsWorktreeRemoveFromBibCodeRpc,
+    );
+    expect(WsRpcGroup.requests.get(WS_METHODS.worktreeRemove)).toBe(WsWorktreeRemoveRpc);
   });
 
   it("contains every RPC exactly once and covers the whole WS surface", () => {

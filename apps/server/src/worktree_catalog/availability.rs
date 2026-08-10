@@ -163,6 +163,25 @@ pub struct RemovalGuard {
     released: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct WorkspaceRemovalIdentity {
+    thread_id: String,
+    path_key: String,
+    removal_id: u64,
+}
+
+impl WorkspaceRemovalIdentity {
+    #[must_use]
+    pub fn thread_id(&self) -> &str {
+        &self.thread_id
+    }
+
+    #[must_use]
+    pub fn path_key(&self) -> &str {
+        &self.path_key
+    }
+}
+
 pub struct WorkspaceAdmissionLease {
     registry: WorkspaceAvailabilityRegistry,
     admission_id: u64,
@@ -693,6 +712,86 @@ impl WorkspaceAvailabilityRegistry {
                 .is_some_and(|watermark| watermark.generation == transition.generation)
     }
 
+    #[must_use]
+    pub fn removal_is_current(&self, identity: &WorkspaceRemovalIdentity) -> bool {
+        let state = lock(&self.inner);
+        state.entries.get(&identity.thread_id).is_some_and(|entry| {
+            entry.state == WorkspaceGuardState::Removing
+                && entry.path_key == identity.path_key
+                && entry.removal_ids.contains(&identity.removal_id)
+        })
+    }
+
+    pub(crate) fn retain_removal(
+        &self,
+        identity: &WorkspaceRemovalIdentity,
+    ) -> Option<RemovalGuard> {
+        let mut state = lock(&self.inner);
+        let current = state.entries.get(&identity.thread_id)?;
+        if current.state != WorkspaceGuardState::Removing
+            || current.path_key != identity.path_key
+            || !current.removal_ids.contains(&identity.removal_id)
+        {
+            return None;
+        }
+        state.next_removal_id = state.next_removal_id.wrapping_add(1).max(1);
+        let removal_id = state.next_removal_id;
+        state
+            .entries
+            .get_mut(&identity.thread_id)?
+            .removal_ids
+            .insert(removal_id);
+        Some(RemovalGuard {
+            registry: self.clone(),
+            thread_id: identity.thread_id.clone(),
+            removal_id,
+            released: false,
+        })
+    }
+
+    #[must_use]
+    pub fn has_removal_admissions(&self, identity: &WorkspaceRemovalIdentity) -> bool {
+        if !self.removal_is_current(identity) {
+            return false;
+        }
+        let thread = AdmissionScope::Thread(identity.thread_id.clone());
+        let state = lock(&self.inner);
+        state.active_admissions.values().any(|admission| {
+            admission.scopes.iter().any(|scope| {
+                scope == &thread
+                    || matches!(scope, AdmissionScope::Path(candidate) if path_is_within(candidate, &identity.path_key))
+            })
+        })
+    }
+
+    pub async fn wait_for_removal_admissions(&self, identity: &WorkspaceRemovalIdentity) {
+        loop {
+            let notified = self.admission_changed.notified();
+            if !self.has_removal_admissions(identity) {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    pub(crate) async fn begin_removal_terminal_signal(
+        &self,
+        identity: &WorkspaceRemovalIdentity,
+    ) -> Option<WorkspaceTerminalSignalPermit> {
+        let terminal_signal = {
+            let state = lock(&self.inner);
+            let entry = state.entries.get(&identity.thread_id)?;
+            if entry.state != WorkspaceGuardState::Removing
+                || entry.path_key != identity.path_key
+                || !entry.removal_ids.contains(&identity.removal_id)
+            {
+                return None;
+            }
+            entry.terminal_signal.clone()
+        };
+        terminal_signal.begin()
+    }
+
     pub(crate) async fn begin_terminal_signal(
         &self,
         transition: &WorkspaceLossTransition,
@@ -831,6 +930,7 @@ impl WorkspaceAvailabilityRegistry {
         {
             return;
         }
+        let _drain = entry.terminal_signal.invalidate();
         if !state.reconciliation_active {
             complete_released_removal(&mut state, thread_id);
         }
@@ -1261,6 +1361,24 @@ impl WorkspaceCleanupOwnership {
 }
 
 impl RemovalGuard {
+    #[must_use]
+    pub fn identity(&self) -> WorkspaceRemovalIdentity {
+        let path_key = {
+            let state = lock(&self.registry.inner);
+            state
+                .entries
+                .get(&self.thread_id)
+                .filter(|entry| entry.removal_ids.contains(&self.removal_id))
+                .map(|entry| entry.path_key.clone())
+                .unwrap_or_default()
+        };
+        WorkspaceRemovalIdentity {
+            thread_id: self.thread_id.clone(),
+            path_key,
+            removal_id: self.removal_id,
+        }
+    }
+
     pub fn release(mut self) {
         self.registry
             .release_removal(&self.thread_id, self.removal_id);
@@ -1652,6 +1770,31 @@ mod tests {
                 .state,
             WorkspaceGuardState::MissingRegistered,
         );
+    }
+
+    #[tokio::test]
+    async fn removal_identity_is_exact_and_terminal_signals_close_on_final_release() {
+        let registry = WorkspaceAvailabilityRegistry::new();
+        let first = registry
+            .mark_removing("thread-1", Path::new("/repo/worktrees/missing"))
+            .await;
+        let identity = first.identity();
+        assert!(registry.removal_is_current(&identity));
+        let signal = registry
+            .begin_removal_terminal_signal(&identity)
+            .await
+            .expect("exact removal terminal signal");
+
+        drop(first);
+        assert!(!registry.removal_is_current(&identity));
+        assert!(
+            registry
+                .begin_removal_terminal_signal(&identity)
+                .await
+                .is_none()
+        );
+        drop(signal);
+        assert_eq!(registry.guard_thread("thread-1").await, Ok(()));
     }
 
     #[tokio::test]
