@@ -29,7 +29,7 @@ use crate::{
         ResolvePullRequestInput, ResolvedPullRequest, SourceControlDiscovery,
     },
     workspace::{WorkspaceMutationFuture, WorkspaceMutationObserver},
-    worktree_catalog::WorkspaceAvailabilityRegistry,
+    worktree_catalog::{WorkspaceAdmissionLease, WorkspaceAvailabilityRegistry},
 };
 
 use super::host_paths::resolve_host_directory;
@@ -176,7 +176,7 @@ impl GitVcsRpcServices {
         request: RpcRequest,
         cancellation: CancellationToken,
     ) -> RpcResult {
-        self.guard_payload_cwd(&request.payload).await?;
+        let _workspace_admission = self.guard_payload_cwd(&request.payload).await?;
         match request.tag.as_str() {
             "shell.openInEditor" => self.open_in_editor(request.payload).await,
             "vcs.pull" => {
@@ -423,10 +423,14 @@ impl GitVcsRpcServices {
                     return;
                 }
             };
-            if let Err(error) = guard_git_path(availability.as_ref(), &input.cwd).await {
-                let _ = sender.send(Err(error)).await;
-                return;
-            }
+            let _workspace_admission = match guard_git_path(availability.as_ref(), &input.cwd).await
+            {
+                Ok(admission) => admission,
+                Err(error) => {
+                    let _ = sender.send(Err(error)).await;
+                    return;
+                }
+            };
             let mut subscription = match broadcaster
                 .subscribe(input.cwd.clone(), cancellation.clone())
                 .await
@@ -437,6 +441,7 @@ impl GitVcsRpcServices {
                     return;
                 }
             };
+            drop(_workspace_admission);
             let mut current_local = None;
             loop {
                 tokio::select! {
@@ -500,10 +505,14 @@ impl GitVcsRpcServices {
                     return;
                 }
             };
-            if let Err(error) = guard_git_path(availability.as_ref(), &input.cwd).await {
-                let _ = sender.send(Err(error)).await;
-                return;
-            }
+            let _workspace_admission = match guard_git_path(availability.as_ref(), &input.cwd).await
+            {
+                Ok(admission) => admission,
+                Err(error) => {
+                    let _ = sender.send(Err(error)).await;
+                    return;
+                }
+            };
             let phases = action_phases(&input.action, input.feature_branch.unwrap_or(false));
             if send_event(
                 &sender,
@@ -795,9 +804,12 @@ impl GitVcsRpcServices {
         open_in_editor_with(payload, launch_editor)
     }
 
-    async fn guard_payload_cwd(&self, payload: &Value) -> Result<(), Value> {
+    async fn guard_payload_cwd(
+        &self,
+        payload: &Value,
+    ) -> Result<Option<WorkspaceAdmissionLease>, Value> {
         let Some(cwd) = payload.get("cwd").and_then(Value::as_str) else {
-            return Ok(());
+            return Ok(None);
         };
         guard_git_path(self.availability_registry.as_ref(), Path::new(cwd)).await
     }
@@ -806,13 +818,17 @@ impl GitVcsRpcServices {
 async fn guard_git_path(
     registry: Option<&WorkspaceAvailabilityRegistry>,
     cwd: &Path,
-) -> Result<(), Value> {
+) -> Result<Option<WorkspaceAdmissionLease>, Value> {
     let Some(registry) = registry else {
-        return Ok(());
+        return Ok(None);
     };
-    registry.guard_path(cwd).await.map_err(|error| {
-        serde_json::to_value(error).expect("workspace unavailable error serializes")
-    })
+    registry
+        .acquire_path_admission([cwd])
+        .await
+        .map(Some)
+        .map_err(|error| {
+            serde_json::to_value(error).expect("workspace unavailable error serializes")
+        })
 }
 
 fn open_in_editor_with(

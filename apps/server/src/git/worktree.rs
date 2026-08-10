@@ -84,24 +84,66 @@ pub enum WorktreeIdentityError {
 
 #[must_use]
 pub fn normalize_worktree_path_key(path: &Path, platform: HostPathPlatform) -> String {
-    let mut normalized = match platform {
+    let source = match platform {
         HostPathPlatform::Posix => path.to_string_lossy().into_owned(),
-        HostPathPlatform::Windows => {
-            collapse_separators(&path.to_string_lossy().replace('\\', "/"))
-        }
+        HostPathPlatform::Windows => path.to_string_lossy().replace('\\', "/"),
     };
-    while normalized.len() > minimum_path_length(&normalized, platform) && normalized.ends_with('/')
-    {
-        normalized.pop();
-    }
+    let normalized = normalize_lexical_components(&source, platform);
     match platform {
         HostPathPlatform::Posix => normalized,
         HostPathPlatform::Windows => normalized.to_ascii_lowercase(),
     }
 }
 
-fn collapse_separators(path: &str) -> String {
-    let preserve_unc_prefix = path.starts_with("//");
+fn normalize_lexical_components(path: &str, platform: HostPathPlatform) -> String {
+    let collapsed = collapse_separators(path, platform == HostPathPlatform::Windows);
+    let (prefix, remainder, locked_components, anchored) = match platform {
+        HostPathPlatform::Windows if collapsed.starts_with("//") => {
+            ("//", &collapsed[2..], 2, true)
+        }
+        HostPathPlatform::Windows
+            if collapsed.as_bytes().get(1) == Some(&b':')
+                && collapsed
+                    .as_bytes()
+                    .first()
+                    .is_some_and(u8::is_ascii_alphabetic) =>
+        {
+            if collapsed.as_bytes().get(2) == Some(&b'/') {
+                (&collapsed[..3], &collapsed[3..], 0, true)
+            } else {
+                (&collapsed[..2], &collapsed[2..], 0, false)
+            }
+        }
+        _ if collapsed.starts_with('/') => ("/", &collapsed[1..], 0, true),
+        _ => ("", collapsed.as_str(), 0, false),
+    };
+
+    let mut components: Vec<&str> = Vec::new();
+    for component in remainder.split('/') {
+        match component {
+            "" | "." => {}
+            ".." if components.len() > locked_components && components.last() != Some(&"..") => {
+                components.pop();
+            }
+            ".." if anchored => {}
+            ".." => components.push(component),
+            _ => components.push(component),
+        }
+    }
+
+    if components.is_empty() {
+        return if prefix.is_empty() {
+            if collapsed.is_empty() { "" } else { "." }.to_owned()
+        } else {
+            prefix.to_owned()
+        };
+    }
+    let joined = components.join("/");
+    format!("{prefix}{joined}")
+}
+
+fn collapse_separators(path: &str, preserve_unc_prefix: bool) -> String {
+    let preserve_unc_prefix = preserve_unc_prefix && path.starts_with("//");
     let mut normalized = String::with_capacity(path.len());
     let mut previous_was_separator = false;
     for (index, character) in path.char_indices() {
@@ -188,20 +230,6 @@ pub fn parse_worktree_porcelain(
         .enumerate()
         .map(|(index, fields)| parse_record(&fields, !nul_delimited, index == 0))
         .collect()
-}
-
-fn minimum_path_length(path: &str, platform: HostPathPlatform) -> usize {
-    if path == "/" {
-        return 1;
-    }
-    if platform == HostPathPlatform::Windows
-        && path.len() >= 3
-        && path.as_bytes()[1] == b':'
-        && path.as_bytes()[2] == b'/'
-    {
-        return 3;
-    }
-    0
 }
 
 fn opaque_key(common_dir_key: &str, path_key: Option<&str>) -> String {
@@ -543,6 +571,58 @@ mod tests {
                 Path::new("//server/share/repo"),
                 HostPathPlatform::Windows
             )
+        );
+        assert_eq!(
+            normalize_worktree_path_key(
+                Path::new("/repo//worktrees/./feature/src/../src"),
+                HostPathPlatform::Posix,
+            ),
+            "/repo/worktrees/feature/src"
+        );
+        assert_eq!(
+            normalize_worktree_path_key(Path::new("/../../repo/worktree"), HostPathPlatform::Posix,),
+            "/repo/worktree",
+            "absolute parent traversal cannot escape the POSIX root",
+        );
+        assert_eq!(
+            normalize_worktree_path_key(Path::new("../../repo"), HostPathPlatform::Posix),
+            "../../repo",
+            "relative parent components retain their unresolved meaning",
+        );
+        assert_eq!(
+            normalize_worktree_path_key(
+                Path::new(r"C:\Repo\\Work\.\src\..\src"),
+                HostPathPlatform::Windows,
+            ),
+            "c:/repo/work/src"
+        );
+        assert_eq!(
+            normalize_worktree_path_key(
+                Path::new(r"C:\..\..\Repo\Work"),
+                HostPathPlatform::Windows,
+            ),
+            "c:/repo/work",
+            "drive-root parent traversal cannot escape the drive root",
+        );
+        assert_eq!(
+            normalize_worktree_path_key(Path::new(r"C:..\Repo\.\Work"), HostPathPlatform::Windows,),
+            "c:../repo/work",
+            "drive-relative parent traversal must remain drive-relative",
+        );
+        assert_eq!(
+            normalize_worktree_path_key(
+                Path::new(r"\\Server\Share\Repo\..\Work"),
+                HostPathPlatform::Windows,
+            ),
+            "//server/share/work"
+        );
+        assert_eq!(
+            normalize_worktree_path_key(
+                Path::new(r"\\Server\Share\..\..\Work"),
+                HostPathPlatform::Windows,
+            ),
+            "//server/share/work",
+            "UNC parent traversal cannot escape the share root",
         );
 
         let repository = worktree_repository_key(Path::new("/repo/.git"), HostPathPlatform::Posix);

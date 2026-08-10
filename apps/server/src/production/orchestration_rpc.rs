@@ -33,6 +33,7 @@ use super::provider_runtime::{
     freeze_delivery_route, route_orchestration_command,
 };
 use super::turn_delivery::TurnDeliveryService;
+use super::workspace_availability::{WorkspaceAdmissionController, WorkspaceAdmissionError};
 
 const STREAM_CAPACITY: usize = 16;
 
@@ -106,6 +107,8 @@ fn register_orchestration_rpc_inner(
     availability: Option<WorkspaceAvailabilityRegistry>,
 ) {
     install_project_command_effects(&engine);
+    let availability = availability
+        .map(|availability| WorkspaceAdmissionController::new(availability, engine.repositories()));
     let dispatch = engine.clone();
     registry.register_unary("orchestration.dispatchCommand", move |request, _| {
         let dispatch = dispatch.clone();
@@ -123,15 +126,16 @@ fn register_orchestration_rpc_inner(
                 ));
             }
             if let OrchestrationCommand::ThreadTurnStart { thread_id, .. } = &command {
-                if let Some(availability) = &availability {
-                    availability
-                        .guard_thread(thread_id)
-                        .await
-                        .map_err(|error| {
-                            serde_json::to_value(error)
-                                .expect("workspace unavailable error serializes")
-                        })?;
-                }
+                let _workspace_admission = if let Some(availability) = &availability {
+                    Some(
+                        availability
+                            .acquire_thread(thread_id, std::iter::empty())
+                            .await
+                            .map_err(workspace_admission_error)?,
+                    )
+                } else {
+                    None
+                };
                 let provider = provider.ok_or_else(|| {
                     invalid_request(
                         &request.tag,
@@ -870,6 +874,17 @@ fn invalid_request(method: &str, message: impl Into<String>) -> Value {
 
 fn orchestration_error(tag: &str, error: impl std::fmt::Display) -> Value {
     json!({ "_tag": tag, "message": error.to_string() })
+}
+
+fn workspace_admission_error(error: WorkspaceAdmissionError) -> Value {
+    match error {
+        WorkspaceAdmissionError::Unavailable(error) => {
+            serde_json::to_value(error).expect("workspace unavailable error serializes")
+        }
+        WorkspaceAdmissionError::Resolution(error) => {
+            orchestration_error("OrchestrationDispatchCommandError", error)
+        }
+    }
 }
 
 fn provider_command_error(error: impl std::fmt::Display) -> Value {

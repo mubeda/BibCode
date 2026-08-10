@@ -168,6 +168,19 @@ guard only when the same normalized path is present again in the same physical
 repository; an active removal guard takes precedence over catalog loss and
 recovery.
 
+Missing-path identity also collapses duplicate separators plus lexical `.` and
+`..` components without escaping POSIX roots, Windows drive roots, or UNC share
+roots. Public work admission takes a short-lived, path-scoped lease after
+resolving the durable thread projection. This includes panel threads that do
+not appear in the workspace catalog: their persisted worktree path, or their
+project root when they have no override, is authoritative. The lease is held
+through durable command admission or external-process publication. Guard
+installation and lease admission are serialized, so loss either observes and
+quiesces work published by an earlier lease or rejects a later lease. Lease
+drop, including cancellation and error unwinding, releases every thread/path
+scope. Nested removal guards retain independent tokens; arbitrary drop order
+cannot reveal a pending missing workspace before the last removal completes.
+
 The guard rejects a new turn before durable admission; terminal open, restart,
 write, and restart-on-attach; client Git status and mutations; and project
 file, search, mutation, editor, asset, and review operations. It intentionally
@@ -178,21 +191,34 @@ external side effects, so a path disappearing between client resolution and
 handler execution cannot fall through to a generic filesystem or process
 failure.
 
-For each admitted loss transition, `WorktreeRuntime` appends one warning
-activity with a deterministic transition-derived ID, requests the provider
-session to stop, and quiesces every terminal for the thread. Terminal quiesce
+Provider delivery and restart reconciliation repeat the persisted thread/path
+admission immediately before provider routing. This closes the gap between a
+durable turn commit and asynchronous delivery. Git process boundaries likewise
+hold a path lease through command execution or long-lived subscription
+publication.
+
+For each admitted loss transition, `WorktreeRuntime` resolves every live
+ordinary or panel thread in the same persisted project whose normalized path
+matches the guarded physical workspace. It deduplicates those IDs, appends one
+warning activity to the catalog owner with a deterministic transition-derived
+ID, requests every affected provider session to stop, and quiesces every
+affected terminal. Terminal quiesce
 signals all processes before waiting and retains each session as an exited
 snapshot with its bounded transcript; it does not use destructive terminal
 close. Conversation and thread rows are likewise retained. A warning-write
 failure is logged but cannot prevent process cleanup.
 
-The graceful cleanup bound is five seconds. Incomplete cleanup is marked as
-`orphanCleanupPending` and handed to the runtime-owned reaper. Its queue holds
-at most 64 jobs; initial loss handling admits at most 16 quiesces concurrently.
-Saturation is logged without clearing the workspace guard or orphan marker;
-dropping the cleanup task handle does not cancel the underlying Tokio task.
-`ProductionRuntime` owns and shuts down both the catalog observer and reaper,
-preventing post-shutdown loss work from being admitted.
+The graceful cleanup bound is five seconds. Incomplete, failed, or panicked
+cleanup is marked as `orphanCleanupPending` and handed to the runtime-owned
+reaper. Its queue and active set are bounded to 64 jobs. One runtime-owned
+semaphore admits at most 16 cleanup attempts globally across overlapping
+catalog observers and reaper retries. A failed attempt retains its counted
+orphan ownership and is retried; only confirmed provider-and-terminal success
+clears that attempt's ownership. Saturation is logged without clearing the
+workspace guard or orphan marker, and dropping a saturated boxed future
+cancels it rather than detaching work. `ProductionRuntime` shuts down the
+catalog observer first, then cancels and drains the reaper's queued and active
+futures before stopping provider and terminal owners.
 
 ## Provider turn flow
 

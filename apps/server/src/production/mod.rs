@@ -18,6 +18,7 @@ pub mod relay;
 pub mod runtime;
 pub mod server_terminal;
 pub mod turn_delivery;
+pub(crate) mod workspace_availability;
 pub mod workspace_preview;
 pub mod worktree_catalog_rpc;
 pub mod worktree_runtime;

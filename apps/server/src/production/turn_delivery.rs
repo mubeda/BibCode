@@ -25,7 +25,10 @@ use crate::{
         deliver_durable_orchestration_turn, finalize_delivery_route_cwd,
         reconcile_orchestration_turn,
     },
+    worktree_catalog::WorkspaceAvailabilityRegistry,
 };
+
+use super::workspace_availability::{WorkspaceAdmissionController, WorkspaceAdmissionError};
 
 #[cfg(test)]
 use crate::production::provider_runtime::ProviderRuntimeError;
@@ -93,6 +96,54 @@ impl TurnDeliveryService {
                 reconcile_orchestration_turn(&provider, &engine, &settings_root, row).await
             })
         });
+        Self::start_worker(
+            engine,
+            MAX_CONCURRENT_THREADS,
+            MAX_CONCURRENT_THREADS,
+            router,
+            reconciler,
+        )
+    }
+
+    pub(crate) fn start_with_availability(
+        engine: OrchestrationEngine,
+        provider: Arc<ProviderRuntimeSupervisor>,
+        settings_root: PathBuf,
+        availability: WorkspaceAvailabilityRegistry,
+    ) -> Self {
+        let route_engine = engine.clone();
+        let route_provider = provider.clone();
+        let route_settings_root = settings_root.clone();
+        let admission =
+            WorkspaceAdmissionController::new(availability.clone(), engine.repositories());
+        let provider_router: ProviderDeliveryRouter = Arc::new(move |command, delivery_key| {
+            let engine = route_engine.clone();
+            let provider = route_provider.clone();
+            let settings_root = route_settings_root.clone();
+            Box::pin(async move {
+                deliver_durable_orchestration_turn(
+                    &provider,
+                    &engine,
+                    &settings_root,
+                    command,
+                    delivery_key,
+                )
+                .await
+            })
+        });
+        let router = guard_delivery_router(admission, provider_router);
+        let reconciliation_engine = engine.clone();
+        let reconciliation_admission =
+            WorkspaceAdmissionController::new(availability, engine.repositories());
+        let provider_reconciler: DeliveryReconciler = Arc::new(move |row| {
+            let engine = reconciliation_engine.clone();
+            let provider = provider.clone();
+            let settings_root = settings_root.clone();
+            Box::pin(async move {
+                reconcile_orchestration_turn(&provider, &engine, &settings_root, row).await
+            })
+        });
+        let reconciler = guard_delivery_reconciler(reconciliation_admission, provider_reconciler);
         Self::start_worker(
             engine,
             MAX_CONCURRENT_THREADS,
@@ -213,6 +264,69 @@ impl TurnDeliveryService {
             "delivery worker must finish or enter force cancellation"
         );
     }
+}
+
+fn workspace_admission_detail(error: WorkspaceAdmissionError) -> String {
+    match error {
+        WorkspaceAdmissionError::Unavailable(error) => error.message,
+        WorkspaceAdmissionError::Resolution(error) => error,
+    }
+}
+
+fn guard_delivery_router(
+    admission: WorkspaceAdmissionController,
+    router: ProviderDeliveryRouter,
+) -> ProviderDeliveryRouter {
+    Arc::new(move |command, delivery_key| {
+        let admission = admission.clone();
+        let router = router.clone();
+        Box::pin(async move {
+            let thread_id = match &command {
+                OrchestrationCommand::ThreadTurnStart { thread_id, .. } => thread_id,
+                _ => {
+                    return ProviderDeliveryOutcome::Rejected {
+                        detail: "durable provider delivery requires a turn start".to_owned(),
+                    };
+                }
+            };
+            let _workspace_admission = match admission
+                .acquire_thread(thread_id, std::iter::empty())
+                .await
+            {
+                Ok(admission) => admission,
+                Err(error) => {
+                    return ProviderDeliveryOutcome::DefinitelyNotSent {
+                        detail: workspace_admission_detail(error),
+                    };
+                }
+            };
+            router(command, delivery_key).await
+        })
+    })
+}
+
+fn guard_delivery_reconciler(
+    admission: WorkspaceAdmissionController,
+    reconciler: DeliveryReconciler,
+) -> DeliveryReconciler {
+    Arc::new(move |row| {
+        let admission = admission.clone();
+        let reconciler = reconciler.clone();
+        Box::pin(async move {
+            let _workspace_admission = match admission
+                .acquire_thread(&row.thread_id, std::iter::empty())
+                .await
+            {
+                Ok(admission) => admission,
+                Err(error) => {
+                    return ProviderReconciliationOutcome::Unavailable {
+                        detail: workspace_admission_detail(error),
+                    };
+                }
+            };
+            reconciler(row).await
+        })
+    })
 }
 
 #[cfg(test)]
@@ -1021,8 +1135,12 @@ mod tests {
             BoxRuntimeFuture, ProviderDriver, ProviderDriverFactory, ProviderLaunchRequest,
             SupervisorOptions,
         },
+        worktree_catalog::{AdoptedWorktreeAvailability, WorkspaceLossTransition},
     };
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::{
+        future::ready,
+        sync::atomic::{AtomicBool, AtomicUsize, Ordering},
+    };
 
     struct NeverFactory;
 
@@ -1070,6 +1188,54 @@ mod tests {
             },
             "createdAt": "2026-08-01T00:00:00Z"
         })
+    }
+
+    #[tokio::test]
+    async fn unavailable_workspace_blocks_delivery_and_reconciliation_before_provider_routing() {
+        let registry = WorkspaceAvailabilityRegistry::new();
+        assert!(
+            registry
+                .mark_unavailable(WorkspaceLossTransition {
+                    thread_id: "thread-guarded".to_owned(),
+                    repository_key: "repository-a".to_owned(),
+                    generation: 1,
+                    path: PathBuf::from("/repo/worktrees/guarded"),
+                    availability: AdoptedWorktreeAvailability::MissingRegistered,
+                })
+                .await
+        );
+        let admission = WorkspaceAdmissionController::registry_only(registry);
+        let delivery_calls = Arc::new(AtomicUsize::new(0));
+        let observed_delivery_calls = delivery_calls.clone();
+        let router = guard_delivery_router(
+            admission.clone(),
+            Arc::new(move |_command, _delivery_key| {
+                observed_delivery_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(ready(ProviderDeliveryOutcome::Accepted { turn_id: None }))
+            }),
+        );
+        let reconciliation_calls = Arc::new(AtomicUsize::new(0));
+        let observed_reconciliation_calls = reconciliation_calls.clone();
+        let reconciler = guard_delivery_reconciler(
+            admission,
+            Arc::new(move |_row| {
+                observed_reconciliation_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(ready(ProviderReconciliationOutcome::Found))
+            }),
+        );
+
+        let command = serde_json::from_value(turn_payload("command-1", "thread-guarded"))
+            .expect("turn command");
+        assert!(matches!(
+            router(command, "delivery-key".to_owned()).await,
+            ProviderDeliveryOutcome::DefinitelyNotSent { .. }
+        ));
+        assert!(matches!(
+            reconciler(row("command-1", "thread-guarded")).await,
+            ProviderReconciliationOutcome::Unavailable { .. }
+        ));
+        assert_eq!(delivery_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(reconciliation_calls.load(Ordering::SeqCst), 0);
     }
 
     async fn seed_delivery(

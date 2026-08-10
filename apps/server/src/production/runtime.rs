@@ -288,7 +288,7 @@ impl ProductionRuntime {
             relay,
             control.clone(),
         )
-        .with_availability_registry(workspace_availability.clone());
+        .with_workspace_admission(workspace_availability.clone(), repositories.clone());
         let worktree_runtime = WorktreeRuntime::start(
             orchestration.clone(),
             provider_runtime.clone(),
@@ -309,10 +309,11 @@ impl ProductionRuntime {
         )
         .await
         .map_err(|error| error.to_string())?;
-        let turn_delivery = Arc::new(TurnDeliveryService::start(
+        let turn_delivery = Arc::new(TurnDeliveryService::start_with_availability(
             orchestration.clone(),
             provider_runtime.clone(),
             config.state_dir(),
+            workspace_availability.clone(),
         ));
 
         let mut registry = RpcRegistry::with_trace_diagnostics(trace_diagnostics.clone());
