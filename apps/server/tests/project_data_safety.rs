@@ -376,28 +376,7 @@ async fn concurrent_adoption_of_a_recognized_store_converges_on_one_identity() {
 
 #[tokio::test]
 async fn crash_left_sidecars_restart_with_the_same_store_identity_and_project() {
-    let root = TempDir::new().expect("temporary crash-store root");
-    let ready = root.path().join("crash-store-ready");
-    let mut child = Command::new(std::env::current_exe().expect("current test executable"))
-        .arg("--exact")
-        .arg("crash_store_fixture_child")
-        .arg("--nocapture")
-        .env(CRASH_STORE_CHILD_ROOT, root.path())
-        .env(CRASH_STORE_CHILD_READY, &ready)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn crash-store fixture child");
-    wait_for_path(&ready, &mut child);
-    child.kill().expect("kill crash-store fixture child");
-    child.wait().expect("reap crash-store fixture child");
-
-    let mut config = ServerConfig::new(root.path());
-    let resolved = resolve_data_root(config.data_root_request.clone()).expect("resolve root");
-    config.base_dir = resolved.effective.clone();
-    config.resolved_data_root = Some(resolved);
-    let paths = StatePaths::from_config(&config);
+    let (_root, config, paths) = crashed_store_fixture();
     let marker_before = std::fs::read(&paths.environment_id).expect("crash-store marker");
     assert!(sqlite_sidecar(&paths.database, "-wal").is_file());
     assert!(sqlite_sidecar(&paths.database, "-shm").is_file());
@@ -423,6 +402,56 @@ async fn crash_left_sidecars_restart_with_the_same_store_identity_and_project() 
         marker_text(&marker_before)
     );
     assert_eq!(title, "Crash project");
+    assert_eq!(
+        std::fs::read(&paths.environment_id).expect("marker remains"),
+        marker_before
+    );
+}
+
+#[tokio::test]
+async fn crash_left_wal_without_shm_restarts_with_only_sqlite_coordination_recreated() {
+    let (_root, config, paths) = crashed_store_fixture();
+    let marker_before = std::fs::read(&paths.environment_id).expect("crash-store marker");
+    let shared_memory = sqlite_sidecar(&paths.database, "-shm");
+    std::fs::remove_file(&shared_memory).expect("remove crash-left SHM fixture");
+    let mut expected_entries = directory_entry_names(&paths.state_dir);
+    expected_entries.push(std::ffi::OsString::from("state.sqlite-shm"));
+    expected_entries.sort();
+
+    let prepared = prepare_store(&config)
+        .await
+        .expect("valid marked crash-store without SHM restarts");
+    let (title, integrity) = prepared
+        .database
+        .call(|connection| {
+            Ok((
+                connection.query_row(
+                    "SELECT title FROM projection_projects WHERE project_id = 'crash-project'",
+                    [],
+                    |row| row.get::<_, String>(0),
+                )?,
+                connection.query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))?,
+            ))
+        })
+        .await
+        .expect("crash-store project and integrity");
+
+    assert_eq!(prepared.classification, StoreClassification::Existing);
+    assert_eq!(
+        prepared.storage_instance_id.to_string(),
+        marker_text(&marker_before)
+    );
+    assert_eq!(title, "Crash project");
+    assert_eq!(integrity, "ok");
+    assert_eq!(directory_entry_names(&paths.state_dir), expected_entries);
+    assert!(
+        shared_memory
+            .metadata()
+            .expect("recreated SQLite SHM")
+            .len()
+            >= 32 * 1024,
+        "SQLite recreates its valid volatile WAL-index coordination file"
+    );
     assert_eq!(
         std::fs::read(&paths.environment_id).expect("marker remains"),
         marker_before
@@ -505,6 +534,41 @@ fn marker_text(bytes: &[u8]) -> String {
         .expect("UTF-8 marker")
         .trim()
         .to_owned()
+}
+
+fn crashed_store_fixture() -> (TempDir, ServerConfig, StatePaths) {
+    let root = TempDir::new().expect("temporary crash-store root");
+    let ready = root.path().join("crash-store-ready");
+    let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+        .arg("--exact")
+        .arg("crash_store_fixture_child")
+        .arg("--nocapture")
+        .env(CRASH_STORE_CHILD_ROOT, root.path())
+        .env(CRASH_STORE_CHILD_READY, &ready)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn crash-store fixture child");
+    wait_for_path(&ready, &mut child);
+    child.kill().expect("kill crash-store fixture child");
+    child.wait().expect("reap crash-store fixture child");
+
+    let mut config = ServerConfig::new(root.path());
+    let resolved = resolve_data_root(config.data_root_request.clone()).expect("resolve root");
+    config.base_dir = resolved.effective.clone();
+    config.resolved_data_root = Some(resolved);
+    let paths = StatePaths::from_config(&config);
+    (root, config, paths)
+}
+
+fn directory_entry_names(path: &Path) -> Vec<std::ffi::OsString> {
+    let mut entries = std::fs::read_dir(path)
+        .expect("state directory")
+        .map(|entry| entry.expect("state entry").file_name())
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries
 }
 
 fn wait_for_path(path: &Path, child: &mut std::process::Child) {

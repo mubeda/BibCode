@@ -1,10 +1,18 @@
-use std::{path::PathBuf, time::Duration};
+use std::{
+    path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 
 use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
 use bibcode_server::{ROUTE_INVENTORY, RpcRegistry, ServerConfig, ServerHandle, ServerRuntime};
 use futures_util::{SinkExt, StreamExt};
 use p256::ecdsa::{Signature, SigningKey, signature::hazmat::PrehashSigner};
 use reqwest::{Client, Response, StatusCode, header};
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tempfile::TempDir;
@@ -1340,6 +1348,100 @@ async fn simultaneous_live_server_starts_share_the_existing_store() {
     .await;
 
     assert_eq!(accepted_by_second["authenticated"], true);
+    shutdown(second).await;
+    shutdown(first).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn server_starts_while_live_store_is_continuously_committed_and_checkpointed() {
+    let temp = TempDir::new().expect("temporary base directory");
+    let first = start_desktop_server(&temp).await;
+    let client = Client::new();
+    let administrator = exchange_token(&client, &first, DESKTOP_BOOTSTRAP, None).await;
+    let administrator_token = access_token(&administrator).to_owned();
+    let database_path = temp.path().join("userdata/state.sqlite");
+    let setup = Connection::open(&database_path).expect("live-store churn setup");
+    setup
+        .execute_batch(
+            "CREATE TABLE validation_startup_churn (
+               singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+               revision INTEGER NOT NULL
+             );
+             INSERT INTO validation_startup_churn (singleton, revision) VALUES (1, 0);",
+        )
+        .expect("live-store churn table");
+    drop(setup);
+    let stop = Arc::new(AtomicBool::new(false));
+    let writer_stop = Arc::clone(&stop);
+    let startup_in_progress = Arc::new(AtomicBool::new(false));
+    let writer_startup_in_progress = Arc::clone(&startup_in_progress);
+    let checkpoints_during_startup = Arc::new(AtomicUsize::new(0));
+    let writer_checkpoints_during_startup = Arc::clone(&checkpoints_during_startup);
+    let (checkpoint_ready, checkpoint_observed) = std::sync::mpsc::sync_channel(1);
+
+    let writer = std::thread::spawn(move || {
+        let checkpoint = Connection::open(database_path).expect("checkpoint connection");
+        checkpoint
+            .busy_timeout(Duration::from_secs(1))
+            .expect("checkpoint busy timeout");
+        let mut checkpoint_ready = Some(checkpoint_ready);
+        let mut successful_checkpoints = 0_usize;
+        let mut ordinal = 0_i64;
+        while !writer_stop.load(Ordering::Acquire) || ordinal < 2 {
+            checkpoint
+                .execute(
+                    "UPDATE validation_startup_churn SET revision = ?1 WHERE singleton = 1",
+                    [ordinal],
+                )
+                .expect("live-store commit");
+            let checkpoint_result = checkpoint
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .expect("live-store checkpoint");
+            if checkpoint_result == 0 {
+                successful_checkpoints += 1;
+                if writer_startup_in_progress.load(Ordering::Acquire) {
+                    writer_checkpoints_during_startup.fetch_add(1, Ordering::AcqRel);
+                }
+                if let Some(ready) = checkpoint_ready.take() {
+                    ready.send(()).expect("signal first checkpoint");
+                }
+            }
+            ordinal += 1;
+            std::thread::yield_now();
+        }
+        successful_checkpoints
+    });
+    checkpoint_observed
+        .recv_timeout(Duration::from_secs(5))
+        .expect("initial checkpoint signal");
+
+    startup_in_progress.store(true, Ordering::Release);
+    let second = start_desktop_server(&temp).await;
+    startup_in_progress.store(false, Ordering::Release);
+    stop.store(true, Ordering::Release);
+    let successful_checkpoints = writer.join().expect("live-store writer thread");
+    assert!(
+        successful_checkpoints >= 2,
+        "writer must checkpoint before and during concurrent startup"
+    );
+    assert!(
+        checkpoints_during_startup.load(Ordering::Acquire) > 0,
+        "at least one commit/checkpoint cycle overlaps second-server startup"
+    );
+    let accepted_by_second = get_json(
+        client
+            .get(http_url(&second, "/api/auth/session"))
+            .bearer_auth(&administrator_token)
+            .send()
+            .await
+            .expect("second server session request"),
+        StatusCode::OK,
+    )
+    .await;
+    assert_eq!(accepted_by_second["authenticated"], true);
+
     shutdown(second).await;
     shutdown(first).await;
 }
