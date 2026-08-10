@@ -8,7 +8,7 @@
         "_tag": "Fail",
         "error": {
           "_tag": "WorktreeRemovalError",
-          "reason": "stale-generation",
+          "reason": "dirty-confirmation-required",
           "message": "%}9WB7`"
         }
       }

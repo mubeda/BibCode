@@ -500,6 +500,8 @@ describe("worktree catalog schemas", () => {
     ).toHaveLength(4);
 
     const reasons = [
+      "command-conflict",
+      "ownership-conflict",
       "stale-plan",
       "dirty-confirmation-required",
       "protected-target",

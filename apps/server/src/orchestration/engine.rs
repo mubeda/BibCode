@@ -1386,6 +1386,9 @@ impl OrchestrationEngine {
                 command_id: command_id.to_owned(),
             });
         }
+        if matches!(receipt.status.as_str(), "reserved" | "prepared") {
+            return Ok(None);
+        }
         if receipt.status != "accepted" {
             return Err(OrchestrationError::PreviouslyRejected {
                 command_id: command_id.to_owned(),
@@ -1404,6 +1407,77 @@ impl OrchestrationEngine {
             .filter(|event| event.event.command_id.as_deref() == Some(command_id))
             .collect::<VecDeque<_>>();
         durable_worktree_removal_result(&events).map(Some)
+    }
+
+    pub(crate) async fn reserve_worktree_removal_admission(
+        &self,
+        command_id: &str,
+        project_id: &str,
+        payload_digest: &str,
+    ) -> Result<(Option<DurableWorktreeRemovalResult>, bool), OrchestrationError> {
+        let accepted_at = current_timestamp(self.repositories.database()).await?;
+        let result_sequence = current_max_sequence(&self.repositories).await?;
+        let (receipt, inserted) = self
+            .repositories
+            .reserve_command_receipt(CommandReceipt {
+                command_id: command_id.to_owned(),
+                aggregate_kind: "project".to_owned(),
+                aggregate_id: project_id.to_owned(),
+                accepted_at,
+                result_sequence,
+                status: "reserved".to_owned(),
+                error: None,
+                payload_digest: Some(payload_digest.to_owned()),
+            })
+            .await
+            .map_err(wrap_persistence)?;
+        if receipt.payload_digest.as_deref() != Some(payload_digest)
+            || receipt.aggregate_kind != "project"
+            || receipt.aggregate_id != project_id
+        {
+            return Err(OrchestrationError::CommandConflict {
+                command_id: command_id.to_owned(),
+            });
+        }
+        let prepared_retry = !inserted && receipt.status == "prepared";
+        let replay = self
+            .replay_admitted_worktree_removal(command_id, payload_digest)
+            .await?;
+        Ok((replay, prepared_retry))
+    }
+
+    pub(crate) async fn prepare_worktree_removal_admission(
+        &self,
+        command_id: &str,
+        project_id: &str,
+        payload_digest: &str,
+    ) -> Result<(), OrchestrationError> {
+        let receipt = self
+            .repositories
+            .prepare_reserved_command_receipt(command_id.to_owned(), payload_digest.to_owned())
+            .await
+            .map_err(wrap_persistence)?
+            .ok_or_else(|| OrchestrationError::CommandConflict {
+                command_id: command_id.to_owned(),
+            })?;
+        if receipt.payload_digest.as_deref() != Some(payload_digest)
+            || receipt.aggregate_kind != "project"
+            || receipt.aggregate_id != project_id
+        {
+            return Err(OrchestrationError::CommandConflict {
+                command_id: command_id.to_owned(),
+            });
+        }
+        if matches!(receipt.status.as_str(), "prepared" | "accepted") {
+            Ok(())
+        } else {
+            Err(OrchestrationError::PreviouslyRejected {
+                command_id: command_id.to_owned(),
+                detail: receipt
+                    .error
+                    .unwrap_or_else(|| "Previously rejected.".to_owned()),
+            })
+        }
     }
 
     #[cfg(test)]
@@ -1793,12 +1867,18 @@ async fn process_envelope(
                 accepted_new: false,
             });
         }
-        return Err(OrchestrationError::PreviouslyRejected {
-            command_id,
-            detail: receipt
-                .error
-                .unwrap_or_else(|| "Previously rejected.".to_owned()),
-        });
+        if matches!(receipt.status.as_str(), "reserved" | "prepared") && admission.is_some() {
+            // A side-effecting application service reserved this immutable command identity
+            // before crossing its external mutation boundary. Final persistence upgrades the
+            // same receipt atomically with its events.
+        } else {
+            return Err(OrchestrationError::PreviouslyRejected {
+                command_id,
+                detail: receipt
+                    .error
+                    .unwrap_or_else(|| "Previously rejected.".to_owned()),
+            });
+        }
     }
     let occurred_at = match command.occurred_at() {
         Some(value) => value.to_owned(),

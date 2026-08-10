@@ -8,7 +8,7 @@
         "_tag": "Fail",
         "error": {
           "_tag": "WorktreeRemovalError",
-          "reason": "orchestration-failed",
+          "reason": "locked",
           "message": "cf`Y[s",
           "currentGeneration": 8
         }

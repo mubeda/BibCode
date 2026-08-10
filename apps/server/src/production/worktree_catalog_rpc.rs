@@ -46,6 +46,65 @@ pub struct WorktreeRemovalQuiesceLease {
     detached: bool,
 }
 
+#[derive(Clone)]
+pub struct WorktreeRemovalQuiesceRequest {
+    identity: WorkspaceRemovalIdentity,
+    project_id: String,
+    repository_key: Option<String>,
+    known_thread_ids: Vec<String>,
+}
+
+impl WorktreeRemovalQuiesceRequest {
+    #[must_use]
+    pub fn project(
+        identity: WorkspaceRemovalIdentity,
+        project_id: String,
+        known_thread_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            identity,
+            project_id,
+            repository_key: None,
+            known_thread_ids,
+        }
+    }
+
+    #[must_use]
+    pub fn repository(
+        identity: WorkspaceRemovalIdentity,
+        project_id: String,
+        repository_key: String,
+        known_thread_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            identity,
+            project_id,
+            repository_key: Some(repository_key),
+            known_thread_ids,
+        }
+    }
+
+    pub(crate) fn identity(&self) -> &WorkspaceRemovalIdentity {
+        &self.identity
+    }
+
+    pub(crate) fn project_id(&self) -> &str {
+        &self.project_id
+    }
+
+    pub(crate) fn repository_key(&self) -> Option<&str> {
+        self.repository_key.as_deref()
+    }
+
+    pub(crate) fn known_thread_ids(&self) -> &[String] {
+        &self.known_thread_ids
+    }
+
+    pub(crate) fn replace_identity(&mut self, identity: WorkspaceRemovalIdentity) {
+        self.identity = identity;
+    }
+}
+
 impl WorktreeRemovalQuiesceLease {
     #[must_use]
     pub fn complete() -> Self {
@@ -84,7 +143,7 @@ impl Drop for WorktreeRemovalQuiesceLease {
 }
 
 pub trait WorktreeRemovalQuiescer: Send + Sync + 'static {
-    fn quiesce(&self, identity: WorkspaceRemovalIdentity) -> WorktreeRemovalQuiesceFuture;
+    fn quiesce(&self, request: WorktreeRemovalQuiesceRequest) -> WorktreeRemovalQuiesceFuture;
 }
 
 pub type WorktreeRemovalGitFuture<T> =
@@ -195,7 +254,7 @@ impl WorktreeRemovalGit for GitRepository {
 struct NoopWorktreeRemovalQuiescer;
 
 impl WorktreeRemovalQuiescer for NoopWorktreeRemovalQuiescer {
-    fn quiesce(&self, _identity: WorkspaceRemovalIdentity) -> WorktreeRemovalQuiesceFuture {
+    fn quiesce(&self, _request: WorktreeRemovalQuiesceRequest) -> WorktreeRemovalQuiesceFuture {
         Box::pin(async { WorktreeRemovalQuiesceLease::complete() })
     }
 }
@@ -734,8 +793,15 @@ struct WorktreePruneImpact {
 struct ResolvedRemovalPlan {
     wire: WorktreeRemovalPlan,
     anchor: PathBuf,
+    repository_key: String,
     record: Option<GitWorktreeRecord>,
     prune_impact: Vec<GitPrunableWorktree>,
+}
+
+struct ResolvedRemovalThread {
+    anchor: PathBuf,
+    path: PathBuf,
+    known_thread_ids: Vec<String>,
 }
 
 #[derive(Clone, Serialize)]
@@ -753,6 +819,8 @@ struct WorktreeRemovalResult {
 enum WorktreeRemovalErrorReason {
     ThreadNotFound,
     EnvironmentUnsupported,
+    CommandConflict,
+    OwnershipConflict,
     StaleGeneration,
     StalePlan,
     DirtyConfirmationRequired,
@@ -801,7 +869,8 @@ async fn remove_from_bibcode(
 ) -> RpcResult {
     let input = decode::<WorktreeRemoveFromBibCodeInput>(request)?;
     let payload_digest = removal_payload_digest(&input)?;
-    if let Some(result) = replay_removal(services, &input.command_id, &payload_digest).await? {
+    let reservation = reserve_removal(services, &input, &payload_digest).await?;
+    if let Some(result) = reservation.result {
         return Ok(encode(result));
     }
     let project_id = input.project_id.clone();
@@ -813,18 +882,27 @@ async fn remove_from_bibcode(
             {
                 return Ok(encode(result));
             }
-            let (_, path) =
+            let resolved =
                 resolve_removal_thread(services, &input.project_id, &input.thread_id).await?;
             let registry = services.catalog.availability_registry();
-            let guard = registry.mark_removing(&input.thread_id, &path).await;
-            let quiesce = services.removal_quiescer.quiesce(guard.identity()).await;
+            let guard = registry
+                .mark_removing(&input.thread_id, &resolved.path)
+                .await;
+            let quiesce = services
+                .removal_quiescer
+                .quiesce(WorktreeRemovalQuiesceRequest::project(
+                    guard.identity(),
+                    input.project_id.clone(),
+                    resolved.known_thread_ids,
+                ))
+                .await;
             let orphan_cleanup_pending = quiesce.orphan_cleanup_pending();
             let result = persist_detach(
                 services,
                 input.command_id,
                 input.project_id.clone(),
                 input.thread_id.clone(),
-                path.clone(),
+                resolved.path.clone(),
                 payload_digest,
                 "not-requested",
                 None,
@@ -832,7 +910,9 @@ async fn remove_from_bibcode(
             )
             .await?;
             quiesce.commit_detached();
-            registry.clear_recovered(&input.thread_id, &path).await;
+            registry
+                .clear_recovered(&input.thread_id, &resolved.path)
+                .await;
             drop(guard);
             services
                 .catalog
@@ -850,7 +930,8 @@ async fn remove_worktree(
 ) -> RpcResult {
     let input = decode::<WorktreeRemoveInput>(request)?;
     let payload_digest = removal_payload_digest(&input)?;
-    if let Some(result) = replay_removal(services, &input.command_id, &payload_digest).await? {
+    let reservation = reserve_removal(services, &input, &payload_digest).await?;
+    if let Some(result) = reservation.result {
         return Ok(encode(result));
     }
     let project_id = input.project_id.clone();
@@ -862,12 +943,12 @@ async fn remove_worktree(
             {
                 return Ok(encode(result));
             }
-            let (_, path) =
+            let resolved =
                 resolve_removal_thread(services, &input.project_id, &input.thread_id).await?;
             let registry = services.catalog.availability_registry();
-            let guard = registry.mark_removing(&input.thread_id, &path).await;
-            let quiesce = services.removal_quiescer.quiesce(guard.identity()).await;
-            let orphan_cleanup_pending = quiesce.orphan_cleanup_pending();
+            let guard = registry
+                .mark_removing(&input.thread_id, &resolved.path)
+                .await;
             let plan = build_removal_plan(
                 services,
                 &input.project_id,
@@ -877,14 +958,41 @@ async fn remove_worktree(
                 &cancellation,
             )
             .await?;
-            if plan.wire.plan_token != input.plan_token {
+            let resumed_git_success = reservation.prepared_retry
+                && matches!(input.mode, WorktreeRemovalMode::DeleteGitWorktree)
+                && plan.wire.availability == "missing-unregistered";
+            if plan.wire.plan_token != input.plan_token && !resumed_git_success {
                 return Err(encode(removal_error(
                     WorktreeRemovalErrorReason::StalePlan,
                     "The removal impact changed after it was confirmed.",
                     Some(plan.wire.generation),
                 )));
             }
-            let git_result = apply_git_removal(services, &input, &plan, &cancellation).await;
+            validate_git_removal_preflight(&input, &plan, resumed_git_success).map_err(encode)?;
+            services
+                .orchestration
+                .prepare_worktree_removal_admission(
+                    &input.command_id,
+                    &input.project_id,
+                    &payload_digest,
+                )
+                .await
+                .map_err(|error| encode(removal_orchestration_error(error)))?;
+            let quiesce = services
+                .removal_quiescer
+                .quiesce(WorktreeRemovalQuiesceRequest::repository(
+                    guard.identity(),
+                    input.project_id.clone(),
+                    plan.repository_key.clone(),
+                    resolved.known_thread_ids,
+                ))
+                .await;
+            let orphan_cleanup_pending = quiesce.orphan_cleanup_pending();
+            let git_result = if resumed_git_success {
+                Ok(("removed", None))
+            } else {
+                apply_git_removal(services, &input, &plan, &cancellation).await
+            };
             let (git_outcome, detail) = match git_result {
                 Ok(outcome) => outcome,
                 Err(error)
@@ -900,7 +1008,7 @@ async fn remove_worktree(
                 input.command_id,
                 input.project_id.clone(),
                 input.thread_id.clone(),
-                path.clone(),
+                resolved.path.clone(),
                 payload_digest,
                 git_outcome,
                 detail,
@@ -908,12 +1016,21 @@ async fn remove_worktree(
             )
             .await?;
             quiesce.commit_detached();
-            registry.clear_recovered(&input.thread_id, &path).await;
-            drop(guard);
-            services
-                .catalog
-                .invalidate_after_mutation(&input.project_id)
+            registry
+                .clear_recovered(&input.thread_id, &resolved.path)
                 .await;
+            drop(guard);
+            if matches!(git_outcome, "removed" | "cleaned") {
+                services
+                    .catalog
+                    .invalidate_repository_after_mutation(&input.project_id)
+                    .await;
+            } else {
+                services
+                    .catalog
+                    .invalidate_after_mutation(&input.project_id)
+                    .await;
+            }
             Ok(encode(result))
         })
         .await
@@ -923,7 +1040,7 @@ async fn resolve_removal_thread(
     services: &WorktreeCatalogRpcServices,
     project_id: &str,
     thread_id: &str,
-) -> Result<(PathBuf, PathBuf), Value> {
+) -> Result<ResolvedRemovalThread, Value> {
     let repositories = services.orchestration.repositories();
     let project = repositories
         .get_project(project_id.to_owned())
@@ -946,7 +1063,56 @@ async fn resolve_removal_thread(
         .filter(|path| !path.trim().is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| encode(removal_not_found()))?;
-    Ok((PathBuf::from(project.workspace_root), path))
+    let path_key = normalize_worktree_path_key(&path, host_path_platform());
+    let project_threads = repositories
+        .list_threads_by_project(project_id.to_owned())
+        .await
+        .map_err(|_| encode(removal_internal()))?;
+    let owners = project_threads
+        .iter()
+        .filter(|candidate| {
+            candidate.kind == "workspace"
+                && candidate.deleted_at.is_none()
+                && candidate
+                    .worktree_path
+                    .as_ref()
+                    .is_some_and(|candidate_path| {
+                        normalize_worktree_path_key(Path::new(candidate_path), host_path_platform())
+                            == path_key
+                    })
+        })
+        .collect::<Vec<_>>();
+    if owners.len() != 1 || owners[0].thread_id != thread_id {
+        return Err(encode(removal_error(
+            WorktreeRemovalErrorReason::OwnershipConflict,
+            "Multiple workspace threads claim the removal target.",
+            None,
+        )));
+    }
+    let project_root_key =
+        normalize_worktree_path_key(Path::new(&project.workspace_root), host_path_platform());
+    let mut known_thread_ids = project_threads
+        .into_iter()
+        .filter(|candidate| candidate.deleted_at.is_none())
+        .filter_map(|candidate| {
+            let candidate_key = candidate
+                .worktree_path
+                .as_ref()
+                .map(|candidate_path| {
+                    normalize_worktree_path_key(Path::new(candidate_path), host_path_platform())
+                })
+                .unwrap_or_else(|| project_root_key.clone());
+            (candidate_key == path_key).then_some(candidate.thread_id)
+        })
+        .collect::<Vec<_>>();
+    known_thread_ids.push(thread_id.to_owned());
+    known_thread_ids.sort();
+    known_thread_ids.dedup();
+    Ok(ResolvedRemovalThread {
+        anchor: PathBuf::from(project.workspace_root),
+        path,
+        known_thread_ids,
+    })
 }
 
 async fn build_removal_plan(
@@ -957,7 +1123,9 @@ async fn build_removal_plan(
     refresh: bool,
     cancellation: &CancellationToken,
 ) -> Result<ResolvedRemovalPlan, Value> {
-    let (anchor, path) = resolve_removal_thread(services, project_id, thread_id).await?;
+    let resolved = resolve_removal_thread(services, project_id, thread_id).await?;
+    let anchor = resolved.anchor;
+    let path = resolved.path;
     let snapshot = if refresh {
         services
             .catalog
@@ -1108,6 +1276,7 @@ async fn build_removal_plan(
     Ok(ResolvedRemovalPlan {
         wire,
         anchor,
+        repository_key: snapshot.repository_key.clone(),
         record,
         prune_impact,
     })
@@ -1210,6 +1379,57 @@ async fn apply_git_removal(
     }
 }
 
+fn validate_git_removal_preflight(
+    input: &WorktreeRemoveInput,
+    plan: &ResolvedRemovalPlan,
+    resumed_git_success: bool,
+) -> Result<(), WorktreeRemovalError> {
+    match input.mode {
+        WorktreeRemovalMode::DeleteGitWorktree => {
+            if plan.wire.availability != "present" && !resumed_git_success {
+                return Err(removal_error(
+                    WorktreeRemovalErrorReason::StalePlan,
+                    "The worktree is no longer present.",
+                    Some(plan.wire.generation),
+                ));
+            }
+            if plan.wire.locked {
+                return Err(removal_error(
+                    WorktreeRemovalErrorReason::Locked,
+                    "The Git worktree registration is locked.",
+                    Some(plan.wire.generation),
+                ));
+            }
+            if !input.force_dirty
+                && (plan.wire.tracked_change_count != 0 || plan.wire.untracked_file_count != 0)
+            {
+                return Err(removal_error(
+                    WorktreeRemovalErrorReason::DirtyConfirmationRequired,
+                    "Dirty worktree deletion requires explicit confirmation.",
+                    Some(plan.wire.generation),
+                ));
+            }
+        }
+        WorktreeRemovalMode::CleanupStaleRegistration => {
+            if plan.wire.availability == "present" {
+                return Err(removal_error(
+                    WorktreeRemovalErrorReason::ProtectedTarget,
+                    "A present worktree cannot be treated as stale registration cleanup.",
+                    Some(plan.wire.generation),
+                ));
+            }
+            if plan.wire.locked {
+                return Err(removal_error(
+                    WorktreeRemovalErrorReason::Locked,
+                    "The stale Git worktree registration is locked.",
+                    Some(plan.wire.generation),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn persist_detach(
     services: &WorktreeCatalogRpcServices,
@@ -1269,6 +1489,57 @@ async fn replay_removal(
             })
         })
         .map_err(|error| encode(removal_orchestration_error(error)))
+}
+
+async fn reserve_removal(
+    services: &WorktreeCatalogRpcServices,
+    input: &impl RemovalAdmissionInput,
+    payload_digest: &str,
+) -> Result<RemovalAdmissionReservation, Value> {
+    services
+        .orchestration
+        .reserve_worktree_removal_admission(input.command_id(), input.project_id(), payload_digest)
+        .await
+        .map(|(result, prepared_retry)| RemovalAdmissionReservation {
+            result: result.map(|result| WorktreeRemovalResult {
+                thread_removed: result.thread_removed,
+                git_outcome: result.git_outcome,
+                detail: result.detail,
+                orphan_cleanup_pending: result.orphan_cleanup_pending,
+            }),
+            prepared_retry,
+        })
+        .map_err(|error| encode(removal_orchestration_error(error)))
+}
+
+struct RemovalAdmissionReservation {
+    result: Option<WorktreeRemovalResult>,
+    prepared_retry: bool,
+}
+
+trait RemovalAdmissionInput {
+    fn command_id(&self) -> &str;
+    fn project_id(&self) -> &str;
+}
+
+impl RemovalAdmissionInput for WorktreeRemoveFromBibCodeInput {
+    fn command_id(&self) -> &str {
+        &self.command_id
+    }
+
+    fn project_id(&self) -> &str {
+        &self.project_id
+    }
+}
+
+impl RemovalAdmissionInput for WorktreeRemoveInput {
+    fn command_id(&self) -> &str {
+        &self.command_id
+    }
+
+    fn project_id(&self) -> &str {
+        &self.project_id
+    }
 }
 
 fn removal_payload_digest(input: &impl Serialize) -> Result<String, Value> {
@@ -1374,12 +1645,12 @@ fn removal_catalog_error(
 fn removal_orchestration_error(error: OrchestrationError) -> WorktreeRemovalError {
     match error {
         OrchestrationError::CommandConflict { .. } => removal_error(
-            WorktreeRemovalErrorReason::OrchestrationFailed,
+            WorktreeRemovalErrorReason::CommandConflict,
             "The command ID was already used with a different removal payload.",
             None,
         ),
         OrchestrationError::WorktreeOwnershipConflict { .. } => removal_error(
-            WorktreeRemovalErrorReason::OrchestrationFailed,
+            WorktreeRemovalErrorReason::OwnershipConflict,
             "Workspace ownership conflicts with removal.",
             None,
         ),

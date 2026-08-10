@@ -761,6 +761,45 @@ async fn active_mutation_worker_releases_its_view_while_an_alias_owns_the_shared
 }
 
 #[tokio::test]
+async fn repository_mutation_invalidation_fans_out_to_shared_views_only() {
+    let shared = inventory("/repo/common", [record("/repo/main", true)]);
+    let unrelated = inventory("/other/common", [record("/other/main", true)]);
+    let inventory = Arc::new(FakeInventorySource::new([
+        shared.clone(),
+        shared.clone(),
+        unrelated,
+        shared.clone(),
+        shared,
+    ]));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([
+            project("project-a", "/repo/main", []),
+            project("project-b", "/repo/main", []),
+            project("project-c", "/other/main", []),
+        ])),
+        inventory,
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+            ("/other/main", DirectoryProbeState::Present),
+            ("/other/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+    let _project_a = service.subscribe("project-a").await.expect("project A");
+    let _project_b = service.subscribe("project-b").await.expect("project B");
+    let project_c = service.subscribe("project-c").await.expect("project C");
+
+    service
+        .invalidate_repository_after_mutation("project-a")
+        .await;
+    wait_for_mutation_refresh_worker_starts(&service, 2).await;
+
+    assert_eq!(service.mutation_refresh_worker_start_count_for_test(), 2);
+    assert_eq!(project_c.latest().generation, 1);
+}
+
+#[tokio::test]
 async fn four_repository_scans_run_concurrently_while_a_fifth_waits() {
     let projects =
         (0..5).map(|index| project(&format!("project-{index}"), &format!("/repo-{index}"), []));

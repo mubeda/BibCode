@@ -142,6 +142,19 @@ payload reuse conflicts. A present Git mutation or absence verification
 failure does not detach. The `worktreeCatalog` capability is advertised only
 with all three registered handlers, scopes, and wire fixtures.
 
+Before quiesce or Git side effects, removal atomically inserts an immutable
+generic command receipt in `reserved` state. A different payload or project for
+that command ID conflicts even when requests hold different physical-repository
+locks. After the fresh plan token and mode-specific preflight pass, the receipt
+advances to `prepared`; successful detach upgrades it to `accepted` in the same
+transaction as the events. Matching `reserved` work is safely re-preflighted,
+while matching `prepared` work may infer a prior verified Git success only when
+the exact target is now missing and unregistered. This makes a crash between Git
+and detach resumable without allowing an unvalidated request to claim success.
+Canonical normalized workspace ownership is also required to be unique before
+the receipt is prepared or Git can run, with detach checking it again as a
+defense.
+
 Every healthy authoritative catalog publication also compares active adopted
 worktrees with durable thread branch metadata. A change dispatches one
 idempotent `thread.meta-updated` command whose ID contains the thread ID plus a
@@ -245,6 +258,17 @@ exact removal token and the resolved alias IDs. Durable detach commits that
 lease so cleanup may finish after projections disappear; any preflight, Git,
 or orchestration failure drops the lease, cancels the queued retry, and releases
 its retained guard before it can affect a later session.
+
+The retry supervisor admits cleanup through a bounded async queue, so saturation
+does not block a Tokio worker or discard truthful pending ownership. Failed and
+timed-out jobs retain their exact Removing guard in a bounded scheduler, retry
+fairly, and re-resolve aliases on every attempt. The server seeds retries with
+preflight-known aliases so same-project panels remain cleanable after detach.
+Destructive removal resolution additionally spans live projects durably pinned
+to the same repository identity and exact normalized checkout path; unrelated
+or unpinned repositories are excluded. A verified Git removal/cleanup
+invalidates every live catalog view sharing the repository entry, whereas
+detach-only and failed cleanup remain scoped to the initiating project.
 
 The guard rejects a new turn before durable admission; terminal open, restart,
 write, and restart-on-attach; client Git status and mutations; and project
