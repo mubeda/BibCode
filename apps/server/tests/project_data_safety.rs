@@ -7,11 +7,19 @@ use bibcode_server::{
     resolve_data_root,
 };
 use rusqlite::Connection;
+use std::{
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::{Duration, Instant},
+};
 use tempfile::TempDir;
 use uuid::Uuid;
 
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
+
+const CRASH_STORE_CHILD_ROOT: &str = "BIBCODE_CRASH_STORE_CHILD_ROOT";
+const CRASH_STORE_CHILD_READY: &str = "BIBCODE_CRASH_STORE_CHILD_READY";
 
 struct StoreFixture {
     _root: TempDir,
@@ -367,35 +375,95 @@ async fn concurrent_adoption_of_a_recognized_store_converges_on_one_identity() {
 }
 
 #[tokio::test]
-async fn wal_store_without_shm_is_rejected_without_creating_sidecars() {
-    let fixture = StoreFixture::with_project("WAL project").await;
-    let connection = Connection::open(&fixture.paths.database).expect("WAL database");
-    connection
-        .pragma_update(None, "journal_mode", "WAL")
-        .expect("enable WAL");
-    connection
-        .pragma_update(None, "wal_autocheckpoint", 0)
-        .expect("disable automatic checkpoint");
-    connection
-        .execute(
-            "UPDATE projection_projects SET title = 'Uncheckpointed project'",
-            [],
-        )
-        .expect("write WAL frame");
-    let wal_path = fixture.paths.database.with_extension("sqlite-wal");
-    let shm_path = fixture.paths.database.with_extension("sqlite-shm");
-    assert!(wal_path.is_file(), "WAL fixture");
-    std::fs::remove_file(&shm_path).expect("remove SHM fixture");
-    let entries_before = directory_snapshot(&fixture.paths.state_dir);
+async fn crash_left_sidecars_restart_with_the_same_store_identity_and_project() {
+    let root = TempDir::new().expect("temporary crash-store root");
+    let ready = root.path().join("crash-store-ready");
+    let mut child = Command::new(std::env::current_exe().expect("current test executable"))
+        .arg("--exact")
+        .arg("crash_store_fixture_child")
+        .arg("--nocapture")
+        .env(CRASH_STORE_CHILD_ROOT, root.path())
+        .env(CRASH_STORE_CHILD_READY, &ready)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn crash-store fixture child");
+    wait_for_path(&ready, &mut child);
+    child.kill().expect("kill crash-store fixture child");
+    child.wait().expect("reap crash-store fixture child");
 
-    fixture
-        .prepare()
+    let mut config = ServerConfig::new(root.path());
+    let resolved = resolve_data_root(config.data_root_request.clone()).expect("resolve root");
+    config.base_dir = resolved.effective.clone();
+    config.resolved_data_root = Some(resolved);
+    let paths = StatePaths::from_config(&config);
+    let marker_before = std::fs::read(&paths.environment_id).expect("crash-store marker");
+    assert!(sqlite_sidecar(&paths.database, "-wal").is_file());
+    assert!(sqlite_sidecar(&paths.database, "-shm").is_file());
+
+    let prepared = prepare_store(&config)
         .await
-        .expect_err("WAL state cannot be inspected without side effects");
+        .expect("valid marked crash-store restarts");
+    let title = prepared
+        .database
+        .call(|connection| {
+            Ok(connection.query_row(
+                "SELECT title FROM projection_projects WHERE project_id = 'crash-project'",
+                [],
+                |row| row.get::<_, String>(0),
+            )?)
+        })
+        .await
+        .expect("crash-store project");
 
-    assert_eq!(directory_snapshot(&fixture.paths.state_dir), entries_before);
-    assert!(!shm_path.exists());
-    drop(connection);
+    assert_eq!(prepared.classification, StoreClassification::Existing);
+    assert_eq!(
+        prepared.storage_instance_id.to_string(),
+        marker_text(&marker_before)
+    );
+    assert_eq!(title, "Crash project");
+    assert_eq!(
+        std::fs::read(&paths.environment_id).expect("marker remains"),
+        marker_before
+    );
+}
+
+#[tokio::test]
+async fn crash_store_fixture_child() {
+    let Some(root) = std::env::var_os(CRASH_STORE_CHILD_ROOT).map(PathBuf::from) else {
+        return;
+    };
+    let ready = PathBuf::from(
+        std::env::var_os(CRASH_STORE_CHILD_READY).expect("crash-store child ready path"),
+    );
+    let mut config = ServerConfig::new(&root);
+    let resolved = resolve_data_root(config.data_root_request.clone()).expect("resolve child root");
+    config.base_dir = resolved.effective.clone();
+    config.resolved_data_root = Some(resolved);
+    let paths = StatePaths::from_config(&config);
+    std::fs::create_dir_all(&paths.state_dir).expect("child state directory");
+    let prepared = prepare_store(&config).await.expect("child store starts");
+    prepared
+        .database
+        .call(|connection| {
+            connection.pragma_update(None, "wal_autocheckpoint", 0)?;
+            connection.execute(
+                "INSERT INTO projection_projects (
+                   project_id, title, workspace_root, default_model_selection_json,
+                   scripts_json, created_at, updated_at, deleted_at
+                 ) VALUES ('crash-project', 'Crash project', '/tmp/crash-project', NULL, '{}',
+                           '2026-08-10T00:00:00Z', '2026-08-10T00:00:00Z', NULL)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("child project write");
+    assert!(sqlite_sidecar(&paths.database, "-wal").is_file());
+    assert!(sqlite_sidecar(&paths.database, "-shm").is_file());
+    std::fs::write(&ready, b"ready").expect("publish child readiness");
+    std::future::pending::<()>().await;
 }
 
 #[cfg(unix)]
@@ -426,20 +494,29 @@ async fn dangling_marker_entry_with_missing_database_is_not_first_run() {
     );
 }
 
-fn directory_snapshot(path: &std::path::Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
-    let mut entries = std::fs::read_dir(path)
-        .expect("state directory")
-        .map(|entry| {
-            let entry = entry.expect("state entry");
-            let file_type = entry.file_type().expect("entry type");
-            let bytes = if file_type.is_file() {
-                std::fs::read(entry.path()).expect("entry bytes")
-            } else {
-                Vec::new()
-            };
-            (entry.file_name(), bytes)
-        })
-        .collect::<Vec<_>>();
-    entries.sort_by(|left, right| left.0.cmp(&right.0));
-    entries
+fn sqlite_sidecar(database: &Path, suffix: &str) -> PathBuf {
+    let mut path = database.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+fn marker_text(bytes: &[u8]) -> String {
+    std::str::from_utf8(bytes)
+        .expect("UTF-8 marker")
+        .trim()
+        .to_owned()
+}
+
+fn wait_for_path(path: &Path, child: &mut std::process::Child) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while !path.exists() {
+        if let Some(status) = child.try_wait().expect("inspect fixture child") {
+            panic!("crash-store fixture child exited before ready: {status}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for crash-store fixture child"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }

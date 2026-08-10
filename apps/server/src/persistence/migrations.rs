@@ -5,6 +5,7 @@ use rusqlite::{
     types::Value,
 };
 use thiserror::Error;
+use uuid::Uuid;
 
 const MIGRATIONS_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS effect_sql_migrations (
@@ -54,19 +55,10 @@ pub(crate) enum ExistingStoreValidationError {
 pub(crate) fn validate_existing_bibcode_store(
     path: &Path,
 ) -> std::result::Result<(), ExistingStoreValidationError> {
-    reject_sqlite_sidecars(path)?;
-    let database_uri =
-        url::Url::from_file_path(path).map_err(|()| ExistingStoreValidationError::Unsafe {
-            path: path.to_path_buf(),
-            detail: "database path cannot be represented as a SQLite file URI".to_owned(),
-        })?;
-    let mut database_uri = database_uri.to_string();
-    database_uri.push_str("?immutable=1");
+    let snapshot = ValidationSnapshot::create(path)?;
     let connection = Connection::open_with_flags(
-        database_uri,
-        OpenFlags::SQLITE_OPEN_READ_ONLY
-            | OpenFlags::SQLITE_OPEN_NO_MUTEX
-            | OpenFlags::SQLITE_OPEN_URI,
+        &snapshot.database,
+        OpenFlags::SQLITE_OPEN_READ_WRITE | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(|source| ExistingStoreValidationError::Corrupt {
         path: path.to_path_buf(),
@@ -151,31 +143,71 @@ pub(crate) fn validate_existing_bibcode_store(
     Ok(())
 }
 
-fn reject_sqlite_sidecars(path: &Path) -> std::result::Result<(), ExistingStoreValidationError> {
-    for suffix in ["-wal", "-shm"] {
-        let mut sidecar = path.as_os_str().to_os_string();
-        sidecar.push(suffix);
-        let sidecar = PathBuf::from(sidecar);
-        match std::fs::symlink_metadata(&sidecar) {
+struct ValidationSnapshot {
+    root: PathBuf,
+    database: PathBuf,
+}
+
+impl ValidationSnapshot {
+    fn create(source_database: &Path) -> std::result::Result<Self, ExistingStoreValidationError> {
+        let source_path = source_database.to_path_buf();
+        let root = std::env::temp_dir().join(format!(
+            "bibcode-store-validation-{}",
+            Uuid::new_v4().as_simple()
+        ));
+        std::fs::create_dir(&root).map_err(|source| ExistingStoreValidationError::Unsafe {
+            path: source_path.clone(),
+            detail: format!("failed to create private validation snapshot: {source}"),
+        })?;
+        let database = root.join("state.sqlite");
+        let snapshot = Self { root, database };
+        std::fs::copy(source_database, &snapshot.database).map_err(|source| {
+            ExistingStoreValidationError::Unsafe {
+                path: source_path.clone(),
+                detail: format!(
+                    "failed to copy database into private validation snapshot: {source}"
+                ),
+            }
+        })?;
+
+        let source_wal = sqlite_sidecar(source_database, "-wal");
+        match std::fs::symlink_metadata(&source_wal) {
             Ok(_) => {
-                return Err(ExistingStoreValidationError::Unsafe {
-                    path: path.to_path_buf(),
-                    detail: format!("SQLite sidecar {} is present", sidecar.display()),
-                });
+                let snapshot_wal = sqlite_sidecar(&snapshot.database, "-wal");
+                std::fs::copy(&source_wal, snapshot_wal).map_err(|source| {
+                    ExistingStoreValidationError::Unsafe {
+                        path: source_path,
+                        detail: format!(
+                            "failed to copy SQLite WAL into private validation snapshot: {source}"
+                        ),
+                    }
+                })?;
             }
             Err(source) if source.kind() == std::io::ErrorKind::NotFound => {}
             Err(source) => {
                 return Err(ExistingStoreValidationError::Unsafe {
-                    path: path.to_path_buf(),
+                    path: source_path,
                     detail: format!(
-                        "failed to inspect SQLite sidecar {}: {source}",
-                        sidecar.display()
+                        "failed to inspect SQLite WAL {}: {source}",
+                        source_wal.display()
                     ),
                 });
             }
         }
+        Ok(snapshot)
     }
-    Ok(())
+}
+
+impl Drop for ValidationSnapshot {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.root);
+    }
+}
+
+fn sqlite_sidecar(database: &Path, suffix: &str) -> PathBuf {
+    let mut path = database.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
 }
 
 fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
@@ -1794,9 +1826,72 @@ fn migration_039(transaction: &Transaction<'_>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MIGRATIONS, Migration, migration_001, run_migrations};
+    use super::{
+        MIGRATIONS, Migration, migration_001, run_migrations, sqlite_sidecar,
+        validate_existing_bibcode_store,
+    };
+    use tempfile::TempDir;
 
     type DeliveryColumn = (String, String, i64, Option<String>, i64);
+
+    #[test]
+    fn validation_of_a_wal_store_preserves_every_source_entry_and_byte() {
+        let root = TempDir::new().expect("temporary validation root");
+        let database = root.path().join("state.sqlite");
+        let mut connection = rusqlite::Connection::open(&database).expect("fixture database");
+        run_migrations(&mut connection, None).expect("fixture migrations");
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("WAL fixture");
+        connection
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("disable fixture checkpoint");
+        connection
+            .execute(
+                "INSERT INTO projection_projects (
+                   project_id, title, workspace_root, default_model_selection_json,
+                   scripts_json, created_at, updated_at, deleted_at
+                 ) VALUES ('validation-project', 'Validation project', '/tmp/validation', NULL,
+                           '{}', '2026-08-10T00:00:00Z', '2026-08-10T00:00:00Z', NULL)",
+                [],
+            )
+            .expect("uncheckpointed fixture write");
+        let before = directory_snapshot(root.path());
+
+        validate_existing_bibcode_store(&database).expect("valid WAL store");
+
+        assert_eq!(directory_snapshot(root.path()), before);
+
+        let shared_memory = sqlite_sidecar(&database, "-shm");
+        std::fs::remove_file(&shared_memory).expect("remove source SHM fixture");
+        let without_shared_memory = directory_snapshot(root.path());
+
+        validate_existing_bibcode_store(&database).expect("valid WAL store without source SHM");
+
+        assert_eq!(directory_snapshot(root.path()), without_shared_memory);
+        assert!(
+            !shared_memory.exists(),
+            "validation never creates source SHM"
+        );
+    }
+
+    fn directory_snapshot(path: &std::path::Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+        let mut entries = std::fs::read_dir(path)
+            .expect("snapshot directory")
+            .map(|entry| {
+                let entry = entry.expect("snapshot entry");
+                let file_type = entry.file_type().expect("snapshot entry type");
+                let bytes = if file_type.is_file() {
+                    std::fs::read(entry.path()).expect("snapshot entry bytes")
+                } else {
+                    Vec::new()
+                };
+                (entry.file_name(), bytes)
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    }
 
     fn assert_delivery_schema(connection: &rusqlite::Connection) -> rusqlite::Result<()> {
         let columns = |table: &str| -> rusqlite::Result<Vec<DeliveryColumn>> {

@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsString,
     fs::File as StdFile,
     fs::OpenOptions as StdOpenOptions,
     path::{Path, PathBuf},
@@ -13,6 +14,7 @@ use std::{
 use rusqlite::{Connection, MAIN_DB, OpenFlags};
 use thiserror::Error;
 use tokio::sync::{Notify, mpsc, oneshot, watch};
+use uuid::Uuid;
 
 const DATABASE_QUEUE_CAPACITY: usize = 64;
 const PREPARED_STATEMENT_CACHE_CAPACITY: usize = 64;
@@ -312,6 +314,14 @@ pub enum PersistenceError {
         #[source]
         source: std::io::Error,
     },
+    #[error("failed to publish new SQLite database at {path}")]
+    Publish {
+        path: PathBuf,
+        #[source]
+        source: std::io::Error,
+    },
+    #[error("new SQLite database path {path} no longer names the staged database")]
+    OwnershipChanged { path: PathBuf },
     #[error("failed to open SQLite database {path}")]
     Open {
         path: PathBuf,
@@ -345,19 +355,89 @@ impl Database {
     }
 
     pub async fn create_new(path: impl AsRef<Path>) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let reserved = StdOpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-            .map_err(|source| PersistenceError::Reserve {
+        Self::create_new_inner(path.as_ref(), |_| Ok(())).await
+    }
+
+    #[cfg(test)]
+    async fn create_new_with_before_reopen<F>(
+        path: impl AsRef<Path>,
+        before_reopen: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(&Path) -> std::io::Result<()>,
+    {
+        Self::create_new_inner(path.as_ref(), before_reopen).await
+    }
+
+    async fn create_new_inner<F>(path: &Path, before_reopen: F) -> Result<Self>
+    where
+        F: FnOnce(&Path) -> std::io::Result<()>,
+    {
+        let path = path.to_path_buf();
+        let staging_path = new_database_staging_path(&path);
+        let reservation = OwnedPathReservation::create(&staging_path).map_err(|source| {
+            PersistenceError::Reserve {
                 path: path.clone(),
                 source,
-            })?;
-        match Self::open_inner(Some(path.clone())).await {
-            Ok(database) => Ok(database),
+            }
+        })?;
+        let staged_database = match Self::open_inner_with_identity(
+            Some(staging_path.clone()),
+            Some(reservation.identity),
+        )
+        .await
+        {
+            Ok(database) => database,
             Err(error) => {
-                remove_reserved_file_if_empty(&path, &reserved);
+                reservation.cleanup();
+                return Err(error);
+            }
+        };
+        staged_database.close().await;
+        if !reservation.owns_path(&staging_path) {
+            reservation.cleanup();
+            return Err(PersistenceError::OwnershipChanged { path });
+        }
+        if sqlite_sidecar_exists(&staging_path) {
+            reservation.cleanup();
+            return Err(PersistenceError::Publish {
+                path,
+                source: std::io::Error::other(
+                    "staged SQLite database retained a journal sidecar after close",
+                ),
+            });
+        }
+
+        if let Err(source) = std::fs::hard_link(&staging_path, &path) {
+            reservation.cleanup();
+            return Err(if source.kind() == std::io::ErrorKind::AlreadyExists {
+                PersistenceError::Reserve { path, source }
+            } else {
+                PersistenceError::Publish { path, source }
+            });
+        }
+        if !reservation.owns_path(&path) {
+            reservation.cleanup();
+            return Err(PersistenceError::OwnershipChanged { path });
+        }
+        if let Err(source) = before_reopen(&path) {
+            remove_path_if_owned(&path, reservation.identity);
+            reservation.cleanup();
+            return Err(PersistenceError::Publish { path, source });
+        }
+        if !reservation.owns_path(&path) {
+            reservation.cleanup();
+            return Err(PersistenceError::OwnershipChanged { path });
+        }
+
+        match Self::open_inner_with_identity(Some(path.clone()), Some(reservation.identity)).await {
+            Ok(database) => {
+                reservation.cleanup();
+                Ok(database)
+            }
+            Err(error) => {
+                remove_path_if_owned(&path, reservation.identity);
+                reservation.cleanup();
                 Err(error)
             }
         }
@@ -368,6 +448,13 @@ impl Database {
     }
 
     async fn open_inner(path: Option<PathBuf>) -> Result<Self> {
+        Self::open_inner_with_identity(path, None).await
+    }
+
+    async fn open_inner_with_identity(
+        path: Option<PathBuf>,
+        expected_identity: Option<FileIdentity>,
+    ) -> Result<Self> {
         let (sender, mut receiver) = mpsc::channel::<DatabaseJob>(DATABASE_QUEUE_CAPACITY);
         let queue_diagnostics = Arc::new(DatabaseQueueDiagnostics::new());
         let (ready_sender, ready_receiver) = oneshot::channel();
@@ -375,7 +462,7 @@ impl Database {
         thread::Builder::new()
             .name("bibcode-sqlite".to_owned())
             .spawn(move || {
-                let connection = open_connection(path.as_deref());
+                let connection = open_connection(path.as_deref(), expected_identity);
                 match connection {
                     Ok(mut connection) => {
                         if ready_sender.send(Ok(())).is_ok() {
@@ -495,7 +582,13 @@ impl Database {
     }
 }
 
-fn open_connection(path: Option<&Path>) -> Result<Connection> {
+fn open_connection(
+    path: Option<&Path>,
+    expected_identity: Option<FileIdentity>,
+) -> Result<Connection> {
+    if let (Some(path), Some(expected_identity)) = (path, expected_identity) {
+        ensure_path_identity(path, expected_identity)?;
+    }
     let connection = match path {
         Some(path) => Connection::open_with_flags(
             path,
@@ -510,6 +603,9 @@ fn open_connection(path: Option<&Path>) -> Result<Connection> {
             source,
         })?,
     };
+    if let (Some(path), Some(expected_identity)) = (path, expected_identity) {
+        ensure_path_identity(path, expected_identity)?;
+    }
 
     connection.set_prepared_statement_cache_capacity(PREPARED_STATEMENT_CACHE_CAPACITY);
     connection
@@ -535,32 +631,166 @@ fn open_connection(path: Option<&Path>) -> Result<Connection> {
     Ok(connection)
 }
 
-fn remove_reserved_file_if_empty(path: &Path, reserved: &StdFile) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FileIdentity {
+    volume: u64,
+    file: u64,
+}
 
-        let Ok(reserved_metadata) = reserved.metadata() else {
-            return;
-        };
-        let Ok(path_metadata) = std::fs::symlink_metadata(path) else {
-            return;
-        };
-        if reserved_metadata.len() == 0
-            && path_metadata.file_type().is_file()
-            && reserved_metadata.dev() == path_metadata.dev()
-            && reserved_metadata.ino() == path_metadata.ino()
-        {
-            let _ = std::fs::remove_file(path);
-        }
+struct OwnedPathReservation {
+    path: PathBuf,
+    file: StdFile,
+    identity: FileIdentity,
+}
+
+impl OwnedPathReservation {
+    fn create(path: &Path) -> std::io::Result<Self> {
+        let file = StdOpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)?;
+        let identity = file_identity(&file)?;
+        Ok(Self {
+            path: path.to_path_buf(),
+            file,
+            identity,
+        })
     }
 
-    #[cfg(not(unix))]
-    {
-        // Without a stable standard-library file identity, leaving the reserved file behind is
-        // safer than risking removal of a path replaced concurrently by another process.
-        let _ = (path, reserved);
+    fn owns_path(&self, path: &Path) -> bool {
+        path_identity(path).is_ok_and(|identity| identity == self.identity)
     }
+
+    fn cleanup(self) {
+        let Self {
+            path,
+            file,
+            identity,
+        } = self;
+        drop(file);
+        remove_path_if_owned(&path, identity);
+    }
+}
+
+fn new_database_staging_path(path: &Path) -> PathBuf {
+    let mut name = OsString::from(".");
+    name.push(path.file_name().unwrap_or_default());
+    name.push(format!(".{}.tmp", Uuid::new_v4().as_simple()));
+    path.with_file_name(name)
+}
+
+fn sqlite_sidecar_exists(path: &Path) -> bool {
+    ["-journal", "-wal", "-shm"]
+        .into_iter()
+        .map(|suffix| {
+            let mut sidecar = path.as_os_str().to_os_string();
+            sidecar.push(suffix);
+            PathBuf::from(sidecar)
+        })
+        .any(|sidecar| std::fs::symlink_metadata(sidecar).is_ok())
+}
+
+fn ensure_path_identity(path: &Path, expected: FileIdentity) -> Result<()> {
+    if path_identity(path).is_ok_and(|actual| actual == expected) {
+        Ok(())
+    } else {
+        Err(PersistenceError::OwnershipChanged {
+            path: path.to_path_buf(),
+        })
+    }
+}
+
+#[cfg(unix)]
+fn remove_path_if_owned(path: &Path, expected: FileIdentity) {
+    if path_identity(path).is_ok_and(|actual| actual == expected) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(windows)]
+fn remove_path_if_owned(path: &Path, expected: FileIdentity) {
+    use std::os::windows::io::AsRawHandle;
+    use std::{mem::size_of, os::windows::fs::OpenOptionsExt};
+    use windows_sys::Win32::Storage::FileSystem::{
+        DELETE, FILE_DISPOSITION_FLAG_DELETE, FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+        FILE_DISPOSITION_INFO, FILE_DISPOSITION_INFO_EX, FILE_GENERIC_READ, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo, FileDispositionInfoEx,
+        SetFileInformationByHandle,
+    };
+
+    let file = match StdOpenOptions::new()
+        .access_mode(FILE_GENERIC_READ | DELETE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .open(path)
+    {
+        Ok(file) => file,
+        Err(_) => return,
+    };
+    if !file_identity(&file).is_ok_and(|actual| actual == expected) {
+        return;
+    }
+    let disposition = FILE_DISPOSITION_INFO_EX {
+        Flags: FILE_DISPOSITION_FLAG_DELETE | FILE_DISPOSITION_FLAG_POSIX_SEMANTICS,
+    };
+    let deleted = unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle(),
+            FileDispositionInfoEx,
+            std::ptr::from_ref(&disposition).cast(),
+            size_of::<FILE_DISPOSITION_INFO_EX>() as u32,
+        )
+    };
+    if deleted == 0 {
+        let fallback = FILE_DISPOSITION_INFO { DeleteFile: true };
+        let _ = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle(),
+                FileDispositionInfo,
+                std::ptr::from_ref(&fallback).cast(),
+                size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+    }
+}
+
+#[cfg(not(any(unix, windows)))]
+fn remove_path_if_owned(_path: &Path, _expected: FileIdentity) {}
+
+fn path_identity(path: &Path) -> std::io::Result<FileIdentity> {
+    file_identity(&StdFile::open(path)?)
+}
+
+#[cfg(unix)]
+fn file_identity(file: &StdFile) -> std::io::Result<FileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = file.metadata()?;
+    Ok(FileIdentity {
+        volume: metadata.dev(),
+        file: metadata.ino(),
+    })
+}
+
+#[cfg(windows)]
+fn file_identity(file: &StdFile) -> std::io::Result<FileIdentity> {
+    use std::mem::MaybeUninit;
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, GetFileInformationByHandle,
+    };
+
+    let mut information = MaybeUninit::<BY_HANDLE_FILE_INFORMATION>::zeroed();
+    let succeeded =
+        unsafe { GetFileInformationByHandle(file.as_raw_handle(), information.as_mut_ptr()) };
+    if succeeded == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let information = unsafe { information.assume_init() };
+    Ok(FileIdentity {
+        volume: u64::from(information.dwVolumeSerialNumber),
+        file: (u64::from(information.nFileIndexHigh) << 32) | u64::from(information.nFileIndexLow),
+    })
 }
 
 #[cfg(test)]
@@ -809,21 +1039,58 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
-    #[test]
-    fn reserved_file_cleanup_never_removes_a_replacement_path() {
+    #[tokio::test]
+    async fn create_new_never_configures_or_removes_a_final_path_replacement() {
         let temp = TempDir::new().expect("temporary database directory");
         let database_path = temp.path().join("state.sqlite");
-        let reserved = StdOpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&database_path)
-            .expect("reserved database");
-        std::fs::remove_file(&database_path).expect("unlink reservation");
-        std::fs::write(&database_path, []).expect("replacement path");
+        let foreign_path = temp.path().join("foreign.sqlite");
+        let foreign = Connection::open(&foreign_path).expect("foreign SQLite fixture");
+        foreign
+            .execute("CREATE TABLE foreign_catalog (value TEXT)", [])
+            .expect("foreign schema");
+        drop(foreign);
+        let replacement = std::fs::read(&foreign_path).expect("foreign SQLite bytes");
+        std::fs::remove_file(&foreign_path).expect("remove foreign staging path");
 
-        remove_reserved_file_if_empty(&database_path, &reserved);
+        Database::create_new_with_before_reopen(&database_path, |final_path| {
+            std::fs::remove_file(final_path)?;
+            std::fs::write(final_path, &replacement)
+        })
+        .await
+        .expect_err("foreign final path must win without being opened");
 
-        assert!(database_path.exists(), "replacement path must remain");
+        assert_eq!(
+            std::fs::read(&database_path).expect("replacement path remains"),
+            replacement
+        );
+        assert_eq!(
+            std::fs::read_dir(temp.path())
+                .expect("database directory")
+                .count(),
+            1,
+            "failed creation cleans only its randomized staging entry"
+        );
+    }
+
+    #[test]
+    fn owned_path_cleanup_removes_only_the_reserved_filesystem_object() {
+        let temp = TempDir::new().expect("temporary database directory");
+        let owned_path = temp.path().join("owned.sqlite");
+        let owned = OwnedPathReservation::create(&owned_path).expect("owned reservation");
+        owned.cleanup();
+        assert!(!owned_path.exists(), "owned reservation is removed");
+
+        let replaced_path = temp.path().join("replaced.sqlite");
+        let replaced = OwnedPathReservation::create(&replaced_path).expect("owned reservation");
+        std::fs::remove_file(&replaced_path).expect("unlink owned reservation");
+        let replacement = b"foreign replacement";
+        std::fs::write(&replaced_path, replacement).expect("replacement path");
+
+        replaced.cleanup();
+
+        assert_eq!(
+            std::fs::read(&replaced_path).expect("replacement remains"),
+            replacement
+        );
     }
 }
