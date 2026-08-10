@@ -9,6 +9,8 @@ import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Queue from "effect/Queue";
+import * as Ref from "effect/Ref";
+import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
 import * as SubscriptionRef from "effect/SubscriptionRef";
 import { AsyncResult, Atom } from "effect/unstable/reactivity";
@@ -18,7 +20,8 @@ import type { SupervisorConnectionState } from "../connection/model.ts";
 import { EnvironmentSupervisor } from "../connection/supervisor.ts";
 import { safeErrorLogAttributes } from "../errors/safeLog.ts";
 import { EnvironmentCacheStore } from "../platform/persistence.ts";
-import { subscribe } from "../rpc/client.ts";
+import { subscribeInSession } from "../rpc/client.ts";
+import type { RpcSession } from "../rpc/session.ts";
 import { applyShellStreamEvent } from "./shellReducer.ts";
 import type { EnvironmentCatalogState } from "./connections.ts";
 import { followStreamInEnvironment } from "./runtime.ts";
@@ -102,6 +105,14 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
     status: Option.isSome(cachedSnapshot) ? "degraded" : "starting",
     error: Option.none(),
   });
+  const stateLock = yield* Semaphore.make(1);
+  const authority = yield* Ref.make<{
+    readonly session: RpcSession;
+    readonly generation: number;
+  } | null>(null);
+  const observedSession = yield* Ref.make<RpcSession | null>(
+    Option.getOrNull(yield* SubscriptionRef.get(supervisor.session)),
+  );
   const persistence = yield* Queue.sliding<OrchestrationShellSnapshot>(1);
 
   const persist = Effect.fn("EnvironmentShellState.persist")(function* (
@@ -125,57 +136,104 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
     Effect.forkScoped,
   );
 
-  const setConnectionState = (connection: SupervisorConnectionState) =>
-    SubscriptionRef.update(state, (current) => {
+  const projectConnectionStateLocked = Effect.fn(
+    "EnvironmentShellState.projectConnectionStateLocked",
+  )(function* (connection: SupervisorConnectionState) {
+    const activeSession = Option.getOrNull(yield* SubscriptionRef.get(supervisor.session));
+    const currentAuthority = yield* Ref.get(authority);
+    const authorityIsCurrent =
+      connection.phase === "connected" &&
+      activeSession !== null &&
+      currentAuthority?.session === activeSession &&
+      currentAuthority.generation === connection.generation;
+    if (!authorityIsCurrent) {
+      yield* Ref.set(authority, null);
+    }
+    yield* SubscriptionRef.update(state, (current) => {
       const status = resolveEnvironmentAvailabilityStatus({
         connection,
         snapshot: current.snapshot,
-        currentStatus: current.status,
+        currentStatus:
+          authorityIsCurrent || current.status !== "live" ? current.status : "synchronizing",
       });
       const error =
         connection.phase === "blocked" && connection.lastFailure !== null
           ? Option.some(connection.lastFailure.message)
-          : status === "starting" || status === "synchronizing" || status === "live"
-            ? Option.none<string>()
-            : current.error;
+          : Option.none<string>();
       return current.status === status &&
         Option.getOrNull(current.error) === Option.getOrNull(error)
         ? current
         : { ...current, status, error };
     });
-  const setStreamError = (error: unknown) =>
+  });
+  const setStreamError = (generation: number, session: RpcSession, error: unknown) =>
     Effect.logWarning("Could not synchronize the environment shell.").pipe(
       Effect.annotateLogs({
         environmentId,
         ...safeErrorLogAttributes(error),
       }),
       Effect.andThen(
-        SubscriptionRef.update(state, (current) => ({
-          ...current,
-          status: cachedAvailabilityStatus(current.snapshot),
-          error: Option.some(SHELL_SYNCHRONIZATION_ERROR_MESSAGE),
-        })),
+        stateLock.withPermits(1)(
+          Effect.gen(function* () {
+            const connection = yield* SubscriptionRef.get(supervisor.state);
+            const activeSession = Option.getOrNull(yield* SubscriptionRef.get(supervisor.session));
+            if (
+              connection.phase !== "connected" ||
+              connection.generation !== generation ||
+              activeSession !== session
+            ) {
+              return;
+            }
+            yield* Ref.set(authority, null);
+            yield* SubscriptionRef.update(state, (current) => ({
+              ...current,
+              status: cachedAvailabilityStatus(current.snapshot),
+              error: Option.some(SHELL_SYNCHRONIZATION_ERROR_MESSAGE),
+            }));
+          }),
+        ),
       ),
     );
 
-  const applyItem = Effect.fn("EnvironmentShellState.applyItem")(function* (
+  const applyItemLocked = Effect.fn("EnvironmentShellState.applyItemLocked")(function* (
+    generation: number,
+    session: RpcSession,
     item: OrchestrationShellStreamItem,
   ) {
+    const connection = yield* SubscriptionRef.get(supervisor.state);
+    const activeSession = Option.getOrNull(yield* SubscriptionRef.get(supervisor.session));
+    if (
+      connection.phase !== "connected" ||
+      connection.generation !== generation ||
+      activeSession !== session
+    ) {
+      return;
+    }
     const current = yield* SubscriptionRef.get(state);
-    const nextSnapshot =
-      item.kind === "snapshot"
-        ? item.snapshot
-        : Option.match(current.snapshot, {
-            onNone: () => null,
-            onSome: (snapshot) =>
-              item.sequence > snapshot.snapshotSequence
-                ? applyShellStreamEvent(snapshot, item)
-                : snapshot,
-          });
+    let nextSnapshot: OrchestrationShellSnapshot | null = null;
+    if (item.kind === "snapshot") {
+      nextSnapshot = item.snapshot;
+    } else {
+      const currentAuthority = yield* Ref.get(authority);
+      if (
+        current.status !== "live" ||
+        currentAuthority?.session !== session ||
+        currentAuthority.generation !== generation ||
+        Option.isNone(current.snapshot) ||
+        item.sequence <= current.snapshot.value.snapshotSequence
+      ) {
+        return;
+      }
+      nextSnapshot = applyShellStreamEvent(current.snapshot.value, item);
+      if (nextSnapshot === current.snapshot.value) {
+        return;
+      }
+    }
     if (nextSnapshot === null) {
       return;
     }
 
+    yield* Ref.set(authority, { session, generation });
     yield* SubscriptionRef.set(state, {
       snapshot: Option.some(nextSnapshot),
       status: "live",
@@ -184,15 +242,61 @@ export const makeEnvironmentShellState = Effect.fn("EnvironmentShellState.make")
     yield* Queue.offer(persistence, nextSnapshot);
   });
 
-  yield* subscribe(
-    ORCHESTRATION_WS_METHODS.subscribeShell,
-    {},
-    {
-      onExpectedFailure: (cause) => setStreamError(Cause.squash(cause)),
-    },
-  ).pipe(Stream.runForEach(applyItem), Effect.forkScoped);
-  yield* SubscriptionRef.changes(supervisor.state).pipe(
-    Stream.runForEach(setConnectionState),
+  const connectionOrSessionChanges = SubscriptionRef.changes(supervisor.state).pipe(
+    Stream.map(() => "connection" as const),
+    Stream.merge(
+      SubscriptionRef.changes(supervisor.session).pipe(Stream.map(() => "session" as const)),
+    ),
+  );
+  yield* connectionOrSessionChanges.pipe(
+    Stream.mapEffect((trigger) =>
+      stateLock.withPermits(1)(
+        Effect.gen(function* () {
+          const connection = yield* SubscriptionRef.get(supervisor.state);
+          const session = Option.getOrNull(yield* SubscriptionRef.get(supervisor.session));
+          const previousSession = yield* Ref.get(observedSession);
+          yield* Ref.set(observedSession, session);
+          yield* projectConnectionStateLocked(connection);
+          return {
+            connection,
+            session,
+            maySubscribe:
+              trigger === "connection" || previousSession === null || previousSession === session,
+          };
+        }),
+      ),
+    ),
+    Stream.changesWith(
+      (previous, current) =>
+        previous.connection.phase === current.connection.phase &&
+        previous.connection.generation === current.connection.generation &&
+        previous.session === current.session &&
+        previous.maySubscribe === current.maySubscribe,
+    ),
+    Stream.switchMap(({ connection, session, maySubscribe }) => {
+      if (connection.phase !== "connected" || session === null || !maySubscribe) {
+        return Stream.empty;
+      }
+      return subscribeInSession(
+        session,
+        environmentId,
+        ORCHESTRATION_WS_METHODS.subscribeShell,
+        {},
+        {
+          onExpectedFailure: (cause) =>
+            setStreamError(connection.generation, session, Cause.squash(cause)),
+        },
+      ).pipe(
+        Stream.map((item) => ({
+          generation: connection.generation,
+          session,
+          item,
+        })),
+      );
+    }),
+    Stream.runForEach(({ generation, session, item }) =>
+      stateLock.withPermits(1)(applyItemLocked(generation, session, item)),
+    ),
     Effect.forkScoped,
   );
 
