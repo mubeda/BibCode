@@ -2042,8 +2042,9 @@ mod tests {
             };
             let loss_availability = availability.clone();
             let loss_transition = forced_loss.clone();
+            let runtime = tokio::runtime::Handle::current();
             let loss_task = tokio::task::spawn_blocking(move || {
-                loss_availability.mark_unavailable_sync(loss_transition)
+                runtime.block_on(loss_availability.mark_unavailable(loss_transition))
             });
             tokio::time::timeout(
                 std::time::Duration::from_secs(5),
@@ -2129,9 +2130,10 @@ mod tests {
         let (loss_started_tx, loss_started_rx) = tokio::sync::oneshot::channel();
         let commit_wins_availability = availability.clone();
         let commit_wins_transition = commit_wins_loss.clone();
+        let runtime = tokio::runtime::Handle::current();
         let loss_task = tokio::task::spawn_blocking(move || {
             let _ = loss_started_tx.send(());
-            commit_wins_availability.mark_unavailable_sync(commit_wins_transition)
+            runtime.block_on(commit_wins_availability.mark_unavailable(commit_wins_transition))
         });
         loss_started_rx.await.expect("loss task starts");
         tokio::task::yield_now().await;
@@ -2286,9 +2288,12 @@ mod tests {
         let (rejected_loss_started_tx, rejected_loss_started_rx) = tokio::sync::oneshot::channel();
         let rejected_commit_wins_availability = availability.clone();
         let rejected_commit_wins_transition = rejected_commit_wins_loss.clone();
+        let runtime = tokio::runtime::Handle::current();
         let rejected_loss_task = tokio::task::spawn_blocking(move || {
             let _ = rejected_loss_started_tx.send(());
-            rejected_commit_wins_availability.mark_unavailable_sync(rejected_commit_wins_transition)
+            runtime.block_on(
+                rejected_commit_wins_availability.mark_unavailable(rejected_commit_wins_transition),
+            )
         });
         rejected_loss_started_rx
             .await

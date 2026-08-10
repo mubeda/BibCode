@@ -2106,7 +2106,7 @@ mod tests {
         manager.shutdown().await;
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[tokio::test]
     async fn terminal_signal_before_recovery_quiesces_all_exact_sessions_before_recovery_returns() {
         let root = tempfile::tempdir().expect("terminal root");
         let backend = Arc::new(RuntimeTestPtyBackend::default());

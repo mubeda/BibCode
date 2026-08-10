@@ -854,6 +854,31 @@ impl WorktreeCatalogService {
         else {
             return self.finish_cancelled(entry, fence);
         };
+        {
+            let mut state = lock(&entry.state);
+            if fence
+                .lifecycle_epoch
+                .is_some_and(|epoch| epoch != state.lifecycle_epoch || state.subscribers == 0)
+            {
+                return Err(cancelled_error());
+            }
+            if state.mutation_epoch != fence.mutation_epoch {
+                return Self::complete_stale_generation(&mut state);
+            }
+            if subscriber_owned && (state.subscribers == 0 || cancellation.is_cancelled()) {
+                let error = cancelled_error();
+                state.completed_at = None;
+                state.completed_refreshes = state.completed_refreshes.wrapping_add(1);
+                state.last_refresh_result = Some(Err(error.clone()));
+                return Err(error);
+            }
+        }
+        let reconciliation = self
+            .inner
+            .availability_registry
+            .prepare_snapshot_reconciliation(&snapshot)
+            .await;
+        reconciliation.wait_for_drains().await;
         let transitions = {
             let mut state = lock(&entry.state);
             if fence
@@ -881,10 +906,7 @@ impl WorktreeCatalogService {
             state.shallow_signature = Some(signature);
             state.failure_backoff = Duration::ZERO;
             state.next_failure_retry = None;
-            let transitions = self
-                .inner
-                .availability_registry
-                .reconcile_snapshot_sync(&snapshot);
+            let transitions = reconciliation.finalize();
             state.sender.send_replace(Arc::clone(&snapshot));
             transitions
         };
@@ -1377,6 +1399,12 @@ impl WorktreeCatalogService {
                 &scan.repository_key,
             )
             .await?;
+            let reconciliation = self
+                .inner
+                .availability_registry
+                .prepare_snapshot_reconciliation(&scan.snapshot)
+                .await;
+            reconciliation.wait_for_drains().await;
             let mut registry = lock(&self.inner.registry);
             if self.inner.shutdown.is_cancelled() {
                 return Err(shutdown_error());
@@ -1399,10 +1427,7 @@ impl WorktreeCatalogService {
                         .insert(scan.repository_key.clone(), Arc::downgrade(&repository));
                     repository
                 });
-            let transitions = self
-                .inner
-                .availability_registry
-                .reconcile_snapshot_sync(&scan.snapshot);
+            let transitions = reconciliation.finalize();
             let (sender, _) = watch::channel(Arc::clone(&scan.snapshot));
             let (poller_ready, _) = watch::channel(0);
             let entry = Arc::new(CatalogEntry {

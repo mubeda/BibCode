@@ -11,7 +11,9 @@ use std::{
 use tokio::sync::{Notify, Semaphore};
 use tokio_util::sync::CancellationToken;
 
-use crate::git::{GitWorktreeInventory, GitWorktreeRecord};
+use crate::git::{
+    GitWorktreeInventory, GitWorktreeRecord, host_path_platform, worktree_repository_key,
+};
 
 use super::service::{
     CatalogFileSystem, CatalogFuture, CatalogProject, CatalogProjectionSource,
@@ -110,6 +112,169 @@ async fn initial_authoritative_missing_snapshot_installs_guard_before_subscripti
     );
     assert_eq!(callback.calls.load(Ordering::SeqCst), 1);
     assert!(callback.guarded.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn authoritative_recovery_drains_terminal_signal_without_holding_the_catalog_entry_lock() {
+    let filesystem = Arc::new(FakeFileSystem::new([
+        ("/repo/main", DirectoryProbeState::Present),
+        ("/repo/adopted", DirectoryProbeState::Missing),
+        ("/repo/common", DirectoryProbeState::Present),
+    ]));
+    let registry = WorkspaceAvailabilityRegistry::new();
+    let service = WorktreeCatalogService::with_dependencies_and_availability(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [thread("thread-1", "/repo/adopted")],
+        )])),
+        Arc::new(FakeInventorySource::new((0..2).map(|_| {
+            inventory(
+                "/repo/common",
+                [record("/repo/main", true), record("/repo/adopted", false)],
+            )
+        }))),
+        filesystem.clone(),
+        CatalogServiceOptions::default(),
+        registry.clone(),
+    );
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+    let missing = subscription.latest();
+    let loss = WorkspaceLossTransition {
+        thread_id: "thread-1".to_owned(),
+        repository_key: missing.repository_key.clone(),
+        generation: missing.generation,
+        path: PathBuf::from("/repo/adopted"),
+        availability: super::AdoptedWorktreeAvailability::MissingRegistered,
+    };
+    let permit = registry
+        .begin_terminal_signal(&loss)
+        .await
+        .expect("terminal cleanup owns the missing transition");
+    let invalidation_started = registry
+        .terminal_signal_invalidation_notification(&loss)
+        .expect("current terminal signal gate");
+    let cleanup_release = Arc::new(Notify::new());
+    let task_cleanup_release = cleanup_release.clone();
+    let cleanup = tokio::spawn(async move {
+        task_cleanup_release.notified().await;
+        tokio::task::yield_now().await;
+        drop(permit);
+    });
+
+    filesystem.set("/repo/adopted", DirectoryProbeState::Present);
+    let refresh_service = service.clone();
+    let refresh = tokio::spawn(async move {
+        refresh_service
+            .refresh("project-1", CatalogRefreshTrigger::Explicit)
+            .await
+    });
+    invalidation_started.notified().await;
+
+    assert!(
+        service.latest("project-1").await.is_some(),
+        "terminal drain must not retain the catalog entry lock"
+    );
+    assert_eq!(
+        registry
+            .guard_thread("thread-1")
+            .await
+            .expect_err("recovery is not visible before terminal cleanup drains")
+            .availability,
+        super::AdoptedWorktreeAvailability::MissingRegistered
+    );
+    assert_eq!(
+        subscription.latest().adopted_workspaces[0].availability,
+        super::AdoptedWorktreeAvailability::MissingRegistered,
+        "the recovered watch snapshot is not visible before terminal cleanup drains"
+    );
+    assert!(!refresh.is_finished());
+
+    cleanup_release.notify_one();
+    cleanup.await.expect("cleanup task");
+    let recovered = refresh
+        .await
+        .expect("refresh task")
+        .expect("authoritative recovery refresh");
+    assert_eq!(
+        recovered.adopted_workspaces[0].availability,
+        super::AdoptedWorktreeAvailability::Present
+    );
+    assert_eq!(
+        subscription.latest().adopted_workspaces[0].availability,
+        super::AdoptedWorktreeAvailability::Present
+    );
+    assert_eq!(registry.guard_thread("thread-1").await, Ok(()));
+}
+
+#[tokio::test]
+async fn bootstrap_recovery_drains_terminal_signal_without_holding_the_catalog_registry() {
+    let registry = WorkspaceAvailabilityRegistry::new();
+    let repository_key = worktree_repository_key(Path::new("/repo/common"), host_path_platform())
+        .as_str()
+        .to_owned();
+    let loss = WorkspaceLossTransition {
+        thread_id: "thread-1".to_owned(),
+        repository_key,
+        generation: 1,
+        path: PathBuf::from("/repo/adopted"),
+        availability: super::AdoptedWorktreeAvailability::MissingRegistered,
+    };
+    assert!(registry.mark_unavailable(loss.clone()).await);
+    let permit = registry
+        .begin_terminal_signal(&loss)
+        .await
+        .expect("terminal cleanup owns the missing transition");
+    let invalidation_started = registry
+        .terminal_signal_invalidation_notification(&loss)
+        .expect("current terminal signal gate");
+    let cleanup_release = Arc::new(Notify::new());
+    let task_cleanup_release = cleanup_release.clone();
+    let cleanup = tokio::spawn(async move {
+        task_cleanup_release.notified().await;
+        tokio::task::yield_now().await;
+        drop(permit);
+    });
+    let service = WorktreeCatalogService::with_dependencies_and_availability(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [thread("thread-1", "/repo/adopted")],
+        )])),
+        Arc::new(FakeInventorySource::new([inventory(
+            "/repo/common",
+            [record("/repo/main", true), record("/repo/adopted", false)],
+        )])),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/adopted", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+        registry.clone(),
+    );
+    let subscribe_service = service.clone();
+    let subscribing = tokio::spawn(async move { subscribe_service.subscribe("project-1").await });
+    invalidation_started.notified().await;
+
+    assert_eq!(
+        service.latest("project-1").await,
+        None,
+        "terminal drain must not retain the catalog registry"
+    );
+    assert!(!subscribing.is_finished());
+
+    cleanup_release.notify_one();
+    cleanup.await.expect("cleanup task");
+    let subscription = subscribing
+        .await
+        .expect("subscription task")
+        .expect("subscription after recovery drain");
+    assert_eq!(
+        subscription.latest().adopted_workspaces[0].availability,
+        super::AdoptedWorktreeAvailability::Present
+    );
+    assert_eq!(registry.guard_thread("thread-1").await, Ok(()));
 }
 
 struct GuardOrderingObserver {
