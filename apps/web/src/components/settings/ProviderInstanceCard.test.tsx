@@ -531,6 +531,32 @@ describe("version advisory", () => {
     ).toHaveLength(0);
   });
 
+  it("shows unchanged update diagnostics and rechecks the provider version", () => {
+    const onRecheck = vi.fn();
+    const markup = render({
+      ...baseProps({
+        liveProvider: advisoryProvider({
+          updateState: {
+            status: "unchanged",
+            startedAt: NOW,
+            finishedAt: NOW,
+            message:
+              "Update completed, but C:\\Users\\mauro\\.local\\bin\\claude.exe still reports 2.1.225; expected 2.1.226.",
+            output: "Successfully updated from 2.1.225 to version 2.1.226",
+          },
+        }),
+      }),
+      onRecheck,
+    } as Props);
+
+    expect(markup).toContain("C:\\Users\\mauro\\.local\\bin\\claude.exe");
+    expect(markup).toContain("still reports 2.1.225; expected 2.1.226");
+    expect(markup).toContain("Successfully updated from 2.1.225 to version 2.1.226");
+
+    (ui.byLabel("Button", "Recheck provider version").onClick as () => void)();
+    expect(onRecheck).toHaveBeenCalledTimes(1);
+  });
+
   it("shows the updating state and omits the run button when no handler is given", () => {
     const markup = render(
       baseProps({ liveProvider: advisoryProvider(), onRunUpdate: vi.fn(), isUpdating: true }),

@@ -4880,6 +4880,123 @@ describe("ChatView turn delivery resolution", () => {
 
     expect(commandCallsFor("thread.resolveDelivery")).toHaveLength(0);
   });
+
+  it("does not show blocked queued delivery as active work", () => {
+    const queuedAt = "2026-03-29T00:00:02.000Z";
+    seedConnectedServerThread(
+      makeThread({
+        session: makeSession({
+          status: "error",
+          lastError: "Provider session ended when BiBCode stopped.",
+        }),
+        messages: [
+          {
+            id: MessageId.make("message-uncertain"),
+            role: "user",
+            text: "possibly delivered",
+            turnId: null,
+            createdAt: now,
+            updatedAt: now,
+            streaming: false,
+            delivery: {
+              state: "uncertain",
+              provider: ProviderDriverKind.make("cursor"),
+              detail: "provider does not support exact delivery reconciliation",
+            },
+          },
+          {
+            id: MessageId.make("message-queued"),
+            role: "user",
+            text: "queued behind uncertainty",
+            turnId: null,
+            createdAt: queuedAt,
+            updatedAt: queuedAt,
+            streaming: false,
+            delivery: {
+              state: "pending",
+              provider: ProviderDriverKind.make("cursor"),
+            },
+          },
+        ],
+      }),
+    );
+
+    renderServerRoute();
+
+    expect(capturedProps("messagesTimeline")["isWorking"]).toBe(false);
+    expect(capturedProps("messagesTimeline")["activeTurnStartedAt"]).toBeNull();
+    expect(capturedProps("chatComposer")["isSendBusy"]).toBe(true);
+    expect(capturedProps("chatComposer")["canCancelPendingSend"]).toBe(true);
+  });
+
+  it("anchors active persisted delivery work to the message timestamp after reload", () => {
+    const pendingAt = "2026-03-29T00:00:02.000Z";
+    seedConnectedServerThread(
+      makeThread({
+        session: makeSession(),
+        messages: [
+          {
+            id: MessageId.make("message-pending"),
+            role: "user",
+            text: "still delivering",
+            turnId: null,
+            createdAt: pendingAt,
+            updatedAt: pendingAt,
+            streaming: false,
+            delivery: {
+              state: "pending",
+              provider: ProviderDriverKind.make("cursor"),
+            },
+          },
+        ],
+      }),
+    );
+
+    renderServerRoute();
+
+    expect(capturedProps("messagesTimeline")["isWorking"]).toBe(true);
+    expect(capturedProps("messagesTimeline")["activeTurnStartedAt"]).toBe(pendingAt);
+  });
+
+  it("does not inherit an abandoned turn timestamp for a newer pending delivery", () => {
+    const pendingAt = "2026-03-29T00:00:02.000Z";
+    seedConnectedServerThread(
+      makeThread({
+        session: makeSession({
+          status: "error",
+          lastError: "Provider session ended when BiBCode stopped.",
+        }),
+        latestTurn: {
+          turnId: TurnId.make("turn-abandoned"),
+          state: "running",
+          requestedAt: now,
+          startedAt: now,
+          completedAt: null,
+          assistantMessageId: null,
+        },
+        messages: [
+          {
+            id: MessageId.make("message-pending-after-restart"),
+            role: "user",
+            text: "deliver after restart",
+            turnId: null,
+            createdAt: pendingAt,
+            updatedAt: pendingAt,
+            streaming: false,
+            delivery: {
+              state: "pending",
+              provider: ProviderDriverKind.make("cursor"),
+            },
+          },
+        ],
+      }),
+    );
+
+    renderServerRoute();
+
+    expect(capturedProps("messagesTimeline")["isWorking"]).toBe(true);
+    expect(capturedProps("messagesTimeline")["activeTurnStartedAt"]).toBe(pendingAt);
+  });
 });
 
 // ─────────────────────────────────────────────────────────────────────

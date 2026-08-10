@@ -1138,15 +1138,7 @@ function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "workin
       <div className="flex items-center gap-2 pt-1 text-[11px] text-muted-foreground/70 tabular-nums">
         <WorkingIndicatorIcon />
         <span>
-          {row.createdAt ? (
-            <>
-              Waiting for <WorkingTimer createdAt={row.createdAt} />
-            </>
-          ) : (
-            <>
-              Waiting for <span className="tabular-nums">0.0s</span>
-            </>
-          )}
+          Waiting for <WorkingTimer createdAt={row.createdAt} />
         </span>
       </div>
     </div>
@@ -1159,19 +1151,35 @@ function WorkingTimelineRow({ row }: { row: Extract<TimelineRow, { kind: "workin
 // ---------------------------------------------------------------------------
 
 /** Live elapsed label for the active waiting row. */
-function WorkingTimer({ createdAt }: { createdAt: string }) {
+function WorkingTimer({ createdAt }: { createdAt: string | null }) {
   const textRef = useRef<HTMLSpanElement>(null);
-  const initialText = formatWorkingTimerNow(createdAt);
+  const elapsedFloorRef = useRef(0);
+  const initialElapsedMs =
+    createdAt === null ? 0 : (readWorkingTimerElapsedMs(createdAt, Date.now()) ?? 0);
+  const initialText = formatWorkingElapsedMs(Math.max(elapsedFloorRef.current, initialElapsedMs));
 
   useEffect(() => {
-    const updateText = () => {
-      if (textRef.current) {
-        textRef.current.textContent = formatWorkingTimerNow(createdAt);
+    const sourceElapsedMs =
+      createdAt === null ? 0 : readWorkingTimerElapsedMs(createdAt, Date.now());
+    if (sourceElapsedMs === null) {
+      return;
+    }
+
+    const elapsedAtAnchorMs = Math.max(elapsedFloorRef.current, sourceElapsedMs);
+    const monotonicAnchorMs = performance.now();
+    let frameId = 0;
+    const updateText = (monotonicNowMs: number) => {
+      const elapsedMs = elapsedAtAnchorMs + Math.max(0, monotonicNowMs - monotonicAnchorMs);
+      elapsedFloorRef.current = Math.max(elapsedFloorRef.current, elapsedMs);
+      const nextText = formatWorkingElapsedMs(elapsedFloorRef.current);
+      if (textRef.current && textRef.current.textContent !== nextText) {
+        textRef.current.textContent = nextText;
       }
+      frameId = requestAnimationFrame(updateText);
     };
-    updateText();
-    const id = setInterval(updateText, 100);
-    return () => clearInterval(id);
+
+    updateText(monotonicAnchorMs);
+    return () => cancelAnimationFrame(frameId);
   }, [createdAt]);
 
   return (
@@ -1778,28 +1786,26 @@ function useStableRows(rows: MessagesTimelineRow[]): MessagesTimelineRow[] {
 // Pure helpers
 // ---------------------------------------------------------------------------
 
-function formatWorkingTimer(startIso: string, endIso: string): string | null {
+function readWorkingTimerElapsedMs(startIso: string, nowMs: number): number | null {
   const startedAtMs = Date.parse(startIso);
-  const endedAtMs = Date.parse(endIso);
-  if (!Number.isFinite(startedAtMs) || !Number.isFinite(endedAtMs)) {
+  if (!Number.isFinite(startedAtMs) || !Number.isFinite(nowMs)) {
     return null;
   }
 
-  const elapsedTenths = Math.max(0, Math.floor((endedAtMs - startedAtMs) / 100));
-  const hours = Math.floor(elapsedTenths / 36_000);
-  const minutes = Math.floor((elapsedTenths % 36_000) / 600);
-  const seconds = (elapsedTenths % 600) / 10;
-  const secondsLabel = `${seconds.toFixed(1)}s`;
+  return Math.max(0, nowMs - startedAtMs);
+}
+
+function formatWorkingElapsedMs(elapsedMs: number): string {
+  const elapsedSeconds = Math.max(0, Math.floor(elapsedMs / 1_000));
+  const hours = Math.floor(elapsedSeconds / 3_600);
+  const minutes = Math.floor((elapsedSeconds % 3_600) / 60);
+  const secondsLabel = `${elapsedSeconds % 60}s`;
 
   if (hours > 0) {
     return `${hours}h ${minutes}m ${secondsLabel}`;
   }
 
   return minutes > 0 ? `${minutes}m ${secondsLabel}` : secondsLabel;
-}
-
-function formatWorkingTimerNow(startIso: string): string {
-  return formatWorkingTimer(startIso, new Date().toISOString()) ?? "0.0s";
 }
 
 type WorkEntryIconName =
