@@ -113,6 +113,14 @@ probe must show a current advisory or a provable installed-version advance
 from a fresh exact-target pre-command probe before the update is reported as
 successful.
 
+When the command exits successfully but the exact executable remains outdated,
+BiBCode reports the resolved executable path together with the detected and
+expected versions. Provider settings retain the captured updater output and a
+**Recheck** action so an externally repaired installation can be verified
+without rerunning the update. The server log records the provider, instance,
+executable, before/after/expected versions, exit code, and verification status
+as structured `provider.maintenance.update.verify` fields.
+
 ## Supported instance customization
 
 The following provider-instance settings are applied by the current runtime:
