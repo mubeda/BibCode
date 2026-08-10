@@ -64,6 +64,18 @@ const h = vi.hoisted(() => {
     discoveredPortsByThreadId: {},
     desktopBootstraps: [],
     desktopUpdateState: null,
+    shellSummary: {
+      catalogReady: false,
+      desiredEnvironmentCount: 0,
+      statuses: [],
+      canShowEmptyProjects: false,
+      hasSnapshot: false,
+      hasSynchronizingShell: false,
+      hasCachedShell: false,
+      hasLiveShell: false,
+      firstError: null,
+      latestSnapshotUpdatedAt: null,
+    },
     updateBtnDisabled: false,
     updateBtnAction: "none",
     showArmWarning: false,
@@ -379,6 +391,11 @@ vi.mock("../state/projects", () => ({
 
 vi.mock("../state/shell", () => ({
   shellEnvironment: { openInEditor: { label: "shell.openInEditor" } },
+  environmentAvailabilityCommands: {
+    retry: { label: "environment.retry" },
+    adoptStorage: { label: "environment.adoptStorage" },
+  },
+  useEnvironmentShellSummary: () => h.state.shellSummary,
 }));
 
 vi.mock("../state/threads", () => ({
@@ -952,6 +969,18 @@ beforeEach(() => {
   h.state.discoveredPortsByThreadId = {};
   h.state.desktopBootstraps = [];
   h.state.desktopUpdateState = null;
+  h.state.shellSummary = {
+    catalogReady: false,
+    desiredEnvironmentCount: 0,
+    statuses: [],
+    canShowEmptyProjects: false,
+    hasSnapshot: false,
+    hasSynchronizingShell: false,
+    hasCachedShell: false,
+    hasLiveShell: false,
+    firstError: null,
+    latestSnapshotUpdatedAt: null,
+  };
   h.state.updateBtnDisabled = false;
   h.state.updateBtnAction = "none";
   h.state.showArmWarning = false;
@@ -1190,9 +1219,83 @@ staticDescribe("Sidebar full render", () => {
     expect(nav[0]!.props["pathname"]).toBe("/settings/appearance");
   });
 
-  it("renders the empty projects state", () => {
+  it("renders the empty projects state only after a live authoritative snapshot", () => {
+    h.state.shellSummary = {
+      ...h.state.shellSummary,
+      catalogReady: true,
+      desiredEnvironmentCount: 1,
+      statuses: [
+        {
+          environmentId: ENV_MAIN,
+          status: "live",
+          hasSnapshot: true,
+          error: null,
+        },
+      ],
+      canShowEmptyProjects: true,
+      hasSnapshot: true,
+      hasLiveShell: true,
+    };
     const markup = render(<Sidebar />);
     expect(markup).toContain("No projects yet");
+  });
+
+  it("renders loading rather than claiming an empty catalog before catalog readiness", () => {
+    const markup = render(<Sidebar />);
+    expect(markup).toContain("Project data is still loading");
+    expect(markup).not.toContain("No projects yet");
+  });
+
+  it("wires storage-change retry, settings, diagnostics, and confirmed adoption", () => {
+    h.state.shellSummary = {
+      ...h.state.shellSummary,
+      catalogReady: true,
+      desiredEnvironmentCount: 1,
+      statuses: [
+        {
+          environmentId: ENV_MAIN,
+          status: "storage-changed",
+          hasSnapshot: false,
+          error: "Persistent storage changed.",
+        },
+      ],
+    };
+    const markup = render(<Sidebar />);
+    expect(markup).toContain("Project data location changed");
+
+    invoke(
+      mustFindProps((props) => props["children"] === "Retry", "project retry action"),
+      "onClick",
+      mouseEvent(),
+    );
+    invoke(
+      mustFindProps((props) => props["children"] === "Settings", "project settings action"),
+      "onClick",
+      mouseEvent(),
+    );
+    invoke(
+      mustFindProps((props) => props["children"] === "Diagnostics", "project diagnostics action"),
+      "onClick",
+      mouseEvent(),
+    );
+    invoke(
+      mustFindProps(
+        (props) => props["children"] === "Use this data location",
+        "project storage adoption action",
+      ),
+      "onClick",
+      mouseEvent(),
+    );
+
+    expect(h.state.commandCalls).toEqual([
+      { label: "environment.retry", input: ENV_MAIN },
+      { label: "environment.adoptStorage", input: ENV_MAIN },
+    ]);
+    expect(h.spies.navigate).toHaveBeenCalledWith({ to: "/settings/connections" });
+    expect(h.spies.navigate).toHaveBeenCalledWith({ to: "/settings/diagnostics" });
+    expect(h.spies.windowConfirm).toHaveBeenCalledWith(
+      expect.stringContaining("will not be merged"),
+    );
   });
 
   it("shows the empty-thread state for an expanded project without workspace threads", () => {

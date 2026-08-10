@@ -180,6 +180,11 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
   CAS. Both the prepared HTTP descriptor and the WebSocket session's
   initial configuration must pass that owner before synchronization, live
   publication, or cache consumption.
+- Project count is never used as an availability signal. The client retains
+  accepted cached shell snapshots through reconnect and blocked states, and
+  only a successful live shell snapshot can replace those rows or confirm an
+  empty project catalog. Catalog loading, zero desired environments, and any
+  non-live desired environment remain explicitly non-authoritative.
 - Desktop catalog capability is fail-closed and tri-state. Only bridge version
   3 with an explicit protected/unprotected flag may select native compare-only,
   native CAS, or IndexedDB migration; rejected, older, or incomplete metadata

@@ -50,6 +50,7 @@ import {
   DEFAULT_RUNTIME_MODE,
   DEFAULT_SERVER_SETTINGS,
   EDITORS,
+  type EnvironmentId,
   ProjectId,
   ProviderInstanceId,
   type ScopedProjectRef,
@@ -129,7 +130,11 @@ import { useDesktopUpdateState } from "../state/desktopUpdate";
 import { useThreadActions } from "../hooks/useThreadActions";
 import { projectEnvironment } from "../state/projects";
 import { useEnvironmentQuery } from "../state/query";
-import { shellEnvironment } from "../state/shell";
+import {
+  environmentAvailabilityCommands,
+  shellEnvironment,
+  useEnvironmentShellSummary,
+} from "../state/shell";
 import { threadEnvironment, useEnvironmentThread } from "../state/threads";
 import { vcsEnvironment } from "../state/vcs";
 import { useEnvironment, useEnvironments, usePrimaryEnvironmentId } from "../state/environments";
@@ -202,6 +207,7 @@ import {
   isContextMenuPointerDown,
   isTrailingDoubleClick,
   resolveProjectStatusIndicator,
+  resolveSidebarProjectAvailability,
   resolveSidebarStageBadgeLabel,
   resolveThreadRowClassName,
   resolveThreadStatusPill,
@@ -233,6 +239,7 @@ import {
   type SidebarProjectSnapshot,
 } from "../sidebarProjectGrouping";
 import { SidebarProviderUpdatePill } from "./sidebar/SidebarProviderUpdatePill";
+import { SidebarProjectAvailability } from "./sidebar/SidebarProjectAvailability";
 const SIDEBAR_SORT_LABELS: Record<SidebarProjectSortOrder, string> = {
   updated_at: "Last user message",
   created_at: "Created at",
@@ -3433,7 +3440,11 @@ interface SidebarProjectsContentProps {
   suppressProjectClickAfterDragRef: React.RefObject<boolean>;
   suppressProjectClickForContextMenuRef: React.RefObject<boolean>;
   attachProjectListAutoAnimateRef: (node: HTMLElement | null) => void;
-  projectsLength: number;
+  projectAvailability: ReturnType<typeof resolveSidebarProjectAvailability>;
+  onRetryProjectEnvironment: (environmentId: EnvironmentId) => void;
+  onOpenProjectSettings: () => void;
+  onViewProjectDiagnostics: () => void;
+  onAdoptProjectStorage: (environmentId: EnvironmentId) => void;
 }
 
 const SidebarProjectsContent = memo(function SidebarProjectsContent(
@@ -3474,7 +3485,11 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
     suppressProjectClickAfterDragRef,
     suppressProjectClickForContextMenuRef,
     attachProjectListAutoAnimateRef,
-    projectsLength,
+    projectAvailability,
+    onRetryProjectEnvironment,
+    onOpenProjectSettings,
+    onViewProjectDiagnostics,
+    onAdoptProjectStorage,
   } = props;
 
   const handleProjectSortOrderChange = useCallback(
@@ -3659,11 +3674,13 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
           </SidebarMenu>
         )}
 
-        {projectsLength === 0 && (
-          <div className="px-2 pt-4 text-center text-xs text-muted-foreground/60">
-            No projects yet
-          </div>
-        )}
+        <SidebarProjectAvailability
+          view={projectAvailability}
+          onRetry={onRetryProjectEnvironment}
+          onOpenSettings={onOpenProjectSettings}
+          onViewDiagnostics={onViewProjectDiagnostics}
+          onAdoptStorage={onAdoptProjectStorage}
+        />
       </SidebarGroup>
     </SidebarContent>
   );
@@ -3671,11 +3688,18 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
 
 export default function Sidebar() {
   const projects = useProjects();
+  const shellSummary = useEnvironmentShellSummary();
   const sidebarThreads = useThreadShells();
   const projectExpandedById = useUiStateStore((store) => store.projectExpandedById);
   const projectOrder = useUiStateStore((store) => store.projectOrder);
   const reorderProjects = useUiStateStore((store) => store.reorderProjects);
   const navigate = useNavigate();
+  const retryProjectEnvironment = useAtomCommand(environmentAvailabilityCommands.retry, {
+    reportFailure: false,
+  });
+  const adoptProjectStorage = useAtomCommand(environmentAvailabilityCommands.adoptStorage, {
+    reportFailure: false,
+  });
   const pathname = useLocation({ select: (loc) => loc.pathname });
   const isOnSettings = pathname.startsWith("/settings");
   const sidebarThreadSortOrder = useClientSettings((s) => s.sidebarThreadSortOrder);
@@ -3715,6 +3739,40 @@ export default function Sidebar() {
   const suppressProjectClickAfterDragRef = useRef(false);
   const suppressProjectClickForContextMenuRef = useRef(false);
   const desktopUpdateState = useDesktopUpdateState();
+  const projectAvailability = useMemo(
+    () =>
+      resolveSidebarProjectAvailability({
+        projectCount: projects.length,
+        catalogReady: shellSummary.catalogReady,
+        environments: shellSummary.statuses,
+      }),
+    [projects.length, shellSummary.catalogReady, shellSummary.statuses],
+  );
+  const handleRetryProjectEnvironment = useCallback(
+    (environmentId: EnvironmentId) => {
+      void retryProjectEnvironment(environmentId);
+    },
+    [retryProjectEnvironment],
+  );
+  const handleOpenProjectSettings = useCallback(() => {
+    void navigate({ to: "/settings/connections" });
+  }, [navigate]);
+  const handleViewProjectDiagnostics = useCallback(() => {
+    void navigate({ to: "/settings/diagnostics" });
+  }, [navigate]);
+  const handleAdoptProjectStorage = useCallback(
+    (environmentId: EnvironmentId) => {
+      if (
+        !window.confirm(
+          "Use this project data location? Projects from the two locations will not be merged.",
+        )
+      ) {
+        return;
+      }
+      void adoptProjectStorage(environmentId);
+    },
+    [adoptProjectStorage],
+  );
   const clearSelection = useThreadSelectionStore((s) => s.clearSelection);
   const setSelectionAnchor = useThreadSelectionStore((s) => s.setAnchor);
   const platform = navigator.platform;
@@ -4309,7 +4367,11 @@ export default function Sidebar() {
             suppressProjectClickAfterDragRef={suppressProjectClickAfterDragRef}
             suppressProjectClickForContextMenuRef={suppressProjectClickForContextMenuRef}
             attachProjectListAutoAnimateRef={attachProjectListAutoAnimateRef}
-            projectsLength={projects.length}
+            projectAvailability={projectAvailability}
+            onRetryProjectEnvironment={handleRetryProjectEnvironment}
+            onOpenProjectSettings={handleOpenProjectSettings}
+            onViewProjectDiagnostics={handleViewProjectDiagnostics}
+            onAdoptProjectStorage={handleAdoptProjectStorage}
           />
 
           <SidebarSeparator />

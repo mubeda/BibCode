@@ -214,7 +214,7 @@ describe("AppRoot thread lifecycle reconciliation", () => {
     [
       "cached live-shell data",
       () => {
-        publishShellState(ENVIRONMENT_ID, shellState("cached", snapshot(20, [HOST_ID])));
+        publishShellState(ENVIRONMENT_ID, shellState("degraded", snapshot(20, [HOST_ID])));
         h.archivedStates.set(ENVIRONMENT_ID, {
           snapshots: [{ environmentId: ENVIRONMENT_ID, snapshot: snapshot(20, []) }],
           error: null,
@@ -294,7 +294,7 @@ describe("AppRoot thread lifecycle reconciliation", () => {
       error: null,
       isLoading: false,
     };
-    publishShellState(ENVIRONMENT_ID, shellState("cached", snapshot(30, [HOST_ID])));
+    publishShellState(ENVIRONMENT_ID, shellState("degraded", snapshot(30, [HOST_ID])));
     h.archivedStates.set(ENVIRONMENT_ID, archived);
     useCenterPanelStore.getState().openTerminalPanel(DELETED_REF, "term-deleted");
     useRightPanelStore.getState().openTerminal(DELETED_REF, "term-deleted");

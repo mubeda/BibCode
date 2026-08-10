@@ -1,5 +1,7 @@
 import * as React from "react";
 import type { SidebarProjectSortOrder, SidebarThreadSortOrder } from "@bibcode/contracts/settings";
+import type { EnvironmentShellAvailability } from "@bibcode/client-runtime/state/shell";
+import type { EnvironmentId } from "@bibcode/contracts";
 import {
   getThreadSortTimestamp,
   sortThreads,
@@ -17,6 +19,78 @@ export const THREAD_JUMP_HINT_SHOW_DELAY_MS = 100;
 // nearby thread usually reuses an already-hot subscription.
 export const SIDEBAR_THREAD_PREWARM_LIMIT = 10;
 export type SidebarNewThreadEnvMode = "local" | "worktree";
+
+export type SidebarProjectAvailabilityView =
+  | {
+      readonly kind: "available" | "empty-confirmed" | "loading";
+      readonly environmentId: null;
+      readonly error: null;
+    }
+  | {
+      readonly kind:
+        | "degraded"
+        | "storage-changed"
+        | "recovery-required"
+        | "unavailable"
+        | "configuration-error";
+      readonly environmentId: EnvironmentId | null;
+      readonly error: string | null;
+      readonly hasCachedProjects: boolean;
+    };
+
+const SIDEBAR_PROJECT_AVAILABILITY_PRIORITY = [
+  "recovery-required",
+  "storage-changed",
+  "configuration-error",
+  "unavailable",
+  "degraded",
+  "synchronizing",
+  "starting",
+] as const;
+
+export function resolveSidebarProjectAvailability(input: {
+  readonly projectCount: number;
+  readonly catalogReady: boolean;
+  readonly environments: ReadonlyArray<EnvironmentShellAvailability>;
+}): SidebarProjectAvailabilityView {
+  if (!input.catalogReady) {
+    return { kind: "loading", environmentId: null, error: null };
+  }
+
+  const everyEnvironmentIsAuthoritative =
+    input.environments.length > 0 &&
+    input.environments.every(
+      (environment) => environment.status === "live" && environment.hasSnapshot,
+    );
+  if (everyEnvironmentIsAuthoritative) {
+    return input.projectCount === 0
+      ? { kind: "empty-confirmed", environmentId: null, error: null }
+      : { kind: "available", environmentId: null, error: null };
+  }
+
+  for (const status of SIDEBAR_PROJECT_AVAILABILITY_PRIORITY) {
+    const environment = input.environments.find((candidate) => candidate.status === status);
+    if (environment === undefined) {
+      continue;
+    }
+    if (status === "starting" || status === "synchronizing") {
+      return { kind: "loading", environmentId: null, error: null };
+    }
+    return {
+      kind: status,
+      environmentId: environment.environmentId,
+      error: environment.error,
+      hasCachedProjects: environment.hasSnapshot && input.projectCount > 0,
+    };
+  }
+
+  return {
+    kind: "unavailable",
+    environmentId: null,
+    error: null,
+    hasCachedProjects: input.projectCount > 0,
+  };
+}
 type SidebarProject = {
   id: string;
   title: string;
