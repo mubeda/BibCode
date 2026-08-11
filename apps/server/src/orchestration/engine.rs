@@ -1473,12 +1473,20 @@ impl std::fmt::Debug for CommandAdmissionClaim {
 #[derive(Clone, Default)]
 struct WorkspaceOwnershipFence {
     keys: Arc<StdMutex<HashMap<String, Weak<WorkspaceOwnershipKey>>>>,
+    #[cfg(test)]
+    contenders: Arc<StdMutex<HashMap<String, Arc<WorkspaceOwnershipContender>>>>,
 }
 
 struct WorkspaceOwnershipKey {
     gate: Arc<AsyncMutex<()>>,
     generation: AtomicU64,
     last_removal_generation: AtomicU64,
+}
+
+#[cfg(test)]
+struct WorkspaceOwnershipContender {
+    attempts: AtomicUsize,
+    changed: tokio::sync::Notify,
 }
 
 struct WorkspaceOwnershipLeaseInner {
@@ -1541,6 +1549,10 @@ impl WorkspaceOwnershipFence {
             .iter()
             .map(|(_, state)| state.generation.load(Ordering::SeqCst))
             .collect::<Vec<_>>();
+        #[cfg(test)]
+        for (key, _) in &states {
+            self.note_contender_attempt(key);
+        }
         let mut guards = Vec::with_capacity(states.len());
         for (_, state) in &states {
             guards.push(state.gate.clone().lock_owned().await);
@@ -1571,22 +1583,47 @@ impl WorkspaceOwnershipFence {
     }
 
     #[cfg(test)]
-    async fn wait_for_contender(&self, path: &Path) {
+    async fn contender_checkpoint(&self, path: &Path) -> (String, usize) {
         let key = canonical_worktree_path_key(path)
             .await
             .expect("test workspace identity");
+        let attempts = self.contender_for(&key).attempts.load(Ordering::SeqCst);
+        (key, attempts)
+    }
+
+    #[cfg(test)]
+    async fn wait_for_contender_after(&self, checkpoint: &(String, usize)) {
+        let (key, attempts) = checkpoint;
+        let contender = self.contender_for(key);
         loop {
-            let has_contender = self
-                .keys
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .get(&key)
-                .is_some_and(|state| state.strong_count() > 1);
-            if has_contender {
+            let changed = contender.changed.notified();
+            if contender.attempts.load(Ordering::SeqCst) > *attempts {
                 return;
             }
-            tokio::task::yield_now().await;
+            changed.await;
         }
+    }
+
+    #[cfg(test)]
+    fn contender_for(&self, key: &str) -> Arc<WorkspaceOwnershipContender> {
+        self.contenders
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(key.to_owned())
+            .or_insert_with(|| {
+                Arc::new(WorkspaceOwnershipContender {
+                    attempts: AtomicUsize::new(0),
+                    changed: tokio::sync::Notify::new(),
+                })
+            })
+            .clone()
+    }
+
+    #[cfg(test)]
+    fn note_contender_attempt(&self, key: &str) {
+        let contender = self.contender_for(key);
+        contender.attempts.fetch_add(1, Ordering::SeqCst);
+        contender.changed.notify_waiters();
     }
 }
 
@@ -9129,6 +9166,10 @@ mod tests {
             .acquire_workspace_removal_ownership(&final_path)
             .await
             .expect("block the second retarget before its first ownership validation");
+        let final_contender = engine
+            .workspace_ownership
+            .contender_checkpoint(&final_path)
+            .await;
         let second_engine = engine.clone();
         let second_target = final_path.clone();
         let second = tokio::spawn(async move {
@@ -9144,7 +9185,14 @@ mod tests {
                 )
                 .await
         });
-        tokio::task::yield_now().await;
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            engine
+                .workspace_ownership
+                .wait_for_contender_after(&final_contender),
+        )
+        .await
+        .expect("second retarget begins its stale ownership acquisition");
         pause.release();
         first
             .await
@@ -9157,10 +9205,16 @@ mod tests {
         .await
         .expect("removal acquires the new owner path")
         .expect("removal ownership");
+        let intermediate_contender = engine
+            .workspace_ownership
+            .contender_checkpoint(&intermediate)
+            .await;
         drop(final_blocker);
         tokio::time::timeout(
             Duration::from_secs(5),
-            engine.workspace_ownership.wait_for_contender(&intermediate),
+            engine
+                .workspace_ownership
+                .wait_for_contender_after(&intermediate_contender),
         )
         .await
         .expect("the stale waiter reloads and fences the newly current source path");
