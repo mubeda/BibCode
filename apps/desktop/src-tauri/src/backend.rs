@@ -42,6 +42,7 @@ const DEFAULT_BACKEND_PORT: u16 = 3773;
 const MAX_TCP_PORT: u16 = u16::MAX;
 const DESKTOP_BACKEND_PORT_PROBE_HOSTS: [&str; 3] = ["127.0.0.1", "0.0.0.0", "::"];
 pub const BACKEND_READY_EVENT: &str = "desktop:backend-ready";
+pub const PROJECT_DATA_STATUS_CHANGED_EVENT: &str = "desktop:project-data-status-changed";
 const WSL_SERVER_BINARY_ENV: &str = "BIBCODE_WSL_SERVER_BINARY";
 const DESKTOP_SETTINGS_FILE_NAME: &str = "desktop-settings.json";
 const BACKEND_READINESS_PATH: &str = "/.well-known/bibcode/environment";
@@ -975,11 +976,27 @@ impl BackendSupervisor {
         let primary_config = match self.start(primary_plan.clone()).await {
             Ok(config) => config,
             Err(detail) => {
-                if let Some(error) = classify_primary_start_error(&primary_plan, &detail) {
-                    self.record_planning_error(error.clone());
-                    return Err(error.to_string());
+                let plan_error = classify_primary_start_error(&primary_plan, &detail);
+                let error = plan_error
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or(detail);
+                self.record_plan_error_with_classification(
+                    &primary_plan,
+                    error.clone(),
+                    plan_error,
+                );
+                if let Err(event_error) = emit_project_data_status_changed(
+                    &app,
+                    &primary_plan.config.environment_id,
+                ) {
+                    tracing::warn!(
+                        target: "bibcode_desktop_tauri::backend",
+                        environment_id = primary_plan.config.environment_id,
+                        "desktop project-data status invalidation failed: {event_error}"
+                    );
                 }
-                return Err(detail);
+                return Err(error);
             }
         };
 
@@ -1452,6 +1469,15 @@ impl BackendSupervisor {
     }
 
     fn record_plan_error(&self, plan: &BackendLaunchPlan, error: String) {
+        self.record_plan_error_with_classification(plan, error, None);
+    }
+
+    fn record_plan_error_with_classification(
+        &self,
+        plan: &BackendLaunchPlan,
+        error: String,
+        plan_error: Option<BackendPlanError>,
+    ) {
         let mut state = self
             .state
             .lock()
@@ -1462,6 +1488,7 @@ impl BackendSupervisor {
         slot.pid = None;
         slot.unavailable = unavailable_wsl_secondary_from_plan(plan, &error);
         slot.last_error = Some(error);
+        slot.plan_error = plan_error;
         slot.restart_scheduled = false;
     }
 
@@ -1555,6 +1582,17 @@ fn emit_backend_ready<R: Runtime>(
         }),
     )
     .map_err(|error| format!("Could not emit desktop backend readiness: {error}"))
+}
+
+fn emit_project_data_status_changed<R: Runtime>(
+    app: &AppHandle<R>,
+    environment_id: &str,
+) -> Result<(), String> {
+    app.emit(
+        PROJECT_DATA_STATUS_CHANGED_EVENT,
+        json!({ "environmentId": environment_id }),
+    )
+    .map_err(|error| format!("Could not emit project-data status change: {error}"))
 }
 
 async fn start_managed_backend(
@@ -2693,6 +2731,7 @@ mod tests {
         connect_async,
         tungstenite::{Message, client::IntoClientRequest},
     };
+    use tauri::Listener;
 
     #[derive(Debug)]
     struct MarkerDesktopUiProcessObserver;
@@ -4489,7 +4528,11 @@ exit /b 9
         let error = classify_primary_start_error(&plan, "WSL process exited before readiness")
             .expect("WSL primary startup failures must remain typed");
 
-        supervisor.record_planning_error(error.clone());
+        supervisor.record_plan_error_with_classification(
+            &plan,
+            error.to_string(),
+            Some(error.clone()),
+        );
 
         assert_eq!(
             supervisor.primary_plan_error(),
@@ -4498,7 +4541,8 @@ exit /b 9
             })
         );
         assert!(supervisor.local_environment_bootstraps().is_empty());
-        assert_eq!(supervisor.current_run_config(), None);
+        assert_eq!(supervisor.current_run_config(), Some(plan.config));
+        assert_eq!(supervisor.project_data_targets().len(), 1);
     }
 
     #[test]
@@ -4703,6 +4747,87 @@ exit /b 9
             .stop(BackendShutdownConfig::default())
             .await
             .expect("default backend should stop");
+    }
+
+    #[tokio::test]
+    async fn failed_default_backend_retains_project_data_target_and_emits_status_change() {
+        use crate::config::IsolatedTestDataRoot;
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+
+        let temp = tempfile::tempdir().expect("isolated desktop data root");
+        let test_data_root = temp.path().join("data-root");
+        let mut context = mock_context(noop_assets());
+        context.config_mut().identifier = format!(
+            "com.bibcode.backend-project-data-failure-tests-{}",
+            std::process::id(),
+        );
+        let app = mock_builder()
+            .manage(IsolatedTestDataRoot::new(test_data_root.clone()))
+            .build(context)
+            .expect("mock Tauri app");
+
+        let initial = BackendSupervisor::new();
+        initial
+            .start_default(app.handle().clone())
+            .await
+            .expect("default backend should initialize the isolated store");
+        initial
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("default backend should close before corruption is injected");
+
+        let marker = test_data_root
+            .join("userdata")
+            .join("environment-id");
+        fs::write(&marker, b"malformed-environment-id\n")
+            .expect("environment marker fixture should write");
+
+        let (event_sender, event_receiver) = mpsc::channel();
+        app.listen_any(PROJECT_DATA_STATUS_CHANGED_EVENT, move |event| {
+            event_sender
+                .send(event.payload().to_string())
+                .expect("project-data event payload should be captured");
+        });
+
+        let supervisor = BackendSupervisor::new();
+        let error = supervisor
+            .start_default(app.handle().clone())
+            .await
+            .expect_err("malformed marker must fail desktop backend startup closed");
+
+        assert!(
+            error.contains("storage instance marker") && error.contains("malformed"),
+            "unexpected error: {error}",
+        );
+        assert!(supervisor.local_environment_bootstraps().is_empty());
+        let targets = supervisor.project_data_targets();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].environment_id, PRIMARY_LOCAL_ENVIRONMENT_ID);
+        assert!(!targets[0].running);
+        match &targets[0].launch_plan.target {
+            BackendLaunchTarget::InProcess { base_dir, .. } => {
+                assert_eq!(
+                    base_dir,
+                    &test_data_root
+                        .canonicalize()
+                        .expect("isolated data root should canonicalize"),
+                );
+            }
+            BackendLaunchTarget::ExternalProcess { .. } => {
+                panic!("native test backend should retain an in-process launch plan");
+            }
+        }
+        let payload = event_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("project-data status invalidation should be emitted");
+        assert_eq!(
+            serde_json::from_str::<Value>(&payload).expect("event payload should be JSON"),
+            json!({ "environmentId": PRIMARY_LOCAL_ENVIRONMENT_ID }),
+        );
+        assert_eq!(
+            fs::read(&marker).expect("malformed marker should remain readable"),
+            b"malformed-environment-id\n",
+        );
     }
 
     #[test]
