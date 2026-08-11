@@ -57,6 +57,15 @@ mod tests {
         );
     }
 
+    #[test]
+    fn sandbox_resolves_executables_from_its_captured_path() {
+        let sandbox = TestSandbox::new("captured-executable");
+        let executable = sandbox.executable_on_path("git");
+
+        assert!(executable.is_absolute());
+        assert!(executable.is_file());
+    }
+
     #[cfg(unix)]
     #[test]
     fn sandbox_writes_an_explicit_owner_executable_unix_script() {

@@ -61,6 +61,34 @@ impl TestSandbox {
         environment
     }
 
+    pub(crate) fn executable_on_path(&self, name: &str) -> PathBuf {
+        let path = self
+            .environment
+            .iter()
+            .find(|(key, _)| key.eq_ignore_ascii_case("PATH"))
+            .map(|(_, value)| value)
+            .expect("test sandbox captured PATH");
+        let executable_names = if cfg!(windows) {
+            vec![
+                name.to_owned(),
+                format!("{name}.exe"),
+                format!("{name}.cmd"),
+                format!("{name}.bat"),
+            ]
+        } else {
+            vec![name.to_owned()]
+        };
+        std::env::split_paths(path)
+            .flat_map(|directory| {
+                executable_names
+                    .iter()
+                    .map(move |name| directory.join(name))
+            })
+            .find(|candidate| candidate.is_file())
+            .and_then(|candidate| std::fs::canonicalize(candidate).ok())
+            .unwrap_or_else(|| panic!("{name} executable was not found on captured PATH"))
+    }
+
     pub(crate) fn process_input(
         &self,
         executable: impl AsRef<Path>,
