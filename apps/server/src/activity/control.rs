@@ -574,16 +574,17 @@ use std::{
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
+use super::cancellation::CancellationOperation;
 use super::model::{
     ACTIVITY_DELTA_MAX_CHANGES, ACTIVITY_ID_MAX_LENGTH, ACTIVITY_PAGE_MAX_LENGTH,
-    ActivityActorControl, ActivityActorControlState, ActivityCancellationOperationSummary,
-    ActivityControlChange, ActivityControlDelta, ActivityControlSnapshot, ActivityLifecycle,
-    ActivityScopeRef, ProviderActivityMutation, validate_text,
+    ActivityActorControl, ActivityActorControlState, ActivityControlChange, ActivityControlDelta,
+    ActivityControlSnapshot, ActivityLifecycle, ActivityScopeRef, ProviderActivityMutation,
+    validate_text,
 };
 
 /// A provider-native cancellation handle. This value stays inside the Rust server and is never
 /// encoded, persisted, or logged with its provider identifiers.
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Eq, Hash, PartialEq)]
 pub(crate) enum ProviderActivityNativeTarget {
     CodexTurn { thread_id: String, turn_id: String },
     ClaudeTask { task_id: String },
@@ -622,7 +623,9 @@ pub(crate) enum ProviderActivityControlUpdate {
 
 /// A cancellation dispatch candidate. The cancellation layer owns populating these after it has
 /// installed an operation fence; observation alone never dispatches provider cancellation.
+#[derive(Clone)]
 pub(crate) struct ActivityDispatchJob {
+    pub(crate) scope_id: String,
     pub(crate) scope: ActivityScopeRef,
     pub(crate) generation: ActivityRuntimeGeneration,
     pub(crate) operation_root_actor_id: String,
@@ -630,6 +633,7 @@ pub(crate) struct ActivityDispatchJob {
     pub(crate) target: ProviderActivityNativeTarget,
 }
 
+#[derive(Clone)]
 pub(crate) enum ActivityDispatchSubject {
     Actor { actor_id: String },
     WorkItem { work_item_id: String },
@@ -643,31 +647,39 @@ pub(crate) enum ActivityControlEvent {
 #[derive(Clone, Debug)]
 pub(crate) struct ActivityControlRegistry {
     inner: Arc<Mutex<ActivityControlRegistryState>>,
-    events: broadcast::Sender<ActivityControlEvent>,
+    pub(super) events: broadcast::Sender<ActivityControlEvent>,
 }
 
 #[derive(Debug, Default)]
-struct ActivityControlRegistryState {
-    scopes: BTreeMap<String, ActivityControlScope>,
+pub(super) struct ActivityControlRegistryState {
+    pub(super) scopes: BTreeMap<String, ActivityControlScope>,
 }
 
 #[derive(Clone, Debug)]
-struct ActivityControlScope {
+pub(super) struct ActivityControlScope {
     scope_id: String,
-    scope: ActivityScopeRef,
-    generation: ActivityRuntimeGeneration,
+    pub(super) scope: ActivityScopeRef,
+    pub(super) generation: ActivityRuntimeGeneration,
     _provider_instance_id: Option<String>,
     revision: u64,
-    actors: BTreeMap<String, ActivityControlActor>,
-    operations: BTreeMap<String, ActivityCancellationOperationSummary>,
+    pub(super) actors: BTreeMap<String, ActivityControlActor>,
+    pub(super) work_items: BTreeMap<String, ActivityControlWorkItem>,
+    pub(super) operations: BTreeMap<String, CancellationOperation>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct ActivityControlActor {
-    parent_actor_id: Option<String>,
-    status: ActivityLifecycle,
-    target: Option<ProviderActivityNativeTarget>,
-    control_revision: u64,
+pub(super) struct ActivityControlActor {
+    pub(super) parent_actor_id: Option<String>,
+    pub(super) status: ActivityLifecycle,
+    pub(super) target: Option<ProviderActivityNativeTarget>,
+    pub(super) control_revision: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct ActivityControlWorkItem {
+    pub(super) owner_actor_id: Option<String>,
+    pub(super) status: ActivityLifecycle,
+    pub(super) target: Option<ProviderActivityNativeTarget>,
 }
 
 impl ActivityControlRegistry {
@@ -701,6 +713,9 @@ impl ActivityControlRegistry {
                         actor.control_revision = actor.control_revision.saturating_add(1);
                     }
                 }
+                for work_item in staged.work_items.values_mut() {
+                    work_item.target = None;
+                }
                 // Cancellation operations are generation-scoped and cannot outlive their targets.
                 staged.operations.clear();
                 let Ok(changes) = staged.pending_changes(existing) else {
@@ -725,6 +740,7 @@ impl ActivityControlRegistry {
                         _provider_instance_id: provider_instance_id,
                         revision: 0,
                         actors: BTreeMap::new(),
+                        work_items: BTreeMap::new(),
                         operations: BTreeMap::new(),
                     },
                 );
@@ -767,6 +783,7 @@ impl ActivityControlRegistry {
                 return Vec::new();
             }
             staged.apply_control_updates(controls);
+            let jobs = staged.reconcile_operations();
             if !staged.validate_graph() || !staged.within_bounds() {
                 return Vec::new();
             }
@@ -774,12 +791,12 @@ impl ActivityControlRegistry {
                 return Vec::new();
             };
             *scope = staged;
-            scope.publish_changes(changes)
+            (scope.publish_changes(changes), jobs)
         };
-        if let Some(event) = event {
+        if let Some(event) = event.0 {
             let _ = self.events.send(ActivityControlEvent::Delta(event));
         }
-        Vec::new()
+        event.1
     }
 
     pub(crate) async fn snapshot(&self, scope_id: &str) -> ActivityControlSnapshot {
@@ -840,10 +857,28 @@ impl ActivityControlRegistry {
             .values()
             .map(|scope| scope.operations.len())
             .sum();
-        (actor_count, operation_count, 0)
+        let target_count = state
+            .scopes
+            .values()
+            .map(|scope| {
+                scope
+                    .actors
+                    .values()
+                    .filter(|actor| actor.target.is_some())
+                    .count()
+                    .saturating_add(
+                        scope
+                            .work_items
+                            .values()
+                            .filter(|work_item| work_item.target.is_some())
+                            .count(),
+                    )
+            })
+            .sum();
+        (actor_count, operation_count, target_count)
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, ActivityControlRegistryState> {
+    pub(super) fn lock(&self) -> std::sync::MutexGuard<'_, ActivityControlRegistryState> {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -911,6 +946,24 @@ impl ActivityControlScope {
                 ProviderActivityMutation::RemoveActor { actor_id } => {
                     self.actors.remove(actor_id);
                 }
+                ProviderActivityMutation::UpsertWorkItem(work_item) => {
+                    if let Some(existing) = self.work_items.get_mut(&work_item.id) {
+                        existing.owner_actor_id = work_item.owner_actor_id.clone();
+                        existing.status = work_item.status;
+                    } else if self.work_items.len() < ACTIVITY_PAGE_MAX_LENGTH {
+                        self.work_items.insert(
+                            work_item.id.clone(),
+                            ActivityControlWorkItem {
+                                owner_actor_id: work_item.owner_actor_id.clone(),
+                                status: work_item.status,
+                                target: None,
+                            },
+                        );
+                    }
+                }
+                ProviderActivityMutation::RemoveWorkItem { work_item_id } => {
+                    self.work_items.remove(work_item_id);
+                }
                 _ => {}
             }
         }
@@ -940,13 +993,28 @@ impl ActivityControlScope {
                     work_item_id,
                     target,
                 } => {
-                    let _ = (work_item_id, target);
+                    let Some(work_item) = self.work_items.get_mut(work_item_id) else {
+                        continue;
+                    };
+                    work_item.target = if matches!(self.scope, ActivityScopeRef::Thread { .. })
+                        && !work_item.status.is_terminal()
+                        && work_item.owner_actor_id.is_some()
+                    {
+                        target.clone()
+                    } else {
+                        None
+                    };
                 }
             }
         }
         for actor in self.actors.values_mut() {
             if actor.status.is_terminal() && actor.target.take().is_some() {
                 actor.control_revision = actor.control_revision.saturating_add(1);
+            }
+        }
+        for work_item in self.work_items.values_mut() {
+            if work_item.status.is_terminal() {
+                work_item.target = None;
             }
         }
     }
@@ -969,12 +1037,30 @@ impl ActivityControlScope {
                     .and_then(|actor| actor.parent_actor_id.as_deref());
             }
             true
+        }) && self.work_items.values().all(|work_item| {
+            work_item
+                .owner_actor_id
+                .as_ref()
+                .is_none_or(|owner| self.actors.contains_key(owner))
         })
     }
 
-    fn within_bounds(&self) -> bool {
+    pub(super) fn within_bounds(&self) -> bool {
+        let target_count = self
+            .actors
+            .values()
+            .filter(|actor| actor.target.is_some())
+            .count()
+            .saturating_add(
+                self.work_items
+                    .values()
+                    .filter(|work_item| work_item.target.is_some())
+                    .count(),
+            );
         self.actors.len() <= ACTIVITY_PAGE_MAX_LENGTH
+            && self.work_items.len() <= ACTIVITY_PAGE_MAX_LENGTH
             && self.operations.len() <= ACTIVITY_PAGE_MAX_LENGTH
+            && target_count <= ACTIVITY_DELTA_MAX_CHANGES
             && self.actors.len().saturating_add(self.operations.len()) <= ACTIVITY_DELTA_MAX_CHANGES
     }
 
@@ -991,7 +1077,14 @@ impl ActivityControlScope {
                             && self.is_descendant_of(candidate_id, actor_id)
                     })
                     .count() as u64;
-                let state = if matches!(self.scope, ActivityScopeRef::Thread { .. })
+                let state = if self
+                    .operations
+                    .values()
+                    .any(|operation| operation.covered_actor_ids.contains(actor_id))
+                    && !actor.status.is_terminal()
+                {
+                    ActivityActorControlState::Requested
+                } else if matches!(self.scope, ActivityScopeRef::Thread { .. })
                     && !actor.status.is_terminal()
                     && actor.target.is_some()
                 {
@@ -1012,7 +1105,7 @@ impl ActivityControlScope {
             .collect()
     }
 
-    fn is_descendant_of(&self, actor_id: &str, ancestor_id: &str) -> bool {
+    pub(super) fn is_descendant_of(&self, actor_id: &str, ancestor_id: &str) -> bool {
         let mut cursor = self
             .actors
             .get(actor_id)
@@ -1029,7 +1122,172 @@ impl ActivityControlScope {
         false
     }
 
-    fn pending_changes(
+    pub(super) fn jobs_for_operation(
+        &self,
+        root_actor_id: &str,
+        residuals_only: bool,
+    ) -> Vec<ActivityDispatchJob> {
+        let Some(operation) = self.operations.get(root_actor_id) else {
+            return Vec::new();
+        };
+        let mut jobs = Vec::new();
+        let mut targets = std::collections::HashSet::new();
+        let actor_ids = std::iter::once(root_actor_id)
+            .chain(
+                self.actors
+                    .keys()
+                    .map(String::as_str)
+                    .filter(|actor_id| *actor_id != root_actor_id),
+            )
+            .collect::<Vec<_>>();
+        for actor_id in actor_ids {
+            let Some(actor) = self.actors.get(actor_id) else {
+                continue;
+            };
+            let included = if residuals_only {
+                operation.residual_actor_ids.contains(actor_id)
+            } else {
+                operation.covered_actor_ids.contains(actor_id)
+            };
+            let Some(target) = included
+                .then_some(actor)
+                .filter(|actor| !actor.status.is_terminal())
+                .and_then(|actor| actor.target.clone())
+            else {
+                continue;
+            };
+            if operation.dispatched_targets.contains(&target) || !targets.insert(target.clone()) {
+                continue;
+            }
+            jobs.push(ActivityDispatchJob {
+                scope_id: self.scope_id.clone(),
+                scope: self.scope.clone(),
+                generation: self.generation.clone(),
+                operation_root_actor_id: root_actor_id.to_owned(),
+                subject: ActivityDispatchSubject::Actor {
+                    actor_id: actor_id.to_owned(),
+                },
+                target,
+            });
+        }
+        for (work_item_id, work_item) in &self.work_items {
+            let included = if residuals_only {
+                operation.residual_work_item_ids.contains(work_item_id)
+            } else {
+                operation.covered_work_item_ids.contains(work_item_id)
+            };
+            let Some(target) = included
+                .then_some(work_item)
+                .filter(|work_item| !work_item.status.is_terminal())
+                .and_then(|work_item| work_item.target.clone())
+            else {
+                continue;
+            };
+            if operation.dispatched_targets.contains(&target) || !targets.insert(target.clone()) {
+                continue;
+            }
+            jobs.push(ActivityDispatchJob {
+                scope_id: self.scope_id.clone(),
+                scope: self.scope.clone(),
+                generation: self.generation.clone(),
+                operation_root_actor_id: root_actor_id.to_owned(),
+                subject: ActivityDispatchSubject::WorkItem {
+                    work_item_id: work_item_id.clone(),
+                },
+                target,
+            });
+        }
+        jobs
+    }
+
+    fn reconcile_operations(&mut self) -> Vec<ActivityDispatchJob> {
+        let roots = self.operations.keys().cloned().collect::<Vec<_>>();
+        let mut jobs = Vec::new();
+        let mut completed = Vec::new();
+        for root_actor_id in roots {
+            let Some(mut operation) = self.operations.remove(&root_actor_id) else {
+                continue;
+            };
+            let before_covered_actors = operation.covered_actor_ids.clone();
+            let before_covered_work = operation.covered_work_item_ids.clone();
+            let before_residual_actors = operation.residual_actor_ids.clone();
+            let before_residual_work = operation.residual_work_item_ids.clone();
+
+            operation.residual_actor_ids.retain(|actor_id| {
+                self.actors
+                    .get(actor_id)
+                    .is_some_and(|actor| !actor.status.is_terminal())
+            });
+            operation.residual_work_item_ids.retain(|work_item_id| {
+                self.work_items
+                    .get(work_item_id)
+                    .is_some_and(|work_item| !work_item.status.is_terminal())
+            });
+
+            loop {
+                let newly_covered =
+                    self.actors
+                        .iter()
+                        .filter(|(actor_id, actor)| {
+                            !operation.covered_actor_ids.contains(*actor_id)
+                                && actor.parent_actor_id.as_ref().is_some_and(|parent| {
+                                    operation.covered_actor_ids.contains(parent)
+                                })
+                        })
+                        .map(|(actor_id, _)| actor_id.clone())
+                        .collect::<Vec<_>>();
+                if newly_covered.is_empty() {
+                    break;
+                }
+                for actor_id in newly_covered {
+                    operation.covered_actor_ids.insert(actor_id.clone());
+                    if self
+                        .actors
+                        .get(&actor_id)
+                        .is_some_and(|actor| !actor.status.is_terminal())
+                    {
+                        operation.residual_actor_ids.insert(actor_id);
+                    }
+                }
+            }
+            for (work_item_id, work_item) in &self.work_items {
+                if work_item
+                    .owner_actor_id
+                    .as_ref()
+                    .is_some_and(|owner| operation.covered_actor_ids.contains(owner))
+                    && work_item.target.is_some()
+                {
+                    operation.covered_work_item_ids.insert(work_item_id.clone());
+                    if !work_item.status.is_terminal() {
+                        operation
+                            .residual_work_item_ids
+                            .insert(work_item_id.clone());
+                    }
+                }
+            }
+            let changed = before_covered_actors != operation.covered_actor_ids
+                || before_covered_work != operation.covered_work_item_ids
+                || before_residual_actors != operation.residual_actor_ids
+                || before_residual_work != operation.residual_work_item_ids;
+            if changed {
+                operation.operation_revision = operation.operation_revision.saturating_add(1);
+            }
+            if operation.residual_actor_ids.is_empty()
+                && operation.residual_work_item_ids.is_empty()
+            {
+                completed.push(root_actor_id);
+                continue;
+            }
+            self.operations.insert(root_actor_id.clone(), operation);
+            jobs.extend(self.jobs_for_operation(&root_actor_id, true));
+        }
+        for root in completed {
+            self.operations.remove(&root);
+        }
+        jobs
+    }
+
+    pub(super) fn pending_changes(
         &self,
         before: &ActivityControlScope,
     ) -> Result<Vec<ActivityControlChange>, ()> {
@@ -1059,14 +1317,17 @@ impl ActivityControlScope {
             .collect::<BTreeSet<_>>()
         {
             match (
-                before.operations.get(root_actor_id),
-                self.operations.get(root_actor_id),
+                before
+                    .operations
+                    .get(root_actor_id)
+                    .map(CancellationOperation::summary),
+                self.operations
+                    .get(root_actor_id)
+                    .map(CancellationOperation::summary),
             ) {
                 (Some(before), Some(after)) if before == after => {}
                 (_, Some(operation)) => {
-                    changes.push(ActivityControlChange::OperationUpserted {
-                        operation: operation.clone(),
-                    });
+                    changes.push(ActivityControlChange::OperationUpserted { operation });
                 }
                 (Some(_), None) => changes.push(ActivityControlChange::OperationRemoved {
                     root_actor_id: (*root_actor_id).clone(),
@@ -1080,7 +1341,7 @@ impl ActivityControlScope {
         Ok(changes)
     }
 
-    fn publish_changes(
+    pub(super) fn publish_changes(
         &mut self,
         changes: Vec<ActivityControlChange>,
     ) -> Option<ActivityControlDelta> {
@@ -1105,6 +1366,7 @@ impl ActivityControlScope {
             _provider_instance_id: None,
             revision: self.revision,
             actors: BTreeMap::new(),
+            work_items: BTreeMap::new(),
             operations: BTreeMap::new(),
         };
         let changes = empty.pending_changes(self).ok()?;
@@ -1116,7 +1378,11 @@ impl ActivityControlScope {
             scope_id: self.scope_id(),
             revision: self.revision,
             actors: self.actor_controls().into_values().collect(),
-            operations: self.operations.values().cloned().collect(),
+            operations: self
+                .operations
+                .values()
+                .map(CancellationOperation::summary)
+                .collect(),
         }
     }
 
