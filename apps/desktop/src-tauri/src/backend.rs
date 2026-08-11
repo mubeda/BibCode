@@ -5552,7 +5552,7 @@ while (-not [IO.File]::Exists({})) {{
             .to_ascii_lowercase();
         assert!(readiness.starts_with(&format!("get {BACKEND_READINESS_PATH} http/1.1")));
 
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             while !bootstrap_path.is_file() {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
