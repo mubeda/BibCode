@@ -582,6 +582,23 @@ impl Database {
         .await
     }
 
+    /// Drains all previously queued SQLite work and checkpoints committed WAL pages.
+    pub async fn checkpoint_wal(&self) -> Result<()> {
+        self.call(|connection| {
+            let (busy, log_pages, checkpointed_pages): (i64, i64, i64) =
+                connection.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                })?;
+            if busy != 0 || checkpointed_pages < log_pages {
+                return Err(PersistenceError::BackupStopped(format!(
+                    "WAL checkpoint remained busy ({checkpointed_pages}/{log_pages} pages)"
+                )));
+            }
+            Ok(())
+        })
+        .await
+    }
+
     pub(crate) async fn backup_to_cancellable(
         &self,
         destination: impl AsRef<Path>,

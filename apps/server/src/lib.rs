@@ -15,6 +15,7 @@ pub mod git;
 mod http;
 mod lifecycle;
 pub mod logging;
+mod maintenance;
 pub mod mcp;
 pub mod orchestration;
 pub mod persistence;
@@ -47,6 +48,12 @@ pub use http::{
     ROUTE_INVENTORY, RouteMethod, RouteSpec,
 };
 pub use lifecycle::{ServerError, ServerHandle, ServerRuntime, StartupAccess};
+pub use maintenance::{
+    DESKTOP_MAINTENANCE_TOKEN_HEADER, MAINTENANCE_UPDATE_CANCEL_PATH,
+    MAINTENANCE_UPDATE_COMMIT_PATH, MAINTENANCE_UPDATE_PREPARE_PATH,
+    MAINTENANCE_UPDATE_STATUS_PATH, PrepareForUpdateResult, RpcAdmissionGate, RpcMutability,
+    http_mutability, rpc_mutability,
+};
 pub use rpc::{
     ACTIVE_RPC_METHODS, CauseItem, ClientMessage, InvalidRequestId, MethodMode, RequestId, RpcExit,
     RpcMethodSpec, RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk, ServerMessage, WireMessage,

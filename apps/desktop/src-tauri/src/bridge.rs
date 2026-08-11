@@ -33,7 +33,7 @@ use crate::tailscale::{
     TailscaleStatus, build_tailscale_https_base_url, probe_tailscale_https_endpoint,
     read_tailscale_status,
 };
-use crate::updates::DesktopUpdateManager;
+use crate::updates::{DesktopUpdateInstallInput, DesktopUpdateManager};
 
 #[cfg(test)]
 pub(crate) type DesktopRuntime = tauri::test::MockRuntime;
@@ -1444,11 +1444,15 @@ pub async fn desktop_bridge_download_update(
 }
 
 #[tauri::command]
-pub fn desktop_bridge_install_update(
+pub async fn desktop_bridge_install_update(
     app: AppHandle<DesktopRuntime>,
     updates: State<'_, DesktopUpdateManager>,
+    backend: State<'_, BackendSupervisor>,
+    input: Option<DesktopUpdateInstallInput>,
 ) -> Result<Value, String> {
-    Ok(updates.install_update(&app))
+    Ok(updates
+        .install_update(&app, backend.inner(), input.unwrap_or_default())
+        .await)
 }
 
 #[cfg(test)]

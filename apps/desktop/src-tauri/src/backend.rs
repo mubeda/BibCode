@@ -244,6 +244,7 @@ impl BackendLaunchPlan {
             "port": config.port,
             "host": &config.bind_host,
             "desktopBootstrapToken": &config.desktop_bootstrap_token,
+            "wslTransport": true,
             "tailscaleServeEnabled": false,
             "tailscaleServePort": TAILSCALE_SERVE_PORT,
         });
@@ -446,6 +447,7 @@ struct BackendState {
     slots: BTreeMap<String, BackendSlotState>,
     next_run_id: u64,
     in_flight_starts: usize,
+    update_coordination: bool,
     lifecycle: BackendLifecycle,
 }
 
@@ -530,9 +532,171 @@ pub struct BackendSupervisor {
     late_start_cleanup_failure: Arc<Mutex<Option<String>>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackendUpdateEnvironment {
+    pub environment_id: String,
+    pub label: String,
+    pub primary: bool,
+    pub running: bool,
+    pub config: Option<BackendRunConfig>,
+    pub unprotected_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BackendUpdateSnapshot {
+    pub environments: Vec<BackendUpdateEnvironment>,
+    running_plans: Vec<BackendLaunchPlan>,
+    unavailable_environments: Vec<BackendUnavailableEnvironment>,
+}
+
 impl BackendSupervisor {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn snapshot_for_update(&self) -> BackendUpdateSnapshot {
+        let state = self
+            .state
+            .lock()
+            .expect("backend supervisor mutex poisoned");
+        let mut environments = Vec::with_capacity(state.slots.len());
+        let mut running_plans = Vec::new();
+        let mut unavailable_environments = Vec::new();
+        for (slot_key, slot) in &state.slots {
+            let primary = slot_key == PRIMARY_LOCAL_ENVIRONMENT_ID;
+            let running = slot.backend.is_some();
+            if running && let Some(plan) = &slot.launch_plan {
+                running_plans.push(plan.clone());
+            }
+            if let Some(unavailable) = &slot.unavailable {
+                unavailable_environments.push(unavailable.clone());
+            }
+            let (environment_id, label, config) = if let Some(plan) = &slot.launch_plan {
+                (
+                    plan.config.environment_id.clone(),
+                    plan.config.label.clone(),
+                    Some(plan.config.clone()),
+                )
+            } else if let Some(unavailable) = &slot.unavailable {
+                (
+                    unavailable.environment_id.clone(),
+                    unavailable.label.clone(),
+                    None,
+                )
+            } else {
+                (
+                    slot_key.clone(),
+                    if primary {
+                        "Local".to_string()
+                    } else {
+                        slot_key.clone()
+                    },
+                    None,
+                )
+            };
+            environments.push(BackendUpdateEnvironment {
+                environment_id,
+                label,
+                primary,
+                running,
+                config,
+                unprotected_reason: (!running).then(|| {
+                    slot.unavailable
+                        .as_ref()
+                        .map(|unavailable| unavailable.detail.clone())
+                        .or_else(|| slot.last_error.clone())
+                        .unwrap_or_else(|| "The configured backend is not running.".to_string())
+                }),
+            });
+        }
+        BackendUpdateSnapshot {
+            environments,
+            running_plans,
+            unavailable_environments,
+        }
+    }
+
+    pub(crate) async fn begin_update_snapshot(&self) -> Result<BackendUpdateSnapshot, String> {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|error| format!("backend supervisor mutex poisoned: {error}"))?;
+            if state.update_coordination {
+                return Err("Desktop backend update protection is already in progress.".to_string());
+            }
+            state.update_coordination = true;
+        }
+        self.wait_for_in_flight_starts().await;
+        Ok(self.snapshot_for_update())
+    }
+
+    pub(crate) fn expect_update_snapshot_exit(&self, snapshot: &BackendUpdateSnapshot) {
+        let state = self
+            .state
+            .lock()
+            .expect("backend supervisor mutex poisoned");
+        for environment in &snapshot.environments {
+            if !environment.running {
+                continue;
+            }
+            if let Some(backend) = state
+                .slots
+                .get(&environment.environment_id)
+                .and_then(|slot| slot.backend.as_ref())
+            {
+                match backend {
+                    ManagedBackend::Child(child) => child.request_stop(),
+                    ManagedBackend::Runtime(runtime) => {
+                        runtime.stop_requested.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn stop_update_snapshot(
+        &self,
+        snapshot: &BackendUpdateSnapshot,
+    ) -> Result<(), String> {
+        self.expect_update_snapshot_exit(snapshot);
+        self.stop(BackendShutdownConfig::default()).await
+    }
+
+    pub(crate) async fn restart_update_snapshot(
+        &self,
+        snapshot: &BackendUpdateSnapshot,
+    ) -> Result<(), String> {
+        let mut errors = Vec::new();
+        for plan in &snapshot.running_plans {
+            if let Err(error) = self
+                .start_with_options_inner(
+                    plan.clone(),
+                    BackendReadinessConfig::default(),
+                    BackendRestartConfig::default(),
+                    true,
+                    true,
+                )
+                .await
+            {
+                errors.push(format!("{}: {error}", plan.config.label));
+            }
+        }
+        for unavailable in &snapshot.unavailable_environments {
+            self.record_unavailable_environment(unavailable.clone());
+        }
+        self.state
+            .lock()
+            .map_err(|error| format!("backend supervisor mutex poisoned: {error}"))?
+            .update_coordination = false;
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Could not restart every desktop backend: {}",
+                errors.join("; ")
+            ))
+        }
     }
 
     fn install_ui_process_observer(&self, observer: Arc<dyn DesktopUiProcessObserver>) {
@@ -742,7 +906,7 @@ impl BackendSupervisor {
         readiness: BackendReadinessConfig,
         restart: BackendRestartConfig,
     ) -> Result<BackendRunConfig, String> {
-        self.start_with_options_inner(plan, readiness, restart, true)
+        self.start_with_options_inner(plan, readiness, restart, true, false)
             .await
     }
 
@@ -752,8 +916,10 @@ impl BackendSupervisor {
         readiness: BackendReadinessConfig,
         restart: BackendRestartConfig,
         reset_restart_attempt: bool,
+        update_recovery: bool,
     ) -> Result<BackendRunConfig, String> {
-        let permit = self.begin_start(reset_restart_attempt)?;
+        let permit =
+            self.begin_start_with_update_recovery(reset_restart_attempt, update_recovery)?;
         let ui_process_observer = self.ui_process_observer_for_start();
         let (config, managed, pid) =
             start_managed_backend(plan.clone(), readiness, ui_process_observer, permit.run_id)
@@ -823,11 +989,23 @@ impl BackendSupervisor {
         Ok(config)
     }
 
+    #[cfg(test)]
     fn begin_start(&self, allow_restart_after_stop: bool) -> Result<BackendStartPermit, String> {
+        self.begin_start_with_update_recovery(allow_restart_after_stop, false)
+    }
+
+    fn begin_start_with_update_recovery(
+        &self,
+        allow_restart_after_stop: bool,
+        update_recovery: bool,
+    ) -> Result<BackendStartPermit, String> {
         let mut state = self
             .state
             .lock()
             .map_err(|error| format!("backend supervisor mutex poisoned: {error}"))?;
+        if state.update_coordination && !update_recovery {
+            return Err("Desktop backend startup is paused during update protection.".to_string());
+        }
         let in_flight_starts = state
             .in_flight_starts
             .checked_add(1)
@@ -1131,7 +1309,7 @@ impl BackendSupervisor {
                 return;
             }
             if let Err(error) = supervisor
-                .start_with_options_inner(plan.clone(), readiness, restart, false)
+                .start_with_options_inner(plan.clone(), readiness, restart, false, false)
                 .await
             {
                 supervisor.schedule_restart(plan, readiness, restart, error);
@@ -2773,6 +2951,117 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn update_snapshot_tracks_primary_and_secondary_running_set_for_exact_restart() {
+        let primary_state = tempfile::tempdir().expect("primary state tempdir should open");
+        let secondary_state = tempfile::tempdir().expect("secondary state tempdir should open");
+        let supervisor = BackendSupervisor::new();
+        let primary_plan =
+            BackendLaunchPlan::local(primary_state.path().to_path_buf(), local_test_config(0));
+        let mut secondary_config = local_test_config(0);
+        secondary_config.environment_id = "wsl:Ubuntu".to_string();
+        secondary_config.label = "WSL (Ubuntu)".to_string();
+        secondary_config.desktop_bootstrap_token = "secondary-token".to_string();
+        let secondary_plan =
+            BackendLaunchPlan::local(secondary_state.path().to_path_buf(), secondary_config);
+
+        supervisor
+            .start(primary_plan)
+            .await
+            .expect("primary backend should start");
+        supervisor
+            .start(secondary_plan)
+            .await
+            .expect("secondary backend should start");
+
+        let snapshot = supervisor.snapshot_for_update();
+        assert_eq!(snapshot.environments.len(), 2);
+        assert!(snapshot.environments[0].primary);
+        assert!(snapshot.environments[0].running);
+        assert!(!snapshot.environments[1].primary);
+        assert!(snapshot.environments[1].running);
+
+        supervisor
+            .stop_update_snapshot(&snapshot)
+            .await
+            .expect("snapshot backends should stop");
+        supervisor
+            .restart_update_snapshot(&snapshot)
+            .await
+            .expect("exact snapshot should restart");
+
+        let restarted = supervisor.snapshot_for_update();
+        assert_eq!(
+            restarted
+                .environments
+                .iter()
+                .filter(|environment| environment.running)
+                .map(|environment| environment.environment_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["primary", "wsl:Ubuntu"]
+        );
+        supervisor
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("restarted backends should stop");
+    }
+
+    #[test]
+    fn update_snapshot_keeps_a_configured_missing_secondary_explicitly_unprotected() {
+        let supervisor = BackendSupervisor::new();
+        supervisor.record_unavailable_environment(BackendUnavailableEnvironment {
+            environment_id: "wsl:Ubuntu".to_string(),
+            label: "WSL (Ubuntu)".to_string(),
+            configured_distro: Some("Ubuntu".to_string()),
+            detail: "distribution is unavailable".to_string(),
+        });
+
+        let snapshot = supervisor.snapshot_for_update();
+        let environment = snapshot
+            .environments
+            .iter()
+            .find(|environment| environment.environment_id == "wsl:Ubuntu")
+            .expect("configured missing secondary should remain in topology");
+        assert!(!environment.primary);
+        assert!(!environment.running);
+        assert_eq!(
+            environment.unprotected_reason.as_deref(),
+            Some("distribution is unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_snapshot_excludes_new_backend_starts_until_recovery_finishes() {
+        let state = tempfile::tempdir().expect("backend state tempdir should open");
+        let supervisor = BackendSupervisor::new();
+        let snapshot = supervisor
+            .begin_update_snapshot()
+            .await
+            .expect("update coordination should begin");
+        let plan = BackendLaunchPlan::local(state.path().to_path_buf(), local_test_config(0));
+
+        assert!(
+            supervisor
+                .start(plan.clone())
+                .await
+                .expect_err("new start must be excluded")
+                .contains("paused during update protection")
+        );
+
+        supervisor
+            .restart_update_snapshot(&snapshot)
+            .await
+            .expect("empty prior set recovery should finish");
+        supervisor
+            .start(plan)
+            .await
+            .expect("starts should resume after recovery");
+        supervisor
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("backend should stop");
+    }
+
     #[test]
     fn builds_primary_bootstrap_for_frontend_resolution() {
         let config = local_test_config(3773);
@@ -2943,6 +3232,7 @@ mod tests {
                         "port": 5050,
                         "host": "0.0.0.0",
                         "desktopBootstrapToken": "desktop-token",
+                        "wslTransport": true,
                         "tailscaleServeEnabled": false,
                         "tailscaleServePort": 443,
                     })

@@ -58,6 +58,7 @@ import type {
   TerminalWriteInput,
 } from "./terminal.ts";
 import type { ServerRemoveKeybindingInput, ServerUpsertKeybindingInput } from "./server.ts";
+import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type {
   DiscoveredLocalServerList,
@@ -160,6 +161,27 @@ export type DesktopUpdateStatus =
   | "downloaded"
   | "error";
 
+export type DesktopUpdatePhase =
+  | "idle"
+  | "checking"
+  | "available"
+  | "protecting"
+  | "installing"
+  | "failed";
+
+export type DesktopUpdateProtectionStatus = "pending" | "protected" | "failed" | "excluded";
+
+export interface DesktopUpdateProtection {
+  environmentId: string;
+  label: string;
+  status: DesktopUpdateProtectionStatus;
+  message: string | null;
+}
+
+export interface DesktopUpdateInstallInput {
+  excludedEnvironmentIds?: readonly string[];
+}
+
 export type DesktopRuntimeArch = "arm64" | "x64" | "other";
 export type DesktopTheme = "light" | "dark" | "system";
 export type DesktopAppStageLabel = "Dev" | "Latest" | "Nightly";
@@ -175,6 +197,20 @@ export const DesktopUpdateStatusSchema = Schema.Literals([
   "downloaded",
   "error",
 ]);
+export const DesktopUpdatePhaseSchema = Schema.Literals([
+  "idle",
+  "checking",
+  "available",
+  "protecting",
+  "installing",
+  "failed",
+]);
+export const DesktopUpdateProtectionSchema = Schema.Struct({
+  environmentId: Schema.String,
+  label: Schema.String,
+  status: Schema.Literals(["pending", "protected", "failed", "excluded"]),
+  message: Schema.NullOr(Schema.String),
+});
 export const DesktopRuntimeArchSchema = Schema.Literals(["arm64", "x64", "other"]);
 export const DesktopThemeSchema = Schema.Literals(["light", "dark", "system"]);
 export const DesktopAppStageLabelSchema = Schema.Literals(["Dev", "Latest", "Nightly"]);
@@ -260,6 +296,8 @@ export interface DesktopUpdateState {
   message: string | null;
   errorContext: "check" | "download" | "install" | null;
   canRetry: boolean;
+  phase?: DesktopUpdatePhase;
+  protection?: ReadonlyArray<DesktopUpdateProtection>;
 }
 
 export const DesktopUpdateStateSchema = Schema.Struct({
@@ -276,6 +314,10 @@ export const DesktopUpdateStateSchema = Schema.Struct({
   message: Schema.NullOr(Schema.String),
   errorContext: Schema.NullOr(Schema.Literals(["check", "download", "install"])),
   canRetry: Schema.Boolean,
+  phase: DesktopUpdatePhaseSchema.pipe(Schema.withDecodingDefault(Effect.succeed("idle"))),
+  protection: Schema.Array(DesktopUpdateProtectionSchema).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
 });
 
 export interface DesktopUpdateActionResult {
@@ -1101,7 +1143,7 @@ export interface DesktopBridge {
   getUpdateState: () => Promise<DesktopUpdateState>;
   checkForUpdate: () => Promise<DesktopUpdateCheckResult>;
   downloadUpdate: () => Promise<DesktopUpdateActionResult>;
-  installUpdate: () => Promise<DesktopUpdateActionResult>;
+  installUpdate: (input?: DesktopUpdateInstallInput) => Promise<DesktopUpdateActionResult>;
   onUpdateState: (listener: (state: DesktopUpdateState) => void) => () => void;
   /**
    * Desktop-only preview surface. Present iff the renderer is hosted by the

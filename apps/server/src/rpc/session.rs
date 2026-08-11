@@ -16,6 +16,7 @@ use super::{
 use crate::{
     auth::{AuthService, Principal, authorization_error, required_scope},
     diagnostics::TraceDiagnosticsStore,
+    maintenance::{RpcAdmissionGate, RpcPermit, rpc_mutability},
 };
 
 const OUTBOUND_CAPACITY: usize = 64;
@@ -112,6 +113,7 @@ enum RpcMethod {
 pub struct RpcRegistry {
     methods: HashMap<String, RpcMethod>,
     trace_diagnostics: Option<TraceDiagnosticsStore>,
+    admission_gate: RpcAdmissionGate,
 }
 
 impl RpcRegistry {
@@ -125,7 +127,12 @@ impl RpcRegistry {
         Self {
             methods: HashMap::new(),
             trace_diagnostics: Some(trace_diagnostics),
+            admission_gate: RpcAdmissionGate::new(),
         }
+    }
+
+    pub(crate) fn admission_gate(&self) -> RpcAdmissionGate {
+        self.admission_gate.clone()
     }
 
     pub fn register_unary<F, Fut>(&mut self, name: impl Into<String>, handler: F)
@@ -492,15 +499,28 @@ async fn process_client_message(
                     }
                 }
             }
-            spawn_request(
-                request,
-                method,
-                dispatch.session.clone(),
-                dispatch.outbound,
-                dispatch.completed,
-                in_flight,
-                dispatch.shutdown,
-            );
+            let admission = match dispatch
+                .registry
+                .admission_gate
+                .admit(rpc_mutability(&request.tag))
+            {
+                Ok(admission) => admission,
+                Err(error) => {
+                    return send_server_message(
+                        dispatch.outbound,
+                        dispatch.shutdown,
+                        ServerMessage::failure(
+                            request.id.clone(),
+                            json!({
+                                "_tag": "UpdateMaintenanceActiveError",
+                                "message": error.to_string(),
+                            }),
+                        ),
+                    )
+                    .await;
+                }
+            };
+            spawn_request(request, method, admission, dispatch, in_flight);
             Ok(())
         }
     }
@@ -509,18 +529,17 @@ async fn process_client_message(
 fn spawn_request(
     request: RpcRequest,
     method: RpcMethod,
-    context: RpcSessionContext,
-    outbound: &mpsc::Sender<ServerMessage>,
-    completed: &mpsc::Sender<RequestId>,
+    admission: RpcPermit,
+    dispatch: &DispatchContext<'_>,
     in_flight: &mut HashMap<RequestId, InFlight>,
-    session_shutdown: &CancellationToken,
 ) {
     let request_id = request.id.clone();
     let cancellation = CancellationToken::new();
     let request_cancellation = cancellation.clone();
-    let outbound = outbound.clone();
-    let completed = completed.clone();
-    let session_shutdown = session_shutdown.clone();
+    let context = dispatch.session.clone();
+    let outbound = dispatch.outbound.clone();
+    let completed = dispatch.completed.clone();
+    let session_shutdown = dispatch.shutdown.clone();
     let (acknowledgements, acknowledgement_receiver) = match method {
         RpcMethod::Unary(_) => (None, None),
         RpcMethod::Stream(_) => {
@@ -532,6 +551,7 @@ fn spawn_request(
     let panic_outbound = outbound.clone();
     let request_shutdown = session_shutdown.clone();
     let task = tokio::spawn(async move {
+        let _admission = admission;
         let execution = AssertUnwindSafe(async move {
             match method {
                 RpcMethod::Unary(handler) => {

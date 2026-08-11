@@ -125,6 +125,26 @@ Stable-channel and nightly prereleases are installer-only. They never receive
 the updater signing overlay, updater signatures, descriptors, or `latest.json`,
 and never feed the app updater.
 
+### Update installation safety
+
+The signed stable updater uses the same project-store protection protocol on
+macOS, Windows, and Linux. Before the platform installer runs, the desktop host
+protects the native primary and every included running secondary with a
+verified `PreUpdate` backup, then waits for those backends to stop. Windows WSL
+primary and secondary runtimes participate through their authenticated desktop
+bootstrap transport. A configured secondary that is not running is shown as
+unprotected; the user must name that exact secondary to exclude it. The primary
+is never excludable.
+
+If preparation, cancellation, commit, backend stop, or platform installation
+fails, the host attempts to restore the exact set of backends that was running
+before protection began. The installer is never called while an included
+backend remains uncommitted or running. This guarantee applies to updates
+installed from the in-app signed stable channel. Replacing the application
+manually with a DMG, NSIS executable, AppImage, or an external package manager
+does not pass through the in-app coordinator; close BiBCode before performing a
+manual replacement.
+
 ## Stable Release Runbook
 
 1. Confirm the intended version and commit have passed the local verification

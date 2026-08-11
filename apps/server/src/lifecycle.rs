@@ -13,6 +13,7 @@ use crate::{
         UnavailableDesktopUiProcessObserver,
     },
     http, logging,
+    maintenance::{UpdateMaintenance, maintenance_routes_enabled},
     persistence::{Database, Repositories, StatePaths, prepare_store},
     production::http_routes::{HttpRouteError, HttpRoutesState},
     production::runtime::ProductionRuntime,
@@ -119,6 +120,8 @@ impl ServerRuntime {
             .await
             .map_err(|error| ServerError::PersistenceInitialize(error.to_string()))?;
         config.storage_instance_id = Some(prepared_store.storage_instance_id);
+        let storage_instance_id = prepared_store.storage_instance_id;
+        let store_classification = prepared_store.classification;
         let database = prepared_store.database;
         let listener = TcpListener::bind((config.host.as_str(), config.port))
             .await
@@ -265,12 +268,33 @@ impl ServerRuntime {
             }
         };
         let shutdown = CancellationToken::new();
+        let admission_gate = rpc_registry.admission_gate();
+        let update_maintenance = if maintenance_routes_enabled(&config) {
+            production_runtime.as_ref().map(|runtime| {
+                UpdateMaintenance::new(
+                    admission_gate.clone(),
+                    runtime.clone(),
+                    database.clone(),
+                    state_paths.clone(),
+                    storage_instance_id,
+                    store_classification,
+                    config.server_version.clone(),
+                    shutdown.clone(),
+                    config.update_maintenance_drain_timeout,
+                    config.update_maintenance_lease,
+                )
+            })
+        } else {
+            None
+        };
         let app = http::build_router(http::AppState {
             config: Arc::new(config),
             shutdown: shutdown.clone(),
             rpc_registry,
             http_routes,
             auth,
+            admission_gate,
+            update_maintenance,
         });
         let server_shutdown = shutdown.clone();
         let completion_signal = shutdown.clone();
