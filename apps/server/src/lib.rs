@@ -36,6 +36,9 @@ pub mod vcs;
 pub mod workspace;
 pub mod worktree_catalog;
 
+#[cfg(test)]
+pub(crate) mod test_support;
+
 use clap::Parser;
 use serde_json::json;
 use thiserror::Error;
