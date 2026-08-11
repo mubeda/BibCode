@@ -1,5 +1,15 @@
 #[cfg(test)]
 mod tests {
+    use std::{
+        sync::{
+            Arc, Barrier, Mutex,
+            atomic::{AtomicBool, Ordering},
+            mpsc,
+        },
+        thread,
+        time::Duration,
+    };
+
     use crate::activity::{
         ActivityCapabilities, ActivityHistoryRecovery, ActivityObservationState,
     };
@@ -145,6 +155,89 @@ mod tests {
             ActivityActorControlState::Available
         );
         assert_eq!(actor(&snapshot, "actor-a").control_revision, 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_commits_publish_contiguous_revisions_in_commit_order() {
+        // Mutation caught: releasing the registry lock between allocating N and publishing N.
+        let registry = ActivityControlRegistry::new();
+        let registration =
+            Arc::new(registry.register_runtime(thread_scope(), "scope-control".to_owned(), None));
+        let mut events = registry.subscribe();
+        registry
+            .observe_provider_batch(&registration, &[running_actor("actor-a", None)], &[])
+            .await;
+        let _ = events.recv().await.expect("initial delta");
+
+        let (first_reached_tx, first_reached_rx) = mpsc::sync_channel(1);
+        let (second_reached_tx, second_reached_rx) = mpsc::sync_channel(1);
+        let (release_first_tx, release_first_rx) = mpsc::sync_channel(1);
+        let release_first_rx = Arc::new(Mutex::new(release_first_rx));
+        let first_seen = Arc::new(AtomicBool::new(false));
+        registry.set_before_publish_hook(Arc::new({
+            let release_first_rx = release_first_rx.clone();
+            let first_seen = first_seen.clone();
+            move |revision| {
+                if revision == 2 && !first_seen.swap(true, Ordering::AcqRel) {
+                    first_reached_tx.send(()).expect("first reached");
+                    release_first_rx
+                        .lock()
+                        .expect("release receiver")
+                        .recv()
+                        .expect("release first");
+                } else if revision == 3 {
+                    second_reached_tx.send(()).expect("second reached");
+                }
+            }
+        }));
+
+        let start = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for turn_id in ["turn-1", "turn-2"] {
+            let registry = registry.clone();
+            let registration = registration.clone();
+            let start = start.clone();
+            workers.push(thread::spawn(move || {
+                start.wait();
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("runtime")
+                    .block_on(registry.observe_provider_batch(
+                        &registration,
+                        &[],
+                        &[ProviderActivityControlUpdate::ActorTarget {
+                            actor_id: "actor-a".to_owned(),
+                            target: Some(ProviderActivityNativeTarget::CodexTurn {
+                                thread_id: "native-thread".to_owned(),
+                                turn_id: turn_id.to_owned(),
+                            }),
+                        }],
+                    ));
+            }));
+        }
+        start.wait();
+        first_reached_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("first publication paused");
+        let second_overtook = second_reached_rx
+            .recv_timeout(Duration::from_millis(100))
+            .is_ok();
+        release_first_tx.send(()).expect("release publication");
+        for worker in workers {
+            worker.join().expect("worker");
+        }
+
+        let mut revisions = Vec::new();
+        for _ in 0..2 {
+            let ActivityControlEvent::Delta(delta) = events.recv().await.expect("ordered delta");
+            revisions.push(delta.revision);
+        }
+        assert!(
+            !second_overtook,
+            "revision 3 reached send before revision 2"
+        );
+        assert_eq!(revisions, vec![2, 3]);
     }
 
     #[tokio::test]
@@ -607,7 +700,7 @@ pub(crate) struct ActivityRuntimeControlRegistration {
     generation: ActivityRuntimeGeneration,
     active: bool,
     inner: Weak<Mutex<ActivityControlRegistryState>>,
-    events: broadcast::Sender<ActivityControlEvent>,
+    publisher: ActivityControlEventPublisher,
 }
 
 pub(crate) enum ProviderActivityControlUpdate {
@@ -644,10 +737,43 @@ pub(crate) enum ActivityControlEvent {
     Delta(ActivityControlDelta),
 }
 
+#[cfg(test)]
+type BeforePublishHook = Arc<dyn Fn(u64) + Send + Sync>;
+
+#[derive(Clone)]
+struct ActivityControlEventPublisher {
+    events: broadcast::Sender<ActivityControlEvent>,
+    #[cfg(test)]
+    before_publish: Arc<Mutex<Option<BeforePublishHook>>>,
+}
+
+impl fmt::Debug for ActivityControlEventPublisher {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActivityControlEventPublisher")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ActivityControlEventPublisher {
+    fn send_delta(&self, delta: ActivityControlDelta) {
+        #[cfg(test)]
+        if let Some(hook) = self
+            .before_publish
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+        {
+            hook(delta.revision);
+        }
+        let _ = self.events.send(ActivityControlEvent::Delta(delta));
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct ActivityControlRegistry {
     inner: Arc<Mutex<ActivityControlRegistryState>>,
-    pub(super) events: broadcast::Sender<ActivityControlEvent>,
+    publisher: ActivityControlEventPublisher,
 }
 
 #[derive(Debug, Default)]
@@ -688,7 +814,11 @@ impl ActivityControlRegistry {
         let (events, _) = broadcast::channel(ACTIVITY_DELTA_MAX_CHANGES);
         Self {
             inner: Arc::new(Mutex::new(ActivityControlRegistryState::default())),
-            events,
+            publisher: ActivityControlEventPublisher {
+                events,
+                #[cfg(test)]
+                before_publish: Arc::new(Mutex::new(None)),
+            },
         }
     }
 
@@ -701,9 +831,9 @@ impl ActivityControlRegistry {
     ) -> ActivityRuntimeControlRegistration {
         let generation = ActivityRuntimeGeneration(Uuid::new_v4());
         let mut active = true;
-        let event = {
+        {
             let mut state = self.lock();
-            if let Some(existing) = state.scopes.get_mut(&scope_id) {
+            let event = if let Some(existing) = state.scopes.get_mut(&scope_id) {
                 let mut staged = existing.clone();
                 staged.generation = generation.clone();
                 staged.scope = scope;
@@ -725,7 +855,7 @@ impl ActivityControlRegistry {
                         generation,
                         active,
                         inner: Arc::downgrade(&self.inner),
-                        events: self.events.clone(),
+                        publisher: self.publisher.clone(),
                     };
                 };
                 *existing = staged;
@@ -745,17 +875,17 @@ impl ActivityControlRegistry {
                     },
                 );
                 None
+            };
+            if let Some(event) = event {
+                self.publisher.send_delta(event);
             }
-        };
-        if let Some(event) = event {
-            let _ = self.events.send(ActivityControlEvent::Delta(event));
         }
         ActivityRuntimeControlRegistration {
             scope_id,
             generation,
             active,
             inner: Arc::downgrade(&self.inner),
-            events: self.events.clone(),
+            publisher: self.publisher.clone(),
         }
     }
 
@@ -770,7 +900,7 @@ impl ActivityControlRegistry {
         {
             return Vec::new();
         }
-        let event = {
+        {
             let mut state = self.lock();
             let Some(scope) = state.scopes.get_mut(&registration.scope_id) else {
                 return Vec::new();
@@ -791,12 +921,11 @@ impl ActivityControlRegistry {
                 return Vec::new();
             };
             *scope = staged;
-            (scope.publish_changes(changes), jobs)
-        };
-        if let Some(event) = event.0 {
-            let _ = self.events.send(ActivityControlEvent::Delta(event));
+            if let Some(event) = scope.publish_changes(changes) {
+                self.publisher.send_delta(event);
+            }
+            jobs
         }
-        event.1
     }
 
     pub(crate) async fn snapshot(&self, scope_id: &str) -> ActivityControlSnapshot {
@@ -844,7 +973,20 @@ impl ActivityControlRegistry {
 
     #[must_use]
     pub(crate) fn subscribe(&self) -> broadcast::Receiver<ActivityControlEvent> {
-        self.events.subscribe()
+        self.publisher.events.subscribe()
+    }
+
+    #[cfg(test)]
+    fn set_before_publish_hook(&self, hook: BeforePublishHook) {
+        *self
+            .publisher
+            .before_publish
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(hook);
+    }
+
+    pub(super) fn publish_delta(&self, delta: ActivityControlDelta) {
+        self.publisher.send_delta(delta);
     }
 
     #[doc(hidden)]
@@ -890,7 +1032,7 @@ impl Drop for ActivityRuntimeControlRegistration {
         if !self.active {
             return;
         }
-        let event = self.inner.upgrade().and_then(|inner| {
+        if let Some(inner) = self.inner.upgrade() {
             let mut state = inner
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -899,13 +1041,14 @@ impl Drop for ActivityRuntimeControlRegistration {
                 .get(&self.scope_id)
                 .is_some_and(|scope| scope.generation == self.generation);
             if !is_current {
-                return None;
+                return;
             }
-            let mut scope = state.scopes.remove(&self.scope_id)?;
-            scope.removal_delta()
-        });
-        if let Some(event) = event {
-            let _ = self.events.send(ActivityControlEvent::Delta(event));
+            let Some(mut scope) = state.scopes.remove(&self.scope_id) else {
+                return;
+            };
+            if let Some(event) = scope.removal_delta() {
+                self.publisher.send_delta(event);
+            }
         }
     }
 }
@@ -1060,6 +1203,12 @@ impl ActivityControlScope {
         self.actors.len() <= ACTIVITY_PAGE_MAX_LENGTH
             && self.work_items.len() <= ACTIVITY_PAGE_MAX_LENGTH
             && self.operations.len() <= ACTIVITY_PAGE_MAX_LENGTH
+            && self
+                .operations
+                .values()
+                .map(|operation| operation.active_attempt_ids.len())
+                .sum::<usize>()
+                <= ACTIVITY_DELTA_MAX_CHANGES
             && target_count <= ACTIVITY_DELTA_MAX_CHANGES
             && self.actors.len().saturating_add(self.operations.len()) <= ACTIVITY_DELTA_MAX_CHANGES
     }
