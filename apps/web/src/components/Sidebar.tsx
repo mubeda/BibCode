@@ -27,7 +27,16 @@ import { ProjectFavicon } from "./ProjectFavicon";
 import { CreateWorktreeDialog } from "./CreateWorktreeDialog";
 import { useAtomValue } from "@effect/atom-react";
 import { autoAnimate } from "@formkit/auto-animate";
-import React, { useCallback, useEffect, memo, useMemo, useRef, useState } from "react";
+import React, {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  memo,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { useShallow } from "zustand/react/shallow";
 import {
   DndContext,
@@ -56,6 +65,7 @@ import {
   type ScopedThreadRef,
   type ResolvedKeybindingsConfig,
   type SidebarProjectGroupingMode,
+  type VcsAdoptedWorktreeStatus,
   ThreadId,
 } from "@bibcode/contracts";
 import {
@@ -239,6 +249,14 @@ import {
 } from "./WorktreeDiscoverySection";
 import { getDiscoveryVisibilityMenuLabel } from "./WorktreeDiscoverySection.logic";
 import { worktreeEnvironment } from "../state/worktrees";
+import { getBulkThreadDeletionConfirmation } from "../worktreeCleanup";
+import { WorktreeAvailabilityWarning } from "./WorktreeAvailabilityWarning";
+import { WorktreeRemovalDialog, type WorktreeRemovalTarget } from "./WorktreeRemovalDialog";
+
+const WorktreeRemovalRequestContext = createContext<
+  ((target: WorktreeRemovalTarget) => void) | null
+>(null);
+
 const SIDEBAR_SORT_LABELS: Record<SidebarProjectSortOrder, string> = {
   updated_at: "Last user message",
   created_at: "Created at",
@@ -455,6 +473,7 @@ interface SidebarThreadRowProps {
   handleThreadContextMenu: (
     threadRef: ScopedThreadRef,
     position: { x: number; y: number },
+    worktreeStatus: VcsAdoptedWorktreeStatus | null,
   ) => Promise<void>;
   clearSelection: () => void;
   commitRename: (
@@ -493,6 +512,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
     openPrLink,
     thread,
   } = props;
+  const requestWorktreeRemoval = useContext(WorktreeRemovalRequestContext);
   const threadRef = scopeThreadRef(thread.environmentId, thread.id);
   const threadKey = scopedThreadKey(threadRef);
   const lastVisitedAt = useUiStateStore((state) => state.threadLastVisitedAtById[threadKey]);
@@ -542,8 +562,23 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
   );
   const threadProjectCwd = threadProject?.workspaceRoot ?? null;
   const gitCwd = thread.worktreePath ?? threadProjectCwd ?? props.projectCwd;
+  const worktreeCatalog = useEnvironmentQuery(
+    thread.worktreePath
+      ? worktreeEnvironment.catalog({
+          environmentId: thread.environmentId,
+          input: { projectId: thread.projectId },
+        })
+      : null,
+  );
+  const worktreeStatus =
+    worktreeCatalog.data?.adoptedWorkspaces.find((status) => status.threadId === thread.id) ?? null;
+  const workspaceActionsAvailable =
+    worktreeStatus === null || worktreeStatus.availability === "present";
+  const refreshWorktreeCatalog = useAtomCommand(worktreeEnvironment.refresh, {
+    reportFailure: false,
+  });
   const gitStatus = useEnvironmentQuery(
-    thread.branch != null && gitCwd !== null
+    workspaceActionsAvailable && thread.branch != null && gitCwd !== null
       ? vcsEnvironment.status({
           environmentId: thread.environmentId,
           input: { cwd: gitCwd },
@@ -690,10 +725,14 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
       }
       void (async () => {
         const result = await settlePromise(() =>
-          handleThreadContextMenu(threadRef, {
-            x: event.clientX,
-            y: event.clientY,
-          }),
+          handleThreadContextMenu(
+            threadRef,
+            {
+              x: event.clientX,
+              y: event.clientY,
+            },
+            worktreeStatus,
+          ),
         );
         if (result._tag === "Failure") {
           const error = squashAtomCommandFailure(result);
@@ -707,7 +746,14 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
         }
       })();
     },
-    [clearSelection, handleMultiSelectContextMenu, handleThreadContextMenu, isSelected, threadRef],
+    [
+      clearSelection,
+      handleMultiSelectContextMenu,
+      handleThreadContextMenu,
+      isSelected,
+      threadRef,
+      worktreeStatus,
+    ],
   );
   const handlePrClick = useCallback(
     (event: React.MouseEvent<HTMLButtonElement>) => {
@@ -1030,6 +1076,31 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
           </div>
         </div>
       </SidebarMenuSubButton>
+      {worktreeStatus && worktreeStatus.availability !== "present" ? (
+        <WorktreeAvailabilityWarning
+          status={worktreeStatus}
+          onRetry={() => {
+            void refreshWorktreeCatalog({
+              environmentId: thread.environmentId,
+              input: { projectId: thread.projectId },
+            });
+          }}
+          onRemove={() => {
+            requestWorktreeRemoval?.({
+              environmentId: thread.environmentId,
+              projectId: thread.projectId,
+              threadId: thread.id,
+              title: thread.title,
+              path: worktreeStatus.path,
+              branch: worktreeStatus.branch ?? thread.branch,
+              availability: worktreeStatus.availability,
+              registrationState: worktreeStatus.registrationState,
+              locked: worktreeStatus.locked,
+              ...(worktreeStatus.lockReason ? { lockReason: worktreeStatus.lockReason } : {}),
+            });
+          }}
+        />
+      ) : null}
       {agentSubRowStatus && (
         <div
           data-thread-selection-safe
@@ -1083,6 +1154,7 @@ interface SidebarProjectThreadListProps {
   handleThreadContextMenu: (
     threadRef: ScopedThreadRef,
     position: { x: number; y: number },
+    worktreeStatus: VcsAdoptedWorktreeStatus | null,
   ) => Promise<void>;
   clearSelection: () => void;
   commitRename: (
@@ -1345,6 +1417,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
     isManualProjectSorting,
     dragHandleProps,
   } = props;
+  const requestWorktreeRemoval = useContext(WorktreeRemovalRequestContext);
   const threadSortOrder = useClientSettings<SidebarThreadSortOrder>(
     (settings) => settings.sidebarThreadSortOrder,
   );
@@ -2227,11 +2300,12 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       if (clicked !== "delete") return;
 
       if (appSettingsConfirmThreadDelete) {
+        const worktreeCount = threadKeys.reduce((count, threadKey) => {
+          const thread = sidebarThreadByKeyRef.current.get(threadKey);
+          return count + (thread?.worktreePath ? 1 : 0);
+        }, 0);
         const confirmed = await api.dialogs.confirm(
-          [
-            `Delete ${count} thread${count === 1 ? "" : "s"}?`,
-            "This permanently clears conversation history for these threads.",
-          ].join("\n"),
+          getBulkThreadDeletionConfirmation(count, worktreeCount),
         );
         if (!confirmed) return;
       }
@@ -2479,7 +2553,11 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
   ]);
 
   const handleThreadContextMenu = useCallback(
-    async (threadRef: ScopedThreadRef, position: { x: number; y: number }) => {
+    async (
+      threadRef: ScopedThreadRef,
+      position: { x: number; y: number },
+      worktreeStatus: VcsAdoptedWorktreeStatus | null,
+    ) => {
       const api = readLocalApi();
       if (!api) return;
       const threadKey = scopedThreadKey(threadRef);
@@ -2490,6 +2568,8 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       );
       const threadWorkspacePath =
         thread.worktreePath ?? threadProject?.workspaceRoot ?? project.workspaceRoot ?? null;
+      const workspaceActionsAvailable =
+        worktreeStatus === null || worktreeStatus.availability === "present";
       const isPinned = pinnedThreadKeys.includes(threadKey);
       const isUnread = unreadThreadKeys.includes(threadKey);
       // Orca-parity "Open in" submenu (item 2): built from the same EDITORS
@@ -2502,16 +2582,24 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         thread.environmentId === primaryEnvironmentId && typeof window !== "undefined"
           ? window.desktopBridge?.openInFileManager !== undefined
           : false;
-      const openInChildren = [
-        ...(canOpenInFileExplorer ? [{ id: "open-in:file-explorer", label: "File Explorer" }] : []),
-        ...openInEditorOptions.map((editor) => ({
-          id: `open-in:${editor.id}`,
-          label: editor.label,
-        })),
-      ];
+      const openInChildren = workspaceActionsAvailable
+        ? [
+            ...(canOpenInFileExplorer
+              ? [{ id: "open-in:file-explorer", label: "File Explorer" }]
+              : []),
+            ...openInEditorOptions.map((editor) => ({
+              id: `open-in:${editor.id}`,
+              label: editor.label,
+            })),
+          ]
+        : [];
       const clicked = await api.contextMenu.show(
         [
-          { id: "update", label: "Update", disabled: !threadWorkspacePath },
+          {
+            id: "update",
+            label: "Update",
+            disabled: !threadWorkspacePath || !workspaceActionsAvailable,
+          },
           openInChildren.length > 0
             ? { id: "open-in", label: "Open in", children: openInChildren }
             : { id: "open-in", label: "Open in", disabled: true },
@@ -2533,7 +2621,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       );
 
       if (clicked === "update") {
-        if (!threadWorkspacePath) return;
+        if (!threadWorkspacePath || !workspaceActionsAvailable) return;
         const pullResult = await pullWorkspaceRow({
           environmentId: thread.environmentId,
           input: { cwd: threadWorkspacePath },
@@ -2623,6 +2711,21 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
         return;
       }
       if (clicked !== "delete") return;
+      if (thread.worktreePath) {
+        requestWorktreeRemoval?.({
+          environmentId: thread.environmentId,
+          projectId: thread.projectId,
+          threadId: thread.id,
+          title: thread.title,
+          path: worktreeStatus?.path ?? thread.worktreePath,
+          branch: worktreeStatus?.branch ?? thread.branch,
+          availability: worktreeStatus?.availability ?? "verification-unavailable",
+          registrationState: worktreeStatus?.registrationState ?? null,
+          locked: worktreeStatus?.locked ?? false,
+          ...(worktreeStatus?.lockReason ? { lockReason: worktreeStatus.lockReason } : {}),
+        });
+        return;
+      }
       if (appSettingsConfirmThreadDelete) {
         const confirmed = await api.dialogs.confirm(
           [
@@ -2662,6 +2765,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       project.workspaceRoot,
       pullWorkspaceRow,
       refreshVcsStatusAfterPull,
+      requestWorktreeRemoval,
       startThreadRename,
       togglePinnedThreadKey,
       unreadThreadKeys,
@@ -3764,7 +3868,14 @@ export default function Sidebar() {
     setCreateWorktreeDialogProjectRef(projectRef);
     setCreateWorktreeDialogOpen(true);
   }, []);
-  const { archiveThread, deleteThread } = useThreadActions();
+  const {
+    archiveThread,
+    deleteThread,
+    worktreeRemovalTarget,
+    requestWorktreeRemoval,
+    closeWorktreeRemovalDialog,
+    completeWorktreeRemoval,
+  } = useThreadActions();
   const { isMobile, setOpenMobile } = useSidebar();
   const routeThreadRef = useParams({
     strict: false,
@@ -4323,7 +4434,7 @@ export default function Sidebar() {
   }, []);
 
   return (
-    <>
+    <WorktreeRemovalRequestContext.Provider value={requestWorktreeRemoval}>
       <CreateWorktreeDialog
         open={createWorktreeDialogOpen}
         onOpenChange={(open) => {
@@ -4331,6 +4442,16 @@ export default function Sidebar() {
           if (!open) setCreateWorktreeDialogProjectRef(null);
         }}
         defaultProjectRef={createWorktreeDialogProjectRef ?? activeRouteProjectRef}
+      />
+      <WorktreeRemovalDialog
+        open={worktreeRemovalTarget !== null}
+        target={worktreeRemovalTarget}
+        onOpenChange={(open) => {
+          if (!open) closeWorktreeRemovalDialog();
+        }}
+        onRemoved={(removedTarget, result) => {
+          void completeWorktreeRemoval(removedTarget, result);
+        }}
       />
       {prewarmedSidebarThreadRefs.map((threadRef) => (
         <SidebarThreadDetailPrewarmer key={scopedThreadKey(threadRef)} threadRef={threadRef} />
@@ -4383,6 +4504,6 @@ export default function Sidebar() {
           <SidebarChromeFooter />
         </>
       )}
-    </>
+    </WorktreeRemovalRequestContext.Provider>
   );
 }
