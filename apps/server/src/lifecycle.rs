@@ -14,7 +14,7 @@ use crate::{
     },
     http, logging,
     maintenance::{UpdateMaintenance, maintenance_routes_enabled},
-    persistence::{Database, Repositories, StatePaths, prepare_store},
+    persistence::{Database, Repositories, StatePaths, StoreRuntimeGuard, prepare_store},
     production::http_routes::{HttpRouteError, HttpRoutesState},
     production::runtime::ProductionRuntime,
     production::{
@@ -39,6 +39,7 @@ pub struct ServerHandle {
     data_root: ResolvedDataRoot,
     startup_access: Option<StartupAccess>,
     database: Option<Database>,
+    _store_runtime_guard: StoreRuntimeGuard,
     _production_runtime: Option<Arc<ProductionRuntime>>,
     shutdown: CancellationToken,
     task: Option<JoinHandle<Result<(), std::io::Error>>>,
@@ -116,6 +117,9 @@ impl ServerRuntime {
             .map_err(|error| ServerError::StateFiles(error.to_string()))?;
         logging::initialize(&state_paths.server_log)
             .map_err(|error| ServerError::Logging(error.to_string()))?;
+        let store_runtime_guard = StoreRuntimeGuard::acquire(&config.base_dir)
+            .await
+            .map_err(|error| ServerError::PersistenceInitialize(error.to_string()))?;
         let prepared_store = prepare_store(&config)
             .await
             .map_err(|error| ServerError::PersistenceInitialize(error.to_string()))?;
@@ -315,6 +319,7 @@ impl ServerRuntime {
             data_root: resolved_data_root,
             startup_access,
             database: Some(database),
+            _store_runtime_guard: store_runtime_guard,
             _production_runtime: production_runtime,
             shutdown,
             task: Some(task),

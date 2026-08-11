@@ -1,8 +1,9 @@
 use bibcode_server::{
     ServerConfig, ServerRuntime,
     persistence::{
-        PreparedStore, StatePaths, StoreClassification, StoreStartupError, prepare_store,
-        run_migrations,
+        BackupTrigger, PreparedStore, RecoveryError, StatePaths, StoreClassification,
+        StoreInspectionStatus, StoreStartupError, create_verified_backup, inspect_store,
+        prepare_store, preserve_and_start_empty, restore_backup, run_migrations,
     },
     production::jwt::PersistentJwtCodec,
     resolve_data_root,
@@ -10,6 +11,7 @@ use bibcode_server::{
 use reqwest::{Client, StatusCode};
 use rusqlite::Connection;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
@@ -718,6 +720,609 @@ async fn dangling_marker_entry_with_missing_database_is_not_first_run() {
             .expect("marker entry remains")
             .file_type()
             .is_symlink()
+    );
+}
+
+#[tokio::test]
+async fn recovery_restore_preserves_the_live_store_before_installing_a_verified_backup() {
+    let fixture = StoreFixture::with_project("Before restore").await;
+    let storage_instance_id = Uuid::new_v4();
+    fixture.write_marker(storage_instance_id);
+    let prepared = fixture.prepare().await.expect("prepare recovery fixture");
+    let backup = create_verified_backup(
+        &prepared.database,
+        &prepared,
+        BackupTrigger::PreUpdate,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .expect("create verified recovery generation");
+    prepared
+        .database
+        .call(|connection| {
+            connection.execute(
+                "UPDATE projection_projects SET title = 'After backup' WHERE project_id = 'protected-project'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("mutate live project after backup");
+    drop(prepared);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    let result = restore_backup(
+        fixture
+            .config
+            .resolved_data_root
+            .as_ref()
+            .expect("resolved recovery root"),
+        backup.manifest.backup_id,
+    )
+    .await
+    .expect("restore verified generation");
+
+    let restored = Connection::open(&fixture.paths.database).expect("restored database");
+    let restored_title: String = restored
+        .query_row(
+            "SELECT title FROM projection_projects WHERE project_id = 'protected-project'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("restored project title");
+    assert_eq!(restored_title, "Before restore");
+    assert_eq!(
+        std::fs::read_to_string(&fixture.paths.environment_id)
+            .expect("restored marker")
+            .trim(),
+        storage_instance_id.to_string()
+    );
+
+    let preserved_database = result.preserved_directory.join("state.sqlite");
+    let preserved = Connection::open(preserved_database).expect("preserved live database");
+    let preserved_title: String = preserved
+        .query_row(
+            "SELECT title FROM projection_projects WHERE project_id = 'protected-project'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("preserved live project title");
+    assert_eq!(preserved_title, "After backup");
+}
+
+#[tokio::test]
+async fn recovery_restore_rejects_a_backup_from_a_different_known_storage_identity() {
+    let fixture = StoreFixture::with_project("Original project").await;
+    fixture.write_marker(Uuid::new_v4());
+    let prepared = fixture.prepare().await.expect("prepare recovery fixture");
+    let backup = create_verified_backup(
+        &prepared.database,
+        &prepared,
+        BackupTrigger::PreUpdate,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .expect("create verified recovery generation");
+    drop(prepared);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    fixture.write_marker(Uuid::new_v4());
+    let database_before = std::fs::read(&fixture.paths.database).expect("live database bytes");
+    let marker_before = std::fs::read(&fixture.paths.environment_id).expect("live marker bytes");
+    let entries_before = directory_entry_names(&fixture.paths.state_dir);
+
+    let error = restore_backup(
+        fixture
+            .config
+            .resolved_data_root
+            .as_ref()
+            .expect("resolved recovery root"),
+        backup.manifest.backup_id,
+    )
+    .await
+    .expect_err("different known storage identity must block restore");
+
+    assert!(matches!(error, RecoveryError::StorageIdentityMismatch));
+    assert_eq!(
+        std::fs::read(&fixture.paths.database).expect("live database remains"),
+        database_before
+    );
+    assert_eq!(
+        std::fs::read(&fixture.paths.environment_id).expect("live marker remains"),
+        marker_before
+    );
+    assert_eq!(
+        directory_entry_names(&fixture.paths.state_dir),
+        entries_before
+    );
+    assert!(!fixture.paths.recovery_journal().exists());
+}
+
+#[tokio::test]
+async fn recovery_restore_rejects_a_tampered_manifest_without_mutating_the_live_store() {
+    let fixture = StoreFixture::with_project("Original project").await;
+    fixture.write_marker(Uuid::new_v4());
+    let prepared = fixture.prepare().await.expect("prepare recovery fixture");
+    let backup = create_verified_backup(
+        &prepared.database,
+        &prepared,
+        BackupTrigger::PreUpdate,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .expect("create verified recovery generation");
+    drop(prepared);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let mut manifest: Value = serde_json::from_slice(
+        &std::fs::read(&backup.manifest_path).expect("backup manifest bytes"),
+    )
+    .expect("backup manifest JSON");
+    manifest["sha256"] = Value::String("0".repeat(64));
+    std::fs::write(
+        &backup.manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("tampered manifest JSON"),
+    )
+    .expect("tamper backup manifest");
+    let database_before = std::fs::read(&fixture.paths.database).expect("live database bytes");
+    let marker_before = std::fs::read(&fixture.paths.environment_id).expect("live marker bytes");
+    let entries_before = directory_entry_names(&fixture.paths.state_dir);
+
+    let error = restore_backup(
+        fixture
+            .config
+            .resolved_data_root
+            .as_ref()
+            .expect("resolved recovery root"),
+        backup.manifest.backup_id,
+    )
+    .await
+    .expect_err("tampered backup must block restore");
+
+    assert!(matches!(
+        error,
+        RecoveryError::Backup(bibcode_server::persistence::BackupError::Verification(_))
+    ));
+    assert_eq!(
+        std::fs::read(&fixture.paths.database).expect("live database remains"),
+        database_before
+    );
+    assert_eq!(
+        std::fs::read(&fixture.paths.environment_id).expect("live marker remains"),
+        marker_before
+    );
+    assert_eq!(
+        directory_entry_names(&fixture.paths.state_dir),
+        entries_before
+    );
+    assert!(!fixture.paths.recovery_journal().exists());
+}
+
+#[tokio::test]
+async fn recovery_restore_rejects_a_backup_from_the_other_state_kind_without_mutating_live_data() {
+    let fixture = StoreFixture::with_project("Userdata project").await;
+    let production_id = Uuid::new_v4();
+    fixture.write_marker(production_id);
+    let production = fixture.prepare().await.expect("prepare userdata store");
+    drop(production);
+
+    let dev_config = fixture
+        .config
+        .clone()
+        .with_dev_url("http://127.0.0.1:5173".parse().expect("development URL"));
+    let dev_paths = StatePaths::from_config(&dev_config);
+    std::fs::create_dir_all(&dev_paths.state_dir).expect("development state directory");
+    let mut dev_connection = Connection::open(&dev_paths.database).expect("development database");
+    run_migrations(&mut dev_connection, None).expect("development migrations");
+    drop(dev_connection);
+    std::fs::write(&dev_paths.environment_id, format!("{}\n", Uuid::new_v4()))
+        .expect("development marker");
+    let dev = prepare_store(&dev_config)
+        .await
+        .expect("prepare development store");
+    let dev_backup = create_verified_backup(
+        &dev.database,
+        &dev,
+        BackupTrigger::PreUpdate,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .expect("create development backup");
+    drop(dev);
+
+    let database_before = std::fs::read(&fixture.paths.database).expect("userdata database bytes");
+    let marker_before =
+        std::fs::read(&fixture.paths.environment_id).expect("userdata marker bytes");
+
+    let error = restore_backup(
+        fixture
+            .config
+            .resolved_data_root
+            .as_ref()
+            .expect("resolved userdata root"),
+        dev_backup.manifest.backup_id,
+    )
+    .await
+    .expect_err("development backup must not restore into userdata");
+
+    assert!(matches!(error, RecoveryError::BackupNotFound));
+    assert_eq!(
+        std::fs::read(&fixture.paths.database).expect("userdata database remains"),
+        database_before
+    );
+    assert_eq!(
+        std::fs::read(&fixture.paths.environment_id).expect("userdata marker remains"),
+        marker_before
+    );
+    assert!(!fixture.paths.recovery_journal().exists());
+}
+
+#[tokio::test]
+async fn recovery_restore_rejects_a_checksum_valid_non_sqlite_backup_without_mutating_live_data() {
+    let fixture = StoreFixture::with_project("Original project").await;
+    fixture.write_marker(Uuid::new_v4());
+    let prepared = fixture.prepare().await.expect("prepare recovery fixture");
+    let backup = create_verified_backup(
+        &prepared.database,
+        &prepared,
+        BackupTrigger::PreUpdate,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .expect("create verified recovery generation");
+    drop(prepared);
+
+    let invalid_database = b"not a SQLite database";
+    std::fs::write(&backup.database, invalid_database).expect("replace backup database");
+    let mut manifest: Value = serde_json::from_slice(
+        &std::fs::read(&backup.manifest_path).expect("backup manifest bytes"),
+    )
+    .expect("backup manifest JSON");
+    manifest["databaseSizeBytes"] = Value::from(invalid_database.len() as u64);
+    manifest["sha256"] = Value::String(
+        Sha256::digest(invalid_database)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect(),
+    );
+    std::fs::write(
+        &backup.manifest_path,
+        serde_json::to_vec_pretty(&manifest).expect("refingerprinted manifest JSON"),
+    )
+    .expect("rewrite backup manifest");
+    let database_before = std::fs::read(&fixture.paths.database).expect("live database bytes");
+    let marker_before = std::fs::read(&fixture.paths.environment_id).expect("live marker bytes");
+
+    let error = restore_backup(
+        fixture
+            .config
+            .resolved_data_root
+            .as_ref()
+            .expect("resolved recovery root"),
+        backup.manifest.backup_id,
+    )
+    .await
+    .expect_err("checksum-valid non-SQLite backup must block restore");
+
+    assert!(matches!(
+        error,
+        RecoveryError::Backup(bibcode_server::persistence::BackupError::Verification(_))
+    ));
+    assert_eq!(
+        std::fs::read(&fixture.paths.database).expect("live database remains"),
+        database_before
+    );
+    assert_eq!(
+        std::fs::read(&fixture.paths.environment_id).expect("live marker remains"),
+        marker_before
+    );
+    assert!(!fixture.paths.recovery_journal().exists());
+}
+
+#[tokio::test]
+async fn recovery_restore_preserves_a_malformed_marker_and_installs_the_verified_identity() {
+    let fixture = StoreFixture::with_project("Before restore").await;
+    let storage_instance_id = Uuid::new_v4();
+    fixture.write_marker(storage_instance_id);
+    let prepared = fixture.prepare().await.expect("prepare recovery fixture");
+    let backup = create_verified_backup(
+        &prepared.database,
+        &prepared,
+        BackupTrigger::PreUpdate,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .expect("create verified recovery generation");
+    drop(prepared);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let malformed = b"not-a-storage-uuid\n";
+    fixture.write_marker_bytes(malformed);
+
+    let result = restore_backup(
+        fixture
+            .config
+            .resolved_data_root
+            .as_ref()
+            .expect("resolved recovery root"),
+        backup.manifest.backup_id,
+    )
+    .await
+    .expect("explicit verified restore repairs malformed marker");
+
+    assert_eq!(
+        std::fs::read(result.preserved_directory.join("environment-id"))
+            .expect("malformed marker was preserved"),
+        malformed
+    );
+    assert_eq!(
+        std::fs::read_to_string(&fixture.paths.environment_id)
+            .expect("verified marker installed")
+            .trim(),
+        storage_instance_id.to_string()
+    );
+}
+
+#[tokio::test]
+async fn recovery_start_empty_preserves_crash_left_sqlite_files_before_new_identity_creation() {
+    let (_root, config, paths) = crashed_store_fixture();
+    let old_marker = std::fs::read_to_string(&paths.environment_id)
+        .expect("crash-left marker")
+        .trim()
+        .to_owned();
+    assert!(sqlite_sidecar(&paths.database, "-wal").is_file());
+    assert!(sqlite_sidecar(&paths.database, "-shm").is_file());
+
+    let result = preserve_and_start_empty(
+        config
+            .resolved_data_root
+            .as_ref()
+            .expect("resolved recovery root"),
+    )
+    .await
+    .expect("preserve crash-left store before start-empty");
+
+    assert!(!paths.database.exists());
+    assert!(!sqlite_sidecar(&paths.database, "-wal").exists());
+    assert!(!sqlite_sidecar(&paths.database, "-shm").exists());
+    assert!(!paths.environment_id.exists());
+    for name in [
+        "state.sqlite",
+        "state.sqlite-wal",
+        "state.sqlite-shm",
+        "environment-id",
+    ] {
+        assert!(result.preserved_directory.join(name).is_file(), "{name}");
+    }
+    let preserved = Connection::open(result.preserved_directory.join("state.sqlite"))
+        .expect("open preserved crash-left store");
+    let preserved_title: String = preserved
+        .query_row(
+            "SELECT title FROM projection_projects WHERE project_id = 'crash-project'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("preserved WAL project");
+    assert_eq!(preserved_title, "Crash project");
+    drop(preserved);
+
+    let prepared = prepare_store(&config)
+        .await
+        .expect("normal startup creates explicit empty store");
+    assert_eq!(prepared.classification, StoreClassification::FirstRun);
+    assert_ne!(prepared.storage_instance_id.to_string(), old_marker);
+}
+
+#[tokio::test]
+async fn recovery_incomplete_journal_never_becomes_a_first_run_store() {
+    let fixture = StoreFixture::new();
+    let journal_bytes = br#"{"operationId":"interrupted"}"#;
+    std::fs::write(fixture.paths.recovery_journal(), journal_bytes)
+        .expect("interrupted recovery journal");
+
+    let error = fixture
+        .prepare()
+        .await
+        .expect_err("incomplete recovery must block first-run creation");
+
+    assert!(matches!(
+        error,
+        StoreStartupError::RecoveryIncomplete { .. }
+    ));
+    assert!(!fixture.paths.database.exists());
+    assert!(!fixture.paths.environment_id.exists());
+    assert_eq!(
+        std::fs::read(fixture.paths.recovery_journal()).expect("journal remains"),
+        journal_bytes
+    );
+}
+
+#[tokio::test]
+async fn recovery_restore_with_an_existing_journal_performs_no_additional_filesystem_writes() {
+    let fixture = StoreFixture::with_project("Journal-protected project").await;
+    fixture.write_marker(Uuid::new_v4());
+    let prepared = fixture.prepare().await.expect("prepare recovery fixture");
+    let backup = create_verified_backup(
+        &prepared.database,
+        &prepared,
+        BackupTrigger::PreUpdate,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .expect("create verified recovery generation");
+    drop(prepared);
+    std::fs::write(fixture.paths.runtime_lock(), b"").expect("existing runtime lock");
+    std::fs::write(fixture.paths.recovery_journal(), b"existing recovery\n")
+        .expect("existing recovery journal");
+    let entries_before = directory_entry_names(&fixture.paths.base_dir);
+    let database_before = std::fs::read(&fixture.paths.database).expect("live database bytes");
+    let marker_before = std::fs::read(&fixture.paths.environment_id).expect("live marker bytes");
+
+    let error = restore_backup(
+        fixture
+            .config
+            .resolved_data_root
+            .as_ref()
+            .expect("resolved recovery root"),
+        backup.manifest.backup_id,
+    )
+    .await
+    .expect_err("existing journal must block a second recovery");
+
+    assert!(matches!(error, RecoveryError::RecoveryInProgress { .. }));
+    assert_eq!(
+        directory_entry_names(&fixture.paths.base_dir),
+        entries_before
+    );
+    assert_eq!(
+        std::fs::read(&fixture.paths.database).expect("live database remains"),
+        database_before
+    );
+    assert_eq!(
+        std::fs::read(&fixture.paths.environment_id).expect("live marker remains"),
+        marker_before
+    );
+}
+
+#[tokio::test]
+async fn recovery_incomplete_staging_never_becomes_a_first_run_store() {
+    let fixture = StoreFixture::new();
+    let staging = fixture.paths.recovery_staging_dir(Uuid::new_v4());
+    std::fs::create_dir(&staging).expect("interrupted recovery staging directory");
+    std::fs::write(staging.join("state.sqlite"), b"partial")
+        .expect("interrupted recovery staging file");
+
+    let error = fixture
+        .prepare()
+        .await
+        .expect_err("incomplete recovery staging must block first-run creation");
+
+    assert!(matches!(
+        error,
+        StoreStartupError::RecoveryIncomplete { path } if path == staging
+    ));
+    assert!(!fixture.paths.database.exists());
+    assert!(!fixture.paths.environment_id.exists());
+    assert_eq!(
+        std::fs::read(staging.join("state.sqlite")).expect("staging remains"),
+        b"partial"
+    );
+}
+
+#[tokio::test]
+async fn recovery_refuses_to_mutate_a_store_owned_by_a_running_server() {
+    let root = TempDir::new().expect("temporary active-store root");
+    let handle = ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))
+        .await
+        .expect("start active store owner");
+    let resolved = handle.data_root().clone();
+    let paths = {
+        let mut config = ServerConfig::new(&resolved.effective);
+        config.base_dir.clone_from(&resolved.effective);
+        config.resolved_data_root = Some(resolved.clone());
+        StatePaths::from_config(&config)
+    };
+    let database_before = std::fs::read(&paths.database).expect("active database bytes");
+    let marker_before = std::fs::read(&paths.environment_id).expect("active marker bytes");
+
+    let error = preserve_and_start_empty(&resolved)
+        .await
+        .expect_err("running store must block offline recovery");
+
+    assert!(matches!(error, RecoveryError::StoreRunning));
+    assert_eq!(
+        std::fs::read(&paths.database).expect("active database remains"),
+        database_before
+    );
+    assert_eq!(
+        std::fs::read(&paths.environment_id).expect("active marker remains"),
+        marker_before
+    );
+    assert!(!paths.recovery_journal().exists());
+    handle.shutdown();
+    handle.join().await.expect("active store owner stops");
+}
+
+#[tokio::test]
+async fn recovery_inspection_reports_verified_store_state_without_mutating_it() {
+    let fixture = StoreFixture::with_project("Inspectable project").await;
+    let storage_instance_id = Uuid::new_v4();
+    fixture.write_marker(storage_instance_id);
+    let prepared = fixture.prepare().await.expect("prepare inspection fixture");
+    let backup = create_verified_backup(
+        &prepared.database,
+        &prepared,
+        BackupTrigger::PreUpdate,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .expect("create verified inspection generation");
+    drop(prepared);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    let database_before = std::fs::read(&fixture.paths.database).expect("database bytes");
+    let marker_before = std::fs::read(&fixture.paths.environment_id).expect("marker bytes");
+    let entries_before = directory_entry_names(&fixture.paths.state_dir);
+
+    let inspection = inspect_store(
+        fixture
+            .config
+            .resolved_data_root
+            .as_ref()
+            .expect("resolved inspection root"),
+    )
+    .await
+    .expect("inspect store");
+
+    assert_eq!(inspection.classification, StoreInspectionStatus::Existing);
+    assert_eq!(
+        inspection
+            .storage_instance_id
+            .map(|value| value.to_string()),
+        Some(storage_instance_id.to_string())
+    );
+    assert_eq!(inspection.backups.len(), 1);
+    assert_eq!(
+        inspection.backups[0].manifest.backup_id,
+        backup.manifest.backup_id
+    );
+    assert_eq!(
+        inspection.requested_root,
+        fixture
+            .config
+            .resolved_data_root
+            .as_ref()
+            .expect("resolved root")
+            .requested
+    );
+    assert_eq!(
+        std::fs::read(&fixture.paths.database).expect("database remains"),
+        database_before
+    );
+    assert_eq!(
+        std::fs::read(&fixture.paths.environment_id).expect("marker remains"),
+        marker_before
+    );
+    assert_eq!(
+        directory_entry_names(&fixture.paths.state_dir),
+        entries_before
+    );
+}
+
+#[tokio::test]
+async fn recovery_inspection_reports_an_absent_root_as_first_run_without_creating_it() {
+    let parent = TempDir::new().expect("temporary parent");
+    let missing_root = parent.path().join("missing-bibcode-root");
+    let config = ServerConfig::new(&missing_root);
+    let root = resolve_data_root(config.data_root_request.clone()).expect("resolve missing root");
+
+    let inspection = inspect_store(&root)
+        .await
+        .expect("inspect absent project-data root");
+
+    assert_eq!(inspection.classification, StoreInspectionStatus::FirstRun);
+    assert!(inspection.storage_instance_id.is_none());
+    assert!(inspection.backups.is_empty());
+    assert!(inspection.backup_issues.is_empty());
+    assert!(
+        !missing_root.exists(),
+        "inspection must not create the root"
     );
 }
 

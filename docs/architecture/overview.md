@@ -146,6 +146,23 @@ for deletion. Newly created backup ancestors and their parents are flushed
 before the next descendant is created on platforms that support directory
 syncing.
 
+Offline recovery is explicit and state-kind scoped. `bibcode storage inspect`
+classifies the resolved store and inventories verified backups without changing
+database, WAL, marker, or catalog bytes. `bibcode storage restore --backup-id`
+accepts only a selected generation whose manifest, location, storage identity,
+checksum, SQLite integrity, and migration prefix verify for that same state
+kind. `bibcode storage start-empty` is the separate destructive choice. Both
+mutating commands first acquire an exclusive runtime lock and the storage
+operation lock, write and flush a recovery journal, and preserve every existing
+database, WAL, SHM, and marker entry in a private recovery generation before
+installing a verified database or allowing the next startup to create a new
+store. Normal server handles hold the runtime lock shared, so multiple
+established servers remain supported while offline recovery fails closed if any
+server owns the root. Startup refuses to create or open SQLite while a recovery
+journal or strict recovery-staging entry remains. A crash or cancellation after
+preservation therefore leaves recoverable files and an explicit incomplete
+operation instead of silently converting the root into a first-run store.
+
 ## Runtime topology
 
 The desktop WebView loads the bundled `apps/web` build (`frontendDist`) or the

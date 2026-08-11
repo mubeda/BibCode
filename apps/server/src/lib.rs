@@ -39,7 +39,7 @@ use clap::Parser;
 use serde_json::json;
 use thiserror::Error;
 
-pub use config::{Cli, ConfigError, ServerConfig, ServerMode};
+pub use config::{Cli, CliAction, ConfigError, ServerConfig, ServerMode, StorageCommand};
 pub use data_root::{
     DataRootError, DataRootRequest, DataRootSource, ResolvedDataRoot, resolve_data_root,
 };
@@ -71,10 +71,20 @@ pub enum RunError {
     ShutdownSignal(#[source] std::io::Error),
     #[error("failed to open the BiBCode browser client")]
     OpenBrowser(#[source] std::io::Error),
+    #[error(transparent)]
+    Recovery(#[from] persistence::RecoveryError),
+    #[error("failed to encode storage command output")]
+    StorageOutput(#[source] serde_json::Error),
 }
 
 pub async fn run_cli() -> Result<(), RunError> {
-    let config = Cli::try_parse()?.into_server_config()?;
+    match Cli::try_parse()?.into_action()? {
+        CliAction::Run(config) => run_server(*config).await,
+        CliAction::Storage(command) => run_storage_command(command).await,
+    }
+}
+
+async fn run_server(config: ServerConfig) -> Result<(), RunError> {
     let open_browser = !config.no_browser;
     let handle = ServerRuntime::start(config).await?;
     let http_base_url = format!("http://{}", handle.local_addr());
@@ -105,6 +115,65 @@ pub async fn run_cli() -> Result<(), RunError> {
         () = handle.wait_for_shutdown() => {}
     }
     handle.join().await?;
+    Ok(())
+}
+
+async fn run_storage_command(command: StorageCommand) -> Result<(), RunError> {
+    let (value, json_output) = match command {
+        StorageCommand::Inspect { root, json } => {
+            let inspection = persistence::inspect_store(&root).await?;
+            let backups = inspection
+                .backups
+                .iter()
+                .map(|backup| &backup.manifest)
+                .collect::<Vec<_>>();
+            let issues = inspection
+                .backup_issues
+                .iter()
+                .map(|issue| {
+                    json!({
+                        "entryName": issue.entry_name,
+                        "message": issue.message,
+                    })
+                })
+                .collect::<Vec<_>>();
+            (
+                json!({
+                    "classification": inspection.classification,
+                    "storageInstanceId": inspection.storage_instance_id,
+                    "backups": backups,
+                    "backupIssues": issues,
+                    "requestedRoot": inspection.requested_root.to_string_lossy(),
+                    "effectiveRoot": inspection.effective_root.to_string_lossy(),
+                    "isFilesystemAlias": inspection.is_filesystem_alias,
+                    "issue": inspection.issue,
+                }),
+                json,
+            )
+        }
+        StorageCommand::Restore {
+            root,
+            backup_id,
+            json,
+        } => (
+            serde_json::to_value(persistence::restore_backup(&root, backup_id).await?)
+                .map_err(RunError::StorageOutput)?,
+            json,
+        ),
+        StorageCommand::StartEmpty { root, json } => (
+            serde_json::to_value(persistence::preserve_and_start_empty(&root).await?)
+                .map_err(RunError::StorageOutput)?,
+            json,
+        ),
+    };
+    if json_output {
+        println!("{value}");
+    } else {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&value).map_err(RunError::StorageOutput)?
+        );
+    }
     Ok(())
 }
 

@@ -16,7 +16,7 @@ use super::{
     StoreOperationGuard, create_verified_backup,
     migrations::{
         ExistingStoreValidationError, apply_migrations, pending_migrations, run_migrations,
-        validate_existing_bibcode_store,
+        validate_existing_bibcode_store, validate_existing_bibcode_store_immutable,
     },
 };
 
@@ -82,6 +82,8 @@ pub enum StoreStartupError {
         #[source]
         source: std::io::Error,
     },
+    #[error("an incomplete project-data recovery operation remains at {path}")]
+    RecoveryIncomplete { path: PathBuf },
     #[error("failed to read storage instance marker {path}")]
     MarkerRead {
         path: PathBuf,
@@ -133,6 +135,14 @@ pub async fn prepare_store(config: &ServerConfig) -> Result<PreparedStore, Store
     let _operation_guard = StoreOperationGuard::acquire_for_startup(&paths)
         .await
         .map_err(StoreStartupError::Backup)?;
+    if try_exists(&paths.recovery_journal())? {
+        return Err(StoreStartupError::RecoveryIncomplete {
+            path: paths.recovery_journal(),
+        });
+    }
+    if let Some(path) = recovery_staging_entry(&paths)? {
+        return Err(StoreStartupError::RecoveryIncomplete { path });
+    }
     let database_exists = try_exists(&paths.database)?;
     let marker_exists = try_exists(&paths.environment_id)?;
     let marker = marker_exists
@@ -150,6 +160,33 @@ pub async fn prepare_store(config: &ServerConfig) -> Result<PreparedStore, Store
             prepare_existing(paths, storage_instance_id, &resolved_config.server_version).await
         }
     }
+}
+
+fn recovery_staging_entry(paths: &StatePaths) -> Result<Option<PathBuf>, StoreStartupError> {
+    let entries =
+        std::fs::read_dir(&paths.base_dir).map_err(|source| StoreStartupError::Inspect {
+            path: paths.base_dir.clone(),
+            source,
+        })?;
+    for entry in entries {
+        let entry = entry.map_err(|source| StoreStartupError::Inspect {
+            path: paths.base_dir.clone(),
+            source,
+        })?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(operation_id) = name
+            .strip_prefix('.')
+            .and_then(|name| name.strip_suffix(".recovery-staging"))
+        else {
+            continue;
+        };
+        if Uuid::parse_str(operation_id).is_ok() {
+            return Ok(Some(entry.path()));
+        }
+    }
+    Ok(None)
 }
 
 fn try_exists(path: &std::path::Path) -> Result<bool, StoreStartupError> {
@@ -198,7 +235,7 @@ async fn prepare_existing_unmarked(
     paths: StatePaths,
     app_version: &str,
 ) -> Result<PreparedStore, StoreStartupError> {
-    validate(&paths.database).await?;
+    validate_existing_store(&paths.database).await?;
     let storage_instance_id = publish_marker(&paths, StorageInstanceId(Uuid::new_v4())).await?;
     prepare_existing_database(
         paths,
@@ -214,7 +251,7 @@ async fn prepare_existing(
     storage_instance_id: StorageInstanceId,
     app_version: &str,
 ) -> Result<PreparedStore, StoreStartupError> {
-    validate(&paths.database).await?;
+    validate_existing_store(&paths.database).await?;
     prepare_existing_database(
         paths,
         storage_instance_id,
@@ -282,11 +319,35 @@ async fn prepare_existing_database(
     })
 }
 
-async fn validate(path: &std::path::Path) -> Result<(), StoreStartupError> {
+pub(crate) async fn validate_existing_store(
+    path: &std::path::Path,
+) -> Result<(), StoreStartupError> {
     validate_with_operation(path.to_path_buf(), |path, cancellation| {
         validate_existing_bibcode_store(&path, &cancellation)
     })
     .await
+}
+
+pub(crate) async fn validate_existing_store_for_inspection(
+    path: &std::path::Path,
+) -> Result<(), StoreStartupError> {
+    let wal = sqlite_sidecar(path, "-wal");
+    let shm = sqlite_sidecar(path, "-shm");
+    let has_sidecars = try_exists(&wal)? || try_exists(&shm)?;
+    validate_with_operation(path.to_path_buf(), move |path, cancellation| {
+        if has_sidecars {
+            validate_existing_bibcode_store(&path, &cancellation)
+        } else {
+            validate_existing_bibcode_store_immutable(&path, &cancellation)
+        }
+    })
+    .await
+}
+
+fn sqlite_sidecar(path: &std::path::Path, suffix: &str) -> PathBuf {
+    let mut sidecar = path.as_os_str().to_os_string();
+    sidecar.push(suffix);
+    PathBuf::from(sidecar)
 }
 
 async fn validate_with_operation<F>(path: PathBuf, operation: F) -> Result<(), StoreStartupError>

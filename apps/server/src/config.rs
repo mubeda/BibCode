@@ -244,6 +244,61 @@ enum CliCommand {
     Serve,
     #[command(about = "Run the BiBCode server.")]
     Start,
+    #[command(about = "Inspect or explicitly recover offline project data.")]
+    Storage(StorageArgs),
+}
+
+#[derive(Debug, Args)]
+struct StorageArgs {
+    #[command(subcommand)]
+    command: StorageSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum StorageSubcommand {
+    #[command(about = "Inspect an offline BiBCode project-data store.")]
+    Inspect {
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Restore a verified backup into an offline store.")]
+    Restore {
+        #[arg(long)]
+        backup_id: uuid::Uuid,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(
+        name = "start-empty",
+        about = "Preserve an offline store and start empty."
+    )]
+    StartEmpty {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub enum CliAction {
+    Run(Box<ServerConfig>),
+    Storage(StorageCommand),
+}
+
+#[derive(Clone, Debug)]
+pub enum StorageCommand {
+    Inspect {
+        root: ResolvedDataRoot,
+        json: bool,
+    },
+    Restore {
+        root: ResolvedDataRoot,
+        backup_id: uuid::Uuid,
+        json: bool,
+    },
+    StartEmpty {
+        root: ResolvedDataRoot,
+        json: bool,
+    },
 }
 
 #[derive(Clone, Debug, Default, Args)]
@@ -285,6 +340,8 @@ pub enum ConfigError {
     BootstrapDecode(#[source] serde_json::Error),
     #[error("desktop bootstrap token must not be empty")]
     EmptyDesktopBootstrapToken,
+    #[error("storage commands cannot be converted into a server configuration")]
+    StorageCommandIsNotServer,
     #[error(transparent)]
     DataRoot(#[from] DataRootError),
 }
@@ -314,8 +371,42 @@ enum ServerModeWire {
 
 impl Cli {
     pub fn into_server_config(self) -> Result<ServerConfig, ConfigError> {
-        let headless = matches!(self.command, Some(CliCommand::Serve));
-        let args = self.root;
+        match self.into_action()? {
+            CliAction::Run(config) => Ok(*config),
+            CliAction::Storage(_) => Err(ConfigError::StorageCommandIsNotServer),
+        }
+    }
+
+    pub fn into_action(self) -> Result<CliAction, ConfigError> {
+        let Self {
+            command,
+            root: args,
+        } = self;
+        let command = match command {
+            Some(CliCommand::Storage(storage)) => {
+                let home_dir = dirs::home_dir().ok_or(DataRootError::HomeDirectoryUnavailable)?;
+                let request = select_data_root_request(
+                    args.base_dir,
+                    bibcode_env_var("BIBCODE_HOME"),
+                    None,
+                    home_dir,
+                );
+                let root = crate::data_root::resolve_data_root(request)?;
+                return Ok(CliAction::Storage(match storage.command {
+                    StorageSubcommand::Inspect { json } => StorageCommand::Inspect { root, json },
+                    StorageSubcommand::Restore { backup_id, json } => StorageCommand::Restore {
+                        root,
+                        backup_id,
+                        json,
+                    },
+                    StorageSubcommand::StartEmpty { json } => {
+                        StorageCommand::StartEmpty { root, json }
+                    }
+                }));
+            }
+            command => command,
+        };
+        let headless = matches!(command, Some(CliCommand::Serve));
         let bootstrap = args.bootstrap_fd.map(read_bootstrap).transpose()?.flatten();
 
         let mode = args
@@ -370,7 +461,7 @@ impl Cli {
         }
         config.desktop_bootstrap_token = desktop_bootstrap_token;
         config.desktop_wsl_transport = bootstrap.as_ref().is_some_and(|value| value.wsl_transport);
-        Ok(config)
+        Ok(CliAction::Run(Box::new(config)))
     }
 }
 

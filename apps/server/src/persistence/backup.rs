@@ -16,7 +16,12 @@ use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
-    Database, MIGRATIONS, PersistenceError, PreparedStore, StateKind, StatePaths, StorageInstanceId,
+    Database, MIGRATIONS, PersistenceError, PreparedStore, StateKind, StatePaths,
+    StorageInstanceId, StoreStartupError,
+};
+use crate::{
+    ServerConfig,
+    data_root::{DataRootRequest, ResolvedDataRoot, resolve_data_root},
 };
 
 const BACKUP_FILE_NAME: &str = "state.sqlite";
@@ -28,6 +33,7 @@ const LOCK_RETRY_DELAY: Duration = Duration::from_millis(5);
 const SQLITE_PROGRESS_OPS: i32 = 1_000;
 const MAX_MANIFEST_BYTES: u64 = 64 * 1024;
 const MAX_PUBLICATION_TIME_SKEW: Duration = Duration::from_secs(60);
+const RECOVERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
@@ -181,6 +187,80 @@ pub struct BackupInventory {
     pub issues: Vec<BackupInventoryIssue>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StoreInspectionStatus {
+    FirstRun,
+    ExistingUnmarked,
+    Existing,
+    DatabaseMissing,
+    MarkerMalformed,
+    CorruptDatabase,
+    UnrecognizedStore,
+    UnsafeDatabaseState,
+    RecoveryIncomplete,
+}
+
+#[derive(Clone, Debug)]
+pub struct StoreInspection {
+    pub classification: StoreInspectionStatus,
+    pub storage_instance_id: Option<StorageInstanceId>,
+    pub backups: Vec<VerifiedBackup>,
+    pub backup_issues: Vec<BackupInventoryIssue>,
+    pub requested_root: PathBuf,
+    pub effective_root: PathBuf,
+    pub is_filesystem_alias: bool,
+    pub issue: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RecoveryAction {
+    Restore,
+    StartEmpty,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RecoveryResult {
+    #[serde(with = "uuid_string")]
+    pub operation_id: Uuid,
+    pub action: RecoveryAction,
+    pub preserved_directory: PathBuf,
+    pub storage_instance_id: Option<StorageInstanceId>,
+}
+
+#[derive(Debug, Error)]
+pub enum RecoveryError {
+    #[error("the effective project-data root changed before recovery")]
+    RootChanged,
+    #[error("the selected verified backup does not exist")]
+    BackupNotFound,
+    #[error("the selected backup belongs to a different storage instance")]
+    StorageIdentityMismatch,
+    #[error("the project-data store is currently owned by a running server")]
+    StoreRunning,
+    #[error("the store recovery journal already exists at {path}")]
+    RecoveryInProgress { path: PathBuf },
+    #[error("the storage instance marker at {path} is malformed")]
+    MarkerMalformed { path: PathBuf },
+    #[error("project-data recovery failed")]
+    Backup(#[from] BackupError),
+    #[error("project-data recovery worker failed")]
+    Worker(#[source] tokio::task::JoinError),
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecoveryJournal {
+    #[serde(with = "uuid_string")]
+    operation_id: Uuid,
+    action: RecoveryAction,
+    state_kind: StateKind,
+    backup_id: Option<String>,
+    phase: &'static str,
+}
+
 #[derive(Debug, Error)]
 pub enum BackupError {
     #[error("failed to access backup path {path}")]
@@ -216,6 +296,80 @@ pub enum BackupError {
 #[derive(Debug)]
 pub struct StoreOperationGuard {
     lock_file: File,
+}
+
+#[derive(Debug)]
+pub struct StoreRuntimeGuard {
+    lock_file: File,
+}
+
+impl StoreRuntimeGuard {
+    pub async fn acquire(effective_root: &Path) -> Result<Self, BackupError> {
+        let lock_path = effective_root.join(".bibcode-runtime.lock");
+        let cancellation = CancellationToken::new();
+        let _cancel_on_drop = CancelOnDrop(cancellation.clone());
+        let deadline = Instant::now()
+            .checked_add(LOCK_WAIT_TIMEOUT)
+            .ok_or_else(|| BackupError::LockTimeout {
+                path: lock_path.clone(),
+            })?;
+        tokio::task::spawn_blocking(move || {
+            let lock_file = open_private_lock_file(&lock_path)?;
+            loop {
+                ensure_lock_wait_active(
+                    &lock_path,
+                    &cancellation,
+                    &CancellationToken::new(),
+                    deadline,
+                )?;
+                match File::try_lock_shared(&lock_file) {
+                    Ok(()) => return Ok(Self { lock_file }),
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        let remaining = deadline.saturating_duration_since(Instant::now());
+                        thread::sleep(LOCK_RETRY_DELAY.min(remaining));
+                    }
+                    Err(std::fs::TryLockError::Error(source)) => {
+                        return Err(BackupError::Io {
+                            path: lock_path,
+                            source,
+                        });
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(BackupError::Worker)?
+    }
+}
+
+impl Drop for StoreRuntimeGuard {
+    fn drop(&mut self) {
+        let _ = self.lock_file.unlock();
+    }
+}
+
+struct OfflineRecoveryGuard {
+    lock_file: File,
+}
+
+impl OfflineRecoveryGuard {
+    fn acquire(paths: &StatePaths) -> Result<Self, RecoveryError> {
+        let path = paths.runtime_lock();
+        let lock_file = open_private_lock_file(&path)?;
+        match lock_file.try_lock() {
+            Ok(()) => Ok(Self { lock_file }),
+            Err(std::fs::TryLockError::WouldBlock) => Err(RecoveryError::StoreRunning),
+            Err(std::fs::TryLockError::Error(source)) => {
+                Err(BackupError::Io { path, source }.into())
+            }
+        }
+    }
+}
+
+impl Drop for OfflineRecoveryGuard {
+    fn drop(&mut self) {
+        let _ = self.lock_file.unlock();
+    }
 }
 
 impl StoreOperationGuard {
@@ -335,6 +489,23 @@ enum BackupFault {
     BeforeReloadVerification,
 }
 
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RecoveryFault {
+    None,
+    AfterPreserve,
+}
+
+impl RecoveryFault {
+    fn inject(self, phase: Self) -> Result<(), RecoveryError> {
+        if self == phase {
+            Err(BackupError::Verification(format!("injected recovery failure at {phase:?}")).into())
+        } else {
+            Ok(())
+        }
+    }
+}
+
 impl BackupFault {
     fn inject(self, phase: Self) -> Result<(), BackupError> {
         if self == phase {
@@ -431,6 +602,748 @@ pub async fn inventory_verified_backups(
     })
     .await
     .map_err(BackupError::Worker)?
+}
+
+pub async fn inspect_store(root: &ResolvedDataRoot) -> Result<StoreInspection, RecoveryError> {
+    let current = resolve_data_root(DataRootRequest {
+        source: root.source,
+        requested: Some(root.requested.clone()),
+        home_dir: PathBuf::new(),
+    })
+    .map_err(|_| RecoveryError::RootChanged)?;
+    if current.effective != root.effective {
+        return Err(RecoveryError::RootChanged);
+    }
+    let mut config = ServerConfig::new(&current.effective);
+    config.base_dir.clone_from(&current.effective);
+    config.resolved_data_root = Some(current.clone());
+    let paths = StatePaths::from_config(&config);
+    if !path_entry_exists(&paths.base_dir)? {
+        return Ok(StoreInspection {
+            classification: StoreInspectionStatus::FirstRun,
+            storage_instance_id: None,
+            backups: Vec::new(),
+            backup_issues: Vec::new(),
+            requested_root: current.requested,
+            effective_root: current.effective,
+            is_filesystem_alias: current.is_filesystem_alias,
+            issue: None,
+        });
+    }
+    let journal_exists = path_entry_exists(&paths.recovery_journal())?;
+    let staging = find_recovery_staging_entry(&paths)?;
+    let database_exists = path_entry_exists(&paths.database)?;
+    let marker_exists = path_entry_exists(&paths.environment_id)?;
+    let marker = if marker_exists {
+        let bytes = fs::read(&paths.environment_id).map_err(|source| BackupError::Io {
+            path: paths.environment_id.clone(),
+            source,
+        })?;
+        std::str::from_utf8(&bytes)
+            .ok()
+            .and_then(|value| Uuid::parse_str(value.trim()).ok())
+            .map(StorageInstanceId::from_uuid)
+    } else {
+        None
+    };
+    let (classification, issue) = if journal_exists || staging.is_some() {
+        (
+            StoreInspectionStatus::RecoveryIncomplete,
+            Some("An incomplete project-data recovery operation requires attention.".to_owned()),
+        )
+    } else if marker_exists && marker.is_none() {
+        (
+            StoreInspectionStatus::MarkerMalformed,
+            Some("The storage instance marker is malformed.".to_owned()),
+        )
+    } else {
+        match (database_exists, marker) {
+            (false, None) => (StoreInspectionStatus::FirstRun, None),
+            (false, Some(_)) => (
+                StoreInspectionStatus::DatabaseMissing,
+                Some("The database is missing while its storage marker remains.".to_owned()),
+            ),
+            (true, marker) => {
+                match super::store::validate_existing_store_for_inspection(&paths.database).await {
+                    Ok(()) if marker.is_some() => (StoreInspectionStatus::Existing, None),
+                    Ok(()) => (StoreInspectionStatus::ExistingUnmarked, None),
+                    Err(error) => {
+                        let status = match &error {
+                            StoreStartupError::CorruptDatabase { .. } => {
+                                StoreInspectionStatus::CorruptDatabase
+                            }
+                            StoreStartupError::UnrecognizedStore { .. } => {
+                                StoreInspectionStatus::UnrecognizedStore
+                            }
+                            _ => StoreInspectionStatus::UnsafeDatabaseState,
+                        };
+                        (status, Some(error.to_string()))
+                    }
+                }
+            }
+        }
+    };
+    let inventory = if let Some(storage_instance_id) = marker {
+        inventory_verified_backups(&paths, storage_instance_id).await?
+    } else {
+        inventory_all_verified_backups(&paths).await?
+    };
+    Ok(StoreInspection {
+        classification,
+        storage_instance_id: marker,
+        backups: inventory.verified,
+        backup_issues: inventory.issues,
+        requested_root: current.requested,
+        effective_root: current.effective,
+        is_filesystem_alias: current.is_filesystem_alias,
+        issue,
+    })
+}
+
+async fn inventory_all_verified_backups(
+    paths: &StatePaths,
+) -> Result<BackupInventory, BackupError> {
+    let paths = paths.clone();
+    let cancellation = CancellationToken::new();
+    let _cancel_on_drop = CancelOnDrop(cancellation.clone());
+    let deadline = Instant::now()
+        .checked_add(BACKUP_TIMEOUT)
+        .ok_or(BackupError::DeadlineElapsed)?;
+    tokio::task::spawn_blocking(move || {
+        let state_kind_directory = paths.backups_dir.join(state_kind_name(paths.state_kind));
+        let entries = match fs::read_dir(&state_kind_directory) {
+            Ok(entries) => entries,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(BackupInventory::default());
+            }
+            Err(source) => {
+                return Err(BackupError::Io {
+                    path: state_kind_directory,
+                    source,
+                });
+            }
+        };
+        let mut combined = BackupInventory::default();
+        for entry in entries {
+            ensure_active(&cancellation, Some(deadline))?;
+            let entry = entry.map_err(|source| BackupError::Io {
+                path: state_kind_directory.clone(),
+                source,
+            })?;
+            let Some(storage_instance_id) = entry
+                .file_name()
+                .to_str()
+                .and_then(|name| Uuid::parse_str(name).ok())
+                .map(StorageInstanceId::from_uuid)
+            else {
+                combined.issues.push(BackupInventoryIssue {
+                    entry_name: entry.file_name().to_string_lossy().into_owned(),
+                    message: "backup store directory name is not a storage UUID".to_owned(),
+                });
+                continue;
+            };
+            match inventory_blocking(
+                &paths,
+                storage_instance_id,
+                Some(&cancellation),
+                Some(deadline),
+            ) {
+                Ok(mut inventory) => {
+                    combined.verified.append(&mut inventory.verified);
+                    combined.issues.append(&mut inventory.issues);
+                }
+                Err(error) => combined.issues.push(BackupInventoryIssue {
+                    entry_name: entry.file_name().to_string_lossy().into_owned(),
+                    message: error.to_string(),
+                }),
+            }
+        }
+        combined
+            .verified
+            .sort_by_key(|backup| backup.identity.publication_time);
+        Ok(combined)
+    })
+    .await
+    .map_err(BackupError::Worker)?
+}
+
+fn path_entry_exists(path: &Path) -> Result<bool, BackupError> {
+    match fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(source) => Err(BackupError::Io {
+            path: path.to_path_buf(),
+            source,
+        }),
+    }
+}
+
+fn find_recovery_staging_entry(paths: &StatePaths) -> Result<Option<PathBuf>, BackupError> {
+    for entry in fs::read_dir(&paths.base_dir).map_err(|source| BackupError::Io {
+        path: paths.base_dir.clone(),
+        source,
+    })? {
+        let entry = entry.map_err(|source| BackupError::Io {
+            path: paths.base_dir.clone(),
+            source,
+        })?;
+        let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        let Some(operation_id) = name
+            .strip_prefix('.')
+            .and_then(|name| name.strip_suffix(".recovery-staging"))
+        else {
+            continue;
+        };
+        if Uuid::parse_str(operation_id).is_ok() {
+            return Ok(Some(entry.path()));
+        }
+    }
+    Ok(None)
+}
+
+pub async fn restore_backup(
+    root: &ResolvedDataRoot,
+    backup_id: Uuid,
+) -> Result<RecoveryResult, RecoveryError> {
+    restore_backup_inner(root, backup_id, RecoveryFault::None).await
+}
+
+#[cfg(test)]
+async fn restore_backup_with_fault(
+    root: &ResolvedDataRoot,
+    backup_id: Uuid,
+    fault: RecoveryFault,
+) -> Result<RecoveryResult, RecoveryError> {
+    restore_backup_inner(root, backup_id, fault).await
+}
+
+async fn restore_backup_inner(
+    root: &ResolvedDataRoot,
+    backup_id: Uuid,
+    fault: RecoveryFault,
+) -> Result<RecoveryResult, RecoveryError> {
+    let current = resolve_data_root(DataRootRequest {
+        source: root.source,
+        requested: Some(root.requested.clone()),
+        home_dir: PathBuf::new(),
+    })
+    .map_err(|_| RecoveryError::RootChanged)?;
+    if current.effective != root.effective {
+        return Err(RecoveryError::RootChanged);
+    }
+    let mut config = ServerConfig::new(&current.effective);
+    config.base_dir.clone_from(&current.effective);
+    config.resolved_data_root = Some(current.clone());
+    let paths = StatePaths::from_config(&config);
+    let _offline = OfflineRecoveryGuard::acquire(&paths)?;
+    let cancellation = CancellationToken::new();
+    let _cancel_on_drop = CancelOnDrop(cancellation.clone());
+    let _guard =
+        StoreOperationGuard::acquire(&paths.base_dir, cancellation.clone(), RECOVERY_TIMEOUT)
+            .await?;
+    let deadline = Instant::now()
+        .checked_add(RECOVERY_TIMEOUT)
+        .ok_or(BackupError::DeadlineElapsed)?;
+    tokio::task::spawn_blocking(move || {
+        restore_backup_blocking(paths, current, backup_id, &cancellation, deadline, fault)
+    })
+    .await
+    .map_err(RecoveryError::Worker)?
+}
+
+fn restore_backup_blocking(
+    paths: StatePaths,
+    expected_root: ResolvedDataRoot,
+    backup_id: Uuid,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+    fault: RecoveryFault,
+) -> Result<RecoveryResult, RecoveryError> {
+    ensure_active(cancellation, Some(deadline))?;
+    let current = resolve_data_root(DataRootRequest {
+        source: expected_root.source,
+        requested: Some(expected_root.requested.clone()),
+        home_dir: PathBuf::new(),
+    })
+    .map_err(|_| RecoveryError::RootChanged)?;
+    if current.effective != expected_root.effective || current.effective != paths.base_dir {
+        return Err(RecoveryError::RootChanged);
+    }
+    ensure_no_recovery_in_progress(&paths)?;
+    let marker_exists = path_entry_exists(&paths.environment_id)?;
+    let marker_id = if marker_exists {
+        let marker_bytes = fs::read(&paths.environment_id).map_err(|source| BackupError::Io {
+            path: paths.environment_id.clone(),
+            source,
+        })?;
+        std::str::from_utf8(&marker_bytes)
+            .ok()
+            .and_then(|value| Uuid::parse_str(value.trim()).ok())
+            .map(StorageInstanceId::from_uuid)
+    } else {
+        None
+    };
+    let selected = find_verified_backup_for_recovery(&paths, backup_id, cancellation, deadline)?
+        .ok_or(RecoveryError::BackupNotFound)?;
+    if marker_id.is_some_and(|marker_id| selected.manifest.storage_instance_id != marker_id) {
+        return Err(RecoveryError::StorageIdentityMismatch);
+    }
+    let restored_storage_id = selected.manifest.storage_instance_id;
+
+    let root_boundary = inspect_root_directory(&paths.base_dir)?;
+    let state_boundary = inspect_child_directory(&root_boundary, &paths.state_dir)?;
+    let recovery_root = paths.base_dir.join("recovery");
+    let recovery_root_boundary = ensure_backup_component(
+        &root_boundary,
+        &recovery_root,
+        true,
+        BackupFault::None,
+        BackupFault::BeforeBackupsDirectorySync,
+        BackupFault::BeforeBackupsParentSync,
+    )?
+    .expect("recovery root was created");
+    let recovery_kind = paths.recovery_dir();
+    let recovery_kind_boundary = ensure_backup_component(
+        &recovery_root_boundary,
+        &recovery_kind,
+        true,
+        BackupFault::None,
+        BackupFault::BeforeStateKindDirectorySync,
+        BackupFault::BeforeStateKindParentSync,
+    )?
+    .expect("recovery state-kind directory was created");
+    let operation_id = Uuid::new_v4();
+    let preserved_directory = recovery_kind.join(format!(
+        "{}-{operation_id}",
+        OffsetDateTime::now_utc().unix_timestamp()
+    ));
+    create_private_directory(&preserved_directory)?;
+    sync_directory(&preserved_directory)?;
+    sync_directory(&recovery_kind)?;
+    let preserved_boundary =
+        inspect_child_directory(&recovery_kind_boundary, &preserved_directory)?;
+
+    let staging_directory = paths.recovery_staging_dir(operation_id);
+    create_private_directory(&staging_directory)?;
+    let staging_boundary = inspect_child_directory(&root_boundary, &staging_directory)?;
+    let staged_database = staging_directory.join(BACKUP_FILE_NAME);
+    copy_verified_database(&selected, &staged_database, cancellation, deadline)?;
+    let staged_marker = staging_directory.join("environment-id");
+    let mut marker = private_create_new(&staged_marker)?;
+    marker
+        .write_all(format!("{restored_storage_id}\n").as_bytes())
+        .and_then(|()| marker.sync_all())
+        .map_err(|source| BackupError::Io {
+            path: staged_marker.clone(),
+            source,
+        })?;
+    drop(marker);
+    sync_directory(&staging_directory)?;
+    ensure_active(cancellation, Some(deadline))?;
+
+    let journal = RecoveryJournal {
+        operation_id,
+        action: RecoveryAction::Restore,
+        state_kind: paths.state_kind,
+        backup_id: Some(backup_id.to_string()),
+        phase: "preserving-live-store",
+    };
+    let mut journal_bytes =
+        serde_json::to_vec_pretty(&journal).map_err(BackupError::ManifestEncode)?;
+    journal_bytes.push(b'\n');
+    let journal_path = paths.recovery_journal();
+    let mut journal_file = private_create_new(&journal_path)?;
+    journal_file
+        .write_all(&journal_bytes)
+        .and_then(|()| journal_file.sync_all())
+        .map_err(|source| BackupError::Io {
+            path: journal_path.clone(),
+            source,
+        })?;
+    drop(journal_file);
+    sync_directory(&paths.base_dir)?;
+
+    preserve_live_file(&state_boundary, &paths.database, &preserved_boundary)?;
+    for suffix in ["-wal", "-shm"] {
+        let sidecar = sqlite_sidecar_path(&paths.database, suffix);
+        if fs::symlink_metadata(&sidecar).is_ok() {
+            preserve_live_file(&state_boundary, &sidecar, &preserved_boundary)?;
+        }
+    }
+    if marker_exists {
+        preserve_live_file(&state_boundary, &paths.environment_id, &preserved_boundary)?;
+    }
+    sync_directory(&preserved_directory)?;
+    sync_directory(&paths.state_dir)?;
+    fault.inject(RecoveryFault::AfterPreserve)?;
+
+    move_staged_file(&staging_boundary, &staged_database, &paths.database)?;
+    move_staged_file(&staging_boundary, &staged_marker, &paths.environment_id)?;
+    sync_directory(&paths.state_dir)?;
+    fs::remove_dir(&staging_directory).map_err(|source| BackupError::Io {
+        path: staging_directory.clone(),
+        source,
+    })?;
+    fs::remove_file(&journal_path).map_err(|source| BackupError::Io {
+        path: journal_path.clone(),
+        source,
+    })?;
+    sync_directory(&paths.base_dir)?;
+    Ok(RecoveryResult {
+        operation_id,
+        action: RecoveryAction::Restore,
+        preserved_directory,
+        storage_instance_id: Some(restored_storage_id),
+    })
+}
+
+pub async fn preserve_and_start_empty(
+    root: &ResolvedDataRoot,
+) -> Result<RecoveryResult, RecoveryError> {
+    let current = resolve_data_root(DataRootRequest {
+        source: root.source,
+        requested: Some(root.requested.clone()),
+        home_dir: PathBuf::new(),
+    })
+    .map_err(|_| RecoveryError::RootChanged)?;
+    if current.effective != root.effective {
+        return Err(RecoveryError::RootChanged);
+    }
+    let mut config = ServerConfig::new(&current.effective);
+    config.base_dir.clone_from(&current.effective);
+    config.resolved_data_root = Some(current.clone());
+    let paths = StatePaths::from_config(&config);
+    let _offline = OfflineRecoveryGuard::acquire(&paths)?;
+    let cancellation = CancellationToken::new();
+    let _cancel_on_drop = CancelOnDrop(cancellation.clone());
+    let _guard =
+        StoreOperationGuard::acquire(&paths.base_dir, cancellation.clone(), RECOVERY_TIMEOUT)
+            .await?;
+    let deadline = Instant::now()
+        .checked_add(RECOVERY_TIMEOUT)
+        .ok_or(BackupError::DeadlineElapsed)?;
+    tokio::task::spawn_blocking(move || {
+        preserve_and_start_empty_blocking(paths, current, &cancellation, deadline)
+    })
+    .await
+    .map_err(RecoveryError::Worker)?
+}
+
+fn preserve_and_start_empty_blocking(
+    paths: StatePaths,
+    expected_root: ResolvedDataRoot,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<RecoveryResult, RecoveryError> {
+    ensure_active(cancellation, Some(deadline))?;
+    let current = resolve_data_root(DataRootRequest {
+        source: expected_root.source,
+        requested: Some(expected_root.requested.clone()),
+        home_dir: PathBuf::new(),
+    })
+    .map_err(|_| RecoveryError::RootChanged)?;
+    if current.effective != expected_root.effective || current.effective != paths.base_dir {
+        return Err(RecoveryError::RootChanged);
+    }
+    ensure_no_recovery_in_progress(&paths)?;
+    let root_boundary = inspect_root_directory(&paths.base_dir)?;
+    let state_boundary = inspect_child_directory(&root_boundary, &paths.state_dir)?;
+    let recovery_root = paths.base_dir.join("recovery");
+    let recovery_root_boundary = ensure_backup_component(
+        &root_boundary,
+        &recovery_root,
+        true,
+        BackupFault::None,
+        BackupFault::BeforeBackupsDirectorySync,
+        BackupFault::BeforeBackupsParentSync,
+    )?
+    .expect("recovery root was created");
+    let recovery_kind = paths.recovery_dir();
+    let recovery_kind_boundary = ensure_backup_component(
+        &recovery_root_boundary,
+        &recovery_kind,
+        true,
+        BackupFault::None,
+        BackupFault::BeforeStateKindDirectorySync,
+        BackupFault::BeforeStateKindParentSync,
+    )?
+    .expect("recovery state-kind directory was created");
+    let operation_id = Uuid::new_v4();
+    let preserved_directory = recovery_kind.join(format!(
+        "{}-{operation_id}",
+        OffsetDateTime::now_utc().unix_timestamp()
+    ));
+    create_private_directory(&preserved_directory)?;
+    sync_directory(&preserved_directory)?;
+    sync_directory(&recovery_kind)?;
+    let preserved_boundary =
+        inspect_child_directory(&recovery_kind_boundary, &preserved_directory)?;
+    let journal = RecoveryJournal {
+        operation_id,
+        action: RecoveryAction::StartEmpty,
+        state_kind: paths.state_kind,
+        backup_id: None,
+        phase: "preserving-live-store",
+    };
+    let mut journal_bytes =
+        serde_json::to_vec_pretty(&journal).map_err(BackupError::ManifestEncode)?;
+    journal_bytes.push(b'\n');
+    let journal_path = paths.recovery_journal();
+    let mut journal_file = private_create_new(&journal_path)?;
+    journal_file
+        .write_all(&journal_bytes)
+        .and_then(|()| journal_file.sync_all())
+        .map_err(|source| BackupError::Io {
+            path: journal_path.clone(),
+            source,
+        })?;
+    drop(journal_file);
+    sync_directory(&paths.base_dir)?;
+
+    for source in [
+        paths.database.clone(),
+        sqlite_sidecar_path(&paths.database, "-wal"),
+        sqlite_sidecar_path(&paths.database, "-shm"),
+        paths.environment_id.clone(),
+    ] {
+        match fs::symlink_metadata(&source) {
+            Ok(_) => preserve_live_file(&state_boundary, &source, &preserved_boundary)?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(source_error) => {
+                return Err(BackupError::Io {
+                    path: source,
+                    source: source_error,
+                }
+                .into());
+            }
+        }
+    }
+    sync_directory(&preserved_directory)?;
+    sync_directory(&paths.state_dir)?;
+    fs::remove_file(&journal_path).map_err(|source| BackupError::Io {
+        path: journal_path.clone(),
+        source,
+    })?;
+    sync_directory(&paths.base_dir)?;
+    Ok(RecoveryResult {
+        operation_id,
+        action: RecoveryAction::StartEmpty,
+        preserved_directory,
+        storage_instance_id: None,
+    })
+}
+
+fn ensure_no_recovery_in_progress(paths: &StatePaths) -> Result<(), RecoveryError> {
+    if path_entry_exists(&paths.recovery_journal())? {
+        return Err(RecoveryError::RecoveryInProgress {
+            path: paths.recovery_journal(),
+        });
+    }
+    if let Some(path) = find_recovery_staging_entry(paths)? {
+        return Err(RecoveryError::RecoveryInProgress { path });
+    }
+    Ok(())
+}
+
+fn find_verified_backup_for_recovery(
+    paths: &StatePaths,
+    backup_id: Uuid,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<Option<VerifiedBackup>, BackupError> {
+    ensure_active(cancellation, Some(deadline))?;
+    let state_kind_directory = paths.backups_dir.join(state_kind_name(paths.state_kind));
+    let entries = match fs::read_dir(&state_kind_directory) {
+        Ok(entries) => entries,
+        Err(source) if source.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(source) => {
+            return Err(BackupError::Io {
+                path: state_kind_directory,
+                source,
+            });
+        }
+    };
+    let mut selected_entry_failed_verification = false;
+    for entry in entries {
+        ensure_active(cancellation, Some(deadline))?;
+        let entry = entry.map_err(|source| BackupError::Io {
+            path: state_kind_directory.clone(),
+            source,
+        })?;
+        let Some(storage_id) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| Uuid::parse_str(name).ok())
+            .map(StorageInstanceId::from_uuid)
+        else {
+            continue;
+        };
+        let selected_path = paths
+            .backup_store_dir(storage_id)
+            .join(backup_id.to_string());
+        let selected_entry_exists = match fs::symlink_metadata(&selected_path) {
+            Ok(_) => true,
+            Err(source) if source.kind() == std::io::ErrorKind::NotFound => false,
+            Err(source) => {
+                return Err(BackupError::Io {
+                    path: selected_path,
+                    source,
+                });
+            }
+        };
+        let Ok(inventory) =
+            inventory_blocking(paths, storage_id, Some(cancellation), Some(deadline))
+        else {
+            selected_entry_failed_verification |= selected_entry_exists;
+            continue;
+        };
+        if let Some(backup) = inventory
+            .verified
+            .into_iter()
+            .find(|backup| backup.manifest.backup_id == backup_id)
+        {
+            return Ok(Some(backup));
+        }
+        selected_entry_failed_verification |= selected_entry_exists;
+    }
+    if selected_entry_failed_verification {
+        return Err(BackupError::Verification(
+            "the selected backup exists but failed verification".to_owned(),
+        ));
+    }
+    Ok(None)
+}
+
+fn copy_verified_database(
+    selected: &VerifiedBackup,
+    destination: &Path,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Result<(), BackupError> {
+    let source_snapshot = plain_path_snapshot(&selected.database, PlainPathKind::File)?;
+    if source_snapshot.identity != selected.identity.database {
+        return Err(BackupError::Verification(
+            "selected backup changed before restore staging".to_owned(),
+        ));
+    }
+    let mut source =
+        open_path_without_following(&selected.database, PlainPathKind::File).map_err(|source| {
+            BackupError::Io {
+                path: selected.database.clone(),
+                source,
+            }
+        })?;
+    let opened = source.metadata().map_err(|source| BackupError::Io {
+        path: selected.database.clone(),
+        source,
+    })?;
+    let opened_snapshot = file_snapshot(&source, &opened).map_err(|source| BackupError::Io {
+        path: selected.database.clone(),
+        source,
+    })?;
+    if opened_snapshot.identity != selected.identity.database {
+        return Err(BackupError::Verification(
+            "selected backup changed while opening restore source".to_owned(),
+        ));
+    }
+    let mut target = private_create_new(destination)?;
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        ensure_active(cancellation, Some(deadline))?;
+        let count = source.read(&mut buffer).map_err(|source| BackupError::Io {
+            path: selected.database.clone(),
+            source,
+        })?;
+        if count == 0 {
+            break;
+        }
+        target
+            .write_all(&buffer[..count])
+            .map_err(|source| BackupError::Io {
+                path: destination.to_path_buf(),
+                source,
+            })?;
+    }
+    target.sync_all().map_err(|source| BackupError::Io {
+        path: destination.to_path_buf(),
+        source,
+    })?;
+    drop(target);
+    let (size, sha256) = database_size_and_hash(destination, Some(cancellation), Some(deadline))?;
+    if size != selected.manifest.database_size_bytes || sha256 != selected.manifest.sha256 {
+        return Err(BackupError::Verification(
+            "staged restore database does not match its verified manifest".to_owned(),
+        ));
+    }
+    let integrity = quick_check_database(destination, Some(cancellation), Some(deadline))?;
+    if integrity != "ok" {
+        return Err(BackupError::QuickCheck {
+            path: destination.to_path_buf(),
+            detail: integrity,
+        });
+    }
+    Ok(())
+}
+
+fn preserve_live_file(
+    state: &BoundDirectory,
+    source: &Path,
+    preserved: &BoundDirectory,
+) -> Result<(), BackupError> {
+    let snapshot = inspect_plain_child_file(state, source)?;
+    let destination = preserved.path.join(
+        source
+            .file_name()
+            .ok_or_else(|| BackupError::Verification("live store file has no name".to_owned()))?,
+    );
+    if fs::symlink_metadata(&destination).is_ok() {
+        return Err(BackupError::Verification(
+            "recovery preservation destination already exists".to_owned(),
+        ));
+    }
+    fs::rename(source, &destination).map_err(|source_error| BackupError::Io {
+        path: source.to_path_buf(),
+        source: source_error,
+    })?;
+    let preserved_snapshot = inspect_plain_child_file(preserved, &destination)?;
+    if preserved_snapshot.identity != snapshot.identity {
+        return Err(BackupError::Verification(
+            "preserved live store file identity changed".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn move_staged_file(
+    staging: &BoundDirectory,
+    source: &Path,
+    destination: &Path,
+) -> Result<(), BackupError> {
+    let snapshot = inspect_plain_child_file(staging, source)?;
+    if fs::symlink_metadata(destination).is_ok() {
+        return Err(BackupError::Verification(
+            "live restore destination unexpectedly exists".to_owned(),
+        ));
+    }
+    fs::rename(source, destination).map_err(|source_error| BackupError::Io {
+        path: destination.to_path_buf(),
+        source: source_error,
+    })?;
+    let confirmed = plain_path_snapshot(destination, PlainPathKind::File)?;
+    if confirmed.identity != snapshot.identity {
+        return Err(BackupError::Verification(
+            "restored live file identity changed during publication".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+fn sqlite_sidecar_path(database: &Path, suffix: &str) -> PathBuf {
+    let mut path = database.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
 }
 
 impl BackupStoreBoundary {
@@ -1759,6 +2672,81 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema version")
+    }
+
+    #[tokio::test]
+    async fn restore_failure_after_preservation_keeps_the_journal_and_recoverable_live_files() {
+        let root = TempDir::new().expect("recovery seam root");
+        let mut config = ServerConfig::new(root.path());
+        let resolved = resolve_data_root(config.data_root_request.clone()).expect("resolve root");
+        config.base_dir.clone_from(&resolved.effective);
+        config.resolved_data_root = Some(resolved.clone());
+        let paths = StatePaths::from_config(&config);
+        fs::create_dir_all(&paths.state_dir).expect("state directory");
+        let mut setup = Connection::open(&paths.database).expect("source database");
+        run_migrations(&mut setup, None).expect("source schema");
+        setup
+            .execute_batch(
+                "INSERT INTO projection_projects (
+                   project_id, title, workspace_root, default_model_selection_json,
+                   scripts_json, created_at, updated_at, deleted_at
+                 ) VALUES ('recovery-seam', 'Preserved', '/tmp/recovery-seam', NULL, '{}',
+                           '2026-08-10T00:00:00Z', '2026-08-10T00:00:00Z', NULL)",
+            )
+            .expect("source row");
+        drop(setup);
+        let storage_instance_id = StorageInstanceId::from_uuid(Uuid::new_v4());
+        fs::write(&paths.environment_id, format!("{storage_instance_id}\n"))
+            .expect("source marker");
+        let database = Database::open_existing(&paths.database)
+            .await
+            .expect("source worker");
+        let prepared = PreparedStore {
+            database: database.clone(),
+            storage_instance_id,
+            classification: crate::persistence::StoreClassification::Existing,
+            paths: paths.clone(),
+        };
+        let backup = create_verified_backup(
+            &database,
+            &prepared,
+            BackupTrigger::PreUpdate,
+            "recovery-seam-test",
+        )
+        .await
+        .expect("verified backup");
+        drop(prepared);
+        database.close().await;
+
+        let error = restore_backup_with_fault(
+            &resolved,
+            backup.manifest.backup_id,
+            RecoveryFault::AfterPreserve,
+        )
+        .await
+        .expect_err("injected post-preservation failure");
+
+        assert!(matches!(
+            error,
+            RecoveryError::Backup(BackupError::Verification(_))
+        ));
+        assert!(paths.recovery_journal().is_file());
+        assert!(!paths.database.exists());
+        assert!(!paths.environment_id.exists());
+        let recovery_entries = fs::read_dir(paths.recovery_dir())
+            .expect("recovery directory")
+            .map(|entry| entry.expect("recovery entry").path())
+            .collect::<Vec<_>>();
+        assert_eq!(recovery_entries.len(), 1);
+        assert!(recovery_entries[0].join("state.sqlite").is_file());
+        assert!(recovery_entries[0].join("environment-id").is_file());
+        let startup = crate::persistence::prepare_store(&config)
+            .await
+            .expect_err("journal must block startup after interrupted restore");
+        assert!(matches!(
+            startup,
+            crate::persistence::StoreStartupError::RecoveryIncomplete { .. }
+        ));
     }
 
     #[tokio::test]

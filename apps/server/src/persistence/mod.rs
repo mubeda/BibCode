@@ -7,7 +7,9 @@ mod store;
 
 pub use backup::{
     BackupError, BackupInventory, BackupInventoryIssue, BackupManifest, BackupTrigger,
-    StoreOperationGuard, VerifiedBackup, create_verified_backup, inventory_verified_backups,
+    RecoveryAction, RecoveryError, RecoveryResult, StoreInspection, StoreInspectionStatus,
+    StoreOperationGuard, StoreRuntimeGuard, VerifiedBackup, create_verified_backup, inspect_store,
+    inventory_verified_backups, preserve_and_start_empty, restore_backup,
 };
 pub use database::{Database, PersistenceError, Result};
 pub use migrations::{MIGRATIONS, Migration, apply_migrations, pending_migrations, run_migrations};

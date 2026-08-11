@@ -90,6 +90,33 @@ impl StatePaths {
             .join(storage_instance_id.to_string())
     }
 
+    #[must_use]
+    pub fn recovery_dir(&self) -> PathBuf {
+        self.base_dir.join("recovery").join(match self.state_kind {
+            StateKind::Userdata => "userdata",
+            StateKind::Dev => "dev",
+        })
+    }
+
+    #[must_use]
+    pub fn recovery_journal(&self) -> PathBuf {
+        self.base_dir.join(match self.state_kind {
+            StateKind::Userdata => ".bibcode-recovery-userdata.json",
+            StateKind::Dev => ".bibcode-recovery-dev.json",
+        })
+    }
+
+    #[must_use]
+    pub fn recovery_staging_dir(&self, operation_id: Uuid) -> PathBuf {
+        self.base_dir
+            .join(format!(".{operation_id}.recovery-staging"))
+    }
+
+    #[must_use]
+    pub fn runtime_lock(&self) -> PathBuf {
+        self.base_dir.join(".bibcode-runtime.lock")
+    }
+
     pub async fn ensure_directories_without_database_side_effects(&self) -> Result<()> {
         for directory in [
             &self.state_dir,
