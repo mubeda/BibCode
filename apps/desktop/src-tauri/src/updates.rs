@@ -925,10 +925,18 @@ async fn decode_maintenance_response<T: serde::de::DeserializeOwned>(
 ) -> Result<T, String> {
     if !response.status().is_success() {
         let status = response.status();
+        let detail = response
+            .json::<UpdateMaintenanceErrorResponse>()
+            .await
+            .ok()
+            .map(|error| bounded_maintenance_error_detail(&error.message));
         return Err(format!(
-            "Could not {operation} {} for update protection (HTTP {}).",
+            "Could not {operation} {} for update protection (HTTP {}).{}",
             config.label,
-            status.as_u16()
+            status.as_u16(),
+            detail
+                .map(|detail| format!(" {detail}"))
+                .unwrap_or_default()
         ));
     }
     response.json::<T>().await.map_err(|error| {
@@ -937,6 +945,23 @@ async fn decode_maintenance_response<T: serde::de::DeserializeOwned>(
             config.label
         )
     })
+}
+
+#[derive(Deserialize)]
+struct UpdateMaintenanceErrorResponse {
+    message: String,
+}
+
+fn bounded_maintenance_error_detail(message: &str) -> String {
+    const MAX_CHARS: usize = 320;
+
+    let single_line = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    if single_line.chars().count() <= MAX_CHARS {
+        return single_line;
+    }
+    let mut bounded = single_line.chars().take(MAX_CHARS).collect::<String>();
+    bounded.push_str("...");
+    bounded
 }
 
 async fn cancel_stop_and_restart(
@@ -1159,6 +1184,18 @@ mod tests {
 
     const TEST_PUBLIC_KEY: &str = "untrusted comment: minisign public key E7620F1842B4E81F\nRWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
     const TEST_SIGNATURE: &str = "untrusted comment: signature from minisign secret key\nRWQf6LRCGA9i59SLOFxz6NxvASXDJeRtuZykwQepbDEGt87ig1BNpWaVWuNrm73YiIiJbq71Wi+dP9eKL8OC351vwIasSSbXxwA=\ntrusted comment: timestamp:1555779966\tfile:test\nQtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfNQUaOAA==";
+
+    #[test]
+    fn maintenance_error_details_are_single_line_and_bounded() {
+        assert_eq!(
+            bounded_maintenance_error_detail("backup\n  verification failed"),
+            "backup verification failed"
+        );
+        let oversized = "x".repeat(400);
+        let bounded = bounded_maintenance_error_detail(&oversized);
+        assert_eq!(bounded.chars().count(), 323);
+        assert!(bounded.ends_with("..."));
+    }
 
     #[test]
     fn primary_protection_failure_cannot_be_excluded() {
