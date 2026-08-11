@@ -450,11 +450,6 @@ enum SupervisorMessage {
         target: ProviderActivityNativeTarget,
         response: oneshot::Sender<Result<ActivityTargetDispatchDisposition, ProviderRuntimeError>>,
     },
-    DispatchObservedActivityJobs {
-        thread_id: String,
-        generation: ActivityRuntimeGeneration,
-        jobs: Vec<ActivityDispatchJob>,
-    },
     InvalidateActivityControls {
         thread_id: String,
         generation: ActivityRuntimeGeneration,
@@ -482,6 +477,21 @@ enum SupervisorMessage {
         idle_generation: Arc<AtomicU64>,
         generation: u64,
     },
+    ActivityDispatchTaskComplete {
+        thread_id: String,
+        generation: ActivityRuntimeGeneration,
+    },
+}
+
+struct ActivityDispatchEnvelope {
+    thread_id: String,
+    generation: ActivityRuntimeGeneration,
+    jobs: Vec<ActivityDispatchJob>,
+}
+
+enum SupervisorInput {
+    Control(SupervisorMessage),
+    Activity(ActivityDispatchEnvelope),
 }
 
 struct SessionEntry {
@@ -504,6 +514,8 @@ struct SessionEntry {
     event_cancellation: CancellationToken,
     idle_generation: Arc<AtomicU64>,
     terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
+    activity_dispatch_sender: mpsc::Sender<ActivityDispatchEnvelope>,
+    activity_dispatch_capacity: usize,
     idle_timeout: Duration,
 }
 
@@ -664,6 +676,7 @@ impl ProviderRuntimeSupervisor {
         let session_idle_timeout = options.session_idle_timeout;
         let (sender, receiver) = mpsc::channel(queue_capacity);
         let (terminal_sender, terminal_receiver) = mpsc::unbounded_channel();
+        let (activity_dispatch_sender, activity_dispatch_receiver) = mpsc::channel(queue_capacity);
         let stopped = CancellationToken::new();
         let worker_stopped = stopped.clone();
         let worker_sender = sender.clone();
@@ -678,6 +691,8 @@ impl ProviderRuntimeSupervisor {
                 worker_sender,
                 terminal_sender,
                 terminal_receiver,
+                activity_dispatch_sender,
+                activity_dispatch_receiver,
                 queue_capacity,
                 session_idle_timeout,
                 worker_stopped,
@@ -1921,6 +1936,8 @@ async fn run_supervisor(
     sender: mpsc::Sender<SupervisorMessage>,
     terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
     mut terminal_receiver: mpsc::UnboundedReceiver<SupervisorMessage>,
+    activity_dispatch_sender: mpsc::Sender<ActivityDispatchEnvelope>,
+    mut activity_dispatch_receiver: mpsc::Receiver<ActivityDispatchEnvelope>,
     deferred_capacity: usize,
     session_idle_timeout: Duration,
     stopped: CancellationToken,
@@ -1932,14 +1949,40 @@ async fn run_supervisor(
     let mut next_delivery_generation = 0_u64;
     let mut deferred_configuration = DeferredConfigurations::new();
     loop {
-        let message = tokio::select! {
+        for entry in sessions.values_mut() {
+            reap_completed_activity_tasks(&mut entry.activity_late_dispatch_tasks).await;
+        }
+        let activity_task_count = sessions
+            .values()
+            .map(|entry| entry.activity_late_dispatch_tasks.len())
+            .sum::<usize>();
+        let input = tokio::select! {
+            biased;
+            message = terminal_receiver.recv(), if !terminal_receiver.is_closed() => {
+                let Some(message) = message else { continue };
+                SupervisorInput::Control(message)
+            }
             message = receiver.recv() => {
                 let Some(message) = message else { break };
-                message
+                SupervisorInput::Control(message)
             }
-            message = terminal_receiver.recv() => {
-                let Some(message) = message else { continue };
-                message
+            envelope = activity_dispatch_receiver.recv(),
+                if activity_task_count < deferred_capacity => {
+                let Some(envelope) = envelope else { continue };
+                SupervisorInput::Activity(envelope)
+            }
+        };
+        let message = match input {
+            SupervisorInput::Control(message) => message,
+            SupervisorInput::Activity(envelope) => {
+                dispatch_activity_envelope(
+                    &activity,
+                    &mut sessions,
+                    envelope,
+                    terminal_sender.clone(),
+                )
+                .await;
+                continue;
             }
         };
         match message {
@@ -1953,6 +1996,8 @@ async fn run_supervisor(
                     operational_log.as_ref(),
                     None,
                     terminal_sender.clone(),
+                    activity_dispatch_sender.clone(),
+                    deferred_capacity,
                     session_idle_timeout,
                     activity_cancellation.clone(),
                 )
@@ -2165,41 +2210,6 @@ async fn run_supervisor(
                     }
                 }
             }
-            SupervisorMessage::DispatchObservedActivityJobs {
-                thread_id,
-                generation,
-                jobs,
-            } => {
-                let activity_enabled = activity.agent_activity_controller().snapshot().enabled;
-                let Some(entry) = sessions.get_mut(&thread_id) else {
-                    continue;
-                };
-                reap_completed_activity_tasks(&mut entry.activity_late_dispatch_tasks).await;
-                let control_current = entry.activity_control.read().await.is_some();
-                if jobs.is_empty()
-                    || !activity_enabled
-                    || !control_current
-                    || entry.activity_runtime_generation != generation
-                    || !entry.configuration_healthy
-                    || entry.activity_late_dispatch_tasks.len() >= ACTIVITY_DELTA_MAX_CHANGES
-                {
-                    continue;
-                }
-                let service = entry.activity_cancellation.read().await.clone();
-                let Some(service) = service else {
-                    continue;
-                };
-                let dispatch_cancellation = entry.activity_late_dispatch_cancellation.clone();
-                entry
-                    .activity_late_dispatch_tasks
-                    .push(tokio::spawn(async move {
-                        tokio::select! {
-                            biased;
-                            () = dispatch_cancellation.cancelled() => {}
-                            () = service.dispatch_observed_jobs(jobs) => {}
-                        }
-                    }));
-            }
             SupervisorMessage::InvalidateActivityControls {
                 thread_id,
                 generation,
@@ -2212,6 +2222,16 @@ async fn run_supervisor(
                     cancel_and_reap_activity_tasks(entry).await;
                 }
                 let _ = response.send(());
+            }
+            SupervisorMessage::ActivityDispatchTaskComplete {
+                thread_id,
+                generation,
+            } => {
+                if let Some(entry) = sessions.get_mut(&thread_id)
+                    && entry.activity_runtime_generation == generation
+                {
+                    reap_completed_activity_tasks(&mut entry.activity_late_dispatch_tasks).await;
+                }
             }
             #[cfg(test)]
             SupervisorMessage::InspectActivityRuntimeGeneration {
@@ -2607,6 +2627,73 @@ fn provider_supports_agent_activity(provider: &str) -> bool {
     matches!(provider, "codex" | "claude" | "claudeAgent" | "opencode")
 }
 
+async fn dispatch_activity_envelope(
+    activity: &ActivityProjection,
+    sessions: &mut HashMap<String, SessionEntry>,
+    envelope: ActivityDispatchEnvelope,
+    terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
+) {
+    if envelope.jobs.is_empty()
+        || envelope.jobs.len() > ACTIVITY_DELTA_MAX_CHANGES
+        || envelope
+            .jobs
+            .iter()
+            .any(|job| job.generation != envelope.generation)
+        || !activity.agent_activity_controller().snapshot().enabled
+    {
+        return;
+    }
+    let Some(entry) = sessions.get_mut(&envelope.thread_id) else {
+        return;
+    };
+    let control_current = entry
+        .activity_control
+        .read()
+        .await
+        .as_ref()
+        .is_some_and(|registration| registration.generation() == envelope.generation);
+    if !control_current
+        || entry.activity_runtime_generation != envelope.generation
+        || !entry.configuration_healthy
+    {
+        return;
+    }
+    let service = entry.activity_cancellation.read().await.clone();
+    let Some(service) = service else {
+        return;
+    };
+    let dispatch_cancellation = entry.activity_late_dispatch_cancellation.clone();
+    let thread_id = envelope.thread_id;
+    let generation = envelope.generation;
+    let completion_thread_id = thread_id.clone();
+    let completion_generation = generation.clone();
+    entry
+        .activity_late_dispatch_tasks
+        .push(tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                () = dispatch_cancellation.cancelled() => {}
+                () = service.dispatch_observed_jobs(envelope.jobs) => {}
+            }
+            let _ = terminal_sender.send(SupervisorMessage::ActivityDispatchTaskComplete {
+                thread_id: completion_thread_id,
+                generation: completion_generation,
+            });
+        }));
+}
+
+async fn send_activity_dispatch_envelope(
+    sender: &mpsc::Sender<ActivityDispatchEnvelope>,
+    cancellation: &CancellationToken,
+    envelope: ActivityDispatchEnvelope,
+) -> bool {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => false,
+        result = sender.send(envelope) => result.is_ok(),
+    }
+}
+
 async fn ensure_live_activity_scope(
     activity: &ActivityProjection,
     request: &ProviderLaunchRequest,
@@ -2778,6 +2865,8 @@ async fn launch_session(
     operational_log: Option<&ProviderOperationalLog>,
     inherited_activity_lifecycle: Option<SharedActivityLifecycle>,
     terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
+    activity_dispatch_sender: mpsc::Sender<ActivityDispatchEnvelope>,
+    activity_dispatch_capacity: usize,
     idle_timeout: Duration,
     activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
 ) -> Result<(), ProviderRuntimeError> {
@@ -2928,10 +3017,8 @@ async fn launch_session(
         activity.clone(),
         activity_lifecycle.clone(),
         activity_capable,
-        activity_runtime_generation.clone(),
         activity_control.clone(),
-        activity_dispatch_cancellation.clone(),
-        activity_late_dispatch_cancellation.clone(),
+        activity_dispatch_sender.clone(),
         format!("supervisor:stream-ended:{activity_lifecycle_id}"),
         cancellation.clone(),
         operational_log.cloned(),
@@ -2961,6 +3048,8 @@ async fn launch_session(
             event_cancellation: cancellation,
             idle_generation,
             terminal_sender,
+            activity_dispatch_sender,
+            activity_dispatch_capacity,
             idle_timeout,
         },
     );
@@ -3374,12 +3463,16 @@ async fn restart_session(
     let mut terminal_sender = None;
     let mut idle_timeout = None;
     let mut activity_cancellation = None;
+    let mut activity_dispatch_sender = None;
+    let mut activity_dispatch_capacity = None;
     if let Some(entry) = sessions.get_mut(thread_id) {
         launch.resume_cursor = entry.resume_cursor.clone();
         inherited_activity_lifecycle = Some(entry.activity_lifecycle.clone());
         terminal_sender = Some(entry.terminal_sender.clone());
         idle_timeout = Some(entry.idle_timeout);
         activity_cancellation = Some(entry.activity_cancellation.clone());
+        activity_dispatch_sender = Some(entry.activity_dispatch_sender.clone());
+        activity_dispatch_capacity = Some(entry.activity_dispatch_capacity);
         entry.activity_control.write().await.take();
         cancel_and_reap_activity_tasks(entry).await;
         entry.driver.shutdown().await?;
@@ -3417,6 +3510,12 @@ async fn restart_session(
         operational_log,
         inherited_activity_lifecycle,
         terminal_sender.ok_or_else(|| ProviderRuntimeError::SessionNotFound {
+            thread_id: thread_id.to_owned(),
+        })?,
+        activity_dispatch_sender.ok_or_else(|| ProviderRuntimeError::SessionNotFound {
+            thread_id: thread_id.to_owned(),
+        })?,
+        activity_dispatch_capacity.ok_or_else(|| ProviderRuntimeError::SessionNotFound {
             thread_id: thread_id.to_owned(),
         })?,
         idle_timeout.ok_or_else(|| ProviderRuntimeError::SessionNotFound {
@@ -3555,10 +3654,8 @@ fn spawn_event_pump(
     activity: ActivityProjection,
     activity_lifecycle: SharedActivityLifecycle,
     activity_capable: bool,
-    activity_runtime_generation: ActivityRuntimeGeneration,
     activity_control: Arc<RwLock<Option<Arc<ActivityRuntimeControlRegistration>>>>,
-    activity_dispatch_cancellation: CancellationToken,
-    activity_late_dispatch_cancellation: CancellationToken,
+    activity_dispatch_sender: mpsc::Sender<ActivityDispatchEnvelope>,
     stream_ended_event_key: String,
     cancellation: CancellationToken,
     operational_log: Option<ProviderOperationalLog>,
@@ -3647,6 +3744,9 @@ fn spawn_event_pump(
                                 native_event_id.as_str(),
                             );
                             let registration = activity_control.read().await.clone();
+                            let observed_generation = registration
+                                .as_ref()
+                                .map(|registration| registration.generation());
                             let jobs = if let Some(registration) = &registration {
                                 Some(
                                     activity
@@ -3675,25 +3775,36 @@ fn spawn_event_pump(
                             };
                             let projection_succeeded = match projection_result {
                                 Err(error) => {
-                                    activity_control.write().await.take();
-                                    activity_late_dispatch_cancellation.cancel();
-                                    activity_dispatch_cancellation.cancel();
+                                    if let Some(generation) = &observed_generation {
+                                        let mut current_registration = activity_control.write().await;
+                                        if current_registration.as_ref().is_some_and(|registration| {
+                                            registration.generation() == *generation
+                                        }) {
+                                            current_registration.take();
+                                        }
+                                    }
                                     drop(registration);
                                     let (response, completion) = oneshot::channel();
-                                    let invalidation_sent = terminal_sender.send(
-                                        SupervisorMessage::InvalidateActivityControls {
-                                            thread_id: launch.thread_id.clone(),
-                                            generation: activity_runtime_generation.clone(),
-                                            response,
-                                        },
-                                    );
+                                    let invalidation_sent = observed_generation
+                                        .clone()
+                                        .is_some_and(|generation| {
+                                            terminal_sender
+                                                .send(
+                                                    SupervisorMessage::InvalidateActivityControls {
+                                                        thread_id: launch.thread_id.clone(),
+                                                        generation,
+                                                        response,
+                                                    },
+                                                )
+                                                .is_ok()
+                                        });
                                     tracing::warn!(
                                         %error,
                                         activity_mutation_count,
                                         activity_control_count,
                                         "failed to project provider activity batch; invalidated targeted controls"
                                     );
-                                    if invalidation_sent.is_ok() {
+                                    if invalidation_sent {
                                         tokio::select! {
                                             biased;
                                             () = cancellation.cancelled() => return,
@@ -3712,16 +3823,31 @@ fn spawn_event_pump(
                                 Ok(_) => true,
                             };
                             if projection_succeeded
+                                && let Some(generation) = observed_generation
                                 && let Some(jobs) = jobs
                                 && !jobs.is_empty()
                             {
-                                let _ = terminal_sender.send(
-                                    SupervisorMessage::DispatchObservedActivityJobs {
+                                if jobs.len() > ACTIVITY_DELTA_MAX_CHANGES {
+                                    tracing::warn!(
+                                        activity_dispatch_job_count = jobs.len(),
+                                        "dropped oversized targeted activity dispatch batch"
+                                    );
+                                } else {
+                                    let envelope = ActivityDispatchEnvelope {
                                         thread_id: launch.thread_id.clone(),
-                                        generation: activity_runtime_generation.clone(),
+                                        generation,
                                         jobs,
-                                    },
-                                );
+                                    };
+                                    if !send_activity_dispatch_envelope(
+                                        &activity_dispatch_sender,
+                                        &cancellation,
+                                        envelope,
+                                    )
+                                    .await
+                                    {
+                                        return;
+                                    }
+                                }
                             }
                         } else {
                             tracing::warn!(
@@ -8406,6 +8532,7 @@ mod tests {
         rollbacks: Vec<i64>,
         shutdowns: usize,
         send_gate: Option<Arc<tokio::sync::Notify>>,
+        send_entered: Option<Arc<tokio::sync::Notify>>,
         reconcile_gate: Option<Arc<tokio::sync::Notify>>,
         reconcile_started: Option<Arc<tokio::sync::Notify>>,
         targeted_calls: Vec<String>,
@@ -8444,7 +8571,13 @@ mod tests {
         ) -> super::BoxRuntimeFuture<'_, Result<Option<String>, super::ProviderRuntimeError>>
         {
             Box::pin(async move {
-                let gate = self.state.lock().unwrap().send_gate.clone();
+                let (gate, entered) = {
+                    let state = self.state.lock().unwrap();
+                    (state.send_gate.clone(), state.send_entered.clone())
+                };
+                if let Some(entered) = entered {
+                    entered.notify_one();
+                }
                 if let Some(gate) = gate {
                     gate.notified().await;
                 }
@@ -10276,7 +10409,7 @@ done
     }
 
     #[tokio::test]
-    async fn provider_batches_dispatch_late_children_and_empty_controls_retire_residuals() {
+    async fn post_reenable_provider_batches_use_fresh_generation_for_late_children() {
         let engine = supervisor_engine().await;
         let activity = super::ActivityProjection::new(ActivityRepository::new(
             engine.repositories().database().clone(),
@@ -10306,6 +10439,16 @@ done
         let mut launch = native_launch(&temp, "codex");
         launch.thread_id = "t1".to_owned();
         supervisor.launch(launch).await.expect("launch runtime");
+        activity.agent_activity_controller().disable().await;
+        supervisor
+            .set_agent_activity_enabled(false)
+            .await
+            .expect("disable runtime activity");
+        activity.agent_activity_controller().enable();
+        supervisor
+            .set_agent_activity_enabled(true)
+            .await
+            .expect("re-enable runtime activity");
         let scope = ActivityScopeRef::Thread {
             thread_id: "t1".to_owned(),
         };
@@ -10431,6 +10574,252 @@ done
         .await
         .expect("terminal residuals retired");
         assert_eq!(state.lock().unwrap().targeted_calls.len(), 2);
+
+        supervisor.shutdown().await.expect("shutdown supervisor");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn bounded_activity_handoff_cancellation_does_not_enqueue_or_block() {
+        let (sender, mut receiver) = mpsc::channel(1);
+        let generation = ActivityRuntimeGeneration::new();
+        sender
+            .send(super::ActivityDispatchEnvelope {
+                thread_id: "t1".to_owned(),
+                generation: generation.clone(),
+                jobs: Vec::new(),
+            })
+            .await
+            .expect("fill bounded handoff");
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let send_cancellation = cancellation.clone();
+        let send = tokio::spawn(async move {
+            super::send_activity_dispatch_envelope(
+                &sender,
+                &send_cancellation,
+                super::ActivityDispatchEnvelope {
+                    thread_id: "t1".to_owned(),
+                    generation,
+                    jobs: Vec::new(),
+                },
+            )
+            .await
+        });
+
+        tokio::task::yield_now().await;
+        assert!(!send.is_finished(), "full handoff must backpressure");
+        cancellation.cancel();
+        assert!(
+            !timeout(std::time::Duration::from_secs(2), send)
+                .await
+                .expect("cancelled handoff returns")
+                .expect("handoff task"),
+            "cancelled handoff must report that it did not enqueue"
+        );
+        assert_eq!(receiver.len(), 1);
+        receiver
+            .recv()
+            .await
+            .expect("first envelope remains queued");
+        assert!(receiver.try_recv().is_err());
+
+        let (closed_sender, closed_receiver) = mpsc::channel(1);
+        drop(closed_receiver);
+        assert!(
+            !super::send_activity_dispatch_envelope(
+                &closed_sender,
+                &tokio_util::sync::CancellationToken::new(),
+                super::ActivityDispatchEnvelope {
+                    thread_id: "t1".to_owned(),
+                    generation: ActivityRuntimeGeneration::new(),
+                    jobs: Vec::new(),
+                },
+            )
+            .await,
+            "closed handoff must fail without blocking"
+        );
+    }
+
+    #[tokio::test]
+    async fn late_job_handoff_backpressures_at_configured_capacity_without_dropping_targets() {
+        const LATE_BATCH_COUNT: usize = 16;
+        let engine = supervisor_engine().await;
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let send_gate = Arc::new(tokio::sync::Notify::new());
+        let send_entered = Arc::new(tokio::sync::Notify::new());
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            send_gate: Some(send_gate.clone()),
+            send_entered: Some(send_entered.clone()),
+            activity_capabilities: crate::activity::ActivityCapabilities::structured_full(false),
+            ..SupervisorDriverState::default()
+        }));
+        let (events_tx, events_rx) = mpsc::channel(1);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state: state.clone(),
+                events: StdMutex::new(Some(events_rx)),
+            }),
+            activity.clone(),
+            super::SupervisorOptions {
+                queue_capacity: 2,
+                ..super::SupervisorOptions::default()
+            },
+        );
+        let cancellation = ActivityCancellationService::new(
+            activity.activity_control_registry(),
+            Arc::new(supervisor.clone()),
+        );
+        supervisor
+            .attach_activity_cancellation(cancellation.clone())
+            .await;
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "codex");
+        launch.thread_id = "t1".to_owned();
+        supervisor.launch(launch).await.expect("launch runtime");
+        let scope = ActivityScopeRef::Thread {
+            thread_id: "t1".to_owned(),
+        };
+        events_tx
+            .send(super::ProviderEvent {
+                native_event_id: Some(
+                    super::ProviderNativeEventId::new("saturation-root".to_owned())
+                        .expect("native event id"),
+                ),
+                event_type: super::ACTIVITY_ONLY_PROVIDER_EVENT_TYPE.to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: None,
+                request_id: None,
+                payload: json!({}),
+                activity: vec![
+                    ProviderActivityMutation::upsert_actor("actor:root", None, "Root", "running")
+                        .expect("root mutation"),
+                ],
+                activity_controls: super::ProviderActivityControls::from_updates(vec![
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id: "actor:root".to_owned(),
+                        target: Some(ProviderActivityNativeTarget::codex_turn(
+                            "native-root-thread".to_owned(),
+                            "native-root-turn".to_owned(),
+                        )),
+                    },
+                ]),
+            })
+            .await
+            .expect("root batch");
+        timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if activity
+                    .snapshot(&scope)
+                    .await
+                    .expect("root snapshot")
+                    .control
+                    .actors
+                    .len()
+                    == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("root control");
+        cancellation
+            .cancel_subtree(scope, "thread:t1", "actor:root", 1)
+            .await
+            .expect("root cancellation");
+
+        let blocked_supervisor = supervisor.clone();
+        let blocked_command = tokio::spawn(async move {
+            blocked_supervisor
+                .handle_orchestration(
+                    serde_json::from_value(json!({
+                        "type":"thread.turn.start", "commandId":"block-supervisor",
+                        "threadId":"t1",
+                        "message":{"messageId":"message","role":"user","text":"hold","attachments":[]},
+                        "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                        "runtimeMode":"full-access", "interactionMode":"default",
+                        "createdAt":"2026-07-16T00:00:00Z"
+                    }))
+                    .expect("blocking command"),
+                )
+                .await
+        });
+        timeout(std::time::Duration::from_secs(2), send_entered.notified())
+            .await
+            .expect("supervisor stalled in provider send");
+
+        let producer = tokio::spawn(async move {
+            for index in 0..LATE_BATCH_COUNT {
+                let actor_id = format!("actor:late:{index}");
+                events_tx
+                    .send(super::ProviderEvent {
+                        native_event_id: Some(
+                            super::ProviderNativeEventId::new(format!("saturation-{index}"))
+                                .expect("native event id"),
+                        ),
+                        event_type: super::ACTIVITY_ONLY_PROVIDER_EVENT_TYPE.to_owned(),
+                        thread_id: "t1".to_owned(),
+                        turn_id: None,
+                        request_id: None,
+                        payload: json!({}),
+                        activity: vec![
+                            ProviderActivityMutation::upsert_actor(
+                                actor_id.clone(),
+                                Some("actor:root"),
+                                format!("Late {index}"),
+                                "running",
+                            )
+                            .expect("late mutation"),
+                        ],
+                        activity_controls: super::ProviderActivityControls::from_updates(vec![
+                            ProviderActivityControlUpdate::ActorTarget {
+                                actor_id,
+                                target: Some(ProviderActivityNativeTarget::codex_turn(
+                                    format!("native-late-thread-{index}"),
+                                    format!("native-late-turn-{index}"),
+                                )),
+                            },
+                        ]),
+                    })
+                    .await
+                    .expect("late batch");
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        assert!(
+            !producer.is_finished(),
+            "late-job producer bypassed the bounded supervisor handoff"
+        );
+
+        send_gate.notify_waiters();
+        blocked_command
+            .await
+            .expect("blocking task")
+            .expect("blocking command completes");
+        timeout(std::time::Duration::from_secs(2), producer)
+            .await
+            .expect("backpressured producer resumes")
+            .expect("producer task");
+        timeout(std::time::Duration::from_secs(2), async {
+            while state.lock().unwrap().targeted_calls.len() != LATE_BATCH_COUNT + 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("every admitted exact target dispatched");
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.interrupts, 0);
+            for index in 0..LATE_BATCH_COUNT {
+                assert!(state.targeted_calls.contains(&format!(
+                    "codex:native-late-thread-{index}:native-late-turn-{index}"
+                )));
+            }
+        }
 
         supervisor.shutdown().await.expect("shutdown supervisor");
         engine.shutdown().await;
@@ -10759,7 +11148,7 @@ done
     }
 
     #[tokio::test]
-    async fn activity_projection_failure_invalidates_controls_without_dispatching_late_jobs() {
+    async fn post_reenable_projection_failure_invalidates_fresh_controls_and_suppresses_dispatch() {
         // Mutation caught: retaining the committed control overlay and dispatching its late-child
         // job after the durable Activity projection rejects the same provider batch.
         let engine = supervisor_engine().await;
@@ -10772,7 +11161,7 @@ done
         let targeted_active = Arc::new(AtomicUsize::new(0));
         let state = Arc::new(StdMutex::new(SupervisorDriverState {
             activity_capabilities: crate::activity::ActivityCapabilities::structured_full(false),
-            targeted_hold_after: Some(2),
+            targeted_hold_after: Some(1),
             targeted_entered: Some(targeted_entered.clone()),
             targeted_release: Some(targeted_release.clone()),
             targeted_active: targeted_active.clone(),
@@ -10799,6 +11188,16 @@ done
         let mut launch = native_launch(&temp, "codex");
         launch.thread_id = "t1".to_owned();
         supervisor.launch(launch).await.expect("launch runtime");
+        activity.agent_activity_controller().disable().await;
+        supervisor
+            .set_agent_activity_enabled(false)
+            .await
+            .expect("disable runtime activity");
+        activity.agent_activity_controller().enable();
+        supervisor
+            .set_agent_activity_enabled(true)
+            .await
+            .expect("re-enable runtime activity");
         let scope = ActivityScopeRef::Thread {
             thread_id: "t1".to_owned(),
         };
@@ -10875,11 +11274,21 @@ done
             root_snapshot.control.actors[0].state,
             crate::activity::ActivityActorControlState::Available
         );
-        cancellation
-            .cancel_subtree(scope.clone(), "thread:t1", "actor:root", 1)
-            .await
-            .expect("root cancellation admitted");
+        let direct_cancellation = cancellation.clone();
+        let direct_scope = scope.clone();
+        let direct_dispatch = tokio::spawn(async move {
+            direct_cancellation
+                .cancel_subtree(direct_scope, "thread:t1", "actor:root", 1)
+                .await
+        });
+        timeout(
+            std::time::Duration::from_secs(2),
+            targeted_entered.notified(),
+        )
+        .await
+        .expect("held direct dispatch entered");
         assert_eq!(state.lock().unwrap().targeted_calls.len(), 1);
+        assert_eq!(targeted_active.load(Ordering::Acquire), 1);
 
         events_tx
             .send(super::ProviderEvent {
@@ -10919,7 +11328,7 @@ done
         )
         .await
         .expect("held late dispatch entered");
-        assert_eq!(targeted_active.load(Ordering::Acquire), 1);
+        assert_eq!(targeted_active.load(Ordering::Acquire), 2);
 
         engine
             .repositories()
@@ -11008,8 +11417,12 @@ done
         .expect("release held late dispatch");
         assert!(
             !orphaned,
-            "projection failure left late provider I/O active"
+            "projection failure left direct or late provider I/O active"
         );
+        direct_dispatch
+            .await
+            .expect("direct cancellation task")
+            .expect("direct cancellation admission remains bounded");
         assert_eq!(
             cancellation
                 .retry_subtree_cancellation(scope, "thread:t1", "actor:root", 1)

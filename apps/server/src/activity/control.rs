@@ -679,6 +679,12 @@ pub(crate) struct ActivityRuntimeControlRegistration {
     publisher: ActivityControlEventPublisher,
 }
 
+impl ActivityRuntimeControlRegistration {
+    pub(crate) fn generation(&self) -> ActivityRuntimeGeneration {
+        self.generation.clone()
+    }
+}
+
 #[derive(Clone, Eq, PartialEq)]
 pub(crate) enum ProviderActivityControlUpdate {
     ActorTarget {

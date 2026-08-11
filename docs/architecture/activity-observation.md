@@ -99,11 +99,18 @@ superseded registration cannot remove its replacement.
 Structured provider batches install and reconcile their private control handles
 after validating the native event identity and before projecting display
 mutations. Any cancellation jobs discovered for late descendants start only
-after control observation and display projection have released their locks.
+after control observation and display projection have released their locks. The
+long-lived event pump reads the generation from the exact registration used for
+each observation; it does not retain a launch-time generation across Activity
+disablement and re-enablement. Late-job batches then cross a dedicated bounded
+handoff whose capacity matches the provider supervisor queue, with at most 256
+jobs per batch and no more active aggregate dispatch tasks than that configured
+capacity. A full handoff backpressures the event pump and session or shutdown
+cancellation abandons the pending send without orphaning provider I/O.
 Terminal display mutations reconcile the overlay even when the provider sends
 no control updates, so completed descendants cannot remain as cancellation
 residuals. If durable display projection rejects a batch after control
-observation, the provider supervisor invalidates that runtime generation,
+observation, the provider supervisor invalidates the exact observed generation,
 suppresses every returned dispatch job, and cancels and reaps its queued or
 in-flight targeted work before ordinary event handling continues. Restart,
 disablement, session stop, and shutdown use the same cancel-before-cleanup
