@@ -16,13 +16,13 @@ use super::model::{
     ACTIVITY_CURSOR_MAX_LENGTH, ACTIVITY_DELTA_MAX_CHANGES, ACTIVITY_DETAIL_MAX_LENGTH,
     ACTIVITY_ID_MAX_LENGTH, ACTIVITY_LABEL_MAX_LENGTH, ACTIVITY_PAGE_MAX_LENGTH,
     ACTIVITY_SUMMARY_MAX_LENGTH, ActivityActorSummary, ActivityCapabilities, ActivityChange,
-    ActivityCounts, ActivityDelta, ActivityDetailPage, ActivityEntry, ActivityEntryKind,
-    ActivityEntryTone, ActivityLifecycle, ActivityModelError, ActivityObservationState,
-    ActivityRecordKind, ActivityRecordSummary, ActivityRosterBucket, ActivityRosterPage,
-    ActivityScopeRef, ActivityScopeSeed, ActivitySection, ActivitySectionHealthMap,
-    ActivitySectionObservationState, ActivitySnapshot, ActivitySummaryCounts,
-    ActivityWorkItemSummary, ProviderActivityMutation, compare_timestamps, max_timestamp,
-    validate_text, validate_timestamp,
+    ActivityControlSnapshot, ActivityCounts, ActivityDelta, ActivityDetailPage, ActivityEntry,
+    ActivityEntryKind, ActivityEntryTone, ActivityLifecycle, ActivityModelError,
+    ActivityObservationState, ActivityRecordKind, ActivityRecordSummary, ActivityRosterBucket,
+    ActivityRosterPage, ActivityScopeRef, ActivityScopeSeed, ActivitySection,
+    ActivitySectionHealthMap, ActivitySectionObservationState, ActivitySnapshot,
+    ActivitySummaryCounts, ActivityWorkItemSummary, ProviderActivityMutation, compare_timestamps,
+    max_timestamp, validate_text, validate_timestamp,
 };
 use super::routing::AgentActivitySource;
 
@@ -1859,8 +1859,8 @@ fn snapshot(
     let (work_items, work_items_has_more) =
         load_snapshot_records(connection, &scope.scope_id, ActivityRecordKind::WorkItem)?;
     Ok(ActivitySnapshot {
-        protocol_version: 1,
-        scope_id: scope.scope_id,
+        protocol_version: 2,
+        scope_id: scope.scope_id.clone(),
         scope: scope.scope,
         revision: scope.revision,
         provider: scope.provider,
@@ -1887,6 +1887,7 @@ fn snapshot(
             .collect(),
         actors_has_more,
         work_items_has_more,
+        control: ActivityControlSnapshot::empty(scope.scope_id.clone()),
         updated_at: scope.updated_at,
     })
 }
@@ -1991,6 +1992,7 @@ fn list_roster(
     };
     Ok(ActivityRosterPage {
         records,
+        actor_controls: Vec::new(),
         next_cursor,
     })
 }
@@ -2083,6 +2085,7 @@ fn list_detail(
     };
     Ok(ActivityDetailPage {
         record,
+        actor_control: None,
         entries,
         next_cursor,
     })

@@ -616,6 +616,7 @@ impl CodexSessionRuntime {
                     background_work: false,
                     history_recovery: ActivityHistoryRecovery::Bounded,
                     terminal_observation: false,
+                    targeted_actor_cancellation: false,
                 },
                 reconciliation_epoch: 0,
                 reconciliation_pass_cancellation: CancellationToken::new(),
@@ -1894,6 +1895,7 @@ impl CodexSessionRuntime {
             background_work: background_support == ReconciliationMethodSupport::Supported,
             history_recovery: history_recovery_for_support(list_support, read_support),
             terminal_observation: false,
+            targeted_actor_cancellation: false,
         };
         let background_health = match background_support {
             ReconciliationMethodSupport::Supported => ActivitySectionHealth::live(),

@@ -394,6 +394,7 @@ impl ClaudeActivityTracker {
                 background_work: false,
                 history_recovery: ActivityHistoryRecovery::None,
                 terminal_observation: false,
+                targeted_actor_cancellation: false,
             },
             observation_state: ActivityObservationState::Live,
         });

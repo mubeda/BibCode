@@ -4310,6 +4310,7 @@ impl ProviderDriver for CodexDriver {
                     background_work: false,
                     history_recovery: ActivityHistoryRecovery::None,
                     terminal_observation: false,
+                    targeted_actor_cancellation: false,
                 },
             })
         })
@@ -6706,6 +6707,7 @@ impl ProviderDriver for ClaudeDriver {
                         background_work: false,
                         history_recovery: ActivityHistoryRecovery::None,
                         terminal_observation: false,
+                        targeted_actor_cancellation: false,
                     }
                 } else {
                     ActivityCapabilities::none()

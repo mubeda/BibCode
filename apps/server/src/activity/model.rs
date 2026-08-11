@@ -344,6 +344,7 @@ pub struct ActivityCapabilities {
     pub background_work: bool,
     pub history_recovery: ActivityHistoryRecovery,
     pub terminal_observation: bool,
+    pub targeted_actor_cancellation: bool,
 }
 
 impl ActivityCapabilities {
@@ -354,6 +355,7 @@ impl ActivityCapabilities {
             background_work: true,
             history_recovery: ActivityHistoryRecovery::Full,
             terminal_observation,
+            targeted_actor_cancellation: false,
         }
     }
 
@@ -364,6 +366,7 @@ impl ActivityCapabilities {
             background_work: false,
             history_recovery: ActivityHistoryRecovery::None,
             terminal_observation: false,
+            targeted_actor_cancellation: false,
         }
     }
 
@@ -855,6 +858,101 @@ pub struct ActivitySummaryCounts {
     pub background_tasks: ActivityCounts,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ActivityActorControlState {
+    Unsupported,
+    Available,
+    Requested,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityActorControl {
+    pub actor_id: String,
+    pub state: ActivityActorControlState,
+    pub control_revision: u64,
+    pub active_descendant_count: u64,
+}
+
+impl ActivityActorControl {
+    pub(crate) fn unsupported(actor_id: String) -> Self {
+        Self {
+            actor_id,
+            state: ActivityActorControlState::Unsupported,
+            control_revision: 0,
+            active_descendant_count: 0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ActivityCancellationOperationState {
+    Requested,
+    Partial,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityCancellationOperationSummary {
+    pub root_actor_id: String,
+    pub state: ActivityCancellationOperationState,
+    pub residual_count: u64,
+    pub message: Option<String>,
+    pub operation_revision: u64,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityControlSnapshot {
+    pub scope_id: String,
+    pub revision: u64,
+    pub actors: Vec<ActivityActorControl>,
+    pub operations: Vec<ActivityCancellationOperationSummary>,
+}
+
+impl ActivityControlSnapshot {
+    pub(crate) fn empty(scope_id: impl Into<String>) -> Self {
+        Self {
+            scope_id: scope_id.into(),
+            revision: 0,
+            actors: Vec::new(),
+            operations: Vec::new(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(
+    tag = "kind",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum ActivityControlChange {
+    ActorUpserted {
+        actor: ActivityActorControl,
+    },
+    ActorRemoved {
+        actor_id: String,
+    },
+    OperationUpserted {
+        operation: ActivityCancellationOperationSummary,
+    },
+    OperationRemoved {
+        root_actor_id: String,
+    },
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityControlDelta {
+    pub scope_id: String,
+    pub previous_revision: u64,
+    pub revision: u64,
+    pub changes: Vec<ActivityControlChange>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(
     tag = "kind",
@@ -935,6 +1033,7 @@ pub struct ActivitySnapshot {
     pub work_items: Vec<ActivityWorkItemSummary>,
     pub actors_has_more: bool,
     pub work_items_has_more: bool,
+    pub control: ActivityControlSnapshot,
     pub updated_at: String,
 }
 
@@ -942,6 +1041,7 @@ pub struct ActivitySnapshot {
 #[serde(rename_all = "camelCase")]
 pub struct ActivityRosterPage {
     pub records: Vec<ActivityRecordSummary>,
+    pub actor_controls: Vec<ActivityActorControl>,
     pub next_cursor: Option<String>,
 }
 
@@ -949,6 +1049,7 @@ pub struct ActivityRosterPage {
 #[serde(rename_all = "camelCase")]
 pub struct ActivityDetailPage {
     pub record: ActivityRecordSummary,
+    pub actor_control: Option<ActivityActorControl>,
     pub entries: Vec<ActivityEntry>,
     pub next_cursor: Option<String>,
 }

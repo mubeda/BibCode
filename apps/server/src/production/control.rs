@@ -2079,7 +2079,7 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
             .to_string(),
         "capabilities": {
             "repositoryIdentity": true,
-            "activityProtocolVersion": activity_protocol_registered.then_some(1),
+            "activityProtocolVersion": activity_protocol_registered.then_some(2),
         },
     })
 }
