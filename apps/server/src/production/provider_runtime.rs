@@ -791,42 +791,14 @@ impl ProviderRuntimeSupervisor {
 impl ActivityCancellationDispatcher for ProviderRuntimeSupervisor {
     fn cancel_target(
         &self,
-        scope: ActivityScopeRef,
+        _scope: ActivityScopeRef,
         _generation: ActivityRuntimeGeneration,
-        target: ProviderActivityNativeTarget,
+        _target: ProviderActivityNativeTarget,
     ) -> futures_util::future::BoxFuture<
         'static,
         Result<ActivityTargetDispatchDisposition, ActivityDispatchError>,
     > {
-        let supervisor = self.clone();
-        Box::pin(async move {
-            let ActivityScopeRef::Thread { thread_id } = scope else {
-                return Err(ActivityDispatchError::TargetUnavailable);
-            };
-            let turn_id = match target {
-                ProviderActivityNativeTarget::CodexTurn { turn_id, .. } => Some(turn_id),
-                ProviderActivityNativeTarget::ClaudeTask { .. } => {
-                    return Err(ActivityDispatchError::TargetUnavailable);
-                }
-            };
-            supervisor
-                .handle_orchestration(OrchestrationCommand::ThreadTurnInterrupt {
-                    command_id: format!("activity-cancel:{}", Uuid::new_v4()),
-                    thread_id,
-                    turn_id,
-                    created_at: now(),
-                })
-                .await
-                .map(|()| ActivityTargetDispatchDisposition::Delivered)
-                .map_err(|error| match error {
-                    ProviderRuntimeError::SessionNotFound { .. }
-                    | ProviderRuntimeError::StaleSession { .. }
-                    | ProviderRuntimeError::UnsupportedCapability { .. } => {
-                        ActivityDispatchError::TargetUnavailable
-                    }
-                    _ => ActivityDispatchError::ProviderUnavailable,
-                })
-        })
+        Box::pin(async { Err(ActivityDispatchError::TargetUnavailable) })
     }
 }
 
@@ -7938,6 +7910,12 @@ async fn wait_for_endpoint(
 mod tests {
     use super::{ProviderDriver, ProviderDriverFactory};
     use crate::{
+        activity::{
+            ActivityCancellationDispatcher, ActivityCancellationService, ActivityControlRegistry,
+            ActivityDispatchError, ActivityRuntimeGeneration, ActivityScopeRef,
+            ActivityTargetDispatchDisposition, ProviderActivityControlUpdate,
+            ProviderActivityMutation, ProviderActivityNativeTarget,
+        },
         diagnostics::{
             AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
             ProcessSampler,
@@ -7953,6 +7931,7 @@ mod tests {
         Json, Router,
         routing::{get, post},
     };
+    use futures_util::future::BoxFuture;
     use serde_json::{Value, json};
     use std::{
         io,
@@ -8003,6 +7982,22 @@ mod tests {
         send_gate: Option<Arc<tokio::sync::Notify>>,
         reconcile_gate: Option<Arc<tokio::sync::Notify>>,
         reconcile_started: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    #[derive(Clone, Default)]
+    struct GenerationCapture(Arc<StdMutex<Option<ActivityRuntimeGeneration>>>);
+
+    impl ActivityCancellationDispatcher for GenerationCapture {
+        fn cancel_target(
+            &self,
+            _scope: ActivityScopeRef,
+            generation: ActivityRuntimeGeneration,
+            _target: ProviderActivityNativeTarget,
+        ) -> BoxFuture<'static, Result<ActivityTargetDispatchDisposition, ActivityDispatchError>>
+        {
+            *self.0.lock().expect("generation capture") = Some(generation);
+            Box::pin(async { Ok(ActivityTargetDispatchDisposition::Delivered) })
+        }
     }
 
     struct SupervisorDriver {
@@ -9542,6 +9537,95 @@ done
             .await
             .expect("native process sample");
         registry.bind_and_snapshot(&rows, Instant::now())
+    }
+
+    #[tokio::test]
+    async fn activity_cancellation_dispatch_fails_closed_without_queueing_provider_io() {
+        let controls = ActivityControlRegistry::new();
+        let scope = ActivityScopeRef::Thread {
+            thread_id: "thread-activity-cancel".to_owned(),
+        };
+        let scope_id = "thread:activity-cancel".to_owned();
+        let registration = controls.register_runtime(scope.clone(), scope_id.clone(), None);
+        controls
+            .observe_provider_batch(
+                &registration,
+                &[ProviderActivityMutation::upsert_actor(
+                    "actor:activity-cancel",
+                    None,
+                    "Activity cancel",
+                    "running",
+                )
+                .expect("actor mutation")],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor:activity-cancel".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::ClaudeTask {
+                        task_id: "native-task".to_owned(),
+                    }),
+                }],
+            )
+            .await;
+        let capture = GenerationCapture::default();
+        let cancellation = ActivityCancellationService::new(controls, Arc::new(capture.clone()));
+        cancellation
+            .cancel_subtree(scope.clone(), &scope_id, "actor:activity-cancel", 1)
+            .await
+            .expect("capture runtime generation");
+        let generation = capture
+            .0
+            .lock()
+            .expect("generation capture")
+            .clone()
+            .expect("captured runtime generation");
+
+        let (sender, mut queued_messages) = mpsc::channel(4);
+        let supervisor = super::ProviderRuntimeSupervisor {
+            sender,
+            stopped: tokio_util::sync::CancellationToken::new(),
+            worker: Arc::new(tokio::sync::Mutex::new(None)),
+            connect_mcp: Arc::new(tokio::sync::RwLock::new(None)),
+            activity_cancellation: Arc::new(tokio::sync::RwLock::new(None)),
+        };
+
+        for target in [
+            ProviderActivityNativeTarget::CodexTurn {
+                thread_id: "native-thread".to_owned(),
+                turn_id: "native-turn".to_owned(),
+            },
+            ProviderActivityNativeTarget::ClaudeTask {
+                task_id: "native-task".to_owned(),
+            },
+        ] {
+            let result = timeout(
+                std::time::Duration::from_millis(20),
+                supervisor.cancel_target(scope.clone(), generation.clone(), target),
+            )
+            .await;
+            let queued = queued_messages.try_recv().is_ok();
+            assert!(
+                !queued,
+                "polling and dropping native activity cancellation queued provider I/O"
+            );
+            assert_eq!(
+                result,
+                Ok(Err(ActivityDispatchError::TargetUnavailable)),
+                "native activity cancellation must fail closed immediately"
+            );
+        }
+
+        let dropped = supervisor.cancel_target(
+            scope,
+            generation,
+            ProviderActivityNativeTarget::CodexTurn {
+                thread_id: "native-thread-dropped".to_owned(),
+                turn_id: "native-turn-dropped".to_owned(),
+            },
+        );
+        drop(dropped);
+        assert!(
+            queued_messages.try_recv().is_err(),
+            "dropping an unpolled cancellation future queued provider I/O"
+        );
     }
 
     #[tokio::test]

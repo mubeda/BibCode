@@ -15,14 +15,14 @@ use crate::{
 };
 
 use super::{
-    ACTIVITY_PAGE_MAX_LENGTH, ActivityAdmittedRead, ActivityCancellationDispatcher,
-    ActivityCancellationError, ActivityCancellationService, ActivityControlEvent,
-    ActivityControlRegistry, ActivityDispatchError, ActivityError, ActivityProjection,
-    ActivityProjectionEvent, ActivityProjections, ActivityRecordKind, ActivityRepositoryError,
-    ActivityResult, ActivityRosterBucket, ActivityRuntimeGeneration, ActivityScopeRef,
-    ActivitySection, ActivitySubtreeCancellationDisposition, ActivitySubtreeCancellationResult,
-    ActivityTargetDispatchDisposition, AgentActivityAdmission, AgentActivityController,
-    ProviderActivityNativeTarget,
+    ACTIVITY_ID_MAX_LENGTH, ACTIVITY_PAGE_MAX_LENGTH, ActivityAdmittedRead,
+    ActivityCancellationDispatcher, ActivityCancellationError, ActivityCancellationService,
+    ActivityControlEvent, ActivityControlRegistry, ActivityDispatchError, ActivityError,
+    ActivityProjection, ActivityProjectionEvent, ActivityProjections, ActivityRecordKind,
+    ActivityRepositoryError, ActivityResult, ActivityRosterBucket, ActivityRuntimeGeneration,
+    ActivityScopeRef, ActivitySection, ActivitySubtreeCancellationDisposition,
+    ActivitySubtreeCancellationResult, ActivityTargetDispatchDisposition, AgentActivityAdmission,
+    AgentActivityController, ProviderActivityNativeTarget,
 };
 
 const DEFAULT_PAGE_LIMIT: usize = 50;
@@ -55,7 +55,7 @@ struct ListDetailInput {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct CancelSubtreeInput {
-    scope: ActivityScopeRef,
+    scope: MutationThreadScopeInput,
     scope_id: String,
     actor_id: String,
     expected_control_revision: u64,
@@ -64,10 +64,24 @@ struct CancelSubtreeInput {
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct RetrySubtreeCancellationInput {
-    scope: ActivityScopeRef,
+    scope: MutationThreadScopeInput,
     scope_id: String,
     root_actor_id: String,
     expected_operation_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct MutationThreadScopeInput {
+    #[serde(rename = "_tag")]
+    _tag: MutationThreadScopeTag,
+    thread_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+enum MutationThreadScopeTag {
+    #[serde(rename = "thread")]
+    Thread,
 }
 
 struct ActivityUnaryResponseGuard {
@@ -178,20 +192,17 @@ pub(crate) fn register_activity_rpc(
                 Ok(input) => input,
                 Err(error) => return RpcUnaryResult::plain(Err(error)),
             };
-            if !matches!(input.scope, ActivityScopeRef::Thread { .. }) {
-                return RpcUnaryResult::plain(Err(cancellation_unsupported_error()));
-            }
+            let (scope, scope_id, actor_id, expected_control_revision) =
+                match validate_cancel_subtree_input(input) {
+                    Ok(input) => input,
+                    Err(error) => return RpcUnaryResult::plain(Err(error)),
+                };
             let controller = projections.chat().agent_activity_controller();
             let Some(admission) = controller.admit() else {
                 return RpcUnaryResult::plain(Err(feature_disabled_error()));
             };
             let result = cancellation
-                .cancel_subtree(
-                    input.scope,
-                    &input.scope_id,
-                    &input.actor_id,
-                    input.expected_control_revision,
-                )
+                .cancel_subtree(scope, &scope_id, &actor_id, expected_control_revision)
                 .await
                 .map(cancellation_result)
                 .map_err(cancellation_error);
@@ -210,19 +221,21 @@ pub(crate) fn register_activity_rpc(
                     Ok(input) => input,
                     Err(error) => return RpcUnaryResult::plain(Err(error)),
                 };
-                if !matches!(input.scope, ActivityScopeRef::Thread { .. }) {
-                    return RpcUnaryResult::plain(Err(cancellation_unsupported_error()));
-                }
+                let (scope, scope_id, root_actor_id, expected_operation_revision) =
+                    match validate_retry_subtree_cancellation_input(input) {
+                        Ok(input) => input,
+                        Err(error) => return RpcUnaryResult::plain(Err(error)),
+                    };
                 let controller = projections.chat().agent_activity_controller();
                 let Some(admission) = controller.admit() else {
                     return RpcUnaryResult::plain(Err(feature_disabled_error()));
                 };
                 let result = cancellation
                     .retry_subtree_cancellation(
-                        input.scope,
-                        &input.scope_id,
-                        &input.root_actor_id,
-                        input.expected_operation_revision,
+                        scope,
+                        &scope_id,
+                        &root_actor_id,
+                        expected_operation_revision,
                     )
                     .await
                     .map(cancellation_result)
@@ -299,12 +312,46 @@ fn cancellation_error(error: ActivityCancellationError) -> Value {
     }
 }
 
-fn cancellation_unsupported_error() -> Value {
-    json!({
-        "_tag": "ActivityError",
-        "message": "Targeted cancellation is not supported for this activity scope.",
-        "reason": "cancellationUnsupported",
+fn validate_cancel_subtree_input(
+    input: CancelSubtreeInput,
+) -> Result<(ActivityScopeRef, String, String, u64), Value> {
+    Ok((
+        validate_mutation_thread_scope(input.scope)?,
+        validate_mutation_id(input.scope_id)?,
+        validate_mutation_id(input.actor_id)?,
+        input.expected_control_revision,
+    ))
+}
+
+fn validate_retry_subtree_cancellation_input(
+    input: RetrySubtreeCancellationInput,
+) -> Result<(ActivityScopeRef, String, String, u64), Value> {
+    Ok((
+        validate_mutation_thread_scope(input.scope)?,
+        validate_mutation_id(input.scope_id)?,
+        validate_mutation_id(input.root_actor_id)?,
+        input.expected_operation_revision,
+    ))
+}
+
+fn validate_mutation_thread_scope(
+    input: MutationThreadScopeInput,
+) -> Result<ActivityScopeRef, Value> {
+    Ok(ActivityScopeRef::Thread {
+        thread_id: validate_mutation_id(input.thread_id)?,
     })
+}
+
+fn validate_mutation_id(value: String) -> Result<String, Value> {
+    let value = value.trim().to_owned();
+    if value.is_empty()
+        || value.encode_utf16().count() > ACTIVITY_ID_MAX_LENGTH
+        || value.chars().any(char::is_control)
+    {
+        Err(invalid_scope_error())
+    } else {
+        Ok(value)
+    }
 }
 
 #[doc(hidden)]
@@ -705,10 +752,11 @@ mod tests {
     use crate::{
         ServerConfig, ServerRuntime,
         activity::{
-            ActivityCancellationDispatcher, ActivityCancellationService, ActivityCapabilities,
-            ActivityControlChange, ActivityControlDelta, ActivityDispatchError, ActivityRepository,
-            ActivityRuntimeGeneration, ActivityScopeSeed, ActivityTargetDispatchDisposition,
-            ProviderActivityControlUpdate, ProviderActivityMutation, ProviderActivityNativeTarget,
+            ACTIVITY_ID_MAX_LENGTH, ActivityCancellationDispatcher, ActivityCancellationService,
+            ActivityCapabilities, ActivityControlChange, ActivityControlDelta,
+            ActivityDispatchError, ActivityRepository, ActivityRuntimeGeneration,
+            ActivityScopeSeed, ActivityTargetDispatchDisposition, ProviderActivityControlUpdate,
+            ProviderActivityMutation, ProviderActivityNativeTarget,
         },
         auth::{AuthService, ClientMetadata},
         persistence::{Database, run_migrations},
@@ -735,6 +783,166 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Box::pin(async { Ok(ActivityTargetDispatchDisposition::Delivered) })
         }
+    }
+
+    #[tokio::test]
+    async fn mutation_rpc_rejects_non_thread_excess_and_unbounded_inputs_before_dispatch() {
+        let database = Database::open_in_memory().await.expect("database");
+        let projections = ActivityProjections::new(
+            ActivityRepository::new(database),
+            AgentActivityController::new(true),
+            AgentActivityController::new(true),
+        );
+        let dispatcher = CountingDispatcher::default();
+        let cancellation_service = ActivityCancellationService::new(
+            projections.chat().activity_control_registry(),
+            Arc::new(dispatcher.clone()),
+        );
+        let mut registry = RpcRegistry::empty();
+        register_activity_rpc(&mut registry, projections, cancellation_service);
+        let directory = tempfile::tempdir().expect("temporary server directory");
+        let handle = ServerRuntime::start_with_registry(
+            ServerConfig::new(directory.path())
+                .with_bind("127.0.0.1", 0)
+                .with_unsafe_no_auth(),
+            registry,
+        )
+        .await
+        .expect("server");
+        let mut socket = connect_async(format!("ws://{}/ws", handle.local_addr()))
+            .await
+            .expect("WebSocket")
+            .0;
+
+        let cancel = json!({
+            "scope": { "_tag": "thread", "threadId": "thread-1" },
+            "scopeId": "thread:thread-1",
+            "actorId": "actor-1",
+            "expectedControlRevision": 0,
+        });
+        let retry = json!({
+            "scope": { "_tag": "thread", "threadId": "thread-1" },
+            "scopeId": "thread:thread-1",
+            "rootActorId": "actor-1",
+            "expectedOperationRevision": 0,
+        });
+        let replace = |base: &Value, key: &str, value: Value| {
+            let mut payload = base.clone();
+            payload
+                .as_object_mut()
+                .expect("mutation payload object")
+                .insert(key.to_owned(), value);
+            payload
+        };
+        let overlong = "x".repeat(ACTIVITY_ID_MAX_LENGTH + 1);
+        let mut native_fields = cancel.clone();
+        let native_fields_object = native_fields
+            .as_object_mut()
+            .expect("mutation payload object");
+        native_fields_object.insert("nativeThreadId".to_owned(), json!("native-thread"));
+        native_fields_object.insert("turnId".to_owned(), json!("native-turn"));
+        native_fields_object.insert("taskId".to_owned(), json!("native-task"));
+        let malformed = vec![
+            (
+                "activity.cancelSubtree",
+                replace(&cancel, "unexpected", json!(true)),
+            ),
+            (
+                "activity.cancelSubtree",
+                json!({
+                    "scope": { "_tag": "thread", "threadId": "thread-1", "terminalId": "native-terminal" },
+                    "scopeId": "thread:thread-1",
+                    "actorId": "actor-1",
+                    "expectedControlRevision": 0,
+                }),
+            ),
+            (
+                "activity.cancelSubtree",
+                json!({
+                    "scope": { "_tag": "terminal", "threadId": "thread-1", "terminalId": "terminal-1" },
+                    "scopeId": "terminal:thread-1",
+                    "actorId": "actor-1",
+                    "expectedControlRevision": 0,
+                }),
+            ),
+            (
+                "activity.cancelSubtree",
+                replace(
+                    &cancel,
+                    "scope",
+                    json!({ "_tag": "thread", "threadId": "" }),
+                ),
+            ),
+            (
+                "activity.cancelSubtree",
+                replace(&cancel, "scopeId", json!("  ")),
+            ),
+            (
+                "activity.cancelSubtree",
+                replace(&cancel, "actorId", json!("\u{0000}")),
+            ),
+            (
+                "activity.cancelSubtree",
+                replace(
+                    &cancel,
+                    "scope",
+                    json!({ "_tag": "thread", "threadId": overlong.clone() }),
+                ),
+            ),
+            (
+                "activity.cancelSubtree",
+                replace(&cancel, "scopeId", json!(overlong.clone())),
+            ),
+            (
+                "activity.cancelSubtree",
+                replace(&cancel, "actorId", json!(overlong.clone())),
+            ),
+            ("activity.cancelSubtree", native_fields),
+            (
+                "activity.cancelSubtree",
+                replace(&cancel, "descendantActorIds", json!(["actor-child"])),
+            ),
+            (
+                "activity.cancelSubtree",
+                replace(&cancel, "expectedControlRevision", json!(-1)),
+            ),
+            (
+                "activity.retrySubtreeCancellation",
+                replace(&retry, "unexpected", json!(true)),
+            ),
+            (
+                "activity.retrySubtreeCancellation",
+                replace(&retry, "rootActorId", json!("actor\nroot")),
+            ),
+            (
+                "activity.retrySubtreeCancellation",
+                replace(&retry, "rootActorId", json!(overlong)),
+            ),
+            (
+                "activity.retrySubtreeCancellation",
+                replace(&retry, "descendantWorkItemIds", json!(["work-child"])),
+            ),
+            (
+                "activity.retrySubtreeCancellation",
+                replace(&retry, "expectedOperationRevision", json!(-1)),
+            ),
+        ];
+
+        for (index, (method, payload)) in malformed.into_iter().enumerate() {
+            let error = rpc_unary(&mut socket, &(index + 1).to_string(), method, payload)
+                .await
+                .expect_err("malformed mutation must be rejected");
+            assert_eq!(error["reason"], "invalidScope", "accepted case {index}");
+            assert_eq!(
+                dispatcher.calls.load(Ordering::SeqCst),
+                0,
+                "dispatched malformed case {index}"
+            );
+        }
+
+        socket.close(None).await.expect("close socket");
+        handle.shutdown();
+        handle.join().await.expect("server joins");
     }
 
     #[tokio::test]
@@ -877,7 +1085,7 @@ mod tests {
                     "actorId": "actor:available",
                     "expectedControlRevision": 1,
                 }),
-                "cancellationUnsupported",
+                "invalidScope",
             ),
         ] {
             let error = rpc_unary(&mut socket, id, "activity.cancelSubtree", payload)
