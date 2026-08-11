@@ -3122,32 +3122,54 @@ mod tests {
         let root = tempfile::tempdir().expect("OpenCode helper process root");
         let executable = root.path().join("invalid-opencode-helper");
         let pid_path = root.path().join("helper.pid");
+        let release_path = root.path().join("release-readiness");
         std::fs::write(
             &executable,
-            "#!/bin/sh\nprintf '%s' \"$$\" > \"$OPENCODE_TEST_PID_PATH\"\nprintf 'opencode server listening on http://0.0.0.0:43127\\n'\nsleep 60\n",
+            "#!/bin/sh\nprintf '%s' \"$$\" > \"$OPENCODE_TEST_PID_PATH\"\nwhile [ ! -f \"$OPENCODE_TEST_RELEASE_PATH\" ]; do sleep 0.01; done\nprintf 'opencode server listening on http://0.0.0.0:43127\\n'\nsleep 60\n",
         )
         .expect("OpenCode helper script");
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
             .expect("OpenCode helper script permissions");
         let launcher =
             SystemOpenCodeHelperLauncher::with_readiness_timeout(Duration::from_secs(10));
-        let result = launcher
-            .start(OpenCodeHelperLaunch {
-                executable: executable.to_string_lossy().into_owned(),
-                args: Vec::new(),
-                cwd: root.path().to_path_buf(),
-                env: BTreeMap::from([(
-                    "OPENCODE_TEST_PID_PATH".to_owned(),
-                    pid_path.to_string_lossy().into_owned(),
-                )]),
-            })
-            .await;
+        let launch_pid_path = pid_path.clone();
+        let launch_release_path = release_path.clone();
+        let start = tokio::spawn(async move {
+            launcher
+                .start(OpenCodeHelperLaunch {
+                    executable: executable.to_string_lossy().into_owned(),
+                    args: Vec::new(),
+                    cwd: root.path().to_path_buf(),
+                    env: BTreeMap::from([
+                        (
+                            "OPENCODE_TEST_PID_PATH".to_owned(),
+                            launch_pid_path.to_string_lossy().into_owned(),
+                        ),
+                        (
+                            "OPENCODE_TEST_RELEASE_PATH".to_owned(),
+                            launch_release_path.to_string_lossy().into_owned(),
+                        ),
+                    ]),
+                })
+                .await
+        });
+
+        let pid = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if let Ok(pid) = std::fs::read_to_string(&pid_path) {
+                    if let Ok(pid) = pid.trim().parse::<i32>() {
+                        break pid;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("OpenCode helper PID should be observed before readiness release");
+        std::fs::write(&release_path, b"release").expect("release OpenCode readiness");
+        let result = start.await.expect("OpenCode helper start task should join");
 
         assert!(result.is_err());
-        let pid = std::fs::read_to_string(&pid_path)
-            .expect("OpenCode helper PID")
-            .parse::<i32>()
-            .expect("numeric OpenCode helper PID");
         tokio::time::timeout(Duration::from_millis(500), async {
             loop {
                 // SAFETY: signal zero only checks the exact test-child PID and
