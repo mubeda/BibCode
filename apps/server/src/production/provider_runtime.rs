@@ -7985,8 +7985,9 @@ mod tests {
     };
     use serde_json::{Value, json};
     use std::{
-        io,
+        io::{self, Read},
         pin::Pin,
+        process::{Command as StdCommand, Output, Stdio as StdStdio},
         sync::{Arc, Mutex as StdMutex},
         task::{Context, Poll},
         time::Instant,
@@ -7999,22 +8000,66 @@ mod tests {
         time::timeout,
     };
 
-    struct CurrentDirectoryGuard {
-        original: std::path::PathBuf,
-    }
-
-    impl CurrentDirectoryGuard {
-        fn enter(path: &std::path::Path) -> Self {
-            let original = std::env::current_dir().expect("read original current directory");
-            std::env::set_current_dir(path).expect("enter fixture current directory");
-            Self { original }
+    fn run_isolated_case(case: &str, test_name: &str) -> Output {
+        let mut child = StdCommand::new(std::env::current_exe().expect("current test binary"))
+            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
+            .env("BIBCODE_TEST_ISOLATED_CASE", case)
+            .stdout(StdStdio::piped())
+            .stderr(StdStdio::piped())
+            .spawn()
+            .expect("run isolated fixture case");
+        let mut stdout = child.stdout.take().expect("isolated child stdout");
+        let mut stderr = child.stderr.take().expect("isolated child stderr");
+        let stdout_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stdout
+                .read_to_end(&mut bytes)
+                .expect("read isolated child stdout");
+            bytes
+        });
+        let stderr_reader = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr
+                .read_to_end(&mut bytes)
+                .expect("read isolated child stderr");
+            bytes
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let (status, timed_out) = loop {
+            if let Some(status) = child.try_wait().expect("poll isolated fixture case") {
+                break (status, false);
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                break (
+                    child.wait().expect("reap timed-out isolated fixture case"),
+                    true,
+                );
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+        let stdout = stdout_reader.join().expect("join isolated stdout reader");
+        let stderr = stderr_reader.join().expect("join isolated stderr reader");
+        assert!(
+            !timed_out,
+            "isolated fixture case timed out:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&stdout),
+            String::from_utf8_lossy(&stderr)
+        );
+        Output {
+            status,
+            stdout,
+            stderr,
         }
     }
 
-    impl Drop for CurrentDirectoryGuard {
-        fn drop(&mut self) {
-            std::env::set_current_dir(&self.original).expect("restore original current directory");
-        }
+    fn is_isolated_case(case: &str, test_name: &str) -> bool {
+        let arguments = std::env::args().collect::<Vec<_>>();
+        std::env::var("BIBCODE_TEST_ISOLATED_CASE").as_deref() == Ok(case)
+            && arguments
+                .windows(2)
+                .any(|values| values == ["--exact", test_name])
+            && arguments.iter().any(|value| value == "--test-threads=1")
     }
 
     #[derive(Default)]
@@ -8242,7 +8287,7 @@ mod tests {
             effort: None,
             agent: None,
             resume_cursor: None,
-            environment: Default::default(),
+            environment: std::env::vars().collect(),
             endpoint: None,
             server_password: None,
             mcp: None,
@@ -8748,7 +8793,6 @@ done
 
     #[tokio::test]
     async fn claude_options_acknowledge_the_exact_launch_vector_and_restart_only_fast_changes() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
         let fixture = executable_fixture(&temp, "claude-options", CLAUDE_FIXTURE);
@@ -8789,7 +8833,6 @@ done
 
     #[tokio::test]
     async fn claude_delivery_waits_for_the_replayed_user_message_before_accepting() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let capture_path = temp.path().join("claude-delivery.jsonl");
         let acknowledgement_gate = temp.path().join("release-acknowledgement");
@@ -8839,7 +8882,6 @@ done
 
     #[tokio::test]
     async fn claude_delivery_disconnect_after_write_without_replay_is_ambiguous() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let capture_path = temp.path().join("claude-delivery.jsonl");
         let driver = claude_delivery_fixture(
@@ -8878,7 +8920,6 @@ done
     #[cfg(unix)]
     #[tokio::test]
     async fn claude_completion_queries_order_stream_usage_mcp_status_then_completion() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let capture_path = temp.path().join("claude-context-query.jsonl");
         let driver = claude_delivery_fixture(
@@ -9116,7 +9157,6 @@ done
 
     #[tokio::test]
     async fn cursor_delivery_missing_session_is_definitely_not_sent() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let capture_path = temp.path().join("cursor-delivery.jsonl");
         let driver = cursor_delivery_fixture(&temp, &capture_path, None, false, false).await;
@@ -9145,7 +9185,6 @@ done
 
     #[tokio::test]
     async fn cursor_delivery_waits_for_the_session_prompt_response_before_accepting() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let capture_path = temp.path().join("cursor-delivery.jsonl");
         let acknowledgement_gate = temp.path().join("release-response");
@@ -9195,7 +9234,6 @@ done
 
     #[tokio::test]
     async fn cursor_delivery_disconnect_after_write_before_response_is_ambiguous() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let capture_path = temp.path().join("cursor-delivery.jsonl");
         let driver = cursor_delivery_fixture(&temp, &capture_path, None, true, false).await;
@@ -9222,7 +9260,6 @@ done
 
     #[tokio::test]
     async fn cursor_delivery_remote_prompt_rejection_is_rejected() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let capture_path = temp.path().join("cursor-delivery.jsonl");
         let driver = cursor_delivery_fixture(&temp, &capture_path, None, false, true).await;
@@ -9250,7 +9287,6 @@ done
     async fn cursor_delivery_prompt_write_zero_bytes_is_definitely_not_sent() {
         // Mutation caught: treating a proven zero-byte failure as possibly submitted prevents a
         // safe retry.
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let (outcome, accepted_prompt_bytes, prompt_reached_peer, _) =
             cursor_delivery_with_prompt_write_failure(PromptWriteFailure::BeforeFirstByte).await;
 
@@ -9266,7 +9302,6 @@ done
     async fn cursor_delivery_prompt_write_partial_bytes_is_ambiguous() {
         // Mutation caught: write_all erases a successful prefix when a later write fails, making
         // a possibly submitted prompt look safe to retry.
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let (outcome, accepted_prompt_bytes, prompt_reached_peer, _) =
             cursor_delivery_with_prompt_write_failure(PromptWriteFailure::AfterPrefix).await;
 
@@ -9288,7 +9323,6 @@ done
     async fn cursor_delivery_prompt_write_flush_failure_is_ambiguous() {
         // Mutation caught: a flush error occurs after write_all accepted the complete prompt frame,
         // so classifying it as definitely unsent can duplicate a provider-visible prompt.
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let (outcome, accepted_prompt_bytes, prompt_reached_peer, _) =
             cursor_delivery_with_prompt_write_failure(PromptWriteFailure::OnFlush).await;
 
@@ -9310,7 +9344,6 @@ done
     async fn cursor_delivery_prompt_write_confirmation_loss_is_ambiguous_without_a_pending_leak() {
         // Mutation caught: dropping the writer confirmation without removing its correlation
         // leaves a permanently pending response entry after the durable driver returns Ambiguous.
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let (outcome, accepted_prompt_bytes, prompt_reached_peer, pending_request_count) =
             cursor_delivery_with_prompt_write_failure(PromptWriteFailure::LoseConfirmation).await;
 
@@ -9576,7 +9609,6 @@ done
 
     #[tokio::test]
     async fn native_factory_attributes_provider_until_child_exit() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let registry = ProcessAttributionRegistry::new();
         let factory = super::NativeProviderDriverFactory::with_process_attribution(
@@ -10194,7 +10226,6 @@ done
 
     #[tokio::test]
     async fn consuming_attributed_child_releases_provider_registration() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let registry = ProcessAttributionRegistry::new();
         let fixture = executable_fixture(&temp, "consumed-claude", CLAUDE_FIXTURE);
@@ -10478,7 +10509,6 @@ done
 
     #[tokio::test]
     async fn native_process_adapters_cover_live_codex_claude_cursor_and_grok_commands() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("provider fixture directory");
         let attachment_root = temp.path().join("state&").join("attachments");
         let factory = super::NativeProviderDriverFactory::new(attachment_root.clone());
@@ -10786,7 +10816,6 @@ done
 
     #[tokio::test]
     async fn native_opencode_adapter_covers_live_session_turn_and_control_commands() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let prompt_body = Arc::new(StdMutex::new(None::<Value>));
         let app = Router::new()
             .route(
@@ -11351,19 +11380,12 @@ done
         );
     }
 
-    #[tokio::test]
-    async fn executable_resolution_prefers_case_insensitive_instance_path_override() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let ambient = tempfile::TempDir::new().expect("ambient executable directory");
+    #[test]
+    fn executable_resolution_prefers_case_insensitive_instance_path_override() {
         let instance = tempfile::TempDir::new().expect("instance executable directory");
         let executable_name = if cfg!(windows) { "codex.exe" } else { "codex" };
-        let ambient_executable = ambient.path().join(executable_name);
         let instance_executable = instance.path().join(executable_name);
-        std::fs::write(&ambient_executable, b"ambient").expect("write ambient executable");
         std::fs::write(&instance_executable, b"instance").expect("write instance executable");
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: process-global environment mutation is serialized by the shared test lock.
-        unsafe { std::env::set_var("PATH", ambient.path()) };
 
         let environment = [(
             std::ffi::OsString::from("pAtH"),
@@ -11376,53 +11398,36 @@ done
                 .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
         );
 
-        match original_path {
-            Some(path) => {
-                // SAFETY: process-global environment mutation is serialized by the shared test lock.
-                unsafe { std::env::set_var("PATH", path) };
-            }
-            None => {
-                // SAFETY: process-global environment mutation is serialized by the shared test lock.
-                unsafe { std::env::remove_var("PATH") };
-            }
-        }
         assert_eq!(resolved, Some(instance_executable));
     }
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn runtime_launch_executes_the_instance_path_binary_instead_of_ambient_path() {
+    async fn runtime_launch_executes_the_configured_instance_path_binary() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::TempDir::new().expect("runtime fixture root");
-        let ambient = temp.path().join("ambient");
         let instance = temp.path().join("instance");
-        std::fs::create_dir_all(&ambient).expect("ambient executable directory");
         std::fs::create_dir_all(&instance).expect("instance executable directory");
-        for (directory, value) in [(&ambient, "ambient"), (&instance, "instance")] {
-            let executable = directory.join("provider-fixture");
-            std::fs::write(
-                &executable,
-                format!(
-                    "#!/bin/sh\nprintf '%s' '{value}' > \"$MARKER\"\nprintf '%s' \"$PATH\" > \"$PATH_MARKER\"\n"
-                ),
-            )
-            .expect("write runtime executable");
-            let mut permissions = std::fs::metadata(&executable)
-                .expect("runtime fixture metadata")
-                .permissions();
-            permissions.set_mode(0o700);
-            std::fs::set_permissions(&executable, permissions)
-                .expect("make runtime fixture executable");
-        }
+        let executable = instance.join("provider-fixture");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '%s' 'instance' > \"$MARKER\"\nprintf '%s' \"$PATH\" > \"$PATH_MARKER\"\n",
+        )
+        .expect("write runtime executable");
+        let mut permissions = std::fs::metadata(&executable)
+            .expect("runtime fixture metadata")
+            .permissions();
+        permissions.set_mode(0o700);
+        std::fs::set_permissions(&executable, permissions)
+            .expect("make runtime fixture executable");
         let marker = temp.path().join("launched");
         let path_marker = temp.path().join("effective-path");
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: process-global environment mutation is serialized by the shared test lock.
-        unsafe { std::env::set_var("PATH", &ambient) };
         let mut request = native_launch(&temp, "fixture");
         request.binary_path = "provider-fixture".to_owned();
+        request
+            .environment
+            .retain(|name, _| !name.eq_ignore_ascii_case("PATH"));
         request
             .environment
             .insert("pAtH".to_owned(), instance.to_string_lossy().into_owned());
@@ -11438,16 +11443,6 @@ done
             .expect("spawn instance executable");
         child.wait().await.expect("wait for runtime fixture");
 
-        match original_path {
-            Some(path) => {
-                // SAFETY: process-global environment mutation is serialized by the shared test lock.
-                unsafe { std::env::set_var("PATH", path) };
-            }
-            None => {
-                // SAFETY: process-global environment mutation is serialized by the shared test lock.
-                unsafe { std::env::remove_var("PATH") };
-            }
-        }
         assert_eq!(
             std::fs::read_to_string(marker).expect("launch marker"),
             "instance"
@@ -11488,76 +11483,63 @@ done
         );
     }
 
-    #[tokio::test]
-    async fn provider_executable_resolution_keeps_one_component_file_in_process_cwd() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let directory = tempfile::TempDir::new().expect("provider fixture directory");
-        let search_directory = tempfile::TempDir::new().expect("provider search directory");
-        let executable_name = if cfg!(windows) {
-            "provider-fixture.exe"
-        } else {
-            "provider-fixture"
-        };
-        std::fs::write(directory.path().join(executable_name), b"fixture")
-            .expect("write provider fixture");
-        let _current_directory = CurrentDirectoryGuard::enter(directory.path());
-
-        assert_eq!(
-            super::resolve_provider_executable_in_path(
-                executable_name,
-                Some(search_directory.path().as_os_str())
-            ),
-            Some(std::path::PathBuf::from(executable_name))
-        );
-    }
-
     #[cfg(unix)]
-    #[tokio::test]
-    async fn provider_executable_resolution_keeps_absolute_file_when_cwd_is_inaccessible() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let directory = tempfile::TempDir::new().expect("provider fixture directory");
-        let executable = directory.path().join("provider-fixture");
-        std::fs::write(&executable, b"fixture").expect("write provider fixture");
-        let inaccessible_cwd = directory.path().join("removed-cwd");
-        std::fs::create_dir(&inaccessible_cwd).expect("create temporary current directory");
-        let _current_directory = CurrentDirectoryGuard::enter(&inaccessible_cwd);
-        std::fs::remove_dir(&inaccessible_cwd).expect("remove current directory");
+    #[test]
+    fn invalid_cwd_cases_are_process_isolated() {
+        const TEST_NAME: &str =
+            "production::provider_runtime::tests::invalid_cwd_cases_are_process_isolated";
+        if is_isolated_case("missing-cwd", TEST_NAME) {
+            let directory = tempfile::tempdir().expect("isolated CWD");
+            let executable = directory.path().join("provider-fixture");
+            std::fs::write(&executable, b"fixture").expect("write provider fixture");
+            let search_directory = directory.path().join("search");
+            std::fs::create_dir(&search_directory).expect("create provider search directory");
+            std::env::set_current_dir(directory.path()).expect("enter isolated CWD");
+            assert_eq!(
+                super::resolve_provider_executable_in_path(
+                    "provider-fixture",
+                    Some(search_directory.as_os_str())
+                ),
+                Some(std::path::PathBuf::from("provider-fixture"))
+            );
+            let inaccessible_cwd = directory.path().join("removed-cwd");
+            std::fs::create_dir(&inaccessible_cwd).expect("create temporary current directory");
+            std::env::set_current_dir(&inaccessible_cwd).expect("enter isolated CWD");
+            std::fs::remove_dir_all(&inaccessible_cwd).expect("remove isolated CWD");
+            assert!(
+                std::env::current_dir().is_err(),
+                "fixture must make the child process CWD inaccessible"
+            );
+
+            assert_eq!(
+                super::resolve_provider_executable_in_path(
+                    &executable.to_string_lossy(),
+                    Some(std::ffi::OsStr::new(""))
+                ),
+                Some(executable.clone())
+            );
+            assert_eq!(
+                super::resolve_provider_executable_in_path(
+                    "provider-fixture",
+                    Some(directory.path().as_os_str())
+                ),
+                Some(executable)
+            );
+            println!("BIBCODE_TEST_ISOLATED_CASE_DONE=missing-cwd");
+            return;
+        }
+
+        let output = run_isolated_case("missing-cwd", TEST_NAME);
         assert!(
-            std::env::current_dir().is_err(),
-            "fixture must make the process cwd inaccessible"
+            output.status.success(),
+            "isolated missing-CWD case failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
-
-        assert_eq!(
-            super::resolve_provider_executable_in_path(
-                &executable.to_string_lossy(),
-                Some(std::ffi::OsStr::new(""))
-            ),
-            Some(executable)
-        );
-    }
-
-    #[cfg(unix)]
-    #[tokio::test]
-    async fn provider_executable_resolution_finds_bare_command_when_cwd_is_inaccessible() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let directory = tempfile::TempDir::new().expect("provider fixture directory");
-        let executable = directory.path().join("provider-fixture");
-        std::fs::write(&executable, b"fixture").expect("write provider fixture");
-        let inaccessible_cwd = directory.path().join("removed-cwd");
-        std::fs::create_dir(&inaccessible_cwd).expect("create temporary current directory");
-        let _current_directory = CurrentDirectoryGuard::enter(&inaccessible_cwd);
-        std::fs::remove_dir(&inaccessible_cwd).expect("remove current directory");
         assert!(
-            std::env::current_dir().is_err(),
-            "fixture must make the process cwd inaccessible"
-        );
-
-        assert_eq!(
-            super::resolve_provider_executable_in_path(
-                "provider-fixture",
-                Some(directory.path().as_os_str())
-            ),
-            Some(executable)
+            String::from_utf8_lossy(&output.stdout)
+                .contains("BIBCODE_TEST_ISOLATED_CASE_DONE=missing-cwd"),
+            "isolated child did not confirm the exact missing-CWD case"
         );
     }
 

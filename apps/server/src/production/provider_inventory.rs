@@ -1595,6 +1595,7 @@ fn is_builtin_driver(driver: &str) -> bool {
 mod tests {
     use super::*;
 
+    use crate::test_support::TestSandbox;
     use axum::{Json, Router, routing::get};
 
     #[cfg(unix)]
@@ -1620,15 +1621,11 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn inventory_probes_the_instance_path_executable_instead_of_ambient_path() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let ambient = tempfile::tempdir().expect("ambient executable directory");
-        let instance = tempfile::tempdir().expect("instance executable directory");
-        write_version_fixture(ambient.path(), "cursor-agent", "2026.01.02-ambient");
-        write_version_fixture(instance.path(), "cursor-agent", "2026.03.04-instance");
-        let original_path = std::env::var_os("PATH");
-        // SAFETY: process-global environment mutation is serialized by the shared test lock.
-        unsafe { std::env::set_var("PATH", ambient.path()) };
+    async fn inventory_probes_the_configured_instance_path_executable() {
+        let sandbox = TestSandbox::new("provider-inventory-path");
+        let instance = sandbox.path("instance");
+        std::fs::create_dir(&instance).expect("instance executable directory");
+        write_version_fixture(&instance, "cursor-agent", "2026.03.04-instance");
         let settings = json!({
             "enableProviderUpdateChecks": false,
             "providerInstances": {
@@ -1637,7 +1634,7 @@ mod tests {
                     "enabled": true,
                     "config": { "binaryPath": "cursor-agent" },
                     "environment": [
-                        { "name": "pAtH", "value": instance.path(), "valueRedacted": false }
+                        { "name": "pAtH", "value": instance, "valueRedacted": false }
                     ]
                 }
             }
@@ -1646,21 +1643,11 @@ mod tests {
         let providers = probe_full(
             &settings,
             Some("cursor-work"),
-            instance.path(),
+            sandbox.root(),
             &ProviderMaintenance::new(),
         )
         .await;
 
-        match original_path {
-            Some(path) => {
-                // SAFETY: process-global environment mutation is serialized by the shared test lock.
-                unsafe { std::env::set_var("PATH", path) };
-            }
-            None => {
-                // SAFETY: process-global environment mutation is serialized by the shared test lock.
-                unsafe { std::env::remove_var("PATH") };
-            }
-        }
         assert_eq!(providers[0].snapshot["version"], "2026.03.04-instance");
     }
 
@@ -1669,7 +1656,6 @@ mod tests {
     async fn exact_target_probe_applies_the_same_case_variant_path_used_for_resolution() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let root = tempfile::tempdir().expect("inventory PATH root");
         let first = root.path().join("first");
         let second = root.path().join("second");
