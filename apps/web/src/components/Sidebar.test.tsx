@@ -202,6 +202,7 @@ const h = vi.hoisted(() => {
     closestCorners: vi.fn(),
     copyToClipboard: vi.fn(),
     windowConfirm: vi.fn(),
+    openProjectDataRecovery: vi.fn(async () => undefined),
   };
 
   const runCommand = (command: { label?: string }, input: unknown) => {
@@ -421,6 +422,12 @@ vi.mock("../state/server", () => ({
 
 vi.mock("../state/desktopUpdate", () => ({
   useDesktopUpdateState: () => h.state.desktopUpdateState,
+}));
+
+vi.mock("../state/projectDataSafety", () => ({
+  projectDataSafetyStore: {
+    open: h.spies.openProjectDataRecovery,
+  },
 }));
 
 vi.mock("./desktopUpdate.logic", () => ({
@@ -715,6 +722,7 @@ function environmentFixture(overrides: {
   environmentId: EnvironmentId;
   label?: string | null;
   connectionId?: string;
+  primary?: boolean;
   displayUrl?: string | null;
   phase?: string;
   error?: string | null;
@@ -723,10 +731,12 @@ function environmentFixture(overrides: {
     environmentId: overrides.environmentId,
     label: overrides.label ?? null,
     entry: {
-      target: {
-        _tag: "BearerConnectionTarget",
-        connectionId: overrides.connectionId ?? "plain",
-      },
+      target: overrides.primary
+        ? { _tag: "PrimaryConnectionTarget" }
+        : {
+            _tag: "BearerConnectionTarget",
+            connectionId: overrides.connectionId ?? "plain",
+          },
     },
     displayUrl: overrides.displayUrl ?? null,
     connection: { phase: overrides.phase ?? "connected", error: overrides.error ?? null },
@@ -1246,7 +1256,17 @@ staticDescribe("Sidebar full render", () => {
     expect(markup).not.toContain("No projects yet");
   });
 
-  it("wires storage-change retry, settings, diagnostics, and confirmed adoption", () => {
+  it("wires storage-change retry, recovery, settings, diagnostics, and confirmed adoption", () => {
+    (globalThis.window as unknown as Record<string, unknown>)["desktopBridge"] = {
+      getProjectDataStatuses: vi.fn(),
+    };
+    h.state.environments = [
+      environmentFixture({
+        environmentId: ENV_MAIN,
+        label: "Local",
+        primary: true,
+      }),
+    ];
     h.state.shellSummary = {
       ...h.state.shellSummary,
       catalogReady: true,
@@ -1265,6 +1285,11 @@ staticDescribe("Sidebar full render", () => {
 
     invoke(
       mustFindProps((props) => props["children"] === "Retry", "project retry action"),
+      "onClick",
+      mouseEvent(),
+    );
+    invoke(
+      mustFindProps((props) => props["children"] === "Recover data", "project recovery action"),
       "onClick",
       mouseEvent(),
     );
@@ -1293,6 +1318,7 @@ staticDescribe("Sidebar full render", () => {
     ]);
     expect(h.spies.navigate).toHaveBeenCalledWith({ to: "/settings/connections" });
     expect(h.spies.navigate).toHaveBeenCalledWith({ to: "/settings/diagnostics" });
+    expect(h.spies.openProjectDataRecovery).toHaveBeenCalledWith(ENV_MAIN, "manual");
     expect(h.spies.windowConfirm).toHaveBeenCalledWith(
       expect.stringContaining("will not be merged"),
     );

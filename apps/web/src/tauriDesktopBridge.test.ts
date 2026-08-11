@@ -1021,6 +1021,41 @@ describe("tauriDesktopBridge", () => {
     });
   });
 
+  it("routes privileged project-data recovery using identifiers rather than renderer paths", async () => {
+    const harness = installTauriHarness();
+    const bridge = await installBridge();
+
+    await expect(bridge.getProjectDataStatuses?.()).resolves.toBeNull();
+    await expect(
+      bridge.restoreProjectData?.("primary", "26b6ca53-27d3-401a-b51f-d7bdf534081f"),
+    ).resolves.toBeNull();
+    await expect(bridge.startEmptyProjectData?.("primary")).resolves.toBeNull();
+    await expect(bridge.retryProjectData?.("primary")).resolves.toBeNull();
+    await expect(bridge.openProjectDataPath?.("primary")).resolves.toBeNull();
+    await expect(bridge.exportProjectDataDiagnostics?.("primary")).resolves.toBeNull();
+
+    expect(harness.invoke).toHaveBeenCalledWith(
+      "desktop_bridge_get_project_data_statuses",
+      undefined,
+    );
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_restore_project_data", {
+      environmentId: "primary",
+      backupId: "26b6ca53-27d3-401a-b51f-d7bdf534081f",
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_start_empty_project_data", {
+      environmentId: "primary",
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_retry_project_data", {
+      environmentId: "primary",
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_open_project_data_path", {
+      environmentId: "primary",
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_export_project_data_diagnostics", {
+      environmentId: "primary",
+    });
+  });
+
   it("routes the remaining desktop bridge capabilities through Tauri commands", async () => {
     const harness = installTauriHarness();
     const bridge = await installBridge();

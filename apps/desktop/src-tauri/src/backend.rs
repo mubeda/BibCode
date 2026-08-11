@@ -174,6 +174,7 @@ pub enum BackendLaunchTarget {
         program: String,
         args: Vec<String>,
         bootstrap_line: String,
+        data_root: Option<String>,
     },
 }
 
@@ -186,6 +187,7 @@ pub struct WslBackendLaunchPlanInput {
     pub renderer_host: String,
     pub desktop_bootstrap_token: String,
     pub binary_path: String,
+    pub data_root: String,
 }
 
 impl BackendLaunchPlan {
@@ -244,6 +246,7 @@ impl BackendLaunchPlan {
             "port": config.port,
             "host": &config.bind_host,
             "desktopBootstrapToken": &config.desktop_bootstrap_token,
+            "bibcodeHome": &input.data_root,
             "wslTransport": true,
             "tailscaleServeEnabled": false,
             "tailscaleServePort": TAILSCALE_SERVE_PORT,
@@ -265,6 +268,7 @@ impl BackendLaunchPlan {
                 program: "wsl.exe".to_string(),
                 args,
                 bootstrap_line: format!("{bootstrap}\n"),
+                data_root: Some(input.data_root),
             },
             log_path: None,
             config,
@@ -549,6 +553,82 @@ pub(crate) struct BackendUpdateSnapshot {
     unavailable_environments: Vec<BackendUnavailableEnvironment>,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct BackendProjectDataTarget {
+    pub environment_id: String,
+    pub label: String,
+    pub running_distro: Option<String>,
+    pub running: bool,
+    pub launch_plan: BackendLaunchPlan,
+}
+
+#[derive(Debug)]
+pub(crate) struct BackendProjectDataOperation {
+    supervisor: BackendSupervisor,
+    target: BackendProjectDataTarget,
+    stopped: bool,
+    _reservation: BackendProjectDataReservation,
+}
+
+#[derive(Debug)]
+struct BackendProjectDataReservation {
+    supervisor: BackendSupervisor,
+}
+
+impl Drop for BackendProjectDataReservation {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.supervisor.state.lock() {
+            state.update_coordination = false;
+        }
+    }
+}
+
+impl BackendProjectDataOperation {
+    pub(crate) fn target(&self) -> &BackendProjectDataTarget {
+        &self.target
+    }
+
+    pub(crate) async fn stop_selected(&mut self) -> Result<(), String> {
+        if self.stopped || !self.target.running {
+            self.stopped = true;
+            return Ok(());
+        }
+        let managed = {
+            let mut state = self
+                .supervisor
+                .state
+                .lock()
+                .map_err(|error| format!("backend supervisor mutex poisoned: {error}"))?;
+            let slot = state
+                .slots
+                .get_mut(&self.target.environment_id)
+                .ok_or_else(|| {
+                    "The selected desktop backend is no longer registered.".to_owned()
+                })?;
+            slot.restart_scheduled = false;
+            slot.backend.take().ok_or_else(|| {
+                "The selected desktop backend stopped before recovery began.".to_owned()
+            })?
+        };
+        stop_managed_backend(managed, BackendShutdownConfig::default()).await?;
+        self.stopped = true;
+        Ok(())
+    }
+
+    pub(crate) async fn restart_after_commit(&self) -> Result<(), String> {
+        self.supervisor
+            .start_with_options_inner(
+                self.target.launch_plan.clone(),
+                BackendReadinessConfig::default(),
+                BackendRestartConfig::default(),
+                true,
+                true,
+            )
+            .await
+            .map(|_| ())
+    }
+}
+
 impl BackendSupervisor {
     pub fn new() -> Self {
         Self::default()
@@ -613,6 +693,60 @@ impl BackendSupervisor {
             environments,
             running_plans,
             unavailable_environments,
+        }
+    }
+
+    pub(crate) fn project_data_targets(&self) -> Vec<BackendProjectDataTarget> {
+        self.state
+            .lock()
+            .expect("backend supervisor mutex poisoned")
+            .slots
+            .values()
+            .filter_map(|slot| {
+                let launch_plan = slot.launch_plan.clone()?;
+                Some(BackendProjectDataTarget {
+                    environment_id: launch_plan.config.environment_id.clone(),
+                    label: launch_plan.config.label.clone(),
+                    running_distro: launch_plan.config.running_distro.clone(),
+                    running: slot.backend.is_some(),
+                    launch_plan,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) async fn begin_project_data_operation(
+        &self,
+        environment_id: &str,
+    ) -> Result<BackendProjectDataOperation, String> {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|error| format!("backend supervisor mutex poisoned: {error}"))?;
+            if state.update_coordination {
+                return Err(
+                    "Another exclusive desktop data operation is already running.".to_owned(),
+                );
+            }
+            state.update_coordination = true;
+        }
+        let reservation = BackendProjectDataReservation {
+            supervisor: self.clone(),
+        };
+        self.wait_for_in_flight_starts().await;
+        let target = self
+            .project_data_targets()
+            .into_iter()
+            .find(|target| target.environment_id == environment_id);
+        match target {
+            Some(target) => Ok(BackendProjectDataOperation {
+                supervisor: self.clone(),
+                target,
+                stopped: false,
+                _reservation: reservation,
+            }),
+            None => Err("The selected project-data environment is not registered.".to_owned()),
         }
     }
 
@@ -1457,6 +1591,7 @@ async fn start_managed_backend(
             program,
             args,
             bootstrap_line,
+            ..
         } => {
             let mut command = Command::new(program);
             configure_background_command(&mut command);
@@ -2081,6 +2216,29 @@ fn resolve_wsl_renderer_host(distro: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn resolve_wsl_data_root(distro: &str) -> Result<String, String> {
+    let environment = run_wsl_command(distro, &["env"])?;
+    let value = environment
+        .lines()
+        .find_map(|line| line.strip_prefix("BIBCODE_HOME="))
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            environment
+                .lines()
+                .find_map(|line| line.strip_prefix("HOME="))
+                .filter(|value| !value.is_empty())
+                .map(|home| format!("{}/.bibcode", home.trim_end_matches('/')))
+        })
+        .ok_or_else(|| format!("WSL distro {distro} did not report BIBCODE_HOME or HOME."))?;
+    if !value.starts_with('/') || value.contains('\r') || value.contains('\0') {
+        return Err(format!(
+            "WSL distro {distro} reported a project data root that is not an absolute Linux path."
+        ));
+    }
+    Ok(value)
+}
+
 fn resolve_wsl_launch_plan_for_distro(
     running_distro: String,
     port: u16,
@@ -2090,6 +2248,7 @@ fn resolve_wsl_launch_plan_for_distro(
     label: String,
 ) -> Result<BackendLaunchPlan, String> {
     let binary_path = resolve_wsl_server_binary(&running_distro)?;
+    let data_root = resolve_wsl_data_root(&running_distro)?;
     let renderer_host = resolve_wsl_renderer_host(&running_distro)
         .unwrap_or_else(|| DESKTOP_LOOPBACK_HOST.to_string());
 
@@ -2101,6 +2260,7 @@ fn resolve_wsl_launch_plan_for_distro(
         renderer_host,
         desktop_bootstrap_token,
         binary_path,
+        data_root,
     })
     .with_log_path(log_path))
 }
@@ -3197,6 +3357,7 @@ mod tests {
             renderer_host: "172.27.0.99".to_string(),
             desktop_bootstrap_token: "desktop-token".to_string(),
             binary_path: "/tmp/bibcode's launch/bibcode".to_string(),
+            data_root: "/srv/bibcode data".to_string(),
         })
         .with_log_path(PathBuf::from(
             "C:/Users/mauro/.bibcode/dev/logs/server-child-wsl-Ubuntu.log",
@@ -3213,7 +3374,9 @@ mod tests {
                 ref program,
                 ref args,
                 ref bootstrap_line,
+                ref data_root,
             } if program == "wsl.exe"
+                && data_root.as_deref() == Some("/srv/bibcode data")
                 && args == &vec![
                     "-d".to_string(),
                     "Ubuntu".to_string(),
@@ -3232,6 +3395,7 @@ mod tests {
                         "port": 5050,
                         "host": "0.0.0.0",
                         "desktopBootstrapToken": "desktop-token",
+                        "bibcodeHome": "/srv/bibcode data",
                         "wslTransport": true,
                         "tailscaleServeEnabled": false,
                         "tailscaleServePort": 443,
@@ -3278,6 +3442,7 @@ mod tests {
             renderer_host: "172.27.0.99".to_string(),
             desktop_bootstrap_token: "wsl-token".to_string(),
             binary_path: "/home/test/bibcode".to_string(),
+            data_root: "/home/test/.bibcode".to_string(),
         });
 
         {
@@ -3325,6 +3490,7 @@ mod tests {
             renderer_host: "172.27.0.99".to_string(),
             desktop_bootstrap_token: "wsl-token".to_string(),
             binary_path: "/home/test/bibcode".to_string(),
+            data_root: "/home/test/.bibcode".to_string(),
         });
 
         {
@@ -3370,6 +3536,7 @@ mod tests {
             renderer_host: "172.20.0.2".to_string(),
             desktop_bootstrap_token: "secondary-token".to_string(),
             binary_path: "/usr/local/bin/bibcode".to_string(),
+            data_root: "/home/test/.bibcode".to_string(),
         });
         {
             let mut state = supervisor
@@ -3445,6 +3612,7 @@ mod tests {
             renderer_host: "172.20.0.2".to_string(),
             desktop_bootstrap_token: "secondary-token".to_string(),
             binary_path: "/usr/local/bin/bibcode".to_string(),
+            data_root: "/home/test/.bibcode".to_string(),
         });
         {
             let mut state = supervisor
@@ -4316,6 +4484,7 @@ exit /b 9
             renderer_host: "172.27.0.1".to_string(),
             desktop_bootstrap_token: "desktop-token".to_string(),
             binary_path: "/usr/local/bin/bibcode".to_string(),
+            data_root: "/home/test/.bibcode".to_string(),
         });
         let error = classify_primary_start_error(&plan, "WSL process exited before readiness")
             .expect("WSL primary startup failures must remain typed");
@@ -4785,6 +4954,7 @@ exit /b 9
                 program: format!("missing-bibcode-backend-{}", Uuid::new_v4().simple()),
                 args: Vec::new(),
                 bootstrap_line: "{}\n".to_string(),
+                data_root: None,
             },
             log_path: None,
             config: local_test_config(4_300),
@@ -5229,6 +5399,7 @@ while (-not [IO.File]::Exists({})) {{
                     script,
                 ],
                 bootstrap_line: bootstrap_line.clone(),
+                data_root: None,
             },
             log_path: Some(temp.path().join("child.log")),
             config: local_test_config(port),
@@ -5312,6 +5483,7 @@ while (-not [IO.File]::Exists({})) {{
                     "Wait-Event".to_string(),
                 ],
                 bootstrap_line: "{}\n".to_string(),
+                data_root: None,
             },
             log_path: None,
             config: local_test_config(port),
