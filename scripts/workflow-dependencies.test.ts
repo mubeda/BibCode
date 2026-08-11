@@ -108,4 +108,16 @@ describe("GitHub workflow dependencies", () => {
       new Set(ledger.keys()),
     );
   });
+
+  it("audits every external action used by the seeded desktop upgrade workflow", () => {
+    const upgradeReferences = references.filter(
+      (reference) => reference.file === "desktop-upgrade-smoke.yml",
+    );
+
+    expect(upgradeReferences.length).toBeGreaterThan(0);
+    for (const reference of upgradeReferences) {
+      expect(reference.revision).toMatch(immutableCommitPattern);
+      expect(ledger.get(reference.action)?.sha).toBe(reference.revision);
+    }
+  });
 });

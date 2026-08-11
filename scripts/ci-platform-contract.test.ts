@@ -12,6 +12,11 @@ const DESKTOP_UI_WORKFLOW_PATH = NodePath.join(
   REPOSITORY_ROOT,
   ".github/workflows/desktop-ui-smoke.yml",
 );
+const DESKTOP_UPGRADE_WORKFLOW_PATH = NodePath.join(
+  REPOSITORY_ROOT,
+  ".github/workflows/desktop-upgrade-smoke.yml",
+);
+const PACKAGE_JSON_PATH = NodePath.join(REPOSITORY_ROOT, "package.json");
 
 interface WorkflowStep {
   readonly env?: Record<string, string>;
@@ -430,5 +435,99 @@ describe("packaged desktop UI smoke contract", () => {
     expect(evidencePaths).toContain("/*.png");
     expect(evidencePaths).toContain("/*.log");
     expect(evidencePaths).not.toContain("/state/");
+  });
+});
+
+describe("seeded packaged desktop upgrade contract", () => {
+  it("exposes the seeded upgrade harness as a repository command", () => {
+    const packageJson = JSON.parse(NodeFS.readFileSync(PACKAGE_JSON_PATH, "utf8")) as {
+      readonly scripts?: Record<string, string>;
+    };
+
+    expect(packageJson.scripts?.["test:desktop:upgrade"]).toBe(
+      "node scripts/seeded-desktop-upgrade-smoke.ts",
+    );
+  });
+
+  it("is release-blocking on the exact supported updater matrix", () => {
+    const { workflow } = readWorkflow(DESKTOP_UPGRADE_WORKFLOW_PATH);
+    const smoke = requireJob(workflow, "seeded_upgrade_smoke");
+
+    expect(workflow.on?.pull_request).toBeDefined();
+    expect(workflow.on?.workflow_dispatch).toBeDefined();
+    expect(smoke.strategy?.["fail-fast"]).toBe(false);
+    expect(smoke.strategy?.matrix?.include).toEqual([
+      {
+        label: "Linux x64 AppImage",
+        runner: "ubuntu-22.04",
+        platform: "linux",
+        arch: "x64",
+        bundle: "appimage",
+      },
+      {
+        label: "Windows x64 NSIS",
+        runner: "windows-2025",
+        platform: "win",
+        arch: "x64",
+        bundle: "nsis",
+      },
+      {
+        label: "macOS arm64",
+        runner: "macos-26",
+        platform: "mac",
+        arch: "arm64",
+        bundle: "dmg",
+      },
+      {
+        label: "macOS x64",
+        runner: "macos-26-intel",
+        platform: "mac",
+        arch: "x64",
+        bundle: "dmg",
+      },
+    ]);
+  });
+
+  it("runs both seeded lanes with ephemeral signing and bounded redacted evidence", () => {
+    const { raw, workflow } = readWorkflow(DESKTOP_UPGRADE_WORKFLOW_PATH);
+    const smoke = requireJob(workflow, "seeded_upgrade_smoke");
+    const commands = allStepCommands(smoke);
+
+    expect(commands).toContain("scripts/resolve-previous-release-tag.ts");
+    expect(commands).toContain("scripts/seeded-desktop-upgrade-smoke.ts");
+    expect(commands).toContain("--previous-tag");
+    expect(commands).toContain("--candidate-version");
+    expect(commands).toContain('--current-tag "v2147483647.0.0"');
+    expect(commands).not.toContain("apps/desktop/package.json");
+    expect(commands).toContain("TAURI_SIGNING_PRIVATE_KEY");
+    expect(commands).toContain("TAURI_SIGNING_PRIVATE_KEY_PASSWORD");
+    expect(raw).toContain("previous-stable");
+    expect(raw).toContain("protected-baseline");
+    expect(raw).not.toMatch(
+      /cat\s+.*(?:private|signing).*key|echo\s+["']?\$(?:TAURI_SIGNING_PRIVATE_KEY|key_password)["']?\s*(?:$|[|>])/m,
+    );
+
+    const evidence = smoke.steps?.find(
+      (step) => step.name === "Upload bounded seeded-upgrade evidence",
+    );
+    expect(evidence?.if).toBe("always()");
+    expect(String(evidence?.with?.path)).toContain("/evidence/");
+    expect(String(evidence?.with?.path)).not.toMatch(/state\.sqlite|\/data\//);
+  });
+
+  it("runs WSL identity coverage or records the unavailable capability reason", () => {
+    const { workflow } = readWorkflow(DESKTOP_UPGRADE_WORKFLOW_PATH);
+    const wsl = requireJob(workflow, "windows_wsl_upgrade_smoke");
+    const commands = allStepCommands(wsl);
+
+    expect(wsl["runs-on"]).toBe("windows-2025");
+    expect(commands).toContain("wsl --status");
+    expect(commands).toContain("capability_reason");
+    expect(commands).toContain("GITHUB_STEP_SUMMARY");
+    expect(commands).toContain("--wsl");
+    expect(commands).toContain("scripts/seeded-desktop-upgrade-smoke.ts");
+    expect(commands).toContain("cargo build -p bibcode-server --bin bibcode --release");
+    expect(commands).toContain("BIBCODE_WSL_SERVER_BINARY");
+    expect(commands).toContain('--current-tag "v2147483647.0.0"');
   });
 });

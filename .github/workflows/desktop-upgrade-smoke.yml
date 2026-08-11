@@ -1,0 +1,268 @@
+name: Seeded Packaged Desktop Upgrade
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  seeded_upgrade_smoke:
+    name: Seeded upgrade - ${{ matrix.label }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - {
+              label: Linux x64 AppImage,
+              runner: ubuntu-22.04,
+              platform: linux,
+              arch: x64,
+              bundle: appimage,
+            }
+          - {
+              label: Windows x64 NSIS,
+              runner: windows-2025,
+              platform: win,
+              arch: x64,
+              bundle: nsis,
+            }
+          - { label: macOS arm64, runner: macos-26, platform: mac, arch: arm64, bundle: dmg }
+          - { label: macOS x64, runner: macos-26-intel, platform: mac, arch: x64, bundle: dmg }
+    steps:
+      - name: Checkout complete release history
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Setup Vite+
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1.15.0
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+
+      - name: Cache Rust build output
+        uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          workspaces: |
+            . -> target
+
+      - name: Install Linux packaged-updater prerequisites
+        if: matrix.platform == 'linux'
+        run: |
+          s''udo apt-get update
+          s''udo apt-get install -y \
+            build-essential curl wget file libxdo-dev libssl-dev \
+            libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev patchelf xvfb xdotool
+
+      - name: Install frozen dependencies
+        run: vp install --frozen-lockfile
+
+      - id: versions
+        name: Resolve previous stable and isolated candidate versions
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous_line="$(node scripts/resolve-previous-release-tag.ts \
+            --channel stable --current-tag "v2147483647.0.0")"
+          previous_tag="${previous_line#previous_tag=}"
+          test -n "$previous_tag"
+          previous_version="${previous_tag#v}"
+          previous_core="${previous_version%%[-+]*}"
+          IFS=. read -r major minor patch <<< "$previous_core"
+          candidate_version="$major.$minor.$((patch + 1))-upgrade.${GITHUB_RUN_NUMBER}"
+          {
+            echo "candidate_version=$candidate_version"
+            echo "previous_tag=$previous_tag"
+            echo "previous_version=$previous_version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate ephemeral updater signing key
+        shell: bash
+        run: |
+          set -euo pipefail
+          key_path="$RUNNER_TEMP/bibcode-seeded-upgrade.key"
+          key_password="$(node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))")"
+          (cd apps/desktop && vp exec tauri signer generate \
+            --ci --password "$key_password" --write-keys "$key_path" >/dev/null)
+          test -s "$key_path"
+          test -s "$key_path.pub"
+          {
+            echo "TAURI_SIGNING_PRIVATE_KEY=$key_path"
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$key_password"
+            echo "BIBCODE_UPGRADE_PUBLIC_KEY_FILE=$key_path.pub"
+          } >> "$GITHUB_ENV"
+
+      - name: Run real previous-stable and protected-baseline upgrades
+        shell: bash
+        run: |
+          set -euo pipefail
+          args=(node scripts/seeded-desktop-upgrade-smoke.ts
+            --platform "${{ matrix.platform }}"
+            --arch "${{ matrix.arch }}"
+            --bundle "${{ matrix.bundle }}"
+            --candidate-version "${{ steps.versions.outputs.candidate_version }}"
+            --previous-tag "${{ steps.versions.outputs.previous_tag }}"
+            --previous-version "${{ steps.versions.outputs.previous_version }}"
+            --public-key-file "$BIBCODE_UPGRADE_PUBLIC_KEY_FILE"
+            --run-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${{ matrix.platform }}-${{ matrix.arch }}"
+            --work-root "$RUNNER_TEMP/bibcode-seeded-upgrade/work"
+            --artifact-dir "$RUNNER_TEMP/bibcode-seeded-upgrade/evidence"
+            --updater-port 43120
+            --restart-timeout-ms 180000)
+          if [[ "${{ matrix.platform }}" == "linux" ]]; then
+            xvfb-run --auto-servernum "${args[@]}"
+          else
+            "${args[@]}"
+          fi
+
+      - name: Upload bounded seeded-upgrade evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: seeded-upgrade-${{ matrix.platform }}-${{ matrix.arch }}
+          path: ${{ runner.temp }}/bibcode-seeded-upgrade/evidence/*
+          if-no-files-found: error
+          retention-days: 7
+
+  windows_wsl_upgrade_smoke:
+    name: Seeded upgrade - Windows WSL primary
+    runs-on: windows-2025
+    timeout-minutes: 240
+    steps:
+      - name: Checkout complete release history
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - id: wsl
+        name: Detect declared WSL capability
+        shell: pwsh
+        run: |
+          $output = wsl --status 2>&1 | Out-String
+          $statusAvailable = $LASTEXITCODE -eq 0
+          $distros = @()
+          if ($statusAvailable) {
+            $distros = @(wsl --list --quiet 2>$null | ForEach-Object { ($_ -replace "`0", "").Trim() } | Where-Object { $_ })
+          }
+          if ($statusAvailable -and $distros.Count -gt 0) {
+            "available=true" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "capability_reason=WSL and an installed distribution are available" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          } else {
+            $reason = if (-not $statusAvailable) { "wsl --status is unavailable" } else { "WSL has no installed distribution" }
+            "available=false" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+            "capability_reason=$reason" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+          }
+
+      - name: Record unavailable WSL capability
+        if: steps.wsl.outputs.available != 'true'
+        shell: pwsh
+        run: |
+          "WSL packaged-upgrade smoke skipped: ${{ steps.wsl.outputs.capability_reason }}" |
+            Out-File -FilePath $env:GITHUB_STEP_SUMMARY -Append
+
+      - name: Setup Vite+
+        if: steps.wsl.outputs.available == 'true'
+        uses: voidzero-dev/setup-vp@250f29ce396baf5e8f24498e17c0dfdebabc26eb # v1.15.0
+        with:
+          node-version-file: package.json
+          cache: true
+          run-install: false
+
+      - name: Setup Rust
+        if: steps.wsl.outputs.available == 'true'
+        uses: dtolnay/rust-toolchain@46511b1c83438f0dd37c02d843619ece5a4abb5b # 1.97.1
+
+      - name: Install frozen dependencies
+        if: steps.wsl.outputs.available == 'true'
+        run: vp install --frozen-lockfile
+
+      - name: Build the WSL server used by the packaged desktop
+        if: steps.wsl.outputs.available == 'true'
+        shell: pwsh
+        run: |
+          $workspaceWsl = (wsl wslpath -a "$env:GITHUB_WORKSPACE").Trim()
+          if ([string]::IsNullOrWhiteSpace($workspaceWsl)) {
+            throw "WSL could not resolve the checkout path"
+          }
+          wsl bash -lc "set -euo pipefail; s''udo apt-get update; s''udo apt-get install -y build-essential clang cmake curl pkg-config libssl-dev"
+          if ($LASTEXITCODE -ne 0) { throw "WSL build prerequisites failed" }
+          wsl bash -lc "set -euo pipefail; if ! command -v cargo >/dev/null; then curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.97.1; fi"
+          if ($LASTEXITCODE -ne 0) { throw "WSL Rust setup failed" }
+          $build = "set -euo pipefail; cd '$workspaceWsl'; export PATH=`"`$HOME/.cargo/bin:`$PATH`"; CARGO_TARGET_DIR='$workspaceWsl/target/x86_64-unknown-linux-gnu' cargo build -p bibcode-server --bin bibcode --release"
+          wsl bash -lc $build
+          if ($LASTEXITCODE -ne 0) { throw "WSL server build failed" }
+          $serverBinary = Join-Path $env:GITHUB_WORKSPACE "target\x86_64-unknown-linux-gnu\release\bibcode"
+          if (-not (Test-Path -LiteralPath $serverBinary -PathType Leaf)) {
+            throw "WSL server build did not produce the expected binary"
+          }
+          "BIBCODE_WSL_SERVER_BINARY=$serverBinary" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - id: wsl_versions
+        name: Resolve WSL previous and candidate versions
+        if: steps.wsl.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          previous_line="$(node scripts/resolve-previous-release-tag.ts --channel stable --current-tag "v2147483647.0.0")"
+          previous_tag="${previous_line#previous_tag=}"
+          test -n "$previous_tag"
+          previous_version="${previous_tag#v}"
+          previous_core="${previous_version%%[-+]*}"
+          IFS=. read -r major minor patch <<< "$previous_core"
+          candidate_version="$major.$minor.$((patch + 1))-wsl.${GITHUB_RUN_NUMBER}"
+          {
+            echo "candidate_version=$candidate_version"
+            echo "previous_tag=$previous_tag"
+            echo "previous_version=$previous_version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Generate WSL ephemeral updater signing key
+        if: steps.wsl.outputs.available == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          key_path="$RUNNER_TEMP/bibcode-seeded-wsl-upgrade.key"
+          key_password="$(node -e "process.stdout.write(require('crypto').randomBytes(32).toString('hex'))")"
+          (cd apps/desktop && vp exec tauri signer generate --ci --password "$key_password" --write-keys "$key_path" >/dev/null)
+          {
+            echo "TAURI_SIGNING_PRIVATE_KEY=$key_path"
+            echo "TAURI_SIGNING_PRIVATE_KEY_PASSWORD=$key_password"
+            echo "BIBCODE_UPGRADE_PUBLIC_KEY_FILE=$key_path.pub"
+          } >> "$GITHUB_ENV"
+
+      - name: Run protected WSL storage-identity upgrade
+        if: steps.wsl.outputs.available == 'true'
+        shell: bash
+        run: |
+          node scripts/seeded-desktop-upgrade-smoke.ts \
+            --wsl \
+            --platform win \
+            --arch x64 \
+            --bundle nsis \
+            --candidate-version "${{ steps.wsl_versions.outputs.candidate_version }}" \
+            --previous-tag "${{ steps.wsl_versions.outputs.previous_tag }}" \
+            --previous-version "${{ steps.wsl_versions.outputs.previous_version }}" \
+            --public-key-file "$BIBCODE_UPGRADE_PUBLIC_KEY_FILE" \
+            --run-id "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-windows-wsl" \
+            --work-root "$RUNNER_TEMP/bibcode-seeded-wsl-upgrade/work" \
+            --artifact-dir "$RUNNER_TEMP/bibcode-seeded-wsl-upgrade/evidence" \
+            --updater-port 43220 \
+            --restart-timeout-ms 240000
+
+      - name: Upload bounded WSL seeded-upgrade evidence
+        if: always() && steps.wsl.outputs.available == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: seeded-upgrade-windows-wsl
+          path: ${{ runner.temp }}/bibcode-seeded-wsl-upgrade/evidence/*
+          if-no-files-found: error
+          retention-days: 7
