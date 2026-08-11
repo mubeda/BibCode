@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::{
-        Arc,
+        Arc, Condvar, Mutex as StdMutex,
         atomic::{AtomicUsize, Ordering},
     },
     time::Duration,
@@ -394,6 +394,347 @@ async fn concurrent_policy_controls_merge_without_losing_a_sibling_update() {
         .worktree_discovery;
     assert_eq!(persisted["visibility"], "shown");
     assert!(persisted["initialPromptDismissedAt"].as_str().is_some());
+    for command_id in ["policy-concurrent-visibility", "policy-concurrent-dismiss"] {
+        assert_eq!(
+            fixture
+                .repositories
+                .get_command_receipt(command_id.to_owned())
+                .await
+                .expect("policy receipt read")
+                .expect("accepted policy receipt")
+                .status,
+            "accepted",
+            "different command IDs must retain normal project serialization"
+        );
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn policy_claim_precedes_project_lock_and_cannot_deadlock_removal() {
+    let mut fixture = CatalogRpcFixture::new(true).await;
+    let thread_id = adopt_external_for_removal(&mut fixture, "policy-first-adopt").await;
+    let plan = removal_plan(&mut fixture, "project-1", &thread_id, "32").await;
+    let command_id = "policy-first-shared-command";
+    let removal = removal_payload(command_id, "project-1", &thread_id, &plan);
+    let address = fixture.handle.as_ref().expect("server handle").local_addr();
+    let mut policy_socket = connect_async(format!("ws://{address}/ws"))
+        .await
+        .expect("policy socket")
+        .0;
+
+    let database = fixture.repositories.database().clone();
+    let observer = database
+        .enable_queue_backpressure_observation_for_integration_test()
+        .expect("exclusive database queue observer");
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let release = Arc::new((StdMutex::new(false), Condvar::new()));
+    let blocker_release = release.clone();
+    let blocker_database = database.clone();
+    let blocker = tokio::spawn(async move {
+        blocker_database
+            .call(move |_| {
+                let _ = entered_tx.send(());
+                let (released, changed) = blocker_release.as_ref();
+                let mut released = released.lock().expect("database blocker mutex");
+                while !*released {
+                    released = changed
+                        .wait(released)
+                        .expect("database blocker mutex after wait");
+                }
+                Ok(())
+            })
+            .await
+    });
+    entered_rx.await.expect("database blocker enters");
+
+    request(
+        &mut policy_socket,
+        "33",
+        "worktree.updateDiscoveryPolicy",
+        json!({
+            "commandId":command_id,
+            "projectId":"project-1",
+            "visibility":"shown"
+        }),
+    )
+    .await;
+    timeout(Duration::from_secs(5), async {
+        while database
+            .queue_backpressure_snapshot_for_integration_test()
+            .reserved_or_queued_jobs
+            < 1
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("policy pauses on its project read while owning the mutation lock");
+
+    request(fixture.socket(), "34", "worktree.remove", removal).await;
+    let _old_order_removal_reached_database = timeout(Duration::from_millis(250), async {
+        while database
+            .queue_backpressure_snapshot_for_integration_test()
+            .reserved_or_queued_jobs
+            < 2
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    {
+        let (released, changed) = release.as_ref();
+        *released.lock().expect("database blocker mutex") = true;
+        changed.notify_one();
+    }
+    blocker
+        .await
+        .expect("database blocker joins")
+        .expect("database blocker succeeds");
+
+    let (policy_exit, removal_exit) = timeout(Duration::from_secs(5), async {
+        tokio::join!(
+            next_server_message(&mut policy_socket),
+            next_server_message(fixture.socket())
+        )
+    })
+    .await
+    .expect("policy and removal must complete without a command/project lock cycle");
+    assert!(matches!(
+        policy_exit,
+        ServerMessage::Exit {
+            exit: RpcExit::Success { .. },
+            ..
+        }
+    ));
+    let ServerMessage::Exit {
+        exit: RpcExit::Failure { cause },
+        ..
+    } = removal_exit
+    else {
+        panic!("expected removal command conflict: {removal_exit:?}");
+    };
+    assert!(removal_failure_has_reason(&cause, "command-conflict"));
+    assert!(
+        fixture.external.exists(),
+        "losing removal must not mutate Git"
+    );
+    assert!(
+        fixture
+            .repositories
+            .get_thread(thread_id)
+            .await
+            .expect("thread read")
+            .expect("thread exists")
+            .deleted_at
+            .is_none(),
+        "losing removal must not detach the thread"
+    );
+    let receipt = fixture
+        .repositories
+        .get_command_receipt(command_id.to_owned())
+        .await
+        .expect("receipt read")
+        .expect("accepted policy receipt");
+    assert_eq!(receipt.status, "accepted");
+    assert_eq!(
+        receipt.payload_digest.as_deref(),
+        Some(
+            canonical_command_digest(&json!({
+                "commandId":command_id,
+                "projectId":"project-1",
+                "visibility":"shown",
+                "acknowledgeGeneration":null,
+                "dismissInitialPrompt":null
+            }))
+            .expect("canonical policy digest")
+            .as_str()
+        )
+    );
+    drop(observer);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn removal_claim_survives_a_cancelled_policy_waiter_and_conflicts_the_next_waiter() {
+    let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+    let release = Arc::new(Semaphore::new(0));
+    let removal_git = Arc::new(BlockingRemovalGit {
+        inner: GitRepository::default(),
+        entered: entered_tx,
+        release: release.clone(),
+    });
+    let mut fixture = CatalogRpcFixture::new_with_removal_git(true, removal_git).await;
+    let thread_id = adopt_external_for_removal(&mut fixture, "policy-waiter-adopt").await;
+    let plan = removal_plan(&mut fixture, "project-1", &thread_id, "35").await;
+    let command_id = "removal-first-policy-command";
+    let removal = removal_payload(command_id, "project-1", &thread_id, &plan);
+    request(fixture.socket(), "36", "worktree.remove", removal.clone()).await;
+    timeout(Duration::from_secs(5), entered_rx.recv())
+        .await
+        .expect("removal reaches Git")
+        .expect("Git boundary");
+
+    let address = fixture.handle.as_ref().expect("server handle").local_addr();
+    let mut cancelled_socket = connect_async(format!("ws://{address}/ws"))
+        .await
+        .expect("cancelled policy socket")
+        .0;
+    request(
+        &mut cancelled_socket,
+        "37",
+        "worktree.updateDiscoveryPolicy",
+        json!({
+            "commandId":command_id,
+            "projectId":"project-1",
+            "visibility":"shown"
+        }),
+    )
+    .await;
+    assert!(
+        timeout(Duration::from_millis(200), cancelled_socket.next())
+            .await
+            .is_err(),
+        "policy must wait without mutating while removal owns the command and project"
+    );
+    send_json(
+        &mut cancelled_socket,
+        json!({"_tag":"Interrupt","requestId":"37"}),
+    )
+    .await;
+    assert!(matches!(
+        next_server_message(&mut cancelled_socket).await,
+        ServerMessage::Exit {
+            exit: RpcExit::Failure { cause },
+            ..
+        } if cause.iter().any(|item| matches!(item, CauseItem::Interrupt { .. }))
+    ));
+
+    let mut next_socket = connect_async(format!("ws://{address}/ws"))
+        .await
+        .expect("next policy socket")
+        .0;
+    request(
+        &mut next_socket,
+        "38",
+        "worktree.updateDiscoveryPolicy",
+        json!({
+            "commandId":command_id,
+            "projectId":"project-1",
+            "visibility":"shown"
+        }),
+    )
+    .await;
+    assert!(
+        timeout(Duration::from_millis(200), next_socket.next())
+            .await
+            .is_err(),
+        "the next waiter must remain behind the live removal claimant"
+    );
+    release.add_permits(1);
+    let removal_result = success_value(fixture.socket(), "36").await;
+    assert_eq!(removal_result["gitOutcome"], "removed");
+    assert_typed_catalog_failure(&mut next_socket, "38", "command-conflict").await;
+    let project = fixture
+        .repositories
+        .get_project("project-1".to_owned())
+        .await
+        .expect("project read")
+        .expect("project exists");
+    assert_eq!(project.worktree_discovery["visibility"], "hidden");
+    let receipt = fixture
+        .repositories
+        .get_command_receipt(command_id.to_owned())
+        .await
+        .expect("receipt read")
+        .expect("accepted removal receipt");
+    assert_eq!(receipt.status, "accepted");
+    assert_eq!(
+        receipt.payload_digest.as_deref(),
+        Some(
+            canonical_command_digest(&removal)
+                .expect("removal digest")
+                .as_str()
+        )
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn cancelling_policy_while_waiting_for_project_lock_releases_its_command_claim() {
+    let mut fixture = CatalogRpcFixture::new(false).await;
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let release = Arc::new(Semaphore::new(0));
+    let holder_release = release.clone();
+    let catalog = fixture.catalog.clone();
+    let holder = tokio::spawn(async move {
+        catalog
+            .with_project_mutation_lock("project-1", || async move {
+                let _ = entered_tx.send(());
+                let permit = holder_release
+                    .acquire()
+                    .await
+                    .expect("project lock release");
+                permit.forget();
+            })
+            .await;
+    });
+    entered_rx.await.expect("project lock holder enters");
+
+    request(
+        fixture.socket(),
+        "39",
+        "worktree.updateDiscoveryPolicy",
+        json!({
+            "commandId":"cancelled-project-wait-policy",
+            "projectId":"project-1",
+            "visibility":"shown"
+        }),
+    )
+    .await;
+    assert!(
+        timeout(Duration::from_millis(200), fixture.socket().next())
+            .await
+            .is_err(),
+        "policy remains queued behind the project lock"
+    );
+    send_json(
+        fixture.socket(),
+        json!({"_tag":"Interrupt","requestId":"39"}),
+    )
+    .await;
+    assert!(matches!(
+        next_server_message(fixture.socket()).await,
+        ServerMessage::Exit {
+            exit: RpcExit::Failure { cause },
+            ..
+        } if cause.iter().any(|item| matches!(item, CauseItem::Interrupt { .. }))
+    ));
+    request(
+        fixture.socket(),
+        "40",
+        "worktree.updateDiscoveryPolicy",
+        json!({
+            "commandId":"cancelled-project-wait-policy",
+            "projectId":"project-1",
+            "visibility":"shown"
+        }),
+    )
+    .await;
+    release.add_permits(1);
+    holder.await.expect("project lock holder joins");
+    let retry = success_value(fixture.socket(), "40").await;
+    assert_eq!(retry["visibility"], "shown");
+    assert_eq!(
+        fixture
+            .repositories
+            .get_command_receipt("cancelled-project-wait-policy".to_owned())
+            .await
+            .expect("receipt read")
+            .expect("accepted retry receipt")
+            .status,
+        "accepted"
+    );
     fixture.shutdown().await;
 }
 

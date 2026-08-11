@@ -73,11 +73,16 @@ checkout paths.
 acknowledgement must name the exact latest authoritative generation. The
 server derives the baseline from eligible normalized paths in that snapshot,
 deduplicates it, caps it at 512, and persists the complete policy through the
-durable `project.meta.update` command. Mutation serialization always acquires
-the stable project-identity lock before the optional physical-repository lock.
-That order prevents a project from switching mutexes while its durable trust
-pin is established while still serializing known cross-project repository
-aliases.
+durable `project.meta.update` command. The policy handler digests the decoded
+public payload, acquires its cancellation-aware command claim, and transfers
+that claim plus the digest into engine persistence. Only then does mutation
+serialization acquire the stable project-identity lock before the optional
+physical-repository lock. This command-claim, project, repository order is the
+same order used by adoption and removal. It prevents both command/project lock
+cycles and a project switching mutexes while its durable trust pin is
+established, while still serializing known cross-project repository aliases.
+An opposite-payload retry fails with typed `command-conflict`; accepted legacy
+policy receipts without a digest retain their replay behavior.
 
 `worktree.adopt` also requires `orchestration:operate`. Its public payload
 contains an opaque catalog key, expected generation, project ID, command ID,

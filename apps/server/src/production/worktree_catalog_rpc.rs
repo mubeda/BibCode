@@ -594,6 +594,18 @@ async fn normalized_existing_path(path: &Path) -> String {
     normalize_worktree_path_key(&canonical, host_path_platform())
 }
 
+async fn acquire_worktree_command_claim(
+    orchestration: &OrchestrationEngine,
+    command_id: &str,
+    cancellation: &CancellationToken,
+) -> Result<CommandAdmissionClaim, OrchestrationError> {
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(OrchestrationError::Cancelled),
+        claim = orchestration.acquire_command_admission(command_id) => claim,
+    }
+}
+
 pub fn register_worktree_catalog_rpc(
     registry: &mut RpcRegistry,
     services: WorktreeCatalogRpcServices,
@@ -621,9 +633,9 @@ pub fn register_worktree_catalog_rpc(
     );
 
     let adoption_services = services.clone();
-    registry.register_unary("worktree.adopt", move |request, _cancellation| {
+    registry.register_unary("worktree.adopt", move |request, cancellation| {
         let services = adoption_services.clone();
-        async move { adopt_worktree(&services, request).await }
+        async move { adopt_worktree(&services, request, cancellation).await }
     });
 
     let plan_services = services.clone();
@@ -635,9 +647,9 @@ pub fn register_worktree_catalog_rpc(
     let detach_services = services.clone();
     registry.register_unary(
         "worktree.removeFromBibCode",
-        move |request, _cancellation| {
+        move |request, cancellation| {
             let services = detach_services.clone();
-            async move { remove_from_bibcode(&services, request).await }
+            async move { remove_from_bibcode(&services, request, cancellation).await }
         },
     );
 
@@ -649,14 +661,18 @@ pub fn register_worktree_catalog_rpc(
 
     registry.register_unary(
         "worktree.updateDiscoveryPolicy",
-        move |request, _cancellation| {
+        move |request, cancellation| {
             let services = services.clone();
-            async move { update_discovery_policy(&services, request).await }
+            async move { update_discovery_policy(&services, request, cancellation).await }
         },
     );
 }
 
-async fn adopt_worktree(services: &WorktreeCatalogRpcServices, request: RpcRequest) -> RpcResult {
+async fn adopt_worktree(
+    services: &WorktreeCatalogRpcServices,
+    request: RpcRequest,
+    cancellation: CancellationToken,
+) -> RpcResult {
     let input = decode::<WorktreeAdoptInput>(request)?;
     let payload_digest = canonical_command_digest(&input).map_err(|_| {
         encode(adoption_error(
@@ -665,11 +681,10 @@ async fn adopt_worktree(services: &WorktreeCatalogRpcServices, request: RpcReque
             None,
         ))
     })?;
-    let command_claim = services
-        .orchestration
-        .acquire_command_admission(&input.command_id)
-        .await
-        .map_err(|error| encode(adoption_orchestration_error(error, None)))?;
+    let command_claim =
+        acquire_worktree_command_claim(&services.orchestration, &input.command_id, &cancellation)
+            .await
+            .map_err(|error| encode(adoption_orchestration_error(error, None)))?;
     if let Some(result) = services
         .orchestration
         .replay_admitted_worktree_adoption(&command_claim, &input.command_id, &payload_digest)
@@ -921,14 +936,14 @@ async fn get_removal_plan(
 async fn remove_from_bibcode(
     services: &WorktreeCatalogRpcServices,
     request: RpcRequest,
+    cancellation: CancellationToken,
 ) -> RpcResult {
     let input = decode::<WorktreeRemoveFromBibCodeInput>(request)?;
     let payload_digest = removal_payload_digest(&input)?;
-    let command_claim = services
-        .orchestration
-        .acquire_command_admission(&input.command_id)
-        .await
-        .map_err(|error| encode(removal_orchestration_error(error)))?;
+    let command_claim =
+        acquire_worktree_command_claim(&services.orchestration, &input.command_id, &cancellation)
+            .await
+            .map_err(|error| encode(removal_orchestration_error(error)))?;
     if let Some(result) =
         replay_removal(services, &command_claim, &input.command_id, &payload_digest).await?
     {
@@ -1005,11 +1020,10 @@ async fn remove_worktree(
 ) -> RpcResult {
     let input = decode::<WorktreeRemoveInput>(request)?;
     let payload_digest = removal_payload_digest(&input)?;
-    let command_claim = services
-        .orchestration
-        .acquire_command_admission(&input.command_id)
-        .await
-        .map_err(|error| encode(removal_orchestration_error(error)))?;
+    let command_claim =
+        acquire_worktree_command_claim(&services.orchestration, &input.command_id, &cancellation)
+            .await
+            .map_err(|error| encode(removal_orchestration_error(error)))?;
     if let Some(result) =
         replay_removal(services, &command_claim, &input.command_id, &payload_digest).await?
     {
@@ -1793,6 +1807,7 @@ fn removal_catalog_error(
             WorktreeRemovalErrorReason::EnvironmentUnsupported
         }
         CatalogErrorReason::StaleGeneration => WorktreeRemovalErrorReason::StaleGeneration,
+        CatalogErrorReason::CommandConflict => WorktreeRemovalErrorReason::CommandConflict,
         CatalogErrorReason::RepositoryUnavailable => WorktreeRemovalErrorReason::RepositoryMismatch,
         CatalogErrorReason::PolicyUpdateFailed | CatalogErrorReason::Internal => {
             WorktreeRemovalErrorReason::Internal
@@ -1870,20 +1885,44 @@ fn catalog_stream(
 async fn update_discovery_policy(
     services: &WorktreeCatalogRpcServices,
     request: RpcRequest,
+    cancellation: CancellationToken,
 ) -> RpcResult {
     let input = decode::<WorktreeDiscoveryPolicyUpdateInput>(request)?;
-    let project_id = input.project_id.clone();
-    services
-        .catalog
-        .with_project_mutation_lock(&project_id, || async {
-            update_discovery_policy_locked(services, input).await
-        })
+    let payload_digest = canonical_command_digest(&input)
+        .map_err(|error| encode(policy_error(format!("Policy admission failed: {error}"))))?;
+    let command_claim =
+        acquire_worktree_command_claim(&services.orchestration, &input.command_id, &cancellation)
+            .await
+            .map_err(|error| encode(policy_orchestration_error(error)))?;
+    let legacy_replay = services
+        .orchestration
+        .repositories()
+        .get_command_receipt(input.command_id.clone())
         .await
+        .map_err(|error| encode(policy_error(error.to_string())))?
+        .is_some_and(|receipt| receipt.payload_digest.is_none());
+    let project_id = input.project_id.clone();
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Err(encode(policy_orchestration_error(OrchestrationError::Cancelled))),
+        result = services.catalog.with_project_mutation_lock(&project_id, || async {
+            update_discovery_policy_locked(
+                services,
+                input,
+                payload_digest,
+                command_claim,
+                legacy_replay,
+            ).await
+        }) => result,
+    }
 }
 
 async fn update_discovery_policy_locked(
     services: &WorktreeCatalogRpcServices,
     input: WorktreeDiscoveryPolicyUpdateInput,
+    payload_digest: String,
+    command_claim: CommandAdmissionClaim,
+    legacy_replay: bool,
 ) -> RpcResult {
     let project = services
         .orchestration
@@ -1927,19 +1966,36 @@ async fn update_discovery_policy_locked(
             "Discovery policy could not be serialized: {error}"
         )))
     })?;
-    services
-        .orchestration
-        .dispatch(OrchestrationCommand::ProjectMetaUpdate {
-            command_id: input.command_id,
-            project_id: input.project_id,
-            title: None,
-            workspace_root: None,
-            default_model_selection: OptionalNullable::Missing,
-            scripts: None,
-            worktree_discovery: Some(policy_value.clone()),
-        })
-        .await
-        .map_err(|error| encode(policy_error(error.to_string())))?;
+    let command = OrchestrationCommand::ProjectMetaUpdate {
+        command_id: input.command_id,
+        project_id: input.project_id,
+        title: None,
+        workspace_root: None,
+        default_model_selection: OptionalNullable::Missing,
+        scripts: None,
+        worktree_discovery: Some(policy_value.clone()),
+    };
+    if legacy_replay {
+        services
+            .orchestration
+            .dispatch_with_command_claim(command, command_claim)
+            .await
+    } else {
+        services
+            .orchestration
+            .dispatch_with_admission_and_command_claim(
+                command,
+                CommandAdmission {
+                    payload_digest,
+                    attachment_refs: Vec::new(),
+                    provider_turn: None,
+                },
+                command_claim,
+                || {},
+            )
+            .await
+    }
+    .map_err(|error| encode(policy_orchestration_error(error)))?;
     Ok(policy_value)
 }
 
@@ -2019,7 +2075,7 @@ struct WorktreeAdoptionError {
     current_generation: Option<u64>,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct WorktreeDiscoveryPolicyUpdateInput {
     command_id: String,
@@ -2082,6 +2138,16 @@ fn policy_error(message: String) -> CatalogError {
     CatalogError::new(CatalogErrorReason::PolicyUpdateFailed, message)
 }
 
+fn policy_orchestration_error(error: OrchestrationError) -> CatalogError {
+    match error {
+        OrchestrationError::CommandConflict { .. } => CatalogError::new(
+            CatalogErrorReason::CommandConflict,
+            "The command ID was already used by another worktree mutation.",
+        ),
+        error => policy_error(error.to_string()),
+    }
+}
+
 fn adoption_error(
     reason: WorktreeAdoptionErrorReason,
     message: impl Into<String>,
@@ -2106,6 +2172,7 @@ fn adoption_catalog_error(
         }
         CatalogErrorReason::StaleGeneration => WorktreeAdoptionErrorReason::StaleGeneration,
         CatalogErrorReason::RepositoryUnavailable
+        | CatalogErrorReason::CommandConflict
         | CatalogErrorReason::PolicyUpdateFailed
         | CatalogErrorReason::Internal => WorktreeAdoptionErrorReason::Internal,
     };

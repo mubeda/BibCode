@@ -153,6 +153,7 @@ pub enum CatalogErrorReason {
     EnvironmentUnsupported,
     RepositoryUnavailable,
     StaleGeneration,
+    CommandConflict,
     PolicyUpdateFailed,
     Internal,
 }

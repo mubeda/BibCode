@@ -8,7 +8,7 @@
         "_tag": "Fail",
         "error": {
           "_tag": "WorktreeCatalogError",
-          "reason": "project-not-found",
+          "reason": "internal",
           "message": "%$.GQq\"1#"
         }
       }
