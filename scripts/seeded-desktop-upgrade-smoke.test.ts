@@ -378,7 +378,10 @@ describe("seeded packaged desktop upgrade harness", () => {
             `require("node:fs").writeFileSync(${JSON.stringify(pidPath)}, String(process.pid)); setInterval(() => {}, 1000);`,
           ],
           cwd: root,
-          timeoutMs: 50,
+          // Node startup can be delayed while the full release graph is
+          // compiling Rust targets. Give the child time to publish its PID;
+          // runBoundedCommand still owns the timeout and reap assertion.
+          timeoutMs: 2_000,
         }),
       ).rejects.toThrow(/timed out/);
 
