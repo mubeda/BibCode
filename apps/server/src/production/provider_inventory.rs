@@ -1621,34 +1621,85 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn inventory_probes_the_configured_instance_path_executable() {
-        let sandbox = TestSandbox::new("provider-inventory-path");
-        let instance = sandbox.path("instance");
-        std::fs::create_dir(&instance).expect("instance executable directory");
-        write_version_fixture(&instance, "cursor-agent", "2026.03.04-instance");
-        let settings = json!({
-            "enableProviderUpdateChecks": false,
-            "providerInstances": {
-                "cursor-work": {
-                    "driver": "cursor",
-                    "enabled": true,
-                    "config": { "binaryPath": "cursor-agent" },
-                    "environment": [
-                        { "name": "pAtH", "value": instance, "valueRedacted": false }
-                    ]
+    async fn inventory_instance_path_outranks_ambient_path_in_an_isolated_process() {
+        const CASE: &str = "provider-inventory-path-precedence";
+        const TEST_NAME: &str = "production::provider_inventory::tests::inventory_instance_path_outranks_ambient_path_in_an_isolated_process";
+        const SENTINEL: &str = "BIBCODE_TEST_ISOLATED_CASE_DONE=provider-inventory-path-precedence";
+
+        if TestSandbox::is_isolated_case(CASE, TEST_NAME) {
+            let instance = std::path::PathBuf::from(
+                std::env::var_os("BIBCODE_TEST_INSTANCE_PATH").expect("isolated instance PATH"),
+            );
+            let root = std::path::PathBuf::from(
+                std::env::var_os("BIBCODE_TEST_ROOT").expect("isolated inventory root"),
+            );
+            let ambient_executable = std::path::PathBuf::from(
+                std::env::var_os("BIBCODE_TEST_AMBIENT_EXECUTABLE")
+                    .expect("isolated ambient executable"),
+            );
+            assert_eq!(
+                resolve_provider_executable_with_environment(
+                    "cursor-agent",
+                    std::iter::empty::<(&std::ffi::OsStr, &std::ffi::OsStr)>(),
+                ),
+                Some(ambient_executable),
+                "the child must have a competing ambient provider executable"
+            );
+            let settings = json!({
+                "enableProviderUpdateChecks": false,
+                "providerInstances": {
+                    "cursor-work": {
+                        "driver": "cursor",
+                        "enabled": true,
+                        "config": { "binaryPath": "cursor-agent" },
+                        "environment": [
+                            { "name": "pAtH", "value": instance, "valueRedacted": false }
+                        ]
+                    }
                 }
-            }
-        });
+            });
 
-        let providers = probe_full(
-            &settings,
-            Some("cursor-work"),
-            sandbox.root(),
-            &ProviderMaintenance::new(),
-        )
-        .await;
+            let providers = probe_full(
+                &settings,
+                Some("cursor-work"),
+                &root,
+                &ProviderMaintenance::new(),
+            )
+            .await;
 
-        assert_eq!(providers[0].snapshot["version"], "2026.03.04-instance");
+            assert_eq!(providers[0].snapshot["version"], "2026.03.04-instance");
+            println!("{SENTINEL}");
+            return;
+        }
+
+        let sandbox = TestSandbox::new("provider-inventory-path");
+        let ambient = sandbox.path("ambient");
+        let instance = sandbox.path("instance");
+        std::fs::create_dir(&ambient).expect("ambient executable directory");
+        std::fs::create_dir(&instance).expect("instance executable directory");
+        let ambient_executable =
+            write_version_fixture(&ambient, "cursor-agent", "2026.01.02-ambient");
+        write_version_fixture(&instance, "cursor-agent", "2026.03.04-instance");
+        let output = sandbox.run_isolated_case(
+            CASE,
+            TEST_NAME,
+            &[
+                ("PATH", ambient.as_os_str()),
+                ("BIBCODE_TEST_INSTANCE_PATH", instance.as_os_str()),
+                ("BIBCODE_TEST_ROOT", sandbox.root().as_os_str()),
+                (
+                    "BIBCODE_TEST_AMBIENT_EXECUTABLE",
+                    ambient_executable.as_os_str(),
+                ),
+            ],
+        );
+        assert!(
+            output.status.success(),
+            "isolated inventory PATH precedence case failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(SENTINEL));
     }
 
     #[cfg(unix)]
