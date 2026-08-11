@@ -8378,7 +8378,7 @@ async fn restart_reconciles_abandoned_running_provider_sessions() {
         session
             .last_error
             .as_deref()
-            .is_some_and(|error| error.contains("Start a new turn"))
+            .is_some_and(|error| error.contains("Review delivery status before continuing"))
     );
     let runtime = engine
         .repositories()
@@ -8446,7 +8446,7 @@ async fn restart_reconciles_abandoned_ready_provider_sessions() {
         session
             .last_error
             .as_deref()
-            .is_some_and(|error| error.contains("Start a new turn"))
+            .is_some_and(|error| error.contains("Review delivery status before continuing"))
     );
     let runtime = engine
         .repositories()

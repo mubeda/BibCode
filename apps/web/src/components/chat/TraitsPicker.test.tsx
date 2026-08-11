@@ -664,6 +664,69 @@ describe("TraitsPicker", () => {
     expect(codexBars).toHaveLength(4);
   });
 
+  it("emphasizes only each provider's highest reasoning value in the toolbar and menu title", async () => {
+    const ultraDescriptor = selectDescriptor("reasoningEffort", "Reasoning", [
+      { id: "high", label: "High" },
+      { id: "max", label: "Max" },
+      { id: "ultra", label: "Ultra" },
+    ]);
+    const maxDescriptor = selectDescriptor("effort", "Reasoning", [
+      { id: "high", label: "High" },
+      { id: "max", label: "Max" },
+    ]);
+
+    await mount(
+      <div>
+        <ComposerTraitControls
+          provider={CODEX}
+          models={modelsWith([ultraDescriptor])}
+          model={MODEL}
+          prompt=""
+          modelOptions={selections(["reasoningEffort", "ultra"])}
+          onPromptChange={vi.fn()}
+          onModelOptionsChange={vi.fn()}
+        />
+        <ComposerTraitControls
+          provider={CLAUDE}
+          models={modelsWith([maxDescriptor])}
+          model={MODEL}
+          prompt=""
+          modelOptions={selections(["effort", "max"])}
+          onPromptChange={vi.fn()}
+          onModelOptionsChange={vi.fn()}
+        />
+        <ComposerTraitControls
+          provider={CLAUDE}
+          models={modelsWith([maxDescriptor])}
+          model={MODEL}
+          prompt=""
+          modelOptions={selections(["effort", "high"])}
+          onPromptChange={vi.fn()}
+          onModelOptionsChange={vi.fn()}
+        />
+      </div>,
+    );
+
+    const ultraButton = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Reasoning effort: Ultra"]',
+    )!;
+    const maxButton = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Reasoning effort: Max"]',
+    )!;
+    const highButton = document.querySelector<HTMLButtonElement>(
+      'button[aria-label="Reasoning effort: High"]',
+    )!;
+    expect(ultraButton.className).toContain("text-destructive");
+    expect(maxButton.className).toContain("text-destructive");
+    expect(highButton.className).not.toContain("text-destructive");
+
+    await click(ultraButton);
+    const ultraItem = radioItem("Ultra");
+    const ultraTitle = ultraItem.querySelector<HTMLElement>("[data-effort-title]");
+    expect(ultraTitle?.className).toContain("text-destructive");
+    expect(ultraItem.className).not.toContain("text-destructive");
+  });
+
   it("keeps unavailable Fast and effort focusable with their reason", async () => {
     const reason = "Fast mode is not supported by Test Model through OpenCode.";
     await mount(

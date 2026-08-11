@@ -223,7 +223,7 @@ describe("environment entity projections", () => {
       harness.shellStateAtom,
       AsyncResult.success<EnvironmentShellState>({
         snapshot: Option.none(),
-        status: "empty",
+        status: "unavailable",
         error: Option.none(),
       }),
     );

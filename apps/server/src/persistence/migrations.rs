@@ -1,6 +1,22 @@
-use rusqlite::{
-    Connection, ErrorCode, OptionalExtension, Result, Transaction, params_from_iter, types::Value,
+use std::{
+    path::{Path, PathBuf},
+    thread,
+    time::{Duration, Instant},
 };
+
+use rusqlite::{
+    Connection, ErrorCode, OpenFlags, OptionalExtension, Result, Transaction,
+    backup::{Backup, StepResult},
+    params_from_iter,
+    types::Value,
+};
+use thiserror::Error;
+use tokio_util::sync::CancellationToken;
+
+const VALIDATION_BACKUP_PAGES_PER_STEP: i32 = 128;
+const VALIDATION_TIMEOUT: Duration = Duration::from_secs(5);
+const VALIDATION_BACKUP_RETRY_DELAY: Duration = Duration::from_millis(2);
+const VALIDATION_INSPECTION_PROGRESS_OPS: i32 = 1_000;
 
 const MIGRATIONS_TABLE_SQL: &str = r#"
 CREATE TABLE IF NOT EXISTS effect_sql_migrations (
@@ -9,6 +25,584 @@ CREATE TABLE IF NOT EXISTS effect_sql_migrations (
   name VARCHAR(255) NOT NULL
 )
 "#;
+
+const CORE_TABLES: &[(u32, &str)] = &[
+    (1, "orchestration_events"),
+    (2, "orchestration_command_receipts"),
+    (3, "checkpoint_diff_blobs"),
+    (4, "provider_session_runtime"),
+    (5, "projection_projects"),
+    (5, "projection_threads"),
+    (5, "projection_thread_messages"),
+    (5, "projection_thread_activities"),
+    (5, "projection_thread_sessions"),
+    (5, "projection_turns"),
+    (5, "projection_pending_approvals"),
+    (5, "projection_state"),
+    (13, "projection_thread_proposed_plans"),
+    (20, "auth_pairing_links"),
+    (20, "auth_sessions"),
+    (34, "activity_scopes"),
+    (34, "activity_records"),
+    (34, "activity_entries"),
+    (34, "activity_journal"),
+    (36, "activity_event_idempotency"),
+    (37, "activity_entry_owners"),
+    (38, "activity_record_retention_counts"),
+    (39, "provider_turn_outbox"),
+    (39, "orchestration_attachment_refs"),
+];
+
+#[derive(Debug, Error)]
+pub(crate) enum ExistingStoreValidationError {
+    #[error("SQLite integrity validation failed for {path}: {detail}")]
+    Corrupt { path: PathBuf, detail: String },
+    #[error("SQLite store at {path} is not a recognized BiBCode store: {detail}")]
+    Unrecognized { path: PathBuf, detail: String },
+    #[error("SQLite store at {path} cannot be inspected without side effects: {detail}")]
+    Unsafe { path: PathBuf, detail: String },
+}
+
+pub(crate) fn validate_existing_bibcode_store(
+    path: &Path,
+    cancellation: &CancellationToken,
+) -> std::result::Result<(), ExistingStoreValidationError> {
+    validate_existing_bibcode_store_inner(
+        path,
+        cancellation,
+        VALIDATION_TIMEOUT,
+        || Ok(()),
+        |_, _| Ok(()),
+        VALIDATION_INSPECTION_PROGRESS_OPS,
+        || {},
+    )
+}
+
+pub(crate) fn validate_existing_bibcode_store_immutable(
+    path: &Path,
+    cancellation: &CancellationToken,
+) -> std::result::Result<(), ExistingStoreValidationError> {
+    let deadline = Instant::now()
+        .checked_add(VALIDATION_TIMEOUT)
+        .ok_or_else(|| ExistingStoreValidationError::Unsafe {
+            path: path.to_path_buf(),
+            detail: "SQLite store validation deadline exceeds the monotonic clock range".to_owned(),
+        })?;
+    ensure_validation_active(path, cancellation, deadline)?;
+    let mut uri =
+        url::Url::from_file_path(path).map_err(|()| ExistingStoreValidationError::Unsafe {
+            path: path.to_path_buf(),
+            detail: "SQLite store path cannot be represented as an immutable file URI".to_owned(),
+        })?;
+    uri.query_pairs_mut().append_pair("immutable", "1");
+    let connection = Connection::open_with_flags(
+        uri.as_str(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|source| ExistingStoreValidationError::Unsafe {
+        path: path.to_path_buf(),
+        detail: format!("failed to open immutable SQLite store: {source}"),
+    })?;
+    let inspection_cancellation = cancellation.clone();
+    connection
+        .progress_handler(
+            VALIDATION_INSPECTION_PROGRESS_OPS,
+            Some(move || validation_stop_reason(&inspection_cancellation, deadline).is_some()),
+        )
+        .map_err(|source| ExistingStoreValidationError::Unsafe {
+            path: path.to_path_buf(),
+            detail: format!("failed to install SQLite validation progress handler: {source}"),
+        })?;
+    let integrity = connection
+        .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+        .map_err(|source| map_corrupt_inspection_error(path, cancellation, deadline, source))?;
+    ensure_validation_active(path, cancellation, deadline)?;
+    if integrity != "ok" {
+        return Err(ExistingStoreValidationError::Corrupt {
+            path: path.to_path_buf(),
+            detail: integrity,
+        });
+    }
+    if !table_exists(&connection, "effect_sql_migrations")
+        .map_err(|source| map_unrecognized_inspection_error(path, cancellation, deadline, source))?
+    {
+        return Err(ExistingStoreValidationError::Unrecognized {
+            path: path.to_path_buf(),
+            detail: "migration ledger is missing".to_owned(),
+        });
+    }
+    let mut statement = connection
+        .prepare("SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id ASC")
+        .map_err(|source| {
+            map_unrecognized_inspection_error(path, cancellation, deadline, source)
+        })?;
+    let recorded = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+        })
+        .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+        .map_err(|source| {
+            map_unrecognized_inspection_error(path, cancellation, deadline, source)
+        })?;
+    ensure_validation_active(path, cancellation, deadline)?;
+    if recorded.is_empty()
+        || recorded.len() > MIGRATIONS.len()
+        || recorded
+            .iter()
+            .zip(MIGRATIONS)
+            .any(|((id, name), expected)| *id != expected.id || name != expected.name)
+    {
+        return Err(ExistingStoreValidationError::Unrecognized {
+            path: path.to_path_buf(),
+            detail: "migration ledger is not an exact prefix of this binary".to_owned(),
+        });
+    }
+    let latest_migration_id = recorded.last().expect("non-empty ledger").0;
+    for (_, table) in CORE_TABLES
+        .iter()
+        .filter(|(migration_id, _)| *migration_id <= latest_migration_id)
+    {
+        ensure_validation_active(path, cancellation, deadline)?;
+        if !table_exists(&connection, table).map_err(|source| {
+            map_unrecognized_inspection_error(path, cancellation, deadline, source)
+        })? {
+            return Err(ExistingStoreValidationError::Unrecognized {
+                path: path.to_path_buf(),
+                detail: format!("required table {table} is missing"),
+            });
+        }
+    }
+    ensure_validation_active(path, cancellation, deadline)
+}
+
+#[cfg(test)]
+fn validate_existing_bibcode_store_with_barrier<F>(
+    path: &Path,
+    cancellation: &CancellationToken,
+    barrier: F,
+) -> std::result::Result<(), ExistingStoreValidationError>
+where
+    F: FnOnce() -> std::result::Result<(), ExistingStoreValidationError>,
+{
+    validate_existing_bibcode_store_inner(
+        path,
+        cancellation,
+        VALIDATION_TIMEOUT,
+        barrier,
+        |_, _| Ok(()),
+        VALIDATION_INSPECTION_PROGRESS_OPS,
+        || {},
+    )
+}
+
+#[cfg(test)]
+pub(super) fn validate_existing_bibcode_store_with_control<F, G>(
+    path: &Path,
+    cancellation: &CancellationToken,
+    timeout: Duration,
+    barrier: F,
+    after_step: G,
+) -> std::result::Result<(), ExistingStoreValidationError>
+where
+    F: FnOnce() -> std::result::Result<(), ExistingStoreValidationError>,
+    G: FnMut(
+        StepResult,
+        rusqlite::backup::Progress,
+    ) -> std::result::Result<(), ExistingStoreValidationError>,
+{
+    validate_existing_bibcode_store_inner(
+        path,
+        cancellation,
+        timeout,
+        barrier,
+        after_step,
+        VALIDATION_INSPECTION_PROGRESS_OPS,
+        || {},
+    )
+}
+
+#[cfg(test)]
+pub(super) fn validate_existing_bibcode_store_with_inspection_control<F, G, H>(
+    path: &Path,
+    cancellation: &CancellationToken,
+    timeout: Duration,
+    barrier: F,
+    after_step: G,
+    inspection_progress: H,
+) -> std::result::Result<(), ExistingStoreValidationError>
+where
+    F: FnOnce() -> std::result::Result<(), ExistingStoreValidationError>,
+    G: FnMut(
+        StepResult,
+        rusqlite::backup::Progress,
+    ) -> std::result::Result<(), ExistingStoreValidationError>,
+    H: FnMut() + Send + 'static,
+{
+    validate_existing_bibcode_store_inner(
+        path,
+        cancellation,
+        timeout,
+        barrier,
+        after_step,
+        1,
+        inspection_progress,
+    )
+}
+
+fn validate_existing_bibcode_store_inner<F, G, H>(
+    path: &Path,
+    cancellation: &CancellationToken,
+    timeout: Duration,
+    barrier: F,
+    after_step: G,
+    inspection_progress_ops: i32,
+    mut inspection_progress: H,
+) -> std::result::Result<(), ExistingStoreValidationError>
+where
+    F: FnOnce() -> std::result::Result<(), ExistingStoreValidationError>,
+    G: FnMut(
+        StepResult,
+        rusqlite::backup::Progress,
+    ) -> std::result::Result<(), ExistingStoreValidationError>,
+    H: FnMut() + Send + 'static,
+{
+    let started = Instant::now();
+    let deadline =
+        started
+            .checked_add(timeout)
+            .ok_or_else(|| ExistingStoreValidationError::Unsafe {
+                path: path.to_path_buf(),
+                detail: "SQLite store validation deadline exceeds the monotonic clock range"
+                    .to_owned(),
+            })?;
+    let connection =
+        coherent_validation_snapshot(path, cancellation, deadline, barrier, after_step)?;
+    ensure_validation_active(path, cancellation, deadline)?;
+    let inspection_cancellation = cancellation.clone();
+    connection
+        .progress_handler(
+            inspection_progress_ops,
+            Some(move || {
+                inspection_progress();
+                validation_stop_reason(&inspection_cancellation, deadline).is_some()
+            }),
+        )
+        .map_err(|source| ExistingStoreValidationError::Unsafe {
+            path: path.to_path_buf(),
+            detail: format!("failed to install SQLite validation progress handler: {source}"),
+        })?;
+
+    ensure_validation_active(path, cancellation, deadline)?;
+    let integrity = connection
+        .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+        .map_err(|source| map_corrupt_inspection_error(path, cancellation, deadline, source))?;
+    ensure_validation_active(path, cancellation, deadline)?;
+    if integrity != "ok" {
+        return Err(ExistingStoreValidationError::Corrupt {
+            path: path.to_path_buf(),
+            detail: integrity,
+        });
+    }
+
+    ensure_validation_active(path, cancellation, deadline)?;
+    if !table_exists(&connection, "effect_sql_migrations")
+        .map_err(|source| map_unrecognized_inspection_error(path, cancellation, deadline, source))?
+    {
+        return Err(ExistingStoreValidationError::Unrecognized {
+            path: path.to_path_buf(),
+            detail: "migration ledger is missing".to_owned(),
+        });
+    }
+
+    ensure_validation_active(path, cancellation, deadline)?;
+    let mut statement = connection
+        .prepare("SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id ASC")
+        .map_err(|source| {
+            map_unrecognized_inspection_error(path, cancellation, deadline, source)
+        })?;
+    let recorded = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+        })
+        .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+        .map_err(|source| {
+            map_unrecognized_inspection_error(path, cancellation, deadline, source)
+        })?;
+    ensure_validation_active(path, cancellation, deadline)?;
+    if recorded.is_empty() {
+        return Err(ExistingStoreValidationError::Unrecognized {
+            path: path.to_path_buf(),
+            detail: "migration ledger is empty".to_owned(),
+        });
+    }
+    if recorded.len() > MIGRATIONS.len()
+        || recorded
+            .iter()
+            .zip(MIGRATIONS)
+            .any(|((id, name), expected)| *id != expected.id || name != expected.name)
+    {
+        return Err(ExistingStoreValidationError::Unrecognized {
+            path: path.to_path_buf(),
+            detail: "migration ledger is not an exact prefix of this binary".to_owned(),
+        });
+    }
+
+    let latest_migration_id = recorded.last().expect("non-empty ledger").0;
+    for (_, table) in CORE_TABLES
+        .iter()
+        .filter(|(migration_id, _)| *migration_id <= latest_migration_id)
+    {
+        ensure_validation_active(path, cancellation, deadline)?;
+        if !table_exists(&connection, table).map_err(|source| {
+            map_unrecognized_inspection_error(path, cancellation, deadline, source)
+        })? {
+            return Err(ExistingStoreValidationError::Unrecognized {
+                path: path.to_path_buf(),
+                detail: format!("required table {table} is missing"),
+            });
+        }
+    }
+    ensure_validation_active(path, cancellation, deadline)?;
+    Ok(())
+}
+
+fn coherent_validation_snapshot<F, G>(
+    source_database: &Path,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+    barrier: F,
+    mut after_step: G,
+) -> std::result::Result<Connection, ExistingStoreValidationError>
+where
+    F: FnOnce() -> std::result::Result<(), ExistingStoreValidationError>,
+    G: FnMut(
+        StepResult,
+        rusqlite::backup::Progress,
+    ) -> std::result::Result<(), ExistingStoreValidationError>,
+{
+    ensure_validation_active(source_database, cancellation, deadline)?;
+    let source = Connection::open_with_flags(
+        source_database,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(|source| ExistingStoreValidationError::Unsafe {
+        path: source_database.to_path_buf(),
+        detail: format!("failed to open source for coherent SQLite backup: {source}"),
+    })?;
+    source
+        .busy_timeout(Duration::ZERO)
+        .map_err(|source| ExistingStoreValidationError::Unsafe {
+            path: source_database.to_path_buf(),
+            detail: format!("failed to disable SQLite's internal validation busy wait: {source}"),
+        })?;
+    ensure_validation_active(source_database, cancellation, deadline)?;
+    barrier()?;
+    ensure_validation_active(source_database, cancellation, deadline)?;
+
+    loop {
+        ensure_validation_active(source_database, cancellation, deadline)?;
+        let mut snapshot = Connection::open_in_memory().map_err(|source| {
+            ExistingStoreValidationError::Unsafe {
+                path: source_database.to_path_buf(),
+                detail: format!("failed to create in-memory validation snapshot: {source}"),
+            }
+        })?;
+        snapshot.busy_timeout(Duration::ZERO).map_err(|source| {
+            ExistingStoreValidationError::Unsafe {
+                path: source_database.to_path_buf(),
+                detail: format!("failed to disable SQLite's internal snapshot busy wait: {source}"),
+            }
+        })?;
+        ensure_validation_active(source_database, cancellation, deadline)?;
+        let backup = match Backup::new(&source, &mut snapshot) {
+            Ok(backup) => backup,
+            Err(source) if is_transient_backup_error(&source) => {
+                thread::sleep(VALIDATION_BACKUP_RETRY_DELAY);
+                continue;
+            }
+            Err(source) => {
+                return Err(ExistingStoreValidationError::Corrupt {
+                    path: source_database.to_path_buf(),
+                    detail: format!("failed to initialize coherent SQLite backup: {source}"),
+                });
+            }
+        };
+        let completed = loop {
+            ensure_validation_active(source_database, cancellation, deadline)?;
+            let (state, restart_attempt) = match backup.step(VALIDATION_BACKUP_PAGES_PER_STEP) {
+                Ok(state) => (state, false),
+                Err(source) if source.sqlite_error_code() == Some(ErrorCode::DatabaseBusy) => {
+                    (StepResult::Busy, true)
+                }
+                Err(source) if source.sqlite_error_code() == Some(ErrorCode::DatabaseLocked) => {
+                    (StepResult::Locked, true)
+                }
+                Err(source) => {
+                    return Err(ExistingStoreValidationError::Corrupt {
+                        path: source_database.to_path_buf(),
+                        detail: format!("failed to read coherent SQLite backup: {source}"),
+                    });
+                }
+            };
+            let progress = backup.progress();
+            if progress.remaining < 0
+                || progress.pagecount < 0
+                || progress.remaining > progress.pagecount
+            {
+                return Err(ExistingStoreValidationError::Unsafe {
+                    path: source_database.to_path_buf(),
+                    detail: format!(
+                        "coherent SQLite backup reported invalid progress: {} of {} pages remain",
+                        progress.remaining, progress.pagecount
+                    ),
+                });
+            }
+            after_step(state, progress)?;
+            ensure_validation_active(source_database, cancellation, deadline)?;
+            if restart_attempt {
+                break false;
+            }
+            match state {
+                StepResult::Done => break true,
+                StepResult::More => thread::yield_now(),
+                StepResult::Busy | StepResult::Locked => {
+                    thread::sleep(VALIDATION_BACKUP_RETRY_DELAY);
+                }
+                _ => {
+                    return Err(ExistingStoreValidationError::Unsafe {
+                        path: source_database.to_path_buf(),
+                        detail: "coherent SQLite backup returned an unsupported state".to_owned(),
+                    });
+                }
+            }
+        };
+        drop(backup);
+        if completed {
+            return Ok(snapshot);
+        }
+        thread::sleep(VALIDATION_BACKUP_RETRY_DELAY);
+    }
+}
+
+fn is_transient_backup_error(error: &rusqlite::Error) -> bool {
+    matches!(
+        error.sqlite_error_code(),
+        Some(ErrorCode::DatabaseBusy | ErrorCode::DatabaseLocked)
+    )
+}
+
+fn ensure_validation_active(
+    source_database: &Path,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> std::result::Result<(), ExistingStoreValidationError> {
+    if let Some(reason) = validation_stop_reason(cancellation, deadline) {
+        return Err(validation_stopped_error(source_database, reason, None));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Copy)]
+enum ValidationStopReason {
+    Cancelled,
+    DeadlineElapsed,
+}
+
+fn validation_stop_reason(
+    cancellation: &CancellationToken,
+    deadline: Instant,
+) -> Option<ValidationStopReason> {
+    if cancellation.is_cancelled() {
+        Some(ValidationStopReason::Cancelled)
+    } else if Instant::now() >= deadline {
+        Some(ValidationStopReason::DeadlineElapsed)
+    } else {
+        None
+    }
+}
+
+fn validation_stopped_error(
+    source_database: &Path,
+    reason: ValidationStopReason,
+    phase: Option<&str>,
+) -> ExistingStoreValidationError {
+    let reason = match reason {
+        ValidationStopReason::Cancelled => "was cancelled",
+        ValidationStopReason::DeadlineElapsed => "deadline elapsed",
+    };
+    let phase = phase.map_or_else(String::new, |phase| format!(" during {phase}"));
+    ExistingStoreValidationError::Unsafe {
+        path: source_database.to_path_buf(),
+        detail: format!("SQLite store validation {reason}{phase}"),
+    }
+}
+
+fn interrupted_inspection_error(
+    source_database: &Path,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+    source: &rusqlite::Error,
+) -> Option<ExistingStoreValidationError> {
+    if source.sqlite_error_code() != Some(ErrorCode::OperationInterrupted) {
+        return None;
+    }
+    Some(match validation_stop_reason(cancellation, deadline) {
+        Some(reason) => validation_stopped_error(
+            source_database,
+            reason,
+            Some("post-backup SQLite inspection"),
+        ),
+        None => ExistingStoreValidationError::Unsafe {
+            path: source_database.to_path_buf(),
+            detail: "post-backup SQLite inspection was interrupted unexpectedly".to_owned(),
+        },
+    })
+}
+
+fn map_corrupt_inspection_error(
+    source_database: &Path,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+    source: rusqlite::Error,
+) -> ExistingStoreValidationError {
+    interrupted_inspection_error(source_database, cancellation, deadline, &source).unwrap_or_else(
+        || ExistingStoreValidationError::Corrupt {
+            path: source_database.to_path_buf(),
+            detail: source.to_string(),
+        },
+    )
+}
+
+fn map_unrecognized_inspection_error(
+    source_database: &Path,
+    cancellation: &CancellationToken,
+    deadline: Instant,
+    source: rusqlite::Error,
+) -> ExistingStoreValidationError {
+    interrupted_inspection_error(source_database, cancellation, deadline, &source).unwrap_or_else(
+        || ExistingStoreValidationError::Unrecognized {
+            path: source_database.to_path_buf(),
+            detail: source.to_string(),
+        },
+    )
+}
+
+#[cfg(test)]
+fn sqlite_sidecar(database: &Path, suffix: &str) -> PathBuf {
+    let mut path = database.as_os_str().to_os_string();
+    path.push(suffix);
+    PathBuf::from(path)
+}
+
+fn table_exists(connection: &Connection, table: &str) -> Result<bool> {
+    connection.query_row(
+        "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type = 'table' AND name = ?)",
+        [table],
+        |row| row.get(0),
+    )
+}
 
 type MigrationFn = for<'connection> fn(&Transaction<'connection>) -> Result<()>;
 
@@ -82,15 +676,54 @@ impl Migration {
     }
 }
 
-/// Runs pending migrations through `through_id`, or all migrations when it is `None`.
+/// Inspects all migrations that have not been recorded by this database.
 ///
-/// The ledger shape and ordering match Effect's SQL migrator. Pending ledger rows and
-/// migration bodies share one transaction, so a failed body leaves neither schema nor
-/// ledger changes behind.
-pub fn run_migrations(
-    connection: &mut Connection,
+/// This function is deliberately read-only. In particular, a database without an Effect
+/// migration ledger is reported as needing every migration without creating that ledger.
+pub fn pending_migrations(connection: &Connection) -> Result<Vec<Migration>> {
+    pending_migrations_through(connection, None)
+}
+
+fn pending_migrations_through(
+    connection: &Connection,
     through_id: Option<u32>,
 ) -> Result<Vec<Migration>> {
+    let ledger_exists = table_exists(connection, "effect_sql_migrations")?;
+    let latest_id = if ledger_exists {
+        connection
+            .query_row(
+                "SELECT migration_id FROM effect_sql_migrations ORDER BY migration_id DESC LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+    } else {
+        0
+    };
+    Ok(MIGRATIONS
+        .iter()
+        .copied()
+        .filter(|migration| {
+            i64::from(migration.id) > latest_id
+                && through_id.is_none_or(|through_id| migration.id <= through_id)
+        })
+        .collect())
+}
+
+/// Applies an already inspected migration suffix transactionally.
+///
+/// Ledger rows and migration bodies share one transaction, so a failed body leaves neither
+/// schema nor ledger changes behind. The suffix is rechecked against the live ledger to retain
+/// the former concurrent-run behavior for direct callers that do not own the store-operation
+/// lock.
+pub fn apply_migrations(
+    connection: &mut Connection,
+    pending: &[Migration],
+) -> Result<Vec<Migration>> {
+    if pending.is_empty() {
+        return Ok(Vec::new());
+    }
     connection.execute_batch(MIGRATIONS_TABLE_SQL)?;
 
     let transaction = connection.transaction()?;
@@ -102,13 +735,10 @@ pub fn run_migrations(
         )
         .optional()?
         .unwrap_or(0);
-    let required = MIGRATIONS
+    let required = pending
         .iter()
         .copied()
-        .filter(|migration| {
-            i64::from(migration.id) > latest_id
-                && through_id.is_none_or(|through_id| migration.id <= through_id)
-        })
+        .filter(|migration| i64::from(migration.id) > latest_id)
         .collect::<Vec<_>>();
 
     if required.is_empty() {
@@ -130,6 +760,15 @@ pub fn run_migrations(
 
     transaction.commit()?;
     Ok(required)
+}
+
+/// Runs pending migrations through `through_id`, or all migrations when it is `None`.
+pub fn run_migrations(
+    connection: &mut Connection,
+    through_id: Option<u32>,
+) -> Result<Vec<Migration>> {
+    let pending = pending_migrations_through(connection, through_id)?;
+    apply_migrations(connection, &pending)
 }
 
 fn insert_ledger_rows(transaction: &Transaction<'_>, migrations: &[Migration]) -> Result<()> {
@@ -1684,9 +2323,338 @@ fn migration_042(transaction: &Transaction<'_>) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{MIGRATIONS, Migration, migration_001, run_migrations};
+    use super::{
+        MIGRATIONS, Migration, migration_001, run_migrations, sqlite_sidecar,
+        validate_existing_bibcode_store, validate_existing_bibcode_store_with_barrier,
+        validate_existing_bibcode_store_with_control,
+        validate_existing_bibcode_store_with_inspection_control,
+    };
+    use tempfile::TempDir;
+    use tokio_util::sync::CancellationToken;
 
     type DeliveryColumn = (String, String, i64, Option<String>, i64);
+
+    #[test]
+    fn validation_of_a_wal_store_preserves_persistent_source_entries_and_bytes() {
+        let root = TempDir::new().expect("temporary validation root");
+        let database = root.path().join("state.sqlite");
+        let mut connection = rusqlite::Connection::open(&database).expect("fixture database");
+        run_migrations(&mut connection, None).expect("fixture migrations");
+        connection
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("WAL fixture");
+        connection
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("disable fixture checkpoint");
+        connection
+            .execute(
+                "INSERT INTO projection_projects (
+                   project_id, title, workspace_root, default_model_selection_json,
+                   scripts_json, created_at, updated_at, deleted_at
+                 ) VALUES ('validation-project', 'Validation project', '/tmp/validation', NULL,
+                           '{}', '2026-08-10T00:00:00Z', '2026-08-10T00:00:00Z', NULL)",
+                [],
+            )
+            .expect("uncheckpointed fixture write");
+        let before = persistent_directory_snapshot(root.path());
+
+        validate_existing_bibcode_store(&database, &CancellationToken::new())
+            .expect("valid WAL store");
+
+        assert_eq!(persistent_directory_snapshot(root.path()), before);
+
+        let crash_root = TempDir::new().expect("temporary crash-left validation root");
+        let crash_database = crash_root.path().join("state.sqlite");
+        std::fs::copy(&database, &crash_database).expect("copy stable main database fixture");
+        std::fs::copy(
+            sqlite_sidecar(&database, "-wal"),
+            sqlite_sidecar(&crash_database, "-wal"),
+        )
+        .expect("copy stable WAL fixture");
+        let without_shared_memory = persistent_directory_snapshot(crash_root.path());
+
+        validate_existing_bibcode_store(&crash_database, &CancellationToken::new())
+            .expect("valid crash-left WAL store without source SHM");
+
+        assert_eq!(
+            persistent_directory_snapshot(crash_root.path()),
+            without_shared_memory
+        );
+        let entries = directory_entry_names(crash_root.path());
+        assert!(entries.contains(&std::ffi::OsString::from("state.sqlite")));
+        assert!(entries.contains(&std::ffi::OsString::from("state.sqlite-wal")));
+        assert!(
+            entries.iter().all(|entry| {
+                entry == "state.sqlite"
+                    || entry == "state.sqlite-wal"
+                    || entry == "state.sqlite-shm"
+            }),
+            "validation may create only SQLite's volatile SHM coordination entry: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn validation_remains_coherent_when_wal_is_checkpointed_after_source_open() {
+        let root = TempDir::new().expect("temporary validation root");
+        let database = root.path().join("state.sqlite");
+        let mut writer = rusqlite::Connection::open(&database).expect("fixture database");
+        writer
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("WAL fixture");
+        writer
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("disable fixture checkpoint");
+        run_migrations(&mut writer, None).expect("fixture migrations remain in WAL");
+        assert!(
+            sqlite_sidecar(&database, "-wal")
+                .metadata()
+                .expect("fixture WAL")
+                .len()
+                > 0
+        );
+
+        validate_existing_bibcode_store_with_barrier(&database, &CancellationToken::new(), || {
+            let checkpoint = writer
+                .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                })
+                .expect("checkpoint fixture WAL");
+            assert_eq!(checkpoint.0, 0, "checkpoint was not blocked");
+            Ok(())
+        })
+        .expect("valid store must remain recognizable across checkpoint reset");
+    }
+
+    #[test]
+    fn validation_yields_between_positive_page_batches_for_a_live_checkpoint() {
+        let root = TempDir::new().expect("temporary validation root");
+        let database = root.path().join("state.sqlite");
+        let mut writer = rusqlite::Connection::open(&database).expect("fixture database");
+        writer
+            .pragma_update(None, "page_size", 512)
+            .expect("small fixture page size");
+        writer
+            .pragma_update(None, "journal_mode", "WAL")
+            .expect("WAL fixture");
+        writer
+            .pragma_update(None, "wal_autocheckpoint", 0)
+            .expect("disable fixture checkpoint");
+        run_migrations(&mut writer, None).expect("fixture migrations");
+        writer
+            .execute_batch(
+                "CREATE TABLE validation_backup_padding (payload BLOB NOT NULL);
+                 INSERT INTO validation_backup_padding (payload) VALUES (zeroblob(262144));
+                 PRAGMA wal_checkpoint(TRUNCATE);",
+            )
+            .expect("multi-batch fixture");
+
+        let mut steps = Vec::new();
+        let mut checkpoint_between_batches = false;
+        validate_existing_bibcode_store_with_control(
+            &database,
+            &CancellationToken::new(),
+            std::time::Duration::from_secs(1),
+            || Ok(()),
+            |state, progress| {
+                steps.push((state, progress.remaining, progress.pagecount));
+                if steps.len() == 1 {
+                    assert_eq!(state, rusqlite::backup::StepResult::More);
+                    assert!(progress.remaining > 0);
+                    writer
+                        .execute(
+                            "UPDATE validation_backup_padding SET payload = zeroblob(262144)",
+                            [],
+                        )
+                        .expect("commit between backup batches");
+                    let busy = writer
+                        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                            row.get::<_, i64>(0)
+                        })
+                        .expect("checkpoint between backup batches");
+                    assert_eq!(busy, 0, "backup batch retained the source lock");
+                    checkpoint_between_batches = true;
+                }
+                Ok(())
+            },
+        )
+        .expect("valid store remains coherent across batched backup");
+
+        assert!(checkpoint_between_batches);
+        assert!(
+            steps.len() > 1,
+            "validation must use multiple bounded steps"
+        );
+        assert_eq!(
+            steps.last().map(|step| step.0),
+            Some(rusqlite::backup::StepResult::Done)
+        );
+    }
+
+    #[test]
+    fn validation_busy_exhaustion_is_bounded_and_preserves_the_store() {
+        let root = TempDir::new().expect("temporary validation root");
+        let database = root.path().join("state.sqlite");
+        let mut writer = rusqlite::Connection::open(&database).expect("fixture database");
+        run_migrations(&mut writer, None).expect("fixture migrations");
+        writer
+            .execute_batch("PRAGMA journal_mode = DELETE; BEGIN EXCLUSIVE;")
+            .expect("hold exclusive source lock");
+        let before = persistent_directory_snapshot(root.path());
+        let marker = root.path().join("environment-id");
+
+        let started = std::time::Instant::now();
+        let error = validate_existing_bibcode_store_with_control(
+            &database,
+            &CancellationToken::new(),
+            std::time::Duration::from_millis(15),
+            || Ok(()),
+            |_, _| Ok(()),
+        )
+        .expect_err("exclusive source lock must exhaust the validation bound");
+
+        assert!(matches!(
+            error,
+            super::ExistingStoreValidationError::Unsafe { .. }
+        ));
+        assert!(
+            error.to_string().contains("deadline"),
+            "deadline exhaustion must remain typed and diagnostic: {error}"
+        );
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(250),
+            "test-configured validation bound must not fall back to five seconds"
+        );
+        assert_eq!(persistent_directory_snapshot(root.path()), before);
+        assert!(!marker.exists(), "validation never publishes a marker");
+        writer
+            .execute_batch("ROLLBACK")
+            .expect("release fixture lock");
+    }
+
+    #[test]
+    fn validation_deadline_interrupts_post_backup_inspection_without_mutation() {
+        let root = TempDir::new().expect("temporary validation root");
+        let database = root.path().join("state.sqlite");
+        let marker = root.path().join("environment-id");
+        let marker_bytes = b"b6b9080d-0544-4d79-9904-e265c6c1a8fd\n";
+        std::fs::write(&marker, marker_bytes).expect("fixture marker");
+        let mut connection = rusqlite::Connection::open(&database).expect("fixture database");
+        run_migrations(&mut connection, None).expect("fixture migrations");
+        drop(connection);
+        let before = persistent_directory_snapshot(root.path());
+        let entered_inspection = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let progress_entered = entered_inspection.clone();
+
+        let started = std::time::Instant::now();
+        let error = validate_existing_bibcode_store_with_inspection_control(
+            &database,
+            &CancellationToken::new(),
+            std::time::Duration::from_millis(250),
+            || Ok(()),
+            |_, _| Ok(()),
+            move || {
+                progress_entered.store(true, std::sync::atomic::Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(300));
+            },
+        )
+        .expect_err("post-backup inspection must observe the absolute deadline");
+
+        assert!(entered_inspection.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(matches!(
+            error,
+            super::ExistingStoreValidationError::Unsafe { .. }
+        ));
+        let error_text = error.to_string();
+        assert!(
+            error_text.contains("deadline") && error_text.contains("post-backup SQLite inspection"),
+            "deadline interruption remains typed and diagnostic: {error}"
+        );
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        assert_eq!(persistent_directory_snapshot(root.path()), before);
+        assert_eq!(std::fs::read(marker).expect("marker remains"), marker_bytes);
+    }
+
+    #[test]
+    fn validation_never_materializes_store_bytes_in_global_temp() {
+        let root = TempDir::new().expect("temporary validation root");
+        let database = root.path().join("state.sqlite");
+        let mut connection = rusqlite::Connection::open(&database).expect("fixture database");
+        run_migrations(&mut connection, None).expect("fixture migrations");
+        drop(connection);
+        let artifacts_before = validation_artifacts();
+
+        let error = validate_existing_bibcode_store_with_barrier(
+            &database,
+            &CancellationToken::new(),
+            || {
+                if validation_artifacts() != artifacts_before {
+                    return Err(super::ExistingStoreValidationError::Unsafe {
+                        path: database.clone(),
+                        detail: "validation materialized store bytes in global temp".to_owned(),
+                    });
+                }
+                Err(super::ExistingStoreValidationError::Unsafe {
+                    path: database.clone(),
+                    detail: "forced validation cancellation".to_owned(),
+                })
+            },
+        )
+        .expect_err("forced validation cancellation");
+
+        assert!(
+            error.to_string().contains("forced validation cancellation"),
+            "validation must reach the forced in-memory cancellation seam: {error}"
+        );
+        assert_eq!(validation_artifacts(), artifacts_before);
+    }
+
+    fn persistent_directory_snapshot(path: &std::path::Path) -> Vec<(std::ffi::OsString, Vec<u8>)> {
+        let mut entries = std::fs::read_dir(path)
+            .expect("snapshot directory")
+            .filter_map(|entry| {
+                let entry = entry.expect("snapshot entry");
+                if entry.file_name().to_string_lossy().ends_with("-shm") {
+                    return None;
+                }
+                let file_type = entry.file_type().expect("snapshot entry type");
+                let bytes = if file_type.is_file() {
+                    std::fs::read(entry.path()).expect("snapshot entry bytes")
+                } else {
+                    Vec::new()
+                };
+                Some((entry.file_name(), bytes))
+            })
+            .collect::<Vec<_>>();
+        entries.sort_by(|left, right| left.0.cmp(&right.0));
+        entries
+    }
+
+    fn directory_entry_names(path: &std::path::Path) -> Vec<std::ffi::OsString> {
+        let mut entries = std::fs::read_dir(path)
+            .expect("snapshot directory")
+            .map(|entry| entry.expect("snapshot entry").file_name())
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
+
+    fn validation_artifacts() -> Vec<std::ffi::OsString> {
+        let mut entries = std::fs::read_dir(std::env::temp_dir())
+            .expect("global temporary directory")
+            .filter_map(|entry| {
+                let name = entry.ok()?.file_name();
+                name.to_string_lossy()
+                    .starts_with("bibcode-store-validation-")
+                    .then_some(name)
+            })
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
 
     fn assert_delivery_schema(connection: &rusqlite::Connection) -> rusqlite::Result<()> {
         let columns = |table: &str| -> rusqlite::Result<Vec<DeliveryColumn>> {

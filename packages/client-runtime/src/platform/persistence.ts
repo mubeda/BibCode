@@ -8,6 +8,7 @@ import * as Context from "effect/Context";
 import * as Effect from "effect/Effect";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 
 import type { ConnectionRegistration } from "../connection/catalog.ts";
 import type { ConnectionTarget } from "../connection/model.ts";
@@ -25,6 +26,9 @@ export class ConnectionPersistenceError extends Schema.TaggedErrorClass<Connecti
       "save-thread",
       "remove-thread",
       "clear-environment",
+      "load-storage-identity",
+      "accept-storage-identity",
+      "reset-connection-catalog",
     ]),
     message: Schema.String,
   },
@@ -46,6 +50,58 @@ export class ConnectionRegistrationStore extends Context.Service<
     readonly remove: (target: ConnectionTarget) => Effect.Effect<void, ConnectionPersistenceError>;
   }
 >()("@bibcode/client-runtime/platform/persistence/ConnectionRegistrationStore") {}
+
+export interface AcceptedStorageIdentity {
+  readonly targetKey: string;
+  readonly storageInstanceId: string;
+}
+
+export const AcceptedStorageIdentitySchema = Schema.Struct({
+  targetKey: Schema.String,
+  storageInstanceId: Schema.String,
+});
+
+export type AcceptedStorageIdentityMutation =
+  | {
+      readonly _tag: "Keep";
+    }
+  | {
+      readonly _tag: "Set";
+      readonly storageInstanceId: string;
+    };
+
+export interface AcceptedStorageIdentityTransition<A> {
+  readonly result: A;
+  readonly mutation: AcceptedStorageIdentityMutation;
+}
+
+export class AcceptedStorageIdentityStore extends Context.Service<
+  AcceptedStorageIdentityStore,
+  {
+    readonly get: (
+      targetKey: string,
+    ) => Effect.Effect<Option.Option<string>, ConnectionPersistenceError>;
+    readonly accept: (
+      identity: AcceptedStorageIdentity,
+    ) => Effect.Effect<void, ConnectionPersistenceError>;
+    readonly transition: <A>(
+      targetKey: string,
+      decide: (acceptedStorageInstanceId: string | null) => AcceptedStorageIdentityTransition<A>,
+    ) => Effect.Effect<A, ConnectionPersistenceError>;
+  }
+>()("@bibcode/client-runtime/platform/persistence/AcceptedStorageIdentityStore") {}
+
+export type ConnectionCatalogHealth =
+  | { readonly status: "ready" }
+  | { readonly status: "recovery-required"; readonly message: string };
+
+export class ConnectionCatalogHealthStore extends Context.Service<
+  ConnectionCatalogHealthStore,
+  {
+    readonly state: SubscriptionRef.SubscriptionRef<ConnectionCatalogHealth>;
+    readonly reset: Effect.Effect<void, ConnectionPersistenceError>;
+  }
+>()("@bibcode/client-runtime/platform/persistence/ConnectionCatalogHealthStore") {}
 
 export class EnvironmentCacheStore extends Context.Service<
   EnvironmentCacheStore,

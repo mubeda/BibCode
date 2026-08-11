@@ -23,6 +23,7 @@ const BASE_ENVIRONMENT = {
     arch: "arm64",
   },
   serverVersion: "0.0.0-test",
+  storageInstanceId: null,
   capabilities: {
     repositoryIdentity: true,
     worktreeCatalog: false,
@@ -82,7 +83,7 @@ describe("environmentBootstrap", () => {
       },
       desktopBridge: undefined,
     });
-    writePrimaryEnvironmentDescriptor({
+    const descriptor = {
       environmentId: EnvironmentId.make("environment-local"),
       label: "Bootstrapped environment",
       platform: {
@@ -90,18 +91,22 @@ describe("environmentBootstrap", () => {
         arch: "arm64",
       },
       serverVersion: "0.0.0-test",
+      storageInstanceId: "0d93cbea-f237-4f37-8829-d816667be35f",
       capabilities: {
         repositoryIdentity: true,
         worktreeCatalog: false,
         activityProtocolVersion: null,
       },
-    });
+    } satisfies ExecutionEnvironmentDescriptor;
+    writePrimaryEnvironmentDescriptor(descriptor);
 
     expect(getPrimaryKnownEnvironment()).toEqual({
       id: "environment-local",
       label: "Bootstrapped environment",
       source: "window-origin",
       environmentId: "environment-local",
+      storageInstanceId: "0d93cbea-f237-4f37-8829-d816667be35f",
+      descriptor,
       target: {
         httpBaseUrl: "http://localhost:3773/",
         wsBaseUrl: "ws://localhost:3773/",

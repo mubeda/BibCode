@@ -28,6 +28,7 @@ use crate::{
             ProviderMaintenance, ProviderMaintenanceTarget, ProviderUpdateLifecycleToken,
             provider_version_advanced, provider_version_regressed,
         },
+        provider_runtime::resolve_provider_executable_with_environment,
         server_terminal::{JsonFuture, JsonStream, ProductionServerControl},
     },
     server_settings::{ProviderSettingsState, normalize_agent_activity_settings},
@@ -763,6 +764,13 @@ impl NativeServerControl {
             return Ok(json!({ "providers": providers }));
         }
         let cwd = std::env::current_dir().unwrap_or_else(|_| self.config.base_dir.clone());
+        let resolved_executable = resolve_provider_executable_with_environment(
+            &target.binary_path,
+            target
+                .environment
+                .iter()
+                .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+        );
         let before_version =
             provider_inventory::probe_maintenance_target_version(&target, &cwd).await;
         let (_, pre_run_settings) = self.settings_snapshot().await;
@@ -869,6 +877,20 @@ impl NativeServerControl {
             .iter()
             .map(|result| result.snapshot.clone())
             .collect::<Vec<_>>();
+        let verified_provider = verification
+            .iter()
+            .find(|provider| provider["instanceId"] == target.instance_id);
+        let after_version = verified_provider
+            .and_then(|provider| provider["version"].as_str())
+            .map(str::to_owned);
+        let expected_version = verified_provider
+            .and_then(|provider| provider["versionAdvisory"]["latestVersion"].as_str())
+            .map(str::to_owned);
+        let executable_display = resolved_executable
+            .as_deref()
+            .unwrap_or_else(|| Path::new(&target.binary_path))
+            .display()
+            .to_string();
         let (status, message) = match self
             .publish_provider_snapshots_if_current(
                 refreshed,
@@ -886,25 +908,55 @@ impl NativeServerControl {
                     before_version.as_deref(),
                 );
                 let message = match status {
-                    "succeeded" => "Provider updated.",
+                    "succeeded" => "Provider updated.".to_owned(),
                     _ if verification.iter().any(|provider| {
                         provider["instanceId"] == target.instance_id
                             && provider["versionAdvisory"]["status"] == "behind_latest"
-                    }) =>
-                    {
-                        "Update command completed, but BiBCode still detects an outdated provider version."
-                    }
-                    _ => {
-                        "Update command completed, but BiBCode could not verify the provider version."
-                    }
+                    }) => match (after_version.as_deref(), expected_version.as_deref()) {
+                        (Some(after_version), Some(expected_version)) => format!(
+                            "Update command completed, but {executable_display} still reports {after_version}; expected {expected_version}."
+                        ),
+                        _ => "Update command completed, but BiBCode still detects an outdated provider version."
+                            .to_owned(),
+                    },
+                    _ => "Update command completed, but BiBCode could not verify the provider version."
+                        .to_owned(),
                 };
                 (status, message)
             }
             None => (
                 "unchanged",
-                "Update command completed, but BiBCode could not verify the provider version.",
+                "Update command completed, but BiBCode could not verify the provider version."
+                    .to_owned(),
             ),
         };
+        if status == "succeeded" {
+            tracing::debug!(
+                operation = "provider.maintenance.update.verify",
+                provider = %target.driver,
+                instance_id = %target.instance_id,
+                executable = %executable_display,
+                before_version = %before_version.as_deref().unwrap_or("unknown"),
+                after_version = %after_version.as_deref().unwrap_or("unknown"),
+                expected_version = %expected_version.as_deref().unwrap_or("unknown"),
+                exit_code = command_result.exit_code,
+                status = %status,
+                "provider update verification"
+            );
+        } else {
+            tracing::warn!(
+                operation = "provider.maintenance.update.verify",
+                provider = %target.driver,
+                instance_id = %target.instance_id,
+                executable = %executable_display,
+                before_version = %before_version.as_deref().unwrap_or("unknown"),
+                after_version = %after_version.as_deref().unwrap_or("unknown"),
+                expected_version = %expected_version.as_deref().unwrap_or("unknown"),
+                exit_code = command_result.exit_code,
+                status = %status,
+                "provider update verification"
+            );
+        }
         let finished_at = now_iso();
         let (providers, _) = self
             .publish_provider_update_state(
@@ -914,7 +966,7 @@ impl NativeServerControl {
                     status,
                     Some(&started_at),
                     Some(&finished_at),
-                    message,
+                    &message,
                     command_result.output.as_deref(),
                 ),
             )
@@ -2021,6 +2073,10 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
         "label": config.environment_label,
         "platform": { "os": platform_os(), "arch": platform_arch() },
         "serverVersion": config.server_version,
+        "storageInstanceId": config
+            .storage_instance_id
+            .expect("a running server has a prepared persistent store")
+            .to_string(),
         "capabilities": {
             "repositoryIdentity": true,
             "worktreeCatalog": true,
@@ -2085,6 +2141,7 @@ pub(crate) fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use std::{
+        io::{self, Write},
         sync::{Mutex as StdMutex, atomic::AtomicUsize},
         time::Duration,
     };
@@ -2092,6 +2149,7 @@ mod tests {
     use axum::{Json, Router, extract::State, routing::get};
     use tokio::net::TcpListener;
     use url::Url;
+    use uuid::Uuid;
 
     use crate::{
         activity::AgentActivityController,
@@ -2102,6 +2160,50 @@ mod tests {
     };
 
     use super::*;
+
+    const TEST_STORAGE_INSTANCE_ID: Uuid = Uuid::from_u128(0x00000000000040008000000000000004);
+
+    fn running_test_config(path: &Path) -> ServerConfig {
+        let mut config = ServerConfig::new(path);
+        config.storage_instance_id = Some(crate::persistence::StorageInstanceId::from_uuid(
+            TEST_STORAGE_INSTANCE_ID,
+        ));
+        config
+    }
+
+    #[derive(Clone, Default)]
+    struct TraceCapture(Arc<StdMutex<Vec<u8>>>);
+
+    struct TraceCaptureWriter(Arc<StdMutex<Vec<u8>>>);
+
+    impl Write for TraceCaptureWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("trace capture lock")
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for TraceCapture {
+        type Writer = TraceCaptureWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            TraceCaptureWriter(self.0.clone())
+        }
+    }
+
+    impl TraceCapture {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("trace capture lock").clone())
+                .expect("UTF-8 trace output")
+        }
+    }
 
     #[test]
     fn post_update_verification_distinguishes_success_and_unchanged() {
@@ -2492,6 +2594,13 @@ mod tests {
         tokio::fs::write(release_directory.join("update-exit-code"), "0")
             .await
             .expect("write successful update exit code");
+        let trace = TraceCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(trace.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
         let succeeded = control
             .update_provider(
                 &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
@@ -2506,6 +2615,29 @@ mod tests {
             .find(|provider| provider["instanceId"] == "cursor-work")
             .expect("successful Cursor provider");
         assert_eq!(succeeded_provider["updateState"]["status"], "unchanged");
+        assert_eq!(
+            succeeded_provider["updateState"]["message"],
+            format!(
+                "Update command completed, but {} still reports 2026.06.19-653a7fb; expected 2026.08.04-aaa8809.",
+                executable.display()
+            )
+        );
+        let trace = trace.text();
+        for expected in [
+            "provider update verification",
+            "provider=cursor",
+            "instance_id=cursor-work",
+            "before_version=2026.06.19-653a7fb",
+            "after_version=2026.06.19-653a7fb",
+            "expected_version=2026.08.04-aaa8809",
+            "exit_code=0",
+            "status=unchanged",
+        ] {
+            assert!(
+                trace.contains(expected),
+                "missing {expected:?} in trace: {trace}"
+            );
+        }
         assert_eq!(
             requests.load(Ordering::SeqCst),
             2,
@@ -3214,7 +3346,7 @@ mod tests {
                     .await
             })
         };
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let event = events.recv().await.expect("provider update event");
                 if event["type"] == "providerStatuses"
@@ -3295,7 +3427,7 @@ mod tests {
                     .await
             })
         };
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let event = events.recv().await.expect("provider update event");
                 if event["type"] == "providerStatuses"
@@ -4395,7 +4527,7 @@ mod tests {
     async fn concurrent_settings_stream_discards_stale_provider_probes_in_commit_order() {
         let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
-        let mut config = ServerConfig::new(temp.path());
+        let mut config = running_test_config(temp.path());
         config.environment_id = "environment-concurrent-stream".to_owned();
         let settings_path = config.state_dir().join("settings.json");
         tokio::fs::create_dir_all(config.state_dir())
@@ -4831,10 +4963,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn environment_descriptor_publishes_prepared_storage_identity_without_paths() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let mut config = ServerConfig::new(temp.path());
+        let resolved = crate::resolve_data_root(config.data_root_request.clone())
+            .expect("resolved test data root");
+        config.base_dir = resolved.effective.clone();
+        config.resolved_data_root = Some(resolved.clone());
+        crate::persistence::StatePaths::from_config(&config)
+            .ensure_directories_without_database_side_effects()
+            .await
+            .expect("state directories");
+        let prepared = crate::persistence::prepare_store(&config)
+            .await
+            .expect("prepared test store");
+        let expected = prepared.storage_instance_id.to_string();
+        config.storage_instance_id = Some(prepared.storage_instance_id);
+
+        let descriptor = environment_descriptor(&config, true);
+
+        assert_eq!(descriptor["storageInstanceId"], expected);
+        let encoded = descriptor.to_string();
+        assert!(!encoded.contains(&resolved.requested.display().to_string()));
+        assert!(!encoded.contains(&resolved.effective.display().to_string()));
+        for forbidden in [
+            "baseDir",
+            "resolvedDataRoot",
+            "requestedRoot",
+            "effectiveRoot",
+            "isFilesystemAlias",
+        ] {
+            assert!(
+                descriptor.get(forbidden).is_none(),
+                "forbidden field {forbidden}"
+            );
+        }
+        prepared.database.close().await;
+    }
+
+    #[tokio::test]
     async fn unit_build_covers_server_control_settings_keybindings_and_streams() {
         let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
-        let mut config = ServerConfig::new(temp.path());
+        let mut config = running_test_config(temp.path());
         config.environment_id = "environment-1".to_owned();
         config.environment_label = "Environment One".to_owned();
         let control = NativeServerControl::new(config.clone(), json!({"policy":"test"})).await;

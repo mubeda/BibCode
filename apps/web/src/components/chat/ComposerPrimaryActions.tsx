@@ -130,6 +130,7 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
   }
 
   if (isRunning || canCancelPendingSend) {
+    const interruptLabel = isRunning ? "Stop generation" : "Cancel queued message";
     return (
       <Tooltip>
         <TooltipTrigger
@@ -139,7 +140,7 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
               className="flex size-8 cursor-pointer items-center justify-center rounded-full bg-destructive/90 text-white shadow-xs shadow-destructive/24 inset-shadow-[0_1px_--theme(--color-white/16%)] transition-all duration-150 hover:bg-destructive hover:scale-105 active:inset-shadow-[0_1px_--theme(--color-black/8%)] active:shadow-none sm:h-8 sm:w-8"
               {...pointerFocusProps}
               onClick={onInterrupt}
-              aria-label="Stop generation"
+              aria-label={interruptLabel}
             />
           }
         >
@@ -147,7 +148,7 @@ export const ComposerPrimaryActions = memo(function ComposerPrimaryActions({
             <rect x="2" y="2" width="8" height="8" rx="1.5" />
           </svg>
         </TooltipTrigger>
-        <TooltipPopup side="top">Stop generation</TooltipPopup>
+        <TooltipPopup side="top">{interruptLabel}</TooltipPopup>
       </Tooltip>
     );
   }

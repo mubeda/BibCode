@@ -125,6 +125,87 @@ Stable-channel and nightly prereleases are installer-only. They never receive
 the updater signing overlay, updater signatures, descriptors, or `latest.json`,
 and never feed the app updater.
 
+### Update installation safety
+
+The signed stable updater uses the same project-store protection protocol on
+macOS, Windows, and Linux. Before the platform installer runs, the desktop host
+protects the native primary and every included running secondary with a
+verified `PreUpdate` backup, then waits for those backends to stop. Windows WSL
+primary and secondary runtimes participate through their authenticated desktop
+bootstrap transport. A configured secondary that is not running is shown as
+unprotected; the user must name that exact secondary to exclude it. The primary
+is never excludable.
+
+If preparation, cancellation, commit, backend stop, or platform installation
+fails, the host attempts to restore the exact set of backends that was running
+before protection began. The installer is never called while an included
+backend remains uncommitted or running. This guarantee applies to updates
+installed from the in-app signed stable channel. Replacing the application
+manually with a DMG, NSIS executable, AppImage, or an external package manager
+does not pass through the in-app coordinator; close BiBCode before performing a
+manual replacement.
+
+The coordinated sequence rejects new mutations, drains admitted mutations,
+quiesces background writers, checkpoints the WAL, publishes and reloads a
+verified `pre-update` backup, stops the captured backend topology, and only then
+invokes the platform installer. Windows waits for the packaged process to exit
+before NSIS replaces files. macOS and Linux install the candidate and relaunch
+the packaged application through their platform updater flow. A failed
+prepare, backup, stop, install, or relaunch leaves the verified backup and any
+recovery-preservation artifacts in the data root and attempts to restart the
+exact prior backend set.
+
+The primary backend is always protected and cannot be excluded. Each running
+secondary is protected independently. A configured but unavailable secondary
+is shown by its exact environment ID and may be explicitly excluded; a generic
+"continue anyway" is not accepted. WSL-only intent never falls back to native
+Windows during update preparation or recovery.
+
+Linux AppImage updates launched through BiBCode use this coordinator. Replacing
+an AppImage directly, installing through an external package manager, or
+manually replacing an NSIS/DMG installation is outside the coordinator. Close
+every BiBCode backend before those operations. Application files and project
+data are separate: a normal in-place updater replaces application files and
+must retain the selected project-data root.
+
+### Seeded packaged-upgrade matrix
+
+[`desktop-upgrade-smoke.yml`](../../.github/workflows/desktop-upgrade-smoke.yml)
+runs real packaged previous-stable-to-candidate and protected-baseline upgrades
+for Windows x64 NSIS, macOS arm64 DMG, macOS x64 DMG, and Linux x64 AppImage.
+The protected lane verifies the same storage UUID, seeded project, and a
+verified `pre-update` backup after restart. A separate Windows job exercises a
+WSL primary when the runner declares WSL plus an installed distribution; an
+unavailable capability produces an explicit skip reason rather than emulated
+coverage.
+
+The harness uses an isolated root outside the checkout, an ephemeral Tauri
+updater key, a loopback-only mock updater, the packaged app's embedded
+WebDriver, and bounded redacted evidence. It never opens or copies the SQLite
+database directly. Linux additionally requires the normal Tauri/AppImage
+libraries plus Xvfb. Run the host-compatible lane from the repository root with
+fresh ports and a work root outside the checkout:
+
+```sh
+TAURI_SIGNING_PRIVATE_KEY=/absolute/path/to/ephemeral.key \
+TAURI_SIGNING_PRIVATE_KEY_PASSWORD='<ephemeral password>' \
+node scripts/seeded-desktop-upgrade-smoke.ts \
+  --platform mac --arch arm64 --bundle dmg \
+  --candidate-version 0.3.11-upgrade.local.1 \
+  --previous-tag v0.3.10 --previous-version 0.3.10 \
+  --public-key-file /absolute/path/to/ephemeral.key.pub \
+  --run-id local-mac-arm64 \
+  --work-root /private/tmp/bibcode-seeded-upgrade/work \
+  --artifact-dir /private/tmp/bibcode-seeded-upgrade/evidence \
+  --updater-port 43120 --restart-timeout-ms 180000
+```
+
+Generate the ephemeral key with `vp exec tauri signer generate` from
+`apps/desktop`, install frozen workspace dependencies, and ensure the host can
+build and launch the selected native bundle. Never use production signing
+secrets for this smoke. Evidence must remain bounded and redact roots,
+bootstrap credentials, update-signing secrets, tokens, and database contents.
+
 ## Stable Release Runbook
 
 1. Confirm the intended version and commit have passed the local verification

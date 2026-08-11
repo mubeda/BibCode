@@ -18,6 +18,8 @@ import {
   type PlatformConnectionRegistration,
   PrimaryConnectionRegistration,
   PrimaryConnectionTarget,
+  UnavailableConnectionRegistration,
+  UnavailableConnectionTarget,
   Wakeups,
 } from "@bibcode/client-runtime/connection";
 import { bootstrapRemoteBearerSession } from "@bibcode/client-runtime/authorization";
@@ -29,6 +31,7 @@ import {
   type DesktopBridge,
   type DesktopEnvironmentBootstrap,
   type DesktopSshEnvironmentTarget,
+  EnvironmentId,
   PRIMARY_LOCAL_ENVIRONMENT_ID,
 } from "@bibcode/contracts";
 import * as Clock from "effect/Clock";
@@ -300,6 +303,19 @@ const loadPrimaryConnectionRegistration = Effect.fn(
 const loadSecondaryConnectionRegistration = Effect.fn(
   "web.connectionPlatform.loadSecondaryConnectionRegistration",
 )(function* (entry: DesktopEnvironmentBootstrap) {
+  if (entry.preflightError?.kind === "wsl-secondary-unavailable") {
+    return {
+      registration: new UnavailableConnectionRegistration({
+        target: new UnavailableConnectionTarget({
+          environmentId: EnvironmentId.make(entry.id),
+          label: entry.label,
+          connectionId: desktopLocalConnectionId(entry.id),
+          configuredDistro: entry.configuredDistro ?? null,
+          detail: entry.preflightError.detail,
+        }),
+      }),
+    };
+  }
   if (
     entry.httpBaseUrl === null ||
     entry.wsBaseUrl === null ||
@@ -523,7 +539,14 @@ const platformConnectionSourceLayer = Layer.effect(
         });
       } else {
         for (const bootstrap of topologyRead.bootstraps) {
-          const signature = `${bootstrap.httpBaseUrl}|${bootstrap.wsBaseUrl}|${bootstrap.bootstrapToken ?? ""}`;
+          const signature = [
+            bootstrap.httpBaseUrl,
+            bootstrap.wsBaseUrl,
+            bootstrap.bootstrapToken ?? "",
+            bootstrap.configuredDistro ?? "",
+            bootstrap.preflightError?.kind ?? "",
+            bootstrap.preflightError?.detail ?? "",
+          ].join("|");
           const cached = previous.get(bootstrap.id);
           if (
             cached !== undefined &&

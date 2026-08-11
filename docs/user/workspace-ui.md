@@ -17,6 +17,13 @@ Projects are shown as groups of workspace rows:
 - Rows can show pinned/unread state and nested agent activity such as provider,
   running state, and elapsed time.
 
+The sidebar says **No projects yet** only after every configured environment
+has connected and returned a successful empty project snapshot. During startup,
+reconnects, unavailable environments, storage-location changes, or recovery
+conditions it shows that availability state instead. Cached project rows stay
+visible during those conditions and are replaced only after a newly accepted
+environment completes synchronization.
+
 Use the project `+` action to create a worktree. The Create Worktree dialog has a
 project selector, Smart/GitHub/Branch/Name modes, an agent picker, advanced
 options, a Create more toggle, and Ctrl+Enter submit.
@@ -144,6 +151,23 @@ the first provider response. Once measured, the meter's popover shows active
 usage, the maximum when known, and lifetime processed tokens when supplied.
 Usage above 90 percent is presented as a warning through the meter's red
 treatment. Automatic-compaction support is stated when the provider reports it.
+
+The access and reasoning controls remain icon-only in the composer toolbar.
+When Full Access is selected, its lock icon is red in both the toolbar and the
+access menu. When the selected reasoning level is the highest level advertised
+by the active provider and model, the toolbar's reasoning bars and the selected
+level title in the menu are red; lower levels remain neutral.
+
+While a provider turn is active, the timeline shows a reversed paint-and-fade
+dotted square followed by `Waiting for` and a whole-second elapsed timer, such
+as `Waiting for 3s`. The timer is anchored to the persisted user-message time
+after reload and never moves backward when the provider start time arrives.
+The animation uses the current theme's muted foreground and becomes static when
+reduced motion is requested. A later pending delivery queued behind an
+unresolved failed or uncertain delivery does not appear active; resolve the
+earlier delivery's Retry/Dismiss notice before the queued message can run. The
+composer remains blocked and offers `Cancel queued message` so queued work can
+be withdrawn before resolving the older delivery.
 
 Question and approval composer footers retain their specialized controls and do
 not gain the normal context-window control.

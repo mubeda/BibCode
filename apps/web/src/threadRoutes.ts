@@ -1,5 +1,5 @@
 import { scopeThreadRef } from "@bibcode/client-runtime/environment";
-import type { EnvironmentShellStatus } from "@bibcode/client-runtime/state/shell";
+import type { EnvironmentAvailabilityStatus } from "@bibcode/client-runtime/state/shell";
 import type { EnvironmentId, ScopedThreadRef, ThreadId } from "@bibcode/contracts";
 import type { DraftId } from "./composerDraftStore";
 
@@ -41,7 +41,7 @@ export function resolveThreadRouteRef(
 
 export interface MissingRouteThreadRedirectInput {
   /** Shell sync status for the route's environment; null when no shell state loaded yet. */
-  readonly shellStatus: EnvironmentShellStatus | null;
+  readonly shellStatus: EnvironmentAvailabilityStatus | null;
   /** True when the route thread resolves as a server thread or a local draft. */
   readonly routeThreadExists: boolean;
   /** Server threads only — client-persisted drafts must not count. */
@@ -51,7 +51,7 @@ export interface MissingRouteThreadRedirectInput {
 /**
  * A thread route may bounce to the index only when a LIVE snapshot from the
  * currently-connected server authoritatively lacks the thread. During backend
- * restarts/reconnects the shell serves a cached snapshot ("cached"/
+ * restarts/reconnects the shell serves a cached snapshot ("degraded"/
  * "synchronizing"), and the first live snapshot after an auth handshake can be
  * empty or partial — navigating on those windows yanks the user off a thread
  * that still exists. Draft threads are client-persisted and survive server

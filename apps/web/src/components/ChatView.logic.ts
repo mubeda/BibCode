@@ -506,6 +506,7 @@ export interface LocalDispatchSnapshot {
   latestTurnCompletedAt: string | null;
   sessionStatus: NonNullable<Thread["session"]>["status"] | null;
   sessionUpdatedAt: string | null;
+  threadError: string | null;
 }
 
 export function findLastCancellableDeliveryMessage(
@@ -518,9 +519,27 @@ export function findLastCancellableDeliveryMessage(
   );
 }
 
+export function findActiveDeliveryMessage(
+  messages: ReadonlyArray<ChatMessage>,
+): ChatMessage | null {
+  const oldestUnresolved = messages.find((message) => {
+    const state = message.delivery?.state;
+    return (
+      state === "pending" || state === "sending" || state === "uncertain" || state === "failed"
+    );
+  });
+  const state = oldestUnresolved?.delivery?.state;
+  return state === "pending" || state === "sending" ? (oldestUnresolved ?? null) : null;
+}
+
 export function createLocalDispatchSnapshot(
   activeThread: Thread | undefined,
-  options?: { preparingWorktree?: boolean; threadId?: ThreadId; messageId?: MessageId },
+  options?: {
+    preparingWorktree?: boolean;
+    threadId?: ThreadId;
+    messageId?: MessageId;
+    threadError?: string | null;
+  },
 ): LocalDispatchSnapshot {
   const latestTurn = activeThread?.latestTurn ?? null;
   const session = activeThread?.session ?? null;
@@ -535,6 +554,7 @@ export function createLocalDispatchSnapshot(
     latestTurnCompletedAt: latestTurn?.completedAt ?? null,
     sessionStatus: session?.status ?? null,
     sessionUpdatedAt: session?.updatedAt ?? null,
+    threadError: options?.threadError ?? null,
   };
 }
 
@@ -551,14 +571,15 @@ export function hasServerAcknowledgedLocalDispatch(input: {
   if (!input.localDispatch) {
     return false;
   }
-  if (input.hasPendingApproval || input.hasPendingUserInput || Boolean(input.threadError)) {
+  const currentThreadError = input.threadError ?? null;
+  if (
+    input.hasPendingApproval ||
+    input.hasPendingUserInput ||
+    (currentThreadError !== null && currentThreadError !== input.localDispatch.threadError)
+  ) {
     return true;
   }
-  if (
-    input.deliveryState === "failed" ||
-    input.deliveryState === "uncertain" ||
-    input.deliveryState === "dismissed"
-  ) {
+  if (input.deliveryState !== null && input.deliveryState !== undefined) {
     return true;
   }
 

@@ -78,7 +78,7 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
         .await
         .expect("WebSocket connects")
         .0;
-    let database = Database::open(config.database_path())
+    let database = Database::open_existing(config.database_path())
         .await
         .expect("projection database");
     let repositories = Repositories::new(database);

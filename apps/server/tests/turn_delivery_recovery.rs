@@ -128,14 +128,13 @@ async fn attachment_abort_child() {
     let Some(state) = std::env::var_os(ATTACHMENT_ABORT_CHILD_STATE).map(PathBuf::from) else {
         return;
     };
-    let config = ServerConfig::new(&state)
-        .with_bind("127.0.0.1", 0)
-        .with_unsafe_no_auth();
-    let state_dir = config.state_dir();
-    let database_path = config.database_path();
+    let attachment_config = ServerConfig::new(&state);
+    let state_dir = attachment_config.state_dir();
+    let database_path = attachment_config.database_path();
     let attachments_dir = state_dir.join("attachments");
     let final_path = attachments_dir.join("aborted-final");
-    let database = Database::open(config.database_path())
+    std::fs::create_dir_all(&state_dir).expect("attachment crash state directory");
+    let database = Database::create_new(database_path.clone())
         .await
         .expect("attachment crash database");
     database
@@ -169,7 +168,10 @@ async fn attachment_abort_child() {
         state_dir,
         delivery,
     );
-    let runtime = ServerRuntime::start_with_registry(config, registry)
+    let rpc_config = ServerConfig::new(state.join("rpc-runtime"))
+        .with_bind("127.0.0.1", 0)
+        .with_unsafe_no_auth();
+    let runtime = ServerRuntime::start_with_registry(rpc_config, registry)
         .await
         .expect("attachment crash RPC runtime");
     let (mut socket, _) = connect_async(format!("ws://{}/ws", runtime.local_addr()))
@@ -438,7 +440,7 @@ async fn durable_boundary_crash_child() {
     let sends =
         PathBuf::from(std::env::var_os(CRASH_BOUNDARY_CHILD_SENDS).expect("crash send journal"));
     configure_crash_provider(&state, &provider);
-    let database = Database::open(&state.join("delivery.sqlite3"))
+    let database = Database::create_new(state.join("delivery.sqlite3"))
         .await
         .expect("crash database");
     database
@@ -595,7 +597,7 @@ async fn restart_crash_boundary(
     reconciliation: ProviderReconciliationOutcome,
     launch_provider: bool,
 ) {
-    let database = Database::open(&state.join("delivery.sqlite3"))
+    let database = Database::open_existing(state.join("delivery.sqlite3"))
         .await
         .expect("restart database");
     let engine = OrchestrationEngine::start(database.clone(), EngineOptions::default())
@@ -1044,7 +1046,9 @@ async fn bootstrap_restart_after_setup_launch_reuses_worktree_and_terminal_for_p
     let repository = Arc::new(GitRepository::default());
     let provider_factory = Arc::new(NeverProvider::default());
     let worktree_path = {
-        let database = Database::open(&database_path).await.expect("database");
+        let database = Database::create_new(&database_path)
+            .await
+            .expect("database");
         database
             .call(|connection| {
                 run_migrations(connection, None)?;
@@ -1184,7 +1188,7 @@ async fn bootstrap_restart_after_setup_launch_reuses_worktree_and_terminal_for_p
     };
 
     {
-        let database = Database::open(&database_path)
+        let database = Database::open_existing(&database_path)
             .await
             .expect("reopened database");
         let engine = OrchestrationEngine::start(database.clone(), EngineOptions::default())
@@ -1353,7 +1357,7 @@ async fn missing_origin_delivery_child() {
     );
 
     let state = TempDir::new().expect("state");
-    let database = Database::open(&state.path().join("delivery.sqlite3"))
+    let database = Database::create_new(state.path().join("delivery.sqlite3"))
         .await
         .expect("database");
     database

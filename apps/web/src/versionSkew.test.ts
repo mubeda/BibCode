@@ -35,6 +35,7 @@ describe("versionSkew", () => {
             arch: "arm64",
           },
           serverVersion: "9.9.9",
+          storageInstanceId: null,
           capabilities: {
             repositoryIdentity: true,
             worktreeCatalog: false,

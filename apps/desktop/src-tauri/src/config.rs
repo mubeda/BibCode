@@ -1,3 +1,4 @@
+use bibcode_server::{DataRootRequest, DataRootSource, ResolvedDataRoot, resolve_data_root};
 use serde_json::{Value, json};
 use std::{
     fs, io,
@@ -7,6 +8,17 @@ use std::{
 use tauri::{AppHandle, Manager, Runtime};
 
 const APP_BASE_NAME: &str = "BiBCode";
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) struct IsolatedTestDataRoot(PathBuf);
+
+#[cfg(test)]
+impl IsolatedTestDataRoot {
+    pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
+        Self(path.into())
+    }
+}
 
 pub(crate) fn bibcode_env_var(name: &str) -> Option<std::ffi::OsString> {
     std::env::var_os(name)
@@ -120,15 +132,39 @@ pub fn resolve_pick_folder_default_path<R: Runtime>(
     resolve_default_path_from_home(&home_directory, raw_options)
 }
 
-pub(crate) fn base_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
-    if let Some(value) = std::env::var_os("BIBCODE_HOME").filter(|value| !value.is_empty()) {
-        return Ok(PathBuf::from(value));
-    }
+fn resolve_data_root_from_home(
+    home_dir: PathBuf,
+    requested: Option<PathBuf>,
+) -> Result<ResolvedDataRoot, String> {
+    let request = match requested {
+        Some(path) => DataRootRequest::explicit(DataRootSource::Environment, path, home_dir),
+        None => DataRootRequest::default(home_dir),
+    };
+    resolve_data_root(request)
+        .map_err(|error| config_error("Could not resolve the BiBCode data root", error))
+}
+
+pub(crate) fn data_root<R: Runtime>(app: &AppHandle<R>) -> Result<ResolvedDataRoot, String> {
     let home = app
         .path()
         .home_dir()
         .map_err(|error| config_error("Could not resolve the home directory", error))?;
-    Ok(home.join(".bibcode"))
+    #[cfg(test)]
+    let requested = app
+        .try_state::<IsolatedTestDataRoot>()
+        .map(|root| root.0.clone())
+        .ok_or_else(|| {
+            "mock Tauri apps must install an explicit isolated test data root".to_owned()
+        })?;
+    #[cfg(test)]
+    return resolve_data_root_from_home(home, Some(requested));
+
+    #[cfg(not(test))]
+    resolve_data_root_from_home(home, bibcode_env_var("BIBCODE_HOME").map(PathBuf::from))
+}
+
+pub(crate) fn base_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
+    data_root(app).map(|resolved| resolved.effective)
 }
 
 pub fn state_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
@@ -212,6 +248,32 @@ pub fn write_json_file(path: &Path, value: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mock_tauri_apps_refuse_to_resolve_the_real_user_data_root() {
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+
+        let app = mock_builder()
+            .build(mock_context(noop_assets()))
+            .expect("mock Tauri app");
+
+        let error = data_root(app.handle())
+            .expect_err("mock apps must require an explicit isolated data root");
+        assert!(error.contains("isolated test data root"), "{error}");
+    }
+
+    #[test]
+    fn rejects_relative_environment_data_root_before_desktop_uses_it() {
+        let temp = tempfile::tempdir().expect("temporary home directory");
+
+        let error = resolve_data_root_from_home(
+            temp.path().to_path_buf(),
+            Some(PathBuf::from("relative/.bibcode")),
+        )
+        .expect_err("relative environment root must fail");
+
+        assert!(error.contains("must be absolute"));
+    }
 
     #[test]
     fn detects_nightly_versions() {

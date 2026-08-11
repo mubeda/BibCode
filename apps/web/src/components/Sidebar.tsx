@@ -59,6 +59,7 @@ import {
   DEFAULT_RUNTIME_MODE,
   DEFAULT_SERVER_SETTINGS,
   EDITORS,
+  type EnvironmentId,
   ProjectId,
   ProviderInstanceId,
   type ScopedProjectRef,
@@ -140,11 +141,16 @@ import { readLocalApi } from "../localApi";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { useNewThreadHandler } from "../hooks/useHandleNewThread";
 import { useDesktopUpdateState } from "../state/desktopUpdate";
+import { projectDataSafetyStore } from "../state/projectDataSafety";
 
 import { useThreadActions } from "../hooks/useThreadActions";
 import { projectEnvironment } from "../state/projects";
 import { useEnvironmentQuery } from "../state/query";
-import { shellEnvironment } from "../state/shell";
+import {
+  environmentAvailabilityCommands,
+  shellEnvironment,
+  useEnvironmentShellSummary,
+} from "../state/shell";
 import { threadEnvironment, useEnvironmentThread } from "../state/threads";
 import { vcsEnvironment } from "../state/vcs";
 import { useEnvironment, useEnvironments, usePrimaryEnvironmentId } from "../state/environments";
@@ -156,12 +162,12 @@ import { Kbd } from "./ui/kbd";
 import {
   getArm64IntelBuildWarningDescription,
   getDesktopUpdateActionError,
-  getDesktopUpdateInstallConfirmationMessage,
   isDesktopUpdateButtonDisabled,
   resolveDesktopUpdateButtonAction,
   shouldShowArm64IntelBuildWarning,
   shouldToastDesktopUpdateActionResult,
 } from "./desktopUpdate.logic";
+import { UpdateProtectionDialog } from "./desktop/UpdateProtectionDialog";
 import { Alert, AlertAction, AlertDescription, AlertTitle } from "./ui/alert";
 import { Button } from "./ui/button";
 import {
@@ -217,6 +223,7 @@ import {
   isContextMenuPointerDown,
   isTrailingDoubleClick,
   resolveProjectStatusIndicator,
+  resolveSidebarProjectAvailability,
   resolveSidebarStageBadgeLabel,
   resolveThreadRowClassName,
   resolveThreadStatusPill,
@@ -257,6 +264,7 @@ import { worktreeEnvironment } from "../state/worktrees";
 import { getBulkThreadDeletionConfirmation } from "../worktreeCleanup";
 import { WorktreeAvailabilityWarning } from "./WorktreeAvailabilityWarning";
 import { WorktreeRemovalDialog, type WorktreeRemovalTarget } from "./WorktreeRemovalDialog";
+import { SidebarProjectAvailability } from "./sidebar/SidebarProjectAvailability";
 
 const WorktreeRemovalRequestContext = createContext<
   ((target: WorktreeRemovalTarget) => void) | null
@@ -3636,7 +3644,12 @@ interface SidebarProjectsContentProps {
   suppressProjectClickAfterDragRef: React.RefObject<boolean>;
   suppressProjectClickForContextMenuRef: React.RefObject<boolean>;
   attachProjectListAutoAnimateRef: (node: HTMLElement | null) => void;
-  projectsLength: number;
+  projectAvailability: ReturnType<typeof resolveSidebarProjectAvailability>;
+  onRetryProjectEnvironment: (environmentId: EnvironmentId) => void;
+  onOpenProjectSettings: () => void;
+  onViewProjectDiagnostics: () => void;
+  onAdoptProjectStorage: (environmentId: EnvironmentId) => void;
+  onRecoverProjectData?: ((environmentId: EnvironmentId) => void) | undefined;
 }
 
 const SidebarProjectsContent = memo(function SidebarProjectsContent(
@@ -3677,7 +3690,12 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
     suppressProjectClickAfterDragRef,
     suppressProjectClickForContextMenuRef,
     attachProjectListAutoAnimateRef,
-    projectsLength,
+    projectAvailability,
+    onRetryProjectEnvironment,
+    onOpenProjectSettings,
+    onViewProjectDiagnostics,
+    onAdoptProjectStorage,
+    onRecoverProjectData,
   } = props;
 
   const handleProjectSortOrderChange = useCallback(
@@ -3862,11 +3880,14 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
           </SidebarMenu>
         )}
 
-        {projectsLength === 0 && (
-          <div className="px-2 pt-4 text-center text-xs text-muted-foreground/60">
-            No projects yet
-          </div>
-        )}
+        <SidebarProjectAvailability
+          view={projectAvailability}
+          onRetry={onRetryProjectEnvironment}
+          onOpenSettings={onOpenProjectSettings}
+          onViewDiagnostics={onViewProjectDiagnostics}
+          onAdoptStorage={onAdoptProjectStorage}
+          onRecoverData={onRecoverProjectData}
+        />
       </SidebarGroup>
     </SidebarContent>
   );
@@ -3874,11 +3895,18 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
 
 export default function Sidebar() {
   const projects = useProjects();
+  const shellSummary = useEnvironmentShellSummary();
   const sidebarThreads = useThreadShells();
   const projectExpandedById = useUiStateStore((store) => store.projectExpandedById);
   const projectOrder = useUiStateStore((store) => store.projectOrder);
   const reorderProjects = useUiStateStore((store) => store.reorderProjects);
   const navigate = useNavigate();
+  const retryProjectEnvironment = useAtomCommand(environmentAvailabilityCommands.retry, {
+    reportFailure: false,
+  });
+  const adoptProjectStorage = useAtomCommand(environmentAvailabilityCommands.adoptStorage, {
+    reportFailure: false,
+  });
   const pathname = useLocation({ select: (loc) => loc.pathname });
   const isOnSettings = pathname.startsWith("/settings");
   const sidebarThreadSortOrder = useClientSettings((s) => s.sidebarThreadSortOrder);
@@ -3943,6 +3971,51 @@ export default function Sidebar() {
   const suppressProjectClickAfterDragRef = useRef(false);
   const suppressProjectClickForContextMenuRef = useRef(false);
   const desktopUpdateState = useDesktopUpdateState();
+  const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
+  const projectAvailability = useMemo(
+    () =>
+      resolveSidebarProjectAvailability({
+        projectCount: projects.length,
+        catalogReady: shellSummary.catalogReady,
+        catalogHealth: shellSummary.catalogHealth,
+        environments: shellSummary.statuses,
+      }),
+    [projects.length, shellSummary.catalogHealth, shellSummary.catalogReady, shellSummary.statuses],
+  );
+  const handleRetryProjectEnvironment = useCallback(
+    (environmentId: EnvironmentId) => {
+      void retryProjectEnvironment(environmentId);
+    },
+    [retryProjectEnvironment],
+  );
+  const handleOpenProjectSettings = useCallback(() => {
+    void navigate({ to: "/settings/connections" });
+  }, [navigate]);
+  const handleViewProjectDiagnostics = useCallback(() => {
+    void navigate({ to: "/settings/diagnostics" });
+  }, [navigate]);
+  const handleRecoverProjectData = useCallback((environmentId: EnvironmentId) => {
+    void projectDataSafetyStore.open(environmentId, "manual").catch(() => undefined);
+  }, []);
+  const handleAdoptProjectStorage = useCallback(
+    (environmentId: EnvironmentId) => {
+      const api = readLocalApi();
+      if (!api) {
+        return;
+      }
+      void api.dialogs
+        .confirm(
+          "Use this project data location? Projects from the two locations will not be merged.",
+        )
+        .then((confirmed) => {
+          if (confirmed) {
+            void adoptProjectStorage(environmentId);
+          }
+        })
+        .catch(() => undefined);
+    },
+    [adoptProjectStorage],
+  );
   const clearSelection = useThreadSelectionStore((s) => s.clearSelection);
   const setSelectionAnchor = useThreadSelectionStore((s) => s.setAnchor);
   const platform = navigator.platform;
@@ -3961,6 +4034,22 @@ export default function Sidebar() {
       new Set(
         environments
           .filter((environment) => isDesktopLocalConnectionTarget(environment.entry.target))
+          .map((environment) => environment.environmentId),
+      ),
+    [environments],
+  );
+  const projectDataRecoveryEnvironmentIds = useMemo(
+    () =>
+      new Set(
+        environments
+          .filter(
+            (environment) =>
+              isDesktopHost &&
+              typeof window !== "undefined" &&
+              window.desktopBridge?.getProjectDataStatuses !== undefined &&
+              (environment.entry.target._tag === "PrimaryConnectionTarget" ||
+                isDesktopLocalConnectionTarget(environment.entry.target)),
+          )
           .map((environment) => environment.environmentId),
       ),
     [environments],
@@ -4435,33 +4524,7 @@ export default function Sidebar() {
     }
 
     if (desktopUpdateButtonAction === "install") {
-      const confirmed = window.confirm(
-        getDesktopUpdateInstallConfirmationMessage(desktopUpdateState),
-      );
-      if (!confirmed) return;
-      void bridge
-        .installUpdate()
-        .then((result) => {
-          if (!shouldToastDesktopUpdateActionResult(result)) return;
-          const actionError = getDesktopUpdateActionError(result);
-          if (!actionError) return;
-          toastManager.add(
-            stackedThreadToast({
-              type: "error",
-              title: "Could not install update",
-              description: actionError,
-            }),
-          );
-        })
-        .catch((error) => {
-          toastManager.add(
-            stackedThreadToast({
-              type: "error",
-              title: "Could not install update",
-              description: error instanceof Error ? error.message : "An unexpected error occurred.",
-            }),
-          );
-        });
+      setUpdateDialogOpen(true);
     }
   }, [desktopUpdateButtonAction, desktopUpdateButtonDisabled, desktopUpdateState]);
 
@@ -4503,6 +4566,27 @@ export default function Sidebar() {
           void handleWorktreeRemoved(removedTarget, result);
         }}
       />
+      {desktopUpdateState && window.desktopBridge ? (
+        <UpdateProtectionDialog
+          open={updateDialogOpen}
+          state={desktopUpdateState}
+          onOpenChange={setUpdateDialogOpen}
+          installUpdate={(input) => window.desktopBridge!.installUpdate(input)}
+          onDiagnostics={() => {
+            setUpdateDialogOpen(false);
+            handleViewProjectDiagnostics();
+          }}
+          onError={(description) => {
+            toastManager.add(
+              stackedThreadToast({
+                type: "error",
+                title: "Could not install update",
+                description,
+              }),
+            );
+          }}
+        />
+      ) : null}
       {prewarmedSidebarThreadRefs.map((threadRef) => (
         <SidebarThreadDetailPrewarmer key={scopedThreadKey(threadRef)} threadRef={threadRef} />
       ))}
@@ -4547,7 +4631,17 @@ export default function Sidebar() {
             suppressProjectClickAfterDragRef={suppressProjectClickAfterDragRef}
             suppressProjectClickForContextMenuRef={suppressProjectClickForContextMenuRef}
             attachProjectListAutoAnimateRef={attachProjectListAutoAnimateRef}
-            projectsLength={projects.length}
+            projectAvailability={projectAvailability}
+            onRetryProjectEnvironment={handleRetryProjectEnvironment}
+            onOpenProjectSettings={handleOpenProjectSettings}
+            onViewProjectDiagnostics={handleViewProjectDiagnostics}
+            onAdoptProjectStorage={handleAdoptProjectStorage}
+            onRecoverProjectData={
+              projectAvailability.environmentId !== null &&
+              projectDataRecoveryEnvironmentIds.has(projectAvailability.environmentId)
+                ? handleRecoverProjectData
+                : undefined
+            }
           />
 
           <SidebarSeparator />
