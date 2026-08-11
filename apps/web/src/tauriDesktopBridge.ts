@@ -428,10 +428,18 @@ function openBrowserFallback(url: string): boolean {
   }
 }
 
+function isWindowsWebViewRuntime(): boolean {
+  return typeof navigator !== "undefined" && /Windows/iu.test(navigator.userAgent);
+}
+
 async function showTauriContextMenu<T extends string>(
   items: readonly ContextMenuItem<T>[],
   position?: { x: number; y: number },
 ): Promise<T | null> {
+  if (isWindowsWebViewRuntime()) {
+    return showContextMenuFallback(items, position);
+  }
+
   try {
     return await tauriInvokeDesktop<T | null>("desktop_bridge_show_context_menu", {
       items,

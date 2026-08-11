@@ -1802,6 +1802,7 @@ function EnvironmentScopedProviderSettingsPanel({
                     }
                   : undefined
               }
+              onRecheck={refreshProviders}
               isUpdating={showInlineUpdateButton ? isDriverUpdateRunning : undefined}
             />
           );

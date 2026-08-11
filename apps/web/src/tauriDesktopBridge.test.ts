@@ -950,6 +950,24 @@ describe("tauriDesktopBridge", () => {
     expect(showContextMenuFallbackMock).not.toHaveBeenCalled();
   });
 
+  it("uses the web context menu when the Windows native popup cannot report failure", async () => {
+    const harness = installTauriHarness({ contextMenuResult: null });
+    vi.stubGlobal("navigator", {
+      userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+    });
+    showContextMenuFallbackMock.mockResolvedValue("delete-worktree");
+    const bridge = await installBridge();
+    const items = [{ id: "delete-worktree", label: "Delete Worktree" }] as const;
+
+    await expect(bridge.showContextMenu(items, { x: 30, y: 40 })).resolves.toBe("delete-worktree");
+
+    expect(harness.invoke).not.toHaveBeenCalledWith(
+      "desktop_bridge_show_context_menu",
+      expect.anything(),
+    );
+    expect(showContextMenuFallbackMock).toHaveBeenCalledWith(items, { x: 30, y: 40 });
+  });
+
   it("falls back to the web context menu when Tauri reports native context menus unsupported", async () => {
     const harness = installTauriHarness({ rejectContextMenu: unsupportedContextMenuError });
     showContextMenuFallbackMock.mockResolvedValue("rename");

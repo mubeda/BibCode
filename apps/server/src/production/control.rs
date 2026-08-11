@@ -28,6 +28,7 @@ use crate::{
             ProviderMaintenance, ProviderMaintenanceTarget, ProviderUpdateLifecycleToken,
             provider_version_advanced, provider_version_regressed,
         },
+        provider_runtime::resolve_provider_executable_with_environment,
         server_terminal::{JsonFuture, JsonStream, ProductionServerControl},
     },
     server_settings::{ProviderSettingsState, normalize_agent_activity_settings},
@@ -763,6 +764,13 @@ impl NativeServerControl {
             return Ok(json!({ "providers": providers }));
         }
         let cwd = std::env::current_dir().unwrap_or_else(|_| self.config.base_dir.clone());
+        let resolved_executable = resolve_provider_executable_with_environment(
+            &target.binary_path,
+            target
+                .environment
+                .iter()
+                .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+        );
         let before_version =
             provider_inventory::probe_maintenance_target_version(&target, &cwd).await;
         let (_, pre_run_settings) = self.settings_snapshot().await;
@@ -869,6 +877,20 @@ impl NativeServerControl {
             .iter()
             .map(|result| result.snapshot.clone())
             .collect::<Vec<_>>();
+        let verified_provider = verification
+            .iter()
+            .find(|provider| provider["instanceId"] == target.instance_id);
+        let after_version = verified_provider
+            .and_then(|provider| provider["version"].as_str())
+            .map(str::to_owned);
+        let expected_version = verified_provider
+            .and_then(|provider| provider["versionAdvisory"]["latestVersion"].as_str())
+            .map(str::to_owned);
+        let executable_display = resolved_executable
+            .as_deref()
+            .unwrap_or_else(|| Path::new(&target.binary_path))
+            .display()
+            .to_string();
         let (status, message) = match self
             .publish_provider_snapshots_if_current(
                 refreshed,
@@ -886,25 +908,55 @@ impl NativeServerControl {
                     before_version.as_deref(),
                 );
                 let message = match status {
-                    "succeeded" => "Provider updated.",
+                    "succeeded" => "Provider updated.".to_owned(),
                     _ if verification.iter().any(|provider| {
                         provider["instanceId"] == target.instance_id
                             && provider["versionAdvisory"]["status"] == "behind_latest"
-                    }) =>
-                    {
-                        "Update command completed, but BiBCode still detects an outdated provider version."
-                    }
-                    _ => {
-                        "Update command completed, but BiBCode could not verify the provider version."
-                    }
+                    }) => match (after_version.as_deref(), expected_version.as_deref()) {
+                        (Some(after_version), Some(expected_version)) => format!(
+                            "Update command completed, but {executable_display} still reports {after_version}; expected {expected_version}."
+                        ),
+                        _ => "Update command completed, but BiBCode still detects an outdated provider version."
+                            .to_owned(),
+                    },
+                    _ => "Update command completed, but BiBCode could not verify the provider version."
+                        .to_owned(),
                 };
                 (status, message)
             }
             None => (
                 "unchanged",
-                "Update command completed, but BiBCode could not verify the provider version.",
+                "Update command completed, but BiBCode could not verify the provider version."
+                    .to_owned(),
             ),
         };
+        if status == "succeeded" {
+            tracing::debug!(
+                operation = "provider.maintenance.update.verify",
+                provider = %target.driver,
+                instance_id = %target.instance_id,
+                executable = %executable_display,
+                before_version = %before_version.as_deref().unwrap_or("unknown"),
+                after_version = %after_version.as_deref().unwrap_or("unknown"),
+                expected_version = %expected_version.as_deref().unwrap_or("unknown"),
+                exit_code = command_result.exit_code,
+                status = %status,
+                "provider update verification"
+            );
+        } else {
+            tracing::warn!(
+                operation = "provider.maintenance.update.verify",
+                provider = %target.driver,
+                instance_id = %target.instance_id,
+                executable = %executable_display,
+                before_version = %before_version.as_deref().unwrap_or("unknown"),
+                after_version = %after_version.as_deref().unwrap_or("unknown"),
+                expected_version = %expected_version.as_deref().unwrap_or("unknown"),
+                exit_code = command_result.exit_code,
+                status = %status,
+                "provider update verification"
+            );
+        }
         let finished_at = now_iso();
         let (providers, _) = self
             .publish_provider_update_state(
@@ -914,7 +966,7 @@ impl NativeServerControl {
                     status,
                     Some(&started_at),
                     Some(&finished_at),
-                    message,
+                    &message,
                     command_result.output.as_deref(),
                 ),
             )
@@ -2088,6 +2140,7 @@ pub(crate) fn now_iso() -> String {
 #[cfg(test)]
 mod tests {
     use std::{
+        io::{self, Write},
         sync::{Mutex as StdMutex, atomic::AtomicUsize},
         time::Duration,
     };
@@ -2115,6 +2168,40 @@ mod tests {
             TEST_STORAGE_INSTANCE_ID,
         ));
         config
+    }
+
+    #[derive(Clone, Default)]
+    struct TraceCapture(Arc<StdMutex<Vec<u8>>>);
+
+    struct TraceCaptureWriter(Arc<StdMutex<Vec<u8>>>);
+
+    impl Write for TraceCaptureWriter {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            self.0
+                .lock()
+                .expect("trace capture lock")
+                .extend_from_slice(buffer);
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'writer> tracing_subscriber::fmt::MakeWriter<'writer> for TraceCapture {
+        type Writer = TraceCaptureWriter;
+
+        fn make_writer(&'writer self) -> Self::Writer {
+            TraceCaptureWriter(self.0.clone())
+        }
+    }
+
+    impl TraceCapture {
+        fn text(&self) -> String {
+            String::from_utf8(self.0.lock().expect("trace capture lock").clone())
+                .expect("UTF-8 trace output")
+        }
     }
 
     #[test]
@@ -2506,6 +2593,13 @@ mod tests {
         tokio::fs::write(release_directory.join("update-exit-code"), "0")
             .await
             .expect("write successful update exit code");
+        let trace = TraceCapture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(trace.clone())
+            .finish();
+        let _subscriber = tracing::subscriber::set_default(subscriber);
         let succeeded = control
             .update_provider(
                 &json!({ "provider": "cursor", "instanceId": "cursor-work" }),
@@ -2520,6 +2614,29 @@ mod tests {
             .find(|provider| provider["instanceId"] == "cursor-work")
             .expect("successful Cursor provider");
         assert_eq!(succeeded_provider["updateState"]["status"], "unchanged");
+        assert_eq!(
+            succeeded_provider["updateState"]["message"],
+            format!(
+                "Update command completed, but {} still reports 2026.06.19-653a7fb; expected 2026.08.04-aaa8809.",
+                executable.display()
+            )
+        );
+        let trace = trace.text();
+        for expected in [
+            "provider update verification",
+            "provider=cursor",
+            "instance_id=cursor-work",
+            "before_version=2026.06.19-653a7fb",
+            "after_version=2026.06.19-653a7fb",
+            "expected_version=2026.08.04-aaa8809",
+            "exit_code=0",
+            "status=unchanged",
+        ] {
+            assert!(
+                trace.contains(expected),
+                "missing {expected:?} in trace: {trace}"
+            );
+        }
         assert_eq!(
             requests.load(Ordering::SeqCst),
             2,

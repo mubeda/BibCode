@@ -32,6 +32,7 @@ import {
   createLocalDispatchSnapshot,
   deriveComposerSendState,
   deriveLockedProvider,
+  findActiveDeliveryMessage,
   findLastCancellableDeliveryMessage,
   getStartedThreadModelChangeBlockReason,
   hasServerAcknowledgedLocalDispatch,
@@ -930,6 +931,68 @@ describe("hasServerAcknowledgedLocalDispatch", () => {
     expect(hasServerAcknowledgedLocalDispatch({ ...common, threadError: "failed" })).toBe(true);
   });
 
+  it("does not mistake a pre-existing thread error for acknowledgement of a new send", () => {
+    const localDispatch = createLocalDispatchSnapshot(makeThread(), {
+      threadError: "Provider session ended when BiBCode stopped.",
+    });
+    const common = {
+      localDispatch,
+      phase: "ready" as const,
+      latestTurn: null,
+      session: null,
+      hasPendingApproval: false,
+      hasPendingUserInput: false,
+    };
+
+    expect(
+      hasServerAcknowledgedLocalDispatch({
+        ...common,
+        threadError: "Provider session ended when BiBCode stopped.",
+      }),
+    ).toBe(false);
+    expect(
+      hasServerAcknowledgedLocalDispatch({
+        ...common,
+        threadError: "The new send failed.",
+      }),
+    ).toBe(true);
+  });
+
+  it("does not acknowledge when a pre-existing local error is cleared before admission", () => {
+    const localDispatch = createLocalDispatchSnapshot(makeThread(), {
+      threadError: "The previous send failed.",
+    });
+
+    expect(
+      hasServerAcknowledgedLocalDispatch({
+        localDispatch,
+        phase: "ready",
+        latestTurn: null,
+        session: null,
+        hasPendingApproval: false,
+        hasPendingUserInput: false,
+        threadError: null,
+      }),
+    ).toBe(false);
+  });
+
+  it("acknowledges a persisted pending delivery before its provider turn starts", () => {
+    const localDispatch = createLocalDispatchSnapshot(makeThread());
+
+    expect(
+      hasServerAcknowledgedLocalDispatch({
+        localDispatch,
+        phase: "ready",
+        latestTurn: null,
+        session: null,
+        deliveryState: "pending",
+        hasPendingApproval: false,
+        hasPendingUserInput: false,
+        threadError: null,
+      }),
+    ).toBe(true);
+  });
+
   it("acknowledges terminal delivery failure without waiting for a provider session", () => {
     const localDispatch = createLocalDispatchSnapshot(makeThread());
 
@@ -998,4 +1061,35 @@ describe("findLastCancellableDeliveryMessage", () => {
       ])?.id,
     ).toBe("sending");
   });
+});
+
+describe("findActiveDeliveryMessage", () => {
+  const message = (
+    id: string,
+    state: "delivered" | "dismissed" | "failed" | "uncertain" | "pending" | "sending",
+  ) =>
+    ({
+      id,
+      delivery: { state, provider: "cursor" },
+    }) as ChatMessage;
+
+  it("returns the oldest claimable delivery after terminal predecessors", () => {
+    expect(
+      findActiveDeliveryMessage([
+        message("delivered", "delivered"),
+        message("dismissed", "dismissed"),
+        message("pending", "pending"),
+        message("sending", "sending"),
+      ])?.id,
+    ).toBe("pending");
+  });
+
+  it.each(["uncertain", "failed"] as const)(
+    "does not report a queued successor as active behind an unresolved %s delivery",
+    (state) => {
+      expect(
+        findActiveDeliveryMessage([message("blocker", state), message("queued", "pending")]),
+      ).toBeNull();
+    },
+  );
 });
