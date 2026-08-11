@@ -1330,6 +1330,37 @@ impl WorktreeCatalogService {
         F: FnOnce() -> Fut,
         Fut: Future<Output = T>,
     {
+        self.with_project_mutation_lock_until_cancelled(project_id, None, operation)
+            .await
+            .expect("a project mutation without cancellation cannot be cancelled")
+    }
+
+    /// Cancels while acquiring the project/repository lock set. Once acquired, the operation
+    /// owns that set until it finishes so dropping its external waiter cannot split a mutation.
+    pub async fn with_project_mutation_lock_cancellation<T, F, Fut>(
+        &self,
+        project_id: &str,
+        cancellation: &CancellationToken,
+        operation: F,
+    ) -> Option<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = T>,
+    {
+        self.with_project_mutation_lock_until_cancelled(project_id, Some(cancellation), operation)
+            .await
+    }
+
+    async fn with_project_mutation_lock_until_cancelled<T, F, Fut>(
+        &self,
+        project_id: &str,
+        cancellation: Option<&CancellationToken>,
+        operation: F,
+    ) -> Option<T>
+    where
+        F: FnOnce() -> Fut,
+        Fut: Future<Output = T>,
+    {
         // Always acquire the immutable project identity first. Repository identity may be
         // established during bootstrap, so keying the only lock by the mutable pin would let
         // one project enter two unrelated critical sections across that transition.
@@ -1350,10 +1381,25 @@ impl WorktreeCatalogService {
                     mutation_lock
                 })
         };
-        let _project_guard = project_lock.lock().await;
-        let repository_key = self
-            .load_project(project_id)
-            .await
+        let _project_guard = if let Some(cancellation) = cancellation {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return None,
+                guard = project_lock.lock() => guard,
+            }
+        } else {
+            project_lock.lock().await
+        };
+        let project = if let Some(cancellation) = cancellation {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return None,
+                project = self.load_project(project_id) => project,
+            }
+        } else {
+            self.load_project(project_id).await
+        };
+        let repository_key = project
             .ok()
             .and_then(|project| project.repository_key)
             .or_else(|| lock(&self.inner.registry).aliases.get(project_id).cloned());
@@ -1375,11 +1421,19 @@ impl WorktreeCatalogService {
                 })
         });
         let _repository_guard = if let Some(repository_lock) = repository_lock.as_ref() {
-            Some(repository_lock.lock().await)
+            Some(if let Some(cancellation) = cancellation {
+                tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => return None,
+                    guard = repository_lock.lock() => guard,
+                }
+            } else {
+                repository_lock.lock().await
+            })
         } else {
             None
         };
-        operation().await
+        Some(operation().await)
     }
 
     async fn ensure_entry(&self, project_id: &str) -> Result<Arc<CatalogEntry>, CatalogError> {

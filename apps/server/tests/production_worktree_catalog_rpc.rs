@@ -739,6 +739,465 @@ async fn cancelling_policy_while_waiting_for_project_lock_releases_its_command_c
 }
 
 #[tokio::test]
+async fn interrupted_policy_handoff_retains_project_serialization_until_terminal_receipt() {
+    let hooks = TestHooks::default();
+    let mut fixture = CatalogRpcFixture::new_with_removal_services_and_options(
+        false,
+        Arc::new(TestNoopQuiescer),
+        None,
+        EngineOptions {
+            queue_capacity: 16,
+            test_hooks: hooks.clone(),
+        },
+    )
+    .await;
+    let pause = hooks.pause_before_next_command_persist();
+    request(
+        fixture.socket(),
+        "41",
+        "worktree.updateDiscoveryPolicy",
+        json!({
+            "commandId":"interrupted-policy-handoff",
+            "projectId":"project-1",
+            "visibility":"shown"
+        }),
+    )
+    .await;
+    timeout(Duration::from_secs(5), pause.wait_until_entered())
+        .await
+        .expect("first policy envelope reaches its pre-persistence boundary");
+
+    send_json(
+        fixture.socket(),
+        json!({"_tag":"Interrupt","requestId":"41"}),
+    )
+    .await;
+    assert!(matches!(
+        next_server_message(fixture.socket()).await,
+        ServerMessage::Exit {
+            exit: RpcExit::Failure { cause },
+            ..
+        } if cause.iter().any(|item| matches!(item, CauseItem::Interrupt { .. }))
+    ));
+    request(
+        fixture.socket(),
+        "42",
+        "worktree.updateDiscoveryPolicy",
+        json!({
+            "commandId":"policy-after-interrupted-handoff",
+            "projectId":"project-1",
+            "dismissInitialPrompt":true
+        }),
+    )
+    .await;
+    assert!(
+        timeout(Duration::from_millis(200), fixture.socket().next())
+            .await
+            .is_err(),
+        "the sibling update remains serialized while the first envelope is paused"
+    );
+    pause.release();
+
+    let sibling = success_value(fixture.socket(), "42").await;
+    assert_eq!(sibling["visibility"], "shown");
+    assert!(sibling["initialPromptDismissedAt"].as_str().is_some());
+    let persisted = fixture
+        .repositories
+        .get_project("project-1".to_owned())
+        .await
+        .expect("project read")
+        .expect("project exists")
+        .worktree_discovery;
+    assert_eq!(persisted["visibility"], "shown");
+    assert!(persisted["initialPromptDismissedAt"].as_str().is_some());
+    for command_id in [
+        "interrupted-policy-handoff",
+        "policy-after-interrupted-handoff",
+    ] {
+        assert_eq!(
+            fixture
+                .repositories
+                .get_command_receipt(command_id.to_owned())
+                .await
+                .expect("receipt read")
+                .expect("accepted policy receipt")
+                .status,
+            "accepted"
+        );
+    }
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn interrupted_policy_receipt_lookup_releases_claim_without_late_mutation() {
+    let mut fixture = CatalogRpcFixture::new(false).await;
+    let database = fixture.repositories.database().clone();
+    let observer = database
+        .enable_queue_backpressure_observation_for_integration_test()
+        .expect("exclusive database queue observer");
+    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+    let release = Arc::new((StdMutex::new(false), Condvar::new()));
+    let blocker_release = release.clone();
+    let blocker_database = database.clone();
+    let blocker = tokio::spawn(async move {
+        blocker_database
+            .call(move |_| {
+                let _ = entered_tx.send(());
+                let (released, changed) = blocker_release.as_ref();
+                let mut released = released.lock().expect("database blocker mutex");
+                while !*released {
+                    released = changed
+                        .wait(released)
+                        .expect("database blocker mutex after wait");
+                }
+                Ok(())
+            })
+            .await
+    });
+    entered_rx.await.expect("database blocker enters");
+
+    request(
+        fixture.socket(),
+        "43",
+        "worktree.updateDiscoveryPolicy",
+        json!({
+            "commandId":"cancelled-policy-receipt-lookup",
+            "projectId":"project-1",
+            "visibility":"shown"
+        }),
+    )
+    .await;
+    timeout(Duration::from_secs(5), async {
+        while database
+            .queue_backpressure_snapshot_for_integration_test()
+            .reserved_or_queued_jobs
+            < 1
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("policy receipt lookup queues behind the blocked database worker");
+    send_json(
+        fixture.socket(),
+        json!({"_tag":"Interrupt","requestId":"43"}),
+    )
+    .await;
+    assert!(matches!(
+        next_server_message(fixture.socket()).await,
+        ServerMessage::Exit {
+            exit: RpcExit::Failure { cause },
+            ..
+        } if cause.iter().any(|item| matches!(item, CauseItem::Interrupt { .. }))
+    ));
+
+    request(
+        fixture.socket(),
+        "44",
+        "worktree.updateDiscoveryPolicy",
+        json!({
+            "commandId":"cancelled-policy-receipt-lookup",
+            "projectId":"project-1",
+            "dismissInitialPrompt":true
+        }),
+    )
+    .await;
+    timeout(Duration::from_secs(5), async {
+        while database
+            .queue_backpressure_snapshot_for_integration_test()
+            .reserved_or_queued_jobs
+            < 2
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("the retry acquires the released command claim and queues its receipt lookup");
+    {
+        let (released, changed) = release.as_ref();
+        *released.lock().expect("database blocker mutex") = true;
+        changed.notify_one();
+    }
+    blocker
+        .await
+        .expect("database blocker joins")
+        .expect("database blocker succeeds");
+    let retry = success_value(fixture.socket(), "44").await;
+    assert_eq!(retry["visibility"], "hidden");
+    assert!(retry["initialPromptDismissedAt"].as_str().is_some());
+    let persisted = fixture
+        .repositories
+        .get_project("project-1".to_owned())
+        .await
+        .expect("project read")
+        .expect("project exists")
+        .worktree_discovery;
+    assert_eq!(persisted["visibility"], "hidden");
+    assert!(persisted["initialPromptDismissedAt"].as_str().is_some());
+    drop(observer);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn legacy_policy_replay_rejects_an_accepted_receipt_from_another_project() {
+    let mut fixture = CatalogRpcFixture::new(false).await;
+    let other_root = fixture.root.path().join("legacy-other-project");
+    fs::create_dir(&other_root).expect("other project root");
+    fixture
+        .engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"project.create",
+                "commandId":"legacy-other-project-create",
+                "projectId":"legacy-other-project",
+                "title":"Legacy Other",
+                "workspaceRoot":other_root,
+                "defaultModelSelection":null,
+                "createdAt":"2026-08-10T01:00:00Z"
+            }))
+            .expect("other project command"),
+        )
+        .await
+        .expect("other project created");
+    fixture
+        .engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"project.meta.update",
+                "commandId":"legacy-cross-project-policy",
+                "projectId":"legacy-other-project",
+                "title":"Legacy Other Updated"
+            }))
+            .expect("legacy other-project command"),
+        )
+        .await
+        .expect("legacy other-project command accepted");
+
+    request(
+        fixture.socket(),
+        "45",
+        "worktree.updateDiscoveryPolicy",
+        json!({
+            "commandId":"legacy-cross-project-policy",
+            "projectId":"project-1",
+            "visibility":"shown"
+        }),
+    )
+    .await;
+    assert_typed_catalog_failure(fixture.socket(), "45", "command-conflict").await;
+    assert_eq!(
+        fixture
+            .repositories
+            .get_project("project-1".to_owned())
+            .await
+            .expect("project read")
+            .expect("project exists")
+            .worktree_discovery["visibility"],
+        "hidden"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn legacy_policy_replay_rejects_an_unproven_project_meta_command_family() {
+    let mut fixture = CatalogRpcFixture::new(false).await;
+    fixture
+        .engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"project.meta.update",
+                "commandId":"legacy-cross-family-policy",
+                "projectId":"project-1",
+                "title":"Legacy Generic Metadata"
+            }))
+            .expect("legacy project metadata command"),
+        )
+        .await
+        .expect("legacy project metadata command accepted");
+
+    request(
+        fixture.socket(),
+        "46",
+        "worktree.updateDiscoveryPolicy",
+        json!({
+            "commandId":"legacy-cross-family-policy",
+            "projectId":"project-1",
+            "visibility":"shown"
+        }),
+    )
+    .await;
+    assert_typed_catalog_failure(fixture.socket(), "46", "command-conflict").await;
+    let project = fixture
+        .repositories
+        .get_project("project-1".to_owned())
+        .await
+        .expect("project read")
+        .expect("project exists");
+    assert_eq!(project.title, "Legacy Generic Metadata");
+    assert_eq!(project.worktree_discovery["visibility"], "hidden");
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn legacy_policy_replay_rejects_an_adoption_result_with_matching_policy_payload() {
+    let mut fixture = CatalogRpcFixture::new(true).await;
+    fixture
+        .engine
+        .dispatch(OrchestrationCommand::WorktreeAdoptResolved {
+            command_id: "legacy-adoption-as-policy".to_owned(),
+            project_id: "project-1".to_owned(),
+            worktree_key: "legacy-adoption-worktree".to_owned(),
+            path: fixture.external.to_string_lossy().into_owned(),
+            branch: Some("feature/external".to_owned()),
+            head: None,
+            model_selection: json!({"instanceId":"codex","model":"gpt-5.4"}),
+            runtime_mode: "full-access".to_owned(),
+            interaction_mode: "default".to_owned(),
+        })
+        .await
+        .expect("legacy adoption accepted");
+
+    request(
+        fixture.socket(),
+        "47",
+        "worktree.updateDiscoveryPolicy",
+        json!({
+            "commandId":"legacy-adoption-as-policy",
+            "projectId":"project-1",
+            "visibility":"hidden"
+        }),
+    )
+    .await;
+    assert_typed_catalog_failure(fixture.socket(), "47", "command-conflict").await;
+    assert_eq!(
+        fixture
+            .repositories
+            .get_project("project-1".to_owned())
+            .await
+            .expect("project read")
+            .expect("project exists")
+            .worktree_discovery["visibility"],
+        "hidden"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn legacy_policy_replay_preserves_a_provable_exact_policy_event() {
+    let mut fixture = CatalogRpcFixture::new(false).await;
+    let mut expected_policy = fixture
+        .repositories
+        .get_project("project-1".to_owned())
+        .await
+        .expect("project read")
+        .expect("project exists")
+        .worktree_discovery;
+    expected_policy["visibility"] = json!("shown");
+    fixture
+        .engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"project.meta.update",
+                "commandId":"legacy-exact-policy",
+                "projectId":"project-1",
+                "worktreeDiscovery":expected_policy
+            }))
+            .expect("legacy policy command"),
+        )
+        .await
+        .expect("legacy policy command accepted");
+
+    request(
+        fixture.socket(),
+        "48",
+        "worktree.updateDiscoveryPolicy",
+        json!({
+            "commandId":"legacy-exact-policy",
+            "projectId":"project-1",
+            "visibility":"shown"
+        }),
+    )
+    .await;
+    assert_eq!(success_value(fixture.socket(), "48").await, expected_policy);
+    assert_eq!(
+        fixture
+            .repositories
+            .get_command_receipt("legacy-exact-policy".to_owned())
+            .await
+            .expect("receipt read")
+            .expect("legacy receipt")
+            .payload_digest,
+        None
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn legacy_policy_replay_resumes_a_digestless_reserved_receipt_after_restart() {
+    let mut fixture = CatalogRpcFixture::new(false).await;
+    let mut expected_policy = fixture
+        .repositories
+        .get_project("project-1".to_owned())
+        .await
+        .expect("project read")
+        .expect("project exists")
+        .worktree_discovery;
+    expected_policy["visibility"] = json!("shown");
+    fixture
+        .repositories
+        .reserve_command_receipt(CommandReceipt {
+            command_id: "legacy-reserved-policy".to_owned(),
+            aggregate_kind: "project".to_owned(),
+            aggregate_id: "project-1".to_owned(),
+            accepted_at: "2026-08-10T01:00:00Z".to_owned(),
+            result_sequence: 0,
+            status: "reserved".to_owned(),
+            error: None,
+            payload_digest: None,
+        })
+        .await
+        .expect("legacy policy reservation");
+
+    request(
+        fixture.socket(),
+        "49",
+        "worktree.updateDiscoveryPolicy",
+        json!({
+            "commandId":"legacy-reserved-policy",
+            "projectId":"project-1",
+            "visibility":"shown"
+        }),
+    )
+    .await;
+    assert_eq!(success_value(fixture.socket(), "49").await, expected_policy);
+    let receipt = fixture
+        .repositories
+        .get_command_receipt("legacy-reserved-policy".to_owned())
+        .await
+        .expect("receipt read")
+        .expect("legacy receipt");
+    assert_eq!(receipt.command_id, "legacy-reserved-policy");
+    assert_eq!(receipt.aggregate_kind, "project");
+    assert_eq!(receipt.aggregate_id, "project-1");
+    assert!(!receipt.accepted_at.is_empty());
+    assert!(receipt.result_sequence > 0);
+    assert_eq!(receipt.status, "accepted");
+    assert_eq!(receipt.error, None);
+    assert_eq!(receipt.payload_digest, None);
+    assert_eq!(
+        fixture
+            .repositories
+            .get_project("project-1".to_owned())
+            .await
+            .expect("project read")
+            .expect("project exists")
+            .worktree_discovery,
+        expected_policy
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn adopt_race_converges_to_one_thread_without_creating_a_git_worktree() {
     let mut fixture = CatalogRpcFixture::new(true).await;
     request(
