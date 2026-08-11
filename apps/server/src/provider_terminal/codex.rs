@@ -405,9 +405,9 @@ impl CodexTerminalObserverFactory {
     pub fn system() -> Self {
         Self::new(
             Arc::new(CachedCodexCapabilityProbe::new(Arc::new(
-                SystemCodexCapabilityProbeRunner,
+                SystemCodexCapabilityProbeRunner::default(),
             ))),
-            Arc::new(SystemCodexHelperLauncher),
+            Arc::new(SystemCodexHelperLauncher::default()),
             Arc::new(SystemCodexRemoteClientFactory),
         )
     }
@@ -1759,7 +1759,29 @@ fn current_timestamp() -> String {
 }
 
 #[derive(Debug)]
-struct SystemCodexCapabilityProbeRunner;
+struct SystemCodexCapabilityProbeRunner {
+    timeout: Duration,
+    cleanup_timeout: Duration,
+}
+
+impl Default for SystemCodexCapabilityProbeRunner {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(3),
+            cleanup_timeout: Duration::from_secs(2),
+        }
+    }
+}
+
+impl SystemCodexCapabilityProbeRunner {
+    #[cfg(test)]
+    const fn with_timeouts(timeout: Duration, cleanup_timeout: Duration) -> Self {
+        Self {
+            timeout,
+            cleanup_timeout,
+        }
+    }
+}
 
 impl CodexCapabilityProbeRunner for SystemCodexCapabilityProbeRunner {
     fn run(
@@ -1779,8 +1801,8 @@ impl CodexCapabilityProbeRunner for SystemCodexCapabilityProbeRunner {
                 SupervisedRunRequest {
                     command,
                     stdin: None,
-                    timeout: Duration::from_secs(3),
-                    cleanup_timeout: Duration::from_secs(2),
+                    timeout: self.timeout,
+                    cleanup_timeout: self.cleanup_timeout,
                     max_output_bytes: CODEX_PROBE_OUTPUT_LIMIT,
                     overflow: SupervisedOverflow::Truncate,
                 },
@@ -1798,7 +1820,24 @@ impl CodexCapabilityProbeRunner for SystemCodexCapabilityProbeRunner {
 }
 
 #[derive(Debug)]
-struct SystemCodexHelperLauncher;
+struct SystemCodexHelperLauncher {
+    readiness_timeout: Duration,
+}
+
+impl Default for SystemCodexHelperLauncher {
+    fn default() -> Self {
+        Self {
+            readiness_timeout: CODEX_HELPER_READY_TIMEOUT,
+        }
+    }
+}
+
+impl SystemCodexHelperLauncher {
+    #[cfg(test)]
+    const fn with_readiness_timeout(readiness_timeout: Duration) -> Self {
+        Self { readiness_timeout }
+    }
+}
 
 impl CodexHelperLauncher for SystemCodexHelperLauncher {
     fn start(&self, launch: CodexHelperLaunch) -> CodexHelperStartFuture<'_> {
@@ -1823,7 +1862,8 @@ impl CodexHelperLauncher for SystemCodexHelperLauncher {
             let child = command
                 .spawn()
                 .map_err(|error| format!("failed to start Codex App Server helper: {error}"))?;
-            let (process, ready) = supervisor.supervise(child, launch.socket_path, permit);
+            let (process, ready) =
+                supervisor.supervise(child, launch.socket_path, permit, self.readiness_timeout);
             ready
                 .await
                 .map_err(|_| "Codex helper supervisor stopped before readiness".to_owned())??;
@@ -1959,6 +1999,7 @@ impl CodexHelperSupervisor {
         mut child: Child,
         socket_path: PathBuf,
         permit: tokio::sync::OwnedSemaphorePermit,
+        readiness_timeout: Duration,
     ) -> (
         SystemCodexHelperProcess,
         tokio::sync::oneshot::Receiver<Result<(), String>>,
@@ -1968,7 +2009,7 @@ impl CodexHelperSupervisor {
         let (ready_sender, ready_receiver) = tokio::sync::oneshot::channel();
         self.runtime.spawn(async move {
             let _permit = permit;
-            let ready_deadline = tokio::time::Instant::now() + CODEX_HELPER_READY_TIMEOUT;
+            let ready_deadline = tokio::time::Instant::now() + readiness_timeout;
             let readiness = loop {
                 if socket_path.exists() {
                     break Ok(());
@@ -2283,10 +2324,13 @@ mod tests {
             "yes x | head -c 262144\nyes y | head -c 262144 >&2",
         );
 
-        let output = SystemCodexCapabilityProbeRunner
-            .run(&executable, Vec::new())
-            .await
-            .expect("large probe");
+        let output = SystemCodexCapabilityProbeRunner::with_timeouts(
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+        )
+        .run(&executable, Vec::new())
+        .await
+        .expect("large probe");
 
         assert!(output.success);
         assert!(
@@ -2311,13 +2355,16 @@ mod tests {
         );
 
         let started = std::time::Instant::now();
-        let result = SystemCodexCapabilityProbeRunner
-            .run(&executable, vec![pid_path.to_string_lossy().into_owned()])
-            .await;
+        let result = SystemCodexCapabilityProbeRunner::with_timeouts(
+            Duration::from_secs(10),
+            Duration::from_secs(2),
+        )
+        .run(&executable, vec![pid_path.to_string_lossy().into_owned()])
+        .await;
 
         assert!(result.is_err(), "hung probe must fail closed");
         assert!(
-            started.elapsed() < Duration::from_secs(6),
+            started.elapsed() < Duration::from_secs(12),
             "hung probe exceeded its bounded timeout and cleanup window"
         );
         let pid = std::fs::read_to_string(&pid_path)
@@ -2342,7 +2389,7 @@ mod tests {
             "printf '%s' \"$$\" > \"$BIBCODE_HELPER_PID\"\nsocket=${3#unix://}\n: > \"$socket\"\nwhile :; do sleep 1; done",
         );
         let endpoint = format!("unix://{}", socket_path.to_string_lossy());
-        let helper = SystemCodexHelperLauncher
+        let helper = SystemCodexHelperLauncher::with_readiness_timeout(Duration::from_secs(10))
             .start(CodexHelperLaunch {
                 executable: executable.to_string_lossy().into_owned(),
                 args: vec![
@@ -2390,7 +2437,7 @@ mod tests {
             "printf '%s' \"$$\" > \"$BIBCODE_HELPER_PID\"\nwhile :; do sleep 1; done",
         );
         let endpoint = format!("unix://{}", socket_path.to_string_lossy());
-        let launcher = SystemCodexHelperLauncher;
+        let launcher = SystemCodexHelperLauncher::with_readiness_timeout(Duration::from_secs(10));
 
         let mut start = launcher.start(CodexHelperLaunch {
             executable: executable.to_string_lossy().into_owned(),

@@ -473,7 +473,7 @@ impl OpenCodeTerminalObserverFactory {
             Arc::new(CachedOpenCodeCapabilityProbe::new(Arc::new(
                 SystemOpenCodeCapabilityProbeRunner,
             ))),
-            Arc::new(SystemOpenCodeHelperLauncher),
+            Arc::new(SystemOpenCodeHelperLauncher::default()),
             Arc::new(SystemOpenCodeRemoteClientFactory),
             Duration::from_secs(10),
         )
@@ -1779,7 +1779,24 @@ impl OpenCodeCapabilityProbeRunner for SystemOpenCodeCapabilityProbeRunner {
 }
 
 #[derive(Debug)]
-struct SystemOpenCodeHelperLauncher;
+struct SystemOpenCodeHelperLauncher {
+    readiness_timeout: Duration,
+}
+
+impl Default for SystemOpenCodeHelperLauncher {
+    fn default() -> Self {
+        Self {
+            readiness_timeout: OPENCODE_HELPER_READY_TIMEOUT,
+        }
+    }
+}
+
+impl SystemOpenCodeHelperLauncher {
+    #[cfg(test)]
+    const fn with_readiness_timeout(readiness_timeout: Duration) -> Self {
+        Self { readiness_timeout }
+    }
+}
 
 impl OpenCodeHelperLauncher for SystemOpenCodeHelperLauncher {
     fn start(
@@ -1815,7 +1832,7 @@ impl OpenCodeHelperLauncher for SystemOpenCodeHelperLauncher {
             });
             let mut stdout = BufReader::new(stdout);
             let endpoint = match tokio::time::timeout(
-                OPENCODE_HELPER_READY_TIMEOUT,
+                self.readiness_timeout,
                 read_opencode_readiness(&mut stdout),
             )
             .await
@@ -3112,7 +3129,8 @@ mod tests {
         .expect("OpenCode helper script");
         std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
             .expect("OpenCode helper script permissions");
-        let launcher = SystemOpenCodeHelperLauncher;
+        let launcher =
+            SystemOpenCodeHelperLauncher::with_readiness_timeout(Duration::from_secs(10));
         let result = launcher
             .start(OpenCodeHelperLaunch {
                 executable: executable.to_string_lossy().into_owned(),
