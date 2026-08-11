@@ -2174,13 +2174,19 @@ impl CodexSessionRuntime {
                     .get("turnId")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                let item_id = params
+                    .get("itemId")
+                    .and_then(Value::as_str)
+                    .filter(|item_id| !item_id.is_empty())
+                    .map(str::to_owned);
                 let delta = params
                     .get("delta")
                     .and_then(Value::as_str)
                     .unwrap_or_default();
-                self.emit(
+                self.emit_with_item_id(
                     "content.delta",
                     turn_id,
+                    item_id,
                     None,
                     json!({
                         "streamKind": "assistant_text",
@@ -2196,7 +2202,26 @@ impl CodexSessionRuntime {
                 }
             }
             "item/completed" => {
-                if let Some((turn_id, payload)) = command_item_event_payload(&params, true) {
+                if params.pointer("/item/type").and_then(Value::as_str) == Some("agentMessage")
+                    && let Some(turn_id) = params
+                        .get("turnId")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                    && let Some(item_id) = params
+                        .pointer("/item/id")
+                        .and_then(Value::as_str)
+                        .filter(|item_id| !item_id.is_empty())
+                        .map(str::to_owned)
+                {
+                    self.emit_with_item_id(
+                        "message.assistant.completed",
+                        Some(turn_id),
+                        Some(item_id),
+                        None,
+                        json!({}),
+                    )
+                    .await;
+                } else if let Some((turn_id, payload)) = command_item_event_payload(&params, true) {
                     self.emit("item.completed", Some(turn_id), None, payload)
                         .await;
                 }
@@ -2323,6 +2348,18 @@ impl CodexSessionRuntime {
         request_id: Option<String>,
         payload: Value,
     ) {
+        self.emit_with_item_id(event_type, turn_id, None, request_id, payload)
+            .await;
+    }
+
+    async fn emit_with_item_id(
+        &self,
+        event_type: &str,
+        turn_id: Option<String>,
+        item_id: Option<String>,
+        request_id: Option<String>,
+        payload: Value,
+    ) {
         let mut counter = self.inner.event_counter.lock().await;
         *counter += 1;
         let event = RuntimeEvent {
@@ -2332,7 +2369,7 @@ impl CodexSessionRuntime {
             event_type: event_type.to_owned(),
             thread_id: self.inner.options.thread_id.clone(),
             turn_id,
-            item_id: None,
+            item_id,
             request_id,
             payload,
             native_event_id: None,

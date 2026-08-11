@@ -9,18 +9,27 @@
     "type": "content.delta",
     "threadId": "fixture-thread",
     "turnId": "fixture-turn",
+    "itemId": "commentary-1",
     "payload": {
       "streamKind": "assistant_text",
-      "delta": "I will make a small update.\n"
+      "delta": "First."
     }
+  },
+  {
+    "type": "message.assistant.completed",
+    "threadId": "fixture-thread",
+    "turnId": "fixture-turn",
+    "itemId": "commentary-1",
+    "payload": {}
   },
   {
     "type": "content.delta",
     "threadId": "fixture-thread",
     "turnId": "fixture-turn",
+    "itemId": "final-1",
     "payload": {
       "streamKind": "assistant_text",
-      "delta": "Done.\n"
+      "delta": "Second."
     }
   },
   {
