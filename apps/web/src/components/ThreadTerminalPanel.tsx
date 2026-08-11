@@ -598,6 +598,7 @@ interface TerminalViewportProps {
   autoFocus: boolean;
   resizeEpoch: number;
   keybindings: ResolvedKeybindingsConfig;
+  workspaceUnavailable?: string | null;
 }
 
 interface TerminalLaunchLocation {
@@ -636,6 +637,7 @@ export function TerminalViewport({
   autoFocus,
   resizeEpoch,
   keybindings,
+  workspaceUnavailable = null,
 }: TerminalViewportProps) {
   const { resolvedTheme } = useTheme();
   const containerRef = useRef<HTMLDivElement>(null);
@@ -867,7 +869,12 @@ export function TerminalViewport({
 
   const restartForTheme = useCallback(() => {
     const terminal = terminalRef.current;
-    if (!terminal || !hasPersistentWindowsConsoleTheme || themeRestartRequestRef.current !== null)
+    if (
+      workspaceUnavailable ||
+      !terminal ||
+      !hasPersistentWindowsConsoleTheme ||
+      themeRestartRequestRef.current !== null
+    )
       return;
 
     const targetSpawnEnv = mergeTerminalSpawnEnv({
@@ -948,6 +955,7 @@ export function TerminalViewport({
     terminalId,
     threadId,
     worktreePath,
+    workspaceUnavailable,
   ]);
 
   useEffect(() => {
@@ -1120,7 +1128,12 @@ export function TerminalViewport({
     };
 
     const sendTerminalInput = (data: string, fallbackError: string) => {
-      if (inputBinding.renderer?.owner !== rendererOwner || data.length === 0) return;
+      if (
+        workspaceUnavailable ||
+        inputBinding.renderer?.owner !== rendererOwner ||
+        data.length === 0
+      )
+        return;
       inputBinding.pendingFallbacks.push({ remaining: data.length, message: fallbackError });
       inputScheduler.enqueue(data);
     };
@@ -1407,6 +1420,7 @@ export function TerminalViewport({
     threadId,
     transcriptRuntime,
     worktreePath,
+    workspaceUnavailable,
   ]);
 
   useEffect(() => {
@@ -1741,7 +1755,8 @@ export function TerminalViewport({
           <Button
             type="button"
             size="xs"
-            disabled={themeRestartPending}
+            disabled={themeRestartPending || workspaceUnavailable !== null}
+            title={workspaceUnavailable ?? undefined}
             aria-label={`Restart ${terminalLabel} to apply ${resolvedTheme === "light" ? "Light" : "Dark"} theme`}
             onClick={restartForTheme}
           >
@@ -1806,6 +1821,7 @@ interface ThreadTerminalPanelProps {
   terminalCommandsById?: ReadonlyMap<string, TerminalLaunchCommand>;
   /** Prefer per-session launch locations when the server already knows a terminal. */
   terminalLaunchLocationsById?: ReadonlyMap<string, TerminalLaunchLocation>;
+  workspaceUnavailable?: string | null;
 }
 
 interface TerminalActionButtonProps {
@@ -1813,14 +1829,30 @@ interface TerminalActionButtonProps {
   className: string;
   onClick: () => void;
   children: ReactNode;
+  disabledReason?: string | null;
 }
 
-function TerminalActionButton({ label, className, onClick, children }: TerminalActionButtonProps) {
+function TerminalActionButton({
+  label,
+  className,
+  onClick,
+  children,
+  disabledReason = null,
+}: TerminalActionButtonProps) {
   return (
     <Popover>
       <PopoverTrigger
         openOnHover
-        render={<button type="button" className={className} onClick={onClick} aria-label={label} />}
+        render={
+          <button
+            type="button"
+            className={className}
+            onClick={onClick}
+            aria-label={label}
+            disabled={disabledReason !== null}
+            title={disabledReason ?? undefined}
+          />
+        }
       >
         {children}
       </PopoverTrigger>
@@ -1831,7 +1863,7 @@ function TerminalActionButton({ label, className, onClick, children }: TerminalA
         align="center"
         className="pointer-events-none select-none"
       >
-        {label}
+        {disabledReason ?? label}
       </PopoverPopup>
     </Popover>
   );
@@ -1865,6 +1897,7 @@ export default function ThreadTerminalPanel({
   terminalLabelsById,
   terminalCommandsById,
   terminalLaunchLocationsById,
+  workspaceUnavailable = null,
 }: ThreadTerminalPanelProps) {
   const normalizedTerminalIds = useMemo(() => {
     const normalizedIds: string[] = [];
@@ -2017,16 +2050,16 @@ export default function ThreadTerminalPanel({
     onSplitTerminal || onSplitTerminalVertical || onNewTerminal,
   );
   const onSplitTerminalAction = useCallback(() => {
-    if (hasReachedSplitLimit || !onSplitTerminal) return;
+    if (workspaceUnavailable || hasReachedSplitLimit || !onSplitTerminal) return;
     onSplitTerminal();
-  }, [hasReachedSplitLimit, onSplitTerminal]);
+  }, [hasReachedSplitLimit, onSplitTerminal, workspaceUnavailable]);
   const onSplitTerminalVerticalAction = useCallback(() => {
-    if (hasReachedSplitLimit || !onSplitTerminalVertical) return;
+    if (workspaceUnavailable || hasReachedSplitLimit || !onSplitTerminalVertical) return;
     onSplitTerminalVertical();
-  }, [hasReachedSplitLimit, onSplitTerminalVertical]);
+  }, [hasReachedSplitLimit, onSplitTerminalVertical, workspaceUnavailable]);
   const onNewTerminalAction = useCallback(() => {
-    onNewTerminal?.();
-  }, [onNewTerminal]);
+    if (!workspaceUnavailable) onNewTerminal?.();
+  }, [onNewTerminal, workspaceUnavailable]);
 
   if (normalizedTerminalIds.length === 0) {
     return (
@@ -2041,6 +2074,8 @@ export default function ThreadTerminalPanel({
               type="button"
               className="rounded-md border border-border/80 bg-background px-3 py-1.5 text-xs font-medium text-foreground transition-colors hover:bg-accent"
               onClick={onNewTerminalAction}
+              disabled={workspaceUnavailable !== null}
+              title={workspaceUnavailable ?? undefined}
             >
               {newTerminalActionLabel}
             </button>
@@ -2073,6 +2108,7 @@ export default function ThreadTerminalPanel({
                   }`}
                   onClick={onSplitTerminalAction}
                   label={splitTerminalActionLabel}
+                  disabledReason={workspaceUnavailable}
                 >
                   <SquareSplitHorizontal className="size-3.25" />
                 </TerminalActionButton>
@@ -2091,6 +2127,7 @@ export default function ThreadTerminalPanel({
                   }`}
                   onClick={onSplitTerminalVerticalAction}
                   label={splitTerminalVerticalActionLabel}
+                  disabledReason={workspaceUnavailable}
                 >
                   <SquareSplitVertical className="size-3.25" />
                 </TerminalActionButton>
@@ -2104,6 +2141,7 @@ export default function ThreadTerminalPanel({
                 className="p-1 text-foreground/90 transition-colors hover:bg-accent"
                 onClick={onNewTerminalAction}
                 label={newTerminalActionLabel}
+                disabledReason={workspaceUnavailable}
               >
                 <Plus className="size-3.25" />
               </TerminalActionButton>
@@ -2172,6 +2210,7 @@ export default function ThreadTerminalPanel({
                           autoFocus={focusEligible && terminalId === resolvedActiveTerminalId}
                           resizeEpoch={0}
                           keybindings={keybindings}
+                          workspaceUnavailable={workspaceUnavailable}
                         />
                       </div>
                     </div>
@@ -2204,6 +2243,7 @@ export default function ThreadTerminalPanel({
                   autoFocus={focusEligible}
                   resizeEpoch={0}
                   keybindings={keybindings}
+                  workspaceUnavailable={workspaceUnavailable}
                 />
               </div>
             )}
@@ -2226,6 +2266,7 @@ export default function ThreadTerminalPanel({
                         }`}
                         onClick={onSplitTerminalAction}
                         label={splitTerminalActionLabel}
+                        disabledReason={workspaceUnavailable}
                       >
                         <SquareSplitHorizontal className="size-3.25" />
                       </TerminalActionButton>
@@ -2241,6 +2282,7 @@ export default function ThreadTerminalPanel({
                         }`}
                         onClick={onSplitTerminalVerticalAction}
                         label={splitTerminalVerticalActionLabel}
+                        disabledReason={workspaceUnavailable}
                       >
                         <SquareSplitVertical className="size-3.25" />
                       </TerminalActionButton>
@@ -2254,6 +2296,7 @@ export default function ThreadTerminalPanel({
                         }`}
                         onClick={onNewTerminalAction}
                         label={newTerminalActionLabel}
+                        disabledReason={workspaceUnavailable}
                       >
                         <Plus className="size-3.25" />
                       </TerminalActionButton>

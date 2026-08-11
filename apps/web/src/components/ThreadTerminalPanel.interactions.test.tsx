@@ -4453,4 +4453,33 @@ describe("ThreadTerminalPanel mounted controls", () => {
     expect(document.querySelector('button[aria-label="Close Terminal"]')).toBeNull();
     expect(onCloseTerminal).not.toHaveBeenCalled();
   });
+
+  it("disables create, split, restart, and terminal writes with one workspace reason", async () => {
+    const reason = "Workspace unavailable. Retry detection or remove it from BiBCode.";
+    const onSplitTerminal = vi.fn();
+    const onNewTerminal = vi.fn();
+    await mount(
+      <ThreadTerminalPanel
+        {...panelProps({ onSplitTerminal, onNewTerminal })}
+        workspaceUnavailable={reason}
+      />,
+    );
+
+    const split = buttonByLabel("Split Terminal Horizontally");
+    const create = buttonByLabel("New Terminal");
+    expect(split.disabled).toBe(true);
+    expect(create.disabled).toBe(true);
+    expect(split.title).toBe(reason);
+    expect(create.title).toBe(reason);
+    await click(split);
+    await click(create);
+    expect(onSplitTerminal).not.toHaveBeenCalled();
+    expect(onNewTerminal).not.toHaveBeenCalled();
+
+    const terminal = xtermState.terminals[0]!;
+    terminal.dataHandler?.("echo blocked\r");
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(testState.writeCommand).not.toHaveBeenCalled();
+  });
 });

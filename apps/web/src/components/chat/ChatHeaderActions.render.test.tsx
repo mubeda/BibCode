@@ -482,8 +482,29 @@ describe("ChatHeaderActions rendering", () => {
     expect(markup).not.toContain('aria-label="More workspace actions"');
     expect(markup).not.toContain('data-testid="git-actions"');
     expect(harness.projectControllerProps).toHaveLength(1);
-    expect(harness.projectControllerProps[0]).toMatchObject({ enabled: false });
+    expect(harness.projectControllerProps[0]).toMatchObject({
+      enabled: false,
+      disabledReason: null,
+    });
     expect(harness.openInControllerProps).toHaveLength(1);
     expect(harness.openInControllerProps[0]).toMatchObject({ enableShortcut: false });
+  });
+
+  it("uses the shared workspace reason for scripts, panels, editor, and Git actions", () => {
+    const reason = "Workspace unavailable. Retry detection or remove it from BiBCode.";
+    renderToStaticMarkup(
+      <ChatHeaderActions {...props({ workspaceUnavailable: reason })} density="expanded" />,
+    );
+
+    expect(harness.projectControllerProps[0]).toMatchObject({
+      enabled: false,
+      disabledReason: reason,
+    });
+    expect(harness.openInControllerProps[0]).toMatchObject({ enableShortcut: false });
+    expect(harness.panelProps).toMatchObject({
+      canCreatePanel: false,
+      unavailableReason: reason,
+    });
+    expect(harness.gitProps[0]).toMatchObject({ workspaceUnavailable: reason });
   });
 });

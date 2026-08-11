@@ -61,6 +61,7 @@ export class FileEditingSessionRegistry<
   private latestOpenRelativePaths: ReadonlySet<string> | null = null;
   private ownerCount = 0;
   private activeRelativePath: string | null = null;
+  private savingEnabled = true;
   private ownershipGeneration = 0;
   private disposed = false;
   private disposePromise: Promise<void> | null = null;
@@ -78,6 +79,7 @@ export class FileEditingSessionRegistry<
     }
     const session = create();
     this.sessions.set(relativePath, session);
+    if (!this.savingEnabled) session.pauseSaving();
     if (relativePath === this.activeRelativePath) session.setAutosaveEnabled(false);
     for (const mutation of this.activePathMutations) {
       if (!mutation.scopePaths.some((path) => isPathAtOrUnder(relativePath, path))) continue;
@@ -97,11 +99,22 @@ export class FileEditingSessionRegistry<
 
     if (previousSession && previousSession !== nextSession) {
       previousSession.setAutosaveEnabled(true);
-      void previousSession.flush().catch((error: unknown) => {
-        this.reportSessionCleanupError(error);
-      });
+      if (this.savingEnabled) {
+        void previousSession.flush().catch((error: unknown) => {
+          this.reportSessionCleanupError(error);
+        });
+      }
     }
     nextSession?.setAutosaveEnabled(false);
+  }
+
+  setSavingEnabled(enabled: boolean): void {
+    if (this.disposed || this.savingEnabled === enabled) return;
+    this.savingEnabled = enabled;
+    for (const session of this.sessions.values()) {
+      if (enabled && !this.isSessionLeased(session)) session.resumeSaving();
+      else session.pauseSaving();
+    }
   }
 
   async beginPathMutation(request: FilePathMutationRequest): Promise<FilePathMutationLease | null> {
@@ -452,8 +465,10 @@ export class FileEditingSessionRegistry<
   ): Promise<void> {
     this.activePathMutations.delete(mutation);
     try {
-      if (resumeSaving) {
-        for (const session of mutation.pausedSessions) session.resumeSaving();
+      if (resumeSaving && this.savingEnabled) {
+        for (const session of mutation.pausedSessions) {
+          if (!this.isSessionLeased(session)) session.resumeSaving();
+        }
       }
 
       if (this.disposed) {

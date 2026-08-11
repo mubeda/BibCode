@@ -198,6 +198,7 @@ import {
 import { newDraftId, newMessageId, newThreadId } from "~/lib/utils";
 import { getProviderModelCapabilities, resolveSelectableProvider } from "../providerModels";
 import { useEnvironmentSettings } from "../hooks/useSettings";
+import { worktreeEnvironment } from "../state/worktrees";
 import { resolveAppModelSelectionForInstance } from "../modelSelection";
 import { resolveThreadProviderBinding } from "../threadProviderBinding";
 import { getTerminalFocusOwner } from "../lib/terminalFocus";
@@ -683,6 +684,9 @@ type EnvironmentUnavailableState = {
   readonly connection: EnvironmentConnectionPresentation;
 };
 
+const WORKSPACE_UNAVAILABLE_REASON =
+  "Workspace unavailable. Retry detection or remove it from BiBCode.";
+
 type ThreadPlanCatalogEntry = Pick<Thread, "id" | "proposedPlans">;
 
 export function eventPathContainsSelector(event: Event, selector: string): boolean {
@@ -862,6 +866,7 @@ interface PersistentThreadTerminalPanelProps {
   splitVerticalShortcutLabel?: string | undefined;
   newShortcutLabel?: string | undefined;
   closeShortcutLabel?: string | undefined;
+  workspaceUnavailable: string | null;
 }
 
 const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPanel({
@@ -880,6 +885,7 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
   splitVerticalShortcutLabel,
   newShortcutLabel,
   closeShortcutLabel,
+  workspaceUnavailable,
 }: PersistentThreadTerminalPanelProps) {
   const serverThread = useThread(threadRef);
   const draftThread = useComposerDraftStore((store) => store.getDraftThreadByRef(threadRef));
@@ -1004,6 +1010,7 @@ const PersistentThreadTerminalPanel = memo(function PersistentThreadTerminalPane
       splitVerticalShortcutLabel={splitVerticalShortcutLabel}
       newShortcutLabel={newShortcutLabel}
       closeShortcutLabel={closeShortcutLabel}
+      workspaceUnavailable={workspaceUnavailable}
       onActiveTerminalChange={onActiveTerminalChange}
       onCloseTerminal={onCloseTerminal}
       onAddTerminalContext={onAddTerminalContext}
@@ -1040,6 +1047,7 @@ interface LiveCenterPanelWorkspaceProps {
   readonly onDropSurface: CenterPanelWorkspaceProps["onDropSurface"];
   readonly onMergeGroup: CenterPanelWorkspaceProps["onMergeGroup"];
   readonly onSetSplitRatio: CenterPanelWorkspaceProps["onSetSplitRatio"];
+  readonly workspaceUnavailable: string | null;
 }
 
 const LiveCenterPanelWorkspace = memo(function LiveCenterPanelWorkspace({
@@ -1064,6 +1072,7 @@ const LiveCenterPanelWorkspace = memo(function LiveCenterPanelWorkspace({
   onDropSurface,
   onMergeGroup,
   onSetSplitRatio,
+  workspaceUnavailable,
 }: LiveCenterPanelWorkspaceProps) {
   const renderCenterSurface = useCallback(
     (surface: CenterSurface, context: CenterPanelSurfaceRenderContext) => {
@@ -1089,6 +1098,7 @@ const LiveCenterPanelWorkspace = memo(function LiveCenterPanelWorkspace({
               focusEligible={context.focused}
               onAddTerminalContext={onAddTerminalContext}
               onClose={() => onCloseSurface(context.groupId, surface)}
+              workspaceUnavailable={workspaceUnavailable}
             />
           );
       }
@@ -1102,6 +1112,7 @@ const LiveCenterPanelWorkspace = memo(function LiveCenterPanelWorkspace({
       onAddTerminalContext,
       onCloseSurface,
       terminalFocusRequestId,
+      workspaceUnavailable,
     ],
   );
 
@@ -1723,6 +1734,30 @@ function ChatViewContent(props: ChatViewProps) {
     ? scopeProjectRef(activeThread.environmentId, activeThread.projectId)
     : null;
   const activeProject = useProject(activeProjectRef);
+  const activeEnvironmentSupportsWorktreeCatalog =
+    activeThread !== undefined &&
+    environmentById.get(activeThread.environmentId)?.serverConfig?.environment.capabilities
+      ?.worktreeCatalog === true;
+  const activeWorktreeCatalog = useEnvironmentQuery(
+    activeThread?.worktreePath && activeProject && activeEnvironmentSupportsWorktreeCatalog
+      ? worktreeEnvironment.catalog({
+          environmentId: activeThread.environmentId,
+          input: { projectId: activeProject.id },
+        })
+      : null,
+  );
+  const activeAdoptedWorkspace =
+    activeThread === undefined
+      ? null
+      : (activeWorktreeCatalog.data?.adoptedWorkspaces.find(
+          (workspace) => workspace.threadId === activeThread.id,
+        ) ?? null);
+  const workspaceUnavailable =
+    activeAdoptedWorkspace?.availability === "missing-registered" ||
+    activeAdoptedWorkspace?.availability === "missing-unregistered" ||
+    activeAdoptedWorkspace?.availability === "removing"
+      ? WORKSPACE_UNAVAILABLE_REASON
+      : null;
   const consumeActivityDockEscapeClose = useCallback(() => {
     if (!activeThread) {
       return false;
@@ -1772,8 +1807,9 @@ function ChatViewContent(props: ChatViewProps) {
   }, [fileEditingSessions, openFileRelativePaths]);
 
   useEffect(() => {
+    fileEditingSessions.setSavingEnabled(workspaceUnavailable === null);
     fileEditingSessions.setActivePath(activeFileRelativePath);
-  }, [activeFileRelativePath, fileEditingSessions]);
+  }, [activeFileRelativePath, fileEditingSessions, workspaceUnavailable]);
 
   useEffect(() => fileEditingSessions.acquireOwnership(), [fileEditingSessions]);
   const [pendingFileSurfaceIdsByProject, setPendingFileSurfaceIdsByProject] = useState<
@@ -2049,6 +2085,15 @@ function ChatViewContent(props: ChatViewProps) {
         ),
       });
     }
+    if (workspaceUnavailable) {
+      items.push({
+        id: `workspace-unavailable:${activeThread?.id ?? "unknown"}`,
+        variant: "warning",
+        icon: <TriangleAlertIcon />,
+        title: "Workspace unavailable",
+        description: workspaceUnavailable,
+      });
+    }
     if (providerBinding.conflict) {
       items.push({
         id: `provider-binding-conflict:${providerBinding.conflict.instanceId}`,
@@ -2080,6 +2125,7 @@ function ChatViewContent(props: ChatViewProps) {
     return items;
   }, [
     activeEnvironmentUnavailableState,
+    activeThread?.id,
     handleReconnectActiveEnvironment,
     navigate,
     providerBinding.conflict,
@@ -2087,6 +2133,7 @@ function ChatViewContent(props: ChatViewProps) {
     versionMismatch,
     versionMismatchDismissKey,
     versionMismatchServerLabel,
+    workspaceUnavailable,
   ]);
   const { lockedProvider, lockedProviderInstanceId } = providerBinding;
   const lockProviderPickerToActiveInstance = isPanel || lockedProviderInstanceId !== null;
@@ -2490,7 +2537,7 @@ function ChatViewContent(props: ChatViewProps) {
       })
     : null;
   const gitStatusQuery = useEnvironmentQuery(
-    gitCwd === null
+    gitCwd === null || workspaceUnavailable !== null
       ? null
       : vcsEnvironment.status({
           environmentId,
@@ -2917,7 +2964,7 @@ function ChatViewContent(props: ChatViewProps) {
     [activeProject, activeThreadId, activeThreadRef, activeThreadWorktreePath, openTerminal],
   );
   const addTerminalSurface = useCallback(() => {
-    if (!activeThreadRef || !activeThreadId || !activeProject) return;
+    if (!activeThreadRef || !activeThreadId || !activeProject || workspaceUnavailable) return;
     const cwd = gitCwd ?? activeProject.workspaceRoot;
     const reservation = reserveActiveTerminalId();
     if (!reservation) return;
@@ -2932,6 +2979,7 @@ function ChatViewContent(props: ChatViewProps) {
     gitCwd,
     openReservedRightPanelTerminal,
     reserveActiveTerminalId,
+    workspaceUnavailable,
   ]);
   const splitPanelTerminal = useCallback(
     (direction: "horizontal" | "vertical" = "horizontal") => {
@@ -2939,6 +2987,7 @@ function ChatViewContent(props: ChatViewProps) {
         !activeThreadRef ||
         !activeThreadId ||
         !activeProject ||
+        workspaceUnavailable !== null ||
         activeRightPanelSurface?.kind !== "terminal" ||
         activeRightPanelSurface.terminalIds.length >= MAX_TERMINALS_PER_GROUP
       ) {
@@ -2966,6 +3015,7 @@ function ChatViewContent(props: ChatViewProps) {
       gitCwd,
       openReservedRightPanelTerminal,
       reserveActiveTerminalId,
+      workspaceUnavailable,
     ],
   );
   const splitPanelTerminalVertical = useCallback(() => {
@@ -3721,7 +3771,8 @@ function ChatViewContent(props: ChatViewProps) {
   // terminal, both sharing the live host thread's resolved effective cwd.
   const handleCreateChatPanel = useCallback(
     (entry: ProviderInstanceEntry) => {
-      if (!activeThread || !activeThreadRef || !centerPanelLaunchContext) return;
+      if (!activeThread || !activeThreadRef || !centerPanelLaunchContext || workspaceUnavailable)
+        return;
       const configuredDefault = settings.providerSessionDefaults[entry.driverKind];
       const projectSelection =
         activeProject?.defaultModelSelection?.instanceId === entry.instanceId
@@ -3753,6 +3804,7 @@ function ChatViewContent(props: ChatViewProps) {
       centerPanelActions,
       centerPanelLaunchContext,
       settings.providerSessionDefaults,
+      workspaceUnavailable,
     ],
   );
   const openCenterTerminal = useCallback(
@@ -3761,10 +3813,10 @@ function ChatViewContent(props: ChatViewProps) {
       options?: OpenTerminalPanelOptions,
       launchOverride?: CenterTerminalLaunch,
     ): Promise<CenterTerminalCreationResult> => {
-      if (!activeThreadRef) {
+      if (!activeThreadRef || workspaceUnavailable) {
         const result = {
           status: "rejected" as const,
-          reason: "Terminal launch context is unavailable.",
+          reason: workspaceUnavailable ?? "Terminal launch context is unavailable.",
         };
         toastManager.add(
           stackedThreadToast({
@@ -3896,6 +3948,7 @@ function ChatViewContent(props: ChatViewProps) {
       closeTerminalMutation,
       openTerminal,
       reserveActiveTerminalId,
+      workspaceUnavailable,
     ],
   );
   const handleOpenTerminalPanel = useCallback(() => {
@@ -3927,7 +3980,14 @@ function ChatViewContent(props: ChatViewProps) {
         rememberAsLastInvoked?: boolean;
       },
     ) => {
-      if (!activeThreadId || !activeThreadRef || !activeProject || !activeThread) return;
+      if (
+        !activeThreadId ||
+        !activeThreadRef ||
+        !activeProject ||
+        !activeThread ||
+        workspaceUnavailable
+      )
+        return;
       if (options?.rememberAsLastInvoked !== false) {
         setLastInvokedScriptByProjectId((current) => {
           if (current[activeProject.id] === script.id) return current;
@@ -4037,6 +4097,7 @@ function ChatViewContent(props: ChatViewProps) {
       setLastInvokedScriptByProjectId,
       setThreadError,
       writeTerminal,
+      workspaceUnavailable,
     ],
   );
   const activeThreadBranch =
@@ -4360,6 +4421,7 @@ function ChatViewContent(props: ChatViewProps) {
       isSendBusy ||
       isConnecting ||
       activeEnvironmentUnavailable ||
+      workspaceUnavailable !== null ||
       providerBinding.conflict !== null ||
       sendInFlightRef.current
     )
@@ -5137,6 +5199,7 @@ function ChatViewContent(props: ChatViewProps) {
       isSendBusy ||
       isConnecting ||
       activeEnvironmentUnavailable ||
+      workspaceUnavailable !== null ||
       sendInFlightRef.current
     ) {
       return;
@@ -5279,6 +5342,7 @@ function ChatViewContent(props: ChatViewProps) {
     activeThread,
     beginLocalDispatch,
     activeEnvironmentUnavailable,
+    workspaceUnavailable,
     createThread,
     deleteThread,
     isConnecting,
@@ -5474,6 +5538,7 @@ function ChatViewContent(props: ChatViewProps) {
         splitVerticalShortcutLabel={splitTerminalVerticalShortcutLabel ?? undefined}
         newShortcutLabel={newTerminalShortcutLabel ?? undefined}
         closeShortcutLabel={closeTerminalShortcutLabel ?? undefined}
+        workspaceUnavailable={workspaceUnavailable}
       />
     ) : activeRightPanelSurface?.kind === "diff" ? (
       <Suspense fallback={null}>
@@ -5481,6 +5546,7 @@ function ChatViewContent(props: ChatViewProps) {
           mode="embedded"
           composerDraftTarget={composerDraftTarget}
           thread={activeThread}
+          workspaceUnavailable={workspaceUnavailable}
         />
       </Suspense>
     ) : activeRightPanelSurface?.kind === "sourceControl" ? (
@@ -5490,6 +5556,7 @@ function ChatViewContent(props: ChatViewProps) {
           mode="embedded"
           threadRef={activeThreadRef}
           gitCwd={gitCwd}
+          workspaceUnavailable={workspaceUnavailable}
         />
       </Suspense>
     ) : activeRightPanelSurface?.kind === "plan" ? (
@@ -5533,6 +5600,7 @@ function ChatViewContent(props: ChatViewProps) {
           onOpenFile={openFileSurface}
           onPendingChange={handleFilePendingChange}
           editingSessions={fileEditingSessions}
+          workspaceUnavailable={workspaceUnavailable}
         />
       </Suspense>
     ) : null
@@ -5707,7 +5775,9 @@ function ChatViewContent(props: ChatViewProps) {
                             lockedProvider={lockedProvider}
                             providerBindingInstanceId={providerBinding.instanceId}
                             lockProviderPickerToActiveInstance={lockProviderPickerToActiveInstance}
-                            providerBindingConflictReason={providerBindingConflictReason}
+                            providerBindingConflictReason={
+                              workspaceUnavailable ?? providerBindingConflictReason
+                            }
                             providerStatuses={providerStatuses as ServerProvider[]}
                             activeProjectDefaultModelSelection={
                               activeProject?.defaultModelSelection
@@ -5816,6 +5886,7 @@ function ChatViewContent(props: ChatViewProps) {
                   onAddProjectScript={saveProjectScript}
                   onUpdateProjectScript={updateProjectScript}
                   onDeleteProjectScript={deleteProjectScript}
+                  workspaceUnavailable={workspaceUnavailable}
                 />
               )}
               hostChatSurfaceBody={hostChatSurfaceBody}
@@ -5834,6 +5905,7 @@ function ChatViewContent(props: ChatViewProps) {
               onDropSurface={dropCenterPanelSurface}
               onMergeGroup={mergeCenterPanelGroup}
               onSetSplitRatio={setCenterPanelSplitRatio}
+              workspaceUnavailable={workspaceUnavailable}
             />
           ) : (
             hostChatSurfaceBody

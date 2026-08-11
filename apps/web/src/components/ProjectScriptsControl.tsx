@@ -112,6 +112,7 @@ export interface ProjectScriptsControlProps {
   keybindings: ResolvedKeybindingsConfig;
   preferredScriptId?: string | null;
   enabled?: boolean;
+  disabledReason?: string | null;
   onRunScript: (script: ProjectScript) => void;
   onAddScript: (input: NewProjectScriptInput) => Promise<ProjectScriptActionResult>;
   onUpdateScript: (
@@ -124,6 +125,7 @@ export interface ProjectScriptsControlProps {
 export interface ProjectScriptsController {
   readonly scripts: ReadonlyArray<ProjectScript>;
   readonly primaryScript: ProjectScript | null;
+  readonly disabledReason: string | null;
   readonly openAddDialog: () => void;
   readonly openEditDialog: (script: ProjectScript) => void;
   readonly runScript: (script: ProjectScript) => void;
@@ -166,6 +168,7 @@ export function useProjectScriptsController({
   keybindings,
   preferredScriptId = null,
   enabled = true,
+  disabledReason = null,
   onRunScript,
   onAddScript,
   onUpdateScript,
@@ -326,6 +329,7 @@ export function useProjectScriptsController({
   const controller: ProjectScriptsControllerState = {
     scripts,
     primaryScript,
+    disabledReason,
     openAddDialog,
     openEditDialog,
     runScript,
@@ -382,6 +386,8 @@ export function ProjectScriptsMenuItems({
           <MenuItem
             key={script.id}
             className={`group ${dropdownItemClassName}`}
+            disabled={controller.disabledReason !== null}
+            title={controller.disabledReason ?? undefined}
             onClick={() => controller.runScript(script)}
           >
             <ScriptIcon icon={script.icon} className="size-4" />
@@ -400,6 +406,8 @@ export function ProjectScriptsMenuItems({
                 size="icon-xs"
                 className="absolute right-0 top-1/2 size-6 -translate-y-1/2 opacity-0 pointer-events-none transition-opacity group-hover:opacity-100 group-hover:pointer-events-auto group-focus-visible:opacity-100 group-focus-visible:pointer-events-auto"
                 aria-label={`Edit ${script.name}`}
+                disabled={controller.disabledReason !== null}
+                title={controller.disabledReason ?? undefined}
                 onPointerDown={(event) => {
                   event.preventDefault();
                   event.stopPropagation();
@@ -416,7 +424,12 @@ export function ProjectScriptsMenuItems({
           </MenuItem>
         );
       })}
-      <MenuItem className={dropdownItemClassName} onClick={controller.openAddDialog}>
+      <MenuItem
+        className={dropdownItemClassName}
+        disabled={controller.disabledReason !== null}
+        title={controller.disabledReason ?? undefined}
+        onClick={controller.openAddDialog}
+      >
         <PlusIcon className="size-4" />
         Add action
       </MenuItem>
@@ -441,6 +454,8 @@ export function ProjectScriptsExpandedActions({
               size="xs"
               variant="outline"
               aria-label={`Run ${primaryScript.name}`}
+              disabled={controller.disabledReason !== null}
+              title={controller.disabledReason ?? undefined}
               onClick={() => controller.runScript(primaryScript)}
             />
           }
@@ -450,12 +465,22 @@ export function ProjectScriptsExpandedActions({
             {primaryScript.name}
           </span>
         </TooltipTrigger>
-        <TooltipPopup side="top">Run {primaryScript.name}</TooltipPopup>
+        <TooltipPopup side="top">
+          {controller.disabledReason ?? `Run ${primaryScript.name}`}
+        </TooltipPopup>
       </Tooltip>
       <GroupSeparator className="hidden @3xl/header-actions:block" />
       <Menu highlightItemOnHover={false}>
         <MenuTrigger
-          render={<Button size="icon-xs" variant="outline" aria-label="Script actions" />}
+          render={
+            <Button
+              size="icon-xs"
+              variant="outline"
+              aria-label="Script actions"
+              disabled={controller.disabledReason !== null}
+              title={controller.disabledReason ?? undefined}
+            />
+          }
         >
           <ChevronDownIcon className="size-4" />
         </MenuTrigger>
