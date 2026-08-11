@@ -92,6 +92,9 @@ actor and operation records, and a delta contains at most 256 changes. It is
 never written to SQLite: after a server restart, historical actors remain
 `unsupported` until the current runtime proves an exact native target. Provider
 native target IDs never cross contracts, persistence, or diagnostic logs.
+The current runtime registration owns its overlay generation: its lifecycle
+cleanup removes that generation with one bounded removal delta, while a
+superseded registration cannot remove its replacement.
 
 Each snapshot negotiates provider capabilities separately: actors, attributed
 entries, background work, history recovery (`full`, `bounded`, or `none`), and

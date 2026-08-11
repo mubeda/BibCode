@@ -291,6 +291,138 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn oversized_runtime_replacement_is_rejected_without_mutating_state_or_revision() {
+        // Mutation caught: publishing an over-256 control delta while replacing a runtime.
+        let registry = ActivityControlRegistry::new();
+        let mut events = registry.subscribe();
+        let first = registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+        {
+            let mut state = registry.lock();
+            let scope = state.scopes.get_mut("scope-control").expect("scope");
+            for index in 0..=ACTIVITY_DELTA_MAX_CHANGES {
+                scope.actors.insert(
+                    format!("actor-{index}"),
+                    ActivityControlActor {
+                        parent_actor_id: None,
+                        status: ActivityLifecycle::Running,
+                        target: Some(ProviderActivityNativeTarget::ClaudeTask {
+                            task_id: format!("native-{index}"),
+                        }),
+                        control_revision: 1,
+                    },
+                );
+            }
+        }
+        let before = registry.snapshot("scope-control").await;
+
+        let replacement =
+            registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+
+        assert!(!replacement.active);
+        assert_eq!(registry.snapshot("scope-control").await, before);
+        assert_eq!(
+            registry.lock().scopes["scope-control"].generation,
+            first.generation
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test]
+    async fn oversized_control_batch_is_rejected_without_a_partial_overlay_update() {
+        // Mutation caught: accepting the prefix of an oversized provider control batch.
+        let registry = ActivityControlRegistry::new();
+        let registration =
+            registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+        registry
+            .observe_provider_batch(&registration, &[running_actor("actor-a", None)], &[])
+            .await;
+        let before = registry.snapshot("scope-control").await;
+        let controls = (0..=ACTIVITY_DELTA_MAX_CHANGES)
+            .map(|index| ProviderActivityControlUpdate::ActorTarget {
+                actor_id: "actor-a".to_owned(),
+                target: Some(ProviderActivityNativeTarget::ClaudeTask {
+                    task_id: format!("native-{index}"),
+                }),
+            })
+            .collect::<Vec<_>>();
+
+        registry
+            .observe_provider_batch(&registration, &[], &controls)
+            .await;
+
+        assert_eq!(registry.snapshot("scope-control").await, before);
+    }
+
+    #[tokio::test]
+    async fn dropping_current_registration_removes_its_scope_with_one_bounded_delta() {
+        // Mutation caught: retaining a completed runtime's native handles after its registration drops.
+        let registry = ActivityControlRegistry::new();
+        let mut events = registry.subscribe();
+        let registration =
+            registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[running_actor("actor-a", None)],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor-a".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::ClaudeTask {
+                        task_id: "native-task".to_owned(),
+                    }),
+                }],
+            )
+            .await;
+        let _ = events.recv().await.expect("upsert delta");
+
+        drop(registration);
+
+        let ActivityControlEvent::Delta(delta) = events.recv().await.expect("removal delta");
+        assert!(delta.changes.len() <= ACTIVITY_DELTA_MAX_CHANGES);
+        assert_eq!(delta.changes.len(), 1);
+        assert_eq!(
+            registry.snapshot("scope-control").await,
+            ActivityControlSnapshot::empty("scope-control")
+        );
+    }
+
+    #[tokio::test]
+    async fn dropping_a_superseded_registration_cannot_remove_its_replacement() {
+        // Mutation caught: an old runtime teardown deleting a newer runtime's overlay.
+        let registry = ActivityControlRegistry::new();
+        let first = registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+        registry
+            .observe_provider_batch(&first, &[running_actor("actor-a", None)], &[])
+            .await;
+        let replacement =
+            registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+
+        drop(first);
+
+        assert_eq!(registry.snapshot("scope-control").await.actors.len(), 1);
+        drop(replacement);
+        assert_eq!(
+            registry.snapshot("scope-control").await,
+            ActivityControlSnapshot::empty("scope-control")
+        );
+    }
+
+    #[test]
+    fn repeated_registration_churn_releases_every_scope() {
+        // Mutation caught: growing the registry's scope map for every completed runtime.
+        let registry = ActivityControlRegistry::new();
+        for index in 0..ACTIVITY_DELTA_MAX_CHANGES * 2 {
+            let registration =
+                registry.register_runtime(thread_scope(), format!("scope-control-{index}"), None);
+            drop(registration);
+        }
+
+        assert!(registry.lock().scopes.is_empty());
+    }
+
+    #[tokio::test]
     async fn terminal_scopes_never_gain_control_capability() {
         // Mutation caught: accepting a native cancellation target from a provider-terminal observer.
         let registry = ActivityControlRegistry::new();
@@ -328,7 +460,7 @@ mod tests {
                 running_actor(&actor_id, parent_id.as_deref())
             })
             .collect::<Vec<_>>();
-        let controls = (0..=ACTIVITY_DELTA_MAX_CHANGES)
+        let controls = (0..ACTIVITY_DELTA_MAX_CHANGES)
             .map(|index| ProviderActivityControlUpdate::ActorTarget {
                 actor_id: format!("actor-{index}"),
                 target: Some(ProviderActivityNativeTarget::ClaudeTask {
@@ -372,7 +504,7 @@ mod tests {
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt,
-    sync::{Arc, Mutex},
+    sync::{Arc, Mutex, Weak},
 };
 
 use tokio::sync::broadcast;
@@ -405,10 +537,12 @@ impl fmt::Debug for ProviderActivityNativeTarget {
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub(crate) struct ActivityRuntimeGeneration(Uuid);
 
-#[derive(Clone)]
-pub(crate) struct ActivityRuntimeControlRegistration {
+pub struct ActivityRuntimeControlRegistration {
     scope_id: String,
     generation: ActivityRuntimeGeneration,
+    active: bool,
+    inner: Weak<Mutex<ActivityControlRegistryState>>,
+    events: broadcast::Sender<ActivityControlEvent>,
 }
 
 pub(crate) enum ProviderActivityControlUpdate {
@@ -438,12 +572,12 @@ pub(crate) enum ActivityDispatchSubject {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum ActivityControlEvent {
+pub enum ActivityControlEvent {
     Delta(ActivityControlDelta),
 }
 
 #[derive(Clone, Debug)]
-pub(crate) struct ActivityControlRegistry {
+pub struct ActivityControlRegistry {
     inner: Arc<Mutex<ActivityControlRegistryState>>,
     events: broadcast::Sender<ActivityControlEvent>,
 }
@@ -474,7 +608,7 @@ struct ActivityControlActor {
 
 impl ActivityControlRegistry {
     #[must_use]
-    pub(crate) fn new() -> Self {
+    pub fn new() -> Self {
         let (events, _) = broadcast::channel(ACTIVITY_DELTA_MAX_CHANGES);
         Self {
             inner: Arc::new(Mutex::new(ActivityControlRegistryState::default())),
@@ -483,26 +617,40 @@ impl ActivityControlRegistry {
     }
 
     #[must_use]
-    pub(crate) fn register_runtime(
+    pub fn register_runtime(
         &self,
         scope: ActivityScopeRef,
         scope_id: String,
         provider_instance_id: Option<String>,
     ) -> ActivityRuntimeControlRegistration {
         let generation = ActivityRuntimeGeneration(Uuid::new_v4());
+        let mut active = true;
         let event = {
             let mut state = self.lock();
             if let Some(existing) = state.scopes.get_mut(&scope_id) {
-                let before = existing.actor_controls();
-                existing.generation = generation.clone();
-                existing.scope = scope;
-                existing._provider_instance_id = provider_instance_id;
-                for actor in existing.actors.values_mut() {
+                let mut staged = existing.clone();
+                staged.generation = generation.clone();
+                staged.scope = scope;
+                staged._provider_instance_id = provider_instance_id;
+                for actor in staged.actors.values_mut() {
                     if actor.target.take().is_some() {
                         actor.control_revision = actor.control_revision.saturating_add(1);
                     }
                 }
-                existing.publish_delta(before)
+                // Cancellation operations are generation-scoped and cannot outlive their targets.
+                staged.operations.clear();
+                let Ok(changes) = staged.pending_changes(existing) else {
+                    active = false;
+                    return ActivityRuntimeControlRegistration {
+                        scope_id,
+                        generation,
+                        active,
+                        inner: Arc::downgrade(&self.inner),
+                        events: self.events.clone(),
+                    };
+                };
+                *existing = staged;
+                existing.publish_changes(changes)
             } else {
                 state.scopes.insert(
                     scope_id.clone(),
@@ -525,7 +673,24 @@ impl ActivityControlRegistry {
         ActivityRuntimeControlRegistration {
             scope_id,
             generation,
+            active,
+            inner: Arc::downgrade(&self.inner),
+            events: self.events.clone(),
         }
+    }
+
+    /// Applies a provider activity batch without accepting provider-native control targets.
+    ///
+    /// This is the public, safe observation surface used by integration coverage. Provider-native
+    /// targets remain crate-private and are only accepted by the server's provider adapters.
+    pub async fn observe_activity_batch(
+        &self,
+        registration: &ActivityRuntimeControlRegistration,
+        activity: &[ProviderActivityMutation],
+    ) {
+        let _ = self
+            .observe_provider_batch(registration, activity, &[])
+            .await;
     }
 
     pub(crate) async fn observe_provider_batch(
@@ -534,6 +699,11 @@ impl ActivityControlRegistry {
         activity: &[ProviderActivityMutation],
         controls: &[ProviderActivityControlUpdate],
     ) -> Vec<ActivityDispatchJob> {
+        if activity.len() > ACTIVITY_DELTA_MAX_CHANGES
+            || controls.len() > ACTIVITY_DELTA_MAX_CHANGES
+        {
+            return Vec::new();
+        }
         let event = {
             let mut state = self.lock();
             let Some(scope) = state.scopes.get_mut(&registration.scope_id) else {
@@ -547,12 +717,14 @@ impl ActivityControlRegistry {
                 return Vec::new();
             }
             staged.apply_control_updates(controls);
-            if !staged.validate_graph() {
+            if !staged.validate_graph() || !staged.within_bounds() {
                 return Vec::new();
             }
-            let before = scope.actor_controls();
+            let Ok(changes) = staged.pending_changes(scope) else {
+                return Vec::new();
+            };
             *scope = staged;
-            scope.publish_delta(before)
+            scope.publish_changes(changes)
         };
         if let Some(event) = event {
             let _ = self.events.send(ActivityControlEvent::Delta(event));
@@ -560,7 +732,7 @@ impl ActivityControlRegistry {
         Vec::new()
     }
 
-    pub(crate) async fn snapshot(&self, scope_id: &str) -> ActivityControlSnapshot {
+    pub async fn snapshot(&self, scope_id: &str) -> ActivityControlSnapshot {
         self.lock()
             .scopes
             .get(scope_id)
@@ -604,7 +776,7 @@ impl ActivityControlRegistry {
     }
 
     #[must_use]
-    pub(crate) fn subscribe(&self) -> broadcast::Receiver<ActivityControlEvent> {
+    pub fn subscribe(&self) -> broadcast::Receiver<ActivityControlEvent> {
         self.events.subscribe()
     }
 
@@ -625,6 +797,31 @@ impl ActivityControlRegistry {
         self.inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+impl Drop for ActivityRuntimeControlRegistration {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let event = self.inner.upgrade().and_then(|inner| {
+            let mut state = inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let is_current = state
+                .scopes
+                .get(&self.scope_id)
+                .is_some_and(|scope| scope.generation == self.generation);
+            if !is_current {
+                return None;
+            }
+            let mut scope = state.scopes.remove(&self.scope_id)?;
+            scope.removal_delta()
+        });
+        if let Some(event) = event {
+            let _ = self.events.send(ActivityControlEvent::Delta(event));
+        }
     }
 }
 
@@ -671,7 +868,7 @@ impl ActivityControlScope {
     }
 
     fn apply_control_updates(&mut self, controls: &[ProviderActivityControlUpdate]) {
-        for update in controls.iter().take(ACTIVITY_DELTA_MAX_CHANGES) {
+        for update in controls {
             match update {
                 ProviderActivityControlUpdate::ActorTarget { actor_id, target } => {
                     let Some(actor) = self.actors.get_mut(actor_id) else {
@@ -725,6 +922,12 @@ impl ActivityControlScope {
         })
     }
 
+    fn within_bounds(&self) -> bool {
+        self.actors.len() <= ACTIVITY_PAGE_MAX_LENGTH
+            && self.operations.len() <= ACTIVITY_PAGE_MAX_LENGTH
+            && self.actors.len().saturating_add(self.operations.len()) <= ACTIVITY_DELTA_MAX_CHANGES
+    }
+
     fn actor_controls(&self) -> BTreeMap<String, ActivityActorControl> {
         self.actors
             .iter()
@@ -776,14 +979,19 @@ impl ActivityControlScope {
         false
     }
 
-    fn publish_delta(
-        &mut self,
-        before: BTreeMap<String, ActivityActorControl>,
-    ) -> Option<ActivityControlDelta> {
+    fn pending_changes(
+        &self,
+        before: &ActivityControlScope,
+    ) -> Result<Vec<ActivityControlChange>, ()> {
+        let before_actors = before.actor_controls();
         let after = self.actor_controls();
         let mut changes = Vec::new();
-        for actor_id in before.keys().chain(after.keys()).collect::<BTreeSet<_>>() {
-            match (before.get(actor_id), after.get(actor_id)) {
+        for actor_id in before_actors
+            .keys()
+            .chain(after.keys())
+            .collect::<BTreeSet<_>>()
+        {
+            match (before_actors.get(actor_id), after.get(actor_id)) {
                 (Some(before), Some(after)) if before == after => {}
                 (_, Some(actor)) => changes.push(ActivityControlChange::ActorUpserted {
                     actor: actor.clone(),
@@ -794,7 +1002,39 @@ impl ActivityControlScope {
                 (None, None) => {}
             }
         }
-        if changes.is_empty() {
+        for root_actor_id in before
+            .operations
+            .keys()
+            .chain(self.operations.keys())
+            .collect::<BTreeSet<_>>()
+        {
+            match (
+                before.operations.get(root_actor_id),
+                self.operations.get(root_actor_id),
+            ) {
+                (Some(before), Some(after)) if before == after => {}
+                (_, Some(operation)) => {
+                    changes.push(ActivityControlChange::OperationUpserted {
+                        operation: operation.clone(),
+                    });
+                }
+                (Some(_), None) => changes.push(ActivityControlChange::OperationRemoved {
+                    root_actor_id: (*root_actor_id).clone(),
+                }),
+                (None, None) => {}
+            }
+        }
+        if changes.len() > ACTIVITY_DELTA_MAX_CHANGES {
+            return Err(());
+        }
+        Ok(changes)
+    }
+
+    fn publish_changes(
+        &mut self,
+        changes: Vec<ActivityControlChange>,
+    ) -> Option<ActivityControlDelta> {
+        if changes.is_empty() || changes.len() > ACTIVITY_DELTA_MAX_CHANGES {
             return None;
         }
         let previous_revision = self.revision;
@@ -805,6 +1045,20 @@ impl ActivityControlScope {
             revision: self.revision,
             changes,
         })
+    }
+
+    fn removal_delta(&mut self) -> Option<ActivityControlDelta> {
+        let empty = ActivityControlScope {
+            scope_id: self.scope_id.clone(),
+            scope: self.scope.clone(),
+            generation: self.generation.clone(),
+            _provider_instance_id: None,
+            revision: self.revision,
+            actors: BTreeMap::new(),
+            operations: BTreeMap::new(),
+        };
+        let changes = empty.pending_changes(self).ok()?;
+        self.publish_changes(changes)
     }
 
     fn snapshot(&self) -> ActivityControlSnapshot {
