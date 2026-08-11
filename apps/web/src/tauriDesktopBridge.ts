@@ -6,6 +6,7 @@ import type {
   DesktopBridge,
   DesktopBridgeHostMetadata,
   DesktopEnvironmentBootstrap,
+  DesktopProjectDataStatusChangedEvent,
   DesktopServerExposureState,
   DesktopSshPasswordPromptRequest,
   DesktopUpdateActionResult,
@@ -32,6 +33,7 @@ import { createTauriPreviewBridge } from "./tauriPreviewBridge";
 
 const CONNECTION_CATALOG_STORAGE_KEY = "bibcode.connectionCatalog";
 const BACKEND_READY_EVENT = "desktop:backend-ready";
+const PROJECT_DATA_STATUS_CHANGED_EVENT = "desktop:project-data-status-changed";
 const MENU_ACTION_EVENT = "desktop:menu-action";
 const NIGHTLY_VERSION_PATTERN = /-nightly\.\d{8}\.\d+$/;
 const SSH_PASSWORD_PROMPT_EVENT = "desktop:ssh-password-prompt";
@@ -490,6 +492,8 @@ function createTauriDesktopBridge(
     ...connectionCatalog,
     getProjectDataStatuses: () =>
       tauriInvokeDesktop("desktop_bridge_get_project_data_statuses", undefined),
+    onProjectDataStatusChanged: (listener: (event: DesktopProjectDataStatusChangedEvent) => void) =>
+      tauriListen(PROJECT_DATA_STATUS_CHANGED_EVENT, listener),
     restoreProjectData: (environmentId, backupId) =>
       tauriInvokeDesktop("desktop_bridge_restore_project_data", { environmentId, backupId }),
     startEmptyProjectData: (environmentId) =>

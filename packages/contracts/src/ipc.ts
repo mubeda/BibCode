@@ -218,6 +218,10 @@ export type DesktopProjectDataStatus =
   | "recovery-required"
   | "unavailable";
 
+export interface DesktopProjectDataStatusChangedEvent {
+  readonly environmentId: string;
+}
+
 export interface DesktopProjectDataBackup {
   backupId: string;
   createdAt: string;
@@ -1169,6 +1173,9 @@ export interface DesktopBridge {
   compareConnectionCatalog?: (expectedCatalog: string | null) => Promise<boolean>;
   clearConnectionCatalog?: () => Promise<void>;
   getProjectDataStatuses?: () => Promise<readonly DesktopProjectDataEnvironmentStatus[]>;
+  onProjectDataStatusChanged?: (
+    listener: (event: DesktopProjectDataStatusChangedEvent) => void,
+  ) => () => void;
   restoreProjectData?: (
     environmentId: string,
     backupId: string,
