@@ -71,6 +71,10 @@ const h = vi.hoisted(() => {
     queryDataByKey: new Map<string, unknown>(),
     queryEmissionsByKey: new Map<string, unknown>(),
     queryRefreshCalls: [] as string[],
+    querySubscriptionStarts: [] as string[],
+    querySubscriptionStops: [] as string[],
+    activeQuerySubscriptions: new Map<string, number>(),
+    chatComposerProps: [] as Array<Record<string, unknown>>,
     assetUrls: [] as string[],
     previewSupported: false,
     previewState: {} as Record<string, unknown>,
@@ -190,9 +194,21 @@ vi.mock("../connection/catalog", () => ({
 vi.mock("../state/query", async () => {
   const AsyncResultModule = await import("effect/unstable/reactivity");
   const CauseModule = await import("effect/Cause");
+  const ReactModule = await import("react");
   return {
     useEnvironmentQuery: (atom: { key?: string } | null) => {
       const key = atom && typeof atom.key === "string" ? atom.key : null;
+      ReactModule.useEffect(() => {
+        if (key === null) return;
+        h.querySubscriptionStarts.push(key);
+        h.activeQuerySubscriptions.set(key, (h.activeQuerySubscriptions.get(key) ?? 0) + 1);
+        return () => {
+          h.querySubscriptionStops.push(key);
+          const remaining = (h.activeQuerySubscriptions.get(key) ?? 1) - 1;
+          if (remaining === 0) h.activeQuerySubscriptions.delete(key);
+          else h.activeQuerySubscriptions.set(key, remaining);
+        };
+      }, [key]);
       const emission = key === null ? undefined : h.queryEmissionsByKey.get(key);
       const result = emission as
         | {
@@ -380,6 +396,7 @@ vi.mock("./DiffWorkerPoolProvider", () => ({
 vi.mock("./chat/ChatComposer", () => ({
   ChatComposer: (props: Record<string, unknown>) => {
     h.captured["chatComposer"] = props;
+    h.chatComposerProps.push(props);
     return <div data-mock="chat-composer" />;
   },
 }));
@@ -883,6 +900,10 @@ beforeEach(() => {
   h.queryDataByKey.clear();
   h.queryEmissionsByKey.clear();
   h.queryRefreshCalls = [];
+  h.querySubscriptionStarts = [];
+  h.querySubscriptionStops = [];
+  h.activeQuerySubscriptions.clear();
+  h.chatComposerProps = [];
   h.assetUrls = [];
   h.previewSupported = false;
   h.previewState = {
@@ -1153,7 +1174,9 @@ describe("ChatView", () => {
       document.body.append(container);
       const root = createRoot(container);
       await act(async () => {
-        root.render(<ChatView variant="panel" panelThreadRef={panelThreadRef} />);
+        root.render(
+          <ChatView variant="panel" panelThreadRef={panelThreadRef} workspaceUnavailable={null} />,
+        );
         await Promise.resolve();
       });
       return { container, root };
@@ -3804,7 +3827,9 @@ describe("ChatView", () => {
       seedServerThread(makeThread());
       seedGitStatus(true);
 
-      const markup = renderToStaticMarkup(<ChatView variant="panel" panelThreadRef={threadRef} />);
+      const markup = renderToStaticMarkup(
+        <ChatView variant="panel" panelThreadRef={threadRef} workspaceUnavailable={null} />,
+      );
 
       expect(markup).toContain('data-mock="messages-timeline"');
       expect(markup).toContain('data-mock="chat-composer"');
@@ -4968,6 +4993,190 @@ describe("ChatView file editing registry lifetime", () => {
 type _AssertRouteProps = ComponentProps<typeof ChatView>;
 
 describe("ChatView adopted workspace availability", () => {
+  it("guards a stale script keybinding and a deferred terminal open with the latest host availability", async () => {
+    const script = {
+      id: "build",
+      name: "Build",
+      command: "vp build",
+      icon: "build" as const,
+      runOnWorktreeCreate: false,
+    };
+    seedEnvironment(makeEnvironmentPresentation());
+    seedProject(makeProject({ scripts: [script] }));
+    seedServerThread(makeThread({ worktreePath: "/external/repo-feature" }));
+    seedGitStatus(true);
+    h.atomValuesByKey.set("atom:keybindings", [
+      {
+        command: "script.build.run",
+        shortcut: {
+          key: "p",
+          metaKey: false,
+          ctrlKey: true,
+          shiftKey: false,
+          altKey: false,
+          modKey: false,
+        },
+      },
+    ]);
+    const terminalOpen = deferredResult<ReturnType<typeof AsyncResult.success<void>>>();
+    h.commandResults["terminal.open"] = () => terminalOpen.promise;
+    const setAvailability = (availability: "present" | "missing-registered") => {
+      h.queryDataByKey.set("worktree.catalog", {
+        adoptedWorkspaces: [
+          {
+            threadId,
+            path: "/external/repo-feature",
+            branch: "feature/adopted",
+            availability,
+            registrationState: "registered",
+            locked: false,
+            lockReason: null,
+          },
+        ],
+      });
+    };
+    setAvailability("present");
+
+    vi.unstubAllGlobals();
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+    Object.defineProperty(Element.prototype, "getAnimations", {
+      configurable: true,
+      value: () => [],
+    });
+    const addWindowListener = vi.spyOn(window, "addEventListener");
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const render = async () => {
+      await act(async () => {
+        root.render(
+          <ChatView
+            environmentId={environmentId}
+            threadId={threadId}
+            routeKind="server"
+            reserveTitleBarControlInset
+          />,
+        );
+        await Promise.resolve();
+      });
+    };
+
+    try {
+      await render();
+      const staleKeydownHandler = addWindowListener.mock.calls.findLast(
+        ([eventName]) => eventName === "keydown",
+      )?.[1];
+      expect(staleKeydownHandler).toBeTypeOf("function");
+      const shortcut = () =>
+        new KeyboardEvent("keydown", { key: "p", ctrlKey: true, bubbles: true });
+
+      await act(async () => {
+        (staleKeydownHandler as EventListener)(shortcut());
+        await Promise.resolve();
+      });
+      expect(h.commandCalls.filter((call) => call.key === "terminal.open")).toHaveLength(1);
+
+      setAvailability("missing-registered");
+      await render();
+      await act(async () => {
+        (staleKeydownHandler as EventListener)(shortcut());
+        await Promise.resolve();
+      });
+      expect(h.commandCalls.filter((call) => call.key === "terminal.open")).toHaveLength(1);
+
+      await act(async () => terminalOpen.resolve(AsyncResult.success(undefined)));
+      expect(h.commandCalls.filter((call) => call.key === "terminal.write")).toHaveLength(0);
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+      addWindowListener.mockRestore();
+    }
+  });
+
+  it("owns one host subscription and propagates availability through sibling panels across rerenders", async () => {
+    const siblingThreadId = ThreadId.make("thread-adopted-sibling");
+    const siblingPath = "/external/repo-feature-sibling";
+    seedEnvironment(makeEnvironmentPresentation());
+    seedProject(makeProject());
+    seedServerThread(makeThread({ worktreePath: "/external/repo-feature" }));
+    seedServerThread(
+      makeThread({ id: siblingThreadId, title: "Sibling", worktreePath: siblingPath }),
+    );
+    seedGitStatus(true);
+    useCenterPanelStore.getState().openChatPanel(threadRef, siblingThreadId, "Codex");
+
+    const setAvailability = (availability: "present" | "missing-registered" | "removing") => {
+      h.queryDataByKey.set("worktree.catalog", {
+        adoptedWorkspaces: [
+          {
+            threadId,
+            path: "/external/repo-feature",
+            branch: "feature/adopted",
+            availability,
+            registrationState: "registered",
+            locked: false,
+            lockReason: null,
+          },
+        ],
+      });
+    };
+    const latestSiblingComposer = () =>
+      h.chatComposerProps.findLast(
+        (props) => (props["activeThread"] as Thread | undefined)?.id === siblingThreadId,
+      );
+
+    setAvailability("present");
+    vi.unstubAllGlobals();
+    Object.assign(globalThis, { IS_REACT_ACT_ENVIRONMENT: true });
+    Object.defineProperty(Element.prototype, "getAnimations", {
+      configurable: true,
+      value: () => [],
+    });
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+    const render = async () => {
+      await act(async () => {
+        root.render(
+          <ChatView
+            environmentId={environmentId}
+            threadId={threadId}
+            routeKind="server"
+            reserveTitleBarControlInset
+          />,
+        );
+        await Promise.resolve();
+      });
+    };
+
+    try {
+      await render();
+      expect(h.querySubscriptionStarts.filter((key) => key === "worktree.catalog")).toHaveLength(1);
+      expect(h.activeQuerySubscriptions.get("worktree.catalog")).toBe(1);
+      expect(latestSiblingComposer()?.["providerBindingConflictReason"]).toBeNull();
+
+      for (const availability of ["missing-registered", "removing"] as const) {
+        setAvailability(availability);
+        await render();
+        expect(latestSiblingComposer()?.["providerBindingConflictReason"]).toEqual(
+          expect.stringContaining("Retry detection"),
+        );
+        expect(h.activeQuerySubscriptions.get("worktree.catalog")).toBe(1);
+      }
+
+      setAvailability("present");
+      await render();
+      expect(latestSiblingComposer()?.["providerBindingConflictReason"]).toBeNull();
+      expect(h.querySubscriptionStarts.filter((key) => key === "worktree.catalog")).toHaveLength(1);
+    } finally {
+      await act(async () => root.unmount());
+      container.remove();
+    }
+
+    expect(h.activeQuerySubscriptions.has("worktree.catalog")).toBe(false);
+    expect(h.querySubscriptionStops.filter((key) => key === "worktree.catalog")).toHaveLength(1);
+  });
+
   it("keeps legacy workspace threads active when the catalog capability is unsupported", () => {
     seedEnvironment(
       makeEnvironmentPresentation({

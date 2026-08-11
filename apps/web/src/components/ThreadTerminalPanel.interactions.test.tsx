@@ -4184,6 +4184,35 @@ describe("TerminalViewport mounted lifecycle", () => {
     expect(terminal.writes).toContain("\r\n[terminal] Unable to open path\r\n");
   });
 
+  it("keeps retained path links mounted but guards activation while the workspace is unavailable", async () => {
+    vi.stubGlobal("navigator", { platform: "MacIntel" });
+    const props = viewportProps();
+    const mounted = await mount(<TerminalViewport {...props} />);
+    const terminal = xtermState.terminals[0]!;
+    terminal.bufferLines.push(terminalBufferLine("retained src/main.ts:12"));
+    const [link] = provideTerminalLinks(terminal) ?? [];
+    expect(link).toBeDefined();
+    terminal.writes.length = 0;
+
+    const reason = "Workspace unavailable. Retry detection or remove it from BiBCode.";
+    await act(async () =>
+      mounted.root.render(<TerminalViewport {...props} workspaceUnavailable={reason} />),
+    );
+
+    expect(xtermState.terminals).toHaveLength(1);
+    expect(terminal.dispose).not.toHaveBeenCalled();
+    link!.activate(new MouseEvent("click", { metaKey: true }));
+    await act(async () => Promise.resolve());
+    expect(testState.openPath).not.toHaveBeenCalled();
+    expect(terminal.writes).toContain(`\r\n[terminal] ${reason}\r\n`);
+
+    await act(async () => mounted.root.render(<TerminalViewport {...props} />));
+    expect(xtermState.terminals).toHaveLength(1);
+    link!.activate(new MouseEvent("click", { metaKey: true }));
+    await act(async () => Promise.resolve());
+    expect(testState.openPath).toHaveBeenCalledWith("/repo/src/main.ts:12");
+  });
+
   it("ignores link providers and activations after the terminal is disposed", async () => {
     vi.stubGlobal("navigator", { platform: "MacIntel" });
     const mounted = await mount(<TerminalViewport {...viewportProps()} />);

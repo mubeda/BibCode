@@ -650,6 +650,7 @@ export function TerminalViewport({
     serverConfig?.availableEditors ?? [],
   );
   const openTerminalPath = useEffectEvent((target: string) => openInPreferredEditor(target));
+  const readWorkspaceUnavailable = useEffectEvent(() => workspaceUnavailable);
   const openPreview = useAtomCommand(previewEnvironment.open, {
     reportFailure: false,
   });
@@ -1129,7 +1130,7 @@ export function TerminalViewport({
 
     const sendTerminalInput = (data: string, fallbackError: string) => {
       if (
-        workspaceUnavailable ||
+        readWorkspaceUnavailable() ||
         inputBinding.renderer?.owner !== rendererOwner ||
         data.length === 0
       )
@@ -1285,6 +1286,11 @@ export function TerminalViewport({
               }
 
               const target = resolvePathLinkTarget(match.text, cwd);
+              const unavailableReason = readWorkspaceUnavailable();
+              if (unavailableReason !== null) {
+                writeSystemMessage(latestTerminal, unavailableReason);
+                return;
+              }
               void (async () => {
                 const result = await openTerminalPath(target);
                 if (result._tag === "Success" || isAtomCommandInterrupted(result)) {
@@ -1420,7 +1426,6 @@ export function TerminalViewport({
     threadId,
     transcriptRuntime,
     worktreePath,
-    workspaceUnavailable,
   ]);
 
   useEffect(() => {
