@@ -37,9 +37,12 @@ path canonicalizes its nearest existing ancestor and appends the normalized
 missing suffix, so a symlinked parent, macOS `/var` alias, or lexical `.`/`..`
 spelling cannot create a second owner or bypass `Removing`. POSIX comparison
 remains case-sensitive. Windows drive and UNC comparison normalizes separators
-and uses Unicode-aware lowercase comparison, including non-ASCII components.
-If physical identity cannot be established at an authority-changing boundary,
-the operation fails closed rather than falling back to a second lexical owner.
+and uses the native invariant uppercase mapping compatible with Windows ordinal
+caseless identity, including non-ASCII and special folds such as Greek
+sigma/final sigma. Only `NotFound` may trigger nearest-existing-ancestor
+resolution. Permission, symlink-loop, and all other identity failures return a
+typed `WorkspaceIdentityError` and abort the authority-changing transition
+rather than falling back to a second lexical owner.
 
 The first authoritative scan through the configured primary checkout is the
 only operation that may establish the durable repository pin. Once pinned, a
@@ -72,6 +75,7 @@ The production bounds are intentionally finite:
 | Idle repository-view eviction | 60 seconds           |
 | Failed-scan retry backoff     | up to 30 seconds     |
 | Discovery baseline            | 512 normalized paths |
+| Runtime-owned mutations       | 64 in flight         |
 
 The subscription is latest-value state, not an event queue: a slow consumer may
 skip intermediate generations but receives the newest snapshot. Subscriptions
@@ -136,8 +140,12 @@ The same authority boundary covers every worktree-bearing owner mutation:
 - `worktree.createManaged` accepts project/ref intent and ordinary thread
   defaults; the server resolves the project root, chooses the checkout path,
   performs Git creation, and persists the workspace owner. Its private rollback
-  can remove only the exact just-created registered nonprimary checkout when
-  owner persistence fails; it is not a public raw-path primitive.
+  carries the exact path and actual branch returned by Git, including an
+  automatically suffixed branch, and removes only state created by that
+  operation when owner persistence fails. It is not a public raw-path
+  primitive. Pull-request worktree creation resolves the PR first, then uses
+  this same atomic owner-creation RPC; the legacy PR preparation RPC is
+  local-checkout-only.
 - `worktree.createPanel` accepts a host thread and derives project, kind,
   branch, and path from that persisted host.
 - `worktree.retarget` accepts an opaque worktree key and expected generation;
@@ -234,6 +242,14 @@ guard, and quiesce/removal ownership until a durable terminal result exists.
 WebSocket interruption or socket closure stops only the caller's wait at that
 point. Runtime shutdown stops accepting new catalog operations and drains these
 owners before catalog and process teardown.
+
+The operation runtime admits at most 64 server-owned mutation lifetimes with a
+non-waiting semaphore acquisition before spawn. Saturation returns the
+structured retryable `WorktreeOperationError` with reason
+`operation-capacity`; shutdown returns `operation-shutting-down`. The permit is
+owned through the terminal operation result, is released on completion, and
+shutdown closes admission before draining every accepted task. There is no
+unbounded waiter queue.
 
 ## Protocol, capability, and operations
 

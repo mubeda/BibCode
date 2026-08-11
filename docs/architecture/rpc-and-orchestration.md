@@ -141,8 +141,11 @@ server resolves the persisted project root, lets the Git owner select the
 managed checkout path, and then hands an internal workspace-thread creation to
 orchestration. If owner persistence fails after Git creation, a private
 rollback verifies and removes only that exact just-created registered
-nonprimary checkout and any branch created by this request; the rollback is not
-registered as a public RPC.
+nonprimary checkout and the actual branch reported as newly created by Git,
+including an automatically suffixed branch; the rollback is not registered as
+a public RPC. Public `vcs.createWorktree` is also absent. Pull-request worktree
+mode resolves the PR branch and then invokes this same atomic owner-creation
+boundary, while `git.preparePullRequestThread` remains local-checkout-only.
 
 `worktree.createPanel` accepts only a persisted host thread plus new panel
 identity/title/defaults. The server re-reads the host under its mutation lock
@@ -188,7 +191,8 @@ server physical identity for create, metadata retarget, adoption, restart, and
 replay. Present paths use filesystem canonicalization; a missing leaf uses its
 canonical nearest existing ancestor plus normalized suffix. POSIX comparison
 remains case-sensitive, while Windows drive and UNC keys normalize separators
-and use Unicode-aware lowercase comparison. Symlink, macOS alias, lexical, and
+and use native invariant uppercase mapping compatible with Windows ordinal
+caseless identity. Symlink, macOS alias, lexical, non-ASCII special-fold, and
 missing-leaf spellings therefore cannot create a second owner. Resolved
 adoption and branch reconciliation command variants are rejected by
 `orchestration.dispatchCommand` even though trusted server services may admit
@@ -261,6 +265,14 @@ accepting these operations and drains their tasks, then shuts down catalog and
 process owners. This is the lifecycle boundary tested by post-enqueue
 WebSocket-interrupt and socket-close races.
 
+The catalog-operation runtime has one named global bound of 64 in-flight
+server-owned lifetimes. It performs non-waiting admission before spawning, so
+there is no unbounded waiter queue. Saturation and closed shutdown admission are
+typed `WorktreeOperationError` results (`operation-capacity` and
+`operation-shutting-down`). Each accepted task owns its permit through the
+terminal result; completion releases capacity and shutdown closes admission
+before draining all accepted tasks.
+
 With that claim held, an already-accepted retry is replayed first. Every new
 removal must then acquire one finite runtime-cleanup lifetime slot before receipt
 reservation, `Removing`, quiesce, Git, or detach; saturation returns the retryable
@@ -302,8 +314,9 @@ by physical host identity. Present paths canonicalize through the filesystem;
 missing leaves resolve the nearest existing ancestor and append their normalized
 suffix. The same key strategy covers Git/catalog joins, owner create/delete/
 retarget/adopt/detach, availability, project-root mutations, removal, and
-cross-project cleanup. Windows drive and UNC keys use Unicode-aware lowercase
-comparison; POSIX keys remain case-sensitive. Mutations acquire deterministically
+cross-project cleanup. Windows drive and UNC keys use native invariant
+uppercase mapping compatible with Windows ordinal caseless identity; POSIX keys
+remain case-sensitive. Mutations acquire deterministically
 ordered keys before worker enqueue. Generic public creation cannot nominate a
 kind or path; trusted resolved commands still acquire every affected physical
 owner key. Removal discovers a server-owned candidate key, acquires it, reruns
@@ -326,7 +339,8 @@ Successful dedicated managed creation records the exact server-created physical
 path for bounded suppression and invalidates its project catalog; dedicated
 verified removal invalidates every matching live view of the durably pinned
 repository. The public raw-path `vcs.removeWorktree` method is not registered,
-typed, scoped, or bridged. The only rollback removal is a private server call
+typed, scoped, or bridged; the same is true of raw `vcs.createWorktree`. The
+only rollback removal is a private server call
 for the exact just-created registered checkout when managed owner persistence
 fails. Pin mismatches and unverifiable identities fail observation closed.
 Observation failure never changes a successful Git response into a failure.
@@ -363,6 +377,11 @@ therefore cover the workspace root and descendants across present and missing
 symlink/macOS/lexical aliases. The public failure is the structured
 `WorkspaceUnavailableError`, including the thread ID, last-known path, and
 catalog availability.
+If physical identity resolution returns anything other than `NotFound`, the
+registry returns typed `WorkspaceIdentityError` and aborts guard admission,
+loss/removal installation, recovery, or snapshot reconciliation without
+changing existing authority. Only a genuinely missing suffix is resolved
+through its nearest existing ancestor.
 
 Only a healthy authoritative catalog snapshot may change this state. Catalog
 reconciliation synchronously closes every superseded terminal-signal gate, then
@@ -379,7 +398,8 @@ an active removal guard takes precedence over catalog loss and recovery.
 
 Missing-path identity also collapses duplicate separators plus lexical `.` and
 `..` components without escaping POSIX roots, Windows drive roots, or UNC share
-roots; Windows comparison lowercases Unicode components rather than ASCII only.
+roots; Windows comparison uses native invariant uppercase mapping compatible
+with ordinal caseless comparison rather than ASCII or Unicode lowercase.
 Public work admission takes a path-scoped lease after resolving the durable
 thread projection. This includes panel threads that do not appear in the
 workspace catalog: their persisted worktree path, or their project root when
