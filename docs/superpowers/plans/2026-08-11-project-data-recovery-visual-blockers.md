@@ -12,7 +12,7 @@
 
 - Do not infer recovery from HTTP status codes or error-message text.
 - Do not accept renderer filesystem paths, storage IDs, credentials, or raw errors in the invalidation event.
-- Do not add T4Code discovery, migration, compatibility, or aliases.
+- Do not add predecessor-product discovery, migration, compatibility, or aliases.
 - Do not automatically adopt, merge, delete, or replace a store.
 - Keep remote bearer, relay, and SSH environments outside privileged local recovery.
 - Preserve the existing browser confirmation fallback and Rust fail-closed database behavior.
