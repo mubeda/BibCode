@@ -1110,16 +1110,17 @@ fn operation_error(
 
 #[cfg(test)]
 mod tests {
-    use std::{path::Path, process::Command};
+    use std::{ffi::OsString, path::Path, time::Duration};
 
     use base64::Engine;
-    use tempfile::TempDir;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
         sync::oneshot,
         task::JoinHandle,
     };
+
+    use crate::test_support::TestSandbox;
 
     use super::*;
 
@@ -1312,40 +1313,67 @@ mod tests {
     }
 
     #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn provider_cli_fixtures_are_instance_owned_in_parallel() {
+        async fn resolve(label: &str) -> ResolvedPullRequest {
+            let sandbox = TestSandbox::new(label);
+            let command = sandbox.executable_script(
+                "gh",
+                &format!("printf '%s\\n' '{{\"number\":42,\"title\":\"{label}\",\"url\":\"https://example.test/42\",\"baseRefName\":\"main\",\"headRefName\":\"feature\",\"state\":\"OPEN\"}}'"),
+                "",
+            );
+            PullRequestService::with_provider_commands(
+                command.to_string_lossy(),
+                "unused-glab",
+                "unused-az",
+            )
+            .resolve_current(
+                ResolvePullRequestInput {
+                    cwd: sandbox.root().to_path_buf(),
+                    provider: ProviderKind::Github,
+                    reference: "feature".to_owned(),
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .expect("resolve fixture PR")
+        }
+
+        let (left, right) = tokio::join!(resolve("left"), resolve("right"));
+        assert_eq!(left.title, "left");
+        assert_eq!(right.title, "right");
+    }
+
+    #[cfg(unix)]
     #[tokio::test]
     async fn provider_cli_flows_cover_github_gitlab_and_azure_resolution_and_creation() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let temporary = tempfile::tempdir().expect("provider CLI directory");
+        let sandbox = TestSandbox::new("provider-cli");
         let script = r#"#!/bin/sh
 case "$(basename "$0"):$*" in
-  gh:*create*) printf '%s\n' 'https://github.com/example/repo/pull/42' ;;
-  gh:*) printf '%s\n' '{"number":42,"title":"GitHub PR","url":"https://github.test/42","baseRefName":"main","headRefName":"feature","state":"OPEN"}' ;;
-  glab:*) printf '%s\n' '{"iid":43,"title":"GitLab MR","web_url":"https://gitlab.test/43","target_branch":"main","source_branch":"feature","state":"opened"}' ;;
-  az:*list*) printf '%s\n' '[{"pullRequestId":44,"title":"Azure PR","url":"https://azure.test/44","targetRefName":"refs/heads/main","sourceRefName":"refs/heads/feature","status":"active"}]' ;;
-  az:*) printf '%s\n' '{"pullRequestId":44,"title":"Azure PR","url":"https://azure.test/44","targetRefName":"refs/heads/main","sourceRefName":"refs/heads/feature","status":"active"}' ;;
+  gh.sh:*create*) printf '%s\n' 'https://github.com/example/repo/pull/42' ;;
+  gh.sh:*) printf '%s\n' '{"number":42,"title":"GitHub PR","url":"https://github.test/42","baseRefName":"main","headRefName":"feature","state":"OPEN"}' ;;
+  glab.sh:*) printf '%s\n' '{"iid":43,"title":"GitLab MR","web_url":"https://gitlab.test/43","target_branch":"main","source_branch":"feature","state":"opened"}' ;;
+  az.sh:*list*) printf '%s\n' '[{"pullRequestId":44,"title":"Azure PR","url":"https://azure.test/44","targetRefName":"refs/heads/main","sourceRefName":"refs/heads/feature","status":"active"}]' ;;
+  az.sh:*) printf '%s\n' '{"pullRequestId":44,"title":"Azure PR","url":"https://azure.test/44","targetRefName":"refs/heads/main","sourceRefName":"refs/heads/feature","status":"active"}' ;;
 esac
 "#;
-        for command in ["gh", "glab", "az"] {
-            let path = temporary.path().join(command);
-            std::fs::write(&path, script).expect("provider fixture should write");
-            let mut permissions = std::fs::metadata(&path).unwrap().permissions();
-            permissions.set_mode(0o755);
-            std::fs::set_permissions(path, permissions).unwrap();
-        }
-        let service = PullRequestService {
-            github_command: temporary.path().join("gh").to_string_lossy().into_owned(),
-            gitlab_command: temporary.path().join("glab").to_string_lossy().into_owned(),
-            azure_command: temporary.path().join("az").to_string_lossy().into_owned(),
-            ..PullRequestService::default()
-        };
+        let service = PullRequestService::with_provider_commands(
+            sandbox
+                .executable_script("gh", script, "")
+                .to_string_lossy(),
+            sandbox
+                .executable_script("glab", script, "")
+                .to_string_lossy(),
+            sandbox
+                .executable_script("az", script, "")
+                .to_string_lossy(),
+        );
         let cancellation = CancellationToken::new();
 
         let current = service
             .resolve_current(
                 ResolvePullRequestInput {
-                    cwd: temporary.path().to_path_buf(),
+                    cwd: sandbox.root().to_path_buf(),
                     provider: ProviderKind::AzureDevops,
                     reference: "feature".to_owned(),
                 },
@@ -1359,7 +1387,7 @@ esac
             let current = service
                 .resolve_current(
                     ResolvePullRequestInput {
-                        cwd: temporary.path().to_path_buf(),
+                        cwd: sandbox.root().to_path_buf(),
                         provider,
                         reference: "feature".to_owned(),
                     },
@@ -1378,7 +1406,7 @@ esac
             let resolved = service
                 .resolve(
                     ResolvePullRequestInput {
-                        cwd: temporary.path().to_path_buf(),
+                        cwd: sandbox.root().to_path_buf(),
                         provider,
                         reference: expected.to_string(),
                     },
@@ -1391,7 +1419,7 @@ esac
             let created = service
                 .create(
                     CreatePullRequestInput {
-                        cwd: temporary.path().to_path_buf(),
+                        cwd: sandbox.root().to_path_buf(),
                         provider,
                         base_branch: "main".to_owned(),
                         head_branch: "feature".to_owned(),
@@ -1408,18 +1436,17 @@ esac
 
     #[tokio::test]
     async fn provider_cli_flows_report_spawn_exit_and_payload_failures() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let temporary = tempfile::tempdir().expect("provider CLI directory");
+        let sandbox = TestSandbox::new("provider-cli-errors");
         let cancellation = CancellationToken::new();
-        let missing = temporary
-            .path()
+        let missing = sandbox
+            .root()
             .join("missing")
             .to_string_lossy()
             .into_owned();
         let missing_service =
             PullRequestService::with_provider_commands(missing.clone(), missing.clone(), missing);
         let resolve_input = |provider| ResolvePullRequestInput {
-            cwd: temporary.path().to_path_buf(),
+            cwd: sandbox.root().to_path_buf(),
             provider,
             reference: "feature".to_owned(),
         };
@@ -1433,7 +1460,7 @@ esac
         );
 
         let failed = provider_failure_fixture(
-            temporary.path(),
+            sandbox.root(),
             "failed",
             "#!/bin/sh\nexit 7\n",
             "@echo off\r\nexit /b 7\r\n",
@@ -1454,7 +1481,7 @@ esac
         );
 
         let invalid = provider_failure_fixture(
-            temporary.path(),
+            sandbox.root(),
             "invalid",
             "#!/bin/sh\nprintf invalid\n",
             "@echo off\r\necho invalid\r\n",
@@ -1485,7 +1512,7 @@ esac
             invalid_service
                 .create(
                     CreatePullRequestInput {
-                        cwd: temporary.path().to_path_buf(),
+                        cwd: sandbox.root().to_path_buf(),
                         provider: ProviderKind::Github,
                         base_branch: "main".to_owned(),
                         head_branch: "feature".to_owned(),
@@ -1525,9 +1552,8 @@ esac
         }
     }
 
-    async fn bitbucket_repository() -> TempDir {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let repository = tempfile::tempdir().expect("temporary repository");
+    async fn bitbucket_repository() -> TestSandbox {
+        let sandbox = TestSandbox::new("bitbucket-repository");
         for args in [
             vec!["init"],
             vec![
@@ -1537,18 +1563,31 @@ esac
                 "https://bitbucket.org/example/native-source-control.git",
             ],
         ] {
-            let output = Command::new("git")
-                .args(args)
-                .current_dir(repository.path())
-                .output()
-                .expect("run git fixture command");
-            assert!(
-                output.status.success(),
-                "git fixture command failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            ProcessRunner
+                .run(
+                    ProcessRequest {
+                        operation: "test.bitbucketRepository.git".to_owned(),
+                        command: PathBuf::from("git"),
+                        args: args.into_iter().map(OsString::from).collect(),
+                        cwd: sandbox.root().to_path_buf(),
+                        env: sandbox
+                            .environment([("GIT_CONFIG_NOSYSTEM", "1")])
+                            .into_iter()
+                            .map(|(key, value)| (key.into(), value.into()))
+                            .collect(),
+                        stdin: None,
+                        timeout: Duration::from_secs(30),
+                        max_output_bytes: 8_000,
+                        output_policy: OutputPolicy::Error,
+                        append_truncation_marker: false,
+                        allow_non_zero_exit: false,
+                    },
+                    &CancellationToken::new(),
+                )
+                .await
+                .expect("run Git fixture command");
         }
-        repository
+        sandbox
     }
 
     #[test]
@@ -1635,7 +1674,7 @@ esac
         let pull_request = service
             .resolve(
                 ResolvePullRequestInput {
-                    cwd: repository.path().to_path_buf(),
+                    cwd: repository.root().to_path_buf(),
                     provider: ProviderKind::Bitbucket,
                     reference: "feature/native".into(),
                 },
@@ -1682,7 +1721,7 @@ esac
         let error = service
             .resolve_current(
                 ResolvePullRequestInput {
-                    cwd: repository.path().to_path_buf(),
+                    cwd: repository.root().to_path_buf(),
                     provider: ProviderKind::Bitbucket,
                     reference: "feature/native".into(),
                 },
@@ -1719,7 +1758,7 @@ esac
         let error = service
             .resolve_current(
                 ResolvePullRequestInput {
-                    cwd: repository.path().to_path_buf(),
+                    cwd: repository.root().to_path_buf(),
                     provider: ProviderKind::Bitbucket,
                     reference: "feature/native".into(),
                 },
@@ -1779,7 +1818,7 @@ esac
             let pull_request = service
                 .resolve(
                     ResolvePullRequestInput {
-                        cwd: repository.path().to_path_buf(),
+                        cwd: repository.root().to_path_buf(),
                         provider: ProviderKind::Bitbucket,
                         reference: reference.into(),
                     },
@@ -1822,7 +1861,7 @@ esac
             let pull_request = service
                 .resolve_current(
                     ResolvePullRequestInput {
-                        cwd: repository.path().to_path_buf(),
+                        cwd: repository.root().to_path_buf(),
                         provider: ProviderKind::Bitbucket,
                         reference: branch.into(),
                     },
@@ -1873,7 +1912,7 @@ esac
         let pull_request = service
             .create(
                 CreatePullRequestInput {
-                    cwd: repository.path().to_path_buf(),
+                    cwd: repository.root().to_path_buf(),
                     provider: ProviderKind::Bitbucket,
                     base_branch: "release".into(),
                     head_branch: "feature/create".into(),
@@ -1919,7 +1958,7 @@ esac
         );
         let cancellation = CancellationToken::new();
         let request_cancellation = cancellation.clone();
-        let cwd = repository.path().to_path_buf();
+        let cwd = repository.root().to_path_buf();
         let request_task = tokio::spawn(async move {
             service
                 .resolve(
@@ -2003,7 +2042,7 @@ esac
         let error = bitbucket_service("http://127.0.0.1:1/2.0", None)
             .resolve(
                 ResolvePullRequestInput {
-                    cwd: repository.path().to_path_buf(),
+                    cwd: repository.root().to_path_buf(),
                     provider: ProviderKind::Bitbucket,
                     reference: "5".into(),
                 },
@@ -2021,7 +2060,7 @@ esac
         )
         .resolve(
             ResolvePullRequestInput {
-                cwd: repository.path().to_path_buf(),
+                cwd: repository.root().to_path_buf(),
                 provider: ProviderKind::Bitbucket,
                 reference: "6".into(),
             },
@@ -2040,7 +2079,7 @@ esac
         )
         .resolve(
             ResolvePullRequestInput {
-                cwd: repository.path().to_path_buf(),
+                cwd: repository.root().to_path_buf(),
                 provider: ProviderKind::Bitbucket,
                 reference: "7".into(),
             },

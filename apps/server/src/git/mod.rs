@@ -13,6 +13,8 @@ pub use parser::{
     PorcelainRecord, parse_numstat, parse_porcelain_v2_line, resolve_numstat_new_path,
 };
 pub use process::{OutputPolicy, ProcessError, ProcessOutput, ProcessRequest, ProcessRunner};
+#[cfg(test)]
+pub(crate) use repository::{BoxGitProcessFuture, GitProcessRunner};
 pub use repository::{
     BoxWorktreeBaseDirectoryFuture, GitRepository, WorktreeBaseDirectoryProvider,
 };
