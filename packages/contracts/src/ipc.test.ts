@@ -4,6 +4,8 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   ContextMenuItemSchema,
   type DesktopBridge,
+  DesktopProjectDataEnvironmentStatusSchema,
+  DesktopProjectDataRecoveryResultSchema,
   type DesktopUpdateState,
   DesktopEnvironmentBootstrapSchema,
   DesktopUpdateStateSchema,
@@ -16,6 +18,89 @@ const decodeDesktopEnvironmentBootstrap = Schema.decodeUnknownSync(
   DesktopEnvironmentBootstrapSchema,
 );
 const decodeDesktopUpdateState = Schema.decodeUnknownSync(DesktopUpdateStateSchema);
+const decodeProjectDataStatus = Schema.decodeUnknownSync(DesktopProjectDataEnvironmentStatusSchema);
+const decodeProjectDataRecoveryResult = Schema.decodeUnknownSync(
+  DesktopProjectDataRecoveryResultSchema,
+);
+
+describe("Desktop project-data recovery contract", () => {
+  it("decodes redacted environment-specific status and verified backups", () => {
+    expect(
+      decodeProjectDataStatus({
+        environmentId: "wsl:Ubuntu",
+        label: "WSL (Ubuntu)",
+        runningDistro: "Ubuntu",
+        status: "recovery-required",
+        requestedRoot: "/home/user/.bibcode",
+        effectiveRoot: "/home/user/.bibcode",
+        isFilesystemAlias: false,
+        storageInstanceId: "b102f72a-c63b-4801-8f14-fba7a16856b8",
+        issue: "The database is missing while its storage marker remains.",
+        backups: [
+          {
+            backupId: "26b6ca53-27d3-401a-b51f-d7bdf534081f",
+            createdAt: "2026-08-10T12:30:00Z",
+            trigger: "pre-update",
+            appVersion: "0.3.10",
+            schemaVersion: 38,
+            sizeBytes: 1024,
+          },
+        ],
+      }),
+    ).toMatchObject({
+      environmentId: "wsl:Ubuntu",
+      status: "recovery-required",
+      backups: [{ trigger: "pre-update", sizeBytes: 1024 }],
+    });
+  });
+
+  it("keeps a committed recovery distinct from a restart failure", () => {
+    expect(
+      decodeProjectDataRecoveryResult({
+        environmentId: "primary",
+        action: "restore",
+        committed: true,
+        preservedDirectory: "/Users/user/.bibcode/recovery/userdata/operation",
+        storageInstanceId: "b102f72a-c63b-4801-8f14-fba7a16856b8",
+        restartError: "The backend could not restart.",
+      }),
+    ).toMatchObject({ committed: true, restartError: "The backend could not restart." });
+  });
+
+  it("exposes only environment and backup identifiers to privileged mutations", async () => {
+    const bridge: Pick<
+      DesktopBridge,
+      "restoreProjectData" | "startEmptyProjectData" | "retryProjectData"
+    > = {
+      restoreProjectData: async (environmentId, backupId) => ({
+        environmentId,
+        action: "restore",
+        committed: true,
+        preservedDirectory: "preserved",
+        storageInstanceId: backupId,
+        restartError: null,
+      }),
+      startEmptyProjectData: async (environmentId) => ({
+        environmentId,
+        action: "start-empty",
+        committed: true,
+        preservedDirectory: "preserved",
+        storageInstanceId: null,
+        restartError: null,
+      }),
+      retryProjectData: async () => undefined,
+    };
+
+    await expect(bridge.restoreProjectData!("primary", "backup-id")).resolves.toMatchObject({
+      environmentId: "primary",
+      action: "restore",
+    });
+    await expect(bridge.startEmptyProjectData!("primary")).resolves.toMatchObject({
+      action: "start-empty",
+    });
+    await expect(bridge.retryProjectData!("primary")).resolves.toBeUndefined();
+  });
+});
 
 const legacyUpdateState = {
   enabled: true,

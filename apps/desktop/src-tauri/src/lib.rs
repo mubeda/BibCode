@@ -7,6 +7,12 @@ macro_rules! desktop_bridge_commands {
             desktop_bridge_get_bridge_metadata,
             desktop_bridge_get_app_branding,
             desktop_bridge_get_local_environment_bootstraps,
+            desktop_bridge_get_project_data_statuses,
+            desktop_bridge_restore_project_data,
+            desktop_bridge_start_empty_project_data,
+            desktop_bridge_retry_project_data,
+            desktop_bridge_open_project_data_path,
+            desktop_bridge_export_project_data_diagnostics,
             desktop_bridge_get_client_settings,
             desktop_bridge_set_client_settings,
             desktop_bridge_get_connection_catalog,
@@ -120,6 +126,12 @@ pub fn run() {
         bridge::desktop_bridge_get_bridge_metadata,
         bridge::desktop_bridge_get_app_branding,
         bridge::desktop_bridge_get_local_environment_bootstraps,
+        bridge::desktop_bridge_get_project_data_statuses,
+        bridge::desktop_bridge_restore_project_data,
+        bridge::desktop_bridge_start_empty_project_data,
+        bridge::desktop_bridge_retry_project_data,
+        bridge::desktop_bridge_open_project_data_path,
+        bridge::desktop_bridge_export_project_data_diagnostics,
         bridge::desktop_bridge_get_client_settings,
         bridge::desktop_bridge_set_client_settings,
         bridge::desktop_bridge_get_connection_catalog,
@@ -215,6 +227,7 @@ mod backend;
 mod bridge;
 mod config;
 mod context_menu;
+mod data_safety;
 mod preview;
 mod security;
 mod shell_environment;

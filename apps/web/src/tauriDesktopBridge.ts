@@ -488,6 +488,18 @@ function createTauriDesktopBridge(
         writeBrowserClientSettings(settings),
       ),
     ...connectionCatalog,
+    getProjectDataStatuses: () =>
+      tauriInvokeDesktop("desktop_bridge_get_project_data_statuses", undefined),
+    restoreProjectData: (environmentId, backupId) =>
+      tauriInvokeDesktop("desktop_bridge_restore_project_data", { environmentId, backupId }),
+    startEmptyProjectData: (environmentId) =>
+      tauriInvokeDesktop("desktop_bridge_start_empty_project_data", { environmentId }),
+    retryProjectData: (environmentId) =>
+      tauriInvokeDesktop("desktop_bridge_retry_project_data", { environmentId }),
+    openProjectDataPath: (environmentId) =>
+      tauriInvokeDesktop("desktop_bridge_open_project_data_path", { environmentId }),
+    exportProjectDataDiagnostics: (environmentId) =>
+      tauriInvokeDesktop("desktop_bridge_export_project_data_diagnostics", { environmentId }),
     discoverSshHosts: () => tauriInvokeOr("desktop_bridge_discover_ssh_hosts", undefined, () => []),
     ensureSshEnvironment: (target, options) =>
       tauriInvokeDesktop("desktop_bridge_ensure_ssh_environment", { target, options }),

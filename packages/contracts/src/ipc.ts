@@ -211,6 +211,74 @@ export const DesktopUpdateProtectionSchema = Schema.Struct({
   status: Schema.Literals(["pending", "protected", "failed", "excluded"]),
   message: Schema.NullOr(Schema.String),
 });
+
+export type DesktopProjectDataStatus =
+  | "healthy"
+  | "storage-changed"
+  | "recovery-required"
+  | "unavailable";
+
+export interface DesktopProjectDataBackup {
+  backupId: string;
+  createdAt: string;
+  trigger: "pre-migration" | "pre-update";
+  appVersion: string;
+  schemaVersion: number;
+  sizeBytes: number;
+}
+
+export const DesktopProjectDataBackupSchema = Schema.Struct({
+  backupId: Schema.String,
+  createdAt: Schema.String,
+  trigger: Schema.Literals(["pre-migration", "pre-update"]),
+  appVersion: Schema.String,
+  schemaVersion: Schema.Number,
+  sizeBytes: Schema.Number,
+});
+
+export interface DesktopProjectDataEnvironmentStatus {
+  environmentId: string;
+  label: string;
+  runningDistro: string | null;
+  status: DesktopProjectDataStatus;
+  requestedRoot: string;
+  effectiveRoot: string;
+  isFilesystemAlias: boolean;
+  storageInstanceId: string | null;
+  issue: string | null;
+  backups: ReadonlyArray<DesktopProjectDataBackup>;
+}
+
+export const DesktopProjectDataEnvironmentStatusSchema = Schema.Struct({
+  environmentId: Schema.String,
+  label: Schema.String,
+  runningDistro: Schema.NullOr(Schema.String),
+  status: Schema.Literals(["healthy", "storage-changed", "recovery-required", "unavailable"]),
+  requestedRoot: Schema.String,
+  effectiveRoot: Schema.String,
+  isFilesystemAlias: Schema.Boolean,
+  storageInstanceId: Schema.NullOr(Schema.String),
+  issue: Schema.NullOr(Schema.String),
+  backups: Schema.Array(DesktopProjectDataBackupSchema),
+});
+
+export interface DesktopProjectDataRecoveryResult {
+  environmentId: string;
+  action: "restore" | "start-empty";
+  committed: boolean;
+  preservedDirectory: string;
+  storageInstanceId: string | null;
+  restartError: string | null;
+}
+
+export const DesktopProjectDataRecoveryResultSchema = Schema.Struct({
+  environmentId: Schema.String,
+  action: Schema.Literals(["restore", "start-empty"]),
+  committed: Schema.Boolean,
+  preservedDirectory: Schema.String,
+  storageInstanceId: Schema.NullOr(Schema.String),
+  restartError: Schema.NullOr(Schema.String),
+});
 export const DesktopRuntimeArchSchema = Schema.Literals(["arm64", "x64", "other"]);
 export const DesktopThemeSchema = Schema.Literals(["light", "dark", "system"]);
 export const DesktopAppStageLabelSchema = Schema.Literals(["Dev", "Latest", "Nightly"]);
@@ -1100,6 +1168,15 @@ export interface DesktopBridge {
   ) => Promise<boolean>;
   compareConnectionCatalog?: (expectedCatalog: string | null) => Promise<boolean>;
   clearConnectionCatalog?: () => Promise<void>;
+  getProjectDataStatuses?: () => Promise<readonly DesktopProjectDataEnvironmentStatus[]>;
+  restoreProjectData?: (
+    environmentId: string,
+    backupId: string,
+  ) => Promise<DesktopProjectDataRecoveryResult>;
+  startEmptyProjectData?: (environmentId: string) => Promise<DesktopProjectDataRecoveryResult>;
+  retryProjectData?: (environmentId: string) => Promise<void>;
+  openProjectDataPath?: (environmentId: string) => Promise<void>;
+  exportProjectDataDiagnostics?: (environmentId: string) => Promise<string | null>;
   discoverSshHosts: () => Promise<readonly DesktopDiscoveredSshHost[]>;
   ensureSshEnvironment: (
     target: DesktopSshEnvironmentTarget,

@@ -2,7 +2,8 @@ use bibcode_server::process::configure_background_std_command;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    fs, io,
+    fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
     sync::Mutex,
@@ -21,6 +22,7 @@ use crate::context_menu::{
     ContextMenuPosition, NativeContextMenuManager, context_menu_request_from_values,
     context_menu_request_has_selectable_items, show_native_context_menu,
 };
+use crate::data_safety;
 use crate::security::{
     CONNECTION_CATALOG_PROTECTION_KIND, protect_string as protect_catalog_string,
     unprotect_string as unprotect_catalog_string,
@@ -931,6 +933,93 @@ pub fn desktop_bridge_get_local_environment_bootstraps(
     backend: State<'_, BackendSupervisor>,
 ) -> Vec<Value> {
     backend.local_environment_bootstraps()
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_get_project_data_statuses(
+    backend: State<'_, BackendSupervisor>,
+) -> Result<Value, String> {
+    serde_json::to_value(data_safety::get_project_data_statuses(backend.inner()).await?)
+        .map_err(|error| format!("Could not encode project-data status: {error}"))
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_restore_project_data(
+    backend: State<'_, BackendSupervisor>,
+    environment_id: String,
+    backup_id: String,
+) -> Result<Value, String> {
+    serde_json::to_value(
+        data_safety::restore_project_data(backend.inner(), &environment_id, &backup_id).await?,
+    )
+    .map_err(|error| format!("Could not encode project-data recovery: {error}"))
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_start_empty_project_data(
+    backend: State<'_, BackendSupervisor>,
+    environment_id: String,
+) -> Result<Value, String> {
+    serde_json::to_value(
+        data_safety::start_empty_project_data(backend.inner(), &environment_id).await?,
+    )
+    .map_err(|error| format!("Could not encode project-data recovery: {error}"))
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_retry_project_data(
+    backend: State<'_, BackendSupervisor>,
+    environment_id: String,
+) -> Result<(), String> {
+    data_safety::retry_project_data(backend.inner(), &environment_id).await
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_open_project_data_path(
+    app: AppHandle<DesktopRuntime>,
+    backend: State<'_, BackendSupervisor>,
+    environment_id: String,
+) -> Result<(), String> {
+    let root = data_safety::project_data_root(backend.inner(), &environment_id).await?;
+    app.opener()
+        .open_path(root, None::<&str>)
+        .map_err(|error| format!("Could not open the project-data folder: {error}"))
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_export_project_data_diagnostics(
+    app: AppHandle<DesktopRuntime>,
+    backend: State<'_, BackendSupervisor>,
+    environment_id: String,
+) -> Result<String, String> {
+    let diagnostics =
+        data_safety::project_data_diagnostics(backend.inner(), &environment_id).await?;
+    let directory = state_dir(&app)?.join("diagnostics");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Could not create the diagnostics directory: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("Could not protect the diagnostics directory: {error}"))?;
+    }
+    let path = directory.join(format!("project-data-{}.json", uuid::Uuid::new_v4()));
+    let bytes = serde_json::to_vec_pretty(&diagnostics)
+        .map_err(|error| format!("Could not encode project-data diagnostics: {error}"))?;
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|error| format!("Could not create project-data diagnostics: {error}"))?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("Could not write project-data diagnostics: {error}"))?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -2724,6 +2813,12 @@ mod tests {
                 desktop_bridge_get_bridge_metadata,
                 desktop_bridge_get_app_branding,
                 desktop_bridge_get_local_environment_bootstraps,
+                desktop_bridge_get_project_data_statuses,
+                desktop_bridge_restore_project_data,
+                desktop_bridge_start_empty_project_data,
+                desktop_bridge_retry_project_data,
+                desktop_bridge_open_project_data_path,
+                desktop_bridge_export_project_data_diagnostics,
                 desktop_bridge_get_client_settings,
                 desktop_bridge_set_client_settings,
                 desktop_bridge_get_connection_catalog,
@@ -2790,6 +2885,10 @@ mod tests {
         assert_eq!(metadata["host"], "tauri");
         assert_eq!(
             invoke("desktop_bridge_get_local_environment_bootstraps", json!({})).unwrap(),
+            json!([])
+        );
+        assert_eq!(
+            invoke("desktop_bridge_get_project_data_statuses", json!({})).unwrap(),
             json!([])
         );
         assert!(

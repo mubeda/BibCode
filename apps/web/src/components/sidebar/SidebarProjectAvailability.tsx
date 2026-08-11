@@ -9,6 +9,7 @@ export interface SidebarProjectAvailabilityProps {
   readonly onOpenSettings: () => void;
   readonly onViewDiagnostics: () => void;
   readonly onAdoptStorage: (environmentId: EnvironmentId) => void;
+  readonly onRecoverData?: ((environmentId: EnvironmentId) => void) | undefined;
 }
 
 function availabilityCopy(view: SidebarProjectAvailabilityView): string | null {
@@ -38,6 +39,7 @@ export function SidebarProjectAvailability({
   onOpenSettings,
   onViewDiagnostics,
   onAdoptStorage,
+  onRecoverData,
 }: SidebarProjectAvailabilityProps) {
   const copy = availabilityCopy(view);
   if (copy === null) {
@@ -65,6 +67,13 @@ export function SidebarProjectAvailability({
           {canActOnEnvironment ? (
             <Button size="xs" variant="ghost" onClick={() => onRetry(view.environmentId!)}>
               Retry
+            </Button>
+          ) : null}
+          {(view.kind === "storage-changed" || view.kind === "recovery-required") &&
+          canActOnEnvironment &&
+          onRecoverData ? (
+            <Button size="xs" variant="outline" onClick={() => onRecoverData(view.environmentId!)}>
+              Recover data
             </Button>
           ) : null}
           <Button size="xs" variant="ghost" onClick={onOpenSettings}>

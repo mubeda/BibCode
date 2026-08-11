@@ -163,6 +163,45 @@ journal or strict recovery-staging entry remains. A crash or cancellation after
 preservation therefore leaves recoverable files and an explicit incomplete
 operation instead of silently converting the root into a first-run store.
 
+## Desktop project-data recovery
+
+The desktop host exposes inspection and recovery only through privileged,
+desktop-only bridge commands. The renderer supplies an environment identifier
+and, for restore, a verified backup identifier; it never supplies a filesystem
+path, executable, distro command, or shell text. Rust resolves the selected
+environment from the authoritative backend launch plan before inspecting or
+mutating its store. Native environments call the server persistence library
+directly. A WSL plan records one validated absolute Linux data root when it is
+created, sends that exact root as `bibcodeHome` in the server bootstrap, and
+reuses it for recovery. This preserves an explicit WSL `BIBCODE_HOME`; recovery
+does not guess `$HOME/.bibcode`. WSL inspection and recovery invoke the bundled
+`bibcode storage inspect|restore|start-empty` CLI with an argument vector and a
+bounded output/time budget, never a shell command string.
+
+Inspection is read-only and happens before a backend is stopped. A selected
+restore generation must verify before the desktop enters its serialized
+project-data operation. The operation prevents concurrent update or backend
+start coordination, stops only the selected environment, commits the server's
+journaled restore or start-empty workflow, and restarts the exact registered
+launch plan only after a committed result. If restart fails, the result still
+reports the committed recovery and carries the separate restart error; a
+failed validation does not stop or restart the backend. The dialog's retry
+action starts that exact plan when it is stopped and then re-inspects it;
+retrying an already-running target is inert. Opening a store path and exporting
+redacted diagnostics also resolve the path inside Rust rather than accepting
+renderer-controlled paths.
+
+The recovery dialog opens automatically only for a recovery-required local
+desktop environment and remains available manually for a storage-identity
+change. Restore requires an explicit backup selection and confirmation.
+Start-empty has a separate confirmation which states that the prior store is
+preserved rather than deleted; after commit, adopting the replacement storage
+identity remains a distinct explicit action before connection retry. Remote
+environments cannot invoke this local privileged recovery surface. Existing
+T4Code files are neither scanned nor migrated: if they overlap a current root,
+the same current-store classifier and recovery rules apply without a
+compatibility alias or fallback.
+
 ## Runtime topology
 
 The desktop WebView loads the bundled `apps/web` build (`frontendDist`) or the

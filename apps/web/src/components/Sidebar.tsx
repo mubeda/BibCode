@@ -126,6 +126,7 @@ import { readLocalApi } from "../localApi";
 import { useComposerDraftStore } from "../composerDraftStore";
 import { useNewThreadHandler } from "../hooks/useHandleNewThread";
 import { useDesktopUpdateState } from "../state/desktopUpdate";
+import { projectDataSafetyStore } from "../state/projectDataSafety";
 
 import { useThreadActions } from "../hooks/useThreadActions";
 import { projectEnvironment } from "../state/projects";
@@ -3445,6 +3446,7 @@ interface SidebarProjectsContentProps {
   onOpenProjectSettings: () => void;
   onViewProjectDiagnostics: () => void;
   onAdoptProjectStorage: (environmentId: EnvironmentId) => void;
+  onRecoverProjectData?: ((environmentId: EnvironmentId) => void) | undefined;
 }
 
 const SidebarProjectsContent = memo(function SidebarProjectsContent(
@@ -3490,6 +3492,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
     onOpenProjectSettings,
     onViewProjectDiagnostics,
     onAdoptProjectStorage,
+    onRecoverProjectData,
   } = props;
 
   const handleProjectSortOrderChange = useCallback(
@@ -3680,6 +3683,7 @@ const SidebarProjectsContent = memo(function SidebarProjectsContent(
           onOpenSettings={onOpenProjectSettings}
           onViewDiagnostics={onViewProjectDiagnostics}
           onAdoptStorage={onAdoptProjectStorage}
+          onRecoverData={onRecoverProjectData}
         />
       </SidebarGroup>
     </SidebarContent>
@@ -3762,6 +3766,9 @@ export default function Sidebar() {
   const handleViewProjectDiagnostics = useCallback(() => {
     void navigate({ to: "/settings/diagnostics" });
   }, [navigate]);
+  const handleRecoverProjectData = useCallback((environmentId: EnvironmentId) => {
+    void projectDataSafetyStore.open(environmentId, "manual").catch(() => undefined);
+  }, []);
   const handleAdoptProjectStorage = useCallback(
     (environmentId: EnvironmentId) => {
       if (
@@ -3793,6 +3800,22 @@ export default function Sidebar() {
       new Set(
         environments
           .filter((environment) => isDesktopLocalConnectionTarget(environment.entry.target))
+          .map((environment) => environment.environmentId),
+      ),
+    [environments],
+  );
+  const projectDataRecoveryEnvironmentIds = useMemo(
+    () =>
+      new Set(
+        environments
+          .filter(
+            (environment) =>
+              isDesktopHost &&
+              typeof window !== "undefined" &&
+              window.desktopBridge?.getProjectDataStatuses !== undefined &&
+              (environment.entry.target._tag === "PrimaryConnectionTarget" ||
+                isDesktopLocalConnectionTarget(environment.entry.target)),
+          )
           .map((environment) => environment.environmentId),
       ),
     [environments],
@@ -4369,6 +4392,12 @@ export default function Sidebar() {
             onOpenProjectSettings={handleOpenProjectSettings}
             onViewProjectDiagnostics={handleViewProjectDiagnostics}
             onAdoptProjectStorage={handleAdoptProjectStorage}
+            onRecoverProjectData={
+              projectAvailability.environmentId !== null &&
+              projectDataRecoveryEnvironmentIds.has(projectAvailability.environmentId)
+                ? handleRecoverProjectData
+                : undefined
+            }
           />
 
           <SidebarSeparator />
