@@ -25,6 +25,65 @@ use super::{
     WorkspaceLossTransition, WorktreeCatalogService,
 };
 
+#[test]
+fn current_thread_runtime_drop_releases_a_live_catalog_subscription() {
+    let (completed_sender, completed_receiver) = std::sync::mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("current-thread runtime");
+        runtime.block_on(async {
+            let service = WorktreeCatalogService::with_dependencies(
+                Arc::new(FakeProjectionSource::new([project(
+                    "project-1",
+                    "/repo/main",
+                    [],
+                )])),
+                Arc::new(FakeInventorySource::new([inventory(
+                    "/repo/common",
+                    [record("/repo/main", true)],
+                )])),
+                Arc::new(FakeFileSystem::new([
+                    ("/repo/main", DirectoryProbeState::Present),
+                    ("/repo/common", DirectoryProbeState::Present),
+                ])),
+                CatalogServiceOptions::default(),
+            );
+            let subscription = service.subscribe("project-1").await.expect("subscription");
+            let (owned_sender, owned_receiver) = tokio::sync::oneshot::channel();
+            tokio::spawn(async move {
+                let _subscription = subscription;
+                let _ = owned_sender.send(());
+                std::future::pending::<()>().await;
+            });
+            owned_receiver.await.expect("subscription owner starts");
+        });
+        drop(runtime);
+        let _ = completed_sender.send(());
+    });
+
+    completed_receiver
+        .recv_timeout(Duration::from_secs(2))
+        .expect("runtime teardown releases the live catalog subscription");
+    worker.join().expect("runtime worker");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn shutdown_drains_a_lifecycle_task_aborted_before_its_first_poll() {
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([])),
+        Arc::new(FakeInventorySource::new([])),
+        Arc::new(FakeFileSystem::new([])),
+        CatalogServiceOptions::default(),
+    );
+    service.register_pending_lifecycle_task_for_test();
+
+    tokio::time::timeout(Duration::from_secs(2), service.shutdown())
+        .await
+        .expect("shutdown drains a lifecycle task that never started");
+}
+
 #[tokio::test]
 async fn authoritative_loss_installs_guard_before_the_quiesce_callback() {
     let filesystem = Arc::new(FakeFileSystem::new([

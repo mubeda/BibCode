@@ -728,8 +728,15 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
         .await
         .expect("close terminal metadata WebSocket");
     socket.close(None).await.expect("close WebSocket");
+    drop(terminal_output_socket);
+    drop(terminal_history_socket);
+    drop(terminal_metadata_socket);
+    drop(socket);
     handle.shutdown();
-    handle.join().await.expect("server joins");
+    timeout(Duration::from_secs(5), handle.join())
+        .await
+        .expect("server joins within five seconds")
+        .expect("server joins");
 }
 
 #[tokio::test]

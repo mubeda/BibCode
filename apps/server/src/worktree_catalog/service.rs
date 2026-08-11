@@ -198,7 +198,7 @@ struct Inner {
 struct LifecycleTasks {
     terminal: bool,
     next_id: u64,
-    active: HashMap<u64, AbortHandle>,
+    active: HashMap<u64, Option<AbortHandle>>,
 }
 
 #[cfg(test)]
@@ -529,31 +529,54 @@ impl WorktreeCatalogService {
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let mut lifecycle = lock(&self.inner.lifecycle_tasks);
-        if lifecycle.terminal {
-            return None;
-        }
-        let task_id = loop {
-            lifecycle.next_id = lifecycle.next_id.wrapping_add(1);
-            if !lifecycle.active.contains_key(&lifecycle.next_id) {
-                break lifecycle.next_id;
+        let task_id = {
+            let mut lifecycle = lock(&self.inner.lifecycle_tasks);
+            if lifecycle.terminal {
+                return None;
             }
+            let task_id = loop {
+                lifecycle.next_id = lifecycle.next_id.wrapping_add(1);
+                if !lifecycle.active.contains_key(&lifecycle.next_id) {
+                    break lifecycle.next_id;
+                }
+            };
+            lifecycle.active.insert(task_id, None);
+            task_id
         };
-        let task_guard = LifecycleTaskGuard {
-            inner: Arc::downgrade(&self.inner),
+        let task_inner = Arc::downgrade(&self.inner);
+        let (start_sender, start_receiver) = oneshot::channel();
+        let task = LifecycleTaskGuard {
+            inner: task_inner,
             task_id,
         };
-        let (start_sender, start_receiver) = oneshot::channel();
         let handle = tokio::spawn(async move {
-            let _task = task_guard;
+            let _task = task;
             if start_receiver.await.is_err() {
                 return;
             }
             future.await;
         });
-        lifecycle.active.insert(task_id, handle.abort_handle());
+        let abort_handle = handle.abort_handle();
+        {
+            let mut lifecycle = lock(&self.inner.lifecycle_tasks);
+            if lifecycle.terminal {
+                drop(lifecycle);
+                abort_handle.abort();
+                return None;
+            }
+            let Some(active) = lifecycle.active.get_mut(&task_id) else {
+                drop(lifecycle);
+                abort_handle.abort();
+                return None;
+            };
+            *active = Some(abort_handle.clone());
+        }
         let registered = register(handle);
-        let _ = start_sender.send(());
+        if start_sender.send(()).is_err() {
+            abort_handle.abort();
+            lock(&self.inner.lifecycle_tasks).active.remove(&task_id);
+            self.inner.lifecycle_tasks_changed.notify_waiters();
+        }
         Some(registered)
     }
 
@@ -1099,7 +1122,11 @@ impl WorktreeCatalogService {
             let mut lifecycle = lock(&self.inner.lifecycle_tasks);
             lifecycle.terminal = true;
             self.inner.shutdown.cancel();
-            lifecycle.active.values().cloned().collect::<Vec<_>>()
+            lifecycle
+                .active
+                .values()
+                .filter_map(Clone::clone)
+                .collect::<Vec<_>>()
         };
         for handle in abort_handles {
             handle.abort();
@@ -2532,6 +2559,11 @@ impl WorktreeCatalogService {
         while self.active_background_task_count_for_test() != 0 {
             tokio::task::yield_now().await;
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn register_pending_lifecycle_task_for_test(&self) {
+        let _ = self.register_lifecycle_task(std::future::pending(), drop);
     }
 
     #[cfg(test)]
