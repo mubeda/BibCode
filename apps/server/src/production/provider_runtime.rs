@@ -29,7 +29,6 @@ use crate::{
             ActivityInput, OrchestrationCommand, OrchestrationEngine, ProposedPlanInput,
             SessionInput,
         },
-        load_snapshot,
     },
     persistence::{ProviderSessionRuntime, Repositories},
     process::{
@@ -3387,27 +3386,49 @@ async fn project_provider_event(
         )
         .await?;
         dispatch_session_state(engine, launch, status, None, last_error).await?;
-        let has_assistant_content = if failed {
-            load_snapshot(&engine.repositories())
-                .await
-                .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
-                .messages
-                .iter()
-                .any(|message| message.message_id == assistant_message_id)
-        } else {
-            true
-        };
-        if has_assistant_content {
+        let messages = engine
+            .repositories()
+            .list_messages_by_thread(event.thread_id.clone())
+            .await
+            .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
+        for (index, message) in messages
+            .into_iter()
+            .filter(|message| {
+                message.thread_id == event.thread_id
+                    && message.turn_id.as_ref() == event.turn_id.as_ref()
+                    && message.role == "assistant"
+                    && message.is_streaming
+            })
+            .enumerate()
+        {
             engine
                 .dispatch(OrchestrationCommand::ThreadMessageAssistantComplete {
-                    command_id: format!("{command_id}:assistant-complete"),
+                    command_id: format!("{command_id}:assistant-complete:{index}"),
                     thread_id: event.thread_id.clone(),
-                    message_id: assistant_message_id.clone(),
+                    message_id: message.message_id,
                     turn_id: event.turn_id.clone(),
                     created_at: created_at.clone(),
                 })
                 .await
                 .map_err(|error| ProviderRuntimeError::Orchestration(error.to_string()))?;
+        }
+    }
+    if matches!(
+        event.event_type.as_str(),
+        "message.assistant.completed" | "assistant.message.completed"
+    ) {
+        let existing_message = engine
+            .repositories()
+            .get_message(assistant_message_id.clone())
+            .await
+            .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
+        if !existing_message.is_some_and(|message| {
+            message.thread_id == event.thread_id
+                && message.turn_id.as_ref() == event.turn_id.as_ref()
+                && message.role == "assistant"
+                && message.is_streaming
+        }) {
+            return Ok(());
         }
     }
     let command = match event.event_type.as_str() {
@@ -3432,12 +3453,7 @@ async fn project_provider_event(
             OrchestrationCommand::ThreadMessageAssistantComplete {
                 command_id,
                 thread_id: event.thread_id,
-                message_id: event
-                    .payload
-                    .get("messageId")
-                    .and_then(Value::as_str)
-                    .unwrap_or("assistant")
-                    .to_owned(),
+                message_id: assistant_message_id,
                 turn_id: event.turn_id,
                 created_at,
             }

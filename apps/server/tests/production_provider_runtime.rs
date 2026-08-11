@@ -8814,7 +8814,7 @@ async fn normalizes_provider_approval_events_into_orchestration_projection() {
 }
 
 #[tokio::test]
-async fn projects_content_and_completion_into_a_settled_assistant_turn() {
+async fn projects_distinct_provider_messages_and_settles_the_completed_turn() {
     let engine = engine().await;
     let state = Arc::new(StdMutex::new(DriverState::default()));
     let (events_tx, events_rx) = mpsc::channel(8);
@@ -8855,9 +8855,29 @@ async fn projects_content_and_completion_into_a_settled_assistant_turn() {
             event_type: "content.delta".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: Some("provider-turn-1".to_owned()),
-            item_id: None,
+            item_id: Some("commentary-1".to_owned()),
             request_id: None,
-            payload: json!({"streamKind":"assistant_text","delta":"CODEX_OK"}),
+            payload: json!({"streamKind":"assistant_text","delta":"First"}),
+            activity: Vec::new(),
+        },
+        ProviderEvent {
+            native_event_id: None,
+            event_type: "content.delta".to_owned(),
+            thread_id: "t1".to_owned(),
+            turn_id: Some("provider-turn-1".to_owned()),
+            item_id: Some("commentary-1".to_owned()),
+            request_id: None,
+            payload: json!({"streamKind":"assistant_text","delta":"."}),
+            activity: Vec::new(),
+        },
+        ProviderEvent {
+            native_event_id: None,
+            event_type: "content.delta".to_owned(),
+            thread_id: "t1".to_owned(),
+            turn_id: Some("provider-turn-1".to_owned()),
+            item_id: Some("final-1".to_owned()),
+            request_id: None,
+            payload: json!({"streamKind":"assistant_text","delta":"Second."}),
             activity: Vec::new(),
         },
         ProviderEvent {
@@ -8877,29 +8897,11 @@ async fn projects_content_and_completion_into_a_settled_assistant_turn() {
     tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
-            let assistant = snapshot
-                .messages
-                .iter()
-                .find(|message| message.thread_id == "t1" && message.role == "assistant");
-            let session = snapshot
-                .sessions
-                .iter()
-                .find(|session| session.thread_id == "t1");
-            let turn = snapshot.turns.iter().find(|turn| {
-                turn.thread_id == "t1" && turn.turn_id.as_deref() == Some("provider-turn-1")
-            });
-            let runtime = engine
-                .repositories()
-                .get_provider_session_runtime("t1".to_owned())
-                .await
-                .unwrap();
-            if assistant.is_some_and(|message| message.text == "CODEX_OK" && !message.is_streaming)
-                && session.is_some_and(|session| {
-                    session.status == "ready" && session.active_turn_id.is_none()
-                })
-                && turn.is_some_and(|turn| turn.state == "completed")
-                && runtime.is_some_and(|runtime| runtime.status == "ready")
-            {
+            if snapshot.activities.iter().any(|activity| {
+                activity.thread_id == "t1"
+                    && activity.summary == "turn.completed"
+                    && activity.payload["state"] == "completed"
+            }) {
                 break;
             }
             tokio::task::yield_now().await;
@@ -8907,7 +8909,386 @@ async fn projects_content_and_completion_into_a_settled_assistant_turn() {
     })
     .await
     .expect("provider completion must settle the projected turn");
+
+    let messages = engine
+        .repositories()
+        .list_messages_by_thread("t1".to_owned())
+        .await
+        .unwrap();
+    let assistant_messages = messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .map(|message| {
+            (
+                message.message_id.as_str(),
+                message.text.as_str(),
+                message.is_streaming,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        assistant_messages,
+        vec![
+            ("assistant:t1:item:commentary-1", "First.", false),
+            ("assistant:t1:item:final-1", "Second.", false),
+        ]
+    );
+    assert!(
+        messages
+            .iter()
+            .all(|message| message.text != "First.Second.")
+    );
     supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn unidentified_provider_chunks_share_one_settled_turn_message() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (events_tx, events_rx) = mpsc::channel(8);
+    let factory = Arc::new(FakeFactory {
+        state,
+        events: StdMutex::new(VecDeque::from([events_rx])),
+    });
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        factory,
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    supervisor.launch(launch()).await.unwrap();
+    let start = OrchestrationCommand::ThreadTurnStart {
+        command_id: "unidentified-turn".to_owned(),
+        thread_id: "t1".to_owned(),
+        message: ThreadMessageInput {
+            message_id: "m-unidentified".to_owned(),
+            role: "user".to_owned(),
+            text: "hello".to_owned(),
+            attachments: vec![],
+        },
+        model_selection: None,
+        title_seed: None,
+        runtime_mode: "full-access".to_owned(),
+        interaction_mode: "default".to_owned(),
+        bootstrap: None,
+        source_proposed_plan: None,
+        created_at: NOW.to_owned(),
+    };
+    engine.dispatch(start.clone()).await.unwrap();
+    supervisor.handle_orchestration(start).await.unwrap();
+
+    for event in [
+        ProviderEvent {
+            native_event_id: None,
+            event_type: "content.delta".to_owned(),
+            thread_id: "t1".to_owned(),
+            turn_id: Some("provider-turn-1".to_owned()),
+            item_id: None,
+            request_id: None,
+            payload: json!({"streamKind":"assistant_text","delta":"hello "}),
+            activity: Vec::new(),
+        },
+        ProviderEvent {
+            native_event_id: None,
+            event_type: "content.delta".to_owned(),
+            thread_id: "t1".to_owned(),
+            turn_id: Some("provider-turn-1".to_owned()),
+            item_id: None,
+            request_id: None,
+            payload: json!({"streamKind":"assistant_text","delta":"from cursor"}),
+            activity: Vec::new(),
+        },
+        ProviderEvent {
+            native_event_id: None,
+            event_type: "turn.completed".to_owned(),
+            thread_id: "t1".to_owned(),
+            turn_id: Some("provider-turn-1".to_owned()),
+            item_id: None,
+            request_id: None,
+            payload: json!({"state":"completed"}),
+            activity: Vec::new(),
+        },
+    ] {
+        events_tx.send(event).await.unwrap();
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
+            if snapshot.activities.iter().any(|activity| {
+                activity.thread_id == "t1"
+                    && activity.summary == "turn.completed"
+                    && activity.payload["state"] == "completed"
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("unidentified provider completion must reach terminal projection");
+
+    let messages = engine
+        .repositories()
+        .list_messages_by_thread("t1".to_owned())
+        .await
+        .unwrap();
+    let assistant_messages = messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .map(|message| {
+            (
+                message.message_id.as_str(),
+                message.text.as_str(),
+                message.is_streaming,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        assistant_messages,
+        vec![(
+            "assistant:t1:turn:provider-turn-1",
+            "hello from cursor",
+            false,
+        )]
+    );
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn completion_without_assistant_text_does_not_create_a_message() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (events_tx, events_rx) = mpsc::channel(8);
+    let factory = Arc::new(FakeFactory {
+        state,
+        events: StdMutex::new(VecDeque::from([events_rx])),
+    });
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        factory,
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    supervisor.launch(launch()).await.unwrap();
+    let start = OrchestrationCommand::ThreadTurnStart {
+        command_id: "empty-turn".to_owned(),
+        thread_id: "t1".to_owned(),
+        message: ThreadMessageInput {
+            message_id: "m-empty".to_owned(),
+            role: "user".to_owned(),
+            text: "hello".to_owned(),
+            attachments: vec![],
+        },
+        model_selection: None,
+        title_seed: None,
+        runtime_mode: "full-access".to_owned(),
+        interaction_mode: "default".to_owned(),
+        bootstrap: None,
+        source_proposed_plan: None,
+        created_at: NOW.to_owned(),
+    };
+    engine.dispatch(start.clone()).await.unwrap();
+    supervisor.handle_orchestration(start).await.unwrap();
+
+    for event in [
+        ProviderEvent {
+            native_event_id: None,
+            event_type: "message.assistant.completed".to_owned(),
+            thread_id: "t1".to_owned(),
+            turn_id: Some("provider-turn-1".to_owned()),
+            item_id: Some("empty-1".to_owned()),
+            request_id: None,
+            payload: json!({}),
+            activity: Vec::new(),
+        },
+        ProviderEvent {
+            native_event_id: None,
+            event_type: "turn.completed".to_owned(),
+            thread_id: "t1".to_owned(),
+            turn_id: Some("provider-turn-1".to_owned()),
+            item_id: None,
+            request_id: None,
+            payload: json!({"state":"completed"}),
+            activity: Vec::new(),
+        },
+    ] {
+        events_tx.send(event).await.unwrap();
+    }
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        loop {
+            let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
+            if snapshot.activities.iter().any(|activity| {
+                activity.thread_id == "t1"
+                    && activity.summary == "turn.completed"
+                    && activity.payload["state"] == "completed"
+            }) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("textless provider completion must reach terminal projection");
+
+    let messages = engine
+        .repositories()
+        .list_messages_by_thread("t1".to_owned())
+        .await
+        .unwrap();
+    let assistant_messages = messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .map(|message| {
+            (
+                message.message_id.as_str(),
+                message.text.as_str(),
+                message.is_streaming,
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(assistant_messages, Vec::<(&str, &str, bool)>::new());
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn failed_and_interrupted_turns_settle_existing_assistant_messages() {
+    let mut outcomes = Vec::new();
+
+    for terminal_state in ["failed", "interrupted"] {
+        let engine = engine().await;
+        let state = Arc::new(StdMutex::new(DriverState::default()));
+        let (events_tx, events_rx) = mpsc::channel(8);
+        let factory = Arc::new(FakeFactory {
+            state,
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        });
+        let supervisor = ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            factory,
+            activity_projection(&engine),
+            SupervisorOptions::default(),
+        );
+        supervisor.launch(launch()).await.unwrap();
+        let start = OrchestrationCommand::ThreadTurnStart {
+            command_id: format!("{terminal_state}-turn"),
+            thread_id: "t1".to_owned(),
+            message: ThreadMessageInput {
+                message_id: format!("m-{terminal_state}"),
+                role: "user".to_owned(),
+                text: "hello".to_owned(),
+                attachments: vec![],
+            },
+            model_selection: None,
+            title_seed: None,
+            runtime_mode: "full-access".to_owned(),
+            interaction_mode: "default".to_owned(),
+            bootstrap: None,
+            source_proposed_plan: None,
+            created_at: NOW.to_owned(),
+        };
+        engine.dispatch(start.clone()).await.unwrap();
+        supervisor.handle_orchestration(start).await.unwrap();
+
+        for event in [
+            ProviderEvent {
+                native_event_id: None,
+                event_type: "content.delta".to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: Some("provider-turn-1".to_owned()),
+                item_id: Some("partial-1".to_owned()),
+                request_id: None,
+                payload: json!({"streamKind":"assistant_text","delta":"Partial response"}),
+                activity: Vec::new(),
+            },
+            ProviderEvent {
+                native_event_id: None,
+                event_type: "turn.completed".to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: Some("provider-turn-1".to_owned()),
+                item_id: None,
+                request_id: None,
+                payload: if terminal_state == "failed" {
+                    json!({"state":"failed","error":{"message":"model unavailable"}})
+                } else {
+                    json!({"state":"interrupted"})
+                },
+                activity: Vec::new(),
+            },
+        ] {
+            events_tx.send(event).await.unwrap();
+        }
+
+        let snapshot = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
+                if snapshot.activities.iter().any(|activity| {
+                    activity.thread_id == "t1"
+                        && activity.summary == "turn.completed"
+                        && activity.payload["state"] == terminal_state
+                }) {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("provider terminal event must reach orchestration projection");
+
+        let messages = engine
+            .repositories()
+            .list_messages_by_thread("t1".to_owned())
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|message| message.role == "assistant")
+            .map(|message| (message.message_id, message.text, message.is_streaming))
+            .collect::<Vec<_>>();
+        let session_error = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.thread_id == "t1")
+            .and_then(|session| session.last_error.clone());
+        let has_provider_error = snapshot.activities.iter().any(|activity| {
+            activity.thread_id == "t1"
+                && activity.kind == "provider.error"
+                && activity.payload["error"]["message"] == "model unavailable"
+        });
+        outcomes.push((
+            terminal_state.to_owned(),
+            messages,
+            session_error,
+            has_provider_error,
+        ));
+        supervisor.shutdown().await.unwrap();
+    }
+
+    assert_eq!(
+        outcomes,
+        vec![
+            (
+                "failed".to_owned(),
+                vec![(
+                    "assistant:t1:item:partial-1".to_owned(),
+                    "Partial response".to_owned(),
+                    false,
+                )],
+                Some("model unavailable".to_owned()),
+                true,
+            ),
+            (
+                "interrupted".to_owned(),
+                vec![(
+                    "assistant:t1:item:partial-1".to_owned(),
+                    "Partial response".to_owned(),
+                    false,
+                )],
+                None,
+                false,
+            ),
+        ]
+    );
 }
 
 #[tokio::test]
