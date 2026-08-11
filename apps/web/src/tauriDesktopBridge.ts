@@ -6,10 +6,12 @@ import type {
   DesktopBridge,
   DesktopBridgeHostMetadata,
   DesktopEnvironmentBootstrap,
+  DesktopProjectDataStatusChangedEvent,
   DesktopServerExposureState,
   DesktopSshPasswordPromptRequest,
   DesktopUpdateActionResult,
   DesktopUpdateCheckResult,
+  DesktopUpdateInstallInput,
   DesktopUpdateState,
   DesktopWslState,
 } from "@bibcode/contracts";
@@ -31,12 +33,16 @@ import { createTauriPreviewBridge } from "./tauriPreviewBridge";
 
 const CONNECTION_CATALOG_STORAGE_KEY = "bibcode.connectionCatalog";
 const BACKEND_READY_EVENT = "desktop:backend-ready";
+const PROJECT_DATA_STATUS_CHANGED_EVENT = "desktop:project-data-status-changed";
 const MENU_ACTION_EVENT = "desktop:menu-action";
 const NIGHTLY_VERSION_PATTERN = /-nightly\.\d{8}\.\d+$/;
 const SSH_PASSWORD_PROMPT_EVENT = "desktop:ssh-password-prompt";
 const UPDATE_STATE_EVENT = "desktop:update-state";
 const LOCAL_ENVIRONMENT_BOOTSTRAP_TIMEOUT_MS = 15_000;
 const LOCAL_ENVIRONMENT_BOOTSTRAP_RETRY_MS = 50;
+const PROTECTED_CONNECTION_CATALOG_BRIDGE_VERSION = 3;
+
+type ConnectionCatalogProtectionCapability = "protected" | "unprotected" | "unknown";
 
 let cachedLocalEnvironmentBootstraps: readonly DesktopEnvironmentBootstrap[] = [];
 let localEnvironmentBootstrapsRefresh: Promise<readonly DesktopEnvironmentBootstrap[]> | null =
@@ -262,13 +268,9 @@ function readLocalStorageConnectionCatalog(): string | null {
   }
 }
 
-function writeLocalStorageConnectionCatalog(catalog: string): boolean {
-  try {
-    localStorage.setItem(CONNECTION_CATALOG_STORAGE_KEY, catalog);
-    return true;
-  } catch {
-    return false;
-  }
+function readProtectedLegacyConnectionCatalog(): string | null {
+  const storage = (window as Window & { readonly localStorage?: Storage }).localStorage;
+  return storage?.getItem(CONNECTION_CATALOG_STORAGE_KEY) ?? null;
 }
 
 function clearLocalStorageConnectionCatalog(): void {
@@ -286,14 +288,49 @@ async function getConnectionCatalog(): Promise<string | null> {
   return catalog ?? readLocalStorageConnectionCatalog();
 }
 
-async function setConnectionCatalog(catalog: string): Promise<boolean> {
-  const stored = await tauriInvokeOr<boolean>(
-    "desktop_bridge_set_connection_catalog",
-    { catalog },
-    () => writeLocalStorageConnectionCatalog(catalog),
-  );
-  if (stored) clearLocalStorageConnectionCatalog();
-  return stored;
+async function getNativeConnectionCatalog(): Promise<string | null> {
+  return tauriInvoke<string | null>("desktop_bridge_get_connection_catalog", undefined);
+}
+
+async function setNativeConnectionCatalog(catalog: string): Promise<boolean> {
+  return tauriInvoke<boolean>("desktop_bridge_set_connection_catalog", { catalog });
+}
+
+async function compareAndSetNativeConnectionCatalog(
+  expectedCatalog: string | null,
+  nextCatalog: string,
+): Promise<boolean> {
+  return tauriInvoke<boolean>("desktop_bridge_compare_and_set_connection_catalog", {
+    expectedCatalog,
+    nextCatalog,
+  });
+}
+
+async function compareNativeConnectionCatalog(expectedCatalog: string | null): Promise<boolean> {
+  return tauriInvoke<boolean>("desktop_bridge_compare_connection_catalog", {
+    expectedCatalog,
+  });
+}
+
+async function clearNativeConnectionCatalog(): Promise<void> {
+  await tauriInvoke("desktop_bridge_clear_connection_catalog", undefined);
+}
+
+async function establishNativeConnectionCatalogSource(): Promise<void> {
+  const legacyCatalog = readProtectedLegacyConnectionCatalog();
+  let nativeCatalog = await getNativeConnectionCatalog();
+
+  if (nativeCatalog === null && legacyCatalog !== null && legacyCatalog.trim() !== "") {
+    await compareAndSetNativeConnectionCatalog(null, legacyCatalog);
+    nativeCatalog = await getNativeConnectionCatalog();
+    if (nativeCatalog === null) {
+      throw new Error("Protected connection catalog migration could not be confirmed.");
+    }
+  }
+
+  if (legacyCatalog !== null) {
+    clearLocalStorageConnectionCatalog();
+  }
 }
 
 async function clearConnectionCatalog(): Promise<void> {
@@ -303,6 +340,26 @@ async function clearConnectionCatalog(): Promise<void> {
     clearLocalStorageConnectionCatalog,
   );
   clearLocalStorageConnectionCatalog();
+}
+
+function unavailableConnectionCatalogOperation<T>(): Promise<T> {
+  return Promise.reject(
+    new Error("Desktop connection catalog protection capability could not be verified."),
+  );
+}
+
+function connectionCatalogProtectionCapability(
+  metadata: DesktopBridgeHostMetadata | null,
+): ConnectionCatalogProtectionCapability {
+  if (metadata?.bridgeVersion !== PROTECTED_CONNECTION_CATALOG_BRIDGE_VERSION) {
+    return "unknown";
+  }
+  const protectedConnectionCatalog = metadata.features?.protectedConnectionCatalog;
+  return protectedConnectionCatalog === true
+    ? "protected"
+    : protectedConnectionCatalog === false
+      ? "unprotected"
+      : "unknown";
 }
 
 function defaultServerExposureState(): DesktopServerExposureState {
@@ -371,10 +428,18 @@ function openBrowserFallback(url: string): boolean {
   }
 }
 
+function isWindowsWebViewRuntime(): boolean {
+  return typeof navigator !== "undefined" && /Windows/iu.test(navigator.userAgent);
+}
+
 async function showTauriContextMenu<T extends string>(
   items: readonly ContextMenuItem<T>[],
   position?: { x: number; y: number },
 ): Promise<T | null> {
+  if (isWindowsWebViewRuntime()) {
+    return showContextMenuFallback(items, position);
+  }
+
   try {
     return await tauriInvokeDesktop<T | null>("desktop_bridge_show_context_menu", {
       items,
@@ -392,13 +457,31 @@ async function showTauriContextMenu<T extends string>(
   }
 }
 
-function createTauriDesktopBridge(previewSupported: boolean): DesktopBridge {
+function createTauriDesktopBridge(
+  previewSupported: boolean,
+  connectionCatalogProtection: ConnectionCatalogProtectionCapability,
+): DesktopBridge {
   const preview = previewSupported
     ? createTauriPreviewBridge({
         invoke: tauriInvoke,
         listen: tauriListen,
       })
     : undefined;
+  const connectionCatalog =
+    connectionCatalogProtection === "protected"
+      ? {
+          getConnectionCatalog: getNativeConnectionCatalog,
+          setConnectionCatalog: setNativeConnectionCatalog,
+          compareConnectionCatalog: compareNativeConnectionCatalog,
+          compareAndSetConnectionCatalog: compareAndSetNativeConnectionCatalog,
+          clearConnectionCatalog: clearNativeConnectionCatalog,
+        }
+      : connectionCatalogProtection === "unprotected"
+        ? { getConnectionCatalog, clearConnectionCatalog }
+        : {
+            getConnectionCatalog: () => unavailableConnectionCatalogOperation<string | null>(),
+            clearConnectionCatalog: () => unavailableConnectionCatalogOperation<void>(),
+          };
 
   return {
     getHostMetadata: () =>
@@ -414,9 +497,21 @@ function createTauriDesktopBridge(previewSupported: boolean): DesktopBridge {
       tauriInvokeOr("desktop_bridge_set_client_settings", { settings }, () =>
         writeBrowserClientSettings(settings),
       ),
-    getConnectionCatalog,
-    setConnectionCatalog,
-    clearConnectionCatalog,
+    ...connectionCatalog,
+    getProjectDataStatuses: () =>
+      tauriInvokeDesktop("desktop_bridge_get_project_data_statuses", undefined),
+    onProjectDataStatusChanged: (listener: (event: DesktopProjectDataStatusChangedEvent) => void) =>
+      tauriListen(PROJECT_DATA_STATUS_CHANGED_EVENT, listener),
+    restoreProjectData: (environmentId, backupId) =>
+      tauriInvokeDesktop("desktop_bridge_restore_project_data", { environmentId, backupId }),
+    startEmptyProjectData: (environmentId) =>
+      tauriInvokeDesktop("desktop_bridge_start_empty_project_data", { environmentId }),
+    retryProjectData: (environmentId) =>
+      tauriInvokeDesktop("desktop_bridge_retry_project_data", { environmentId }),
+    openProjectDataPath: (environmentId) =>
+      tauriInvokeDesktop("desktop_bridge_open_project_data_path", { environmentId }),
+    exportProjectDataDiagnostics: (environmentId) =>
+      tauriInvokeDesktop("desktop_bridge_export_project_data_diagnostics", { environmentId }),
     discoverSshHosts: () => tauriInvokeOr("desktop_bridge_discover_ssh_hosts", undefined, () => []),
     ensureSshEnvironment: (target, options) =>
       tauriInvokeDesktop("desktop_bridge_ensure_ssh_environment", { target, options }),
@@ -494,8 +589,11 @@ function createTauriDesktopBridge(previewSupported: boolean): DesktopBridge {
       tauriInvokeDesktop("desktop_bridge_check_for_update", undefined),
     downloadUpdate: (): Promise<DesktopUpdateActionResult> =>
       tauriInvokeDesktop("desktop_bridge_download_update", undefined),
-    installUpdate: (): Promise<DesktopUpdateActionResult> =>
-      tauriInvokeDesktop("desktop_bridge_install_update", undefined),
+    installUpdate: (input?: DesktopUpdateInstallInput): Promise<DesktopUpdateActionResult> =>
+      tauriInvokeDesktop(
+        "desktop_bridge_install_update",
+        input === undefined ? undefined : { input },
+      ),
     onUpdateState: (listener: (state: DesktopUpdateState) => void) =>
       tauriListen(UPDATE_STATE_EVENT, listener),
     ...(preview ? { preview } : {}),
@@ -519,7 +617,23 @@ async function installTauriDesktopBridge(): Promise<void> {
     return;
   }
 
-  const bridge = createTauriDesktopBridge(metadata?.features.preview === true);
+  const declaredConnectionCatalogProtection = connectionCatalogProtectionCapability(metadata);
+  const connectionCatalogProtection =
+    declaredConnectionCatalogProtection === "protected"
+      ? await establishNativeConnectionCatalogSource().then(
+          () => declaredConnectionCatalogProtection,
+          () => "unknown" as const,
+        )
+      : declaredConnectionCatalogProtection;
+
+  if (window.desktopBridge !== undefined) {
+    return;
+  }
+
+  const bridge = createTauriDesktopBridge(
+    metadata?.features?.preview === true,
+    connectionCatalogProtection,
+  );
   window.desktopBridge = bridge;
   const preview = bridge.preview;
   if (preview) startBrowserSurfaceSync(preview);

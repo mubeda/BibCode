@@ -2,6 +2,10 @@ import {
   type DesktopSshEnvironmentTarget,
   EnvironmentId,
   type OrchestrationShellSnapshot,
+  type OrchestrationThread,
+  ProjectId,
+  ProviderInstanceId,
+  ThreadId,
 } from "@bibcode/contracts";
 import { describe, expect, it } from "@effect/vitest";
 import * as Deferred from "effect/Deferred";
@@ -26,11 +30,14 @@ import {
   SshConnectionProfile,
   type ConnectionCredential,
   type ConnectionProfile,
+  UnavailableConnectionRegistration,
 } from "./catalog.ts";
 import * as Connectivity from "./connectivity.ts";
 import * as ConnectionCredentialStore from "./credentialStore.ts";
 import * as ConnectionDriver from "./driver.ts";
 import {
+  type ConnectionAttemptError,
+  ConnectionStorageChangedError,
   ConnectionTransientError,
   BearerConnectionTarget,
   PrimaryConnectionTarget,
@@ -39,6 +46,7 @@ import {
   type ConnectionTarget,
   type PreparedConnection,
   type SupervisorConnectionState,
+  UnavailableConnectionTarget,
 } from "./model.ts";
 import * as Persistence from "../platform/persistence.ts";
 import * as ConnectionProfileStore from "./profileStore.ts";
@@ -63,6 +71,18 @@ const SECOND_TARGET = new PrimaryConnectionTarget({
 const PREPARED: PreparedConnection = {
   environmentId: TARGET.environmentId,
   label: TARGET.label,
+  descriptor: {
+    environmentId: TARGET.environmentId,
+    label: TARGET.label,
+    platform: { os: "linux", arch: "x64" },
+    serverVersion: "0.0.0-test",
+    storageInstanceId: "store-test",
+    capabilities: {
+      repositoryIdentity: true,
+      worktreeCatalog: false,
+      activityProtocolVersion: null,
+    },
+  },
   httpBaseUrl: TARGET.httpBaseUrl,
   socketUrl: "wss://environment.example.test/ws",
   httpAuthorization: null,
@@ -118,6 +138,29 @@ const CACHED_SNAPSHOT: OrchestrationShellSnapshot = {
   threads: [],
   updatedAt: "2026-06-06T00:00:00.000Z",
 };
+const CACHED_THREAD: OrchestrationThread = {
+  id: ThreadId.make("thread-cached"),
+  projectId: ProjectId.make("project-cached"),
+  title: "Cached thread",
+  modelSelection: {
+    instanceId: ProviderInstanceId.make("codex"),
+    model: "gpt-5.4",
+  },
+  runtimeMode: "full-access",
+  interactionMode: "default",
+  branch: "main",
+  worktreePath: null,
+  latestTurn: null,
+  createdAt: "2026-04-01T00:00:00.000Z",
+  updatedAt: "2026-04-01T00:00:00.000Z",
+  archivedAt: null,
+  deletedAt: null,
+  messages: [],
+  proposedPlans: [],
+  activities: [],
+  checkpoints: [],
+  session: null,
+};
 
 interface SessionControl {
   readonly closed: Deferred.Deferred<never, ConnectionTransientError>;
@@ -128,19 +171,27 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
   initialProfiles: ReadonlyArray<ConnectionProfile> = [],
   initialCredentials: ReadonlyArray<readonly [string, ConnectionCredential]> = [],
   options?: {
-    readonly beforeSessionConnect?: (environmentId: EnvironmentId) => Effect.Effect<void>;
+    readonly beforeSessionConnect?: (
+      environmentId: EnvironmentId,
+    ) => Effect.Effect<void, ConnectionAttemptError>;
     readonly beforeRegistrationRegister?: (
       registration: ConnectionRegistration,
     ) => Effect.Effect<void, Persistence.ConnectionPersistenceError>;
     readonly beforeRegistrationRemove?: (
       target: ConnectionTarget,
     ) => Effect.Effect<void, Persistence.ConnectionPersistenceError>;
+    readonly afterStorageIdentityAccept?: (
+      identity: Persistence.AcceptedStorageIdentity,
+    ) => Effect.Effect<void>;
   },
 ) {
   const storedTargets = yield* Ref.make(
     new Map(initialTargets.map((target) => [target.environmentId, target])),
   );
   const shellCache = yield* Ref.make(new Map([[TARGET.environmentId, CACHED_SNAPSHOT]]));
+  const threadCache = yield* Ref.make(
+    new Map([[TARGET.environmentId, new Map([[CACHED_THREAD.id, CACHED_THREAD]])]]),
+  );
   const cacheClears = yield* Ref.make<ReadonlyArray<EnvironmentId>>([]);
   const ownedDataClears = yield* Ref.make<ReadonlyArray<EnvironmentId>>([]);
   const sessions = yield* Ref.make<ReadonlyArray<SessionControl>>([]);
@@ -170,6 +221,10 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     ]),
   );
   const disconnectedSshTargets = yield* Ref.make<ReadonlyArray<DesktopSshEnvironmentTarget>>([]);
+  const acceptedStorageIdentities = yield* Ref.make(new Map<string, string>());
+  const acceptedStorageIdentityWrites = yield* Ref.make<
+    ReadonlyArray<Persistence.AcceptedStorageIdentity>
+  >([]);
 
   const targetStore = Persistence.ConnectionTargetStore.of({
     list: Ref.get(storedTargets).pipe(Effect.map((targets) => [...targets.values()])),
@@ -233,6 +288,68 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
         });
       }),
   });
+  const acceptedStorageIdentityService = {
+    get: (targetKey: string) =>
+      Ref.get(acceptedStorageIdentities).pipe(
+        Effect.map((current) => Option.fromUndefinedOr(current.get(targetKey))),
+      ),
+    accept: (identity: Persistence.AcceptedStorageIdentity) =>
+      Ref.update(acceptedStorageIdentities, (current) => {
+        const next = new Map(current);
+        next.set(identity.targetKey, identity.storageInstanceId);
+        return next;
+      }).pipe(
+        Effect.andThen(
+          Ref.update(acceptedStorageIdentityWrites, (current) => [...current, identity]),
+        ),
+        Effect.andThen(options?.afterStorageIdentityAccept?.(identity) ?? Effect.void),
+      ),
+    transition: <A>(
+      targetKey: string,
+      decide: (acceptedStorageInstanceId: string | null) => {
+        readonly result: A;
+        readonly mutation:
+          | { readonly _tag: "Keep" }
+          | { readonly _tag: "Set"; readonly storageInstanceId: string };
+      },
+    ) =>
+      Ref.modify(
+        acceptedStorageIdentities,
+        (
+          current,
+        ): readonly [
+          {
+            readonly result: A;
+            readonly identity: Persistence.AcceptedStorageIdentity | null;
+          },
+          Map<string, string>,
+        ] => {
+          const transition = decide(current.get(targetKey) ?? null);
+          if (transition.mutation._tag === "Keep") {
+            return [{ result: transition.result, identity: null }, current] as const;
+          }
+          const identity = {
+            targetKey,
+            storageInstanceId: transition.mutation.storageInstanceId,
+          };
+          const next = new Map(current);
+          next.set(targetKey, identity.storageInstanceId);
+          return [{ result: transition.result, identity }, next] as const;
+        },
+      ).pipe(
+        Effect.flatMap(({ result, identity }) =>
+          identity === null
+            ? Effect.succeed(result)
+            : Ref.update(acceptedStorageIdentityWrites, (current) => [...current, identity]).pipe(
+                Effect.andThen(options?.afterStorageIdentityAccept?.(identity) ?? Effect.void),
+                Effect.as(result),
+              ),
+        ),
+      ),
+  };
+  const acceptedStorageIdentityStore = Persistence.AcceptedStorageIdentityStore.of(
+    acceptedStorageIdentityService,
+  );
   const cacheStore = Persistence.EnvironmentCacheStore.of({
     loadShell: (environmentId) =>
       Ref.get(shellCache).pipe(
@@ -244,15 +361,39 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
         next.set(environmentId, snapshot);
         return next;
       }),
-    loadThread: (_environmentId, _threadId) => Effect.succeed(Option.none()),
-    saveThread: (_environmentId, _thread) => Effect.void,
-    removeThread: (_environmentId, _threadId) => Effect.void,
+    loadThread: (environmentId, threadId) =>
+      Ref.get(threadCache).pipe(
+        Effect.map((cache) => Option.fromUndefinedOr(cache.get(environmentId)?.get(threadId))),
+      ),
+    saveThread: (environmentId, thread) =>
+      Ref.update(threadCache, (current) => {
+        const next = new Map(current);
+        const threads = new Map(next.get(environmentId));
+        threads.set(thread.id, thread);
+        next.set(environmentId, threads);
+        return next;
+      }),
+    removeThread: (environmentId, threadId) =>
+      Ref.update(threadCache, (current) => {
+        const next = new Map(current);
+        const threads = new Map(next.get(environmentId));
+        threads.delete(threadId);
+        next.set(environmentId, threads);
+        return next;
+      }),
     clear: (environmentId) =>
       Ref.update(shellCache, (current) => {
         const next = new Map(current);
         next.delete(environmentId);
         return next;
       }).pipe(
+        Effect.andThen(
+          Ref.update(threadCache, (current) => {
+            const next = new Map(current);
+            next.delete(environmentId);
+            return next;
+          }),
+        ),
         Effect.andThen(
           Ref.update(cacheClears, (environmentIds) => [...environmentIds, environmentId]),
         ),
@@ -331,6 +472,12 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     connect: (entry, reportProgress) =>
       Effect.gen(function* () {
         const target = entry.target;
+        if (target._tag === "UnavailableConnectionTarget") {
+          return yield* new ConnectionTransientError({
+            reason: "endpoint-unavailable",
+            detail: target.detail,
+          });
+        }
         const prepared = {
           ...PREPARED,
           environmentId: target.environmentId,
@@ -364,6 +511,7 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
       Layer.mergeAll(
         Layer.succeed(Persistence.ConnectionTargetStore, targetStore),
         Layer.succeed(Persistence.ConnectionRegistrationStore, registrationStore),
+        Layer.succeed(Persistence.AcceptedStorageIdentityStore, acceptedStorageIdentityStore),
         Layer.succeed(ConnectionProfileStore.ConnectionProfileStore, profileStore),
         Layer.succeed(ConnectionCredentialStore.ConnectionCredentialStore, credentialStore),
         Layer.succeed(TokenStore.RemoteDpopAccessTokenStore, tokenStore),
@@ -384,6 +532,7 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     layer,
     storedTargets,
     shellCache,
+    threadCache,
     cacheClears,
     ownedDataClears,
     sessions,
@@ -393,6 +542,8 @@ const makeHarness = Effect.fn("TestEnvironmentRegistry.makeHarness")(function* (
     storedCredentials,
     storedRemoteTokens,
     disconnectedSshTargets,
+    acceptedStorageIdentities,
+    acceptedStorageIdentityWrites,
     networkStatus,
   };
 });
@@ -658,6 +809,198 @@ describe("EnvironmentRegistry", () => {
     }),
   );
 
+  it.effect("adopts the current structured storage change and retries exactly once", () =>
+    Effect.gen(function* () {
+      const connectionAttempts = yield* Ref.make(0);
+      const adoptionOrder = yield* Ref.make<ReadonlyArray<string>>([]);
+      const firstAttemptStarted = yield* Deferred.make<void>();
+      const releaseFirstAttempt = yield* Deferred.make<void>();
+      const harness = yield* makeHarness([TARGET], [], [], {
+        beforeSessionConnect: () =>
+          Ref.updateAndGet(connectionAttempts, (count) => count + 1).pipe(
+            Effect.tap((attempt) =>
+              Ref.update(adoptionOrder, (current) => [...current, `attempt:${attempt}`]),
+            ),
+            Effect.flatMap((attempt) =>
+              attempt === 1
+                ? Deferred.succeed(firstAttemptStarted, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseFirstAttempt)),
+                    Effect.andThen(
+                      Effect.fail(
+                        new ConnectionStorageChangedError({
+                          reason: "storage-changed",
+                          detail: "The environment reported a different persistent store.",
+                          targetKey: "structured:error-target",
+                          acceptedStorageInstanceId: "store-a",
+                          reportedStorageInstanceId: "store-b",
+                        }),
+                      ),
+                    ),
+                  )
+                : Effect.void,
+            ),
+          ),
+        afterStorageIdentityAccept: (identity) =>
+          Ref.update(adoptionOrder, (current) => [
+            ...current,
+            `accept:${identity.targetKey}:${identity.storageInstanceId}`,
+          ]),
+      });
+      yield* Ref.set(
+        harness.acceptedStorageIdentities,
+        new Map([["structured:error-target", "store-a"]]),
+      );
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.start;
+        yield* Deferred.await(firstAttemptStarted);
+        yield* Effect.yieldNow;
+        yield* Deferred.succeed(releaseFirstAttempt, undefined);
+        yield* awaitConnectionState(
+          registry,
+          TARGET.environmentId,
+          (state) => state.phase === "blocked",
+        );
+
+        yield* registry.acceptStorageIdentity(TARGET.environmentId);
+        yield* awaitConnectionState(
+          registry,
+          TARGET.environmentId,
+          (state) => state.phase === "connected",
+        );
+
+        expect(yield* Ref.get(harness.acceptedStorageIdentityWrites)).toEqual([
+          {
+            targetKey: "structured:error-target",
+            storageInstanceId: "store-b",
+          },
+        ]);
+        expect(yield* Ref.get(connectionAttempts)).toBe(2);
+        expect(yield* Ref.get(adoptionOrder)).toEqual([
+          "attempt:1",
+          "accept:structured:error-target:store-b",
+          "attempt:2",
+        ]);
+        expect(yield* Ref.get(harness.cacheClears)).toEqual([]);
+        expect(yield* Ref.get(harness.ownedDataClears)).toEqual([]);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("rejects stale storage adoption without overwriting a newer accepted identity", () =>
+    Effect.gen(function* () {
+      const connectionAttempts = yield* Ref.make(0);
+      const firstAttemptStarted = yield* Deferred.make<void>();
+      const releaseFirstAttempt = yield* Deferred.make<void>();
+      const storageChanged = () =>
+        new ConnectionStorageChangedError({
+          reason: "storage-changed",
+          detail: "The environment reported a different persistent store.",
+          targetKey: "structured:error-target",
+          acceptedStorageInstanceId: "store-a",
+          reportedStorageInstanceId: "store-b",
+        });
+      const harness = yield* makeHarness([TARGET], [], [], {
+        beforeSessionConnect: () =>
+          Ref.updateAndGet(connectionAttempts, (count) => count + 1).pipe(
+            Effect.flatMap((attempt) =>
+              attempt === 1
+                ? Deferred.succeed(firstAttemptStarted, undefined).pipe(
+                    Effect.andThen(Deferred.await(releaseFirstAttempt)),
+                    Effect.andThen(Effect.fail(storageChanged())),
+                  )
+                : Effect.fail(storageChanged()),
+            ),
+          ),
+      });
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.start;
+        yield* Deferred.await(firstAttemptStarted);
+        yield* Effect.yieldNow;
+        yield* Deferred.succeed(releaseFirstAttempt, undefined);
+        yield* awaitConnectionState(
+          registry,
+          TARGET.environmentId,
+          (state) => state.phase === "blocked",
+        );
+        yield* Ref.update(harness.acceptedStorageIdentities, (current) => {
+          const next = new Map(current);
+          next.set("structured:error-target", "store-c");
+          return next;
+        });
+
+        const result = yield* Effect.result(registry.acceptStorageIdentity(TARGET.environmentId));
+
+        expect(Result.isFailure(result)).toBe(true);
+        if (Result.isFailure(result)) {
+          expect(result.failure).toMatchObject({
+            _tag: "ConnectionPersistenceError",
+            operation: "accept-storage-identity",
+          });
+        }
+        expect(yield* Ref.get(harness.acceptedStorageIdentities)).toEqual(
+          new Map([["structured:error-target", "store-c"]]),
+        );
+        expect(yield* Ref.get(harness.acceptedStorageIdentityWrites)).toEqual([]);
+        expect(yield* Ref.get(connectionAttempts)).toBe(1);
+        expect(yield* Ref.get(harness.cacheClears)).toEqual([]);
+        expect(yield* Ref.get(harness.ownedDataClears)).toEqual([]);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("refuses storage adoption unless the environment is currently storage-blocked", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([TARGET]);
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+        yield* registry.start;
+        yield* awaitConnectionState(
+          registry,
+          TARGET.environmentId,
+          (state) => state.phase === "connected",
+        );
+
+        const error = yield* Effect.flip(registry.acceptStorageIdentity(TARGET.environmentId));
+
+        expect(error).toMatchObject({
+          _tag: "ConnectionPersistenceError",
+          operation: "accept-storage-identity",
+        });
+        expect(yield* Ref.get(harness.acceptedStorageIdentityWrites)).toEqual([]);
+        expect(yield* Ref.get(harness.sessions)).toHaveLength(1);
+        expect(yield* Ref.get(harness.cacheClears)).toEqual([]);
+        expect(yield* Ref.get(harness.ownedDataClears)).toEqual([]);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
+  it.effect("does not start an unsupervised environment to evaluate storage adoption", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness([TARGET]);
+
+      yield* Effect.gen(function* () {
+        const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+
+        const error = yield* Effect.flip(registry.acceptStorageIdentity(TARGET.environmentId));
+        for (let iteration = 0; iteration < 100; iteration += 1) {
+          yield* Effect.yieldNow;
+        }
+
+        expect(error).toMatchObject({
+          _tag: "ConnectionPersistenceError",
+          operation: "accept-storage-identity",
+        });
+        expect(yield* Ref.get(harness.sessions)).toEqual([]);
+        expect(yield* Ref.get(harness.acceptedStorageIdentityWrites)).toEqual([]);
+      }).pipe(Effect.provide(harness.layer), Effect.scoped);
+    }),
+  );
+
   it.effect("removes all relay-owned data without touching non-cloud connections", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness(
@@ -905,6 +1248,64 @@ describe("EnvironmentRegistry", () => {
         expect(yield* Ref.get(harness.sessions)).toHaveLength(1);
       }).pipe(Effect.provide(harness.layer), Effect.scoped);
     }),
+  );
+
+  it.effect(
+    "retains shell and thread caches for a desired unavailable platform environment until disable",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeHarness(
+          [],
+          [],
+          [
+            [
+              "local:wsl:Ubuntu",
+              new BearerConnectionCredential({ token: "previous-live-session-token" }),
+            ],
+          ],
+        );
+        const unavailableTarget = new UnavailableConnectionTarget({
+          environmentId: TARGET.environmentId,
+          label: "WSL (Ubuntu)",
+          connectionId: "local:wsl:Ubuntu",
+          configuredDistro: "Ubuntu",
+          detail: "the configured WSL distribution could not start",
+        });
+        const unavailableRegistration = new UnavailableConnectionRegistration({
+          target: unavailableTarget,
+        });
+
+        yield* Effect.gen(function* () {
+          const registry = yield* EnvironmentRegistry.EnvironmentRegistry;
+
+          yield* registry.reconcilePlatform([unavailableRegistration]);
+          yield* awaitConnectionState(
+            registry,
+            TARGET.environmentId,
+            (state) => state.phase === "backoff",
+          );
+
+          expect(
+            (yield* SubscriptionRef.get(registry.entries)).get(TARGET.environmentId)?.target,
+          ).toEqual(unavailableTarget);
+          expect((yield* Ref.get(harness.shellCache)).get(TARGET.environmentId)).toEqual(
+            CACHED_SNAPSHOT,
+          );
+          expect(
+            (yield* Ref.get(harness.threadCache)).get(TARGET.environmentId)?.get(CACHED_THREAD.id),
+          ).toEqual(CACHED_THREAD);
+          expect(yield* Ref.get(harness.cacheClears)).toEqual([]);
+          expect((yield* Ref.get(harness.storedCredentials)).has("local:wsl:Ubuntu")).toBe(false);
+
+          yield* registry.reconcilePlatform([]);
+          expect((yield* Ref.get(harness.shellCache)).has(TARGET.environmentId)).toBe(false);
+          expect((yield* Ref.get(harness.threadCache)).has(TARGET.environmentId)).toBe(false);
+          expect(yield* Ref.get(harness.cacheClears)).toEqual([TARGET.environmentId]);
+
+          yield* registry.reconcilePlatform([]);
+          expect(yield* Ref.get(harness.cacheClears)).toEqual([TARGET.environmentId]);
+        }).pipe(Effect.provide(harness.layer), Effect.scoped);
+      }),
   );
 
   it.effect("removes all owned SSH state only on explicit removal", () =>

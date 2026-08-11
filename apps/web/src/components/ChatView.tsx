@@ -267,6 +267,7 @@ import {
   collectUserMessageBlobPreviewUrls,
   createLocalDispatchSnapshot,
   deriveComposerSendState,
+  findActiveDeliveryMessage,
   findLastCancellableDeliveryMessage,
   hasServerAcknowledgedLocalDispatch,
   getStartedThreadModelChangeBlockReason,
@@ -777,7 +778,7 @@ function useLocalDispatchState(input: {
   phase: SessionPhase;
   activePendingApproval: ApprovalRequestId | null;
   activePendingUserInput: ApprovalRequestId | null;
-  threadError: string | null | undefined;
+  localError: string | null | undefined;
 }) {
   const [localDispatch, setLocalDispatch] = useState<LocalDispatchSnapshot | null>(null);
 
@@ -809,7 +810,7 @@ function useLocalDispatchState(input: {
         session: input.activeThread?.session ?? null,
         hasPendingApproval: input.activePendingApproval !== null,
         hasPendingUserInput: input.activePendingUserInput !== null,
-        threadError: input.threadError,
+        threadError: input.localError,
         deliveryState: localDispatchDeliveryState,
       }),
     [
@@ -818,7 +819,7 @@ function useLocalDispatchState(input: {
       input.activePendingUserInput,
       input.activeThread?.session,
       input.phase,
-      input.threadError,
+      input.localError,
       localDispatchDeliveryState,
       localDispatch,
     ],
@@ -826,6 +827,9 @@ function useLocalDispatchState(input: {
   const activeLocalDispatch = serverAcknowledgedLocalDispatch ? null : localDispatch;
   const cancellableDelivery = input.activeThread
     ? findLastCancellableDeliveryMessage(input.activeThread.messages)
+    : null;
+  const activeDelivery = input.activeThread
+    ? findActiveDeliveryMessage(input.activeThread.messages)
     : null;
   const beginLocalDispatch = useCallback(
     (options?: { preparingWorktree?: boolean; threadId?: ThreadId; messageId?: MessageId }) => {
@@ -837,21 +841,26 @@ function useLocalDispatchState(input: {
             ? active
             : { ...active, preparingWorktree };
         }
-        return createLocalDispatchSnapshot(input.activeThread, options);
+        return createLocalDispatchSnapshot(input.activeThread, {
+          ...options,
+          threadError: input.localError ?? null,
+        });
       });
     },
-    [input.activeThread, serverAcknowledgedLocalDispatch],
+    [input.activeThread, input.localError, serverAcknowledgedLocalDispatch],
   );
 
   return {
     beginLocalDispatch,
     resetLocalDispatch,
     localDispatchStartedAt: activeLocalDispatch?.startedAt ?? null,
+    activeDeliveryStartedAt: activeDelivery?.createdAt ?? null,
     cancellableDeliveryThreadId: cancellableDelivery ? (input.activeThread?.id ?? null) : null,
     cancellableDeliveryMessageId: cancellableDelivery?.id ?? null,
     canCancelPendingSend: cancellableDelivery !== null,
     isPreparingWorktree: activeLocalDispatch?.preparingWorktree ?? false,
     isSendBusy: activeLocalDispatch !== null || cancellableDelivery !== null,
+    isSendActivelyWorking: activeLocalDispatch !== null || activeDelivery !== null,
   };
 }
 
@@ -2296,25 +2305,28 @@ function ChatViewContent(props: ChatViewProps) {
     beginLocalDispatch,
     resetLocalDispatch,
     localDispatchStartedAt,
+    activeDeliveryStartedAt,
     cancellableDeliveryThreadId,
     cancellableDeliveryMessageId,
     canCancelPendingSend,
     isPreparingWorktree,
     isSendBusy,
+    isSendActivelyWorking,
   } = useLocalDispatchState({
     activeThread,
     activeLatestTurn,
     phase,
     activePendingApproval: activePendingApproval?.requestId ?? null,
     activePendingUserInput: activePendingUserInput?.requestId ?? null,
-    threadError,
+    localError: isServerThread ? localServerError : localDraftError,
   });
-  const isWorking = phase === "running" || isSendBusy || isConnecting || isRevertingCheckpoint;
-  const activeWorkStartedAt = deriveActiveWorkStartedAt(
-    activeLatestTurn,
-    activeThread?.session ?? null,
-    localDispatchStartedAt,
-  );
+  const isWorking =
+    phase === "running" || isSendActivelyWorking || isConnecting || isRevertingCheckpoint;
+  const sendStartedAt = localDispatchStartedAt ?? activeDeliveryStartedAt;
+  const activeWorkStartedAt =
+    phase !== "running" && sendStartedAt !== null
+      ? sendStartedAt
+      : deriveActiveWorkStartedAt(activeLatestTurn, activeThread?.session ?? null, sendStartedAt);
   useEffect(() => {
     attachmentPreviewHandoffByMessageIdRef.current = attachmentPreviewHandoffByMessageId;
   }, [attachmentPreviewHandoffByMessageId]);

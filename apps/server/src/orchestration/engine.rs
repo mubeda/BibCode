@@ -9499,7 +9499,9 @@ mod tests {
 
         let temp = TempDir::new().expect("temporary database directory");
         let database_path = temp.path().join("context-window.sqlite");
-        let database = Database::open(&database_path).await.expect("database");
+        let database = Database::create_new(&database_path)
+            .await
+            .expect("database");
         database
             .call(|connection| {
                 run_migrations(connection, None)?;
@@ -9608,7 +9610,7 @@ mod tests {
         drop(engine);
         drop(database);
 
-        let reopened_database = Database::open(&database_path)
+        let reopened_database = Database::open_existing(&database_path)
             .await
             .expect("database reopens");
         let reopened = OrchestrationEngine::start(reopened_database, EngineOptions::default())

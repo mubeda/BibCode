@@ -12,6 +12,8 @@ export interface KnownEnvironment {
   readonly label: string;
   readonly source: KnownEnvironmentSource;
   readonly environmentId?: EnvironmentId;
+  readonly storageInstanceId?: ExecutionEnvironmentDescriptor["storageInstanceId"];
+  readonly descriptor?: ExecutionEnvironmentDescriptor;
   readonly target: KnownEnvironmentConnectionTarget;
 }
 
@@ -37,5 +39,7 @@ export function attachEnvironmentDescriptor(
     ...environment,
     environmentId: descriptor.environmentId,
     label: descriptor.label,
+    storageInstanceId: descriptor.storageInstanceId,
+    descriptor,
   };
 }

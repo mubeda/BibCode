@@ -2,9 +2,11 @@ use bibcode_server::process::configure_background_std_command;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
-    fs, io,
+    fs,
+    io::{self, Write},
     path::{Path, PathBuf},
     process::Command,
+    sync::Mutex,
     time::Duration,
 };
 use tauri::{AppHandle, Manager, Runtime, State};
@@ -12,7 +14,7 @@ use tauri_plugin_dialog::{DialogExt, MessageDialogButtons};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 
-use crate::backend::{BackendRunConfig, BackendSupervisor};
+use crate::backend::{BackendPlanError, BackendRunConfig, BackendSupervisor};
 use crate::config::{
     app_branding, read_json_file, resolve_pick_folder_default_path, state_dir, write_json_file,
 };
@@ -20,6 +22,7 @@ use crate::context_menu::{
     ContextMenuPosition, NativeContextMenuManager, context_menu_request_from_values,
     context_menu_request_has_selectable_items, show_native_context_menu,
 };
+use crate::data_safety;
 use crate::security::{
     CONNECTION_CATALOG_PROTECTION_KIND, protect_string as protect_catalog_string,
     unprotect_string as unprotect_catalog_string,
@@ -32,7 +35,7 @@ use crate::tailscale::{
     TailscaleStatus, build_tailscale_https_base_url, probe_tailscale_https_endpoint,
     read_tailscale_status,
 };
-use crate::updates::DesktopUpdateManager;
+use crate::updates::{DesktopUpdateInstallInput, DesktopUpdateManager};
 
 #[cfg(test)]
 pub(crate) type DesktopRuntime = tauri::test::MockRuntime;
@@ -50,7 +53,7 @@ const DEFAULT_TAILSCALE_SERVE_PORT: u16 = 443;
 const PRIMARY_LOCAL_ENVIRONMENT_ID: &str = "primary";
 const WSL_INSTANCE_ID_PREFIX: &str = "wsl:";
 const REMOTE_API_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
-const TAURI_DESKTOP_BRIDGE_VERSION: u16 = 1;
+const TAURI_DESKTOP_BRIDGE_VERSION: u16 = 3;
 const MAX_DIAGNOSTIC_ARCHIVE_BYTES: usize = 20 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -82,6 +85,61 @@ struct ConnectionCatalogDocument {
     catalog: Option<String>,
     encrypted_catalog: Option<String>,
     protection: Option<String>,
+}
+
+pub(crate) struct ConnectionCatalogCoordinator {
+    catalog: Mutex<()>,
+}
+
+impl ConnectionCatalogCoordinator {
+    pub(crate) fn new() -> Self {
+        Self {
+            catalog: Mutex::new(()),
+        }
+    }
+
+    fn with_lock<T>(&self, operation: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let _guard = self
+            .catalog
+            .lock()
+            .map_err(|_| "The connection catalog coordinator is unavailable.".to_string())?;
+        operation()
+    }
+
+    fn read_with(
+        &self,
+        read: impl FnOnce() -> Result<Option<String>, String>,
+    ) -> Result<Option<String>, String> {
+        self.with_lock(read)
+    }
+
+    fn compare_with(
+        &self,
+        expected: Option<&str>,
+        read: impl FnOnce() -> Result<Option<String>, String>,
+    ) -> Result<bool, String> {
+        self.with_lock(|| Ok(read()?.as_deref() == expected))
+    }
+
+    fn compare_and_set_with(
+        &self,
+        expected: Option<&str>,
+        next: &str,
+        read: impl FnOnce() -> Result<Option<String>, String>,
+        write: impl FnOnce(&str) -> Result<(), String>,
+    ) -> Result<bool, String> {
+        self.with_lock(|| {
+            if read()?.as_deref() != expected {
+                return Ok(false);
+            }
+            write(next)?;
+            Ok(true)
+        })
+    }
+}
+
+fn connection_catalog_command_error(operation: &str) -> String {
+    format!("Could not {operation} the protected connection catalog.")
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize)]
@@ -234,9 +292,11 @@ fn normalize_wsl_distro(value: Option<String>) -> Option<String> {
 }
 
 fn normalize_desktop_settings_document(document: DesktopSettingsDocument) -> DesktopSettings {
-    let wsl_backend_enabled = document
-        .wsl_backend_enabled
-        .unwrap_or_else(|| document.wsl_mode.as_deref() == Some("wsl"));
+    let wsl_only = document.wsl_only.unwrap_or(false);
+    let wsl_backend_enabled = wsl_only
+        || document
+            .wsl_backend_enabled
+            .unwrap_or_else(|| document.wsl_mode.as_deref() == Some("wsl"));
 
     DesktopSettings {
         server_exposure_mode: normalize_server_exposure_mode(
@@ -246,7 +306,7 @@ fn normalize_desktop_settings_document(document: DesktopSettingsDocument) -> Des
         tailscale_serve_port: normalize_tailscale_serve_port(document.tailscale_serve_port),
         wsl_backend_enabled,
         wsl_distro: normalize_wsl_distro(document.wsl_distro),
-        wsl_only: document.wsl_only.unwrap_or(false),
+        wsl_only,
     }
 }
 
@@ -805,15 +865,30 @@ fn resolve_pick_folder_dialog_default_path<R: Runtime>(
     resolve_wsl_pick_folder_default_path(raw_options, target_distro.as_deref(), &distros, None)
 }
 
-fn wsl_state(settings: &DesktopSettings) -> Value {
+fn wsl_state(settings: &DesktopSettings, backend: &BackendSupervisor) -> Value {
     let (available, distros) = read_wsl_environment();
+    let preflight_error = match backend.primary_plan_error() {
+        Some(BackendPlanError::WslPrimaryUnavailable { detail }) => Some(json!({
+            "kind": "wsl-primary-unavailable",
+            "detail": detail,
+        })),
+        Some(BackendPlanError::Other { .. }) => None,
+        None => backend
+            .secondary_unavailable_environment()
+            .map(|unavailable| {
+                json!({
+                    "kind": "wsl-secondary-unavailable",
+                    "detail": unavailable.detail,
+                })
+            }),
+    };
     json!({
         "enabled": settings.wsl_backend_enabled,
         "distro": &settings.wsl_distro,
         "available": available,
         "wslOnly": settings.wsl_only,
         "distros": distros,
-        "preflightError": null,
+        "preflightError": preflight_error,
     })
 }
 
@@ -839,6 +914,7 @@ pub fn desktop_bridge_get_bridge_metadata(app: AppHandle<DesktopRuntime>) -> Val
             "wslDiscovery": true,
             "sshRemoteHttp": true,
             "connectionCatalog": true,
+            "protectedConnectionCatalog": cfg!(target_os = "windows"),
             "sshProvisioning": true,
             "preview": crate::preview::host::is_supported(),
             "updater": app.updater().is_ok(),
@@ -857,6 +933,93 @@ pub fn desktop_bridge_get_local_environment_bootstraps(
     backend: State<'_, BackendSupervisor>,
 ) -> Vec<Value> {
     backend.local_environment_bootstraps()
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_get_project_data_statuses(
+    backend: State<'_, BackendSupervisor>,
+) -> Result<Value, String> {
+    serde_json::to_value(data_safety::get_project_data_statuses(backend.inner()).await?)
+        .map_err(|error| format!("Could not encode project-data status: {error}"))
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_restore_project_data(
+    backend: State<'_, BackendSupervisor>,
+    environment_id: String,
+    backup_id: String,
+) -> Result<Value, String> {
+    serde_json::to_value(
+        data_safety::restore_project_data(backend.inner(), &environment_id, &backup_id).await?,
+    )
+    .map_err(|error| format!("Could not encode project-data recovery: {error}"))
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_start_empty_project_data(
+    backend: State<'_, BackendSupervisor>,
+    environment_id: String,
+) -> Result<Value, String> {
+    serde_json::to_value(
+        data_safety::start_empty_project_data(backend.inner(), &environment_id).await?,
+    )
+    .map_err(|error| format!("Could not encode project-data recovery: {error}"))
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_retry_project_data(
+    backend: State<'_, BackendSupervisor>,
+    environment_id: String,
+) -> Result<(), String> {
+    data_safety::retry_project_data(backend.inner(), &environment_id).await
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_open_project_data_path(
+    app: AppHandle<DesktopRuntime>,
+    backend: State<'_, BackendSupervisor>,
+    environment_id: String,
+) -> Result<(), String> {
+    let root = data_safety::project_data_root(backend.inner(), &environment_id).await?;
+    app.opener()
+        .open_path(root, None::<&str>)
+        .map_err(|error| format!("Could not open the project-data folder: {error}"))
+}
+
+#[tauri::command]
+pub async fn desktop_bridge_export_project_data_diagnostics(
+    app: AppHandle<DesktopRuntime>,
+    backend: State<'_, BackendSupervisor>,
+    environment_id: String,
+) -> Result<String, String> {
+    let diagnostics =
+        data_safety::project_data_diagnostics(backend.inner(), &environment_id).await?;
+    let directory = state_dir(&app)?.join("diagnostics");
+    fs::create_dir_all(&directory)
+        .map_err(|error| format!("Could not create the diagnostics directory: {error}"))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
+            .map_err(|error| format!("Could not protect the diagnostics directory: {error}"))?;
+    }
+    let path = directory.join(format!("project-data-{}.json", uuid::Uuid::new_v4()));
+    let bytes = serde_json::to_vec_pretty(&diagnostics)
+        .map_err(|error| format!("Could not encode project-data diagnostics: {error}"))?;
+    let mut options = fs::OpenOptions::new();
+    options.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|error| format!("Could not create project-data diagnostics: {error}"))?;
+    file.write_all(&bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("Could not write project-data diagnostics: {error}"))?;
+    Ok(path.to_string_lossy().into_owned())
 }
 
 #[tauri::command]
@@ -879,26 +1042,72 @@ pub fn desktop_bridge_set_client_settings(
 #[tauri::command]
 pub fn desktop_bridge_get_connection_catalog(
     app: AppHandle<DesktopRuntime>,
+    catalogs: State<'_, ConnectionCatalogCoordinator>,
 ) -> Result<Option<String>, String> {
-    let path = connection_catalog_path(&app)?;
-    read_connection_catalog_document(&path)
+    let path =
+        connection_catalog_path(&app).map_err(|_| connection_catalog_command_error("load"))?;
+    catalogs
+        .read_with(|| read_connection_catalog_document(&path))
+        .map_err(|_| connection_catalog_command_error("load"))
 }
 
 #[tauri::command]
 pub fn desktop_bridge_set_connection_catalog(
     app: AppHandle<DesktopRuntime>,
+    catalogs: State<'_, ConnectionCatalogCoordinator>,
     catalog: String,
 ) -> Result<bool, String> {
-    let path = connection_catalog_path(&app)?;
-    write_connection_catalog_document(&path, &catalog)
+    let path =
+        connection_catalog_path(&app).map_err(|_| connection_catalog_command_error("save"))?;
+    catalogs
+        .with_lock(|| write_connection_catalog_document(&path, &catalog))
+        .map_err(|_| connection_catalog_command_error("save"))
+}
+
+#[tauri::command]
+pub fn desktop_bridge_compare_and_set_connection_catalog(
+    app: AppHandle<DesktopRuntime>,
+    catalogs: State<'_, ConnectionCatalogCoordinator>,
+    expected_catalog: Option<String>,
+    next_catalog: String,
+) -> Result<bool, String> {
+    let path =
+        connection_catalog_path(&app).map_err(|_| connection_catalog_command_error("update"))?;
+    catalogs
+        .compare_and_set_with(
+            expected_catalog.as_deref(),
+            &next_catalog,
+            || read_connection_catalog_document(&path),
+            |catalog| write_connection_catalog_document(&path, catalog).map(|_| ()),
+        )
+        .map_err(|_| connection_catalog_command_error("update"))
+}
+
+#[tauri::command]
+pub fn desktop_bridge_compare_connection_catalog(
+    app: AppHandle<DesktopRuntime>,
+    catalogs: State<'_, ConnectionCatalogCoordinator>,
+    expected_catalog: Option<String>,
+) -> Result<bool, String> {
+    let path =
+        connection_catalog_path(&app).map_err(|_| connection_catalog_command_error("compare"))?;
+    catalogs
+        .compare_with(expected_catalog.as_deref(), || {
+            read_connection_catalog_document(&path)
+        })
+        .map_err(|_| connection_catalog_command_error("compare"))
 }
 
 #[tauri::command]
 pub fn desktop_bridge_clear_connection_catalog(
     app: AppHandle<DesktopRuntime>,
+    catalogs: State<'_, ConnectionCatalogCoordinator>,
 ) -> Result<(), String> {
-    let path = connection_catalog_path(&app)?;
-    clear_connection_catalog_document(&path)
+    let path =
+        connection_catalog_path(&app).map_err(|_| connection_catalog_command_error("clear"))?;
+    catalogs
+        .with_lock(|| clear_connection_catalog_document(&path))
+        .map_err(|_| connection_catalog_command_error("clear"))
 }
 
 #[tauri::command]
@@ -1016,44 +1225,53 @@ pub async fn desktop_bridge_set_tailscale_serve_enabled(
 }
 
 #[tauri::command]
-pub fn desktop_bridge_get_wsl_state(app: AppHandle<DesktopRuntime>) -> Result<Value, String> {
-    read_desktop_settings(&app).map(|settings| wsl_state(&settings))
+pub fn desktop_bridge_get_wsl_state(
+    app: AppHandle<DesktopRuntime>,
+    backend: State<'_, BackendSupervisor>,
+) -> Result<Value, String> {
+    read_desktop_settings(&app).map(|settings| wsl_state(&settings, &backend))
 }
 
 #[tauri::command]
-pub fn desktop_bridge_set_wsl_backend_enabled(
+pub async fn desktop_bridge_set_wsl_backend_enabled(
     app: AppHandle<DesktopRuntime>,
+    backend: State<'_, BackendSupervisor>,
     enabled: bool,
 ) -> Result<Value, String> {
-    update_desktop_settings(&app, |settings| {
+    let settings = update_desktop_settings(&app, |settings| {
         settings.wsl_backend_enabled = enabled;
         if !enabled {
             settings.wsl_only = false;
         }
-    })
-    .map(|settings| wsl_state(&settings))
+    })?;
+    backend.restart_default_if_active(app.clone()).await?;
+    Ok(wsl_state(&settings, &backend))
 }
 
 #[tauri::command]
-pub fn desktop_bridge_set_wsl_distro(
+pub async fn desktop_bridge_set_wsl_distro(
     app: AppHandle<DesktopRuntime>,
+    backend: State<'_, BackendSupervisor>,
     distro: Option<String>,
 ) -> Result<Value, String> {
-    update_desktop_settings(&app, |settings| {
+    let settings = update_desktop_settings(&app, |settings| {
         settings.wsl_distro = normalize_wsl_distro(distro);
-    })
-    .map(|settings| wsl_state(&settings))
+    })?;
+    backend.restart_default_if_active(app.clone()).await?;
+    Ok(wsl_state(&settings, &backend))
 }
 
 #[tauri::command]
-pub fn desktop_bridge_set_wsl_only(
+pub async fn desktop_bridge_set_wsl_only(
     app: AppHandle<DesktopRuntime>,
+    backend: State<'_, BackendSupervisor>,
     enabled: bool,
 ) -> Result<Value, String> {
-    update_desktop_settings(&app, |settings| {
+    let settings = update_desktop_settings(&app, |settings| {
         settings.wsl_only = enabled;
-    })
-    .map(|settings| wsl_state(&settings))
+    })?;
+    backend.restart_default_if_active(app.clone()).await?;
+    Ok(wsl_state(&settings, &backend))
 }
 
 #[tauri::command]
@@ -1315,20 +1533,25 @@ pub async fn desktop_bridge_download_update(
 }
 
 #[tauri::command]
-pub fn desktop_bridge_install_update(
+pub async fn desktop_bridge_install_update(
     app: AppHandle<DesktopRuntime>,
     updates: State<'_, DesktopUpdateManager>,
+    backend: State<'_, BackendSupervisor>,
+    input: Option<DesktopUpdateInstallInput>,
 ) -> Result<Value, String> {
-    Ok(updates.install_update(&app))
+    Ok(updates
+        .install_update(&app, backend.inner(), input.unwrap_or_default())
+        .await)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::BackendUnavailableEnvironment;
     use std::future::Future;
     use std::io::{Read, Write};
     use std::net::{TcpListener, TcpStream};
-    use std::sync::mpsc;
+    use std::sync::{Arc, Barrier, Mutex, mpsc};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     #[test]
@@ -1570,6 +1793,152 @@ mod tests {
         );
     }
 
+    fn compare_test_catalog(
+        catalogs: &ConnectionCatalogCoordinator,
+        value: &Mutex<Option<String>>,
+        expected: Option<&str>,
+        next: &str,
+    ) -> Result<bool, String> {
+        catalogs.compare_and_set_with(
+            expected,
+            next,
+            || Ok(value.lock().expect("test catalog lock").clone()),
+            |catalog| {
+                *value.lock().expect("test catalog lock") = Some(catalog.to_string());
+                Ok(())
+            },
+        )
+    }
+
+    #[test]
+    fn connection_catalog_compare_and_set_preserves_conflicting_values() {
+        let catalogs = ConnectionCatalogCoordinator::new();
+        let value = Mutex::new(Some("before".to_string()));
+
+        assert!(compare_test_catalog(&catalogs, &value, Some("before"), "winner").unwrap());
+        assert!(!compare_test_catalog(&catalogs, &value, Some("before"), "loser").unwrap());
+        assert_eq!(
+            catalogs
+                .read_with(|| Ok(value.lock().expect("test catalog lock").clone()))
+                .unwrap(),
+            Some("winner".to_string())
+        );
+    }
+
+    #[test]
+    fn connection_catalog_compare_only_matches_without_a_writer() {
+        let catalogs = ConnectionCatalogCoordinator::new();
+        let value = Mutex::new(Some("current".to_string()));
+
+        assert!(
+            catalogs
+                .compare_with(Some("current"), || {
+                    Ok(value.lock().expect("test catalog lock").clone())
+                })
+                .unwrap()
+        );
+        assert!(
+            !catalogs
+                .compare_with(Some("stale"), || {
+                    Ok(value.lock().expect("test catalog lock").clone())
+                })
+                .unwrap()
+        );
+        assert_eq!(
+            value.lock().expect("test catalog lock").as_deref(),
+            Some("current")
+        );
+
+        let missing = tempfile::tempdir().expect("tempdir");
+        let path = missing.path().join("catalog.json");
+        assert!(
+            catalogs
+                .compare_with(None, || read_connection_catalog_document(&path))
+                .unwrap()
+        );
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn connection_catalog_compare_only_holds_the_shared_writer_lock() {
+        let catalogs = Arc::new(ConnectionCatalogCoordinator::new());
+        let value = Arc::new(Mutex::new(Some("before".to_string())));
+        let (compare_entered, compare_entered_rx) = mpsc::channel();
+        let (release_compare, release_compare_rx) = mpsc::channel();
+        let compare_catalogs = Arc::clone(&catalogs);
+        let compare_value = Arc::clone(&value);
+        let comparison = std::thread::spawn(move || {
+            compare_catalogs.compare_with(Some("before"), || {
+                compare_entered
+                    .send(())
+                    .expect("comparison should report entry");
+                release_compare_rx
+                    .recv()
+                    .expect("comparison should be released");
+                Ok(compare_value.lock().expect("test catalog lock").clone())
+            })
+        });
+        compare_entered_rx
+            .recv()
+            .expect("comparison should enter the coordinator");
+
+        let writer_catalogs = Arc::clone(&catalogs);
+        let writer_value = Arc::clone(&value);
+        let (writer_done, writer_done_rx) = mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            let result =
+                compare_test_catalog(&writer_catalogs, &writer_value, Some("before"), "after");
+            writer_done
+                .send(())
+                .expect("writer should report completion");
+            result
+        });
+
+        assert!(
+            writer_done_rx
+                .recv_timeout(Duration::from_millis(50))
+                .is_err(),
+            "writer must wait while compare-only owns the coordinator"
+        );
+        release_compare
+            .send(())
+            .expect("comparison should be released");
+        assert!(comparison.join().expect("comparison should join").unwrap());
+        assert!(writer.join().expect("writer should join").unwrap());
+        assert_eq!(
+            value.lock().expect("test catalog lock").as_deref(),
+            Some("after")
+        );
+    }
+
+    #[test]
+    fn concurrent_connection_catalog_compare_and_set_has_exactly_one_winner() {
+        let catalogs = Arc::new(ConnectionCatalogCoordinator::new());
+        let value = Arc::new(Mutex::new(Some("before".to_string())));
+        let start = Arc::new(Barrier::new(3));
+        let mut workers = Vec::new();
+        for next in ["first", "second"] {
+            let catalogs = Arc::clone(&catalogs);
+            let value = Arc::clone(&value);
+            let start = Arc::clone(&start);
+            workers.push(std::thread::spawn(move || {
+                start.wait();
+                compare_test_catalog(&catalogs, &value, Some("before"), next).unwrap()
+            }));
+        }
+        start.wait();
+
+        let results = workers
+            .into_iter()
+            .map(|worker| worker.join().expect("catalog worker should finish"))
+            .collect::<Vec<_>>();
+        assert_eq!(results.iter().filter(|result| **result).count(), 1);
+        assert!(matches!(
+            value.lock().expect("test catalog lock").as_deref(),
+            Some("first" | "second")
+        ));
+    }
+
     #[test]
     fn rejects_unsupported_connection_catalog_documents() {
         assert_eq!(
@@ -1642,7 +2011,7 @@ mod tests {
     #[tokio::test]
     async fn platform_state_helpers_cover_non_wsl_and_disabled_tailscale_paths() {
         let settings = default_desktop_settings();
-        let state = wsl_state(&settings);
+        let state = wsl_state(&settings, &BackendSupervisor::new());
         if !cfg!(target_os = "windows") {
             assert_eq!(state["available"], false);
             assert_eq!(state["distros"], json!([]));
@@ -1656,6 +2025,73 @@ mod tests {
                 .await
                 .expect("disabled Tailscale discovery should succeed")
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn wsl_state_exposes_a_tagged_primary_failure_without_a_fallback_bootstrap() {
+        let settings = DesktopSettings {
+            wsl_backend_enabled: true,
+            wsl_only: true,
+            wsl_distro: Some("Ubuntu".to_string()),
+            ..default_desktop_settings()
+        };
+        let backend = BackendSupervisor::new();
+        backend.record_planning_error(BackendPlanError::WslPrimaryUnavailable {
+            detail: "the selected distribution could not start".to_string(),
+        });
+
+        let state = wsl_state(&settings, &backend);
+
+        assert_eq!(
+            state["preflightError"],
+            json!({
+                "kind": "wsl-primary-unavailable",
+                "detail": "the selected distribution could not start",
+            })
+        );
+        assert!(backend.local_environment_bootstraps().is_empty());
+    }
+
+    #[test]
+    fn wsl_state_exposes_a_tagged_secondary_failure_without_removing_it_from_topology() {
+        let settings = DesktopSettings {
+            wsl_backend_enabled: true,
+            wsl_only: false,
+            wsl_distro: Some("Ubuntu".to_string()),
+            ..default_desktop_settings()
+        };
+        let backend = BackendSupervisor::new();
+        backend.record_unavailable_environment(BackendUnavailableEnvironment {
+            environment_id: "wsl:Ubuntu".to_string(),
+            label: "WSL (Ubuntu)".to_string(),
+            configured_distro: Some("Ubuntu".to_string()),
+            detail: "the selected distribution could not start".to_string(),
+        });
+
+        let state = wsl_state(&settings, &backend);
+
+        assert_eq!(
+            state["preflightError"],
+            json!({
+                "kind": "wsl-secondary-unavailable",
+                "detail": "the selected distribution could not start",
+            })
+        );
+        assert_eq!(
+            backend.local_environment_bootstraps(),
+            vec![json!({
+                "id": "wsl:Ubuntu",
+                "label": "WSL (Ubuntu)",
+                "configuredDistro": "Ubuntu",
+                "runningDistro": null,
+                "httpBaseUrl": null,
+                "wsBaseUrl": null,
+                "preflightError": {
+                    "kind": "wsl-secondary-unavailable",
+                    "detail": "the selected distribution could not start",
+                },
+            })]
         );
     }
 
@@ -1717,6 +2153,18 @@ mod tests {
                 wsl_only: true,
             }
         );
+    }
+
+    #[test]
+    fn persisted_wsl_only_intent_normalizes_the_backend_to_enabled() {
+        let settings = normalize_desktop_settings_document(DesktopSettingsDocument {
+            wsl_backend_enabled: Some(false),
+            wsl_only: Some(true),
+            ..DesktopSettingsDocument::default()
+        });
+
+        assert!(settings.wsl_only);
+        assert!(settings.wsl_backend_enabled);
     }
 
     #[test]
@@ -2088,9 +2536,13 @@ mod tests {
         let metadata = desktop_bridge_get_bridge_metadata(base_app.handle().clone());
 
         assert_eq!(metadata["host"], "tauri");
-        assert_eq!(metadata["bridgeVersion"], 1);
+        assert_eq!(metadata["bridgeVersion"], 3);
         assert_eq!(metadata["features"]["localBackend"], true);
         assert_eq!(metadata["features"]["connectionCatalog"], true);
+        assert_eq!(
+            metadata["features"]["protectedConnectionCatalog"],
+            cfg!(target_os = "windows")
+        );
         assert_eq!(
             metadata["features"]["preview"],
             crate::preview::host::is_supported()
@@ -2339,15 +2791,19 @@ mod tests {
 
     #[test]
     fn tauri_ipc_handlers_preserve_runtime_agnostic_bridge_contracts() {
+        use crate::config::IsolatedTestDataRoot;
         use tauri::test::{INVOKE_KEY, get_ipc_response, mock_builder};
 
+        let temp = tempfile::tempdir().expect("isolated desktop data root");
         // Use the generated application context so IPC exercises the same command
         // permissions as the production desktop shell.
         let mut context = crate::desktop_context();
         context.config_mut().identifier =
             format!("com.bibcode.bridge-tests-{}", std::process::id());
         let app = mock_builder()
+            .manage(IsolatedTestDataRoot::new(temp.path().join("data-root")))
             .manage(BackendSupervisor::new())
+            .manage(ConnectionCatalogCoordinator::new())
             .manage(NativeContextMenuManager::new())
             .manage(SshEnvironmentManager::new())
             .manage(SshPasswordPromptManager::new())
@@ -2357,10 +2813,18 @@ mod tests {
                 desktop_bridge_get_bridge_metadata,
                 desktop_bridge_get_app_branding,
                 desktop_bridge_get_local_environment_bootstraps,
+                desktop_bridge_get_project_data_statuses,
+                desktop_bridge_restore_project_data,
+                desktop_bridge_start_empty_project_data,
+                desktop_bridge_retry_project_data,
+                desktop_bridge_open_project_data_path,
+                desktop_bridge_export_project_data_diagnostics,
                 desktop_bridge_get_client_settings,
                 desktop_bridge_set_client_settings,
                 desktop_bridge_get_connection_catalog,
                 desktop_bridge_set_connection_catalog,
+                desktop_bridge_compare_connection_catalog,
+                desktop_bridge_compare_and_set_connection_catalog,
                 desktop_bridge_clear_connection_catalog,
                 desktop_bridge_discover_ssh_hosts,
                 desktop_bridge_ensure_ssh_environment,
@@ -2416,13 +2880,15 @@ mod tests {
             )
             .map(|body| body.deserialize::<Value>().unwrap())
         };
-        let test_state_dir = state_dir(app.handle()).expect("mock state directory");
-        let _ = fs::remove_dir_all(&test_state_dir);
-
+        let test_state_dir = state_dir(app.handle()).expect("isolated mock state directory");
         let metadata = invoke("desktop_bridge_get_bridge_metadata", json!({})).unwrap();
         assert_eq!(metadata["host"], "tauri");
         assert_eq!(
             invoke("desktop_bridge_get_local_environment_bootstraps", json!({})).unwrap(),
+            json!([])
+        );
+        assert_eq!(
+            invoke("desktop_bridge_get_project_data_statuses", json!({})).unwrap(),
             json!([])
         );
         assert!(
@@ -2433,6 +2899,31 @@ mod tests {
         assert!(client_settings.is_null() || client_settings.is_object());
         let catalog = invoke("desktop_bridge_get_connection_catalog", json!({})).unwrap();
         assert!(catalog.is_null() || catalog.is_string());
+        assert_eq!(
+            invoke(
+                "desktop_bridge_compare_connection_catalog",
+                json!({"expectedCatalog": catalog.clone()}),
+            )
+            .unwrap(),
+            true
+        );
+        assert_eq!(
+            invoke(
+                "desktop_bridge_compare_and_set_connection_catalog",
+                json!({"expectedCatalog":"stale-catalog","nextCatalog":"ignored-catalog"}),
+            )
+            .unwrap(),
+            false
+        );
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(
+            invoke(
+                "desktop_bridge_compare_and_set_connection_catalog",
+                json!({"expectedCatalog":null,"nextCatalog":"must-not-persist"}),
+            )
+            .expect_err("unprotected native catalog writes must fail closed"),
+            "Could not update the protected connection catalog."
+        );
         let _ = invoke("desktop_bridge_discover_ssh_hosts", json!({}));
         assert!(invoke("desktop_bridge_get_wsl_state", json!({})).unwrap()["enabled"].is_boolean());
         assert!(
@@ -2496,10 +2987,32 @@ mod tests {
             json!({"catalog":"test-catalog"}),
         );
         #[cfg(target_os = "windows")]
-        assert_eq!(
-            set_catalog.expect("Windows DPAPI should protect the catalog"),
-            true
-        );
+        {
+            assert_eq!(
+                set_catalog.expect("Windows DPAPI should protect the catalog"),
+                true
+            );
+            assert_eq!(
+                invoke(
+                    "desktop_bridge_compare_and_set_connection_catalog",
+                    json!({"expectedCatalog":"test-catalog","nextCatalog":"winner-catalog"}),
+                )
+                .unwrap(),
+                true
+            );
+            assert_eq!(
+                invoke("desktop_bridge_get_connection_catalog", json!({})).unwrap(),
+                "winner-catalog"
+            );
+            assert_eq!(
+                invoke(
+                    "desktop_bridge_compare_and_set_connection_catalog",
+                    json!({"expectedCatalog":"test-catalog","nextCatalog":"loser-catalog"}),
+                )
+                .unwrap(),
+                false
+            );
+        }
         #[cfg(not(target_os = "windows"))]
         assert!(
             set_catalog.is_err(),
@@ -2683,6 +3196,5 @@ mod tests {
                 "{command} should reject missing command arguments",
             );
         }
-        let _ = fs::remove_dir_all(test_state_dir);
     }
 }

@@ -1,6 +1,7 @@
 import {
   BearerConnectionTarget,
   PrimaryConnectionTarget,
+  UnavailableConnectionTarget,
 } from "@bibcode/client-runtime/connection";
 import { EnvironmentId, PRIMARY_LOCAL_ENVIRONMENT_ID } from "@bibcode/contracts";
 import { describe, expect, it } from "vite-plus/test";
@@ -34,6 +35,19 @@ describe("desktop local connection identity", () => {
 
     expect(isDesktopLocalConnectionTarget(target)).toBe(false);
     expect(desktopLocalBackendId(target)).toBeNull();
+  });
+
+  it("keeps an unavailable desired WSL environment desktop-local", () => {
+    const target = new UnavailableConnectionTarget({
+      connectionId: desktopLocalConnectionId("wsl:Ubuntu"),
+      environmentId: EnvironmentId.make("wsl:Ubuntu"),
+      label: "WSL (Ubuntu)",
+      configuredDistro: "Ubuntu",
+      detail: "the configured WSL distribution could not start",
+    });
+
+    expect(isDesktopLocalConnectionTarget(target)).toBe(true);
+    expect(desktopLocalBackendId(target)).toBe("wsl:Ubuntu");
   });
 });
 

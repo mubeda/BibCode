@@ -59,6 +59,55 @@ describe("execution environment contracts", () => {
     ).toBe(true);
   });
 
+  it("defaults storage identity to null for an older remote descriptor", () => {
+    const decoded = decodeExecutionEnvironmentDescriptor({
+      ...descriptor,
+      capabilities: { repositoryIdentity: true },
+    });
+
+    expect(decoded.storageInstanceId).toBeNull();
+  });
+
+  it("decodes a new server storage identity", () => {
+    const decoded = decodeExecutionEnvironmentDescriptor({
+      ...descriptor,
+      storageInstanceId: "0d93cbea-f237-4f37-8829-d816667be35f",
+      capabilities: { repositoryIdentity: true },
+    });
+
+    expect(decoded.storageInstanceId).toBe("0d93cbea-f237-4f37-8829-d816667be35f");
+  });
+
+  it("accepts a non-UUID storage identity from a third-party server", () => {
+    const decoded = decodeExecutionEnvironmentDescriptor({
+      ...descriptor,
+      storageInstanceId: "third-party-store",
+      capabilities: { repositoryIdentity: true },
+    });
+
+    expect(decoded.storageInstanceId).toBe("third-party-store");
+  });
+
+  it("trims surrounding whitespace from a supplied storage identity", () => {
+    const decoded = decodeExecutionEnvironmentDescriptor({
+      ...descriptor,
+      storageInstanceId: "  third-party-store  ",
+      capabilities: { repositoryIdentity: true },
+    });
+
+    expect(decoded.storageInstanceId).toBe("third-party-store");
+  });
+
+  it("rejects a whitespace-only storage identity", () => {
+    expect(() =>
+      decodeExecutionEnvironmentDescriptor({
+        ...descriptor,
+        storageInstanceId: "   ",
+        capabilities: { repositoryIdentity: true },
+      }),
+    ).toThrow();
+  });
+
   it("defaults the activity protocol version for an old descriptor", () => {
     expect(
       decodeExecutionEnvironmentDescriptor({
@@ -83,6 +132,7 @@ describe("execution environment contracts", () => {
   it("keeps a legacy non-activity client compatible with additive descriptors and conversation traffic", () => {
     const legacyDescriptor = decodeLegacyExecutionEnvironmentDescriptor({
       ...descriptor,
+      storageInstanceId: "0d93cbea-f237-4f37-8829-d816667be35f",
       capabilities: {
         repositoryIdentity: true,
         activityProtocolVersion: 1,

@@ -55,6 +55,7 @@ import type {
   TerminalWriteInput,
 } from "./terminal.ts";
 import type { ServerRemoveKeybindingInput, ServerUpsertKeybindingInput } from "./server.ts";
+import * as Effect from "effect/Effect";
 import * as Schema from "effect/Schema";
 import type {
   DiscoveredLocalServerList,
@@ -157,6 +158,27 @@ export type DesktopUpdateStatus =
   | "downloaded"
   | "error";
 
+export type DesktopUpdatePhase =
+  | "idle"
+  | "checking"
+  | "available"
+  | "protecting"
+  | "installing"
+  | "failed";
+
+export type DesktopUpdateProtectionStatus = "pending" | "protected" | "failed" | "excluded";
+
+export interface DesktopUpdateProtection {
+  environmentId: string;
+  label: string;
+  status: DesktopUpdateProtectionStatus;
+  message: string | null;
+}
+
+export interface DesktopUpdateInstallInput {
+  excludedEnvironmentIds?: readonly string[];
+}
+
 export type DesktopRuntimeArch = "arm64" | "x64" | "other";
 export type DesktopTheme = "light" | "dark" | "system";
 export type DesktopAppStageLabel = "Dev" | "Latest" | "Nightly";
@@ -172,6 +194,92 @@ export const DesktopUpdateStatusSchema = Schema.Literals([
   "downloaded",
   "error",
 ]);
+export const DesktopUpdatePhaseSchema = Schema.Literals([
+  "idle",
+  "checking",
+  "available",
+  "protecting",
+  "installing",
+  "failed",
+]);
+export const DesktopUpdateProtectionSchema = Schema.Struct({
+  environmentId: Schema.String,
+  label: Schema.String,
+  status: Schema.Literals(["pending", "protected", "failed", "excluded"]),
+  message: Schema.NullOr(Schema.String),
+});
+
+export type DesktopProjectDataStatus =
+  | "healthy"
+  | "storage-changed"
+  | "recovery-required"
+  | "unavailable";
+
+export interface DesktopProjectDataStatusChangedEvent {
+  readonly environmentId: string;
+}
+
+export interface DesktopProjectDataBackup {
+  backupId: string;
+  createdAt: string;
+  trigger: "pre-migration" | "pre-update";
+  appVersion: string;
+  schemaVersion: number;
+  sizeBytes: number;
+}
+
+export const DesktopProjectDataBackupSchema = Schema.Struct({
+  backupId: Schema.String,
+  createdAt: Schema.String,
+  trigger: Schema.Literals(["pre-migration", "pre-update"]),
+  appVersion: Schema.String,
+  schemaVersion: Schema.Number,
+  sizeBytes: Schema.Number,
+});
+
+export interface DesktopProjectDataEnvironmentStatus {
+  environmentId: string;
+  label: string;
+  runningDistro: string | null;
+  status: DesktopProjectDataStatus;
+  requestedRoot: string;
+  effectiveRoot: string;
+  isFilesystemAlias: boolean;
+  storageInstanceId: string | null;
+  issue: string | null;
+  backups: ReadonlyArray<DesktopProjectDataBackup>;
+}
+
+export const DesktopProjectDataEnvironmentStatusSchema = Schema.Struct({
+  environmentId: Schema.String,
+  label: Schema.String,
+  runningDistro: Schema.NullOr(Schema.String),
+  status: Schema.Literals(["healthy", "storage-changed", "recovery-required", "unavailable"]),
+  requestedRoot: Schema.String,
+  effectiveRoot: Schema.String,
+  isFilesystemAlias: Schema.Boolean,
+  storageInstanceId: Schema.NullOr(Schema.String),
+  issue: Schema.NullOr(Schema.String),
+  backups: Schema.Array(DesktopProjectDataBackupSchema),
+});
+
+export interface DesktopProjectDataRecoveryResult {
+  environmentId: string;
+  action: "restore" | "start-empty";
+  committed: boolean;
+  preservedDirectory: string;
+  storageInstanceId: string | null;
+  restartError: string | null;
+}
+
+export const DesktopProjectDataRecoveryResultSchema = Schema.Struct({
+  environmentId: Schema.String,
+  action: Schema.Literals(["restore", "start-empty"]),
+  committed: Schema.Boolean,
+  preservedDirectory: Schema.String,
+  storageInstanceId: Schema.NullOr(Schema.String),
+  restartError: Schema.NullOr(Schema.String),
+});
 export const DesktopRuntimeArchSchema = Schema.Literals(["arm64", "x64", "other"]);
 export const DesktopThemeSchema = Schema.Literals(["light", "dark", "system"]);
 export const DesktopAppStageLabelSchema = Schema.Literals(["Dev", "Latest", "Nightly"]);
@@ -185,6 +293,7 @@ export interface DesktopBridgeFeatureFlags {
   wslDiscovery: boolean;
   sshRemoteHttp: boolean;
   connectionCatalog: boolean;
+  protectedConnectionCatalog: boolean;
   sshProvisioning: boolean;
   preview: boolean;
   updater: boolean;
@@ -199,6 +308,7 @@ export const DesktopBridgeFeatureFlagsSchema = Schema.Struct({
   wslDiscovery: Schema.Boolean,
   sshRemoteHttp: Schema.Boolean,
   connectionCatalog: Schema.Boolean,
+  protectedConnectionCatalog: Schema.Boolean,
   sshProvisioning: Schema.Boolean,
   preview: Schema.Boolean,
   updater: Schema.Boolean,
@@ -255,6 +365,8 @@ export interface DesktopUpdateState {
   message: string | null;
   errorContext: "check" | "download" | "install" | null;
   canRetry: boolean;
+  phase?: DesktopUpdatePhase;
+  protection?: ReadonlyArray<DesktopUpdateProtection>;
 }
 
 export const DesktopUpdateStateSchema = Schema.Struct({
@@ -271,6 +383,10 @@ export const DesktopUpdateStateSchema = Schema.Struct({
   message: Schema.NullOr(Schema.String),
   errorContext: Schema.NullOr(Schema.Literals(["check", "download", "install"])),
   canRetry: Schema.Boolean,
+  phase: DesktopUpdatePhaseSchema.pipe(Schema.withDecodingDefault(Effect.succeed("idle"))),
+  protection: Schema.Array(DesktopUpdateProtectionSchema).pipe(
+    Schema.withDecodingDefault(Effect.succeed([])),
+  ),
 });
 
 export interface DesktopUpdateActionResult {
@@ -301,6 +417,35 @@ export const DesktopUpdateCheckResultSchema = Schema.Struct({
 // importing brand machinery from the desktop package.
 export const PRIMARY_LOCAL_ENVIRONMENT_ID = "primary";
 
+export interface DesktopWslPrimaryUnavailableError {
+  kind: "wsl-primary-unavailable";
+  detail: string;
+}
+
+export const DesktopWslPrimaryUnavailableErrorSchema = Schema.Struct({
+  kind: Schema.Literal("wsl-primary-unavailable"),
+  detail: Schema.String,
+});
+
+export interface DesktopWslSecondaryUnavailableError {
+  kind: "wsl-secondary-unavailable";
+  detail: string;
+}
+
+export const DesktopWslSecondaryUnavailableErrorSchema = Schema.Struct({
+  kind: Schema.Literal("wsl-secondary-unavailable"),
+  detail: Schema.String,
+});
+
+export type DesktopWslPreflightError =
+  | DesktopWslPrimaryUnavailableError
+  | DesktopWslSecondaryUnavailableError;
+
+export const DesktopWslPreflightErrorSchema = Schema.Union([
+  DesktopWslPrimaryUnavailableErrorSchema,
+  DesktopWslSecondaryUnavailableErrorSchema,
+]);
+
 export interface DesktopEnvironmentBootstrap {
   // Stable backend instance id (e.g. "primary" or "wsl:ubuntu"). The
   // web env runtime keys local environments off this so projects
@@ -311,18 +456,26 @@ export interface DesktopEnvironmentBootstrap {
   // from id because a default-tracking instance keeps the stable
   // "wsl:default" IPC target while each run launches a specific distro.
   runningDistro?: string | null;
+  // The explicit distro whose desired registration this entry represents.
+  // null/absent means the stable default-tracking WSL registration.
+  configuredDistro?: string | null;
   httpBaseUrl: string | null;
   wsBaseUrl: string | null;
   bootstrapToken?: string;
+  // Present only when this desired WSL secondary could not be planned or
+  // started. Unavailable entries intentionally have no endpoint or token.
+  preflightError?: DesktopWslSecondaryUnavailableError | null;
 }
 
 export const DesktopEnvironmentBootstrapSchema = Schema.Struct({
   id: Schema.String,
   label: Schema.String,
   runningDistro: Schema.optionalKey(Schema.NullOr(Schema.String)),
+  configuredDistro: Schema.optionalKey(Schema.NullOr(Schema.String)),
   httpBaseUrl: Schema.NullOr(Schema.String),
   wsBaseUrl: Schema.NullOr(Schema.String),
   bootstrapToken: Schema.optionalKey(Schema.String),
+  preflightError: Schema.optionalKey(Schema.NullOr(DesktopWslSecondaryUnavailableErrorSchema)),
 });
 
 export const DesktopSshEnvironmentTargetSchema = Schema.Struct({
@@ -496,17 +649,16 @@ export interface DesktopWslState {
   // null means "track the current WSL default distro".
   distro: string | null;
   available: boolean;
-  // When true (and `enabled` is also true) the desktop runs only the
-  // WSL backend as the primary; the Windows-side Node backend is not
-  // started. Toggling this requires an app restart because the
+  // When true the desktop runs only the WSL backend as the primary and treats
+  // this intent as authoritative even if a persisted `enabled` flag is stale.
+  // The Windows-side backend is not started. Toggling this requires an app restart because the
   // primary backend's spec is captured once at layer init.
   wslOnly: boolean;
   distros: readonly DesktopWslDistro[];
-  // Reason the dual-mode WSL backend last failed preflight (no node, wrong
-  // version, missing build tools), or null. Surfaced inline in Connections
-  // settings. Always null in wsl-only mode — that path shows a dialog and
-  // falls back to Windows instead.
-  preflightError: string | null;
+  // A structured primary or secondary WSL failure. Primary failures never
+  // substitute Windows; secondary failures leave the Windows primary live.
+  // null means planning/startup has not failed.
+  preflightError: DesktopWslPreflightError | null;
 }
 
 export const DesktopWslStateSchema = Schema.Struct({
@@ -515,7 +667,7 @@ export const DesktopWslStateSchema = Schema.Struct({
   available: Schema.Boolean,
   wslOnly: Schema.Boolean,
   distros: Schema.Array(DesktopWslDistroSchema),
-  preflightError: Schema.NullOr(Schema.String),
+  preflightError: Schema.NullOr(DesktopWslPreflightErrorSchema),
 });
 
 /**
@@ -1011,7 +1163,24 @@ export interface DesktopBridge {
   setClientSettings: (settings: ClientSettings) => Promise<void>;
   getConnectionCatalog?: () => Promise<string | null>;
   setConnectionCatalog?: (catalog: string) => Promise<boolean>;
+  compareAndSetConnectionCatalog?: (
+    expectedCatalog: string | null,
+    nextCatalog: string,
+  ) => Promise<boolean>;
+  compareConnectionCatalog?: (expectedCatalog: string | null) => Promise<boolean>;
   clearConnectionCatalog?: () => Promise<void>;
+  getProjectDataStatuses?: () => Promise<readonly DesktopProjectDataEnvironmentStatus[]>;
+  onProjectDataStatusChanged?: (
+    listener: (event: DesktopProjectDataStatusChangedEvent) => void,
+  ) => () => void;
+  restoreProjectData?: (
+    environmentId: string,
+    backupId: string,
+  ) => Promise<DesktopProjectDataRecoveryResult>;
+  startEmptyProjectData?: (environmentId: string) => Promise<DesktopProjectDataRecoveryResult>;
+  retryProjectData?: (environmentId: string) => Promise<void>;
+  openProjectDataPath?: (environmentId: string) => Promise<void>;
+  exportProjectDataDiagnostics?: (environmentId: string) => Promise<string | null>;
   discoverSshHosts: () => Promise<readonly DesktopDiscoveredSshHost[]>;
   ensureSshEnvironment: (
     target: DesktopSshEnvironmentTarget,
@@ -1055,7 +1224,7 @@ export interface DesktopBridge {
   getUpdateState: () => Promise<DesktopUpdateState>;
   checkForUpdate: () => Promise<DesktopUpdateCheckResult>;
   downloadUpdate: () => Promise<DesktopUpdateActionResult>;
-  installUpdate: () => Promise<DesktopUpdateActionResult>;
+  installUpdate: (input?: DesktopUpdateInstallInput) => Promise<DesktopUpdateActionResult>;
   onUpdateState: (listener: (state: DesktopUpdateState) => void) => () => void;
   /**
    * Desktop-only preview surface. Present iff the renderer is hosted by the

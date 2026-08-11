@@ -186,14 +186,15 @@ describe("ComposerPrimaryActions", () => {
     expect(markup).toContain('<span data-tooltip="true">Stop generation</span>');
   });
 
-  it("offers cancellation while an admitted message is still sending", () => {
+  it("labels cancellation distinctly while an admitted message is queued or sending", () => {
     const { markup } = renderActions({
       isSendBusy: true,
       canCancelPendingSend: true,
       sendBlockedReason: "Provider metadata conflicts with the active session.",
     });
 
-    expect(markup).toContain("Stop generation");
+    expect(markup).toContain("Cancel queued message");
+    expect(markup).not.toContain("Stop generation");
     invoke(harness.tooltipTriggers[0]!.props, "onClick");
     expect(defaults.onInterrupt).toHaveBeenCalledOnce();
   });

@@ -399,7 +399,7 @@ describe("provider update launch notification logic", () => {
       phase: "unchanged",
       type: "warning",
       title: "Provider still needs an update",
-      description: "Cursor still appears outdated. Check provider settings for details.",
+      description: "still old",
     });
   });
 
@@ -610,6 +610,7 @@ describe("provider update launch notification logic", () => {
       key: "unchanged:cursor:2026-04-23T10:00:00.000Z:still old",
       tone: "warning",
       title: "Cursor still needs an update",
+      description: "still old",
       dismissible: true,
     });
   });

@@ -1,4 +1,4 @@
-import { EnvironmentId } from "@bibcode/contracts";
+import { EnvironmentId, type ExecutionEnvironmentDescriptor } from "@bibcode/contracts";
 import * as Schema from "effect/Schema";
 
 const ConnectionTargetBase = {
@@ -38,11 +38,27 @@ export class SshConnectionTarget extends Schema.TaggedClass<SshConnectionTarget>
   },
 ) {}
 
+/**
+ * A platform-owned environment that remains desired but currently has no
+ * usable endpoint. It is deliberately not persistable: the host topology is
+ * the sole owner and the resolver must fail before any transport/session work.
+ */
+export class UnavailableConnectionTarget extends Schema.TaggedClass<UnavailableConnectionTarget>()(
+  "UnavailableConnectionTarget",
+  {
+    ...ConnectionTargetBase,
+    connectionId: Schema.String,
+    configuredDistro: Schema.NullOr(Schema.String),
+    detail: Schema.String,
+  },
+) {}
+
 export const ConnectionTarget = Schema.Union([
   PrimaryConnectionTarget,
   BearerConnectionTarget,
   RelayConnectionTarget,
   SshConnectionTarget,
+  UnavailableConnectionTarget,
 ]);
 export type ConnectionTarget = typeof ConnectionTarget.Type;
 
@@ -71,6 +87,8 @@ export const ConnectionBlockedReason = Schema.Literals([
   "authentication",
   "configuration",
   "permission",
+  "recovery-required",
+  "storage-changed",
   "unsupported",
 ]);
 export type ConnectionBlockedReason = typeof ConnectionBlockedReason.Type;
@@ -101,7 +119,25 @@ export class ConnectionBlockedError extends Schema.TaggedErrorClass<ConnectionBl
   }
 }
 
-export type ConnectionAttemptError = ConnectionTransientError | ConnectionBlockedError;
+export class ConnectionStorageChangedError extends Schema.TaggedErrorClass<ConnectionStorageChangedError>()(
+  "ConnectionStorageChangedError",
+  {
+    reason: Schema.Literal("storage-changed"),
+    detail: Schema.String,
+    targetKey: Schema.String,
+    acceptedStorageInstanceId: Schema.String,
+    reportedStorageInstanceId: Schema.String,
+  },
+) {
+  override get message(): string {
+    return this.detail;
+  }
+}
+
+export type ConnectionAttemptError =
+  | ConnectionTransientError
+  | ConnectionBlockedError
+  | ConnectionStorageChangedError;
 
 export type PreparedHttpAuthorization =
   | {
@@ -116,6 +152,7 @@ export type PreparedHttpAuthorization =
 export interface PreparedConnection {
   readonly environmentId: EnvironmentId;
   readonly label: string;
+  readonly descriptor: ExecutionEnvironmentDescriptor;
   readonly httpBaseUrl: string;
   readonly socketUrl: string;
   readonly httpAuthorization: PreparedHttpAuthorization | null;

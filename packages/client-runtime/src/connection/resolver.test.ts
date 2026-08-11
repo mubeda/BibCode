@@ -1,4 +1,8 @@
-import { EnvironmentId, type DesktopSshEnvironmentTarget } from "@bibcode/contracts";
+import {
+  EnvironmentId,
+  type DesktopSshEnvironmentTarget,
+  type ExecutionEnvironmentDescriptor,
+} from "@bibcode/contracts";
 import { RelayEnvironmentConnectScope } from "@bibcode/contracts/relay";
 import { describe, expect, it } from "@effect/vitest";
 import * as Effect from "effect/Effect";
@@ -7,6 +11,7 @@ import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 
 import * as ManagedRelay from "../relay/managedRelay.ts";
+import { remoteHttpClientLayer } from "../rpc/http.ts";
 import * as ConnectionResolver from "./resolver.ts";
 import * as ClientCapabilities from "../platform/capabilities.ts";
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
@@ -26,6 +31,7 @@ import {
   RelayConnectionTarget,
   SshConnectionTarget,
   type ConnectionTarget,
+  UnavailableConnectionTarget,
 } from "./model.ts";
 import * as ConnectionProfileStore from "./profileStore.ts";
 
@@ -35,6 +41,21 @@ const ENDPOINT = {
   wsBaseUrl: "wss://environment.example.test",
   providerKind: "cloudflare_tunnel" as const,
 };
+const DESCRIPTOR = {
+  environmentId: ENVIRONMENT_ID,
+  label: "Current environment",
+  platform: {
+    os: "linux",
+    arch: "x64",
+  },
+  serverVersion: "0.0.0-test",
+  storageInstanceId: "store-current",
+  capabilities: {
+    repositoryIdentity: true,
+    worktreeCatalog: false,
+    activityProtocolVersion: null,
+  },
+} satisfies ExecutionEnvironmentDescriptor;
 const SSH_TARGET: DesktopSshEnvironmentTarget = {
   alias: "development",
   hostname: "development.example.test",
@@ -76,6 +97,7 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
   readonly authorizeDpop?: RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization["Service"]["authorizeDpop"];
   readonly primaryBearerToken?: string;
   readonly prepareSsh?: ClientCapabilities.SshEnvironmentGateway["Service"]["prepare"];
+  readonly descriptor?: ExecutionEnvironmentDescriptor;
 }) => {
   const profiles = new Map(
     (options?.profiles ?? []).map((profile) => [profile.connectionId, profile]),
@@ -98,6 +120,7 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
       options?.authorizeBearer ??
       ((input) =>
         Effect.succeed({
+          descriptor: options?.descriptor ?? DESCRIPTOR,
           environmentId: input.expectedEnvironmentId,
           label: "Authorized bearer environment",
           httpBaseUrl: input.httpBaseUrl,
@@ -112,6 +135,7 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
       ((input) =>
         input.obtainBootstrap.pipe(
           Effect.as({
+            descriptor: options?.descriptor ?? DESCRIPTOR,
             environmentId: input.expectedEnvironmentId,
             label: "Authorized relay environment",
             httpBaseUrl: ENDPOINT.httpBaseUrl,
@@ -141,6 +165,7 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
   });
 
   const dependencies = Layer.mergeAll(
+    remoteHttpClientLayer(() => Promise.resolve(Response.json(options?.descriptor ?? DESCRIPTOR))),
     Layer.succeed(ConnectionProfileStore.ConnectionProfileStore, profileStore),
     Layer.succeed(ConnectionCredentialStore.ConnectionCredentialStore, credentialStore),
     Layer.succeed(
@@ -174,6 +199,28 @@ const makeDependencies = Effect.fn("TestConnectionResolver.makeDependencies")((o
 });
 
 describe("ConnectionResolver", () => {
+  it.effect("rejects an unavailable desired environment before resolving any endpoint", () =>
+    Effect.gen(function* () {
+      const brokerLayer = yield* makeDependencies();
+      const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(brokerLayer));
+      const target = new UnavailableConnectionTarget({
+        environmentId: ENVIRONMENT_ID,
+        label: "WSL (Ubuntu)",
+        connectionId: "local:wsl:Ubuntu",
+        configuredDistro: "Ubuntu",
+        detail: "the configured WSL distribution could not start",
+      });
+
+      const error = yield* broker.prepare(catalogEntry(target)).pipe(Effect.flip);
+
+      expect(error).toBeInstanceOf(ConnectionTransientError);
+      expect(error).toMatchObject({
+        reason: "endpoint-unavailable",
+        detail: "the configured WSL distribution could not start",
+      });
+    }),
+  );
+
   it.effect("prepares a primary environment without remote capabilities", () =>
     Effect.gen(function* () {
       const brokerLayer = yield* makeDependencies();
@@ -187,7 +234,8 @@ describe("ConnectionResolver", () => {
 
       expect(yield* broker.prepare(catalogEntry(target))).toEqual({
         environmentId: ENVIRONMENT_ID,
-        label: "Primary",
+        label: DESCRIPTOR.label,
+        descriptor: DESCRIPTOR,
         httpBaseUrl: "http://127.0.0.1:3777",
         socketUrl: "ws://127.0.0.1:3777/ws",
         httpAuthorization: null,
@@ -204,6 +252,7 @@ describe("ConnectionResolver", () => {
         authorizeBearer: (input) =>
           Ref.update(bearerInputs, (values) => [...values, input.bearerToken]).pipe(
             Effect.as({
+              descriptor: DESCRIPTOR,
               environmentId: input.expectedEnvironmentId,
               label: "Primary",
               httpBaseUrl: input.httpBaseUrl,
@@ -224,6 +273,7 @@ describe("ConnectionResolver", () => {
       });
 
       expect(yield* broker.prepare(catalogEntry(target))).toMatchObject({
+        descriptor: DESCRIPTOR,
         socketUrl: "ws://127.0.0.1:3777/ws?wsTicket=desktop",
         httpAuthorization: { _tag: "Bearer", token: "desktop-bearer" },
         target,
@@ -252,6 +302,7 @@ describe("ConnectionResolver", () => {
         authorizeBearer: (input) =>
           Ref.update(bearerInputs, (values) => [...values, input.bearerToken]).pipe(
             Effect.as({
+              descriptor: DESCRIPTOR,
               environmentId: input.expectedEnvironmentId,
               label: "Saved",
               httpBaseUrl: input.httpBaseUrl,
@@ -265,9 +316,9 @@ describe("ConnectionResolver", () => {
       });
       const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(brokerLayer));
 
-      expect(
-        (yield* broker.prepare(catalogEntry(target, Option.some(profile)))).socketUrl,
-      ).toContain("wsTicket=ticket");
+      const prepared = yield* broker.prepare(catalogEntry(target, Option.some(profile)));
+      expect(prepared.socketUrl).toContain("wsTicket=ticket");
+      expect(prepared.descriptor).toEqual(DESCRIPTOR);
       expect(yield* Ref.get(bearerInputs)).toEqual(["secret-bearer"]);
     }),
   );
@@ -307,6 +358,7 @@ describe("ConnectionResolver", () => {
               Ref.update(bootstrapCredentials, (values) => [...values, bootstrap.credential]),
             ),
             Effect.as({
+              descriptor: DESCRIPTOR,
               environmentId: input.expectedEnvironmentId,
               label: "Cloud",
               httpBaseUrl: ENDPOINT.httpBaseUrl,
@@ -320,7 +372,9 @@ describe("ConnectionResolver", () => {
       });
       const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(brokerLayer));
 
-      expect((yield* broker.prepare(catalogEntry(target))).socketUrl).toContain("wsTicket=dpop");
+      const prepared = yield* broker.prepare(catalogEntry(target));
+      expect(prepared.socketUrl).toContain("wsTicket=dpop");
+      expect(prepared.descriptor).toEqual(DESCRIPTOR);
       expect(yield* Ref.get(relayInputs)).toEqual([
         {
           clerkToken: "clerk-session",
@@ -361,9 +415,9 @@ describe("ConnectionResolver", () => {
       });
       const broker = yield* ConnectionResolver.ConnectionResolver.pipe(Effect.provide(brokerLayer));
 
-      expect(
-        (yield* broker.prepare(catalogEntry(target, Option.some(profile)))).socketUrl,
-      ).toContain("wsTicket=bearer");
+      const prepared = yield* broker.prepare(catalogEntry(target, Option.some(profile)));
+      expect(prepared.socketUrl).toContain("wsTicket=bearer");
+      expect(prepared.descriptor).toEqual(DESCRIPTOR);
       expect(yield* Ref.get(preparedTargets)).toEqual([SSH_TARGET]);
     }),
   );

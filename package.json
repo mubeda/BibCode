@@ -25,6 +25,7 @@
     "test:coverage:rust": "node scripts/check-rust-coverage.ts",
     "check:dependency-ledger": "node scripts/check-dependency-upgrade-ledger.ts",
     "test:desktop": "vp run --filter @bibcode/desktop test",
+    "test:desktop:upgrade": "node scripts/seeded-desktop-upgrade-smoke.ts",
     "test:ui:desktop": "vp run --filter @bibcode/desktop test:ui",
     "test:ui:desktop:build": "vp run --filter @bibcode/desktop test:ui:build",
     "fmt": "vp fmt",

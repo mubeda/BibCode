@@ -4,21 +4,21 @@
   "values": [
     {
       "version": 1,
-      "sequence": 2147483645,
+      "sequence": 2,
       "type": "ready",
       "payload": {
-        "at": "",
+        "at": "2026-01-01T00:00:00.000Z",
         "environment": {
-          "environmentId": "rmobsvOSK[e",
-          "label": "z#",
+          "environmentId": "fixture",
+          "label": "Fixture",
           "platform": {
-            "os": "darwin",
+            "os": "windows",
             "arch": "x64"
           },
-          "serverVersion": "valueOf",
+          "serverVersion": "0.1.1",
+          "storageInstanceId": "00000000-0000-4000-8000-000000000002",
           "capabilities": {
             "repositoryIdentity": true,
-            "worktreeCatalog": true,
             "activityProtocolVersion": 1
           }
         }

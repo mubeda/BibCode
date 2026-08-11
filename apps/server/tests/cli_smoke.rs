@@ -3,8 +3,13 @@ use std::{
     time::Duration,
 };
 
-use bibcode_server::Cli;
+use bibcode_server::{
+    Cli, ServerConfig, ServerRuntime,
+    persistence::{BackupTrigger, StatePaths, create_verified_backup, prepare_store},
+    resolve_data_root,
+};
 use clap::Parser;
+use rusqlite::Connection;
 use serde_json::{Value, json};
 use tempfile::TempDir;
 use tokio::{
@@ -31,6 +36,158 @@ fn headless_binary_exposes_the_compatible_serve_flags() {
     ] {
         assert!(stdout.contains(expected), "missing {expected} in {stdout}");
     }
+}
+
+#[tokio::test]
+async fn storage_inspect_prints_one_json_document_for_an_offline_store() {
+    let root = TempDir::new().expect("temporary storage root");
+    let handle = ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))
+        .await
+        .expect("seed inspectable store");
+    handle.shutdown();
+    handle.join().await.expect("stop inspectable store");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bibcode"))
+        .args(["storage", "inspect", "--base-dir"])
+        .arg(root.path())
+        .arg("--json")
+        .output()
+        .expect("run storage inspect");
+
+    assert!(
+        output.status.success(),
+        "storage inspect failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("inspection JSON");
+    assert_eq!(value["classification"], "existing");
+    assert!(value["storageInstanceId"].as_str().is_some());
+    assert_eq!(value["backups"], json!([]));
+    assert_eq!(
+        value["effectiveRoot"],
+        root.path()
+            .canonicalize()
+            .expect("canonical storage root")
+            .to_string_lossy()
+            .as_ref()
+    );
+}
+
+#[tokio::test]
+async fn storage_restore_prints_json_and_restores_the_selected_verified_generation() {
+    let root = TempDir::new().expect("temporary storage root");
+    let mut config = ServerConfig::new(root.path());
+    let resolved = resolve_data_root(config.data_root_request.clone()).expect("resolve root");
+    config.base_dir.clone_from(&resolved.effective);
+    config.resolved_data_root = Some(resolved);
+    let paths = StatePaths::from_config(&config);
+    std::fs::create_dir_all(&paths.state_dir).expect("state directory");
+    let prepared = prepare_store(&config)
+        .await
+        .expect("prepare CLI recovery store");
+    prepared
+        .database
+        .call(|connection| {
+            connection.execute(
+                "INSERT INTO projection_projects (
+                   project_id, title, workspace_root, default_model_selection_json,
+                   scripts_json, created_at, updated_at, deleted_at
+                 ) VALUES ('cli-project', 'Before restore', '/tmp/cli-project', NULL, '{}',
+                           '2026-08-10T00:00:00Z', '2026-08-10T00:00:00Z', NULL)",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("seed CLI project");
+    let backup = create_verified_backup(
+        &prepared.database,
+        &prepared,
+        BackupTrigger::PreUpdate,
+        env!("CARGO_PKG_VERSION"),
+    )
+    .await
+    .expect("create CLI restore generation");
+    prepared
+        .database
+        .call(|connection| {
+            connection.execute(
+                "UPDATE projection_projects SET title = 'After backup' WHERE project_id = 'cli-project'",
+                [],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("mutate CLI project");
+    drop(prepared);
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bibcode"))
+        .args(["storage", "restore", "--base-dir"])
+        .arg(root.path())
+        .args([
+            "--backup-id",
+            &backup.manifest.backup_id.to_string(),
+            "--json",
+        ])
+        .output()
+        .expect("run storage restore");
+
+    assert!(
+        output.status.success(),
+        "storage restore failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: Value = serde_json::from_slice(&output.stdout).expect("restore JSON");
+    assert_eq!(value["action"], "restore");
+    assert!(value["preservedDirectory"].as_str().is_some());
+    let restored = Connection::open(&paths.database).expect("restored database");
+    let title: String = restored
+        .query_row(
+            "SELECT title FROM projection_projects WHERE project_id = 'cli-project'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("restored CLI project");
+    assert_eq!(title, "Before restore");
+}
+
+#[tokio::test]
+async fn storage_start_empty_exits_nonzero_without_mutating_a_running_store() {
+    let root = TempDir::new().expect("temporary active storage root");
+    let handle = ServerRuntime::start(ServerConfig::new(root.path()).with_bind("127.0.0.1", 0))
+        .await
+        .expect("start active storage owner");
+    let mut config = ServerConfig::new(root.path());
+    let resolved = handle.data_root().clone();
+    config.base_dir.clone_from(&resolved.effective);
+    config.resolved_data_root = Some(resolved);
+    let paths = StatePaths::from_config(&config);
+    let database_before = std::fs::read(&paths.database).expect("active database bytes");
+    let marker_before = std::fs::read(&paths.environment_id).expect("active marker bytes");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_bibcode"))
+        .args(["storage", "start-empty", "--base-dir"])
+        .arg(root.path())
+        .arg("--json")
+        .output()
+        .expect("run unsafe start-empty");
+
+    assert!(!output.status.success());
+    assert!(
+        String::from_utf8_lossy(&output.stderr)
+            .contains("project-data store is currently owned by a running server")
+    );
+    assert_eq!(
+        std::fs::read(&paths.database).expect("active database remains"),
+        database_before
+    );
+    assert_eq!(
+        std::fs::read(&paths.environment_id).expect("active marker remains"),
+        marker_before
+    );
+    handle.shutdown();
+    handle.join().await.expect("stop active storage owner");
 }
 
 #[test]

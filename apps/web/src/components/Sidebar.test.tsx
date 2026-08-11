@@ -69,6 +69,18 @@ const h = vi.hoisted(() => {
     discoveredPortsByThreadId: {},
     desktopBootstraps: [],
     desktopUpdateState: null,
+    shellSummary: {
+      catalogReady: false,
+      desiredEnvironmentCount: 0,
+      statuses: [],
+      canShowEmptyProjects: false,
+      hasSnapshot: false,
+      hasSynchronizingShell: false,
+      hasCachedShell: false,
+      hasLiveShell: false,
+      firstError: null,
+      latestSnapshotUpdatedAt: null,
+    },
     updateBtnDisabled: false,
     updateBtnAction: "none",
     showArmWarning: false,
@@ -198,6 +210,7 @@ const h = vi.hoisted(() => {
     closestCorners: vi.fn(),
     copyToClipboard: vi.fn(),
     windowConfirm: vi.fn(),
+    openProjectDataRecovery: vi.fn(async () => undefined),
   };
 
   const runCommand = (command: { label?: string }, input: unknown) => {
@@ -399,6 +412,11 @@ vi.mock("../state/projects", () => ({
 
 vi.mock("../state/shell", () => ({
   shellEnvironment: { openInEditor: { label: "shell.openInEditor" } },
+  environmentAvailabilityCommands: {
+    retry: { label: "environment.retry" },
+    adoptStorage: { label: "environment.adoptStorage" },
+  },
+  useEnvironmentShellSummary: () => h.state.shellSummary,
 }));
 
 vi.mock("../state/threads", () => ({
@@ -439,6 +457,12 @@ vi.mock("../state/worktrees", () => ({
   },
   useWorktreeCatalogFocusRefresh: (projects: ReadonlyArray<unknown>) => {
     h.state.discoveryFocusRefreshCalls.push([...projects]);
+  },
+}));
+
+vi.mock("../state/projectDataSafety", () => ({
+  projectDataSafetyStore: {
+    open: h.spies.openProjectDataRecovery,
   },
 }));
 
@@ -764,6 +788,7 @@ function environmentFixture(overrides: {
   environmentId: EnvironmentId;
   label?: string | null;
   connectionId?: string;
+  primary?: boolean;
   displayUrl?: string | null;
   phase?: string;
   error?: string | null;
@@ -772,10 +797,12 @@ function environmentFixture(overrides: {
     environmentId: overrides.environmentId,
     label: overrides.label ?? null,
     entry: {
-      target: {
-        _tag: "BearerConnectionTarget",
-        connectionId: overrides.connectionId ?? "plain",
-      },
+      target: overrides.primary
+        ? { _tag: "PrimaryConnectionTarget" }
+        : {
+            _tag: "BearerConnectionTarget",
+            connectionId: overrides.connectionId ?? "plain",
+          },
     },
     displayUrl: overrides.displayUrl ?? null,
     connection: { phase: overrides.phase ?? "connected", error: overrides.error ?? null },
@@ -1021,6 +1048,18 @@ beforeEach(() => {
   h.state.discoveredPortsByThreadId = {};
   h.state.desktopBootstraps = [];
   h.state.desktopUpdateState = null;
+  h.state.shellSummary = {
+    catalogReady: false,
+    desiredEnvironmentCount: 0,
+    statuses: [],
+    canShowEmptyProjects: false,
+    hasSnapshot: false,
+    hasSynchronizingShell: false,
+    hasCachedShell: false,
+    hasLiveShell: false,
+    firstError: null,
+    latestSnapshotUpdatedAt: null,
+  };
   h.state.updateBtnDisabled = false;
   h.state.updateBtnAction = "none";
   h.state.showArmWarning = false;
@@ -1260,9 +1299,148 @@ staticDescribe("Sidebar full render", () => {
     expect(nav[0]!.props["pathname"]).toBe("/settings/appearance");
   });
 
-  it("renders the empty projects state", () => {
+  it("renders the empty projects state only after a live authoritative snapshot", () => {
+    h.state.shellSummary = {
+      ...h.state.shellSummary,
+      catalogReady: true,
+      desiredEnvironmentCount: 1,
+      statuses: [
+        {
+          environmentId: ENV_MAIN,
+          status: "live",
+          hasSnapshot: true,
+          error: null,
+        },
+      ],
+      canShowEmptyProjects: true,
+      hasSnapshot: true,
+      hasLiveShell: true,
+    };
     const markup = render(<Sidebar />);
     expect(markup).toContain("No projects yet");
+  });
+
+  it("renders loading rather than claiming an empty catalog before catalog readiness", () => {
+    const markup = render(<Sidebar />);
+    expect(markup).toContain("Project data is still loading");
+    expect(markup).not.toContain("No projects yet");
+  });
+
+  it("wires storage-change actions and confirms storage adoption through the local dialog", async () => {
+    fakeLocalApi();
+    h.spies.dialogConfirm.mockResolvedValue(true);
+    (globalThis.window as unknown as Record<string, unknown>)["desktopBridge"] = {
+      getProjectDataStatuses: vi.fn(),
+    };
+    h.state.environments = [
+      environmentFixture({
+        environmentId: ENV_MAIN,
+        label: "Local",
+        primary: true,
+      }),
+    ];
+    h.state.shellSummary = {
+      ...h.state.shellSummary,
+      catalogReady: true,
+      desiredEnvironmentCount: 1,
+      statuses: [
+        {
+          environmentId: ENV_MAIN,
+          status: "storage-changed",
+          hasSnapshot: false,
+          error: "Persistent storage changed.",
+        },
+      ],
+    };
+    const markup = render(<Sidebar />);
+    expect(markup).toContain("Project data location changed");
+
+    invoke(
+      mustFindProps((props) => props["children"] === "Retry", "project retry action"),
+      "onClick",
+      mouseEvent(),
+    );
+    invoke(
+      mustFindProps((props) => props["children"] === "Recover data", "project recovery action"),
+      "onClick",
+      mouseEvent(),
+    );
+    invoke(
+      mustFindProps((props) => props["children"] === "Settings", "project settings action"),
+      "onClick",
+      mouseEvent(),
+    );
+    invoke(
+      mustFindProps((props) => props["children"] === "Diagnostics", "project diagnostics action"),
+      "onClick",
+      mouseEvent(),
+    );
+    invoke(
+      mustFindProps(
+        (props) => props["children"] === "Use this data location",
+        "project storage adoption action",
+      ),
+      "onClick",
+      mouseEvent(),
+    );
+    await flush();
+
+    expect(h.state.commandCalls).toEqual([
+      { label: "environment.retry", input: ENV_MAIN },
+      { label: "environment.adoptStorage", input: ENV_MAIN },
+    ]);
+    expect(h.spies.navigate).toHaveBeenCalledWith({ to: "/settings/connections" });
+    expect(h.spies.navigate).toHaveBeenCalledWith({ to: "/settings/diagnostics" });
+    expect(h.spies.openProjectDataRecovery).toHaveBeenCalledWith(ENV_MAIN, "manual");
+    expect(h.spies.dialogConfirm).toHaveBeenCalledWith(
+      "Use this project data location? Projects from the two locations will not be merged.",
+    );
+    expect(h.spies.windowConfirm).not.toHaveBeenCalled();
+  });
+
+  it("cancels storage adoption when the local dialog is declined", async () => {
+    fakeLocalApi();
+    h.spies.dialogConfirm.mockResolvedValue(false);
+    h.state.environments = [
+      environmentFixture({
+        environmentId: ENV_MAIN,
+        label: "Local",
+        primary: true,
+      }),
+    ];
+    h.state.shellSummary = {
+      ...h.state.shellSummary,
+      catalogReady: true,
+      desiredEnvironmentCount: 1,
+      statuses: [
+        {
+          environmentId: ENV_MAIN,
+          status: "storage-changed",
+          hasSnapshot: false,
+          error: "Persistent storage changed.",
+        },
+      ],
+    };
+    render(<Sidebar />);
+
+    invoke(
+      mustFindProps(
+        (props) => props["children"] === "Use this data location",
+        "project storage adoption action",
+      ),
+      "onClick",
+      mouseEvent(),
+    );
+    await flush();
+
+    expect(h.spies.dialogConfirm).toHaveBeenCalledWith(
+      "Use this project data location? Projects from the two locations will not be merged.",
+    );
+    expect(h.spies.windowConfirm).not.toHaveBeenCalled();
+    expect(h.state.commandCalls).not.toContainEqual({
+      label: "environment.adoptStorage",
+      input: ENV_MAIN,
+    });
   });
 
   it("shows the empty-thread state for an expanded project without workspace threads", () => {
@@ -1377,12 +1555,15 @@ staticDescribe("Sidebar full render", () => {
     );
   });
 
-  it("runs the install flow behind a confirmation and toasts errors", async () => {
+  it("runs installation through typed project protection and toasts errors", async () => {
     baseScenario();
     h.state.desktopUpdateState = { phase: "downloaded" };
     h.state.showArmWarning = true;
     h.state.updateBtnAction = "install";
-    const installUpdate = vi.fn(async () => ({ toast: true, error: "install failed" }));
+    const installUpdate = vi.fn(async () => ({
+      completed: false,
+      state: { message: "install failed" },
+    }));
     (globalThis.window as unknown as Record<string, unknown>)["desktopBridge"] = {
       downloadUpdate: vi.fn(),
       installUpdate,
@@ -1394,14 +1575,18 @@ staticDescribe("Sidebar full render", () => {
     );
     expect(button).toBeDefined();
 
-    // First: user declines the confirm.
-    h.spies.windowConfirm.mockReturnValueOnce(false);
+    // The update action opens the typed protection dialog without using a
+    // browser confirmation or invoking the installer directly.
     invoke(button!.props, "onClick", mouseEvent());
     await flush();
     expect(installUpdate).not.toHaveBeenCalled();
+    expect(h.spies.windowConfirm).not.toHaveBeenCalled();
 
-    // Then: user accepts, install reports an error.
-    invoke(button!.props, "onClick", mouseEvent());
+    const protectAndInstall = captured("Button").find(
+      (entry) => entry.props["children"] === "Protect projects and install",
+    );
+    expect(protectAndInstall).toBeDefined();
+    invoke(protectAndInstall!.props, "onClick", mouseEvent());
     await flush();
     expect(installUpdate).toHaveBeenCalled();
     expect(h.spies.toastAdd).toHaveBeenCalledWith(
@@ -1410,7 +1595,7 @@ staticDescribe("Sidebar full render", () => {
 
     // And: install rejects entirely.
     installUpdate.mockRejectedValueOnce(new Error("io error"));
-    invoke(button!.props, "onClick", mouseEvent());
+    invoke(protectAndInstall!.props, "onClick", mouseEvent());
     await flush();
     expect(h.spies.toastAdd).toHaveBeenCalledWith(
       expect.objectContaining({ title: "Could not install update", description: "io error" }),
@@ -1472,6 +1657,11 @@ staticDescribe("Sidebar full render", () => {
       (entry) => entry.props["children"] === "Install ARM build",
     )!;
     invoke(install.props, "onClick", mouseEvent());
+    await flush();
+    const protectAndInstall = captured("Button").find(
+      (entry) => entry.props["children"] === "Protect projects and install",
+    )!;
+    invoke(protectAndInstall.props, "onClick", mouseEvent());
     await flush();
     expect(h.spies.toastAdd).toHaveBeenCalledWith(
       expect.objectContaining({ description: "An unexpected error occurred." }),

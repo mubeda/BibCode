@@ -7,6 +7,7 @@ import {
   DownloadIcon,
   LoaderIcon,
   PlusIcon,
+  RefreshCwIcon,
   TriangleAlertIcon,
   Trash2Icon,
   XIcon,
@@ -353,6 +354,7 @@ interface ProviderInstanceCardProps {
   readonly onFavoriteModelsChange: (next: ReadonlyArray<string>) => void;
   readonly onModelOrderChange: (next: ReadonlyArray<string>) => void;
   readonly onRunUpdate?: (() => void) | undefined;
+  readonly onRecheck?: (() => void) | undefined;
   readonly isUpdating?: boolean | undefined;
 }
 
@@ -399,6 +401,7 @@ export function ProviderInstanceCard({
   onFavoriteModelsChange,
   onModelOrderChange,
   onRunUpdate,
+  onRecheck,
   isUpdating = false,
 }: ProviderInstanceCardProps) {
   const enabled = instance.enabled ?? true;
@@ -420,6 +423,11 @@ export function ProviderInstanceCard({
   const versionAdvisory = getProviderVersionAdvisoryPresentation(liveProvider?.versionAdvisory);
   const hasProviderUpdate = versionAdvisory?.kind === "update";
   const updateCommand = versionAdvisory?.updateCommand ?? null;
+  const terminalUpdateState =
+    liveProvider?.updateState?.status === "failed" ||
+    liveProvider?.updateState?.status === "unchanged"
+      ? liveProvider.updateState
+      : null;
   const FallbackIconComponent = driverOption?.icon;
   const displayName =
     instance.displayName?.trim() || driverOption?.label || String(instance.driver);
@@ -664,6 +672,44 @@ export function ProviderInstanceCard({
                           {versionAdvisory.detail}
                         </p>
                       </div>
+                      {terminalUpdateState ? (
+                        <div className="grid gap-2 rounded-md border border-warning/35 bg-warning/5 p-2.5">
+                          {terminalUpdateState.message ? (
+                            <p className="break-words text-xs leading-snug text-foreground">
+                              {terminalUpdateState.message}
+                            </p>
+                          ) : null}
+                          {terminalUpdateState.output ? (
+                            <details className="min-w-0 text-xs text-muted-foreground">
+                              <summary className="cursor-pointer select-none font-medium text-foreground">
+                                Update output
+                              </summary>
+                              <ScrollArea
+                                scrollFade
+                                className="mt-1.5 max-h-40 rounded border bg-background/70"
+                              >
+                                <pre className="w-max min-w-full whitespace-pre-wrap break-words p-2 font-mono text-[11px] leading-relaxed">
+                                  {terminalUpdateState.output}
+                                </pre>
+                              </ScrollArea>
+                            </details>
+                          ) : null}
+                          {onRecheck ? (
+                            <Button
+                              type="button"
+                              size="xs"
+                              variant="outline"
+                              className="w-full"
+                              disabled={isUpdating}
+                              onClick={onRecheck}
+                              aria-label="Recheck provider version"
+                            >
+                              <RefreshCwIcon className={cn(isUpdating && "animate-spin")} />
+                              Recheck
+                            </Button>
+                          ) : null}
+                        </div>
+                      ) : null}
                       {hasProviderUpdate && onRunUpdate ? (
                         <Button
                           type="button"

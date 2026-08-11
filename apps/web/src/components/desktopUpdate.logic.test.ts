@@ -104,6 +104,11 @@ describe("desktop update button state", () => {
     expect(isDesktopUpdateButtonDisabled(state)).toBe(true);
     expect(getDesktopUpdateButtonTooltip(state)).toContain("42%");
   });
+
+  it("disables duplicate actions while protecting or installing", () => {
+    expect(isDesktopUpdateButtonDisabled({ ...baseState, phase: "protecting" })).toBe(true);
+    expect(isDesktopUpdateButtonDisabled({ ...baseState, phase: "installing" })).toBe(true);
+  });
 });
 
 describe("getDesktopUpdateActionError", () => {

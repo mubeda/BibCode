@@ -24,6 +24,13 @@ Set `BIBCODE_DEV_INSTANCE` to shift both deterministically, or set
 `BIBCODE_PORT_OFFSET` to an explicit numeric offset. These are development-runner
 defaults; the standalone native server's default port is `3773`.
 
+The desktop development runner defaults `BIBCODE_HOME` to `~/.bibcode`. Debug
+builds use its `dev` state kind while installed builds use `userdata`; a dev
+launch does not make either store disposable. Desktop Rust tests use explicit
+temporary roots and fail closed if a Tauri mock attempts to resolve the real
+default user root, so `cargo test -p bibcode-desktop` must not mutate either
+state kind.
+
 ## Build And Quality
 
 - `vp run build`: build application, package, lint-plugin, and script outputs.

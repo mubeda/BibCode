@@ -169,7 +169,7 @@ async fn generic_project_upsert_cannot_establish_or_replace_repository_identity(
 async fn worktree_repository_identity_pin_persists_across_database_restart() {
     let root = tempfile::tempdir().expect("database directory");
     let path = root.path().join("catalog.sqlite3");
-    let database = Database::open(&path).await.expect("database opens");
+    let database = Database::create_new(&path).await.expect("database opens");
     database
         .call(|connection| {
             run_migrations(connection, None)?;
@@ -194,7 +194,11 @@ async fn worktree_repository_identity_pin_persists_across_database_restart() {
     );
     drop(repositories);
 
-    let reopened = Repositories::new(Database::open(&path).await.expect("database reopens"));
+    let reopened = Repositories::new(
+        Database::open_existing(&path)
+            .await
+            .expect("database reopens"),
+    );
     let project = reopened
         .get_project("project-restart-pin".to_owned())
         .await

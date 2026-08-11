@@ -90,6 +90,12 @@ export class EnvironmentRegistry extends Context.Service<
       | PlatformEnvironmentRemovalError
     >;
     readonly retryNow: (environmentId: EnvironmentId) => Effect.Effect<void>;
+    readonly acceptStorageIdentity: (
+      environmentId: EnvironmentId,
+    ) => Effect.Effect<
+      void,
+      Persistence.ConnectionPersistenceError | EnvironmentNotRegisteredError
+    >;
     readonly state: (
       environmentId: EnvironmentId,
     ) => Effect.Effect<SupervisorConnectionState, EnvironmentNotRegisteredError>;
@@ -128,6 +134,7 @@ interface EnvironmentServiceScope {
 export const make = Effect.gen(function* () {
   const storage = yield* Persistence.ConnectionTargetStore;
   const registrations = yield* Persistence.ConnectionRegistrationStore;
+  const identities = yield* Persistence.AcceptedStorageIdentityStore;
   const cache = yield* Persistence.EnvironmentCacheStore;
   const ownedDataCleanup = yield* Persistence.EnvironmentOwnedDataCleanup;
   const profiles = yield* ConnectionProfileStore.ConnectionProfileStore;
@@ -434,6 +441,18 @@ export const make = Effect.gen(function* () {
                 }),
               ),
             );
+          } else if (registration._tag === "UnavailableConnectionRegistration") {
+            // A desired-but-unavailable desktop backend must not retain a
+            // credential from its previous live registration. Its typed
+            // target keeps identity/cache state without remaining usable.
+            yield* credentials.remove(registration.target.connectionId).pipe(
+              Effect.catch((error) =>
+                Effect.logWarning("Could not clear the unavailable platform credential.", {
+                  environmentId: target.environmentId,
+                  error,
+                }),
+              ),
+            );
           }
 
           const persistedTarget = (yield* Ref.get(persistedTargetsByEnvironment)).get(
@@ -487,7 +506,11 @@ export const make = Effect.gen(function* () {
             next.delete(environmentId);
             return next;
           });
-          if (entry !== undefined && entry.target._tag === "BearerConnectionTarget") {
+          if (
+            entry !== undefined &&
+            (entry.target._tag === "BearerConnectionTarget" ||
+              entry.target._tag === "UnavailableConnectionTarget")
+          ) {
             yield* credentials.remove(entry.target.connectionId).pipe(
               Effect.catch((error) =>
                 Effect.logWarning("Could not clear the platform bearer credential.", {
@@ -628,6 +651,58 @@ export const make = Effect.gen(function* () {
       Effect.catchTag("EnvironmentNotRegisteredError", () => Effect.void),
       Effect.withSpan("EnvironmentRegistry.retryNow"),
     );
+  const acceptStorageIdentity = Effect.fn("EnvironmentRegistry.acceptStorageIdentity")(function* (
+    environmentId: EnvironmentId,
+  ) {
+    yield* withLeaseLock(
+      environmentId,
+      Effect.uninterruptible(
+        Effect.gen(function* () {
+          yield* getEntry(environmentId);
+          const supervisor = (yield* SubscriptionRef.get(serviceScopes)).get(
+            environmentId,
+          )?.supervisor;
+          if (supervisor === undefined) {
+            return yield* new Persistence.ConnectionPersistenceError({
+              operation: "accept-storage-identity",
+              message: "The environment is not currently blocked by a persistent store change.",
+            });
+          }
+          const current = yield* SubscriptionRef.get(supervisor.state);
+          if (
+            current.phase !== "blocked" ||
+            current.lastFailure?._tag !== "ConnectionStorageChangedError"
+          ) {
+            return yield* new Persistence.ConnectionPersistenceError({
+              operation: "accept-storage-identity",
+              message: "The environment is not currently blocked by a persistent store change.",
+            });
+          }
+          const storageFailure = current.lastFailure;
+          const adopted = yield* identities.transition(
+            storageFailure.targetKey,
+            (acceptedStorageInstanceId) =>
+              acceptedStorageInstanceId === storageFailure.acceptedStorageInstanceId
+                ? {
+                    result: true,
+                    mutation: {
+                      _tag: "Set",
+                      storageInstanceId: storageFailure.reportedStorageInstanceId,
+                    },
+                  }
+                : { result: false, mutation: { _tag: "Keep" } },
+          );
+          if (!adopted) {
+            return yield* new Persistence.ConnectionPersistenceError({
+              operation: "accept-storage-identity",
+              message: "The accepted persistent store changed before it could be adopted.",
+            });
+          }
+          yield* supervisor.retryNow;
+        }),
+      ),
+    );
+  });
   const state = Effect.fn("EnvironmentRegistry.state")(function* (environmentId: EnvironmentId) {
     const supervisor = yield* acquireSupervisor(environmentId);
     return yield* SubscriptionRef.get(supervisor.state);
@@ -667,6 +742,7 @@ export const make = Effect.gen(function* () {
     remove,
     removeRelayEnvironments,
     retryNow,
+    acceptStorageIdentity,
     state,
     stateChanges,
     run,
