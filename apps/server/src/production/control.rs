@@ -4956,7 +4956,7 @@ mod tests {
     #[test]
     fn environment_descriptor_advertises_complete_worktree_catalog_surface() {
         let temp = tempfile::tempdir().expect("state directory");
-        let config = ServerConfig::new(temp.path());
+        let config = running_test_config(temp.path());
         let descriptor = environment_descriptor(&config, false);
         assert_eq!(descriptor["capabilities"]["repositoryIdentity"], true);
         assert_eq!(descriptor["capabilities"]["worktreeCatalog"], true);
