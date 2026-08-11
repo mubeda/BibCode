@@ -181,6 +181,16 @@ cancellation cannot commit the user decision without also scheduling the
 retry. Adoption neither clears environment caches nor reads, writes, copies,
 or merges either server database.
 
+This identity boundary starts when both sides understand persistent store
+UUIDs. An older server reports `null`, and the client deliberately treats that
+as unverifiable without erasing an accepted UUID. Likewise, the first
+protected release cannot infer whether an earlier release had already selected
+a different valid database before either database had a marker. Once a store
+publishes an identity and the client accepts it, subsequent switches are
+blocked before synchronization. See
+[Project data safety and recovery](../guides/project-data-recovery.md) for the
+observable platform scenarios and supported recovery actions.
+
 ## State and retry policy
 
 The supervisor publishes these phases:

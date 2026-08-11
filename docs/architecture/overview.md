@@ -53,6 +53,34 @@ flowchart TB
 - **Shared runtime (`packages/shared`)** contains runtime utilities used by
   multiple packages through explicit subpath exports.
 
+## Project-data ownership and identity
+
+The Rust server is the source of truth for the requested and effective data
+root, state kind, store classification, storage-instance marker, SQLite
+database, verified backups, and offline recovery. The desktop host does not
+invent a path or manipulate those files through renderer input. It resolves a
+native or WSL environment from its authoritative launch plan and coordinates
+privileged multi-backend inspection, update protection, stop, recovery, and
+exact-plan restart around the server-owned persistence operations.
+
+The resolved base root defaults to the current user's `~/.bibcode`. An explicit
+CLI `--base-dir` takes precedence, followed by `BIBCODE_HOME`, followed by the
+desktop bootstrap root. Development and installed desktop builds use that same
+base root by default but intentionally select different state kinds: `dev` and
+`userdata`. Changing the account, home/profile, explicit root, drive, mount, or
+the target of a symlink/junction therefore selects a different effective
+store; it is not evidence that the previous store was deleted. Recovery and
+diagnostics always report both the requested root and the canonical effective
+root so that alias changes are visible.
+
+`environmentId` is a logical routing identity. `storageInstanceId` is the
+persistent UUID of one prepared store. The client records the first observed
+non-null storage identity for a stable target and blocks a different identity
+before synchronization or cache consumption. That boundary cannot reconstruct
+history that predates marker deployment: the first protected release cannot
+detect that an earlier build already switched to another valid unmarked
+BiBCode database until the database receives a UUID and a client accepts it.
+
 The server classifies its persistent SQLite store before opening it for normal
 read/write traffic. The absence of both `state.sqlite` and its
 `environment-id` storage-instance marker is the only automatic first-run case.

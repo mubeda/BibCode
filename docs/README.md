@@ -18,6 +18,7 @@ current behavior.
 - [Workspace UI](./user/workspace-ui.md)
 - [Keybindings](./user/keybindings.md)
 - [Remote access](./user/remote-access.md)
+- [Project data safety and recovery](./guides/project-data-recovery.md)
 - [Source control providers](./integrations/source-control-providers.md)
 
 ## Provider guides
