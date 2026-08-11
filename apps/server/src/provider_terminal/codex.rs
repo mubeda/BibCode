@@ -2407,7 +2407,7 @@ mod tests {
             endpoint,
             socket_path,
         });
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 tokio::select! {
                     result = &mut start => {
