@@ -17,7 +17,7 @@ use bibcode_server::{
         ActivityLifecycle, ActivityProjection, ActivityProjections, ActivityRecordKind,
         ActivityRepository, ActivityRosterBucket, ActivityScopeSeed, ActivitySection,
         ActivityWorkItemSummary, AgentActivityController, AgentActivitySource,
-        ProviderActivityMutation, register_activity_rpc,
+        ProviderActivityMutation, register_activity_rpc_for_integration_test,
     },
     diagnostics::{ProcessAttributionRegistry, TraceDiagnosticsStore},
     orchestration::engine::{EngineOptions, OrchestrationEngine},
@@ -1826,7 +1826,7 @@ impl RpcFixture {
         );
         let projection = projections.chat();
         let mut registry = RpcRegistry::empty();
-        register_activity_rpc(&mut registry, projections);
+        register_activity_rpc_for_integration_test(&mut registry, projections);
         let directory = tempfile::tempdir().expect("server directory");
         let handle = ServerRuntime::start_with_registry(
             ServerConfig::new(directory.path())

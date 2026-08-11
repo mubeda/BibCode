@@ -18,7 +18,8 @@
         "attributedActivity": false,
         "backgroundWork": false,
         "historyRecovery": "none",
-        "terminalObservation": false
+        "terminalObservation": false,
+        "targetedActorCancellation": false
       },
       "observationState": "live"
     }
@@ -43,7 +44,8 @@
       "attributedActivity": false,
       "backgroundWork": false,
       "historyRecovery": "none",
-      "terminalObservation": false
+      "terminalObservation": false,
+      "targetedActorCancellation": false
     }
   }
 }

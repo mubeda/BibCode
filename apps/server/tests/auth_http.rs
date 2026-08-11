@@ -595,6 +595,33 @@ async fn websocket_authorizes_rpc_scopes_and_streams_auth_access_changes() {
         assert_eq!(authorized["exit"]["_tag"], "Success");
         assert_eq!(authorized["exit"]["value"]["tag"], tag);
     }
+    for (id, tag) in [
+        ("114", "activity.cancelSubtree"),
+        ("115", "activity.retrySubtreeCancellation"),
+    ] {
+        send_ws_json(
+            &mut restricted_socket,
+            json!({
+                "_tag": "Request",
+                "id": id,
+                "tag": tag,
+                "payload": {},
+                "headers": []
+            }),
+        )
+        .await;
+        let denied = next_ws_json(&mut restricted_socket).await;
+        assert_eq!(denied["_tag"], "Exit");
+        assert_eq!(denied["exit"]["_tag"], "Failure");
+        assert_eq!(
+            denied["exit"]["cause"][0]["error"]["_tag"],
+            "EnvironmentAuthorizationError"
+        );
+        assert_eq!(
+            denied["exit"]["cause"][0]["error"]["requiredScope"],
+            "orchestration:operate"
+        );
+    }
     send_ws_json(
         &mut restricted_socket,
         json!({
@@ -734,6 +761,27 @@ async fn websocket_authorizes_rpc_scopes_and_streams_auth_access_changes() {
         stream_denied["exit"]["cause"][0]["error"]["requiredScope"],
         "orchestration:read"
     );
+    for (id, tag) in [
+        ("109", "activity.cancelSubtree"),
+        ("1090", "activity.retrySubtreeCancellation"),
+    ] {
+        send_ws_json(
+            &mut operate_socket,
+            json!({
+                "_tag": "Request",
+                "id": id,
+                "tag": tag,
+                "payload": {},
+                "headers": []
+            }),
+        )
+        .await;
+        let authorized = next_ws_json(&mut operate_socket).await;
+        assert_eq!(authorized["_tag"], "Exit");
+        assert_eq!(authorized["requestId"], id);
+        assert_eq!(authorized["exit"]["_tag"], "Success");
+        assert_eq!(authorized["exit"]["value"]["tag"], tag);
+    }
     send_ws_json(
         &mut operate_socket,
         json!({
@@ -1519,6 +1567,8 @@ async fn start_desktop_server(temp: &TempDir) -> ServerHandle {
         "activity.getSnapshot",
         "activity.listRoster",
         "activity.listDetail",
+        "activity.cancelSubtree",
+        "activity.retrySubtreeCancellation",
     ] {
         let response_tag = tag.to_owned();
         registry.register_unary(tag, move |_request, _cancellation| {

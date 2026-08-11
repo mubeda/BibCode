@@ -1,3 +1,6 @@
+use std::sync::Arc;
+
+use futures_util::future::BoxFuture;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
@@ -12,10 +15,14 @@ use crate::{
 };
 
 use super::{
-    ACTIVITY_PAGE_MAX_LENGTH, ActivityAdmittedRead, ActivityError, ActivityProjection,
+    ACTIVITY_PAGE_MAX_LENGTH, ActivityAdmittedRead, ActivityCancellationDispatcher,
+    ActivityCancellationError, ActivityCancellationService, ActivityControlEvent,
+    ActivityControlRegistry, ActivityDispatchError, ActivityError, ActivityProjection,
     ActivityProjectionEvent, ActivityProjections, ActivityRecordKind, ActivityRepositoryError,
-    ActivityResult, ActivityRosterBucket, ActivityScopeRef, ActivitySection,
-    AgentActivityAdmission, AgentActivityController,
+    ActivityResult, ActivityRosterBucket, ActivityRuntimeGeneration, ActivityScopeRef,
+    ActivitySection, ActivitySubtreeCancellationDisposition, ActivitySubtreeCancellationResult,
+    ActivityTargetDispatchDisposition, AgentActivityAdmission, AgentActivityController,
+    ProviderActivityNativeTarget,
 };
 
 const DEFAULT_PAGE_LIMIT: usize = 50;
@@ -45,6 +52,24 @@ struct ListDetailInput {
     limit: usize,
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct CancelSubtreeInput {
+    scope: ActivityScopeRef,
+    scope_id: String,
+    actor_id: String,
+    expected_control_revision: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+struct RetrySubtreeCancellationInput {
+    scope: ActivityScopeRef,
+    scope_id: String,
+    root_actor_id: String,
+    expected_operation_revision: u64,
+}
+
 struct ActivityUnaryResponseGuard {
     controller: AgentActivityController,
     admission: AgentActivityAdmission,
@@ -71,7 +96,11 @@ const fn default_page_limit() -> usize {
     DEFAULT_PAGE_LIMIT
 }
 
-pub fn register_activity_rpc(registry: &mut RpcRegistry, projections: ActivityProjections) {
+pub(crate) fn register_activity_rpc(
+    registry: &mut RpcRegistry,
+    projections: ActivityProjections,
+    cancellation: ActivityCancellationService,
+) {
     let snapshot_projections = projections.clone();
     registry.register_guarded_unary("activity.getSnapshot", move |request, _cancellation| {
         let projections = snapshot_projections.clone();
@@ -139,12 +168,168 @@ pub fn register_activity_rpc(registry: &mut RpcRegistry, projections: ActivityPr
         }
     });
 
+    let cancel_projections = projections.clone();
+    let cancel_service = cancellation.clone();
+    registry.register_guarded_unary("activity.cancelSubtree", move |request, _cancellation| {
+        let projections = cancel_projections.clone();
+        let cancellation = cancel_service.clone();
+        async move {
+            let input = match decode::<CancelSubtreeInput>(request.payload) {
+                Ok(input) => input,
+                Err(error) => return RpcUnaryResult::plain(Err(error)),
+            };
+            if !matches!(input.scope, ActivityScopeRef::Thread { .. }) {
+                return RpcUnaryResult::plain(Err(cancellation_unsupported_error()));
+            }
+            let controller = projections.chat().agent_activity_controller();
+            let Some(admission) = controller.admit() else {
+                return RpcUnaryResult::plain(Err(feature_disabled_error()));
+            };
+            let result = cancellation
+                .cancel_subtree(
+                    input.scope,
+                    &input.scope_id,
+                    &input.actor_id,
+                    input.expected_control_revision,
+                )
+                .await
+                .map(cancellation_result)
+                .map_err(cancellation_error);
+            guarded_control_result(result, controller, admission)
+        }
+    });
+
+    let retry_projections = projections.clone();
+    registry.register_guarded_unary(
+        "activity.retrySubtreeCancellation",
+        move |request, _cancellation| {
+            let projections = retry_projections.clone();
+            let cancellation = cancellation.clone();
+            async move {
+                let input = match decode::<RetrySubtreeCancellationInput>(request.payload) {
+                    Ok(input) => input,
+                    Err(error) => return RpcUnaryResult::plain(Err(error)),
+                };
+                if !matches!(input.scope, ActivityScopeRef::Thread { .. }) {
+                    return RpcUnaryResult::plain(Err(cancellation_unsupported_error()));
+                }
+                let controller = projections.chat().agent_activity_controller();
+                let Some(admission) = controller.admit() else {
+                    return RpcUnaryResult::plain(Err(feature_disabled_error()));
+                };
+                let result = cancellation
+                    .retry_subtree_cancellation(
+                        input.scope,
+                        &input.scope_id,
+                        &input.root_actor_id,
+                        input.expected_operation_revision,
+                    )
+                    .await
+                    .map(cancellation_result)
+                    .map_err(cancellation_error);
+                guarded_control_result(result, controller, admission)
+            }
+        },
+    );
+
     registry.register_stream_with_context(
         "subscribeActivity",
         move |request, context, cancellation| {
             activity_stream(projections.clone(), request, context, cancellation)
         },
     );
+}
+
+fn guarded_control_result(
+    result: Result<Value, Value>,
+    controller: AgentActivityController,
+    admission: AgentActivityAdmission,
+) -> RpcUnaryResult {
+    RpcUnaryResult::guarded(
+        result,
+        ActivityUnaryResponseGuard {
+            controller,
+            admission,
+        },
+    )
+}
+
+fn cancellation_result(result: ActivitySubtreeCancellationResult) -> Value {
+    let disposition = match result.disposition {
+        ActivitySubtreeCancellationDisposition::Accepted => "accepted",
+        ActivitySubtreeCancellationDisposition::InProgress => "inProgress",
+        ActivitySubtreeCancellationDisposition::AlreadyTerminal => "alreadyTerminal",
+    };
+    json!({
+        "disposition": disposition,
+        "rootActorId": result.root_actor_id,
+        "operationRevision": result.operation_revision,
+    })
+}
+
+fn cancellation_error(error: ActivityCancellationError) -> Value {
+    match error {
+        ActivityCancellationError::NotFound => json!({
+            "_tag": "ActivityError",
+            "message": "The requested activity actor was not found.",
+            "reason": "notFound",
+        }),
+        ActivityCancellationError::InvalidScope => invalid_scope_error(),
+        ActivityCancellationError::StaleScope => json!({
+            "_tag": "ActivityError",
+            "message": "The activity scope has changed. Refresh and try again.",
+            "reason": "staleScope",
+        }),
+        ActivityCancellationError::StaleActor => json!({
+            "_tag": "ActivityError",
+            "message": "The activity actor has changed. Refresh and try again.",
+            "reason": "staleActor",
+        }),
+        ActivityCancellationError::StaleOperation => json!({
+            "_tag": "ActivityError",
+            "message": "The cancellation operation has changed. Refresh and try again.",
+            "reason": "staleOperation",
+        }),
+        ActivityCancellationError::TargetUnavailable => json!({
+            "_tag": "ActivityError",
+            "message": "The provider cancellation target is no longer available.",
+            "reason": "targetUnavailable",
+        }),
+        ActivityCancellationError::CapacityExceeded => internal_error(),
+    }
+}
+
+fn cancellation_unsupported_error() -> Value {
+    json!({
+        "_tag": "ActivityError",
+        "message": "Targeted cancellation is not supported for this activity scope.",
+        "reason": "cancellationUnsupported",
+    })
+}
+
+#[doc(hidden)]
+pub fn register_activity_rpc_for_integration_test(
+    registry: &mut RpcRegistry,
+    projections: ActivityProjections,
+) {
+    let cancellation = ActivityCancellationService::new(
+        projections.chat().activity_control_registry(),
+        Arc::new(UnavailableCancellationDispatcher),
+    );
+    register_activity_rpc(registry, projections, cancellation);
+}
+
+struct UnavailableCancellationDispatcher;
+
+impl ActivityCancellationDispatcher for UnavailableCancellationDispatcher {
+    fn cancel_target(
+        &self,
+        _scope: ActivityScopeRef,
+        _generation: ActivityRuntimeGeneration,
+        _target: ProviderActivityNativeTarget,
+    ) -> BoxFuture<'static, Result<ActivityTargetDispatchDisposition, ActivityDispatchError>> {
+        Box::pin(async { Err(ActivityDispatchError::ProviderUnavailable) })
+    }
 }
 
 fn encode_admitted_read<T: serde::Serialize>(
@@ -190,6 +375,8 @@ fn activity_stream(
             let _ = send(&sender, Err(feature_disabled_error()), &cancellation).await;
             return;
         };
+        let control_registry = projection.activity_control_registry();
+        let mut control_deltas = control_registry.subscribe();
         let mut deltas = projection.subscribe();
         let snapshot = tokio::select! {
             biased;
@@ -214,6 +401,7 @@ fn activity_stream(
         };
         let mut scope_id = snapshot.scope_id.clone();
         let mut streamed_revision = snapshot.revision;
+        let mut streamed_control_revision = snapshot.control.revision;
         if !send(
             &sender,
             Ok(vec![json!({ "kind": "snapshot", "snapshot": snapshot })]),
@@ -237,12 +425,17 @@ fn activity_stream(
                     }
                     return;
                 }
-                received = deltas.recv() => received,
+                received = async {
+                    tokio::select! {
+                        received = deltas.recv() => StreamEvent::Observation(received),
+                        received = control_deltas.recv() => StreamEvent::Control(received),
+                    }
+                } => received,
             };
             match received {
-                Ok(ActivityProjectionEvent::Delta(delta))
+                StreamEvent::Observation(Ok(ActivityProjectionEvent::Delta(delta)))
                     if delta.scope_id != scope_id || delta.revision <= streamed_revision => {}
-                Ok(ActivityProjectionEvent::Delta(delta))
+                StreamEvent::Observation(Ok(ActivityProjectionEvent::Delta(delta)))
                     if delta.previous_revision == streamed_revision =>
                 {
                     let revision = delta.revision;
@@ -257,8 +450,8 @@ fn activity_stream(
                     }
                     streamed_revision = revision;
                 }
-                Ok(ActivityProjectionEvent::Delta(_)) => {
-                    let Some((fresh_scope_id, revision)) =
+                StreamEvent::Observation(Ok(ActivityProjectionEvent::Delta(_))) => {
+                    let Some((fresh_scope_id, revision, control_revision)) =
                         send_fresh_snapshot(&projection, &scope, &context, &sender, &cancellation)
                             .await
                     else {
@@ -266,13 +459,14 @@ fn activity_stream(
                     };
                     scope_id = fresh_scope_id;
                     streamed_revision = revision;
+                    streamed_control_revision = control_revision;
                 }
-                Ok(ActivityProjectionEvent::ScopeReplaced {
+                StreamEvent::Observation(Ok(ActivityProjectionEvent::ScopeReplaced {
                     scope: replaced_scope,
                     scope_id: replacement_scope_id,
-                }) if replaced_scope != scope || replacement_scope_id == scope_id => {}
-                Ok(ActivityProjectionEvent::ScopeReplaced { .. }) => {
-                    let Some((fresh_scope_id, revision)) =
+                })) if replaced_scope != scope || replacement_scope_id == scope_id => {}
+                StreamEvent::Observation(Ok(ActivityProjectionEvent::ScopeReplaced { .. })) => {
+                    let Some((fresh_scope_id, revision, control_revision)) =
                         send_fresh_snapshot(&projection, &scope, &context, &sender, &cancellation)
                             .await
                     else {
@@ -280,9 +474,10 @@ fn activity_stream(
                     };
                     scope_id = fresh_scope_id;
                     streamed_revision = revision;
+                    streamed_control_revision = control_revision;
                 }
-                Err(broadcast::error::RecvError::Lagged(_)) => {
-                    let Some((fresh_scope_id, revision)) =
+                StreamEvent::Observation(Err(broadcast::error::RecvError::Lagged(_))) => {
+                    let Some((fresh_scope_id, revision, control_revision)) =
                         send_fresh_snapshot(&projection, &scope, &context, &sender, &cancellation)
                             .await
                     else {
@@ -290,8 +485,43 @@ fn activity_stream(
                     };
                     scope_id = fresh_scope_id;
                     streamed_revision = revision;
+                    streamed_control_revision = control_revision;
                 }
-                Err(broadcast::error::RecvError::Closed) => return,
+                StreamEvent::Observation(Err(broadcast::error::RecvError::Closed)) => return,
+                StreamEvent::Control(Ok(ActivityControlEvent::Delta(delta)))
+                    if delta.scope_id != scope_id
+                        || delta.revision <= streamed_control_revision => {}
+                StreamEvent::Control(Ok(ActivityControlEvent::Delta(delta)))
+                    if delta.previous_revision == streamed_control_revision =>
+                {
+                    let revision = delta.revision;
+                    if !send(
+                        &sender,
+                        Ok(vec![json!({ "kind": "control-delta", "delta": delta })]),
+                        &cancellation,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    streamed_control_revision = revision;
+                }
+                StreamEvent::Control(Ok(ActivityControlEvent::Delta(_)))
+                | StreamEvent::Control(Err(broadcast::error::RecvError::Lagged(_))) => {
+                    let Some(revision) = send_fresh_control_snapshot(
+                        &control_registry,
+                        &scope_id,
+                        &context,
+                        &sender,
+                        &cancellation,
+                    )
+                    .await
+                    else {
+                        return;
+                    };
+                    streamed_control_revision = revision;
+                }
+                StreamEvent::Control(Err(broadcast::error::RecvError::Closed)) => return,
             }
         }
     });
@@ -304,7 +534,7 @@ async fn send_fresh_snapshot(
     context: &RpcSessionContext,
     sender: &mpsc::Sender<RpcStreamChunk>,
     cancellation: &CancellationToken,
-) -> Option<(String, u64)> {
+) -> Option<(String, u64, u64)> {
     if !authorize_activity_read(context, sender, cancellation).await {
         return None;
     }
@@ -320,7 +550,11 @@ async fn send_fresh_snapshot(
             return None;
         }
     };
-    let result = (snapshot.scope_id.clone(), snapshot.revision);
+    let result = (
+        snapshot.scope_id.clone(),
+        snapshot.revision,
+        snapshot.control.revision,
+    );
     send(
         sender,
         Ok(vec![json!({ "kind": "snapshot", "snapshot": snapshot })]),
@@ -328,6 +562,38 @@ async fn send_fresh_snapshot(
     )
     .await
     .then_some(result)
+}
+
+enum StreamEvent {
+    Observation(Result<ActivityProjectionEvent, broadcast::error::RecvError>),
+    Control(Result<ActivityControlEvent, broadcast::error::RecvError>),
+}
+
+async fn send_fresh_control_snapshot(
+    registry: &ActivityControlRegistry,
+    scope_id: &str,
+    context: &RpcSessionContext,
+    sender: &mpsc::Sender<RpcStreamChunk>,
+    cancellation: &CancellationToken,
+) -> Option<u64> {
+    if !authorize_activity_read(context, sender, cancellation).await {
+        return None;
+    }
+    let control = registry.snapshot(scope_id).await;
+    if control.scope_id != scope_id {
+        let _ = send(sender, Err(internal_error()), cancellation).await;
+        return None;
+    }
+    let revision = control.revision;
+    send(
+        sender,
+        Ok(vec![
+            json!({ "kind": "control-snapshot", "control": control }),
+        ]),
+        cancellation,
+    )
+    .await
+    .then_some(revision)
 }
 
 async fn authorize_activity_read(
@@ -428,17 +694,460 @@ fn internal_error() -> Value {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
 
     use crate::{
-        ServerConfig,
-        activity::{ActivityCapabilities, ActivityRepository, ActivityScopeSeed},
+        ServerConfig, ServerRuntime,
+        activity::{
+            ActivityCancellationDispatcher, ActivityCancellationService, ActivityCapabilities,
+            ActivityControlChange, ActivityControlDelta, ActivityDispatchError, ActivityRepository,
+            ActivityRuntimeGeneration, ActivityScopeSeed, ActivityTargetDispatchDisposition,
+            ProviderActivityControlUpdate, ProviderActivityMutation, ProviderActivityNativeTarget,
+        },
         auth::{AuthService, ClientMetadata},
         persistence::{Database, run_migrations},
         rpc::RequestId,
     };
+    use futures_util::{SinkExt, StreamExt, future::BoxFuture};
+    use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message};
 
     use super::*;
+
+    #[derive(Clone, Default)]
+    struct CountingDispatcher {
+        calls: Arc<AtomicUsize>,
+    }
+
+    impl ActivityCancellationDispatcher for CountingDispatcher {
+        fn cancel_target(
+            &self,
+            _scope: ActivityScopeRef,
+            _generation: ActivityRuntimeGeneration,
+            _target: ProviderActivityNativeTarget,
+        ) -> BoxFuture<'static, Result<ActivityTargetDispatchDisposition, ActivityDispatchError>>
+        {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(ActivityTargetDispatchDisposition::Delivered) })
+        }
+    }
+
+    #[tokio::test]
+    async fn mutation_rpc_validates_before_dispatch_and_redacts_native_targets() {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let projections = ActivityProjections::new(
+            ActivityRepository::new(database),
+            AgentActivityController::new(true),
+            AgentActivityController::new(true),
+        );
+        let projection = projections.chat();
+        let scope = ActivityScopeSeed::thread(
+            "thread:mutation-rpc",
+            "mutation-rpc",
+            "codex",
+            Some("codex"),
+            ActivityCapabilities::structured_full(false),
+        )
+        .expect("scope");
+        projection
+            .ensure_scope(scope.clone())
+            .await
+            .expect("scope persistence");
+        let control_registry = projection.activity_control_registry();
+        let registration = control_registry.register_runtime(
+            scope.scope.clone(),
+            scope.scope_id.clone(),
+            Some("codex".to_owned()),
+        );
+        let available =
+            ProviderActivityMutation::upsert_actor("actor:available", None, "Available", "running")
+                .expect("available actor");
+        let unsupported = ProviderActivityMutation::upsert_actor(
+            "actor:unsupported",
+            None,
+            "Unsupported",
+            "running",
+        )
+        .expect("unsupported actor");
+        let terminal =
+            ProviderActivityMutation::upsert_actor("actor:terminal", None, "Terminal", "completed")
+                .expect("terminal actor");
+        control_registry
+            .observe_provider_batch(
+                &registration,
+                &[available, unsupported, terminal],
+                &[
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id: "actor:available".to_owned(),
+                        target: Some(ProviderActivityNativeTarget::CodexTurn {
+                            thread_id: "native-thread-secret".to_owned(),
+                            turn_id: "native-turn-secret".to_owned(),
+                        }),
+                    },
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id: "actor:terminal".to_owned(),
+                        target: Some(ProviderActivityNativeTarget::ClaudeTask {
+                            task_id: "native-task-secret".to_owned(),
+                        }),
+                    },
+                ],
+            )
+            .await;
+        let dispatcher = CountingDispatcher::default();
+        let cancellation_service =
+            ActivityCancellationService::new(control_registry, Arc::new(dispatcher.clone()));
+        let mut registry = RpcRegistry::empty();
+        register_activity_rpc(&mut registry, projections, cancellation_service);
+        let directory = tempfile::tempdir().expect("temporary server directory");
+        let handle = ServerRuntime::start_with_registry(
+            ServerConfig::new(directory.path())
+                .with_bind("127.0.0.1", 0)
+                .with_unsafe_no_auth(),
+            registry,
+        )
+        .await
+        .expect("server");
+        let mut socket = connect_async(format!("ws://{}/ws", handle.local_addr()))
+            .await
+            .expect("WebSocket")
+            .0;
+
+        for (id, payload, expected_reason) in [
+            (
+                "1",
+                json!({
+                    "scope": { "_tag": "thread", "threadId": "mutation-rpc" },
+                    "scopeId": "thread:stale",
+                    "actorId": "actor:available",
+                    "expectedControlRevision": 1,
+                }),
+                "staleScope",
+            ),
+            (
+                "2",
+                json!({
+                    "scope": { "_tag": "thread", "threadId": "mutation-rpc" },
+                    "scopeId": "thread:mutation-rpc",
+                    "actorId": "actor:available",
+                    "expectedControlRevision": 0,
+                }),
+                "staleActor",
+            ),
+            (
+                "3",
+                json!({
+                    "scope": { "_tag": "thread", "threadId": "mutation-rpc" },
+                    "scopeId": "thread:mutation-rpc",
+                    "actorId": "actor:missing",
+                    "expectedControlRevision": 0,
+                }),
+                "notFound",
+            ),
+            (
+                "4",
+                json!({
+                    "scope": { "_tag": "thread", "threadId": "mutation-rpc" },
+                    "scopeId": "thread:mutation-rpc",
+                    "actorId": "actor:unsupported",
+                    "expectedControlRevision": 0,
+                }),
+                "targetUnavailable",
+            ),
+            (
+                "5",
+                json!({
+                    "scope": {
+                        "_tag": "terminal",
+                        "threadId": "mutation-rpc",
+                        "terminalId": "terminal-1"
+                    },
+                    "scopeId": "terminal:mutation-rpc",
+                    "actorId": "actor:available",
+                    "expectedControlRevision": 1,
+                }),
+                "cancellationUnsupported",
+            ),
+        ] {
+            let error = rpc_unary(&mut socket, id, "activity.cancelSubtree", payload)
+                .await
+                .expect_err("request must be rejected before dispatch");
+            assert_eq!(error["reason"], expected_reason);
+            assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 0);
+        }
+
+        let terminal_result = rpc_unary(
+            &mut socket,
+            "6",
+            "activity.cancelSubtree",
+            json!({
+                "scope": { "_tag": "thread", "threadId": "mutation-rpc" },
+                "scopeId": "thread:mutation-rpc",
+                "actorId": "actor:terminal",
+                "expectedControlRevision": 0,
+            }),
+        )
+        .await
+        .expect("terminal actor result");
+        assert_eq!(terminal_result["disposition"], "alreadyTerminal");
+        assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 0);
+
+        let accepted = rpc_unary(
+            &mut socket,
+            "7",
+            "activity.cancelSubtree",
+            json!({
+                "scope": { "_tag": "thread", "threadId": "mutation-rpc" },
+                "scopeId": "thread:mutation-rpc",
+                "actorId": "actor:available",
+                "expectedControlRevision": 1,
+            }),
+        )
+        .await
+        .expect("accepted cancellation");
+        assert_eq!(accepted["disposition"], "accepted");
+        assert_eq!(accepted["rootActorId"], "actor:available");
+        assert_eq!(accepted["operationRevision"], 1);
+        assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 1);
+
+        let duplicate = rpc_unary(
+            &mut socket,
+            "8",
+            "activity.cancelSubtree",
+            json!({
+                "scope": { "_tag": "thread", "threadId": "mutation-rpc" },
+                "scopeId": "thread:mutation-rpc",
+                "actorId": "actor:available",
+                "expectedControlRevision": 1,
+            }),
+        )
+        .await
+        .expect("duplicate cancellation");
+        assert_eq!(duplicate["disposition"], "inProgress");
+        assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 1);
+
+        let stale_retry = rpc_unary(
+            &mut socket,
+            "9",
+            "activity.retrySubtreeCancellation",
+            json!({
+                "scope": { "_tag": "thread", "threadId": "mutation-rpc" },
+                "scopeId": "thread:mutation-rpc",
+                "rootActorId": "actor:available",
+                "expectedOperationRevision": 0,
+            }),
+        )
+        .await
+        .expect_err("stale retry revision");
+        assert_eq!(stale_retry["reason"], "staleOperation");
+        assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 1);
+
+        let retry = rpc_unary(
+            &mut socket,
+            "10",
+            "activity.retrySubtreeCancellation",
+            json!({
+                "scope": { "_tag": "thread", "threadId": "mutation-rpc" },
+                "scopeId": "thread:mutation-rpc",
+                "rootActorId": "actor:available",
+                "expectedOperationRevision": 1,
+            }),
+        )
+        .await
+        .expect("retry cancellation");
+        assert_eq!(retry["disposition"], "accepted");
+        assert_eq!(retry["operationRevision"], 2);
+        assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 2);
+
+        let wire = serde_json::to_string(&(terminal_result, accepted, duplicate, retry))
+            .expect("serialize wire results");
+        for secret in [
+            "native-thread-secret",
+            "native-turn-secret",
+            "native-task-secret",
+        ] {
+            assert!(!wire.contains(secret));
+        }
+
+        socket.close(None).await.expect("close socket");
+        handle.shutdown();
+        handle.join().await.expect("server joins");
+    }
+
+    async fn rpc_unary(
+        socket: &mut WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        id: &str,
+        tag: &str,
+        payload: Value,
+    ) -> Result<Value, Value> {
+        socket
+            .send(Message::Text(
+                json!({
+                    "_tag": "Request",
+                    "id": id,
+                    "tag": tag,
+                    "payload": payload,
+                    "headers": [],
+                })
+                .to_string()
+                .into(),
+            ))
+            .await
+            .expect("send RPC request");
+        let message = loop {
+            let message = socket.next().await.expect("RPC response").expect("frame");
+            if let Message::Text(text) = message {
+                break serde_json::from_str::<Value>(&text).expect("response JSON");
+            }
+        };
+        assert_eq!(message["_tag"], "Exit");
+        assert_eq!(message["requestId"], id);
+        match message["exit"]["_tag"].as_str() {
+            Some("Success") => Ok(message["exit"]["value"].clone()),
+            Some("Failure") => Err(message["exit"]["cause"][0]["error"].clone()),
+            other => panic!("unexpected RPC exit: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn control_stream_revisions_recover_independently_without_native_ids() {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let projections = ActivityProjections::with_capacity(
+            ActivityRepository::new(database),
+            AgentActivityController::new(true),
+            AgentActivityController::new(true),
+            8,
+        );
+        let projection = projections.chat();
+        let scope = ActivityScopeSeed::thread(
+            "thread:control-stream",
+            "control-stream",
+            "codex",
+            Some("codex"),
+            ActivityCapabilities::structured_full(false),
+        )
+        .expect("scope");
+        projection
+            .ensure_scope(scope.clone())
+            .await
+            .expect("scope persistence");
+        let control_registry = projection.activity_control_registry();
+        let _registration = control_registry.register_runtime(
+            scope.scope.clone(),
+            scope.scope_id.clone(),
+            Some("codex".to_owned()),
+        );
+
+        let cancellation = CancellationToken::new();
+        let mut stream = activity_stream(
+            projections,
+            RpcRequest {
+                id: RequestId::try_from("1").expect("request ID"),
+                tag: "subscribeActivity".to_owned(),
+                payload: json!({ "_tag": "thread", "threadId": "control-stream" }),
+                headers: Vec::new(),
+                trace_id: None,
+                span_id: None,
+                sampled: None,
+            },
+            RpcSessionContext::unauthenticated(),
+            cancellation.clone(),
+        );
+        let initial = stream
+            .recv()
+            .await
+            .expect("initial chunk")
+            .expect("initial snapshot");
+        assert_eq!(initial[0]["kind"], "snapshot");
+        assert_eq!(initial[0]["snapshot"]["protocolVersion"], 2);
+        assert_eq!(initial[0]["snapshot"]["control"]["revision"], 0);
+
+        let actor = ProviderActivityMutation::upsert_actor("actor:child", None, "Child", "running")
+            .expect("actor");
+        projection
+            .apply(
+                &scope.scope_id,
+                "event:actor".to_owned(),
+                vec![actor.clone()],
+                "2026-08-11T12:00:00Z".to_owned(),
+            )
+            .await
+            .expect("persistent actor");
+        let persistent = stream
+            .recv()
+            .await
+            .expect("persistent chunk")
+            .expect("persistent delta");
+        assert_eq!(persistent[0]["kind"], "delta");
+
+        control_registry
+            .observe_provider_batch(
+                &_registration,
+                &[actor],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor:child".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::CodexTurn {
+                        thread_id: "native-thread-secret".to_owned(),
+                        turn_id: "native-turn-secret".to_owned(),
+                    }),
+                }],
+            )
+            .await;
+        let control = stream
+            .recv()
+            .await
+            .expect("control chunk")
+            .expect("control delta");
+        assert_eq!(control[0]["kind"], "control-delta");
+        assert_eq!(control[0]["delta"]["previousRevision"], 0);
+        assert_eq!(control[0]["delta"]["revision"], 1);
+        assert_eq!(
+            control[0]["delta"]["changes"][0]["actor"]["state"],
+            "available"
+        );
+        let serialized = serde_json::to_string(&control).expect("serialized control delta");
+        assert!(!serialized.contains("native-thread-secret"));
+        assert!(!serialized.contains("native-turn-secret"));
+
+        control_registry.publish_delta(ActivityControlDelta {
+            scope_id: scope.scope_id.clone(),
+            previous_revision: 2,
+            revision: 3,
+            changes: vec![ActivityControlChange::ActorRemoved {
+                actor_id: "actor:other".to_owned(),
+            }],
+        });
+        let replacement = stream
+            .recv()
+            .await
+            .expect("control replacement chunk")
+            .expect("control replacement");
+        assert_eq!(replacement[0]["kind"], "control-snapshot");
+        assert_eq!(replacement[0]["control"]["revision"], 1);
+        assert_eq!(
+            replacement[0]["control"]["actors"][0]["actorId"],
+            "actor:child"
+        );
+        cancellation.cancel();
+    }
 
     #[tokio::test]
     async fn revision_gap_replaces_the_stream_with_an_authoritative_snapshot() {
