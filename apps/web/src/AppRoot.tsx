@@ -1,6 +1,6 @@
 import { RouterProvider } from "@tanstack/react-router";
 import { EnvironmentId } from "@bibcode/contracts";
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, useState } from "react";
 
 import { ProjectDataRecoveryDialog } from "./components/desktop/ProjectDataRecoveryDialog";
 import { PreviewAutomationHosts } from "./components/preview/PreviewAutomationHosts";
@@ -25,8 +25,11 @@ export function ProjectDataRecoveryCoordinator() {
     reportFailure: false,
   });
   const { environments } = useEnvironments();
-  const hasDesktopRecovery =
-    typeof window !== "undefined" && window.desktopBridge?.getProjectDataStatuses !== undefined;
+  const bridge = typeof window === "undefined" ? undefined : window.desktopBridge;
+  const hasDesktopRecovery = bridge?.getProjectDataStatuses !== undefined;
+  const [bridgeRecoveryEnvironmentId, setBridgeRecoveryEnvironmentId] = useState<string | null>(
+    null,
+  );
   const localEnvironmentIds = new Set(
     environments
       .filter(
@@ -37,12 +40,40 @@ export function ProjectDataRecoveryCoordinator() {
       )
       .map((environment) => environment.environmentId),
   );
-  const automaticEnvironmentId =
+  const shellRecoveryEnvironmentId =
     summary.statuses.find(
       (status) =>
         status.status === "recovery-required" && localEnvironmentIds.has(status.environmentId),
     )?.environmentId ?? null;
+  const automaticEnvironmentId = shellRecoveryEnvironmentId ?? bridgeRecoveryEnvironmentId;
   const lastAutomaticEnvironmentId = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (bridge?.getProjectDataStatuses === undefined) {
+      setBridgeRecoveryEnvironmentId(null);
+      return;
+    }
+
+    let active = true;
+    const inspect = async () => {
+      const statuses = await bridge.getProjectDataStatuses?.();
+      if (!active || statuses === undefined) {
+        return;
+      }
+      setBridgeRecoveryEnvironmentId(
+        statuses.find((status) => status.status === "recovery-required")?.environmentId ?? null,
+      );
+    };
+
+    void inspect().catch(() => undefined);
+    const dispose = bridge.onProjectDataStatusChanged?.(() => {
+      void inspect().catch(() => undefined);
+    });
+    return () => {
+      active = false;
+      dispose?.();
+    };
+  }, [bridge]);
 
   useEffect(() => {
     if (automaticEnvironmentId === null) {
