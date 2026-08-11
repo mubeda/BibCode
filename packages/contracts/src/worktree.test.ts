@@ -207,6 +207,19 @@ describe("worktree catalog schemas", () => {
     });
   });
 
+  it("decodes a discovery-policy command conflict", () => {
+    expect(
+      decodeCatalogError({
+        _tag: "WorktreeCatalogError",
+        reason: "command-conflict",
+        message: "The command ID was already used by another worktree mutation.",
+      }),
+    ).toMatchObject({
+      _tag: "WorktreeCatalogError",
+      reason: "command-conflict",
+    });
+  });
+
   it("accepts project-scoped catalog reads without client-supplied paths", () => {
     expect(decodeCatalogInput({ projectId: "project-1" })).toEqual({ projectId: "project-1" });
     expect(decodeCatalogRefreshInput({ projectId: "project-1" })).toEqual({

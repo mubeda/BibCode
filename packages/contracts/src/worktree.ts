@@ -220,6 +220,7 @@ export const WorktreeCatalogErrorReason = Schema.Literals([
   "environment-unsupported",
   "repository-unavailable",
   "stale-generation",
+  "command-conflict",
   "policy-update-failed",
   "internal",
 ]);

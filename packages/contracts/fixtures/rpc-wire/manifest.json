@@ -822,7 +822,7 @@
     "typed-failures/vcs__refreshStatus-00.json": "c6014c37c93460a18771726c108a1d15fe3e74f86f1de229ecbe999e1dbb6428",
     "typed-failures/vcs__refreshStatus-01.json": "bca6f869de8d862e69070fee42013122b00c89c2403f106db355f160c3577d4f",
     "typed-failures/vcs__refreshStatus-02.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
-    "typed-failures/vcs__refreshWorktreeCatalog-00.json": "09650e0ae7a286b501cfc9bd5bf5b467fe217454b87656c5040d9c3fc20c2370",
+    "typed-failures/vcs__refreshWorktreeCatalog-00.json": "f428aca4770b9651dea9ffba0e4d391815f06155f2aafe897ddfde1269c06701",
     "typed-failures/vcs__refreshWorktreeCatalog-01.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
     "typed-failures/vcs__removeWorktree-00.json": "db4c9484fa03affcb35e463a516074a33a24d8c98d74bae227aa8015c6a5ecca",
     "typed-failures/vcs__removeWorktree-01.json": "bca6f869de8d862e69070fee42013122b00c89c2403f106db355f160c3577d4f",
@@ -844,7 +844,7 @@
     "typed-failures/worktree__remove-01.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
     "typed-failures/worktree__removeFromBibCode-00.json": "6a5011823533b36cb7bff73bbb50ca144e23326afd1beb6f7413826c39cd97ab",
     "typed-failures/worktree__removeFromBibCode-01.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
-    "typed-failures/worktree__updateDiscoveryPolicy-00.json": "09650e0ae7a286b501cfc9bd5bf5b467fe217454b87656c5040d9c3fc20c2370",
+    "typed-failures/worktree__updateDiscoveryPolicy-00.json": "f428aca4770b9651dea9ffba0e4d391815f06155f2aafe897ddfde1269c06701",
     "typed-failures/worktree__updateDiscoveryPolicy-01.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720"
   },
   "staleMethodIdentifiers": ["projects.add", "projects.list", "projects.remove"],
