@@ -25,7 +25,7 @@ const decodeProjectDataRecoveryResult = Schema.decodeUnknownSync(
 
 describe("Desktop project-data recovery contract", () => {
   it("exposes a disposable project data status invalidation subscription", () => {
-    let listener: ((event: { readonly environmentId: string }) => void) | null = null;
+    let listener: (event: { readonly environmentId: string }) => void = () => undefined;
     const dispose = vi.fn();
     const bridge: Pick<DesktopBridge, "onProjectDataStatusChanged"> = {
       onProjectDataStatusChanged: (nextListener) => {
@@ -36,7 +36,7 @@ describe("Desktop project-data recovery contract", () => {
     const received: unknown[] = [];
 
     const unsubscribe = bridge.onProjectDataStatusChanged?.((event) => received.push(event));
-    listener?.({ environmentId: "primary" });
+    listener({ environmentId: "primary" });
     unsubscribe?.();
 
     expect(received).toEqual([{ environmentId: "primary" }]);
