@@ -1,5 +1,5 @@
 import * as Schema from "effect/Schema";
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it, vi } from "vite-plus/test";
 
 import {
   ContextMenuItemSchema,
@@ -24,6 +24,25 @@ const decodeProjectDataRecoveryResult = Schema.decodeUnknownSync(
 );
 
 describe("Desktop project-data recovery contract", () => {
+  it("exposes a disposable project data status invalidation subscription", () => {
+    let listener: ((event: { readonly environmentId: string }) => void) | null = null;
+    const dispose = vi.fn();
+    const bridge: Pick<DesktopBridge, "onProjectDataStatusChanged"> = {
+      onProjectDataStatusChanged: (nextListener) => {
+        listener = nextListener;
+        return dispose;
+      },
+    };
+    const received: unknown[] = [];
+
+    const unsubscribe = bridge.onProjectDataStatusChanged?.((event) => received.push(event));
+    listener?.({ environmentId: "primary" });
+    unsubscribe?.();
+
+    expect(received).toEqual([{ environmentId: "primary" }]);
+    expect(dispose).toHaveBeenCalledTimes(1);
+  });
+
   it("decodes redacted environment-specific status and verified backups", () => {
     expect(
       decodeProjectDataStatus({

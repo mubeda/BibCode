@@ -1056,6 +1056,31 @@ describe("tauriDesktopBridge", () => {
     });
   });
 
+  it("forwards project data status invalidations and disposes the native listener", async () => {
+    const harness = installTauriHarness();
+    const bridge = await installBridge();
+    const received: unknown[] = [];
+
+    const dispose = bridge.onProjectDataStatusChanged?.((event) => received.push(event));
+    expect(dispose).toEqual(expect.any(Function));
+    await Promise.resolve();
+
+    expect(harness.listen).toHaveBeenCalledWith(
+      "desktop:project-data-status-changed",
+      expect.any(Function),
+    );
+    harness.listeners.get("desktop:project-data-status-changed")?.({
+      payload: { environmentId: "primary" },
+    });
+    expect(received).toEqual([{ environmentId: "primary" }]);
+
+    dispose?.();
+    await Promise.resolve();
+    expect(
+      harness.unlisteners.get("desktop:project-data-status-changed"),
+    ).toHaveBeenCalledTimes(1);
+  });
+
   it("routes the remaining desktop bridge capabilities through Tauri commands", async () => {
     const harness = installTauriHarness();
     const bridge = await installBridge();
