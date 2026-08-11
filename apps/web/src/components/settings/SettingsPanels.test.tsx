@@ -2049,6 +2049,26 @@ describe("ProviderSettingsPanel", () => {
 describe("ArchivedThreadsPanel", () => {
   const env1 = EnvironmentId.make("environment-one");
   const env2 = EnvironmentId.make("environment-two");
+  const removedTarget = {
+    environmentId: env1,
+    projectId: "project-a",
+    threadId: "thread-new",
+    title: "Newer thread",
+    path: "/work/alpha-worktrees/feature",
+    branch: "feature/archived",
+    availability: "missing-registered",
+    registrationState: "prunable",
+    locked: false,
+  } as const;
+  const removedResult = {
+    threadRemoved: true,
+    gitOutcome: "removed",
+    orphanCleanupPending: false,
+  } as const;
+
+  function reportRemoval(): void {
+    invoke(control("dialog", "worktree-removal"), "onRemoved", removedTarget, removedResult);
+  }
 
   function archivedSnapshots() {
     return [
@@ -2301,6 +2321,67 @@ describe("ArchivedThreadsPanel", () => {
       threadId: "thread-new",
     });
     expect(h.requestWorktreeRemoval).not.toHaveBeenCalled();
+  });
+
+  it("surfaces a post-removal navigation failure without refreshing the archive", async () => {
+    h.completeWorktreeRemoval.mockResolvedValueOnce({
+      _tag: "Failure",
+      cause: new Error("route unavailable"),
+    });
+    render(<ArchivedThreadsPanel />);
+
+    reportRemoval();
+    await flush();
+
+    expect(h.toastAdd).toHaveBeenCalledTimes(1);
+    expect(h.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "error",
+        title: "Worktree removed, but navigation failed",
+        description: "route unavailable",
+      }),
+    );
+    expect(h.archive.refresh).not.toHaveBeenCalled();
+  });
+
+  it("refreshes once after successful post-removal cleanup", async () => {
+    render(<ArchivedThreadsPanel />);
+
+    reportRemoval();
+    await flush();
+
+    expect(h.archive.refresh).toHaveBeenCalledTimes(1);
+    expect(h.toastAdd).not.toHaveBeenCalled();
+  });
+
+  it("does not refresh or toast for interrupted cleanup after unmount", async () => {
+    const previousActEnvironment = (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean })
+      .IS_REACT_ACT_ENVIRONMENT;
+    (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
+    const completion = deferred<unknown>();
+    h.completeWorktreeRemoval.mockReturnValueOnce(completion.promise);
+    const container = document.createElement("div");
+    document.body.append(container);
+    const root = createRoot(container);
+
+    try {
+      await act(async () => root.render(<ArchivedThreadsPanel />));
+      reportRemoval();
+      await act(async () => root.unmount());
+      completion.resolve({ _tag: "Failure", interrupted: true });
+      await flush();
+
+      expect(h.archive.refresh).not.toHaveBeenCalled();
+      expect(h.toastAdd).not.toHaveBeenCalled();
+    } finally {
+      container.remove();
+      if (previousActEnvironment === undefined) {
+        Reflect.deleteProperty(globalThis, "IS_REACT_ACT_ENVIRONMENT");
+      } else {
+        (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT =
+          previousActEnvironment;
+      }
+    }
   });
 
   it("ignores context menus when no local API is present", async () => {

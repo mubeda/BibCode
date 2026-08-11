@@ -1043,6 +1043,7 @@ beforeEach(() => {
   h.spies.toastAdd.mockReturnValue("toast-1");
   h.spies.archiveThread.mockResolvedValue({ _tag: "Success", value: undefined });
   h.spies.deleteThread.mockResolvedValue({ _tag: "Success", value: undefined });
+  h.spies.completeWorktreeRemoval.mockResolvedValue({ _tag: "Success", value: undefined });
   h.spies.getDraftThreadByProjectRef.mockReturnValue(null);
   h.spies.openDiscoveredPort.mockImplementation(async () => h.state.openDiscoveredPortResult);
   h.spies.pointerWithin.mockReturnValue([]);
@@ -2121,6 +2122,66 @@ staticDescribe("worktree discovery integration", () => {
         path: "C:/wt/x",
       }),
     );
+  });
+});
+
+staticDescribe("worktree removal completion owner", () => {
+  const removedTarget = {
+    environmentId: ENV_MAIN,
+    projectId: projectA.id,
+    threadId: threadActive.id,
+    title: threadActive.title,
+    path: "C:/wt/x",
+    branch: "feat/x",
+    availability: "present",
+    registrationState: "registered",
+    locked: false,
+  } as const;
+  const removedResult = {
+    threadRemoved: true,
+    gitOutcome: "removed",
+    orphanCleanupPending: false,
+  } as const;
+
+  async function reportRemoval(): Promise<void> {
+    baseScenario();
+    render(<Sidebar />);
+    const dialog = captured("WorktreeRemovalDialog").at(-1);
+    expect(dialog).toBeDefined();
+    const onRemoved = dialog!.props.onRemoved as (
+      target: typeof removedTarget,
+      result: typeof removedResult,
+    ) => void;
+    onRemoved(removedTarget, removedResult);
+    await flush();
+  }
+
+  it("surfaces fallback-navigation failure exactly once", async () => {
+    h.spies.completeWorktreeRemoval.mockResolvedValueOnce(failureResult("route unavailable"));
+
+    await reportRemoval();
+
+    expect(h.spies.toastAdd).toHaveBeenCalledTimes(1);
+    expect(h.spies.toastAdd).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "error",
+        title: "Worktree removed, but navigation failed",
+        description: "route unavailable",
+      }),
+    );
+  });
+
+  it("keeps successful and interrupted cleanup silent", async () => {
+    await reportRemoval();
+    expect(h.spies.toastAdd).not.toHaveBeenCalled();
+
+    vi.clearAllMocks();
+    h.spies.completeWorktreeRemoval.mockResolvedValueOnce({
+      _tag: "Failure",
+      cause: Cause.interrupt(1),
+    });
+    await reportRemoval();
+    expect(h.spies.toastAdd).not.toHaveBeenCalled();
   });
 });
 

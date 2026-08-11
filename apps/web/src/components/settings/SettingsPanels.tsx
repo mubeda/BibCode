@@ -12,6 +12,7 @@ import {
   type ProviderInstanceConfig,
   type ProviderInstanceId,
   type ProviderSessionDefault,
+  type WorktreeRemovalResult,
 } from "@bibcode/contracts";
 import { scopeThreadRef } from "@bibcode/client-runtime/environment";
 import { safeErrorLogAttributes } from "@bibcode/client-runtime/errors";
@@ -51,7 +52,7 @@ import { buildHostedChannelSelectionUrl, type HostedAppChannel } from "../../hos
 import { useTheme } from "../../hooks/useTheme";
 import { usePrimarySettings, useUpdatePrimarySettings } from "../../hooks/useSettings";
 import { useThreadActions } from "../../hooks/useThreadActions";
-import { WorktreeRemovalDialog } from "../WorktreeRemovalDialog";
+import { WorktreeRemovalDialog, type WorktreeRemovalTarget } from "../WorktreeRemovalDialog";
 import { useDesktopUpdateState } from "../../state/desktopUpdate";
 import {
   getCustomModelOptionsByInstance,
@@ -1945,6 +1946,30 @@ export function ArchivedThreadsPanel() {
     [confirmAndDeleteThread, refreshArchivedThreads, requestWorktreeRemoval, unarchiveThread],
   );
 
+  const handleWorktreeRemoved = useCallback(
+    async (removedTarget: WorktreeRemovalTarget, result: WorktreeRemovalResult) => {
+      const cleanupResult = await completeWorktreeRemoval(removedTarget, result);
+      if (cleanupResult._tag === "Success") {
+        refreshArchivedThreads();
+        return;
+      }
+      if (isAtomCommandInterrupted(cleanupResult)) return;
+
+      const error = squashAtomCommandFailure(cleanupResult);
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Worktree removed, but navigation failed",
+          description:
+            error instanceof Error
+              ? error.message
+              : "Select another thread from the archived list to continue.",
+        }),
+      );
+    },
+    [completeWorktreeRemoval, refreshArchivedThreads],
+  );
+
   return (
     <>
       <WorktreeRemovalDialog
@@ -1954,9 +1979,7 @@ export function ArchivedThreadsPanel() {
           if (!open) closeWorktreeRemovalDialog();
         }}
         onRemoved={(removedTarget, result) => {
-          void completeWorktreeRemoval(removedTarget, result).then(() => {
-            refreshArchivedThreads();
-          });
+          void handleWorktreeRemoved(removedTarget, result);
         }}
       />
       <SettingsPageContainer>

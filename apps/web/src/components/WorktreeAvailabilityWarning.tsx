@@ -30,6 +30,14 @@ export function WorktreeAvailabilityWarning({
         : status.availability === "verification-unavailable"
           ? "This worktree could not be verified. Its last known state is retained."
           : "Removal is in progress.";
+  const registrationState =
+    status.registrationState === "registered"
+      ? "Registered"
+      : status.registrationState === "prunable"
+        ? "Prunable (stale)"
+        : status.availability === "missing-unregistered"
+          ? "Not registered"
+          : "Unknown";
 
   return (
     <div
@@ -49,6 +57,10 @@ export function WorktreeAvailabilityWarning({
         <div>
           <dt className="sr-only">Full path</dt>
           <dd className="break-all font-mono text-[11px]">{status.path}</dd>
+        </div>
+        <div>
+          <dt className="inline font-medium">Git registration: </dt>
+          <dd className="inline">{registrationState}</dd>
         </div>
         {status.locked ? (
           <div>
