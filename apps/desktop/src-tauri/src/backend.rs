@@ -2707,9 +2707,9 @@ mod tests {
     use bibcode_server::diagnostics::{
         DesktopUiObservation, ProcessIdentity, UiCoverage, UiCoverageStatus,
     };
-    use bibcode_server::{
-        DataRootRequest, DataRootSource, RpcExit, ServerMessage, resolve_data_root,
-    };
+    #[cfg(unix)]
+    use bibcode_server::{DataRootRequest, resolve_data_root};
+    use bibcode_server::{DataRootSource, RpcExit, ServerMessage};
     use futures_util::{SinkExt, StreamExt};
     use std::{
         cell::Cell,
