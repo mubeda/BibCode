@@ -4,10 +4,12 @@ import * as Effect from "effect/Effect";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
+import * as HttpClient from "effect/unstable/http/HttpClient";
 
 import * as RemoteEnvironmentAuthorization from "../authorization/service.ts";
 import * as ManagedRelay from "../relay/managedRelay.ts";
 import * as ClientCapabilities from "../platform/capabilities.ts";
+import { fetchRemoteEnvironmentDescriptor } from "../environment/descriptor.ts";
 import {
   BearerConnectionCredential,
   BearerConnectionProfile,
@@ -19,6 +21,7 @@ import {
   credentialMissingError,
   environmentMismatchError,
   mapManagedRelayError,
+  mapRemoteEnvironmentError,
   profileMissingError,
 } from "./errors.ts";
 import type {
@@ -29,7 +32,11 @@ import type {
   RelayConnectionTarget,
   SshConnectionTarget,
 } from "./model.ts";
-import { ConnectionBlockedError, type ConnectionAttemptError } from "./model.ts";
+import {
+  ConnectionBlockedError,
+  ConnectionTransientError,
+  type ConnectionAttemptError,
+} from "./model.ts";
 import * as ConnectionProfileStore from "./profileStore.ts";
 
 export class ConnectionResolver extends Context.Service<
@@ -56,15 +63,29 @@ function primarySocketUrl(target: PrimaryConnectionTarget): string {
 const makePrimaryBroker = Effect.fn("clientRuntime.connection.broker.makePrimary")(function* () {
   const auth = yield* ClientCapabilities.PrimaryEnvironmentAuth;
   const remote = yield* RemoteEnvironmentAuthorization.RemoteEnvironmentAuthorization;
+  const httpClient = yield* HttpClient.HttpClient;
 
   return Effect.fn("clientRuntime.connection.broker.primary")(function* (
     target: PrimaryConnectionTarget,
   ) {
     const bearerToken = yield* auth.bearerToken;
     if (Option.isNone(bearerToken)) {
+      const descriptor = yield* fetchRemoteEnvironmentDescriptor({
+        httpBaseUrl: target.httpBaseUrl,
+      }).pipe(
+        Effect.mapError(mapRemoteEnvironmentError),
+        Effect.provideService(HttpClient.HttpClient, httpClient),
+      );
+      if (descriptor.environmentId !== target.environmentId) {
+        return yield* environmentMismatchError({
+          expected: target.environmentId,
+          actual: descriptor.environmentId,
+        });
+      }
       return {
-        environmentId: target.environmentId,
-        label: target.label,
+        environmentId: descriptor.environmentId,
+        label: descriptor.label,
+        descriptor,
         httpBaseUrl: target.httpBaseUrl,
         socketUrl: primarySocketUrl(target),
         httpAuthorization: null,
@@ -129,6 +150,7 @@ const makeBearerBroker = Effect.fn("clientRuntime.connection.broker.makeBearer")
     return {
       environmentId: authorized.environmentId,
       label: authorized.label,
+      descriptor: authorized.descriptor,
       httpBaseUrl: authorized.httpBaseUrl,
       socketUrl: authorized.socketUrl,
       httpAuthorization: authorized.httpAuthorization,
@@ -168,6 +190,7 @@ const makeRelayBroker = Effect.fn("clientRuntime.connection.broker.makeRelay")(f
     return {
       environmentId: authorized.environmentId,
       label: authorized.label,
+      descriptor: authorized.descriptor,
       httpBaseUrl: authorized.httpBaseUrl,
       socketUrl: authorized.socketUrl,
       httpAuthorization: authorized.httpAuthorization,
@@ -223,6 +246,7 @@ const makeSshBroker = Effect.fn("clientRuntime.connection.broker.makeSsh")(funct
     return {
       environmentId: authorized.environmentId,
       label: authorized.label,
+      descriptor: authorized.descriptor,
       httpBaseUrl: authorized.httpBaseUrl,
       socketUrl: authorized.socketUrl,
       httpAuthorization: authorized.httpAuthorization,
@@ -254,6 +278,11 @@ export const make = Effect.gen(function* () {
         return yield* relay(target);
       case "SshConnectionTarget":
         return yield* ssh({ ...entry, target });
+      case "UnavailableConnectionTarget":
+        return yield* new ConnectionTransientError({
+          reason: "endpoint-unavailable",
+          detail: target.detail,
+        });
     }
   });
 

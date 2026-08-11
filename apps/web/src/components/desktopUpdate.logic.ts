@@ -34,7 +34,11 @@ export function shouldShowArm64IntelBuildWarning(state: DesktopUpdateState | nul
 }
 
 export function isDesktopUpdateButtonDisabled(state: DesktopUpdateState | null): boolean {
-  return state?.status === "downloading";
+  return (
+    state?.status === "downloading" ||
+    state?.phase === "protecting" ||
+    state?.phase === "installing"
+  );
 }
 
 export function getArm64IntelBuildWarningDescription(state: DesktopUpdateState): string {

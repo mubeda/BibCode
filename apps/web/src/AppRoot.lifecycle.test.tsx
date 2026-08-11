@@ -73,7 +73,10 @@ vi.mock("./state/environments", () => ({
   useEnvironments: () => ({
     isReady: true,
     networkStatus: "online",
-    environments: h.environmentIds.map((environmentId) => ({ environmentId })),
+    environments: h.environmentIds.map((environmentId) => ({
+      environmentId,
+      entry: { target: { _tag: "PrimaryConnectionTarget" } },
+    })),
   }),
 }));
 
@@ -81,6 +84,37 @@ vi.mock("./state/shell", () => ({
   environmentShell: {
     stateValueAtom: (environmentId: EnvironmentId) => ({ environmentId }),
   },
+  environmentAvailabilityCommands: { retry: {}, adoptStorage: {} },
+  useEnvironmentShellSummary: () => ({ statuses: [] }),
+}));
+
+vi.mock("./state/use-atom-command", () => ({
+  useAtomCommand: () => vi.fn(async () => undefined),
+}));
+
+vi.mock("./state/projectDataSafety", () => ({
+  projectDataSafetyStore: {
+    open: vi.fn(async () => undefined),
+    close: vi.fn(),
+    retry: vi.fn(async () => undefined),
+    restore: vi.fn(),
+    startEmpty: vi.fn(),
+    openPath: vi.fn(),
+    exportDiagnostics: vi.fn(),
+  },
+  useProjectDataSafetySnapshot: () => ({
+    open: false,
+    environmentId: null,
+    selected: null,
+    busy: false,
+    error: null,
+    lastResult: null,
+    requiresStorageAdoption: false,
+  }),
+}));
+
+vi.mock("./components/desktop/ProjectDataRecoveryDialog", () => ({
+  ProjectDataRecoveryDialog: () => null,
 }));
 
 vi.mock("./lib/archivedThreadsState", () => ({
@@ -214,7 +248,7 @@ describe("AppRoot thread lifecycle reconciliation", () => {
     [
       "cached live-shell data",
       () => {
-        publishShellState(ENVIRONMENT_ID, shellState("cached", snapshot(20, [HOST_ID])));
+        publishShellState(ENVIRONMENT_ID, shellState("degraded", snapshot(20, [HOST_ID])));
         h.archivedStates.set(ENVIRONMENT_ID, {
           snapshots: [{ environmentId: ENVIRONMENT_ID, snapshot: snapshot(20, []) }],
           error: null,
@@ -294,7 +328,7 @@ describe("AppRoot thread lifecycle reconciliation", () => {
       error: null,
       isLoading: false,
     };
-    publishShellState(ENVIRONMENT_ID, shellState("cached", snapshot(30, [HOST_ID])));
+    publishShellState(ENVIRONMENT_ID, shellState("degraded", snapshot(30, [HOST_ID])));
     h.archivedStates.set(ENVIRONMENT_ID, archived);
     useCenterPanelStore.getState().openTerminalPanel(DELETED_REF, "term-deleted");
     useRightPanelStore.getState().openTerminal(DELETED_REF, "term-deleted");

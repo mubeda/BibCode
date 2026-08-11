@@ -88,6 +88,7 @@ pub struct ProductionRuntime {
     orchestration_effects: OrchestrationEffects,
     diagnostic_bundle: DiagnosticBundleService,
     _resource_sampler: Arc<NativeResourceSampler>,
+    update_quiesced: tokio::sync::Mutex<bool>,
 }
 
 pub fn finalize_rpc_registry(
@@ -313,6 +314,7 @@ impl ProductionRuntime {
             orchestration_effects,
             diagnostic_bundle,
             _resource_sampler: resource_sampler,
+            update_quiesced: tokio::sync::Mutex::new(false),
         })
     }
 
@@ -428,19 +430,37 @@ impl ProductionRuntime {
         })
     }
 
-    pub async fn shutdown(&self) {
+    pub async fn quiesce_for_update(&self) -> Result<(), String> {
+        let mut quiesced = self.update_quiesced.lock().await;
+        if *quiesced {
+            return Ok(());
+        }
+        let mut first_error = None;
         self.provider_update_checks.shutdown().await;
         self.turn_delivery.shutdown().await;
         self.orchestration_effects.shutdown().await;
         if let Err(error) = self.provider_runtime.shutdown().await {
             let error = bound_diagnostic_string(&error.to_string(), 160);
             tracing::warn!(%error, "provider process-owner cleanup completed with failures");
+            first_error = Some(error);
         }
         self.terminal_services.shutdown().await;
         if let Err(error) = self.operational_logs.shutdown().await {
             tracing::warn!(%error, "failed to shut down operational logs cleanly");
+            if first_error.is_none() {
+                first_error = Some(error);
+            }
         }
         self.orchestration.shutdown().await;
+        *quiesced = true;
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
+    pub async fn shutdown(&self) {
+        let _ = self.quiesce_for_update().await;
     }
 }
 

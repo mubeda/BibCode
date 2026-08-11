@@ -39,6 +39,8 @@ const pf = vi.hoisted(() => ({
   secondaryRead: { _tag: "Success", bootstraps: [] as unknown[] } as unknown,
   descriptor: { environmentId: "environment-primary", label: "Primary" } as unknown,
   bearerAccess: { access_token: "secondary-token", expires_in: 3_600 } as unknown,
+  descriptorCalls: [] as string[],
+  bearerBootstrapCalls: [] as string[],
   clearCalls: [] as string[],
   trackCalls: [] as Array<{ requestId: string; tag: string }>,
   ackCalls: [] as string[],
@@ -105,12 +107,17 @@ vi.mock("@bibcode/client-runtime/relay", async () => {
 });
 
 vi.mock("@bibcode/client-runtime/environment", () => ({
-  fetchRemoteEnvironmentDescriptor: (_input: { httpBaseUrl: string }) =>
-    Effect.succeed(pf.descriptor),
+  fetchRemoteEnvironmentDescriptor: (input: { httpBaseUrl: string }) => {
+    pf.descriptorCalls.push(input.httpBaseUrl);
+    return Effect.succeed(pf.descriptor);
+  },
 }));
 
 vi.mock("@bibcode/client-runtime/authorization", () => ({
-  bootstrapRemoteBearerSession: (_input: unknown) => Effect.succeed(pf.bearerAccess),
+  bootstrapRemoteBearerSession: (input: { httpBaseUrl: string }) => {
+    pf.bearerBootstrapCalls.push(input.httpBaseUrl);
+    return Effect.succeed(pf.bearerAccess);
+  },
 }));
 
 import {
@@ -276,6 +283,8 @@ function resetPf(): void {
   pf.secondaryRead = { _tag: "Success", bootstraps: [] };
   pf.descriptor = { environmentId: "environment-primary", label: "Primary" };
   pf.bearerAccess = { access_token: "secondary-token", expires_in: 3_600 };
+  pf.descriptorCalls = [];
+  pf.bearerBootstrapCalls = [];
   pf.clearCalls.length = 0;
   pf.trackCalls.length = 0;
   pf.ackCalls.length = 0;
@@ -783,6 +792,59 @@ describe("connectionPlatformLayer connection source", () => {
       const registrations = Option.getOrThrow(head);
       // Primary (same-origin) + secondary (desktop-local bearer) registrations.
       expect(registrations.length).toBeGreaterThanOrEqual(2);
+    }).pipe(Effect.provide(Layer.mergeAll(connectionPlatformLayer, TestClock.layer())));
+  });
+
+  it.effect("retains a configured unavailable WSL secondary without fabricating a session", () => {
+    stubBrowser({ desktopBridge: makeBridge([]) });
+    pf.isHostedStatic = false;
+    pf.primaryTarget = {
+      source: "cli",
+      target: {
+        httpBaseUrl: "http://127.0.0.1:3773/",
+        wsBaseUrl: "ws://127.0.0.1:3773/",
+      },
+    };
+    pf.secondaryRead = {
+      _tag: "Success",
+      bootstraps: [
+        {
+          id: "wsl:Ubuntu",
+          label: "WSL (Ubuntu)",
+          configuredDistro: "Ubuntu",
+          runningDistro: null,
+          httpBaseUrl: null,
+          wsBaseUrl: null,
+          preflightError: {
+            kind: "wsl-secondary-unavailable",
+            detail: "the configured WSL distribution could not start",
+          },
+        },
+      ],
+    };
+    return Effect.gen(function* () {
+      const source = yield* PlatformConnectionSource;
+      const fiber = yield* Effect.forkChild(
+        Stream.runHead(source.registrations.pipe(Stream.take(1))),
+      );
+      yield* TestClock.adjust("3 seconds");
+      const registrations = Option.getOrThrow(yield* Fiber.join(fiber));
+
+      expect(registrations).toContainEqual(
+        expect.objectContaining({
+          _tag: "UnavailableConnectionRegistration",
+          target: expect.objectContaining({
+            _tag: "UnavailableConnectionTarget",
+            environmentId: "wsl:Ubuntu",
+            label: "WSL (Ubuntu)",
+            connectionId: "local:wsl:Ubuntu",
+            configuredDistro: "Ubuntu",
+            detail: "the configured WSL distribution could not start",
+          }),
+        }),
+      );
+      expect(pf.descriptorCalls).toEqual(["http://127.0.0.1:3773/"]);
+      expect(pf.bearerBootstrapCalls).toEqual([]);
     }).pipe(Effect.provide(Layer.mergeAll(connectionPlatformLayer, TestClock.layer())));
   });
 

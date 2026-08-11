@@ -115,6 +115,15 @@ export function createEnvironmentCatalogAtoms<R, E>(
         Effect.flatMap((registry) => registry.retryNow(environmentId)),
       ),
   });
+  const acceptStorageIdentity = createRuntimeCommand(runtime, {
+    label: "environment-catalog:accept-storage-identity",
+    scheduler: commandScheduler,
+    concurrency: serial,
+    execute: (environmentId: EnvironmentIdType) =>
+      EnvironmentRegistry.EnvironmentRegistry.pipe(
+        Effect.flatMap((registry) => registry.acceptStorageIdentity(environmentId)),
+      ),
+  });
 
   return {
     catalogAtom,
@@ -126,5 +135,6 @@ export function createEnvironmentCatalogAtoms<R, E>(
     remove,
     removeRelayEnvironments,
     retryNow,
+    acceptStorageIdentity,
   };
 }

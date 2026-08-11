@@ -1,4 +1,4 @@
-import { EnvironmentId } from "@bibcode/contracts";
+import { EnvironmentId, type ExecutionEnvironmentDescriptor } from "@bibcode/contracts";
 import type { RelayManagedEndpoint } from "@bibcode/contracts/relay";
 import {
   exchangeRemoteDpopAccessToken,
@@ -33,6 +33,7 @@ export interface RelayEnvironmentAuthorization {
 export interface AuthorizedRemoteEnvironment {
   readonly environmentId: EnvironmentId;
   readonly label: string;
+  readonly descriptor: ExecutionEnvironmentDescriptor;
   readonly httpBaseUrl: string;
   readonly socketUrl: string;
   readonly httpAuthorization: PreparedHttpAuthorization;
@@ -61,7 +62,9 @@ const TOKEN_EXPIRY_SAFETY_MARGIN_MS = 60_000;
 const CACHED_ENDPOINT_FAILURE_THRESHOLD = 2;
 
 function mapDpopSocketError(error: RemoteEnvironmentAuthError | ConnectionAttemptError) {
-  return error._tag === "ConnectionTransientError" || error._tag === "ConnectionBlockedError"
+  return error._tag === "ConnectionTransientError" ||
+    error._tag === "ConnectionBlockedError" ||
+    error._tag === "ConnectionStorageChangedError"
     ? error
     : mapRemoteEnvironmentError(error);
 }
@@ -126,6 +129,7 @@ export const make = Effect.gen(function* () {
         Effect.provideService(HttpClient.HttpClient, httpClient),
       );
       return {
+        descriptor,
         environmentId: descriptor.environmentId,
         label: descriptor.label,
         httpBaseUrl: input.httpBaseUrl,
@@ -196,24 +200,38 @@ export const make = Effect.gen(function* () {
         yield* Effect.annotateCurrentSpan({
           "connection.remote_token_cache": "hit",
         });
-        const cachedSocket = yield* createDpopSocketUrl(cached.value).pipe(Effect.result);
-        if (Result.isSuccess(cachedSocket)) {
+        const cachedConnection = yield* Effect.gen(function* () {
+          const descriptor = yield* fetchDescriptor(cached.value.endpoint.httpBaseUrl).pipe(
+            Effect.provideService(HttpClient.HttpClient, httpClient),
+            Effect.withSpan("environment.authorization.descriptor"),
+          );
+          if (descriptor.environmentId !== input.expectedEnvironmentId) {
+            return yield* environmentMismatchError({
+              expected: input.expectedEnvironmentId,
+              actual: descriptor.environmentId,
+            });
+          }
+          const socketUrl = yield* createDpopSocketUrl(cached.value);
+          return { descriptor, socketUrl };
+        }).pipe(Effect.result);
+        if (Result.isSuccess(cachedConnection)) {
           yield* resetCachedEndpointFailures(input.expectedEnvironmentId);
           return {
-            environmentId: cached.value.environmentId,
-            label: cached.value.label,
+            descriptor: cachedConnection.success.descriptor,
+            environmentId: cachedConnection.success.descriptor.environmentId,
+            label: cachedConnection.success.descriptor.label,
             httpBaseUrl: cached.value.endpoint.httpBaseUrl,
-            socketUrl: cachedSocket.success,
+            socketUrl: cachedConnection.success.socketUrl,
             httpAuthorization: {
               _tag: "Dpop" as const,
               accessToken: cached.value.accessToken,
             },
           };
         }
-        if (cachedSocket.failure._tag === "ConnectionBlockedError") {
-          return yield* mapDpopSocketError(cachedSocket.failure);
+        if (cachedConnection.failure._tag === "ConnectionBlockedError") {
+          return yield* mapDpopSocketError(cachedConnection.failure);
         }
-        const mappedFailure = mapDpopSocketError(cachedSocket.failure);
+        const mappedFailure = mapDpopSocketError(cachedConnection.failure);
         if (mappedFailure._tag === "ConnectionTransientError") {
           const failureCount = yield* recordCachedEndpointFailure(input.expectedEnvironmentId);
           if (failureCount < CACHED_ENDPOINT_FAILURE_THRESHOLD) {
@@ -280,6 +298,7 @@ export const make = Effect.gen(function* () {
         .put(token)
         .pipe(Effect.withSpan("environment.authorization.accessToken.persist"));
       return {
+        descriptor,
         environmentId: descriptor.environmentId,
         label: descriptor.label,
         httpBaseUrl: bootstrap.endpoint.httpBaseUrl,

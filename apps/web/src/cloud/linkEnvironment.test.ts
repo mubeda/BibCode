@@ -260,6 +260,7 @@ describe("web cloud link environment client", () => {
       label: TARGET.label,
       platform: { os: "darwin", arch: "arm64" },
       serverVersion: "0.0.0-test",
+      storageInstanceId: null,
       capabilities: { repositoryIdentity: true, activityProtocolVersion: null },
     });
 

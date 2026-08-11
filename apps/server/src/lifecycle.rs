@@ -7,12 +7,14 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     auth::{AuthService, SecretStore},
     config::{ServerConfig, ServerMode},
+    data_root::{DataRootError, ResolvedDataRoot, resolve_data_root},
     diagnostics::{
         DesktopUiProcessObserver, NotApplicableUiProcessObserver,
         UnavailableDesktopUiProcessObserver,
     },
     http, logging,
-    persistence::{Database, Repositories, StatePaths, run_migrations},
+    maintenance::{UpdateMaintenance, maintenance_routes_enabled},
+    persistence::{Database, Repositories, StatePaths, StoreRuntimeGuard, prepare_store},
     production::http_routes::{HttpRouteError, HttpRoutesState},
     production::runtime::ProductionRuntime,
     production::{
@@ -34,8 +36,10 @@ pub struct ServerRuntime;
 
 pub struct ServerHandle {
     local_addr: SocketAddr,
+    data_root: ResolvedDataRoot,
     startup_access: Option<StartupAccess>,
-    _database: Database,
+    database: Option<Database>,
+    _store_runtime_guard: StoreRuntimeGuard,
     _production_runtime: Option<Arc<ProductionRuntime>>,
     shutdown: CancellationToken,
     task: Option<JoinHandle<Result<(), std::io::Error>>>,
@@ -50,6 +54,8 @@ pub struct StartupAccess {
 
 #[derive(Debug, Error)]
 pub enum ServerError {
+    #[error(transparent)]
+    DataRoot(#[from] DataRootError),
     #[error("failed to create the server base directory")]
     CreateBaseDirectory(#[source] std::io::Error),
     #[error("failed to initialize native server state files: {0}")]
@@ -94,30 +100,33 @@ impl ServerRuntime {
     }
 
     async fn start_internal(
-        config: ServerConfig,
+        mut config: ServerConfig,
         custom_registry: Option<RpcRegistry>,
         ui_process_observer: Arc<dyn DesktopUiProcessObserver>,
     ) -> Result<ServerHandle, ServerError> {
+        let resolved_data_root = resolve_data_root(config.data_root_request.clone())?;
+        config.base_dir = resolved_data_root.effective.clone();
+        config.resolved_data_root = Some(resolved_data_root.clone());
         tokio::fs::create_dir_all(&config.base_dir)
             .await
             .map_err(ServerError::CreateBaseDirectory)?;
         let state_paths = StatePaths::from_config(&config);
         state_paths
-            .ensure_directories()
+            .ensure_directories_without_database_side_effects()
             .await
             .map_err(|error| ServerError::StateFiles(error.to_string()))?;
         logging::initialize(&state_paths.server_log)
             .map_err(|error| ServerError::Logging(error.to_string()))?;
-        let database = Database::open(config.database_path())
+        let store_runtime_guard = StoreRuntimeGuard::acquire(&config.base_dir)
             .await
             .map_err(|error| ServerError::PersistenceInitialize(error.to_string()))?;
-        database
-            .call(|connection| {
-                run_migrations(connection, None)?;
-                Ok(())
-            })
+        let prepared_store = prepare_store(&config)
             .await
             .map_err(|error| ServerError::PersistenceInitialize(error.to_string()))?;
+        config.storage_instance_id = Some(prepared_store.storage_instance_id);
+        let storage_instance_id = prepared_store.storage_instance_id;
+        let store_classification = prepared_store.classification;
+        let database = prepared_store.database;
         let listener = TcpListener::bind((config.host.as_str(), config.port))
             .await
             .map_err(ServerError::Bind)?;
@@ -227,6 +236,10 @@ impl ServerRuntime {
                     "label": config.environment_label,
                     "platform": { "os": std::env::consts::OS, "arch": std::env::consts::ARCH },
                     "serverVersion": config.server_version,
+                    "storageInstanceId": config
+                        .storage_instance_id
+                        .expect("a running server has a prepared persistent store")
+                        .to_string(),
                     "capabilities": { "repositoryIdentity": true },
                 });
                 let connect = Arc::new(
@@ -259,12 +272,33 @@ impl ServerRuntime {
             }
         };
         let shutdown = CancellationToken::new();
+        let admission_gate = rpc_registry.admission_gate();
+        let update_maintenance = if maintenance_routes_enabled(&config) {
+            production_runtime.as_ref().map(|runtime| {
+                UpdateMaintenance::new(
+                    admission_gate.clone(),
+                    runtime.clone(),
+                    database.clone(),
+                    state_paths.clone(),
+                    storage_instance_id,
+                    store_classification,
+                    config.server_version.clone(),
+                    shutdown.clone(),
+                    config.update_maintenance_drain_timeout,
+                    config.update_maintenance_lease,
+                )
+            })
+        } else {
+            None
+        };
         let app = http::build_router(http::AppState {
             config: Arc::new(config),
             shutdown: shutdown.clone(),
             rpc_registry,
             http_routes,
             auth,
+            admission_gate,
+            update_maintenance,
         });
         let server_shutdown = shutdown.clone();
         let completion_signal = shutdown.clone();
@@ -282,8 +316,10 @@ impl ServerRuntime {
 
         Ok(ServerHandle {
             local_addr,
+            data_root: resolved_data_root,
             startup_access,
-            _database: database,
+            database: Some(database),
+            _store_runtime_guard: store_runtime_guard,
             _production_runtime: production_runtime,
             shutdown,
             task: Some(task),
@@ -405,6 +441,11 @@ impl ServerHandle {
     }
 
     #[must_use]
+    pub fn data_root(&self) -> &ResolvedDataRoot {
+        &self.data_root
+    }
+
+    #[must_use]
     pub fn startup_access(&self) -> Option<&StartupAccess> {
         self.startup_access.as_ref()
     }
@@ -419,9 +460,15 @@ impl ServerHandle {
 
     pub async fn join(mut self) -> Result<(), ServerError> {
         let task = self.task.take().ok_or(ServerError::AlreadyJoined)?;
-        task.await
-            .map_err(ServerError::Join)?
-            .map_err(ServerError::Serve)
+        let result = match task.await {
+            Ok(result) => result.map_err(ServerError::Serve),
+            Err(error) => Err(ServerError::Join(error)),
+        };
+        drop(self._production_runtime.take());
+        if let Some(database) = self.database.take() {
+            database.close().await;
+        }
+        result
     }
 }
 
@@ -467,6 +514,16 @@ impl Drop for ServerHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn rejects_relative_programmatic_data_roots_before_creating_state() {
+        let error = match ServerRuntime::start(ServerConfig::new("relative/.bibcode")).await {
+            Ok(_) => panic!("relative data root must fail at runtime start"),
+            Err(error) => error,
+        };
+
+        assert!(matches!(error, ServerError::DataRoot(_)));
+    }
 
     #[tokio::test]
     async fn default_ui_observers_match_the_server_runtime_mode() {

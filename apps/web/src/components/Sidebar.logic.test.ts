@@ -17,6 +17,7 @@ import {
   resolveProjectStatusIndicator,
   resolveSidebarNewThreadSeedContext,
   resolveSidebarNewThreadEnvMode,
+  resolveSidebarProjectAvailability,
   resolveSidebarStageBadgeLabel,
   resolveThreadRowClassName,
   resolveThreadStatusPill,
@@ -40,6 +41,100 @@ import {
 } from "../types";
 
 const localEnvironmentId = EnvironmentId.make("environment-local");
+
+function availabilityEnvironment(
+  status:
+    | "starting"
+    | "synchronizing"
+    | "live"
+    | "degraded"
+    | "storage-changed"
+    | "recovery-required"
+    | "unavailable"
+    | "configuration-error",
+  options: { readonly hasSnapshot?: boolean } = {},
+) {
+  return {
+    environmentId: localEnvironmentId,
+    status,
+    hasSnapshot: options.hasSnapshot ?? false,
+    error: null,
+  };
+}
+
+describe("resolveSidebarProjectAvailability", () => {
+  it("renders corrupt catalog health as configuration recovery instead of empty", () => {
+    expect(
+      resolveSidebarProjectAvailability({
+        projectCount: 0,
+        catalogReady: true,
+        catalogHealth: {
+          status: "recovery-required",
+          message: "The connection catalog needs recovery.",
+        },
+        environments: [],
+      }),
+    ).toEqual({
+      kind: "configuration-error",
+      environmentId: null,
+      error: "The connection catalog needs recovery.",
+      hasCachedProjects: false,
+    });
+  });
+
+  it.each([
+    ["catalog-loading", false, []],
+    ["starting", true, [availabilityEnvironment("starting")]],
+    ["synchronizing", true, [availabilityEnvironment("synchronizing")]],
+    ["degraded", true, [availabilityEnvironment("degraded", { hasSnapshot: true })]],
+    ["storage-changed", true, [availabilityEnvironment("storage-changed")]],
+    ["recovery-required", true, [availabilityEnvironment("recovery-required")]],
+    ["unavailable", true, [availabilityEnvironment("unavailable")]],
+    ["configuration-error", true, [availabilityEnvironment("configuration-error")]],
+  ] as const)("does not claim empty projects for %s", (_name, catalogReady, environments) => {
+    expect(
+      resolveSidebarProjectAvailability({
+        projectCount: 0,
+        catalogReady,
+        environments,
+      }).kind,
+    ).not.toBe("empty-confirmed");
+  });
+
+  it("does not claim empty projects when the loaded catalog has no desired environments", () => {
+    expect(
+      resolveSidebarProjectAvailability({
+        projectCount: 0,
+        catalogReady: true,
+        environments: [],
+      }).kind,
+    ).not.toBe("empty-confirmed");
+  });
+
+  it("confirms empty only when every desired environment is live and authoritative", () => {
+    expect(
+      resolveSidebarProjectAvailability({
+        projectCount: 0,
+        catalogReady: true,
+        environments: [availabilityEnvironment("live", { hasSnapshot: true })],
+      }),
+    ).toEqual({ kind: "empty-confirmed", environmentId: null, error: null });
+  });
+
+  it("keeps cached projects visible while reporting a storage change", () => {
+    expect(
+      resolveSidebarProjectAvailability({
+        projectCount: 1,
+        catalogReady: true,
+        environments: [availabilityEnvironment("storage-changed", { hasSnapshot: true })],
+      }),
+    ).toMatchObject({
+      kind: "storage-changed",
+      environmentId: localEnvironmentId,
+      hasCachedProjects: true,
+    });
+  });
+});
 
 describe("resolveSidebarStageBadgeLabel", () => {
   it("returns Nightly for nightly primary server versions", () => {

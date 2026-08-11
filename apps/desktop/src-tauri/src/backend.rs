@@ -2,8 +2,8 @@ use bibcode_server::diagnostics::{DesktopUiProcessObserver, UnavailableDesktopUi
 use bibcode_server::process::{configure_background_command, configure_background_std_command};
 use bibcode_server::{
     DESKTOP_SHUTDOWN_PATH as SERVER_BACKEND_SHUTDOWN_PATH,
-    DESKTOP_SHUTDOWN_TOKEN_HEADER as SERVER_BACKEND_SHUTDOWN_TOKEN_HEADER, ServerConfig,
-    ServerRuntime,
+    DESKTOP_SHUTDOWN_TOKEN_HEADER as SERVER_BACKEND_SHUTDOWN_TOKEN_HEADER, DataRootRequest,
+    DataRootSource, ResolvedDataRoot, ServerConfig, ServerRuntime,
 };
 use serde_json::{Value, json};
 use std::{
@@ -20,6 +20,7 @@ use std::{
     time::{Duration, Instant},
 };
 use tauri::{AppHandle, Emitter, Runtime};
+use thiserror::Error;
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt as TokioAsyncWriteExt},
     process::{Child, Command},
@@ -41,6 +42,7 @@ const DEFAULT_BACKEND_PORT: u16 = 3773;
 const MAX_TCP_PORT: u16 = u16::MAX;
 const DESKTOP_BACKEND_PORT_PROBE_HOSTS: [&str; 3] = ["127.0.0.1", "0.0.0.0", "::"];
 pub const BACKEND_READY_EVENT: &str = "desktop:backend-ready";
+pub const PROJECT_DATA_STATUS_CHANGED_EVENT: &str = "desktop:project-data-status-changed";
 const WSL_SERVER_BINARY_ENV: &str = "BIBCODE_WSL_SERVER_BINARY";
 const DESKTOP_SETTINGS_FILE_NAME: &str = "desktop-settings.json";
 const BACKEND_READINESS_PATH: &str = "/.well-known/bibcode/environment";
@@ -124,15 +126,56 @@ pub struct BackendLaunchPlan {
     pub config: BackendRunConfig,
 }
 
+#[derive(Debug, Clone, Error, PartialEq, Eq)]
+pub(crate) enum BackendPlanError {
+    #[error("WSL primary is unavailable: {detail}")]
+    WslPrimaryUnavailable { detail: String },
+    #[error("desktop backend planning failed: {detail}")]
+    Other { detail: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackendUnavailableEnvironment {
+    pub environment_id: String,
+    pub label: String,
+    pub configured_distro: Option<String>,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DefaultLaunchPlans {
+    plans: Vec<BackendLaunchPlan>,
+    unavailable_secondary: Option<BackendUnavailableEnvironment>,
+}
+
+impl BackendUnavailableEnvironment {
+    fn to_environment_bootstrap(&self) -> Value {
+        json!({
+            "id": &self.environment_id,
+            "label": &self.label,
+            "configuredDistro": &self.configured_distro,
+            "runningDistro": null,
+            "httpBaseUrl": null,
+            "wsBaseUrl": null,
+            "preflightError": {
+                "kind": "wsl-secondary-unavailable",
+                "detail": &self.detail,
+            },
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BackendLaunchTarget {
     InProcess {
         base_dir: PathBuf,
+        data_root: ResolvedDataRoot,
     },
     ExternalProcess {
         program: String,
         args: Vec<String>,
         bootstrap_line: String,
+        data_root: Option<String>,
     },
 }
 
@@ -145,15 +188,37 @@ pub struct WslBackendLaunchPlanInput {
     pub renderer_host: String,
     pub desktop_bootstrap_token: String,
     pub binary_path: String,
+    pub data_root: String,
 }
 
 impl BackendLaunchPlan {
     pub fn local(base_dir: PathBuf, config: BackendRunConfig) -> Self {
+        let data_root = ResolvedDataRoot {
+            source: DataRootSource::Cli,
+            requested: base_dir.clone(),
+            effective: base_dir.clone(),
+            is_filesystem_alias: false,
+        };
         Self {
-            target: BackendLaunchTarget::InProcess { base_dir },
+            target: BackendLaunchTarget::InProcess {
+                base_dir,
+                data_root,
+            },
             log_path: None,
             config,
         }
+    }
+
+    fn with_data_root(mut self, data_root: ResolvedDataRoot) -> Self {
+        if let BackendLaunchTarget::InProcess {
+            base_dir,
+            data_root: target_data_root,
+        } = &mut self.target
+        {
+            *base_dir = data_root.effective.clone();
+            *target_data_root = data_root;
+        }
+        self
     }
 
     pub fn with_log_path(mut self, log_path: PathBuf) -> Self {
@@ -182,6 +247,8 @@ impl BackendLaunchPlan {
             "port": config.port,
             "host": &config.bind_host,
             "desktopBootstrapToken": &config.desktop_bootstrap_token,
+            "bibcodeHome": &input.data_root,
+            "wslTransport": true,
             "tailscaleServeEnabled": false,
             "tailscaleServePort": TAILSCALE_SERVE_PORT,
         });
@@ -202,6 +269,7 @@ impl BackendLaunchPlan {
                 program: "wsl.exe".to_string(),
                 args,
                 bootstrap_line: format!("{bootstrap}\n"),
+                data_root: Some(input.data_root),
             },
             log_path: None,
             config,
@@ -373,6 +441,8 @@ struct BackendSlotState {
     backend: Option<ManagedBackend>,
     pid: Option<u32>,
     last_error: Option<String>,
+    plan_error: Option<BackendPlanError>,
+    unavailable: Option<BackendUnavailableEnvironment>,
     restart_attempt: u32,
     restart_scheduled: bool,
 }
@@ -382,6 +452,7 @@ struct BackendState {
     slots: BTreeMap<String, BackendSlotState>,
     next_run_id: u64,
     in_flight_starts: usize,
+    update_coordination: bool,
     lifecycle: BackendLifecycle,
 }
 
@@ -466,9 +537,301 @@ pub struct BackendSupervisor {
     late_start_cleanup_failure: Arc<Mutex<Option<String>>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct BackendUpdateEnvironment {
+    pub environment_id: String,
+    pub label: String,
+    pub primary: bool,
+    pub running: bool,
+    pub config: Option<BackendRunConfig>,
+    pub unprotected_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BackendUpdateSnapshot {
+    pub environments: Vec<BackendUpdateEnvironment>,
+    running_plans: Vec<BackendLaunchPlan>,
+    unavailable_environments: Vec<BackendUnavailableEnvironment>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct BackendProjectDataTarget {
+    pub environment_id: String,
+    pub label: String,
+    pub running_distro: Option<String>,
+    pub running: bool,
+    pub launch_plan: BackendLaunchPlan,
+}
+
+#[derive(Debug)]
+pub(crate) struct BackendProjectDataOperation {
+    supervisor: BackendSupervisor,
+    target: BackendProjectDataTarget,
+    stopped: bool,
+    _reservation: BackendProjectDataReservation,
+}
+
+#[derive(Debug)]
+struct BackendProjectDataReservation {
+    supervisor: BackendSupervisor,
+}
+
+impl Drop for BackendProjectDataReservation {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.supervisor.state.lock() {
+            state.update_coordination = false;
+        }
+    }
+}
+
+impl BackendProjectDataOperation {
+    pub(crate) fn target(&self) -> &BackendProjectDataTarget {
+        &self.target
+    }
+
+    pub(crate) async fn stop_selected(&mut self) -> Result<(), String> {
+        if self.stopped || !self.target.running {
+            self.stopped = true;
+            return Ok(());
+        }
+        let managed = {
+            let mut state = self
+                .supervisor
+                .state
+                .lock()
+                .map_err(|error| format!("backend supervisor mutex poisoned: {error}"))?;
+            let slot = state
+                .slots
+                .get_mut(&self.target.environment_id)
+                .ok_or_else(|| {
+                    "The selected desktop backend is no longer registered.".to_owned()
+                })?;
+            slot.restart_scheduled = false;
+            slot.backend.take().ok_or_else(|| {
+                "The selected desktop backend stopped before recovery began.".to_owned()
+            })?
+        };
+        stop_managed_backend(managed, BackendShutdownConfig::default()).await?;
+        self.stopped = true;
+        Ok(())
+    }
+
+    pub(crate) async fn restart_after_commit(&self) -> Result<(), String> {
+        self.supervisor
+            .start_with_options_inner(
+                self.target.launch_plan.clone(),
+                BackendReadinessConfig::default(),
+                BackendRestartConfig::default(),
+                true,
+                true,
+            )
+            .await
+            .map(|_| ())
+    }
+}
+
 impl BackendSupervisor {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn snapshot_for_update(&self) -> BackendUpdateSnapshot {
+        let state = self
+            .state
+            .lock()
+            .expect("backend supervisor mutex poisoned");
+        let mut environments = Vec::with_capacity(state.slots.len());
+        let mut running_plans = Vec::new();
+        let mut unavailable_environments = Vec::new();
+        for (slot_key, slot) in &state.slots {
+            let primary = slot_key == PRIMARY_LOCAL_ENVIRONMENT_ID;
+            let running = slot.backend.is_some();
+            if running && let Some(plan) = &slot.launch_plan {
+                running_plans.push(plan.clone());
+            }
+            if let Some(unavailable) = &slot.unavailable {
+                unavailable_environments.push(unavailable.clone());
+            }
+            let (environment_id, label, config) = if let Some(plan) = &slot.launch_plan {
+                (
+                    plan.config.environment_id.clone(),
+                    plan.config.label.clone(),
+                    Some(plan.config.clone()),
+                )
+            } else if let Some(unavailable) = &slot.unavailable {
+                (
+                    unavailable.environment_id.clone(),
+                    unavailable.label.clone(),
+                    None,
+                )
+            } else {
+                (
+                    slot_key.clone(),
+                    if primary {
+                        "Local".to_string()
+                    } else {
+                        slot_key.clone()
+                    },
+                    None,
+                )
+            };
+            environments.push(BackendUpdateEnvironment {
+                environment_id,
+                label,
+                primary,
+                running,
+                config,
+                unprotected_reason: (!running).then(|| {
+                    slot.unavailable
+                        .as_ref()
+                        .map(|unavailable| unavailable.detail.clone())
+                        .or_else(|| slot.last_error.clone())
+                        .unwrap_or_else(|| "The configured backend is not running.".to_string())
+                }),
+            });
+        }
+        BackendUpdateSnapshot {
+            environments,
+            running_plans,
+            unavailable_environments,
+        }
+    }
+
+    pub(crate) fn project_data_targets(&self) -> Vec<BackendProjectDataTarget> {
+        self.state
+            .lock()
+            .expect("backend supervisor mutex poisoned")
+            .slots
+            .values()
+            .filter_map(|slot| {
+                let launch_plan = slot.launch_plan.clone()?;
+                Some(BackendProjectDataTarget {
+                    environment_id: launch_plan.config.environment_id.clone(),
+                    label: launch_plan.config.label.clone(),
+                    running_distro: launch_plan.config.running_distro.clone(),
+                    running: slot.backend.is_some(),
+                    launch_plan,
+                })
+            })
+            .collect()
+    }
+
+    pub(crate) async fn begin_project_data_operation(
+        &self,
+        environment_id: &str,
+    ) -> Result<BackendProjectDataOperation, String> {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|error| format!("backend supervisor mutex poisoned: {error}"))?;
+            if state.update_coordination {
+                return Err(
+                    "Another exclusive desktop data operation is already running.".to_owned(),
+                );
+            }
+            state.update_coordination = true;
+        }
+        let reservation = BackendProjectDataReservation {
+            supervisor: self.clone(),
+        };
+        self.wait_for_in_flight_starts().await;
+        let target = self
+            .project_data_targets()
+            .into_iter()
+            .find(|target| target.environment_id == environment_id);
+        match target {
+            Some(target) => Ok(BackendProjectDataOperation {
+                supervisor: self.clone(),
+                target,
+                stopped: false,
+                _reservation: reservation,
+            }),
+            None => Err("The selected project-data environment is not registered.".to_owned()),
+        }
+    }
+
+    pub(crate) async fn begin_update_snapshot(&self) -> Result<BackendUpdateSnapshot, String> {
+        {
+            let mut state = self
+                .state
+                .lock()
+                .map_err(|error| format!("backend supervisor mutex poisoned: {error}"))?;
+            if state.update_coordination {
+                return Err("Desktop backend update protection is already in progress.".to_string());
+            }
+            state.update_coordination = true;
+        }
+        self.wait_for_in_flight_starts().await;
+        Ok(self.snapshot_for_update())
+    }
+
+    pub(crate) fn expect_update_snapshot_exit(&self, snapshot: &BackendUpdateSnapshot) {
+        let state = self
+            .state
+            .lock()
+            .expect("backend supervisor mutex poisoned");
+        for environment in &snapshot.environments {
+            if !environment.running {
+                continue;
+            }
+            if let Some(backend) = state
+                .slots
+                .get(&environment.environment_id)
+                .and_then(|slot| slot.backend.as_ref())
+            {
+                match backend {
+                    ManagedBackend::Child(child) => child.request_stop(),
+                    ManagedBackend::Runtime(runtime) => {
+                        runtime.stop_requested.store(true, Ordering::SeqCst);
+                    }
+                }
+            }
+        }
+    }
+
+    pub(crate) async fn stop_update_snapshot(
+        &self,
+        snapshot: &BackendUpdateSnapshot,
+    ) -> Result<(), String> {
+        self.expect_update_snapshot_exit(snapshot);
+        self.stop(BackendShutdownConfig::default()).await
+    }
+
+    pub(crate) async fn restart_update_snapshot(
+        &self,
+        snapshot: &BackendUpdateSnapshot,
+    ) -> Result<(), String> {
+        let mut errors = Vec::new();
+        for plan in &snapshot.running_plans {
+            if let Err(error) = self
+                .start_with_options_inner(
+                    plan.clone(),
+                    BackendReadinessConfig::default(),
+                    BackendRestartConfig::default(),
+                    true,
+                    true,
+                )
+                .await
+            {
+                errors.push(format!("{}: {error}", plan.config.label));
+            }
+        }
+        for unavailable in &snapshot.unavailable_environments {
+            self.record_unavailable_environment(unavailable.clone());
+        }
+        self.state
+            .lock()
+            .map_err(|error| format!("backend supervisor mutex poisoned: {error}"))?
+            .update_coordination = false;
+        if errors.is_empty() {
+            Ok(())
+        } else {
+            Err(format!(
+                "Could not restart every desktop backend: {}",
+                errors.join("; ")
+            ))
+        }
     }
 
     fn install_ui_process_observer(&self, observer: Arc<dyn DesktopUiProcessObserver>) {
@@ -502,7 +865,9 @@ impl BackendSupervisor {
             if slot_key == PRIMARY_LOCAL_ENVIRONMENT_ID {
                 continue;
             }
-            if let Some(plan) = &slot.launch_plan
+            if let Some(unavailable) = &slot.unavailable {
+                bootstraps.push(unavailable.to_environment_bootstrap());
+            } else if let Some(plan) = &slot.launch_plan
                 && slot.last_error.is_none()
             {
                 bootstraps.push(plan.config.to_environment_bootstrap());
@@ -541,6 +906,44 @@ impl BackendSupervisor {
             .last_error = Some(error.into());
     }
 
+    pub(crate) fn record_planning_error(&self, error: BackendPlanError) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("backend supervisor mutex poisoned");
+        let slot = state
+            .slots
+            .entry(PRIMARY_LOCAL_ENVIRONMENT_ID.to_string())
+            .or_default();
+        slot.launch_plan = None;
+        slot.backend = None;
+        slot.pid = None;
+        slot.last_error = Some(error.to_string());
+        slot.plan_error = Some(error);
+        slot.restart_scheduled = false;
+    }
+
+    pub(crate) fn primary_plan_error(&self) -> Option<BackendPlanError> {
+        self.state
+            .lock()
+            .expect("backend supervisor mutex poisoned")
+            .slots
+            .get(PRIMARY_LOCAL_ENVIRONMENT_ID)
+            .and_then(|slot| slot.plan_error.clone())
+    }
+
+    pub(crate) fn secondary_unavailable_environment(
+        &self,
+    ) -> Option<BackendUnavailableEnvironment> {
+        self.state
+            .lock()
+            .expect("backend supervisor mutex poisoned")
+            .slots
+            .iter()
+            .filter(|(slot_key, _)| slot_key.as_str() != PRIMARY_LOCAL_ENVIRONMENT_ID)
+            .find_map(|(_, slot)| slot.unavailable.clone())
+    }
+
     pub async fn start_default<R: Runtime>(
         &self,
         app: AppHandle<R>,
@@ -554,13 +957,51 @@ impl BackendSupervisor {
         reason: &'static str,
     ) -> Result<BackendRunConfig, String> {
         self.install_ui_process_observer(ui_process_observer::for_app(&app));
-        let mut plans = default_launch_plans(&app)?;
+        let selection = match default_launch_plans(&app) {
+            Ok(selection) => selection,
+            Err(error) => {
+                self.record_planning_error(error.clone());
+                return Err(error.to_string());
+            }
+        };
+        let DefaultLaunchPlans {
+            mut plans,
+            unavailable_secondary,
+        } = selection;
         let primary_index = plans
             .iter()
             .position(|plan| plan.config.environment_id == PRIMARY_LOCAL_ENVIRONMENT_ID)
             .unwrap_or(0);
         let primary_plan = plans.remove(primary_index);
-        let primary_config = self.start(primary_plan).await?;
+        let primary_config = match self.start(primary_plan.clone()).await {
+            Ok(config) => config,
+            Err(detail) => {
+                let plan_error = classify_primary_start_error(&primary_plan, &detail);
+                let error = plan_error
+                    .as_ref()
+                    .map(ToString::to_string)
+                    .unwrap_or(detail);
+                self.record_plan_error_with_classification(
+                    &primary_plan,
+                    error.clone(),
+                    plan_error,
+                );
+                if let Err(event_error) =
+                    emit_project_data_status_changed(&app, &primary_plan.config.environment_id)
+                {
+                    tracing::warn!(
+                        target: "bibcode_desktop_tauri::backend",
+                        environment_id = primary_plan.config.environment_id,
+                        "desktop project-data status invalidation failed: {event_error}"
+                    );
+                }
+                return Err(error);
+            }
+        };
+
+        if let Some(unavailable) = unavailable_secondary {
+            self.record_unavailable_environment(unavailable);
+        }
 
         for plan in plans {
             if let Err(error) = self.start(plan.clone()).await {
@@ -586,10 +1027,9 @@ impl BackendSupervisor {
                 .state
                 .lock()
                 .expect("backend supervisor mutex poisoned");
-            state
-                .slots
-                .values()
-                .any(|slot| slot.backend.is_some() || slot.launch_plan.is_some())
+            state.slots.values().any(|slot| {
+                slot.backend.is_some() || slot.launch_plan.is_some() || slot.last_error.is_some()
+            })
         };
         if !is_active {
             return Ok(None);
@@ -616,7 +1056,7 @@ impl BackendSupervisor {
         readiness: BackendReadinessConfig,
         restart: BackendRestartConfig,
     ) -> Result<BackendRunConfig, String> {
-        self.start_with_options_inner(plan, readiness, restart, true)
+        self.start_with_options_inner(plan, readiness, restart, true, false)
             .await
     }
 
@@ -626,8 +1066,10 @@ impl BackendSupervisor {
         readiness: BackendReadinessConfig,
         restart: BackendRestartConfig,
         reset_restart_attempt: bool,
+        update_recovery: bool,
     ) -> Result<BackendRunConfig, String> {
-        let permit = self.begin_start(reset_restart_attempt)?;
+        let permit =
+            self.begin_start_with_update_recovery(reset_restart_attempt, update_recovery)?;
         let ui_process_observer = self.ui_process_observer_for_start();
         let (config, managed, pid) =
             start_managed_backend(plan.clone(), readiness, ui_process_observer, permit.run_id)
@@ -652,6 +1094,8 @@ impl BackendSupervisor {
                 slot.launch_plan = Some(active_plan);
                 slot.pid = pid;
                 slot.last_error = None;
+                slot.plan_error = None;
+                slot.unavailable = None;
                 slot.restart_scheduled = false;
                 if reset_restart_attempt {
                     slot.restart_attempt = 0;
@@ -695,11 +1139,23 @@ impl BackendSupervisor {
         Ok(config)
     }
 
+    #[cfg(test)]
     fn begin_start(&self, allow_restart_after_stop: bool) -> Result<BackendStartPermit, String> {
+        self.begin_start_with_update_recovery(allow_restart_after_stop, false)
+    }
+
+    fn begin_start_with_update_recovery(
+        &self,
+        allow_restart_after_stop: bool,
+        update_recovery: bool,
+    ) -> Result<BackendStartPermit, String> {
         let mut state = self
             .state
             .lock()
             .map_err(|error| format!("backend supervisor mutex poisoned: {error}"))?;
+        if state.update_coordination && !update_recovery {
+            return Err("Desktop backend startup is paused during update protection.".to_string());
+        }
         let in_flight_starts = state
             .in_flight_starts
             .checked_add(1)
@@ -983,7 +1439,8 @@ impl BackendSupervisor {
             }
             slot.backend = None;
             slot.pid = None;
-            slot.last_error = Some(reason);
+            slot.last_error = Some(reason.clone());
+            slot.unavailable = unavailable_wsl_secondary_from_plan(&plan, &reason);
             slot.restart_attempt = slot.restart_attempt.saturating_add(1);
             slot.restart_scheduled = true;
             let attempt = slot.restart_attempt;
@@ -1002,7 +1459,7 @@ impl BackendSupervisor {
                 return;
             }
             if let Err(error) = supervisor
-                .start_with_options_inner(plan.clone(), readiness, restart, false)
+                .start_with_options_inner(plan.clone(), readiness, restart, false, false)
                 .await
             {
                 supervisor.schedule_restart(plan, readiness, restart, error);
@@ -1011,6 +1468,15 @@ impl BackendSupervisor {
     }
 
     fn record_plan_error(&self, plan: &BackendLaunchPlan, error: String) {
+        self.record_plan_error_with_classification(plan, error, None);
+    }
+
+    fn record_plan_error_with_classification(
+        &self,
+        plan: &BackendLaunchPlan,
+        error: String,
+        plan_error: Option<BackendPlanError>,
+    ) {
         let mut state = self
             .state
             .lock()
@@ -1019,7 +1485,30 @@ impl BackendSupervisor {
         slot.launch_plan = Some(plan.clone());
         slot.backend = None;
         slot.pid = None;
+        slot.unavailable = unavailable_wsl_secondary_from_plan(plan, &error);
         slot.last_error = Some(error);
+        slot.plan_error = plan_error;
+        slot.restart_scheduled = false;
+    }
+
+    pub(crate) fn record_unavailable_environment(
+        &self,
+        unavailable: BackendUnavailableEnvironment,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .expect("backend supervisor mutex poisoned");
+        let slot = state
+            .slots
+            .entry(unavailable.environment_id.clone())
+            .or_default();
+        slot.launch_plan = None;
+        slot.backend = None;
+        slot.pid = None;
+        slot.last_error = Some(unavailable.detail.clone());
+        slot.plan_error = None;
+        slot.unavailable = Some(unavailable);
         slot.restart_scheduled = false;
     }
 
@@ -1094,6 +1583,17 @@ fn emit_backend_ready<R: Runtime>(
     .map_err(|error| format!("Could not emit desktop backend readiness: {error}"))
 }
 
+fn emit_project_data_status_changed<R: Runtime>(
+    app: &AppHandle<R>,
+    environment_id: &str,
+) -> Result<(), String> {
+    app.emit(
+        PROJECT_DATA_STATUS_CHANGED_EVENT,
+        json!({ "environmentId": environment_id }),
+    )
+    .map_err(|error| format!("Could not emit project-data status change: {error}"))
+}
+
 async fn start_managed_backend(
     plan: BackendLaunchPlan,
     readiness: BackendReadinessConfig,
@@ -1101,8 +1601,8 @@ async fn start_managed_backend(
     run_id: u64,
 ) -> Result<(BackendRunConfig, ManagedBackend, Option<u32>), String> {
     match &plan.target {
-        BackendLaunchTarget::InProcess { base_dir } => {
-            let server_config = server_config_for_launch(base_dir.clone(), &plan.config);
+        BackendLaunchTarget::InProcess { data_root, .. } => {
+            let server_config = server_config_for_launch(data_root.clone(), &plan.config);
             let handle =
                 ServerRuntime::start_with_ui_process_observer(server_config, ui_process_observer)
                     .await
@@ -1128,6 +1628,7 @@ async fn start_managed_backend(
             program,
             args,
             bootstrap_line,
+            ..
         } => {
             let mut command = Command::new(program);
             configure_background_command(&mut command);
@@ -1170,8 +1671,18 @@ async fn start_managed_backend(
     }
 }
 
-fn server_config_for_launch(base_dir: PathBuf, config: &BackendRunConfig) -> ServerConfig {
-    let mut server_config = ServerConfig::new(base_dir).with_bind(&config.bind_host, config.port);
+fn server_config_for_launch(
+    data_root: ResolvedDataRoot,
+    config: &BackendRunConfig,
+) -> ServerConfig {
+    let mut server_config =
+        ServerConfig::new(data_root.effective.clone()).with_bind(&config.bind_host, config.port);
+    server_config.data_root_request = DataRootRequest::explicit(
+        data_root.source,
+        data_root.requested.clone(),
+        PathBuf::new(),
+    );
+    server_config.resolved_data_root = Some(data_root);
     server_config.mode = bibcode_server::ServerMode::Desktop;
     server_config.no_browser = true;
     server_config.desktop_bootstrap_token = Some(config.desktop_bootstrap_token.clone());
@@ -1742,6 +2253,29 @@ fn resolve_wsl_renderer_host(distro: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn resolve_wsl_data_root(distro: &str) -> Result<String, String> {
+    let environment = run_wsl_command(distro, &["env"])?;
+    let value = environment
+        .lines()
+        .find_map(|line| line.strip_prefix("BIBCODE_HOME="))
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| {
+            environment
+                .lines()
+                .find_map(|line| line.strip_prefix("HOME="))
+                .filter(|value| !value.is_empty())
+                .map(|home| format!("{}/.bibcode", home.trim_end_matches('/')))
+        })
+        .ok_or_else(|| format!("WSL distro {distro} did not report BIBCODE_HOME or HOME."))?;
+    if !value.starts_with('/') || value.contains('\r') || value.contains('\0') {
+        return Err(format!(
+            "WSL distro {distro} reported a project data root that is not an absolute Linux path."
+        ));
+    }
+    Ok(value)
+}
+
 fn resolve_wsl_launch_plan_for_distro(
     running_distro: String,
     port: u16,
@@ -1751,6 +2285,7 @@ fn resolve_wsl_launch_plan_for_distro(
     label: String,
 ) -> Result<BackendLaunchPlan, String> {
     let binary_path = resolve_wsl_server_binary(&running_distro)?;
+    let data_root = resolve_wsl_data_root(&running_distro)?;
     let renderer_host = resolve_wsl_renderer_host(&running_distro)
         .unwrap_or_else(|| DESKTOP_LOOPBACK_HOST.to_string());
 
@@ -1762,6 +2297,7 @@ fn resolve_wsl_launch_plan_for_distro(
         renderer_host,
         desktop_bootstrap_token,
         binary_path,
+        data_root,
     })
     .with_log_path(log_path))
 }
@@ -1793,8 +2329,7 @@ fn resolve_wsl_secondary_launch_plan<R: Runtime>(
         format!("Could not find an available desktop backend port outside {primary_port}.")
     })?;
     let log_path = wsl_backend_log_path(app, &running_distro)?;
-    let environment_id = format!("{WSL_INSTANCE_ID_PREFIX}{running_distro}");
-    let label = format!("WSL ({running_distro})");
+    let (environment_id, label) = configured_wsl_secondary_identity(settings);
     resolve_wsl_launch_plan_for_distro(
         running_distro,
         port,
@@ -1805,65 +2340,156 @@ fn resolve_wsl_secondary_launch_plan<R: Runtime>(
     )
 }
 
-fn default_launch_plans<R: Runtime>(app: &AppHandle<R>) -> Result<Vec<BackendLaunchPlan>, String> {
-    let base_dir = desktop_base_dir(app)?;
-    let log_path = primary_backend_log_path(app)?;
-    let port = crate::config::bibcode_env_var("BIBCODE_PORT")
-        .and_then(|value| value.into_string().ok())
-        .and_then(|value| value.parse::<u16>().ok())
-        .or_else(select_desktop_backend_port)
-        .or_else(portpicker::pick_unused_port)
-        .unwrap_or(DEFAULT_BACKEND_PORT);
-    let settings = read_backend_desktop_settings(app)?;
-    let desktop_bootstrap_token = Uuid::new_v4().simple().to_string();
-    if settings.wsl_backend_enabled && settings.wsl_only {
-        match resolve_wsl_primary_launch_plan(
-            &settings,
-            port,
-            desktop_bootstrap_token.clone(),
-            log_path.clone(),
-        ) {
-            Ok(plan) => return Ok(vec![plan]),
-            Err(error) => {
-                tracing::warn!(
-                    target: "bibcode_desktop_tauri::backend",
-                    "falling back to Windows backend after WSL-only launch planning failed: {error}"
-                );
-            }
-        }
+fn select_default_launch_plans<NativePrimary, WslPrimary, WslSecondary>(
+    settings: &BackendDesktopSettings,
+    native_primary: NativePrimary,
+    wsl_primary: WslPrimary,
+    wsl_secondary: WslSecondary,
+) -> Result<DefaultLaunchPlans, BackendPlanError>
+where
+    NativePrimary: FnOnce() -> Result<BackendLaunchPlan, String>,
+    WslPrimary: FnOnce() -> Result<BackendLaunchPlan, String>,
+    WslSecondary: FnOnce() -> Result<BackendLaunchPlan, String>,
+{
+    if settings.wsl_only {
+        return wsl_primary()
+            .map(|plan| DefaultLaunchPlans {
+                plans: vec![plan],
+                unavailable_secondary: None,
+            })
+            .map_err(|detail| BackendPlanError::WslPrimaryUnavailable { detail });
     }
-    let exposure = resolve_backend_exposure(&settings, port);
-    let config = BackendRunConfig {
-        environment_id: PRIMARY_LOCAL_ENVIRONMENT_ID.to_string(),
-        label: "Local".to_string(),
-        running_distro: None,
-        port,
-        bind_host: exposure.bind_host,
-        local_host: DESKTOP_LOOPBACK_HOST.to_string(),
-        desktop_bootstrap_token,
-        server_exposure_mode: exposure.mode,
-        endpoint_url: exposure.endpoint_url,
-        advertised_host: exposure.advertised_host,
-        tailscale_serve_enabled: settings.tailscale_serve_enabled,
-        tailscale_serve_port: settings.tailscale_serve_port,
-    };
 
-    let primary_plan = BackendLaunchPlan::local(base_dir.clone(), config).with_log_path(log_path);
+    let primary_plan = native_primary().map_err(|detail| BackendPlanError::Other { detail })?;
     let mut plans = vec![primary_plan];
-
+    let mut unavailable_secondary = None;
     if settings.wsl_backend_enabled {
-        match resolve_wsl_secondary_launch_plan(app, &settings, port) {
+        match wsl_secondary() {
             Ok(plan) => plans.push(plan),
             Err(error) => {
                 tracing::warn!(
                     target: "bibcode_desktop_tauri::backend",
                     "skipping secondary WSL backend launch planning: {error}"
                 );
+                unavailable_secondary = Some(configured_wsl_secondary_unavailable(settings, error));
             }
         }
     }
+    Ok(DefaultLaunchPlans {
+        plans,
+        unavailable_secondary,
+    })
+}
 
-    Ok(plans)
+fn configured_wsl_secondary_identity(settings: &BackendDesktopSettings) -> (String, String) {
+    match settings.wsl_distro.as_deref() {
+        Some(distro) => (
+            format!("{WSL_INSTANCE_ID_PREFIX}{distro}"),
+            format!("WSL ({distro})"),
+        ),
+        None => (
+            format!("{WSL_INSTANCE_ID_PREFIX}default"),
+            "WSL (default)".to_string(),
+        ),
+    }
+}
+
+fn configured_wsl_secondary_unavailable(
+    settings: &BackendDesktopSettings,
+    detail: String,
+) -> BackendUnavailableEnvironment {
+    let (environment_id, label) = configured_wsl_secondary_identity(settings);
+    BackendUnavailableEnvironment {
+        environment_id,
+        label,
+        configured_distro: settings.wsl_distro.clone(),
+        detail,
+    }
+}
+
+fn classify_primary_start_error(
+    plan: &BackendLaunchPlan,
+    detail: &str,
+) -> Option<BackendPlanError> {
+    matches!(
+        &plan.target,
+        BackendLaunchTarget::ExternalProcess { program, .. } if program == "wsl.exe"
+    )
+    .then(|| BackendPlanError::WslPrimaryUnavailable {
+        detail: detail.to_string(),
+    })
+}
+
+fn unavailable_wsl_secondary_from_plan(
+    plan: &BackendLaunchPlan,
+    detail: &str,
+) -> Option<BackendUnavailableEnvironment> {
+    if plan.config.environment_id == PRIMARY_LOCAL_ENVIRONMENT_ID
+        || !matches!(
+            &plan.target,
+            BackendLaunchTarget::ExternalProcess { program, .. } if program == "wsl.exe"
+        )
+    {
+        return None;
+    }
+    let configured_distro = plan
+        .config
+        .environment_id
+        .strip_prefix(WSL_INSTANCE_ID_PREFIX)
+        .filter(|distro| *distro != "default")
+        .map(str::to_string);
+    Some(BackendUnavailableEnvironment {
+        environment_id: plan.config.environment_id.clone(),
+        label: plan.config.label.clone(),
+        configured_distro,
+        detail: detail.to_string(),
+    })
+}
+
+fn default_launch_plans<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Result<DefaultLaunchPlans, BackendPlanError> {
+    let settings =
+        read_backend_desktop_settings(app).map_err(|detail| BackendPlanError::Other { detail })?;
+    let log_path =
+        primary_backend_log_path(app).map_err(|detail| BackendPlanError::Other { detail })?;
+    let port = crate::config::bibcode_env_var("BIBCODE_PORT")
+        .and_then(|value| value.into_string().ok())
+        .and_then(|value| value.parse::<u16>().ok())
+        .or_else(select_desktop_backend_port)
+        .or_else(portpicker::pick_unused_port)
+        .unwrap_or(DEFAULT_BACKEND_PORT);
+    let desktop_bootstrap_token = Uuid::new_v4().simple().to_string();
+    let native_bootstrap_token = desktop_bootstrap_token.clone();
+    let native_log_path = log_path.clone();
+    select_default_launch_plans(
+        &settings,
+        || {
+            let data_root = crate::config::data_root(app)?;
+            let exposure = resolve_backend_exposure(&settings, port);
+            let config = BackendRunConfig {
+                environment_id: PRIMARY_LOCAL_ENVIRONMENT_ID.to_string(),
+                label: "Local".to_string(),
+                running_distro: None,
+                port,
+                bind_host: exposure.bind_host,
+                local_host: DESKTOP_LOOPBACK_HOST.to_string(),
+                desktop_bootstrap_token: native_bootstrap_token,
+                server_exposure_mode: exposure.mode,
+                endpoint_url: exposure.endpoint_url,
+                advertised_host: exposure.advertised_host,
+                tailscale_serve_enabled: settings.tailscale_serve_enabled,
+                tailscale_serve_port: settings.tailscale_serve_port,
+            };
+            Ok(
+                BackendLaunchPlan::local(data_root.effective.clone(), config)
+                    .with_data_root(data_root)
+                    .with_log_path(native_log_path),
+            )
+        },
+        || resolve_wsl_primary_launch_plan(&settings, port, desktop_bootstrap_token, log_path),
+        || resolve_wsl_secondary_launch_plan(app, &settings, port),
+    )
 }
 
 fn wsl_server_binary_candidates() -> Result<Vec<PathBuf>, String> {
@@ -2057,6 +2683,7 @@ fn decode_backend_desktop_settings(raw: Option<&str>) -> BackendDesktopSettings 
         .and_then(|raw| serde_json::from_str::<BackendDesktopSettingsDocument>(raw).ok())
         .unwrap_or_default();
 
+    let wsl_only = document.wsl_only.unwrap_or(false);
     BackendDesktopSettings {
         server_exposure_mode: match document.server_exposure_mode.as_deref() {
             Some("network-accessible") => "network-accessible".to_string(),
@@ -2064,14 +2691,14 @@ fn decode_backend_desktop_settings(raw: Option<&str>) -> BackendDesktopSettings 
         },
         tailscale_serve_enabled: document.tailscale_serve_enabled.unwrap_or(false),
         tailscale_serve_port: normalize_tailscale_serve_port(document.tailscale_serve_port),
-        wsl_backend_enabled: document.wsl_backend_enabled.unwrap_or(false),
-        wsl_only: document.wsl_only.unwrap_or(false),
+        wsl_backend_enabled: wsl_only || document.wsl_backend_enabled.unwrap_or(false),
+        wsl_only,
         wsl_distro: normalize_wsl_distro(document.wsl_distro),
     }
 }
 
 fn desktop_base_dir<R: Runtime>(app: &AppHandle<R>) -> Result<PathBuf, String> {
-    crate::config::base_dir(app)
+    crate::config::data_root(app).map(|resolved| resolved.effective)
 }
 
 #[cfg(test)]
@@ -2080,7 +2707,9 @@ mod tests {
     use bibcode_server::diagnostics::{
         DesktopUiObservation, ProcessIdentity, UiCoverage, UiCoverageStatus,
     };
-    use bibcode_server::{RpcExit, ServerMessage};
+    use bibcode_server::{
+        DataRootRequest, DataRootSource, RpcExit, ServerMessage, resolve_data_root,
+    };
     use futures_util::{SinkExt, StreamExt};
     use std::{
         cell::Cell,
@@ -2096,6 +2725,7 @@ mod tests {
         thread,
         time::Duration,
     };
+    use tauri::Listener;
     use tokio::io::{AsyncRead, ReadBuf};
     use tokio_tungstenite::{
         connect_async,
@@ -2345,14 +2975,25 @@ mod tests {
         format!("'{}'", path.to_string_lossy().replace('\'', "''"))
     }
 
+    fn test_cli_data_root(base_dir: &Path) -> ResolvedDataRoot {
+        ResolvedDataRoot {
+            source: DataRootSource::Cli,
+            requested: base_dir.to_path_buf(),
+            effective: base_dir.to_path_buf(),
+            is_filesystem_alias: false,
+        }
+    }
+
     async fn start_test_server(
         base_dir: &Path,
     ) -> (bibcode_server::ServerHandle, BackendRunConfig) {
         let mut config = local_test_config(0);
-        let handle =
-            ServerRuntime::start(server_config_for_launch(base_dir.to_path_buf(), &config))
-                .await
-                .expect("test server should start");
+        let handle = ServerRuntime::start(server_config_for_launch(
+            test_cli_data_root(base_dir),
+            &config,
+        ))
+        .await
+        .expect("test server should start");
         config.port = handle.local_addr().port();
         (handle, config)
     }
@@ -2362,7 +3003,7 @@ mod tests {
     ) -> (bibcode_server::ServerHandle, BackendRunConfig) {
         let mut config = local_test_config(0);
         let server_config =
-            server_config_for_launch(base_dir.to_path_buf(), &config).with_unsafe_no_auth();
+            server_config_for_launch(test_cli_data_root(base_dir), &config).with_unsafe_no_auth();
         let handle = ServerRuntime::start(server_config)
             .await
             .expect("RPC test server should start");
@@ -2508,6 +3149,117 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn update_snapshot_tracks_primary_and_secondary_running_set_for_exact_restart() {
+        let primary_state = tempfile::tempdir().expect("primary state tempdir should open");
+        let secondary_state = tempfile::tempdir().expect("secondary state tempdir should open");
+        let supervisor = BackendSupervisor::new();
+        let primary_plan =
+            BackendLaunchPlan::local(primary_state.path().to_path_buf(), local_test_config(0));
+        let mut secondary_config = local_test_config(0);
+        secondary_config.environment_id = "wsl:Ubuntu".to_string();
+        secondary_config.label = "WSL (Ubuntu)".to_string();
+        secondary_config.desktop_bootstrap_token = "secondary-token".to_string();
+        let secondary_plan =
+            BackendLaunchPlan::local(secondary_state.path().to_path_buf(), secondary_config);
+
+        supervisor
+            .start(primary_plan)
+            .await
+            .expect("primary backend should start");
+        supervisor
+            .start(secondary_plan)
+            .await
+            .expect("secondary backend should start");
+
+        let snapshot = supervisor.snapshot_for_update();
+        assert_eq!(snapshot.environments.len(), 2);
+        assert!(snapshot.environments[0].primary);
+        assert!(snapshot.environments[0].running);
+        assert!(!snapshot.environments[1].primary);
+        assert!(snapshot.environments[1].running);
+
+        supervisor
+            .stop_update_snapshot(&snapshot)
+            .await
+            .expect("snapshot backends should stop");
+        supervisor
+            .restart_update_snapshot(&snapshot)
+            .await
+            .expect("exact snapshot should restart");
+
+        let restarted = supervisor.snapshot_for_update();
+        assert_eq!(
+            restarted
+                .environments
+                .iter()
+                .filter(|environment| environment.running)
+                .map(|environment| environment.environment_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["primary", "wsl:Ubuntu"]
+        );
+        supervisor
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("restarted backends should stop");
+    }
+
+    #[test]
+    fn update_snapshot_keeps_a_configured_missing_secondary_explicitly_unprotected() {
+        let supervisor = BackendSupervisor::new();
+        supervisor.record_unavailable_environment(BackendUnavailableEnvironment {
+            environment_id: "wsl:Ubuntu".to_string(),
+            label: "WSL (Ubuntu)".to_string(),
+            configured_distro: Some("Ubuntu".to_string()),
+            detail: "distribution is unavailable".to_string(),
+        });
+
+        let snapshot = supervisor.snapshot_for_update();
+        let environment = snapshot
+            .environments
+            .iter()
+            .find(|environment| environment.environment_id == "wsl:Ubuntu")
+            .expect("configured missing secondary should remain in topology");
+        assert!(!environment.primary);
+        assert!(!environment.running);
+        assert_eq!(
+            environment.unprotected_reason.as_deref(),
+            Some("distribution is unavailable")
+        );
+    }
+
+    #[tokio::test]
+    async fn update_snapshot_excludes_new_backend_starts_until_recovery_finishes() {
+        let state = tempfile::tempdir().expect("backend state tempdir should open");
+        let supervisor = BackendSupervisor::new();
+        let snapshot = supervisor
+            .begin_update_snapshot()
+            .await
+            .expect("update coordination should begin");
+        let plan = BackendLaunchPlan::local(state.path().to_path_buf(), local_test_config(0));
+
+        assert!(
+            supervisor
+                .start(plan.clone())
+                .await
+                .expect_err("new start must be excluded")
+                .contains("paused during update protection")
+        );
+
+        supervisor
+            .restart_update_snapshot(&snapshot)
+            .await
+            .expect("empty prior set recovery should finish");
+        supervisor
+            .start(plan)
+            .await
+            .expect("starts should resume after recovery");
+        supervisor
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("backend should stop");
+    }
+
     #[test]
     fn builds_primary_bootstrap_for_frontend_resolution() {
         let config = local_test_config(3773);
@@ -2566,7 +3318,7 @@ mod tests {
         assert_eq!(plan.log_path, None);
         assert!(matches!(
             plan.target,
-            BackendLaunchTarget::InProcess { ref base_dir } if base_dir == &PathBuf::from("C:/Users/mauro/.bibcode")
+            BackendLaunchTarget::InProcess { ref base_dir, .. } if base_dir == &PathBuf::from("C:/Users/mauro/.bibcode")
         ));
 
         let logged_plan = plan.with_log_path(PathBuf::from(
@@ -2583,8 +3335,15 @@ mod tests {
     #[test]
     fn server_config_for_launch_uses_desktop_runtime_settings() {
         let config = local_test_config(3773);
-        let server_config =
-            server_config_for_launch(PathBuf::from("C:/Users/mauro/.bibcode"), &config);
+        let server_config = server_config_for_launch(
+            ResolvedDataRoot {
+                source: DataRootSource::Cli,
+                requested: PathBuf::from("C:/Users/mauro/.bibcode"),
+                effective: PathBuf::from("C:/Users/mauro/.bibcode"),
+                is_filesystem_alias: false,
+            },
+            &config,
+        );
 
         assert_eq!(server_config.host, "127.0.0.1");
         assert_eq!(server_config.port, 3773);
@@ -2600,6 +3359,32 @@ mod tests {
         assert_eq!(server_config.environment_label, "Local");
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn server_config_for_launch_preserves_environment_alias_diagnostics() {
+        let temp = tempfile::tempdir().expect("temporary root");
+        let target = temp.path().join("target");
+        std::fs::create_dir(&target).expect("target directory");
+        let alias = temp.path().join("alias");
+        std::os::unix::fs::symlink(&target, &alias).expect("alias symlink");
+        let data_root = resolve_data_root(DataRootRequest::explicit(
+            DataRootSource::Environment,
+            alias.clone(),
+            temp.path().to_path_buf(),
+        ))
+        .expect("resolve environment alias");
+
+        let server_config = server_config_for_launch(data_root.clone(), &local_test_config(0));
+
+        assert_eq!(
+            server_config.data_root_request.source,
+            DataRootSource::Environment
+        );
+        assert_eq!(server_config.data_root_request.requested, Some(alias));
+        assert_eq!(server_config.base_dir, data_root.effective);
+        assert_eq!(server_config.resolved_data_root, Some(data_root));
+    }
+
     #[test]
     fn builds_wsl_launch_plan_with_explicit_binary() {
         let plan = BackendLaunchPlan::wsl(WslBackendLaunchPlanInput {
@@ -2610,6 +3395,7 @@ mod tests {
             renderer_host: "172.27.0.99".to_string(),
             desktop_bootstrap_token: "desktop-token".to_string(),
             binary_path: "/tmp/bibcode's launch/bibcode".to_string(),
+            data_root: "/srv/bibcode data".to_string(),
         })
         .with_log_path(PathBuf::from(
             "C:/Users/mauro/.bibcode/dev/logs/server-child-wsl-Ubuntu.log",
@@ -2626,7 +3412,9 @@ mod tests {
                 ref program,
                 ref args,
                 ref bootstrap_line,
+                ref data_root,
             } if program == "wsl.exe"
+                && data_root.as_deref() == Some("/srv/bibcode data")
                 && args == &vec![
                     "-d".to_string(),
                     "Ubuntu".to_string(),
@@ -2645,6 +3433,8 @@ mod tests {
                         "port": 5050,
                         "host": "0.0.0.0",
                         "desktopBootstrapToken": "desktop-token",
+                        "bibcodeHome": "/srv/bibcode data",
+                        "wslTransport": true,
                         "tailscaleServeEnabled": false,
                         "tailscaleServePort": 443,
                     })
@@ -2690,6 +3480,7 @@ mod tests {
             renderer_host: "172.27.0.99".to_string(),
             desktop_bootstrap_token: "wsl-token".to_string(),
             binary_path: "/home/test/bibcode".to_string(),
+            data_root: "/home/test/.bibcode".to_string(),
         });
 
         {
@@ -2737,6 +3528,7 @@ mod tests {
             renderer_host: "172.27.0.99".to_string(),
             desktop_bootstrap_token: "wsl-token".to_string(),
             binary_path: "/home/test/bibcode".to_string(),
+            data_root: "/home/test/.bibcode".to_string(),
         });
 
         {
@@ -2782,6 +3574,7 @@ mod tests {
             renderer_host: "172.20.0.2".to_string(),
             desktop_bootstrap_token: "secondary-token".to_string(),
             binary_path: "/usr/local/bin/bibcode".to_string(),
+            data_root: "/home/test/.bibcode".to_string(),
         });
         {
             let mut state = supervisor
@@ -2843,6 +3636,59 @@ mod tests {
         assert_eq!(slot.pid, None);
         assert_eq!(slot.last_error.as_deref(), Some("launch failed"));
         assert!(!slot.restart_scheduled);
+    }
+
+    #[test]
+    fn secondary_wsl_start_failure_remains_in_unavailable_topology() {
+        let supervisor = BackendSupervisor::new();
+        let primary = BackendLaunchPlan::local(PathBuf::from("C:/state"), local_test_config(4_300));
+        let secondary = BackendLaunchPlan::wsl(WslBackendLaunchPlanInput {
+            environment_id: "wsl:Ubuntu".to_string(),
+            label: "WSL (Ubuntu)".to_string(),
+            running_distro: "Ubuntu".to_string(),
+            port: 4_301,
+            renderer_host: "172.20.0.2".to_string(),
+            desktop_bootstrap_token: "secondary-token".to_string(),
+            binary_path: "/usr/local/bin/bibcode".to_string(),
+            data_root: "/home/test/.bibcode".to_string(),
+        });
+        {
+            let mut state = supervisor
+                .state
+                .lock()
+                .expect("backend supervisor mutex poisoned");
+            state.slots.insert(
+                PRIMARY_LOCAL_ENVIRONMENT_ID.to_string(),
+                BackendSlotState {
+                    launch_plan: Some(primary),
+                    ..BackendSlotState::default()
+                },
+            );
+        }
+
+        supervisor.record_plan_error(
+            &secondary,
+            "WSL process exited before readiness".to_string(),
+        );
+
+        assert_eq!(
+            supervisor.local_environment_bootstraps(),
+            vec![
+                local_test_config(4_300).to_environment_bootstrap(),
+                json!({
+                    "id": "wsl:Ubuntu",
+                    "label": "WSL (Ubuntu)",
+                    "configuredDistro": "Ubuntu",
+                    "runningDistro": null,
+                    "httpBaseUrl": null,
+                    "wsBaseUrl": null,
+                    "preflightError": {
+                        "kind": "wsl-secondary-unavailable",
+                        "detail": "WSL process exited before readiness",
+                    },
+                }),
+            ]
+        );
     }
 
     #[test]
@@ -3535,6 +4381,170 @@ exit /b 9
     }
 
     #[test]
+    fn wsl_only_planning_failure_never_builds_a_windows_fallback() {
+        let settings = BackendDesktopSettings {
+            server_exposure_mode: "local-only".to_string(),
+            tailscale_serve_enabled: false,
+            tailscale_serve_port: 443,
+            wsl_backend_enabled: true,
+            wsl_only: true,
+            wsl_distro: Some("Unavailable".to_string()),
+        };
+        let native_planned = Cell::new(false);
+
+        let error = select_default_launch_plans(
+            &settings,
+            || {
+                native_planned.set(true);
+                panic!("native Windows planning must not run in WSL-only mode")
+            },
+            || Err("the selected distribution cannot start".to_string()),
+            || panic!("secondary WSL planning must not run in WSL-only mode"),
+        )
+        .expect_err("WSL-only planning must fail closed");
+
+        assert!(matches!(
+            error,
+            BackendPlanError::WslPrimaryUnavailable { detail }
+                if detail == "the selected distribution cannot start"
+        ));
+        assert!(!native_planned.get());
+    }
+
+    #[test]
+    fn persisted_wsl_only_intent_never_plans_windows_when_enabled_flag_is_skewed() {
+        let settings = BackendDesktopSettings {
+            server_exposure_mode: "local-only".to_string(),
+            tailscale_serve_enabled: false,
+            tailscale_serve_port: 443,
+            wsl_backend_enabled: false,
+            wsl_only: true,
+            wsl_distro: Some("Ubuntu".to_string()),
+        };
+        let native_planned = Cell::new(false);
+
+        let error = select_default_launch_plans(
+            &settings,
+            || {
+                native_planned.set(true);
+                panic!("persisted WSL-only intent must prevent native Windows planning")
+            },
+            || Err("the configured WSL primary is unavailable".to_string()),
+            || panic!("secondary WSL planning must not run for WSL-only intent"),
+        )
+        .expect_err("skewed WSL-only settings must fail closed");
+
+        assert!(matches!(
+            error,
+            BackendPlanError::WslPrimaryUnavailable { detail }
+                if detail == "the configured WSL primary is unavailable"
+        ));
+        assert!(!native_planned.get());
+    }
+
+    #[test]
+    fn secondary_wsl_planning_failure_remains_in_desired_topology() {
+        let settings = BackendDesktopSettings {
+            server_exposure_mode: "local-only".to_string(),
+            tailscale_serve_enabled: false,
+            tailscale_serve_port: 443,
+            wsl_backend_enabled: true,
+            wsl_only: false,
+            wsl_distro: Some("Ubuntu".to_string()),
+        };
+
+        let selection = select_default_launch_plans(
+            &settings,
+            || {
+                Ok(BackendLaunchPlan::local(
+                    PathBuf::from("C:/state"),
+                    local_test_config(4_300),
+                ))
+            },
+            || panic!("WSL primary planning must not run for Windows-primary settings"),
+            || Err("the configured WSL distribution is unavailable".to_string()),
+        )
+        .expect("secondary planning failure must not prevent native primary planning");
+
+        assert_eq!(selection.plans.len(), 1);
+        assert_eq!(
+            selection.unavailable_secondary,
+            Some(BackendUnavailableEnvironment {
+                environment_id: "wsl:Ubuntu".to_string(),
+                label: "WSL (Ubuntu)".to_string(),
+                configured_distro: Some("Ubuntu".to_string()),
+                detail: "the configured WSL distribution is unavailable".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn default_tracking_secondary_identity_is_stable_across_live_and_unavailable_states() {
+        let default_tracking = BackendDesktopSettings {
+            server_exposure_mode: "local-only".to_string(),
+            tailscale_serve_enabled: false,
+            tailscale_serve_port: 443,
+            wsl_backend_enabled: true,
+            wsl_only: false,
+            wsl_distro: None,
+        };
+        let explicit_ubuntu = BackendDesktopSettings {
+            wsl_distro: Some("Ubuntu".to_string()),
+            ..default_tracking.clone()
+        };
+
+        let (live_id, live_label) = configured_wsl_secondary_identity(&default_tracking);
+        let unavailable = configured_wsl_secondary_unavailable(
+            &default_tracking,
+            "default distro unavailable".to_string(),
+        );
+
+        assert_eq!(live_id, "wsl:default");
+        assert_eq!(live_label, "WSL (default)");
+        assert_eq!(unavailable.environment_id, live_id);
+        assert_eq!(unavailable.label, live_label);
+        assert_eq!(unavailable.configured_distro, None);
+        assert_ne!(
+            configured_wsl_secondary_identity(&explicit_ubuntu).0,
+            unavailable.environment_id,
+            "only an explicit distro choice may replace the default-tracking identity",
+        );
+    }
+
+    #[test]
+    fn wsl_primary_start_failure_remains_typed_and_has_no_bootstrap() {
+        let supervisor = BackendSupervisor::new();
+        let plan = BackendLaunchPlan::wsl(WslBackendLaunchPlanInput {
+            environment_id: PRIMARY_LOCAL_ENVIRONMENT_ID.to_string(),
+            label: "WSL (Ubuntu)".to_string(),
+            running_distro: "Ubuntu".to_string(),
+            port: 3773,
+            renderer_host: "172.27.0.1".to_string(),
+            desktop_bootstrap_token: "desktop-token".to_string(),
+            binary_path: "/usr/local/bin/bibcode".to_string(),
+            data_root: "/home/test/.bibcode".to_string(),
+        });
+        let error = classify_primary_start_error(&plan, "WSL process exited before readiness")
+            .expect("WSL primary startup failures must remain typed");
+
+        supervisor.record_plan_error_with_classification(
+            &plan,
+            error.to_string(),
+            Some(error.clone()),
+        );
+
+        assert_eq!(
+            supervisor.primary_plan_error(),
+            Some(BackendPlanError::WslPrimaryUnavailable {
+                detail: "WSL process exited before readiness".to_string(),
+            })
+        );
+        assert!(supervisor.local_environment_bootstraps().is_empty());
+        assert_eq!(supervisor.current_run_config(), Some(plan.config));
+        assert_eq!(supervisor.project_data_targets().len(), 1);
+    }
+
+    #[test]
     fn normalizes_tailscale_ports_and_local_only_exposure() {
         assert_eq!(normalize_tailscale_serve_port(None), 443);
         assert_eq!(normalize_tailscale_serve_port(Some(0)), 443);
@@ -3672,9 +4682,12 @@ exit /b 9
 
     #[test]
     fn mock_runtime_resolves_default_backend_paths_and_launch_plan() {
+        use crate::config::IsolatedTestDataRoot;
         use tauri::test::{mock_builder, mock_context, noop_assets};
 
+        let temp = tempfile::tempdir().expect("isolated desktop data root");
         let app = mock_builder()
+            .manage(IsolatedTestDataRoot::new(temp.path().join("data-root")))
             .build(mock_context(noop_assets()))
             .expect("mock Tauri app");
         let handle = app.handle();
@@ -3689,19 +4702,31 @@ exit /b 9
                 .unwrap()
                 .ends_with("server-child-wsl-Ubuntu_Test.log")
         );
-        assert!(!default_launch_plans(handle).unwrap().is_empty());
+        assert!(!default_launch_plans(handle).unwrap().plans.is_empty());
     }
 
     #[tokio::test]
     async fn mock_runtime_starts_restarts_and_stops_the_default_backend() {
+        use crate::config::IsolatedTestDataRoot;
         use tauri::test::{mock_builder, mock_context, noop_assets};
 
+        let temp = tempfile::tempdir().expect("isolated desktop data root");
+        let test_data_root = temp.path().join("data-root");
         let mut context = mock_context(noop_assets());
         context.config_mut().identifier =
             format!("com.bibcode.backend-tests-{}", std::process::id());
-        let app = mock_builder().build(context).expect("mock Tauri app");
+        let app = mock_builder()
+            .manage(IsolatedTestDataRoot::new(test_data_root.clone()))
+            .build(context)
+            .expect("mock Tauri app");
         let base_dir = desktop_base_dir(app.handle()).expect("desktop base directory");
-        let _ = fs::remove_dir_all(&base_dir);
+        assert_eq!(
+            base_dir,
+            temp.path()
+                .canonicalize()
+                .expect("temporary root should canonicalize")
+                .join("data-root")
+        );
         let supervisor = BackendSupervisor::new();
 
         let started = supervisor
@@ -3721,7 +4746,85 @@ exit /b 9
             .stop(BackendShutdownConfig::default())
             .await
             .expect("default backend should stop");
-        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[tokio::test]
+    async fn failed_default_backend_retains_project_data_target_and_emits_status_change() {
+        use crate::config::IsolatedTestDataRoot;
+        use tauri::test::{mock_builder, mock_context, noop_assets};
+
+        let temp = tempfile::tempdir().expect("isolated desktop data root");
+        let test_data_root = temp.path().join("data-root");
+        let mut context = mock_context(noop_assets());
+        context.config_mut().identifier = format!(
+            "com.bibcode.backend-project-data-failure-tests-{}",
+            std::process::id(),
+        );
+        let app = mock_builder()
+            .manage(IsolatedTestDataRoot::new(test_data_root.clone()))
+            .build(context)
+            .expect("mock Tauri app");
+
+        let initial = BackendSupervisor::new();
+        initial
+            .start_default(app.handle().clone())
+            .await
+            .expect("default backend should initialize the isolated store");
+        initial
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("default backend should close before corruption is injected");
+
+        let marker = test_data_root.join("userdata").join("environment-id");
+        fs::write(&marker, b"malformed-environment-id\n")
+            .expect("environment marker fixture should write");
+
+        let (event_sender, event_receiver) = mpsc::channel();
+        app.listen_any(PROJECT_DATA_STATUS_CHANGED_EVENT, move |event| {
+            event_sender
+                .send(event.payload().to_string())
+                .expect("project-data event payload should be captured");
+        });
+
+        let supervisor = BackendSupervisor::new();
+        let error = supervisor
+            .start_default(app.handle().clone())
+            .await
+            .expect_err("malformed marker must fail desktop backend startup closed");
+
+        assert!(
+            error.contains("storage instance marker") && error.contains("malformed"),
+            "unexpected error: {error}",
+        );
+        assert!(supervisor.local_environment_bootstraps().is_empty());
+        let targets = supervisor.project_data_targets();
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].environment_id, PRIMARY_LOCAL_ENVIRONMENT_ID);
+        assert!(!targets[0].running);
+        match &targets[0].launch_plan.target {
+            BackendLaunchTarget::InProcess { base_dir, .. } => {
+                assert_eq!(
+                    base_dir,
+                    &test_data_root
+                        .canonicalize()
+                        .expect("isolated data root should canonicalize"),
+                );
+            }
+            BackendLaunchTarget::ExternalProcess { .. } => {
+                panic!("native test backend should retain an in-process launch plan");
+            }
+        }
+        let payload = event_receiver
+            .recv_timeout(Duration::from_secs(1))
+            .expect("project-data status invalidation should be emitted");
+        assert_eq!(
+            serde_json::from_str::<Value>(&payload).expect("event payload should be JSON"),
+            json!({ "environmentId": PRIMARY_LOCAL_ENVIRONMENT_ID }),
+        );
+        assert_eq!(
+            fs::read(&marker).expect("malformed marker should remain readable"),
+            b"malformed-environment-id\n",
+        );
     }
 
     #[test]
@@ -3973,6 +5076,7 @@ exit /b 9
                 program: format!("missing-bibcode-backend-{}", Uuid::new_v4().simple()),
                 args: Vec::new(),
                 bootstrap_line: "{}\n".to_string(),
+                data_root: None,
             },
             log_path: None,
             config: local_test_config(4_300),
@@ -4417,6 +5521,7 @@ while (-not [IO.File]::Exists({})) {{
                     script,
                 ],
                 bootstrap_line: bootstrap_line.clone(),
+                data_root: None,
             },
             log_path: Some(temp.path().join("child.log")),
             config: local_test_config(port),
@@ -4500,6 +5605,7 @@ while (-not [IO.File]::Exists({})) {{
                     "Wait-Event".to_string(),
                 ],
                 bootstrap_line: "{}\n".to_string(),
+                data_root: None,
             },
             log_path: None,
             config: local_test_config(port),
