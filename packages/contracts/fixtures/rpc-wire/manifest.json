@@ -334,10 +334,6 @@
       "mode": "unary"
     },
     {
-      "name": "vcs.removeWorktree",
-      "mode": "unary"
-    },
-    {
       "name": "vcs.stageFiles",
       "mode": "unary"
     },
@@ -354,6 +350,14 @@
       "mode": "unary"
     },
     {
+      "name": "worktree.createManaged",
+      "mode": "unary"
+    },
+    {
+      "name": "worktree.createPanel",
+      "mode": "unary"
+    },
+    {
       "name": "worktree.getRemovalPlan",
       "mode": "unary"
     },
@@ -363,6 +367,10 @@
     },
     {
       "name": "worktree.removeFromBibCode",
+      "mode": "unary"
+    },
+    {
+      "name": "worktree.retarget",
       "mode": "unary"
     },
     {
@@ -588,9 +596,6 @@
     "typed-failures/vcs__refreshStatus-02.json",
     "typed-failures/vcs__refreshWorktreeCatalog-00.json",
     "typed-failures/vcs__refreshWorktreeCatalog-01.json",
-    "typed-failures/vcs__removeWorktree-00.json",
-    "typed-failures/vcs__removeWorktree-01.json",
-    "typed-failures/vcs__removeWorktree-02.json",
     "typed-failures/vcs__stageFiles-00.json",
     "typed-failures/vcs__stageFiles-01.json",
     "typed-failures/vcs__stageFiles-02.json",
@@ -602,12 +607,19 @@
     "typed-failures/vcs__unstageFiles-02.json",
     "typed-failures/worktree__adopt-00.json",
     "typed-failures/worktree__adopt-01.json",
+    "typed-failures/worktree__createManaged-00.json",
+    "typed-failures/worktree__createManaged-01.json",
+    "typed-failures/worktree__createManaged-02.json",
+    "typed-failures/worktree__createPanel-00.json",
+    "typed-failures/worktree__createPanel-01.json",
     "typed-failures/worktree__getRemovalPlan-00.json",
     "typed-failures/worktree__getRemovalPlan-01.json",
     "typed-failures/worktree__remove-00.json",
     "typed-failures/worktree__remove-01.json",
     "typed-failures/worktree__removeFromBibCode-00.json",
     "typed-failures/worktree__removeFromBibCode-01.json",
+    "typed-failures/worktree__retarget-00.json",
+    "typed-failures/worktree__retarget-01.json",
     "typed-failures/worktree__updateDiscoveryPolicy-00.json",
     "typed-failures/worktree__updateDiscoveryPolicy-01.json"
   ],
@@ -824,9 +836,6 @@
     "typed-failures/vcs__refreshStatus-02.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
     "typed-failures/vcs__refreshWorktreeCatalog-00.json": "f428aca4770b9651dea9ffba0e4d391815f06155f2aafe897ddfde1269c06701",
     "typed-failures/vcs__refreshWorktreeCatalog-01.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
-    "typed-failures/vcs__removeWorktree-00.json": "db4c9484fa03affcb35e463a516074a33a24d8c98d74bae227aa8015c6a5ecca",
-    "typed-failures/vcs__removeWorktree-01.json": "bca6f869de8d862e69070fee42013122b00c89c2403f106db355f160c3577d4f",
-    "typed-failures/vcs__removeWorktree-02.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
     "typed-failures/vcs__stageFiles-00.json": "db4c9484fa03affcb35e463a516074a33a24d8c98d74bae227aa8015c6a5ecca",
     "typed-failures/vcs__stageFiles-01.json": "bca6f869de8d862e69070fee42013122b00c89c2403f106db355f160c3577d4f",
     "typed-failures/vcs__stageFiles-02.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
@@ -838,12 +847,19 @@
     "typed-failures/vcs__unstageFiles-02.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
     "typed-failures/worktree__adopt-00.json": "a2573748bef58c5cfca2521d3f4bfe08efe0dad3d4fa52b2e9737fba3d0ee8b1",
     "typed-failures/worktree__adopt-01.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
+    "typed-failures/worktree__createManaged-00.json": "a2573748bef58c5cfca2521d3f4bfe08efe0dad3d4fa52b2e9737fba3d0ee8b1",
+    "typed-failures/worktree__createManaged-01.json": "db4c9484fa03affcb35e463a516074a33a24d8c98d74bae227aa8015c6a5ecca",
+    "typed-failures/worktree__createManaged-02.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
+    "typed-failures/worktree__createPanel-00.json": "a2573748bef58c5cfca2521d3f4bfe08efe0dad3d4fa52b2e9737fba3d0ee8b1",
+    "typed-failures/worktree__createPanel-01.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
     "typed-failures/worktree__getRemovalPlan-00.json": "6a5011823533b36cb7bff73bbb50ca144e23326afd1beb6f7413826c39cd97ab",
     "typed-failures/worktree__getRemovalPlan-01.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
     "typed-failures/worktree__remove-00.json": "6a5011823533b36cb7bff73bbb50ca144e23326afd1beb6f7413826c39cd97ab",
     "typed-failures/worktree__remove-01.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
     "typed-failures/worktree__removeFromBibCode-00.json": "6a5011823533b36cb7bff73bbb50ca144e23326afd1beb6f7413826c39cd97ab",
     "typed-failures/worktree__removeFromBibCode-01.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
+    "typed-failures/worktree__retarget-00.json": "a2573748bef58c5cfca2521d3f4bfe08efe0dad3d4fa52b2e9737fba3d0ee8b1",
+    "typed-failures/worktree__retarget-01.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720",
     "typed-failures/worktree__updateDiscoveryPolicy-00.json": "f428aca4770b9651dea9ffba0e4d391815f06155f2aafe897ddfde1269c06701",
     "typed-failures/worktree__updateDiscoveryPolicy-01.json": "5da6c3eeca5fc91f0c33b9483d2ae9e1c2f7bb4c5fdc51a31dd5cbb22745e720"
   },
@@ -1080,9 +1096,6 @@
     "typed-failures/vcs__refreshStatus-02.json",
     "typed-failures/vcs__refreshWorktreeCatalog-00.json",
     "typed-failures/vcs__refreshWorktreeCatalog-01.json",
-    "typed-failures/vcs__removeWorktree-00.json",
-    "typed-failures/vcs__removeWorktree-01.json",
-    "typed-failures/vcs__removeWorktree-02.json",
     "typed-failures/vcs__stageFiles-00.json",
     "typed-failures/vcs__stageFiles-01.json",
     "typed-failures/vcs__stageFiles-02.json",
@@ -1094,12 +1107,19 @@
     "typed-failures/vcs__unstageFiles-02.json",
     "typed-failures/worktree__adopt-00.json",
     "typed-failures/worktree__adopt-01.json",
+    "typed-failures/worktree__createManaged-00.json",
+    "typed-failures/worktree__createManaged-01.json",
+    "typed-failures/worktree__createManaged-02.json",
+    "typed-failures/worktree__createPanel-00.json",
+    "typed-failures/worktree__createPanel-01.json",
     "typed-failures/worktree__getRemovalPlan-00.json",
     "typed-failures/worktree__getRemovalPlan-01.json",
     "typed-failures/worktree__remove-00.json",
     "typed-failures/worktree__remove-01.json",
     "typed-failures/worktree__removeFromBibCode-00.json",
     "typed-failures/worktree__removeFromBibCode-01.json",
+    "typed-failures/worktree__retarget-00.json",
+    "typed-failures/worktree__retarget-01.json",
     "typed-failures/worktree__updateDiscoveryPolicy-00.json",
     "typed-failures/worktree__updateDiscoveryPolicy-01.json"
   ]

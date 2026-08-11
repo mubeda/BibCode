@@ -1,6 +1,7 @@
 import {
+  EnvironmentId,
+  ORCHESTRATION_WS_METHODS,
   type ExecutionEnvironmentDescriptor,
-  type EnvironmentId,
   type ProjectWorktreeDiscoveryPolicy,
   type ThreadId,
   type VcsAdoptedWorktreeStatus,
@@ -8,7 +9,10 @@ import {
   type VcsWorktreeDescriptor,
   type WorktreeAdoptInput,
   type WorktreeAdoptResult,
+  type WorktreeCreateManagedInput,
+  type WorktreeCreatePanelInput,
   type WorktreeKey,
+  type WorktreeRetargetInput,
   type WorktreeRemovalPlan,
   type WorktreeRemovalResult,
   WS_METHODS,
@@ -16,15 +20,24 @@ import {
 import * as Cause from "effect/Cause";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Option from "effect/Option";
+import * as Schema from "effect/Schema";
 import * as Semaphore from "effect/Semaphore";
 import * as Stream from "effect/Stream";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 import { Atom } from "effect/unstable/reactivity";
 
 import type { EnvironmentRegistry } from "../connection/registry.ts";
-import { request, subscribe, type EnvironmentRpcInput } from "../rpc/client.ts";
+import { EnvironmentSupervisor } from "../connection/supervisor.ts";
+import {
+  EnvironmentRpcUnavailableError,
+  requestInSession,
+  subscribeInSession,
+  type EnvironmentRpcInput,
+  type EnvironmentUnaryRpcTag,
+} from "../rpc/client.ts";
 import {
   createAtomCommandScheduler,
-  createEnvironmentRpcCommand,
   createEnvironmentSubscriptionAtomFamily,
   createRuntimeCommand,
   runInEnvironment,
@@ -102,10 +115,128 @@ export function deriveAdoptedWorkspaceStateByThreadId(
   return new Map(snapshot.adoptedWorkspaces.map((workspace) => [workspace.threadId, workspace]));
 }
 
+export type WorktreeCatalogCapabilityPolicy =
+  | {
+      readonly catalogRpc: "enabled";
+      readonly removal: "catalog";
+    }
+  | {
+      readonly catalogRpc: "disabled";
+      readonly removal: "legacy-detach-only";
+    };
+
+export function selectWorktreeCatalogCapabilityPolicy(
+  environmentDescriptor: ExecutionEnvironmentDescriptor | null | undefined,
+): WorktreeCatalogCapabilityPolicy {
+  return environmentDescriptor?.capabilities?.worktreeCatalog === true
+    ? { catalogRpc: "enabled", removal: "catalog" }
+    : { catalogRpc: "disabled", removal: "legacy-detach-only" };
+}
+
 export function isWorktreeCatalogSupported(
-  environmentDescriptor: ExecutionEnvironmentDescriptor,
+  environmentDescriptor: ExecutionEnvironmentDescriptor | null | undefined,
 ): boolean {
-  return environmentDescriptor.capabilities.worktreeCatalog;
+  return selectWorktreeCatalogCapabilityPolicy(environmentDescriptor).catalogRpc === "enabled";
+}
+
+export function selectWorktreeWorkspaceActionsAvailable(
+  workspace: Pick<VcsAdoptedWorktreeStatus, "availability"> | null | undefined,
+): boolean {
+  return (
+    workspace === null ||
+    workspace === undefined ||
+    workspace.availability === "present" ||
+    workspace.availability === "verification-unavailable"
+  );
+}
+
+export class WorktreeCatalogUnsupportedError extends Schema.TaggedErrorClass<WorktreeCatalogUnsupportedError>()(
+  "WorktreeCatalogUnsupportedError",
+  {
+    environmentId: EnvironmentId,
+  },
+) {
+  override get message(): string {
+    return `Environment ${this.environmentId} does not support the worktree catalog.`;
+  }
+}
+
+const negotiatedWorktreeCatalogPolicy = Effect.fn("Worktrees.negotiatedCapabilityPolicy")(
+  function* () {
+    const supervisor = yield* EnvironmentSupervisor;
+    const session = yield* SubscriptionRef.get(supervisor.session).pipe(
+      Effect.flatMap(
+        Option.match({
+          onNone: () =>
+            Effect.fail(
+              new EnvironmentRpcUnavailableError({
+                environmentId: supervisor.target.environmentId,
+                message: `${supervisor.target.label} is not connected.`,
+              }),
+            ),
+          onSome: Effect.succeed,
+        }),
+      ),
+    );
+    const serverConfig = yield* session.initialConfig;
+    return {
+      environmentId: supervisor.target.environmentId,
+      session,
+      policy: selectWorktreeCatalogCapabilityPolicy(serverConfig.environment),
+    } as const;
+  },
+);
+
+const requireWorktreeCatalog = Effect.fn("Worktrees.requireCatalog")(function* () {
+  const negotiated = yield* negotiatedWorktreeCatalogPolicy();
+  if (negotiated.policy.catalogRpc === "disabled") {
+    return yield* new WorktreeCatalogUnsupportedError({
+      environmentId: negotiated.environmentId,
+    });
+  }
+  return negotiated;
+});
+
+function requestWithWorktreeCatalogCapability<TTag extends EnvironmentUnaryRpcTag>(
+  tag: TTag,
+  input: EnvironmentRpcInput<TTag>,
+) {
+  return Effect.gen(function* () {
+    const negotiated = yield* requireWorktreeCatalog();
+    return yield* requestInSession(negotiated.session, negotiated.environmentId, tag, input);
+  });
+}
+
+function subscribeToWorktreeCatalog(
+  input: EnvironmentRpcInput<typeof WS_METHODS.subscribeWorktreeCatalog>,
+) {
+  return Stream.unwrap(
+    EnvironmentSupervisor.pipe(
+      Effect.map((supervisor) =>
+        SubscriptionRef.changes(supervisor.session).pipe(
+          Stream.switchMap(
+            Option.match({
+              onNone: () => Stream.empty,
+              onSome: (session) =>
+                Stream.fromEffect(session.initialConfig).pipe(
+                  Stream.flatMap((serverConfig) =>
+                    selectWorktreeCatalogCapabilityPolicy(serverConfig.environment).catalogRpc ===
+                    "enabled"
+                      ? subscribeInSession(
+                          session,
+                          supervisor.target.environmentId,
+                          WS_METHODS.subscribeWorktreeCatalog,
+                          input,
+                        )
+                      : Stream.empty,
+                  ),
+                ),
+            }),
+          ),
+        ),
+      ),
+    ),
+  );
 }
 
 function retainLastUsableWorktreeCatalogRows<E, R>(
@@ -184,7 +315,10 @@ export function createWorktreeEnvironmentAtoms<R, E>(
   }) =>
     withProjectMutationLane(
       projectKey(target),
-      runInEnvironment(target.environmentId, request(WS_METHODS.worktreeAdopt, target.input)),
+      runInEnvironment(
+        target.environmentId,
+        requestWithWorktreeCatalogCapability(WS_METHODS.worktreeAdopt, target.input),
+      ),
     );
   const addOne = createRuntimeCommand(runtime, {
     label: "environment-data:worktrees:add-one",
@@ -222,13 +356,17 @@ export function createWorktreeEnvironmentAtoms<R, E>(
       readonly environmentId: EnvironmentId;
       readonly input: WorktreeAddAllInput;
     }) =>
-      withEnvironmentBulkLane(
-        target.environmentId,
-        Effect.forEach(
-          target.input.candidates,
-          (candidate) => adoptCandidate(target.environmentId, candidate),
-          { concurrency: 4 },
-        ).pipe(Effect.map((results): WorktreeAddAllResult => ({ results }))),
+      runInEnvironment(target.environmentId, requireWorktreeCatalog()).pipe(
+        Effect.andThen(
+          withEnvironmentBulkLane(
+            target.environmentId,
+            Effect.forEach(
+              target.input.candidates,
+              (candidate) => adoptCandidate(target.environmentId, candidate),
+              { concurrency: 4 },
+            ).pipe(Effect.map((results): WorktreeAddAllResult => ({ results }))),
+          ),
+        ),
       ),
   });
   const getRemovalPlanEffect = (target: {
@@ -237,7 +375,7 @@ export function createWorktreeEnvironmentAtoms<R, E>(
   }) =>
     runInEnvironment(
       target.environmentId,
-      request(WS_METHODS.worktreeGetRemovalPlan, target.input),
+      requestWithWorktreeCatalogCapability(WS_METHODS.worktreeGetRemovalPlan, target.input),
     );
 
   return {
@@ -245,13 +383,20 @@ export function createWorktreeEnvironmentAtoms<R, E>(
       label: "environment-data:worktrees:catalog",
       idleTtlMs: 0,
       subscribe: (input: EnvironmentRpcInput<typeof WS_METHODS.subscribeWorktreeCatalog>) =>
-        retainLastUsableWorktreeCatalogRows(subscribe(WS_METHODS.subscribeWorktreeCatalog, input)),
+        retainLastUsableWorktreeCatalogRows(subscribeToWorktreeCatalog(input)),
     }),
-    refresh: createEnvironmentRpcCommand(runtime, {
+    refresh: createRuntimeCommand(runtime, {
       label: "environment-data:worktrees:refresh",
-      tag: WS_METHODS.vcsRefreshWorktreeCatalog,
       scheduler: refreshScheduler,
       concurrency: { mode: "singleFlight", key: projectKey },
+      execute: (target: {
+        readonly environmentId: EnvironmentId;
+        readonly input: EnvironmentRpcInput<typeof WS_METHODS.vcsRefreshWorktreeCatalog>;
+      }) =>
+        runInEnvironment(
+          target.environmentId,
+          requestWithWorktreeCatalogCapability(WS_METHODS.vcsRefreshWorktreeCatalog, target.input),
+        ),
     }),
     updatePolicy: createRuntimeCommand(runtime, {
       label: "environment-data:worktrees:update-policy",
@@ -263,7 +408,52 @@ export function createWorktreeEnvironmentAtoms<R, E>(
           projectKey(target),
           runInEnvironment(
             target.environmentId,
-            request(WS_METHODS.worktreeUpdateDiscoveryPolicy, target.input),
+            requestWithWorktreeCatalogCapability(
+              WS_METHODS.worktreeUpdateDiscoveryPolicy,
+              target.input,
+            ),
+          ),
+        ),
+    }),
+    createManaged: createRuntimeCommand(runtime, {
+      label: "environment-data:worktrees:create-managed",
+      execute: (target: {
+        readonly environmentId: EnvironmentId;
+        readonly input: WorktreeCreateManagedInput;
+      }) =>
+        withProjectMutationLane(
+          projectKey(target),
+          runInEnvironment(
+            target.environmentId,
+            requestWithWorktreeCatalogCapability(WS_METHODS.worktreeCreateManaged, target.input),
+          ),
+        ),
+    }),
+    createPanel: createRuntimeCommand(runtime, {
+      label: "environment-data:worktrees:create-panel",
+      execute: (target: {
+        readonly environmentId: EnvironmentId;
+        readonly input: WorktreeCreatePanelInput;
+      }) =>
+        withProjectMutationLane(
+          JSON.stringify([target.environmentId, target.input.hostThreadId]),
+          runInEnvironment(
+            target.environmentId,
+            requestWithWorktreeCatalogCapability(WS_METHODS.worktreeCreatePanel, target.input),
+          ),
+        ),
+    }),
+    retarget: createRuntimeCommand(runtime, {
+      label: "environment-data:worktrees:retarget",
+      execute: (target: {
+        readonly environmentId: EnvironmentId;
+        readonly input: WorktreeRetargetInput;
+      }) =>
+        withProjectMutationLane(
+          projectKey(target),
+          runInEnvironment(
+            target.environmentId,
+            requestWithWorktreeCatalogCapability(WS_METHODS.worktreeRetarget, target.input),
           ),
         ),
     }),
@@ -283,7 +473,32 @@ export function createWorktreeEnvironmentAtoms<R, E>(
           projectKey(target),
           runInEnvironment(
             target.environmentId,
-            request(WS_METHODS.worktreeRemoveFromBibCode, target.input),
+            Effect.gen(function* () {
+              const negotiated = yield* negotiatedWorktreeCatalogPolicy();
+              if (negotiated.policy.removal === "catalog") {
+                return yield* requestInSession(
+                  negotiated.session,
+                  negotiated.environmentId,
+                  WS_METHODS.worktreeRemoveFromBibCode,
+                  target.input,
+                );
+              }
+              yield* requestInSession(
+                negotiated.session,
+                negotiated.environmentId,
+                ORCHESTRATION_WS_METHODS.dispatchCommand,
+                {
+                  type: "thread.delete",
+                  commandId: target.input.commandId,
+                  threadId: target.input.threadId,
+                },
+              );
+              return {
+                threadRemoved: true,
+                gitOutcome: "not-requested",
+                orphanCleanupPending: false,
+              } satisfies WorktreeRemovalResult;
+            }),
           ),
         ),
     }),
@@ -297,7 +512,7 @@ export function createWorktreeEnvironmentAtoms<R, E>(
           projectKey(target),
           runInEnvironment(
             target.environmentId,
-            request(WS_METHODS.worktreeRemove, target.input),
+            requestWithWorktreeCatalogCapability(WS_METHODS.worktreeRemove, target.input),
           ).pipe(
             Effect.map((result): WorktreeRemoveCommandResult => ({ _tag: "Removed", result })),
             Effect.catchTag("WorktreeRemovalError", (error) =>

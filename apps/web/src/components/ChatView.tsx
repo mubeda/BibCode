@@ -66,6 +66,10 @@ import {
   squashAtomCommandFailure,
   type AtomCommandResult,
 } from "@bibcode/client-runtime/state/runtime";
+import {
+  selectWorktreeCatalogCapabilityPolicy,
+  selectWorktreeWorkspaceActionsAvailable,
+} from "@bibcode/client-runtime/state/worktrees";
 import * as Cause from "effect/Cause";
 import * as Option from "effect/Option";
 import * as Schema from "effect/Schema";
@@ -195,7 +199,7 @@ import {
   nextProjectScriptId,
   projectScriptIdFromCommand,
 } from "~/projectScripts";
-import { newDraftId, newMessageId, newThreadId } from "~/lib/utils";
+import { newCommandId, newDraftId, newMessageId, newThreadId } from "~/lib/utils";
 import { getProviderModelCapabilities, resolveSelectableProvider } from "../providerModels";
 import { useEnvironmentSettings } from "../hooks/useSettings";
 import { worktreeEnvironment } from "../state/worktrees";
@@ -1168,7 +1172,9 @@ function ChatViewContent(props: ChatViewProps) {
   const openTerminal = useAtomCommand(terminalEnvironment.open, "terminal open");
   const writeTerminal = useAtomCommand(terminalEnvironment.write, "terminal write");
   const closeTerminalMutation = useAtomCommand(terminalEnvironment.close, "terminal close");
-  const createThread = useAtomCommand(threadEnvironment.create, { reportFailure: false });
+  const createPanelThread = useAtomCommand(worktreeEnvironment.createPanel, {
+    reportFailure: false,
+  });
   const deleteThread = useAtomCommand(threadEnvironment.delete, { reportFailure: false });
   const updateThreadMetadata = useAtomCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
@@ -1736,10 +1742,13 @@ function ChatViewContent(props: ChatViewProps) {
     ? scopeProjectRef(activeThread.environmentId, activeThread.projectId)
     : null;
   const activeProject = useProject(activeProjectRef);
+  const activeEnvironmentDescriptor =
+    activeThread === undefined
+      ? undefined
+      : environmentById.get(activeThread.environmentId)?.serverConfig?.environment;
   const activeEnvironmentSupportsWorktreeCatalog =
-    activeThread !== undefined &&
-    environmentById.get(activeThread.environmentId)?.serverConfig?.environment.capabilities
-      ?.worktreeCatalog === true;
+    activeEnvironmentDescriptor !== undefined &&
+    selectWorktreeCatalogCapabilityPolicy(activeEnvironmentDescriptor).catalogRpc === "enabled";
   const activeWorktreeCatalog = useEnvironmentQuery(
     !isPanel &&
       activeThread?.worktreePath &&
@@ -1759,11 +1768,9 @@ function ChatViewContent(props: ChatViewProps) {
         ) ?? null);
   const workspaceUnavailable = isPanel
     ? props.workspaceUnavailable
-    : activeAdoptedWorkspace?.availability === "missing-registered" ||
-        activeAdoptedWorkspace?.availability === "missing-unregistered" ||
-        activeAdoptedWorkspace?.availability === "removing"
-      ? WORKSPACE_UNAVAILABLE_REASON
-      : null;
+    : selectWorktreeWorkspaceActionsAvailable(activeAdoptedWorkspace)
+      ? null
+      : WORKSPACE_UNAVAILABLE_REASON;
   const workspaceUnavailableRef = useRef(workspaceUnavailable);
   useLayoutEffect(() => {
     workspaceUnavailableRef.current = workspaceUnavailable;
@@ -5257,18 +5264,18 @@ function ChatViewContent(props: ChatViewProps) {
       resetLocalDispatch();
     };
 
-    const createResult = await createThread({
+    const createResult = await createPanelThread({
       environmentId,
       input: {
+        commandId: newCommandId(),
+        hostThreadId: activeThread.id,
         threadId: nextThreadId,
-        projectId: activeProject.id,
         title: nextThreadTitle,
-        modelSelection: nextThreadModelSelection,
-        runtimeMode,
-        interactionMode: "default",
-        branch: activeThreadBranch,
-        worktreePath: activeThread.worktreePath,
-        createdAt,
+        threadDefaults: {
+          modelSelection: nextThreadModelSelection,
+          runtimeMode,
+          interactionMode: "default",
+        },
       },
     });
     let failure: AtomCommandResult<unknown, unknown> | null =
@@ -5357,7 +5364,7 @@ function ChatViewContent(props: ChatViewProps) {
     beginLocalDispatch,
     activeEnvironmentUnavailable,
     workspaceUnavailable,
-    createThread,
+    createPanelThread,
     deleteThread,
     isConnecting,
     isSendBusy,

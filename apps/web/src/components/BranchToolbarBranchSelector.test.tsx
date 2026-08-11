@@ -142,6 +142,12 @@ const testState = vi.hoisted(() => ({
     isPending: false,
     refresh: vi.fn(),
   },
+  catalogQuery: {
+    data: null as unknown,
+    error: null as string | null,
+    isPending: false,
+    refresh: vi.fn(),
+  },
   statusAtoms: [] as unknown[],
   branchState: {
     refs: [] as unknown[],
@@ -153,6 +159,7 @@ const testState = vi.hoisted(() => ({
   commands: {
     "cmd:stopSession": vi.fn(),
     "cmd:updateMetadata": vi.fn(),
+    "cmd:retargetWorktree": vi.fn(),
     "cmd:switchRef": vi.fn(),
     "cmd:createRef": vi.fn(),
   } as Record<string, ReturnType<typeof vi.fn>>,
@@ -293,9 +300,9 @@ vi.mock("../state/entities", () => ({
 }));
 
 vi.mock("../state/query", () => ({
-  useEnvironmentQuery: (atom: unknown) => {
+  useEnvironmentQuery: (atom: { kind?: string } | null) => {
     testState.statusAtoms.push(atom);
-    return testState.statusQuery;
+    return atom?.kind === "worktree-catalog" ? testState.catalogQuery : testState.statusQuery;
   },
 }));
 
@@ -311,6 +318,13 @@ vi.mock("../state/vcs", () => ({
     switchRef: "cmd:switchRef",
     createRef: "cmd:createRef",
     status: (args: unknown) => ({ kind: "status-atom", args }),
+  },
+}));
+
+vi.mock("../state/worktrees", () => ({
+  worktreeEnvironment: {
+    catalog: (args: unknown) => ({ kind: "worktree-catalog", args }),
+    retarget: "cmd:retargetWorktree",
   },
 }));
 
@@ -520,6 +534,34 @@ beforeEach(() => {
   testState.draftThreadByRef = null;
   testState.setDraftThreadContext.mockReset();
   testState.statusQuery = { data: status(), error: null, isPending: false, refresh: vi.fn() };
+  testState.catalogQuery = {
+    data: {
+      repositoryKey: "repository-1",
+      generation: 12,
+      authoritative: true,
+      observedAt: "2026-08-11T00:00:00.000Z",
+      scanStatus: { _tag: "ready" },
+      worktrees: [
+        {
+          worktreeKey: "worktree-existing",
+          path: "C:/repo-wt",
+          branch: "wt-branch",
+          head: "abc123",
+          isPrimary: false,
+          isBare: false,
+          locked: false,
+          registrationState: "registered",
+          directoryState: "present",
+          adoptionState: "none",
+          eligibleForAdoption: true,
+        },
+      ],
+      adoptedWorkspaces: [],
+    },
+    error: null,
+    isPending: false,
+    refresh: vi.fn(),
+  };
   testState.statusAtoms = [];
   testState.branchState = {
     refs: [...REFS],
@@ -531,6 +573,7 @@ beforeEach(() => {
   testState.commands = {
     "cmd:stopSession": vi.fn().mockResolvedValue(AsyncResult.success(undefined)),
     "cmd:updateMetadata": vi.fn().mockResolvedValue(AsyncResult.success(undefined)),
+    "cmd:retargetWorktree": vi.fn().mockResolvedValue(AsyncResult.success({ threadId: THREAD_ID })),
     "cmd:switchRef": vi.fn().mockResolvedValue(AsyncResult.success({ refName: null })),
     "cmd:createRef": vi.fn().mockResolvedValue(AsyncResult.success({ refName: "created" })),
   };
@@ -680,7 +723,7 @@ describe("BranchToolbarBranchSelector", () => {
     expect(onComposerFocusRequest).toHaveBeenCalled();
   });
 
-  it("reuses an existing worktree and stops the running session", () => {
+  it("retargets to an opaque catalog worktree and stops the running session", async () => {
     const onActiveThreadBranchOverrideChange = vi.fn();
     useServerThread({ session: { id: "session-1" } });
     render(buildProps({ onActiveThreadBranchOverrideChange }));
@@ -692,10 +735,21 @@ describe("BranchToolbarBranchSelector", () => {
       environmentId: ENVIRONMENT_ID,
       input: { threadId: THREAD_ID },
     });
-    expect(testState.commands["cmd:updateMetadata"]).toHaveBeenCalledWith({
+    expect(testState.commands["cmd:retargetWorktree"]).toHaveBeenCalledWith({
       environmentId: ENVIRONMENT_ID,
-      input: { threadId: THREAD_ID, branch: "wt-branch", worktreePath: "C:/repo-wt" },
+      input: {
+        commandId: expect.any(String),
+        projectId: "proj-1",
+        threadId: THREAD_ID,
+        worktreeKey: "worktree-existing",
+        expectedGeneration: 12,
+      },
     });
+    expect(testState.commands["cmd:updateMetadata"]).not.toHaveBeenCalled();
+    expect(testState.commands["cmd:retargetWorktree"]!.mock.calls[0]?.[0].input).not.toHaveProperty(
+      "worktreePath",
+    );
+    await Promise.resolve();
     expect(onActiveThreadBranchOverrideChange).toHaveBeenCalledWith("wt-branch");
     expect(testState.commands["cmd:switchRef"]).not.toHaveBeenCalled();
   });
@@ -716,7 +770,7 @@ describe("BranchToolbarBranchSelector", () => {
     expect(hooks.optimisticCalls).toEqual(["main", "main"]);
     expect(testState.commands["cmd:updateMetadata"]).toHaveBeenCalledWith({
       environmentId: ENVIRONMENT_ID,
-      input: { threadId: THREAD_ID, branch: "main", worktreePath: null },
+      input: { threadId: THREAD_ID, branch: "main" },
     });
     expect(onActiveThreadBranchOverrideChange).toHaveBeenCalledWith("main");
     expect(testState.branchState.refresh).toHaveBeenCalled();
@@ -738,7 +792,7 @@ describe("BranchToolbarBranchSelector", () => {
     expect(hooks.optimisticCalls).toEqual(["remote-only", "remote-only"]);
     expect(testState.commands["cmd:updateMetadata"]).toHaveBeenCalledWith({
       environmentId: ENVIRONMENT_ID,
-      input: { threadId: THREAD_ID, branch: "remote-only", worktreePath: null },
+      input: { threadId: THREAD_ID, branch: "remote-only" },
     });
   });
 

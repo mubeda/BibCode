@@ -2123,6 +2123,94 @@ staticDescribe("worktree discovery integration", () => {
       }),
     );
   });
+
+  it("keeps retained verification-unavailable rows usable for workspace actions", async () => {
+    baseScenario();
+    h.state.serverConfigs = new Map([
+      [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: true } } }],
+    ]);
+    h.state.worktreeCatalogs.set(`${ENV_MAIN}:${projectA.id}`, {
+      repositoryKey: WorktreeRepositoryKey.make("repository:repo-a"),
+      generation: 44,
+      authoritative: false,
+      observedAt: "2026-08-09T12:02:00.000Z",
+      scanStatus: {
+        _tag: "degraded",
+        reason: "git-failed",
+        message: "verification is temporarily unavailable",
+        failedAt: "2026-08-09T12:02:00.000Z",
+        lastAuthoritativeAt: "2026-08-09T12:01:00.000Z",
+      },
+      worktrees: [],
+      adoptedWorkspaces: [
+        {
+          threadId: threadActive.id,
+          worktreeKey: WorktreeKey.make("worktree:retained"),
+          path: "C:/wt/x",
+          branch: "feature/x",
+          availability: "verification-unavailable",
+          registrationState: "registered",
+          locked: false,
+        },
+      ],
+    });
+
+    render(<Sidebar />);
+    fakeLocalApi();
+    let menuItems: Array<{ id: string; disabled?: boolean; children?: unknown[] }> = [];
+    h.spies.contextMenuShow.mockImplementation(async (items) => {
+      menuItems = items;
+      return null;
+    });
+    const row = mustFindProps(byTestId("thread-row-thread-active"), "retained degraded row");
+    invoke(row, "onContextMenu", mouseEvent());
+    await flush();
+
+    expect(menuItems.find((item) => item.id === "update")?.disabled).toBe(false);
+    expect(menuItems.find((item) => item.id === "open-in")?.disabled).not.toBe(true);
+  });
+
+  it("starts no row subscription and uses direct legacy detach when capability is false", async () => {
+    baseScenario();
+    h.state.serverConfigs = new Map([
+      [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: false } } }],
+    ]);
+
+    render(<Sidebar />);
+    expect(h.state.discoveryCatalogSubscriptions).toEqual([]);
+    fakeLocalApi();
+    h.spies.contextMenuShow.mockResolvedValue("delete");
+    const row = mustFindProps(byTestId("thread-row-thread-active"), "legacy worktree row");
+    invoke(row, "onContextMenu", mouseEvent());
+    await flush();
+
+    expect(h.spies.deleteThread).toHaveBeenCalledWith({
+      environmentId: ENV_MAIN,
+      threadId: threadActive.id,
+    });
+    expect(h.spies.requestWorktreeRemoval).not.toHaveBeenCalled();
+  });
+
+  it("keeps false-capability bulk deletion on detach-only thread actions", async () => {
+    baseScenario();
+    h.state.serverConfigs = new Map([
+      [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: false } } }],
+    ]);
+    h.selectionStore.setState({
+      selectedThreadKeys: new Set([threadKeyOf(threadIdle), threadKeyOf(threadActive)]),
+    });
+
+    render(<Sidebar />);
+    expect(h.state.discoveryCatalogSubscriptions).toEqual([]);
+    fakeLocalApi();
+    h.spies.contextMenuShow.mockResolvedValue("delete");
+    const row = mustFindProps(byTestId("thread-row-thread-idle"), "legacy bulk row");
+    invoke(row, "onContextMenu", mouseEvent());
+    await flush();
+
+    expect(h.spies.deleteThread).toHaveBeenCalledTimes(2);
+    expect(h.spies.requestWorktreeRemoval).not.toHaveBeenCalled();
+  });
 });
 
 staticDescribe("worktree removal completion owner", () => {
@@ -2773,7 +2861,8 @@ staticDescribe("primary row", () => {
       (call: { label: string }) => call.label === "thread.create",
     );
     expect(createCall).toBeDefined();
-    expect(createCall.input.input.kind).toBe("default");
+    expect(createCall.input.input).not.toHaveProperty("kind");
+    expect(createCall.input.input).not.toHaveProperty("worktreePath");
     expect(createCall.input.input.modelSelection.model).toBe("claude-fable-5");
     expect(createCall.input.input.modelSelection.options).toEqual([
       { id: "effort", value: "high" },

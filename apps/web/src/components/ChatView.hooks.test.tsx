@@ -214,6 +214,13 @@ vi.mock("../state/vcs", () => ({
   },
 }));
 
+vi.mock("../state/worktrees", () => ({
+  worktreeEnvironment: {
+    catalog: () => ({ key: "worktree.catalog" }),
+    createPanel: { key: "worktree.createPanel" },
+  },
+}));
+
 vi.mock("../state/shell", () => ({
   environmentShell: {
     stateAtom: (environmentId: string) => ({ key: `shell:${environmentId}` }),
@@ -2838,17 +2845,17 @@ describe("ChatView project script handlers", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(commandCallsFor("thread.create")).toHaveLength(1);
-    expect(commandCallsFor("thread.create")[0]?.input).toMatchObject({
+    expect(commandCallsFor("worktree.createPanel")).toHaveLength(1);
+    expect(commandCallsFor("worktree.createPanel")[0]?.input).toMatchObject({
       environmentId,
       input: {
-        projectId,
-        branch: "feature/panels",
-        worktreePath: "X:/demo/worktrees/panels",
-        modelSelection: {
-          instanceId: codexInstanceId,
-          model: "gpt-configured",
-          options: [{ id: "reasoningEffort", value: "high" }],
+        hostThreadId: threadId,
+        threadDefaults: {
+          modelSelection: {
+            instanceId: codexInstanceId,
+            model: "gpt-configured",
+            options: [{ id: "reasoningEffort", value: "high" }],
+          },
         },
       },
     });
@@ -2902,12 +2909,14 @@ describe("ChatView project script handlers", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(commandCallsFor("thread.create")[0]?.input).toMatchObject({
+    expect(commandCallsFor("worktree.createPanel")[0]?.input).toMatchObject({
       input: {
-        modelSelection: {
-          instanceId: claudeInstanceId,
-          model: "claude-sonnet-5",
-          options: [{ id: "effort", value: "ultrathink" }],
+        threadDefaults: {
+          modelSelection: {
+            instanceId: claudeInstanceId,
+            model: "claude-sonnet-5",
+            options: [{ id: "effort", value: "ultrathink" }],
+          },
         },
       },
     });
@@ -2943,12 +2952,14 @@ describe("ChatView project script handlers", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(commandCallsFor("thread.create")[0]?.input).toMatchObject({
+    expect(commandCallsFor("worktree.createPanel")[0]?.input).toMatchObject({
       input: {
-        modelSelection: {
-          instanceId: codexInstanceId,
-          model: DEFAULT_MODEL_BY_PROVIDER[ProviderDriverKind.make("codex")],
-          options: [{ id: "reasoningEffort", value: "high" }],
+        threadDefaults: {
+          modelSelection: {
+            instanceId: codexInstanceId,
+            model: DEFAULT_MODEL_BY_PROVIDER[ProviderDriverKind.make("codex")],
+            options: [{ id: "reasoningEffort", value: "high" }],
+          },
         },
       },
     });
@@ -3174,12 +3185,14 @@ describe("ChatView project script handlers", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    expect(commandCallsFor("thread.create")).toHaveLength(1);
-    expect(commandCallsFor("thread.create")[0]?.input).toMatchObject({
+    expect(commandCallsFor("worktree.createPanel")).toHaveLength(1);
+    expect(commandCallsFor("worktree.createPanel")[0]?.input).toMatchObject({
       input: {
-        modelSelection: {
-          instanceId: targetInstanceId,
-          model: "gpt-built-in",
+        threadDefaults: {
+          modelSelection: {
+            instanceId: targetInstanceId,
+            model: "gpt-built-in",
+          },
         },
       },
     });
@@ -3200,26 +3213,30 @@ describe("ChatView project script handlers", () => {
     await Promise.resolve();
     await Promise.resolve();
 
-    const createCalls = commandCallsFor("thread.create");
+    const createCalls = commandCallsFor("worktree.createPanel");
     expect(createCalls).toHaveLength(1);
     const createInput = createCalls[0]?.input as {
       environmentId: EnvironmentId;
       input: {
         threadId: ThreadId;
         title: string;
-        modelSelection: { instanceId: ProviderInstanceId; model: string };
-        kind: string;
+        hostThreadId: ThreadId;
+        threadDefaults: {
+          modelSelection: { instanceId: ProviderInstanceId; model: string };
+        };
       };
     };
     expect(createInput).toMatchObject({
       environmentId,
       input: {
         title: "Panel — Claude",
-        modelSelection: {
-          instanceId: ProviderInstanceId.make("claudeAgent"),
-          model: DEFAULT_MODEL_BY_PROVIDER[claudeDriver],
+        hostThreadId: threadId,
+        threadDefaults: {
+          modelSelection: {
+            instanceId: ProviderInstanceId.make("claudeAgent"),
+            model: DEFAULT_MODEL_BY_PROVIDER[claudeDriver],
+          },
         },
-        kind: "panel",
       },
     });
     expect(warn).toHaveBeenCalledWith(
@@ -4492,7 +4509,7 @@ describe("ChatView send flows", () => {
     const composer = capturedProps("chatComposer");
     await (composer["onImplementPlanInNewThread"] as () => Promise<void>)();
 
-    expect(commandCallsFor("thread.create")).toHaveLength(1);
+    expect(commandCallsFor("worktree.createPanel")).toHaveLength(1);
     expect(commandCallsFor("thread.startTurn")).toHaveLength(1);
     // Failure path deletes the freshly created thread and toasts.
     expect(commandCallsFor("thread.delete")).toHaveLength(1);

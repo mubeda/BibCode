@@ -119,6 +119,91 @@ const decodeChatAttachment = Schema.decodeUnknownEffect(ChatAttachment);
 const decodeClientOrchestrationCommand = Schema.decodeUnknownEffect(ClientOrchestrationCommand);
 const encodeClientOrchestrationCommand = Schema.encodeEffect(ClientOrchestrationCommand);
 
+it.effect("client orchestration schema excludes workspace authority fields", () =>
+  Effect.gen(function* () {
+    const commands = [
+      {
+        type: "project.meta.update",
+        commandId: "project-meta-1",
+        projectId: "project-1",
+        worktreeDiscovery: {
+          visibility: "shown",
+          initialPromptDismissedAt: null,
+          baselinePaths: ["/caller/chosen"],
+        },
+      },
+      {
+        type: "thread.create",
+        commandId: "thread-create-1",
+        threadId: "thread-1",
+        projectId: "project-1",
+        title: "Thread",
+        modelSelection: { provider: "codex", model: "gpt-5" },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        kind: "workspace",
+        branch: null,
+        worktreePath: "/caller/chosen",
+        createdAt: "2026-08-11T00:00:00.000Z",
+      },
+      {
+        type: "thread.meta.update",
+        commandId: "thread-meta-1",
+        threadId: "thread-1",
+        worktreePath: "/caller/retargeted",
+      },
+      {
+        type: "thread.turn.start",
+        commandId: "turn-start-1",
+        threadId: "thread-1",
+        message: {
+          messageId: "message-1",
+          role: "user",
+          text: "hello",
+          attachments: [],
+        },
+        runtimeMode: "full-access",
+        interactionMode: "default",
+        bootstrap: {
+          createThread: {
+            projectId: "project-1",
+            title: "Thread",
+            modelSelection: { provider: "codex", model: "gpt-5" },
+            runtimeMode: "full-access",
+            interactionMode: "default",
+            branch: null,
+            worktreePath: "/caller/chosen",
+            createdAt: "2026-08-11T00:00:00.000Z",
+          },
+          prepareWorktree: {
+            projectCwd: "/caller/chosen",
+            baseBranch: "main",
+          },
+        },
+        createdAt: "2026-08-11T00:00:00.000Z",
+      },
+    ] as const;
+
+    const decoded = yield* Effect.all(
+      commands.map((command) => decodeClientOrchestrationCommand(command)),
+    );
+    const projectMeta = decoded[0]!;
+    const threadCreate = decoded[1]!;
+    const threadMeta = decoded[2]!;
+    const turnStart = decoded[3]!;
+
+    assert.isFalse("worktreeDiscovery" in projectMeta);
+    assert.isFalse("kind" in threadCreate);
+    assert.isFalse("worktreePath" in threadCreate);
+    assert.isFalse("worktreePath" in threadMeta);
+    if (turnStart.type !== "thread.turn.start" || turnStart.bootstrap === undefined) {
+      assert.fail("Expected a bootstrap turn-start command.");
+    }
+    assert.isFalse("worktreePath" in turnStart.bootstrap.createThread!);
+    assert.isFalse("projectCwd" in turnStart.bootstrap.prepareWorktree!);
+  }),
+);
+
 it.effect("decodes image and file chat attachments", () =>
   Effect.gen(function* () {
     const image = {

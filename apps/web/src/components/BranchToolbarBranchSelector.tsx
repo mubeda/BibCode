@@ -3,7 +3,7 @@ import {
   isAtomCommandInterrupted,
   squashAtomCommandFailure,
 } from "@bibcode/client-runtime/state/runtime";
-import type { EnvironmentId, VcsRef, ThreadId } from "@bibcode/contracts";
+import type { EnvironmentId, VcsRef, ThreadId, WorktreeKey } from "@bibcode/contracts";
 import { LegendList, type LegendListRef } from "@legendapp/list/react";
 import { ChevronDownIcon, GitBranchIcon, RefreshCwIcon, SearchIcon } from "lucide-react";
 import {
@@ -27,7 +27,8 @@ import { useEnvironmentQuery } from "../state/query";
 import { threadEnvironment } from "../state/threads";
 import { useAtomCommand } from "../state/use-atom-command";
 import { vcsEnvironment } from "../state/vcs";
-import { cn } from "../lib/utils";
+import { worktreeEnvironment } from "../state/worktrees";
+import { cn, newCommandId } from "../lib/utils";
 import { parsePullRequestReference } from "../pullRequestReference";
 import { getSourceControlPresentation } from "../sourceControlPresentation";
 import {
@@ -112,6 +113,9 @@ export function BranchToolbarBranchSelector({
     threadEnvironment.updateMetadata,
     "thread metadata update",
   );
+  const retargetWorktree = useAtomCommand(worktreeEnvironment.retarget, {
+    reportFailure: false,
+  });
   const switchRef = useAtomCommand(vcsEnvironment.switchRef, {
     reportFailure: false,
   });
@@ -138,6 +142,14 @@ export function BranchToolbarBranchSelector({
       ? scopeProjectRef(draftThread.environmentId, draftThread.projectId)
       : null;
   const activeProject = useProject(activeProjectRef);
+  const worktreeCatalogQuery = useEnvironmentQuery(
+    activeProject === null
+      ? null
+      : worktreeEnvironment.catalog({
+          environmentId,
+          input: { projectId: activeProject.id },
+        }),
+  );
 
   const activeThreadId = serverThread?.id ?? (draftThread ? threadId : undefined);
   const activeThreadBranch =
@@ -160,21 +172,58 @@ export function BranchToolbarBranchSelector({
   // Thread branch mutation (colocated — only this component calls it)
   // ---------------------------------------------------------------------------
   const setThreadBranch = useCallback(
-    (branch: string | null, worktreePath: string | null) => {
+    (branch: string | null, worktreePath: string | null, worktreeKey?: WorktreeKey) => {
       if (!activeThreadId || !activeProject) return;
-      if (serverSession && worktreePath !== activeWorktreePath) {
-        void stopThreadSession({
-          environmentId,
-          input: { threadId: activeThreadId },
-        });
-      }
       if (hasServerThread) {
+        if (worktreePath !== activeWorktreePath) {
+          const generation = worktreeCatalogQuery.data?.authoritative
+            ? worktreeCatalogQuery.data.generation
+            : null;
+          if (worktreeKey === undefined || generation === null) {
+            toastManager.add(
+              stackedThreadToast({
+                type: "error",
+                title: "Could not switch worktree.",
+                description: "Refresh the worktree catalog and try again.",
+              }),
+            );
+            return;
+          }
+          if (serverSession) {
+            void stopThreadSession({
+              environmentId,
+              input: { threadId: activeThreadId },
+            });
+          }
+          void retargetWorktree({
+            environmentId,
+            input: {
+              commandId: newCommandId(),
+              projectId: activeProject.id,
+              threadId: activeThreadId,
+              worktreeKey,
+              expectedGeneration: generation,
+            },
+          }).then((result) => {
+            if (result._tag === "Success") {
+              onActiveThreadBranchOverrideChange?.(branch);
+            } else if (!isAtomCommandInterrupted(result)) {
+              toastManager.add(
+                stackedThreadToast({
+                  type: "error",
+                  title: "Could not switch worktree.",
+                  description: toBranchActionErrorMessage(squashAtomCommandFailure(result)),
+                }),
+              );
+            }
+          });
+          return;
+        }
         void updateThreadMetadata({
           environmentId,
           input: {
             threadId: activeThreadId,
             branch,
-            worktreePath,
           },
         });
       }
@@ -208,6 +257,8 @@ export function BranchToolbarBranchSelector({
       effectiveEnvMode,
       stopThreadSession,
       updateThreadMetadata,
+      retargetWorktree,
+      worktreeCatalogQuery.data,
     ],
   );
 
@@ -342,7 +393,10 @@ export function BranchToolbarBranchSelector({
     });
 
     if (selectionTarget.reuseExistingWorktree) {
-      setThreadBranch(refName.name, selectionTarget.nextWorktreePath);
+      const target = worktreeCatalogQuery.data?.worktrees.find(
+        (worktree) => worktree.path === selectionTarget.nextWorktreePath,
+      );
+      setThreadBranch(refName.name, selectionTarget.nextWorktreePath, target?.worktreeKey);
       setIsBranchMenuOpen(false);
       onComposerFocusRequest?.();
       return;

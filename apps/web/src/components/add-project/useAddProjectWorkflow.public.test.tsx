@@ -410,10 +410,11 @@ describe("useAddProjectWorkflow public adapter", () => {
       environmentId,
       input: expect.objectContaining({
         projectId: existingProjectId,
-        kind: "default",
         modelSelection: expect.objectContaining({ instanceId: claudeInstanceId }),
       }),
     });
+    expect(harness.createThread.mock.calls[0]?.[0].input).not.toHaveProperty("kind");
+    expect(harness.createThread.mock.calls[0]?.[0].input).not.toHaveProperty("worktreePath");
     const createdThreadId = harness.createThread.mock.calls[0]?.[0].input.threadId;
     expect(harness.navigate).toHaveBeenCalledWith({
       to: "/$environmentId/$threadId",
