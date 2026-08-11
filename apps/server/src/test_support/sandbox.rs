@@ -9,6 +9,8 @@ use std::{
 
 use tempfile::TempDir;
 
+use crate::process::ProcessRunInput;
+
 #[derive(Debug)]
 pub(crate) struct TestSandbox {
     root: TempDir,
@@ -57,6 +59,18 @@ impl TestSandbox {
                 .map(|(key, value)| (key.into(), value.into())),
         );
         environment
+    }
+
+    pub(crate) fn process_input(
+        &self,
+        executable: impl AsRef<Path>,
+        args: impl IntoIterator<Item = impl Into<String>>,
+    ) -> ProcessRunInput {
+        let mut input =
+            ProcessRunInput::new(executable.as_ref().to_string_lossy().into_owned(), args);
+        input.spawn_cwd = Some(self.root().to_path_buf());
+        input.env = Some(self.environment(std::iter::empty::<(String, String)>()));
+        input
     }
 
     #[cfg(unix)]
