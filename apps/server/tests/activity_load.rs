@@ -69,9 +69,10 @@ const DISABLED_TERMINAL_LAUNCHES: usize = 8;
 const SECRET_DISABLED_PAYLOAD: &str = "disabled-load-secret-content";
 
 #[test]
-fn control_registry_mutation_surface_is_not_publicly_exported() {
+fn cancellation_control_mutation_surface_is_not_publicly_exported() {
     // Mutation caught: letting external crates register scopes or inject activity into the overlay.
     let activity_module = include_str!("../src/activity/mod.rs");
+    let cancellation_module = include_str!("../src/activity/cancellation.rs");
     let control_module = include_str!("../src/activity/control.rs");
 
     assert!(!activity_module.contains("pub use control::"));
@@ -82,10 +83,12 @@ fn control_registry_mutation_surface_is_not_publicly_exported() {
         "    pub fn register_runtime(",
         "    pub fn observe_provider_batch(",
         "    pub fn observe_activity_batch(",
+        "pub trait ActivityCancellationDispatcher",
+        "pub struct ActivityCancellationService",
     ] {
         assert!(
-            !control_module.contains(signature),
-            "control mutation surface leaked publicly: {signature}"
+            !control_module.contains(signature) && !cancellation_module.contains(signature),
+            "cancellation mutation surface leaked publicly: {signature}"
         );
     }
 }

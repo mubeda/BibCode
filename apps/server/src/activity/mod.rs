@@ -1,4 +1,6 @@
-#[allow(dead_code)] // Cancellation dispatch starts in Task 3; Task 2 establishes its private seam.
+#[allow(dead_code)] // Wired into RPC and provider dispatch by the next integration task.
+mod cancellation;
+#[allow(dead_code)] // The crate-private overlay is consumed with cancellation integration.
 mod control;
 mod controller;
 mod model;
@@ -7,6 +9,9 @@ mod repository;
 mod routing;
 mod rpc;
 
+#[allow(unused_imports)]
+pub(crate) use cancellation::*;
+#[allow(unused_imports)]
 pub(crate) use control::*;
 pub use controller::*;
 pub use model::*;
