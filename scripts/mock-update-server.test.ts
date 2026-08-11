@@ -11,9 +11,11 @@ import * as Path from "effect/Path";
 import { HttpClient, HttpClientRequest, HttpRouter } from "effect/unstable/http";
 
 import {
+  formatMockUpdateRequestLogEntry,
   makeMockUpdateRouteLayer,
   makeMockUpdateServerLayer,
   makeResolveMockUpdateServerConfig,
+  MOCK_UPDATE_READY_PATH,
   openValidatedUpdateFile,
   resolveByteRange,
   resolveRequestedFilePath,
@@ -379,6 +381,7 @@ it.layer(NodeServices.layer)("mock-update-server", (it) => {
             ConfigProvider.fromEnv({
               env: {
                 BIBCODE_DESKTOP_MOCK_UPDATE_SERVER_PORT: "4312",
+                BIBCODE_DESKTOP_MOCK_UPDATE_SERVER_REQUEST_LOG: path.join(root, "requests.jsonl"),
                 BIBCODE_DESKTOP_MOCK_UPDATE_SERVER_ROOT: root,
               },
             }),
@@ -386,6 +389,7 @@ it.layer(NodeServices.layer)("mock-update-server", (it) => {
         ),
       );
       assert.equal(config.port, 4312);
+      assert.equal(config.requestLogPath, path.join(root, "requests.jsonl"));
       assert.equal(config.rootRealPath, yield* fileSystem.realPath(path.resolve(root)));
 
       const scriptDirectory = path.join(root, "scripts");
@@ -396,9 +400,37 @@ it.layer(NodeServices.layer)("mock-update-server", (it) => {
         Effect.provide(ConfigProvider.layer(ConfigProvider.fromEnv({ env: {} }))),
       );
       assert.equal(defaults.port, 3000);
+      assert.isUndefined(defaults.requestLogPath);
       assert.equal(defaults.rootRealPath, yield* fileSystem.realPath(defaultRoot));
 
       assert.ok(makeMockUpdateServerLayer(config));
+    }),
+  );
+
+  it.effect("publishes deterministic readiness and range-request logs without query secrets", () =>
+    Effect.gen(function* () {
+      const fileSystem = yield* FileSystem.FileSystem;
+      const root = yield* fileSystem.makeTempDirectoryScoped({ prefix: "mock-update-ready-" });
+      const rootRealPath = yield* fileSystem.realPath(root);
+      yield* fileSystem.writeFileString(NodePath.join(root, "candidate.AppImage"), "candidate");
+
+      yield* withMockUpdateServer(
+        rootRealPath,
+        Effect.gen(function* () {
+          const client = yield* HttpClient.HttpClient;
+          const ready = yield* client.get(MOCK_UPDATE_READY_PATH);
+          assert.equal(ready.status, 200);
+          assert.deepEqual(yield* ready.json, { ready: true });
+
+          const entry = formatMockUpdateRequestLogEntry({
+            method: "GET",
+            range: "bytes=0-3",
+            requestUrl: "/candidate.AppImage?token=updater-secret",
+          });
+          assert.equal(entry, '{"method":"GET","path":"/candidate.AppImage","range":"bytes=0-3"}');
+          assert.notInclude(entry, "updater-secret");
+        }),
+      );
     }),
   );
 
