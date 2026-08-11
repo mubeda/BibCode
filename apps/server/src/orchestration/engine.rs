@@ -1391,6 +1391,11 @@ struct CommandEnvelope {
     on_commit: Option<Box<dyn FnOnce() + Send + 'static>>,
 }
 
+struct CommandDispatchOptions<'a> {
+    on_commit: Option<Box<dyn FnOnce() + Send + 'static>>,
+    handoff_cancellation: Option<&'a CancellationToken>,
+}
+
 #[derive(Clone, Default)]
 struct CommandAdmissionFence {
     keys: Arc<StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
@@ -1688,6 +1693,86 @@ impl OrchestrationEngine {
             () = self.shutdown.cancelled() => Err(OrchestrationError::Cancelled),
             claim = self.command_admission.acquire(command_id) => Ok(claim),
         }
+    }
+
+    pub(crate) async fn get_command_receipt_with_claim_cancellation(
+        &self,
+        claim: &CommandAdmissionClaim,
+        command_id: &str,
+        cancellation: &CancellationToken,
+    ) -> Result<Option<CommandReceipt>, OrchestrationError> {
+        claim.ensure_owns(command_id)?;
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => Err(OrchestrationError::Cancelled),
+            receipt = self.repositories.get_command_receipt(command_id.to_owned()) => {
+                receipt.map_err(wrap_persistence)
+            }
+        }
+    }
+
+    pub(crate) async fn verify_legacy_worktree_policy_replay(
+        &self,
+        claim: &CommandAdmissionClaim,
+        receipt: &CommandReceipt,
+        command_id: &str,
+        project_id: &str,
+        expected_policy: &Value,
+    ) -> Result<(), OrchestrationError> {
+        claim.ensure_owns(command_id)?;
+        if receipt.payload_digest.is_some() {
+            return Err(OrchestrationError::CommandConflict {
+                command_id: command_id.to_owned(),
+            });
+        }
+        if receipt.status != "accepted" {
+            return Err(OrchestrationError::PreviouslyRejected {
+                command_id: command_id.to_owned(),
+                detail: receipt
+                    .error
+                    .clone()
+                    .unwrap_or_else(|| "Previously rejected.".to_owned()),
+            });
+        }
+        if receipt.aggregate_kind != "project" || receipt.aggregate_id != project_id {
+            return Err(OrchestrationError::CommandConflict {
+                command_id: command_id.to_owned(),
+            });
+        }
+        let from_sequence_exclusive = receipt.result_sequence.saturating_sub(1).max(0);
+        let events = self
+            .repositories
+            .read_events_from_sequence(from_sequence_exclusive, 1)
+            .await
+            .map_err(wrap_persistence)?;
+        let [event] = events.as_slice() else {
+            return Err(OrchestrationError::CommandConflict {
+                command_id: command_id.to_owned(),
+            });
+        };
+        let compatible_payload = event.event.payload.as_object().is_some_and(|payload| {
+            payload.len() == 3
+                && payload.get("projectId").and_then(Value::as_str) == Some(project_id)
+                && payload.get("updatedAt").is_some_and(Value::is_string)
+                && payload.get("worktreeDiscovery") == Some(expected_policy)
+        });
+        if event.sequence != receipt.result_sequence
+            || event.event.command_id.as_deref() != Some(command_id)
+            || event.event.event_type != "project.meta-updated"
+            || event.event.aggregate_kind != "project"
+            || event.event.aggregate_id != project_id
+            || !event
+                .event
+                .metadata
+                .as_object()
+                .is_some_and(serde_json::Map::is_empty)
+            || !compatible_payload
+        {
+            return Err(OrchestrationError::CommandConflict {
+                command_id: command_id.to_owned(),
+            });
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1990,6 +2075,27 @@ impl OrchestrationEngine {
         .await
     }
 
+    pub(crate) async fn dispatch_with_admission_and_command_claim_until_handoff(
+        &self,
+        command: OrchestrationCommand,
+        admission: CommandAdmission,
+        command_claim: CommandAdmissionClaim,
+        cancellation: &CancellationToken,
+    ) -> Result<DispatchResult, OrchestrationError> {
+        self.dispatch_plain_with_commit(
+            command,
+            Some(admission),
+            None,
+            Some(command_claim),
+            None,
+            CommandDispatchOptions {
+                on_commit: None,
+                handoff_cancellation: Some(cancellation),
+            },
+        )
+        .await
+    }
+
     pub(crate) async fn dispatch_with_command_claim(
         &self,
         command: OrchestrationCommand,
@@ -1997,6 +2103,26 @@ impl OrchestrationEngine {
     ) -> Result<DispatchResult, OrchestrationError> {
         self.dispatch_inner(command, None, None, Some(command_claim), None, None)
             .await
+    }
+
+    pub(crate) async fn dispatch_with_command_claim_until_handoff(
+        &self,
+        command: OrchestrationCommand,
+        command_claim: CommandAdmissionClaim,
+        cancellation: &CancellationToken,
+    ) -> Result<DispatchResult, OrchestrationError> {
+        self.dispatch_plain_with_commit(
+            command,
+            None,
+            None,
+            Some(command_claim),
+            None,
+            CommandDispatchOptions {
+                on_commit: None,
+                handoff_cancellation: Some(cancellation),
+            },
+        )
+        .await
     }
 
     pub(crate) async fn dispatch_with_admission_ownership_and_command_claim(
@@ -2052,7 +2178,10 @@ impl OrchestrationEngine {
             lifetime,
             command_claim,
             ownership,
-            on_commit,
+            CommandDispatchOptions {
+                on_commit,
+                handoff_cancellation: None,
+            },
         )
         .await
     }
@@ -2061,8 +2190,18 @@ impl OrchestrationEngine {
         &self,
         command: OrchestrationCommand,
     ) -> Result<DispatchResult, OrchestrationError> {
-        self.dispatch_plain_with_commit(command, None, None, None, None, None)
-            .await
+        self.dispatch_plain_with_commit(
+            command,
+            None,
+            None,
+            None,
+            None,
+            CommandDispatchOptions {
+                on_commit: None,
+                handoff_cancellation: None,
+            },
+        )
+        .await
     }
 
     async fn dispatch_plain_with_commit(
@@ -2072,8 +2211,12 @@ impl OrchestrationEngine {
         lifetime: Option<CommandLifetimeGuard>,
         command_claim: Option<CommandAdmissionClaim>,
         ownership: Option<WorkspaceOwnershipLease>,
-        on_commit: Option<Box<dyn FnOnce() + Send + 'static>>,
+        options: CommandDispatchOptions<'_>,
     ) -> Result<DispatchResult, OrchestrationError> {
+        let CommandDispatchOptions {
+            on_commit,
+            handoff_cancellation,
+        } = options;
         if self.shutdown.is_cancelled() {
             return Err(OrchestrationError::Cancelled);
         }
@@ -2118,7 +2261,8 @@ impl OrchestrationEngine {
             }
         };
         let (response_tx, response_rx) = oneshot::channel();
-        self.sender
+        let send = self
+            .sender
             .send(WorkerEnvelope::Command(Box::new(CommandEnvelope {
                 command,
                 admission,
@@ -2127,9 +2271,17 @@ impl OrchestrationEngine {
                 ownership,
                 response: response_tx,
                 on_commit,
-            })))
-            .await
-            .map_err(|_| OrchestrationError::WorkerClosed)?;
+            })));
+        if let Some(cancellation) = handoff_cancellation {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return Err(OrchestrationError::Cancelled),
+                result = send => result,
+            }
+        } else {
+            send.await
+        }
+        .map_err(|_| OrchestrationError::WorkerClosed)?;
         response_rx
             .await
             .map_err(|_| OrchestrationError::ResponseDropped)?
@@ -8508,6 +8660,102 @@ mod tests {
             .acquire_command_admission("handoff-command")
             .await
             .expect("claim releases exactly once without deadlock");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn cancelled_receipt_lookup_releases_its_command_claim_while_database_is_blocked() {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let engine = OrchestrationEngine::start(database.clone(), EngineOptions::default())
+            .await
+            .expect("engine");
+        let observer = database
+            .enable_queue_backpressure_observation_for_integration_test()
+            .expect("exclusive database queue observer");
+        let (entered_tx, entered_rx) = oneshot::channel();
+        let release = Arc::new((StdMutex::new(false), Condvar::new()));
+        let blocker_release = release.clone();
+        let blocker_database = database.clone();
+        let blocker = tokio::spawn(async move {
+            blocker_database
+                .call(move |_| {
+                    let _ = entered_tx.send(());
+                    let (released, changed) = blocker_release.as_ref();
+                    let mut released = released.lock().expect("database blocker mutex");
+                    while !*released {
+                        released = changed
+                            .wait(released)
+                            .expect("database blocker mutex after wait");
+                    }
+                    Ok(())
+                })
+                .await
+        });
+        entered_rx.await.expect("database blocker enters");
+
+        let claim = engine
+            .acquire_command_admission("cancelled-receipt-lookup")
+            .await
+            .expect("initial command claim");
+        let cancellation = CancellationToken::new();
+        let lookup_engine = engine.clone();
+        let lookup_cancellation = cancellation.clone();
+        let lookup = tokio::spawn(async move {
+            let result = lookup_engine
+                .get_command_receipt_with_claim_cancellation(
+                    &claim,
+                    "cancelled-receipt-lookup",
+                    &lookup_cancellation,
+                )
+                .await;
+            drop(claim);
+            result
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while database
+                .queue_backpressure_snapshot_for_integration_test()
+                .reserved_or_queued_jobs
+                < 1
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("receipt lookup queues behind the database blocker");
+        cancellation.cancel();
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), lookup)
+                .await
+                .expect("cancelled lookup completes")
+                .expect("lookup task joins"),
+            Err(OrchestrationError::Cancelled)
+        ));
+        let next_claim = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.acquire_command_admission("cancelled-receipt-lookup"),
+        )
+        .await
+        .expect("next claimant does not wait for the blocked receipt lookup")
+        .expect("next claimant acquires");
+        drop(next_claim);
+
+        {
+            let (released, changed) = release.as_ref();
+            *released.lock().expect("database blocker mutex") = true;
+            changed.notify_one();
+        }
+        blocker
+            .await
+            .expect("database blocker joins")
+            .expect("database blocker succeeds");
+        drop(observer);
         engine.shutdown().await;
     }
 

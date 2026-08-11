@@ -75,14 +75,26 @@ server derives the baseline from eligible normalized paths in that snapshot,
 deduplicates it, caps it at 512, and persists the complete policy through the
 durable `project.meta.update` command. The policy handler digests the decoded
 public payload, acquires its cancellation-aware command claim, and transfers
-that claim plus the digest into engine persistence. Only then does mutation
-serialization acquire the stable project-identity lock before the optional
-physical-repository lock. This command-claim, project, repository order is the
-same order used by adoption and removal. It prevents both command/project lock
-cycles and a project switching mutexes while its durable trust pin is
-established, while still serializing known cross-project repository aliases.
-An opposite-payload retry fails with typed `command-conflict`; accepted legacy
-policy receipts without a digest retain their replay behavior.
+that claim plus the digest into engine persistence. Receipt lookup remains
+cancellable while the claim is local. Mutation serialization then acquires the
+stable project-identity lock before the optional physical-repository lock. The
+policy mutation task may outlive an interrupted RPC: cancellation wins while
+waiting for either lock or before engine-envelope handoff, but a successfully
+enqueued envelope retains both mutation locks and the command claim until its
+terminal receipt. A different command therefore re-reads the complete policy
+after its predecessor commits instead of enqueueing a stale full replacement.
+This command-claim, project, repository order is the same order used by
+adoption and removal. It prevents both command/project lock cycles and a
+project switching mutexes while its durable trust pin is established, while
+still serializing known cross-project repository aliases. An opposite-payload
+retry fails with typed `command-conflict`. A digest-less accepted legacy
+receipt replays only when its project identity, terminal sequence, sole empty-
+metadata `project.meta-updated` event, and exact complete policy payload prove
+that it was the same policy operation; unrelated project, generic metadata,
+adoption, and removal receipts fail closed as `command-conflict`.
+Digest-less `reserved` or `prepared` policy receipts still follow the engine's
+aggregate-checked restart-resume path; only accepted legacy replay requires the
+terminal-event proof.
 
 `worktree.adopt` also requires `orchestration:operate`. Its public payload
 contains an opaque catalog key, expected generation, project ID, command ID,

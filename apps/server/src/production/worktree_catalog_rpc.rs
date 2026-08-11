@@ -24,7 +24,7 @@ use crate::{
         canonical_command_digest,
         engine::{CommandAdmissionClaim, OptionalNullable, WorkspaceOwnershipLease},
     },
-    persistence::Repositories,
+    persistence::{CommandReceipt, Repositories},
     rpc::{RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk},
     worktree_catalog::{
         AdoptionValidationError, AdoptionValidationErrorReason, CatalogError, CatalogErrorReason,
@@ -1894,26 +1894,47 @@ async fn update_discovery_policy(
         acquire_worktree_command_claim(&services.orchestration, &input.command_id, &cancellation)
             .await
             .map_err(|error| encode(policy_orchestration_error(error)))?;
-    let legacy_replay = services
+    let existing_receipt = services
         .orchestration
-        .repositories()
-        .get_command_receipt(input.command_id.clone())
+        .get_command_receipt_with_claim_cancellation(
+            &command_claim,
+            &input.command_id,
+            &cancellation,
+        )
         .await
-        .map_err(|error| encode(policy_error(error.to_string())))?
-        .is_some_and(|receipt| receipt.payload_digest.is_none());
+        .map_err(|error| encode(policy_orchestration_error(error)))?;
     let project_id = input.project_id.clone();
-    tokio::select! {
-        biased;
-        () = cancellation.cancelled() => Err(encode(policy_orchestration_error(OrchestrationError::Cancelled))),
-        result = services.catalog.with_project_mutation_lock(&project_id, || async {
-            update_discovery_policy_locked(
-                services,
-                input,
-                payload_digest,
-                command_claim,
-                legacy_replay,
-            ).await
-        }) => result,
+    let services = services.clone();
+    let mutation_cancellation = cancellation.clone();
+    let mutation = tokio::spawn(async move {
+        let operation_cancellation = mutation_cancellation.clone();
+        services
+            .catalog
+            .with_project_mutation_lock_cancellation(
+                &project_id,
+                &mutation_cancellation,
+                || async {
+                    update_discovery_policy_locked(
+                        &services,
+                        input,
+                        payload_digest,
+                        command_claim,
+                        existing_receipt,
+                        operation_cancellation,
+                    )
+                    .await
+                },
+            )
+            .await
+    });
+    match mutation.await {
+        Ok(Some(result)) => result,
+        Ok(None) => Err(encode(policy_orchestration_error(
+            OrchestrationError::Cancelled,
+        ))),
+        Err(error) => Err(encode(policy_error(format!(
+            "Policy mutation task failed: {error}"
+        )))),
     }
 }
 
@@ -1922,7 +1943,8 @@ async fn update_discovery_policy_locked(
     input: WorktreeDiscoveryPolicyUpdateInput,
     payload_digest: String,
     command_claim: CommandAdmissionClaim,
-    legacy_replay: bool,
+    existing_receipt: Option<CommandReceipt>,
+    cancellation: CancellationToken,
 ) -> RpcResult {
     let project = services
         .orchestration
@@ -1966,6 +1988,26 @@ async fn update_discovery_policy_locked(
             "Discovery policy could not be serialized: {error}"
         )))
     })?;
+    let legacy_receipt = existing_receipt
+        .as_ref()
+        .is_some_and(|receipt| receipt.payload_digest.is_none());
+    if let Some(receipt) = existing_receipt.as_ref()
+        && receipt.payload_digest.is_none()
+        && receipt.status == "accepted"
+    {
+        services
+            .orchestration
+            .verify_legacy_worktree_policy_replay(
+                &command_claim,
+                receipt,
+                &input.command_id,
+                &input.project_id,
+                &policy_value,
+            )
+            .await
+            .map_err(|error| encode(policy_orchestration_error(error)))?;
+        return Ok(policy_value);
+    }
     let command = OrchestrationCommand::ProjectMetaUpdate {
         command_id: input.command_id,
         project_id: input.project_id,
@@ -1975,15 +2017,15 @@ async fn update_discovery_policy_locked(
         scripts: None,
         worktree_discovery: Some(policy_value.clone()),
     };
-    if legacy_replay {
+    if legacy_receipt {
         services
             .orchestration
-            .dispatch_with_command_claim(command, command_claim)
+            .dispatch_with_command_claim_until_handoff(command, command_claim, &cancellation)
             .await
     } else {
         services
             .orchestration
-            .dispatch_with_admission_and_command_claim(
+            .dispatch_with_admission_and_command_claim_until_handoff(
                 command,
                 CommandAdmission {
                     payload_digest,
@@ -1991,7 +2033,7 @@ async fn update_discovery_policy_locked(
                     provider_turn: None,
                 },
                 command_claim,
-                || {},
+                &cancellation,
             )
             .await
     }
