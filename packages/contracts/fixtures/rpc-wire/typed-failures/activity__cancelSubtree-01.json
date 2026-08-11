@@ -7,9 +7,9 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "ActivityError",
-          "message": "*3",
-          "reason": "targetUnavailable"
+          "_tag": "EnvironmentAuthorizationError",
+          "message": "\"'kVT/_82:",
+          "requiredScope": "relay:read"
         }
       }
     ]

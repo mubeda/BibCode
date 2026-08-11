@@ -46,6 +46,10 @@ describe("WS_METHODS", () => {
     expect(WS_METHODS.activityGetSnapshot).toBe("activity.getSnapshot");
     expect(WS_METHODS.activityListRoster).toBe("activity.listRoster");
     expect(WS_METHODS.activityListDetail).toBe("activity.listDetail");
+    expect(WS_METHODS).toMatchObject({
+      activityCancelSubtree: "activity.cancelSubtree",
+      activityRetrySubtreeCancellation: "activity.retrySubtreeCancellation",
+    });
     expect(WS_METHODS.subscribeActivity).toBe("subscribeActivity");
   });
 });
@@ -67,6 +71,8 @@ describe("individual RPC definitions", () => {
     expect(WsSourceControlLookupRepositoryRpc._tag).toBe(WS_METHODS.sourceControlLookupRepository);
     expect(WsProjectsReadFileRpc._tag).toBe(WS_METHODS.projectsReadFile);
     expect(WsActivityGetSnapshotRpc._tag).toBe(WS_METHODS.activityGetSnapshot);
+    expect(WsRpcGroup.requests.has("activity.cancelSubtree")).toBe(true);
+    expect(WsRpcGroup.requests.has("activity.retrySubtreeCancellation")).toBe(true);
     expect(WsSubscribeActivityRpc._tag).toBe(WS_METHODS.subscribeActivity);
   });
 

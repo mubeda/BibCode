@@ -8,8 +8,8 @@
         "_tag": "Fail",
         "error": {
           "_tag": "ActivityError",
-          "message": "*3",
-          "reason": "targetUnavailable"
+          "message": "toString",
+          "reason": "partialCancellation"
         }
       }
     ]

@@ -1,0 +1,15 @@
+{
+  "_tag": "Request",
+  "id": "900719925474099312345",
+  "tag": "activity.retrySubtreeCancellation",
+  "payload": {
+    "scope": {
+      "_tag": "thread",
+      "threadId": "thread-1"
+    },
+    "scopeId": "thread:thread-1",
+    "rootActorId": "actor:child-1",
+    "expectedOperationRevision": 4
+  },
+  "headers": []
+}

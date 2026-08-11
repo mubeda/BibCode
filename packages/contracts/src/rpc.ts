@@ -9,15 +9,18 @@ import {
   EnvironmentAuthorizationError,
 } from "./auth.ts";
 import {
+  ActivityCancelSubtreeInput,
   ActivityDetailPage,
   ActivityError,
   ActivityGetSnapshotInput,
   ActivityListDetailInput,
   ActivityListRosterInput,
   ActivityRosterPage,
+  ActivityRetrySubtreeCancellationInput,
   ActivityScopeRef,
   ActivitySnapshot,
   ActivityStreamItem,
+  ActivitySubtreeCancellationResult,
 } from "./activity.ts";
 import {
   FilesystemBrowseInput,
@@ -237,6 +240,8 @@ export const WS_METHODS = {
   activityGetSnapshot: "activity.getSnapshot",
   activityListRoster: "activity.listRoster",
   activityListDetail: "activity.listDetail",
+  activityCancelSubtree: "activity.cancelSubtree",
+  activityRetrySubtreeCancellation: "activity.retrySubtreeCancellation",
 
   // Terminal methods
   terminalOpen: "terminal.open",
@@ -840,6 +845,21 @@ export const WsActivityListDetailRpc = Rpc.make(WS_METHODS.activityListDetail, {
   error: Schema.Union([ActivityError, EnvironmentAuthorizationError]),
 });
 
+export const WsActivityCancelSubtreeRpc = Rpc.make(WS_METHODS.activityCancelSubtree, {
+  payload: ActivityCancelSubtreeInput,
+  success: ActivitySubtreeCancellationResult,
+  error: Schema.Union([ActivityError, EnvironmentAuthorizationError]),
+});
+
+export const WsActivityRetrySubtreeCancellationRpc = Rpc.make(
+  WS_METHODS.activityRetrySubtreeCancellation,
+  {
+    payload: ActivityRetrySubtreeCancellationInput,
+    success: ActivitySubtreeCancellationResult,
+    error: Schema.Union([ActivityError, EnvironmentAuthorizationError]),
+  },
+);
+
 export const WsSubscribeActivityRpc = Rpc.make(WS_METHODS.subscribeActivity, {
   payload: ActivityScopeRef,
   success: ActivityStreamItem,
@@ -925,6 +945,8 @@ export const WsRpcGroup = RpcGroup.make(
   WsActivityGetSnapshotRpc,
   WsActivityListRosterRpc,
   WsActivityListDetailRpc,
+  WsActivityCancelSubtreeRpc,
+  WsActivityRetrySubtreeCancellationRpc,
   WsSubscribeActivityRpc,
   WsOrchestrationDispatchCommandRpc,
   WsOrchestrationGetTurnDiffRpc,
