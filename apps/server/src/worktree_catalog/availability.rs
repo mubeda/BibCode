@@ -388,7 +388,7 @@ impl WorkspaceAvailabilityRegistry {
     }
 
     #[cfg(test)]
-    fn fail_identity_resolution_for_test(&self, kind: io::ErrorKind) {
+    pub(crate) fn fail_identity_resolution_for_test(&self, kind: io::ErrorKind) {
         *lock(&self.identity_resolution_error) = Some(kind);
     }
 

@@ -113,6 +113,15 @@ pub(crate) struct CatalogShallowSignature {
     pub availability: u64,
 }
 
+#[cfg(test)]
+pub(crate) struct RefreshBookkeepingForTest {
+    pub completed_refreshes: u64,
+    pub last_refresh_result: Option<Result<(), CatalogErrorReason>>,
+    pub pending_mutation_refresh_epoch: Option<u64>,
+    pub failure_backoff: Duration,
+    pub retry_scheduled: bool,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) enum DirectoryProbeState {
     Present,
@@ -994,14 +1003,19 @@ impl WorktreeCatalogService {
                 return Err(error);
             }
         }
-        let reconciliation = self
+        let reconciliation = match self
             .inner
             .availability_registry
             .prepare_snapshot_reconciliation(&snapshot)
             .await
             .map_err(|error| {
                 CatalogError::new(CatalogErrorReason::RepositoryUnavailable, error.message)
-            })?;
+            }) {
+            Ok(reconciliation) => reconciliation,
+            Err(error) => {
+                return self.finish_scan_error(entry, fence, ScanError::Catalog(error));
+            }
+        };
         reconciliation.wait_for_drains().await;
         let transitions = {
             let mut state = lock(&entry.state);
@@ -2405,15 +2419,7 @@ impl WorktreeCatalogService {
                 last_authoritative_at: Some(state.last_authoritative.observed_at.clone()),
             },
         ));
-        state.failure_backoff = if state.failure_backoff.is_zero() {
-            self.inner.options.poll_interval
-        } else {
-            state
-                .failure_backoff
-                .saturating_mul(2)
-                .min(self.inner.options.failed_retry_max)
-        };
-        state.next_failure_retry = Some(Instant::now() + state.failure_backoff);
+        self.schedule_failure_retry(&mut state);
         state.completed_at = Some(Instant::now());
         state.completed_refreshes = state.completed_refreshes.wrapping_add(1);
         state.snapshot = Arc::clone(&snapshot);
@@ -2439,6 +2445,7 @@ impl WorktreeCatalogService {
             return Self::complete_stale_generation(&mut state).map(|_| ());
         }
         let restored = if error.reason == CatalogErrorReason::RepositoryUnavailable {
+            self.schedule_failure_retry(&mut state);
             Arc::new(retained_snapshot(
                 &state.last_authoritative,
                 CatalogScanStatus::Degraded {
@@ -2458,6 +2465,18 @@ impl WorktreeCatalogService {
         Self::clear_pending_mutation_refresh(&mut state, fence.mutation_epoch);
         state.sender.send_replace(restored);
         Ok(())
+    }
+
+    fn schedule_failure_retry(&self, state: &mut EntryState) {
+        state.failure_backoff = if state.failure_backoff.is_zero() {
+            self.inner.options.poll_interval
+        } else {
+            state
+                .failure_backoff
+                .saturating_mul(2)
+                .min(self.inner.options.failed_retry_max)
+        };
+        state.next_failure_retry = Some(Instant::now() + state.failure_backoff);
     }
 
     fn finish_cancelled(
@@ -2866,6 +2885,25 @@ impl WorktreeCatalogService {
         self.inner
             .repository_observation_requests
             .load(Ordering::SeqCst)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn refresh_bookkeeping_for_test(
+        &self,
+        project_id: &str,
+    ) -> Option<RefreshBookkeepingForTest> {
+        let entry = self.entry_for_project(project_id)?;
+        let state = lock(&entry.state);
+        Some(RefreshBookkeepingForTest {
+            completed_refreshes: state.completed_refreshes,
+            last_refresh_result: state
+                .last_refresh_result
+                .as_ref()
+                .map(|result| result.as_ref().map(|_| ()).map_err(|error| error.reason)),
+            pending_mutation_refresh_epoch: state.pending_mutation_refresh_epoch,
+            failure_backoff: state.failure_backoff,
+            retry_scheduled: state.next_failure_retry.is_some(),
+        })
     }
 
     #[cfg(test)]

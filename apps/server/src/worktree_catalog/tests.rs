@@ -1079,6 +1079,88 @@ async fn warm_repository_identity_mismatch_retains_arrays_and_publishes_degraded
 }
 
 #[tokio::test]
+async fn warm_identity_reconciliation_error_restores_retained_snapshot_and_finishes_once() {
+    let registry = WorkspaceAvailabilityRegistry::new();
+    let inventory = Arc::new(FakeInventorySource::new((0..2).map(|_| {
+        inventory(
+            "/repo/common",
+            [record("/repo/main", true), record("/repo/external", false)],
+        )
+    })));
+    let options = CatalogServiceOptions::default();
+    let expected_backoff = options.poll_interval;
+    let service = WorktreeCatalogService::with_dependencies_and_availability(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [thread("thread-1", "/repo/external")],
+        )])),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/external", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        options,
+        registry.clone(),
+    );
+    let subscription = service.subscribe("project-1").await.expect("subscription");
+    let authoritative = subscription.latest();
+    let before = service
+        .refresh_bookkeeping_for_test("project-1")
+        .expect("warm refresh bookkeeping");
+
+    registry.fail_identity_resolution_for_test(std::io::ErrorKind::PermissionDenied);
+    service.invalidate_after_mutation("project-1").await;
+    wait_for_mutation_refresh_worker_starts(&service, 1).await;
+    wait_for_active_mutation_refresh_workers(&service, 0).await;
+
+    let degraded = subscription.latest();
+    let after = service
+        .refresh_bookkeeping_for_test("project-1")
+        .expect("settled refresh bookkeeping");
+    assert_eq!(inventory.calls().len(), 2, "the failed refresh runs once");
+    assert_eq!(service.mutation_refresh_worker_start_count_for_test(), 1);
+    assert_eq!(
+        service.max_active_mutation_refresh_worker_count_for_test(),
+        1
+    );
+    assert_eq!(
+        after.completed_refreshes,
+        before.completed_refreshes + 1,
+        "the refresh is finalized once"
+    );
+    assert_eq!(
+        after.last_refresh_result,
+        Some(Err(super::CatalogErrorReason::RepositoryUnavailable)),
+        "coalesced waiters retain the terminal catalog error"
+    );
+    assert_eq!(
+        after.pending_mutation_refresh_epoch, None,
+        "the completed mutation epoch is cleared"
+    );
+    assert_eq!(after.failure_backoff, expected_backoff);
+    assert!(
+        after.retry_scheduled,
+        "the degraded refresh schedules one retry"
+    );
+    assert!(!degraded.authoritative);
+    assert_eq!(degraded.generation, authoritative.generation);
+    assert_eq!(degraded.worktrees, authoritative.worktrees);
+    assert_eq!(
+        degraded.adopted_workspaces,
+        authoritative.adopted_workspaces
+    );
+    assert!(matches!(
+        degraded.scan_status,
+        super::CatalogScanStatus::Degraded {
+            reason: super::CatalogDegradedReason::AnchorUnavailable,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
 async fn mutation_epoch_rejects_a_stale_in_flight_result() {
     let inventory = Arc::new(PausingSecondInventorySource::new(inventory(
         "/repo/common",
