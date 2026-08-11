@@ -84,6 +84,7 @@ interface FilePreviewPanelProps {
   onOpenFile: (relativePath: string) => void;
   onPendingChange: (relativePath: string, pending: boolean) => void;
   editingSessions: FileEditingSessionRegistry<FileEditingSession<FileCommentAnnotationGroup>>;
+  workspaceUnavailable?: string | null;
 }
 
 const FILE_EXPLORER_STORAGE_KEY = "bibcode.fileExplorerOpen";
@@ -281,6 +282,7 @@ function useFileEditingSession({
   relativePath,
   file,
   onPendingChange,
+  enabled,
 }: {
   editingSessions: FilePreviewPanelProps["editingSessions"];
   environmentId: EnvironmentId;
@@ -288,10 +290,11 @@ function useFileEditingSession({
   relativePath: string | null;
   file: ReturnType<typeof useProjectFileQuery>;
   onPendingChange: FilePreviewPanelProps["onPendingChange"];
+  enabled: boolean;
 }): FileEditingSession<FileCommentAnnotationGroup> | null {
   const writeFile = useAtomCommand(projectEnvironment.writeFile);
   return useMemo(() => {
-    if (!relativePath || !file.data || file.data.truncated) return null;
+    if (!enabled || !relativePath || !file.data || file.data.truncated) return null;
     return editingSessions.getOrCreate(
       relativePath,
       () =>
@@ -311,7 +314,16 @@ function useFileEditingSession({
           },
         }),
     );
-  }, [cwd, editingSessions, environmentId, file.data, onPendingChange, relativePath, writeFile]);
+  }, [
+    cwd,
+    editingSessions,
+    enabled,
+    environmentId,
+    file.data,
+    onPendingChange,
+    relativePath,
+    writeFile,
+  ]);
 }
 
 /**
@@ -642,6 +654,7 @@ export default function FilePreviewPanel({
   onOpenFile,
   onPendingChange,
   editingSessions,
+  workspaceUnavailable = null,
 }: FilePreviewPanelProps) {
   const { resolvedTheme } = useTheme();
   const wordWrap = useClientSettings((settings) => settings.wordWrap);
@@ -661,6 +674,7 @@ export default function FilePreviewPanel({
     relativePath,
     file,
     onPendingChange,
+    enabled: workspaceUnavailable === null,
   });
   const [explorerOpen, setExplorerOpen] = useState(initialExplorerOpen);
   const [markdownSourceView, setMarkdownSourceView] = useState<{
@@ -828,7 +842,7 @@ export default function FilePreviewPanel({
           cleanStatus={
             file.data?.truncated || (file.error && file.data === null)
               ? "Editing unavailable"
-              : null
+              : workspaceUnavailable
           }
           markdownView={
             isMarkdown
@@ -916,7 +930,26 @@ export default function FilePreviewPanel({
                 wordWrap={wordWrap}
                 onPostRender={onFilePostRender}
               />
-            ) : null
+            ) : (
+              <Virtualizer className="file-preview-virtualizer min-h-0 flex-1 overflow-auto">
+                <File
+                  file={{
+                    name: relativePath,
+                    contents: file.data.contents,
+                    cacheKey: projectFileCacheKey(cwd, relativePath, file.data.contents),
+                  }}
+                  options={{
+                    disableFileHeader: true,
+                    overflow: wordWrap ? "wrap" : "scroll",
+                    theme: resolveDiffThemeName(resolvedTheme),
+                    themeType: resolvedTheme,
+                    unsafeCSS: FILE_LINK_REVEAL_UNSAFE_CSS,
+                    onPostRender: onFilePostRender,
+                  }}
+                  className="min-h-full"
+                />
+              </Virtualizer>
+            )
           ) : null}
         </div>
         {explorerOpen || relativePath === null ? (
@@ -937,6 +970,7 @@ export default function FilePreviewPanel({
               availableEditors={availableEditors}
               onOpenFile={onOpenFile}
               onBeginPathMutation={(request) => editingSessions.beginPathMutation(request)}
+              workspaceUnavailable={workspaceUnavailable}
             />
           </aside>
         ) : null}

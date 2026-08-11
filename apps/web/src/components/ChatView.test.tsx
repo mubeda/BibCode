@@ -161,6 +161,12 @@ vi.mock("../state/vcs", () => ({
   },
 }));
 
+vi.mock("../state/worktrees", () => ({
+  worktreeEnvironment: {
+    catalog: () => ({ key: "worktree.catalog" }),
+  },
+}));
+
 vi.mock("../state/shell", () => ({
   environmentShell: {
     stateAtom: (environmentId: string) => ({ key: `shell:${environmentId}` }),
@@ -741,7 +747,10 @@ interface TestEnvironmentPresentation {
     readonly environment: {
       readonly label: string;
       readonly serverVersion?: string;
-      readonly capabilities?: { readonly activityProtocolVersion: 1 | null };
+      readonly capabilities?: {
+        readonly activityProtocolVersion: 1 | null;
+        readonly worktreeCatalog?: boolean;
+      };
     };
   } | null;
 }
@@ -757,7 +766,10 @@ function makeEnvironmentPresentation(
     connection: { phase: "connected", error: null, traceId: null },
     serverConfig: {
       providers: [codexProvider],
-      environment: { label: "Local" },
+      environment: {
+        label: "Local",
+        capabilities: { activityProtocolVersion: 1, worktreeCatalog: true },
+      },
     },
     ...overrides,
   };
@@ -4954,3 +4966,127 @@ describe("ChatView file editing registry lifetime", () => {
 });
 
 type _AssertRouteProps = ComponentProps<typeof ChatView>;
+
+describe("ChatView adopted workspace availability", () => {
+  it("keeps legacy workspace threads active when the catalog capability is unsupported", () => {
+    seedEnvironment(
+      makeEnvironmentPresentation({
+        serverConfig: {
+          providers: [codexProvider],
+          environment: {
+            label: "Legacy",
+            capabilities: { activityProtocolVersion: 1, worktreeCatalog: false },
+          },
+        },
+      }),
+    );
+    seedProject(makeProject());
+    seedServerThread(makeThread({ worktreePath: "/legacy/worktree" }));
+    h.queryDataByKey.set("worktree.catalog", {
+      adoptedWorkspaces: [{ threadId, availability: "missing-registered" }],
+    });
+
+    renderServerRoute();
+
+    expect(capturedProps<Record<string, unknown>>("chatHeaderActions")).toMatchObject({
+      workspaceUnavailable: null,
+    });
+    expect(capturedProps<Record<string, unknown>>("chatComposer")).toMatchObject({
+      providerBindingConflictReason: null,
+    });
+  });
+
+  it("uses an adopted worktree path unchanged across the active chat surface", () => {
+    seedEnvironment(makeEnvironmentPresentation());
+    seedProject(makeProject());
+    seedServerThread(makeThread({ worktreePath: "/external/repo-feature" }));
+    seedGitStatus(true);
+    h.queryDataByKey.set("worktree.catalog", {
+      adoptedWorkspaces: [
+        {
+          threadId,
+          path: "/external/repo-feature",
+          branch: "feature/adopted",
+          availability: "present",
+          registrationState: "registered",
+          locked: false,
+          lockReason: null,
+        },
+      ],
+    });
+
+    renderServerRoute();
+
+    expect(capturedProps<Record<string, unknown>>("chatHeaderActions")).toMatchObject({
+      gitCwd: "/external/repo-feature",
+      openInCwd: "/external/repo-feature",
+      workspaceUnavailable: null,
+    });
+    expect(capturedProps<Record<string, unknown>>("chatComposer")).toMatchObject({
+      providerBindingConflictReason: null,
+    });
+  });
+
+  it.each(["missing-registered", "missing-unregistered", "removing"] as const)(
+    "shares one actionable guard while retaining conversation history for %s",
+    async (availability) => {
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(
+        makeThread({
+          worktreePath: "/external/repo-feature",
+          messages: [
+            {
+              id: MessageId.make("message-history"),
+              role: "user",
+              text: "Retained history",
+              turnId: null,
+              createdAt: now,
+              updatedAt: now,
+              streaming: false,
+            },
+          ],
+        }),
+      );
+      seedGitStatus(true);
+      h.queryDataByKey.set("worktree.catalog", {
+        adoptedWorkspaces: [
+          {
+            threadId,
+            path: "/external/repo-feature",
+            branch: "feature/adopted",
+            availability,
+            registrationState: availability === "missing-unregistered" ? null : "registered",
+            locked: false,
+            lockReason: null,
+          },
+        ],
+      });
+
+      renderServerRoute();
+      const header = capturedProps<Record<string, unknown>>("chatHeaderActions");
+      const composer = capturedProps<Record<string, unknown>>("chatComposer");
+      const reason = header["workspaceUnavailable"];
+
+      expect(reason).toEqual(expect.stringContaining("Retry detection"));
+      expect(composer["providerBindingConflictReason"]).toBe(reason);
+      expect(
+        capturedProps<{ timelineEntries: Array<{ message?: { text?: string } }> }>(
+          "messagesTimeline",
+        ).timelineEntries,
+      ).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            message: expect.objectContaining({ text: "Retained history" }),
+          }),
+        ]),
+      );
+      expect(
+        capturedProps<{ items: ComposerBannerStackItem[] }>("composerBannerStack").items,
+      ).toEqual(expect.arrayContaining([expect.objectContaining({ description: reason })]));
+
+      await (composer["onSend"] as () => Promise<void>)();
+      expect(h.commandCalls.some((call) => call.key === "thread.startTurn")).toBe(false);
+    },
+  );
+});

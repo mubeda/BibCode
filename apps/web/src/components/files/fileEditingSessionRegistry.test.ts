@@ -69,6 +69,69 @@ describe("FileEditingSessionRegistry", () => {
     expect(session.flush).toHaveBeenCalledOnce();
   });
 
+  it("pauses every session across workspace loss without flushing on deactivation", () => {
+    const registry = new FileEditingSessionRegistry<ReturnType<typeof fakeSession>>();
+    const active = registry.getOrCreate("src/app.ts", () => fakeSession("src/app.ts"));
+    registry.setActivePath("src/app.ts");
+
+    registry.setSavingEnabled(false);
+    registry.setActivePath(null);
+    const addedWhileUnavailable = registry.getOrCreate("src/other.ts", () =>
+      fakeSession("src/other.ts"),
+    );
+
+    expect(active.pauseSaving).toHaveBeenCalledOnce();
+    expect(active.setAutosaveEnabled).toHaveBeenLastCalledWith(true);
+    expect(active.flush).not.toHaveBeenCalled();
+    expect(addedWhileUnavailable.pauseSaving).toHaveBeenCalledOnce();
+
+    registry.setSavingEnabled(true);
+    expect(active.resumeSaving).toHaveBeenCalledOnce();
+    expect(addedWhileUnavailable.resumeSaving).toHaveBeenCalledOnce();
+  });
+
+  it("composes workspace suspension with an active path-mutation lease", async () => {
+    const registry = new FileEditingSessionRegistry<ReturnType<typeof fakeSession>>();
+    const session = registry.getOrCreate("src/app.ts", () => fakeSession("src/app.ts"));
+    const lease = await registry.beginPathMutation({
+      kind: "rename",
+      fromRelativePath: "src/app.ts",
+      toRelativePath: "src/renamed.ts",
+    });
+
+    registry.setSavingEnabled(false);
+    registry.setSavingEnabled(true);
+    expect(session.resumeSaving).not.toHaveBeenCalled();
+
+    registry.setSavingEnabled(false);
+    lease!.release();
+    await vi.waitFor(() => expect(session.resumeSaving).not.toHaveBeenCalled());
+
+    registry.setSavingEnabled(true);
+    expect(session.resumeSaving).toHaveBeenCalledOnce();
+  });
+
+  it("does not resume a mutation-owned session while acquisition is settling", async () => {
+    const registry = new FileEditingSessionRegistry<ReturnType<typeof fakeSession>>();
+    const session = registry.getOrCreate("src/app.ts", () => fakeSession("src/app.ts"));
+    const settlement = deferredResult<"saved" | "failed">();
+    session.settle.mockReturnValue(settlement.promise);
+
+    const leasePromise = registry.beginPathMutation({
+      kind: "rename",
+      fromRelativePath: "src/app.ts",
+      toRelativePath: "src/renamed.ts",
+    });
+    registry.setSavingEnabled(false);
+    registry.setSavingEnabled(true);
+
+    expect(session.resumeSaving).not.toHaveBeenCalled();
+    settlement.resolve("saved");
+    const lease = await leasePromise;
+    lease!.release();
+    await vi.waitFor(() => expect(session.resumeSaving).toHaveBeenCalledOnce());
+  });
+
   it("persists a paused active edit immediately when a deactivation is released", async () => {
     vi.useFakeTimers();
     const persist = vi.fn(async () => AsyncResult.success(undefined));

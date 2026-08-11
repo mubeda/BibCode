@@ -1613,4 +1613,15 @@ describe("effects wiring", () => {
     expect(descendantCoordinator.settle).toHaveBeenCalledTimes(1);
     expect(testState.editingSessions.beginPathMutation).toHaveBeenCalledTimes(3);
   });
+
+  it("renders a guarded read-only file surface and passes the same reason to the browser", () => {
+    const reason = "Workspace unavailable. Retry detection or remove it from BiBCode.";
+    setFileData("const retained = true;\n");
+    const markup = renderPanel(baseProps({ workspaceUnavailable: reason }));
+
+    expect(ui.find("FileEditorToolbar")).toMatchObject({ canSave: false, cleanStatus: reason });
+    expect(ui.find("FileBrowserPanel")).toMatchObject({ workspaceUnavailable: reason });
+    expect(markup).toContain('data-file="src/app.ts"');
+    expect(testState.editingSessions.getOrCreate).not.toHaveBeenCalled();
+  });
 });

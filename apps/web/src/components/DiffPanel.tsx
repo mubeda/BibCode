@@ -184,6 +184,7 @@ interface DiffPanelProps {
   mode?: DiffPanelMode;
   composerDraftTarget: ScopedThreadRef | DraftId;
   thread?: Thread | null;
+  workspaceUnavailable?: string | null;
 }
 
 export { DiffWorkerPoolProvider } from "./DiffWorkerPoolProvider";
@@ -192,6 +193,7 @@ export default function DiffPanel({
   mode = "inline",
   composerDraftTarget,
   thread: threadOverride,
+  workspaceUnavailable = null,
 }: DiffPanelProps) {
   const { resolvedTheme } = useTheme();
   const settings = useClientSettings();
@@ -243,7 +245,10 @@ export default function DiffPanel({
     serverConfig?.availableEditors ?? [],
   );
   const gitStatusQuery = useEnvironmentQuery(
-    activeThread !== null && activeThread !== undefined && activeCwd != null
+    workspaceUnavailable === null &&
+      activeThread !== null &&
+      activeThread !== undefined &&
+      activeCwd != null
       ? vcsEnvironment.status({
           environmentId: activeThread.environmentId,
           input: { cwd: activeCwd },
@@ -331,14 +336,14 @@ export default function DiffPanel({
       ignoreWhitespace: diffIgnoreWhitespace,
       cacheScope: selectedTurn ? `turn:${selectedTurn.turnId}` : null,
     },
-    { enabled: isGitRepo && selectedTurn !== undefined },
+    { enabled: workspaceUnavailable === null && isGitRepo && selectedTurn !== undefined },
   );
   // Always diff at the thread's own cwd. (A former fallback re-queried at the
   // server's cwd when ReviewService rejected out-of-root paths — that check is
   // gone now that projects can live anywhere, and the fallback silently showed
   // the wrong repo's diff.)
   const branchDiffPreview = useEnvironmentQuery(
-    selectedTurnId === null && activeThread && activeCwd
+    workspaceUnavailable === null && selectedTurnId === null && activeThread && activeCwd
       ? reviewEnvironment.diffPreview({
           environmentId: activeThread.environmentId,
           input: {
@@ -350,14 +355,15 @@ export default function DiffPanel({
       : null,
   );
   useEffect(() => {
-    if (gitRefreshRequestId === 0 || selectedTurnId !== null) return;
+    if (workspaceUnavailable || gitRefreshRequestId === 0 || selectedTurnId !== null) return;
     branchDiffPreview.refresh();
-  }, [branchDiffPreview.refresh, gitRefreshRequestId, selectedTurnId]);
+  }, [branchDiffPreview.refresh, gitRefreshRequestId, selectedTurnId, workspaceUnavailable]);
   const selectedGitSource = branchDiffPreview.data?.sources.find(
     (source) => source.kind === (selectedGitScope === "unstaged" ? "working-tree" : "branch-range"),
   );
   const localBranchRefs = useEnvironmentQuery(
-    selectedTurnId === null &&
+    workspaceUnavailable === null &&
+      selectedTurnId === null &&
       selectedGitScope === "branch" &&
       activeThread &&
       branchDiffPreview.data?.cwd
@@ -374,7 +380,8 @@ export default function DiffPanel({
       : null,
   );
   const remoteBranchRefs = useEnvironmentQuery(
-    selectedTurnId === null &&
+    workspaceUnavailable === null &&
+      selectedTurnId === null &&
       selectedGitScope === "branch" &&
       activeThread &&
       branchDiffPreview.data?.cwd
@@ -749,7 +756,14 @@ export default function DiffPanel({
 
   return (
     <DiffPanelShell mode={mode} header={headerRow}>
-      {!activeThread ? (
+      {workspaceUnavailable ? (
+        <div
+          role="alert"
+          className="flex flex-1 items-center justify-center px-5 text-center text-xs text-muted-foreground"
+        >
+          {workspaceUnavailable}
+        </div>
+      ) : !activeThread ? (
         <div className="flex flex-1 items-center justify-center px-5 text-center text-xs text-muted-foreground/70">
           Select a thread to inspect turn diffs.
         </div>

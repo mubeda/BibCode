@@ -777,4 +777,18 @@ describe("DiffPanel: mode prop", () => {
     const markup = render("sidebar");
     expect(markup).toContain('data-mode="sidebar"');
   });
+
+  it("suppresses workspace refresh queries while guarded", () => {
+    h.gitRefreshRequestId = 4;
+    const markup = renderToStaticMarkup(
+      <DiffPanel
+        composerDraftTarget={routeRef as never}
+        workspaceUnavailable="Workspace unavailable. Retry detection or remove it from BiBCode."
+      />,
+    );
+    runEffects();
+
+    expect(markup).toContain("Workspace unavailable. Retry detection or remove it from BiBCode.");
+    expect(h.diffPreviewRefresh).not.toHaveBeenCalled();
+  });
 });
