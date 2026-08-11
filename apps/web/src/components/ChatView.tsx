@@ -1175,6 +1175,9 @@ function ChatViewContent(props: ChatViewProps) {
   const createPanelThread = useAtomCommand(worktreeEnvironment.createPanel, {
     reportFailure: false,
   });
+  const createManagedWorktree = useAtomCommand(worktreeEnvironment.createManaged, {
+    reportFailure: false,
+  });
   const deleteThread = useAtomCommand(threadEnvironment.delete, { reportFailure: false });
   const updateThreadMetadata = useAtomCommand(threadEnvironment.updateMetadata, {
     reportFailure: false,
@@ -1999,14 +2002,68 @@ function ChatViewContent(props: ChatViewProps) {
   );
 
   const handlePreparedPullRequestThread = useCallback(
-    async (input: { branch: string; worktreePath: string | null }) => {
-      await openOrReuseProjectDraftThread({
-        branch: input.branch,
-        worktreePath: input.worktreePath,
-        envMode: input.worktreePath ? "worktree" : "local",
+    async (input: { branch: string; mode: "local" | "worktree" }) => {
+      if (input.mode === "local") {
+        await openOrReuseProjectDraftThread({
+          branch: input.branch,
+          worktreePath: null,
+          envMode: "local",
+        });
+        return;
+      }
+      if (!activeProject) {
+        throw new Error("No active project is available for this pull request.");
+      }
+      const nextThreadId = newThreadId();
+      const targetInstanceId =
+        activeProject.defaultModelSelection?.instanceId ??
+        useComposerDraftStore.getState().stickyActiveProvider ??
+        defaultInstanceIdForDriver(ProviderDriverKind.make("codex"));
+      const resolution = resolveProviderSessionSelectionForInstance({
+        instanceId: targetInstanceId,
+        providers: activeEnvironment?.serverConfig?.providers ?? [],
+        settings,
+        projectSelection: activeProject.defaultModelSelection,
+      });
+      const result = await createManagedWorktree({
+        environmentId: activeProject.environmentId,
+        input: {
+          commandId: newCommandId(),
+          projectId: activeProject.id,
+          threadId: nextThreadId,
+          title: input.branch,
+          refName: input.branch,
+          newRefName: null,
+          baseRefName: null,
+          threadDefaults: {
+            modelSelection: resolution.modelSelection,
+            runtimeMode: DEFAULT_RUNTIME_MODE,
+            interactionMode: DEFAULT_INTERACTION_MODE,
+          },
+        },
+      });
+      if (result._tag === "Failure") {
+        throw squashAtomCommandFailure(result);
+      }
+      if (resolution.fallback) {
+        console.warn("Provider session default fallback", resolution.fallback);
+      }
+      await navigate({
+        to: "/$environmentId/$threadId",
+        params: {
+          environmentId: activeProject.environmentId,
+          threadId: nextThreadId,
+        },
       });
     },
-    [openOrReuseProjectDraftThread],
+    [
+      activeEnvironment?.serverConfig?.providers,
+      activeProject,
+      createManagedWorktree,
+      navigate,
+      openOrReuseProjectDraftThread,
+      settings,
+    ],
   );
 
   useEffect(() => {
@@ -5857,7 +5914,6 @@ function ChatViewContent(props: ChatViewProps) {
                       key={pullRequestDialogState.key}
                       open
                       environmentId={activeThread.environmentId}
-                      threadId={activeThread.id}
                       cwd={activeProject?.workspaceRoot ?? null}
                       initialReference={pullRequestDialogState.initialReference}
                       onOpenChange={(open) => {

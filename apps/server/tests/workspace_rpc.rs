@@ -41,6 +41,7 @@ async fn workspace_unavailable_rejects_file_search_and_review_before_side_effect
                 availability: AdoptedWorktreeAvailability::MissingRegistered,
             })
             .await
+            .expect("physical identity resolves")
     );
     let rpc = WorkspaceRpc::new(WorkspaceService::default()).with_availability_registry(registry);
     let physical_root = canonical_worktree_path_key(root.path())

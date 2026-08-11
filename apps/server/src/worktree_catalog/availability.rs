@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    io,
     path::{Path, PathBuf},
     sync::{Arc, Condvar, Mutex, MutexGuard},
 };
@@ -13,7 +14,7 @@ use crate::{
     persistence::{CommitFence, CommitPermit},
 };
 
-use super::{AdoptedWorktreeAvailability, WorktreeCatalogSnapshot};
+use super::{AdoptedWorktreeAvailability, WorktreeCatalogSnapshot, bounded_message};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum WorkspaceGuardState {
@@ -44,6 +45,67 @@ pub struct WorkspaceUnavailable {
     pub availability: AdoptedWorktreeAvailability,
     #[serde(skip)]
     pub state: WorkspaceGuardState,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkspaceIdentityError {
+    #[serde(rename = "_tag")]
+    pub tag: &'static str,
+    pub reason: &'static str,
+    pub message: String,
+    pub path: String,
+}
+
+impl WorkspaceIdentityError {
+    fn new(path: &Path, error: &io::Error) -> Self {
+        Self {
+            tag: "WorkspaceIdentityError",
+            reason: "workspace-identity-unavailable",
+            message: bounded_message(format!(
+                "The physical workspace identity for '{}' could not be verified: {error}",
+                path.display()
+            )),
+            path: path.to_string_lossy().into_owned(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(untagged)]
+pub enum WorkspaceAdmissionError {
+    Unavailable(WorkspaceUnavailable),
+    Identity(WorkspaceIdentityError),
+}
+
+impl WorkspaceAdmissionError {
+    #[must_use]
+    pub fn identity(&self) -> Option<&WorkspaceIdentityError> {
+        match self {
+            Self::Identity(error) => Some(error),
+            Self::Unavailable(_) => None,
+        }
+    }
+
+    #[must_use]
+    pub fn unavailable(&self) -> Option<&WorkspaceUnavailable> {
+        match self {
+            Self::Unavailable(error) => Some(error),
+            Self::Identity(_) => None,
+        }
+    }
+}
+
+impl From<WorkspaceUnavailable> for WorkspaceAdmissionError {
+    fn from(error: WorkspaceUnavailable) -> Self {
+        Self::Unavailable(error)
+    }
+}
+
+impl From<WorkspaceIdentityError> for WorkspaceAdmissionError {
+    fn from(error: WorkspaceIdentityError) -> Self {
+        Self::Identity(error)
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -80,6 +142,8 @@ pub struct WorkspaceAvailabilityRegistry {
     terminal_signal_before_permit_pause: Arc<Mutex<Option<TerminalSignalPermitPause>>>,
     #[cfg(test)]
     terminal_signal_after_permit_pause: Arc<Mutex<Option<TerminalSignalPermitPause>>>,
+    #[cfg(test)]
+    identity_resolution_error: Arc<Mutex<Option<io::ErrorKind>>>,
 }
 
 #[derive(Default)]
@@ -316,6 +380,31 @@ impl WorkspaceAvailabilityRegistry {
         Self::default()
     }
 
+    #[cfg(test)]
+    fn with_identity_resolution_error_for_test(kind: io::ErrorKind) -> Self {
+        let registry = Self::new();
+        *lock(&registry.identity_resolution_error) = Some(kind);
+        registry
+    }
+
+    #[cfg(test)]
+    fn fail_identity_resolution_for_test(&self, kind: io::ErrorKind) {
+        *lock(&self.identity_resolution_error) = Some(kind);
+    }
+
+    async fn physical_path_key(&self, path: &Path) -> Result<String, WorkspaceIdentityError> {
+        #[cfg(test)]
+        if let Some(kind) = *lock(&self.identity_resolution_error) {
+            return Err(WorkspaceIdentityError::new(
+                path,
+                &io::Error::new(kind, "injected physical identity failure"),
+            ));
+        }
+        canonical_worktree_path_key(path)
+            .await
+            .map_err(|error| WorkspaceIdentityError::new(path, &error))
+    }
+
     pub async fn guard_thread(&self, thread_id: &str) -> Result<(), WorkspaceUnavailable> {
         let state = lock(&self.inner);
         state
@@ -324,28 +413,28 @@ impl WorkspaceAvailabilityRegistry {
             .map_or(Ok(()), |entry| Err(unavailable(entry)))
     }
 
-    pub async fn guard_path(&self, path: &Path) -> Result<(), WorkspaceUnavailable> {
-        let physical = physical_path_key(path).await;
+    pub async fn guard_path(&self, path: &Path) -> Result<(), WorkspaceAdmissionError> {
+        let physical = self.physical_path_key(path).await?;
         let state = lock(&self.inner);
         state
             .entries
             .values()
             .find(|entry| path_is_within(&physical, &entry.path_key))
-            .map_or(Ok(()), |entry| Err(unavailable(entry)))
+            .map_or(Ok(()), |entry| Err(unavailable(entry).into()))
     }
 
     pub async fn acquire_admission<'a>(
         &self,
         thread_id: &str,
         paths: impl IntoIterator<Item = &'a Path>,
-    ) -> Result<WorkspaceAdmissionLease, WorkspaceUnavailable> {
+    ) -> Result<WorkspaceAdmissionLease, WorkspaceAdmissionError> {
         self.acquire_admission_inner(Some(thread_id), paths).await
     }
 
     pub async fn acquire_path_admission<'a>(
         &self,
         paths: impl IntoIterator<Item = &'a Path>,
-    ) -> Result<WorkspaceAdmissionLease, WorkspaceUnavailable> {
+    ) -> Result<WorkspaceAdmissionLease, WorkspaceAdmissionError> {
         self.acquire_admission_inner(None, paths).await
     }
 
@@ -353,23 +442,23 @@ impl WorkspaceAvailabilityRegistry {
         &self,
         thread_id: Option<&str>,
         paths: impl IntoIterator<Item = &'a Path>,
-    ) -> Result<WorkspaceAdmissionLease, WorkspaceUnavailable> {
+    ) -> Result<WorkspaceAdmissionLease, WorkspaceAdmissionError> {
         let mut path_keys = HashSet::new();
         for path in paths {
-            path_keys.insert(physical_path_key(path).await);
+            path_keys.insert(self.physical_path_key(path).await?);
         }
         let mut state = lock(&self.inner);
         if let Some(thread_id) = thread_id
             && let Some(entry) = state.entries.get(thread_id)
         {
-            return Err(unavailable(entry));
+            return Err(unavailable(entry).into());
         }
         if let Some(entry) = state.entries.values().find(|entry| {
             path_keys
                 .iter()
                 .any(|path| path_is_within(path, &entry.path_key))
         }) {
-            return Err(unavailable(entry));
+            return Err(unavailable(entry).into());
         }
 
         let mut scopes = Vec::with_capacity(path_keys.len() + usize::from(thread_id.is_some()));
@@ -422,8 +511,11 @@ impl WorkspaceAvailabilityRegistry {
         })
     }
 
-    pub async fn mark_unavailable(&self, mut transition: WorkspaceLossTransition) -> bool {
-        transition.path = PathBuf::from(physical_path_key(&transition.path).await);
+    pub async fn mark_unavailable(
+        &self,
+        mut transition: WorkspaceLossTransition,
+    ) -> Result<bool, WorkspaceIdentityError> {
+        transition.path = PathBuf::from(self.physical_path_key(&transition.path).await?);
         let expected = transition.clone();
         let reconciliation = self
             .prepare_reconciliation(vec![WorkspaceAvailabilityAction::MarkUnavailable {
@@ -432,14 +524,18 @@ impl WorkspaceAvailabilityRegistry {
             }])
             .await;
         reconciliation.wait_for_drains().await;
-        reconciliation
+        Ok(reconciliation
             .finalize()
             .iter()
-            .any(|transition| transition == &expected)
+            .any(|transition| transition == &expected))
     }
 
-    pub async fn mark_removing(&self, thread_id: &str, path: &Path) -> RemovalGuard {
-        let path_key = physical_path_key(path).await;
+    pub async fn mark_removing(
+        &self,
+        thread_id: &str,
+        path: &Path,
+    ) -> Result<RemovalGuard, WorkspaceIdentityError> {
+        let path_key = self.physical_path_key(path).await?;
         let removal_id = {
             let mut state = lock(&self.inner);
             state.next_removal_id = state.next_removal_id.wrapping_add(1).max(1);
@@ -454,16 +550,20 @@ impl WorkspaceAvailabilityRegistry {
             .await;
         reconciliation.wait_for_drains().await;
         reconciliation.finalize();
-        RemovalGuard {
+        Ok(RemovalGuard {
             registry: self.clone(),
             thread_id: thread_id.to_owned(),
             removal_id,
             released: false,
-        }
+        })
     }
 
-    pub async fn clear_recovered(&self, thread_id: &str, path: &Path) {
-        self.clear_matching(thread_id, path, None).await;
+    pub async fn clear_recovered(
+        &self,
+        thread_id: &str,
+        path: &Path,
+    ) -> Result<(), WorkspaceIdentityError> {
+        self.clear_matching(thread_id, path, None).await
     }
 
     pub async fn clear_recovered_in_repository(
@@ -471,13 +571,18 @@ impl WorkspaceAvailabilityRegistry {
         thread_id: &str,
         path: &Path,
         repository_key: &str,
-    ) {
+    ) -> Result<(), WorkspaceIdentityError> {
         self.clear_matching(thread_id, path, Some(repository_key))
-            .await;
+            .await
     }
 
-    async fn clear_matching(&self, thread_id: &str, path: &Path, repository_key: Option<&str>) {
-        let path_key = physical_path_key(path).await;
+    async fn clear_matching(
+        &self,
+        thread_id: &str,
+        path: &Path,
+        repository_key: Option<&str>,
+    ) -> Result<(), WorkspaceIdentityError> {
+        let path_key = self.physical_path_key(path).await?;
         let reconciliation = self
             .prepare_reconciliation(vec![WorkspaceAvailabilityAction::ClearRecovered {
                 thread_id: thread_id.to_owned(),
@@ -487,30 +592,31 @@ impl WorkspaceAvailabilityRegistry {
             .await;
         reconciliation.wait_for_drains().await;
         reconciliation.finalize();
+        Ok(())
     }
 
     pub async fn reconcile_snapshot(
         &self,
         snapshot: &WorktreeCatalogSnapshot,
-    ) -> Vec<WorkspaceLossTransition> {
-        let reconciliation = self.prepare_snapshot_reconciliation(snapshot).await;
+    ) -> Result<Vec<WorkspaceLossTransition>, WorkspaceIdentityError> {
+        let reconciliation = self.prepare_snapshot_reconciliation(snapshot).await?;
         reconciliation.wait_for_drains().await;
-        reconciliation.finalize()
+        Ok(reconciliation.finalize())
     }
 
     pub(crate) async fn prepare_snapshot_reconciliation(
         &self,
         snapshot: &WorktreeCatalogSnapshot,
-    ) -> WorkspaceAvailabilityReconciliation {
+    ) -> Result<WorkspaceAvailabilityReconciliation, WorkspaceIdentityError> {
         if !snapshot.authoritative {
-            return self.prepare_reconciliation(Vec::new()).await;
+            return Ok(self.prepare_reconciliation(Vec::new()).await);
         }
         let mut actions = Vec::new();
         for workspace in &snapshot.adopted_workspaces {
             match workspace.availability {
                 AdoptedWorktreeAvailability::MissingRegistered
                 | AdoptedWorktreeAvailability::MissingUnregistered => {
-                    let path = physical_path_key(Path::new(&workspace.path)).await;
+                    let path = self.physical_path_key(Path::new(&workspace.path)).await?;
                     let transition = WorkspaceLossTransition {
                         thread_id: workspace.thread_id.clone(),
                         repository_key: snapshot.repository_key.clone(),
@@ -524,7 +630,7 @@ impl WorkspaceAvailabilityRegistry {
                     });
                 }
                 AdoptedWorktreeAvailability::Present => {
-                    let path_key = physical_path_key(Path::new(&workspace.path)).await;
+                    let path_key = self.physical_path_key(Path::new(&workspace.path)).await?;
                     actions.push(WorkspaceAvailabilityAction::ClearRecovered {
                         thread_id: workspace.thread_id.clone(),
                         path_key,
@@ -535,7 +641,7 @@ impl WorkspaceAvailabilityRegistry {
                 | AdoptedWorktreeAvailability::Removing => {}
             }
         }
-        self.prepare_reconciliation(actions).await
+        Ok(self.prepare_reconciliation(actions).await)
     }
 
     async fn prepare_reconciliation(
@@ -851,7 +957,7 @@ impl WorkspaceAvailabilityRegistry {
         transition: &WorkspaceLossTransition,
     ) -> Option<Arc<Notify>> {
         let guard_state = transition.guard_state()?;
-        let path_key = physical_path_key(&transition.path).await;
+        let path_key = self.physical_path_key(&transition.path).await.ok()?;
         let state = lock(&self.inner);
         let entry = state.entries.get(&transition.thread_id)?;
         (entry.repository_key == transition.repository_key
@@ -1528,12 +1634,6 @@ fn normalized_path(path: &Path) -> String {
     normalize_worktree_path_key(path, host_path_platform())
 }
 
-async fn physical_path_key(path: &Path) -> String {
-    canonical_worktree_path_key(path)
-        .await
-        .unwrap_or_else(|_| normalized_path(path))
-}
-
 fn path_is_within(candidate: &str, root: &str) -> bool {
     candidate == root
         || candidate
@@ -1621,15 +1721,35 @@ mod tests {
             AdoptedWorktreeAvailability::MissingRegistered,
         );
 
-        assert!(registry.mark_unavailable(missing.clone()).await);
-        assert!(!registry.mark_unavailable(missing).await);
+        assert!(
+            registry
+                .mark_unavailable(missing.clone())
+                .await
+                .expect("physical identity resolves")
+        );
+        assert!(
+            !registry
+                .mark_unavailable(missing)
+                .await
+                .expect("physical identity resolves")
+        );
         let changed = transition(
             "repository-a",
             7,
             AdoptedWorktreeAvailability::MissingUnregistered,
         );
-        assert!(registry.mark_unavailable(changed.clone()).await);
-        assert!(!registry.mark_unavailable(changed).await);
+        assert!(
+            registry
+                .mark_unavailable(changed.clone())
+                .await
+                .expect("physical identity resolves")
+        );
+        assert!(
+            !registry
+                .mark_unavailable(changed)
+                .await
+                .expect("physical identity resolves")
+        );
 
         let thread_error = registry
             .guard_thread("thread-1")
@@ -1642,8 +1762,10 @@ mod tests {
             registry
                 .guard_path(Path::new("/repo/worktrees/missing/src/lib.rs"))
                 .await
-                .expect_err("a nested cwd cannot bypass the workspace guard"),
-            thread_error
+                .expect_err("a nested cwd cannot bypass the workspace guard")
+                .unavailable()
+                .expect("guard failure is workspace unavailable"),
+            &thread_error
         );
     }
 
@@ -1659,14 +1781,101 @@ mod tests {
         let physical_descendant = physical_parent.join("removed-worktree/src/lib.rs");
         let registry = WorkspaceAvailabilityRegistry::new();
 
-        let _removing = registry.mark_removing("thread-1", &alias_missing).await;
+        let _removing = registry
+            .mark_removing("thread-1", &alias_missing)
+            .await
+            .expect("physical identity resolves");
 
         let unavailable = registry
             .guard_path(&physical_descendant)
             .await
             .expect_err("a missing checkout alias cannot bypass its physical removal guard");
+        let unavailable = unavailable
+            .unavailable()
+            .expect("alias resolves to the removal guard");
         assert_eq!(unavailable.thread_id, "thread-1");
         assert_eq!(unavailable.state, WorkspaceGuardState::Removing);
+    }
+
+    #[tokio::test]
+    async fn non_missing_identity_failures_abort_every_authority_changing_transition() {
+        let path = Path::new("/repo/worktrees/identity-error");
+
+        let unavailable_registry =
+            WorkspaceAvailabilityRegistry::with_identity_resolution_error_for_test(
+                std::io::ErrorKind::PermissionDenied,
+            );
+        let unavailable_error = unavailable_registry
+            .mark_unavailable(WorkspaceLossTransition {
+                thread_id: "thread-identity".to_owned(),
+                repository_key: "repository-a".to_owned(),
+                generation: 1,
+                path: path.to_path_buf(),
+                availability: AdoptedWorktreeAvailability::MissingRegistered,
+            })
+            .await
+            .expect_err("permission errors cannot become lexical guard authority");
+        assert_eq!(unavailable_error.tag, "WorkspaceIdentityError");
+        assert_eq!(
+            unavailable_registry.guard_thread("thread-identity").await,
+            Ok(())
+        );
+
+        let removal_registry =
+            WorkspaceAvailabilityRegistry::with_identity_resolution_error_for_test(
+                std::io::ErrorKind::Other,
+            );
+        let Err(removal_error) = removal_registry
+            .mark_removing("thread-identity", path)
+            .await
+        else {
+            panic!("symlink loops cannot create a lexical removal guard");
+        };
+        assert_eq!(removal_error.tag, "WorkspaceIdentityError");
+        assert_eq!(
+            removal_registry.guard_thread("thread-identity").await,
+            Ok(())
+        );
+
+        let admission_registry =
+            WorkspaceAvailabilityRegistry::with_identity_resolution_error_for_test(
+                std::io::ErrorKind::PermissionDenied,
+            );
+        let Err(admission_error) = admission_registry.acquire_path_admission([path]).await else {
+            panic!("identity failures cannot admit an unverified filesystem operation");
+        };
+        assert_eq!(
+            admission_error
+                .identity()
+                .expect("typed identity error")
+                .tag,
+            "WorkspaceIdentityError"
+        );
+
+        let recovery_registry = WorkspaceAvailabilityRegistry::new();
+        recovery_registry
+            .mark_unavailable(WorkspaceLossTransition {
+                thread_id: "thread-recovery".to_owned(),
+                repository_key: "repository-a".to_owned(),
+                generation: 1,
+                path: path.to_path_buf(),
+                availability: AdoptedWorktreeAvailability::MissingRegistered,
+            })
+            .await
+            .expect("initial physical identity resolves");
+        recovery_registry.fail_identity_resolution_for_test(std::io::ErrorKind::PermissionDenied);
+        let recovery_error = recovery_registry
+            .clear_recovered("thread-recovery", path)
+            .await
+            .expect_err("identity failure aborts recovery");
+        assert_eq!(recovery_error.tag, "WorkspaceIdentityError");
+        assert!(
+            recovery_registry
+                .guard_thread("thread-recovery")
+                .await
+                .is_err(),
+            "failed recovery cannot clear the existing guard"
+        );
     }
 
     #[test]
@@ -1687,6 +1896,7 @@ mod tests {
                     AdoptedWorktreeAvailability::MissingUnregistered,
                 ))
                 .await
+                .expect("physical identity resolves")
         );
 
         registry
@@ -1695,14 +1905,16 @@ mod tests {
                 Path::new("/repo/worktrees/other"),
                 "repository-a",
             )
-            .await;
+            .await
+            .expect("physical identity resolves");
         registry
             .clear_recovered_in_repository(
                 "thread-1",
                 Path::new("/repo/worktrees/missing"),
                 "repository-b",
             )
-            .await;
+            .await
+            .expect("physical identity resolves");
         assert!(registry.guard_thread("thread-1").await.is_err());
 
         registry
@@ -1711,7 +1923,8 @@ mod tests {
                 Path::new("/repo/worktrees/missing"),
                 "repository-a",
             )
-            .await;
+            .await
+            .expect("physical identity resolves");
         assert_eq!(registry.guard_thread("thread-1").await, Ok(()));
     }
 
@@ -1726,10 +1939,12 @@ mod tests {
                     AdoptedWorktreeAvailability::MissingRegistered,
                 ))
                 .await
+                .expect("physical identity resolves")
         );
         let removal = registry
             .mark_removing("thread-1", Path::new("/repo/worktrees/missing"))
-            .await;
+            .await
+            .expect("physical identity resolves");
         let removing = registry
             .guard_thread("thread-1")
             .await
@@ -1744,6 +1959,7 @@ mod tests {
                     AdoptedWorktreeAvailability::MissingUnregistered,
                 ))
                 .await
+                .expect("physical identity resolves")
         );
         assert_eq!(
             registry
@@ -1776,16 +1992,20 @@ mod tests {
                     AdoptedWorktreeAvailability::MissingRegistered,
                 ))
                 .await
+                .expect("physical identity resolves")
         );
         let outer = registry
             .mark_removing("thread-1", Path::new("/repo/worktrees/missing"))
-            .await;
+            .await
+            .expect("physical identity resolves");
         let middle = registry
             .mark_removing("thread-1", Path::new("/repo/worktrees/missing"))
-            .await;
+            .await
+            .expect("physical identity resolves");
         let inner = registry
             .mark_removing("thread-1", Path::new("/repo/worktrees/missing"))
-            .await;
+            .await
+            .expect("physical identity resolves");
 
         drop(middle);
         drop(outer);
@@ -1814,7 +2034,8 @@ mod tests {
         let registry = WorkspaceAvailabilityRegistry::new();
         let first = registry
             .mark_removing("thread-1", Path::new("/repo/worktrees/missing"))
-            .await;
+            .await
+            .expect("physical identity resolves");
         let identity = first.identity();
         assert!(registry.removal_is_current(&identity));
         let signal = registry
@@ -1845,7 +2066,8 @@ mod tests {
 
         let _removal = registry
             .mark_removing("thread-1", Path::new("/repo/worktrees/missing"))
-            .await;
+            .await
+            .expect("physical identity resolves");
 
         assert!(cancellation.is_cancelled());
         assert_eq!(
@@ -1864,7 +2086,13 @@ mod tests {
             11,
             AdoptedWorktreeAvailability::MissingRegistered,
         );
-        assert!(registry.reconcile_snapshot(&degraded).await.is_empty());
+        assert!(
+            registry
+                .reconcile_snapshot(&degraded)
+                .await
+                .expect("physical identity resolves")
+                .is_empty()
+        );
         assert_eq!(registry.guard_thread("thread-1").await, Ok(()));
 
         let missing = snapshot(
@@ -1873,7 +2101,14 @@ mod tests {
             12,
             AdoptedWorktreeAvailability::MissingRegistered,
         );
-        assert_eq!(registry.reconcile_snapshot(&missing).await.len(), 1);
+        assert_eq!(
+            registry
+                .reconcile_snapshot(&missing)
+                .await
+                .expect("physical identity resolves")
+                .len(),
+            1
+        );
         assert!(registry.guard_thread("thread-1").await.is_err());
 
         let recovered = snapshot(
@@ -1882,7 +2117,13 @@ mod tests {
             13,
             AdoptedWorktreeAvailability::Present,
         );
-        assert!(registry.reconcile_snapshot(&recovered).await.is_empty());
+        assert!(
+            registry
+                .reconcile_snapshot(&recovered)
+                .await
+                .expect("physical identity resolves")
+                .is_empty()
+        );
         assert_eq!(registry.guard_thread("thread-1").await, Ok(()));
     }
 
@@ -1897,6 +2138,7 @@ mod tests {
                     AdoptedWorktreeAvailability::MissingRegistered,
                 ))
                 .await
+                .expect("physical identity resolves")
         );
         let transition = transition(
             "repository-a",
@@ -1925,7 +2167,12 @@ mod tests {
             15,
             AdoptedWorktreeAvailability::MissingRegistered,
         );
-        assert!(registry.mark_unavailable(older.clone()).await);
+        assert!(
+            registry
+                .mark_unavailable(older.clone())
+                .await
+                .expect("physical identity resolves")
+        );
         let active = registry
             .begin_orphan_cleanup(&older)
             .expect("active ownership");
@@ -1938,7 +2185,12 @@ mod tests {
             16,
             AdoptedWorktreeAvailability::MissingUnregistered,
         );
-        assert!(registry.mark_unavailable(newer).await);
+        assert!(
+            registry
+                .mark_unavailable(newer)
+                .await
+                .expect("physical identity resolves")
+        );
 
         assert!(active.is_cancelled());
         assert!(saturated.is_cancelled());
@@ -1955,7 +2207,12 @@ mod tests {
             16,
             AdoptedWorktreeAvailability::MissingRegistered,
         );
-        assert!(registry.mark_unavailable(older.clone()).await);
+        assert!(
+            registry
+                .mark_unavailable(older.clone())
+                .await
+                .expect("physical identity resolves")
+        );
         let first = registry
             .begin_terminal_signal(&older)
             .await
@@ -2009,7 +2266,10 @@ mod tests {
         second_release.notify_one();
         second_cleanup.await.expect("second cleanup task");
         assert!(
-            newer_loss.await.expect("newer loss task"),
+            newer_loss
+                .await
+                .expect("newer loss task")
+                .expect("physical identity resolves"),
             "the newer transition installs after terminal signaling finishes"
         );
         assert!(registry.begin_terminal_signal(&older).await.is_none());
@@ -2029,7 +2289,12 @@ mod tests {
             18,
             AdoptedWorktreeAvailability::MissingRegistered,
         );
-        assert!(registry.mark_unavailable(loss.clone()).await);
+        assert!(
+            registry
+                .mark_unavailable(loss.clone())
+                .await
+                .expect("physical identity resolves")
+        );
         let permit = registry
             .begin_terminal_signal(&loss)
             .await
@@ -2056,7 +2321,8 @@ mod tests {
                     Path::new("/repo/worktrees/missing"),
                     "repository-a",
                 )
-                .await;
+                .await
+                .expect("physical identity resolves");
         });
         invalidation_started.notified().await;
 
@@ -2076,7 +2342,12 @@ mod tests {
             19,
             AdoptedWorktreeAvailability::MissingRegistered,
         );
-        assert!(registry.mark_unavailable(loss.clone()).await);
+        assert!(
+            registry
+                .mark_unavailable(loss.clone())
+                .await
+                .expect("physical identity resolves")
+        );
         let permit = registry
             .begin_terminal_signal(&loss)
             .await
@@ -2093,7 +2364,8 @@ mod tests {
                     Path::new("/repo/worktrees/missing"),
                     "repository-a",
                 )
-                .await;
+                .await
+                .expect("physical identity resolves");
         });
         invalidation_started.notified().await;
         recovery.abort();
@@ -2120,7 +2392,8 @@ mod tests {
                 Path::new("/repo/worktrees/missing"),
                 "repository-a",
             )
-            .await;
+            .await
+            .expect("physical identity resolves");
         assert_eq!(registry.guard_thread("thread-1").await, Ok(()));
     }
 
@@ -2132,7 +2405,12 @@ mod tests {
             20,
             AdoptedWorktreeAvailability::MissingRegistered,
         );
-        assert!(registry.mark_unavailable(loss.clone()).await);
+        assert!(
+            registry
+                .mark_unavailable(loss.clone())
+                .await
+                .expect("physical identity resolves")
+        );
         let permit = registry
             .begin_terminal_signal(&loss)
             .await
@@ -2159,7 +2437,10 @@ mod tests {
         assert!(!removal.is_finished());
         cleanup_release.notify_one();
         cleanup.await.expect("cleanup task");
-        let guard = removal.await.expect("removal task");
+        let guard = removal
+            .await
+            .expect("removal task")
+            .expect("physical identity resolves");
         assert_eq!(
             registry
                 .guard_thread("thread-1")
@@ -2191,7 +2472,12 @@ mod tests {
             15,
             AdoptedWorktreeAvailability::MissingRegistered,
         );
-        assert!(registry.mark_unavailable(loss.clone()).await);
+        assert!(
+            registry
+                .mark_unavailable(loss.clone())
+                .await
+                .expect("physical identity resolves")
+        );
 
         let waiter_registry = registry.clone();
         let waiter_loss = loss.clone();
@@ -2234,6 +2520,7 @@ mod tests {
                     AdoptedWorktreeAvailability::MissingRegistered,
                 ))
                 .await
+                .expect("physical identity resolves")
         );
 
         assert!(
@@ -2268,7 +2555,12 @@ mod tests {
             16,
             AdoptedWorktreeAvailability::MissingRegistered,
         );
-        assert!(registry.mark_unavailable(loss.clone()).await);
+        assert!(
+            registry
+                .mark_unavailable(loss.clone())
+                .await
+                .expect("physical identity resolves")
+        );
         let waiter_registry = registry.clone();
         let waiter = tokio::spawn(async move {
             waiter_registry.wait_for_transition_admissions(&loss).await;
@@ -2317,6 +2609,7 @@ mod tests {
                 .await
                 .expect("loss unblocks after permit drop")
                 .expect("loss task joins")
+                .expect("physical identity resolves")
         );
         assert!(
             fence.acquire().is_err(),

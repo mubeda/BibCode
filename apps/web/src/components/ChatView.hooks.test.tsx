@@ -217,6 +217,7 @@ vi.mock("../state/vcs", () => ({
 vi.mock("../state/worktrees", () => ({
   worktreeEnvironment: {
     catalog: () => ({ key: "worktree.catalog" }),
+    createManaged: { key: "worktree.createManaged" },
     createPanel: { key: "worktree.createPanel" },
   },
 }));
@@ -5371,9 +5372,9 @@ describe("ChatView banners and dialogs", () => {
     await (
       dialog["onPrepared"] as (input: {
         branch: string;
-        worktreePath: string | null;
+        mode: "local" | "worktree";
       }) => Promise<void>
-    )({ branch: "pr-branch", worktreePath: null });
+    )({ branch: "pr-branch", mode: "local" });
 
     expect(h.navigateCalls.length).toBeGreaterThanOrEqual(1);
     const navigateCall = h.navigateCalls[0] as {
@@ -5416,16 +5417,66 @@ describe("ChatView banners and dialogs", () => {
     await (
       dialog["onPrepared"] as (input: {
         branch: string;
-        worktreePath: string | null;
+        mode: "local" | "worktree";
       }) => Promise<void>
-    )({ branch: "pr-branch", worktreePath: "X:/wt" });
+    )({ branch: "pr-branch", mode: "local" });
 
     const session = useComposerDraftStore.getState().getDraftSession(draftId);
-    expect(session?.worktreePath).toBe("X:/wt");
-    expect(session?.envMode).toBe("worktree");
+    expect(session?.worktreePath).toBeNull();
+    expect(session?.envMode).toBe("local");
     expect(h.navigateCalls).toContainEqual({
       to: "/draft/$draftId",
       params: { draftId },
+    });
+  });
+
+  it("creates a pull request worktree through the dedicated atomic owner boundary", async () => {
+    seedConnectedServerThread();
+    seedHostState("pullRequestDialogState", { initialReference: null, key: 3 });
+    h.commandResults["worktree.createManaged"] = (raw) => {
+      const command = raw as {
+        input: { threadId: ThreadId; refName: string };
+      };
+      return AsyncResult.success({
+        threadId: command.input.threadId,
+        path: "X:/managed/pr-branch",
+        refName: command.input.refName,
+      });
+    };
+
+    renderServerRoute();
+    const dialog = capturedProps("pullRequestThreadDialog");
+    await (
+      dialog["onPrepared"] as (input: {
+        branch: string;
+        mode: "local" | "worktree";
+      }) => Promise<void>
+    )({ branch: "pr-branch", mode: "worktree" });
+
+    const [createCall] = commandCallsFor("worktree.createManaged");
+    expect(createCall?.input).toMatchObject({
+      environmentId,
+      input: {
+        projectId,
+        refName: "pr-branch",
+        newRefName: null,
+        baseRefName: null,
+      },
+    });
+    if (!createCall) {
+      throw new Error("expected one managed-worktree creation call");
+    }
+    const managedInput = (createCall.input as { input: Record<string, unknown> }).input;
+    expect(managedInput).not.toHaveProperty("cwd");
+    expect(managedInput).not.toHaveProperty("path");
+    expect(managedInput).not.toHaveProperty("worktreePath");
+    expect(managedInput).not.toHaveProperty("kind");
+    expect(h.navigateCalls).toContainEqual({
+      to: "/$environmentId/$threadId",
+      params: {
+        environmentId,
+        threadId: managedInput["threadId"],
+      },
     });
   });
 

@@ -56,12 +56,6 @@ export function createVcsEnvironmentAtoms<R, E>(
       scheduler: vcsCommandScheduler,
       concurrency: vcsCommandConcurrency,
     }),
-    createWorktree: createEnvironmentRpcCommand(runtime, {
-      label: "environment-data:vcs:create-worktree",
-      tag: WS_METHODS.vcsCreateWorktree,
-      scheduler: vcsCommandScheduler,
-      concurrency: vcsCommandConcurrency,
-    }),
     clone: createEnvironmentRpcCommand(runtime, {
       label: "environment-data:vcs:clone",
       tag: WS_METHODS.vcsClone,

@@ -196,6 +196,14 @@ pub struct VcsWorktree {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct VcsCreateWorktreeResult {
     pub worktree: VcsWorktree,
+    #[serde(skip)]
+    pub(crate) rollback: Option<ManagedWorktreeRollback>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ManagedWorktreeRollback {
+    pub(crate) created_path: PathBuf,
+    pub(crate) created_branch: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

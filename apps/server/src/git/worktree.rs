@@ -111,8 +111,62 @@ pub fn normalize_worktree_path_key(path: &Path, platform: HostPathPlatform) -> S
     let normalized = normalize_lexical_components(&source, platform);
     match platform {
         HostPathPlatform::Posix => normalized,
-        HostPathPlatform::Windows => normalized.to_lowercase(),
+        HostPathPlatform::Windows => windows_ordinal_case_key(&normalized),
     }
+}
+
+#[cfg(not(windows))]
+fn windows_ordinal_case_key(value: &str) -> String {
+    value.to_uppercase()
+}
+
+#[cfg(windows)]
+fn windows_ordinal_case_key(value: &str) -> String {
+    use windows_sys::Win32::Globalization::{
+        LCMAP_UPPERCASE, LCMapStringEx, LOCALE_NAME_INVARIANT,
+    };
+
+    let source = value.encode_utf16().collect::<Vec<_>>();
+    let Ok(source_len) = i32::try_from(source.len()) else {
+        return value.to_uppercase();
+    };
+    // SAFETY: all pointers reference valid UTF-16 buffers for the lengths supplied.
+    let required = unsafe {
+        LCMapStringEx(
+            LOCALE_NAME_INVARIANT,
+            LCMAP_UPPERCASE,
+            source.as_ptr(),
+            source_len,
+            std::ptr::null_mut(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        )
+    };
+    if required <= 0 {
+        return value.to_uppercase();
+    }
+    let mut output = vec![0_u16; required as usize];
+    // SAFETY: output has exactly the capacity reported by the first LCMapStringEx call.
+    let written = unsafe {
+        LCMapStringEx(
+            LOCALE_NAME_INVARIANT,
+            LCMAP_UPPERCASE,
+            source.as_ptr(),
+            source_len,
+            output.as_mut_ptr(),
+            required,
+            std::ptr::null(),
+            std::ptr::null(),
+            0,
+        )
+    };
+    if written <= 0 {
+        return value.to_uppercase();
+    }
+    output.truncate(written as usize);
+    String::from_utf16(&output).unwrap_or_else(|_| value.to_uppercase())
 }
 
 /// Resolves a worktree path through existing host ancestors before normalizing it.
@@ -124,8 +178,8 @@ pub async fn canonical_worktree_path_key(path: &Path) -> io::Result<String> {
     let source = path.to_string_lossy();
     if platform == HostPathPlatform::Posix && looks_like_windows_absolute_path(&source) {
         let foreign_source = source.replace('\\', "/");
-        return Ok(normalize_lexical_components(
-            &foreign_source,
+        return Ok(normalize_worktree_path_key(
+            Path::new(&foreign_source),
             HostPathPlatform::Windows,
         ));
     }
@@ -746,14 +800,14 @@ mod tests {
     fn normalizes_host_path_keys_and_derives_stable_opaque_keys() {
         assert_eq!(
             normalize_worktree_path_key(Path::new(r"C:\Repo\Work\"), HostPathPlatform::Windows),
-            "c:/repo/work"
+            "C:/REPO/WORK"
         );
         assert_eq!(
             normalize_worktree_path_key(
                 Path::new(r"\\Server\Share\Repo\"),
                 HostPathPlatform::Windows
             ),
-            "//server/share/repo"
+            "//SERVER/SHARE/REPO"
         );
         assert_ne!(
             normalize_worktree_path_key(Path::new("/Repo"), HostPathPlatform::Posix),
@@ -799,19 +853,19 @@ mod tests {
                 Path::new(r"C:\Repo\\Work\.\src\..\src"),
                 HostPathPlatform::Windows,
             ),
-            "c:/repo/work/src"
+            "C:/REPO/WORK/SRC"
         );
         assert_eq!(
             normalize_worktree_path_key(
                 Path::new(r"C:\..\..\Repo\Work"),
                 HostPathPlatform::Windows,
             ),
-            "c:/repo/work",
+            "C:/REPO/WORK",
             "drive-root parent traversal cannot escape the drive root",
         );
         assert_eq!(
             normalize_worktree_path_key(Path::new(r"C:..\Repo\.\Work"), HostPathPlatform::Windows,),
-            "c:../repo/work",
+            "C:../REPO/WORK",
             "drive-relative parent traversal must remain drive-relative",
         );
         assert_eq!(
@@ -819,14 +873,14 @@ mod tests {
                 Path::new(r"\\Server\Share\Repo\..\Work"),
                 HostPathPlatform::Windows,
             ),
-            "//server/share/work"
+            "//SERVER/SHARE/WORK"
         );
         assert_eq!(
             normalize_worktree_path_key(
                 Path::new(r"\\Server\Share\..\..\Work"),
                 HostPathPlatform::Windows,
             ),
-            "//server/share/work",
+            "//SERVER/SHARE/WORK",
             "UNC parent traversal cannot escape the share root",
         );
 
@@ -861,13 +915,13 @@ mod tests {
             canonical_worktree_path_key(Path::new(r"C:\Repo\.worktrees\bootstrap"))
                 .await
                 .expect("drive path remains a foreign absolute path"),
-            "C:/Repo/.worktrees/bootstrap"
+            "C:/REPO/.WORKTREES/BOOTSTRAP"
         );
         assert_eq!(
             canonical_worktree_path_key(Path::new(r"\\SÉRVEUR\PARTAGÉ\Δelta"))
                 .await
                 .expect("UNC path remains a foreign absolute path"),
-            "//SÉRVEUR/PARTAGÉ/Δelta"
+            "//SÉRVEUR/PARTAGÉ/ΔELTA"
         );
     }
 
@@ -894,6 +948,39 @@ mod tests {
                 HostPathPlatform::Windows,
             ),
             "UNC server, share, and path components share one Unicode identity"
+        );
+        assert_eq!(
+            normalize_worktree_path_key(Path::new(r"C:\RÉPO\Σ\Feature"), HostPathPlatform::Windows,),
+            normalize_worktree_path_key(Path::new(r"c:/répo/ς/feature"), HostPathPlatform::Windows,),
+            "Windows ordinal caseless identity treats sigma and final sigma as one path"
+        );
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn windows_native_present_and_missing_aliases_share_ordinal_identity() {
+        let root = tempfile::tempdir().expect("Windows identity root");
+        let present = root.path().join("RÉPO").join("Σ");
+        std::fs::create_dir_all(&present).expect("present Unicode path");
+        let present_alias = root.path().join("répo").join("ς");
+        assert_eq!(
+            canonical_worktree_path_key(&present)
+                .await
+                .expect("present identity"),
+            canonical_worktree_path_key(&present_alias)
+                .await
+                .expect("present alias identity")
+        );
+
+        let missing = present.join("MISSING").join("Σ");
+        let missing_alias = present_alias.join("missing").join("ς");
+        assert_eq!(
+            canonical_worktree_path_key(&missing)
+                .await
+                .expect("missing identity"),
+            canonical_worktree_path_key(&missing_alias)
+                .await
+                .expect("missing alias identity")
         );
     }
 

@@ -416,8 +416,8 @@ fn decode<T: for<'de> Deserialize<'de>>(payload: Value) -> Result<T, Value> {
     })
 }
 
-fn workspace_unavailable_wire(error: crate::worktree_catalog::WorkspaceUnavailable) -> Value {
-    serde_json::to_value(error).expect("workspace unavailable error serializes")
+fn workspace_unavailable_wire(error: impl serde::Serialize) -> Value {
+    serde_json::to_value(error).expect("workspace availability error serializes")
 }
 
 fn encode<T: serde::Serialize>(value: T) -> Result<Value, WorkspaceError> {
@@ -707,12 +707,17 @@ mod tests {
         let loss_cancellation = admission.loss_cancellation();
         let loss =
             tokio::spawn(async move { loss_registry.mark_unavailable(loss_transition).await });
-        assert!(loss.await.expect("loss task joins"));
+        assert!(
+            loss.await
+                .expect("loss task joins")
+                .expect("physical identity resolves")
+        );
         assert!(loss_cancellation.is_cancelled());
         drop(admission);
         registry
             .clear_recovered("workspace-thread", &physical_root)
-            .await;
+            .await
+            .expect("physical identity resolves");
 
         let admission = rpc
             .acquire_path(&root.path().to_string_lossy())

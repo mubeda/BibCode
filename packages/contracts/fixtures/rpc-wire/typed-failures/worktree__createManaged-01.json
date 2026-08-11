@@ -7,16 +7,9 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "GitCommandError",
-          "operation": " u#&%!z-<B",
-          "command": "j^L :*,0",
-          "cwd": "",
-          "argumentCount": -1.2153674953603718e-30,
-          "exitCode": 3.6433760072445244e-44,
-          "stdoutLength": 3.402820221199752e38,
-          "stderrLength": -2.6624670822171524e-44,
-          "detail": "}m~;G",
-          "cause": [-18409486606.150444]
+          "_tag": "WorktreeOperationError",
+          "reason": "operation-shutting-down",
+          "message": "u#&%!z-<B"
         }
       }
     ]

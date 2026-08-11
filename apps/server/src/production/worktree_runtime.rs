@@ -2139,7 +2139,8 @@ mod tests {
         let registry = WorkspaceAvailabilityRegistry::new();
         let caller_guard = registry
             .mark_removing("thread-removal", Path::new("/repo/removal"))
-            .await;
+            .await
+            .expect("physical identity resolves");
         let identity = caller_guard.identity();
         let actions = Arc::new(FakeActions::removal_retry());
         let runtime = WorktreeRuntime::start_for_test(
@@ -2182,7 +2183,8 @@ mod tests {
         let registry = WorkspaceAvailabilityRegistry::new();
         let caller_guard = registry
             .mark_removing("thread-removal", Path::new("/repo/removal"))
-            .await;
+            .await
+            .expect("physical identity resolves");
         let identity = caller_guard.identity();
         let runtime = WorktreeRuntime::start_for_test(
             Arc::new(FakeActions::pending()),
@@ -2209,7 +2211,8 @@ mod tests {
         let registry = WorkspaceAvailabilityRegistry::new();
         let caller_guard = registry
             .mark_removing("thread-removal", Path::new("/repo/removal"))
-            .await;
+            .await
+            .expect("physical identity resolves");
         let identity = caller_guard.identity();
         let actions = Arc::new(FakeActions::default());
         let runtime = WorktreeRuntime::start_for_test(
@@ -2267,7 +2270,8 @@ mod tests {
             .expect("first cleanup slot");
         let guard = registry
             .mark_removing("saturated-removal", Path::new("/repo/saturated-removal"))
-            .await;
+            .await
+            .expect("physical identity resolves");
         let lease = WorktreeRemovalQuiescer::quiesce(
             &runtime,
             admission,
@@ -2300,7 +2304,8 @@ mod tests {
         let registry = WorkspaceAvailabilityRegistry::new();
         let guard = registry
             .mark_removing("backoff-removal", Path::new("/repo/backoff-removal"))
-            .await;
+            .await
+            .expect("physical identity resolves");
         let actions = Arc::new(FakeActions::removal_always_fails());
         let runtime = WorktreeRuntime::start_for_test(
             actions.clone(),
@@ -2351,7 +2356,8 @@ mod tests {
         let registry = WorkspaceAvailabilityRegistry::new();
         let caller_guard = registry
             .mark_removing("thread-removal", Path::new("/repo/removal"))
-            .await;
+            .await
+            .expect("physical identity resolves");
         let actions = Arc::new(FakeActions::removal_resolution_retry(vec![
             "thread-removal".to_owned(),
             "panel-alias".to_owned(),
@@ -2406,7 +2412,8 @@ mod tests {
         let registry = WorkspaceAvailabilityRegistry::new();
         let caller_guard = registry
             .mark_removing("thread-removal", Path::new("/repo/removal"))
-            .await;
+            .await
+            .expect("physical identity resolves");
         let actions = Arc::new(FakeActions::removal_always_fails());
         let runtime = WorktreeRuntime::start_for_test(
             actions.clone(),
@@ -2506,7 +2513,8 @@ mod tests {
         let registry = WorkspaceAvailabilityRegistry::new();
         let guard = registry
             .mark_removing("thread-project-a", Path::new("/repo/shared-worktree"))
-            .await;
+            .await
+            .expect("physical identity resolves");
         let request = WorktreeRemovalQuiesceRequest::repository(
             guard.identity(),
             "project-a".to_owned(),
@@ -2553,7 +2561,12 @@ mod tests {
             .await
             .expect("workspace admission");
         let cancellation = lease.loss_cancellation();
-        assert!(registry.mark_unavailable(loss.clone()).await);
+        assert!(
+            registry
+                .mark_unavailable(loss.clone())
+                .await
+                .expect("physical identity resolves")
+        );
         assert!(cancellation.is_cancelled());
         assert!(
             registry
@@ -2605,7 +2618,12 @@ mod tests {
         let actions = Arc::new(HangingAliasActions::default());
         let registry = WorkspaceAvailabilityRegistry::new();
         let loss = transition(1);
-        assert!(registry.mark_unavailable(loss.clone()).await);
+        assert!(
+            registry
+                .mark_unavailable(loss.clone())
+                .await
+                .expect("physical identity resolves")
+        );
         let runtime = WorktreeRuntime::start_for_test(
             actions.clone(),
             registry.clone(),
@@ -2849,11 +2867,21 @@ mod tests {
         }
         let registry = WorkspaceAvailabilityRegistry::new();
         let loss = transition(1);
-        assert!(registry.mark_unavailable(loss.clone()).await);
+        assert!(
+            registry
+                .mark_unavailable(loss.clone())
+                .await
+                .expect("physical identity resolves")
+        );
         append_workspace_warning(&engine, loss.clone())
             .await
             .expect("warning");
-        assert!(!registry.mark_unavailable(loss.clone()).await);
+        assert!(
+            !registry
+                .mark_unavailable(loss.clone())
+                .await
+                .expect("physical identity resolves")
+        );
 
         let snapshot = load_snapshot(&engine.repositories())
             .await
@@ -2947,7 +2975,12 @@ mod tests {
             panic_first: false,
         });
         let registry = WorkspaceAvailabilityRegistry::new();
-        assert!(registry.mark_unavailable(transition(1)).await);
+        assert!(
+            registry
+                .mark_unavailable(transition(1))
+                .await
+                .expect("physical identity resolves")
+        );
         let runtime = WorktreeRuntime::start_for_test(
             actions.clone(),
             registry.clone(),
@@ -2980,7 +3013,12 @@ mod tests {
             retry_release: retry_release.clone(),
         });
         let registry = WorkspaceAvailabilityRegistry::new();
-        assert!(registry.mark_unavailable(transition(1)).await);
+        assert!(
+            registry
+                .mark_unavailable(transition(1))
+                .await
+                .expect("physical identity resolves")
+        );
         let runtime = WorktreeRuntime::start_for_test(
             actions.clone(),
             registry.clone(),
@@ -3051,7 +3089,12 @@ mod tests {
             .await
             .expect("physical terminal root")
             .into();
-        assert!(registry.mark_unavailable(loss.clone()).await);
+        assert!(
+            registry
+                .mark_unavailable(loss.clone())
+                .await
+                .expect("physical identity resolves")
+        );
         let signal_pause = registry.pause_before_next_terminal_signal_permit();
         let actions = Arc::new(RuntimeTerminalActions {
             registry: registry.clone(),
@@ -3075,7 +3118,8 @@ mod tests {
                 loss.path.as_path(),
                 &loss.repository_key,
             )
-            .await;
+            .await
+            .expect("physical identity resolves");
         let recovered_admission = registry
             .acquire_admission(&loss.thread_id, [loss.path.as_path()])
             .await
@@ -3135,7 +3179,12 @@ mod tests {
             .await
             .expect("physical terminal root")
             .into();
-        assert!(registry.mark_unavailable(loss.clone()).await);
+        assert!(
+            registry
+                .mark_unavailable(loss.clone())
+                .await
+                .expect("physical identity resolves")
+        );
         let signal_pause = registry.pause_before_next_terminal_signal_permit();
         let actions = Arc::new(RuntimeTerminalActions {
             registry: registry.clone(),
@@ -3158,7 +3207,8 @@ mod tests {
                 loss.path.as_path(),
                 &loss.repository_key,
             )
-            .await;
+            .await
+            .expect("physical identity resolves");
         signal_pause.release();
         tokio::time::timeout(Duration::from_secs(1), async {
             while runtime.active_reaper_jobs() != 0 {
@@ -3224,7 +3274,12 @@ mod tests {
             .await
             .expect("physical terminal root")
             .into();
-        assert!(registry.mark_unavailable(loss.clone()).await);
+        assert!(
+            registry
+                .mark_unavailable(loss.clone())
+                .await
+                .expect("physical identity resolves")
+        );
         let signal_pause = registry.pause_after_next_terminal_signal_permit();
         let actions = Arc::new(RuntimeTerminalActions {
             registry: registry.clone(),
@@ -3255,7 +3310,8 @@ mod tests {
                     recovery_loss.path.as_path(),
                     &recovery_loss.repository_key,
                 )
-                .await;
+                .await
+                .expect("physical identity resolves");
         });
         tokio::time::timeout(Duration::from_secs(1), invalidation_started.notified())
             .await
@@ -3331,7 +3387,12 @@ mod tests {
         });
         let registry = WorkspaceAvailabilityRegistry::new();
         let loss = transition(1);
-        assert!(registry.mark_unavailable(loss.clone()).await);
+        assert!(
+            registry
+                .mark_unavailable(loss.clone())
+                .await
+                .expect("physical identity resolves")
+        );
         let runtime = WorktreeRuntime::start_for_test(
             actions.clone(),
             registry.clone(),
@@ -3352,7 +3413,8 @@ mod tests {
                 loss.path.as_path(),
                 &loss.repository_key,
             )
-            .await;
+            .await
+            .expect("physical identity resolves");
         assert!(!registry.orphan_cleanup_pending(&loss.thread_id));
         let replacement = registry
             .acquire_admission(&loss.thread_id, [loss.path.as_path()])
@@ -3380,7 +3442,12 @@ mod tests {
             panic_first: true,
         });
         let registry = WorkspaceAvailabilityRegistry::new();
-        assert!(registry.mark_unavailable(transition(1)).await);
+        assert!(
+            registry
+                .mark_unavailable(transition(1))
+                .await
+                .expect("physical identity resolves")
+        );
         let runtime = WorktreeRuntime::start_for_test(
             actions.clone(),
             registry.clone(),
@@ -3408,7 +3475,12 @@ mod tests {
             drops: drops.clone(),
         });
         let registry = WorkspaceAvailabilityRegistry::new();
-        assert!(registry.mark_unavailable(transition(1)).await);
+        assert!(
+            registry
+                .mark_unavailable(transition(1))
+                .await
+                .expect("physical identity resolves")
+        );
         let runtime = WorktreeRuntime::start_for_test(
             actions,
             registry.clone(),
@@ -3445,7 +3517,12 @@ mod tests {
         let actions = Arc::new(FakeActions::pending());
         let registry = WorkspaceAvailabilityRegistry::new();
         for index in 1..=3 {
-            assert!(registry.mark_unavailable(transition(index)).await);
+            assert!(
+                registry
+                    .mark_unavailable(transition(index))
+                    .await
+                    .expect("physical identity resolves")
+            );
         }
         let runtime = WorktreeRuntime::start_for_test(
             actions.clone(),
@@ -3490,7 +3567,12 @@ mod tests {
         let actions = Arc::new(FakeActions::pending());
         let registry = WorkspaceAvailabilityRegistry::new();
         for index in 1..=3 {
-            assert!(registry.mark_unavailable(transition(index)).await);
+            assert!(
+                registry
+                    .mark_unavailable(transition(index))
+                    .await
+                    .expect("physical identity resolves")
+            );
         }
         let runtime = WorktreeRuntime::start_for_test(
             actions.clone(),

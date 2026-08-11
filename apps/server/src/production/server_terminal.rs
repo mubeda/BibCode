@@ -703,6 +703,9 @@ fn workspace_admission_error(error: WorkspaceAdmissionError) -> Value {
         WorkspaceAdmissionError::Unavailable(error) => {
             serde_json::to_value(error).expect("workspace unavailable error serializes")
         }
+        WorkspaceAdmissionError::Identity(error) => {
+            serde_json::to_value(error).expect("workspace identity error serializes")
+        }
         WorkspaceAdmissionError::Resolution(error) => terminal_error(TerminalError::Io(error)),
     }
 }

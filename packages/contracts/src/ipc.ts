@@ -1,8 +1,6 @@
 import type {
   VcsCreateRefInput,
   VcsCreateRefResult,
-  VcsCreateWorktreeInput,
-  VcsCreateWorktreeResult,
   VcsInitInput,
   VcsListRefsInput,
   VcsListRefsResult,
@@ -1250,7 +1248,6 @@ export interface EnvironmentApi {
   };
   vcs: {
     listRefs: (input: VcsListRefsInput) => Promise<VcsListRefsResult>;
-    createWorktree: (input: VcsCreateWorktreeInput) => Promise<VcsCreateWorktreeResult>;
     createRef: (input: VcsCreateRefInput) => Promise<VcsCreateRefResult>;
     switchRef: (input: VcsSwitchRefInput) => Promise<VcsSwitchRefResult>;
     init: (input: VcsInitInput) => Promise<void>;

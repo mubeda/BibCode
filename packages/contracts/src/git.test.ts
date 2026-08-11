@@ -5,7 +5,6 @@ import {
   GitCommandError,
   GitManagerError,
   GitManagerServiceError,
-  VcsCreateWorktreeInput,
   GitPreparePullRequestThreadInput,
   GitPullRequestMaterializationError,
   GitRunStackedActionResult,
@@ -20,7 +19,6 @@ import {
   makeInvalidClassInstance,
 } from "./test/schemaAssertions.ts";
 
-const decodeCreateWorktreeInput = Schema.decodeUnknownSync(VcsCreateWorktreeInput);
 const decodePreparePullRequestThreadInput = Schema.decodeUnknownSync(
   GitPreparePullRequestThreadInput,
 );
@@ -30,54 +28,31 @@ const decodeResolvePullRequestResult = Schema.decodeUnknownSync(GitResolvePullRe
 const decodeManagerServiceError = Schema.decodeUnknownSync(GitManagerServiceError);
 const encodeManagerServiceError = Schema.encodeUnknownSync(GitManagerServiceError);
 
-describe("VcsCreateWorktreeInput", () => {
-  it("accepts omitted newRefName for existing-refName worktrees", () => {
-    const parsed = decodeCreateWorktreeInput({
-      cwd: "/repo",
-      refName: "feature/existing",
-      path: "/tmp/worktree",
-    });
-
-    expect(parsed.newRefName).toBeUndefined();
-    expect(parsed.refName).toBe("feature/existing");
-  });
-
-  it("accepts explicit null refs for existing-ref worktrees", () => {
-    const parsed = decodeCreateWorktreeInput({
-      cwd: "/repo",
-      refName: "feature/existing",
-      newRefName: null,
-      baseRefName: null,
-      path: null,
-    });
-
-    expect(parsed.newRefName).toBeNull();
-    expect(parsed.baseRefName).toBeNull();
-  });
-
-  it("accepts baseRefName metadata for a new worktree ref", () => {
-    const parsed = decodeCreateWorktreeInput({
-      cwd: "/repo",
-      refName: "0123456789abcdef",
-      newRefName: "feature/new",
-      baseRefName: "origin/main",
-      path: "/tmp/worktree",
-    });
-
-    expect(parsed.baseRefName).toBe("origin/main");
-  });
-});
-
 describe("GitPreparePullRequestThreadInput", () => {
-  it("accepts pull request references and mode", () => {
+  it("accepts only local preparation without client-directed owner identity", () => {
     const parsed = decodePreparePullRequestThreadInput({
       cwd: "/repo",
       reference: "#42",
-      mode: "worktree",
+      mode: "local",
     });
 
     expect(parsed.reference).toBe("#42");
-    expect(parsed.mode).toBe("worktree");
+    expect(parsed.mode).toBe("local");
+    expect(() =>
+      decodePreparePullRequestThreadInput({
+        cwd: "/repo",
+        reference: "#42",
+        mode: "worktree",
+      }),
+    ).toThrow();
+    expect(() =>
+      decodePreparePullRequestThreadInput({
+        cwd: "/repo",
+        reference: "#42",
+        mode: "local",
+        threadId: "caller-selected-owner",
+      }),
+    ).toThrow();
   });
 });
 
@@ -235,16 +210,5 @@ describe("git errors", () => {
       makeInvalidClassInstance(GitPullRequestMaterializationError.prototype, invalid),
       encodeExpected,
     );
-  });
-
-  it("reports invalid worktree paths on decode and encode", () => {
-    const invalid = { cwd: "/repo", refName: "main", path: "" };
-    const expected = {
-      rootTag: "Composite" as const,
-      paths: [["path"]],
-      containsTag: "InvalidValue" as const,
-    };
-    expectDecodeFailure(VcsCreateWorktreeInput, invalid, expected);
-    expectEncodeFailure(VcsCreateWorktreeInput, invalid, expected);
   });
 });

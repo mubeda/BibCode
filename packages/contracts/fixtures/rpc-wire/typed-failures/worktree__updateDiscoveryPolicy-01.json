@@ -7,9 +7,9 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "EnvironmentAuthorizationError",
-          "message": "oca",
-          "requiredScope": "review:write"
+          "_tag": "WorktreeOperationError",
+          "reason": "operation-capacity",
+          "message": "^hu[S4b"
         }
       }
     ]

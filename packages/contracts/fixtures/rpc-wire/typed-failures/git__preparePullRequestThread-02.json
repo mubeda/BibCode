@@ -7,9 +7,10 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "EnvironmentAuthorizationError",
-          "message": "/p;@rv)",
-          "requiredScope": "orchestration:read"
+          "_tag": "WorkspaceIdentityError",
+          "reason": "workspace-identity-unavailable",
+          "message": "/p;@rv)t,/",
+          "path": "11|z>]}"
         }
       }
     ]

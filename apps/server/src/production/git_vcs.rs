@@ -2,7 +2,6 @@ use std::{
     ffi::OsString,
     future::Future,
     path::{Path, PathBuf},
-    pin::Pin,
     sync::Arc,
     time::Duration,
 };
@@ -19,9 +18,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     git::{
-        ChangeRequest, CreateWorktreeInput, GitRepository, OutputPolicy, ProcessRequest,
-        ProcessRunner, StatusBroadcaster, VcsStatusLocalResult, VcsStatusRemoteResult,
-        VcsStatusStreamEvent,
+        ChangeRequest, GitRepository, OutputPolicy, ProcessRequest, ProcessRunner,
+        StatusBroadcaster, VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusStreamEvent,
     },
     rpc::{RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk},
     source_control::{
@@ -44,7 +42,6 @@ pub const GIT_VCS_UNARY_METHODS: &[&str] = &[
     "vcs.refreshStatus",
     "vcs.listRefs",
     "vcs.listCommits",
-    "vcs.createWorktree",
     "vcs.clone",
     "vcs.createRef",
     "vcs.switchRef",
@@ -63,23 +60,12 @@ pub const GIT_VCS_UNARY_METHODS: &[&str] = &[
 
 pub const GIT_VCS_STREAM_METHODS: &[&str] = &["subscribeVcsStatus", "git.runStackedAction"];
 
-pub type CatalogMutationFuture<'a> = Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
-
-pub trait CatalogMutationObserver: Send + Sync {
-    fn note_managed_creation<'a>(
-        &'a self,
-        cwd: &'a Path,
-        path: &'a Path,
-    ) -> CatalogMutationFuture<'a>;
-}
-
 #[derive(Clone)]
 pub struct GitVcsRpcServices {
     repository: Arc<GitRepository>,
     broadcaster: StatusBroadcaster,
     discovery: SourceControlDiscovery,
     pull_requests: PullRequestService,
-    catalog_mutation_observer: Option<Arc<dyn CatalogMutationObserver>>,
     availability_registry: Option<WorkspaceAvailabilityRegistry>,
 }
 
@@ -113,18 +99,8 @@ impl GitVcsRpcServices {
             repository,
             discovery: SourceControlDiscovery::default(),
             pull_requests: PullRequestService::default(),
-            catalog_mutation_observer: None,
             availability_registry: None,
         }
-    }
-
-    #[must_use]
-    pub fn with_catalog_mutation_observer(
-        mut self,
-        observer: Arc<dyn CatalogMutationObserver>,
-    ) -> Self {
-        self.catalog_mutation_observer = Some(observer);
-        self
     }
 
     #[must_use]
@@ -240,36 +216,6 @@ impl GitVcsRpcServices {
                         )
                         .await,
                 )
-            }
-            "vcs.createWorktree" => {
-                let input: CreateWorktree = decode(request.payload, "vcs.createWorktree")?;
-                let cwd = input.cwd.clone();
-                let result = self
-                    .repository
-                    .create_worktree(
-                        CreateWorktreeInput {
-                            cwd: input.cwd,
-                            ref_name: input.ref_name,
-                            new_ref_name: input.new_ref_name,
-                            base_ref_name: input.base_ref_name,
-                            path: input.path,
-                        },
-                        &cancellation,
-                    )
-                    .await;
-                match result {
-                    Ok(created) => {
-                        if let Some(observer) = &self.catalog_mutation_observer
-                            && let Err(error) = observer
-                                .note_managed_creation(&cwd, Path::new(&created.worktree.path))
-                                .await
-                        {
-                            tracing::warn!(%error, "catalog creation observation failed");
-                        }
-                        Ok(encode_value(created))
-                    }
-                    Err(error) => Err(serialize_error(error)),
-                }
             }
             "vcs.clone" => {
                 let input: CloneInput = decode(request.payload, "vcs.clone")?;
@@ -630,6 +576,7 @@ impl GitVcsRpcServices {
         input: PreparePullRequestInput,
         cancellation: &CancellationToken,
     ) -> RpcResult {
+        let PreparePullRequestMode::Local = input.mode;
         let pull_request = self
             .resolve_pull_request(
                 &PullRequestInput {
@@ -649,30 +596,11 @@ impl GitVcsRpcServices {
                 "Pull request has no head branch.",
             ));
         }
-        let (branch, worktree_path) = if input.mode == "worktree" {
-            let created = self
-                .repository
-                .create_worktree(
-                    CreateWorktreeInput {
-                        cwd: input.cwd,
-                        ref_name: branch.clone(),
-                        new_ref_name: None,
-                        base_ref_name: None,
-                        path: None,
-                    },
-                    cancellation,
-                )
-                .await
-                .map_err(serialize_error)?;
-            prepared_worktree_response_fields(branch, created)
-        } else {
-            self.repository
-                .switch_ref(&input.cwd, &branch, cancellation)
-                .await
-                .map_err(serialize_error)?;
-            (branch, None)
-        };
-        Ok(json!({ "pullRequest": pull_request, "branch": branch, "worktreePath": worktree_path }))
+        self.repository
+            .switch_ref(&input.cwd, &branch, cancellation)
+            .await
+            .map_err(serialize_error)?;
+        Ok(json!({ "pullRequest": pull_request, "branch": branch }))
     }
 
     async fn lookup_repository(
@@ -1021,15 +949,6 @@ struct ListCommitsInput {
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct CreateWorktree {
-    cwd: PathBuf,
-    ref_name: String,
-    new_ref_name: Option<String>,
-    base_ref_name: Option<String>,
-    path: Option<PathBuf>,
-}
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
 struct CloneInput {
     url: String,
     parent_dir: PathBuf,
@@ -1071,13 +990,16 @@ struct PullRequestInput {
     reference: String,
 }
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct PreparePullRequestInput {
     cwd: PathBuf,
     reference: String,
-    mode: String,
-    #[allow(dead_code)]
-    thread_id: Option<String>,
+    mode: PreparePullRequestMode,
+}
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum PreparePullRequestMode {
+    Local,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -1591,20 +1513,9 @@ fn summarize_commit_context(context: &str, paths: Option<&[String]>) -> String {
         )
 }
 
-fn prepared_worktree_response_fields(
-    _requested_branch: String,
-    created: crate::git::VcsCreateWorktreeResult,
-) -> (String, Option<String>) {
-    (created.worktree.ref_name, Some(created.worktree.path))
-}
-
 #[cfg(all(test, windows))]
 mod tests {
-    use super::{
-        EditorLaunchStrategy, editor_launch_strategy, open_in_editor_with,
-        prepared_worktree_response_fields,
-    };
-    use crate::git::{VcsCreateWorktreeResult, VcsWorktree};
+    use super::{EditorLaunchStrategy, editor_launch_strategy, open_in_editor_with};
     use serde_json::json;
 
     #[test]
@@ -1646,25 +1557,6 @@ mod tests {
         assert_eq!(error["command"], "rustrover");
         assert_eq!(error["args"], json!(["C:\\repo"]));
         assert_eq!(error["cause"], "missing fixture editor");
-    }
-
-    #[test]
-    fn pull_request_worktree_response_uses_the_repository_returned_ref() {
-        let (branch, worktree_path) = prepared_worktree_response_fields(
-            "feature".to_owned(),
-            VcsCreateWorktreeResult {
-                worktree: VcsWorktree {
-                    path: "C:/repo/.bibcode-worktrees/feature-2".to_owned(),
-                    ref_name: "feature-2".to_owned(),
-                },
-            },
-        );
-
-        assert_eq!(branch, "feature-2");
-        assert_eq!(
-            worktree_path.as_deref(),
-            Some("C:/repo/.bibcode-worktrees/feature-2")
-        );
     }
 }
 
@@ -1769,6 +1661,7 @@ mod tests {
                         crate::worktree_catalog::AdoptedWorktreeAvailability::MissingRegistered,
                 })
                 .await
+                .expect("physical identity resolves")
         );
 
         let error = task
@@ -1808,6 +1701,7 @@ mod tests {
                         crate::worktree_catalog::AdoptedWorktreeAvailability::MissingRegistered,
                 })
                 .await
+                .expect("physical identity resolves")
         );
 
         let error = stream
@@ -1958,26 +1852,6 @@ mod tests {
         )
         .await
         .expect("changed file should discard");
-
-        let worktree = temporary.path().join("worktree");
-        unary(
-            &services,
-            "vcs.createWorktree",
-            json!({
-                "cwd":cwd,
-                "refName":"feature",
-                "newRefName":null,
-                "baseRefName":null,
-                "path":worktree,
-            }),
-        )
-        .await
-        .expect("worktree should create");
-        services
-            .repository
-            .remove_worktree(Path::new(&cwd), &worktree, true, &CancellationToken::new())
-            .await
-            .expect("private repository rollback primitive should remove");
 
         let clone_parent = temporary.path().join("clones");
         tokio::fs::create_dir_all(&clone_parent)

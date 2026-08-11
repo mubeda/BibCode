@@ -5965,7 +5965,12 @@ async fn recovered_provider_replacement_survives_a_paused_old_workspace_loss_sto
         path: PathBuf::from("/repo/worktrees/t1"),
         availability: AdoptedWorktreeAvailability::MissingRegistered,
     };
-    assert!(availability.mark_unavailable(transition).await);
+    assert!(
+        availability
+            .mark_unavailable(transition)
+            .await
+            .expect("physical identity resolves")
+    );
     let old_identity = supervisor
         .capture_session_identity("t1")
         .await
@@ -5974,7 +5979,8 @@ async fn recovered_provider_replacement_survives_a_paused_old_workspace_loss_sto
 
     availability
         .clear_recovered_in_repository("t1", Path::new("/repo/worktrees/t1"), "repository-1")
-        .await;
+        .await
+        .expect("physical identity resolves");
     supervisor
         .handle_orchestration(OrchestrationCommand::ThreadRuntimeModeSet {
             command_id: "recovery-restarts-provider".to_owned(),

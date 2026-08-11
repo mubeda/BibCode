@@ -7,9 +7,9 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "EnvironmentAuthorizationError",
-          "message": ".JG_b*",
-          "requiredScope": "terminal:operate"
+          "_tag": "WorktreeOperationError",
+          "reason": "operation-shutting-down",
+          "message": "JG_b*^Mi\\bt"
         }
       }
     ]

@@ -9,10 +9,12 @@ import {
   WorktreeAdoptResult,
   WorktreeAdoptionError,
   WorktreeCatalogError,
+  WorktreeOperationError,
   WorktreeRemovalError,
   WorktreeRemovalPlan,
   WorktreeRemovalResult,
   WorkspaceUnavailableError,
+  WorkspaceIdentityError,
   WorktreeCatalogInput,
   WorktreeCatalogRefreshInput,
   WorktreeDiscoveryPolicyUpdateInput,
@@ -40,8 +42,12 @@ const decodeAdoptionError = Schema.decodeUnknownSync(WorktreeAdoptionError);
 const encodeAdoptionError = Schema.encodeSync(WorktreeAdoptionError);
 const decodeRemovalError = Schema.decodeUnknownSync(WorktreeRemovalError);
 const encodeRemovalError = Schema.encodeSync(WorktreeRemovalError);
+const decodeOperationError = Schema.decodeUnknownSync(WorktreeOperationError);
+const encodeOperationError = Schema.encodeSync(WorktreeOperationError);
 const decodeWorkspaceUnavailableError = Schema.decodeUnknownSync(WorkspaceUnavailableError);
 const encodeWorkspaceUnavailableError = Schema.encodeSync(WorkspaceUnavailableError);
+const decodeWorkspaceIdentityError = Schema.decodeUnknownSync(WorkspaceIdentityError);
+const encodeWorkspaceIdentityError = Schema.encodeSync(WorkspaceIdentityError);
 const decodeCatalogInput = Schema.decodeUnknownSync(WorktreeCatalogInput);
 const decodeAdoptInput = Schema.decodeUnknownSync(WorktreeAdoptInput);
 const encodeAdoptInput = Schema.encodeSync(WorktreeAdoptInput);
@@ -471,6 +477,17 @@ describe("worktree catalog schemas", () => {
       path: "/repo/missing",
       availability: "missing-registered",
     });
+    const operationError = decodeOperationError({
+      _tag: "WorktreeOperationError",
+      reason: "operation-capacity",
+      message: "Retry after another worktree operation finishes.",
+    });
+    const workspaceIdentityError = decodeWorkspaceIdentityError({
+      _tag: "WorkspaceIdentityError",
+      reason: "workspace-identity-unavailable",
+      message: "The physical workspace identity could not be verified.",
+      path: "/repo/unverified",
+    });
     const results = [
       {
         threadRemoved: true,
@@ -490,10 +507,16 @@ describe("worktree catalog schemas", () => {
       "WorktreeAdoptionError",
     );
     expect(decodeRemovalError(encodeRemovalError(removalError))._tag).toBe("WorktreeRemovalError");
+    expect(decodeOperationError(encodeOperationError(operationError))._tag).toBe(
+      "WorktreeOperationError",
+    );
     expect(
       decodeWorkspaceUnavailableError(encodeWorkspaceUnavailableError(workspaceUnavailableError))
         ._tag,
     ).toBe("WorkspaceUnavailableError");
+    expect(
+      decodeWorkspaceIdentityError(encodeWorkspaceIdentityError(workspaceIdentityError))._tag,
+    ).toBe("WorkspaceIdentityError");
     expect(
       results.map((result) =>
         decodeRemovalResult(encodeRemovalResult(decodeRemovalResult(result))),

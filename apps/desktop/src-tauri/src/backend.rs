@@ -4171,7 +4171,6 @@ exit /b 9
             "sourceControl.lookupRepository",
             "sourceControl.publishRepository",
             "vcs.createRef",
-            "vcs.createWorktree",
             "vcs.discardFiles",
             "vcs.generateCommitMessage",
             "vcs.listCommits",

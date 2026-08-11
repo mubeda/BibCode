@@ -2,7 +2,7 @@ use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
-    sync::{Arc, Mutex},
+    sync::Mutex,
     time::Duration,
 };
 
@@ -19,38 +19,11 @@ use tokio::time::timeout;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 use bibcode_server::production::git_vcs::{
-    CatalogMutationFuture, CatalogMutationObserver, GIT_VCS_STREAM_METHODS, GIT_VCS_UNARY_METHODS,
-    GitVcsRpcServices, register_git_vcs_rpc,
+    GIT_VCS_STREAM_METHODS, GIT_VCS_UNARY_METHODS, GitVcsRpcServices, register_git_vcs_rpc,
 };
 
 const ISOLATED_GIT_TEST: &str = "BIBCODE_PRODUCTION_GIT_VCS_RPC_ISOLATED";
 static ISOLATED_GIT_TEST_LOCK: Mutex<()> = Mutex::new(());
-
-#[derive(Default)]
-struct RecordingCatalogMutationObserver {
-    creations: Mutex<Vec<(PathBuf, PathBuf)>>,
-    fail_observation: bool,
-}
-
-impl CatalogMutationObserver for RecordingCatalogMutationObserver {
-    fn note_managed_creation<'a>(
-        &'a self,
-        cwd: &'a Path,
-        path: &'a Path,
-    ) -> CatalogMutationFuture<'a> {
-        Box::pin(async move {
-            self.creations
-                .lock()
-                .expect("creation records")
-                .push((cwd.to_path_buf(), path.to_path_buf()));
-            if self.fail_observation {
-                Err("Git repository identity could not be verified after creation".to_owned())
-            } else {
-                Ok(())
-            }
-        })
-    }
-}
 
 type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
 
@@ -74,6 +47,7 @@ async fn workspace_unavailable_rejects_git_status_and_mutation_before_process_la
                 availability: AdoptedWorktreeAvailability::MissingUnregistered,
             })
             .await
+            .expect("physical identity resolves")
     );
     let services = GitVcsRpcServices::default().with_availability_registry(availability);
     let mut registry = RpcRegistry::empty();
@@ -162,7 +136,6 @@ fn registrar_owns_the_complete_git_vcs_rpc_surface() {
             "vcs.refreshStatus",
             "vcs.listRefs",
             "vcs.listCommits",
-            "vcs.createWorktree",
             "vcs.clone",
             "vcs.createRef",
             "vcs.switchRef",
@@ -186,60 +159,46 @@ fn registrar_owns_the_complete_git_vcs_rpc_surface() {
 }
 
 #[tokio::test]
-async fn unverifiable_catalog_identity_does_not_reclassify_successful_managed_creation() {
+async fn raw_vcs_create_worktree_is_unavailable_without_git_side_effects() {
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     initialize_repository(&repository);
-    commit_file(
-        repository.path(),
-        "README.md",
-        "catalog observer\n",
-        "initial",
-    );
-    let worktree = repository.path().join("catalog-observed");
-    let observer = Arc::new(RecordingCatalogMutationObserver {
-        fail_observation: true,
-        ..RecordingCatalogMutationObserver::default()
-    });
-    let services =
-        GitVcsRpcServices::with_repository(Arc::new(bibcode_server::git::GitRepository::default()))
-            .with_catalog_mutation_observer(observer.clone());
-    let mut registry = RpcRegistry::empty();
-    register_git_vcs_rpc(&mut registry, services);
-    let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
-        .await
-        .expect("server starts");
-    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
-        .await
-        .expect("WebSocket connects");
+    commit_file(repository.path(), "tracked.txt", "base\n", "initial");
+    let worktree_path = temp.path().join("raw-created");
+    let mut server = GitServerHarness::start(&temp).await;
 
     request(
-        &mut socket,
-        "901",
+        server.socket(),
+        "906",
         "vcs.createWorktree",
         json!({
             "cwd": repository.path(),
             "refName": "main",
-            "newRefName": "feature/catalog-observed",
+            "newRefName": "feature/raw-created",
             "baseRefName": "main",
-            "path": worktree,
+            "path": worktree_path,
         }),
     )
     .await;
-    let created = success_value(&mut socket, "901").await;
-    let created_path = PathBuf::from(created["worktree"]["path"].as_str().expect("created path"));
-    assert_eq!(
-        observer
-            .creations
-            .lock()
-            .expect("creation records")
-            .as_slice(),
-        &[(repository.path().to_path_buf(), created_path)]
+    let response = next_server_message(server.socket()).await;
+    assert!(
+        matches!(
+            &response,
+            ServerMessage::Defect { defect }
+                if defect.as_str().is_some_and(|detail| {
+                    detail.contains("Unknown request tag")
+                        && detail.contains("vcs.createWorktree")
+                })
+        ),
+        "the retired raw creation method must be unavailable: {response:?}"
     );
-
-    socket.close(None).await.expect("close WebSocket");
-    handle.shutdown();
-    handle.join().await.expect("server joins");
+    assert!(!worktree_path.exists());
+    assert!(
+        git_stdout(&repository, &["branch", "--list", "feature/raw-created"])
+            .trim()
+            .is_empty()
+    );
+    server.shutdown().await;
 }
 
 #[tokio::test]
@@ -255,7 +214,7 @@ async fn registers_native_vcs_handlers_with_unchanged_wire_shapes() {
         .await
         .expect("WebSocket connects");
 
-    let cwd = repository.path().to_string_lossy();
+    let cwd = repository.path().to_string_lossy().into_owned();
     request(&mut socket, "1", "vcs.init", json!({ "cwd": cwd })).await;
     assert_success_eq(&mut socket, "1", Value::Null).await;
 
@@ -1345,31 +1304,16 @@ async fn list_refs_commits_and_ref_lifecycle_round_trip_over_rpc() {
         "main"
     );
 
-    request(
-        server.socket(),
-        "205",
-        "vcs.createWorktree",
-        json!({
-            "cwd": cwd,
-            "refName": "main",
-            "newRefName": "feature/worktree",
-            "baseRefName": "main",
-            "path": worktree_path,
-        }),
-    )
-    .await;
-    let created_worktree = success_value(server.socket(), "205").await;
-    assert_eq!(
-        created_worktree["worktree"]["refName"],
-        json!("feature/worktree")
-    );
-    assert_eq!(
-        canonical_path(
-            created_worktree["worktree"]["path"]
-                .as_str()
-                .expect("worktree path"),
-        ),
-        canonical_path(&worktree_path)
+    run_git_in(
+        &repository,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/worktree",
+            worktree_path.to_str().expect("UTF-8 worktree path"),
+            "main",
+        ],
     );
     assert!(worktree_path.exists());
 
@@ -1715,23 +1659,16 @@ async fn clone_pull_and_worktree_lifecycle_round_trip_over_rpc() {
         "remote change\n"
     );
 
-    request(
-        server.socket(),
-        "404",
-        "vcs.createWorktree",
-        json!({
-            "cwd": consumer_cwd,
-            "refName": "main",
-            "newRefName": "feature/pull-worktree",
-            "baseRefName": "main",
-            "path": worktree_path,
-        }),
-    )
-    .await;
-    let created_worktree = success_value(server.socket(), "404").await;
-    assert_eq!(
-        created_worktree["worktree"]["refName"],
-        "feature/pull-worktree"
+    run_git_in(
+        &consumer,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/pull-worktree",
+            worktree_path.to_str().expect("UTF-8 worktree path"),
+            "main",
+        ],
     );
     assert!(worktree_path.exists());
     fs::write(worktree_path.join("dirty.txt"), "dirty\n").expect("dirty worktree file");
@@ -2324,14 +2261,55 @@ async fn pull_request_rpc_adapters_execute_resolution_and_preparation_paths() {
         json!({
             "cwd":cwd,
             "reference":"current",
-            "mode":"switch",
-            "threadId":"thread-1",
+            "mode":"local",
         }),
     )
     .await;
     let preparation = failure_value(server.socket(), "602").await;
     assert_eq!(preparation["_tag"], "SourceControlProviderError");
 
+    server.shutdown().await;
+}
+
+#[tokio::test]
+async fn pull_request_preparation_rejects_client_directed_worktree_ownership_fields() {
+    let temp = TempDir::new().expect("temporary server directory");
+    let repository = TempDir::new().expect("temporary repository");
+    initialize_repository(&repository);
+    commit_file(repository.path(), "tracked.txt", "base\n", "initial");
+    let cwd = repository.path().to_string_lossy();
+    let mut server = GitServerHarness::start(&temp).await;
+
+    for (request_id, payload) in [
+        (
+            "603",
+            json!({"cwd":cwd.clone(),"reference":"current","mode":"worktree"}),
+        ),
+        (
+            "604",
+            json!({
+                "cwd":cwd.clone(),
+                "reference":"current",
+                "mode":"local",
+                "threadId":"caller-selected-owner"
+            }),
+        ),
+    ] {
+        request(
+            server.socket(),
+            request_id,
+            "git.preparePullRequestThread",
+            payload,
+        )
+        .await;
+        let error = failure_value(server.socket(), request_id).await;
+        assert_eq!(error["_tag"], "RpcRequestInvalid");
+    }
+
+    assert_eq!(
+        git_stdout(&repository, &["branch", "--show-current"]).trim(),
+        "main"
+    );
     server.shutdown().await;
 }
 

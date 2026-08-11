@@ -68,7 +68,9 @@ describe("WS_METHODS", () => {
     expect(unique.size).toBe(values.length);
   });
 
-  it("does not expose a raw destructive worktree method", () => {
+  it("does not expose raw worktree lifecycle methods", () => {
+    expect("vcsCreateWorktree" in WS_METHODS).toBe(false);
+    expect(Object.values(WS_METHODS)).not.toContain("vcs.createWorktree");
     expect("vcsRemoveWorktree" in WS_METHODS).toBe(false);
     expect(Object.values(WS_METHODS)).not.toContain("vcs.removeWorktree");
   });
@@ -119,6 +121,55 @@ describe("individual RPC definitions", () => {
       WsReviewGetDiffPreviewRpc,
     ]) {
       expect(() => Schema.decodeUnknownSync(rpc.errorSchema)(unavailable)).not.toThrow();
+    }
+  });
+
+  it("accepts physical identity failures at guarded and removal boundaries", () => {
+    const identity = {
+      _tag: "WorkspaceIdentityError",
+      reason: "workspace-identity-unavailable",
+      message: "The physical workspace identity could not be verified.",
+      path: "/repo/worktrees/alias",
+    };
+    for (const rpc of [
+      WsOrchestrationDispatchCommandRpc,
+      WsTerminalOpenRpc,
+      WsTerminalWriteRpc,
+      WsVcsPullRpc,
+      WsProjectsReadFileRpc,
+      WsReviewGetDiffPreviewRpc,
+      WsWorktreeRemoveFromBibCodeRpc,
+      WsWorktreeRemoveRpc,
+    ]) {
+      expect(() => Schema.decodeUnknownSync(rpc.errorSchema)(identity)).not.toThrow();
+    }
+  });
+
+  it("accepts structured finite-operation admission failures at every mutating worktree boundary", () => {
+    for (const failure of [
+      {
+        _tag: "WorktreeOperationError",
+        reason: "operation-capacity",
+        message: "The server is already processing the maximum number of worktree operations.",
+      },
+      {
+        _tag: "WorktreeOperationError",
+        reason: "operation-shutting-down",
+        message: "The worktree operation runtime is shutting down.",
+      },
+    ]) {
+      for (const rpc of [
+        WsWorktreeUpdateDiscoveryPolicyRpc,
+        WsWorktreeAdoptRpc,
+        WsWorktreeCreateManagedRpc,
+        WsWorktreeCreatePanelRpc,
+        WsWorktreeRetargetRpc,
+        WsWorktreeGetRemovalPlanRpc,
+        WsWorktreeRemoveFromBibCodeRpc,
+        WsWorktreeRemoveRpc,
+      ]) {
+        expect(() => Schema.decodeUnknownSync(rpc.errorSchema)(failure)).not.toThrow();
+      }
     }
   });
 

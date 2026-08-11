@@ -269,6 +269,7 @@ impl TurnDeliveryService {
 fn workspace_admission_detail(error: WorkspaceAdmissionError) -> String {
     match error {
         WorkspaceAdmissionError::Unavailable(error) => error.message,
+        WorkspaceAdmissionError::Identity(error) => error.message,
         WorkspaceAdmissionError::Resolution(error) => error,
     }
 }
@@ -1225,6 +1226,7 @@ mod tests {
                     availability: AdoptedWorktreeAvailability::MissingRegistered,
                 })
                 .await
+                .expect("physical identity resolves")
         );
         let admission = WorkspaceAdmissionController::registry_only(registry);
         let delivery_calls = Arc::new(AtomicUsize::new(0));
@@ -1318,6 +1320,7 @@ mod tests {
                     availability: AdoptedWorktreeAvailability::MissingRegistered,
                 })
                 .await
+                .expect("physical identity resolves")
         );
         tokio::task::yield_now().await;
         let finished = route.is_finished();
@@ -3437,7 +3440,7 @@ mod tests {
         assert_eq!(thread.branch.as_deref(), Some("bibcode/bootstrap"));
         assert_eq!(
             thread.worktree_path.as_deref(),
-            Some("C:/repo/.worktrees/bootstrap")
+            Some("C:/REPO/.WORKTREES/BOOTSTRAP")
         );
 
         service.shutdown().await;
