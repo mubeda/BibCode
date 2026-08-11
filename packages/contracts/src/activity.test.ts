@@ -419,6 +419,86 @@ describe("activity contracts", () => {
     ).toThrow();
   });
 
+  it("enforces every public control collection bound and non-negative revision/count", () => {
+    // Mutation caught: accepting an unbounded or negative server-authoritative control value.
+    const controlSnapshot = snapshot.control;
+    const actorControl = controlSnapshot.actors[0];
+    const operation = {
+      rootActorId: actor.id,
+      state: "partial" as const,
+      residualCount: 1,
+      message: "One descendant could not be stopped.",
+      operationRevision: 2,
+    };
+    const controlDelta = {
+      scopeId: snapshot.scopeId,
+      previousRevision: 6,
+      revision: 7,
+      changes: [{ kind: "actor-upserted" as const, actor: actorControl }],
+    };
+    const decodeControlSnapshot = Schema.decodeUnknownSync(
+      Reflect.get(ActivityModule, "ActivityControlSnapshot") as Schema.Codec<
+        unknown,
+        unknown,
+        never,
+        never
+      >,
+    );
+    const decodeControlDelta = Schema.decodeUnknownSync(
+      Reflect.get(ActivityModule, "ActivityControlDelta") as Schema.Codec<
+        unknown,
+        unknown,
+        never,
+        never
+      >,
+    );
+
+    expect(() =>
+      decodeControlSnapshot({
+        ...controlSnapshot,
+        actors: Array.from({ length: 201 }, (_, index) => ({
+          actorId: `actor:bounded-${index}`,
+          state: "available",
+          controlRevision: index,
+          activeDescendantCount: 0,
+        })),
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeControlDelta({
+        ...controlDelta,
+        changes: Array.from({ length: 257 }, () => controlDelta.changes[0]),
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeControlSnapshot({
+        ...controlSnapshot,
+        actors: [{ ...actorControl, controlRevision: -1 }],
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeControlSnapshot({
+        ...controlSnapshot,
+        actors: [{ ...actorControl, activeDescendantCount: -1 }],
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeControlSnapshot({
+        ...controlSnapshot,
+        operations: [{ ...operation, residualCount: -1 }],
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeControlSnapshot({
+        ...controlSnapshot,
+        operations: [{ ...operation, operationRevision: -1 }],
+      }),
+    ).toThrow();
+    expect(() => decodeControlSnapshot({ ...controlSnapshot, revision: -1 })).toThrow();
+    expect(() => decodeControlDelta({ ...controlDelta, previousRevision: -1 })).toThrow();
+    expect(() => decodeControlDelta({ ...controlDelta, revision: -1 })).toThrow();
+  });
+
   it("rejects invalid snapshot revisions", () => {
     expect(() =>
       decodeActivitySnapshot({
