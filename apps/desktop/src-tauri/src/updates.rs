@@ -1,11 +1,19 @@
-use std::{sync::Mutex, time::Duration};
+use std::{collections::BTreeSet, sync::Mutex, time::Duration};
 
+use bibcode_server::{
+    DESKTOP_MAINTENANCE_TOKEN_HEADER, MAINTENANCE_UPDATE_CANCEL_PATH,
+    MAINTENANCE_UPDATE_COMMIT_PATH, MAINTENANCE_UPDATE_PREPARE_PATH, PrepareForUpdateResult,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tauri::{AppHandle, Emitter, Manager, Runtime};
 use tauri_plugin_updater::{Error as UpdaterError, Update, UpdaterExt};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 
-use crate::config::{app_version, runtime_info};
+use crate::{
+    backend::{BackendRunConfig, BackendSupervisor, BackendUpdateSnapshot},
+    config::{app_version, runtime_info},
+};
 
 const UPDATE_STATE_EVENT: &str = "desktop:update-state";
 const STATUS_DISABLED: &str = "disabled";
@@ -19,10 +27,80 @@ const STATUS_ERROR: &str = "error";
 const STARTUP_UPDATE_CHECK_DELAY: Duration = Duration::from_secs(15);
 const BACKGROUND_UPDATE_CHECK_INTERVAL: Duration = Duration::from_secs(30 * 60);
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum UpdatePhase {
+    #[default]
+    Idle,
+    Checking,
+    Available,
+    Protecting,
+    Installing,
+    Failed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum ProtectionStatus {
+    Pending,
+    Protected,
+    Failed,
+    Excluded,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DesktopUpdateProtection {
+    environment_id: String,
+    label: String,
+    #[serde(skip)]
+    primary: bool,
+    status: ProtectionStatus,
+    message: Option<String>,
+}
+
+fn apply_named_secondary_exclusions(
+    protection: &mut [DesktopUpdateProtection],
+    exclusions: &BTreeSet<String>,
+) -> Result<(), String> {
+    for entry in protection
+        .iter_mut()
+        .filter(|entry| entry.status == ProtectionStatus::Failed)
+    {
+        if entry.primary {
+            return Err(format!(
+                "The primary environment {} must be protected before installation.",
+                entry.label
+            ));
+        }
+        if exclusions.contains(&entry.environment_id) {
+            entry.status = ProtectionStatus::Excluded;
+        } else {
+            return Err(format!(
+                "The secondary environment {} must be protected or explicitly excluded by name.",
+                entry.label
+            ));
+        }
+    }
+    Ok(())
+}
+
 struct DownloadedUpdate {
     update: Update,
     version: String,
     bytes: Vec<u8>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct DesktopUpdateInstallInput {
+    #[serde(default)]
+    excluded_environment_ids: Vec<String>,
+}
+
+struct PreparedBackend {
+    config: BackendRunConfig,
+    operation_id: String,
 }
 
 #[derive(Default)]
@@ -39,6 +117,9 @@ struct DesktopUpdateInner {
     can_retry: bool,
     check_in_flight: bool,
     download_in_flight: bool,
+    install_in_flight: bool,
+    phase: UpdatePhase,
+    protection: Vec<DesktopUpdateProtection>,
 }
 
 #[derive(Default)]
@@ -50,6 +131,8 @@ pub struct DesktopUpdateManager {
     background_check_completions: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     background_check_completion: tokio::sync::Notify,
+    #[cfg(test)]
+    install_failure: Mutex<Option<String>>,
 }
 
 #[derive(Clone, Copy)]
@@ -181,6 +264,8 @@ impl DesktopUpdateManager {
                     inner.message = None;
                     inner.error_context = None;
                     inner.can_retry = false;
+                    inner.phase = UpdatePhase::Available;
+                    inner.protection.clear();
                 });
                 let update_state = state.emit(&app);
                 json!({
@@ -201,6 +286,8 @@ impl DesktopUpdateManager {
                     inner.message = None;
                     inner.error_context = None;
                     inner.can_retry = false;
+                    inner.phase = UpdatePhase::Idle;
+                    inner.protection.clear();
                 });
                 let update_state = state.emit(&app);
                 json!({
@@ -215,6 +302,7 @@ impl DesktopUpdateManager {
                     inner.message = Some(message);
                     inner.error_context = Some("check");
                     inner.can_retry = true;
+                    inner.phase = UpdatePhase::Failed;
                 });
                 let state = state.emit(&app);
                 json!({
@@ -279,6 +367,8 @@ impl DesktopUpdateManager {
             inner.message = None;
             inner.error_context = None;
             inner.can_retry = false;
+            inner.phase = UpdatePhase::Available;
+            inner.protection.clear();
             let state = inner.clone_without_updates();
             let guard = UpdateOperationGuard {
                 manager: self,
@@ -325,6 +415,7 @@ impl DesktopUpdateManager {
                     inner.message = None;
                     inner.error_context = None;
                     inner.can_retry = false;
+                    inner.phase = UpdatePhase::Available;
                 });
                 let update_state = state.emit(&app);
                 json!({
@@ -340,6 +431,7 @@ impl DesktopUpdateManager {
                     inner.message = Some(message);
                     inner.error_context = Some("download");
                     inner.can_retry = true;
+                    inner.phase = UpdatePhase::Failed;
                 });
                 let state = state.emit(&app);
                 json!({
@@ -351,11 +443,35 @@ impl DesktopUpdateManager {
         }
     }
 
-    pub fn install_update<R: Runtime>(&self, app: &AppHandle<R>) -> Value {
+    pub async fn install_update<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        backend: &BackendSupervisor,
+        input: DesktopUpdateInstallInput,
+    ) -> Value {
+        let busy_state = {
+            let mut inner = self.inner.lock().expect("desktop update mutex poisoned");
+            if inner.install_in_flight {
+                Some(update_state_value(app, true, &inner))
+            } else {
+                inner.install_in_flight = true;
+                None
+            }
+        };
+        if let Some(state) = busy_state {
+            return json!({
+                "accepted": false,
+                "completed": false,
+                "state": state,
+            });
+        }
+
         if let Err(error) = app.updater() {
             if is_updater_disabled(&error) {
+                self.replace_inner(|inner| inner.install_in_flight = false);
                 return disabled_update_action_result(disabled_update_state(app));
             }
+            self.replace_inner(|inner| inner.install_in_flight = false);
             let state = self.record_error_state(app, "install", error.to_string());
             return json!({
                 "accepted": false,
@@ -370,8 +486,8 @@ impl DesktopUpdateManager {
             .expect("desktop update mutex poisoned")
             .downloaded_update
             .take();
-
         let Some(downloaded) = downloaded else {
+            self.replace_inner(|inner| inner.install_in_flight = false);
             let state = self.record_error_state(
                 app,
                 "install",
@@ -383,8 +499,140 @@ impl DesktopUpdateManager {
                 "state": state,
             });
         };
+        let snapshot = match backend.begin_update_snapshot().await {
+            Ok(snapshot) => snapshot,
+            Err(error) => {
+                return self.finish_failed_install(app, downloaded, Vec::new(), error);
+            }
+        };
+        let mut protection = snapshot
+            .environments
+            .iter()
+            .map(|environment| DesktopUpdateProtection {
+                environment_id: environment.environment_id.clone(),
+                label: environment.label.clone(),
+                primary: environment.primary,
+                status: if environment.running {
+                    ProtectionStatus::Pending
+                } else {
+                    ProtectionStatus::Failed
+                },
+                message: environment.unprotected_reason.clone(),
+            })
+            .collect::<Vec<_>>();
+        if !protection.iter().any(|entry| entry.primary) {
+            protection.insert(
+                0,
+                DesktopUpdateProtection {
+                    environment_id: "primary".to_string(),
+                    label: "Local".to_string(),
+                    primary: true,
+                    status: ProtectionStatus::Failed,
+                    message: Some("The primary desktop backend is not running.".to_string()),
+                },
+            );
+        }
+        self.replace_inner(|inner| {
+            inner.phase = UpdatePhase::Protecting;
+            inner.protection = protection.clone();
+        });
 
-        match downloaded.update.install(&downloaded.bytes) {
+        self.replace_inner(|inner| {
+            inner.message = None;
+            inner.error_context = None;
+            inner.can_retry = false;
+        })
+        .emit(app);
+
+        let exclusions = input
+            .excluded_environment_ids
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        let mut prepared = Vec::new();
+        for environment in &snapshot.environments {
+            if !environment.running {
+                continue;
+            }
+            let Some(config) = environment.config.clone() else {
+                set_protection_failure(
+                    &mut protection,
+                    &environment.environment_id,
+                    "The running backend has no launch configuration.".to_string(),
+                );
+                continue;
+            };
+            if !environment.primary && exclusions.contains(&environment.environment_id) {
+                set_protection_failure(
+                    &mut protection,
+                    &environment.environment_id,
+                    "This secondary environment was explicitly excluded.".to_string(),
+                );
+                continue;
+            }
+            match prepare_backend_for_update(&config).await {
+                Ok(result) => {
+                    set_protection_status(
+                        &mut protection,
+                        &environment.environment_id,
+                        ProtectionStatus::Protected,
+                        None,
+                    );
+                    prepared.push(PreparedBackend {
+                        config,
+                        operation_id: result.operation_id,
+                    });
+                }
+                Err(error) => {
+                    set_protection_failure(&mut protection, &environment.environment_id, error);
+                }
+            }
+            self.replace_inner(|inner| inner.protection = protection.clone())
+                .emit(app);
+        }
+
+        if let Err(error) = apply_named_secondary_exclusions(&mut protection, &exclusions) {
+            let recovery_error = cancel_stop_and_restart(backend, &snapshot, &prepared)
+                .await
+                .err();
+            let message = append_recovery_error(error, recovery_error);
+            return self.finish_failed_install(app, downloaded, protection, message);
+        }
+
+        self.replace_inner(|inner| inner.protection = protection.clone())
+            .emit(app);
+        backend.expect_update_snapshot_exit(&snapshot);
+        let mut commit_error = None;
+        for operation in &prepared {
+            if let Err(error) = finish_backend_update(
+                &operation.config,
+                MAINTENANCE_UPDATE_COMMIT_PATH,
+                &operation.operation_id,
+            )
+            .await
+                && commit_error.is_none()
+            {
+                commit_error = Some(error);
+            }
+        }
+
+        if let Some(error) = commit_error {
+            let recovery_error = stop_and_restart(backend, &snapshot).await.err();
+            let message = append_recovery_error(error, recovery_error);
+            return self.finish_failed_install(app, downloaded, protection, message);
+        }
+        if let Err(error) = backend.stop_update_snapshot(&snapshot).await {
+            let recovery_error = backend.restart_update_snapshot(&snapshot).await.err();
+            let message = append_recovery_error(error, recovery_error);
+            return self.finish_failed_install(app, downloaded, protection, message);
+        }
+
+        self.replace_inner(|inner| {
+            inner.phase = UpdatePhase::Installing;
+            inner.protection = protection.clone();
+        })
+        .emit(app);
+
+        match self.install_downloaded(&downloaded) {
             Ok(()) => {
                 let state = self.replace_inner(|inner| {
                     inner.status = Some(STATUS_DOWNLOADED.to_string());
@@ -393,6 +641,9 @@ impl DesktopUpdateManager {
                     inner.message = None;
                     inner.error_context = None;
                     inner.can_retry = false;
+                    inner.install_in_flight = false;
+                    inner.phase = UpdatePhase::Installing;
+                    inner.protection = protection;
                 });
                 let update_state = state.emit(app);
                 let result = json!({
@@ -406,14 +657,61 @@ impl DesktopUpdateManager {
                 result
             }
             Err(error) => {
-                let state = self.record_error_state(app, "install", error.to_string());
-                json!({
-                    "accepted": true,
-                    "completed": false,
-                    "state": state,
-                })
+                let recovery_error = backend.restart_update_snapshot(&snapshot).await.err();
+                let message = append_recovery_error(error, recovery_error);
+                self.finish_failed_install(app, downloaded, protection, message)
             }
         }
+    }
+
+    fn install_downloaded(&self, downloaded: &DownloadedUpdate) -> Result<(), String> {
+        #[cfg(test)]
+        if let Some(error) = self
+            .install_failure
+            .lock()
+            .expect("desktop update install failure mutex poisoned")
+            .take()
+        {
+            return Err(error);
+        }
+        downloaded
+            .update
+            .install(&downloaded.bytes)
+            .map_err(|error| error.to_string())
+    }
+
+    #[cfg(test)]
+    fn fail_next_install(&self, error: impl Into<String>) {
+        *self
+            .install_failure
+            .lock()
+            .expect("desktop update install failure mutex poisoned") = Some(error.into());
+    }
+
+    fn finish_failed_install<R: Runtime>(
+        &self,
+        app: &AppHandle<R>,
+        downloaded: DownloadedUpdate,
+        protection: Vec<DesktopUpdateProtection>,
+        message: String,
+    ) -> Value {
+        let state = self.replace_inner(|inner| {
+            inner.downloaded_version = Some(downloaded.version.clone());
+            inner.downloaded_update = Some(downloaded);
+            inner.download_percent = Some(100.0);
+            inner.status = Some(STATUS_ERROR.to_string());
+            inner.message = Some(message);
+            inner.error_context = Some("install");
+            inner.can_retry = true;
+            inner.install_in_flight = false;
+            inner.phase = UpdatePhase::Failed;
+            inner.protection = protection;
+        });
+        json!({
+            "accepted": true,
+            "completed": false,
+            "state": state.emit(app),
+        })
     }
 
     fn replace_inner(&self, update: impl FnOnce(&mut DesktopUpdateInner)) -> DesktopUpdateInner {
@@ -436,6 +734,8 @@ impl DesktopUpdateManager {
         inner.message = None;
         inner.error_context = None;
         inner.can_retry = false;
+        inner.phase = UpdatePhase::Checking;
+        inner.protection.clear();
         let state = inner.clone_without_updates();
         Some((
             UpdateOperationGuard {
@@ -465,6 +765,7 @@ impl DesktopUpdateManager {
             inner.message = Some(message);
             inner.error_context = Some(context);
             inner.can_retry = true;
+            inner.phase = UpdatePhase::Failed;
         });
         state.emit(app)
     }
@@ -491,6 +792,9 @@ impl DesktopUpdateInner {
             can_retry: self.can_retry,
             check_in_flight: false,
             download_in_flight: false,
+            install_in_flight: false,
+            phase: self.phase,
+            protection: self.protection.clone(),
         }
     }
 
@@ -503,12 +807,15 @@ impl DesktopUpdateInner {
         self.message = prior_state.message.clone();
         self.error_context = prior_state.error_context;
         self.can_retry = prior_state.can_retry;
+        self.phase = prior_state.phase;
+        self.protection = prior_state.protection.clone();
     }
 }
 
 fn can_begin_check(inner: &DesktopUpdateInner) -> bool {
     !inner.check_in_flight
         && !inner.download_in_flight
+        && !inner.install_in_flight
         && !matches!(
             inner.status.as_deref(),
             Some(STATUS_DOWNLOADING | STATUS_DOWNLOADED)
@@ -518,10 +825,169 @@ fn can_begin_check(inner: &DesktopUpdateInner) -> bool {
 fn can_begin_download(inner: &DesktopUpdateInner) -> bool {
     !inner.check_in_flight
         && !inner.download_in_flight
+        && !inner.install_in_flight
         && !matches!(
             inner.status.as_deref(),
             Some(STATUS_DOWNLOADING | STATUS_DOWNLOADED)
         )
+}
+
+fn set_protection_status(
+    protection: &mut [DesktopUpdateProtection],
+    environment_id: &str,
+    status: ProtectionStatus,
+    message: Option<String>,
+) {
+    if let Some(entry) = protection
+        .iter_mut()
+        .find(|entry| entry.environment_id == environment_id)
+    {
+        entry.status = status;
+        entry.message = message;
+    }
+}
+
+fn set_protection_failure(
+    protection: &mut [DesktopUpdateProtection],
+    environment_id: &str,
+    message: String,
+) {
+    set_protection_status(
+        protection,
+        environment_id,
+        ProtectionStatus::Failed,
+        Some(message),
+    );
+}
+
+async fn prepare_backend_for_update(
+    config: &BackendRunConfig,
+) -> Result<PrepareForUpdateResult, String> {
+    let response = reqwest::Client::new()
+        .post(format!(
+            "{}{}",
+            config.http_base_url(),
+            MAINTENANCE_UPDATE_PREPARE_PATH
+        ))
+        .header(
+            DESKTOP_MAINTENANCE_TOKEN_HEADER,
+            &config.desktop_bootstrap_token,
+        )
+        .timeout(Duration::from_secs(45))
+        .send()
+        .await
+        .map_err(|error| {
+            format!(
+                "Could not prepare {} for update protection: {error}",
+                config.label
+            )
+        })?;
+    decode_maintenance_response(config, "prepare", response).await
+}
+
+async fn finish_backend_update(
+    config: &BackendRunConfig,
+    path: &str,
+    operation_id: &str,
+) -> Result<(), String> {
+    let response = reqwest::Client::new()
+        .post(format!("{}{}", config.http_base_url(), path))
+        .header(
+            DESKTOP_MAINTENANCE_TOKEN_HEADER,
+            &config.desktop_bootstrap_token,
+        )
+        .json(&json!({ "operationId": operation_id }))
+        .timeout(Duration::from_secs(10))
+        .send()
+        .await
+        .map_err(|error| {
+            format!(
+                "Could not complete update maintenance for {}: {error}",
+                config.label
+            )
+        })?;
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        let status = response.status();
+        Err(format!(
+            "Update maintenance for {} failed with HTTP {}.",
+            config.label,
+            status.as_u16()
+        ))
+    }
+}
+
+async fn decode_maintenance_response<T: serde::de::DeserializeOwned>(
+    config: &BackendRunConfig,
+    operation: &str,
+    response: reqwest::Response,
+) -> Result<T, String> {
+    if !response.status().is_success() {
+        let status = response.status();
+        return Err(format!(
+            "Could not {operation} {} for update protection (HTTP {}).",
+            config.label,
+            status.as_u16()
+        ));
+    }
+    response.json::<T>().await.map_err(|error| {
+        format!(
+            "Could not decode the update protection result for {}: {error}",
+            config.label
+        )
+    })
+}
+
+async fn cancel_stop_and_restart(
+    backend: &BackendSupervisor,
+    snapshot: &BackendUpdateSnapshot,
+    prepared: &[PreparedBackend],
+) -> Result<(), String> {
+    let mut errors = Vec::new();
+    backend.expect_update_snapshot_exit(snapshot);
+    for operation in prepared {
+        if let Err(error) = finish_backend_update(
+            &operation.config,
+            MAINTENANCE_UPDATE_CANCEL_PATH,
+            &operation.operation_id,
+        )
+        .await
+        {
+            errors.push(error);
+        }
+    }
+    if let Err(error) = stop_and_restart(backend, snapshot).await {
+        errors.push(error);
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors.join("; "))
+    }
+}
+
+async fn stop_and_restart(
+    backend: &BackendSupervisor,
+    snapshot: &BackendUpdateSnapshot,
+) -> Result<(), String> {
+    let stop = backend.stop_update_snapshot(snapshot).await;
+    let restart = backend.restart_update_snapshot(snapshot).await;
+    match (stop, restart) {
+        (Ok(()), Ok(())) => Ok(()),
+        (Err(stop), Ok(())) => Err(stop),
+        (Ok(()), Err(restart)) => Err(restart),
+        (Err(stop), Err(restart)) => Err(format!("{stop}; {restart}")),
+    }
+}
+
+fn append_recovery_error(message: String, recovery_error: Option<String>) -> String {
+    match recovery_error {
+        Some(recovery_error) => {
+            format!("{message} Desktop backend recovery also failed: {recovery_error}")
+        }
+        None => message,
+    }
 }
 
 pub async fn run_background_update_checks<R: Runtime>(app: AppHandle<R>) {
@@ -600,6 +1066,8 @@ pub fn disabled_update_state<R: Runtime>(app: &AppHandle<R>) -> Value {
         "message": null,
         "errorContext": null,
         "canRetry": false,
+        "phase": UpdatePhase::Idle,
+        "protection": [],
     })
 }
 
@@ -623,6 +1091,8 @@ fn error_update_state<R: Runtime>(
         "message": message,
         "errorContext": context,
         "canRetry": true,
+        "phase": UpdatePhase::Failed,
+        "protection": [],
     })
 }
 
@@ -646,6 +1116,8 @@ fn update_state_value<R: Runtime>(
         "message": inner.message,
         "errorContext": inner.error_context,
         "canRetry": inner.can_retry,
+        "phase": inner.phase,
+        "protection": inner.protection,
     })
 }
 
@@ -667,6 +1139,7 @@ pub fn disabled_update_action_result(state: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::backend::{BackendLaunchPlan, BackendShutdownConfig, BackendUnavailableEnvironment};
     use base64::{Engine as _, engine::general_purpose::STANDARD};
     use std::{
         io::{Read, Write},
@@ -686,6 +1159,202 @@ mod tests {
 
     const TEST_PUBLIC_KEY: &str = "untrusted comment: minisign public key E7620F1842B4E81F\nRWQf6LRCGA9i53mlYecO4IzT51TGPpvWucNSCh1CBM0QTaLn73Y7GFO3";
     const TEST_SIGNATURE: &str = "untrusted comment: signature from minisign secret key\nRWQf6LRCGA9i59SLOFxz6NxvASXDJeRtuZykwQepbDEGt87ig1BNpWaVWuNrm73YiIiJbq71Wi+dP9eKL8OC351vwIasSSbXxwA=\ntrusted comment: timestamp:1555779966\tfile:test\nQtKMXWyYcwdpZAlPF7tE2ENJkRd1ujvKjlj1m9RtHTBnZPa5WKU5uWRs5GoP5M/VqE81QFuMKI5k/SfNQUaOAA==";
+
+    #[test]
+    fn primary_protection_failure_cannot_be_excluded() {
+        let mut protection = vec![DesktopUpdateProtection {
+            environment_id: "primary".to_string(),
+            label: "Local".to_string(),
+            primary: true,
+            status: ProtectionStatus::Failed,
+            message: Some("backup failed".to_string()),
+        }];
+
+        let error = apply_named_secondary_exclusions(
+            &mut protection,
+            &["primary".to_string()].into_iter().collect(),
+        )
+        .expect_err("primary failure must remain blocking");
+
+        assert!(error.contains("primary"));
+        assert_eq!(protection[0].status, ProtectionStatus::Failed);
+    }
+
+    #[test]
+    fn failed_secondary_requires_an_exact_named_exclusion() {
+        let failed = DesktopUpdateProtection {
+            environment_id: "wsl:Ubuntu".to_string(),
+            label: "WSL (Ubuntu)".to_string(),
+            primary: false,
+            status: ProtectionStatus::Failed,
+            message: Some("backup failed".to_string()),
+        };
+        let mut without_exclusion = vec![failed.clone()];
+        assert!(
+            apply_named_secondary_exclusions(&mut without_exclusion, &Default::default()).is_err()
+        );
+
+        let mut with_exclusion = vec![failed];
+        apply_named_secondary_exclusions(
+            &mut with_exclusion,
+            &["wsl:Ubuntu".to_string()].into_iter().collect(),
+        )
+        .expect("the exact secondary may be excluded");
+        assert_eq!(with_exclusion[0].status, ProtectionStatus::Excluded);
+    }
+
+    #[test]
+    fn update_state_serializes_protecting_before_installing() {
+        let app = updater_test_app("http://127.0.0.1:9/latest.json".to_string());
+        let handle = app.handle();
+        let mut state = DesktopUpdateInner {
+            phase: UpdatePhase::Protecting,
+            ..DesktopUpdateInner::default()
+        };
+        state.protection.push(DesktopUpdateProtection {
+            environment_id: "primary".to_string(),
+            label: "Local".to_string(),
+            primary: true,
+            status: ProtectionStatus::Pending,
+            message: None,
+        });
+
+        let protecting = update_state_value(handle, true, &state);
+        assert_eq!(protecting["phase"], "protecting");
+        assert_eq!(protecting["protection"][0]["status"], "pending");
+
+        state.phase = UpdatePhase::Installing;
+        let installing = update_state_value(handle, true, &state);
+        assert_eq!(installing["phase"], "installing");
+    }
+
+    #[tokio::test]
+    async fn overlapping_install_returns_protecting_state_without_consuming_the_attempt() {
+        let app = updater_test_app("http://127.0.0.1:9/latest.json".to_string());
+        let handle = app.handle();
+        let manager = DesktopUpdateManager::new();
+        manager.replace_inner(|inner| {
+            inner.install_in_flight = true;
+            inner.phase = UpdatePhase::Protecting;
+        });
+
+        let result = manager
+            .install_update(
+                handle,
+                &BackendSupervisor::new(),
+                DesktopUpdateInstallInput::default(),
+            )
+            .await;
+
+        assert_eq!(result["accepted"], false);
+        assert_eq!(result["state"]["phase"], "protecting");
+        assert!(
+            manager
+                .inner
+                .lock()
+                .expect("desktop update mutex poisoned")
+                .install_in_flight
+        );
+    }
+
+    #[tokio::test]
+    async fn secondary_exclusion_commits_primary_and_installer_failure_restarts_prior_set() {
+        let (base_url, update_server) = spawn_update_server("test");
+        let app = updater_test_app(format!("{base_url}/latest.json"));
+        let handle = app.handle();
+        let manager = DesktopUpdateManager::new();
+        assert_eq!(
+            manager.check_for_update(handle.clone()).await["checked"],
+            true
+        );
+        assert_eq!(
+            manager.download_update(handle.clone()).await["completed"],
+            true
+        );
+        update_server.join().expect("update server should stop");
+
+        let state = tempfile::tempdir().expect("backend state tempdir should open");
+        let supervisor = BackendSupervisor::new();
+        supervisor
+            .start(BackendLaunchPlan::local(
+                state.path().to_path_buf(),
+                test_backend_config(),
+            ))
+            .await
+            .expect("primary backend should start");
+        supervisor.record_unavailable_environment(BackendUnavailableEnvironment {
+            environment_id: "wsl:Ubuntu".to_string(),
+            label: "WSL (Ubuntu)".to_string(),
+            configured_distro: Some("Ubuntu".to_string()),
+            detail: "distribution is unavailable".to_string(),
+        });
+
+        let blocked = manager
+            .install_update(handle, &supervisor, DesktopUpdateInstallInput::default())
+            .await;
+        assert_eq!(blocked["completed"], false);
+        assert_eq!(blocked["state"]["phase"], "failed");
+        assert_eq!(blocked["state"]["protection"][0]["status"], "protected");
+        assert_eq!(blocked["state"]["protection"][1]["status"], "failed");
+        assert!(
+            supervisor
+                .snapshot_for_update()
+                .environments
+                .iter()
+                .any(|environment| environment.primary && environment.running)
+        );
+
+        manager.fail_next_install("synthetic installer failure");
+        let failed_install = manager
+            .install_update(
+                handle,
+                &supervisor,
+                DesktopUpdateInstallInput {
+                    excluded_environment_ids: vec!["wsl:Ubuntu".to_string()],
+                },
+            )
+            .await;
+        assert_eq!(failed_install["completed"], false);
+        assert_eq!(failed_install["state"]["phase"], "failed");
+        assert_eq!(
+            failed_install["state"]["protection"][1]["status"],
+            "excluded"
+        );
+        assert!(
+            failed_install["state"]["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("synthetic installer failure"))
+        );
+        assert!(
+            supervisor
+                .snapshot_for_update()
+                .environments
+                .iter()
+                .any(|environment| environment.primary && environment.running)
+        );
+
+        supervisor
+            .stop(BackendShutdownConfig::default())
+            .await
+            .expect("restarted primary should stop");
+    }
+
+    fn test_backend_config() -> BackendRunConfig {
+        BackendRunConfig {
+            environment_id: "primary".to_string(),
+            label: "Local".to_string(),
+            running_distro: None,
+            port: 0,
+            bind_host: "127.0.0.1".to_string(),
+            local_host: "127.0.0.1".to_string(),
+            desktop_bootstrap_token: "desktop-update-test-token".to_string(),
+            server_exposure_mode: "local-only".to_string(),
+            endpoint_url: None,
+            advertised_host: None,
+            tailscale_serve_enabled: false,
+            tailscale_serve_port: 443,
+        }
+    }
 
     fn assert_request_read(stream: &mut std::net::TcpStream, message: &str) {
         let mut request = [0_u8; 2048];
@@ -896,6 +1565,7 @@ mod tests {
         assert_eq!(manager.state(handle)["status"], STATUS_DISABLED);
 
         tauri::async_runtime::block_on(async {
+            let backend = BackendSupervisor::new();
             assert_eq!(
                 manager.check_for_update(handle.clone()).await["checked"],
                 false
@@ -904,8 +1574,13 @@ mod tests {
                 manager.download_update(handle.clone()).await["accepted"],
                 false
             );
+            assert_eq!(
+                manager
+                    .install_update(handle, &backend, DesktopUpdateInstallInput::default())
+                    .await["accepted"],
+                false
+            );
         });
-        assert_eq!(manager.install_update(handle)["accepted"], false);
     }
 
     #[tokio::test]
@@ -943,7 +1618,10 @@ mod tests {
 
         #[cfg(target_os = "macos")]
         {
-            let install = manager.install_update(handle);
+            let backend = BackendSupervisor::new();
+            let install = manager
+                .install_update(handle, &backend, DesktopUpdateInstallInput::default())
+                .await;
             assert_eq!(install["accepted"], true);
             assert_eq!(install["completed"], false);
             assert_eq!(install["state"]["status"], STATUS_ERROR);
@@ -983,7 +1661,13 @@ mod tests {
         assert_eq!(download["accepted"], false);
         assert_eq!(download["state"]["errorContext"], "download");
 
-        let install = manager.install_update(handle);
+        let install = manager
+            .install_update(
+                handle,
+                &BackendSupervisor::new(),
+                DesktopUpdateInstallInput::default(),
+            )
+            .await;
         assert_eq!(install["accepted"], false);
         assert_eq!(install["state"]["errorContext"], "install");
 

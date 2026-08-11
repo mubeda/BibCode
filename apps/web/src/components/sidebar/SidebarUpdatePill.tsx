@@ -1,4 +1,5 @@
 import { DownloadIcon, RotateCwIcon, TriangleAlertIcon, XIcon } from "lucide-react";
+import { useNavigate } from "@tanstack/react-router";
 import { useCallback, useState } from "react";
 import { isDesktopHost } from "../../env";
 import { useDesktopUpdateState } from "../../state/desktopUpdate";
@@ -7,19 +8,21 @@ import {
   getArm64IntelBuildWarningDescription,
   getDesktopUpdateActionError,
   getDesktopUpdateButtonTooltip,
-  getDesktopUpdateInstallConfirmationMessage,
   isDesktopUpdateButtonDisabled,
   resolveDesktopUpdateButtonAction,
   shouldShowArm64IntelBuildWarning,
   shouldShowDesktopUpdateButton,
   shouldToastDesktopUpdateActionResult,
 } from "../desktopUpdate.logic";
+import { UpdateProtectionDialog } from "../desktop/UpdateProtectionDialog";
 import { Alert, AlertDescription, AlertTitle } from "../ui/alert";
 import { Tooltip, TooltipPopup, TooltipTrigger } from "../ui/tooltip";
 
 export function SidebarUpdatePill() {
+  const navigate = useNavigate();
   const state = useDesktopUpdateState();
   const [dismissed, setDismissed] = useState(false);
+  const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
 
   const visible = isDesktopHost && shouldShowDesktopUpdateButton(state) && !dismissed;
   const tooltip = state ? getDesktopUpdateButtonTooltip(state) : "Update available";
@@ -70,108 +73,107 @@ export function SidebarUpdatePill() {
     }
 
     if (action === "install") {
-      const confirmed = window.confirm(getDesktopUpdateInstallConfirmationMessage(state));
-      if (!confirmed) return;
-      void bridge
-        .installUpdate()
-        .then((result) => {
-          if (!shouldToastDesktopUpdateActionResult(result)) return;
-          const actionError = getDesktopUpdateActionError(result);
-          if (!actionError) return;
-          toastManager.add(
-            stackedThreadToast({
-              type: "error",
-              title: "Could not install update",
-              description: actionError,
-            }),
-          );
-        })
-        .catch((error) => {
-          toastManager.add(
-            stackedThreadToast({
-              type: "error",
-              title: "Could not install update",
-              description: error instanceof Error ? error.message : "An unexpected error occurred.",
-            }),
-          );
-        });
+      setUpdateDialogOpen(true);
     }
   }, [action, disabled, state]);
 
   if (!visible && !showArm64Warning) return null;
 
   return (
-    <div className="flex flex-col gap-1">
-      {showArm64Warning && arm64Description && (
-        <Alert variant="warning" className="rounded-2xl border-warning/40 bg-warning/8 text-xs">
-          <TriangleAlertIcon />
-          <AlertTitle>Intel build on Apple Silicon</AlertTitle>
-          <AlertDescription>{arm64Description}</AlertDescription>
-        </Alert>
-      )}
-      {visible && (
-        <div
-          className={`group/update relative flex h-7 w-full items-center rounded-lg bg-primary/15 text-xs font-medium text-primary ${
-            disabled ? " cursor-not-allowed opacity-60" : ""
-          }`}
-        >
-          <div className="pointer-events-none absolute inset-0 rounded-lg transition-colors group-has-[button.update-main:hover]/update:bg-primary/22" />
-          <Tooltip>
-            <TooltipTrigger
-              render={
-                <button
-                  type="button"
-                  aria-label={tooltip}
-                  aria-disabled={disabled || undefined}
-                  disabled={disabled}
-                  className="update-main relative flex h-full flex-1 items-center gap-2 px-2 enabled:cursor-pointer"
-                  onClick={handleAction}
-                >
-                  {action === "install" ? (
-                    <>
-                      <RotateCwIcon className="size-3.5" />
-                      <span>Restart to update</span>
-                    </>
-                  ) : state?.status === "downloading" ? (
-                    <>
-                      <DownloadIcon className="size-3.5" />
-                      <span>
-                        Downloading
-                        {typeof state.downloadPercent === "number"
-                          ? ` (${Math.floor(state.downloadPercent)}%)`
-                          : "…"}
-                      </span>
-                    </>
-                  ) : (
-                    <>
-                      <DownloadIcon className="size-3.5" />
-                      <span>Update available</span>
-                    </>
-                  )}
-                </button>
-              }
-            />
-            <TooltipPopup side="top">{tooltip}</TooltipPopup>
-          </Tooltip>
-          {action === "download" && (
+    <>
+      <div className="flex flex-col gap-1">
+        {showArm64Warning && arm64Description && (
+          <Alert variant="warning" className="rounded-2xl border-warning/40 bg-warning/8 text-xs">
+            <TriangleAlertIcon />
+            <AlertTitle>Intel build on Apple Silicon</AlertTitle>
+            <AlertDescription>{arm64Description}</AlertDescription>
+          </Alert>
+        )}
+        {visible && (
+          <div
+            className={`group/update relative flex h-7 w-full items-center rounded-lg bg-primary/15 text-xs font-medium text-primary ${
+              disabled ? " cursor-not-allowed opacity-60" : ""
+            }`}
+          >
+            <div className="pointer-events-none absolute inset-0 rounded-lg transition-colors group-has-[button.update-main:hover]/update:bg-primary/22" />
             <Tooltip>
               <TooltipTrigger
                 render={
                   <button
                     type="button"
-                    aria-label="Dismiss update"
-                    className="mr-1 inline-flex size-5 items-center justify-center rounded-md text-primary/60 transition-colors hover:text-primary"
-                    onClick={() => setDismissed(true)}
+                    aria-label={tooltip}
+                    aria-disabled={disabled || undefined}
+                    disabled={disabled}
+                    className="update-main relative flex h-full flex-1 items-center gap-2 px-2 enabled:cursor-pointer"
+                    onClick={handleAction}
                   >
-                    <XIcon className="size-3.5" />
+                    {action === "install" ? (
+                      <>
+                        <RotateCwIcon className="size-3.5" />
+                        <span>Restart to update</span>
+                      </>
+                    ) : state?.status === "downloading" ? (
+                      <>
+                        <DownloadIcon className="size-3.5" />
+                        <span>
+                          Downloading
+                          {typeof state.downloadPercent === "number"
+                            ? ` (${Math.floor(state.downloadPercent)}%)`
+                            : "…"}
+                        </span>
+                      </>
+                    ) : (
+                      <>
+                        <DownloadIcon className="size-3.5" />
+                        <span>Update available</span>
+                      </>
+                    )}
                   </button>
                 }
               />
-              <TooltipPopup side="top">Dismiss until next launch</TooltipPopup>
+              <TooltipPopup side="top">{tooltip}</TooltipPopup>
             </Tooltip>
-          )}
-        </div>
-      )}
-    </div>
+            {action === "download" && (
+              <Tooltip>
+                <TooltipTrigger
+                  render={
+                    <button
+                      type="button"
+                      aria-label="Dismiss update"
+                      className="mr-1 inline-flex size-5 items-center justify-center rounded-md text-primary/60 transition-colors hover:text-primary"
+                      onClick={() => setDismissed(true)}
+                    >
+                      <XIcon className="size-3.5" />
+                    </button>
+                  }
+                />
+                <TooltipPopup side="top">Dismiss until next launch</TooltipPopup>
+              </Tooltip>
+            )}
+          </div>
+        )}
+      </div>
+      {state ? (
+        <UpdateProtectionDialog
+          open={updateDialogOpen}
+          state={state}
+          onOpenChange={setUpdateDialogOpen}
+          installUpdate={(input) => window.desktopBridge!.installUpdate(input)}
+          onDiagnostics={() => {
+            setUpdateDialogOpen(false);
+            void navigate({ to: "/settings/diagnostics" });
+          }}
+          onError={(description) => {
+            toastManager.add(
+              stackedThreadToast({
+                type: "error",
+                title: "Could not install update",
+                description,
+              }),
+            );
+          }}
+        />
+      ) : null}
+    </>
   );
 }

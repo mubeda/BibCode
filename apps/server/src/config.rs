@@ -2,6 +2,7 @@ use std::{
     fmt,
     io::{self, BufRead},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 #[cfg(unix)]
@@ -45,11 +46,16 @@ pub struct ServerConfig {
     pub dev_url: Option<Url>,
     pub no_browser: bool,
     pub desktop_bootstrap_token: Option<String>,
+    /// True only for a desktop-owned server launched through the WSL bootstrap transport.
+    #[doc(hidden)]
+    pub desktop_wsl_transport: bool,
     pub unsafe_no_auth: bool,
     pub environment_id: String,
     pub environment_label: String,
     pub server_version: String,
     pub storage_instance_id: Option<StorageInstanceId>,
+    pub(crate) update_maintenance_drain_timeout: Duration,
+    pub(crate) update_maintenance_lease: Duration,
 }
 
 impl ServerConfig {
@@ -70,11 +76,14 @@ impl ServerConfig {
             dev_url: None,
             no_browser: false,
             desktop_bootstrap_token: None,
+            desktop_wsl_transport: false,
             unsafe_no_auth: false,
             environment_id: "local".to_owned(),
             environment_label: "Local".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
             storage_instance_id: None,
+            update_maintenance_drain_timeout: Duration::from_secs(30),
+            update_maintenance_lease: Duration::from_secs(90),
         }
     }
 
@@ -111,6 +120,19 @@ impl ServerConfig {
     #[must_use]
     pub fn with_unsafe_no_auth(mut self) -> Self {
         self.unsafe_no_auth = true;
+        self
+    }
+
+    /// Overrides maintenance timing for deterministic integration tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_update_maintenance_timing_for_integration_test(
+        mut self,
+        drain_timeout: Duration,
+        lease: Duration,
+    ) -> Self {
+        self.update_maintenance_drain_timeout = drain_timeout;
+        self.update_maintenance_lease = lease;
         self
     }
 
@@ -154,6 +176,28 @@ mod tests {
                 .with_desktop(String::new())
                 .is_err()
         );
+    }
+
+    #[test]
+    fn desktop_bootstrap_wsl_transport_is_explicit_and_defaults_closed() {
+        let base = serde_json::json!({
+            "mode": "desktop",
+            "noBrowser": true,
+            "port": 3773,
+            "bibcodeHome": null,
+            "host": "0.0.0.0",
+            "desktopBootstrapToken": "token",
+            "tailscaleServeEnabled": false,
+            "tailscaleServePort": 443
+        });
+        let native: DesktopBootstrap =
+            serde_json::from_value(base.clone()).expect("native bootstrap should decode");
+        assert!(!native.wsl_transport);
+        let mut wsl = base;
+        wsl["wslTransport"] = serde_json::json!(true);
+        let wsl: DesktopBootstrap =
+            serde_json::from_value(wsl).expect("WSL bootstrap should decode");
+        assert!(wsl.wsl_transport);
     }
 
     #[test]
@@ -254,6 +298,8 @@ struct DesktopBootstrap {
     bibcode_home: Option<PathBuf>,
     host: String,
     desktop_bootstrap_token: String,
+    #[serde(default)]
+    wsl_transport: bool,
     #[allow(dead_code)]
     tailscale_serve_enabled: bool,
     #[allow(dead_code)]
@@ -323,6 +369,7 @@ impl Cli {
             return Err(ConfigError::EmptyDesktopBootstrapToken);
         }
         config.desktop_bootstrap_token = desktop_bootstrap_token;
+        config.desktop_wsl_transport = bootstrap.as_ref().is_some_and(|value| value.wsl_transport);
         Ok(config)
     }
 }

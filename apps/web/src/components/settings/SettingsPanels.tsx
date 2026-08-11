@@ -1,5 +1,5 @@
 import { ArchiveIcon, ArchiveX, LoaderIcon, PlusIcon, RefreshCwIcon } from "lucide-react";
-import { Link } from "@tanstack/react-router";
+import { Link, useNavigate } from "@tanstack/react-router";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useAtomValue } from "@effect/atom-react";
 import {
@@ -33,10 +33,10 @@ import { APP_VERSION, HOSTED_APP_CHANNEL, HOSTED_APP_CHANNEL_LABEL } from "../..
 import {
   canCheckForUpdate,
   getDesktopUpdateButtonTooltip,
-  getDesktopUpdateInstallConfirmationMessage,
   isDesktopUpdateButtonDisabled,
   resolveDesktopUpdateButtonAction,
 } from "../../components/desktopUpdate.logic";
+import { UpdateProtectionDialog } from "../desktop/UpdateProtectionDialog";
 import { ProviderModelPicker } from "../chat/ProviderModelPicker";
 import { ProviderInstanceIcon } from "../chat/ProviderInstanceIcon";
 import { TraitsPicker } from "../chat/TraitsPicker";
@@ -243,7 +243,9 @@ function AboutVersionTitle({ availableVersion }: { readonly availableVersion?: s
 }
 
 function AboutVersionSection() {
+  const navigate = useNavigate();
   const updateState = useDesktopUpdateState();
+  const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
 
   const hasDesktopBridge = typeof window !== "undefined" && Boolean(window.desktopBridge);
   const selectedHostedAppChannel = hasDesktopBridge ? null : HOSTED_APP_CHANNEL;
@@ -268,21 +270,7 @@ function AboutVersionSection() {
     }
 
     if (action === "install") {
-      const confirmed = window.confirm(
-        getDesktopUpdateInstallConfirmationMessage(
-          updateState ?? { availableVersion: null, downloadedVersion: null },
-        ),
-      );
-      if (!confirmed) return;
-      void bridge.installUpdate().catch((error: unknown) => {
-        toastManager.add(
-          stackedThreadToast({
-            type: "error",
-            title: "Could not install update",
-            description: error instanceof Error ? error.message : "Install failed.",
-          }),
-        );
-      });
+      setUpdateDialogOpen(true);
       return;
     }
 
@@ -385,6 +373,27 @@ function AboutVersionSection() {
               </SelectPopup>
             </Select>
           }
+        />
+      ) : null}
+      {updateState && window.desktopBridge ? (
+        <UpdateProtectionDialog
+          open={updateDialogOpen}
+          state={updateState}
+          onOpenChange={setUpdateDialogOpen}
+          installUpdate={(input) => window.desktopBridge!.installUpdate(input)}
+          onDiagnostics={() => {
+            setUpdateDialogOpen(false);
+            void navigate({ to: "/settings/diagnostics" });
+          }}
+          onError={(description) => {
+            toastManager.add(
+              stackedThreadToast({
+                type: "error",
+                title: "Could not install update",
+                description,
+              }),
+            );
+          }}
         />
       ) : null}
     </>

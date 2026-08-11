@@ -47,6 +47,8 @@ describe("desktopUpdateStateAtom", () => {
       status: "downloaded",
       availableVersion: "1.1.0",
       downloadedVersion: "1.1.0",
+      phase: "protecting",
+      protection: [{ environmentId: "primary", label: "Local", status: "pending", message: null }],
     };
     listener?.(downloadedState);
 

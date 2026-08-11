@@ -4,7 +4,9 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   ContextMenuItemSchema,
   type DesktopBridge,
+  type DesktopUpdateState,
   DesktopEnvironmentBootstrapSchema,
+  DesktopUpdateStateSchema,
 } from "./ipc.ts";
 import { expectDecodeFailure, expectEncodeFailure } from "./test/schemaAssertions.ts";
 
@@ -13,6 +15,85 @@ const encodeContextMenuItem = Schema.encodeSync(ContextMenuItemSchema);
 const decodeDesktopEnvironmentBootstrap = Schema.decodeUnknownSync(
   DesktopEnvironmentBootstrapSchema,
 );
+const decodeDesktopUpdateState = Schema.decodeUnknownSync(DesktopUpdateStateSchema);
+
+const legacyUpdateState = {
+  enabled: true,
+  status: "downloaded",
+  currentVersion: "1.0.0",
+  hostArch: "x64",
+  appArch: "x64",
+  runningUnderArm64Translation: false,
+  availableVersion: "1.1.0",
+  downloadedVersion: "1.1.0",
+  downloadPercent: 100,
+  checkedAt: null,
+  message: null,
+  errorContext: null,
+  canRetry: false,
+} satisfies DesktopUpdateState;
+
+describe("Desktop update protection contract", () => {
+  it("decodes additive protection fields from a current host", () => {
+    expect(
+      decodeDesktopUpdateState({
+        ...legacyUpdateState,
+        phase: "protecting",
+        protection: [
+          {
+            environmentId: "primary",
+            label: "Local",
+            status: "protected",
+            message: null,
+          },
+          {
+            environmentId: "wsl:Ubuntu",
+            label: "WSL (Ubuntu)",
+            status: "failed",
+            message: "Backup failed.",
+          },
+        ],
+      }),
+    ).toMatchObject({
+      phase: "protecting",
+      protection: [
+        { environmentId: "primary", status: "protected" },
+        { environmentId: "wsl:Ubuntu", status: "failed" },
+      ],
+    });
+  });
+
+  it("defaults fields omitted by an older desktop host without losing update state", () => {
+    expect(decodeDesktopUpdateState(legacyUpdateState)).toEqual({
+      ...legacyUpdateState,
+      phase: "idle",
+      protection: [],
+    });
+  });
+
+  it("exposes explicit named exclusions on the asynchronous install command", async () => {
+    const installUpdate: Pick<DesktopBridge, "installUpdate">["installUpdate"] = async (input) => ({
+      accepted: true,
+      completed: false,
+      state: {
+        ...legacyUpdateState,
+        phase: "failed",
+        protection: [
+          {
+            environmentId: input?.excludedEnvironmentIds?.[0] ?? "missing",
+            label: "WSL (Ubuntu)",
+            status: "excluded",
+            message: null,
+          },
+        ],
+      },
+    });
+
+    await expect(installUpdate({ excludedEnvironmentIds: ["wsl:Ubuntu"] })).resolves.toMatchObject({
+      state: { protection: [{ environmentId: "wsl:Ubuntu", status: "excluded" }] },
+    });
+  });
+});
 
 describe("DesktopBridge connection catalog", () => {
   it("exposes an exact-raw compare-and-set operation", async () => {

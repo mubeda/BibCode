@@ -7,16 +7,17 @@ use std::{
 use axum::{
     Json, Router,
     body::Body,
-    extract::{FromRef, State, WebSocketUpgrade},
+    extract::{FromRef, Request, State, WebSocketUpgrade},
     http::{
         HeaderMap, Method, StatusCode, Uri,
         header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE, HOST, LOCATION},
     },
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use percent_encoding::percent_decode_str;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 use subtle::ConstantTimeEq;
 use tokio::fs::File;
@@ -26,6 +27,12 @@ use tower_http::cors::{AllowOrigin, Any, CorsLayer};
 use crate::{
     auth,
     config::{ServerConfig, ServerMode},
+    maintenance::{
+        DESKTOP_MAINTENANCE_TOKEN_HEADER, MAINTENANCE_UPDATE_CANCEL_PATH,
+        MAINTENANCE_UPDATE_COMMIT_PATH, MAINTENANCE_UPDATE_PREPARE_PATH,
+        MAINTENANCE_UPDATE_STATUS_PATH, MaintenanceError, RpcAdmissionGate, UpdateMaintenance,
+        http_mutability,
+    },
     production::http_routes::{self, HttpRoutesState},
     rpc::{RpcRegistry, RpcSessionContext, run_session},
 };
@@ -93,6 +100,10 @@ pub const ROUTE_INVENTORY: &[RouteSpec] = &[
     route(RouteMethod::Post, "/api/diagnostics/logs.zip"),
     route(RouteMethod::Get, "/api/assets/*"),
     route(RouteMethod::Post, DESKTOP_SHUTDOWN_PATH),
+    route(RouteMethod::Post, MAINTENANCE_UPDATE_PREPARE_PATH),
+    route(RouteMethod::Post, MAINTENANCE_UPDATE_COMMIT_PATH),
+    route(RouteMethod::Post, MAINTENANCE_UPDATE_CANCEL_PATH),
+    route(RouteMethod::Get, MAINTENANCE_UPDATE_STATUS_PATH),
     route(RouteMethod::Post, "/mcp"),
     route(RouteMethod::Delete, "/mcp"),
     route(RouteMethod::Get, "*"),
@@ -105,6 +116,8 @@ pub(crate) struct AppState {
     pub rpc_registry: RpcRegistry,
     pub auth: auth::AuthService,
     pub http_routes: HttpRoutesState,
+    pub admission_gate: RpcAdmissionGate,
+    pub update_maintenance: Option<Arc<UpdateMaintenance>>,
 }
 
 impl FromRef<AppState> for HttpRoutesState {
@@ -119,10 +132,38 @@ pub(crate) fn build_router(state: AppState) -> Router {
     router
         .route(ENVIRONMENT_DESCRIPTOR_PATH, get(environment_descriptor))
         .route(DESKTOP_SHUTDOWN_PATH, post(desktop_shutdown))
+        .route(MAINTENANCE_UPDATE_PREPARE_PATH, post(update_prepare))
+        .route(MAINTENANCE_UPDATE_COMMIT_PATH, post(update_commit))
+        .route(MAINTENANCE_UPDATE_CANCEL_PATH, post(update_cancel))
+        .route(MAINTENANCE_UPDATE_STATUS_PATH, get(update_status))
         .route("/ws", get(websocket))
         .fallback(static_or_dev)
+        .layer(middleware::from_fn_with_state(
+            state.admission_gate.clone(),
+            request_admission,
+        ))
         .layer(cors)
         .with_state(state)
+}
+
+async fn request_admission(
+    State(gate): State<RpcAdmissionGate>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let mutability = http_mutability(request.method().as_str(), request.uri().path());
+    let Ok(_permit) = gate.admit(mutability) else {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            [(CACHE_CONTROL, "no-store")],
+            Json(json!({
+                "_tag": "UpdateMaintenanceActiveError",
+                "message": "Persistent mutations are temporarily closed while project data is protected.",
+            })),
+        )
+            .into_response();
+    };
+    next.run(request).await
 }
 
 fn cors_layer(config: &ServerConfig) -> CorsLayer {
@@ -134,6 +175,7 @@ fn cors_layer(config: &ServerConfig) -> CorsLayer {
             axum::http::HeaderName::from_static("b3"),
             axum::http::HeaderName::from_static("traceparent"),
             axum::http::HeaderName::from_static("dpop"),
+            axum::http::HeaderName::from_static(DESKTOP_MAINTENANCE_TOKEN_HEADER),
         ])
         .max_age(std::time::Duration::from_secs(600));
     let Some(dev_url) = &config.dev_url else {
@@ -276,6 +318,137 @@ async fn desktop_shutdown(State(state): State<AppState>, headers: HeaderMap) -> 
         StatusCode::ACCEPTED,
         [(CACHE_CONTROL, "no-store")],
         Json(json!({ "shuttingDown": true })),
+    )
+        .into_response()
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct UpdateOperationInput {
+    operation_id: String,
+}
+
+fn authorized_update_maintenance(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<Arc<UpdateMaintenance>, StatusCode> {
+    let Some(maintenance) = state.update_maintenance.clone() else {
+        return Err(StatusCode::NOT_FOUND);
+    };
+    let supplied_token = headers
+        .get(DESKTOP_MAINTENANCE_TOKEN_HEADER)
+        .and_then(|value| value.to_str().ok());
+    if !token_matches(
+        state.config.desktop_bootstrap_token.as_deref(),
+        supplied_token,
+    ) {
+        return Err(StatusCode::FORBIDDEN);
+    }
+    Ok(maintenance)
+}
+
+async fn update_prepare(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let maintenance = match authorized_update_maintenance(&state, &headers) {
+        Ok(maintenance) => maintenance,
+        Err(status) => {
+            return (status, status.canonical_reason().unwrap_or("Error")).into_response();
+        }
+    };
+    match maintenance.prepare().await {
+        Ok(result) => (StatusCode::OK, [(CACHE_CONTROL, "no-store")], Json(result)).into_response(),
+        Err(error) => maintenance_error_response(error),
+    }
+}
+
+async fn update_commit(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<UpdateOperationInput>,
+) -> Response {
+    let maintenance = match authorized_update_maintenance(&state, &headers) {
+        Ok(maintenance) => maintenance,
+        Err(status) => {
+            return (status, status.canonical_reason().unwrap_or("Error")).into_response();
+        }
+    };
+    let operation_id = match uuid::Uuid::parse_str(&input.operation_id) {
+        Ok(operation_id) => operation_id,
+        Err(_) => return maintenance_error_response(MaintenanceError::OperationMismatch),
+    };
+    match maintenance.commit(operation_id).await {
+        Ok(()) => {
+            maintenance.shutdown_after_response();
+            (
+                StatusCode::OK,
+                [(CACHE_CONTROL, "no-store")],
+                Json(json!({"committed":true})),
+            )
+                .into_response()
+        }
+        Err(error) => maintenance_error_response(error),
+    }
+}
+
+async fn update_cancel(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(input): Json<UpdateOperationInput>,
+) -> Response {
+    let maintenance = match authorized_update_maintenance(&state, &headers) {
+        Ok(maintenance) => maintenance,
+        Err(status) => {
+            return (status, status.canonical_reason().unwrap_or("Error")).into_response();
+        }
+    };
+    let operation_id = match uuid::Uuid::parse_str(&input.operation_id) {
+        Ok(operation_id) => operation_id,
+        Err(_) => return maintenance_error_response(MaintenanceError::OperationMismatch),
+    };
+    match maintenance.cancel(operation_id).await {
+        Ok(()) => {
+            maintenance.shutdown_after_response();
+            (
+                StatusCode::OK,
+                [(CACHE_CONTROL, "no-store")],
+                Json(json!({"cancelled":true})),
+            )
+                .into_response()
+        }
+        Err(error) => maintenance_error_response(error),
+    }
+}
+
+async fn update_status(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let maintenance = match authorized_update_maintenance(&state, &headers) {
+        Ok(maintenance) => maintenance,
+        Err(status) => {
+            return (status, status.canonical_reason().unwrap_or("Error")).into_response();
+        }
+    };
+    (
+        StatusCode::OK,
+        [(CACHE_CONTROL, "no-store")],
+        Json(maintenance.status().await),
+    )
+        .into_response()
+}
+
+fn maintenance_error_response(error: MaintenanceError) -> Response {
+    let status = match error {
+        MaintenanceError::OperationMismatch | MaintenanceError::NoPreparedOperation => {
+            StatusCode::CONFLICT
+        }
+        MaintenanceError::AdmissionClosed
+        | MaintenanceError::DrainTimeout { .. }
+        | MaintenanceError::Preparation(_) => StatusCode::SERVICE_UNAVAILABLE,
+    };
+    (
+        status,
+        [(CACHE_CONTROL, "no-store")],
+        Json(json!({
+            "_tag":"UpdateMaintenanceError",
+            "message":error.to_string(),
+        })),
     )
         .into_response()
 }

@@ -146,12 +146,12 @@ import { Kbd } from "./ui/kbd";
 import {
   getArm64IntelBuildWarningDescription,
   getDesktopUpdateActionError,
-  getDesktopUpdateInstallConfirmationMessage,
   isDesktopUpdateButtonDisabled,
   resolveDesktopUpdateButtonAction,
   shouldShowArm64IntelBuildWarning,
   shouldToastDesktopUpdateActionResult,
 } from "./desktopUpdate.logic";
+import { UpdateProtectionDialog } from "./desktop/UpdateProtectionDialog";
 import { Alert, AlertAction, AlertDescription, AlertTitle } from "./ui/alert";
 import { Button } from "./ui/button";
 import {
@@ -3739,6 +3739,7 @@ export default function Sidebar() {
   const suppressProjectClickAfterDragRef = useRef(false);
   const suppressProjectClickForContextMenuRef = useRef(false);
   const desktopUpdateState = useDesktopUpdateState();
+  const [updateDialogOpen, setUpdateDialogOpen] = useState(false);
   const projectAvailability = useMemo(
     () =>
       resolveSidebarProjectAvailability({
@@ -4266,33 +4267,7 @@ export default function Sidebar() {
     }
 
     if (desktopUpdateButtonAction === "install") {
-      const confirmed = window.confirm(
-        getDesktopUpdateInstallConfirmationMessage(desktopUpdateState),
-      );
-      if (!confirmed) return;
-      void bridge
-        .installUpdate()
-        .then((result) => {
-          if (!shouldToastDesktopUpdateActionResult(result)) return;
-          const actionError = getDesktopUpdateActionError(result);
-          if (!actionError) return;
-          toastManager.add(
-            stackedThreadToast({
-              type: "error",
-              title: "Could not install update",
-              description: actionError,
-            }),
-          );
-        })
-        .catch((error) => {
-          toastManager.add(
-            stackedThreadToast({
-              type: "error",
-              title: "Could not install update",
-              description: error instanceof Error ? error.message : "An unexpected error occurred.",
-            }),
-          );
-        });
+      setUpdateDialogOpen(true);
     }
   }, [desktopUpdateButtonAction, desktopUpdateButtonDisabled, desktopUpdateState]);
 
@@ -4324,6 +4299,27 @@ export default function Sidebar() {
         }}
         defaultProjectRef={createWorktreeDialogProjectRef ?? activeRouteProjectRef}
       />
+      {desktopUpdateState && window.desktopBridge ? (
+        <UpdateProtectionDialog
+          open={updateDialogOpen}
+          state={desktopUpdateState}
+          onOpenChange={setUpdateDialogOpen}
+          installUpdate={(input) => window.desktopBridge!.installUpdate(input)}
+          onDiagnostics={() => {
+            setUpdateDialogOpen(false);
+            handleViewProjectDiagnostics();
+          }}
+          onError={(description) => {
+            toastManager.add(
+              stackedThreadToast({
+                type: "error",
+                title: "Could not install update",
+                description,
+              }),
+            );
+          }}
+        />
+      ) : null}
       {prewarmedSidebarThreadRefs.map((threadRef) => (
         <SidebarThreadDetailPrewarmer key={scopedThreadKey(threadRef)} threadRef={threadRef} />
       ))}

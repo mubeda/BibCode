@@ -1410,12 +1410,15 @@ staticDescribe("Sidebar full render", () => {
     );
   });
 
-  it("runs the install flow behind a confirmation and toasts errors", async () => {
+  it("runs installation through typed project protection and toasts errors", async () => {
     baseScenario();
     h.state.desktopUpdateState = { phase: "downloaded" };
     h.state.showArmWarning = true;
     h.state.updateBtnAction = "install";
-    const installUpdate = vi.fn(async () => ({ toast: true, error: "install failed" }));
+    const installUpdate = vi.fn(async () => ({
+      completed: false,
+      state: { message: "install failed" },
+    }));
     (globalThis.window as unknown as Record<string, unknown>)["desktopBridge"] = {
       downloadUpdate: vi.fn(),
       installUpdate,
@@ -1427,14 +1430,18 @@ staticDescribe("Sidebar full render", () => {
     );
     expect(button).toBeDefined();
 
-    // First: user declines the confirm.
-    h.spies.windowConfirm.mockReturnValueOnce(false);
+    // The update action opens the typed protection dialog without using a
+    // browser confirmation or invoking the installer directly.
     invoke(button!.props, "onClick", mouseEvent());
     await flush();
     expect(installUpdate).not.toHaveBeenCalled();
+    expect(h.spies.windowConfirm).not.toHaveBeenCalled();
 
-    // Then: user accepts, install reports an error.
-    invoke(button!.props, "onClick", mouseEvent());
+    const protectAndInstall = captured("Button").find(
+      (entry) => entry.props["children"] === "Protect projects and install",
+    );
+    expect(protectAndInstall).toBeDefined();
+    invoke(protectAndInstall!.props, "onClick", mouseEvent());
     await flush();
     expect(installUpdate).toHaveBeenCalled();
     expect(h.spies.toastAdd).toHaveBeenCalledWith(
@@ -1443,7 +1450,7 @@ staticDescribe("Sidebar full render", () => {
 
     // And: install rejects entirely.
     installUpdate.mockRejectedValueOnce(new Error("io error"));
-    invoke(button!.props, "onClick", mouseEvent());
+    invoke(protectAndInstall!.props, "onClick", mouseEvent());
     await flush();
     expect(h.spies.toastAdd).toHaveBeenCalledWith(
       expect.objectContaining({ title: "Could not install update", description: "io error" }),
@@ -1505,6 +1512,11 @@ staticDescribe("Sidebar full render", () => {
       (entry) => entry.props["children"] === "Install ARM build",
     )!;
     invoke(install.props, "onClick", mouseEvent());
+    await flush();
+    const protectAndInstall = captured("Button").find(
+      (entry) => entry.props["children"] === "Protect projects and install",
+    )!;
+    invoke(protectAndInstall.props, "onClick", mouseEvent());
     await flush();
     expect(h.spies.toastAdd).toHaveBeenCalledWith(
       expect.objectContaining({ description: "An unexpected error occurred." }),

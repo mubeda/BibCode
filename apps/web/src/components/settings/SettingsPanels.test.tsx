@@ -76,6 +76,7 @@ const h = vi.hoisted(() => {
     updateProviderCommand: vi.fn(),
     genericCommand: vi.fn(),
     toastAdd: vi.fn(),
+    navigate: vi.fn(),
     dispatchStateUpdates: false,
     atoms: {
       observability: Symbol("primaryServerObservabilityAtom"),
@@ -199,6 +200,7 @@ vi.mock("@tanstack/react-router", () => ({
       {props.children as ReactNode}
     </a>
   ),
+  useNavigate: () => h.navigate,
 }));
 
 vi.mock("@bibcode/client-runtime/environment", () => ({
@@ -1093,7 +1095,7 @@ describe("AboutSettingsPanel", () => {
       expect(bridge.downloadUpdate).toHaveBeenCalledTimes(2);
     });
 
-    it("asks for confirmation before installing a downloaded update", async () => {
+    it("opens typed protection before installing a downloaded update", () => {
       const bridge = {
         installUpdate: vi.fn().mockRejectedValue(new Error("install failed")),
         checkForUpdate: vi.fn(),
@@ -1108,16 +1110,8 @@ describe("AboutSettingsPanel", () => {
       render(<AboutSettingsPanel />);
       const button = control("button", "Install");
       invoke(button, "onClick");
-      expect(confirmSpy).toHaveBeenCalledTimes(1);
+      expect(confirmSpy).not.toHaveBeenCalled();
       expect(bridge.installUpdate).not.toHaveBeenCalled();
-
-      confirmSpy.mockReturnValue(true);
-      invoke(button, "onClick");
-      await flush();
-      expect(bridge.installUpdate).toHaveBeenCalledTimes(1);
-      expect(h.toastAdd).toHaveBeenCalledWith(
-        expect.objectContaining({ title: "Could not install update" }),
-      );
     });
 
     it("shows the downloading state as disabled", () => {

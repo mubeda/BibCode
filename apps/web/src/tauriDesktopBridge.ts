@@ -10,6 +10,7 @@ import type {
   DesktopSshPasswordPromptRequest,
   DesktopUpdateActionResult,
   DesktopUpdateCheckResult,
+  DesktopUpdateInstallInput,
   DesktopUpdateState,
   DesktopWslState,
 } from "@bibcode/contracts";
@@ -564,8 +565,11 @@ function createTauriDesktopBridge(
       tauriInvokeDesktop("desktop_bridge_check_for_update", undefined),
     downloadUpdate: (): Promise<DesktopUpdateActionResult> =>
       tauriInvokeDesktop("desktop_bridge_download_update", undefined),
-    installUpdate: (): Promise<DesktopUpdateActionResult> =>
-      tauriInvokeDesktop("desktop_bridge_install_update", undefined),
+    installUpdate: (input?: DesktopUpdateInstallInput): Promise<DesktopUpdateActionResult> =>
+      tauriInvokeDesktop(
+        "desktop_bridge_install_update",
+        input === undefined ? undefined : { input },
+      ),
     onUpdateState: (listener: (state: DesktopUpdateState) => void) =>
       tauriListen(UPDATE_STATE_EVENT, listener),
     ...(preview ? { preview } : {}),

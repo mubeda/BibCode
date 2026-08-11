@@ -184,6 +184,36 @@ the resolver rejects connection attempts before creating a transport or
 session. Explicit disable or distro replacement is what removes that desired
 identity and clears its environment cache.
 
+## Desktop update protection
+
+The Tauri host coordinates update installation across the complete local
+backend topology. It atomically snapshots the running primary and secondary
+backends, prevents a new backend start from entering that snapshot, and keeps
+configured-but-unavailable secondaries visible as unprotected. The primary is
+always required. A user may proceed past a failed secondary only by selecting
+that exact environment in the typed protection dialog; the primary can never
+be excluded.
+
+Each included backend exposes an authenticated maintenance API only in desktop
+mode. Native desktop runtimes must be loopback-bound. An external WSL runtime
+may use its wildcard bind only when its desktop bootstrap explicitly marks the
+transport as WSL-owned; the ordinary native wildcard case remains denied. The
+maintenance owner admits status and other read traffic, rejects new mutating
+HTTP and WebSocket RPC operations, and keeps a permit until every admitted
+mutation has committed or failed. Preparation then drains existing mutation
+permits with a bound, quiesces runtime-owned writers, queues, providers,
+terminals, and background tasks, checkpoints SQLite's WAL, and publishes and
+reloads a verified `PreUpdate` backup while holding the store-operation lock.
+
+Preparation is single-flight and returns a lease-bound identifier. Commit and
+cancel must present that identifier. Commit sends its HTTP response before the
+backend exits cleanly; cancellation, preparation failure, and lease expiry also
+exit instead of resuming a partially quiesced runtime. The host marks those
+exits as expected, stops every backend from the captured running set, and does
+not invoke the platform installer until every included backend has committed
+and stopped. A prepare, cancel, commit, stop, or installer failure attempts to
+restart the exact prior running set before update coordination is released.
+
 The WebView engine is the operating system's, so it differs per platform:
 WKWebView on macOS, WebKitGTK on Linux, and WebView2 on Windows. Browser API
 support therefore varies between desktop hosts, and between desktop and browser
@@ -259,6 +289,9 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
 - Configured secondary WSL planning/start failures remain desired, unavailable
   topology with stable identity and no endpoint/session. They do not remove
   cached project/thread state; explicit disable or distro replacement does.
+- Desktop update installation requires a verified pre-update backup for the
+  primary and every non-excluded running secondary, stops the captured running
+  set before invoking the installer, and restarts that exact set on failure.
 - Normal application traffic uses HTTP and WebSocket RPC in every host.
 - `packages/contracts` remains schema-only.
 - Rust owns all production backend behavior. TypeScript is limited to clients,

@@ -14,11 +14,15 @@ const harness = vi.hoisted(() => ({
   shouldToast: false,
   toastAdd: vi.fn(),
   stackedToast: vi.fn((value: unknown) => value),
-  confirm: vi.fn(),
+  navigate: vi.fn(),
   bridge: null as null | {
     downloadUpdate: ReturnType<typeof vi.fn>;
     installUpdate: ReturnType<typeof vi.fn>;
   },
+}));
+
+vi.mock("@tanstack/react-router", () => ({
+  useNavigate: () => harness.navigate,
 }));
 
 vi.mock("react", async (importOriginal) => ({
@@ -32,7 +36,6 @@ vi.mock("../desktopUpdate.logic", () => ({
   getArm64IntelBuildWarningDescription: () => "Use the native Apple Silicon build.",
   getDesktopUpdateActionError: () => harness.actionError,
   getDesktopUpdateButtonTooltip: () => "Update tooltip",
-  getDesktopUpdateInstallConfirmationMessage: () => "Restart now?",
   isDesktopUpdateButtonDisabled: () => harness.disabled,
   resolveDesktopUpdateButtonAction: () => harness.action,
   shouldShowArm64IntelBuildWarning: () => harness.showWarning,
@@ -92,12 +95,11 @@ beforeEach(() => {
   harness.shouldToast = false;
   harness.toastAdd.mockReset();
   harness.stackedToast.mockClear();
-  harness.confirm.mockReset();
-  harness.confirm.mockReturnValue(true);
+  harness.navigate.mockReset();
   harness.bridge = null;
   Object.defineProperty(globalThis, "window", {
     configurable: true,
-    value: { confirm: harness.confirm, desktopBridge: null },
+    value: { desktopBridge: null },
   });
 });
 
@@ -219,33 +221,15 @@ describe("SidebarUpdatePill", () => {
     );
   });
 
-  it("installs only after confirmation and reports result and rejection failures", async () => {
-    const installUpdate = vi.fn().mockResolvedValue({ completed: false });
+  it("opens typed protection instead of invoking the installer directly", () => {
+    const installUpdate = vi.fn();
     harness.bridge = { downloadUpdate: vi.fn(), installUpdate };
     (window as unknown as { desktopBridge: unknown }).desktopBridge = harness.bridge;
     harness.state = { status: "downloaded" };
     harness.visible = true;
     harness.action = "install";
-    harness.confirm.mockReturnValueOnce(false);
     actionButton(SidebarUpdatePill()).onClick();
+    expect(harness.setDismissed).toHaveBeenCalledWith(true);
     expect(installUpdate).not.toHaveBeenCalled();
-
-    harness.shouldToast = true;
-    harness.actionError = "install failed";
-    actionButton(SidebarUpdatePill()).onClick();
-    await vi.waitFor(() =>
-      expect(harness.toastAdd).toHaveBeenCalledWith(
-        expect.objectContaining({ title: "Could not install update" }),
-      ),
-    );
-
-    harness.toastAdd.mockReset();
-    installUpdate.mockRejectedValueOnce("rejected");
-    actionButton(SidebarUpdatePill()).onClick();
-    await vi.waitFor(() =>
-      expect(harness.toastAdd).toHaveBeenCalledWith(
-        expect.objectContaining({ description: "An unexpected error occurred." }),
-      ),
-    );
   });
 });
