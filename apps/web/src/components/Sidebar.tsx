@@ -3771,14 +3771,20 @@ export default function Sidebar() {
   }, []);
   const handleAdoptProjectStorage = useCallback(
     (environmentId: EnvironmentId) => {
-      if (
-        !window.confirm(
-          "Use this project data location? Projects from the two locations will not be merged.",
-        )
-      ) {
+      const api = readLocalApi();
+      if (!api) {
         return;
       }
-      void adoptProjectStorage(environmentId);
+      void api.dialogs
+        .confirm(
+          "Use this project data location? Projects from the two locations will not be merged.",
+        )
+        .then((confirmed) => {
+          if (confirmed) {
+            void adoptProjectStorage(environmentId);
+          }
+        })
+        .catch(() => undefined);
     },
     [adoptProjectStorage],
   );

@@ -1256,7 +1256,9 @@ staticDescribe("Sidebar full render", () => {
     expect(markup).not.toContain("No projects yet");
   });
 
-  it("wires storage-change retry, recovery, settings, diagnostics, and confirmed adoption", () => {
+  it("wires storage-change actions and confirms storage adoption through the local dialog", async () => {
+    fakeLocalApi();
+    h.spies.dialogConfirm.mockResolvedValue(true);
     (globalThis.window as unknown as Record<string, unknown>)["desktopBridge"] = {
       getProjectDataStatuses: vi.fn(),
     };
@@ -1311,6 +1313,7 @@ staticDescribe("Sidebar full render", () => {
       "onClick",
       mouseEvent(),
     );
+    await flush();
 
     expect(h.state.commandCalls).toEqual([
       { label: "environment.retry", input: ENV_MAIN },
@@ -1319,9 +1322,55 @@ staticDescribe("Sidebar full render", () => {
     expect(h.spies.navigate).toHaveBeenCalledWith({ to: "/settings/connections" });
     expect(h.spies.navigate).toHaveBeenCalledWith({ to: "/settings/diagnostics" });
     expect(h.spies.openProjectDataRecovery).toHaveBeenCalledWith(ENV_MAIN, "manual");
-    expect(h.spies.windowConfirm).toHaveBeenCalledWith(
-      expect.stringContaining("will not be merged"),
+    expect(h.spies.dialogConfirm).toHaveBeenCalledWith(
+      "Use this project data location? Projects from the two locations will not be merged.",
     );
+    expect(h.spies.windowConfirm).not.toHaveBeenCalled();
+  });
+
+  it("cancels storage adoption when the local dialog is declined", async () => {
+    fakeLocalApi();
+    h.spies.dialogConfirm.mockResolvedValue(false);
+    h.state.environments = [
+      environmentFixture({
+        environmentId: ENV_MAIN,
+        label: "Local",
+        primary: true,
+      }),
+    ];
+    h.state.shellSummary = {
+      ...h.state.shellSummary,
+      catalogReady: true,
+      desiredEnvironmentCount: 1,
+      statuses: [
+        {
+          environmentId: ENV_MAIN,
+          status: "storage-changed",
+          hasSnapshot: false,
+          error: "Persistent storage changed.",
+        },
+      ],
+    };
+    render(<Sidebar />);
+
+    invoke(
+      mustFindProps(
+        (props) => props["children"] === "Use this data location",
+        "project storage adoption action",
+      ),
+      "onClick",
+      mouseEvent(),
+    );
+    await flush();
+
+    expect(h.spies.dialogConfirm).toHaveBeenCalledWith(
+      "Use this project data location? Projects from the two locations will not be merged.",
+    );
+    expect(h.spies.windowConfirm).not.toHaveBeenCalled();
+    expect(h.state.commandCalls).not.toContainEqual({
+      label: "environment.adoptStorage",
+      input: ENV_MAIN,
+    });
   });
 
   it("shows the empty-thread state for an expanded project without workspace threads", () => {
