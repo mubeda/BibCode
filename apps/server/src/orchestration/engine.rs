@@ -678,7 +678,7 @@ pub struct TestHooks {
     fail_next_projector: Arc<StdMutex<Option<FailProjectorOnce>>>,
     pause_after_admission_commit: Arc<StdMutex<Option<AdmissionCommitPause>>>,
     #[cfg(test)]
-    pause_after_command_receipt_preflight: Arc<StdMutex<Option<AdmissionCommitPause>>>,
+    generic_external_preparation_attempts: Arc<AtomicUsize>,
     pause_before_command_persist: Arc<StdMutex<Option<AdmissionCommitPause>>>,
     pause_before_command_finalization: Arc<StdMutex<Option<PersistenceCommitPause>>>,
     pause_after_command_finalization: Arc<StdMutex<Option<PersistenceCommitPause>>>,
@@ -770,16 +770,15 @@ impl TestHooks {
     }
 
     #[cfg(test)]
-    pub(crate) fn pause_after_next_command_receipt_preflight(&self) -> AdmissionCommitPause {
-        let pause = AdmissionCommitPause {
-            entered: Arc::new(tokio::sync::Notify::new()),
-            release: Arc::new(tokio::sync::Notify::new()),
-        };
-        *self
-            .pause_after_command_receipt_preflight
-            .lock()
-            .expect("command receipt preflight pause mutex") = Some(pause.clone());
-        pause
+    pub(crate) fn note_generic_external_preparation_attempt(&self) {
+        self.generic_external_preparation_attempts
+            .fetch_add(1, Ordering::SeqCst);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn generic_external_preparation_attempts(&self) -> usize {
+        self.generic_external_preparation_attempts
+            .load(Ordering::SeqCst)
     }
 
     pub fn pause_before_next_command_finalization(&self) -> PersistenceCommitPause {
@@ -842,19 +841,6 @@ impl TestHooks {
             .pause_after_admission_commit
             .lock()
             .expect("admission pause mutex")
-            .take();
-        if let Some(pause) = pause {
-            pause.entered.notify_one();
-            pause.release.notified().await;
-        }
-    }
-
-    #[cfg(test)]
-    pub(crate) async fn maybe_pause_after_command_receipt_preflight(&self) {
-        let pause = self
-            .pause_after_command_receipt_preflight
-            .lock()
-            .expect("command receipt preflight pause mutex")
             .take();
         if let Some(pause) = pause {
             pause.entered.notify_one();
@@ -1399,9 +1385,82 @@ struct CommandEnvelope {
     command: OrchestrationCommand,
     admission: Option<CommandAdmission>,
     lifetime: Option<CommandLifetimeGuard>,
+    command_claim: CommandAdmissionClaim,
     ownership: Option<WorkspaceOwnershipLease>,
     response: oneshot::Sender<Result<DispatchResult, OrchestrationError>>,
     on_commit: Option<Box<dyn FnOnce() + Send + 'static>>,
+}
+
+#[derive(Clone, Default)]
+struct CommandAdmissionFence {
+    keys: Arc<StdMutex<HashMap<String, Weak<AsyncMutex<()>>>>>,
+}
+
+#[derive(Clone)]
+pub(crate) struct CommandAdmissionClaim {
+    inner: Arc<CommandAdmissionClaimInner>,
+}
+
+struct CommandAdmissionClaimInner {
+    command_id: String,
+    _guard: OwnedMutexGuard<()>,
+}
+
+impl CommandAdmissionFence {
+    async fn acquire(&self, command_id: &str) -> CommandAdmissionClaim {
+        let gate = {
+            let mut registry = self
+                .keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry.retain(|_, gate| gate.strong_count() > 0);
+            registry
+                .get(command_id)
+                .and_then(Weak::upgrade)
+                .unwrap_or_else(|| {
+                    let gate = Arc::new(AsyncMutex::new(()));
+                    registry.insert(command_id.to_owned(), Arc::downgrade(&gate));
+                    gate
+                })
+        };
+        CommandAdmissionClaim {
+            inner: Arc::new(CommandAdmissionClaimInner {
+                command_id: command_id.to_owned(),
+                _guard: gate.lock_owned().await,
+            }),
+        }
+    }
+
+    #[cfg(test)]
+    fn retained_key_count(&self) -> usize {
+        let mut registry = self
+            .keys
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registry.retain(|_, gate| gate.strong_count() > 0);
+        registry.len()
+    }
+}
+
+impl CommandAdmissionClaim {
+    fn ensure_owns(&self, command_id: &str) -> Result<(), OrchestrationError> {
+        if self.inner.command_id == command_id {
+            Ok(())
+        } else {
+            Err(OrchestrationError::CommandConflict {
+                command_id: command_id.to_owned(),
+            })
+        }
+    }
+}
+
+impl std::fmt::Debug for CommandAdmissionClaim {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CommandAdmissionClaim")
+            .field("command_id", &self.inner.command_id)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -1569,6 +1628,7 @@ pub struct OrchestrationEngine {
     worker: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
     bootstrap_effects: Arc<StdMutex<Option<Arc<dyn ThreadTurnBootstrapEffects>>>>,
     project_command_effects: Arc<StdMutex<Option<Arc<dyn ProjectCommandEffects>>>>,
+    command_admission: CommandAdmissionFence,
     workspace_ownership: WorkspaceOwnershipFence,
     #[cfg(test)]
     test_hooks: TestHooks,
@@ -1604,6 +1664,7 @@ impl OrchestrationEngine {
             worker: Arc::new(tokio::sync::Mutex::new(Some(worker))),
             bootstrap_effects: Arc::new(StdMutex::new(None)),
             project_command_effects,
+            command_admission: CommandAdmissionFence::default(),
             workspace_ownership: WorkspaceOwnershipFence::default(),
             #[cfg(test)]
             test_hooks: options.test_hooks,
@@ -1614,14 +1675,33 @@ impl OrchestrationEngine {
         &self,
         command: OrchestrationCommand,
     ) -> Result<DispatchResult, OrchestrationError> {
-        self.dispatch_inner(command, None, None, None, None).await
+        self.dispatch_inner(command, None, None, None, None, None)
+            .await
+    }
+
+    pub(crate) async fn acquire_command_admission(
+        &self,
+        command_id: &str,
+    ) -> Result<CommandAdmissionClaim, OrchestrationError> {
+        tokio::select! {
+            biased;
+            () = self.shutdown.cancelled() => Err(OrchestrationError::Cancelled),
+            claim = self.command_admission.acquire(command_id) => Ok(claim),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn command_admission_registry_len_for_test(&self) -> usize {
+        self.command_admission.retained_key_count()
     }
 
     pub(crate) async fn replay_admitted_worktree_adoption(
         &self,
+        claim: &CommandAdmissionClaim,
         command_id: &str,
         payload_digest: &str,
     ) -> Result<Option<DispatchResult>, OrchestrationError> {
+        claim.ensure_owns(command_id)?;
         let Some(receipt) = self
             .repositories
             .get_command_receipt(command_id.to_owned())
@@ -1659,9 +1739,11 @@ impl OrchestrationEngine {
 
     pub(crate) async fn replay_admitted_worktree_removal(
         &self,
+        claim: &CommandAdmissionClaim,
         command_id: &str,
         payload_digest: &str,
     ) -> Result<Option<DurableWorktreeRemovalResult>, OrchestrationError> {
+        claim.ensure_owns(command_id)?;
         let Some(receipt) = self
             .repositories
             .get_command_receipt(command_id.to_owned())
@@ -1700,10 +1782,12 @@ impl OrchestrationEngine {
 
     pub(crate) async fn reserve_generic_command_admission(
         &self,
+        claim: &CommandAdmissionClaim,
         command: &OrchestrationCommand,
         payload_digest: &str,
     ) -> Result<bool, OrchestrationError> {
         let command_id = command.command_id().to_owned();
+        claim.ensure_owns(&command_id)?;
         let aggregate = command.aggregate_ref();
         let accepted_at = current_timestamp(self.repositories.database()).await?;
         let result_sequence = current_max_sequence(&self.repositories).await?;
@@ -1741,9 +1825,11 @@ impl OrchestrationEngine {
 
     pub(crate) async fn release_generic_command_admission(
         &self,
+        claim: &CommandAdmissionClaim,
         command: &OrchestrationCommand,
         payload_digest: &str,
     ) -> Result<bool, OrchestrationError> {
+        claim.ensure_owns(command.command_id())?;
         let aggregate = command.aggregate_ref();
         self.repositories
             .release_reserved_command_receipt(
@@ -1758,10 +1844,12 @@ impl OrchestrationEngine {
 
     pub(crate) async fn reserve_worktree_removal_admission(
         &self,
+        claim: &CommandAdmissionClaim,
         command_id: &str,
         project_id: &str,
         payload_digest: &str,
     ) -> Result<(Option<DurableWorktreeRemovalResult>, bool), OrchestrationError> {
+        claim.ensure_owns(command_id)?;
         let accepted_at = current_timestamp(self.repositories.database()).await?;
         let result_sequence = current_max_sequence(&self.repositories).await?;
         let (receipt, inserted) = self
@@ -1788,17 +1876,19 @@ impl OrchestrationEngine {
         }
         let prepared_retry = !inserted && receipt.status == "prepared";
         let replay = self
-            .replay_admitted_worktree_removal(command_id, payload_digest)
+            .replay_admitted_worktree_removal(claim, command_id, payload_digest)
             .await?;
         Ok((replay, prepared_retry))
     }
 
     pub(crate) async fn prepare_worktree_removal_admission(
         &self,
+        claim: &CommandAdmissionClaim,
         command_id: &str,
         project_id: &str,
         payload_digest: &str,
     ) -> Result<(), OrchestrationError> {
+        claim.ensure_owns(command_id)?;
         let receipt = self
             .repositories
             .prepare_reserved_command_receipt(command_id.to_owned(), payload_digest.to_owned())
@@ -1829,10 +1919,12 @@ impl OrchestrationEngine {
 
     pub(crate) async fn verify_prepared_worktree_removal_admission(
         &self,
+        claim: &CommandAdmissionClaim,
         command_id: &str,
         project_id: &str,
         payload_digest: &str,
     ) -> Result<(), OrchestrationError> {
+        claim.ensure_owns(command_id)?;
         if self
             .repositories
             .verify_prepared_command_receipt(
@@ -1858,10 +1950,11 @@ impl OrchestrationEngine {
         command: OrchestrationCommand,
         on_commit: impl FnOnce() + Send + 'static,
     ) -> Result<DispatchResult, OrchestrationError> {
-        self.dispatch_inner(command, None, None, None, Some(Box::new(on_commit)))
+        self.dispatch_inner(command, None, None, None, None, Some(Box::new(on_commit)))
             .await
     }
 
+    #[cfg(test)]
     pub(crate) async fn dispatch_with_admission(
         &self,
         command: OrchestrationCommand,
@@ -1873,15 +1966,44 @@ impl OrchestrationEngine {
             Some(admission),
             None,
             None,
+            None,
             Some(Box::new(on_commit)),
         )
         .await
     }
 
-    pub(crate) async fn dispatch_with_admission_and_ownership(
+    pub(crate) async fn dispatch_with_admission_and_command_claim(
         &self,
         command: OrchestrationCommand,
         admission: CommandAdmission,
+        command_claim: CommandAdmissionClaim,
+        on_commit: impl FnOnce() + Send + 'static,
+    ) -> Result<DispatchResult, OrchestrationError> {
+        self.dispatch_inner(
+            command,
+            Some(admission),
+            None,
+            Some(command_claim),
+            None,
+            Some(Box::new(on_commit)),
+        )
+        .await
+    }
+
+    pub(crate) async fn dispatch_with_command_claim(
+        &self,
+        command: OrchestrationCommand,
+        command_claim: CommandAdmissionClaim,
+    ) -> Result<DispatchResult, OrchestrationError> {
+        self.dispatch_inner(command, None, None, Some(command_claim), None, None)
+            .await
+    }
+
+    pub(crate) async fn dispatch_with_admission_ownership_and_command_claim(
+        &self,
+        command: OrchestrationCommand,
+        admission: CommandAdmission,
+        command_claim: CommandAdmissionClaim,
         ownership: WorkspaceOwnershipLease,
         on_commit: impl FnOnce() + Send + 'static,
     ) -> Result<DispatchResult, OrchestrationError> {
@@ -1889,23 +2011,26 @@ impl OrchestrationEngine {
             command,
             Some(admission),
             None,
+            Some(command_claim),
             Some(ownership),
             Some(Box::new(on_commit)),
         )
         .await
     }
 
-    pub(crate) async fn dispatch_with_admission_and_lifetime(
+    pub(crate) async fn dispatch_with_admission_lifetime_and_command_claim(
         &self,
         command: OrchestrationCommand,
         admission: CommandAdmission,
         lifetime: CommandLifetimeGuard,
+        command_claim: CommandAdmissionClaim,
         on_commit: impl FnOnce() + Send + 'static,
     ) -> Result<DispatchResult, OrchestrationError> {
         self.dispatch_inner(
             command,
             Some(admission),
             Some(lifetime),
+            Some(command_claim),
             None,
             Some(Box::new(on_commit)),
         )
@@ -1917,18 +2042,26 @@ impl OrchestrationEngine {
         command: OrchestrationCommand,
         admission: Option<CommandAdmission>,
         lifetime: Option<CommandLifetimeGuard>,
+        command_claim: Option<CommandAdmissionClaim>,
         ownership: Option<WorkspaceOwnershipLease>,
         on_commit: Option<Box<dyn FnOnce() + Send + 'static>>,
     ) -> Result<DispatchResult, OrchestrationError> {
-        self.dispatch_plain_with_commit(command, admission, lifetime, ownership, on_commit)
-            .await
+        self.dispatch_plain_with_commit(
+            command,
+            admission,
+            lifetime,
+            command_claim,
+            ownership,
+            on_commit,
+        )
+        .await
     }
 
     async fn dispatch_plain(
         &self,
         command: OrchestrationCommand,
     ) -> Result<DispatchResult, OrchestrationError> {
-        self.dispatch_plain_with_commit(command, None, None, None, None)
+        self.dispatch_plain_with_commit(command, None, None, None, None, None)
             .await
     }
 
@@ -1937,12 +2070,19 @@ impl OrchestrationEngine {
         command: OrchestrationCommand,
         admission: Option<CommandAdmission>,
         lifetime: Option<CommandLifetimeGuard>,
+        command_claim: Option<CommandAdmissionClaim>,
         ownership: Option<WorkspaceOwnershipLease>,
         on_commit: Option<Box<dyn FnOnce() + Send + 'static>>,
     ) -> Result<DispatchResult, OrchestrationError> {
         if self.shutdown.is_cancelled() {
             return Err(OrchestrationError::Cancelled);
         }
+        let command_claim = if let Some(command_claim) = command_claim {
+            command_claim.ensure_owns(command.command_id())?;
+            command_claim
+        } else {
+            self.acquire_command_admission(command.command_id()).await?
+        };
         let ownership = if let Some(ownership) = ownership {
             let required_ownership_keys =
                 command_workspace_ownership_keys(&self.repositories, &command).await?;
@@ -1983,6 +2123,7 @@ impl OrchestrationEngine {
                 command,
                 admission,
                 lifetime,
+                command_claim,
                 ownership,
                 response: response_tx,
                 on_commit,
@@ -2209,6 +2350,7 @@ fn spawn_worker(
                                 command,
                                 admission,
                                 lifetime,
+                                command_claim,
                                 ownership,
                                 response,
                                 on_commit,
@@ -2244,6 +2386,7 @@ fn spawn_worker(
                                 ProcessEnvelopeInput {
                                     command,
                                     admission,
+                                    command_claim: &command_claim,
                                     cancellation: cancellation.as_ref(),
                                     commit_fence,
                                 },
@@ -2252,16 +2395,22 @@ fn spawn_worker(
                             if result.is_err()
                                 && let Some((command_id, aggregate_kind, aggregate_id, digest)) =
                                     failed_turn_reservation
-                                && let Err(error) = repositories
-                                    .release_reserved_command_receipt(
-                                        command_id,
-                                        aggregate_kind,
-                                        aggregate_id,
-                                        digest,
-                                    )
-                                    .await
                             {
-                                result = Err(wrap_persistence(error));
+                                let cleanup = match command_claim.ensure_owns(&command_id) {
+                                    Ok(()) => repositories
+                                        .release_reserved_command_receipt(
+                                            command_id,
+                                            aggregate_kind,
+                                            aggregate_id,
+                                            digest,
+                                        )
+                                        .await
+                                        .map_err(wrap_persistence),
+                                    Err(error) => Err(error),
+                                };
+                                if let Err(error) = cleanup {
+                                    result = Err(error);
+                                }
                             }
                             if result.as_ref().is_ok_and(|outcome| outcome.accepted_new)
                             {
@@ -2278,6 +2427,7 @@ fn spawn_worker(
                             let _ = response.send(result.map(|outcome| outcome.result));
                             drop(lifetime);
                             drop(ownership);
+                            drop(command_claim);
                         }
                         WorkerEnvelope::DeliveryTransition(DeliveryTransitionEnvelope { transition, response }) => {
                             let result = persist_turn_delivery_transition(&repositories, &events, &hooks, transition).await;
@@ -2293,6 +2443,7 @@ fn spawn_worker(
 struct ProcessEnvelopeInput<'a> {
     command: OrchestrationCommand,
     admission: Option<CommandAdmission>,
+    command_claim: &'a CommandAdmissionClaim,
     cancellation: Option<&'a CancellationToken>,
     commit_fence: Option<CommitFence>,
 }
@@ -2308,6 +2459,7 @@ async fn process_envelope(
     let ProcessEnvelopeInput {
         mut command,
         admission,
+        command_claim,
         cancellation,
         commit_fence,
     } = input;
@@ -2538,6 +2690,7 @@ async fn process_envelope(
 
     reserve_project_create_side_effect(
         repositories,
+        command_claim,
         &command,
         admission.as_ref(),
         &occurred_at,
@@ -2729,6 +2882,7 @@ async fn prepare_project_create(
 
 async fn reserve_project_create_side_effect(
     repositories: &Repositories,
+    command_claim: &CommandAdmissionClaim,
     command: &OrchestrationCommand,
     admission: Option<&CommandAdmission>,
     occurred_at: &str,
@@ -2745,6 +2899,7 @@ async fn reserve_project_create_side_effect(
     else {
         return Ok(());
     };
+    command_claim.ensure_owns(command_id)?;
     let payload_digest = admission.map(|admission| admission.payload_digest.clone());
     let (receipt, _) = repositories
         .reserve_command_receipt(CommandReceipt {
@@ -7952,7 +8107,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn project_create_arbitrates_command_identity_before_external_preparation() {
+    async fn project_create_claims_command_identity_before_external_preparation() {
         let database = Database::open_in_memory().await.expect("database");
         database
             .call(|connection| {
@@ -7993,30 +8148,48 @@ mod tests {
                 .await
         });
         effects.canonicalize_entered.notified().await;
-        let reserved = engine
-            .reserve_worktree_removal_admission(
-                "shared-side-effect-command",
-                "project-side-effect",
-                "removal-payload",
-            )
-            .await
-            .expect("removal reserves");
-        assert!(reserved.0.is_none());
+        let removal_engine = engine.clone();
+        let mut removal = tokio::spawn(async move {
+            let claim = removal_engine
+                .acquire_command_admission("shared-side-effect-command")
+                .await?;
+            removal_engine
+                .reserve_worktree_removal_admission(
+                    &claim,
+                    "shared-side-effect-command",
+                    "project-side-effect",
+                    "removal-payload",
+                )
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut removal)
+                .await
+                .is_err(),
+            "removal must wait while project creation owns external preparation"
+        );
         effects.canonicalize_release.notify_one();
 
+        dispatch
+            .await
+            .expect("dispatch joins")
+            .expect("project creation retains its claim");
+        assert_eq!(effects.prepare_calls.load(Ordering::SeqCst), 1);
         assert!(matches!(
-            dispatch.await.expect("dispatch joins"),
+            removal.await.expect("removal joins"),
             Err(OrchestrationError::CommandConflict { .. })
         ));
-        assert_eq!(effects.prepare_calls.load(Ordering::SeqCst), 0);
         let receipt = engine
             .repositories()
             .get_command_receipt("shared-side-effect-command".to_owned())
             .await
             .expect("receipt read")
             .expect("receipt");
-        assert_eq!(receipt.status, "reserved");
-        assert_eq!(receipt.payload_digest.as_deref(), Some("removal-payload"));
+        assert_eq!(receipt.status, "accepted");
+        assert_eq!(
+            receipt.payload_digest.as_deref(),
+            Some("generic-project-payload")
+        );
         engine.shutdown().await;
     }
 
@@ -8063,21 +8236,34 @@ mod tests {
         });
         effects.prepare_entered.notified().await;
 
-        assert!(matches!(
-            engine
+        let removal_engine = engine.clone();
+        let mut removal = tokio::spawn(async move {
+            let claim = removal_engine
+                .acquire_command_admission("generic-first-side-effect-command")
+                .await?;
+            removal_engine
                 .reserve_worktree_removal_admission(
+                    &claim,
                     "generic-first-side-effect-command",
                     "project-side-effect",
                     "removal-payload",
                 )
-                .await,
-            Err(OrchestrationError::CommandConflict { .. })
-        ));
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut removal)
+                .await
+                .is_err()
+        );
         effects.prepare_release.notify_one();
         dispatch
             .await
             .expect("dispatch joins")
             .expect("generic command retains reservation");
+        assert!(matches!(
+            removal.await.expect("removal joins"),
+            Err(OrchestrationError::CommandConflict { .. })
+        ));
         let receipt = engine
             .repositories()
             .get_command_receipt("generic-first-side-effect-command".to_owned())
@@ -8089,6 +8275,239 @@ mod tests {
             receipt.payload_digest.as_deref(),
             Some("generic-project-payload")
         );
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn command_admission_claim_serializes_cleanup_waiters_and_does_not_leak_keys() {
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let engine = OrchestrationEngine::start(database.clone(), EngineOptions::default())
+            .await
+            .expect("engine starts");
+        let command: OrchestrationCommand = serde_json::from_value(json!({
+            "type":"project.delete",
+            "commandId":"cleanup-owned-command",
+            "projectId":"cleanup-owned-project",
+            "force":true
+        }))
+        .expect("generic command");
+        let claimant_a = engine
+            .acquire_command_admission("cleanup-owned-command")
+            .await
+            .expect("claimant A owns command admission");
+        assert!(
+            engine
+                .reserve_generic_command_admission(&claimant_a, &command, "cleanup-owned-digest")
+                .await
+                .expect("claimant A reserves")
+        );
+
+        let waiter_engine = engine.clone();
+        let mut waiter_b = tokio::spawn(async move {
+            waiter_engine
+                .acquire_command_admission("cleanup-owned-command")
+                .await
+        });
+        let cancelled_engine = engine.clone();
+        let cancelled = tokio::spawn(async move {
+            cancelled_engine
+                .acquire_command_admission("cleanup-owned-command")
+                .await
+        });
+        tokio::task::yield_now().await;
+        cancelled.abort();
+        assert!(
+            cancelled
+                .await
+                .expect_err("cancelled waiter stops")
+                .is_cancelled()
+        );
+
+        let removal_engine = engine.clone();
+        let mut changed_removal = tokio::spawn(async move {
+            let claim = removal_engine
+                .acquire_command_admission("cleanup-owned-command")
+                .await?;
+            let reservation = removal_engine
+                .reserve_worktree_removal_admission(
+                    &claim,
+                    "cleanup-owned-command",
+                    "different-project",
+                    "different-removal-digest",
+                )
+                .await;
+            Ok::<_, OrchestrationError>((claim, reservation))
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut waiter_b)
+                .await
+                .is_err(),
+            "identical claimant B must wait through A cleanup"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut changed_removal)
+                .await
+                .is_err(),
+            "changed removal C must not inspect or reserve while A is live"
+        );
+        assert!(
+            engine
+                .release_generic_command_admission(&claimant_a, &command, "cleanup-owned-digest")
+                .await
+                .expect("claimant A performs exact cleanup")
+        );
+        drop(claimant_a);
+
+        let claimant_b = waiter_b
+            .await
+            .expect("claimant B task joins")
+            .expect("claimant B acquires after A cleanup");
+        assert!(
+            engine
+                .reserve_generic_command_admission(&claimant_b, &command, "cleanup-owned-digest")
+                .await
+                .expect("claimant B resumes after A cleanup")
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut changed_removal)
+                .await
+                .is_err(),
+            "changed removal C must remain blocked while B owns the retry"
+        );
+        assert!(
+            engine
+                .release_generic_command_admission(&claimant_b, &command, "cleanup-owned-digest")
+                .await
+                .expect("claimant B performs exact cleanup")
+        );
+        drop(claimant_b);
+        let (_claimant_c, removal_reservation) = changed_removal
+            .await
+            .expect("changed removal task joins")
+            .expect("changed removal acquires after generic terminality");
+        assert!(
+            removal_reservation
+                .expect("changed removal may reserve after cleanup")
+                .0
+                .is_none()
+        );
+
+        for index in 0..64 {
+            let claim = engine
+                .acquire_command_admission(&format!("bounded-command-{index}"))
+                .await
+                .expect("bounded claim");
+            drop(claim);
+        }
+        assert!(
+            engine.command_admission_registry_len_for_test() <= 1,
+            "dead command IDs must not accumulate in the weak registry"
+        );
+        engine.shutdown().await;
+
+        let restarted = OrchestrationEngine::start(database, EngineOptions::default())
+            .await
+            .expect("engine restarts with a fresh command gate");
+        let restart_claim = restarted
+            .acquire_command_admission("cleanup-owned-command")
+            .await
+            .expect("fresh process gate acquires durable command ID");
+        let resumed = restarted
+            .reserve_worktree_removal_admission(
+                &restart_claim,
+                "cleanup-owned-command",
+                "different-project",
+                "different-removal-digest",
+            )
+            .await
+            .expect("durable reserved removal remains resumable");
+        assert!(resumed.0.is_none());
+        restarted.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn admitted_worker_retains_command_claim_after_rpc_cancellation() {
+        let hooks = TestHooks::default();
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let engine = OrchestrationEngine::start(
+            database,
+            EngineOptions {
+                test_hooks: hooks.clone(),
+                ..EngineOptions::default()
+            },
+        )
+        .await
+        .expect("engine starts");
+        let command =
+            project_create_command_at("handoff-command", "handoff-project", "C:/handoff-project");
+        let digest = canonical_command_digest(&command).expect("command digest");
+        let claim = engine
+            .acquire_command_admission("handoff-command")
+            .await
+            .expect("RPC owns command claim");
+        let pause = hooks.pause_before_next_command_persist();
+        let dispatch_engine = engine.clone();
+        let dispatch = tokio::spawn(async move {
+            dispatch_engine
+                .dispatch_with_admission_and_command_claim(
+                    command,
+                    CommandAdmission {
+                        payload_digest: digest,
+                        attachment_refs: Vec::new(),
+                        provider_turn: None,
+                    },
+                    claim,
+                    || {},
+                )
+                .await
+        });
+        pause.wait_until_entered().await;
+        dispatch.abort();
+        assert!(dispatch.await.expect_err("RPC task stops").is_cancelled());
+
+        let waiter_engine = engine.clone();
+        let mut waiter = tokio::spawn(async move {
+            waiter_engine
+                .acquire_command_admission("handoff-command")
+                .await
+        });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), &mut waiter)
+                .await
+                .is_err(),
+            "worker handoff must retain the claim after caller cancellation"
+        );
+        pause.release();
+        let replay_claim = waiter
+            .await
+            .expect("waiter task joins")
+            .expect("claim releases after worker terminality");
+        let receipt = engine
+            .repositories()
+            .get_command_receipt("handoff-command".to_owned())
+            .await
+            .expect("receipt read")
+            .expect("accepted receipt");
+        assert_eq!(receipt.status, "accepted");
+        drop(replay_claim);
+        engine
+            .acquire_command_admission("handoff-command")
+            .await
+            .expect("claim releases exactly once without deadlock");
         engine.shutdown().await;
     }
 

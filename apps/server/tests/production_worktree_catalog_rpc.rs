@@ -16,14 +16,15 @@ use bibcode_server::{
         GitWorktreeRecord, GitWorktreeRemovalInspection,
     },
     orchestration::{
-        EngineOptions, OrchestrationCommand, OrchestrationEngine, OrchestrationError,
-        canonical_command_digest, engine::TestHooks,
+        EngineOptions, OrchestrationCommand, OrchestrationEngine, canonical_command_digest,
+        engine::TestHooks,
     },
     persistence::{
         CommandReceipt, Database, OrchestrationEvent, ProjectionProject, ProjectionThread,
         Repositories, run_migrations,
     },
     production::git_vcs::{CatalogMutationObserver, GitVcsRpcServices, register_git_vcs_rpc},
+    production::orchestration_rpc::register_orchestration_rpc,
     production::worktree_catalog_rpc::{
         WorktreeCatalogMutationObserver, WorktreeCatalogRpcServices,
         WorktreeRemovalCleanupAdmission, WorktreeRemovalCleanupAdmissionError,
@@ -1427,7 +1428,7 @@ async fn removal_command_reservation_allows_only_one_cross_repository_git_mutati
 }
 
 #[tokio::test]
-async fn generic_command_cannot_overwrite_prepared_removal_receipt_after_git() {
+async fn generic_command_claim_blocks_removal_before_git_and_keeps_terminal_receipt() {
     let hooks = TestHooks::default();
     let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
     let release = Arc::new(Semaphore::new(0));
@@ -1466,27 +1467,102 @@ async fn generic_command_cannot_overwrite_prepared_removal_receipt_after_git() {
     pause.wait_until_entered().await;
 
     request(fixture.socket(), "1267", "worktree.remove", removal.clone()).await;
-    timeout(Duration::from_secs(5), entered_rx.recv())
-        .await
-        .expect("removal reaches Git")
-        .expect("Git boundary");
-    release.add_permits(1);
+    assert!(
+        timeout(Duration::from_millis(200), entered_rx.recv())
+            .await
+            .is_err(),
+        "removal must wait behind the generic command claim before Git"
+    );
     pause.release();
 
-    assert!(matches!(
-        generic_task.await.expect("generic join"),
-        Err(OrchestrationError::CommandConflict { .. })
-    ));
-    let result = success_value(fixture.socket(), "1267").await;
-    assert_eq!(result["gitOutcome"], "removed");
-    assert_eq!(result["threadRemoved"], true);
-    assert!(!fixture.external.exists());
+    generic_task
+        .await
+        .expect("generic join")
+        .expect("generic claimant commits first");
+    assert_typed_removal_failure(fixture.socket(), "1267", "command-conflict").await;
+    assert!(fixture.external.exists());
     let receipt = fixture
         .repositories
         .get_command_receipt("shared-generic-removal-command".to_owned())
         .await
         .expect("receipt read")
         .expect("accepted receipt");
+    assert_eq!(receipt.status, "accepted");
+    assert_eq!(receipt.payload_digest, None);
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn removal_command_claim_blocks_generic_dispatch_through_git_and_detach() {
+    let (entered_tx, mut entered_rx) = mpsc::unbounded_channel();
+    let release = Arc::new(Semaphore::new(0));
+    let removal_git = Arc::new(BlockingRemovalGit {
+        inner: GitRepository::default(),
+        entered: entered_tx,
+        release: release.clone(),
+    });
+    let mut fixture = CatalogRpcFixture::new_with_removal_git(true, removal_git).await;
+    let thread_id = adopt_external_for_removal(&mut fixture, "removal-first-adopt").await;
+    let plan = removal_plan(&mut fixture, "project-1", &thread_id, "1268").await;
+    let removal = removal_payload(
+        "removal-first-shared-command",
+        "project-1",
+        &thread_id,
+        &plan,
+    );
+    request(fixture.socket(), "1269", "worktree.remove", removal.clone()).await;
+    timeout(Duration::from_secs(5), entered_rx.recv())
+        .await
+        .expect("removal reaches Git")
+        .expect("Git boundary");
+
+    let address = fixture.handle.as_ref().expect("server handle").local_addr();
+    let mut generic_socket = connect_async(format!("ws://{address}/ws"))
+        .await
+        .expect("generic socket")
+        .0;
+    request(
+        &mut generic_socket,
+        "1270",
+        "orchestration.dispatchCommand",
+        json!({
+            "type":"thread.meta.update",
+            "commandId":"removal-first-shared-command",
+            "threadId":thread_id,
+            "title":"must-not-commit"
+        }),
+    )
+    .await;
+    assert!(
+        timeout(Duration::from_millis(200), generic_socket.next())
+            .await
+            .is_err(),
+        "generic dispatch must wait while removal owns Git and detach"
+    );
+    release.add_permits(1);
+    let removal_result = success_value(fixture.socket(), "1269").await;
+    assert_eq!(removal_result["gitOutcome"], "removed");
+    match next_server_message(&mut generic_socket).await {
+        ServerMessage::Exit {
+            exit: RpcExit::Failure { cause },
+            ..
+        } => assert!(
+            cause.iter().any(|item| match item {
+                CauseItem::Fail { error } => error["message"]
+                    .as_str()
+                    .is_some_and(|message| message.to_ascii_lowercase().contains("conflict")),
+                _ => false,
+            }),
+            "generic loser must report a command conflict: {cause:?}"
+        ),
+        other => panic!("expected generic command conflict after removal: {other:?}"),
+    }
+    let receipt = fixture
+        .repositories
+        .get_command_receipt("removal-first-shared-command".to_owned())
+        .await
+        .expect("receipt read")
+        .expect("accepted removal receipt");
     assert_eq!(receipt.status, "accepted");
     assert_eq!(
         receipt.payload_digest.as_deref(),
@@ -2732,6 +2808,7 @@ impl CatalogRpcFixture {
             removal_services.with_removal_git(git)
         });
         register_worktree_catalog_rpc(&mut registry, removal_services);
+        register_orchestration_rpc(&mut registry, engine.clone());
         register_git_vcs_rpc(
             &mut registry,
             GitVcsRpcServices::with_repository(git_repository.clone())
