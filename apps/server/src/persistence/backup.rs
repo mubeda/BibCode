@@ -2490,7 +2490,10 @@ fn write_manifest(path: &Path, manifest: &BackupManifest) -> Result<(), BackupEr
 }
 
 fn sync_file(path: &Path) -> Result<(), BackupError> {
-    File::open(path)
+    OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
         .and_then(|file| file.sync_all())
         .map_err(|source| BackupError::Io {
             path: path.to_path_buf(),
@@ -2676,6 +2679,18 @@ mod tests {
                 |row| row.get(0),
             )
             .expect("schema version")
+    }
+
+    #[test]
+    fn staged_database_sync_reopens_the_file_with_write_access() {
+        let root = TempDir::new().expect("sync fixture root");
+        let path = root.path().join(BACKUP_FILE_NAME);
+        let mut file = private_create_new(&path).expect("sync fixture should create");
+        file.write_all(b"durable backup fixture")
+            .expect("sync fixture should write");
+        drop(file);
+
+        sync_file(&path).expect("staged database should flush on every supported platform");
     }
 
     #[tokio::test]
