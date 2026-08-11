@@ -659,7 +659,7 @@ mod tests {
     }
 }
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     fmt,
     sync::{Arc, Mutex, Weak},
 };
@@ -1203,6 +1203,29 @@ impl ActivityControlScope {
         self.actors.len() <= ACTIVITY_PAGE_MAX_LENGTH
             && self.work_items.len() <= ACTIVITY_PAGE_MAX_LENGTH
             && self.operations.len() <= ACTIVITY_PAGE_MAX_LENGTH
+            && self.operations.values().all(|operation| {
+                operation.covered_actor_ids.len() <= ACTIVITY_PAGE_MAX_LENGTH
+                    && operation.covered_work_item_ids.len() <= ACTIVITY_PAGE_MAX_LENGTH
+                    && operation.dispatched_targets.len() <= ACTIVITY_DELTA_MAX_CHANGES
+                    && operation.active_attempt_ids.len() <= ACTIVITY_DELTA_MAX_CHANGES
+                    && operation.active_attempt_targets.len() == operation.active_attempt_ids.len()
+                    && operation
+                        .active_attempt_ids
+                        .iter()
+                        .all(|id| operation.active_attempt_targets.contains_key(id))
+                    && operation
+                        .active_attempt_targets
+                        .values()
+                        .map(HashSet::len)
+                        .sum::<usize>()
+                        <= ACTIVITY_DELTA_MAX_CHANGES
+                    && operation
+                        .active_attempt_targets
+                        .values()
+                        .flatten()
+                        .all(|target| operation.dispatched_targets.contains(target))
+                    && self.operation_retained_target_count(operation) <= ACTIVITY_DELTA_MAX_CHANGES
+            })
             && self
                 .operations
                 .values()
@@ -1362,6 +1385,13 @@ impl ActivityControlScope {
             let before_residual_actors = operation.residual_actor_ids.clone();
             let before_residual_work = operation.residual_work_item_ids.clone();
 
+            operation
+                .covered_actor_ids
+                .retain(|actor_id| self.actors.contains_key(actor_id));
+            operation
+                .covered_work_item_ids
+                .retain(|work_item_id| self.work_items.contains_key(work_item_id));
+
             operation.residual_actor_ids.retain(|actor_id| {
                 self.actors
                     .get(actor_id)
@@ -1414,6 +1444,7 @@ impl ActivityControlScope {
                     }
                 }
             }
+            self.prune_operation_targets(&mut operation);
             let changed = before_covered_actors != operation.covered_actor_ids
                 || before_covered_work != operation.covered_work_item_ids
                 || before_residual_actors != operation.residual_actor_ids
@@ -1434,6 +1465,48 @@ impl ActivityControlScope {
             self.operations.remove(&root);
         }
         jobs
+    }
+
+    fn operation_live_targets(
+        &self,
+        operation: &CancellationOperation,
+    ) -> HashSet<ProviderActivityNativeTarget> {
+        let mut targets = HashSet::new();
+        for actor_id in &operation.covered_actor_ids {
+            if let Some(target) = self
+                .actors
+                .get(actor_id)
+                .filter(|actor| !actor.status.is_terminal())
+                .and_then(|actor| actor.target.clone())
+            {
+                targets.insert(target);
+            }
+        }
+        for work_item_id in &operation.covered_work_item_ids {
+            if let Some(target) = self
+                .work_items
+                .get(work_item_id)
+                .filter(|work_item| !work_item.status.is_terminal())
+                .and_then(|work_item| work_item.target.clone())
+            {
+                targets.insert(target);
+            }
+        }
+        targets
+    }
+
+    fn operation_retained_target_count(&self, operation: &CancellationOperation) -> usize {
+        let mut targets = self.operation_live_targets(operation);
+        targets.extend(operation.dispatched_targets.iter().cloned());
+        targets.len()
+    }
+
+    pub(super) fn prune_operation_targets(&self, operation: &mut CancellationOperation) {
+        let mut retained = self.operation_live_targets(operation);
+        retained.extend(operation.active_attempt_targets.values().flatten().cloned());
+        operation
+            .dispatched_targets
+            .retain(|target| retained.contains(target));
     }
 
     pub(super) fn pending_changes(
