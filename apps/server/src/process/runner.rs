@@ -348,6 +348,12 @@ fn resolve_command(input: &ProcessRunInput) -> ResolvedCommand {
 mod tests {
     use super::*;
     use crate::test_support::TestSandbox;
+    use tokio::{io::AsyncReadExt, net::TcpListener};
+
+    const CANCELLATION_FIXTURE_READY_ADDRESS: &str = "BIBCODE_RUNNER_FIXTURE_READY_ADDRESS";
+    const CANCELLATION_FIXTURE_TEST: &str =
+        "process::runner::tests::runner_cancellation_fixture_child_emits_readiness";
+    const FIXTURE_READY_TIMEOUT: Duration = Duration::from_secs(5);
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn runner_uses_command_local_environment_for_parallel_children() {
@@ -402,29 +408,65 @@ mod tests {
     async fn runner_cancels_parallel_fixture_children_after_spawn() {
         async fn run(label: &str) -> ProcessError {
             let sandbox = TestSandbox::new(label);
-            let script = sandbox.executable_script(
-                "wait-for-cancellation",
-                "sleep 30",
-                "@echo off\r\nping -n 31 127.0.0.1 >nul",
-            );
+            let listener = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind fixture readiness listener");
+            let address = listener
+                .local_addr()
+                .expect("fixture readiness listener address");
             let cancellation = CancellationToken::new();
-            let canceller = cancellation.clone();
-            let (result, ()) = tokio::join!(
-                ProcessRunner.run_with_cancellation(
-                    sandbox.process_input(script, Vec::<String>::new()),
-                    cancellation,
-                ),
-                async move {
-                    tokio::task::yield_now().await;
-                    canceller.cancel();
-                }
+            let mut input = sandbox.process_input(
+                std::env::current_exe().expect("current test executable"),
+                ["--exact", CANCELLATION_FIXTURE_TEST, "--nocapture"],
             );
-            result.expect_err("cancellation must terminate the spawned fixture child")
+            input.env = Some(
+                sandbox.environment([(CANCELLATION_FIXTURE_READY_ADDRESS, address.to_string())]),
+            );
+            let running =
+                tokio::spawn(ProcessRunner.run_with_cancellation(input, cancellation.clone()));
+
+            let readiness = tokio::time::timeout(FIXTURE_READY_TIMEOUT, async {
+                let (mut stream, _) = listener.accept().await.map_err(|error| error.to_string())?;
+                let mut ready = [0_u8; 1];
+                stream
+                    .read_exact(&mut ready)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                (ready == [b'R'])
+                    .then_some(())
+                    .ok_or_else(|| "unexpected fixture readiness payload".to_owned())
+            })
+            .await;
+            if !matches!(readiness, Ok(Ok(()))) {
+                cancellation.cancel();
+                let _ = running.await;
+                panic!(
+                    "fixture child did not emit readiness before the bounded timeout: {readiness:?}"
+                );
+            }
+
+            cancellation.cancel();
+            running
+                .await
+                .expect("runner task should join")
+                .expect_err("cancellation must terminate the ready fixture child")
         }
 
         let (left, right) = tokio::join!(run("cancel-left"), run("cancel-right"));
         assert!(left.is_cancelled());
         assert!(right.is_cancelled());
+    }
+
+    #[test]
+    fn runner_cancellation_fixture_child_emits_readiness() {
+        let Ok(address) = std::env::var(CANCELLATION_FIXTURE_READY_ADDRESS) else {
+            return;
+        };
+        let mut stream = std::net::TcpStream::connect(address)
+            .expect("fixture child should connect its readiness handshake");
+        std::io::Write::write_all(&mut stream, b"R")
+            .expect("fixture child should emit its readiness handshake");
+        std::thread::sleep(Duration::from_secs(30));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
