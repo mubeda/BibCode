@@ -3586,7 +3586,7 @@ fn context_window_activity_payload(payload: &Value) -> Option<Value> {
 
 const PROVIDER_ITEM_ID_MAX_CHARS: usize = 512;
 
-fn valid_provider_item_id(item_id: Option<&str>) -> Option<&str> {
+pub(crate) fn valid_provider_item_id(item_id: Option<&str>) -> Option<&str> {
     let item_id = item_id?.trim();
     (!item_id.is_empty()
         && item_id.chars().count() <= PROVIDER_ITEM_ID_MAX_CHARS
