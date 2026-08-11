@@ -179,6 +179,15 @@ impl ActivityProjection {
         self.controller.clone()
     }
 
+    /// Returns the projection-owned ephemeral control overlay for integration diagnostics.
+    ///
+    /// The registry deliberately exposes no provider-native targets and performs no persistence.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn activity_control_registry_for_integration_test(&self) -> ActivityControlRegistry {
+        self.control_registry.clone()
+    }
+
     #[doc(hidden)]
     #[must_use]
     pub fn with_capacity(repository: ActivityRepository, capacity: usize) -> Self {
