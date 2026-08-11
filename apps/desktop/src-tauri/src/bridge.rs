@@ -2702,14 +2702,17 @@ mod tests {
 
     #[test]
     fn tauri_ipc_handlers_preserve_runtime_agnostic_bridge_contracts() {
+        use crate::config::IsolatedTestDataRoot;
         use tauri::test::{INVOKE_KEY, get_ipc_response, mock_builder};
 
+        let temp = tempfile::tempdir().expect("isolated desktop data root");
         // Use the generated application context so IPC exercises the same command
         // permissions as the production desktop shell.
         let mut context = crate::desktop_context();
         context.config_mut().identifier =
             format!("com.bibcode.bridge-tests-{}", std::process::id());
         let app = mock_builder()
+            .manage(IsolatedTestDataRoot::new(temp.path().join("data-root")))
             .manage(BackendSupervisor::new())
             .manage(ConnectionCatalogCoordinator::new())
             .manage(NativeContextMenuManager::new())
@@ -2782,9 +2785,7 @@ mod tests {
             )
             .map(|body| body.deserialize::<Value>().unwrap())
         };
-        let test_state_dir = state_dir(app.handle()).expect("mock state directory");
-        let _ = fs::remove_dir_all(&test_state_dir);
-
+        let test_state_dir = state_dir(app.handle()).expect("isolated mock state directory");
         let metadata = invoke("desktop_bridge_get_bridge_metadata", json!({})).unwrap();
         assert_eq!(metadata["host"], "tauri");
         assert_eq!(
@@ -3096,6 +3097,5 @@ mod tests {
                 "{command} should reject missing command arguments",
             );
         }
-        let _ = fs::remove_dir_all(test_state_dir);
     }
 }
