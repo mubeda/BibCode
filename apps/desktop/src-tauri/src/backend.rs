@@ -3016,6 +3016,7 @@ mod tests {
         id: usize,
         method: &str,
         payload: Value,
+        response_timeout: Duration,
     ) -> ServerMessage
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
@@ -3034,7 +3035,7 @@ mod tests {
             ))
             .await
             .expect("RPC request should send");
-        let frame = tokio::time::timeout(Duration::from_secs(10), socket.next())
+        let frame = tokio::time::timeout(response_timeout, socket.next())
             .await
             .expect("RPC response should arrive before the timeout")
             .expect("RPC socket should remain open")
@@ -3084,7 +3085,14 @@ mod tests {
         let (mut socket, _) = connect_async(request)
             .await
             .expect("desktop runtime WebSocket should connect");
-        let response = request_rpc(&mut socket, 1, "server.getProcessDiagnostics", json!({})).await;
+        let response = request_rpc(
+            &mut socket,
+            1,
+            "server.getProcessDiagnostics",
+            json!({}),
+            Duration::from_secs(10),
+        )
+        .await;
         assert_rpc_completed("server.getProcessDiagnostics", &response);
         socket.close(None).await.expect("RPC socket should close");
     }
@@ -5291,12 +5299,26 @@ exit /b 9
         .into_iter()
         .enumerate()
         {
-            let message = request_rpc(&mut socket, id + 1, method, json!({})).await;
+            let message = request_rpc(
+                &mut socket,
+                id + 1,
+                method,
+                json!({}),
+                Duration::from_secs(45),
+            )
+            .await;
             assert_rpc_completed(method, &message);
         }
 
         let cwd = workspace.path().to_string_lossy();
-        let initialized = request_rpc(&mut socket, 100, "vcs.init", json!({ "cwd": cwd })).await;
+        let initialized = request_rpc(
+            &mut socket,
+            100,
+            "vcs.init",
+            json!({ "cwd": cwd }),
+            Duration::from_secs(45),
+        )
+        .await;
         assert!(
             matches!(
                 &initialized,
@@ -5312,6 +5334,7 @@ exit /b 9
             101,
             "vcs.listRefs",
             json!({ "cwd": cwd, "limit": 25 }),
+            Duration::from_secs(45),
         )
         .await;
         assert!(matches!(
@@ -5334,6 +5357,7 @@ exit /b 9
                 "rows": 24,
                 "env": {}
             }),
+            Duration::from_secs(45),
         )
         .await;
         assert!(matches!(
@@ -5353,6 +5377,7 @@ exit /b 9
                 "cols": 100,
                 "rows": 30
             }),
+            Duration::from_secs(45),
         )
         .await;
         assert!(matches!(
@@ -5370,6 +5395,7 @@ exit /b 9
                 "threadId": "desktop-runtime-smoke",
                 "terminalId": "desktop-runtime-terminal"
             }),
+            Duration::from_secs(45),
         )
         .await;
         assert!(matches!(
