@@ -47,6 +47,8 @@ registers their RPC adapters in `RpcRegistry`:
   and projections;
 - `ProviderRuntimeSupervisor` owns provider session processes and native
   protocol adapters;
+- `ActivityCancellationService` owns bounded, generation-fenced targeted
+  cancellation admission and dispatches only server-held provider targets;
 - `TurnDeliveryService` routes admitted turns to provider runtimes while
   preserving delivery and recovery invariants;
 - activity, preview, Git/VCS, terminal, settings, diagnostics, authentication,

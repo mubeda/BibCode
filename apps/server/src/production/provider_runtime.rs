@@ -14,10 +14,12 @@ use std::{
 
 use crate::{
     activity::{
-        ACTIVITY_ID_MAX_LENGTH, ActivityCapabilities, ActivityHistoryRecovery,
-        ActivityObservationState, ActivityProjection, ActivityRepositoryError, ActivityScopeRef,
-        ActivityScopeSeed, ActivitySection, ActivitySectionHealth, ActivitySummaryCounts,
-        AgentActivityController, ProviderActivityMutation,
+        ACTIVITY_ID_MAX_LENGTH, ActivityCancellationDispatcher, ActivityCancellationService,
+        ActivityCapabilities, ActivityDispatchError, ActivityHistoryRecovery,
+        ActivityObservationState, ActivityProjection, ActivityRepositoryError,
+        ActivityRuntimeGeneration, ActivityScopeRef, ActivityScopeSeed, ActivitySection,
+        ActivitySectionHealth, ActivitySummaryCounts, ActivityTargetDispatchDisposition,
+        AgentActivityController, ProviderActivityMutation, ProviderActivityNativeTarget,
     },
     diagnostics::{
         AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
@@ -372,6 +374,7 @@ pub struct ProviderRuntimeSupervisor {
     stopped: CancellationToken,
     worker: Arc<Mutex<Option<JoinHandle<()>>>>,
     connect_mcp: Arc<RwLock<Option<Arc<ConnectMcpService>>>>,
+    activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
 }
 
 enum SupervisorMessage {
@@ -613,7 +616,12 @@ impl ProviderRuntimeSupervisor {
             stopped,
             worker: Arc::new(Mutex::new(Some(worker))),
             connect_mcp: Arc::new(RwLock::new(None)),
+            activity_cancellation: Arc::new(RwLock::new(None)),
         }
+    }
+
+    pub(crate) async fn attach_activity_cancellation(&self, service: ActivityCancellationService) {
+        *self.activity_cancellation.write().await = Some(service);
     }
 
     pub async fn attach_connect_mcp(&self, service: Arc<ConnectMcpService>) {
@@ -758,6 +766,7 @@ impl ProviderRuntimeSupervisor {
         if let Some(worker) = self.worker.lock().await.take() {
             let _ = worker.await;
         }
+        self.activity_cancellation.write().await.take();
         result
     }
 
@@ -776,6 +785,48 @@ impl ProviderRuntimeSupervisor {
         response_rx
             .await
             .map_err(|_| ProviderRuntimeError::ResponseDropped)?
+    }
+}
+
+impl ActivityCancellationDispatcher for ProviderRuntimeSupervisor {
+    fn cancel_target(
+        &self,
+        scope: ActivityScopeRef,
+        _generation: ActivityRuntimeGeneration,
+        target: ProviderActivityNativeTarget,
+    ) -> futures_util::future::BoxFuture<
+        'static,
+        Result<ActivityTargetDispatchDisposition, ActivityDispatchError>,
+    > {
+        let supervisor = self.clone();
+        Box::pin(async move {
+            let ActivityScopeRef::Thread { thread_id } = scope else {
+                return Err(ActivityDispatchError::TargetUnavailable);
+            };
+            let turn_id = match target {
+                ProviderActivityNativeTarget::CodexTurn { turn_id, .. } => Some(turn_id),
+                ProviderActivityNativeTarget::ClaudeTask { .. } => {
+                    return Err(ActivityDispatchError::TargetUnavailable);
+                }
+            };
+            supervisor
+                .handle_orchestration(OrchestrationCommand::ThreadTurnInterrupt {
+                    command_id: format!("activity-cancel:{}", Uuid::new_v4()),
+                    thread_id,
+                    turn_id,
+                    created_at: now(),
+                })
+                .await
+                .map(|()| ActivityTargetDispatchDisposition::Delivered)
+                .map_err(|error| match error {
+                    ProviderRuntimeError::SessionNotFound { .. }
+                    | ProviderRuntimeError::StaleSession { .. }
+                    | ProviderRuntimeError::UnsupportedCapability { .. } => {
+                        ActivityDispatchError::TargetUnavailable
+                    }
+                    _ => ActivityDispatchError::ProviderUnavailable,
+                })
+        })
     }
 }
 

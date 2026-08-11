@@ -5,8 +5,9 @@ use bibcode_server::{
     activity::{
         ActivityActorSummary, ActivityCapabilities, ActivityEntry, ActivityEntryKind,
         ActivityEntryTone, ActivityLifecycle, ActivityProjection, ActivityProjections,
-        ActivityRecordKind, ActivityRepository, ActivityScopeSeed, AgentActivityController,
-        ProviderActivityMutation, register_activity_rpc,
+        ActivityRecordKind, ActivityRepository, ActivityScopeSeed, ActivityWorkItemSummary,
+        AgentActivityController, ProviderActivityMutation,
+        register_activity_rpc_for_integration_test,
     },
     persistence::{Database, run_migrations},
 };
@@ -49,6 +50,9 @@ async fn activity_unary_rpc_pages_rosters_and_detail_and_bounds_scope_errors() {
                     )
                     .expect("done actor"),
                 ),
+                ProviderActivityMutation::UpsertWorkItem(
+                    work_item("work:active", "actor:active").expect("active work item"),
+                ),
                 ProviderActivityMutation::AppendEntry(
                     entry("entry:older", "actor:active", "2026-07-22T12:00:02Z")
                         .expect("older entry"),
@@ -73,6 +77,10 @@ async fn activity_unary_rpc_pages_rosters_and_detail_and_bounds_scope_errors() {
     .await
     .expect("snapshot");
     assert_eq!(snapshot["scopeId"], "thread:rpc");
+    assert_eq!(snapshot["protocolVersion"], 2);
+    assert_eq!(snapshot["control"]["scopeId"], "thread:rpc");
+    assert_eq!(snapshot["control"]["actors"].as_array().unwrap().len(), 2);
+    assert_eq!(snapshot["control"]["operations"], json!([]));
     assert_eq!(
         snapshot["counts"]["subagents"],
         json!({ "active": 1, "done": 1 })
@@ -93,6 +101,9 @@ async fn activity_unary_rpc_pages_rosters_and_detail_and_bounds_scope_errors() {
     .await
     .expect("active roster");
     assert_eq!(active["records"][0]["id"], "actor:active");
+    assert_eq!(active["actorControls"].as_array().unwrap().len(), 1);
+    assert_eq!(active["actorControls"][0]["actorId"], "actor:active");
+    assert_eq!(active["actorControls"][0]["state"], "unsupported");
     assert!(active["nextCursor"].is_null());
 
     let missing_scope = unary(
@@ -149,6 +160,8 @@ async fn activity_unary_rpc_pages_rosters_and_detail_and_bounds_scope_errors() {
     .await
     .expect("detail");
     assert_eq!(detail["entries"][0]["id"], "entry:newer");
+    assert_eq!(detail["actorControl"]["actorId"], "actor:active");
+    assert_eq!(detail["actorControl"]["state"], "unsupported");
     let cursor = detail["nextCursor"].as_str().expect("detail cursor");
     let next_detail = unary(
         &mut socket,
@@ -166,6 +179,22 @@ async fn activity_unary_rpc_pages_rosters_and_detail_and_bounds_scope_errors() {
     .await
     .expect("next detail");
     assert_eq!(next_detail["entries"][0]["id"], "entry:older");
+
+    let work_detail = unary(
+        &mut socket,
+        "50",
+        "activity.listDetail",
+        json!({
+            "scope": { "_tag": "thread", "threadId": "rpc" },
+            "scopeId": "thread:rpc",
+            "recordKind": "workItem",
+            "recordId": "work:active",
+            "limit": 1
+        }),
+    )
+    .await
+    .expect("work-item detail");
+    assert!(work_detail["actorControl"].is_null());
 
     let invalid_cursor = unary(
         &mut socket,
@@ -323,7 +352,7 @@ async fn feature_disabled_stream_emits_one_error_completes_and_unary_reads_reser
     let scope = thread_scope("thread:feature-disabled", "feature-disabled");
     projection.ensure_scope(scope).await.expect("scope");
     let mut registry = RpcRegistry::empty();
-    register_activity_rpc(&mut registry, projections);
+    register_activity_rpc_for_integration_test(&mut registry, projections);
     let directory = tempfile::tempdir().expect("server directory");
     let handle = ServerRuntime::start_with_registry(
         ServerConfig::new(directory.path())
@@ -717,7 +746,7 @@ async fn assert_unary_activity_read_is_drained_and_fenced(
         .expect("seed activity");
 
     let mut registry = RpcRegistry::empty();
-    register_activity_rpc(&mut registry, projections);
+    register_activity_rpc_for_integration_test(&mut registry, projections);
     let directory = tempfile::tempdir().expect("server directory");
     let handle = ServerRuntime::start_with_registry(
         ServerConfig::new(directory.path())
@@ -1295,9 +1324,11 @@ fn activity_methods_are_in_the_authenticated_rpc_inventory() {
     assert_eq!(
         activity_methods,
         [
+            ("activity.cancelSubtree", MethodMode::Unary),
             ("activity.getSnapshot", MethodMode::Unary),
             ("activity.listDetail", MethodMode::Unary),
             ("activity.listRoster", MethodMode::Unary),
+            ("activity.retrySubtreeCancellation", MethodMode::Unary,),
             ("subscribeActivity", MethodMode::Stream),
         ]
     );
@@ -1317,9 +1348,11 @@ async fn activity_authorization_rejects_unauthenticated_websocket_before_unary_o
             .map(|method| method.name)
             .collect::<Vec<_>>(),
         [
+            "activity.cancelSubtree",
             "activity.getSnapshot",
             "activity.listDetail",
             "activity.listRoster",
+            "activity.retrySubtreeCancellation",
             "subscribeActivity",
         ]
     );
@@ -1369,7 +1402,7 @@ impl AuthRequiredFixture {
             capacity,
         );
         let mut registry = RpcRegistry::empty();
-        register_activity_rpc(&mut registry, projections);
+        register_activity_rpc_for_integration_test(&mut registry, projections);
         let directory = tempfile::tempdir().expect("temporary server directory");
         let handle = ServerRuntime::start_with_registry(
             ServerConfig::new(directory.path()).with_bind("127.0.0.1", 0),
@@ -1408,7 +1441,7 @@ impl Fixture {
         let chat_projection = projections.chat();
         let terminal_projection = projections.terminal();
         let mut registry = RpcRegistry::empty();
-        register_activity_rpc(&mut registry, projections);
+        register_activity_rpc_for_integration_test(&mut registry, projections);
         let directory = tempfile::tempdir().expect("temporary server directory");
         let handle = ServerRuntime::start_with_registry(
             ServerConfig::new(directory.path())
@@ -1480,7 +1513,7 @@ impl SourceSpecificFixture {
             .await
             .expect("terminal scope persistence");
         let mut registry = RpcRegistry::empty();
-        register_activity_rpc(&mut registry, projections.clone());
+        register_activity_rpc_for_integration_test(&mut registry, projections.clone());
         let directory = tempfile::tempdir().expect("temporary server directory");
         let handle = ServerRuntime::start_with_registry(
             ServerConfig::new(directory.path())
@@ -1542,6 +1575,25 @@ fn actor(
         "2026-07-22T12:00:00Z",
         updated_at,
         terminal_at,
+    )
+}
+
+fn work_item(
+    id: &str,
+    owner_actor_id: &str,
+) -> Result<ActivityWorkItemSummary, bibcode_server::activity::ActivityModelError> {
+    ActivityWorkItemSummary::try_new(
+        id,
+        Some(owner_actor_id),
+        id,
+        "task",
+        None,
+        None,
+        ActivityLifecycle::Running,
+        None,
+        "2026-07-22T12:00:00Z",
+        "2026-07-22T12:00:00Z",
+        None,
     )
 }
 

@@ -61,6 +61,28 @@ fn complete_registry() -> RpcRegistry {
     complete_registry_without(&[])
 }
 
+#[test]
+fn rpc_inventory_includes_activity_control_mutations_as_unary_methods() {
+    let activity_control = ACTIVE_RPC_METHODS
+        .iter()
+        .filter(|method| {
+            matches!(
+                method.name,
+                "activity.cancelSubtree" | "activity.retrySubtreeCancellation"
+            )
+        })
+        .map(|method| (method.name, method.mode))
+        .collect::<Vec<_>>();
+
+    assert_eq!(
+        activity_control,
+        [
+            ("activity.cancelSubtree", MethodMode::Unary),
+            ("activity.retrySubtreeCancellation", MethodMode::Unary),
+        ]
+    );
+}
+
 async fn fixture() -> (TempDir, NativeServerControl) {
     let directory = tempfile::tempdir().expect("temporary state directory");
     let mut config = test_config(directory.path());

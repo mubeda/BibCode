@@ -209,14 +209,17 @@ transaction), and active or still-referenced records are retained even if that
 temporarily leaves the scope above its target. Exact rules are in
 [`apps/server/src/activity/repository.rs`](../../apps/server/src/activity/repository.rs).
 
-All four activity RPCs—including replacement snapshots on a subscription—need
-the authenticated environment session's `orchestration:read` scope. Roster and
-detail requests must bind the requested scope reference to the current
-`scopeId`, so a stale or different scope generation cannot be paged. Before
-persistence, display text is bounded, control characters are normalized, and
-common authorization, cookie, password, secret, token, and API-key assignments
-are redacted. Operational logs record activity metadata such as mutation
-counts, not provider-native payload bodies.
+Snapshot, roster, detail, and subscription reads—including replacement
+snapshots—need the authenticated environment session's `orchestration:read`
+scope. `activity.cancelSubtree` and `activity.retrySubtreeCancellation` are
+mutations and require `orchestration:operate`; maintenance admission closes
+both with the other environment mutations. Roster and detail requests bind the
+requested scope reference to the current `scopeId`, while cancellation also
+fences the actor or operation revision before provider I/O. Terminal scopes are
+read-only. Before persistence, display text is bounded, control characters are
+normalized, and common authorization, cookie, password, secret, token, and
+API-key assignments are redacted. Operational logs and typed errors never
+include provider-native cancellation targets or provider payload bodies.
 
 Raw hidden reasoning is never activity commentary. Codex can publish the
 provider's completed reasoning **summary**, but not its raw reasoning content.
