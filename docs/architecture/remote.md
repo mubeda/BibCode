@@ -129,6 +129,15 @@ endpoint can install software, start a process, or use SSH.
 - Remote descriptors expose storage identity but never requested/effective
   roots, alias diagnostics, or other server filesystem paths.
 
+Storage-identity mismatch protection applies equally to direct bearer,
+BiBCode Connect, and desktop-managed SSH targets: a different non-null
+`storageInstanceId` is blocked before synchronization. The desktop project-data
+recovery screen is intentionally narrower. It can inspect or mutate only a
+desktop-owned native or WSL launch plan whose root the Rust host can resolve.
+It cannot open, restore, start empty, or export local-path diagnostics for a
+bearer, relay, or SSH remote environment. Recovery of a remote store must be
+performed on the machine that owns that server and filesystem.
+
 ## Current limitations
 
 - OS-backed protection for the desktop connection catalog is implemented on
