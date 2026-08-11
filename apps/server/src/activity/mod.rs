@@ -7,9 +7,7 @@ mod repository;
 mod routing;
 mod rpc;
 
-pub use control::{
-    ActivityControlEvent, ActivityControlRegistry, ActivityRuntimeControlRegistration,
-};
+pub(crate) use control::*;
 pub use controller::*;
 pub use model::*;
 pub use projection::*;
