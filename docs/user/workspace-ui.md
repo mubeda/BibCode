@@ -33,6 +33,50 @@ local desktop environment, **Open in → File Explorer** opens the repository
 folder for a primary row or the worktree folder for a worktree row. The action
 is omitted for remote environments and browser mode.
 
+### Discovering existing worktrees
+
+When a connected server advertises worktree-catalog support, BiBCode can show
+Git worktrees that already belong to a project repository but have no workspace
+row. New projects start with discovery hidden. The first authoritative result
+offers **Add**, **Add all**, or **Keep hidden**; the project menu can later
+switch between hidden and shown discovery. A hidden acknowledged result is a
+compact `Hiding N` summary, while shown results appear as dashed discovered
+rows grouped by connected environment and project.
+
+Adding a discovered row adopts that exact server-observed candidate as an
+ordinary workspace. It does not create a Git worktree and does not run the
+project's worktree-creation script. Concurrent clicks converge on the same
+workspace. Candidate rows expose the full host path in their tooltip and
+accessible name, but the client submits only the project, opaque catalog key,
+generation, and command data; the server rechecks the path and repository.
+
+Catalog controls are absent for servers without the capability. Active
+catalogs refresh after reconnect and when the window regains focus or becomes
+visible. If an observation is degraded, the UI keeps the last authoritative
+rows instead of treating them as deleted.
+
+### Missing and removing worktrees
+
+An adopted worktree that is authoritatively missing remains selectable. Its row
+shows the branch, host path, registration/lock context, a warning, and actions
+to retry verification or remove it. The same warning and disabled filesystem
+work apply to all chat panels hosted by that workspace. A temporary Git,
+permission, or probe failure is shown as verification unavailable and does not
+claim that the directory is missing.
+
+Removal always begins by loading a fresh server plan. For a present worktree the
+dialog offers exactly these outcomes: cancel, remove the workspace from
+BiBCode, or delete the Git worktree and remove it from BiBCode. Dirty changes
+and stale-registration prune impact require separate confirmations. If the plan
+changes before execution, the dialog requires review again.
+
+For an already missing worktree, BiBCode may offer verified cleanup of its stale
+Git registration before detaching. Cleanup failure is reported as a partial
+outcome while the workspace can still be removed from BiBCode. A failed
+deletion of a present worktree leaves the workspace attached. Removal requests
+contain IDs, the plan token and generation, the selected mode, and confirmation
+flags—not a filesystem path.
+
 ## Center Panel
 
 The active thread's main chat starts as the first center tab. It can be reordered,

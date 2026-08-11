@@ -60,6 +60,23 @@ without exactly one declared scope fails a server test.
 
 ## Worktree catalog flow
 
+The catalog protocol is server-resolved and capability gated:
+
+| RPC                              | Scope                   | Boundary                                                                                    |
+| -------------------------------- | ----------------------- | ------------------------------------------------------------------------------------------- |
+| `subscribeWorktreeCatalog`       | `orchestration:read`    | Stream the latest project snapshot; the request contains only `projectId`.                  |
+| `vcs.refreshWorktreeCatalog`     | `orchestration:read`    | Request one bounded observation and return its snapshot.                                    |
+| `worktree.updateDiscoveryPolicy` | `orchestration:operate` | Persist a complete policy derived from an exact authoritative generation.                   |
+| `worktree.adopt`                 | `orchestration:operate` | Resolve an opaque catalog candidate and create, restore, or return its canonical workspace. |
+| `worktree.getRemovalPlan`        | `orchestration:read`    | Bind current removal facts into an opaque plan token.                                       |
+| `worktree.removeFromBibCode`     | `orchestration:operate` | Detach ownership without a Git mutation.                                                    |
+| `worktree.remove`                | `orchestration:operate` | Perform the explicitly selected verified Git action and apply its detach rules.             |
+
+The browser never supplies a checkout path to these methods. Repository trust,
+path normalization, catalog joins, availability, plan validation, and Git
+effects remain server-owned. See [Worktree catalog](./worktree-catalog.md) for
+the full lifecycle and resource bounds.
+
 `subscribeWorktreeCatalog` publishes the server-owned latest catalog snapshot
 for one persisted project through a watch-backed RPC stream: the atomic initial
 read is marked seen, and acknowledgement lag replaces pending state instead of
@@ -158,6 +175,14 @@ identical retries exact even after the thread projection is deleted; changed
 payload reuse conflicts. A present Git mutation or absence verification
 failure does not detach. The `worktreeCatalog` capability is advertised only
 with all three registered handlers, scopes, and wire fixtures.
+
+The durable detach transaction emits the same-path panel `thread.deleted`
+events in stable order, the canonical `thread.deleted`, and one
+`project.meta-updated` policy compaction. The receipt-linked immutable removal
+result commits with those events. Adoption similarly commits its immutable
+result, thread create/unarchive event when needed, and policy compaction in one
+transaction. These event groups, rather than the current projection, are the
+accepted replay proof.
 
 Every command-ID reservation path first acquires the orchestration engine's
 process-local command-admission claim. The engine keeps a weak, bounded registry

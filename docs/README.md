@@ -33,6 +33,7 @@ current behavior.
 - [Overview](./architecture/overview.md)
 - [Provider architecture](./architecture/providers.md)
 - [Activity observation](./architecture/activity-observation.md)
+- [Worktree catalog](./architecture/worktree-catalog.md)
 - [RPC and orchestration](./architecture/rpc-and-orchestration.md)
 - [Connection runtime](./architecture/connection-runtime.md)
 - [Runtime modes](./architecture/runtime-modes.md)
