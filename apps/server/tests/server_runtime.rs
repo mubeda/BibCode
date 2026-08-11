@@ -214,6 +214,28 @@ async fn acknowledge_rpc_chunk(
         .expect("acknowledge RPC chunk");
 }
 
+async fn next_rpc_wire_for_request(
+    socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    request_id: &str,
+    context: &str,
+) -> Value {
+    loop {
+        let wire = next_rpc_wire(socket, context).await;
+        if wire["requestId"] == request_id {
+            return wire;
+        }
+
+        assert_eq!(
+            wire["_tag"], "Chunk",
+            "{context} received an unexpected frame for another request"
+        );
+        let other_request_id = wire["requestId"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{context} unrelated chunk request ID"));
+        acknowledge_rpc_chunk(socket, other_request_id).await;
+    }
+}
+
 #[tokio::test]
 async fn binds_an_ephemeral_port_and_serves_the_environment_descriptor() {
     let temp = TempDir::new().expect("temporary base directory");
@@ -311,7 +333,7 @@ async fn authenticated_rpc_and_lifecycle_descriptors_match_the_well_known_storag
 
     send_rpc_request(&mut socket, "12", "subscribeServerLifecycle").await;
     for expected_type in ["welcome", "ready"] {
-        let lifecycle = next_rpc_wire(&mut socket, expected_type).await;
+        let lifecycle = next_rpc_wire_for_request(&mut socket, "12", expected_type).await;
         assert_eq!(lifecycle["_tag"], "Chunk");
         assert_eq!(lifecycle["requestId"], "12");
         assert_eq!(lifecycle["values"][0]["type"], expected_type);
