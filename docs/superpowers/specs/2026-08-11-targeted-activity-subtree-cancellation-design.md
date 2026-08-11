@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-11
 
-**Status:** Approved in conversation; pending written-spec review
+**Status:** Approved; pending implementation
 
 ## Summary
 
@@ -241,24 +241,32 @@ mismatched clients and servers.
 Add a scope-level capability indicating that targeted actor cancellation can be
 represented. The scope capability does not make every actor cancellable.
 
-Each actor summary gains canonical control metadata with these states:
+Each actor may have a canonical control-overlay record, joined to the actor by
+`actorId`, with these states:
 
 - `unsupported`: no exact handle exists for this actor in the current runtime;
 - `available`: an exact handle exists and no covering cancellation is active;
 - `requested`: this actor is covered by an active cancellation fence.
 
-The control metadata also carries a non-negative `controlRevision`. The server
+The control record also carries a non-negative `controlRevision`. The server
 increments it whenever the actor's native handle, provider runtime instance, or
 control eligibility changes. The revision is an Activity concurrency fence, not
-a provider identifier or bearer credential.
+a provider identifier or bearer credential. It also carries the current active
+descendant count used for the Stop button's accessible subtree-impact label;
+changing that count advances the overlay revision but does not by itself change
+the actor's handle-fencing `controlRevision`.
 
-The control metadata contains no native identifier. It is a bounded ephemeral
-overlay merged into snapshots and deltas by the server control service. It is
-not persisted with historical Activity records. On server restart, provider
-runtimes and their control connections are replaced, so old handles and
-cancellation intent cannot be resumed safely. The new runtime generation must
-re-prove control eligibility, while ordinary provider reconciliation remains
-responsible for observed lifecycle recovery.
+The control record contains no native identifier. Control records and operation
+summaries live in a bounded `ActivityControlSnapshot` with its own monotonic
+revision and `ActivityControlDelta` stream items. Roster pages carry matching
+control records for their returned actors, and actor detail carries its matching
+control record or `null`. This bounded ephemeral overlay is joined by canonical
+actor ID by the client; it is not stored inside `ActivityActorSummary` or
+persisted with historical Activity records. On server restart, provider runtimes
+and their control connections are replaced, so old handles and cancellation
+intent cannot be resumed safely. The new runtime generation must re-prove
+control eligibility, while ordinary provider reconciliation remains responsible
+for observed lifecycle recovery.
 
 Snapshots and deltas also carry a bounded ephemeral cancellation-operation
 summary for each selected subtree that is still stopping or incomplete. A
