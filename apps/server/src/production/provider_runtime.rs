@@ -7978,6 +7978,7 @@ mod tests {
             ProviderEnvironmentVariableState, ProviderInstanceState, ProviderSettingsState,
             ProvidersState,
         },
+        test_support::TestSandbox,
     };
     use axum::{
         Json, Router,
@@ -7985,9 +7986,8 @@ mod tests {
     };
     use serde_json::{Value, json};
     use std::{
-        io::{self, Read},
+        io,
         pin::Pin,
-        process::{Command as StdCommand, Output, Stdio as StdStdio},
         sync::{Arc, Mutex as StdMutex},
         task::{Context, Poll},
         time::Instant,
@@ -7999,68 +7999,6 @@ mod tests {
         sync::mpsc,
         time::timeout,
     };
-
-    fn run_isolated_case(case: &str, test_name: &str) -> Output {
-        let mut child = StdCommand::new(std::env::current_exe().expect("current test binary"))
-            .args(["--exact", test_name, "--nocapture", "--test-threads=1"])
-            .env("BIBCODE_TEST_ISOLATED_CASE", case)
-            .stdout(StdStdio::piped())
-            .stderr(StdStdio::piped())
-            .spawn()
-            .expect("run isolated fixture case");
-        let mut stdout = child.stdout.take().expect("isolated child stdout");
-        let mut stderr = child.stderr.take().expect("isolated child stderr");
-        let stdout_reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stdout
-                .read_to_end(&mut bytes)
-                .expect("read isolated child stdout");
-            bytes
-        });
-        let stderr_reader = std::thread::spawn(move || {
-            let mut bytes = Vec::new();
-            stderr
-                .read_to_end(&mut bytes)
-                .expect("read isolated child stderr");
-            bytes
-        });
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
-        let (status, timed_out) = loop {
-            if let Some(status) = child.try_wait().expect("poll isolated fixture case") {
-                break (status, false);
-            }
-            if std::time::Instant::now() >= deadline {
-                let _ = child.kill();
-                break (
-                    child.wait().expect("reap timed-out isolated fixture case"),
-                    true,
-                );
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
-        };
-        let stdout = stdout_reader.join().expect("join isolated stdout reader");
-        let stderr = stderr_reader.join().expect("join isolated stderr reader");
-        assert!(
-            !timed_out,
-            "isolated fixture case timed out:\nstdout:\n{}\nstderr:\n{}",
-            String::from_utf8_lossy(&stdout),
-            String::from_utf8_lossy(&stderr)
-        );
-        Output {
-            status,
-            stdout,
-            stderr,
-        }
-    }
-
-    fn is_isolated_case(case: &str, test_name: &str) -> bool {
-        let arguments = std::env::args().collect::<Vec<_>>();
-        std::env::var("BIBCODE_TEST_ISOLATED_CASE").as_deref() == Ok(case)
-            && arguments
-                .windows(2)
-                .any(|values| values == ["--exact", test_name])
-            && arguments.iter().any(|value| value == "--test-threads=1")
-    }
 
     #[derive(Default)]
     struct SupervisorDriverState {
@@ -8271,6 +8209,7 @@ mod tests {
     }
 
     fn native_launch(temp: &TempDir, provider: &str) -> super::ProviderLaunchRequest {
+        let environment_sandbox = TestSandbox::new("provider-launch-environment");
         super::ProviderLaunchRequest {
             thread_id: "native-test-thread".to_owned(),
             activity_causal_revision: 0,
@@ -8287,7 +8226,7 @@ mod tests {
             effort: None,
             agent: None,
             resume_cursor: None,
-            environment: std::env::vars().collect(),
+            environment: environment_sandbox.environment(std::iter::empty::<(String, String)>()),
             endpoint: None,
             server_password: None,
             mcp: None,
@@ -11380,77 +11319,134 @@ done
         );
     }
 
-    #[test]
-    fn executable_resolution_prefers_case_insensitive_instance_path_override() {
-        let instance = tempfile::TempDir::new().expect("instance executable directory");
-        let executable_name = if cfg!(windows) { "codex.exe" } else { "codex" };
-        let instance_executable = instance.path().join(executable_name);
-        std::fs::write(&instance_executable, b"instance").expect("write instance executable");
-
-        let environment = [(
-            std::ffi::OsString::from("pAtH"),
-            std::ffi::OsString::from(instance.path()),
-        )];
-        let resolved = super::resolve_provider_executable_with_environment(
-            "codex",
-            environment
-                .iter()
-                .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
-        );
-
-        assert_eq!(resolved, Some(instance_executable));
-    }
-
     #[cfg(unix)]
     #[tokio::test]
-    async fn runtime_launch_executes_the_configured_instance_path_binary() {
+    async fn provider_path_outranks_ambient_for_resolution_and_launch_in_isolated_process() {
         use std::os::unix::fs::PermissionsExt;
 
-        let temp = tempfile::TempDir::new().expect("runtime fixture root");
-        let instance = temp.path().join("instance");
+        const CASE: &str = "provider-runtime-path-precedence";
+        const TEST_NAME: &str = "production::provider_runtime::tests::provider_path_outranks_ambient_for_resolution_and_launch_in_isolated_process";
+        const SENTINEL: &str = "BIBCODE_TEST_ISOLATED_CASE_DONE=provider-runtime-path-precedence";
+
+        if TestSandbox::is_isolated_case(CASE, TEST_NAME) {
+            let temp = TempDir::new().expect("provider runtime PATH child");
+            let instance = std::path::PathBuf::from(
+                std::env::var_os("BIBCODE_TEST_INSTANCE_PATH").expect("isolated instance PATH"),
+            );
+            let instance_executable = instance.join("provider-fixture");
+            let ambient_executable = std::path::PathBuf::from(
+                std::env::var_os("BIBCODE_TEST_AMBIENT_EXECUTABLE")
+                    .expect("isolated ambient executable"),
+            );
+            let marker = std::path::PathBuf::from(
+                std::env::var_os("BIBCODE_TEST_RUNTIME_MARKER").expect("isolated runtime marker"),
+            );
+            let path_marker = std::path::PathBuf::from(
+                std::env::var_os("BIBCODE_TEST_PATH_MARKER").expect("isolated PATH marker"),
+            );
+            assert_eq!(
+                super::resolve_provider_executable_with_environment(
+                    "provider-fixture",
+                    std::iter::empty::<(&std::ffi::OsStr, &std::ffi::OsStr)>(),
+                ),
+                Some(ambient_executable),
+                "the child must have a competing ambient provider executable"
+            );
+            let environment = [(
+                std::ffi::OsString::from("pAtH"),
+                instance.as_os_str().to_owned(),
+            )];
+            assert_eq!(
+                super::resolve_provider_executable_with_environment(
+                    "provider-fixture",
+                    environment
+                        .iter()
+                        .map(|(name, value)| (name.as_os_str(), value.as_os_str())),
+                ),
+                Some(instance_executable)
+            );
+
+            let mut request = native_launch(&temp, "fixture");
+            request.binary_path = "provider-fixture".to_owned();
+            request
+                .environment
+                .retain(|name, _| !name.eq_ignore_ascii_case("PATH"));
+            request
+                .environment
+                .insert("pAtH".to_owned(), instance.to_string_lossy().into_owned());
+            request
+                .environment
+                .insert("MARKER".to_owned(), marker.to_string_lossy().into_owned());
+            request.environment.insert(
+                "PATH_MARKER".to_owned(),
+                path_marker.to_string_lossy().into_owned(),
+            );
+
+            let mut child =
+                super::spawn_child(&request, &[], false, ProcessAttributionRegistry::new())
+                    .expect("spawn instance executable");
+            child.wait().await.expect("wait for runtime fixture");
+
+            assert_eq!(
+                std::fs::read_to_string(marker).expect("launch marker"),
+                "instance"
+            );
+            assert_eq!(
+                std::fs::read_to_string(path_marker).expect("effective PATH marker"),
+                instance.to_string_lossy()
+            );
+            println!("{SENTINEL}");
+            return;
+        }
+
+        let sandbox = TestSandbox::new("provider-runtime-path-parent");
+        let ambient = sandbox.path("ambient");
+        let instance = sandbox.path("instance");
+        std::fs::create_dir_all(&ambient).expect("ambient executable directory");
         std::fs::create_dir_all(&instance).expect("instance executable directory");
-        let executable = instance.join("provider-fixture");
-        std::fs::write(
-            &executable,
-            "#!/bin/sh\nprintf '%s' 'instance' > \"$MARKER\"\nprintf '%s' \"$PATH\" > \"$PATH_MARKER\"\n",
-        )
-        .expect("write runtime executable");
-        let mut permissions = std::fs::metadata(&executable)
-            .expect("runtime fixture metadata")
-            .permissions();
-        permissions.set_mode(0o700);
-        std::fs::set_permissions(&executable, permissions)
-            .expect("make runtime fixture executable");
-        let marker = temp.path().join("launched");
-        let path_marker = temp.path().join("effective-path");
-        let mut request = native_launch(&temp, "fixture");
-        request.binary_path = "provider-fixture".to_owned();
-        request
-            .environment
-            .retain(|name, _| !name.eq_ignore_ascii_case("PATH"));
-        request
-            .environment
-            .insert("pAtH".to_owned(), instance.to_string_lossy().into_owned());
-        request
-            .environment
-            .insert("MARKER".to_owned(), marker.to_string_lossy().into_owned());
-        request.environment.insert(
-            "PATH_MARKER".to_owned(),
-            path_marker.to_string_lossy().into_owned(),
+        let ambient_executable = ambient.join("provider-fixture");
+        let instance_executable = instance.join("provider-fixture");
+        for (executable, label) in [
+            (&ambient_executable, "ambient"),
+            (&instance_executable, "instance"),
+        ] {
+            std::fs::write(
+                executable,
+                format!(
+                    "#!/bin/sh\nprintf '%s' '{label}' > \"$MARKER\"\nprintf '%s' \"$PATH\" > \"$PATH_MARKER\"\n"
+                ),
+            )
+            .expect("write runtime executable");
+            let mut permissions = std::fs::metadata(executable)
+                .expect("runtime fixture metadata")
+                .permissions();
+            permissions.set_mode(0o700);
+            std::fs::set_permissions(executable, permissions)
+                .expect("make runtime fixture executable");
+        }
+        let marker = sandbox.path("launched");
+        let path_marker = sandbox.path("effective-path");
+        let output = sandbox.run_isolated_case(
+            CASE,
+            TEST_NAME,
+            &[
+                ("PATH", ambient.as_os_str()),
+                ("BIBCODE_TEST_INSTANCE_PATH", instance.as_os_str()),
+                (
+                    "BIBCODE_TEST_AMBIENT_EXECUTABLE",
+                    ambient_executable.as_os_str(),
+                ),
+                ("BIBCODE_TEST_RUNTIME_MARKER", marker.as_os_str()),
+                ("BIBCODE_TEST_PATH_MARKER", path_marker.as_os_str()),
+            ],
         );
-
-        let mut child = super::spawn_child(&request, &[], false, ProcessAttributionRegistry::new())
-            .expect("spawn instance executable");
-        child.wait().await.expect("wait for runtime fixture");
-
-        assert_eq!(
-            std::fs::read_to_string(marker).expect("launch marker"),
-            "instance"
+        assert!(
+            output.status.success(),
+            "isolated runtime PATH precedence case failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
-        assert_eq!(
-            std::fs::read_to_string(path_marker).expect("effective PATH marker"),
-            instance.to_string_lossy()
-        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(SENTINEL));
     }
 
     #[cfg(windows)]
@@ -11488,7 +11484,7 @@ done
     fn invalid_cwd_cases_are_process_isolated() {
         const TEST_NAME: &str =
             "production::provider_runtime::tests::invalid_cwd_cases_are_process_isolated";
-        if is_isolated_case("missing-cwd", TEST_NAME) {
+        if TestSandbox::is_isolated_case("missing-cwd", TEST_NAME) {
             let directory = tempfile::tempdir().expect("isolated CWD");
             let executable = directory.path().join("provider-fixture");
             std::fs::write(&executable, b"fixture").expect("write provider fixture");
@@ -11529,7 +11525,8 @@ done
             return;
         }
 
-        let output = run_isolated_case("missing-cwd", TEST_NAME);
+        let sandbox = TestSandbox::new("provider-missing-cwd-parent");
+        let output = sandbox.run_isolated_case("missing-cwd", TEST_NAME, &[]);
         assert!(
             output.status.success(),
             "isolated missing-CWD case failed:\nstdout:\n{}\nstderr:\n{}",

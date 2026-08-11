@@ -1316,27 +1316,75 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn maintenance_classifies_the_configured_instance_path_executable() {
-        let root = tempfile::tempdir().expect("maintenance executable root");
-        let instance = root.path().join("instance/.npm-global/bin");
+    async fn maintenance_instance_path_outranks_ambient_path_in_an_isolated_process() {
+        const CASE: &str = "provider-maintenance-path-precedence";
+        const TEST_NAME: &str = "production::provider_maintenance::tests::maintenance_instance_path_outranks_ambient_path_in_an_isolated_process";
+        const SENTINEL: &str =
+            "BIBCODE_TEST_ISOLATED_CASE_DONE=provider-maintenance-path-precedence";
+
+        if TestSandbox::is_isolated_case(CASE, TEST_NAME) {
+            let instance = std::path::PathBuf::from(
+                std::env::var_os("BIBCODE_TEST_INSTANCE_PATH").expect("isolated instance PATH"),
+            );
+            let ambient_executable = std::path::PathBuf::from(
+                std::env::var_os("BIBCODE_TEST_AMBIENT_EXECUTABLE")
+                    .expect("isolated ambient executable"),
+            );
+            assert_eq!(
+                resolve_provider_executable_with_environment(
+                    "opencode",
+                    std::iter::empty::<(&std::ffi::OsStr, &std::ffi::OsStr)>(),
+                ),
+                Some(ambient_executable),
+                "the child must have a competing ambient provider executable"
+            );
+            let target = ProviderMaintenanceTarget {
+                instance_id: "opencode-work".to_owned(),
+                driver: "opencode".to_owned(),
+                binary_path: "opencode".to_owned(),
+                environment: vec![("PaTh".into(), instance.as_os_str().to_owned())],
+            };
+
+            let capabilities = ProviderMaintenance::new().capabilities(&target).await;
+
+            assert_eq!(
+                capabilities
+                    .update
+                    .as_ref()
+                    .map(|update| update.display.as_str()),
+                Some("npm install -g opencode-ai@latest")
+            );
+            println!("{SENTINEL}");
+            return;
+        }
+
+        let sandbox = TestSandbox::new("provider-maintenance-path");
+        let ambient = sandbox.path("ambient/.opencode/bin");
+        let instance = sandbox.path("instance/.npm-global/bin");
+        std::fs::create_dir_all(&ambient).expect("ambient executable directory");
         std::fs::create_dir_all(&instance).expect("instance executable directory");
+        let ambient_executable = ambient.join("opencode");
+        std::fs::write(&ambient_executable, b"ambient").expect("ambient executable");
         std::fs::write(instance.join("opencode"), b"instance").expect("instance executable");
-        let target = ProviderMaintenanceTarget {
-            instance_id: "opencode-work".to_owned(),
-            driver: "opencode".to_owned(),
-            binary_path: "opencode".to_owned(),
-            environment: vec![("PaTh".into(), instance.as_os_str().to_owned())],
-        };
-
-        let capabilities = ProviderMaintenance::new().capabilities(&target).await;
-
-        assert_eq!(
-            capabilities
-                .update
-                .as_ref()
-                .map(|update| update.display.as_str()),
-            Some("npm install -g opencode-ai@latest")
+        let output = sandbox.run_isolated_case(
+            CASE,
+            TEST_NAME,
+            &[
+                ("PATH", ambient.as_os_str()),
+                ("BIBCODE_TEST_INSTANCE_PATH", instance.as_os_str()),
+                (
+                    "BIBCODE_TEST_AMBIENT_EXECUTABLE",
+                    ambient_executable.as_os_str(),
+                ),
+            ],
         );
+        assert!(
+            output.status.success(),
+            "isolated maintenance PATH precedence case failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stdout).contains(SENTINEL));
     }
 }
 use std::{
