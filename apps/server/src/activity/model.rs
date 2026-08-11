@@ -33,7 +33,7 @@ pub type ActivityModelResult<T> = Result<T, ActivityModelError>;
 
 /// An opaque generation fence for one live provider runtime's Activity controls.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub struct ActivityRuntimeGeneration(Uuid);
+pub(crate) struct ActivityRuntimeGeneration(Uuid);
 
 impl ActivityRuntimeGeneration {
     pub(crate) fn new() -> Self {
@@ -49,16 +49,19 @@ impl ActivityRuntimeGeneration {
 pub struct ProviderActivityNativeTarget(ProviderActivityNativeTargetKind);
 
 #[derive(Clone, Eq, Hash, PartialEq)]
+#[allow(dead_code)] // Provider adapters install these exact handles in Tasks 6 and 8.
 enum ProviderActivityNativeTargetKind {
     CodexTurn { thread_id: String, turn_id: String },
     ClaudeTask { task_id: String },
 }
 
 impl ProviderActivityNativeTarget {
+    #[allow(dead_code)] // Used by the Codex adapter installed in Task 6.
     pub(crate) fn codex_turn(thread_id: String, turn_id: String) -> Self {
         Self(ProviderActivityNativeTargetKind::CodexTurn { thread_id, turn_id })
     }
 
+    #[allow(dead_code)] // Used by the Claude adapter installed in Task 8.
     pub(crate) fn claude_task(task_id: String) -> Self {
         Self(ProviderActivityNativeTargetKind::ClaudeTask { task_id })
     }
@@ -77,18 +80,6 @@ impl ProviderActivityNativeTarget {
             ProviderActivityNativeTargetKind::ClaudeTask { task_id } => Some(task_id),
             ProviderActivityNativeTargetKind::CodexTurn { .. } => None,
         }
-    }
-
-    #[doc(hidden)]
-    #[must_use]
-    pub fn codex_turn_for_integration_test(thread_id: &str, turn_id: &str) -> Self {
-        Self::codex_turn(thread_id.to_owned(), turn_id.to_owned())
-    }
-
-    #[doc(hidden)]
-    #[must_use]
-    pub fn claude_task_for_integration_test(task_id: &str) -> Self {
-        Self::claude_task(task_id.to_owned())
     }
 }
 

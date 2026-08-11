@@ -38,7 +38,7 @@ pub enum ActivityTargetDispatchDisposition {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ActivityDispatchError {
+pub(crate) enum ActivityDispatchError {
     ProviderUnavailable,
     TargetUnavailable,
 }

@@ -102,7 +102,12 @@ mutations. Any cancellation jobs discovered for late descendants start only
 after control observation and display projection have released their locks.
 Terminal display mutations reconcile the overlay even when the provider sends
 no control updates, so completed descendants cannot remain as cancellation
-residuals.
+residuals. If durable display projection rejects a batch after control
+observation, the provider supervisor invalidates that runtime generation,
+suppresses every returned dispatch job, and cancels and reaps its queued or
+in-flight targeted work before ordinary event handling continues. Restart,
+disablement, session stop, and shutdown use the same cancel-before-cleanup
+ownership rule, so no late dispatch task outlives its session.
 
 Each snapshot negotiates provider capabilities separately: actors, attributed
 entries, background work, history recovery (`full`, `bounded`, or `none`), and

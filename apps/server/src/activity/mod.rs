@@ -9,9 +9,9 @@ mod repository;
 mod routing;
 mod rpc;
 
+pub use cancellation::ActivityTargetDispatchDisposition;
 #[allow(unused_imports)]
 pub(crate) use cancellation::*;
-pub use cancellation::{ActivityDispatchError, ActivityTargetDispatchDisposition};
 #[allow(unused_imports)]
 pub(crate) use control::*;
 pub use controller::*;
