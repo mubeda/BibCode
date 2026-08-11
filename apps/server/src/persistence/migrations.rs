@@ -78,6 +78,105 @@ pub(crate) fn validate_existing_bibcode_store(
     )
 }
 
+pub(crate) fn validate_existing_bibcode_store_immutable(
+    path: &Path,
+    cancellation: &CancellationToken,
+) -> std::result::Result<(), ExistingStoreValidationError> {
+    let deadline = Instant::now()
+        .checked_add(VALIDATION_TIMEOUT)
+        .ok_or_else(|| ExistingStoreValidationError::Unsafe {
+            path: path.to_path_buf(),
+            detail: "SQLite store validation deadline exceeds the monotonic clock range".to_owned(),
+        })?;
+    ensure_validation_active(path, cancellation, deadline)?;
+    let mut uri =
+        url::Url::from_file_path(path).map_err(|()| ExistingStoreValidationError::Unsafe {
+            path: path.to_path_buf(),
+            detail: "SQLite store path cannot be represented as an immutable file URI".to_owned(),
+        })?;
+    uri.query_pairs_mut().append_pair("immutable", "1");
+    let connection = Connection::open_with_flags(
+        uri.as_str(),
+        OpenFlags::SQLITE_OPEN_READ_ONLY
+            | OpenFlags::SQLITE_OPEN_NO_MUTEX
+            | OpenFlags::SQLITE_OPEN_URI,
+    )
+    .map_err(|source| ExistingStoreValidationError::Unsafe {
+        path: path.to_path_buf(),
+        detail: format!("failed to open immutable SQLite store: {source}"),
+    })?;
+    let inspection_cancellation = cancellation.clone();
+    connection
+        .progress_handler(
+            VALIDATION_INSPECTION_PROGRESS_OPS,
+            Some(move || validation_stop_reason(&inspection_cancellation, deadline).is_some()),
+        )
+        .map_err(|source| ExistingStoreValidationError::Unsafe {
+            path: path.to_path_buf(),
+            detail: format!("failed to install SQLite validation progress handler: {source}"),
+        })?;
+    let integrity = connection
+        .query_row("PRAGMA quick_check", [], |row| row.get::<_, String>(0))
+        .map_err(|source| map_corrupt_inspection_error(path, cancellation, deadline, source))?;
+    ensure_validation_active(path, cancellation, deadline)?;
+    if integrity != "ok" {
+        return Err(ExistingStoreValidationError::Corrupt {
+            path: path.to_path_buf(),
+            detail: integrity,
+        });
+    }
+    if !table_exists(&connection, "effect_sql_migrations")
+        .map_err(|source| map_unrecognized_inspection_error(path, cancellation, deadline, source))?
+    {
+        return Err(ExistingStoreValidationError::Unrecognized {
+            path: path.to_path_buf(),
+            detail: "migration ledger is missing".to_owned(),
+        });
+    }
+    let mut statement = connection
+        .prepare("SELECT migration_id, name FROM effect_sql_migrations ORDER BY migration_id ASC")
+        .map_err(|source| {
+            map_unrecognized_inspection_error(path, cancellation, deadline, source)
+        })?;
+    let recorded = statement
+        .query_map([], |row| {
+            Ok((row.get::<_, u32>(0)?, row.get::<_, String>(1)?))
+        })
+        .and_then(Iterator::collect::<rusqlite::Result<Vec<_>>>)
+        .map_err(|source| {
+            map_unrecognized_inspection_error(path, cancellation, deadline, source)
+        })?;
+    ensure_validation_active(path, cancellation, deadline)?;
+    if recorded.is_empty()
+        || recorded.len() > MIGRATIONS.len()
+        || recorded
+            .iter()
+            .zip(MIGRATIONS)
+            .any(|((id, name), expected)| *id != expected.id || name != expected.name)
+    {
+        return Err(ExistingStoreValidationError::Unrecognized {
+            path: path.to_path_buf(),
+            detail: "migration ledger is not an exact prefix of this binary".to_owned(),
+        });
+    }
+    let latest_migration_id = recorded.last().expect("non-empty ledger").0;
+    for (_, table) in CORE_TABLES
+        .iter()
+        .filter(|(migration_id, _)| *migration_id <= latest_migration_id)
+    {
+        ensure_validation_active(path, cancellation, deadline)?;
+        if !table_exists(&connection, table).map_err(|source| {
+            map_unrecognized_inspection_error(path, cancellation, deadline, source)
+        })? {
+            return Err(ExistingStoreValidationError::Unrecognized {
+                path: path.to_path_buf(),
+                detail: format!("required table {table} is missing"),
+            });
+        }
+    }
+    ensure_validation_active(path, cancellation, deadline)
+}
+
 #[cfg(test)]
 fn validate_existing_bibcode_store_with_barrier<F>(
     path: &Path,
