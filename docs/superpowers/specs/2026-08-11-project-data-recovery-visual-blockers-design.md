@@ -42,7 +42,7 @@ failed primary backend can never create.
 - Inferring recovery from HTTP status codes or error-message text.
 - Letting the renderer supply a filesystem path or storage identifier.
 - Changing offline restore or start-empty semantics.
-- Adding T4Code discovery, migration, compatibility, or aliases.
+- Adding predecessor-product discovery, migration, compatibility, or aliases.
 - Automatically adopting, merging, deleting, or replacing a store.
 - Making remote bearer, relay, or SSH environments eligible for local desktop
   recovery.
