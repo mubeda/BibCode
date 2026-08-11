@@ -71,6 +71,7 @@ pub struct RelayClientOptions {
     search_path: Option<OsString>,
     release_asset: Option<RelayReleaseAsset>,
     download_timeout: Duration,
+    validation_timeout: Duration,
 }
 
 impl RelayClientOptions {
@@ -91,6 +92,7 @@ impl RelayClientOptions {
             search_path: std::env::var_os("PATH"),
             release_asset,
             download_timeout: Duration::from_secs(120),
+            validation_timeout: VALIDATION_TIMEOUT,
         }
     }
 
@@ -128,6 +130,13 @@ impl RelayClientOptions {
     #[must_use]
     pub const fn with_download_timeout(mut self, duration: Duration) -> Self {
         self.download_timeout = duration;
+        self
+    }
+
+    #[cfg(test)]
+    #[must_use]
+    pub const fn with_validation_timeout(mut self, duration: Duration) -> Self {
+        self.validation_timeout = duration;
         self
     }
 
@@ -345,11 +354,12 @@ impl NativeRelayClient {
         make_executable(&executable).await?;
 
         report_stage(report, "validating").await?;
-        run_checked(
+        run_checked_with_timeout(
             &executable,
             [OsString::from("--version")],
             "validation_failed",
             "downloaded relay client binary did not run",
+            self.options.validation_timeout,
         )
         .await?;
 
@@ -590,10 +600,24 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
+    run_checked_with_timeout(program, args, reason, message, VALIDATION_TIMEOUT).await
+}
+
+async fn run_checked_with_timeout<I, S>(
+    program: impl AsRef<OsStr>,
+    args: I,
+    reason: &'static str,
+    message: &'static str,
+    validation_timeout: Duration,
+) -> Result<(), RelayInstallError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
     let mut command = Command::new(program);
     configure_background_command(&mut command);
     command.args(args).kill_on_drop(true);
-    let output = timeout(VALIDATION_TIMEOUT, command.output())
+    let output = timeout(validation_timeout, command.output())
         .await
         .map_err(|_| RelayInstallError::new(reason, format!("{message}: timed out")))?
         .map_err(|error| RelayInstallError::new(reason, format!("{message}: {error}")))?;
@@ -1006,7 +1030,8 @@ mod tests {
         )
         .with_search_path(OsString::new())
         .with_release_asset(Some(asset))
-        .with_download_timeout(Duration::from_secs(5));
+        .with_download_timeout(Duration::from_secs(5))
+        .with_validation_timeout(Duration::from_secs(45));
         let managed = install_options.managed_executable_path();
         let service = relay_client_service_with_options(install_options);
         let install_events = service.install().await.expect("install relay");
