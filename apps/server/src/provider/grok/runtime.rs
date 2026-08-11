@@ -35,6 +35,8 @@ pub struct GrokRuntimeEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     pub payload: Value,
 }
@@ -48,6 +50,8 @@ pub struct GrokRuntimeEventStableView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     pub payload: Value,
 }
@@ -59,6 +63,7 @@ impl GrokRuntimeEvent {
             event_type: self.event_type.clone(),
             thread_id: self.thread_id.clone(),
             turn_id: self.turn_id.clone(),
+            item_id: self.item_id.clone(),
             request_id: self.request_id.clone(),
             payload: self.payload.clone(),
         }
@@ -697,6 +702,7 @@ impl GrokSessionRuntime {
             event_type: event_type.to_owned(),
             thread_id: self.inner.options.thread_id.clone(),
             turn_id,
+            item_id: None,
             request_id,
             payload,
         });
