@@ -2517,24 +2517,26 @@ fn ensure_plain_file(path: &Path) -> Result<(), BackupError> {
     plain_path_snapshot(path, PlainPathKind::File).map(|_| ())
 }
 
+#[cfg(unix)]
 fn set_private_directory_permissions(path: &Path) -> Result<(), BackupError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let directory =
-            open_path_without_following(path, PlainPathKind::Directory).map_err(|source| {
-                BackupError::Io {
-                    path: path.to_path_buf(),
-                    source,
-                }
-            })?;
-        directory
-            .set_permissions(fs::Permissions::from_mode(0o700))
-            .map_err(|source| BackupError::Io {
+    use std::os::unix::fs::PermissionsExt;
+    let directory =
+        open_path_without_following(path, PlainPathKind::Directory).map_err(|source| {
+            BackupError::Io {
                 path: path.to_path_buf(),
                 source,
-            })?;
-    }
+            }
+        })?;
+    directory
+        .set_permissions(fs::Permissions::from_mode(0o700))
+        .map_err(|source| BackupError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(not(unix))]
+fn set_private_directory_permissions(_path: &Path) -> Result<(), BackupError> {
     Ok(())
 }
 
@@ -2618,16 +2620,18 @@ fn private_create_new(path: &Path) -> Result<File, BackupError> {
     }
 }
 
+#[cfg(unix)]
 fn set_private_open_file_permissions(file: &File, path: &Path) -> Result<(), BackupError> {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        file.set_permissions(fs::Permissions::from_mode(0o600))
-            .map_err(|source| BackupError::Io {
-                path: path.to_path_buf(),
-                source,
-            })?;
-    }
+    use std::os::unix::fs::PermissionsExt;
+    file.set_permissions(fs::Permissions::from_mode(0o600))
+        .map_err(|source| BackupError::Io {
+            path: path.to_path_buf(),
+            source,
+        })
+}
+
+#[cfg(not(unix))]
+fn set_private_open_file_permissions(_file: &File, _path: &Path) -> Result<(), BackupError> {
     Ok(())
 }
 
