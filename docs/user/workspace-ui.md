@@ -108,6 +108,23 @@ usage, the maximum when known, and lifetime processed tokens when supplied.
 Usage above 90 percent is presented as a warning through the meter's red
 treatment. Automatic-compaction support is stated when the provider reports it.
 
+The access and reasoning controls remain icon-only in the composer toolbar.
+When Full Access is selected, its lock icon is red in both the toolbar and the
+access menu. When the selected reasoning level is the highest level advertised
+by the active provider and model, the toolbar's reasoning bars and the selected
+level title in the menu are red; lower levels remain neutral.
+
+While a provider turn is active, the timeline shows a reversed paint-and-fade
+dotted square followed by `Waiting for` and a whole-second elapsed timer, such
+as `Waiting for 3s`. The timer is anchored to the persisted user-message time
+after reload and never moves backward when the provider start time arrives.
+The animation uses the current theme's muted foreground and becomes static when
+reduced motion is requested. A later pending delivery queued behind an
+unresolved failed or uncertain delivery does not appear active; resolve the
+earlier delivery's Retry/Dismiss notice before the queued message can run. The
+composer remains blocked and offers `Cancel queued message` so queued work can
+be withdrawn before resolving the older delivery.
+
 Question and approval composer footers retain their specialized controls and do
 not gain the normal context-window control.
 

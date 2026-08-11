@@ -184,6 +184,16 @@ export function findProviderEffortDescriptor(
   return null;
 }
 
+function isHighestEffortSelection(
+  descriptor: Extract<ProviderOptionDescriptor, { type: "select" }> | null,
+  value: string,
+): boolean {
+  if (!descriptor || value.length === 0 || descriptor.options.length === 0) {
+    return false;
+  }
+  return descriptor.options.at(-1)?.id === value;
+}
+
 function getSelectedTraits(
   provider: ProviderDriverKind,
   models: ReadonlyArray<ServerProviderModel>,
@@ -425,57 +435,68 @@ export const TraitsMenuContent = memo(function TraitsMenuContentImpl({
 
   return (
     <>
-      {visibleSelectDescriptors.map((descriptor, index) => (
-        <div key={descriptor.id}>
-          {index > 0 ? <MenuDivider /> : null}
-          <MenuGroup>
-            <div className="px-2 pt-1.5 pb-1 font-medium text-muted-foreground text-xs">
-              {descriptor.label}
-            </div>
-            {ultrathinkInBodyText && descriptor.id === primarySelectDescriptor?.id ? (
-              <div className="px-2 pb-1.5 text-muted-foreground/80 text-xs">
-                Your prompt contains &quot;ultrathink&quot; in the text. Remove it to change this
-                option.
+      {visibleSelectDescriptors.map((descriptor, index) => {
+        const selectedValue =
+          selectedPromptInjectedEffort && descriptor.id === primarySelectDescriptor?.id
+            ? selectedPromptInjectedEffort
+            : (getDescriptorStringValue(descriptor) ?? "");
+        const isPrimaryEffortDescriptor = descriptor.id === primarySelectDescriptor?.id;
+        const highestEffortSelected =
+          isPrimaryEffortDescriptor &&
+          isHighestEffortSelection(primarySelectDescriptor, selectedValue);
+
+        return (
+          <div key={descriptor.id}>
+            {index > 0 ? <MenuDivider /> : null}
+            <MenuGroup>
+              <div className="px-2 pt-1.5 pb-1 font-medium text-muted-foreground text-xs">
+                {descriptor.label}
               </div>
-            ) : null}
-            <MenuRadioGroup
-              value={
-                selectedPromptInjectedEffort && descriptor.id === primarySelectDescriptor?.id
-                  ? selectedPromptInjectedEffort
-                  : (getDescriptorStringValue(descriptor) ?? "")
-              }
-              onValueChange={(value) => {
-                if (isPending) return;
-                handleTraitSelectChange({
-                  descriptor,
-                  value,
-                  descriptors,
-                  primarySelectDescriptor,
-                  ultrathinkPromptControlled,
-                  ultrathinkInBodyText,
-                  prompt,
-                  onPromptChange,
-                  updateDescriptor,
-                });
-              }}
-            >
-              {descriptor.options.map((option) => (
-                <MenuRadioItem
-                  key={option.id}
-                  value={option.id}
-                  disabled={
-                    isPending ||
-                    (ultrathinkInBodyText && descriptor.id === primarySelectDescriptor?.id)
-                  }
-                >
-                  {option.label}
-                  {option.isDefault ? " (default)" : ""}
-                </MenuRadioItem>
-              ))}
-            </MenuRadioGroup>
-          </MenuGroup>
-        </div>
-      ))}
+              {ultrathinkInBodyText && isPrimaryEffortDescriptor ? (
+                <div className="px-2 pb-1.5 text-muted-foreground/80 text-xs">
+                  Your prompt contains &quot;ultrathink&quot; in the text. Remove it to change this
+                  option.
+                </div>
+              ) : null}
+              <MenuRadioGroup
+                value={selectedValue}
+                onValueChange={(value) => {
+                  if (isPending) return;
+                  handleTraitSelectChange({
+                    descriptor,
+                    value,
+                    descriptors,
+                    primarySelectDescriptor,
+                    ultrathinkPromptControlled,
+                    ultrathinkInBodyText,
+                    prompt,
+                    onPromptChange,
+                    updateDescriptor,
+                  });
+                }}
+              >
+                {descriptor.options.map((option) => (
+                  <MenuRadioItem
+                    key={option.id}
+                    value={option.id}
+                    disabled={isPending || (ultrathinkInBodyText && isPrimaryEffortDescriptor)}
+                  >
+                    <span
+                      data-effort-title={isPrimaryEffortDescriptor ? "true" : undefined}
+                      className={cn(
+                        highestEffortSelected && option.id === selectedValue && "text-destructive",
+                      )}
+                    >
+                      {option.label}
+                      {option.isDefault ? " (default)" : ""}
+                    </span>
+                  </MenuRadioItem>
+                ))}
+              </MenuRadioGroup>
+            </MenuGroup>
+          </div>
+        );
+      })}
       {visibleBooleanDescriptors.map((descriptor, index) => (
         <div key={descriptor.id}>
           {index > 0 || visibleSelectDescriptors.length > 0 ? <MenuDivider /> : null}
@@ -567,6 +588,7 @@ export const ComposerTraitControls = memo(function ComposerTraitControls({
   const effortLabel =
     primarySelectDescriptor?.options.find((option) => option.id === effortValue)?.label ??
     primarySelectDescriptor?.label;
+  const effortIsHighest = isHighestEffortSelection(primarySelectDescriptor, effortValue);
 
   const resolvedFastAvailability =
     fastAvailability ??
@@ -611,7 +633,9 @@ export const ComposerTraitControls = memo(function ComposerTraitControls({
       className={cn(
         "h-7 px-1.5",
         resolvedEffortAvailability.state === "supported"
-          ? "text-foreground/80 hover:text-foreground"
+          ? !isPending && effortIsHighest
+            ? "text-destructive hover:text-destructive"
+            : "text-foreground/80 hover:text-foreground"
           : "border border-input bg-background text-muted-foreground/70",
       )}
       aria-label={effortTooltip}
