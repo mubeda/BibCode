@@ -24,6 +24,8 @@ describe("WorktreeAvailabilityWarning", () => {
     expect(markup).toContain("feature/one");
     expect(markup).toContain("/repo/worktrees/feature-one");
     expect(markup).toContain("Git registration remains");
+    expect(markup).toContain("Git registration:");
+    expect(markup).toContain("Prunable (stale)");
     expect(markup).toContain("Retry detection");
     expect(markup).toContain("Remove from BiBCode");
   });
@@ -50,7 +52,33 @@ describe("WorktreeAvailabilityWarning", () => {
 
     expect(locked).toContain("Kept by another tool");
     expect(unregistered).toContain("Git no longer registers this worktree");
+    expect(unregistered).toContain("Not registered");
     expect(unregistered).not.toContain("Clean stale");
+  });
+
+  it("shows the concrete registered and unknown states", () => {
+    const registered = renderToStaticMarkup(
+      <WorktreeAvailabilityWarning
+        status={{ ...missing, registrationState: "registered" }}
+        onRetry={vi.fn()}
+        onRemove={vi.fn()}
+      />,
+    );
+    const unknown = renderToStaticMarkup(
+      <WorktreeAvailabilityWarning
+        status={{
+          ...missing,
+          availability: "verification-unavailable",
+          registrationState: null,
+        }}
+        onRetry={vi.fn()}
+        onRemove={vi.fn()}
+      />,
+    );
+
+    expect(registered).toContain("Registered");
+    expect(registered).not.toContain("Prunable (stale)");
+    expect(unknown).toContain("Unknown");
   });
 
   it("renders verification and removing states but nothing for a present workspace", () => {

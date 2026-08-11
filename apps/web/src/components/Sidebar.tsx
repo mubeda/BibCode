@@ -66,6 +66,7 @@ import {
   type ResolvedKeybindingsConfig,
   type SidebarProjectGroupingMode,
   type VcsAdoptedWorktreeStatus,
+  type WorktreeRemovalResult,
   ThreadId,
 } from "@bibcode/contracts";
 import {
@@ -3876,6 +3877,24 @@ export default function Sidebar() {
     closeWorktreeRemovalDialog,
     completeWorktreeRemoval,
   } = useThreadActions();
+  const handleWorktreeRemoved = useCallback(
+    async (removedTarget: WorktreeRemovalTarget, result: WorktreeRemovalResult) => {
+      const cleanupResult = await completeWorktreeRemoval(removedTarget, result);
+      if (cleanupResult._tag !== "Failure" || isAtomCommandInterrupted(cleanupResult)) return;
+      const error = squashAtomCommandFailure(cleanupResult);
+      toastManager.add(
+        stackedThreadToast({
+          type: "error",
+          title: "Worktree removed, but navigation failed",
+          description:
+            error instanceof Error
+              ? error.message
+              : "Select another thread from the sidebar to continue.",
+        }),
+      );
+    },
+    [completeWorktreeRemoval],
+  );
   const { isMobile, setOpenMobile } = useSidebar();
   const routeThreadRef = useParams({
     strict: false,
@@ -4450,7 +4469,7 @@ export default function Sidebar() {
           if (!open) closeWorktreeRemovalDialog();
         }}
         onRemoved={(removedTarget, result) => {
-          void completeWorktreeRemoval(removedTarget, result);
+          void handleWorktreeRemoved(removedTarget, result);
         }}
       />
       {prewarmedSidebarThreadRefs.map((threadRef) => (
