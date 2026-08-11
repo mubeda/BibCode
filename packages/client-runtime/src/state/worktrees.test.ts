@@ -1,6 +1,7 @@
 import {
   CommandId,
   EnvironmentId,
+  ORCHESTRATION_WS_METHODS,
   ProjectId,
   ProviderInstanceId,
   ThreadId,
@@ -33,6 +34,9 @@ import {
   deriveAdoptedWorkspaceStateByThreadId,
   deriveWorktreeDiscoveryState,
   isWorktreeCatalogSupported,
+  selectWorktreeCatalogCapabilityPolicy,
+  selectWorktreeWorkspaceActionsAvailable,
+  WorktreeCatalogUnsupportedError,
 } from "./worktrees.ts";
 
 const ENVIRONMENT_ONE = EnvironmentId.make("environment-1");
@@ -101,10 +105,12 @@ const hiddenPolicy = {
   baselinePaths: [],
 };
 
-function session(client: WsRpcProtocolClient): RpcSession {
+function session(client: WsRpcProtocolClient, worktreeCatalog = true): RpcSession {
   return {
     client,
-    initialConfig: Effect.never,
+    initialConfig: Effect.succeed({
+      environment: { capabilities: { worktreeCatalog } },
+    } as never),
     ready: Effect.void,
     probe: Effect.void,
     closed: Effect.never,
@@ -113,17 +119,17 @@ function session(client: WsRpcProtocolClient): RpcSession {
 
 const makeAtomHarnessFromClients = Effect.fn("TestWorktrees.makeAtomHarnessFromClients")(function* (
   clients: ReadonlyMap<EnvironmentId, WsRpcProtocolClient>,
+  catalogCapabilities: ReadonlyMap<EnvironmentId, boolean> = new Map(),
 ) {
   const supervisors = new Map<EnvironmentId, EnvironmentSupervisor["Service"]>();
   for (const [environmentId, client] of clients) {
-    const supervisorSession = yield* SubscriptionRef.make<Option.Option<RpcSession>>(
-      Option.some(session(client)),
-    );
     supervisors.set(
       environmentId,
       EnvironmentSupervisor.of({
         target: { environmentId, label: environmentId },
-        session: supervisorSession,
+        session: yield* SubscriptionRef.make<Option.Option<RpcSession>>(
+          Option.some(session(client, catalogCapabilities.get(environmentId) ?? true)),
+        ),
       } as never),
     );
   }
@@ -155,11 +161,12 @@ const makeAtomHarness = Effect.fn("TestWorktrees.makeAtomHarness")(function* (
 
 const makeCommandHarness = Effect.fn("TestWorktrees.makeCommandHarness")(function* (
   clients: ReadonlyMap<EnvironmentId, WsRpcProtocolClient>,
+  catalogCapabilities: ReadonlyMap<EnvironmentId, boolean> = new Map(),
 ) {
   const supervisors = new Map<EnvironmentId, EnvironmentSupervisor["Service"]>();
   for (const [environmentId, client] of clients) {
     const supervisorSession = yield* SubscriptionRef.make<Option.Option<RpcSession>>(
-      Option.some(session(client)),
+      Option.some(session(client, catalogCapabilities.get(environmentId) ?? true)),
     );
     supervisors.set(
       environmentId,
@@ -176,7 +183,7 @@ const makeCommandHarness = Effect.fn("TestWorktrees.makeCommandHarness")(functio
   const worktrees = createWorktreeEnvironmentAtoms(
     Atom.runtime(Layer.succeed(EnvironmentRegistry, environmentRegistry)),
   );
-  return { worktrees, atomRegistry: AtomRegistry.make() };
+  return { worktrees, atomRegistry: AtomRegistry.make(), supervisors };
 });
 
 const threadDefaults: WorktreeAdoptInput["threadDefaults"] = {
@@ -225,6 +232,19 @@ function readSnapshot<E>(
 }
 
 describe("deriveWorktreeDiscoveryState", () => {
+  it("derives catalog RPC and legacy detach strategies from one capability policy", () => {
+    expect(
+      selectWorktreeCatalogCapabilityPolicy({
+        capabilities: { worktreeCatalog: true },
+      } as never),
+    ).toEqual({ catalogRpc: "enabled", removal: "catalog" });
+    expect(
+      selectWorktreeCatalogCapabilityPolicy({
+        capabilities: { worktreeCatalog: false },
+      } as never),
+    ).toEqual({ catalogRpc: "disabled", removal: "legacy-detach-only" });
+  });
+
   it("gates catalog support from the decoded environment capability", () => {
     expect(
       isWorktreeCatalogSupported({
@@ -237,6 +257,24 @@ describe("deriveWorktreeDiscoveryState", () => {
       } as never),
     ).toBe(true);
   });
+
+  it.each([
+    [null, true],
+    ["present", true],
+    ["verification-unavailable", true],
+    ["missing-registered", false],
+    ["missing-unregistered", false],
+    ["removing", false],
+  ] as const)(
+    "treats cold and retained degraded rows as usable while blocking only proven %s state",
+    (availability, expected) => {
+      expect(
+        selectWorktreeWorkspaceActionsAvailable(
+          availability === null ? null : ({ availability } as VcsAdoptedWorktreeStatus),
+        ),
+      ).toBe(expected);
+    },
+  );
 
   it("expands hidden initial candidates", () => {
     const candidate = descriptor("/repo-worktrees/first");
@@ -326,6 +364,34 @@ describe("deriveWorktreeDiscoveryState", () => {
 });
 
 describe("worktree catalog atoms", () => {
+  it.effect("starts no catalog subscription when the negotiated capability is false", () =>
+    Effect.gen(function* () {
+      let subscriptionCalls = 0;
+      const client = {
+        [WS_METHODS.subscribeWorktreeCatalog]: () => {
+          subscriptionCalls += 1;
+          return Stream.never;
+        },
+      } as unknown as WsRpcProtocolClient;
+      const harness = yield* makeAtomHarnessFromClients(
+        new Map([[ENVIRONMENT_ONE, client]]),
+        new Map([[ENVIRONMENT_ONE, false]]),
+      );
+      const catalog = harness.worktrees.catalog({
+        environmentId: ENVIRONMENT_ONE,
+        input: { projectId: PROJECT_ID },
+      });
+
+      const unmount = harness.atomRegistry.mount(catalog);
+      yield* Effect.yieldNow;
+      yield* Effect.yieldNow;
+
+      expect(subscriptionCalls).toBe(0);
+      unmount();
+      harness.atomRegistry.dispose();
+    }),
+  );
+
   it.effect("finalizes the live catalog across reconnect, final unmount, and remount", () =>
     Effect.gen(function* () {
       const subscriptions = { initial: 0, reconnected: 0 };
@@ -490,6 +556,321 @@ describe("worktree catalog atoms", () => {
       unmountSecond();
       harness.atomRegistry.dispose();
     }),
+  );
+});
+
+describe("worktree catalog capability enforcement", () => {
+  it.effect(
+    "makes no new-method calls and uses only generic thread deletion for legacy detach",
+    () =>
+      Effect.gen(function* () {
+        const worktreeMethodCalls: string[] = [];
+        const genericCommands: unknown[] = [];
+        const unexpectedUnary = (method: string) => (_input: unknown) =>
+          Effect.sync(() => {
+            worktreeMethodCalls.push(method);
+            throw new Error(`unexpected ${method}`);
+          });
+        const client = {
+          [WS_METHODS.vcsRefreshWorktreeCatalog]: unexpectedUnary(
+            WS_METHODS.vcsRefreshWorktreeCatalog,
+          ),
+          [WS_METHODS.worktreeUpdateDiscoveryPolicy]: unexpectedUnary(
+            WS_METHODS.worktreeUpdateDiscoveryPolicy,
+          ),
+          [WS_METHODS.worktreeAdopt]: unexpectedUnary(WS_METHODS.worktreeAdopt),
+          [WS_METHODS.worktreeCreateManaged]: unexpectedUnary(WS_METHODS.worktreeCreateManaged),
+          [WS_METHODS.worktreeCreatePanel]: unexpectedUnary(WS_METHODS.worktreeCreatePanel),
+          [WS_METHODS.worktreeRetarget]: unexpectedUnary(WS_METHODS.worktreeRetarget),
+          [WS_METHODS.worktreeGetRemovalPlan]: unexpectedUnary(WS_METHODS.worktreeGetRemovalPlan),
+          [WS_METHODS.worktreeRemoveFromBibCode]: unexpectedUnary(
+            WS_METHODS.worktreeRemoveFromBibCode,
+          ),
+          [WS_METHODS.worktreeRemove]: unexpectedUnary(WS_METHODS.worktreeRemove),
+          [ORCHESTRATION_WS_METHODS.dispatchCommand]: (command: unknown) =>
+            Effect.sync(() => {
+              genericCommands.push(command);
+              return { status: "accepted" } as never;
+            }),
+        } as unknown as WsRpcProtocolClient;
+        const harness = yield* makeCommandHarness(
+          new Map([[ENVIRONMENT_ONE, client]]),
+          new Map([[ENVIRONMENT_ONE, false]]),
+        );
+
+        const unsupportedResults = [
+          yield* Effect.promise(() =>
+            harness.worktrees.refresh.run(harness.atomRegistry, {
+              environmentId: ENVIRONMENT_ONE,
+              input: { projectId: PROJECT_ID },
+            }),
+          ),
+          yield* Effect.promise(() =>
+            harness.worktrees.updatePolicy.run(harness.atomRegistry, {
+              environmentId: ENVIRONMENT_ONE,
+              input: {
+                commandId: CommandId.make("command-policy-legacy"),
+                projectId: PROJECT_ID,
+                visibility: "hidden",
+              },
+            }),
+          ),
+          yield* Effect.promise(() =>
+            harness.worktrees.addOne.run(harness.atomRegistry, {
+              environmentId: ENVIRONMENT_ONE,
+              input: {
+                commandId: CommandId.make("command-adopt-legacy"),
+                projectId: PROJECT_ID,
+                worktreeKey: WorktreeKey.make("worktree-legacy"),
+                expectedGeneration: 7,
+                threadDefaults,
+              },
+            }),
+          ),
+          yield* Effect.promise(() =>
+            harness.worktrees.addAll.run(
+              harness.atomRegistry,
+              addAllInput(ENVIRONMENT_ONE, 1, () => PROJECT_ID),
+            ),
+          ),
+          yield* Effect.promise(() =>
+            harness.worktrees.createManaged.run(harness.atomRegistry, {
+              environmentId: ENVIRONMENT_ONE,
+              input: {
+                commandId: CommandId.make("command-create-managed-legacy"),
+                projectId: PROJECT_ID,
+                threadId: ThreadId.make("thread-create-managed-legacy"),
+                title: "Managed worktree",
+                refName: "HEAD",
+                newRefName: "feature/managed",
+                baseRefName: "HEAD",
+                threadDefaults,
+              },
+            }),
+          ),
+          yield* Effect.promise(() =>
+            harness.worktrees.createPanel.run(harness.atomRegistry, {
+              environmentId: ENVIRONMENT_ONE,
+              input: {
+                commandId: CommandId.make("command-create-panel-legacy"),
+                hostThreadId: ThreadId.make("thread-host-legacy"),
+                threadId: ThreadId.make("thread-panel-legacy"),
+                title: "Panel",
+                threadDefaults,
+              },
+            }),
+          ),
+          yield* Effect.promise(() =>
+            harness.worktrees.retarget.run(harness.atomRegistry, {
+              environmentId: ENVIRONMENT_ONE,
+              input: {
+                commandId: CommandId.make("command-retarget-legacy"),
+                projectId: PROJECT_ID,
+                threadId: ThreadId.make("thread-retarget-legacy"),
+                worktreeKey: WorktreeKey.make("worktree-retarget-legacy"),
+                expectedGeneration: 7,
+              },
+            }),
+          ),
+          yield* Effect.promise(() =>
+            harness.worktrees.getRemovalPlan.run(harness.atomRegistry, {
+              environmentId: ENVIRONMENT_ONE,
+              input: {
+                projectId: PROJECT_ID,
+                threadId: ThreadId.make("thread-legacy"),
+              },
+            }),
+          ),
+          yield* Effect.promise(() =>
+            harness.worktrees.remove.run(harness.atomRegistry, {
+              environmentId: ENVIRONMENT_ONE,
+              input: {
+                commandId: CommandId.make("command-remove-legacy"),
+                projectId: PROJECT_ID,
+                threadId: ThreadId.make("thread-legacy"),
+                mode: "delete-git-worktree",
+                expectedGeneration: 7,
+                planToken: WorktreeRemovalPlanToken.make("plan-legacy"),
+                forceDirty: false,
+                confirmRepositoryWidePrune: false,
+              },
+            }),
+          ),
+        ];
+        const detach = yield* Effect.promise(() =>
+          harness.worktrees.removeFromBibCode.run(harness.atomRegistry, {
+            environmentId: ENVIRONMENT_ONE,
+            input: {
+              commandId: CommandId.make("command-detach-legacy"),
+              projectId: PROJECT_ID,
+              threadId: ThreadId.make("thread-legacy"),
+            },
+          }),
+        );
+
+        expect(unsupportedResults.every((result) => result._tag === "Failure")).toBe(true);
+        const firstFailure = unsupportedResults[0];
+        expect(firstFailure?._tag).toBe("Failure");
+        if (firstFailure?._tag === "Failure") {
+          expect(Cause.squash(firstFailure.cause as Cause.Cause<unknown>)).toBeInstanceOf(
+            WorktreeCatalogUnsupportedError,
+          );
+        }
+        expect(detach).toMatchObject({
+          _tag: "Success",
+          value: {
+            threadRemoved: true,
+            gitOutcome: "not-requested",
+            orphanCleanupPending: false,
+          },
+        });
+        expect(worktreeMethodCalls).toEqual([]);
+        expect(genericCommands).toEqual([
+          {
+            type: "thread.delete",
+            commandId: "command-detach-legacy",
+            threadId: "thread-legacy",
+          },
+        ]);
+        expect(genericCommands[0]).not.toHaveProperty("path");
+        expect(genericCommands[0]).not.toHaveProperty("cwd");
+        harness.atomRegistry.dispose();
+      }),
+  );
+
+  it.effect("binds a catalog request to the session whose capability was negotiated", () =>
+    Effect.gen(function* () {
+      let supportedCalls = 0;
+      let unsupportedCalls = 0;
+      const supportedClient = {
+        [WS_METHODS.vcsRefreshWorktreeCatalog]: () =>
+          Effect.sync(() => {
+            supportedCalls += 1;
+            return undefined as never;
+          }),
+      } as unknown as WsRpcProtocolClient;
+      const unsupportedClient = {
+        [WS_METHODS.vcsRefreshWorktreeCatalog]: () =>
+          Effect.sync(() => {
+            unsupportedCalls += 1;
+            return undefined as never;
+          }),
+      } as unknown as WsRpcProtocolClient;
+      const harness = yield* makeCommandHarness(new Map([[ENVIRONMENT_ONE, supportedClient]]));
+      const supervisor = harness.supervisors.get(ENVIRONMENT_ONE)!;
+      const unsupportedSession = session(unsupportedClient, false);
+      const transitioningSession = {
+        ...session(supportedClient, true),
+        initialConfig: SubscriptionRef.set(
+          supervisor.session,
+          Option.some(unsupportedSession),
+        ).pipe(Effect.as({ environment: { capabilities: { worktreeCatalog: true } } } as never)),
+      } satisfies RpcSession;
+      yield* SubscriptionRef.set(supervisor.session, Option.some(transitioningSession));
+
+      const result = yield* Effect.promise(() =>
+        harness.worktrees.refresh.run(harness.atomRegistry, {
+          environmentId: ENVIRONMENT_ONE,
+          input: { projectId: PROJECT_ID },
+        }),
+      );
+
+      expect(result._tag).toBe("Success");
+      expect(supportedCalls).toBe(1);
+      expect(unsupportedCalls).toBe(0);
+      harness.atomRegistry.dispose();
+    }),
+  );
+
+  it.effect(
+    "routes dedicated create and retarget commands through the negotiated catalog session",
+    () =>
+      Effect.gen(function* () {
+        const calls: Array<{ readonly method: string; readonly input: unknown }> = [];
+        const client = {
+          [WS_METHODS.worktreeCreateManaged]: (input: unknown) =>
+            Effect.sync(() => {
+              calls.push({ method: WS_METHODS.worktreeCreateManaged, input });
+              return {
+                threadId: "thread-managed",
+                path: "/repo/.worktrees/managed",
+                refName: "feature/managed",
+              } as never;
+            }),
+          [WS_METHODS.worktreeCreatePanel]: (input: unknown) =>
+            Effect.sync(() => {
+              calls.push({ method: WS_METHODS.worktreeCreatePanel, input });
+              return { threadId: "thread-panel" } as never;
+            }),
+          [WS_METHODS.worktreeRetarget]: (input: unknown) =>
+            Effect.sync(() => {
+              calls.push({ method: WS_METHODS.worktreeRetarget, input });
+              return { threadId: "thread-retarget" } as never;
+            }),
+        } as unknown as WsRpcProtocolClient;
+        const harness = yield* makeCommandHarness(new Map([[ENVIRONMENT_ONE, client]]));
+        const managedInput = {
+          commandId: CommandId.make("command-managed"),
+          projectId: PROJECT_ID,
+          threadId: ThreadId.make("thread-managed"),
+          title: "Managed worktree",
+          refName: "HEAD",
+          newRefName: "feature/managed",
+          baseRefName: "HEAD",
+          threadDefaults,
+        } as const;
+        const panelInput = {
+          commandId: CommandId.make("command-panel"),
+          hostThreadId: ThreadId.make("thread-host"),
+          threadId: ThreadId.make("thread-panel"),
+          title: "Panel",
+          threadDefaults,
+        } as const;
+        const retargetInput = {
+          commandId: CommandId.make("command-retarget"),
+          projectId: PROJECT_ID,
+          threadId: ThreadId.make("thread-retarget"),
+          worktreeKey: WorktreeKey.make("worktree-target"),
+          expectedGeneration: 12,
+        } as const;
+
+        const managed = yield* Effect.promise(() =>
+          harness.worktrees.createManaged.run(harness.atomRegistry, {
+            environmentId: ENVIRONMENT_ONE,
+            input: managedInput,
+          }),
+        );
+        const panel = yield* Effect.promise(() =>
+          harness.worktrees.createPanel.run(harness.atomRegistry, {
+            environmentId: ENVIRONMENT_ONE,
+            input: panelInput,
+          }),
+        );
+        const retarget = yield* Effect.promise(() =>
+          harness.worktrees.retarget.run(harness.atomRegistry, {
+            environmentId: ENVIRONMENT_ONE,
+            input: retargetInput,
+          }),
+        );
+
+        expect([managed._tag, panel._tag, retarget._tag]).toEqual([
+          "Success",
+          "Success",
+          "Success",
+        ]);
+        expect(calls).toEqual([
+          { method: WS_METHODS.worktreeCreateManaged, input: managedInput },
+          { method: WS_METHODS.worktreeCreatePanel, input: panelInput },
+          { method: WS_METHODS.worktreeRetarget, input: retargetInput },
+        ]);
+        for (const call of calls) {
+          expect(call.input).not.toHaveProperty("cwd");
+          expect(call.input).not.toHaveProperty("path");
+          expect(call.input).not.toHaveProperty("worktreePath");
+          expect(call.input).not.toHaveProperty("kind");
+        }
+        harness.atomRegistry.dispose();
+      }),
   );
 });
 

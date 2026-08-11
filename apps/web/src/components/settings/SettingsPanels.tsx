@@ -21,6 +21,7 @@ import {
   settlePromise,
   squashAtomCommandFailure,
 } from "@bibcode/client-runtime/state/runtime";
+import { selectWorktreeCatalogCapabilityPolicy } from "@bibcode/client-runtime/state/worktrees";
 import {
   BUNDLED_TERMINAL_FONT_PREFERENCE,
   DEFAULT_DEFAULT_AGENT_SELECTION,
@@ -71,7 +72,7 @@ import {
 } from "../../state/server";
 import { usePrimaryEnvironment } from "../../state/environments";
 import { useEnvironmentQuery } from "../../state/query";
-import { useProjects } from "../../state/entities";
+import { useProjects, useServerConfigs } from "../../state/entities";
 import { useArchivedThreadSnapshots } from "../../lib/archivedThreadsState";
 import {
   isCustomTerminalFontAvailable,
@@ -1811,8 +1812,10 @@ function EnvironmentScopedProviderSettingsPanel({
 
 export function ArchivedThreadsPanel() {
   const projects = useProjects();
+  const serverConfigs = useServerConfigs();
   const {
     unarchiveThread,
+    deleteThread,
     confirmAndDeleteThread,
     worktreeRemovalTarget,
     requestWorktreeRemoval,
@@ -1914,7 +1917,16 @@ export function ArchivedThreadsPanel() {
       }
 
       if (clicked === "delete") {
-        if (thread.worktreePath && thread.kind !== "panel") {
+        const serverConfig = serverConfigs.get(thread.environmentId);
+        const removalPolicy =
+          serverConfig === undefined
+            ? null
+            : selectWorktreeCatalogCapabilityPolicy(serverConfig.environment).removal;
+        if (
+          thread.worktreePath &&
+          thread.kind !== "panel" &&
+          removalPolicy !== "legacy-detach-only"
+        ) {
           requestWorktreeRemoval({
             environmentId: thread.environmentId,
             projectId: thread.projectId,
@@ -1928,7 +1940,23 @@ export function ArchivedThreadsPanel() {
           });
           return;
         }
-        const result = await confirmAndDeleteThread(threadRef);
+        const isLegacyWorktreeDetach =
+          thread.worktreePath !== null &&
+          thread.worktreePath !== undefined &&
+          thread.kind !== "panel" &&
+          removalPolicy === "legacy-detach-only";
+        if (isLegacyWorktreeDetach) {
+          const confirmed = await api.dialogs.confirm(
+            [
+              `Remove worktree "${thread.title}" from BiBCode?`,
+              "The Git worktree and its files will be left untouched.",
+            ].join("\n"),
+          );
+          if (!confirmed) return;
+        }
+        const result = isLegacyWorktreeDetach
+          ? await deleteThread(threadRef)
+          : await confirmAndDeleteThread(threadRef);
         if (result._tag === "Success") {
           refreshArchivedThreads();
         } else if (!isAtomCommandInterrupted(result)) {
@@ -1943,7 +1971,14 @@ export function ArchivedThreadsPanel() {
         }
       }
     },
-    [confirmAndDeleteThread, refreshArchivedThreads, requestWorktreeRemoval, unarchiveThread],
+    [
+      confirmAndDeleteThread,
+      deleteThread,
+      refreshArchivedThreads,
+      requestWorktreeRemoval,
+      serverConfigs,
+      unarchiveThread,
+    ],
   );
 
   const handleWorktreeRemoved = useCallback(

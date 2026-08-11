@@ -82,6 +82,10 @@ import {
   settlePromise,
   squashAtomCommandFailure,
 } from "@bibcode/client-runtime/state/runtime";
+import {
+  selectWorktreeCatalogCapabilityPolicy,
+  selectWorktreeWorkspaceActionsAvailable,
+} from "@bibcode/client-runtime/state/worktrees";
 import { Link, useLocation, useNavigate, useParams, useRouter } from "@tanstack/react-router";
 import {
   MAX_SIDEBAR_THREAD_PREVIEW_COUNT,
@@ -563,8 +567,12 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
   );
   const threadProjectCwd = threadProject?.workspaceRoot ?? null;
   const gitCwd = thread.worktreePath ?? threadProjectCwd ?? props.projectCwd;
+  const serverConfig = useServerConfigs().get(thread.environmentId);
+  const worktreeCatalogSupported =
+    serverConfig !== undefined &&
+    selectWorktreeCatalogCapabilityPolicy(serverConfig.environment).catalogRpc === "enabled";
   const worktreeCatalog = useEnvironmentQuery(
-    thread.worktreePath
+    thread.worktreePath && worktreeCatalogSupported
       ? worktreeEnvironment.catalog({
           environmentId: thread.environmentId,
           input: { projectId: thread.projectId },
@@ -573,8 +581,7 @@ export const SidebarThreadRow = memo(function SidebarThreadRow(props: SidebarThr
   );
   const worktreeStatus =
     worktreeCatalog.data?.adoptedWorkspaces.find((status) => status.threadId === thread.id) ?? null;
-  const workspaceActionsAvailable =
-    worktreeStatus === null || worktreeStatus.availability === "present";
+  const workspaceActionsAvailable = selectWorktreeWorkspaceActionsAvailable(worktreeStatus);
   const refreshWorktreeCatalog = useAtomCommand(worktreeEnvironment.refresh, {
     reportFailure: false,
   });
@@ -2207,9 +2214,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
           modelSelection: resolution.modelSelection,
           runtimeMode: DEFAULT_RUNTIME_MODE,
           interactionMode: DEFAULT_PROVIDER_INTERACTION_MODE,
-          kind: "default",
           branch: null,
-          worktreePath: null,
         },
       });
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
@@ -2569,8 +2574,12 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       );
       const threadWorkspacePath =
         thread.worktreePath ?? threadProject?.workspaceRoot ?? project.workspaceRoot ?? null;
-      const workspaceActionsAvailable =
-        worktreeStatus === null || worktreeStatus.availability === "present";
+      const workspaceActionsAvailable = selectWorktreeWorkspaceActionsAvailable(worktreeStatus);
+      const threadServerConfig = serverConfigs.get(thread.environmentId);
+      const removalPolicy =
+        threadServerConfig === undefined
+          ? null
+          : selectWorktreeCatalogCapabilityPolicy(threadServerConfig.environment).removal;
       const isPinned = pinnedThreadKeys.includes(threadKey);
       const isUnread = unreadThreadKeys.includes(threadKey);
       // Orca-parity "Open in" submenu (item 2): built from the same EDITORS
@@ -2713,6 +2722,27 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       }
       if (clicked !== "delete") return;
       if (thread.worktreePath) {
+        if (removalPolicy === "legacy-detach-only") {
+          const confirmed = await api.dialogs.confirm(
+            [
+              `Remove worktree "${thread.title}" from BiBCode?`,
+              "The Git worktree and its files will be left untouched.",
+            ].join("\n"),
+          );
+          if (!confirmed) return;
+          const result = await deleteThread(threadRef);
+          if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+            const error = squashAtomCommandFailure(result);
+            toastManager.add(
+              stackedThreadToast({
+                type: "error",
+                title: "Failed to remove worktree from BiBCode",
+                description: error instanceof Error ? error.message : "An error occurred.",
+              }),
+            );
+          }
+          return;
+        }
         requestWorktreeRemoval?.({
           environmentId: thread.environmentId,
           projectId: thread.projectId,
@@ -2770,6 +2800,7 @@ const SidebarProjectItem = memo(function SidebarProjectItem(props: SidebarProjec
       startThreadRename,
       togglePinnedThreadKey,
       unreadThreadKeys,
+      serverConfigs,
     ],
   );
 

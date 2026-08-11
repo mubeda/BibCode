@@ -61,7 +61,9 @@ const h = vi.hoisted(() => {
     updateState: null as unknown,
     primaryEnvironment: null as unknown,
     projects: [] as unknown[],
+    serverConfigs: new Map<string, unknown>(),
     unarchiveThread: vi.fn(),
+    deleteThread: vi.fn(),
     confirmAndDeleteThread: vi.fn(),
     requestWorktreeRemoval: vi.fn(),
     closeWorktreeRemovalDialog: vi.fn(),
@@ -167,11 +169,13 @@ vi.mock("../../state/environments", () => ({
 
 vi.mock("../../state/entities", () => ({
   useProjects: () => h.projects,
+  useServerConfigs: () => h.serverConfigs,
 }));
 
 vi.mock("../../hooks/useThreadActions", () => ({
   useThreadActions: () => ({
     unarchiveThread: h.unarchiveThread,
+    deleteThread: h.deleteThread,
     confirmAndDeleteThread: h.confirmAndDeleteThread,
     worktreeRemovalTarget: null,
     requestWorktreeRemoval: h.requestWorktreeRemoval,
@@ -2117,6 +2121,10 @@ describe("ArchivedThreadsPanel", () => {
 
   beforeEach(() => {
     h.projects = [{ environmentId: env1 }, { environmentId: env2 }];
+    h.serverConfigs = new Map([
+      [env1, { environment: { capabilities: { worktreeCatalog: true } } }],
+      [env2, { environment: { capabilities: { worktreeCatalog: true } } }],
+    ]);
   });
 
   it("shows the loading state", () => {
@@ -2295,6 +2303,42 @@ describe("ArchivedThreadsPanel", () => {
       locked: false,
     });
     expect(h.confirmAndDeleteThread).not.toHaveBeenCalled();
+  });
+
+  it("uses generic detach-only deletion for an archived worktree on an unsupported server", async () => {
+    const snapshots = archivedSnapshots() as any[];
+    const archivedThread = snapshots[0].snapshot.threads[1];
+    archivedThread.worktreePath = "/work/alpha-worktrees/feature";
+    archivedThread.branch = "feature/archived";
+    h.archive.snapshots = snapshots;
+    h.serverConfigs = new Map([
+      [env1, { environment: { capabilities: { worktreeCatalog: false } } }],
+      [env2, { environment: { capabilities: { worktreeCatalog: true } } }],
+    ]);
+    const confirm = vi.fn().mockResolvedValue(true);
+    h.localApi = {
+      contextMenu: { show: vi.fn().mockResolvedValue("delete") },
+      dialogs: { confirm },
+    };
+    render(<ArchivedThreadsPanel />);
+
+    const row = h.rows.find(
+      (entry) => entry.title === "Newer thread" && typeof entry.onContextMenu === "function",
+    );
+    (row!.onContextMenu as (event: unknown) => void)({
+      preventDefault: () => {},
+      clientX: 3,
+      clientY: 4,
+    });
+    await flush();
+
+    expect(confirm).toHaveBeenCalledWith(expect.stringContaining("files will be left untouched"));
+    expect(h.deleteThread).toHaveBeenCalledWith({
+      environmentId: env1,
+      threadId: "thread-new",
+    });
+    expect(h.confirmAndDeleteThread).not.toHaveBeenCalled();
+    expect(h.requestWorktreeRemoval).not.toHaveBeenCalled();
   });
 
   it("keeps archived panel-thread deletion on the ordinary thread path", async () => {

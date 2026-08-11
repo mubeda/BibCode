@@ -168,6 +168,7 @@ vi.mock("../state/vcs", () => ({
 vi.mock("../state/worktrees", () => ({
   worktreeEnvironment: {
     catalog: () => ({ key: "worktree.catalog" }),
+    createPanel: { key: "worktree.createPanel" },
   },
 }));
 
@@ -3609,12 +3610,33 @@ describe("ChatView", () => {
       });
       header.onOpenTerminalPanel();
       await vi.waitFor(() => {
-        expect(h.commandCalls.some((call) => call.key === "thread.create")).toBe(true);
+        expect(h.commandCalls.some((call) => call.key === "worktree.createPanel")).toBe(true);
         const surfaces =
           useCenterPanelStore.getState().byThreadKey[scopedThreadKey(threadRef)]?.surfaces ?? [];
         expect(surfaces.some((surface) => surface.kind === "chat")).toBe(true);
         expect(surfaces.some((surface) => surface.kind === "terminal")).toBe(true);
       });
+
+      const createPanel = h.commandCalls.find((call) => call.key === "worktree.createPanel");
+      expect(createPanel).toBeDefined();
+      expect(createPanel!.input).toMatchObject({
+        environmentId,
+        input: {
+          commandId: expect.any(String),
+          hostThreadId: threadId,
+          title: "Panel — Codex",
+          threadDefaults: {
+            modelSelection: expect.objectContaining({ instanceId: codexInstanceId }),
+            runtimeMode: "full-access",
+            interactionMode: "default",
+          },
+        },
+      });
+      const createPanelInput = (createPanel!.input as { input: object }).input;
+      expect(createPanelInput).not.toHaveProperty("worktreePath");
+      expect(createPanelInput).not.toHaveProperty("branch");
+      expect(createPanelInput).not.toHaveProperty("kind");
+      expect(createPanelInput).not.toHaveProperty("projectId");
 
       expect(markup).toContain('data-mock="messages-timeline"');
       expect(markup).toContain('data-mock="chat-composer"');
@@ -5105,7 +5127,9 @@ describe("ChatView adopted workspace availability", () => {
     seedGitStatus(true);
     useCenterPanelStore.getState().openChatPanel(threadRef, siblingThreadId, "Codex");
 
-    const setAvailability = (availability: "present" | "missing-registered" | "removing") => {
+    const setAvailability = (
+      availability: "present" | "verification-unavailable" | "missing-registered" | "removing",
+    ) => {
       h.queryDataByKey.set("worktree.catalog", {
         adoptedWorkspaces: [
           {
@@ -5155,6 +5179,14 @@ describe("ChatView adopted workspace availability", () => {
       expect(h.activeQuerySubscriptions.get("worktree.catalog")).toBe(1);
       expect(latestSiblingComposer()?.["providerBindingConflictReason"]).toBeNull();
 
+      setAvailability("verification-unavailable");
+      await render();
+      expect(latestSiblingComposer()?.["providerBindingConflictReason"]).toBeNull();
+      expect(
+        capturedProps<Record<string, unknown>>("chatHeaderActions")["workspaceUnavailable"],
+      ).toBeNull();
+      expect(h.activeQuerySubscriptions.get("worktree.catalog")).toBe(1);
+
       for (const availability of ["missing-registered", "removing"] as const) {
         setAvailability(availability);
         await render();
@@ -5203,6 +5235,7 @@ describe("ChatView adopted workspace availability", () => {
     expect(capturedProps<Record<string, unknown>>("chatComposer")).toMatchObject({
       providerBindingConflictReason: null,
     });
+    expect(h.querySubscriptionStarts.filter((key) => key === "worktree.catalog")).toHaveLength(0);
   });
 
   it("uses an adopted worktree path unchanged across the active chat surface", () => {

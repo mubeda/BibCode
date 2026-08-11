@@ -1522,7 +1522,6 @@ staticDescribe("stacked action results", () => {
       input: {
         threadId: THREAD_REF.threadId,
         branch: "feature/auto",
-        worktreePath: "/wt",
       },
     });
   });
@@ -1723,7 +1722,6 @@ staticDescribe("status refresh on focus", () => {
       input: {
         threadId: THREAD_REF.threadId,
         branch: "feature/live",
-        worktreePath: "/wt",
       },
     });
   });

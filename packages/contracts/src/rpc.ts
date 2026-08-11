@@ -50,7 +50,6 @@ import {
   VcsPullInput,
   GitPullRequestRefInput,
   VcsPullResult,
-  VcsRemoveWorktreeInput,
   GitResolvePullRequestResult,
   GitRunStackedActionInput,
   VcsStageFilesInput,
@@ -81,7 +80,13 @@ import {
   ProviderInteractionMode,
   RuntimeMode,
 } from "./orchestration.ts";
-import { CommandId, NonNegativeInt, ProjectId, ThreadId } from "./baseSchemas.ts";
+import {
+  CommandId,
+  NonNegativeInt,
+  ProjectId,
+  ThreadId,
+  TrimmedNonEmptyString,
+} from "./baseSchemas.ts";
 import { ProviderInstanceId } from "./providerInstance.ts";
 import {
   RelayClientInstallFailedError,
@@ -222,6 +227,54 @@ export const WorktreeAdoptInput = Schema.Struct({
 });
 export type WorktreeAdoptInput = typeof WorktreeAdoptInput.Type;
 
+const WorktreeThreadDefaults = Schema.Struct({
+  modelSelection: ModelSelection,
+  runtimeMode: RuntimeMode,
+  interactionMode: ProviderInteractionMode,
+});
+
+export const WorktreeCreateManagedInput = Schema.Struct({
+  commandId: CommandId,
+  projectId: ProjectId,
+  threadId: ThreadId,
+  title: TrimmedNonEmptyString,
+  refName: TrimmedNonEmptyString,
+  newRefName: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+  baseRefName: Schema.optional(Schema.NullOr(TrimmedNonEmptyString)),
+  threadDefaults: WorktreeThreadDefaults,
+});
+export type WorktreeCreateManagedInput = typeof WorktreeCreateManagedInput.Type;
+
+export const WorktreeCreatePanelInput = Schema.Struct({
+  commandId: CommandId,
+  hostThreadId: ThreadId,
+  threadId: ThreadId,
+  title: TrimmedNonEmptyString,
+  threadDefaults: WorktreeThreadDefaults,
+});
+export type WorktreeCreatePanelInput = typeof WorktreeCreatePanelInput.Type;
+
+export const WorktreeRetargetInput = Schema.Struct({
+  commandId: CommandId,
+  projectId: ProjectId,
+  threadId: ThreadId,
+  worktreeKey: WorktreeKey,
+  expectedGeneration: NonNegativeInt,
+});
+export type WorktreeRetargetInput = typeof WorktreeRetargetInput.Type;
+
+export const WorktreeThreadResult = Schema.Struct({
+  threadId: ThreadId,
+});
+export type WorktreeThreadResult = typeof WorktreeThreadResult.Type;
+
+export const WorktreeManagedCreateResult = Schema.Struct({
+  threadId: ThreadId,
+  path: TrimmedNonEmptyString,
+  refName: TrimmedNonEmptyString,
+});
+export type WorktreeManagedCreateResult = typeof WorktreeManagedCreateResult.Type;
+
 export const WorktreeGetRemovalPlanInput = Schema.Struct({
   projectId: ProjectId,
   threadId: ThreadId,
@@ -274,7 +327,6 @@ export const WS_METHODS = {
   vcsListRefs: "vcs.listRefs",
   vcsListCommits: "vcs.listCommits",
   vcsCreateWorktree: "vcs.createWorktree",
-  vcsRemoveWorktree: "vcs.removeWorktree",
   vcsClone: "vcs.clone",
   vcsCreateRef: "vcs.createRef",
   vcsSwitchRef: "vcs.switchRef",
@@ -286,6 +338,9 @@ export const WS_METHODS = {
   vcsRefreshWorktreeCatalog: "vcs.refreshWorktreeCatalog",
   worktreeUpdateDiscoveryPolicy: "worktree.updateDiscoveryPolicy",
   worktreeAdopt: "worktree.adopt",
+  worktreeCreateManaged: "worktree.createManaged",
+  worktreeCreatePanel: "worktree.createPanel",
+  worktreeRetarget: "worktree.retarget",
   worktreeGetRemovalPlan: "worktree.getRemovalPlan",
   worktreeRemoveFromBibCode: "worktree.removeFromBibCode",
   worktreeRemove: "worktree.remove",
@@ -693,11 +748,6 @@ export const WsVcsCreateWorktreeRpc = Rpc.make(WS_METHODS.vcsCreateWorktree, {
   error: Schema.Union([GitCommandError, WorkspaceUnavailableError, EnvironmentAuthorizationError]),
 });
 
-export const WsVcsRemoveWorktreeRpc = Rpc.make(WS_METHODS.vcsRemoveWorktree, {
-  payload: VcsRemoveWorktreeInput,
-  error: Schema.Union([GitCommandError, WorkspaceUnavailableError, EnvironmentAuthorizationError]),
-});
-
 export const WsVcsCloneRpc = Rpc.make(WS_METHODS.vcsClone, {
   payload: GitCloneInput,
   success: GitCloneResult,
@@ -771,6 +821,24 @@ export const WsWorktreeUpdateDiscoveryPolicyRpc = Rpc.make(
 export const WsWorktreeAdoptRpc = Rpc.make(WS_METHODS.worktreeAdopt, {
   payload: WorktreeAdoptInput,
   success: WorktreeAdoptResult,
+  error: Schema.Union([WorktreeAdoptionError, EnvironmentAuthorizationError]),
+});
+
+export const WsWorktreeCreateManagedRpc = Rpc.make(WS_METHODS.worktreeCreateManaged, {
+  payload: WorktreeCreateManagedInput,
+  success: WorktreeManagedCreateResult,
+  error: Schema.Union([WorktreeAdoptionError, GitCommandError, EnvironmentAuthorizationError]),
+});
+
+export const WsWorktreeCreatePanelRpc = Rpc.make(WS_METHODS.worktreeCreatePanel, {
+  payload: WorktreeCreatePanelInput,
+  success: WorktreeThreadResult,
+  error: Schema.Union([WorktreeAdoptionError, EnvironmentAuthorizationError]),
+});
+
+export const WsWorktreeRetargetRpc = Rpc.make(WS_METHODS.worktreeRetarget, {
+  payload: WorktreeRetargetInput,
+  success: WorktreeThreadResult,
   error: Schema.Union([WorktreeAdoptionError, EnvironmentAuthorizationError]),
 });
 
@@ -1080,7 +1148,6 @@ export const WsRpcGroup = RpcGroup.make(
   WsVcsListRefsRpc,
   WsVcsListCommitsRpc,
   WsVcsCreateWorktreeRpc,
-  WsVcsRemoveWorktreeRpc,
   WsVcsCloneRpc,
   WsVcsCreateRefRpc,
   WsVcsSwitchRefRpc,
@@ -1093,6 +1160,9 @@ export const WsRpcGroup = RpcGroup.make(
   WsVcsRefreshWorktreeCatalogRpc,
   WsWorktreeUpdateDiscoveryPolicyRpc,
   WsWorktreeAdoptRpc,
+  WsWorktreeCreateManagedRpc,
+  WsWorktreeCreatePanelRpc,
+  WsWorktreeRetargetRpc,
   WsWorktreeGetRemovalPlanRpc,
   WsWorktreeRemoveFromBibCodeRpc,
   WsWorktreeRemoveRpc,
