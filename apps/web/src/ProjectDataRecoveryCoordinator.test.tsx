@@ -8,6 +8,9 @@ const h = vi.hoisted(() => ({
   summary: {
     statuses: [] as Array<{ environmentId: string; status: string }>,
   },
+  projectDataStatuses: [] as Array<{ environmentId: string; status: string }>,
+  projectDataStatusListener: null as ((event: { readonly environmentId: string }) => void) | null,
+  disposeProjectDataStatus: vi.fn(),
   open: vi.fn(async () => undefined),
   snapshot: {
     open: false,
@@ -63,8 +66,17 @@ let root: Root;
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   h.summary.statuses = [];
+  h.projectDataStatuses = [];
+  h.projectDataStatusListener = null;
+  h.disposeProjectDataStatus.mockClear();
   h.open.mockClear();
-  window.desktopBridge = { getProjectDataStatuses: vi.fn() } as never;
+  window.desktopBridge = {
+    getProjectDataStatuses: vi.fn(async () => h.projectDataStatuses),
+    onProjectDataStatusChanged: vi.fn((listener) => {
+      h.projectDataStatusListener = listener;
+      return h.disposeProjectDataStatus;
+    }),
+  } as never;
   container = document.createElement("div");
   document.body.append(container);
   root = createRoot(container);
@@ -77,6 +89,82 @@ afterEach(async () => {
 });
 
 describe("ProjectDataRecoveryCoordinator", () => {
+  const inspect = async () => {
+    await Promise.resolve();
+    await Promise.resolve();
+  };
+
+  it("opens recovery when a desktop startup failure was recorded before mount", async () => {
+    h.projectDataStatuses = [{ environmentId: "primary", status: "recovery-required" }];
+
+    await act(async () => {
+      root.render(<ProjectDataRecoveryCoordinator />);
+      await inspect();
+    });
+
+    expect(h.open).toHaveBeenCalledWith("primary", "automatic");
+  });
+
+  it("re-inspects after desktop invalidation and opens one recovery dialog per episode", async () => {
+    h.projectDataStatuses = [{ environmentId: "primary", status: "healthy" }];
+    await act(async () => {
+      root.render(<ProjectDataRecoveryCoordinator />);
+      await inspect();
+    });
+    expect(h.open).not.toHaveBeenCalled();
+
+    h.projectDataStatuses = [{ environmentId: "primary", status: "recovery-required" }];
+    await act(async () => {
+      h.projectDataStatusListener?.({ environmentId: "primary" });
+      await inspect();
+    });
+    expect(h.open).toHaveBeenCalledTimes(1);
+    expect(h.open).toHaveBeenCalledWith("primary", "automatic");
+
+    await act(async () => {
+      h.projectDataStatusListener?.({ environmentId: "primary" });
+      await inspect();
+    });
+    expect(h.open).toHaveBeenCalledTimes(1);
+
+    h.projectDataStatuses = [{ environmentId: "primary", status: "healthy" }];
+    await act(async () => {
+      h.projectDataStatusListener?.({ environmentId: "primary" });
+      await inspect();
+    });
+    h.projectDataStatuses = [{ environmentId: "primary", status: "recovery-required" }];
+    await act(async () => {
+      h.projectDataStatusListener?.({ environmentId: "primary" });
+      await inspect();
+    });
+    expect(h.open).toHaveBeenCalledTimes(2);
+  });
+
+  it("does not open from healthy or unavailable desktop project data", async () => {
+    h.projectDataStatuses = [
+      { environmentId: "primary", status: "healthy" },
+      { environmentId: "wsl:Ubuntu", status: "unavailable" },
+    ];
+
+    await act(async () => {
+      root.render(<ProjectDataRecoveryCoordinator />);
+      await inspect();
+    });
+
+    expect(h.open).not.toHaveBeenCalled();
+  });
+
+  it("disposes the desktop invalidation listener on unmount", async () => {
+    await act(async () => {
+      root.render(<ProjectDataRecoveryCoordinator />);
+      await inspect();
+    });
+
+    await act(async () => root.unmount());
+    expect(h.disposeProjectDataStatus).toHaveBeenCalledTimes(1);
+    root = createRoot(container);
+  });
+
   it("automatically opens once for each recovery-required episode", async () => {
     h.summary.statuses = [{ environmentId: "primary", status: "recovery-required" }];
     await act(async () => root.render(<ProjectDataRecoveryCoordinator />));
