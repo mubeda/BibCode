@@ -5,9 +5,10 @@ use tokio::{
     sync::Semaphore,
     time::{Instant, timeout, timeout_at},
 };
+use uuid::Uuid;
 
 use super::{
-    ActivityCancellationOperationState, ActivityCancellationOperationSummary, ActivityControlEvent,
+    ActivityCancellationOperationState, ActivityCancellationOperationSummary,
     ActivityControlRegistry, ActivityDispatchJob, ActivityDispatchSubject,
     ActivityRuntimeGeneration, ActivityScopeRef, ProviderActivityNativeTarget,
 };
@@ -68,6 +69,9 @@ pub(crate) struct ActivityCancellationService {
     dispatcher: Arc<dyn ActivityCancellationDispatcher>,
 }
 
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub(super) struct ActivityDispatchAttemptId(Uuid);
+
 #[derive(Clone)]
 pub(super) struct CancellationOperation {
     pub(super) root_actor_id: String,
@@ -75,6 +79,7 @@ pub(super) struct CancellationOperation {
     pub(super) covered_actor_ids: HashSet<String>,
     pub(super) covered_work_item_ids: HashSet<String>,
     pub(super) dispatched_targets: HashSet<ProviderActivityNativeTarget>,
+    pub(super) active_attempt_ids: HashSet<ActivityDispatchAttemptId>,
     pub(super) residual_actor_ids: HashSet<String>,
     pub(super) residual_work_item_ids: HashSet<String>,
     pub(super) state: ActivityCancellationOperationState,
@@ -90,6 +95,7 @@ impl fmt::Debug for CancellationOperation {
             .field("covered_actor_count", &self.covered_actor_ids.len())
             .field("covered_work_item_count", &self.covered_work_item_ids.len())
             .field("dispatched_target_count", &self.dispatched_targets.len())
+            .field("active_attempt_count", &self.active_attempt_ids.len())
             .field("residual_actor_count", &self.residual_actor_ids.len())
             .field(
                 "residual_work_item_count",
@@ -122,6 +128,51 @@ struct CancellationAdmission {
     result: ActivitySubtreeCancellationResult,
     selected_job: Option<ActivityDispatchJob>,
     remaining_jobs: Vec<ActivityDispatchJob>,
+    attempt: Option<CancellationAttemptGuard>,
+}
+
+struct CancellationAttemptGuard {
+    registry: ActivityControlRegistry,
+    scope_id: String,
+    generation: ActivityRuntimeGeneration,
+    attempt_id: ActivityDispatchAttemptId,
+    armed: bool,
+}
+
+impl CancellationAttemptGuard {
+    fn new(
+        registry: ActivityControlRegistry,
+        scope_id: String,
+        generation: ActivityRuntimeGeneration,
+        attempt_id: ActivityDispatchAttemptId,
+    ) -> Self {
+        Self {
+            registry,
+            scope_id,
+            generation,
+            attempt_id,
+            armed: true,
+        }
+    }
+
+    fn attempt_id(&self) -> &ActivityDispatchAttemptId {
+        &self.attempt_id
+    }
+
+    fn finish(mut self, failed: bool) {
+        self.registry
+            .finish_attempt(&self.scope_id, &self.generation, &self.attempt_id, failed);
+        self.armed = false;
+    }
+}
+
+impl Drop for CancellationAttemptGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            self.registry
+                .finish_attempt(&self.scope_id, &self.generation, &self.attempt_id, true);
+        }
+    }
 }
 
 impl ActivityCancellationService {
@@ -145,12 +196,15 @@ impl ActivityCancellationService {
         let admission =
             self.admit_cancellation(scope, scope_id, actor_id, expected_control_revision)?;
         if admission.result.disposition == ActivitySubtreeCancellationDisposition::Accepted {
-            let failed = self
-                .dispatch_operation(admission.selected_job, admission.remaining_jobs)
-                .await;
-            if failed {
-                self.mark_partial(scope_id, &admission.result.root_actor_id);
-            }
+            self.dispatch_operation(
+                admission.selected_job,
+                admission.remaining_jobs,
+                admission
+                    .attempt
+                    .expect("accepted admission has an attempt"),
+                Arc::new(Semaphore::new(DESCENDANT_DISPATCH_CONCURRENCY)),
+            )
+            .await;
         }
         Ok(admission.result)
     }
@@ -164,12 +218,13 @@ impl ActivityCancellationService {
     ) -> Result<ActivitySubtreeCancellationResult, ActivityCancellationError> {
         let admission =
             self.admit_retry(scope, scope_id, root_actor_id, expected_operation_revision)?;
-        let failed = self
-            .dispatch_operation(admission.selected_job, admission.remaining_jobs)
-            .await;
-        if failed {
-            self.mark_partial(scope_id, &admission.result.root_actor_id);
-        }
+        self.dispatch_operation(
+            admission.selected_job,
+            admission.remaining_jobs,
+            admission.attempt.expect("retry admission has an attempt"),
+            Arc::new(Semaphore::new(DESCENDANT_DISPATCH_CONCURRENCY)),
+        )
+        .await;
         Ok(admission.result)
     }
 
@@ -177,16 +232,72 @@ impl ActivityCancellationService {
         if jobs.is_empty() {
             return;
         }
-        let roots = jobs
-            .iter()
-            .map(|job| (job.scope_id.clone(), job.operation_root_actor_id.clone()))
-            .collect::<HashSet<_>>();
-        let failed = self.dispatch_operation(None, jobs).await;
-        if failed {
-            for (scope_id, root_actor_id) in roots {
-                self.mark_partial(&scope_id, &root_actor_id);
-            }
+        let mut grouped = std::collections::BTreeMap::new();
+        for job in jobs {
+            grouped
+                .entry((job.scope_id.clone(), job.operation_root_actor_id.clone()))
+                .or_insert_with(Vec::new)
+                .push(job);
         }
+        let semaphore = Arc::new(Semaphore::new(DESCENDANT_DISPATCH_CONCURRENCY));
+        let mut pending = FuturesUnordered::new();
+        for ((scope_id, root_actor_id), jobs) in grouped {
+            let Some(attempt) = self.begin_observed_attempt(&scope_id, &root_actor_id) else {
+                continue;
+            };
+            let service = self.clone();
+            let semaphore = semaphore.clone();
+            pending.push(async move {
+                service
+                    .dispatch_operation(None, jobs, attempt, semaphore)
+                    .await;
+            });
+        }
+        while pending.next().await.is_some() {}
+    }
+
+    fn begin_observed_attempt(
+        &self,
+        scope_id: &str,
+        root_actor_id: &str,
+    ) -> Option<CancellationAttemptGuard> {
+        let (generation, attempt_id) = {
+            let mut state = self.registry.lock();
+            let scope = state.scopes.get_mut(scope_id)?;
+            let owner_root = scope
+                .operations
+                .contains_key(root_actor_id)
+                .then(|| root_actor_id.to_owned())
+                .or_else(|| {
+                    scope
+                        .operations
+                        .iter()
+                        .find(|(_, operation)| operation.covered_actor_ids.contains(root_actor_id))
+                        .map(|(root, _)| root.clone())
+                })?;
+            let active_attempt_count = scope
+                .operations
+                .values()
+                .map(|operation| operation.active_attempt_ids.len())
+                .sum::<usize>();
+            if active_attempt_count >= crate::activity::ACTIVITY_DELTA_MAX_CHANGES {
+                return None;
+            }
+            let generation = scope.generation.clone();
+            let attempt_id = ActivityDispatchAttemptId(Uuid::new_v4());
+            scope
+                .operations
+                .get_mut(&owner_root)?
+                .active_attempt_ids
+                .insert(attempt_id.clone());
+            (generation, attempt_id)
+        };
+        Some(CancellationAttemptGuard::new(
+            self.registry.clone(),
+            scope_id.to_owned(),
+            generation,
+            attempt_id,
+        ))
     }
 
     fn admit_cancellation(
@@ -196,7 +307,7 @@ impl ActivityCancellationService {
         actor_id: &str,
         expected_control_revision: u64,
     ) -> Result<CancellationAdmission, ActivityCancellationError> {
-        let (event, admission) = {
+        let admission = {
             let mut state = self.registry.lock();
             let scope = state
                 .scopes
@@ -223,6 +334,7 @@ impl ActivityCancellationService {
                     },
                     selected_job: None,
                     remaining_jobs: Vec::new(),
+                    attempt: None,
                 });
             }
             if actor.target.is_none() {
@@ -242,6 +354,7 @@ impl ActivityCancellationService {
                     },
                     selected_job: None,
                     remaining_jobs: Vec::new(),
+                    attempt: None,
                 });
             }
 
@@ -284,12 +397,14 @@ impl ActivityCancellationService {
                 .filter(|(_, operation)| covered_actor_ids.contains(&operation.root_actor_id))
                 .map(|(root, _)| root.clone())
                 .collect::<Vec<_>>();
+            let attempt_id = ActivityDispatchAttemptId(Uuid::new_v4());
             let mut operation = CancellationOperation {
                 root_actor_id: actor_id.to_owned(),
                 generation: scope.generation.clone(),
                 covered_actor_ids,
                 covered_work_item_ids,
                 dispatched_targets: HashSet::new(),
+                active_attempt_ids: HashSet::from([attempt_id.clone()]),
                 residual_actor_ids,
                 residual_work_item_ids,
                 state: ActivityCancellationOperationState::Requested,
@@ -312,6 +427,12 @@ impl ActivityCancellationService {
                     operation
                         .dispatched_targets
                         .extend(absorbed.dispatched_targets);
+                    operation
+                        .active_attempt_ids
+                        .extend(absorbed.active_attempt_ids);
+                    if absorbed.state == ActivityCancellationOperationState::Partial {
+                        operation.state = ActivityCancellationOperationState::Partial;
+                    }
                 }
             }
             if scope.operations.len() >= crate::activity::ACTIVITY_PAGE_MAX_LENGTH {
@@ -336,25 +457,25 @@ impl ActivityCancellationService {
                 .map_err(|()| ActivityCancellationError::CapacityExceeded)?;
             let event = scope.publish_changes(changes);
             let operation_revision = scope.operations[actor_id].operation_revision;
-            (
-                event,
-                CancellationAdmission {
-                    result: ActivitySubtreeCancellationResult {
-                        disposition: ActivitySubtreeCancellationDisposition::Accepted,
-                        root_actor_id: actor_id.to_owned(),
-                        operation_revision: Some(operation_revision),
-                    },
-                    selected_job,
-                    remaining_jobs,
+            if let Some(event) = event {
+                self.registry.publish_delta(event);
+            }
+            CancellationAdmission {
+                result: ActivitySubtreeCancellationResult {
+                    disposition: ActivitySubtreeCancellationDisposition::Accepted,
+                    root_actor_id: actor_id.to_owned(),
+                    operation_revision: Some(operation_revision),
                 },
-            )
+                selected_job,
+                remaining_jobs,
+                attempt: Some(CancellationAttemptGuard::new(
+                    self.registry.clone(),
+                    scope_id.to_owned(),
+                    scope.generation.clone(),
+                    attempt_id,
+                )),
+            }
         };
-        if let Some(event) = event {
-            let _ = self
-                .registry
-                .events
-                .send(ActivityControlEvent::Delta(event));
-        }
         Ok(admission)
     }
 
@@ -365,7 +486,7 @@ impl ActivityCancellationService {
         root_actor_id: &str,
         expected_operation_revision: u64,
     ) -> Result<CancellationAdmission, ActivityCancellationError> {
-        let (event, admission) = {
+        let admission = {
             let mut state = self.registry.lock();
             let scope = state
                 .scopes
@@ -375,6 +496,15 @@ impl ActivityCancellationService {
                 || !matches!(requested_scope, ActivityScopeRef::Thread { .. })
             {
                 return Err(ActivityCancellationError::InvalidScope);
+            }
+            if scope
+                .operations
+                .values()
+                .map(|operation| operation.active_attempt_ids.len())
+                .sum::<usize>()
+                >= crate::activity::ACTIVITY_DELTA_MAX_CHANGES
+            {
+                return Err(ActivityCancellationError::CapacityExceeded);
             }
             let before = scope.clone();
             let operation = scope
@@ -387,6 +517,8 @@ impl ActivityCancellationService {
             operation.state = ActivityCancellationOperationState::Requested;
             operation.operation_revision = operation.operation_revision.saturating_add(1);
             operation.dispatched_targets.clear();
+            let attempt_id = ActivityDispatchAttemptId(Uuid::new_v4());
+            operation.active_attempt_ids.insert(attempt_id.clone());
             let jobs = scope.jobs_for_operation(root_actor_id, true);
             let selected_job = jobs
                 .iter()
@@ -401,25 +533,25 @@ impl ActivityCancellationService {
                 .map_err(|()| ActivityCancellationError::CapacityExceeded)?;
             let event = scope.publish_changes(changes);
             let revision = scope.operations[root_actor_id].operation_revision;
-            (
-                event,
-                CancellationAdmission {
-                    result: ActivitySubtreeCancellationResult {
-                        disposition: ActivitySubtreeCancellationDisposition::Accepted,
-                        root_actor_id: root_actor_id.to_owned(),
-                        operation_revision: Some(revision),
-                    },
-                    selected_job,
-                    remaining_jobs,
+            if let Some(event) = event {
+                self.registry.publish_delta(event);
+            }
+            CancellationAdmission {
+                result: ActivitySubtreeCancellationResult {
+                    disposition: ActivitySubtreeCancellationDisposition::Accepted,
+                    root_actor_id: root_actor_id.to_owned(),
+                    operation_revision: Some(revision),
                 },
-            )
+                selected_job,
+                remaining_jobs,
+                attempt: Some(CancellationAttemptGuard::new(
+                    self.registry.clone(),
+                    scope_id.to_owned(),
+                    scope.generation.clone(),
+                    attempt_id,
+                )),
+            }
         };
-        if let Some(event) = event {
-            let _ = self
-                .registry
-                .events
-                .send(ActivityControlEvent::Delta(event));
-        }
         Ok(admission)
     }
 
@@ -427,22 +559,24 @@ impl ActivityCancellationService {
         &self,
         selected_job: Option<ActivityDispatchJob>,
         remaining_jobs: Vec<ActivityDispatchJob>,
-    ) -> bool {
+        attempt: CancellationAttemptGuard,
+        semaphore: Arc<Semaphore>,
+    ) {
         let deadline = Instant::now() + OPERATION_DEADLINE;
         let mut failed = false;
         if let Some(job) = selected_job {
-            failed |= self.dispatch_one(job).await;
+            failed |= self.dispatch_one(job, attempt.attempt_id()).await;
         }
-        let semaphore = Arc::new(Semaphore::new(DESCENDANT_DISPATCH_CONCURRENCY));
         let mut pending = FuturesUnordered::new();
         for job in remaining_jobs {
             let service = self.clone();
             let semaphore = semaphore.clone();
+            let attempt_id = attempt.attempt_id().clone();
             pending.push(async move {
                 let Ok(_permit) = semaphore.acquire_owned().await else {
                     return true;
                 };
-                service.dispatch_one(job).await
+                service.dispatch_one(job, &attempt_id).await
             });
         }
         let drain = async {
@@ -453,11 +587,15 @@ impl ActivityCancellationService {
         if timeout_at(deadline, drain).await.is_err() {
             failed = true;
         }
-        failed
+        attempt.finish(failed);
     }
 
-    async fn dispatch_one(&self, job: ActivityDispatchJob) -> bool {
-        if !self.prepare_dispatch(&job) {
+    async fn dispatch_one(
+        &self,
+        job: ActivityDispatchJob,
+        attempt_id: &ActivityDispatchAttemptId,
+    ) -> bool {
+        if !self.prepare_dispatch(&job, attempt_id) {
             return false;
         }
         !matches!(
@@ -471,7 +609,11 @@ impl ActivityCancellationService {
         )
     }
 
-    fn prepare_dispatch(&self, job: &ActivityDispatchJob) -> bool {
+    fn prepare_dispatch(
+        &self,
+        job: &ActivityDispatchJob,
+        attempt_id: &ActivityDispatchAttemptId,
+    ) -> bool {
         let mut state = self.registry.lock();
         let Some(scope) = state.scopes.get_mut(&job.scope_id) else {
             return false;
@@ -479,10 +621,19 @@ impl ActivityCancellationService {
         if scope.generation != job.generation || scope.scope != job.scope {
             return false;
         }
-        let Some(operation) = scope.operations.get_mut(&job.operation_root_actor_id) else {
+        let Some(owner_root) = scope
+            .operations
+            .iter()
+            .find(|(_, operation)| operation.active_attempt_ids.contains(attempt_id))
+            .map(|(root, _)| root.clone())
+        else {
+            return false;
+        };
+        let Some(operation) = scope.operations.get_mut(&owner_root) else {
             return false;
         };
         if operation.generation != job.generation
+            || !operation.active_attempt_ids.contains(attempt_id)
             || operation.dispatched_targets.contains(&job.target)
         {
             return false;
@@ -509,33 +660,48 @@ impl ActivityCancellationService {
         }
         operation.dispatched_targets.insert(job.target.clone())
     }
+}
 
-    fn mark_partial(&self, scope_id: &str, root_actor_id: &str) {
-        let event = {
-            let mut state = self.registry.lock();
+impl ActivityControlRegistry {
+    fn finish_attempt(
+        &self,
+        scope_id: &str,
+        generation: &ActivityRuntimeGeneration,
+        attempt_id: &ActivityDispatchAttemptId,
+        failed: bool,
+    ) {
+        {
+            let mut state = self.lock();
             let Some(scope) = state.scopes.get_mut(scope_id) else {
                 return;
             };
-            let before = scope.clone();
-            let Some(operation) = scope.operations.get_mut(root_actor_id) else {
-                return;
-            };
-            if operation.state == ActivityCancellationOperationState::Partial {
+            if &scope.generation != generation {
                 return;
             }
-            operation.state = ActivityCancellationOperationState::Partial;
-            operation.operation_revision = operation.operation_revision.saturating_add(1);
+            let before = scope.clone();
+            let Some(owner_root) = scope
+                .operations
+                .iter()
+                .find(|(_, operation)| operation.active_attempt_ids.contains(attempt_id))
+                .map(|(root, _)| root.clone())
+            else {
+                return;
+            };
+            let Some(operation) = scope.operations.get_mut(&owner_root) else {
+                return;
+            };
+            operation.active_attempt_ids.remove(attempt_id);
+            if failed && operation.state != ActivityCancellationOperationState::Partial {
+                operation.state = ActivityCancellationOperationState::Partial;
+                operation.operation_revision = operation.operation_revision.saturating_add(1);
+            }
             let Ok(changes) = scope.pending_changes(&before) else {
                 *scope = before;
                 return;
             };
-            scope.publish_changes(changes)
-        };
-        if let Some(event) = event {
-            let _ = self
-                .registry
-                .events
-                .send(ActivityControlEvent::Delta(event));
+            if let Some(event) = scope.publish_changes(changes) {
+                self.publish_delta(event);
+            }
         }
     }
 }
@@ -696,6 +862,10 @@ mod tests {
 
         fn peak(&self) -> usize {
             self.peak.load(Ordering::Acquire)
+        }
+
+        fn active(&self) -> usize {
+            self.active.load(Ordering::Acquire)
         }
     }
 
@@ -992,6 +1162,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn absorbed_in_flight_failure_marks_the_current_owner_partial_without_redispatch() {
+        // Mutation caught: reporting an absorbed attempt's failure only to its removed root.
+        let registry = ActivityControlRegistry::new();
+        let _registration = install_tree(&registry, SCOPE_ID, "thread-a").await;
+        let dispatcher = Arc::new(FakeDispatcher::default());
+        dispatcher.fail("native-alpha-two");
+        dispatcher.hold("native-alpha-two");
+        let service = Arc::new(ActivityCancellationService::new(
+            registry.clone(),
+            dispatcher.clone(),
+        ));
+        let snapshot = registry.snapshot(SCOPE_ID).await;
+        let child_service = service.clone();
+        let child_revision = actor_revision(&snapshot, "alpha-two");
+        let child = tokio::spawn(async move {
+            child_service
+                .cancel_subtree(
+                    thread_scope("thread-a"),
+                    SCOPE_ID,
+                    "alpha-two",
+                    child_revision,
+                )
+                .await
+        });
+        dispatcher.wait_for_calls(1).await;
+
+        service
+            .cancel_subtree(
+                thread_scope("thread-a"),
+                SCOPE_ID,
+                "alpha",
+                actor_revision(&registry.snapshot(SCOPE_ID).await, "alpha"),
+            )
+            .await
+            .expect("ancestor cancellation");
+        dispatcher.release_one();
+        child.await.expect("join").expect("child cancellation");
+
+        let operation = &registry.snapshot(SCOPE_ID).await.operations[0];
+        assert_eq!(operation.root_actor_id, "alpha");
+        assert_eq!(operation.state, ActivityCancellationOperationState::Partial);
+        assert_eq!(
+            dispatcher
+                .calls()
+                .iter()
+                .filter(|call| call.as_str() == "native-alpha-two")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn ancestor_absorbs_an_already_partial_descendant_without_losing_partial_state() {
+        // Mutation caught: resetting an absorbed partial operation to Requested.
+        let registry = ActivityControlRegistry::new();
+        let _registration = install_tree(&registry, SCOPE_ID, "thread-a").await;
+        let dispatcher = Arc::new(FakeDispatcher::default());
+        dispatcher.fail("native-alpha-two");
+        let service = ActivityCancellationService::new(registry.clone(), dispatcher.clone());
+
+        service
+            .cancel_subtree(
+                thread_scope("thread-a"),
+                SCOPE_ID,
+                "alpha-two",
+                actor_revision(&registry.snapshot(SCOPE_ID).await, "alpha-two"),
+            )
+            .await
+            .expect("partial descendant cancellation");
+        assert_eq!(
+            registry.snapshot(SCOPE_ID).await.operations[0].state,
+            ActivityCancellationOperationState::Partial
+        );
+
+        service
+            .cancel_subtree(
+                thread_scope("thread-a"),
+                SCOPE_ID,
+                "alpha",
+                actor_revision(&registry.snapshot(SCOPE_ID).await, "alpha"),
+            )
+            .await
+            .expect("ancestor cancellation");
+
+        let operation = &registry.snapshot(SCOPE_ID).await.operations[0];
+        assert_eq!(operation.root_actor_id, "alpha");
+        assert_eq!(operation.state, ActivityCancellationOperationState::Partial);
+        assert_eq!(
+            dispatcher
+                .calls()
+                .iter()
+                .filter(|call| call.as_str() == "native-alpha-two")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
     async fn late_descendant_is_fenced_requested_and_dispatched_but_outward_actor_is_not() {
         // Mutation caught: admitting late work outside the original root fence or leaving it available.
         let registry = ActivityControlRegistry::new();
@@ -1176,6 +1444,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn late_dispatch_failure_marks_only_its_disjoint_operation_partial() {
+        // Mutation caught: sharing one failure flag across unrelated late-descendant fences.
+        let registry = ActivityControlRegistry::new();
+        let registration =
+            registry.register_runtime(thread_scope("thread-a"), SCOPE_ID.to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[
+                    running_actor("root-a", None),
+                    running_actor("child-a", Some("root-a")),
+                    running_actor("root-b", None),
+                    running_actor("child-b", Some("root-b")),
+                ],
+                &[
+                    actor_target("root-a"),
+                    actor_target("child-a"),
+                    actor_target("root-b"),
+                    actor_target("child-b"),
+                ],
+            )
+            .await;
+        let dispatcher = Arc::new(FakeDispatcher::default());
+        let service = ActivityCancellationService::new(registry.clone(), dispatcher.clone());
+        for root in ["root-a", "root-b"] {
+            service
+                .cancel_subtree(
+                    thread_scope("thread-a"),
+                    SCOPE_ID,
+                    root,
+                    actor_revision(&registry.snapshot(SCOPE_ID).await, root),
+                )
+                .await
+                .expect("initial cancellation");
+        }
+        dispatcher.fail("native-late-a");
+
+        let jobs = registry
+            .observe_provider_batch(
+                &registration,
+                &[
+                    running_actor("late-a", Some("child-a")),
+                    running_actor("late-b", Some("child-b")),
+                ],
+                &[actor_target("late-a"), actor_target("late-b")],
+            )
+            .await;
+        service.dispatch_observed_jobs(jobs).await;
+
+        let operations = registry.snapshot(SCOPE_ID).await.operations;
+        let state = |root: &str| {
+            operations
+                .iter()
+                .find(|operation| operation.root_actor_id == root)
+                .expect("operation")
+                .state
+        };
+        assert_eq!(state("root-a"), ActivityCancellationOperationState::Partial);
+        assert_eq!(
+            state("root-b"),
+            ActivityCancellationOperationState::Requested
+        );
+    }
+
+    #[tokio::test]
     async fn stale_retry_revision_performs_no_provider_io() {
         // Mutation caught: accepting a retry against an obsolete operation summary.
         let registry = ActivityControlRegistry::new();
@@ -1227,6 +1560,77 @@ mod tests {
         let operation = &registry.snapshot(SCOPE_ID).await.operations[0];
         assert_eq!(operation.state, ActivityCancellationOperationState::Partial);
         assert_eq!(operation.residual_count, 1);
+    }
+
+    #[tokio::test]
+    async fn aborting_after_admission_before_selected_await_marks_partial_and_allows_retry() {
+        // Mutation caught: dropping an admitted request without disarming its Requested fence.
+        let registry = ActivityControlRegistry::new();
+        let _registration = install_tree(&registry, SCOPE_ID, "thread-a").await;
+        let dispatcher = Arc::new(FakeDispatcher::default());
+        let service = ActivityCancellationService::new(registry.clone(), dispatcher.clone());
+        let revision = actor_revision(&registry.snapshot(SCOPE_ID).await, "alpha");
+
+        let admission = service
+            .admit_cancellation(thread_scope("thread-a"), SCOPE_ID, "alpha", revision)
+            .expect("admission");
+        assert_eq!(
+            registry.snapshot(SCOPE_ID).await.operations[0].state,
+            ActivityCancellationOperationState::Requested
+        );
+        drop(admission);
+
+        let partial = registry.snapshot(SCOPE_ID).await.operations[0].clone();
+        assert_eq!(partial.state, ActivityCancellationOperationState::Partial);
+        service
+            .retry_subtree_cancellation(
+                thread_scope("thread-a"),
+                SCOPE_ID,
+                "alpha",
+                partial.operation_revision,
+            )
+            .await
+            .expect("retry after dropped admission");
+        assert!(!dispatcher.calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn aborting_during_selected_dispatch_marks_partial_cancels_io_and_allows_retry() {
+        // Mutation caught: dropping the selected provider future while leaving Requested stranded.
+        let registry = ActivityControlRegistry::new();
+        let _registration = install_tree(&registry, SCOPE_ID, "thread-a").await;
+        let dispatcher = Arc::new(FakeDispatcher::default());
+        dispatcher.hold("native-alpha");
+        let service = Arc::new(ActivityCancellationService::new(
+            registry.clone(),
+            dispatcher.clone(),
+        ));
+        let revision = actor_revision(&registry.snapshot(SCOPE_ID).await, "alpha");
+        let running_service = service.clone();
+        let running = tokio::spawn(async move {
+            running_service
+                .cancel_subtree(thread_scope("thread-a"), SCOPE_ID, "alpha", revision)
+                .await
+        });
+        dispatcher.wait_for_calls(1).await;
+
+        running.abort();
+        assert!(running.await.expect_err("aborted").is_cancelled());
+        assert_eq!(dispatcher.active(), 0);
+        let partial = registry.snapshot(SCOPE_ID).await.operations[0].clone();
+        assert_eq!(partial.state, ActivityCancellationOperationState::Partial);
+
+        dispatcher.release_one();
+        service
+            .retry_subtree_cancellation(
+                thread_scope("thread-a"),
+                SCOPE_ID,
+                "alpha",
+                partial.operation_revision,
+            )
+            .await
+            .expect("retry after abort");
+        assert!(dispatcher.calls().len() > 1);
     }
 
     #[tokio::test]
