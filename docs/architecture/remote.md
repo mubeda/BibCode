@@ -11,8 +11,12 @@ environment identity.
 - One server process represents one environment.
 - Access and launch are separate decisions. An endpoint says how to connect;
   SSH may additionally launch or discover a server before creating forwarding.
-- `environmentId` is the stable identity. URLs, tunnel hostnames, SSH ports, and
-  labels may change without creating a new environment.
+- `environmentId` is the stable logical routing identity. URLs, tunnel
+  hostnames, SSH ports, and labels may change without creating a new logical
+  environment, but this ID alone does not identify its persistent store.
+- Current servers expose the persistent store UUID as `storageInstanceId` on
+  direct and BiBCode Connect descriptors. New clients decode an omitted field
+  from an older or third-party server as `null`.
 - Remote clients use the same HTTP and Effect RPC APIs as local clients.
 - Credentials are exchanged for bounded sessions; raw bootstrap credentials do
   not remain in WebSocket URLs.
@@ -122,6 +126,17 @@ endpoint can install software, start a process, or use SSH.
 - A tunnel changes reachability, not the environment's authorization rules.
 - Hosted HTTPS clients must not select plain-HTTP endpoints that browsers would
   block as mixed content.
+- Remote descriptors expose storage identity but never requested/effective
+  roots, alias diagnostics, or other server filesystem paths.
+
+Storage-identity mismatch protection applies equally to direct bearer,
+BiBCode Connect, and desktop-managed SSH targets: a different non-null
+`storageInstanceId` is blocked before synchronization. The desktop project-data
+recovery screen is intentionally narrower. It can inspect or mutate only a
+desktop-owned native or WSL launch plan whose root the Rust host can resolve.
+It cannot open, restore, start empty, or export local-path diagnostics for a
+bearer, relay, or SSH remote environment. Recovery of a remote store must be
+performed on the machine that owns that server and filesystem.
 
 ## Current limitations
 

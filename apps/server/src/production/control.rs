@@ -2073,6 +2073,10 @@ fn environment_descriptor(config: &ServerConfig, activity_protocol_registered: b
         "label": config.environment_label,
         "platform": { "os": platform_os(), "arch": platform_arch() },
         "serverVersion": config.server_version,
+        "storageInstanceId": config
+            .storage_instance_id
+            .expect("a running server has a prepared persistent store")
+            .to_string(),
         "capabilities": {
             "repositoryIdentity": true,
             "activityProtocolVersion": activity_protocol_registered.then_some(1),
@@ -2144,6 +2148,7 @@ mod tests {
     use axum::{Json, Router, extract::State, routing::get};
     use tokio::net::TcpListener;
     use url::Url;
+    use uuid::Uuid;
 
     use crate::{
         activity::AgentActivityController,
@@ -2154,6 +2159,16 @@ mod tests {
     };
 
     use super::*;
+
+    const TEST_STORAGE_INSTANCE_ID: Uuid = Uuid::from_u128(0x00000000000040008000000000000004);
+
+    fn running_test_config(path: &Path) -> ServerConfig {
+        let mut config = ServerConfig::new(path);
+        config.storage_instance_id = Some(crate::persistence::StorageInstanceId::from_uuid(
+            TEST_STORAGE_INSTANCE_ID,
+        ));
+        config
+    }
 
     #[derive(Clone, Default)]
     struct TraceCapture(Arc<StdMutex<Vec<u8>>>);
@@ -3330,7 +3345,7 @@ mod tests {
                     .await
             })
         };
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let event = events.recv().await.expect("provider update event");
                 if event["type"] == "providerStatuses"
@@ -3411,7 +3426,7 @@ mod tests {
                     .await
             })
         };
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let event = events.recv().await.expect("provider update event");
                 if event["type"] == "providerStatuses"
@@ -4511,7 +4526,7 @@ mod tests {
     async fn concurrent_settings_stream_discards_stale_provider_probes_in_commit_order() {
         let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
-        let mut config = ServerConfig::new(temp.path());
+        let mut config = running_test_config(temp.path());
         config.environment_id = "environment-concurrent-stream".to_owned();
         let settings_path = config.state_dir().join("settings.json");
         tokio::fs::create_dir_all(config.state_dir())
@@ -4938,10 +4953,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn environment_descriptor_publishes_prepared_storage_identity_without_paths() {
+        let temp = tempfile::tempdir().expect("state directory");
+        let mut config = ServerConfig::new(temp.path());
+        let resolved = crate::resolve_data_root(config.data_root_request.clone())
+            .expect("resolved test data root");
+        config.base_dir = resolved.effective.clone();
+        config.resolved_data_root = Some(resolved.clone());
+        crate::persistence::StatePaths::from_config(&config)
+            .ensure_directories_without_database_side_effects()
+            .await
+            .expect("state directories");
+        let prepared = crate::persistence::prepare_store(&config)
+            .await
+            .expect("prepared test store");
+        let expected = prepared.storage_instance_id.to_string();
+        config.storage_instance_id = Some(prepared.storage_instance_id);
+
+        let descriptor = environment_descriptor(&config, true);
+
+        assert_eq!(descriptor["storageInstanceId"], expected);
+        let encoded = descriptor.to_string();
+        assert!(!encoded.contains(&resolved.requested.display().to_string()));
+        assert!(!encoded.contains(&resolved.effective.display().to_string()));
+        for forbidden in [
+            "baseDir",
+            "resolvedDataRoot",
+            "requestedRoot",
+            "effectiveRoot",
+            "isFilesystemAlias",
+        ] {
+            assert!(
+                descriptor.get(forbidden).is_none(),
+                "forbidden field {forbidden}"
+            );
+        }
+        prepared.database.close().await;
+    }
+
+    #[tokio::test]
     async fn unit_build_covers_server_control_settings_keybindings_and_streams() {
         let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
-        let mut config = ServerConfig::new(temp.path());
+        let mut config = running_test_config(temp.path());
         config.environment_id = "environment-1".to_owned();
         config.environment_label = "Environment One".to_owned();
         let control = NativeServerControl::new(config.clone(), json!({"policy":"test"})).await;

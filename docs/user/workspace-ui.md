@@ -17,6 +17,13 @@ Projects are shown as groups of workspace rows:
 - Rows can show pinned/unread state and nested agent activity such as provider,
   running state, and elapsed time.
 
+The sidebar says **No projects yet** only after every configured environment
+has connected and returned a successful empty project snapshot. During startup,
+reconnects, unavailable environments, storage-location changes, or recovery
+conditions it shows that availability state instead. Cached project rows stay
+visible during those conditions and are replaced only after a newly accepted
+environment completes synchronization.
+
 Use the project `+` action to create a worktree. The Create Worktree dialog has a
 project selector, Smart/GitHub/Branch/Name modes, an agent picker, advanced
 options, a Create more toggle, and Ctrl+Enter submit.

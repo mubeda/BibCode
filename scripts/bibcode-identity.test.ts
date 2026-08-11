@@ -91,6 +91,16 @@ const compatibilityFiles = new Set([
   "docs/superpowers/specs/2026-08-01-provider-maintenance-rust-design.md",
 ]);
 
+const explicitPredecessorDocumentationFiles = new Set([
+  "docs/architecture/overview.md",
+  "docs/guides/project-data-recovery.md",
+  "docs/superpowers/plans/2026-08-09-project-data-safety.md",
+]);
+const documentedPredecessorPattern = new RegExp(
+  ["(?<![A-Za-z0-9_])T", "4", "(?:\\s*Code)?(?![A-Za-z0-9_])"].join(""),
+  "gi",
+);
+
 function projectFiles(): string[] {
   return NodeChildProcess.execFileSync(
     "git",
@@ -128,7 +138,11 @@ describe("BiBCode identity", () => {
       const absolutePath = NodePath.join(REPOSITORY_ROOT, path);
       const content = NodeFS.readFileSync(absolutePath, "utf8");
       for (const [index, line] of content.split(/\r?\n/u).entries()) {
-        const contentMatch = firstMatch(line);
+        const contentMatch = firstMatch(
+          explicitPredecessorDocumentationFiles.has(normalizedPath)
+            ? line.replaceAll(documentedPredecessorPattern, "")
+            : line,
+        );
         if (contentMatch) {
           findings.push(`${normalizedPath}:${String(index + 1)} matches /${contentMatch}/i`);
         }

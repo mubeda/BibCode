@@ -2,6 +2,7 @@ use std::{
     fmt,
     io::{self, BufRead},
     path::{Path, PathBuf},
+    time::Duration,
 };
 
 #[cfg(unix)]
@@ -11,6 +12,9 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde::Deserialize;
 use thiserror::Error;
 use url::Url;
+
+use crate::data_root::{DataRootError, DataRootRequest, DataRootSource, ResolvedDataRoot};
+use crate::persistence::StorageInstanceId;
 
 pub const DEFAULT_PORT: u16 = 3773;
 
@@ -36,31 +40,50 @@ pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub base_dir: PathBuf,
+    pub data_root_request: DataRootRequest,
+    pub resolved_data_root: Option<ResolvedDataRoot>,
     pub static_dir: Option<PathBuf>,
     pub dev_url: Option<Url>,
     pub no_browser: bool,
     pub desktop_bootstrap_token: Option<String>,
+    /// True only for a desktop-owned server launched through the WSL bootstrap transport.
+    #[doc(hidden)]
+    pub desktop_wsl_transport: bool,
     pub unsafe_no_auth: bool,
     pub environment_id: String,
     pub environment_label: String,
     pub server_version: String,
+    pub storage_instance_id: Option<StorageInstanceId>,
+    pub(crate) update_maintenance_drain_timeout: Duration,
+    pub(crate) update_maintenance_lease: Duration,
 }
 
 impl ServerConfig {
     pub fn new(base_dir: impl AsRef<Path>) -> Self {
+        let base_dir = base_dir.as_ref().to_path_buf();
         Self {
             mode: ServerMode::Web,
             host: "127.0.0.1".to_owned(),
             port: DEFAULT_PORT,
-            base_dir: base_dir.as_ref().to_path_buf(),
+            data_root_request: DataRootRequest::explicit(
+                DataRootSource::Cli,
+                base_dir.clone(),
+                dirs::home_dir().unwrap_or_default(),
+            ),
+            resolved_data_root: None,
+            base_dir,
             static_dir: None,
             dev_url: None,
             no_browser: false,
             desktop_bootstrap_token: None,
+            desktop_wsl_transport: false,
             unsafe_no_auth: false,
             environment_id: "local".to_owned(),
             environment_label: "Local".to_owned(),
             server_version: env!("CARGO_PKG_VERSION").to_owned(),
+            storage_instance_id: None,
+            update_maintenance_drain_timeout: Duration::from_secs(30),
+            update_maintenance_lease: Duration::from_secs(90),
         }
     }
 
@@ -100,6 +123,19 @@ impl ServerConfig {
         self
     }
 
+    /// Overrides maintenance timing for deterministic integration tests.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_update_maintenance_timing_for_integration_test(
+        mut self,
+        drain_timeout: Duration,
+        lease: Duration,
+    ) -> Self {
+        self.update_maintenance_drain_timeout = drain_timeout;
+        self.update_maintenance_lease = lease;
+        self
+    }
+
     #[must_use]
     pub fn state_dir(&self) -> PathBuf {
         self.base_dir.join(if self.dev_url.is_some() {
@@ -118,6 +154,8 @@ impl ServerConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::data_root::DataRootSource;
+    use clap::Parser;
 
     #[test]
     fn owned_builder_inputs_cover_desktop_and_static_configuration() {
@@ -139,6 +177,55 @@ mod tests {
                 .is_err()
         );
     }
+
+    #[test]
+    fn desktop_bootstrap_wsl_transport_is_explicit_and_defaults_closed() {
+        let base = serde_json::json!({
+            "mode": "desktop",
+            "noBrowser": true,
+            "port": 3773,
+            "bibcodeHome": null,
+            "host": "0.0.0.0",
+            "desktopBootstrapToken": "token",
+            "tailscaleServeEnabled": false,
+            "tailscaleServePort": 443
+        });
+        let native: DesktopBootstrap =
+            serde_json::from_value(base.clone()).expect("native bootstrap should decode");
+        assert!(!native.wsl_transport);
+        let mut wsl = base;
+        wsl["wslTransport"] = serde_json::json!(true);
+        let wsl: DesktopBootstrap =
+            serde_json::from_value(wsl).expect("WSL bootstrap should decode");
+        assert!(wsl.wsl_transport);
+    }
+
+    #[test]
+    fn cli_base_dir_preserves_the_raw_cli_data_root_request() {
+        let config = Cli::try_parse_from(["bibcode", "serve", "--base-dir", "/var/lib/bibcode"])
+            .expect("parse CLI")
+            .into_server_config()
+            .expect("build server config");
+
+        assert_eq!(config.data_root_request.source, DataRootSource::Cli);
+        assert_eq!(
+            config.data_root_request.requested,
+            Some(PathBuf::from("/var/lib/bibcode"))
+        );
+    }
+
+    #[test]
+    fn environment_base_dir_preserves_the_raw_environment_data_root_request() {
+        let request = select_data_root_request(
+            None,
+            Some(std::ffi::OsString::from("/var/lib/bibcode")),
+            None,
+            PathBuf::from("/home/alice"),
+        );
+
+        assert_eq!(request.source, DataRootSource::Environment);
+        assert_eq!(request.requested, Some(PathBuf::from("/var/lib/bibcode")));
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -157,6 +244,61 @@ enum CliCommand {
     Serve,
     #[command(about = "Run the BiBCode server.")]
     Start,
+    #[command(about = "Inspect or explicitly recover offline project data.")]
+    Storage(StorageArgs),
+}
+
+#[derive(Debug, Args)]
+struct StorageArgs {
+    #[command(subcommand)]
+    command: StorageSubcommand,
+}
+
+#[derive(Debug, Subcommand)]
+enum StorageSubcommand {
+    #[command(about = "Inspect an offline BiBCode project-data store.")]
+    Inspect {
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(about = "Restore a verified backup into an offline store.")]
+    Restore {
+        #[arg(long)]
+        backup_id: uuid::Uuid,
+        #[arg(long)]
+        json: bool,
+    },
+    #[command(
+        name = "start-empty",
+        about = "Preserve an offline store and start empty."
+    )]
+    StartEmpty {
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Clone, Debug)]
+pub enum CliAction {
+    Run(Box<ServerConfig>),
+    Storage(StorageCommand),
+}
+
+#[derive(Clone, Debug)]
+pub enum StorageCommand {
+    Inspect {
+        root: ResolvedDataRoot,
+        json: bool,
+    },
+    Restore {
+        root: ResolvedDataRoot,
+        backup_id: uuid::Uuid,
+        json: bool,
+    },
+    StartEmpty {
+        root: ResolvedDataRoot,
+        json: bool,
+    },
 }
 
 #[derive(Clone, Debug, Default, Args)]
@@ -170,7 +312,7 @@ struct ServerArgs {
     #[arg(long, env = "BIBCODE_PORT", global = true)]
     port: Option<u16>,
 
-    #[arg(long, env = "BIBCODE_HOME", global = true)]
+    #[arg(long, global = true)]
     base_dir: Option<PathBuf>,
 
     #[arg(long, global = true)]
@@ -198,10 +340,10 @@ pub enum ConfigError {
     BootstrapDecode(#[source] serde_json::Error),
     #[error("desktop bootstrap token must not be empty")]
     EmptyDesktopBootstrapToken,
-    #[error("failed to resolve the default server base directory")]
-    CurrentDirectory(#[source] io::Error),
-    #[error("the current user's home directory is unavailable")]
-    HomeDirectoryUnavailable,
+    #[error("storage commands cannot be converted into a server configuration")]
+    StorageCommandIsNotServer,
+    #[error(transparent)]
+    DataRoot(#[from] DataRootError),
 }
 
 #[derive(Debug, Deserialize)]
@@ -213,6 +355,8 @@ struct DesktopBootstrap {
     bibcode_home: Option<PathBuf>,
     host: String,
     desktop_bootstrap_token: String,
+    #[serde(default)]
+    wsl_transport: bool,
     #[allow(dead_code)]
     tailscale_serve_enabled: bool,
     #[allow(dead_code)]
@@ -227,8 +371,42 @@ enum ServerModeWire {
 
 impl Cli {
     pub fn into_server_config(self) -> Result<ServerConfig, ConfigError> {
-        let headless = matches!(self.command, Some(CliCommand::Serve));
-        let args = self.root;
+        match self.into_action()? {
+            CliAction::Run(config) => Ok(*config),
+            CliAction::Storage(_) => Err(ConfigError::StorageCommandIsNotServer),
+        }
+    }
+
+    pub fn into_action(self) -> Result<CliAction, ConfigError> {
+        let Self {
+            command,
+            root: args,
+        } = self;
+        let command = match command {
+            Some(CliCommand::Storage(storage)) => {
+                let home_dir = dirs::home_dir().ok_or(DataRootError::HomeDirectoryUnavailable)?;
+                let request = select_data_root_request(
+                    args.base_dir,
+                    bibcode_env_var("BIBCODE_HOME"),
+                    None,
+                    home_dir,
+                );
+                let root = crate::data_root::resolve_data_root(request)?;
+                return Ok(CliAction::Storage(match storage.command {
+                    StorageSubcommand::Inspect { json } => StorageCommand::Inspect { root, json },
+                    StorageSubcommand::Restore { backup_id, json } => StorageCommand::Restore {
+                        root,
+                        backup_id,
+                        json,
+                    },
+                    StorageSubcommand::StartEmpty { json } => {
+                        StorageCommand::StartEmpty { root, json }
+                    }
+                }));
+            }
+            command => command,
+        };
+        let headless = matches!(command, Some(CliCommand::Serve));
         let bootstrap = args.bootstrap_fd.map(read_bootstrap).transpose()?.flatten();
 
         let mode = args
@@ -239,15 +417,15 @@ impl Cli {
                 })
             })
             .unwrap_or_default();
-        let raw_base_dir = args.base_dir.or_else(|| {
+        let home_dir = dirs::home_dir().ok_or(DataRootError::HomeDirectoryUnavailable)?;
+        let data_root_request = select_data_root_request(
+            args.base_dir,
+            bibcode_env_var("BIBCODE_HOME"),
             bootstrap
                 .as_ref()
-                .and_then(|value| value.bibcode_home.clone())
-        });
-        let base_dir = match raw_base_dir {
-            Some(path) => resolve_base_dir(path)?,
-            None => default_base_dir()?,
-        };
+                .and_then(|value| value.bibcode_home.clone()),
+            home_dir,
+        );
         let host = args
             .host
             .or_else(|| bootstrap.as_ref().map(|value| value.host.clone()))
@@ -257,7 +435,14 @@ impl Cli {
             .or_else(|| bootstrap.as_ref().map(|value| value.port))
             .unwrap_or(DEFAULT_PORT);
 
-        let mut config = ServerConfig::new(base_dir).with_bind(host, port);
+        let mut config = ServerConfig::new(
+            data_root_request
+                .requested
+                .clone()
+                .unwrap_or_else(|| data_root_request.home_dir.join(".bibcode")),
+        )
+        .with_bind(host, port);
+        config.data_root_request = data_root_request;
         config.mode = mode;
         config.static_dir = args.static_dir;
         config.dev_url = args.dev_url;
@@ -275,30 +460,31 @@ impl Cli {
             return Err(ConfigError::EmptyDesktopBootstrapToken);
         }
         config.desktop_bootstrap_token = desktop_bootstrap_token;
-        Ok(config)
+        config.desktop_wsl_transport = bootstrap.as_ref().is_some_and(|value| value.wsl_transport);
+        Ok(CliAction::Run(Box::new(config)))
     }
 }
 
-fn default_base_dir() -> Result<PathBuf, ConfigError> {
-    let home = dirs::home_dir().ok_or(ConfigError::HomeDirectoryUnavailable)?;
-    Ok(home.join(".bibcode"))
+fn bibcode_env_var(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name)
 }
 
-fn resolve_base_dir(path: PathBuf) -> Result<PathBuf, ConfigError> {
-    let path = match path.strip_prefix("~") {
-        Ok(relative) => dirs::home_dir()
-            .map(|home| home.join(relative))
-            .ok_or(ConfigError::HomeDirectoryUnavailable)?,
-        Err(_) => path,
-    };
-    let path = if path.is_absolute() {
-        path
-    } else {
-        std::env::current_dir()
-            .map(|directory| directory.join(path))
-            .map_err(ConfigError::CurrentDirectory)?
-    };
-    Ok(path)
+fn select_data_root_request(
+    cli_base_dir: Option<PathBuf>,
+    environment_base_dir: Option<std::ffi::OsString>,
+    desktop_bootstrap_base_dir: Option<PathBuf>,
+    home_dir: PathBuf,
+) -> DataRootRequest {
+    match (cli_base_dir, environment_base_dir) {
+        (Some(path), _) => DataRootRequest::explicit(DataRootSource::Cli, path, home_dir),
+        (None, Some(path)) => {
+            DataRootRequest::explicit(DataRootSource::Environment, PathBuf::from(path), home_dir)
+        }
+        (None, None) => match desktop_bootstrap_base_dir {
+            Some(path) => DataRootRequest::explicit(DataRootSource::Cli, path, home_dir),
+            None => DataRootRequest::default(home_dir),
+        },
+    }
 }
 
 fn read_bootstrap(fd: i32) -> Result<Option<DesktopBootstrap>, ConfigError> {

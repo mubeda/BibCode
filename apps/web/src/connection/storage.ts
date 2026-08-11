@@ -1,4 +1,7 @@
 import {
+  AcceptedStorageIdentityStore,
+  type ConnectionCatalogHealth,
+  ConnectionCatalogHealthStore,
   ConnectionCatalogDocument,
   type ConnectionCatalogDocument as ConnectionCatalogDocumentType,
   ConnectionPersistenceError,
@@ -29,7 +32,7 @@ import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
-import * as Semaphore from "effect/Semaphore";
+import * as SubscriptionRef from "effect/SubscriptionRef";
 
 const DATABASE_NAME = "bibcode:connection-runtime";
 const DATABASE_VERSION = 2;
@@ -37,6 +40,9 @@ const CATALOG_STORE_NAME = "catalog";
 const SHELL_STORE_NAME = "shell";
 const THREAD_STORE_NAME = "thread";
 const CATALOG_KEY = "document";
+const MAX_CATALOG_COMPARE_AND_SET_ATTEMPTS = 8;
+const CORRUPT_CATALOG_MESSAGE =
+  "The connection catalog is corrupt and must be reset before it can be changed.";
 const SHELL_SNAPSHOT_CACHE_SCHEMA_VERSION = 1;
 
 const StoredShellSnapshot = Schema.Struct({
@@ -83,6 +89,25 @@ function persistenceError(
   return new ConnectionPersistenceError({
     operation,
     message: `Could not ${operation.replaceAll("-", " ")}: ${String(cause)}`,
+  });
+}
+
+function storageIdentityPersistenceError(
+  operation: "load-storage-identity" | "accept-storage-identity",
+) {
+  return new ConnectionPersistenceError({
+    operation,
+    message:
+      operation === "load-storage-identity"
+        ? "Could not load the accepted storage identity."
+        : "Could not accept the reported storage identity.",
+  });
+}
+
+function catalogResetPersistenceError() {
+  return new ConnectionPersistenceError({
+    operation: "reset-connection-catalog",
+    message: "Could not reset the connection catalog.",
   });
 }
 
@@ -149,6 +174,86 @@ function writeDatabaseValue(
   }).pipe(Effect.withSpan("web.connectionStorage.writeDatabaseValue"));
 }
 
+function compareAndSetDatabaseValue(
+  database: IDBDatabase,
+  storeName: string,
+  key: IDBValidKey,
+  expected: string | null,
+  next: string,
+) {
+  return Effect.callback<boolean, ConnectionTransientError>((resume) => {
+    const transaction = database.transaction(storeName, "readwrite");
+    let matched = false;
+    transaction.addEventListener("error", () => {
+      resume(
+        Effect.fail(
+          catalogError(
+            "compare and set",
+            transaction.error ?? "Unknown IndexedDB transaction error",
+          ),
+        ),
+      );
+    });
+    transaction.addEventListener("abort", () => {
+      resume(
+        Effect.fail(
+          catalogError(
+            "compare and set",
+            transaction.error ?? "Unknown IndexedDB transaction abort",
+          ),
+        ),
+      );
+    });
+    transaction.addEventListener("complete", () => {
+      resume(Effect.succeed(matched));
+    });
+
+    const store = transaction.objectStore(storeName);
+    const request = store.get(key);
+    request.addEventListener("success", () => {
+      const current = typeof request.result === "string" ? request.result : null;
+      if (current !== expected) return;
+      matched = true;
+      store.put(next, key);
+    });
+  }).pipe(Effect.withSpan("web.connectionStorage.compareAndSetDatabaseValue"));
+}
+
+function compareDatabaseValue(
+  database: IDBDatabase,
+  storeName: string,
+  key: IDBValidKey,
+  expected: string | null,
+) {
+  return Effect.callback<boolean, ConnectionTransientError>((resume) => {
+    const transaction = database.transaction(storeName, "readwrite");
+    let matched = false;
+    transaction.addEventListener("error", () => {
+      resume(
+        Effect.fail(
+          catalogError("compare", transaction.error ?? "Unknown IndexedDB transaction error"),
+        ),
+      );
+    });
+    transaction.addEventListener("abort", () => {
+      resume(
+        Effect.fail(
+          catalogError("compare", transaction.error ?? "Unknown IndexedDB transaction abort"),
+        ),
+      );
+    });
+    transaction.addEventListener("complete", () => {
+      resume(Effect.succeed(matched));
+    });
+
+    const request = transaction.objectStore(storeName).get(key);
+    request.addEventListener("success", () => {
+      const current = typeof request.result === "string" ? request.result : null;
+      matched = current === expected;
+    });
+  }).pipe(Effect.withSpan("web.connectionStorage.compareDatabaseValue"));
+}
+
 function removeDatabaseValue(database: IDBDatabase, storeName: string, key: IDBValidKey) {
   return Effect.callback<void, ConnectionTransientError>((resume) => {
     const transaction = database.transaction(storeName, "readwrite");
@@ -212,34 +317,50 @@ const encodeCatalog = Effect.fn("web.connectionStorage.encodeCatalog")(function*
 
 export interface CatalogBackend {
   readonly read: Effect.Effect<string | null, ConnectionTransientError>;
-  readonly write: (raw: string) => Effect.Effect<void, ConnectionTransientError>;
+  readonly compare: (expected: string | null) => Effect.Effect<boolean, ConnectionTransientError>;
+  readonly compareAndSet: (
+    expected: string | null,
+    next: string,
+  ) => Effect.Effect<boolean, ConnectionTransientError>;
   readonly quarantine?: (raw: string) => Effect.Effect<void, ConnectionTransientError>;
 }
 
 export function makeCatalogBackend(database: IDBDatabase): CatalogBackend {
   const bridge = window.desktopBridge;
-  if (bridge?.getConnectionCatalog !== undefined && bridge.setConnectionCatalog !== undefined) {
+  if (
+    bridge?.getConnectionCatalog !== undefined &&
+    bridge.compareAndSetConnectionCatalog !== undefined
+  ) {
     return {
       read: Effect.tryPromise({
         try: () => bridge.getConnectionCatalog!(),
         catch: (cause) => catalogError("load", cause),
       }),
-      write: (raw) =>
-        Effect.tryPromise({
-          try: () => bridge.setConnectionCatalog!(raw),
-          catch: (cause) => catalogError("save", cause),
-        }).pipe(
-          Effect.flatMap((stored) =>
-            stored
-              ? Effect.void
-              : Effect.fail(
-                  catalogError(
-                    "save",
-                    "Desktop secure storage is unavailable in this system context.",
-                  ),
-                ),
-          ),
-        ),
+      compare: (expected) => {
+        if (bridge.compareConnectionCatalog === undefined) {
+          return Effect.fail(
+            catalogError("compare", "Desktop connection catalog comparison is unavailable."),
+          );
+        }
+        return Effect.tryPromise({
+          try: () => bridge.compareConnectionCatalog!(expected),
+          catch: (cause) => catalogError("compare", cause),
+        });
+      },
+      compareAndSet: (expected, next) => {
+        if (bridge.compareAndSetConnectionCatalog === undefined) {
+          return Effect.fail(
+            catalogError(
+              "compare and set",
+              "Desktop connection catalog compare-and-set is unavailable.",
+            ),
+          );
+        }
+        return Effect.tryPromise({
+          try: () => bridge.compareAndSetConnectionCatalog!(expected, next),
+          catch: (cause) => catalogError("compare and set", cause),
+        });
+      },
     };
   }
 
@@ -247,79 +368,226 @@ export function makeCatalogBackend(database: IDBDatabase): CatalogBackend {
     read: readDatabaseValue(database, CATALOG_STORE_NAME, CATALOG_KEY).pipe(
       Effect.map((value) => (typeof value === "string" ? value : null)),
     ),
-    write: (raw) => writeDatabaseValue(database, CATALOG_STORE_NAME, CATALOG_KEY, raw),
+    compare: (expected) =>
+      compareDatabaseValue(database, CATALOG_STORE_NAME, CATALOG_KEY, expected),
+    compareAndSet: (expected, next) =>
+      compareAndSetDatabaseValue(database, CATALOG_STORE_NAME, CATALOG_KEY, expected, next),
     quarantine: (raw) =>
       writeDatabaseValue(database, CATALOG_STORE_NAME, `${CATALOG_KEY}:corrupt:${Date.now()}`, raw),
   };
 }
 
+const migrateLegacyRendererCatalog = Effect.fn(
+  "web.connectionStorage.migrateLegacyRendererCatalog",
+)(function* (backend: CatalogBackend) {
+  const bridge = window.desktopBridge;
+  if (
+    bridge?.getConnectionCatalog === undefined ||
+    bridge.compareAndSetConnectionCatalog !== undefined
+  ) {
+    return;
+  }
+
+  const raw = yield* Effect.tryPromise({
+    try: () => bridge.getConnectionCatalog!(),
+    catch: () => catalogError("migrate", "Could not read the legacy desktop catalog."),
+  });
+  if (raw === null) return;
+  if (bridge.clearConnectionCatalog === undefined) {
+    return yield* catalogError(
+      "migrate",
+      "Could not clear the legacy desktop catalog after migration.",
+    );
+  }
+
+  const legacyDocument =
+    raw.trim() === ""
+      ? Option.none<ConnectionCatalogDocumentType>()
+      : yield* decodeCatalog(raw).pipe(
+          Effect.map(Option.some),
+          Effect.orElseSucceed(() => Option.none<ConnectionCatalogDocumentType>()),
+        );
+  const clearLegacyCatalog = Effect.tryPromise({
+    try: () => bridge.clearConnectionCatalog!(),
+    catch: () => catalogError("migrate", "Could not clear the legacy desktop catalog."),
+  });
+
+  yield* Effect.uninterruptible(
+    Effect.gen(function* () {
+      for (let attempt = 0; attempt < MAX_CATALOG_COMPARE_AND_SET_ATTEMPTS; attempt += 1) {
+        const current = yield* backend.read;
+        if (current !== null && current.trim() !== "") {
+          const currentDocument = yield* decodeCatalog(current).pipe(
+            Effect.map(Option.some),
+            Effect.orElseSucceed(() => Option.none<ConnectionCatalogDocumentType>()),
+          );
+          if (Option.isSome(currentDocument) || Option.isNone(legacyDocument)) {
+            return yield* clearLegacyCatalog;
+          }
+        } else if (Option.isNone(legacyDocument)) {
+          return yield* clearLegacyCatalog;
+        }
+
+        const migrated = yield* backend.compareAndSet(current, raw);
+        if (migrated) {
+          if (current !== null && current.trim() !== "" && backend.quarantine !== undefined) {
+            yield* backend.quarantine(current).pipe(
+              Effect.catch((cause) =>
+                Effect.logWarning("Could not quarantine the replaced web connection catalog.", {
+                  error: cause.message,
+                }),
+              ),
+            );
+          }
+          return yield* clearLegacyCatalog;
+        }
+        yield* Effect.yieldNow;
+      }
+
+      return yield* catalogError(
+        "migrate",
+        "The browser catalog changed too many times during legacy desktop migration.",
+      );
+    }),
+  );
+});
+
 interface CatalogStore {
+  readonly health: SubscriptionRef.SubscriptionRef<ConnectionCatalogHealth>;
   readonly read: Effect.Effect<ConnectionCatalogDocumentType, ConnectionTransientError>;
+  readonly reset: Effect.Effect<void, ConnectionTransientError>;
   readonly update: (
     transform: (catalog: ConnectionCatalogDocumentType) => ConnectionCatalogDocumentType,
   ) => Effect.Effect<void, ConnectionTransientError>;
+  readonly modify: <A>(
+    transform: (catalog: ConnectionCatalogDocumentType) => {
+      readonly mutation:
+        | { readonly _tag: "Keep" }
+        | { readonly _tag: "Set"; readonly document: ConnectionCatalogDocumentType };
+      readonly result: A;
+    },
+  ) => Effect.Effect<A, ConnectionTransientError>;
 }
 
 export const makeCatalogStore = Effect.fn("web.connectionStorage.makeCatalogStore")(function* (
   backend: CatalogBackend,
 ) {
-  const state = yield* Ref.make<Option.Option<ConnectionCatalogDocumentType>>(Option.none());
-  const lock = yield* Semaphore.make(1);
+  const health = yield* SubscriptionRef.make<ConnectionCatalogHealth>({ status: "ready" });
+  const quarantinedRevision = yield* Ref.make<string | null>(null);
 
-  const loadUnlocked = Effect.fn("web.connectionStorage.loadCatalog")(function* () {
-    const cached = yield* Ref.get(state);
-    if (Option.isSome(cached)) {
-      return cached.value;
+  const enterRecovery = Effect.fn("web.connectionStorage.enterCatalogRecovery")(function* (
+    raw: string,
+  ) {
+    const priorRevision = yield* Ref.get(quarantinedRevision);
+    if (priorRevision !== raw && backend.quarantine !== undefined) {
+      yield* backend
+        .quarantine(raw)
+        .pipe(
+          Effect.catch(() =>
+            Effect.logWarning("Could not quarantine the corrupt web connection catalog."),
+          ),
+        );
     }
-    const raw = yield* backend.read;
-    let catalog = EMPTY_CONNECTION_CATALOG_DOCUMENT;
-    if (raw !== null && raw.trim() !== "") {
-      catalog = yield* decodeCatalog(raw).pipe(
-        Effect.catch((error) =>
-          Effect.gen(function* () {
-            yield* Effect.logWarning("Discarding a corrupt web connection catalog.", {
-              error: error.message,
-            });
-            if (backend.quarantine !== undefined) {
-              yield* backend.quarantine(raw).pipe(
-                Effect.catch((cause) =>
-                  Effect.logWarning("Could not quarantine the corrupt web connection catalog.", {
-                    error: cause.message,
-                  }),
-                ),
-              );
-            }
-            const encoded = yield* encodeCatalog(EMPTY_CONNECTION_CATALOG_DOCUMENT);
-            yield* backend.write(encoded).pipe(
-              Effect.catch((cause) =>
-                Effect.logWarning("Could not persist the recovered web connection catalog.", {
-                  error: cause.message,
-                }),
-              ),
-            );
-            return EMPTY_CONNECTION_CATALOG_DOCUMENT;
-          }),
-        ),
-      );
-    }
-    yield* Ref.set(state, Option.some(catalog));
-    return catalog;
+    yield* Ref.set(quarantinedRevision, raw);
+    yield* SubscriptionRef.set(health, {
+      status: "recovery-required",
+      message: CORRUPT_CATALOG_MESSAGE,
+    });
   });
 
-  const read = lock.withPermits(1)(loadUnlocked());
-  const update: CatalogStore["update"] = Effect.fn("web.connectionStorage.updateCatalog")(
+  const leaveRecovery = Effect.gen(function* () {
+    yield* Ref.set(quarantinedRevision, null);
+    yield* SubscriptionRef.set(health, { status: "ready" });
+  });
+
+  const loadVersion = Effect.fn("web.connectionStorage.loadCatalog")(function* () {
+    const raw = yield* backend.read;
+    const currentHealth = yield* SubscriptionRef.get(health);
+    if (raw === null || raw.trim() === "") {
+      return {
+        raw,
+        document: EMPTY_CONNECTION_CATALOG_DOCUMENT,
+        recoveryRequired: currentHealth.status === "recovery-required",
+      } as const;
+    }
+
+    const decoded = yield* decodeCatalog(raw).pipe(
+      Effect.map(Option.some),
+      Effect.catch(() =>
+        Effect.logWarning("The web connection catalog requires recovery.").pipe(
+          Effect.as(Option.none<ConnectionCatalogDocumentType>()),
+        ),
+      ),
+    );
+    if (Option.isSome(decoded)) {
+      if (currentHealth.status === "recovery-required") {
+        yield* leaveRecovery;
+      }
+      return { raw, document: decoded.value, recoveryRequired: false } as const;
+    }
+
+    yield* enterRecovery(raw);
+    return {
+      raw,
+      document: EMPTY_CONNECTION_CATALOG_DOCUMENT,
+      recoveryRequired: true,
+    } as const;
+  });
+
+  const read = loadVersion().pipe(Effect.map(({ document }) => document));
+  const modify: CatalogStore["modify"] = Effect.fn("web.connectionStorage.modifyCatalog")(
     function* (transform) {
-      yield* lock.withPermits(1)(
-        Effect.gen(function* () {
-          const next = transform(yield* loadUnlocked());
-          yield* backend.write(yield* encodeCatalog(next));
-          yield* Ref.set(state, Option.some(next));
-        }),
-      );
+      for (let attempt = 0; attempt < MAX_CATALOG_COMPARE_AND_SET_ATTEMPTS; attempt += 1) {
+        const { raw, document, recoveryRequired } = yield* loadVersion();
+        if (recoveryRequired) {
+          return yield* catalogError("update", CORRUPT_CATALOG_MESSAGE);
+        }
+        const transition = transform(document);
+        const updated =
+          transition.mutation._tag === "Keep"
+            ? yield* Effect.uninterruptible(backend.compare(raw))
+            : yield* Effect.uninterruptible(
+                encodeCatalog(transition.mutation.document).pipe(
+                  Effect.flatMap((next) => backend.compareAndSet(raw, next)),
+                ),
+              );
+        if (updated) return transition.result;
+        yield* Effect.yieldNow;
+      }
+      return yield* catalogError("update", "The connection catalog changed too many times.");
     },
   );
+  const update: CatalogStore["update"] = (transform) =>
+    modify((document) => ({
+      mutation: { _tag: "Set", document: transform(document) },
+      result: undefined,
+    }));
 
-  return { read, update } satisfies CatalogStore;
+  const reset = Effect.uninterruptible(
+    Effect.gen(function* () {
+      const emptyRaw = yield* encodeCatalog(EMPTY_CONNECTION_CATALOG_DOCUMENT);
+      for (let attempt = 0; attempt < MAX_CATALOG_COMPARE_AND_SET_ATTEMPTS; attempt += 1) {
+        const raw = yield* backend.read;
+        if (raw !== null && raw.trim() !== "") {
+          const decoded = yield* decodeCatalog(raw).pipe(Effect.option);
+          if (Option.isSome(decoded)) {
+            yield* leaveRecovery;
+            return;
+          }
+          yield* enterRecovery(raw);
+        }
+
+        if (yield* backend.compareAndSet(raw, emptyRaw)) {
+          yield* leaveRecovery;
+          return;
+        }
+        yield* Effect.yieldNow;
+      }
+      return yield* catalogError("reset", "The connection catalog changed too many times.");
+    }),
+  ).pipe(Effect.withSpan("web.connectionStorage.resetCatalog"));
+
+  return { health, modify, read, reset, update } satisfies CatalogStore;
 });
 
 export const connectionStorageLayer = Layer.effectContext(
@@ -327,7 +595,14 @@ export const connectionStorageLayer = Layer.effectContext(
     const database = yield* Effect.acquireRelease(openDatabase(), (database) =>
       Effect.sync(() => database.close()),
     );
-    const catalog = yield* makeCatalogStore(makeCatalogBackend(database));
+    const backend = makeCatalogBackend(database);
+    yield* migrateLegacyRendererCatalog(backend);
+    const catalog = yield* makeCatalogStore(backend);
+
+    const catalogHealthStore = ConnectionCatalogHealthStore.of({
+      state: catalog.health,
+      reset: catalog.reset.pipe(Effect.mapError(catalogResetPersistenceError)),
+    });
 
     const targetStore = ConnectionTargetStore.of({
       list: catalog.read.pipe(
@@ -423,6 +698,60 @@ export const connectionStorageLayer = Layer.effectContext(
             environmentId,
           ),
         })),
+    });
+    const acceptedStorageIdentityStore = AcceptedStorageIdentityStore.of({
+      get: (targetKey) =>
+        catalog.read.pipe(
+          Effect.map((document) =>
+            Option.fromUndefinedOr(
+              document.acceptedStorageIdentities.find(
+                (identity) => identity.targetKey === targetKey,
+              )?.storageInstanceId,
+            ),
+          ),
+          Effect.mapError(() => storageIdentityPersistenceError("load-storage-identity")),
+        ),
+      accept: (identity) =>
+        catalog
+          .update((document) => ({
+            ...document,
+            acceptedStorageIdentities: replaceCatalogValue(
+              document.acceptedStorageIdentities,
+              (value) => value.targetKey,
+              identity,
+            ),
+          }))
+          .pipe(Effect.mapError(() => storageIdentityPersistenceError("accept-storage-identity"))),
+      transition: (targetKey, decide) =>
+        catalog
+          .modify((document) => {
+            const acceptedStorageInstanceId =
+              document.acceptedStorageIdentities.find(
+                (identity) => identity.targetKey === targetKey,
+              )?.storageInstanceId ?? null;
+            const transition = decide(acceptedStorageInstanceId);
+            if (transition.mutation._tag === "Keep") {
+              return { mutation: { _tag: "Keep" }, result: transition.result };
+            }
+            return {
+              mutation: {
+                _tag: "Set",
+                document: {
+                  ...document,
+                  acceptedStorageIdentities: replaceCatalogValue(
+                    document.acceptedStorageIdentities,
+                    (value) => value.targetKey,
+                    {
+                      targetKey,
+                      storageInstanceId: transition.mutation.storageInstanceId,
+                    },
+                  ),
+                },
+              },
+              result: transition.result,
+            };
+          })
+          .pipe(Effect.mapError(() => storageIdentityPersistenceError("accept-storage-identity"))),
     });
     const cacheStore = EnvironmentCacheStore.of({
       loadShell: (environmentId) =>
@@ -532,6 +861,8 @@ export const connectionStorageLayer = Layer.effectContext(
       Context.add(ProfileStore.ConnectionProfileStore, profileStore),
       Context.add(CredentialStore.ConnectionCredentialStore, credentialStore),
       Context.add(TokenStore.RemoteDpopAccessTokenStore, remoteTokenStore),
+      Context.add(AcceptedStorageIdentityStore, acceptedStorageIdentityStore),
+      Context.add(ConnectionCatalogHealthStore, catalogHealthStore),
       Context.add(EnvironmentCacheStore, cacheStore),
     );
   }),

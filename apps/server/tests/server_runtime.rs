@@ -13,7 +13,7 @@ use tokio::{
     net::{TcpListener, TcpStream},
     time::timeout,
 };
-use tokio_tungstenite::{connect_async, tungstenite::Message};
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 use url::Url;
 use uuid::Uuid;
 
@@ -162,6 +162,58 @@ async fn fetch_server_config(client: &Client, address: SocketAddr, access_token:
     wire["exit"]["value"].clone()
 }
 
+async fn send_rpc_request(
+    socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    request_id: &str,
+    tag: &str,
+) {
+    socket
+        .send(Message::Text(
+            serde_json::json!({
+                "_tag": "Request",
+                "id": request_id,
+                "tag": tag,
+                "payload": {},
+                "headers": []
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .unwrap_or_else(|error| panic!("send {tag} request: {error}"));
+}
+
+async fn next_rpc_wire(
+    socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    context: &str,
+) -> Value {
+    let frame = timeout(Duration::from_secs(2), socket.next())
+        .await
+        .unwrap_or_else(|_| panic!("{context} timeout"))
+        .unwrap_or_else(|| panic!("{context} WebSocket remains open"))
+        .unwrap_or_else(|error| panic!("{context} frame: {error}"));
+    serde_json::from_str(
+        frame
+            .to_text()
+            .unwrap_or_else(|error| panic!("{context} text: {error}")),
+    )
+    .unwrap_or_else(|error| panic!("{context} JSON: {error}"))
+}
+
+async fn acknowledge_rpc_chunk(
+    socket: &mut WebSocketStream<MaybeTlsStream<TcpStream>>,
+    request_id: &str,
+) {
+    socket
+        .send(Message::Text(
+            serde_json::json!({ "_tag": "Ack", "requestId": request_id })
+                .to_string()
+                .into(),
+        ))
+        .await
+        .expect("acknowledge RPC chunk");
+}
+
 #[tokio::test]
 async fn binds_an_ephemeral_port_and_serves_the_environment_descriptor() {
     let temp = TempDir::new().expect("temporary base directory");
@@ -181,6 +233,96 @@ async fn binds_an_ephemeral_port_and_serves_the_environment_descriptor() {
     assert_eq!(descriptor["environmentId"], "local");
     assert_eq!(descriptor["capabilities"]["repositoryIdentity"], true);
 
+    handle.shutdown();
+    timeout(Duration::from_secs(2), handle.join())
+        .await
+        .expect("shutdown timeout")
+        .expect("server joins");
+}
+
+#[tokio::test]
+async fn authenticated_rpc_and_lifecycle_descriptors_match_the_well_known_storage_identity() {
+    let temp = TempDir::new().expect("temporary base directory");
+    write_disabled_provider_settings(&temp);
+    let handle = ServerRuntime::start(test_config(&temp))
+        .await
+        .expect("production server starts");
+    let client = proxy_free_client();
+    let well_known = client
+        .get(endpoint(
+            handle.local_addr(),
+            "/.well-known/bibcode/environment",
+        ))
+        .send()
+        .await
+        .expect("well-known descriptor response")
+        .json::<Value>()
+        .await
+        .expect("well-known descriptor JSON");
+    let storage_instance_id = well_known["storageInstanceId"]
+        .as_str()
+        .expect("well-known storage instance ID")
+        .to_owned();
+    Uuid::parse_str(&storage_instance_id).expect("well-known storage instance UUID");
+
+    let credential = handle
+        .startup_access()
+        .expect("authenticated web startup access")
+        .credential
+        .clone();
+    let access_token = exchange_startup_credential(&client, handle.local_addr(), &credential).await;
+    let ticket_response = client
+        .post(endpoint(handle.local_addr(), "/api/auth/websocket-ticket"))
+        .bearer_auth(&access_token)
+        .send()
+        .await
+        .expect("WebSocket ticket response");
+    assert_eq!(ticket_response.status(), StatusCode::OK);
+    let ticket_body = ticket_response
+        .json::<Value>()
+        .await
+        .expect("WebSocket ticket JSON");
+    let ticket = ticket_body["ticket"].as_str().expect("WebSocket ticket");
+    let (mut socket, _) =
+        connect_async(format!("ws://{}/ws?wsTicket={ticket}", handle.local_addr()))
+            .await
+            .expect("authenticated RPC WebSocket");
+
+    send_rpc_request(&mut socket, "10", "server.getConfig").await;
+    let get_config = next_rpc_wire(&mut socket, "server.getConfig").await;
+    assert_eq!(get_config["_tag"], "Exit");
+    assert_eq!(get_config["requestId"], "10");
+    assert_eq!(get_config["exit"]["_tag"], "Success");
+    assert_eq!(
+        get_config["exit"]["value"]["environment"]["storageInstanceId"],
+        storage_instance_id
+    );
+
+    send_rpc_request(&mut socket, "11", "subscribeServerConfig").await;
+    let config_snapshot = next_rpc_wire(&mut socket, "server config snapshot").await;
+    assert_eq!(config_snapshot["_tag"], "Chunk");
+    assert_eq!(config_snapshot["requestId"], "11");
+    assert_eq!(config_snapshot["values"][0]["type"], "snapshot");
+    assert_eq!(
+        config_snapshot["values"][0]["config"]["environment"]["storageInstanceId"],
+        storage_instance_id
+    );
+    acknowledge_rpc_chunk(&mut socket, "11").await;
+
+    send_rpc_request(&mut socket, "12", "subscribeServerLifecycle").await;
+    for expected_type in ["welcome", "ready"] {
+        let lifecycle = next_rpc_wire(&mut socket, expected_type).await;
+        assert_eq!(lifecycle["_tag"], "Chunk");
+        assert_eq!(lifecycle["requestId"], "12");
+        assert_eq!(lifecycle["values"][0]["type"], expected_type);
+        assert_eq!(
+            lifecycle["values"][0]["payload"]["environment"]["storageInstanceId"],
+            storage_instance_id
+        );
+        acknowledge_rpc_chunk(&mut socket, "12").await;
+    }
+
+    socket.close(None).await.expect("close RPC WebSocket");
     handle.shutdown();
     timeout(Duration::from_secs(2), handle.join())
         .await
@@ -541,9 +683,16 @@ async fn directory_at_database_path_returns_typed_persistence_error() {
     match error {
         ServerError::PersistenceInitialize(message) => {
             assert!(database_path.is_dir(), "deliberate database fixture");
-            assert_eq!(
-                message,
-                format!("failed to open SQLite database {}", database_path.display())
+            let canonical_database_path = database_path
+                .canonicalize()
+                .expect("canonical database fixture");
+            assert!(
+                message.contains(&canonical_database_path.display().to_string()),
+                "typed error identifies the classified database path: {message}"
+            );
+            assert!(
+                message.contains("cannot be inspected without side effects"),
+                "directory fixture is rejected before private snapshot validation: {message}"
             );
         }
         other => panic!("expected PersistenceInitialize, got {other:?}"),
@@ -801,6 +950,10 @@ fn expected_routes() -> Vec<(&'static str, &'static str)> {
         ("POST", "/api/diagnostics/logs.zip"),
         ("GET", "/api/assets/*"),
         ("POST", "/.well-known/bibcode/desktop/shutdown"),
+        ("POST", "/api/maintenance/update/prepare"),
+        ("POST", "/api/maintenance/update/commit"),
+        ("POST", "/api/maintenance/update/cancel"),
+        ("GET", "/api/maintenance/update/status"),
         ("POST", "/mcp"),
         ("DELETE", "/mcp"),
         ("GET", "*"),

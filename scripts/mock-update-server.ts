@@ -13,8 +13,11 @@ import { HttpRouter, HttpServerRequest, HttpServerResponse } from "effect/unstab
 
 export interface MockUpdateServerConfig {
   readonly port: number;
+  readonly requestLogPath?: string;
   readonly rootRealPath: string;
 }
+
+export const MOCK_UPDATE_READY_PATH = "/.well-known/bibcode-updater-ready";
 
 export const makeResolveMockUpdateServerConfig = (scriptDirectory: string) =>
   Effect.gen(function* () {
@@ -22,6 +25,9 @@ export const makeResolveMockUpdateServerConfig = (scriptDirectory: string) =>
     const path = yield* Path.Path;
     const config = yield* Config.all({
       port: Config.port("BIBCODE_DESKTOP_MOCK_UPDATE_SERVER_PORT").pipe(Config.withDefault(3000)),
+      requestLogPath: Config.string("BIBCODE_DESKTOP_MOCK_UPDATE_SERVER_REQUEST_LOG").pipe(
+        Config.option,
+      ),
       root: Config.string("BIBCODE_DESKTOP_MOCK_UPDATE_SERVER_ROOT").pipe(
         Config.withDefault("../release-mock"),
       ),
@@ -31,6 +37,9 @@ export const makeResolveMockUpdateServerConfig = (scriptDirectory: string) =>
 
     return {
       port: config.port,
+      ...(config.requestLogPath._tag === "Some"
+        ? { requestLogPath: path.resolve(config.requestLogPath.value) }
+        : {}),
       rootRealPath: yield* fileSystem.realPath(resolvedRoot),
     } satisfies MockUpdateServerConfig;
   });
@@ -80,6 +89,19 @@ export type ByteRange =
   | { readonly _tag: "Full" }
   | { readonly _tag: "Partial"; readonly start: number; readonly end: number }
   | { readonly _tag: "Unsatisfiable" };
+
+export function formatMockUpdateRequestLogEntry(input: {
+  readonly method: string;
+  readonly range?: string | undefined;
+  readonly requestUrl: string | undefined;
+}): string {
+  const path = (input.requestUrl ?? "/").split("?", 1)[0]!;
+  return JSON.stringify({
+    method: input.method,
+    path,
+    ...(input.range === undefined ? {} : { range: input.range }),
+  });
+}
 
 export interface UpdateFileStat {
   readonly dev: bigint;
@@ -228,6 +250,7 @@ export function resolveByteRange(rangeHeader: string | undefined, size: number):
 export const makeMockUpdateRouteLayer = (
   rootRealPath: string,
   openFile: typeof openValidatedUpdateFile = openValidatedUpdateFile,
+  requestLogPath?: string,
 ) => {
   return HttpRouter.add(
     "*",
@@ -235,7 +258,21 @@ export const makeMockUpdateRouteLayer = (
     Effect.gen(function* () {
       const request = yield* HttpServerRequest.HttpServerRequest;
       const requestPath = request.url.split("?", 1)[0];
-      yield* Effect.logInfo(`Request received for path: ${requestPath}`);
+      const requestLogEntry = formatMockUpdateRequestLogEntry({
+        method: request.method,
+        range: request.headers.range,
+        requestUrl: request.url,
+      });
+      yield* Effect.logInfo(requestLogEntry);
+      if (requestLogPath !== undefined) {
+        yield* Effect.promise(() =>
+          NodeFS.promises.appendFile(requestLogPath, `${requestLogEntry}\n`),
+        );
+      }
+
+      if (requestPath === MOCK_UPDATE_READY_PATH && request.method === "GET") {
+        return yield* HttpServerResponse.json({ ready: true });
+      }
 
       if (request.method !== "GET" && request.method !== "HEAD") {
         return HttpServerResponse.empty({
@@ -321,7 +358,9 @@ export const makeMockUpdateRouteLayer = (
 };
 
 export const makeMockUpdateServerLayer = (config: MockUpdateServerConfig) =>
-  HttpRouter.serve(makeMockUpdateRouteLayer(config.rootRealPath)).pipe(
+  HttpRouter.serve(
+    makeMockUpdateRouteLayer(config.rootRealPath, openValidatedUpdateFile, config.requestLogPath),
+  ).pipe(
     Layer.provideMerge(
       NodeHttpServer.layer(NodeHttp.createServer, {
         host: "localhost",

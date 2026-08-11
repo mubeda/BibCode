@@ -1,6 +1,6 @@
 use std::{path::PathBuf, result::Result as StdResult};
 
-use serde::{Serialize, de::DeserializeOwned};
+use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use thiserror::Error;
 use tokio::{
     fs::{self, OpenOptions},
@@ -10,8 +10,21 @@ use uuid::Uuid;
 
 use crate::ServerConfig;
 
+use super::StorageInstanceId;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum StateKind {
+    Userdata,
+    Dev,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StatePaths {
+    pub base_dir: PathBuf,
+    pub state_kind: StateKind,
+    pub backups_dir: PathBuf,
+    pub operation_lock: PathBuf,
     pub state_dir: PathBuf,
     pub database: PathBuf,
     pub keybindings: PathBuf,
@@ -35,9 +48,18 @@ impl StatePaths {
     #[must_use]
     pub fn from_config(config: &ServerConfig) -> Self {
         let state_dir = config.state_dir();
+        let state_kind = if config.dev_url.is_some() {
+            StateKind::Dev
+        } else {
+            StateKind::Userdata
+        };
         let logs_dir = state_dir.join("logs");
         let provider_logs_dir = logs_dir.join("provider");
         Self {
+            base_dir: config.base_dir.clone(),
+            state_kind,
+            backups_dir: config.base_dir.join("backups"),
+            operation_lock: config.base_dir.join(".bibcode-storage.lock"),
             database: state_dir.join("state.sqlite"),
             keybindings: state_dir.join("keybindings.json"),
             settings: state_dir.join("settings.json"),
@@ -58,7 +80,44 @@ impl StatePaths {
         }
     }
 
-    pub async fn ensure_directories(&self) -> Result<()> {
+    #[must_use]
+    pub fn backup_store_dir(&self, storage_instance_id: StorageInstanceId) -> PathBuf {
+        self.backups_dir
+            .join(match self.state_kind {
+                StateKind::Userdata => "userdata",
+                StateKind::Dev => "dev",
+            })
+            .join(storage_instance_id.to_string())
+    }
+
+    #[must_use]
+    pub fn recovery_dir(&self) -> PathBuf {
+        self.base_dir.join("recovery").join(match self.state_kind {
+            StateKind::Userdata => "userdata",
+            StateKind::Dev => "dev",
+        })
+    }
+
+    #[must_use]
+    pub fn recovery_journal(&self) -> PathBuf {
+        self.base_dir.join(match self.state_kind {
+            StateKind::Userdata => ".bibcode-recovery-userdata.json",
+            StateKind::Dev => ".bibcode-recovery-dev.json",
+        })
+    }
+
+    #[must_use]
+    pub fn recovery_staging_dir(&self, operation_id: Uuid) -> PathBuf {
+        self.base_dir
+            .join(format!(".{operation_id}.recovery-staging"))
+    }
+
+    #[must_use]
+    pub fn runtime_lock(&self) -> PathBuf {
+        self.base_dir.join(".bibcode-runtime.lock")
+    }
+
+    pub async fn ensure_directories_without_database_side_effects(&self) -> Result<()> {
         for directory in [
             &self.state_dir,
             &self.provider_status_cache_dir,
@@ -311,6 +370,13 @@ mod tests {
     fn derives_the_existing_userdata_and_dev_paths() {
         let base = PathBuf::from("workspace-state");
         let production = StatePaths::from_config(&ServerConfig::new(&base));
+        assert_eq!(production.base_dir, base);
+        assert_eq!(production.state_kind, StateKind::Userdata);
+        assert_eq!(production.backups_dir, base.join("backups"));
+        assert_eq!(
+            production.operation_lock,
+            base.join(".bibcode-storage.lock")
+        );
         assert_eq!(production.database, base.join("userdata/state.sqlite"));
         assert_eq!(
             production.keybindings,
@@ -323,6 +389,7 @@ mod tests {
                 .with_dev_url(Url::parse("http://127.0.0.1:5173").expect("development URL")),
         );
         assert_eq!(development.database, base.join("dev/state.sqlite"));
+        assert_eq!(development.state_kind, StateKind::Dev);
     }
 
     #[tokio::test]
@@ -389,17 +456,20 @@ mod tests {
         let paths = StatePaths::from_config(&ServerConfig::new(temp.path()));
 
         paths
-            .ensure_directories()
+            .ensure_directories_without_database_side_effects()
             .await
             .expect("state directories are created");
 
         assert!(paths.logs_dir.is_dir());
         assert!(paths.server_log.is_file());
+        assert!(!paths.database.exists());
 
         fs::remove_file(&paths.server_log).await.unwrap();
         fs::create_dir(&paths.server_log).await.unwrap();
         assert!(matches!(
-            paths.ensure_directories().await,
+            paths
+                .ensure_directories_without_database_side_effects()
+                .await,
             Err(StateFileError::Persist { .. })
         ));
     }

@@ -1,5 +1,18 @@
-import { DEFAULT_CLIENT_SETTINGS, type DesktopBridge } from "@bibcode/contracts";
+import {
+  BearerConnectionTarget,
+  ConnectionTransientError,
+  decideStorageIdentity,
+  type PreparedConnection,
+  verifyPreparedStorageIdentity,
+} from "@bibcode/client-runtime/connection";
+import { AcceptedStorageIdentityStore } from "@bibcode/client-runtime/platform";
+import { DEFAULT_CLIENT_SETTINGS, type DesktopBridge, EnvironmentId } from "@bibcode/contracts";
+import { it as effectIt } from "@effect/vitest";
+import * as Effect from "effect/Effect";
+import { IDBFactory } from "fake-indexeddb";
 import { afterEach, describe, expect, it, vi } from "vite-plus/test";
+
+import { connectionStorageLayer } from "./connection/storage";
 
 type TauriEventHandler = (event: { payload: unknown }) => void;
 
@@ -40,11 +53,23 @@ const defaultLocalEnvironmentBootstrap = {
 
 function installTauriHarness(options?: {
   readonly previewSupported?: boolean;
+  readonly protectedConnectionCatalog?: boolean;
   readonly rejectMetadata?: boolean;
+  readonly metadataError?: unknown;
+  readonly bridgeVersion?: number;
+  readonly omitProtectedConnectionCatalog?: boolean;
   readonly contextMenuResult?: string | null;
   readonly rejectContextMenu?: unknown;
   readonly rejectSshProvisioning?: boolean;
   readonly localEnvironmentBootstraps?: readonly unknown[] | (() => readonly unknown[]);
+  readonly nativeConnectionCatalog?: string | null | (() => string | null);
+  readonly compareAndSetConnectionCatalog?: (
+    expectedCatalog: string | null,
+    nextCatalog: string,
+  ) => boolean;
+  readonly compareConnectionCatalog?: (expectedCatalog: string | null) => boolean;
+  readonly rejectConnectionCatalogCompareAndSet?: unknown;
+  readonly clearConnectionCatalog?: () => void;
   readonly rejectFallbackCommands?: boolean;
   readonly rejectListeners?: boolean;
 }) {
@@ -55,11 +80,11 @@ function installTauriHarness(options?: {
     switch (command) {
       case "desktop_bridge_get_bridge_metadata":
         if (options?.rejectMetadata) {
-          return Promise.reject(new Error("bridge metadata unavailable"));
+          return Promise.reject(options.metadataError ?? new Error("bridge metadata unavailable"));
         }
         return Promise.resolve({
           host: "tauri",
-          bridgeVersion: 1,
+          bridgeVersion: options?.bridgeVersion ?? 3,
           features: {
             localBackend: true,
             localBearerToken: true,
@@ -68,6 +93,11 @@ function installTauriHarness(options?: {
             wslDiscovery: true,
             sshRemoteHttp: true,
             connectionCatalog: true,
+            ...(options?.omitProtectedConnectionCatalog
+              ? {}
+              : {
+                  protectedConnectionCatalog: options?.protectedConnectionCatalog ?? true,
+                }),
             preview: options?.previewSupported ?? false,
             updater: false,
             menuEvents: true,
@@ -119,15 +149,45 @@ function installTauriHarness(options?: {
       case "desktop_bridge_get_connection_catalog":
         return options?.rejectFallbackCommands
           ? Promise.reject(new Error("native catalog unavailable"))
-          : Promise.resolve("native-catalog");
+          : Promise.resolve(
+              options !== undefined && "nativeConnectionCatalog" in options
+                ? typeof options.nativeConnectionCatalog === "function"
+                  ? options.nativeConnectionCatalog()
+                  : options.nativeConnectionCatalog
+                : "native-catalog",
+            );
       case "desktop_bridge_set_connection_catalog":
         return options?.rejectFallbackCommands
           ? Promise.reject(new Error("native catalog unavailable"))
           : Promise.resolve(args?.catalog === "saved-catalog");
-      case "desktop_bridge_clear_connection_catalog":
+      case "desktop_bridge_compare_and_set_connection_catalog":
+        if ("rejectConnectionCatalogCompareAndSet" in (options ?? {})) {
+          return Promise.reject(options?.rejectConnectionCatalogCompareAndSet);
+        }
         return options?.rejectFallbackCommands
           ? Promise.reject(new Error("native catalog unavailable"))
-          : Promise.resolve(undefined);
+          : Promise.resolve(
+              options?.compareAndSetConnectionCatalog?.(
+                (args?.expectedCatalog as string | null) ?? null,
+                args?.nextCatalog as string,
+              ) ??
+                (args?.expectedCatalog === "native-catalog" &&
+                  args?.nextCatalog === "saved-catalog"),
+            );
+      case "desktop_bridge_compare_connection_catalog":
+        return options?.rejectFallbackCommands
+          ? Promise.reject(new Error("native catalog unavailable"))
+          : Promise.resolve(
+              options?.compareConnectionCatalog?.(
+                (args?.expectedCatalog as string | null) ?? null,
+              ) ?? args?.expectedCatalog === "native-catalog",
+            );
+      case "desktop_bridge_clear_connection_catalog":
+        if (options?.rejectFallbackCommands) {
+          return Promise.reject(new Error("native catalog unavailable"));
+        }
+        options?.clearConnectionCatalog?.();
+        return Promise.resolve(undefined);
       case "desktop_bridge_fetch_environment_descriptor":
         return Promise.resolve({ environmentId: "ssh-env" });
       case "desktop_bridge_bootstrap_ssh_bearer_session":
@@ -174,6 +234,102 @@ async function installBridge(): Promise<DesktopBridge> {
     throw new Error("Expected Tauri adapter to install window.desktopBridge.");
   }
   return bridge;
+}
+
+const SENSITIVE_CONNECTION_CATALOG = JSON.stringify({
+  schemaVersion: 1,
+  targets: [
+    {
+      _tag: "BearerConnectionTarget",
+      environmentId: "sensitive-environment",
+      label: "Sensitive remote",
+      connectionId: "sensitive-connection",
+    },
+  ],
+  profiles: [
+    {
+      _tag: "BearerConnectionProfile",
+      connectionId: "sensitive-connection",
+      environmentId: "sensitive-environment",
+      label: "Sensitive remote",
+      httpBaseUrl: "https://private.example.test/secret-path",
+      wsBaseUrl: "wss://private.example.test/secret-path",
+    },
+  ],
+  credentials: [
+    {
+      connectionId: "sensitive-connection",
+      credential: {
+        _tag: "BearerConnectionCredential",
+        token: "secret-bearer-token",
+      },
+    },
+  ],
+  remoteDpopTokens: [
+    {
+      environmentId: "sensitive-environment",
+      label: "Sensitive remote",
+      endpoint: {
+        httpBaseUrl: "https://private.example.test/secret-path",
+        wsBaseUrl: "wss://private.example.test/secret-path",
+        providerKind: "cloudflare_tunnel",
+      },
+      accessToken: "secret-dpop-token",
+      expiresAtEpochMs: 1_000_000,
+      dpopThumbprint: "secret-thumbprint",
+    },
+  ],
+  acceptedStorageIdentities: [
+    {
+      targetKey: "bearer:sensitive-connection",
+      storageInstanceId: "sensitive-store-id",
+    },
+  ],
+});
+
+function sensitivePrepared(storageInstanceId: string | null): PreparedConnection {
+  const environmentId = EnvironmentId.make("sensitive-environment");
+  const target = new BearerConnectionTarget({
+    environmentId,
+    label: "Sensitive remote",
+    connectionId: "sensitive-connection",
+  });
+  return {
+    environmentId,
+    label: target.label,
+    descriptor: {
+      environmentId,
+      label: target.label,
+      platform: { os: "windows", arch: "x64" },
+      serverVersion: "0.0.0-test",
+      storageInstanceId,
+      capabilities: { repositoryIdentity: true, activityProtocolVersion: null },
+    },
+    httpBaseUrl: "https://private.example.test/secret-path",
+    socketUrl: "wss://private.example.test/secret-path/ws",
+    httpAuthorization: null,
+    target,
+  };
+}
+
+function readIndexedDbConnectionCatalog(factory: IDBFactory): Promise<string | null> {
+  return new Promise((resolve, reject) => {
+    const open = factory.open("bibcode:connection-runtime", 2);
+    open.addEventListener("error", () => reject(open.error));
+    open.addEventListener("success", () => {
+      const database = open.result;
+      const request = database
+        .transaction("catalog", "readonly")
+        .objectStore("catalog")
+        .get("document");
+      request.addEventListener("error", () => reject(request.error));
+      request.addEventListener("success", () => {
+        const raw = request.result;
+        database.close();
+        resolve(typeof raw === "string" ? raw : null);
+      });
+    });
+  });
 }
 
 describe("tauriDesktopBridge", () => {
@@ -304,7 +460,7 @@ describe("tauriDesktopBridge", () => {
 
     await expect(bridge.getHostMetadata?.()).resolves.toEqual({
       host: "tauri",
-      bridgeVersion: 1,
+      bridgeVersion: 3,
       features: {
         localBackend: true,
         localBearerToken: true,
@@ -313,6 +469,7 @@ describe("tauriDesktopBridge", () => {
         wslDiscovery: true,
         sshRemoteHttp: true,
         connectionCatalog: true,
+        protectedConnectionCatalog: true,
         preview: false,
         updater: false,
         menuEvents: true,
@@ -365,10 +522,16 @@ describe("tauriDesktopBridge", () => {
 
     expect(bridge.getConnectionCatalog).toBeDefined();
     expect(bridge.setConnectionCatalog).toBeDefined();
+    expect(bridge.compareAndSetConnectionCatalog).toBeDefined();
+    expect(bridge.compareConnectionCatalog).toBeDefined();
     expect(bridge.clearConnectionCatalog).toBeDefined();
 
     await expect(bridge.getConnectionCatalog!()).resolves.toBe("native-catalog");
     await expect(bridge.setConnectionCatalog!("saved-catalog")).resolves.toBe(true);
+    await expect(
+      bridge.compareAndSetConnectionCatalog!("native-catalog", "saved-catalog"),
+    ).resolves.toBe(true);
+    await expect(bridge.compareConnectionCatalog!("native-catalog")).resolves.toBe(true);
     await expect(bridge.clearConnectionCatalog!()).resolves.toBeUndefined();
 
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_get_connection_catalog", undefined);
@@ -376,10 +539,383 @@ describe("tauriDesktopBridge", () => {
       catalog: "saved-catalog",
     });
     expect(harness.invoke).toHaveBeenCalledWith(
+      "desktop_bridge_compare_and_set_connection_catalog",
+      {
+        expectedCatalog: "native-catalog",
+        nextCatalog: "saved-catalog",
+      },
+    );
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_compare_connection_catalog", {
+      expectedCatalog: "native-catalog",
+    });
+    expect(harness.invoke).toHaveBeenCalledWith(
       "desktop_bridge_clear_connection_catalog",
       undefined,
     );
   });
+
+  it("collapses a protected legacy catalog into native storage before publishing the bridge", async () => {
+    const storage = new Map<string, string>([
+      ["bibcode.connectionCatalog", SENSITIVE_CONNECTION_CATALOG],
+    ]);
+    const localStorage = {
+      getItem: vi.fn((key: string) => storage.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storage.set(key, value)),
+      removeItem: vi.fn((key: string) => storage.delete(key)),
+    };
+    let nativeCatalog: string | null = null;
+    const compareAndSetConnectionCatalog = vi.fn(
+      (expectedCatalog: string | null, nextCatalog: string) => {
+        if (nativeCatalog !== expectedCatalog) return false;
+        nativeCatalog = nextCatalog;
+        return true;
+      },
+    );
+    const harness = installTauriHarness({
+      nativeConnectionCatalog: () => nativeCatalog,
+      compareAndSetConnectionCatalog,
+      compareConnectionCatalog: (expected) => nativeCatalog === expected,
+    });
+    Object.assign(window, { localStorage });
+    vi.stubGlobal("localStorage", localStorage);
+    const bridge = await installBridge();
+
+    expect(nativeCatalog).toBe(SENSITIVE_CONNECTION_CATALOG);
+    expect(storage.has("bibcode.connectionCatalog")).toBe(false);
+    await expect(bridge.getConnectionCatalog!()).resolves.toBe(SENSITIVE_CONNECTION_CATALOG);
+    await expect(bridge.compareConnectionCatalog!(SENSITIVE_CONNECTION_CATALOG)).resolves.toBe(
+      true,
+    );
+    expect(compareAndSetConnectionCatalog).toHaveBeenCalledTimes(1);
+    expect(compareAndSetConnectionCatalog).toHaveBeenCalledWith(null, SENSITIVE_CONNECTION_CATALOG);
+    expect(harness.invoke).toHaveBeenCalledWith(
+      "desktop_bridge_compare_and_set_connection_catalog",
+      { expectedCatalog: null, nextCatalog: SENSITIVE_CONNECTION_CATALOG },
+    );
+  });
+
+  effectIt.effect(
+    "keeps accepted changed and unverifiable decisions read-only after protected migration",
+    () =>
+      Effect.gen(function* () {
+        vi.stubGlobal("indexedDB", new IDBFactory());
+        const storage = new Map<string, string>([
+          ["bibcode.connectionCatalog", SENSITIVE_CONNECTION_CATALOG],
+        ]);
+        const localStorage = {
+          getItem: vi.fn((key: string) => storage.get(key) ?? null),
+          setItem: vi.fn((key: string, value: string) => storage.set(key, value)),
+          removeItem: vi.fn((key: string) => storage.delete(key)),
+        };
+        let nativeCatalog: string | null = null;
+        const compareAndSetConnectionCatalog = vi.fn(
+          (expectedCatalog: string | null, nextCatalog: string) => {
+            if (nativeCatalog !== expectedCatalog) return false;
+            nativeCatalog = nextCatalog;
+            return true;
+          },
+        );
+        installTauriHarness({
+          nativeConnectionCatalog: () => nativeCatalog,
+          compareAndSetConnectionCatalog,
+          compareConnectionCatalog: (expected) => nativeCatalog === expected,
+        });
+        Object.assign(window, { localStorage });
+        vi.stubGlobal("localStorage", localStorage);
+        yield* Effect.promise(() => installBridge());
+
+        const decisions = yield* Effect.gen(function* () {
+          const identities = yield* AcceptedStorageIdentityStore;
+          const transition = (reported: string | null) =>
+            identities.transition("bearer:sensitive-connection", (accepted) => ({
+              result: decideStorageIdentity(accepted, reported),
+              mutation: { _tag: "Keep" as const },
+            }));
+          const accepted = yield* transition("sensitive-store-id");
+          const unverifiable = yield* transition(null);
+          const changed = yield* verifyPreparedStorageIdentity(
+            sensitivePrepared("different-store-id"),
+          ).pipe(Effect.result);
+          return { accepted, unverifiable, changed };
+        }).pipe(Effect.provide(connectionStorageLayer));
+
+        expect(decisions.accepted).toEqual({ _tag: "Accepted", value: "sensitive-store-id" });
+        expect(decisions.unverifiable).toEqual({
+          _tag: "Unverifiable",
+          accepted: "sensitive-store-id",
+        });
+        expect(decisions.changed).toMatchObject({
+          _tag: "Failure",
+          failure: {
+            _tag: "ConnectionStorageChangedError",
+            acceptedStorageInstanceId: "sensitive-store-id",
+            reportedStorageInstanceId: "different-store-id",
+          },
+        });
+        expect(compareAndSetConnectionCatalog).toHaveBeenCalledTimes(1);
+        expect(storage.has("bibcode.connectionCatalog")).toBe(false);
+      }),
+  );
+
+  it("preserves a concurrent native winner while collapsing a protected legacy catalog", async () => {
+    const storage = new Map<string, string>([
+      ["bibcode.connectionCatalog", SENSITIVE_CONNECTION_CATALOG],
+    ]);
+    const localStorage = {
+      getItem: vi.fn((key: string) => storage.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storage.set(key, value)),
+      removeItem: vi.fn((key: string) => storage.delete(key)),
+    };
+    const nativeWinner = "native-concurrent-winner";
+    let nativeCatalog: string | null = null;
+    const compareAndSetConnectionCatalog = vi.fn(() => {
+      nativeCatalog = nativeWinner;
+      return false;
+    });
+    installTauriHarness({
+      nativeConnectionCatalog: () => nativeCatalog,
+      compareAndSetConnectionCatalog,
+    });
+    Object.assign(window, { localStorage });
+    vi.stubGlobal("localStorage", localStorage);
+
+    const bridge = await installBridge();
+
+    expect(nativeCatalog).toBe(nativeWinner);
+    await expect(bridge.getConnectionCatalog!()).resolves.toBe(nativeWinner);
+    expect(compareAndSetConnectionCatalog).toHaveBeenCalledOnce();
+    expect(storage.has("bibcode.connectionCatalog")).toBe(false);
+  });
+
+  it("keeps an existing native catalog authoritative over a stale renderer copy", async () => {
+    const storage = new Map<string, string>([
+      ["bibcode.connectionCatalog", SENSITIVE_CONNECTION_CATALOG],
+    ]);
+    const localStorage = {
+      getItem: vi.fn((key: string) => storage.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storage.set(key, value)),
+      removeItem: vi.fn((key: string) => storage.delete(key)),
+    };
+    const compareAndSetConnectionCatalog = vi.fn(() => false);
+    const harness = installTauriHarness({
+      nativeConnectionCatalog: "native-existing-winner",
+      compareAndSetConnectionCatalog,
+    });
+    Object.assign(window, { localStorage });
+    vi.stubGlobal("localStorage", localStorage);
+
+    const bridge = await installBridge();
+
+    await expect(bridge.getConnectionCatalog!()).resolves.toBe("native-existing-winner");
+    expect(compareAndSetConnectionCatalog).not.toHaveBeenCalled();
+    expect(storage.has("bibcode.connectionCatalog")).toBe(false);
+    const nativeRead = harness.invoke.mock.invocationCallOrder.find(
+      (_, index) =>
+        harness.invoke.mock.calls[index]?.[0] === "desktop_bridge_get_connection_catalog",
+    );
+    expect(nativeRead).toBeLessThan(localStorage.removeItem.mock.invocationCallOrder[0]!);
+  });
+
+  effectIt.effect("fails protected catalog migration closed without changing either source", () =>
+    Effect.gen(function* () {
+      const indexedDb = new IDBFactory();
+      vi.stubGlobal("indexedDB", indexedDb);
+      const storage = new Map<string, string>([
+        ["bibcode.connectionCatalog", SENSITIVE_CONNECTION_CATALOG],
+      ]);
+      const localStorage = {
+        getItem: vi.fn((key: string) => storage.get(key) ?? null),
+        setItem: vi.fn((key: string, value: string) => storage.set(key, value)),
+        removeItem: vi.fn((key: string) => storage.delete(key)),
+      };
+      let nativeCatalog: string | null = null;
+      installTauriHarness({
+        nativeConnectionCatalog: () => nativeCatalog,
+        rejectConnectionCatalogCompareAndSet: new Error(
+          "DPAPI failed for C:\\Users\\alice with secret-bearer-token",
+        ),
+      });
+      Object.assign(window, { localStorage });
+      vi.stubGlobal("localStorage", localStorage);
+
+      const bridge = yield* Effect.promise(() => installBridge());
+      const bridgeResult = yield* Effect.promise(() =>
+        bridge.getConnectionCatalog!().then(
+          () => "resolved",
+          (error: unknown) => String(error),
+        ),
+      );
+      const persistenceResult = yield* Effect.gen(function* () {
+        const identities = yield* AcceptedStorageIdentityStore;
+        yield* identities.accept({
+          targetKey: "platform:primary",
+          storageInstanceId: "must-not-be-persisted",
+        });
+      }).pipe(Effect.provide(connectionStorageLayer), Effect.result);
+
+      expect(bridgeResult).toContain("protection capability could not be verified");
+      expect(bridgeResult).not.toContain("secret-bearer-token");
+      expect(bridgeResult).not.toContain("C:\\Users\\alice");
+      expect(persistenceResult._tag).toBe("Failure");
+      if (persistenceResult._tag === "Failure") {
+        expect(persistenceResult.failure).toBeInstanceOf(ConnectionTransientError);
+        expect(String(persistenceResult.failure)).not.toContain("secret-bearer-token");
+        expect(String(persistenceResult.failure)).not.toContain("C:\\Users\\alice");
+      }
+      expect(nativeCatalog).toBeNull();
+      expect(storage.get("bibcode.connectionCatalog")).toBe(SENSITIVE_CONNECTION_CATALOG);
+      expect(localStorage.removeItem).not.toHaveBeenCalled();
+      expect(yield* Effect.promise(() => readIndexedDbConnectionCatalog(indexedDb))).toBeNull();
+    }),
+  );
+
+  it("fails protected catalog initialization closed when the renderer legacy source is unreadable", async () => {
+    const localStorage = {
+      getItem: vi.fn(() => {
+        throw new Error("renderer storage failed with secret-bearer-token");
+      }),
+      setItem: vi.fn(),
+      removeItem: vi.fn(),
+    };
+    const compareAndSetConnectionCatalog = vi.fn(() => true);
+    installTauriHarness({
+      nativeConnectionCatalog: null,
+      compareAndSetConnectionCatalog,
+    });
+    Object.assign(window, { localStorage });
+    vi.stubGlobal("localStorage", localStorage);
+
+    const bridge = await installBridge();
+    const result = await bridge.getConnectionCatalog!().then(
+      () => "resolved",
+      (error: unknown) => String(error),
+    );
+
+    expect(result).toContain("protection capability could not be verified");
+    expect(result).not.toContain("secret-bearer-token");
+    expect(compareAndSetConnectionCatalog).not.toHaveBeenCalled();
+    expect(localStorage.removeItem).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { name: "absent", legacy: null },
+    { name: "blank", legacy: "   " },
+  ])("publishes native-only catalog operations for a $name renderer value", async ({ legacy }) => {
+    const storage = new Map<string, string>();
+    if (legacy !== null) storage.set("bibcode.connectionCatalog", legacy);
+    const localStorage = {
+      getItem: vi.fn((key: string) => storage.get(key) ?? null),
+      setItem: vi.fn((key: string, value: string) => storage.set(key, value)),
+      removeItem: vi.fn((key: string) => storage.delete(key)),
+    };
+    const compareAndSetConnectionCatalog = vi.fn(() => true);
+    installTauriHarness({
+      nativeConnectionCatalog: null,
+      compareAndSetConnectionCatalog,
+      compareConnectionCatalog: (expected) => expected === null,
+    });
+    Object.assign(window, { localStorage });
+    vi.stubGlobal("localStorage", localStorage);
+
+    const bridge = await installBridge();
+
+    await expect(bridge.getConnectionCatalog!()).resolves.toBeNull();
+    await expect(bridge.compareConnectionCatalog!(null)).resolves.toBe(true);
+    expect(compareAndSetConnectionCatalog).not.toHaveBeenCalled();
+    expect(storage.has("bibcode.connectionCatalog")).toBe(false);
+  });
+
+  it("omits native catalog mutation methods when protected CAS is unavailable", async () => {
+    installTauriHarness({ protectedConnectionCatalog: false });
+    const bridge = await installBridge();
+
+    expect(bridge.getConnectionCatalog).toBeDefined();
+    expect(bridge.clearConnectionCatalog).toBeDefined();
+    expect(bridge.setConnectionCatalog).toBeUndefined();
+    expect(bridge.compareAndSetConnectionCatalog).toBeUndefined();
+    expect(bridge.compareConnectionCatalog).toBeUndefined();
+  });
+
+  effectIt.effect.each([
+    {
+      name: "the metadata command rejects",
+      options: {
+        rejectMetadata: true,
+        metadataError: new Error(
+          "metadata failed with secret-bearer-token at /Users/alice/private/catalog.json",
+        ),
+      },
+    },
+    {
+      name: "the host reports bridge version 1",
+      options: { bridgeVersion: 1 },
+    },
+    {
+      name: "the host reports bridge version 2 without compare-only support",
+      options: { bridgeVersion: 2 },
+    },
+    {
+      name: "the protected-catalog feature is missing",
+      options: { omitProtectedConnectionCatalog: true },
+    },
+  ])("fails catalog mutation closed when $name", ({ options }) =>
+    Effect.gen(function* () {
+      const indexedDb = new IDBFactory();
+      vi.stubGlobal("indexedDB", indexedDb);
+      let nativeCatalog: string | null = SENSITIVE_CONNECTION_CATALOG;
+      const browserStorage = new Map<string, string>([
+        ["bibcode.connectionCatalog", SENSITIVE_CONNECTION_CATALOG],
+      ]);
+      const localStorage = {
+        getItem: vi.fn((key: string) => browserStorage.get(key) ?? null),
+        setItem: vi.fn((key: string, value: string) => browserStorage.set(key, value)),
+        removeItem: vi.fn((key: string) => browserStorage.delete(key)),
+      };
+      const harness = installTauriHarness({
+        ...options,
+        nativeConnectionCatalog: () => nativeCatalog,
+        compareAndSetConnectionCatalog: (expected, next) => {
+          if (nativeCatalog !== expected) return false;
+          nativeCatalog = next;
+          return true;
+        },
+        clearConnectionCatalog: () => {
+          nativeCatalog = null;
+        },
+      });
+      Object.assign(window, { localStorage });
+      vi.stubGlobal("localStorage", localStorage);
+      yield* Effect.promise(() => installBridge());
+
+      const result = yield* Effect.gen(function* () {
+        const identityStore = yield* AcceptedStorageIdentityStore;
+        yield* identityStore.accept({
+          targetKey: "platform:primary",
+          storageInstanceId: "must-not-be-persisted",
+        });
+      }).pipe(Effect.provide(connectionStorageLayer), Effect.result);
+
+      expect
+        .soft(yield* Effect.promise(() => readIndexedDbConnectionCatalog(indexedDb)))
+        .toBeNull();
+      expect.soft(nativeCatalog).toBe(SENSITIVE_CONNECTION_CATALOG);
+      expect
+        .soft(browserStorage.get("bibcode.connectionCatalog"))
+        .toBe(SENSITIVE_CONNECTION_CATALOG);
+      expect
+        .soft(harness.invoke)
+        .not.toHaveBeenCalledWith("desktop_bridge_clear_connection_catalog", undefined);
+      expect(result._tag).toBe("Failure");
+      if (result._tag === "Failure") {
+        expect(result.failure).toBeInstanceOf(ConnectionTransientError);
+        expect(result.failure.message).toContain("Could not migrate the local connection catalog");
+        expect(result.failure.message).not.toContain("secret-bearer-token");
+        expect(result.failure.message).not.toContain("secret-dpop-token");
+        expect(result.failure.message).not.toContain("/Users/alice");
+        expect(result.failure.message).not.toContain("private.example.test");
+      }
+    }),
+  );
 
   it("normalizes structured unsupported errors returned by Tauri commands", async () => {
     installTauriHarness({ rejectSshProvisioning: true });
@@ -474,10 +1010,20 @@ describe("tauriDesktopBridge", () => {
       completed: false,
       state: { status: "disabled" },
     });
+    await expect(bridge.installUpdate({ excludedEnvironmentIds: ["wsl:Ubuntu"] })).resolves.toEqual(
+      {
+        accepted: false,
+        completed: false,
+        state: { status: "disabled" },
+      },
+    );
 
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_check_for_update", undefined);
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_download_update", undefined);
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_install_update", undefined);
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_install_update", {
+      input: { excludedEnvironmentIds: ["wsl:Ubuntu"] },
+    });
   });
 
   it("saves diagnostic archives through the Tauri host", async () => {
@@ -491,6 +1037,64 @@ describe("tauriDesktopBridge", () => {
       filename: "diagnostics.zip",
       bytes: [0x50, 0x4b],
     });
+  });
+
+  it("routes privileged project-data recovery using identifiers rather than renderer paths", async () => {
+    const harness = installTauriHarness();
+    const bridge = await installBridge();
+
+    await expect(bridge.getProjectDataStatuses?.()).resolves.toBeNull();
+    await expect(
+      bridge.restoreProjectData?.("primary", "26b6ca53-27d3-401a-b51f-d7bdf534081f"),
+    ).resolves.toBeNull();
+    await expect(bridge.startEmptyProjectData?.("primary")).resolves.toBeNull();
+    await expect(bridge.retryProjectData?.("primary")).resolves.toBeNull();
+    await expect(bridge.openProjectDataPath?.("primary")).resolves.toBeNull();
+    await expect(bridge.exportProjectDataDiagnostics?.("primary")).resolves.toBeNull();
+
+    expect(harness.invoke).toHaveBeenCalledWith(
+      "desktop_bridge_get_project_data_statuses",
+      undefined,
+    );
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_restore_project_data", {
+      environmentId: "primary",
+      backupId: "26b6ca53-27d3-401a-b51f-d7bdf534081f",
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_start_empty_project_data", {
+      environmentId: "primary",
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_retry_project_data", {
+      environmentId: "primary",
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_open_project_data_path", {
+      environmentId: "primary",
+    });
+    expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_export_project_data_diagnostics", {
+      environmentId: "primary",
+    });
+  });
+
+  it("forwards project data status invalidations and disposes the native listener", async () => {
+    const harness = installTauriHarness();
+    const bridge = await installBridge();
+    const received: unknown[] = [];
+
+    const dispose = bridge.onProjectDataStatusChanged?.((event) => received.push(event));
+    expect(dispose).toEqual(expect.any(Function));
+    await Promise.resolve();
+
+    expect(harness.listen).toHaveBeenCalledWith(
+      "desktop:project-data-status-changed",
+      expect.any(Function),
+    );
+    harness.listeners.get("desktop:project-data-status-changed")?.({
+      payload: { environmentId: "primary" },
+    });
+    expect(received).toEqual([{ environmentId: "primary" }]);
+
+    dispose?.();
+    await Promise.resolve();
+    expect(harness.unlisteners.get("desktop:project-data-status-changed")).toHaveBeenCalledTimes(1);
   });
 
   it("routes the remaining desktop bridge capabilities through Tauri commands", async () => {
@@ -659,7 +1263,10 @@ describe("tauriDesktopBridge", () => {
       setItem: vi.fn((key: string, value: string) => storage.set(key, value)),
       removeItem: vi.fn((key: string) => storage.delete(key)),
     };
-    const harness = installTauriHarness({ rejectFallbackCommands: true });
+    const harness = installTauriHarness({
+      rejectFallbackCommands: true,
+      protectedConnectionCatalog: false,
+    });
     Object.assign(window, {
       confirm: vi.fn(() => true),
       open: vi.fn(),
@@ -672,7 +1279,8 @@ describe("tauriDesktopBridge", () => {
     await expect(bridge.setClientSettings(DEFAULT_CLIENT_SETTINGS)).resolves.toBeUndefined();
     await expect(bridge.getClientSettings()).resolves.toEqual(DEFAULT_CLIENT_SETTINGS);
     await expect(bridge.getConnectionCatalog!()).resolves.toBe("browser-catalog");
-    await expect(bridge.setConnectionCatalog!("browser-catalog")).resolves.toBe(true);
+    expect(bridge.setConnectionCatalog).toBeUndefined();
+    expect(bridge.compareAndSetConnectionCatalog).toBeUndefined();
     await expect(bridge.clearConnectionCatalog!()).resolves.toBeUndefined();
     await expect(bridge.discoverSshHosts()).resolves.toEqual([]);
     await expect(
@@ -723,14 +1331,6 @@ describe("tauriDesktopBridge", () => {
       "_blank",
       "noopener,noreferrer",
     );
-    expect(localStorage.setItem).toHaveBeenCalledWith(
-      "bibcode.connectionCatalog",
-      "browser-catalog",
-    );
-    expect(localStorage.setItem).toHaveBeenCalledWith(
-      "bibcode.connectionCatalog",
-      "browser-catalog",
-    );
     expect(localStorage.removeItem).toHaveBeenCalled();
     expect(harness.invoke).toHaveBeenCalledWith("desktop_bridge_get_update_state", undefined);
   });
@@ -747,13 +1347,17 @@ describe("tauriDesktopBridge", () => {
         throw new Error("storage blocked");
       }),
     };
-    installTauriHarness({ rejectFallbackCommands: true, rejectListeners: true });
+    installTauriHarness({
+      rejectFallbackCommands: true,
+      rejectListeners: true,
+      protectedConnectionCatalog: false,
+    });
     Object.assign(window, { localStorage });
     vi.stubGlobal("localStorage", localStorage);
     const bridge = await installBridge();
 
     await expect(bridge.getConnectionCatalog!()).resolves.toBeNull();
-    await expect(bridge.setConnectionCatalog!("catalog")).resolves.toBe(false);
+    expect(bridge.setConnectionCatalog).toBeUndefined();
     await expect(bridge.clearConnectionCatalog!()).resolves.toBeUndefined();
     const dispose = bridge.onMenuAction(() => {
       throw new Error("listener must stay inactive");
@@ -762,7 +1366,6 @@ describe("tauriDesktopBridge", () => {
     await Promise.resolve();
 
     expect(localStorage.getItem).toHaveBeenCalled();
-    expect(localStorage.setItem).toHaveBeenCalled();
     expect(localStorage.removeItem).toHaveBeenCalled();
   });
 

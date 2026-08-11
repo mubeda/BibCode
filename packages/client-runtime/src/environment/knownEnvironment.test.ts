@@ -1,7 +1,12 @@
-import { EnvironmentId, ProjectId, ThreadId } from "@bibcode/contracts";
+import {
+  EnvironmentId,
+  ProjectId,
+  ThreadId,
+  type ExecutionEnvironmentDescriptor,
+} from "@bibcode/contracts";
 import { describe, expect, it } from "vite-plus/test";
 
-import { createKnownEnvironment } from "./knownEnvironment.ts";
+import { attachEnvironmentDescriptor, createKnownEnvironment } from "./knownEnvironment.ts";
 import {
   parseScopedProjectKey,
   parseScopedThreadKey,
@@ -31,6 +36,54 @@ describe("known environment bootstrap helpers", () => {
         wsBaseUrl: "wss://remote.example.com",
       },
     });
+  });
+
+  it("retains the descriptor storage identity on an attached environment", () => {
+    const environment = createKnownEnvironment({
+      label: "Unresolved environment",
+      target: {
+        httpBaseUrl: "https://remote.example.com",
+        wsBaseUrl: "wss://remote.example.com",
+      },
+    });
+    const descriptor = {
+      environmentId: EnvironmentId.make("remote"),
+      label: "Remote environment",
+      platform: { os: "linux", arch: "x64" },
+      serverVersion: "0.3.8",
+      storageInstanceId: "0d93cbea-f237-4f37-8829-d816667be35f",
+      capabilities: {
+        repositoryIdentity: true,
+        activityProtocolVersion: 1,
+      },
+    } satisfies ExecutionEnvironmentDescriptor;
+
+    expect(attachEnvironmentDescriptor(environment, descriptor).storageInstanceId).toBe(
+      "0d93cbea-f237-4f37-8829-d816667be35f",
+    );
+  });
+
+  it("retains the complete descriptor on an attached environment", () => {
+    const environment = createKnownEnvironment({
+      label: "Unresolved environment",
+      target: {
+        httpBaseUrl: "https://remote.example.com",
+        wsBaseUrl: "wss://remote.example.com",
+      },
+    });
+    const descriptor = {
+      environmentId: EnvironmentId.make("remote"),
+      label: "Remote environment",
+      platform: { os: "linux", arch: "x64" },
+      serverVersion: "0.3.8",
+      storageInstanceId: null,
+      capabilities: {
+        repositoryIdentity: true,
+        activityProtocolVersion: null,
+      },
+    } satisfies ExecutionEnvironmentDescriptor;
+
+    expect(attachEnvironmentDescriptor(environment, descriptor).descriptor).toEqual(descriptor);
   });
 });
 
