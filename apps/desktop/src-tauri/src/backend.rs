@@ -986,10 +986,9 @@ impl BackendSupervisor {
                     error.clone(),
                     plan_error,
                 );
-                if let Err(event_error) = emit_project_data_status_changed(
-                    &app,
-                    &primary_plan.config.environment_id,
-                ) {
+                if let Err(event_error) =
+                    emit_project_data_status_changed(&app, &primary_plan.config.environment_id)
+                {
                     tracing::warn!(
                         target: "bibcode_desktop_tauri::backend",
                         environment_id = primary_plan.config.environment_id,
@@ -2726,12 +2725,12 @@ mod tests {
         thread,
         time::Duration,
     };
+    use tauri::Listener;
     use tokio::io::{AsyncRead, ReadBuf};
     use tokio_tungstenite::{
         connect_async,
         tungstenite::{Message, client::IntoClientRequest},
     };
-    use tauri::Listener;
 
     #[derive(Debug)]
     struct MarkerDesktopUiProcessObserver;
@@ -4776,9 +4775,7 @@ exit /b 9
             .await
             .expect("default backend should close before corruption is injected");
 
-        let marker = test_data_root
-            .join("userdata")
-            .join("environment-id");
+        let marker = test_data_root.join("userdata").join("environment-id");
         fs::write(&marker, b"malformed-environment-id\n")
             .expect("environment marker fixture should write");
 

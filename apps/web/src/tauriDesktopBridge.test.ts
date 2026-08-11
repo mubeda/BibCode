@@ -1076,9 +1076,7 @@ describe("tauriDesktopBridge", () => {
 
     dispose?.();
     await Promise.resolve();
-    expect(
-      harness.unlisteners.get("desktop:project-data-status-changed"),
-    ).toHaveBeenCalledTimes(1);
+    expect(harness.unlisteners.get("desktop:project-data-status-changed")).toHaveBeenCalledTimes(1);
   });
 
   it("routes the remaining desktop bridge capabilities through Tauri commands", async () => {
