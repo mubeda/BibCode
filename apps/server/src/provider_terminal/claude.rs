@@ -482,7 +482,7 @@ impl ClaudeTerminalObserverFactory {
     #[must_use]
     pub fn system() -> Self {
         Self::new(Arc::new(CachedClaudeCapabilityProbe::new(Arc::new(
-            SystemClaudeCapabilityProbeRunner,
+            SystemClaudeCapabilityProbeRunner::default(),
         ))))
     }
 
@@ -1720,7 +1720,21 @@ fn current_timestamp() -> String {
 }
 
 #[derive(Debug)]
-struct SystemClaudeCapabilityProbeRunner;
+struct SystemClaudeCapabilityProbeRunner {
+    timeout: Duration,
+}
+
+impl SystemClaudeCapabilityProbeRunner {
+    const fn with_timeout(timeout: Duration) -> Self {
+        Self { timeout }
+    }
+}
+
+impl Default for SystemClaudeCapabilityProbeRunner {
+    fn default() -> Self {
+        Self::with_timeout(Duration::from_secs(2))
+    }
+}
 
 impl ClaudeCapabilityProbeRunner for SystemClaudeCapabilityProbeRunner {
     fn run(
@@ -1740,7 +1754,7 @@ impl ClaudeCapabilityProbeRunner for SystemClaudeCapabilityProbeRunner {
                 SupervisedRunRequest {
                     command,
                     stdin: None,
-                    timeout: Duration::from_secs(2),
+                    timeout: self.timeout,
                     cleanup_timeout: Duration::from_secs(1),
                     max_output_bytes: CLAUDE_PROBE_OUTPUT_LIMIT,
                     overflow: SupervisedOverflow::Truncate,
@@ -1942,7 +1956,7 @@ mod tests {
              dd if=/dev/zero bs=262144 count=1 1>&2 2>/dev/null",
         );
 
-        let output = SystemClaudeCapabilityProbeRunner
+        let output = SystemClaudeCapabilityProbeRunner::with_timeout(Duration::from_secs(10))
             .run(&executable, Vec::new())
             .await
             .expect("large probe");
@@ -2190,7 +2204,9 @@ mod tests {
         if !executable.is_file() {
             return;
         }
-        let probe = CachedClaudeCapabilityProbe::new(Arc::new(SystemClaudeCapabilityProbeRunner));
+        let probe = CachedClaudeCapabilityProbe::new(Arc::new(
+            SystemClaudeCapabilityProbeRunner::default(),
+        ));
 
         for phase in ["cold", "cached-capabilities"] {
             let started = std::time::Instant::now();
