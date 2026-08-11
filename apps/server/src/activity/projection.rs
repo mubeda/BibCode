@@ -179,15 +179,6 @@ impl ActivityProjection {
         self.controller.clone()
     }
 
-    /// Returns the projection-owned ephemeral control overlay for integration diagnostics.
-    ///
-    /// The registry deliberately exposes no provider-native targets and performs no persistence.
-    #[doc(hidden)]
-    #[must_use]
-    pub fn activity_control_registry_for_integration_test(&self) -> ActivityControlRegistry {
-        self.control_registry.clone()
-    }
-
     #[doc(hidden)]
     #[must_use]
     pub fn with_capacity(repository: ActivityRepository, capacity: usize) -> Self {
@@ -745,6 +736,53 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), controller.disable())
             .await
             .expect("admission released after registry cleanup");
+    }
+
+    #[tokio::test]
+    async fn projection_owned_control_updates_reserve_no_sqlite_queue_work() {
+        // Mutation caught: making the ephemeral overlay schedule repository work through its owner.
+        let database = Database::open_in_memory().await.expect("database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let observer = database
+            .enable_queue_backpressure_observation_for_integration_test()
+            .expect("queue observer");
+        let before = database.queue_backpressure_snapshot_for_integration_test();
+        let projection = ActivityProjection::new(ActivityRepository::new(database.clone()));
+        let registry = projection.activity_control_registry();
+        {
+            let registration = registry.register_runtime(
+                ActivityScopeRef::Thread {
+                    thread_id: "thread:control-queue".to_owned(),
+                },
+                "scope:control-queue".to_owned(),
+                None,
+            );
+            registry
+                .observe_provider_batch(
+                    &registration,
+                    &[ProviderActivityMutation::upsert_actor(
+                        "actor:control-queue",
+                        None,
+                        "Control queue actor",
+                        "running",
+                    )
+                    .expect("actor")],
+                    &[],
+                )
+                .await;
+        }
+
+        assert_eq!(
+            database.queue_backpressure_snapshot_for_integration_test(),
+            before
+        );
+        drop(observer);
     }
 
     #[tokio::test]

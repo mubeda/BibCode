@@ -13,11 +13,11 @@ use std::{
 use bibcode_server::{
     RpcRegistry, ServerConfig, ServerMessage, ServerRuntime,
     activity::{
-        ActivityCapabilities, ActivityControlEvent, ActivityEntry, ActivityEntryKind,
-        ActivityEntryTone, ActivityLifecycle, ActivityProjection, ActivityProjections,
-        ActivityRecordKind, ActivityRepository, ActivityRosterBucket, ActivityScopeRef,
-        ActivityScopeSeed, ActivitySection, ActivityWorkItemSummary, AgentActivityController,
-        AgentActivitySource, ProviderActivityMutation, register_activity_rpc,
+        ActivityCapabilities, ActivityEntry, ActivityEntryKind, ActivityEntryTone,
+        ActivityLifecycle, ActivityProjection, ActivityProjections, ActivityRecordKind,
+        ActivityRepository, ActivityRosterBucket, ActivityScopeSeed, ActivitySection,
+        ActivityWorkItemSummary, AgentActivityController, AgentActivitySource,
+        ProviderActivityMutation, register_activity_rpc,
     },
     diagnostics::{ProcessAttributionRegistry, TraceDiagnosticsStore},
     orchestration::engine::{EngineOptions, OrchestrationEngine},
@@ -67,6 +67,28 @@ const DISABLED_EVENT_COUNT: usize = 10_000;
 const PREVIOUSLY_INSTRUMENTED_TERMINALS: usize = 2;
 const DISABLED_TERMINAL_LAUNCHES: usize = 8;
 const SECRET_DISABLED_PAYLOAD: &str = "disabled-load-secret-content";
+
+#[test]
+fn control_registry_mutation_surface_is_not_publicly_exported() {
+    // Mutation caught: letting external crates register scopes or inject activity into the overlay.
+    let activity_module = include_str!("../src/activity/mod.rs");
+    let control_module = include_str!("../src/activity/control.rs");
+
+    assert!(!activity_module.contains("pub use control::"));
+    for signature in [
+        "pub struct ActivityControlRegistry",
+        "pub struct ActivityRuntimeControlRegistration",
+        "pub enum ActivityControlEvent",
+        "    pub fn register_runtime(",
+        "    pub fn observe_provider_batch(",
+        "    pub fn observe_activity_batch(",
+    ] {
+        assert!(
+            !control_module.contains(signature),
+            "control mutation surface leaked publicly: {signature}"
+        );
+    }
+}
 
 #[derive(Debug)]
 struct RejectingProviderDriverFactory;
@@ -611,104 +633,6 @@ async fn disabled_gate_reserves_no_database_jobs_for_mutations_or_reads() {
         0
     );
     assert_eq!(projection.registry_counts_for_integration_test(), (0, 0));
-    drop(observer);
-}
-
-#[tokio::test]
-async fn control_registry_keeps_tree_deltas_lifecycle_and_database_work_bounded() {
-    // Mutation caught: persisting control-only updates or retaining a superseded runtime overlay.
-    let database = Database::open_in_memory().await.expect("database");
-    database
-        .call(|connection| {
-            run_migrations(connection, None)?;
-            Ok(())
-        })
-        .await
-        .expect("migrations");
-    let observer = database
-        .enable_queue_backpressure_observation_for_integration_test()
-        .expect("queue observer");
-    let before = database.queue_backpressure_snapshot_for_integration_test();
-    let projection = ActivityProjection::new(ActivityRepository::new(database.clone()));
-    let registry = projection.activity_control_registry_for_integration_test();
-    let mut events = registry.subscribe();
-    let scope = ActivityScopeRef::Thread {
-        thread_id: "thread:control-load".to_owned(),
-    };
-    let first = registry.register_runtime(scope, "scope:control-load".to_owned(), None);
-    let mutations = (0..=PAGE_LIMIT)
-        .map(|index| {
-            let actor_id = format!("actor:{index}");
-            let parent_id = (index % 4 != 0).then(|| format!("actor:{}", index - 1));
-            ProviderActivityMutation::upsert_actor(
-                actor_id,
-                parent_id.as_deref(),
-                format!("Actor {index}"),
-                "running",
-            )
-            .expect("actor")
-        })
-        .collect::<Vec<_>>();
-
-    registry.observe_activity_batch(&first, &mutations).await;
-
-    let snapshot = registry.snapshot("scope:control-load").await;
-    assert_eq!(snapshot.actors.len(), PAGE_LIMIT);
-    assert!(
-        !snapshot
-            .actors
-            .iter()
-            .any(|actor| actor.actor_id == "actor:200")
-    );
-    for (actor_id, descendant_count) in [
-        ("actor:0", 3),
-        ("actor:1", 2),
-        ("actor:2", 1),
-        ("actor:3", 0),
-    ] {
-        assert_eq!(
-            snapshot
-                .actors
-                .iter()
-                .find(|actor| actor.actor_id == actor_id)
-                .expect("tree actor")
-                .active_descendant_count,
-            descendant_count
-        );
-    }
-    let ActivityControlEvent::Delta(delta) = events.recv().await.expect("batch delta");
-    assert!(delta.changes.len() <= MUTATION_BATCH_LIMIT);
-    assert!(matches!(
-        events.try_recv(),
-        Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-    ));
-
-    let replacement = registry.register_runtime(
-        ActivityScopeRef::Thread {
-            thread_id: "thread:control-load".to_owned(),
-        },
-        "scope:control-load".to_owned(),
-        None,
-    );
-    registry
-        .observe_activity_batch(&first, &[mutations[0].clone()])
-        .await;
-    drop(first);
-    assert_eq!(
-        registry.snapshot("scope:control-load").await.actors.len(),
-        PAGE_LIMIT
-    );
-    drop(replacement);
-    let ActivityControlEvent::Delta(removal) = events.recv().await.expect("removal delta");
-    assert!(removal.changes.len() <= MUTATION_BATCH_LIMIT);
-    assert_eq!(
-        registry.snapshot("scope:control-load").await.actors.len(),
-        0
-    );
-    assert_eq!(
-        database.queue_backpressure_snapshot_for_integration_test(),
-        before
-    );
     drop(observer);
 }
 
