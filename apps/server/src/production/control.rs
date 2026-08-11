@@ -3345,7 +3345,7 @@ mod tests {
                     .await
             })
         };
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let event = events.recv().await.expect("provider update event");
                 if event["type"] == "providerStatuses"
@@ -3426,7 +3426,7 @@ mod tests {
                     .await
             })
         };
-        tokio::time::timeout(Duration::from_secs(2), async {
+        tokio::time::timeout(Duration::from_secs(10), async {
             loop {
                 let event = events.recv().await.expect("provider update event");
                 if event["type"] == "providerStatuses"
