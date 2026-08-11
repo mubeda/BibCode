@@ -22,7 +22,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     crypto::sha256_hex,
-    git::{host_path_platform, normalize_worktree_path_key},
+    git::canonical_worktree_path_key,
     orchestration::{OrchestrationCommand, OrchestrationEngine, engine::ActivityInput},
     persistence::Repositories,
     production::{
@@ -1211,23 +1211,39 @@ async fn workspace_thread_ids(
         );
     }
     let project_root = project.map(|project| project.workspace_root);
-    let transition_path = normalize_worktree_path_key(&transition.path, host_path_platform());
-    let mut thread_ids = repositories
+    let transition_path = canonical_worktree_path_key(&transition.path)
+        .await
+        .map_err(|error| error.to_string())?;
+    let project_root_key = match project_root.as_deref() {
+        Some(path) => Some(
+            canonical_worktree_path_key(Path::new(path))
+                .await
+                .map_err(|error| error.to_string())?,
+        ),
+        None => None,
+    };
+    let candidates = repositories
         .list_threads_by_project(owner.project_id)
         .await
-        .map_err(|error| error.to_string())?
+        .map_err(|error| error.to_string())?;
+    let mut thread_ids = Vec::new();
+    for thread in candidates
         .into_iter()
         .filter(|thread| thread.deleted_at.is_none())
-        .filter_map(|thread| {
-            let path = thread
-                .worktree_path
-                .as_deref()
-                .or(project_root.as_deref())?;
-            (normalize_worktree_path_key(std::path::Path::new(path), host_path_platform())
-                == transition_path)
-                .then_some(thread.thread_id)
-        })
-        .collect::<Vec<_>>();
+    {
+        let key = match thread.worktree_path.as_deref() {
+            Some(path) => canonical_worktree_path_key(Path::new(path))
+                .await
+                .map_err(|error| error.to_string())?,
+            None => match project_root_key.as_ref() {
+                Some(key) => key.clone(),
+                None => continue,
+            },
+        };
+        if key == transition_path {
+            thread_ids.push(thread.thread_id);
+        }
+    }
     if !thread_ids.contains(&transition.thread_id) {
         thread_ids.push(transition.thread_id.clone());
     }
@@ -1253,24 +1269,27 @@ async fn removal_thread_ids(
                 project.project_id == request.project_id()
             }
     }) {
-        let project_root = project.workspace_root;
-        thread_ids.extend(
-            repositories
-                .list_threads_by_project(project.project_id)
-                .await
-                .map_err(|error| error.to_string())?
-                .into_iter()
-                .filter(|thread| thread.deleted_at.is_none())
-                .filter_map(|thread| {
-                    let path = thread
-                        .worktree_path
-                        .as_deref()
-                        .unwrap_or(project_root.as_str());
-                    (normalize_worktree_path_key(Path::new(path), host_path_platform())
-                        == request.identity().path_key())
-                    .then_some(thread.thread_id)
-                }),
-        );
+        let project_root = canonical_worktree_path_key(Path::new(&project.workspace_root))
+            .await
+            .map_err(|error| error.to_string())?;
+        let candidates = repositories
+            .list_threads_by_project(project.project_id)
+            .await
+            .map_err(|error| error.to_string())?;
+        for thread in candidates
+            .into_iter()
+            .filter(|thread| thread.deleted_at.is_none())
+        {
+            let path_key = match thread.worktree_path.as_deref() {
+                Some(path) => canonical_worktree_path_key(Path::new(path))
+                    .await
+                    .map_err(|error| error.to_string())?,
+                None => project_root.clone(),
+            };
+            if path_key == request.identity().path_key() {
+                thread_ids.push(thread.thread_id);
+            }
+        }
     }
     if !thread_ids
         .iter()
@@ -3028,7 +3047,10 @@ mod tests {
 
         let registry = WorkspaceAvailabilityRegistry::new();
         let mut loss = transition(1);
-        loss.path = root.path().to_path_buf();
+        loss.path = crate::git::canonical_worktree_path_key(root.path())
+            .await
+            .expect("physical terminal root")
+            .into();
         assert!(registry.mark_unavailable(loss.clone()).await);
         let signal_pause = registry.pause_before_next_terminal_signal_permit();
         let actions = Arc::new(RuntimeTerminalActions {
@@ -3109,7 +3131,10 @@ mod tests {
 
         let registry = WorkspaceAvailabilityRegistry::new();
         let mut loss = transition(1);
-        loss.path = root.path().to_path_buf();
+        loss.path = crate::git::canonical_worktree_path_key(root.path())
+            .await
+            .expect("physical terminal root")
+            .into();
         assert!(registry.mark_unavailable(loss.clone()).await);
         let signal_pause = registry.pause_before_next_terminal_signal_permit();
         let actions = Arc::new(RuntimeTerminalActions {
@@ -3195,7 +3220,10 @@ mod tests {
 
         let registry = WorkspaceAvailabilityRegistry::new();
         let mut loss = transition(1);
-        loss.path = root.path().to_path_buf();
+        loss.path = crate::git::canonical_worktree_path_key(root.path())
+            .await
+            .expect("physical terminal root")
+            .into();
         assert!(registry.mark_unavailable(loss.clone()).await);
         let signal_pause = registry.pause_after_next_terminal_signal_permit();
         let actions = Arc::new(RuntimeTerminalActions {
@@ -3218,6 +3246,7 @@ mod tests {
         let recovery_loss = loss.clone();
         let invalidation_started = registry
             .terminal_signal_invalidation_notification(&loss)
+            .await
             .expect("current terminal signal gate");
         let recovery = tokio::spawn(async move {
             recovery_registry

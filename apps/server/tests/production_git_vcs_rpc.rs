@@ -29,7 +29,6 @@ static ISOLATED_GIT_TEST_LOCK: Mutex<()> = Mutex::new(());
 #[derive(Default)]
 struct RecordingCatalogMutationObserver {
     creations: Mutex<Vec<(PathBuf, PathBuf)>>,
-    removals: Mutex<Vec<(PathBuf, PathBuf)>>,
     fail_observation: bool,
 }
 
@@ -46,24 +45,6 @@ impl CatalogMutationObserver for RecordingCatalogMutationObserver {
                 .push((cwd.to_path_buf(), path.to_path_buf()));
             if self.fail_observation {
                 Err("Git repository identity could not be verified after creation".to_owned())
-            } else {
-                Ok(())
-            }
-        })
-    }
-
-    fn invalidate_after_removal<'a>(
-        &'a self,
-        cwd: &'a Path,
-        path: &'a Path,
-    ) -> CatalogMutationFuture<'a> {
-        Box::pin(async move {
-            self.removals
-                .lock()
-                .expect("removal records")
-                .push((cwd.to_path_buf(), path.to_path_buf()));
-            if self.fail_observation {
-                Err("Git repository identity could not be verified after removal".to_owned())
             } else {
                 Ok(())
             }
@@ -182,7 +163,6 @@ fn registrar_owns_the_complete_git_vcs_rpc_surface() {
             "vcs.listRefs",
             "vcs.listCommits",
             "vcs.createWorktree",
-            "vcs.removeWorktree",
             "vcs.clone",
             "vcs.createRef",
             "vcs.switchRef",
@@ -206,7 +186,7 @@ fn registrar_owns_the_complete_git_vcs_rpc_surface() {
 }
 
 #[tokio::test]
-async fn unverifiable_catalog_identity_does_not_reclassify_successful_git_mutations() {
+async fn unverifiable_catalog_identity_does_not_reclassify_successful_managed_creation() {
     let temp = TempDir::new().expect("temporary server directory");
     let repository = TempDir::new().expect("temporary repository");
     initialize_repository(&repository);
@@ -255,23 +235,6 @@ async fn unverifiable_catalog_identity_does_not_reclassify_successful_git_mutati
             .expect("creation records")
             .as_slice(),
         &[(repository.path().to_path_buf(), created_path)]
-    );
-
-    request(
-        &mut socket,
-        "902",
-        "vcs.removeWorktree",
-        json!({ "cwd": repository.path(), "path": worktree, "force": true }),
-    )
-    .await;
-    assert_success_eq(&mut socket, "902", Value::Null).await;
-    assert_eq!(
-        observer
-            .removals
-            .lock()
-            .expect("removal records")
-            .as_slice(),
-        &[(repository.path().to_path_buf(), worktree)]
     );
 
     socket.close(None).await.expect("close WebSocket");
@@ -1780,8 +1743,19 @@ async fn clone_pull_and_worktree_lifecycle_round_trip_over_rpc() {
         json!({ "cwd": consumer_cwd, "path": worktree_path, "force": true }),
     )
     .await;
-    assert_success_eq(server.socket(), "405", Value::Null).await;
-    assert!(!worktree_path.exists());
+    let response = next_server_message(server.socket()).await;
+    assert!(
+        matches!(
+            response,
+            ServerMessage::Defect { defect }
+                if defect.as_str().is_some_and(|detail| {
+                    detail.contains("Unknown request tag")
+                        && detail.contains("vcs.removeWorktree")
+                })
+        ),
+        "the retired raw removal method must be unavailable"
+    );
+    assert!(worktree_path.exists());
     assert!(consumer.is_dir());
     assert_eq!(
         git_stdout_in(&consumer, &["rev-parse", "--is-inside-work-tree"]).trim(),
@@ -1792,7 +1766,7 @@ async fn clone_pull_and_worktree_lifecycle_round_trip_over_rpc() {
         .lines()
         .filter_map(|line| line.strip_prefix("worktree "))
         .collect::<Vec<_>>();
-    assert_eq!(listed_worktrees.len(), 1);
+    assert_eq!(listed_worktrees.len(), 2);
     assert_eq!(
         canonical_path(listed_worktrees[0]),
         canonical_path(&consumer)

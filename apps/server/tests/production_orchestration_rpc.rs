@@ -120,7 +120,7 @@ async fn harness() -> Harness {
 }
 
 #[tokio::test]
-async fn workspace_unavailable_rejects_turn_before_durable_admission_but_allows_delete() {
+async fn workspace_unavailable_rejects_turn_and_generic_owner_delete_without_retiring_guard() {
     let temp = TempDir::new().expect("temporary base directory");
     let workspace = temp.path().join("guarded-workspace");
     std::fs::create_dir(&workspace).expect("workspace");
@@ -169,7 +169,11 @@ async fn workspace_unavailable_rejects_turn_before_durable_admission_but_allows_
             .await
     );
     let mut registry = RpcRegistry::empty();
-    register_orchestration_rpc_with_availability(&mut registry, engine.clone(), availability);
+    register_orchestration_rpc_with_availability(
+        &mut registry,
+        engine.clone(),
+        availability.clone(),
+    );
     let handle = ServerRuntime::start_with_registry(test_config(&temp), registry)
         .await
         .expect("server starts");
@@ -198,9 +202,10 @@ async fn workspace_unavailable_rejects_turn_before_durable_admission_but_allows_
             .is_none()
     );
 
-    dispatch_command(
+    rpc_request(
         &mut socket,
         "2",
+        "orchestration.dispatchCommand",
         json!({
             "type":"thread.delete",
             "commandId":"delete-guarded-thread",
@@ -209,6 +214,34 @@ async fn workspace_unavailable_rejects_turn_before_durable_admission_but_allows_
         }),
     )
     .await;
+    let delete_error = expect_failure(&mut socket, "2").await;
+    assert_invalid_request(
+        &delete_error,
+        "orchestration.dispatchCommand",
+        "dedicated server-resolved",
+    );
+    assert!(
+        engine
+            .repositories()
+            .get_thread("thread-guarded".to_owned())
+            .await
+            .expect("thread query")
+            .is_some_and(|thread| thread.deleted_at.is_none()),
+        "generic deletion must leave the adopted owner intact"
+    );
+    assert!(
+        engine
+            .repositories()
+            .get_command_receipt("delete-guarded-thread".to_owned())
+            .await
+            .expect("receipt query")
+            .is_none(),
+        "public rejection happens before durable command admission"
+    );
+    assert!(
+        availability.guard_thread("thread-guarded").await.is_err(),
+        "generic rejection cannot silently retire the adopted workspace guard"
+    );
 
     socket.close(None).await.expect("close WebSocket");
     handle.shutdown();
@@ -406,6 +439,20 @@ fn create_thread(thread_id: &str, project_id: &str, title: &str) -> Value {
     })
 }
 
+fn create_public_thread(thread_id: &str, project_id: &str, title: &str) -> Value {
+    json!({
+        "type": "thread.create",
+        "commandId": format!("create-{thread_id}"),
+        "threadId": thread_id,
+        "projectId": project_id,
+        "title": title,
+        "modelSelection": {"instanceId": "codex", "model": "gpt-5"},
+        "runtimeMode": "full-access",
+        "interactionMode": "default",
+        "createdAt": CREATED_AT,
+    })
+}
+
 #[tokio::test]
 async fn orchestration_rpc_registration_has_the_contract_modes() {
     let harness = harness().await;
@@ -435,11 +482,43 @@ async fn orchestration_rpc_registration_has_the_contract_modes() {
 }
 
 #[tokio::test]
-async fn public_dispatch_rejects_server_resolved_worktree_commands() {
+async fn public_dispatch_rejects_every_generic_worktree_authority_bypass() {
     let harness = harness().await;
     let outcome = AssertUnwindSafe(async {
+        let authority_workspace = harness.workspace_root("authority-project");
+        harness
+            .engine
+            .dispatch(
+                serde_json::from_value(create_project(
+                    "authority-project",
+                    &authority_workspace,
+                ))
+                .expect("project command"),
+            )
+            .await
+            .expect("project created");
+        harness
+            .engine
+            .dispatch(
+                serde_json::from_value(create_thread(
+                    "adopted-owner",
+                    "authority-project",
+                    "Adopted owner",
+                ))
+                .expect("internal owner command"),
+            )
+            .await
+            .expect("internal adopted owner created");
+        let default_thread_id = load_snapshot(&harness.engine.repositories())
+            .await
+            .expect("snapshot")
+            .threads
+            .into_iter()
+            .find(|thread| thread.project_id == "authority-project" && thread.kind == "default")
+            .expect("default thread")
+            .thread_id;
         let mut socket = harness.connect().await;
-        for (request_id, payload) in [
+        let rejected = [
             (
                 "61",
                 json!({
@@ -465,7 +544,130 @@ async fn public_dispatch_rejects_server_resolved_worktree_commands() {
                     "branch": "main"
                 }),
             ),
-        ] {
+            (
+                "63",
+                json!({
+                    "type":"worktree.detach-resolved",
+                    "commandId":"internal-detach",
+                    "projectId":"authority-project",
+                    "threadId":"adopted-owner",
+                    "path":"C:/worktrees/adopted-owner",
+                    "gitOutcome":"not-requested",
+                    "detail":null,
+                    "orphanCleanupPending":false
+                }),
+            ),
+            (
+                "64",
+                json!({
+                    "type":"project.meta.update",
+                    "commandId":"raw-discovery-policy",
+                    "projectId":"authority-project",
+                    "worktreeDiscovery":{
+                        "visibility":"shown",
+                        "initialPromptDismissedAt":null,
+                        "baselinePaths":["C:/client/chosen-baseline"]
+                    }
+                }),
+            ),
+            (
+                "65",
+                json!({
+                    "type":"thread.create",
+                    "commandId":"raw-kind-create",
+                    "threadId":"raw-panel",
+                    "projectId":"authority-project",
+                    "title":"Raw panel",
+                    "kind":"panel",
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access",
+                    "interactionMode":"default",
+                    "branch":null,
+                    "worktreePath":null,
+                    "createdAt":CREATED_AT
+                }),
+            ),
+            (
+                "66",
+                json!({
+                    "type":"thread.create",
+                    "commandId":"raw-path-create",
+                    "threadId":"raw-owner",
+                    "projectId":"authority-project",
+                    "title":"Raw owner",
+                    "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access",
+                    "interactionMode":"default",
+                    "branch":"raw",
+                    "worktreePath":"C:/client/chosen-worktree",
+                    "createdAt":CREATED_AT
+                }),
+            ),
+            (
+                "67",
+                json!({
+                    "type":"thread.meta.update",
+                    "commandId":"raw-retarget",
+                    "threadId":default_thread_id,
+                    "worktreePath":"C:/client/chosen-retarget"
+                }),
+            ),
+            (
+                "68",
+                json!({
+                    "type":"thread.turn.start",
+                    "commandId":"raw-bootstrap-path",
+                    "threadId":"raw-bootstrap-owner",
+                    "message":{"messageId":"raw-bootstrap-message","role":"user","text":"raw","attachments":[]},
+                    "runtimeMode":"full-access",
+                    "interactionMode":"default",
+                    "bootstrap":{
+                        "createThread":{
+                            "projectId":"authority-project",
+                            "title":"Raw bootstrap",
+                            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                            "runtimeMode":"full-access",
+                            "interactionMode":"default",
+                            "branch":"raw",
+                            "worktreePath":"C:/client/chosen-bootstrap",
+                            "createdAt":CREATED_AT
+                        },
+                        "prepareWorktree":{
+                            "projectCwd":"C:/client/chosen-repository",
+                            "baseBranch":"main"
+                        }
+                    },
+                    "createdAt":CREATED_AT
+                }),
+            ),
+            (
+                "69",
+                json!({
+                    "type":"thread.delete",
+                    "commandId":"raw-adopted-delete",
+                    "threadId":"adopted-owner"
+                }),
+            ),
+            (
+                "70",
+                json!({
+                    "type":"project.delete",
+                    "commandId":"raw-project-delete",
+                    "projectId":"authority-project",
+                    "force":true
+                }),
+            ),
+        ];
+        for (request_id, payload) in rejected {
+            let command_id = payload["commandId"]
+                .as_str()
+                .expect("rejected command id")
+                .to_owned();
+            let expected_message = if command_id.starts_with("internal-") {
+                "server-internal"
+            } else {
+                "dedicated server-resolved"
+            };
             rpc_request(
                 &mut socket,
                 request_id,
@@ -474,17 +676,22 @@ async fn public_dispatch_rejects_server_resolved_worktree_commands() {
             )
             .await;
             let error = expect_failure(&mut socket, request_id).await;
-            assert_invalid_request(&error, "orchestration.dispatchCommand", "server-internal");
+            assert_invalid_request(
+                &error,
+                "orchestration.dispatchCommand",
+                expected_message,
+            );
+            assert!(
+                harness
+                    .engine
+                    .repositories()
+                    .get_command_receipt(command_id)
+                    .await
+                    .expect("receipt query")
+                    .is_none(),
+                "a rejected public worktree-authority bypass cannot reserve or persist a receipt"
+            );
         }
-        assert!(
-            harness
-                .engine
-                .repositories()
-                .get_command_receipt("internal-adopt".to_owned())
-                .await
-                .expect("receipt query")
-                .is_none()
-        );
         socket.close(None).await.expect("close WebSocket");
     })
     .catch_unwind()
@@ -1152,7 +1359,7 @@ async fn orchestration_lifecycle_and_query_rpcs_round_trip_real_state() {
         let created_thread = dispatch_command(
             &mut socket,
             "2",
-            create_thread("thread-1", "project-1", "Workspace thread"),
+            create_public_thread("thread-1", "project-1", "Workspace thread"),
         )
         .await;
         assert!(
@@ -1169,7 +1376,6 @@ async fn orchestration_lifecycle_and_query_rpcs_round_trip_real_state() {
                 "threadId": "thread-1",
                 "title": "Workspace thread renamed",
                 "branch": "feature/rpc",
-                "worktreePath": "C:/worktrees/thread-1",
             }),
         )
         .await;
@@ -1494,7 +1700,7 @@ async fn shell_and_thread_streams_refresh_on_relevant_events_and_interrupt_clean
         dispatch_command(
             &mut command_socket,
             "2",
-            create_thread("thread-watched", "project-streams", "Watched thread"),
+            create_public_thread("thread-watched", "project-streams", "Watched thread"),
         )
         .await;
 
@@ -1528,7 +1734,7 @@ async fn shell_and_thread_streams_refresh_on_relevant_events_and_interrupt_clean
         dispatch_command(
             &mut command_socket,
             "3",
-            create_thread("thread-unrelated", "project-streams", "Unrelated thread"),
+            create_public_thread("thread-unrelated", "project-streams", "Unrelated thread"),
         )
         .await;
         let shell_after_unrelated = expect_snapshot_chunk(&mut shell_socket, "101").await;
@@ -1550,7 +1756,6 @@ async fn shell_and_thread_streams_refresh_on_relevant_events_and_interrupt_clean
                 "threadId": "thread-watched",
                 "title": "Watched thread updated",
                 "branch": "feature/watched",
-                "worktreePath": "C:/worktrees/thread-watched",
             }),
         )
         .await;

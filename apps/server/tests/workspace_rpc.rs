@@ -1,5 +1,6 @@
 use bibcode_server::{
     assets,
+    git::canonical_worktree_path_key,
     production::host_paths::process_compatible_path,
     project, review, workspace,
     worktree_catalog::{
@@ -42,6 +43,9 @@ async fn workspace_unavailable_rejects_file_search_and_review_before_side_effect
             .await
     );
     let rpc = WorkspaceRpc::new(WorkspaceService::default()).with_availability_registry(registry);
+    let physical_root = canonical_worktree_path_key(root.path())
+        .await
+        .expect("physical workspace root");
 
     for (method, payload) in [
         (
@@ -64,7 +68,7 @@ async fn workspace_unavailable_rejects_file_search_and_review_before_side_effect
         assert_eq!(error["_tag"], "WorkspaceUnavailableError");
         assert_eq!(error["reason"], "workspace-unavailable");
         assert_eq!(error["threadId"], "thread-1");
-        assert_eq!(error["path"], path_string(root.path()));
+        assert_eq!(error["path"], physical_root);
         assert_eq!(error["availability"], "missing-registered");
     }
 }

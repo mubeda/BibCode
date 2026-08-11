@@ -169,6 +169,7 @@ pub struct ThreadTurnStartBootstrapCreateThread {
     pub runtime_mode: String,
     pub interaction_mode: String,
     pub branch: Option<String>,
+    #[serde(default)]
     pub worktree_path: Option<String>,
     pub created_at: String,
 }
@@ -176,6 +177,7 @@ pub struct ThreadTurnStartBootstrapCreateThread {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ThreadTurnStartBootstrapPrepareWorktree {
+    #[serde(default)]
     pub project_cwd: String,
     pub base_branch: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -388,7 +390,7 @@ pub enum OrchestrationCommand {
         #[serde(rename = "interactionMode", default = "default_interaction_mode")]
         interaction_mode: String,
         branch: Option<String>,
-        #[serde(rename = "worktreePath")]
+        #[serde(rename = "worktreePath", default)]
         worktree_path: Option<String>,
         #[serde(rename = "createdAt")]
         created_at: String,
@@ -1448,7 +1450,7 @@ impl CommandAdmissionFence {
 }
 
 impl CommandAdmissionClaim {
-    fn ensure_owns(&self, command_id: &str) -> Result<(), OrchestrationError> {
+    pub(crate) fn ensure_owns(&self, command_id: &str) -> Result<(), OrchestrationError> {
         if self.inner.command_id == command_id {
             Ok(())
         } else {
@@ -1566,6 +1568,25 @@ impl WorkspaceOwnershipFence {
                 committed: AtomicBool::new(false),
             }),
         })
+    }
+
+    #[cfg(test)]
+    async fn wait_for_contender(&self, path: &Path) {
+        let key = canonical_worktree_path_key(path)
+            .await
+            .expect("test workspace identity");
+        loop {
+            let has_contender = self
+                .keys
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .get(&key)
+                .is_some_and(|state| state.strong_count() > 1);
+            if has_contender {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
     }
 }
 
@@ -2125,21 +2146,24 @@ impl OrchestrationEngine {
         .await
     }
 
-    pub(crate) async fn dispatch_with_admission_ownership_and_command_claim(
+    pub(crate) async fn dispatch_with_admission_ownership_and_command_claim_until_handoff(
         &self,
         command: OrchestrationCommand,
         admission: CommandAdmission,
         command_claim: CommandAdmissionClaim,
         ownership: WorkspaceOwnershipLease,
-        on_commit: impl FnOnce() + Send + 'static,
+        cancellation: &CancellationToken,
     ) -> Result<DispatchResult, OrchestrationError> {
-        self.dispatch_inner(
+        self.dispatch_plain_with_commit(
             command,
             Some(admission),
             None,
             Some(command_claim),
             Some(ownership),
-            Some(Box::new(on_commit)),
+            CommandDispatchOptions {
+                on_commit: None,
+                handoff_cancellation: Some(cancellation),
+            },
         )
         .await
     }
@@ -2746,6 +2770,7 @@ async fn process_envelope(
     }
 
     canonicalize_project_command(model, &mut command, project_command_effects).await?;
+    canonicalize_worktree_command(&mut command).await?;
     let project_create_identity = match &command {
         OrchestrationCommand::ProjectCreate {
             project_id,
@@ -3006,6 +3031,80 @@ async fn canonicalize_project_command_with_historical_timeout(
     Ok(())
 }
 
+async fn canonicalize_worktree_command(
+    command: &mut OrchestrationCommand,
+) -> Result<(), OrchestrationError> {
+    let command_id = command.command_id().to_owned();
+    match command {
+        OrchestrationCommand::WorktreeAdoptResolved { path, .. }
+        | OrchestrationCommand::WorktreeDetachResolved { path, .. } => {
+            canonicalize_command_worktree_path(&command_id, path).await?;
+        }
+        OrchestrationCommand::ThreadCreate {
+            worktree_path: Some(path),
+            ..
+        } => canonicalize_command_worktree_path(&command_id, path).await?,
+        OrchestrationCommand::ThreadMetaUpdate {
+            worktree_path: OptionalNullable::Present(Some(path)),
+            ..
+        } => canonicalize_command_worktree_path(&command_id, path).await?,
+        OrchestrationCommand::ThreadTurnStart {
+            bootstrap: Some(bootstrap),
+            ..
+        } => {
+            if let Some(path) = bootstrap
+                .create_thread
+                .as_mut()
+                .and_then(|create| create.worktree_path.as_mut())
+            {
+                canonicalize_command_worktree_path(&command_id, path).await?;
+            }
+        }
+        OrchestrationCommand::ProjectMetaUpdate {
+            worktree_discovery: Some(policy),
+            ..
+        } => canonicalize_policy_baseline(&command_id, policy).await?,
+        _ => {}
+    }
+    Ok(())
+}
+
+async fn canonicalize_command_worktree_path(
+    command_id: &str,
+    path: &mut String,
+) -> Result<(), OrchestrationError> {
+    *path = canonical_worktree_path_key(Path::new(path))
+        .await
+        .map_err(|error| OrchestrationError::WorkspaceOwnershipIdentity {
+            command_id: command_id.to_owned(),
+            path: path.clone(),
+            detail: error.to_string(),
+        })?;
+    Ok(())
+}
+
+async fn canonicalize_policy_baseline(
+    command_id: &str,
+    policy: &mut Value,
+) -> Result<(), OrchestrationError> {
+    let Some(paths) = policy
+        .as_object_mut()
+        .and_then(|policy| policy.get_mut("baselinePaths"))
+        .and_then(Value::as_array_mut)
+    else {
+        return Ok(());
+    };
+    for path in paths {
+        let Some(value) = path.as_str() else {
+            continue;
+        };
+        let mut canonical = value.to_owned();
+        canonicalize_command_worktree_path(command_id, &mut canonical).await?;
+        *path = Value::String(canonical);
+    }
+    Ok(())
+}
+
 async fn prepare_project_create(
     command: &OrchestrationCommand,
     effects: Option<&dyn ProjectCommandEffects>,
@@ -3201,6 +3300,17 @@ async fn plan_command(
                     thread.project_id == *project_id && thread.deleted_at.is_none()
                 })
                 .collect();
+            if active
+                .iter()
+                .any(|(_, thread)| thread.kind == "workspace" && thread.worktree_path.is_some())
+            {
+                return invariant(
+                    command,
+                    format!(
+                        "Project '{project_id}' contains an adopted worktree owner; detach it through the dedicated server-resolved worktree API before deleting the project."
+                    ),
+                );
+            }
             if force != &Some(true) && active.iter().any(|(_, thread)| thread.kind != "default") {
                 return invariant(
                     command,
@@ -3497,6 +3607,14 @@ async fn plan_command(
                     format!("Default thread '{thread_id}' cannot be deleted directly."),
                 );
             }
+            if thread.kind == "workspace" && thread.worktree_path.is_some() {
+                return invariant(
+                    command,
+                    format!(
+                        "Thread '{thread_id}' owns an adopted worktree; detach it through the dedicated server-resolved worktree API."
+                    ),
+                );
+            }
             Ok(vec![make_event(
                 "thread.deleted",
                 "thread",
@@ -3560,7 +3678,24 @@ async fn plan_command(
             branch,
             worktree_path,
         } => {
-            require_thread(model, command, thread_id)?;
+            let thread = require_thread(model, command, thread_id)?;
+            if thread.kind == "workspace"
+                && let OptionalNullable::Present(Some(path)) = worktree_path
+            {
+                let path_key = normalized_worktree_path_key(path);
+                if model.threads.iter().any(|(candidate_id, candidate)| {
+                    candidate_id != thread_id
+                        && candidate.project_id == thread.project_id
+                        && candidate.kind == "workspace"
+                        && candidate.deleted_at.is_none()
+                        && candidate.worktree_path_key.as_deref() == Some(path_key.as_str())
+                }) {
+                    return Err(OrchestrationError::WorktreeOwnershipConflict {
+                        project_id: thread.project_id.clone(),
+                        owner_count: 2,
+                    });
+                }
+            }
             let mut payload = json!({"threadId":thread_id,"updatedAt":occurred_at});
             insert_optional(&mut payload, "title", title.as_ref().map(|v| json!(v)));
             insert_optional(&mut payload, "modelSelection", model_selection.clone());
@@ -4675,11 +4810,13 @@ async fn load_command_model(
         .await
         .map_err(wrap_persistence)?
     {
+        let mut worktree_discovery = project.worktree_discovery.clone();
+        canonicalize_policy_baseline("engine.start", &mut worktree_discovery).await?;
         projects.insert(
             project.project_id.clone(),
             ProjectState {
                 workspace_root: project.workspace_root.clone(),
-                worktree_discovery: project.worktree_discovery.clone(),
+                worktree_discovery,
                 deleted_at: project.deleted_at.clone(),
             },
         );
@@ -4688,6 +4825,16 @@ async fn load_command_model(
             .await
             .map_err(wrap_persistence)?
         {
+            let worktree_path_key = match thread.worktree_path.as_deref() {
+                Some(path) => Some(canonical_worktree_path_key(Path::new(path)).await.map_err(
+                    |error| OrchestrationError::WorkspaceOwnershipIdentity {
+                        command_id: "engine.start".to_owned(),
+                        path: path.to_owned(),
+                        detail: error.to_string(),
+                    },
+                )?),
+                None => None,
+            };
             threads.insert(
                 thread.thread_id.clone(),
                 ThreadState {
@@ -4697,10 +4844,7 @@ async fn load_command_model(
                     interaction_mode: thread.interaction_mode.clone(),
                     branch: thread.branch.clone(),
                     worktree_path: thread.worktree_path.clone(),
-                    worktree_path_key: thread
-                        .worktree_path
-                        .as_deref()
-                        .map(normalized_worktree_path_key),
+                    worktree_path_key,
                     archived_at: thread.archived_at.clone(),
                     deleted_at: thread.deleted_at.clone(),
                 },
@@ -6211,6 +6355,76 @@ mod tests {
         }
 
         #[tokio::test]
+        async fn generic_delete_fails_closed_for_an_adopted_owner_and_its_project() {
+            let engine = detach_engine().await;
+            create_thread(
+                &engine,
+                "generic-delete-owner-create",
+                "workspace-owner",
+                "workspace",
+                PATH,
+            )
+            .await;
+            create_thread(
+                &engine,
+                "generic-delete-panel-create",
+                "owner-panel",
+                "panel",
+                PATH,
+            )
+            .await;
+
+            let owner_delete = engine
+                .dispatch(OrchestrationCommand::ThreadDelete {
+                    command_id: "generic-delete-owner".to_owned(),
+                    thread_id: "workspace-owner".to_owned(),
+                })
+                .await;
+            assert!(
+                matches!(owner_delete, Err(OrchestrationError::Invariant { .. })),
+                "generic deletion cannot retire an adopted owner: {owner_delete:?}"
+            );
+
+            let project_delete = engine
+                .dispatch(OrchestrationCommand::ProjectDelete {
+                    command_id: "generic-delete-owner-project".to_owned(),
+                    project_id: PROJECT_ID.to_owned(),
+                    force: Some(true),
+                })
+                .await;
+            assert!(
+                matches!(project_delete, Err(OrchestrationError::Invariant { .. })),
+                "force cannot bypass exact adopted-owner retirement: {project_delete:?}"
+            );
+
+            engine
+                .dispatch(OrchestrationCommand::ThreadDelete {
+                    command_id: "generic-delete-panel".to_owned(),
+                    thread_id: "owner-panel".to_owned(),
+                })
+                .await
+                .expect("a dependent panel remains ordinary non-owner orchestration");
+            let snapshot = load_snapshot(&engine.repositories())
+                .await
+                .expect("snapshot");
+            assert!(
+                snapshot
+                    .threads
+                    .iter()
+                    .find(|thread| thread.thread_id == "workspace-owner")
+                    .is_some_and(|thread| thread.deleted_at.is_none())
+            );
+            assert!(
+                snapshot
+                    .projects
+                    .iter()
+                    .find(|project| project.project_id == PROJECT_ID)
+                    .is_some_and(|project| project.deleted_at.is_none())
+            );
+            engine.shutdown().await;
+        }
+
+        #[tokio::test]
         async fn worktree_detach_accepts_an_archived_owner_and_rejects_a_second_owner() {
             let archived = detach_engine().await;
             create_thread(
@@ -6350,6 +6564,18 @@ mod tests {
             }
         }
 
+        fn detach_owner(command_id: &str, thread_id: &str) -> OrchestrationCommand {
+            OrchestrationCommand::WorktreeDetachResolved {
+                command_id: command_id.to_owned(),
+                project_id: PROJECT_ID.to_owned(),
+                thread_id: thread_id.to_owned(),
+                path: PATH.to_owned(),
+                git_outcome: "not-requested".to_owned(),
+                detail: None,
+                orphan_cleanup_pending: false,
+            }
+        }
+
         async fn create_thread(
             engine: &OrchestrationEngine,
             command_id: &str,
@@ -6382,6 +6608,74 @@ mod tests {
                 })
                 .await
                 .expect("thread");
+        }
+
+        #[cfg(unix)]
+        #[tokio::test]
+        async fn adoption_joins_the_same_physical_workspace_through_a_symlink_alias() {
+            let engine = adoption_engine(TestHooks::default()).await;
+            let root = tempfile::tempdir().expect("physical workspace parent");
+            let physical = root.path().join("physical-worktree");
+            std::fs::create_dir(&physical).expect("physical worktree");
+            let alias = root.path().join("worktree-alias");
+            std::os::unix::fs::symlink(&physical, &alias).expect("worktree alias");
+            let physical = physical.to_string_lossy().into_owned();
+            let alias = alias.to_string_lossy().into_owned();
+            create_thread_at(
+                &engine,
+                "physical-owner-create",
+                "physical-owner",
+                "workspace",
+                &physical,
+            )
+            .await;
+            engine
+                .dispatch(OrchestrationCommand::ProjectMetaUpdate {
+                    command_id: "physical-alias-policy".to_owned(),
+                    project_id: PROJECT_ID.to_owned(),
+                    title: None,
+                    workspace_root: None,
+                    default_model_selection: OptionalNullable::Missing,
+                    scripts: None,
+                    worktree_discovery: Some(json!({
+                        "visibility": "shown",
+                        "initialPromptDismissedAt": "2026-08-09T00:00:00Z",
+                        "baselinePaths": [alias]
+                    })),
+                })
+                .await
+                .expect("alias policy");
+
+            let result = engine
+                .dispatch(OrchestrationCommand::WorktreeAdoptResolved {
+                    command_id: "adopt-physical-alias".to_owned(),
+                    project_id: PROJECT_ID.to_owned(),
+                    worktree_key: "physical-alias-key".to_owned(),
+                    path: alias,
+                    branch: Some("feature/physical".to_owned()),
+                    head: Some("abc1234".to_owned()),
+                    model_selection: json!({"instanceId":"codex","model":"gpt-5"}),
+                    runtime_mode: "full-access".to_owned(),
+                    interaction_mode: "plan".to_owned(),
+                })
+                .await
+                .expect("adopt alias");
+
+            assert_eq!(result.thread_id.as_deref(), Some("physical-owner"));
+            assert_eq!(result.disposition.as_deref(), Some("existing"));
+            assert_eq!(
+                engine
+                    .repositories()
+                    .list_threads_by_project(PROJECT_ID.to_owned())
+                    .await
+                    .expect("threads")
+                    .into_iter()
+                    .filter(|thread| thread.kind == "workspace" && thread.deleted_at.is_none())
+                    .count(),
+                1,
+                "one physical checkout must have one durable workspace owner"
+            );
+            engine.shutdown().await;
         }
 
         async fn replace_adoption_result_metadata(
@@ -6597,10 +6891,10 @@ mod tests {
                 .expect("created adoption");
             replace_adoption_result_metadata(&created, "adopt-legacy-created", None).await;
             created
-                .dispatch(OrchestrationCommand::ThreadDelete {
-                    command_id: "delete-legacy-created-owner".to_owned(),
-                    thread_id: created_result.thread_id.clone().expect("created thread id"),
-                })
+                .dispatch(detach_owner(
+                    "delete-legacy-created-owner",
+                    &created_result.thread_id.clone().expect("created thread id"),
+                ))
                 .await
                 .expect("delete created owner");
             assert_eq!(
@@ -6634,10 +6928,10 @@ mod tests {
                 .expect("restored adoption");
             replace_adoption_result_metadata(&restored, "adopt-legacy-restored", None).await;
             restored
-                .dispatch(OrchestrationCommand::ThreadDelete {
-                    command_id: "delete-legacy-restored-owner".to_owned(),
-                    thread_id: "legacy-restored-owner".to_owned(),
-                })
+                .dispatch(detach_owner(
+                    "delete-legacy-restored-owner",
+                    "legacy-restored-owner",
+                ))
                 .await
                 .expect("delete restored owner");
             assert_eq!(
@@ -6895,10 +7189,7 @@ mod tests {
             assert_eq!(active_result.thread_id.as_deref(), Some("active-owner"));
             assert_eq!(active_result.disposition.as_deref(), Some("existing"));
             active
-                .dispatch(OrchestrationCommand::ThreadDelete {
-                    command_id: "delete-active-owner".to_owned(),
-                    thread_id: "active-owner".to_owned(),
-                })
+                .dispatch(detach_owner("delete-active-owner", "active-owner"))
                 .await
                 .expect("delete accepted owner");
             let events_before_retry = active
@@ -8840,7 +9131,7 @@ mod tests {
             .expect("block the second retarget before its first ownership validation");
         let second_engine = engine.clone();
         let second_target = final_path.clone();
-        let mut second = tokio::spawn(async move {
+        let second = tokio::spawn(async move {
             second_engine
                 .dispatch(
                     serde_json::from_value(json!({
@@ -8867,17 +9158,22 @@ mod tests {
         .expect("removal acquires the new owner path")
         .expect("removal ownership");
         drop(final_blocker);
-        assert!(
-            tokio::time::timeout(Duration::from_millis(100), &mut second)
-                .await
-                .is_err(),
-            "the stale waiter must reload and fence the newly current source path"
-        );
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.workspace_ownership.wait_for_contender(&intermediate),
+        )
+        .await
+        .expect("the stale waiter reloads and fences the newly current source path");
+        assert!(!second.is_finished());
         drop(removal_lease);
         second
             .await
             .expect("second retarget joins")
             .expect("second retarget");
+        let expected_final_path = std::fs::canonicalize(&final_path)
+            .expect("canonical final owner path")
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
             engine
                 .repositories()
@@ -8887,7 +9183,7 @@ mod tests {
                 .expect("thread")
                 .worktree_path
                 .as_deref(),
-            Some(final_path.to_string_lossy().as_ref())
+            Some(expected_final_path.as_str())
         );
         engine.shutdown().await;
     }

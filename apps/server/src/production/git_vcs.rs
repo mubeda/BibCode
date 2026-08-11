@@ -45,7 +45,6 @@ pub const GIT_VCS_UNARY_METHODS: &[&str] = &[
     "vcs.listRefs",
     "vcs.listCommits",
     "vcs.createWorktree",
-    "vcs.removeWorktree",
     "vcs.clone",
     "vcs.createRef",
     "vcs.switchRef",
@@ -68,12 +67,6 @@ pub type CatalogMutationFuture<'a> = Pin<Box<dyn Future<Output = Result<(), Stri
 
 pub trait CatalogMutationObserver: Send + Sync {
     fn note_managed_creation<'a>(
-        &'a self,
-        cwd: &'a Path,
-        path: &'a Path,
-    ) -> CatalogMutationFuture<'a>;
-
-    fn invalidate_after_removal<'a>(
         &'a self,
         cwd: &'a Path,
         path: &'a Path,
@@ -277,26 +270,6 @@ impl GitVcsRpcServices {
                     }
                     Err(error) => Err(serialize_error(error)),
                 }
-            }
-            "vcs.removeWorktree" => {
-                let input: RemoveWorktree = decode(request.payload, "vcs.removeWorktree")?;
-                self.repository
-                    .remove_worktree(
-                        &input.cwd,
-                        &input.path,
-                        input.force.unwrap_or(false),
-                        &cancellation,
-                    )
-                    .await
-                    .map_err(serialize_error)?;
-                if let Some(observer) = &self.catalog_mutation_observer
-                    && let Err(error) = observer
-                        .invalidate_after_removal(&input.cwd, &input.path)
-                        .await
-                {
-                    tracing::warn!(%error, "catalog removal observation failed");
-                }
-                Ok(Value::Null)
             }
             "vcs.clone" => {
                 let input: CloneInput = decode(request.payload, "vcs.clone")?;
@@ -1054,12 +1027,6 @@ struct CreateWorktree {
     new_ref_name: Option<String>,
     base_ref_name: Option<String>,
     path: Option<PathBuf>,
-}
-#[derive(Deserialize)]
-struct RemoveWorktree {
-    cwd: PathBuf,
-    path: PathBuf,
-    force: Option<bool>,
 }
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -2006,13 +1973,11 @@ mod tests {
         )
         .await
         .expect("worktree should create");
-        unary(
-            &services,
-            "vcs.removeWorktree",
-            json!({"cwd":cwd,"path":worktree,"force":true}),
-        )
-        .await
-        .expect("worktree should remove");
+        services
+            .repository
+            .remove_worktree(Path::new(&cwd), &worktree, true, &CancellationToken::new())
+            .await
+            .expect("private repository rollback primitive should remove");
 
         let clone_parent = temporary.path().join("clones");
         tokio::fs::create_dir_all(&clone_parent)

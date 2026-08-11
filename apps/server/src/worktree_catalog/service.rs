@@ -1,5 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
+    ffi::OsString,
     future::Future,
     hash::{DefaultHasher, Hash, Hasher},
     path::{Path, PathBuf},
@@ -274,6 +275,7 @@ struct RepositoryState {
     last_result_lifecycle_epoch: Option<u64>,
     lifecycle_epoch: u64,
     subscribers: usize,
+    active_users: usize,
     scan_cancellation: CancellationToken,
 }
 
@@ -286,6 +288,7 @@ impl Default for RepositoryState {
             last_result_lifecycle_epoch: None,
             lifecycle_epoch: 0,
             subscribers: 0,
+            active_users: 0,
             scan_cancellation: CancellationToken::new(),
         }
     }
@@ -304,6 +307,7 @@ struct EntryState {
     next_mutation_refresh_worker_id: u64,
     lifecycle_epoch: u64,
     subscribers: usize,
+    unary_users: usize,
     suppressions: HashMap<String, Instant>,
     shallow_signature: Option<CatalogShallowSignature>,
     poller: Option<OwnedTask>,
@@ -315,6 +319,12 @@ struct EntryState {
 
 pub struct CatalogSubscription {
     receiver: watch::Receiver<Arc<WorktreeCatalogSnapshot>>,
+    service: WorktreeCatalogService,
+    entry: Arc<CatalogEntry>,
+    released: bool,
+}
+
+struct CatalogActiveUser {
     service: WorktreeCatalogService,
     entry: Arc<CatalogEntry>,
     released: bool,
@@ -400,10 +410,17 @@ struct CatalogAnchor {
     is_primary: bool,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct TrustedRepositoryAnchor {
+    pub path: PathBuf,
+    pub repository_key: String,
+}
+
 #[derive(Clone, Copy)]
 struct RefreshFence {
     mutation_epoch: u64,
     lifecycle_epoch: Option<u64>,
+    requires_subscriber: bool,
 }
 
 impl From<CatalogError> for ScanError {
@@ -648,18 +665,19 @@ impl WorktreeCatalogService {
             eviction.cancellation.cancel();
         }
         let first_subscriber = state.subscribers == 0;
-        if first_subscriber {
+        if state.subscribers + state.unary_users == 0 {
             state.lifecycle_epoch = state.lifecycle_epoch.wrapping_add(1);
             state.scan_cancellation = self.inner.shutdown.child_token();
         }
         let lifecycle_epoch = state.lifecycle_epoch;
         state.subscribers += 1;
         let mut repository_state = lock(&entry.repository.state);
-        if repository_state.subscribers == 0 {
+        if repository_state.active_users == 0 {
             repository_state.lifecycle_epoch = repository_state.lifecycle_epoch.wrapping_add(1);
             repository_state.scan_cancellation = self.inner.shutdown.child_token();
         }
         repository_state.subscribers += 1;
+        repository_state.active_users += 1;
         let receiver = state.sender.subscribe();
         drop(repository_state);
         drop(state);
@@ -674,6 +692,57 @@ impl WorktreeCatalogService {
         })
     }
 
+    async fn acquire_active_user(
+        &self,
+        project_id: &str,
+    ) -> Result<CatalogActiveUser, CatalogError> {
+        loop {
+            let entry = self.ensure_entry(project_id).await?;
+            if let Some(user) = self.reserve_active_user(project_id, entry) {
+                return Ok(user);
+            }
+        }
+    }
+
+    fn reserve_active_user(
+        &self,
+        project_id: &str,
+        entry: Arc<CatalogEntry>,
+    ) -> Option<CatalogActiveUser> {
+        let registry = lock(&self.inner.registry);
+        if self.inner.shutdown.is_cancelled()
+            || !registry
+                .entries
+                .get(project_id)
+                .is_some_and(|candidate| Arc::ptr_eq(candidate, &entry))
+        {
+            return None;
+        }
+        let mut state = lock(&entry.state);
+        if let Some(eviction) = state.eviction.take() {
+            eviction.cancellation.cancel();
+        }
+        if state.subscribers + state.unary_users == 0 {
+            state.lifecycle_epoch = state.lifecycle_epoch.wrapping_add(1);
+            state.scan_cancellation = self.inner.shutdown.child_token();
+        }
+        state.unary_users += 1;
+        let mut repository_state = lock(&entry.repository.state);
+        if repository_state.active_users == 0 {
+            repository_state.lifecycle_epoch = repository_state.lifecycle_epoch.wrapping_add(1);
+            repository_state.scan_cancellation = self.inner.shutdown.child_token();
+        }
+        repository_state.active_users += 1;
+        drop(repository_state);
+        drop(state);
+        drop(registry);
+        Some(CatalogActiveUser {
+            service: self.clone(),
+            entry,
+            released: false,
+        })
+    }
+
     pub async fn refresh(
         &self,
         project_id: &str,
@@ -682,8 +751,9 @@ impl WorktreeCatalogService {
         if self.inner.shutdown.is_cancelled() {
             return Err(shutdown_error());
         }
-        let entry = self.ensure_entry(project_id).await?;
-        self.refresh_entry(project_id, &entry, trigger, None).await
+        let user = self.acquire_active_user(project_id).await?;
+        self.refresh_entry(project_id, &user.entry, trigger, None)
+            .await
     }
 
     pub(crate) fn set_healthy_snapshot_observer(
@@ -729,7 +799,13 @@ impl WorktreeCatalogService {
         ownership: Option<RefreshOwnership>,
     ) -> Result<Arc<WorktreeCatalogSnapshot>, CatalogError> {
         let requested_at = Instant::now();
-        let (completed_refreshes, cancellation, subscriber_owned, lifecycle_epoch) = {
+        let (
+            completed_refreshes,
+            cancellation,
+            lifecycle_owned,
+            lifecycle_epoch,
+            requires_subscriber,
+        ) = {
             let state = lock(&entry.state);
             if let Some(ownership) = ownership.as_ref() {
                 if state.lifecycle_epoch != ownership.lifecycle_epoch
@@ -743,10 +819,11 @@ impl WorktreeCatalogService {
                     ownership.cancellation.clone(),
                     true,
                     Some(ownership.lifecycle_epoch),
+                    true,
                 )
             } else {
-                let subscriber_owned = state.subscribers != 0;
-                let cancellation = if subscriber_owned {
+                let lifecycle_owned = state.subscribers + state.unary_users != 0;
+                let cancellation = if lifecycle_owned {
                     state.scan_cancellation.clone()
                 } else {
                     self.inner.shutdown.child_token()
@@ -754,8 +831,9 @@ impl WorktreeCatalogService {
                 (
                     state.completed_refreshes,
                     cancellation,
-                    subscriber_owned,
-                    subscriber_owned.then_some(state.lifecycle_epoch),
+                    lifecycle_owned,
+                    lifecycle_owned.then_some(state.lifecycle_epoch),
+                    false,
                 )
             }
         };
@@ -769,9 +847,9 @@ impl WorktreeCatalogService {
         }
         {
             let state = lock(&entry.state);
-            if lifecycle_epoch
-                .is_some_and(|epoch| epoch != state.lifecycle_epoch || state.subscribers == 0)
-            {
+            if lifecycle_epoch.is_some_and(|epoch| {
+                epoch != state.lifecycle_epoch || lifecycle_inactive(&state, requires_subscriber)
+            }) {
                 return Err(cancelled_error());
             }
             if state.completed_refreshes != completed_refreshes {
@@ -805,9 +883,9 @@ impl WorktreeCatalogService {
         }
         let (fence, next_generation, suppressions, previous) = {
             let mut state = lock(&entry.state);
-            if lifecycle_epoch
-                .is_some_and(|epoch| epoch != state.lifecycle_epoch || state.subscribers == 0)
-                || cancellation.is_cancelled()
+            if lifecycle_epoch.is_some_and(|epoch| {
+                epoch != state.lifecycle_epoch || lifecycle_inactive(&state, requires_subscriber)
+            }) || cancellation.is_cancelled()
             {
                 return Err(cancelled_error());
             }
@@ -825,6 +903,7 @@ impl WorktreeCatalogService {
                 RefreshFence {
                     mutation_epoch: state.mutation_epoch,
                     lifecycle_epoch,
+                    requires_subscriber,
                 },
                 state.last_authoritative.generation + 1,
                 state.suppressions.keys().cloned().collect::<HashSet<_>>(),
@@ -897,16 +976,17 @@ impl WorktreeCatalogService {
         };
         {
             let mut state = lock(&entry.state);
-            if fence
-                .lifecycle_epoch
-                .is_some_and(|epoch| epoch != state.lifecycle_epoch || state.subscribers == 0)
-            {
+            if fence.lifecycle_epoch.is_some_and(|epoch| {
+                epoch != state.lifecycle_epoch || lifecycle_inactive(&state, requires_subscriber)
+            }) {
                 return Err(cancelled_error());
             }
             if state.mutation_epoch != fence.mutation_epoch {
                 return Self::complete_stale_generation(&mut state);
             }
-            if subscriber_owned && (state.subscribers == 0 || cancellation.is_cancelled()) {
+            if lifecycle_owned
+                && (lifecycle_inactive(&state, requires_subscriber) || cancellation.is_cancelled())
+            {
                 let error = cancelled_error();
                 state.completed_at = None;
                 state.completed_refreshes = state.completed_refreshes.wrapping_add(1);
@@ -922,16 +1002,17 @@ impl WorktreeCatalogService {
         reconciliation.wait_for_drains().await;
         let transitions = {
             let mut state = lock(&entry.state);
-            if fence
-                .lifecycle_epoch
-                .is_some_and(|epoch| epoch != state.lifecycle_epoch || state.subscribers == 0)
-            {
+            if fence.lifecycle_epoch.is_some_and(|epoch| {
+                epoch != state.lifecycle_epoch || lifecycle_inactive(&state, requires_subscriber)
+            }) {
                 return Err(cancelled_error());
             }
             if state.mutation_epoch != fence.mutation_epoch {
                 return Self::complete_stale_generation(&mut state);
             }
-            if subscriber_owned && (state.subscribers == 0 || cancellation.is_cancelled()) {
+            if lifecycle_owned
+                && (lifecycle_inactive(&state, requires_subscriber) || cancellation.is_cancelled())
+            {
                 let error = cancelled_error();
                 state.completed_at = None;
                 state.completed_refreshes = state.completed_refreshes.wrapping_add(1);
@@ -959,7 +1040,10 @@ impl WorktreeCatalogService {
 
     pub async fn latest(&self, project_id: &str) -> Option<Arc<WorktreeCatalogSnapshot>> {
         let entry = self.entry_for_project(project_id)?;
-        Some(Arc::clone(&lock(&entry.state).snapshot))
+        let user = self.reserve_active_user(project_id, entry)?;
+        let snapshot = Arc::clone(&lock(&user.entry.state).snapshot);
+        drop(user);
+        Some(snapshot)
     }
 
     /// Revalidates a catalog candidate against live Git membership and filesystem presence.
@@ -971,13 +1055,17 @@ impl WorktreeCatalogService {
         project_id: &str,
         candidate_key: &str,
     ) -> Result<ResolvedAdoptionCandidate, AdoptionValidationError> {
-        let entry = self.ensure_entry(project_id).await.map_err(|error| {
-            AdoptionValidationError::new(
-                AdoptionValidationErrorReason::CatalogUnavailable,
-                error.message,
-                None,
-            )
-        })?;
+        let user = self
+            .acquire_active_user(project_id)
+            .await
+            .map_err(|error| {
+                AdoptionValidationError::new(
+                    AdoptionValidationErrorReason::CatalogUnavailable,
+                    error.message,
+                    None,
+                )
+            })?;
+        let entry = &user.entry;
         let snapshot = Arc::clone(&lock(&entry.state).snapshot);
         let generation = snapshot.generation;
         let descriptor = snapshot
@@ -1143,9 +1231,11 @@ impl WorktreeCatalogService {
                 mutation_tasks.extend(state.mutation_refresh_worker.take());
                 state.pending_mutation_refresh_epoch = None;
                 state.subscribers = 0;
+                state.unary_users = 0;
                 let mut repository_state = lock(&entry.repository.state);
                 repository_state.scan_cancellation.cancel();
                 repository_state.subscribers = 0;
+                repository_state.active_users = 0;
             }
             registry.aliases.clear();
             registry.entries.clear();
@@ -1348,7 +1438,11 @@ impl WorktreeCatalogService {
         let Some(entry) = self.entry_for_project(project_id) else {
             return;
         };
-        let path = normalize_worktree_path_key(path, host_path_platform());
+        let cancellation = self.inner.shutdown.child_token();
+        let path = self
+            .physical_path_key(path, &cancellation)
+            .await
+            .unwrap_or_else(|_| normalize_worktree_path_key(path, host_path_platform()));
         lock(&entry.state).suppressions.insert(path, Instant::now());
     }
 
@@ -1572,6 +1666,7 @@ impl WorktreeCatalogService {
                     next_mutation_refresh_worker_id: 0,
                     lifecycle_epoch: 0,
                     subscribers: 0,
+                    unary_users: 0,
                     suppressions: HashMap::new(),
                     shallow_signature: None,
                     poller: None,
@@ -1587,6 +1682,7 @@ impl WorktreeCatalogService {
             registry
                 .aliases
                 .insert(project_id.to_owned(), scan.repository_key);
+            self.schedule_idle_eviction(&entry, false);
             Ok((entry, transitions))
         }
         .await;
@@ -1673,6 +1769,82 @@ impl WorktreeCatalogService {
             }));
         }
         Ok(None)
+    }
+
+    pub(crate) async fn resolve_trusted_repository_anchor(
+        &self,
+        project_id: &str,
+        excluded_path: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<TrustedRepositoryAnchor, CatalogError> {
+        let user = self.acquire_active_user(project_id).await?;
+        let entry = &user.entry;
+        let project = self.load_project(project_id).await?;
+        let pinned_repository_key = project.repository_key.clone().ok_or_else(|| {
+            CatalogError::new(
+                CatalogErrorReason::RepositoryUnavailable,
+                "Removal requires a durable repository identity established by the catalog.",
+            )
+        })?;
+        let excluded_key = self
+            .physical_path_key(excluded_path, cancellation)
+            .await
+            .map_err(scan_error_for_bootstrap)?;
+        let mut candidates = Vec::new();
+        candidates.push(project.workspace_root.clone());
+        candidates
+            .extend(canonical_threads(&project).filter_map(|thread| thread.worktree_path.clone()));
+        candidates.push(entry.repository.common_dir.clone());
+        let mut anchor = None;
+        for candidate in candidates {
+            if self
+                .physical_path_key(&candidate, cancellation)
+                .await
+                .map_err(scan_error_for_bootstrap)?
+                == excluded_key
+            {
+                continue;
+            }
+            if self
+                .probe(&candidate, cancellation)
+                .await
+                .map_err(scan_error_for_bootstrap)?
+                == DirectoryProbeState::Present
+            {
+                anchor = Some(CatalogAnchor {
+                    is_primary: candidate == project.workspace_root,
+                    path: candidate,
+                });
+                break;
+            }
+        }
+        let anchor = anchor.ok_or_else(|| {
+            CatalogError::new(
+                CatalogErrorReason::RepositoryUnavailable,
+                "No reachable trusted Git anchor is available for removal.",
+            )
+        })?;
+        let observation = self
+            .observe(
+                anchor.path.clone(),
+                Some(&pinned_repository_key),
+                cancellation.clone(),
+            )
+            .await
+            .map_err(scan_error_for_bootstrap)?;
+        let current_project = self.load_project(project_id).await?;
+        if current_project.repository_key.as_deref() != Some(pinned_repository_key.as_str())
+            || observation.repository_key != pinned_repository_key
+        {
+            return Err(CatalogError::new(
+                CatalogErrorReason::RepositoryUnavailable,
+                "The project's durable repository identity changed while resolving its removal anchor.",
+            ));
+        }
+        Ok(TrustedRepositoryAnchor {
+            path: anchor.path,
+            repository_key: pinned_repository_key,
+        })
     }
 
     async fn verify_or_establish_repository_key(
@@ -1870,7 +2042,7 @@ impl WorktreeCatalogService {
                     )))
                 });
             }
-            (state.subscribers != 0).then(|| state.scan_cancellation.clone())
+            (state.active_users != 0).then(|| state.scan_cancellation.clone())
         };
         let repository_owned = repository_cancellation.is_some();
         let cancellation = repository_cancellation.unwrap_or_else(|| caller_cancellation.clone());
@@ -1928,6 +2100,56 @@ impl WorktreeCatalogService {
         }
     }
 
+    async fn physical_path_key(
+        &self,
+        path: &Path,
+        cancellation: &CancellationToken,
+    ) -> Result<String, ScanError> {
+        let lexical = PathBuf::from(normalize_worktree_path_key(path, host_path_platform()));
+        let absolute = if lexical.is_absolute() {
+            lexical
+        } else {
+            std::env::current_dir()
+                .map_err(|error| physical_identity_error(path, error))?
+                .join(lexical)
+        };
+        let mut ancestor = absolute.as_path();
+        let mut missing = Vec::<OsString>::new();
+        loop {
+            let result = tokio::select! {
+                _ = cancellation.cancelled() => return Err(ScanError::Cancelled),
+                result = self.inner.filesystem.canonicalize(ancestor.to_path_buf()) => result,
+            };
+            match result {
+                Ok(mut canonical) => {
+                    for component in missing.iter().rev() {
+                        canonical.push(component);
+                    }
+                    return Ok(normalize_worktree_path_key(
+                        &canonical,
+                        host_path_platform(),
+                    ));
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    let component = ancestor
+                        .file_name()
+                        .ok_or_else(|| physical_identity_error(path, error))?;
+                    missing.push(component.to_os_string());
+                    ancestor = ancestor.parent().ok_or_else(|| {
+                        physical_identity_error(
+                            path,
+                            std::io::Error::new(
+                                std::io::ErrorKind::NotFound,
+                                "workspace path has no existing ancestor",
+                            ),
+                        )
+                    })?;
+                }
+                Err(error) => return Err(physical_identity_error(path, error)),
+            }
+        }
+    }
+
     async fn join_snapshot(
         &self,
         project: &CatalogProject,
@@ -1947,7 +2169,7 @@ impl WorktreeCatalogService {
         for thread in canonical_threads(project) {
             if let Some(path) = &thread.worktree_path {
                 thread_paths
-                    .entry(normalize_worktree_path_key(path, platform))
+                    .entry(self.physical_path_key(path, cancellation).await?)
                     .or_default()
                     .push(thread);
             }
@@ -1994,21 +2216,13 @@ impl WorktreeCatalogService {
             } else {
                 None
             };
-            let normalized_path = normalize_worktree_path_key(
-                resolved_path.as_deref().unwrap_or(record.path.as_path()),
-                platform,
-            );
-            let reported_path = normalize_worktree_path_key(&record.path, platform);
-            let record_worktree_key = worktree_key(
-                common_dir,
-                resolved_path.as_deref().unwrap_or(record.path.as_path()),
-                platform,
-            )
-            .as_str()
-            .to_owned();
+            let normalized_path = self.physical_path_key(&record.path, cancellation).await?;
+            let record_worktree_key =
+                worktree_key(common_dir, Path::new(&normalized_path), platform)
+                    .as_str()
+                    .to_owned();
             let owner = thread_paths
                 .get(&normalized_path)
-                .or_else(|| thread_paths.get(&reported_path))
                 .and_then(|threads| threads.first())
                 .copied()
                 .or_else(|| {
@@ -2072,7 +2286,7 @@ impl WorktreeCatalogService {
             let Some(path) = &thread.worktree_path else {
                 continue;
             };
-            let normalized = normalize_worktree_path_key(path, platform);
+            let normalized = self.physical_path_key(path, cancellation).await?;
             let descriptor = worktrees.iter().find(|descriptor| {
                 descriptor.adopted_thread_id.as_deref() == Some(thread.thread_id.as_str())
                     || descriptor.path == normalized
@@ -2167,10 +2381,9 @@ impl WorktreeCatalogService {
         failure: ScanFailure,
     ) -> Result<Arc<WorktreeCatalogSnapshot>, CatalogError> {
         let mut state = lock(&entry.state);
-        if fence
-            .lifecycle_epoch
-            .is_some_and(|epoch| epoch != state.lifecycle_epoch || state.subscribers == 0)
-        {
+        if fence.lifecycle_epoch.is_some_and(|epoch| {
+            epoch != state.lifecycle_epoch || lifecycle_inactive(&state, fence.requires_subscriber)
+        }) {
             return Err(cancelled_error());
         }
         if state.mutation_epoch != fence.mutation_epoch {
@@ -2211,10 +2424,9 @@ impl WorktreeCatalogService {
         error: &CatalogError,
     ) -> Result<(), CatalogError> {
         let mut state = lock(&entry.state);
-        if fence
-            .lifecycle_epoch
-            .is_some_and(|epoch| epoch != state.lifecycle_epoch || state.subscribers == 0)
-        {
+        if fence.lifecycle_epoch.is_some_and(|epoch| {
+            epoch != state.lifecycle_epoch || lifecycle_inactive(&state, fence.requires_subscriber)
+        }) {
             return Err(cancelled_error());
         }
         if state.mutation_epoch != fence.mutation_epoch {
@@ -2249,10 +2461,9 @@ impl WorktreeCatalogService {
     ) -> Result<Arc<WorktreeCatalogSnapshot>, CatalogError> {
         let error = cancelled_error();
         let mut state = lock(&entry.state);
-        if fence
-            .lifecycle_epoch
-            .is_some_and(|epoch| epoch != state.lifecycle_epoch || state.subscribers == 0)
-        {
+        if fence.lifecycle_epoch.is_some_and(|epoch| {
+            epoch != state.lifecycle_epoch || lifecycle_inactive(&state, fence.requires_subscriber)
+        }) {
             return Err(error);
         }
         if state.mutation_epoch != fence.mutation_epoch {
@@ -2444,7 +2655,7 @@ impl WorktreeCatalogService {
         }
     }
 
-    fn release(&self, entry: &Arc<CatalogEntry>) {
+    fn release_subscription(&self, entry: &Arc<CatalogEntry>) {
         let should_evict = {
             let mut state = lock(&entry.state);
             if state.subscribers == 0 {
@@ -2458,26 +2669,62 @@ impl WorktreeCatalogService {
                 }
                 state.pending_mutation_refresh_epoch = None;
                 state.mutation_refresh_worker.take();
-                state.scan_cancellation.cancel();
                 state.completed_at = None;
+            }
+            let final_active_user = state.subscribers + state.unary_users == 0;
+            if final_active_user {
+                state.scan_cancellation.cancel();
             }
             #[cfg(test)]
             self.pause_final_release_for_test(final_subscriber);
             let mut repository_state = lock(&entry.repository.state);
             repository_state.subscribers = repository_state.subscribers.saturating_sub(1);
-            if repository_state.subscribers == 0 {
+            repository_state.active_users = repository_state.active_users.saturating_sub(1);
+            if repository_state.active_users == 0 {
                 repository_state.scan_cancellation.cancel();
             }
-            final_subscriber
+            final_active_user
         };
         if !should_evict {
             return;
         }
+        self.schedule_idle_eviction(entry, true);
+    }
+
+    fn release_active_user(&self, entry: &Arc<CatalogEntry>) {
+        let should_evict = {
+            let mut state = lock(&entry.state);
+            if state.unary_users == 0 {
+                return;
+            }
+            state.unary_users -= 1;
+            let final_active_user = state.subscribers + state.unary_users == 0;
+            if final_active_user {
+                state.scan_cancellation.cancel();
+                state.completed_at = None;
+            }
+            let mut repository_state = lock(&entry.repository.state);
+            repository_state.active_users = repository_state.active_users.saturating_sub(1);
+            if repository_state.active_users == 0 {
+                repository_state.scan_cancellation.cancel();
+            }
+            final_active_user
+        };
+        if should_evict {
+            self.schedule_idle_eviction(entry, true);
+        }
+    }
+
+    fn schedule_idle_eviction(&self, entry: &Arc<CatalogEntry>, released_user: bool) {
+        #[cfg(not(test))]
+        let _ = released_user;
         if self.inner.shutdown.is_cancelled() {
             return;
         }
         #[cfg(test)]
-        self.pause_eviction_registration_for_test();
+        if released_user {
+            self.pause_eviction_registration_for_test();
+        }
         let cancellation = self.inner.shutdown.child_token();
         let task_cancellation = cancellation.clone();
         let weak_inner = Arc::downgrade(&self.inner);
@@ -2485,7 +2732,7 @@ impl WorktreeCatalogService {
         let project_id = entry.project_id.clone();
         let idle_eviction = self.inner.options.idle_eviction;
         let mut state = lock(&entry.state);
-        if state.subscribers != 0 {
+        if state.subscribers + state.unary_users != 0 {
             return;
         }
         let _ = self.register_lifecycle_task(
@@ -2504,9 +2751,11 @@ impl WorktreeCatalogService {
                     .get(&project_id)
                     .is_some_and(|candidate| Arc::ptr_eq(candidate, &entry))
                 {
-                    if lock(&entry.state).subscribers != 0 {
+                    let state = lock(&entry.state);
+                    if state.subscribers + state.unary_users != 0 {
                         return;
                     }
+                    drop(state);
                     registry.entries.remove(&project_id);
                     registry.aliases.remove(&project_id);
                     registry.bootstrap_locks.remove(&project_id);
@@ -2514,9 +2763,11 @@ impl WorktreeCatalogService {
             },
             |handle| {
                 #[cfg(test)]
-                self.inner
-                    .eviction_task_registrations
-                    .fetch_add(1, Ordering::SeqCst);
+                if released_user {
+                    self.inner
+                        .eviction_task_registrations
+                        .fetch_add(1, Ordering::SeqCst);
+                }
                 state.eviction = Some(OwnedTask {
                     cancellation,
                     handle,
@@ -2722,7 +2973,16 @@ impl SubscriptionReservation {
 impl Drop for SubscriptionReservation {
     fn drop(&mut self) {
         if !self.committed {
-            self.service.release(&self.entry);
+            self.service.release_subscription(&self.entry);
+        }
+    }
+}
+
+impl Drop for CatalogActiveUser {
+    fn drop(&mut self) {
+        if !self.released {
+            self.released = true;
+            self.service.release_active_user(&self.entry);
         }
     }
 }
@@ -2751,7 +3011,7 @@ impl Drop for CatalogSubscription {
     fn drop(&mut self) {
         if !self.released {
             self.released = true;
-            self.service.release(&self.entry);
+            self.service.release_subscription(&self.entry);
         }
     }
 }
@@ -2798,7 +3058,7 @@ fn scan_error_for_bootstrap(error: ScanError) -> CatalogError {
 fn cancelled_error() -> CatalogError {
     CatalogError::new(
         CatalogErrorReason::RepositoryUnavailable,
-        "Catalog work was cancelled after its final subscriber detached.",
+        "Catalog work was cancelled after its final active user detached.",
     )
 }
 
@@ -2821,6 +3081,14 @@ fn retained_snapshot(
         scan_status,
         worktrees: authoritative.worktrees.clone(),
         adopted_workspaces: authoritative.adopted_workspaces.clone(),
+    }
+}
+
+fn lifecycle_inactive(state: &EntryState, requires_subscriber: bool) -> bool {
+    if requires_subscriber {
+        state.subscribers == 0
+    } else {
+        state.subscribers + state.unary_users == 0
     }
 }
 
@@ -2986,6 +3254,16 @@ fn degraded_reason(detail: &str) -> CatalogDegradedReason {
     } else {
         CatalogDegradedReason::GitFailed
     }
+}
+
+fn physical_identity_error(path: &Path, error: std::io::Error) -> ScanError {
+    ScanError::Catalog(CatalogError::new(
+        CatalogErrorReason::Internal,
+        format!(
+            "Failed to resolve physical workspace identity for {}: {error}",
+            path.display()
+        ),
+    ))
 }
 
 pub(super) struct TokioCatalogFileSystem;

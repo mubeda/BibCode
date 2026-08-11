@@ -86,13 +86,15 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "vcs.generateCommitMessage"
         | "vcs.init"
         | "vcs.pull"
-        | "vcs.removeWorktree"
         | "vcs.stageFiles"
         | "vcs.switchRef"
         | "vcs.unstageFiles" => Some(SCOPE_ORCHESTRATION_OPERATE),
         "worktree.adopt"
+        | "worktree.createManaged"
+        | "worktree.createPanel"
         | "worktree.remove"
         | "worktree.removeFromBibCode"
+        | "worktree.retarget"
         | "worktree.updateDiscoveryPolicy" => Some(SCOPE_ORCHESTRATION_OPERATE),
         "terminal.attach"
         | "terminal.clear"

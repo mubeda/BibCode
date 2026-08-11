@@ -16,7 +16,7 @@ use crate::{
     orchestration::{
         CommandAdmission, NewProviderTurnDelivery, OrchestrationCommand, OrchestrationEngine,
         OrchestrationError, canonical_command_digest,
-        engine::{CommandLifetimeGuard, TurnDeliveryResolutionAction},
+        engine::{CommandLifetimeGuard, OptionalNullable, TurnDeliveryResolutionAction},
         load_snapshot,
     },
     persistence::{OrchestrationEvent, ProjectionThread},
@@ -118,14 +118,9 @@ fn register_orchestration_rpc_inner(
         async move {
             let payload_digest = canonical_command_digest(&request.payload)
                 .map_err(|error| invalid_request(&request.tag, error))?;
-            let command = serde_json::from_value::<OrchestrationCommand>(request.payload)
-                .map_err(|error| invalid_request(&request.tag, error.to_string()))?;
-            if command.is_server_internal() {
-                return Err(invalid_request(
-                    &request.tag,
-                    "server-internal orchestration commands cannot be dispatched by clients",
-                ));
-            }
+            let command = decode_public_orchestration_command(&dispatch, request.payload)
+                .await
+                .map_err(|error| invalid_request(&request.tag, error))?;
             let command_claim = dispatch
                 .acquire_command_admission(command.command_id())
                 .await
@@ -204,6 +199,130 @@ fn register_orchestration_rpc_inner(
         "orchestration.subscribeThread",
         move |request, cancellation| thread_stream(engine.clone(), request, cancellation),
     );
+}
+
+/// Decodes the public orchestration wire shape and resolves the small amount of
+/// server-owned context that ordinary commands need. Worktree policy, identity,
+/// lifecycle kind, and adopted-owner deletion are deliberately not part of this
+/// generic ingress.
+pub(crate) async fn decode_public_orchestration_command(
+    engine: &OrchestrationEngine,
+    payload: Value,
+) -> Result<OrchestrationCommand, String> {
+    let supplied_prepare_cwd = payload
+        .get("bootstrap")
+        .and_then(|bootstrap| bootstrap.get("prepareWorktree"))
+        .and_then(Value::as_object)
+        .is_some_and(|prepare| prepare.contains_key("projectCwd"));
+    let mut command = serde_json::from_value::<OrchestrationCommand>(payload)
+        .map_err(|error| error.to_string())?;
+    if command.is_server_internal() {
+        return Err(
+            "server-internal orchestration commands cannot be dispatched by clients".to_owned(),
+        );
+    }
+
+    const DEDICATED_AUTHORITY: &str = "worktree authority requires a dedicated server-resolved RPC";
+    match &command {
+        OrchestrationCommand::ProjectMetaUpdate {
+            worktree_discovery: Some(_),
+            ..
+        }
+        | OrchestrationCommand::ThreadCreate { kind: Some(_), .. }
+        | OrchestrationCommand::ThreadCreate {
+            worktree_path: Some(_),
+            ..
+        }
+        | OrchestrationCommand::ThreadMetaUpdate {
+            worktree_path: OptionalNullable::Present(_),
+            ..
+        } => return Err(DEDICATED_AUTHORITY.to_owned()),
+        OrchestrationCommand::ThreadTurnStart {
+            bootstrap: Some(bootstrap),
+            ..
+        } if supplied_prepare_cwd
+            || bootstrap
+                .create_thread
+                .as_ref()
+                .is_some_and(|create| create.worktree_path.is_some()) =>
+        {
+            return Err(DEDICATED_AUTHORITY.to_owned());
+        }
+        OrchestrationCommand::ThreadDelete { thread_id, .. } => {
+            if engine
+                .repositories()
+                .get_thread(thread_id.clone())
+                .await
+                .map_err(|error| error.to_string())?
+                .is_some_and(|thread| {
+                    thread.deleted_at.is_none()
+                        && thread.kind == "workspace"
+                        && thread.worktree_path.is_some()
+                })
+            {
+                return Err(DEDICATED_AUTHORITY.to_owned());
+            }
+        }
+        OrchestrationCommand::ProjectDelete { project_id, .. }
+            if engine
+                .repositories()
+                .list_threads_by_project(project_id.clone())
+                .await
+                .map_err(|error| error.to_string())?
+                .into_iter()
+                .any(|thread| {
+                    thread.deleted_at.is_none()
+                        && thread.kind == "workspace"
+                        && thread.worktree_path.is_some()
+                }) =>
+        {
+            return Err(DEDICATED_AUTHORITY.to_owned());
+        }
+        _ => {}
+    }
+
+    if let OrchestrationCommand::ThreadCreate {
+        project_id, kind, ..
+    } = &mut command
+    {
+        let has_default = engine
+            .repositories()
+            .list_threads_by_project(project_id.clone())
+            .await
+            .map_err(|error| error.to_string())?
+            .into_iter()
+            .any(|thread| thread.deleted_at.is_none() && thread.kind == "default");
+        *kind = Some(if has_default { "workspace" } else { "default" }.to_owned());
+    }
+
+    if let OrchestrationCommand::ThreadTurnStart {
+        thread_id,
+        bootstrap: Some(bootstrap),
+        ..
+    } = &mut command
+        && let Some(prepare) = bootstrap.prepare_worktree.as_mut()
+    {
+        let project_id = if let Some(create) = bootstrap.create_thread.as_ref() {
+            create.project_id.clone()
+        } else {
+            engine
+                .repositories()
+                .get_thread(thread_id.clone())
+                .await
+                .map_err(|error| error.to_string())?
+                .ok_or_else(|| format!("thread '{thread_id}' does not exist"))?
+                .project_id
+        };
+        prepare.project_cwd = engine
+            .repositories()
+            .get_project(project_id.clone())
+            .await
+            .map_err(|error| error.to_string())?
+            .filter(|project| project.deleted_at.is_none())
+            .ok_or_else(|| format!("project '{project_id}' does not exist"))?
+            .workspace_root;
+    }
+    Ok(command)
 }
 
 async fn dispatch_prepared_command(
