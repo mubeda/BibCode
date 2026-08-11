@@ -6482,7 +6482,7 @@ async fn rejected_unknown_option_keeps_the_existing_session() {
 }
 
 #[tokio::test]
-async fn rejected_metadata_rpc_does_not_persist_selection_or_receipt() {
+async fn rejected_metadata_rpc_keeps_selection_and_leaves_exact_receipt_resumable() {
     let engine = engine().await;
     let state = Arc::new(StdMutex::new(DriverState {
         set_options_results: VecDeque::from([
@@ -6528,21 +6528,17 @@ async fn rejected_metadata_rpc_does_not_persist_selection_or_receipt() {
         .await
         .unwrap();
 
-    rpc_request(
-        &mut socket,
-        "901",
-        json!({
-            "type":"thread.meta.update",
-            "commandId":"reject-made-up-rpc",
-            "threadId":"t1",
-            "modelSelection":{
-                "instanceId":"codex",
-                "model":"gpt-5",
-                "options":[{"id":"madeUpMode","value":true}]
-            }
-        }),
-    )
-    .await;
+    let command = json!({
+        "type":"thread.meta.update",
+        "commandId":"reject-made-up-rpc",
+        "threadId":"t1",
+        "modelSelection":{
+            "instanceId":"codex",
+            "model":"gpt-5",
+            "options":[{"id":"madeUpMode","value":true}]
+        }
+    });
+    rpc_request(&mut socket, "901", command.clone()).await;
     rpc_response(&mut socket, "901")
         .await
         .expect_err("rejected live option must reject the metadata RPC");
@@ -6557,15 +6553,27 @@ async fn rejected_metadata_rpc_does_not_persist_selection_or_receipt() {
         thread.model_selection,
         json!({"instanceId":"codex","model":"gpt-5"})
     );
-    assert!(
-        engine
-            .repositories()
-            .get_command_receipt("reject-made-up-rpc".to_owned())
-            .await
-            .unwrap()
-            .is_none(),
-        "a rejected live selection must not have an accepted receipt"
-    );
+    let reserved = engine
+        .repositories()
+        .get_command_receipt("reject-made-up-rpc".to_owned())
+        .await
+        .unwrap()
+        .expect("provider rejection leaves an exact reservation");
+    assert_eq!(reserved.status, "reserved");
+    assert!(reserved.payload_digest.is_some());
+
+    rpc_request(&mut socket, "902", command).await;
+    rpc_response(&mut socket, "902")
+        .await
+        .expect("same-payload retry resumes the provider mutation");
+    let accepted = engine
+        .repositories()
+        .get_command_receipt("reject-made-up-rpc".to_owned())
+        .await
+        .unwrap()
+        .expect("resumed command has a durable receipt");
+    assert_eq!(accepted.status, "accepted");
+    assert_eq!(accepted.payload_digest, reserved.payload_digest);
 
     socket.close(None).await.unwrap();
     handle.shutdown();
