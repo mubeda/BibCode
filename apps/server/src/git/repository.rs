@@ -47,10 +47,10 @@ struct GitExecutionOptions {
     output_policy: OutputPolicy,
 }
 
-type BoxGitProcessFuture<'a> =
+pub(crate) type BoxGitProcessFuture<'a> =
     Pin<Box<dyn Future<Output = Result<ProcessOutput, ProcessError>> + Send + 'a>>;
 
-trait GitProcessRunner: Send + Sync {
+pub(crate) trait GitProcessRunner: Send + Sync {
     fn run<'a>(
         &'a self,
         request: ProcessRequest,
@@ -192,7 +192,7 @@ impl GitRepository {
     }
 
     #[cfg(test)]
-    fn with_runner_for_test(runner: Arc<dyn GitProcessRunner>) -> Self {
+    pub(crate) fn with_runner_for_test(runner: Arc<dyn GitProcessRunner>) -> Self {
         Self {
             runner,
             worktree_settings: Arc::new(DefaultWorktreeBaseDirectory),

@@ -1162,12 +1162,12 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     use crate::persistence::{Database, ProjectionProject, Repositories, run_migrations};
+    use crate::test_support::TestSandbox;
 
     use super::*;
 
     #[tokio::test]
     async fn unit_build_covers_workspace_normalization_and_checkpoint_git_lifecycle() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let parent = tempfile::tempdir().expect("workspace parent");
         let missing = parent.path().join("nested/project");
         assert!(matches!(
@@ -1219,18 +1219,18 @@ mod tests {
             .expect("project command prepares");
         assert!(command_root.is_dir());
 
-        let repository = tempfile::tempdir().expect("repository");
+        let repository = TestSandbox::new("orchestration-checkpoint");
         let cancellation = CancellationToken::new();
         assert!(
-            !is_git_repository(repository.path(), &cancellation)
+            !is_git_repository(repository.root(), &cancellation)
                 .await
                 .expect("non-repository probe")
         );
-        run_git(repository.path(), &["init"], &[], false, &cancellation)
+        run_git(repository.root(), &["init"], &[], false, &cancellation)
             .await
             .expect("git init");
         run_git(
-            repository.path(),
+            repository.root(),
             &["config", "core.autocrlf", "false"],
             &[],
             false,
@@ -1239,7 +1239,7 @@ mod tests {
         .await
         .expect("disable fixture line-ending conversion");
         run_git(
-            repository.path(),
+            repository.root(),
             &["config", "user.name", "BiBCode Test"],
             &[],
             false,
@@ -1248,7 +1248,7 @@ mod tests {
         .await
         .expect("git user name");
         run_git(
-            repository.path(),
+            repository.root(),
             &["config", "user.email", "bibcode@example.test"],
             &[],
             false,
@@ -1256,14 +1256,14 @@ mod tests {
         )
         .await
         .expect("git user email");
-        tokio::fs::write(repository.path().join("tracked.txt"), "baseline\n")
+        tokio::fs::write(repository.root().join("tracked.txt"), "baseline\n")
             .await
             .expect("baseline file");
-        run_git(repository.path(), &["add", "."], &[], false, &cancellation)
+        run_git(repository.root(), &["add", "."], &[], false, &cancellation)
             .await
             .expect("git add");
         run_git(
-            repository.path(),
+            repository.root(),
             &["commit", "-m", "baseline"],
             &[],
             false,
@@ -1272,32 +1272,32 @@ mod tests {
         .await
         .expect("git commit");
         assert!(
-            is_git_repository(repository.path(), &cancellation)
+            is_git_repository(repository.root(), &cancellation)
                 .await
                 .expect("repository probe")
         );
 
-        capture_checkpoint(repository.path(), "thread/one", 0)
+        capture_checkpoint(repository.root(), "thread/one", 0)
             .await
             .expect("baseline checkpoint");
         let baseline_ref = checkpoint_ref("thread/one", 0);
         assert!(
-            has_ref(repository.path(), &baseline_ref, &cancellation)
+            has_ref(repository.root(), &baseline_ref, &cancellation)
                 .await
                 .expect("baseline ref")
         );
-        tokio::fs::write(repository.path().join("tracked.txt"), "changed\n")
+        tokio::fs::write(repository.root().join("tracked.txt"), "changed\n")
             .await
             .expect("changed file");
-        tokio::fs::write(repository.path().join("new.txt"), "new\n")
+        tokio::fs::write(repository.root().join("new.txt"), "new\n")
             .await
             .expect("new file");
-        capture_checkpoint_with_cancellation(repository.path(), "thread/one", 1, &cancellation)
+        capture_checkpoint_with_cancellation(repository.root(), "thread/one", 1, &cancellation)
             .await
             .expect("changed checkpoint");
         let changed_ref = checkpoint_ref("thread/one", 1);
         let files = diff_file_summaries(
-            repository.path(),
+            repository.root(),
             &baseline_ref,
             &changed_ref,
             &cancellation,
@@ -1306,20 +1306,20 @@ mod tests {
         .expect("checkpoint diff");
         assert_eq!(files.len(), 2);
         assert!(
-            restore_checkpoint(repository.path(), &baseline_ref, false, &cancellation)
+            restore_checkpoint(repository.root(), &baseline_ref, false, &cancellation)
                 .await
                 .expect("checkpoint restore")
         );
         assert_eq!(
-            tokio::fs::read_to_string(repository.path().join("tracked.txt"))
+            tokio::fs::read_to_string(repository.root().join("tracked.txt"))
                 .await
                 .expect("restored file"),
             "baseline\n"
         );
-        assert!(!repository.path().join("new.txt").exists());
+        assert!(!repository.root().join("new.txt").exists());
         assert!(
             restore_checkpoint(
-                repository.path(),
+                repository.root(),
                 "refs/bibcode/checkpoints/missing",
                 true,
                 &cancellation,
@@ -1329,7 +1329,7 @@ mod tests {
         );
         assert!(
             !restore_checkpoint(
-                repository.path(),
+                repository.root(),
                 "refs/bibcode/checkpoints/missing",
                 false,
                 &cancellation,
@@ -1337,11 +1337,11 @@ mod tests {
             .await
             .expect("missing checkpoint")
         );
-        delete_ref(repository.path(), &changed_ref, &cancellation)
+        delete_ref(repository.root(), &changed_ref, &cancellation)
             .await
             .expect("checkpoint ref deletes");
         assert!(
-            !has_ref(repository.path(), &changed_ref, &cancellation)
+            !has_ref(repository.root(), &changed_ref, &cancellation)
                 .await
                 .expect("deleted ref")
         );

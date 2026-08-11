@@ -66,6 +66,7 @@ pub struct GitVcsRpcServices {
     broadcaster: StatusBroadcaster,
     discovery: SourceControlDiscovery,
     pull_requests: PullRequestService,
+    github_command: PathBuf,
     availability_registry: Option<WorkspaceAvailabilityRegistry>,
 }
 
@@ -99,8 +100,19 @@ impl GitVcsRpcServices {
             repository,
             discovery: SourceControlDiscovery::default(),
             pull_requests: PullRequestService::default(),
+            github_command: PathBuf::from("gh"),
             availability_registry: None,
         }
+    }
+
+    #[cfg(test)]
+    fn with_repository_and_github_command(
+        repository: Arc<GitRepository>,
+        github_command: PathBuf,
+    ) -> Self {
+        let mut services = Self::with_repository(repository);
+        services.github_command = github_command;
+        services
     }
 
     #[must_use]
@@ -610,7 +622,7 @@ impl GitVcsRpcServices {
     ) -> RpcResult {
         let (command, args) = match input.provider.as_str() {
             "github" => (
-                "gh",
+                self.github_command.as_path(),
                 vec![
                     "repo",
                     "view",
@@ -620,7 +632,7 @@ impl GitVcsRpcServices {
                 ],
             ),
             "gitlab" => (
-                "glab",
+                Path::new("glab"),
                 vec!["repo", "view", &input.repository, "--output", "json"],
             ),
             provider => {
@@ -708,7 +720,7 @@ impl GitVcsRpcServices {
             .run(
                 ProcessRequest {
                     operation: "source-control.publishRepository.create".into(),
-                    command: "gh".into(),
+                    command: self.github_command.clone(),
                     args: [
                         "repo",
                         "create",
@@ -1426,7 +1438,7 @@ async fn send_event(sender: &mpsc::Sender<RpcStreamChunk>, event: Value) -> Resu
 }
 
 async fn run_provider_json(
-    command: &str,
+    command: &Path,
     args: &[&str],
     cwd: Option<&std::path::Path>,
     cancellation: CancellationToken,
@@ -1437,7 +1449,7 @@ async fn run_provider_json(
         .run(
             ProcessRequest {
                 operation: format!("source-control.{operation}"),
-                command: command.into(),
+                command: command.to_path_buf(),
                 args: args.iter().map(OsString::from).collect(),
                 cwd: cwd
                     .unwrap_or_else(|| std::path::Path::new("."))
@@ -1564,41 +1576,7 @@ mod tests {
 mod tests {
     use super::*;
     use crate::RequestId;
-    use std::ffi::{OsStr, OsString};
-
-    struct EnvGuard {
-        saved: Vec<(&'static str, Option<OsString>)>,
-    }
-
-    impl EnvGuard {
-        fn new(keys: &[&'static str]) -> Self {
-            Self {
-                saved: keys
-                    .iter()
-                    .map(|key| (*key, std::env::var_os(key)))
-                    .collect(),
-            }
-        }
-
-        fn set(key: &'static str, value: impl AsRef<OsStr>) {
-            // The external-process lock serializes environment-sensitive unit tests.
-            unsafe { std::env::set_var(key, value) };
-        }
-    }
-
-    impl Drop for EnvGuard {
-        fn drop(&mut self) {
-            for (key, value) in self.saved.drain(..) {
-                // Restore every environment value before releasing the process lock.
-                unsafe {
-                    match value {
-                        Some(value) => std::env::set_var(key, value),
-                        None => std::env::remove_var(key),
-                    }
-                }
-            }
-        }
-    }
+    use std::{collections::VecDeque, sync::Mutex};
 
     fn rpc_request(tag: &str, payload: Value) -> RpcRequest {
         RpcRequest {
@@ -1612,17 +1590,82 @@ mod tests {
         }
     }
 
-    fn git(cwd: &std::path::Path, args: &[&str]) {
-        let output = std::process::Command::new("git")
-            .args(args)
-            .current_dir(cwd)
-            .output()
-            .expect("git should start");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr),
-        );
+    async fn git(cwd: &std::path::Path, args: &[&str]) {
+        ProcessRunner
+            .run(
+                ProcessRequest {
+                    operation: "test.gitVcs.git".to_owned(),
+                    command: PathBuf::from("git"),
+                    args: args.iter().map(OsString::from).collect(),
+                    cwd: cwd.to_path_buf(),
+                    env: [("GIT_CONFIG_NOSYSTEM", "1")]
+                        .into_iter()
+                        .map(|(key, value)| (key.into(), value.into()))
+                        .collect(),
+                    stdin: None,
+                    timeout: Duration::from_secs(30),
+                    max_output_bytes: 128_000,
+                    output_policy: OutputPolicy::Error,
+                    append_truncation_marker: false,
+                    allow_non_zero_exit: false,
+                },
+                &CancellationToken::new(),
+            )
+            .await
+            .unwrap_or_else(|error| panic!("git {args:?} failed: {error}"));
+    }
+
+    struct FixtureGitRunner {
+        outputs: Mutex<VecDeque<crate::git::ProcessOutput>>,
+    }
+
+    impl FixtureGitRunner {
+        fn main_branch_push() -> Self {
+            Self {
+                outputs: Mutex::new(
+                    [
+                        crate::git::ProcessOutput {
+                            exit_code: 0,
+                            stdout: "main\n".to_owned(),
+                            stderr: String::new(),
+                            stdout_truncated: false,
+                            stderr_truncated: false,
+                        },
+                        crate::git::ProcessOutput {
+                            exit_code: 1,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            stdout_truncated: false,
+                            stderr_truncated: false,
+                        },
+                        crate::git::ProcessOutput {
+                            exit_code: 0,
+                            stdout: String::new(),
+                            stderr: String::new(),
+                            stdout_truncated: false,
+                            stderr_truncated: false,
+                        },
+                    ]
+                    .into(),
+                ),
+            }
+        }
+    }
+
+    impl crate::git::GitProcessRunner for FixtureGitRunner {
+        fn run<'a>(
+            &'a self,
+            _request: ProcessRequest,
+            _cancellation: &'a CancellationToken,
+        ) -> crate::git::BoxGitProcessFuture<'a> {
+            let output = self
+                .outputs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .pop_front()
+                .expect("fixture Git output");
+            Box::pin(async move { Ok(output) })
+        }
     }
 
     async fn unary(services: &GitVcsRpcServices, tag: &str, payload: Value) -> RpcResult {
@@ -1675,13 +1718,12 @@ mod tests {
 
     #[tokio::test]
     async fn workspace_loss_ends_an_admitted_status_stream_with_the_exact_error() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let temporary = tempfile::tempdir().expect("temporary Git repository");
-        git(temporary.path(), &["init", "-b", "main"]);
+        let sandbox = crate::test_support::TestSandbox::new("workspace-loss-status");
+        git(sandbox.root(), &["init", "-b", "main"]).await;
         let registry = WorkspaceAvailabilityRegistry::new();
         let services = GitVcsRpcServices::default().with_availability_registry(registry.clone());
         let mut stream = services.status_stream(
-            rpc_request("subscribeVcsStatus", json!({"cwd": temporary.path()})),
+            rpc_request("subscribeVcsStatus", json!({"cwd": sandbox.root()})),
             CancellationToken::new(),
         );
         stream
@@ -1696,7 +1738,7 @@ mod tests {
                     thread_id: "thread-status".to_owned(),
                     repository_key: "repository-status".to_owned(),
                     generation: 1,
-                    path: temporary.path().to_path_buf(),
+                    path: sandbox.root().to_path_buf(),
                     availability:
                         crate::worktree_catalog::AdoptedWorktreeAvailability::MissingRegistered,
                 })
@@ -1713,16 +1755,69 @@ mod tests {
         assert_eq!(error["threadId"], "thread-status");
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn github_cli_and_git_runner_fixtures_are_instance_owned_in_parallel() {
+        async fn publish(label: &str) -> (Value, Value) {
+            let sandbox = crate::test_support::TestSandbox::new(label);
+            let github_command = sandbox.executable_script(
+                "gh",
+                &format!(
+                    "case \"$1:$2\" in\n  repo:view) printf '%s\\n' '{{\"nameWithOwner\":\"owner/{label}\",\"url\":\"https://github.test/owner/{label}\",\"sshUrl\":\"git@github.test:owner/{label}.git\"}}' ;;\n  repo:create) exit 0 ;;\n  *) exit 64 ;;\nesac"
+                ),
+                "",
+            );
+            let repository = Arc::new(GitRepository::with_runner_for_test(Arc::new(
+                FixtureGitRunner::main_branch_push(),
+            )));
+            let services =
+                GitVcsRpcServices::with_repository_and_github_command(repository, github_command);
+            let cwd = sandbox.root().to_path_buf();
+            let lookup = unary(
+                &services,
+                "sourceControl.lookupRepository",
+                json!({
+                    "provider":"github",
+                    "repository":format!("owner/{label}"),
+                    "cwd":cwd,
+                }),
+            )
+            .await
+            .expect("GitHub lookup fixture should resolve");
+            let published = unary(
+                &services,
+                "sourceControl.publishRepository",
+                json!({
+                    "cwd":sandbox.root(),
+                    "provider":"github",
+                    "repository":format!("owner/{label}"),
+                    "visibility":"private",
+                    "protocol":"ssh",
+                    "remoteName":"origin"
+                }),
+            )
+            .await
+            .expect("GitHub publish fixture should use its owned Git runner");
+            (lookup, published)
+        }
+
+        let ((left_lookup, left_published), (right_lookup, right_published)) =
+            tokio::join!(publish("left"), publish("right"));
+        assert_eq!(left_lookup["nameWithOwner"], "owner/left");
+        assert_eq!(right_lookup["nameWithOwner"], "owner/right");
+        assert_eq!(left_published["branch"], "main");
+        assert_eq!(right_published["branch"], "main");
+    }
+
     #[tokio::test]
     async fn native_git_vcs_service_covers_repository_lifecycle_and_validation_paths() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let temporary = tempfile::tempdir().expect("temporary repository parent");
-        let repository = temporary.path().join("repository");
+        let sandbox = crate::test_support::TestSandbox::new("native-git-vcs");
+        let repository = sandbox.root().join("repository");
         tokio::fs::create_dir_all(&repository)
             .await
             .expect("repository directory should create");
         let cwd = repository.to_string_lossy().into_owned();
-        let services = GitVcsRpcServices::default();
+        let mut services = GitVcsRpcServices::default();
 
         assert!(
             unary(&services, "vcs.init", json!({"cwd":cwd,"kind":"mercurial"}),)
@@ -1735,11 +1830,12 @@ mod tests {
                 .expect("repository should initialize"),
             Value::Null,
         );
-        git(&repository, &["config", "user.name", "BiBCode Test"]);
+        git(&repository, &["config", "user.name", "BiBCode Test"]).await;
         git(
             &repository,
             &["config", "user.email", "bibcode@example.test"],
-        );
+        )
+        .await;
 
         tokio::fs::write(repository.join("tracked.txt"), "first\n")
             .await
@@ -1772,8 +1868,8 @@ mod tests {
             .expect("file should stage"),
             Value::Null,
         );
-        git(&repository, &["commit", "--quiet", "-m", "initial"]);
-        git(&repository, &["branch", "-M", "main"]);
+        git(&repository, &["commit", "--quiet", "-m", "initial"]).await;
+        git(&repository, &["branch", "-M", "main"]).await;
 
         let refs = unary(
             &services,
@@ -1853,7 +1949,7 @@ mod tests {
         .await
         .expect("changed file should discard");
 
-        let clone_parent = temporary.path().join("clones");
+        let clone_parent = sandbox.root().join("clones");
         tokio::fs::create_dir_all(&clone_parent)
             .await
             .expect("clone parent should create");
@@ -1903,7 +1999,7 @@ mod tests {
                 .expect("source control should discover")["versionControlSystems"]
                 .is_array()
         );
-        let source_clone = temporary.path().join("source-clone");
+        let source_clone = sandbox.root().join("source-clone");
         assert!(
             unary(
                 &services,
@@ -2061,7 +2157,7 @@ mod tests {
 
         assert_eq!(
             run_provider_json(
-                "/bin/sh",
+                Path::new("/bin/sh"),
                 &["-c", "printf '{\"ok\":true}'"],
                 Some(&repository),
                 CancellationToken::new(),
@@ -2074,7 +2170,7 @@ mod tests {
         );
         assert!(
             run_provider_json(
-                "/bin/sh",
+                Path::new("/bin/sh"),
                 &["-c", "exit 1"],
                 None,
                 CancellationToken::new(),
@@ -2086,7 +2182,7 @@ mod tests {
         );
         assert!(
             run_provider_json(
-                "/bin/sh",
+                Path::new("/bin/sh"),
                 &["-c", "printf invalid"],
                 None,
                 CancellationToken::new(),
@@ -2099,47 +2195,34 @@ mod tests {
 
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-
-            let bare_remote = temporary.path().join("published.git");
+            let bare_remote = sandbox.root().join("published.git");
             tokio::fs::create_dir(&bare_remote)
                 .await
                 .expect("bare remote directory");
-            git(&bare_remote, &["init", "--bare"]);
+            git(&bare_remote, &["init", "--bare"]).await;
 
-            let gh = temporary.path().join("gh");
-            tokio::fs::write(
-                &gh,
-                r#"#!/bin/sh
+            let gh = sandbox.executable_script(
+                "gh",
+                &format!(
+                    r#"#!/bin/sh
 case "$1:$2" in
   repo:view)
-    printf '%s\n' '{"nameWithOwner":"owner/name","url":"https://github.test/owner/name","sshUrl":"git@github.test:owner/name.git"}'
+    printf '%s\n' '{{"nameWithOwner":"owner/name","url":"https://github.test/owner/name","sshUrl":"git@github.test:owner/name.git"}}'
     ;;
   repo:create)
-    git remote add origin "$BIBCODE_TEST_REMOTE"
+    git remote add origin "{}"
     ;;
   *)
     exit 64
     ;;
 esac
 "#,
-            )
-            .await
-            .expect("gh fixture");
-            std::fs::set_permissions(&gh, std::fs::Permissions::from_mode(0o700))
-                .expect("gh fixture permissions");
-
-            let _environment = EnvGuard::new(&["PATH", "BIBCODE_TEST_REMOTE"]);
-            let inherited_path = std::env::var_os("PATH").unwrap_or_default();
-            EnvGuard::set(
-                "PATH",
-                std::env::join_paths(
-                    std::iter::once(temporary.path().to_path_buf())
-                        .chain(std::env::split_paths(&inherited_path)),
-                )
-                .expect("fixture PATH"),
+                    bare_remote.display(),
+                ),
+                "",
             );
-            EnvGuard::set("BIBCODE_TEST_REMOTE", &bare_remote);
+
+            services.github_command = gh;
 
             let lookup = unary(
                 &services,
