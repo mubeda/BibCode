@@ -59,9 +59,9 @@ startup cleanup interrupts unresolved records in persisted terminal scopes, and
 replacing the current generation for the same terminal interrupts active
 records in the prior scope.
 
-## Protocol v1, revisions, and resync
+## Protocol v2, revisions, control overlays, and resync
 
-The server advertises `activityProtocolVersion: 1` in environment capabilities.
+The server advertises `activityProtocolVersion: 2` in environment capabilities.
 The client subscribes only when that exact feature is advertised; `null` means
 the activity protocol is unavailable. This server/client negotiation is
 independent of provider CLI probing. See
@@ -69,7 +69,7 @@ independent of provider CLI probing. See
 and [`packages/client-runtime/src/state/activity.ts`](../../packages/client-runtime/src/state/activity.ts).
 
 Every subscription starts with a full `ActivitySnapshot` whose
-`protocolVersion` is `1`. Effective changes are journaled as contiguous deltas:
+`protocolVersion` is `2`. Effective observation changes are journaled as contiguous deltas:
 `previousRevision` must equal the accepted snapshot revision and `revision` is
 the next value. A large mutation batch may be split into multiple deltas of at
 most 256 changes. Duplicate and net-no-op provider events do not consume a
@@ -84,6 +84,14 @@ subscription and therefore a new authoritative snapshot. The server rules are
 in [`apps/server/src/activity/rpc.rs`](../../apps/server/src/activity/rpc.rs);
 the client rules are in
 [`packages/client-runtime/src/state/activityReducer.ts`](../../packages/client-runtime/src/state/activityReducer.ts).
+
+Targeted cancellation control is an independent ephemeral overlay. It has its
+own contiguous revision stream and joins durable actor summaries only at the
+snapshot, roster, and detail RPC boundaries. The overlay retains at most 200
+actor and operation records, and a delta contains at most 256 changes. It is
+never written to SQLite: after a server restart, historical actors remain
+`unsupported` until the current runtime proves an exact native target. Provider
+native target IDs never cross contracts, persistence, or diagnostic logs.
 
 Each snapshot negotiates provider capabilities separately: actors, attributed
 entries, background work, history recovery (`full`, `bounded`, or `none`), and

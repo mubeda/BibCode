@@ -361,7 +361,7 @@ async fn config_and_settings_match_the_typescript_contract_without_faking_provid
     assert_eq!(config["auth"], auth_descriptor());
     assert_eq!(
         config["environment"]["capabilities"]["activityProtocolVersion"],
-        1
+        2
     );
     assert!(
         config["cwd"]
@@ -459,7 +459,7 @@ async fn activity_protocol_cannot_be_advertised_before_registry_validation() {
     let after_registration = call(&control, "server.getConfig", json!({})).await;
     assert_eq!(
         after_registration["environment"]["capabilities"]["activityProtocolVersion"],
-        1
+        2
     );
 
     let post_registration_cancellation = CancellationToken::new();
@@ -471,11 +471,11 @@ async fn activity_protocol_cannot_be_advertised_before_registry_validation() {
     let post_registration_ready = next_event(&mut post_registration_lifecycle).await;
     assert_eq!(
         post_registration_welcome["payload"]["environment"]["capabilities"]["activityProtocolVersion"],
-        1
+        2
     );
     assert_eq!(
         post_registration_ready["payload"]["environment"]["capabilities"]["activityProtocolVersion"],
-        1
+        2
     );
     cancellation.cancel();
     post_registration_cancellation.cancel();

@@ -4638,6 +4638,7 @@ async fn claude_transcript_recovery_event_persists_and_reloads_activity() {
                         background_work: true,
                         history_recovery: ActivityHistoryRecovery::Bounded,
                         terminal_observation: false,
+                        targeted_actor_cancellation: false,
                     },
                     observation_state: ActivityObservationState::Live,
                 },
@@ -4892,6 +4893,7 @@ async fn authoritative_startup_capabilities_replace_runtime_observation_and_rese
         background_work: false,
         history_recovery: ActivityHistoryRecovery::Bounded,
         terminal_observation: false,
+        targeted_actor_cancellation: false,
     };
     let state = Arc::new(StdMutex::new(DriverState {
         start_results: VecDeque::from([
@@ -10090,6 +10092,7 @@ cat >/dev/null
             background_work: false,
             history_recovery: ActivityHistoryRecovery::None,
             terminal_observation: false,
+            targeted_actor_cancellation: false,
         }
     );
     supported_driver.shutdown().await.unwrap();
@@ -10144,6 +10147,7 @@ cat >/dev/null
             background_work: false,
             history_recovery: ActivityHistoryRecovery::None,
             terminal_observation: false,
+            targeted_actor_cancellation: false,
         }
     );
     let event = timeout(Duration::from_secs(2), driver.next_event())
@@ -10232,6 +10236,7 @@ cat >/dev/null
             background_work: false,
             history_recovery: ActivityHistoryRecovery::None,
             terminal_observation: false,
+            targeted_actor_cancellation: false,
         }
     );
     timeout(Duration::from_secs(2), async {
@@ -10827,6 +10832,7 @@ done
             background_work: false,
             history_recovery: ActivityHistoryRecovery::None,
             terminal_observation: false,
+            targeted_actor_cancellation: false,
         }
     );
     assert!(

@@ -2574,6 +2574,7 @@ async fn reconciliation_recurses_with_encoded_paths_and_recovers_a_missed_child_
                 background_work: false,
                 history_recovery: ActivityHistoryRecovery::Full,
                 terminal_observation: false,
+                targeted_actor_cancellation: false,
             },
             observation_state: ActivityObservationState::Live,
         }
@@ -5331,6 +5332,7 @@ async fn reconciliation_native_ids_do_not_collide_after_same_thread_runtime_rest
             background_work: false,
             history_recovery: ActivityHistoryRecovery::Full,
             terminal_observation: false,
+            targeted_actor_cancellation: false,
         },
     )
     .await;
@@ -5658,6 +5660,7 @@ async fn reconciliation_downgrades_unsupported_history_without_failing_chat() {
                 background_work: false,
                 history_recovery: ActivityHistoryRecovery::Bounded,
                 terminal_observation: false,
+                targeted_actor_cancellation: false,
             },
             observation_state: ActivityObservationState::Live,
         }
@@ -6161,6 +6164,7 @@ async fn reconciliation_marks_transient_failure_stale_then_recovers_with_bounded
                 background_work: false,
                 history_recovery: ActivityHistoryRecovery::Full,
                 terminal_observation: false,
+                targeted_actor_cancellation: false,
             },
             observation_state: ActivityObservationState::Live,
         }
