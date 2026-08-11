@@ -9,15 +9,19 @@ use std::{
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tokio::sync::watch;
+use tokio::{
+    sync::{Mutex, oneshot, watch},
+    task::JoinHandle,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     crypto::sha256_hex,
     git::{
-        GitCommandError, GitPrunableWorktree, GitRepository, GitWorktreeInventory,
-        GitWorktreeRecord, GitWorktreeRemovalInspection, git_worktree_prune_impact_digest,
-        host_path_platform, normalize_worktree_path_key, worktree_key, worktree_repository_key,
+        CreateWorktreeInput, GitCommandError, GitPrunableWorktree, GitRepository,
+        GitWorktreeInventory, GitWorktreeRecord, GitWorktreeRemovalInspection,
+        canonical_worktree_path_key, git_worktree_prune_impact_digest, host_path_platform,
+        normalize_worktree_path_key, worktree_key, worktree_repository_key,
     },
     orchestration::{
         CommandAdmission, OrchestrationCommand, OrchestrationEngine, OrchestrationError,
@@ -52,20 +56,21 @@ pub type WorktreeRemovalCleanupAdmissionFuture = Pin<
     >,
 >;
 
+#[derive(Clone)]
 pub struct WorktreeRemovalCleanupAdmission {
-    _resource: Box<dyn Send + 'static>,
+    _resource: Arc<dyn Send + Sync + 'static>,
 }
 
 impl WorktreeRemovalCleanupAdmission {
     fn unlimited() -> Self {
         Self {
-            _resource: Box::new(()),
+            _resource: Arc::new(()),
         }
     }
 
-    pub(crate) fn retaining(resource: impl Send + 'static) -> Self {
+    pub(crate) fn retaining(resource: impl Send + Sync + 'static) -> Self {
         Self {
-            _resource: Box::new(resource),
+            _resource: Arc::new(resource),
         }
     }
 }
@@ -310,8 +315,65 @@ impl WorktreeRemovalQuiescer for NoopWorktreeRemovalQuiescer {
 pub struct WorktreeCatalogRpcServices {
     catalog: WorktreeCatalogService,
     orchestration: OrchestrationEngine,
+    creation_git: Option<Arc<GitRepository>>,
     removal_quiescer: Arc<dyn WorktreeRemovalQuiescer>,
     removal_git: Option<Arc<dyn WorktreeRemovalGit>>,
+    operations: WorktreeCatalogOperationRuntime,
+}
+
+#[derive(Clone)]
+pub struct WorktreeCatalogOperationRuntime {
+    state: Arc<Mutex<WorktreeCatalogOperationState>>,
+}
+
+struct WorktreeCatalogOperationState {
+    accepting: bool,
+    tasks: Vec<JoinHandle<()>>,
+}
+
+impl WorktreeCatalogOperationRuntime {
+    fn new() -> Self {
+        Self {
+            state: Arc::new(Mutex::new(WorktreeCatalogOperationState {
+                accepting: true,
+                tasks: Vec::new(),
+            })),
+        }
+    }
+
+    async fn run(&self, operation: impl Future<Output = RpcResult> + Send + 'static) -> RpcResult {
+        let (result_sender, result_receiver) = oneshot::channel();
+        {
+            let mut state = self.state.lock().await;
+            if !state.accepting {
+                return Err(encode(CatalogError::new(
+                    CatalogErrorReason::Internal,
+                    "The worktree operation runtime is shutting down.",
+                )));
+            }
+            state.tasks.retain(|task| !task.is_finished());
+            state.tasks.push(tokio::spawn(async move {
+                let _ = result_sender.send(operation.await);
+            }));
+        }
+        result_receiver.await.unwrap_or_else(|_| {
+            Err(encode(CatalogError::new(
+                CatalogErrorReason::Internal,
+                "The server-owned worktree operation ended without a result.",
+            )))
+        })
+    }
+
+    pub async fn shutdown(&self) {
+        let tasks = {
+            let mut state = self.state.lock().await;
+            state.accepting = false;
+            std::mem::take(&mut state.tasks)
+        };
+        for task in tasks {
+            let _ = task.await;
+        }
+    }
 }
 
 impl WorktreeCatalogRpcServices {
@@ -320,14 +382,17 @@ impl WorktreeCatalogRpcServices {
         catalog.set_healthy_snapshot_observer(Arc::new(BranchReconciliationObserver {
             orchestration: orchestration.clone(),
         }));
-        let removal_git = catalog
-            .git_repository()
+        let creation_git = catalog.git_repository();
+        let removal_git = creation_git
+            .clone()
             .map(|repository| repository as Arc<dyn WorktreeRemovalGit>);
         Self {
             catalog,
             orchestration,
+            creation_git,
             removal_quiescer: Arc::new(NoopWorktreeRemovalQuiescer),
             removal_git,
+            operations: WorktreeCatalogOperationRuntime::new(),
         }
     }
 
@@ -341,6 +406,11 @@ impl WorktreeCatalogRpcServices {
     pub fn with_removal_git(mut self, git: Arc<dyn WorktreeRemovalGit>) -> Self {
         self.removal_git = Some(git);
         self
+    }
+
+    #[must_use]
+    pub fn operation_runtime(&self) -> WorktreeCatalogOperationRuntime {
+        self.operations.clone()
     }
 }
 
@@ -572,19 +642,6 @@ impl CatalogMutationObserver for WorktreeCatalogMutationObserver {
             Ok(())
         })
     }
-
-    fn invalidate_after_removal<'a>(
-        &'a self,
-        cwd: &'a Path,
-        path: &'a Path,
-    ) -> CatalogMutationFuture<'a> {
-        Box::pin(async move {
-            for project_id in self.project_ids_for_mutation(cwd, path).await? {
-                self.catalog.invalidate_after_mutation(&project_id).await;
-            }
-            Ok(())
-        })
-    }
 }
 
 async fn normalized_existing_path(path: &Path) -> String {
@@ -636,6 +693,24 @@ pub fn register_worktree_catalog_rpc(
     registry.register_unary("worktree.adopt", move |request, cancellation| {
         let services = adoption_services.clone();
         async move { adopt_worktree(&services, request, cancellation).await }
+    });
+
+    let create_managed_services = services.clone();
+    registry.register_unary("worktree.createManaged", move |request, cancellation| {
+        let services = create_managed_services.clone();
+        async move { create_managed_worktree(&services, request, cancellation).await }
+    });
+
+    let create_panel_services = services.clone();
+    registry.register_unary("worktree.createPanel", move |request, cancellation| {
+        let services = create_panel_services.clone();
+        async move { create_worktree_panel(&services, request, cancellation).await }
+    });
+
+    let retarget_services = services.clone();
+    registry.register_unary("worktree.retarget", move |request, cancellation| {
+        let services = retarget_services.clone();
+        async move { retarget_worktree_thread(&services, request, cancellation).await }
     });
 
     let plan_services = services.clone();
@@ -694,10 +769,35 @@ async fn adopt_worktree(
         return adoption_dispatch_result(result, None);
     }
     let project_id = input.project_id.clone();
-    services
-        .catalog
-        .with_project_mutation_lock(&project_id, || async {
-            adopt_worktree_locked(services, input, payload_digest, command_claim).await
+    let operation_runtime = services.operations.clone();
+    let services = services.clone();
+    operation_runtime
+        .run(async move {
+            let operation_cancellation = cancellation.clone();
+            let lock_cancellation = cancellation.clone();
+            let catalog = services.catalog.clone();
+            catalog
+                .with_project_mutation_lock_cancellation(
+                    &project_id,
+                    &lock_cancellation,
+                    || async move {
+                        adopt_worktree_locked(
+                            &services,
+                            input,
+                            payload_digest,
+                            command_claim,
+                            &operation_cancellation,
+                        )
+                        .await
+                    },
+                )
+                .await
+                .unwrap_or_else(|| {
+                    Err(encode(adoption_orchestration_error(
+                        OrchestrationError::Cancelled,
+                        None,
+                    )))
+                })
         })
         .await
 }
@@ -707,6 +807,7 @@ async fn adopt_worktree_locked(
     input: WorktreeAdoptInput,
     payload_digest: String,
     command_claim: CommandAdmissionClaim,
+    cancellation: &CancellationToken,
 ) -> RpcResult {
     let (mut snapshot, refreshed) = match services.catalog.latest(&input.project_id).await {
         Some(snapshot) => (snapshot, false),
@@ -765,7 +866,7 @@ async fn adopt_worktree_locked(
         .map_err(|error| encode(adoption_validation_error(error)))?;
     let result = services
         .orchestration
-        .dispatch_with_admission_and_command_claim(
+        .dispatch_with_admission_and_command_claim_until_handoff(
             OrchestrationCommand::WorktreeAdoptResolved {
                 command_id: input.command_id,
                 project_id: input.project_id.clone(),
@@ -783,7 +884,7 @@ async fn adopt_worktree_locked(
                 provider_turn: None,
             },
             command_claim,
-            || {},
+            cancellation,
         )
         .await
         .map_err(|error| {
@@ -799,8 +900,506 @@ async fn adopt_worktree_locked(
     adoption_dispatch_result(result, Some(snapshot.generation))
 }
 
+async fn replay_thread_operation(
+    services: &WorktreeCatalogRpcServices,
+    command_claim: &CommandAdmissionClaim,
+    command_id: &str,
+    payload_digest: &str,
+) -> Result<bool, Value> {
+    command_claim
+        .ensure_owns(command_id)
+        .map_err(|error| encode(adoption_orchestration_error(error, None)))?;
+    let Some(receipt) = services
+        .orchestration
+        .repositories()
+        .get_command_receipt(command_id.to_owned())
+        .await
+        .map_err(|_| {
+            encode(adoption_error(
+                WorktreeAdoptionErrorReason::Internal,
+                "The durable command receipt could not be read.",
+                None,
+            ))
+        })?
+    else {
+        return Ok(false);
+    };
+    if receipt.payload_digest.as_deref() != Some(payload_digest) {
+        return Err(encode(adoption_error(
+            WorktreeAdoptionErrorReason::CommandConflict,
+            "The command ID was already used for another worktree operation.",
+            None,
+        )));
+    }
+    if receipt.status == "accepted" {
+        return Ok(true);
+    }
+    Err(encode(adoption_error(
+        WorktreeAdoptionErrorReason::OrchestrationFailed,
+        receipt
+            .error
+            .unwrap_or_else(|| "The previous worktree operation was rejected.".to_owned()),
+        None,
+    )))
+}
+
+async fn create_managed_worktree(
+    services: &WorktreeCatalogRpcServices,
+    request: RpcRequest,
+    cancellation: CancellationToken,
+) -> RpcResult {
+    let input = decode::<WorktreeCreateManagedInput>(request)?;
+    let payload_digest = canonical_command_digest(&input).map_err(|_| {
+        encode(adoption_error(
+            WorktreeAdoptionErrorReason::Internal,
+            "The managed creation payload could not be admitted.",
+            None,
+        ))
+    })?;
+    let command_claim =
+        acquire_worktree_command_claim(&services.orchestration, &input.command_id, &cancellation)
+            .await
+            .map_err(|error| encode(adoption_orchestration_error(error, None)))?;
+    if replay_thread_operation(services, &command_claim, &input.command_id, &payload_digest).await?
+    {
+        let thread = services
+            .orchestration
+            .repositories()
+            .get_thread(input.thread_id.clone())
+            .await
+            .map_err(|_| {
+                encode(adoption_error(
+                    WorktreeAdoptionErrorReason::Internal,
+                    "The managed workspace could not be reloaded.",
+                    None,
+                ))
+            })?
+            .and_then(|thread| thread.worktree_path.clone().map(|path| (thread, path)))
+            .ok_or_else(|| {
+                encode(adoption_error(
+                    WorktreeAdoptionErrorReason::OrchestrationFailed,
+                    "The accepted managed workspace is no longer available.",
+                    None,
+                ))
+            })?;
+        return Ok(encode(WorktreeManagedCreateResult {
+            thread_id: input.thread_id,
+            path: thread.1,
+            ref_name: thread.0.branch.unwrap_or(input.ref_name),
+        }));
+    }
+    let project_id = input.project_id.clone();
+    let operation_runtime = services.operations.clone();
+    let services = services.clone();
+    operation_runtime
+        .run(async move {
+            let lock_cancellation = cancellation.clone();
+            let catalog = services.catalog.clone();
+            catalog
+                .with_project_mutation_lock_cancellation(
+                    &project_id,
+                    &lock_cancellation,
+                    || async move {
+                        create_managed_worktree_locked(
+                            &services,
+                            input,
+                            payload_digest,
+                            command_claim,
+                            &cancellation,
+                        )
+                        .await
+                    },
+                )
+                .await
+                .unwrap_or_else(|| {
+                    Err(encode(adoption_orchestration_error(
+                        OrchestrationError::Cancelled,
+                        None,
+                    )))
+                })
+        })
+        .await
+}
+
+async fn create_managed_worktree_locked(
+    services: &WorktreeCatalogRpcServices,
+    input: WorktreeCreateManagedInput,
+    payload_digest: String,
+    command_claim: CommandAdmissionClaim,
+    cancellation: &CancellationToken,
+) -> RpcResult {
+    let project = services
+        .orchestration
+        .repositories()
+        .get_project(input.project_id.clone())
+        .await
+        .map_err(|_| {
+            encode(adoption_error(
+                WorktreeAdoptionErrorReason::Internal,
+                "The project could not be read.",
+                None,
+            ))
+        })?
+        .filter(|project| project.deleted_at.is_none())
+        .ok_or_else(|| {
+            encode(adoption_error(
+                WorktreeAdoptionErrorReason::ProjectNotFound,
+                "Project was not found.",
+                None,
+            ))
+        })?;
+    let repository = services.creation_git.clone().ok_or_else(|| {
+        encode(adoption_error(
+            WorktreeAdoptionErrorReason::EnvironmentUnsupported,
+            "Managed worktree creation is unavailable in this environment.",
+            None,
+        ))
+    })?;
+    let created_branch = input.new_ref_name.clone();
+    let created = repository
+        .create_worktree(
+            CreateWorktreeInput {
+                cwd: PathBuf::from(&project.workspace_root),
+                ref_name: input.ref_name.clone(),
+                new_ref_name: input.new_ref_name.clone(),
+                base_ref_name: input.base_ref_name.clone(),
+                path: None,
+            },
+            cancellation,
+        )
+        .await
+        .map_err(encode)?;
+    let created_path = PathBuf::from(&created.worktree.path);
+    let terminal_cancellation = CancellationToken::new();
+    let dispatch = services
+        .orchestration
+        .dispatch_with_admission_and_command_claim_until_handoff(
+            OrchestrationCommand::ThreadCreate {
+                command_id: input.command_id,
+                thread_id: input.thread_id.clone(),
+                project_id: input.project_id.clone(),
+                title: input.title,
+                kind: Some("workspace".to_owned()),
+                model_selection: input.thread_defaults.model_selection,
+                runtime_mode: input.thread_defaults.runtime_mode,
+                interaction_mode: input.thread_defaults.interaction_mode,
+                branch: Some(created.worktree.ref_name.clone()),
+                worktree_path: Some(created.worktree.path.clone()),
+                created_at: now_iso(),
+            },
+            CommandAdmission {
+                payload_digest,
+                attachment_refs: Vec::new(),
+                provider_turn: None,
+            },
+            command_claim,
+            &terminal_cancellation,
+        )
+        .await;
+    if let Err(error) = dispatch {
+        let rollback = repository
+            .rollback_managed_worktree_creation(
+                Path::new(&project.workspace_root),
+                &created_path,
+                created_branch.as_deref(),
+            )
+            .await;
+        let detail = match rollback {
+            Ok(()) => error.to_string(),
+            Err(rollback) => format!(
+                "{error}; exact managed-worktree rollback also failed: {}",
+                rollback.detail
+            ),
+        };
+        return Err(encode(adoption_error(
+            WorktreeAdoptionErrorReason::OrchestrationFailed,
+            detail,
+            None,
+        )));
+    }
+    services
+        .catalog
+        .note_managed_creation(&input.project_id, &created_path)
+        .await;
+    services
+        .catalog
+        .invalidate_after_mutation(&input.project_id)
+        .await;
+    Ok(encode(WorktreeManagedCreateResult {
+        thread_id: input.thread_id,
+        path: created.worktree.path,
+        ref_name: created.worktree.ref_name,
+    }))
+}
+
+async fn create_worktree_panel(
+    services: &WorktreeCatalogRpcServices,
+    request: RpcRequest,
+    cancellation: CancellationToken,
+) -> RpcResult {
+    let input = decode::<WorktreeCreatePanelInput>(request)?;
+    let payload_digest = canonical_command_digest(&input).map_err(|_| {
+        encode(adoption_error(
+            WorktreeAdoptionErrorReason::Internal,
+            "The panel creation payload could not be admitted.",
+            None,
+        ))
+    })?;
+    let command_claim =
+        acquire_worktree_command_claim(&services.orchestration, &input.command_id, &cancellation)
+            .await
+            .map_err(|error| encode(adoption_orchestration_error(error, None)))?;
+    if replay_thread_operation(services, &command_claim, &input.command_id, &payload_digest).await?
+    {
+        return Ok(encode(WorktreeThreadResult {
+            thread_id: input.thread_id,
+        }));
+    }
+    let repositories = services.orchestration.repositories();
+    let host = repositories
+        .get_thread(input.host_thread_id.clone())
+        .await
+        .map_err(|_| {
+            encode(adoption_error(
+                WorktreeAdoptionErrorReason::Internal,
+                "The host thread could not be read.",
+                None,
+            ))
+        })?
+        .filter(|thread| thread.deleted_at.is_none())
+        .ok_or_else(|| {
+            encode(adoption_error(
+                WorktreeAdoptionErrorReason::WorktreeNotFound,
+                "The host thread was not found.",
+                None,
+            ))
+        })?;
+    let project_id = host.project_id;
+    let operation_runtime = services.operations.clone();
+    let services = services.clone();
+    operation_runtime
+        .run(async move {
+            let lock_cancellation = cancellation.clone();
+            let catalog = services.catalog.clone();
+            let locked_project_id = project_id.clone();
+            catalog
+                .with_project_mutation_lock_cancellation(
+                    &project_id,
+                    &lock_cancellation,
+                    || async move {
+                        let host = services
+                            .orchestration
+                            .repositories()
+                            .get_thread(input.host_thread_id.clone())
+                            .await
+                            .map_err(|_| {
+                                encode(adoption_error(
+                                    WorktreeAdoptionErrorReason::Internal,
+                                    "The host thread could not be revalidated.",
+                                    None,
+                                ))
+                            })?
+                            .filter(|thread| {
+                                thread.deleted_at.is_none()
+                                    && thread.project_id == locked_project_id
+                            })
+                            .ok_or_else(|| {
+                                encode(adoption_error(
+                                    WorktreeAdoptionErrorReason::WorktreeNotFound,
+                                    "The host thread changed before panel creation.",
+                                    None,
+                                ))
+                            })?;
+                        let result = services
+                            .orchestration
+                            .dispatch_with_admission_and_command_claim_until_handoff(
+                                OrchestrationCommand::ThreadCreate {
+                                    command_id: input.command_id,
+                                    thread_id: input.thread_id.clone(),
+                                    project_id: locked_project_id.clone(),
+                                    title: input.title,
+                                    kind: Some("panel".to_owned()),
+                                    model_selection: input.thread_defaults.model_selection,
+                                    runtime_mode: input.thread_defaults.runtime_mode,
+                                    interaction_mode: input.thread_defaults.interaction_mode,
+                                    branch: host.branch,
+                                    worktree_path: host.worktree_path,
+                                    created_at: now_iso(),
+                                },
+                                CommandAdmission {
+                                    payload_digest,
+                                    attachment_refs: Vec::new(),
+                                    provider_turn: None,
+                                },
+                                command_claim,
+                                &cancellation,
+                            )
+                            .await
+                            .map_err(|error| encode(adoption_orchestration_error(error, None)))?;
+                        let _ = result;
+                        Ok(encode(WorktreeThreadResult {
+                            thread_id: input.thread_id,
+                        }))
+                    },
+                )
+                .await
+                .unwrap_or_else(|| {
+                    Err(encode(adoption_orchestration_error(
+                        OrchestrationError::Cancelled,
+                        None,
+                    )))
+                })
+        })
+        .await
+}
+
+async fn retarget_worktree_thread(
+    services: &WorktreeCatalogRpcServices,
+    request: RpcRequest,
+    cancellation: CancellationToken,
+) -> RpcResult {
+    let input = decode::<WorktreeRetargetInput>(request)?;
+    let payload_digest = canonical_command_digest(&input).map_err(|_| {
+        encode(adoption_error(
+            WorktreeAdoptionErrorReason::Internal,
+            "The retarget payload could not be admitted.",
+            None,
+        ))
+    })?;
+    let command_claim =
+        acquire_worktree_command_claim(&services.orchestration, &input.command_id, &cancellation)
+            .await
+            .map_err(|error| encode(adoption_orchestration_error(error, None)))?;
+    if replay_thread_operation(services, &command_claim, &input.command_id, &payload_digest).await?
+    {
+        return Ok(encode(WorktreeThreadResult {
+            thread_id: input.thread_id,
+        }));
+    }
+    let project_id = input.project_id.clone();
+    let operation_runtime = services.operations.clone();
+    let services = services.clone();
+    operation_runtime
+        .run(async move {
+            let lock_cancellation = cancellation.clone();
+            let catalog = services.catalog.clone();
+            let locked_project_id = project_id.clone();
+            catalog
+                .with_project_mutation_lock_cancellation(
+                    &project_id,
+                    &lock_cancellation,
+                    || async move {
+                        let (mut snapshot, refreshed) =
+                            match services.catalog.latest(&locked_project_id).await {
+                                Some(snapshot) => (snapshot, false),
+                                None => services
+                                    .catalog
+                                    .refresh(&locked_project_id, CatalogRefreshTrigger::Explicit)
+                                    .await
+                                    .map(|snapshot| (snapshot, true))
+                                    .map_err(|error| encode(adoption_catalog_error(error, None)))?,
+                            };
+                        if !refreshed
+                            && (!snapshot.authoritative
+                                || snapshot.generation != input.expected_generation)
+                        {
+                            snapshot = services
+                                .catalog
+                                .refresh(&locked_project_id, CatalogRefreshTrigger::Explicit)
+                                .await
+                                .map_err(|error| {
+                                    encode(adoption_catalog_error(error, Some(snapshot.generation)))
+                                })?;
+                        }
+                        if !snapshot.authoritative
+                            || input.expected_generation > snapshot.generation
+                        {
+                            return Err(encode(adoption_error(
+                                WorktreeAdoptionErrorReason::StaleGeneration,
+                                "The selected worktree catalog generation changed.",
+                                Some(snapshot.generation),
+                            )));
+                        }
+                        let descriptor = snapshot
+                            .worktrees
+                            .iter()
+                            .find(|descriptor| descriptor.worktree_key == input.worktree_key)
+                            .ok_or_else(|| {
+                                encode(adoption_error(
+                                    WorktreeAdoptionErrorReason::WorktreeNotFound,
+                                    "The selected worktree is not present.",
+                                    Some(snapshot.generation),
+                                ))
+                            })?;
+                        if descriptor.is_primary
+                            || descriptor.is_bare
+                            || descriptor.registration_state
+                                != WorktreeRegistrationState::Registered
+                            || descriptor.directory_state != WorktreeDirectoryState::Present
+                            || descriptor
+                                .adopted_thread_id
+                                .as_deref()
+                                .is_some_and(|owner| owner != input.thread_id)
+                        {
+                            return Err(encode(adoption_error(
+                                WorktreeAdoptionErrorReason::OwnershipConflict,
+                                "The selected worktree cannot be assigned to this thread.",
+                                Some(snapshot.generation),
+                            )));
+                        }
+                        let resolved = services
+                            .catalog
+                            .resolve_adoption_candidate(&locked_project_id, &input.worktree_key)
+                            .await
+                            .map_err(|error| encode(adoption_validation_error(error)))?;
+                        services
+                            .orchestration
+                            .dispatch_with_admission_and_command_claim_until_handoff(
+                                OrchestrationCommand::ThreadMetaUpdate {
+                                    command_id: input.command_id,
+                                    thread_id: input.thread_id.clone(),
+                                    title: None,
+                                    model_selection: None,
+                                    branch: OptionalNullable::Present(resolved.branch),
+                                    worktree_path: OptionalNullable::Present(Some(resolved.path)),
+                                },
+                                CommandAdmission {
+                                    payload_digest,
+                                    attachment_refs: Vec::new(),
+                                    provider_turn: None,
+                                },
+                                command_claim,
+                                &cancellation,
+                            )
+                            .await
+                            .map_err(|error| {
+                                encode(adoption_orchestration_error(
+                                    error,
+                                    Some(snapshot.generation),
+                                ))
+                            })?;
+                        services
+                            .catalog
+                            .invalidate_after_mutation(&locked_project_id)
+                            .await;
+                        Ok(encode(WorktreeThreadResult {
+                            thread_id: input.thread_id,
+                        }))
+                    },
+                )
+                .await
+                .unwrap_or_else(|| {
+                    Err(encode(adoption_orchestration_error(
+                        OrchestrationError::Cancelled,
+                        None,
+                    )))
+                })
+        })
+        .await
+}
+
 #[derive(Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorktreeRemoveFromBibCodeInput {
     command_id: String,
     project_id: String,
@@ -808,7 +1407,7 @@ struct WorktreeRemoveFromBibCodeInput {
 }
 
 #[derive(Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorktreeRemoveInput {
     command_id: String,
     project_id: String,
@@ -828,7 +1427,7 @@ enum WorktreeRemovalMode {
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorktreeGetRemovalPlanInput {
     project_id: String,
     thread_id: String,
@@ -868,7 +1467,6 @@ struct ResolvedRemovalPlan {
 }
 
 struct ResolvedRemovalThread {
-    anchor: PathBuf,
     path: PathBuf,
     known_thread_ids: Vec<String>,
 }
@@ -921,16 +1519,27 @@ async fn get_removal_plan(
     cancellation: CancellationToken,
 ) -> RpcResult {
     let input = decode::<WorktreeGetRemovalPlanInput>(request)?;
-    let plan = build_removal_plan(
-        services,
-        &input.project_id,
-        &input.thread_id,
-        None,
-        true,
-        &cancellation,
-    )
-    .await?;
-    Ok(encode(plan.wire))
+    let project_id = input.project_id.clone();
+    let catalog = services.catalog.clone();
+    catalog
+        .with_project_mutation_lock_cancellation(&project_id, &cancellation, || async {
+            let plan = build_removal_plan(
+                services,
+                &input.project_id,
+                &input.thread_id,
+                None,
+                true,
+                &cancellation,
+            )
+            .await?;
+            Ok(encode(plan.wire))
+        })
+        .await
+        .unwrap_or_else(|| {
+            Err(encode(removal_orchestration_error(
+                OrchestrationError::Cancelled,
+            )))
+        })
 }
 
 async fn remove_from_bibcode(
@@ -949,15 +1558,39 @@ async fn remove_from_bibcode(
     {
         return Ok(encode(result));
     }
+    let operation_runtime = services.operations.clone();
+    let services = services.clone();
+    operation_runtime
+        .run(async move {
+            remove_from_bibcode_owned(
+                &services,
+                input,
+                payload_digest,
+                command_claim,
+                cancellation,
+            )
+            .await
+        })
+        .await
+}
+
+async fn remove_from_bibcode_owned(
+    services: &WorktreeCatalogRpcServices,
+    input: WorktreeRemoveFromBibCodeInput,
+    payload_digest: String,
+    command_claim: CommandAdmissionClaim,
+    cancellation: CancellationToken,
+) -> RpcResult {
     let cleanup_admission = admit_removal_cleanup(services).await?;
+    let cleanup_lifecycle = cleanup_admission.clone();
     let reservation = reserve_removal(services, &command_claim, &input, &payload_digest).await?;
     if let Some(result) = reservation.result {
         return Ok(encode(result));
     }
     let project_id = input.project_id.clone();
-    services
-        .catalog
-        .with_project_mutation_lock(&project_id, || async {
+    let catalog = services.catalog.clone();
+    catalog
+        .with_project_mutation_lock_cancellation(&project_id, &cancellation, || async {
             if let Some(result) =
                 replay_removal(services, &command_claim, &input.command_id, &payload_digest).await?
             {
@@ -997,6 +1630,7 @@ async fn remove_from_bibcode(
                 orphan_cleanup_pending,
                 command_claim.clone(),
                 ownership.clone(),
+                &cancellation,
             )
             .await?;
             quiesce.commit_detached();
@@ -1008,9 +1642,15 @@ async fn remove_from_bibcode(
                 .catalog
                 .invalidate_after_mutation(&input.project_id)
                 .await;
+            drop(cleanup_lifecycle);
             Ok(encode(result))
         })
         .await
+        .unwrap_or_else(|| {
+            Err(encode(removal_orchestration_error(
+                OrchestrationError::Cancelled,
+            )))
+        })
 }
 
 async fn remove_worktree(
@@ -1029,15 +1669,39 @@ async fn remove_worktree(
     {
         return Ok(encode(result));
     }
+    let operation_runtime = services.operations.clone();
+    let services = services.clone();
+    operation_runtime
+        .run(async move {
+            remove_worktree_owned(
+                &services,
+                input,
+                payload_digest,
+                command_claim,
+                cancellation,
+            )
+            .await
+        })
+        .await
+}
+
+async fn remove_worktree_owned(
+    services: &WorktreeCatalogRpcServices,
+    input: WorktreeRemoveInput,
+    payload_digest: String,
+    command_claim: CommandAdmissionClaim,
+    cancellation: CancellationToken,
+) -> RpcResult {
     let cleanup_admission = admit_removal_cleanup(services).await?;
+    let cleanup_lifecycle = cleanup_admission.clone();
     let reservation = reserve_removal(services, &command_claim, &input, &payload_digest).await?;
     if let Some(result) = reservation.result {
         return Ok(encode(result));
     }
     let project_id = input.project_id.clone();
-    services
-        .catalog
-        .with_project_mutation_lock(&project_id, || async {
+    let catalog = services.catalog.clone();
+    catalog
+        .with_project_mutation_lock_cancellation(&project_id, &cancellation, || async {
             if let Some(result) =
                 replay_removal(services, &command_claim, &input.command_id, &payload_digest).await?
             {
@@ -1053,7 +1717,7 @@ async fn remove_worktree(
             let guard = registry
                 .mark_removing(&input.thread_id, &resolved.path)
                 .await;
-            let plan = build_removal_plan(
+            let mut plan = build_removal_plan(
                 services,
                 &input.project_id,
                 &input.thread_id,
@@ -1106,10 +1770,37 @@ async fn remove_worktree(
                 )
                 .await
                 .map_err(|error| encode(removal_orchestration_error(error)))?;
+            if cancellation.is_cancelled() {
+                return Err(encode(removal_orchestration_error(
+                    OrchestrationError::Cancelled,
+                )));
+            }
+            let terminal_cancellation = CancellationToken::new();
+            if !resumed_git_success {
+                let trusted_anchor = services
+                    .catalog
+                    .resolve_trusted_repository_anchor(
+                        &input.project_id,
+                        &resolved.path,
+                        &terminal_cancellation,
+                    )
+                    .await
+                    .map_err(|error| {
+                        encode(removal_catalog_error(error, Some(plan.wire.generation)))
+                    })?;
+                if trusted_anchor.repository_key != plan.repository_key {
+                    return Err(encode(removal_error(
+                        WorktreeRemovalErrorReason::RepositoryMismatch,
+                        "The trusted removal anchor changed repository identity before Git mutation.",
+                        Some(plan.wire.generation),
+                    )));
+                }
+                plan.anchor = trusted_anchor.path;
+            }
             let git_result = if resumed_git_success {
                 Ok(("removed", None))
             } else {
-                apply_git_removal(services, &input, &plan, &cancellation).await
+                apply_git_removal(services, &input, &plan, &terminal_cancellation).await
             };
             let (git_outcome, detail) = match git_result {
                 Ok(outcome) => outcome,
@@ -1133,6 +1824,7 @@ async fn remove_worktree(
                 orphan_cleanup_pending,
                 command_claim.clone(),
                 ownership.clone(),
+                &terminal_cancellation,
             )
             .await?;
             quiesce.commit_detached();
@@ -1151,9 +1843,15 @@ async fn remove_worktree(
                     .invalidate_after_mutation(&input.project_id)
                     .await;
             }
+            drop(cleanup_lifecycle);
             Ok(encode(result))
         })
         .await
+        .unwrap_or_else(|| {
+            Err(encode(removal_orchestration_error(
+                OrchestrationError::Cancelled,
+            )))
+        })
 }
 
 async fn resolve_removal_thread(
@@ -1178,58 +1876,63 @@ async fn resolve_removal_thread(
                 && thread.deleted_at.is_none()
         })
         .ok_or_else(|| encode(removal_not_found()))?;
-    let path = thread
+    let persisted_path = thread
         .worktree_path
         .filter(|path| !path.trim().is_empty())
         .map(PathBuf::from)
         .ok_or_else(|| encode(removal_not_found()))?;
-    let path_key = normalize_worktree_path_key(&path, host_path_platform());
+    let path_key = canonical_worktree_path_key(&persisted_path)
+        .await
+        .map_err(|_| encode(removal_internal()))?;
+    let path = PathBuf::from(&path_key);
     let project_threads = repositories
         .list_threads_by_project(project_id.to_owned())
         .await
         .map_err(|_| encode(removal_internal()))?;
-    let owners = project_threads
-        .iter()
-        .filter(|candidate| {
-            candidate.kind == "workspace"
-                && candidate.deleted_at.is_none()
-                && candidate
-                    .worktree_path
-                    .as_ref()
-                    .is_some_and(|candidate_path| {
-                        normalize_worktree_path_key(Path::new(candidate_path), host_path_platform())
-                            == path_key
-                    })
-        })
-        .collect::<Vec<_>>();
-    if owners.len() != 1 || owners[0].thread_id != thread_id {
+    let mut owner_ids = Vec::new();
+    for candidate in &project_threads {
+        if candidate.kind != "workspace" || candidate.deleted_at.is_some() {
+            continue;
+        }
+        let Some(candidate_path) = candidate.worktree_path.as_deref() else {
+            continue;
+        };
+        let candidate_key = canonical_worktree_path_key(Path::new(candidate_path))
+            .await
+            .map_err(|_| encode(removal_internal()))?;
+        if candidate_key == path_key {
+            owner_ids.push(candidate.thread_id.as_str());
+        }
+    }
+    if owner_ids.len() != 1 || owner_ids[0] != thread_id {
         return Err(encode(removal_error(
             WorktreeRemovalErrorReason::OwnershipConflict,
             "Multiple workspace threads claim the removal target.",
             None,
         )));
     }
-    let project_root_key =
-        normalize_worktree_path_key(Path::new(&project.workspace_root), host_path_platform());
-    let mut known_thread_ids = project_threads
+    let project_root_key = canonical_worktree_path_key(Path::new(&project.workspace_root))
+        .await
+        .map_err(|_| encode(removal_internal()))?;
+    let mut known_thread_ids = Vec::new();
+    for candidate in project_threads
         .into_iter()
         .filter(|candidate| candidate.deleted_at.is_none())
-        .filter_map(|candidate| {
-            let candidate_key = candidate
-                .worktree_path
-                .as_ref()
-                .map(|candidate_path| {
-                    normalize_worktree_path_key(Path::new(candidate_path), host_path_platform())
-                })
-                .unwrap_or_else(|| project_root_key.clone());
-            (candidate_key == path_key).then_some(candidate.thread_id)
-        })
-        .collect::<Vec<_>>();
+    {
+        let candidate_key = match candidate.worktree_path.as_deref() {
+            Some(candidate_path) => canonical_worktree_path_key(Path::new(candidate_path))
+                .await
+                .map_err(|_| encode(removal_internal()))?,
+            None => project_root_key.clone(),
+        };
+        if candidate_key == path_key {
+            known_thread_ids.push(candidate.thread_id);
+        }
+    }
     known_thread_ids.push(thread_id.to_owned());
     known_thread_ids.sort();
     known_thread_ids.dedup();
     Ok(ResolvedRemovalThread {
-        anchor: PathBuf::from(project.workspace_root),
         path,
         known_thread_ids,
     })
@@ -1249,9 +1952,7 @@ async fn resolve_removal_thread_with_ownership(
         .await
         .map_err(|error| encode(removal_orchestration_error(error)))?;
     let resolved = resolve_removal_thread(services, project_id, thread_id).await?;
-    if normalize_worktree_path_key(&candidate.path, host_path_platform())
-        != normalize_worktree_path_key(&resolved.path, host_path_platform())
-    {
+    if candidate.path != resolved.path {
         return Err(encode(removal_error(
             WorktreeRemovalErrorReason::OwnershipConflict,
             "Workspace ownership changed during removal preflight.",
@@ -1270,7 +1971,6 @@ async fn build_removal_plan(
     cancellation: &CancellationToken,
 ) -> Result<ResolvedRemovalPlan, Value> {
     let resolved = resolve_removal_thread(services, project_id, thread_id).await?;
-    let anchor = resolved.anchor;
     let path = resolved.path;
     let snapshot = if refresh {
         services
@@ -1297,6 +1997,19 @@ async fn build_removal_plan(
             Some(snapshot.generation),
         )));
     }
+    let trusted_anchor = services
+        .catalog
+        .resolve_trusted_repository_anchor(project_id, &path, cancellation)
+        .await
+        .map_err(|error| encode(removal_catalog_error(error, Some(snapshot.generation))))?;
+    if trusted_anchor.repository_key != snapshot.repository_key {
+        return Err(encode(removal_error(
+            WorktreeRemovalErrorReason::RepositoryMismatch,
+            "The catalog removal anchor no longer matches the confirmed repository.",
+            Some(snapshot.generation),
+        )));
+    }
+    let anchor = trusted_anchor.path;
     let repository = services.removal_git.clone().ok_or_else(|| {
         encode(removal_error(
             WorktreeRemovalErrorReason::EnvironmentUnsupported,
@@ -1321,12 +2034,19 @@ async fn build_removal_plan(
             Some(snapshot.generation),
         )));
     }
-    let path_key = normalize_worktree_path_key(&path, host_path_platform());
-    let record = inventory
-        .records
-        .iter()
-        .find(|record| normalize_worktree_path_key(&record.path, host_path_platform()) == path_key)
-        .cloned();
+    let path_key = canonical_worktree_path_key(&path)
+        .await
+        .map_err(|_| encode(removal_git_failed(Some(snapshot.generation))))?;
+    let mut record = None;
+    for candidate in &inventory.records {
+        let candidate_key = canonical_worktree_path_key(&candidate.path)
+            .await
+            .map_err(|_| encode(removal_git_failed(Some(snapshot.generation))))?;
+        if candidate_key == path_key {
+            record = Some(candidate.clone());
+            break;
+        }
+    }
     if record
         .as_ref()
         .is_some_and(|record| record.is_primary || record.is_bare)
@@ -1589,10 +2309,11 @@ async fn persist_detach(
     orphan_cleanup_pending: bool,
     command_claim: CommandAdmissionClaim,
     ownership: WorkspaceOwnershipLease,
+    cancellation: &CancellationToken,
 ) -> Result<WorktreeRemovalResult, Value> {
     services
         .orchestration
-        .dispatch_with_admission_ownership_and_command_claim(
+        .dispatch_with_admission_ownership_and_command_claim_until_handoff(
             OrchestrationCommand::WorktreeDetachResolved {
                 command_id,
                 project_id,
@@ -1609,7 +2330,7 @@ async fn persist_detach(
             },
             command_claim,
             ownership,
-            || {},
+            cancellation,
         )
         .await
         .map_err(|error| encode(removal_orchestration_error(error)))?;
@@ -1906,36 +2627,35 @@ async fn update_discovery_policy(
     let project_id = input.project_id.clone();
     let services = services.clone();
     let mutation_cancellation = cancellation.clone();
-    let mutation = tokio::spawn(async move {
-        let operation_cancellation = mutation_cancellation.clone();
-        services
-            .catalog
-            .with_project_mutation_lock_cancellation(
-                &project_id,
-                &mutation_cancellation,
-                || async {
-                    update_discovery_policy_locked(
-                        &services,
-                        input,
-                        payload_digest,
-                        command_claim,
-                        existing_receipt,
-                        operation_cancellation,
-                    )
-                    .await
-                },
-            )
-            .await
-    });
-    match mutation.await {
-        Ok(Some(result)) => result,
-        Ok(None) => Err(encode(policy_orchestration_error(
-            OrchestrationError::Cancelled,
-        ))),
-        Err(error) => Err(encode(policy_error(format!(
-            "Policy mutation task failed: {error}"
-        )))),
-    }
+    let operation_runtime = services.operations.clone();
+    operation_runtime
+        .run(async move {
+            let operation_cancellation = mutation_cancellation.clone();
+            let catalog = services.catalog.clone();
+            catalog
+                .with_project_mutation_lock_cancellation(
+                    &project_id,
+                    &mutation_cancellation,
+                    || async {
+                        update_discovery_policy_locked(
+                            &services,
+                            input,
+                            payload_digest,
+                            command_claim,
+                            existing_receipt,
+                            operation_cancellation,
+                        )
+                        .await
+                    },
+                )
+                .await
+                .unwrap_or_else(|| {
+                    Err(encode(policy_orchestration_error(
+                        OrchestrationError::Cancelled,
+                    )))
+                })
+        })
+        .await
 }
 
 async fn update_discovery_policy_locked(
@@ -2060,13 +2780,13 @@ pub fn compact_eligible_baseline(snapshot: &WorktreeCatalogSnapshot) -> Result<V
 }
 
 #[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorktreeCatalogInput {
     project_id: String,
 }
 
 #[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorktreeAdoptInput {
     command_id: String,
     project_id: String,
@@ -2075,12 +2795,59 @@ struct WorktreeAdoptInput {
     thread_defaults: WorktreeAdoptThreadDefaults,
 }
 
-#[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Clone, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorktreeAdoptThreadDefaults {
     model_selection: Value,
     runtime_mode: String,
     interaction_mode: String,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorktreeCreateManagedInput {
+    command_id: String,
+    project_id: String,
+    thread_id: String,
+    title: String,
+    ref_name: String,
+    new_ref_name: Option<String>,
+    base_ref_name: Option<String>,
+    thread_defaults: WorktreeAdoptThreadDefaults,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorktreeCreatePanelInput {
+    command_id: String,
+    host_thread_id: String,
+    thread_id: String,
+    title: String,
+    thread_defaults: WorktreeAdoptThreadDefaults,
+}
+
+#[derive(Deserialize, Serialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct WorktreeRetargetInput {
+    command_id: String,
+    project_id: String,
+    thread_id: String,
+    worktree_key: String,
+    expected_generation: u64,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeThreadResult {
+    thread_id: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeManagedCreateResult {
+    thread_id: String,
+    path: String,
+    ref_name: String,
 }
 
 #[derive(Serialize)]
@@ -2118,7 +2885,7 @@ struct WorktreeAdoptionError {
 }
 
 #[derive(Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WorktreeDiscoveryPolicyUpdateInput {
     command_id: String,
     project_id: String,

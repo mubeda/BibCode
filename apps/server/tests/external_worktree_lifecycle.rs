@@ -59,6 +59,7 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
     fs::write(
         config.state_dir().join("settings.json"),
         serde_json::to_vec(&json!({
+            "enableProviderUpdateChecks": false,
             "providerInstances": {
                 "codex": {
                     "driver": "codex",
@@ -382,6 +383,56 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
                 .is_some_and(|terminal_id| terminal_id.starts_with("setup-"))),
         "adoption must not launch an observable setup terminal"
     );
+    let registrations_before_raw_remove = git_output(&main, &["worktree", "list", "--porcelain"]);
+    request(
+        &mut socket,
+        "31",
+        "vcs.removeWorktree",
+        json!({"cwd":main,"path":external,"force":true}),
+    )
+    .await;
+    loop {
+        match next(&mut socket).await {
+            ServerMessage::Defect { defect }
+                if defect.as_str().is_some_and(|detail| {
+                    detail.contains("Unknown request tag") && detail.contains("vcs.removeWorktree")
+                }) =>
+            {
+                break;
+            }
+            ServerMessage::Chunk { request_id, .. } => ack(&mut socket, request_id.as_str()).await,
+            other => panic!("expected the retired raw removal method to be unavailable: {other:?}"),
+        }
+    }
+    assert!(
+        external.is_dir(),
+        "raw removal cannot delete the live adopted checkout"
+    );
+    assert_eq!(
+        git_output(&main, &["worktree", "list", "--porcelain"]),
+        registrations_before_raw_remove,
+        "raw removal cannot mutate Git registration"
+    );
+    assert!(
+        repositories
+            .get_thread(thread_id.clone())
+            .await
+            .expect("owner read after raw removal rejection")
+            .is_some_and(|thread| thread.deleted_at.is_none()),
+        "raw removal cannot retire the adopted owner"
+    );
+    assert!(
+        !provider_shutdowns.exists(),
+        "raw removal rejection cannot quiesce the active provider"
+    );
+    request(
+        &mut socket,
+        "32",
+        "terminal.write",
+        json!({"threadId":thread_id,"terminalId":"lifecycle-terminal","data":"\n"}),
+    )
+    .await;
+    success(&mut socket, "32").await;
     request(
         &mut socket,
         "7",

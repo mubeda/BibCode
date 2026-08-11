@@ -18,7 +18,7 @@ use crate::git::{
 use super::service::{
     CatalogFileSystem, CatalogFuture, CatalogProject, CatalogProjectionSource,
     CatalogServiceOptions, CatalogShallowSignature, CatalogThread, DirectoryProbeState,
-    InventorySource, ScanFailure,
+    InventorySource, ScanFailure, TokioCatalogFileSystem,
 };
 use super::{
     CatalogRefreshTrigger, CatalogWorkspaceLossObserver, WorkspaceAvailabilityRegistry,
@@ -212,6 +212,7 @@ async fn authoritative_recovery_drains_terminal_signal_without_holding_the_catal
         .expect("terminal cleanup owns the missing transition");
     let invalidation_started = registry
         .terminal_signal_invalidation_notification(&loss)
+        .await
         .expect("current terminal signal gate");
     let cleanup_release = Arc::new(Notify::new());
     let task_cleanup_release = cleanup_release.clone();
@@ -286,6 +287,7 @@ async fn bootstrap_recovery_drains_terminal_signal_without_holding_the_catalog_r
         .expect("terminal cleanup owns the missing transition");
     let invalidation_started = registry
         .terminal_signal_invalidation_notification(&loss)
+        .await
         .expect("current terminal signal gate");
     let cleanup_release = Arc::new(Notify::new());
     let task_cleanup_release = cleanup_release.clone();
@@ -675,7 +677,8 @@ async fn shared_observation_never_substitutes_for_validating_a_different_anchor(
 }
 
 #[tokio::test]
-async fn detached_project_stops_waiting_while_an_aliased_project_keeps_shared_observation_alive() {
+async fn cancelled_unary_project_stops_waiting_while_an_aliased_project_keeps_shared_observation_alive()
+ {
     let inventory = Arc::new(PausingAfterTwoInventorySource::new(inventory(
         "/repo/common",
         [record("/repo/main", true)],
@@ -714,23 +717,16 @@ async fn detached_project_stops_waiting_while_an_aliased_project_keeps_shared_ob
     tokio::task::yield_now().await;
 
     drop(project_a);
-    for _ in 0..100 {
-        if refresh_a.is_finished() {
-            break;
-        }
-        tokio::task::yield_now().await;
-    }
     assert!(
-        refresh_a.is_finished(),
-        "detached view must stop waiting for the shared observation"
+        !refresh_a.is_finished(),
+        "the still-active unary request owns its catalog lifecycle after the subscription detaches"
     );
-    let error = refresh_a
-        .await
-        .expect("A refresh task")
-        .expect_err("detached A refresh is cancelled");
-    assert_eq!(
-        error.reason,
-        super::CatalogErrorReason::RepositoryUnavailable
+    refresh_a.abort();
+    assert!(
+        refresh_a
+            .await
+            .expect_err("A unary refresh is cancelled")
+            .is_cancelled()
     );
     assert_eq!(inventory.calls.load(Ordering::SeqCst), 3);
     assert!(!refresh_b.is_finished());
@@ -1650,6 +1646,80 @@ async fn joins_active_archived_panel_deleted_missing_and_conflicting_threads_on_
     assert_eq!(retained.worktrees, snapshot.worktrees);
 }
 
+#[cfg(unix)]
+#[tokio::test]
+async fn catalog_joins_an_owner_and_inventory_record_by_physical_workspace_identity() {
+    let root = tempfile::tempdir().expect("catalog identity root");
+    let main = root.path().join("main");
+    let physical = root.path().join("physical-worktree");
+    let common_dir = root.path().join("common");
+    std::fs::create_dir(&main).expect("main checkout");
+    std::fs::create_dir(&physical).expect("physical worktree");
+    std::fs::create_dir(&common_dir).expect("common Git directory");
+    let alias = root.path().join("worktree-alias");
+    std::os::unix::fs::symlink(&physical, &alias).expect("worktree alias");
+    let projections = Arc::new(FakeProjectionSource::new([(
+        "project-1".to_owned(),
+        CatalogProject {
+            workspace_root: main.clone(),
+            baseline_paths: Vec::new(),
+            threads: vec![CatalogThread {
+                thread_id: "owner".to_owned(),
+                kind: "workspace".to_owned(),
+                worktree_path: Some(alias),
+                branch: Some("feature".to_owned()),
+                archived: false,
+                deleted: false,
+            }],
+            repository_key: None,
+        },
+    )]));
+    let inventory = GitWorktreeInventory {
+        common_dir,
+        records: vec![
+            GitWorktreeRecord {
+                path: main,
+                head: Some("abc123".to_owned()),
+                branch: Some("main".to_owned()),
+                is_primary: true,
+                is_bare: false,
+                locked: false,
+                lock_reason: None,
+                is_prunable: false,
+                prunable_reason: None,
+            },
+            GitWorktreeRecord {
+                path: physical.clone(),
+                head: Some("def456".to_owned()),
+                branch: Some("feature".to_owned()),
+                is_primary: false,
+                is_bare: false,
+                locked: false,
+                lock_reason: None,
+                is_prunable: false,
+                prunable_reason: None,
+            },
+        ],
+        nul_delimited: true,
+    };
+    let service = WorktreeCatalogService::with_dependencies(
+        projections,
+        Arc::new(FakeInventorySource::new([inventory])),
+        Arc::new(TokioCatalogFileSystem),
+        CatalogServiceOptions::default(),
+    );
+
+    let subscription = service.subscribe("project-1").await.expect("catalog");
+    let canonical = std::fs::canonicalize(&physical)
+        .expect("canonical physical worktree")
+        .to_string_lossy()
+        .into_owned();
+    let snapshot = subscription.latest();
+    let descriptor = descriptor(&snapshot, &canonical);
+    assert_eq!(descriptor.adopted_thread_id.as_deref(), Some("owner"));
+    assert!(!descriptor.eligible_for_adoption);
+}
+
 #[tokio::test]
 async fn concurrent_refresh_waiters_receive_the_same_ownership_conflict() {
     let projections = Arc::new(FakeProjectionSource::new([project(
@@ -1818,7 +1888,7 @@ async fn final_unsubscribe_interrupts_an_in_progress_shallow_signature() {
 }
 
 #[tokio::test]
-async fn final_unsubscribe_cancels_in_progress_git_without_publishing_a_result() {
+async fn final_catalog_user_cancels_in_progress_git_without_publishing_a_result() {
     let inventory = Arc::new(CancellationAwareInventorySource::new(inventory(
         "/repo/common",
         [record("/repo/main", true)],
@@ -1848,16 +1918,20 @@ async fn final_unsubscribe_cancels_in_progress_git_without_publishing_a_result()
     wait_for_count(&inventory.calls, 2).await;
 
     drop(subscription);
-    wait_for_count(&inventory.cancellations, 1).await;
-    let error = refresh
-        .await
-        .expect("refresh task")
-        .expect_err("cancelled refresh must not publish a result");
-
-    assert_eq!(
-        error.reason,
-        super::CatalogErrorReason::RepositoryUnavailable
+    tokio::task::yield_now().await;
+    assert_eq!(inventory.cancellations.load(Ordering::SeqCst), 0);
+    assert!(
+        !refresh.is_finished(),
+        "the unary refresh remains an active catalog user after final unsubscribe"
     );
+    refresh.abort();
+    assert!(
+        refresh
+            .await
+            .expect_err("unary refresh task is cancelled")
+            .is_cancelled()
+    );
+    wait_for_count(&inventory.cancellations, 1).await;
     assert_eq!(
         service
             .latest("project-1")
@@ -1876,7 +1950,7 @@ async fn final_unsubscribe_cancels_in_progress_git_without_publishing_a_result()
 }
 
 #[tokio::test]
-async fn final_unsubscribe_interrupts_in_progress_directory_probes() {
+async fn final_catalog_user_interrupts_in_progress_directory_probes() {
     let filesystem = Arc::new(SwitchableBlockingProbeFileSystem::new([
         ("/repo/main", DirectoryProbeState::Present),
         ("/repo/external", DirectoryProbeState::Present),
@@ -1910,16 +1984,20 @@ async fn final_unsubscribe_interrupts_in_progress_directory_probes() {
     wait_for_count(&filesystem.active, 1).await;
 
     drop(subscription);
-    wait_for_count(&filesystem.interrupted, 1).await;
-    let error = refresh
-        .await
-        .expect("refresh task")
-        .expect_err("cancelled probes must not publish a result");
-
-    assert_eq!(
-        error.reason,
-        super::CatalogErrorReason::RepositoryUnavailable
+    tokio::task::yield_now().await;
+    assert_eq!(filesystem.interrupted.load(Ordering::SeqCst), 0);
+    assert!(
+        !refresh.is_finished(),
+        "the unary refresh remains an active catalog user after final unsubscribe"
     );
+    refresh.abort();
+    assert!(
+        refresh
+            .await
+            .expect_err("unary refresh task is cancelled")
+            .is_cancelled()
+    );
+    wait_for_count(&filesystem.interrupted, 1).await;
     assert_eq!(filesystem.active.load(Ordering::SeqCst), 0);
     assert_eq!(
         service
@@ -2062,6 +2140,11 @@ async fn immediate_reattach_ignores_a_cancelled_refresh_from_the_prior_lifecycle
     };
     wait_for_count(&inventory.calls, 2).await;
     drop(first);
+    assert!(
+        !stale_refresh.is_finished(),
+        "the unary request keeps the prior lifecycle active after unsubscribe"
+    );
+    stale_refresh.abort();
     wait_for_count(&inventory.cancelled, 1).await;
 
     let reattach = {
@@ -2072,13 +2155,11 @@ async fn immediate_reattach_ignores_a_cancelled_refresh_from_the_prior_lifecycle
     assert!(!reattach.is_finished(), "old refresh is still unwinding");
     inventory.release.add_permits(1);
 
-    let stale_error = stale_refresh
-        .await
-        .expect("stale refresh task")
-        .expect_err("prior lifecycle is cancelled");
-    assert_eq!(
-        stale_error.reason,
-        super::CatalogErrorReason::RepositoryUnavailable
+    assert!(
+        stale_refresh
+            .await
+            .expect_err("prior unary refresh task is cancelled")
+            .is_cancelled()
     );
     let current = reattach
         .await
@@ -2088,6 +2169,104 @@ async fn immediate_reattach_ignores_a_cancelled_refresh_from_the_prior_lifecycle
     assert_eq!(current.latest().generation, 2);
     assert_eq!(inventory.calls.load(Ordering::SeqCst), 3);
     assert_eq!(service.active_poller_count_for_test(), 1);
+}
+
+#[tokio::test(start_paused = true)]
+async fn unary_refresh_participates_in_idle_lifecycle_and_evicts_after_final_release() {
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        Arc::new(FakeInventorySource::new((0..2).map(|_| {
+            inventory("/repo/common", [record("/repo/main", true)])
+        }))),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+
+    service
+        .refresh("project-1", CatalogRefreshTrigger::Explicit)
+        .await
+        .expect("unary refresh");
+    assert_eq!(service.entry_count_for_test(), 1);
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(59)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(service.entry_count_for_test(), 1);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        service.entry_count_for_test(),
+        0,
+        "the final unary user must schedule the same pointer-checked idle eviction as a subscriber"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn unary_reuse_at_the_idle_deadline_survives_until_the_cancelled_user_releases() {
+    let inventory = Arc::new(PausingAfterTwoInventorySource::new(inventory(
+        "/repo/common",
+        [record("/repo/main", true)],
+    )));
+    let service = WorktreeCatalogService::with_dependencies(
+        Arc::new(FakeProjectionSource::new([project(
+            "project-1",
+            "/repo/main",
+            [],
+        )])),
+        inventory.clone(),
+        Arc::new(FakeFileSystem::new([
+            ("/repo/main", DirectoryProbeState::Present),
+            ("/repo/common", DirectoryProbeState::Present),
+        ])),
+        CatalogServiceOptions::default(),
+    );
+    service
+        .refresh("project-1", CatalogRefreshTrigger::Explicit)
+        .await
+        .expect("initial unary refresh");
+    tokio::time::advance(Duration::from_secs(59)).await;
+    tokio::task::yield_now().await;
+
+    let reusing = {
+        let service = service.clone();
+        tokio::spawn(async move {
+            service
+                .refresh("project-1", CatalogRefreshTrigger::Explicit)
+                .await
+        })
+    };
+    wait_for_count(&inventory.calls, 3).await;
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        service.entry_count_for_test(),
+        1,
+        "an active unary user cancels the old pointer-checked eviction"
+    );
+
+    reusing.abort();
+    assert!(
+        reusing
+            .await
+            .expect_err("unary task is cancelled")
+            .is_cancelled()
+    );
+    tokio::time::advance(Duration::from_secs(59)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(service.entry_count_for_test(), 1);
+    tokio::time::advance(Duration::from_secs(1)).await;
+    tokio::task::yield_now().await;
+    assert_eq!(
+        service.entry_count_for_test(),
+        0,
+        "cancelling the final unary user starts a fresh full idle window"
+    );
 }
 
 #[tokio::test(start_paused = true)]

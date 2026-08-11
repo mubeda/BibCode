@@ -4177,7 +4177,6 @@ exit /b 9
             "vcs.listCommits",
             "vcs.pull",
             "vcs.refreshStatus",
-            "vcs.removeWorktree",
             "vcs.stageFiles",
             "vcs.switchRef",
             "vcs.unstageFiles",

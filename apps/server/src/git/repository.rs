@@ -23,9 +23,9 @@ use super::{
     PullStatus, SourceControlProviderInfo, VcsCommit, VcsCreateWorktreeResult,
     VcsListCommitsResult, VcsListRefsResult, VcsPullResult, VcsRef, VcsStagingArea,
     VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusResult, VcsWorkingTree,
-    VcsWorkingTreeFile, VcsWorkingTreeFileStatus, VcsWorktree, git_worktree_prune_impact_digest,
-    host_path_platform, normalize_worktree_path_key, parse_numstat, parse_porcelain_v2_line,
-    parse_worktree_porcelain,
+    VcsWorkingTreeFile, VcsWorkingTreeFileStatus, VcsWorktree, canonical_worktree_path_key,
+    git_worktree_prune_impact_digest, host_path_platform, normalize_worktree_path_key,
+    parse_numstat, parse_porcelain_v2_line, parse_worktree_porcelain,
 };
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -1679,6 +1679,61 @@ impl GitRepository {
                     display_path(owned_path.path())
                 ),
             ));
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn rollback_managed_worktree_creation(
+        &self,
+        cwd: &Path,
+        created_path: &Path,
+        created_branch: Option<&str>,
+    ) -> Result<(), GitCommandError> {
+        let cancellation = CancellationToken::new();
+        let created_key = canonical_worktree_path_key(created_path)
+            .await
+            .map_err(|error| {
+                simple_error(
+                    "GitVcsDriver.createWorktree.rollback",
+                    cwd,
+                    &format!("The created worktree identity could not be verified: {error}"),
+                )
+            })?;
+        let inventory = self.worktree_inventory(cwd, &cancellation).await?;
+        let mut created_record = None;
+        for record in inventory.records {
+            let record_key = canonical_worktree_path_key(&record.path)
+                .await
+                .map_err(|error| {
+                    simple_error(
+                        "GitVcsDriver.createWorktree.rollback",
+                        cwd,
+                        &format!("A registered worktree identity could not be verified: {error}"),
+                    )
+                })?;
+            if record_key == created_key {
+                created_record = Some(record);
+                break;
+            }
+        }
+        let record = created_record.ok_or_else(|| {
+            simple_error(
+                "GitVcsDriver.createWorktree.rollback",
+                cwd,
+                "The exact created worktree is no longer registered.",
+            )
+        })?;
+        if record.is_primary || record.is_bare {
+            return Err(simple_error(
+                "GitVcsDriver.createWorktree.rollback",
+                cwd,
+                "The exact created worktree resolved to a protected checkout.",
+            ));
+        }
+        self.remove_worktree_verified(cwd, &record, true, &cancellation)
+            .await?;
+        if let Some(branch) = created_branch {
+            self.rollback_created_branch(cwd, branch).await?;
         }
         Ok(())
     }

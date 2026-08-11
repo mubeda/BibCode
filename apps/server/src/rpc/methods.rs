@@ -111,14 +111,16 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     unary("vcs.pull"),
     unary("vcs.refreshStatus"),
     unary("vcs.refreshWorktreeCatalog"),
-    unary("vcs.removeWorktree"),
     unary("vcs.stageFiles"),
     unary("vcs.switchRef"),
     unary("vcs.unstageFiles"),
     unary("worktree.adopt"),
+    unary("worktree.createManaged"),
+    unary("worktree.createPanel"),
     unary("worktree.getRemovalPlan"),
     unary("worktree.remove"),
     unary("worktree.removeFromBibCode"),
+    unary("worktree.retarget"),
     unary("worktree.updateDiscoveryPolicy"),
 ];
 

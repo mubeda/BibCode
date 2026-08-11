@@ -9,8 +9,8 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    git::{host_path_platform, normalize_worktree_path_key},
-    persistence::CommitFence,
+    git::{canonical_worktree_path_key, host_path_platform, normalize_worktree_path_key},
+    persistence::{CommitFence, CommitPermit},
 };
 
 use super::{AdoptedWorktreeAvailability, WorktreeCatalogSnapshot};
@@ -325,21 +325,12 @@ impl WorkspaceAvailabilityRegistry {
     }
 
     pub async fn guard_path(&self, path: &Path) -> Result<(), WorkspaceUnavailable> {
-        let lexical = normalized_path(path);
-        let canonical = tokio::fs::canonicalize(path)
-            .await
-            .ok()
-            .map(|path| normalized_path(&path));
+        let physical = physical_path_key(path).await;
         let state = lock(&self.inner);
         state
             .entries
             .values()
-            .find(|entry| {
-                path_is_within(&lexical, &entry.path_key)
-                    || canonical
-                        .as_deref()
-                        .is_some_and(|path| path_is_within(path, &entry.path_key))
-            })
+            .find(|entry| path_is_within(&physical, &entry.path_key))
             .map_or(Ok(()), |entry| Err(unavailable(entry)))
     }
 
@@ -365,10 +356,7 @@ impl WorkspaceAvailabilityRegistry {
     ) -> Result<WorkspaceAdmissionLease, WorkspaceUnavailable> {
         let mut path_keys = HashSet::new();
         for path in paths {
-            path_keys.insert(normalized_path(path));
-            if let Ok(canonical) = tokio::fs::canonicalize(path).await {
-                path_keys.insert(normalized_path(&canonical));
-            }
+            path_keys.insert(physical_path_key(path).await);
         }
         let mut state = lock(&self.inner);
         if let Some(thread_id) = thread_id
@@ -434,7 +422,8 @@ impl WorkspaceAvailabilityRegistry {
         })
     }
 
-    pub async fn mark_unavailable(&self, transition: WorkspaceLossTransition) -> bool {
+    pub async fn mark_unavailable(&self, mut transition: WorkspaceLossTransition) -> bool {
+        transition.path = PathBuf::from(physical_path_key(&transition.path).await);
         let expected = transition.clone();
         let reconciliation = self
             .prepare_reconciliation(vec![WorkspaceAvailabilityAction::MarkUnavailable {
@@ -450,7 +439,7 @@ impl WorkspaceAvailabilityRegistry {
     }
 
     pub async fn mark_removing(&self, thread_id: &str, path: &Path) -> RemovalGuard {
-        let path_key = normalized_path(path);
+        let path_key = physical_path_key(path).await;
         let removal_id = {
             let mut state = lock(&self.inner);
             state.next_removal_id = state.next_removal_id.wrapping_add(1).max(1);
@@ -488,10 +477,11 @@ impl WorkspaceAvailabilityRegistry {
     }
 
     async fn clear_matching(&self, thread_id: &str, path: &Path, repository_key: Option<&str>) {
+        let path_key = physical_path_key(path).await;
         let reconciliation = self
             .prepare_reconciliation(vec![WorkspaceAvailabilityAction::ClearRecovered {
                 thread_id: thread_id.to_owned(),
-                path_key: normalized_path(path),
+                path_key,
                 repository_key: repository_key.map(str::to_owned),
             }])
             .await;
@@ -520,11 +510,12 @@ impl WorkspaceAvailabilityRegistry {
             match workspace.availability {
                 AdoptedWorktreeAvailability::MissingRegistered
                 | AdoptedWorktreeAvailability::MissingUnregistered => {
+                    let path = physical_path_key(Path::new(&workspace.path)).await;
                     let transition = WorkspaceLossTransition {
                         thread_id: workspace.thread_id.clone(),
                         repository_key: snapshot.repository_key.clone(),
                         generation: snapshot.generation,
-                        path: PathBuf::from(&workspace.path),
+                        path: PathBuf::from(path),
                         availability: workspace.availability,
                     };
                     actions.push(WorkspaceAvailabilityAction::MarkUnavailable {
@@ -533,9 +524,10 @@ impl WorkspaceAvailabilityRegistry {
                     });
                 }
                 AdoptedWorktreeAvailability::Present => {
+                    let path_key = physical_path_key(Path::new(&workspace.path)).await;
                     actions.push(WorkspaceAvailabilityAction::ClearRecovered {
                         thread_id: workspace.thread_id.clone(),
-                        path_key: normalized_path(Path::new(&workspace.path)),
+                        path_key,
                         repository_key: Some(snapshot.repository_key.clone()),
                     });
                 }
@@ -854,12 +846,12 @@ impl WorkspaceAvailabilityRegistry {
     }
 
     #[cfg(test)]
-    pub(crate) fn terminal_signal_invalidation_notification(
+    pub(crate) async fn terminal_signal_invalidation_notification(
         &self,
         transition: &WorkspaceLossTransition,
     ) -> Option<Arc<Notify>> {
         let guard_state = transition.guard_state()?;
-        let path_key = normalized_path(&transition.path);
+        let path_key = physical_path_key(&transition.path).await;
         let state = lock(&self.inner);
         let entry = state.entries.get(&transition.thread_id)?;
         (entry.repository_key == transition.repository_key
@@ -1032,6 +1024,23 @@ impl WorkspaceAdmissionLease {
     #[must_use]
     pub(crate) fn commit_fence(&self) -> CommitFence {
         self.finalization.commit_fence()
+    }
+
+    pub(crate) fn begin_finalization(&self) -> Result<CommitPermit, WorkspaceUnavailable> {
+        self.commit_fence().acquire().map_err(|_| {
+            self.loss_cancellation
+                .unavailable()
+                .unwrap_or_else(|| WorkspaceUnavailable {
+                    tag: "WorkspaceUnavailableError",
+                    reason: "workspace_transition",
+                    message: "The workspace became unavailable before the mutation finalized."
+                        .to_owned(),
+                    thread_id: String::new(),
+                    path: String::new(),
+                    availability: AdoptedWorktreeAvailability::Removing,
+                    state: WorkspaceGuardState::Removing,
+                })
+        })
     }
 }
 
@@ -1519,6 +1528,12 @@ fn normalized_path(path: &Path) -> String {
     normalize_worktree_path_key(path, host_path_platform())
 }
 
+async fn physical_path_key(path: &Path) -> String {
+    canonical_worktree_path_key(path)
+        .await
+        .unwrap_or_else(|_| normalized_path(path))
+}
+
 fn path_is_within(candidate: &str, root: &str) -> bool {
     candidate == root
         || candidate
@@ -1630,6 +1645,28 @@ mod tests {
                 .expect_err("a nested cwd cannot bypass the workspace guard"),
             thread_error
         );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn missing_workspace_aliases_share_one_physical_removal_guard() {
+        let root = tempfile::tempdir().expect("workspace parent");
+        let physical_parent = root.path().join("physical");
+        std::fs::create_dir(&physical_parent).expect("physical parent");
+        let alias_parent = root.path().join("alias");
+        std::os::unix::fs::symlink(&physical_parent, &alias_parent).expect("parent alias");
+        let alias_missing = alias_parent.join("removed-worktree");
+        let physical_descendant = physical_parent.join("removed-worktree/src/lib.rs");
+        let registry = WorkspaceAvailabilityRegistry::new();
+
+        let _removing = registry.mark_removing("thread-1", &alias_missing).await;
+
+        let unavailable = registry
+            .guard_path(&physical_descendant)
+            .await
+            .expect_err("a missing checkout alias cannot bypass its physical removal guard");
+        assert_eq!(unavailable.thread_id, "thread-1");
+        assert_eq!(unavailable.state, WorkspaceGuardState::Removing);
     }
 
     #[test]
@@ -1929,6 +1966,7 @@ mod tests {
             .expect("second terminal signal permit");
         let invalidation_started = registry
             .terminal_signal_invalidation_notification(&older)
+            .await
             .expect("current terminal signal gate");
 
         let newer = transition(
@@ -1998,6 +2036,7 @@ mod tests {
             .expect("terminal cleanup owns the missing transition");
         let invalidation_started = registry
             .terminal_signal_invalidation_notification(&loss)
+            .await
             .expect("current terminal signal gate");
         let cleanup = tokio::spawn(async move {
             let _permit = permit;
@@ -2044,6 +2083,7 @@ mod tests {
             .expect("terminal cleanup owns the missing transition");
         let invalidation_started = registry
             .terminal_signal_invalidation_notification(&loss)
+            .await
             .expect("current terminal signal gate");
         let recovery_registry = registry.clone();
         let recovery = tokio::spawn(async move {
@@ -2099,6 +2139,7 @@ mod tests {
             .expect("terminal cleanup owns the missing transition");
         let invalidation_started = registry
             .terminal_signal_invalidation_notification(&loss)
+            .await
             .expect("current terminal signal gate");
         let cleanup_release = Arc::new(Notify::new());
         let task_cleanup_release = cleanup_release.clone();

@@ -57,8 +57,8 @@ use crate::{
         turn_delivery::TurnDeliveryService,
         workspace_preview::{WorkspacePreviewRpcServices, register_workspace_preview_rpc},
         worktree_catalog_rpc::{
-            WorktreeCatalogMutationObserver, WorktreeCatalogRpcServices,
-            register_worktree_catalog_rpc,
+            WorktreeCatalogMutationObserver, WorktreeCatalogOperationRuntime,
+            WorktreeCatalogRpcServices, register_worktree_catalog_rpc,
         },
         worktree_runtime::WorktreeRuntime,
     },
@@ -94,6 +94,7 @@ pub struct ProductionRuntime {
     orchestration_effects: OrchestrationEffects,
     diagnostic_bundle: DiagnosticBundleService,
     _worktree_catalog: WorktreeCatalogService,
+    worktree_catalog_operations: WorktreeCatalogOperationRuntime,
     worktree_runtime: WorktreeRuntime,
     _resource_sampler: Arc<NativeResourceSampler>,
 }
@@ -329,11 +330,11 @@ impl ProductionRuntime {
         );
         register_workspace_preview_rpc(&mut registry, workspace_preview);
         register_git_vcs_rpc(&mut registry, git_vcs);
-        register_worktree_catalog_rpc(
-            &mut registry,
+        let worktree_catalog_rpc =
             WorktreeCatalogRpcServices::new(worktree_catalog.clone(), orchestration.clone())
-                .with_removal_quiescer(Arc::new(worktree_runtime.clone())),
-        );
+                .with_removal_quiescer(Arc::new(worktree_runtime.clone()));
+        let worktree_catalog_operations = worktree_catalog_rpc.operation_runtime();
+        register_worktree_catalog_rpc(&mut registry, worktree_catalog_rpc);
         register_server_terminal_rpc(&mut registry, terminal_services.clone());
         finalize_rpc_registry(&registry, &control)?;
 
@@ -351,6 +352,7 @@ impl ProductionRuntime {
             orchestration_effects,
             diagnostic_bundle,
             _worktree_catalog: worktree_catalog,
+            worktree_catalog_operations,
             worktree_runtime,
             _resource_sampler: resource_sampler,
         })
@@ -372,9 +374,11 @@ impl ProductionRuntime {
                 ))
             }
             JsonOperation::OrchestrationDispatch => {
-                let command: OrchestrationCommand = serde_json::from_value(
+                let command = super::orchestration_rpc::decode_public_orchestration_command(
+                    &self.orchestration,
                     payload.ok_or_else(|| bad_request("Request body is required."))?,
                 )
+                .await
                 .map_err(bad_request)?;
                 if matches!(command, OrchestrationCommand::ThreadTurnStart { .. }) {
                     return Err(bad_request(
@@ -469,6 +473,7 @@ impl ProductionRuntime {
     }
 
     pub async fn shutdown(&self) {
+        self.worktree_catalog_operations.shutdown().await;
         self._worktree_catalog.shutdown().await;
         self.worktree_runtime.shutdown().await;
         self.provider_update_checks.shutdown().await;
@@ -1096,7 +1101,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn http_turn_start_cannot_bypass_durable_admission() {
+    async fn http_dispatch_cannot_bypass_durable_or_worktree_authority() {
         let state = TempDir::new().expect("state");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
         let database = Database::open_in_memory().await.expect("database");
@@ -1168,6 +1173,70 @@ mod tests {
                 .expect("delivery")
                 .is_none()
         );
+
+        runtime
+            .orchestration
+            .dispatch(
+                serde_json::from_value(json!({
+                    "type":"thread.create","commandId":"http-owner-create",
+                    "threadId":"http-adopted-owner","projectId":"http-project",
+                    "title":"Adopted owner","modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                    "runtimeMode":"full-access","interactionMode":"default","branch":"feature/http",
+                    "worktreePath":workspace_root.join("external-worktree"),"createdAt":"2026-08-01T00:00:02Z"
+                }))
+                .expect("internal owner command"),
+            )
+            .await
+            .expect("internal owner created");
+        for payload in [
+            json!({
+                "type":"worktree.adopt-resolved","commandId":"http-internal-adopt",
+                "projectId":"http-project","worktreeKey":"client-key","path":"/client/path",
+                "branch":"main","head":"abcdef1","modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access","interactionMode":"default"
+            }),
+            json!({
+                "type":"project.meta.update","commandId":"http-raw-policy","projectId":"http-project",
+                "worktreeDiscovery":{"visibility":"shown","initialPromptDismissedAt":null,"baselinePaths":["/client/baseline"]}
+            }),
+            json!({
+                "type":"thread.create","commandId":"http-raw-path","threadId":"http-raw-owner",
+                "projectId":"http-project","title":"Raw owner","modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access","interactionMode":"default","branch":"raw",
+                "worktreePath":"/client/worktree","createdAt":"2026-08-01T00:00:03Z"
+            }),
+            json!({
+                "type":"thread.delete","commandId":"http-raw-owner-delete","threadId":"http-adopted-owner"
+            }),
+            json!({
+                "type":"project.delete","commandId":"http-raw-project-delete","projectId":"http-project","force":true
+            }),
+        ] {
+            let command_id = payload["commandId"]
+                .as_str()
+                .expect("command id")
+                .to_owned();
+            let rejected = runtime
+                .json(
+                    JsonOperation::OrchestrationDispatch,
+                    Some(payload),
+                    route_context(),
+                )
+                .await;
+            assert!(
+                rejected.is_err(),
+                "HTTP generic dispatch must reject worktree authority"
+            );
+            assert!(
+                runtime
+                    .orchestration
+                    .repositories()
+                    .get_command_receipt(command_id)
+                    .await
+                    .expect("receipt")
+                    .is_none()
+            );
+        }
         runtime.shutdown().await;
     }
 

@@ -111,7 +111,7 @@ pub fn normalize_worktree_path_key(path: &Path, platform: HostPathPlatform) -> S
     let normalized = normalize_lexical_components(&source, platform);
     match platform {
         HostPathPlatform::Posix => normalized,
-        HostPathPlatform::Windows => normalized.to_ascii_lowercase(),
+        HostPathPlatform::Windows => normalized.to_lowercase(),
     }
 }
 
@@ -120,7 +120,16 @@ pub fn normalize_worktree_path_key(path: &Path, platform: HostPathPlatform) -> S
 /// The leaf may already have been removed. Resolving the nearest existing ancestor keeps
 /// aliases such as macOS `/var` and `/private/var` on one server-owned identity key.
 pub async fn canonical_worktree_path_key(path: &Path) -> io::Result<String> {
-    let lexical = PathBuf::from(normalize_worktree_path_key(path, host_path_platform()));
+    let platform = host_path_platform();
+    let source = path.to_string_lossy();
+    if platform == HostPathPlatform::Posix && looks_like_windows_absolute_path(&source) {
+        let foreign_source = source.replace('\\', "/");
+        return Ok(normalize_lexical_components(
+            &foreign_source,
+            HostPathPlatform::Windows,
+        ));
+    }
+    let lexical = PathBuf::from(normalize_worktree_path_key(path, platform));
     let absolute = if lexical.is_absolute() {
         lexical
     } else {
@@ -163,6 +172,16 @@ pub async fn canonical_worktree_path_key(path: &Path) -> io::Result<String> {
             Err(error) => return Err(error),
         }
     }
+}
+
+fn looks_like_windows_absolute_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    (bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\'))
+        || path.starts_with("\\\\")
+        || path.starts_with("//")
 }
 
 fn normalize_lexical_components(path: &str, platform: HostPathPlatform) -> String {
@@ -614,9 +633,9 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        HostPathPlatform, WorktreeIdentityError, normalize_worktree_path_key,
-        parse_worktree_porcelain, parse_worktree_prune_dry_run, resolved_worktree_keys,
-        worktree_key, worktree_repository_key,
+        HostPathPlatform, WorktreeIdentityError, canonical_worktree_path_key,
+        normalize_worktree_path_key, parse_worktree_porcelain, parse_worktree_prune_dry_run,
+        resolved_worktree_keys, worktree_key, worktree_repository_key,
     };
 
     #[test]
@@ -832,6 +851,49 @@ mod tests {
                 Path::new("/repo/"),
                 HostPathPlatform::Posix,
             )
+        );
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn foreign_windows_absolute_paths_are_not_anchored_to_the_posix_process_directory() {
+        assert_eq!(
+            canonical_worktree_path_key(Path::new(r"C:\Repo\.worktrees\bootstrap"))
+                .await
+                .expect("drive path remains a foreign absolute path"),
+            "C:/Repo/.worktrees/bootstrap"
+        );
+        assert_eq!(
+            canonical_worktree_path_key(Path::new(r"\\SÉRVEUR\PARTAGÉ\Δelta"))
+                .await
+                .expect("UNC path remains a foreign absolute path"),
+            "//SÉRVEUR/PARTAGÉ/Δelta"
+        );
+    }
+
+    #[test]
+    fn windows_path_identity_case_folds_non_ascii_drive_and_unc_components() {
+        assert_eq!(
+            normalize_worktree_path_key(
+                Path::new(r"C:\RÉPO\Ünicode\Feature"),
+                HostPathPlatform::Windows,
+            ),
+            normalize_worktree_path_key(
+                Path::new(r"c:/répo/ünicode/feature"),
+                HostPathPlatform::Windows,
+            ),
+            "drive paths use Unicode-aware case folding"
+        );
+        assert_eq!(
+            normalize_worktree_path_key(
+                Path::new(r"\\SÉRVEUR\PARTAGÉ\Δelta"),
+                HostPathPlatform::Windows,
+            ),
+            normalize_worktree_path_key(
+                Path::new("//sérveur/partagé/δelta"),
+                HostPathPlatform::Windows,
+            ),
+            "UNC server, share, and path components share one Unicode identity"
         );
     }
 

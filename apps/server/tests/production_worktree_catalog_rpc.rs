@@ -26,15 +26,17 @@ use bibcode_server::{
     production::git_vcs::{CatalogMutationObserver, GitVcsRpcServices, register_git_vcs_rpc},
     production::orchestration_rpc::register_orchestration_rpc,
     production::worktree_catalog_rpc::{
-        WorktreeCatalogMutationObserver, WorktreeCatalogRpcServices,
-        WorktreeRemovalCleanupAdmission, WorktreeRemovalCleanupAdmissionError,
-        WorktreeRemovalCleanupAdmissionFuture, WorktreeRemovalGit, WorktreeRemovalGitFuture,
-        WorktreeRemovalQuiesceFuture, WorktreeRemovalQuiesceLease, WorktreeRemovalQuiesceRequest,
-        WorktreeRemovalQuiescer, compact_eligible_baseline, register_worktree_catalog_rpc,
+        WorktreeCatalogMutationObserver, WorktreeCatalogOperationRuntime,
+        WorktreeCatalogRpcServices, WorktreeRemovalCleanupAdmission,
+        WorktreeRemovalCleanupAdmissionError, WorktreeRemovalCleanupAdmissionFuture,
+        WorktreeRemovalGit, WorktreeRemovalGitFuture, WorktreeRemovalQuiesceFuture,
+        WorktreeRemovalQuiesceLease, WorktreeRemovalQuiesceRequest, WorktreeRemovalQuiescer,
+        compact_eligible_baseline, register_worktree_catalog_rpc,
     },
     worktree_catalog::{
-        CatalogScanStatus, WorktreeAdoptionState, WorktreeCatalogService, WorktreeCatalogSnapshot,
-        WorktreeDescriptor, WorktreeDirectoryState, WorktreeRegistrationState,
+        CatalogScanStatus, WorkspaceAvailabilityRegistry, WorktreeAdoptionState,
+        WorktreeCatalogService, WorktreeCatalogSnapshot, WorktreeDescriptor,
+        WorktreeDirectoryState, WorktreeRegistrationState,
     },
 };
 use futures_util::{SinkExt, StreamExt};
@@ -49,6 +51,252 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungsten
 use tokio_util::sync::CancellationToken;
 
 type TestSocket = WebSocketStream<MaybeTlsStream<tokio::net::TcpStream>>;
+
+#[tokio::test]
+async fn dedicated_worktree_creation_rejects_client_selected_filesystem_authority() {
+    let mut fixture = CatalogRpcFixture::new(false).await;
+    let client_selected = fixture.root.path().join("client-selected");
+    let main = fixture.main.clone();
+
+    request(
+        fixture.socket(),
+        "9900",
+        "worktree.createManaged",
+        json!({
+            "commandId":"managed-authority-command",
+            "projectId":"project-1",
+            "threadId":"managed-authority-thread",
+            "title":"Managed authority",
+            "refName":"main",
+            "newRefName":"feature/client-selected",
+            "baseRefName":"main",
+            "cwd":main,
+            "path":client_selected,
+            "threadDefaults":{
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access",
+                "interactionMode":"default"
+            }
+        }),
+    )
+    .await;
+
+    let message = next_server_message(fixture.socket()).await;
+    let ServerMessage::Exit {
+        request_id,
+        exit: RpcExit::Failure { cause },
+    } = message
+    else {
+        panic!("expected raw filesystem authority to be rejected: {message:?}");
+    };
+    assert_eq!(request_id.as_str(), "9900");
+    assert!(cause.iter().any(|item| matches!(
+        item,
+        CauseItem::Fail { error } if error["_tag"] == "RpcRequestInvalid"
+    )));
+    assert!(!client_selected.exists());
+    assert!(
+        fixture
+            .repositories
+            .get_thread("managed-authority-thread".to_owned())
+            .await
+            .expect("thread read")
+            .is_none()
+    );
+    assert!(
+        !git_output(
+            &fixture.main,
+            &["branch", "--list", "feature/client-selected"]
+        )
+        .contains("feature/client-selected")
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn dedicated_create_panel_and_retarget_resolve_workspace_authority_server_side() {
+    let mut fixture = CatalogRpcFixture::new(false).await;
+    request(
+        fixture.socket(),
+        "9901",
+        "worktree.createManaged",
+        json!({
+            "commandId":"managed-create-command",
+            "projectId":"project-1",
+            "threadId":"managed-thread",
+            "title":"Managed workspace",
+            "refName":"main",
+            "newRefName":"feature/managed-create",
+            "baseRefName":"main",
+            "threadDefaults":{
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access",
+                "interactionMode":"default"
+            }
+        }),
+    )
+    .await;
+    let managed = success_value(fixture.socket(), "9901").await;
+    let managed_path = managed["path"].as_str().expect("managed path").to_owned();
+    assert!(Path::new(&managed_path).is_dir());
+    assert_eq!(managed["refName"], "feature/managed-create");
+    let owner = fixture
+        .repositories
+        .get_thread("managed-thread".to_owned())
+        .await
+        .expect("managed owner read")
+        .expect("managed owner exists");
+    assert_eq!(owner.kind, "workspace");
+    assert_eq!(owner.worktree_path.as_deref(), Some(managed_path.as_str()));
+
+    request(
+        fixture.socket(),
+        "9902",
+        "worktree.createPanel",
+        json!({
+            "commandId":"managed-panel-command",
+            "hostThreadId":"managed-thread",
+            "threadId":"managed-panel",
+            "title":"Managed panel",
+            "threadDefaults":{
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access",
+                "interactionMode":"default"
+            }
+        }),
+    )
+    .await;
+    assert_eq!(
+        success_value(fixture.socket(), "9902").await["threadId"],
+        "managed-panel"
+    );
+    let panel = fixture
+        .repositories
+        .get_thread("managed-panel".to_owned())
+        .await
+        .expect("panel read")
+        .expect("panel exists");
+    assert_eq!(panel.kind, "panel");
+    assert_eq!(panel.project_id, "project-1");
+    assert_eq!(panel.worktree_path.as_deref(), Some(managed_path.as_str()));
+    assert_eq!(panel.branch.as_deref(), Some("feature/managed-create"));
+
+    let target =
+        fixture.create_named_external_worktree("retarget-target", "feature/retarget-target");
+    request(
+        fixture.socket(),
+        "9903",
+        "vcs.refreshWorktreeCatalog",
+        json!({"projectId":"project-1"}),
+    )
+    .await;
+    let snapshot = success_value(fixture.socket(), "9903").await;
+    let target_path = canonical_string(&target);
+    let descriptor = snapshot["worktrees"]
+        .as_array()
+        .expect("worktrees")
+        .iter()
+        .find(|descriptor| descriptor["path"] == target_path)
+        .expect("retarget descriptor");
+    request(
+        fixture.socket(),
+        "9904",
+        "worktree.retarget",
+        json!({
+            "commandId":"managed-retarget-command",
+            "projectId":"project-1",
+            "threadId":"managed-thread",
+            "worktreeKey":descriptor["worktreeKey"],
+            "expectedGeneration":snapshot["generation"]
+        }),
+    )
+    .await;
+    assert_eq!(
+        success_value(fixture.socket(), "9904").await["threadId"],
+        "managed-thread"
+    );
+    let retargeted = fixture
+        .repositories
+        .get_thread("managed-thread".to_owned())
+        .await
+        .expect("retargeted owner read")
+        .expect("retargeted owner exists");
+    assert_eq!(
+        retargeted.worktree_path.as_deref(),
+        Some(target_path.as_str())
+    );
+    assert_eq!(
+        retargeted.branch.as_deref(),
+        Some("feature/retarget-target")
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn managed_creation_rolls_back_exact_server_owned_worktree_when_projection_rejects() {
+    let mut fixture = CatalogRpcFixture::new(false).await;
+    let existing_thread_id = fixture
+        .repositories
+        .list_threads_by_project("project-1".to_owned())
+        .await
+        .expect("project threads")
+        .into_iter()
+        .find(|thread| thread.deleted_at.is_none())
+        .expect("project default thread")
+        .thread_id;
+    let before = git_output(&fixture.main, &["worktree", "list", "--porcelain"]);
+
+    request(
+        fixture.socket(),
+        "9905",
+        "worktree.createManaged",
+        json!({
+            "commandId":"managed-rollback-command",
+            "projectId":"project-1",
+            "threadId":existing_thread_id,
+            "title":"Rejected duplicate",
+            "refName":"main",
+            "newRefName":"feature/managed-rollback",
+            "baseRefName":"main",
+            "threadDefaults":{
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access",
+                "interactionMode":"default"
+            }
+        }),
+    )
+    .await;
+    let message = next_server_message(fixture.socket()).await;
+    let ServerMessage::Exit {
+        request_id,
+        exit: RpcExit::Failure { cause },
+    } = message
+    else {
+        panic!("expected duplicate owner projection to fail: {message:?}");
+    };
+    assert_eq!(request_id.as_str(), "9905");
+    assert!(cause.iter().any(|item| matches!(
+        item,
+        CauseItem::Fail { error }
+            if error["_tag"] == "WorktreeAdoptionError"
+                && error["reason"] == "orchestration-failed"
+    )));
+    assert_eq!(
+        git_output(&fixture.main, &["worktree", "list", "--porcelain"]),
+        before,
+        "rollback must leave exactly the pre-existing registrations"
+    );
+    assert!(
+        git_output(
+            &fixture.main,
+            &["branch", "--list", "feature/managed-rollback"]
+        )
+        .trim()
+        .is_empty(),
+        "rollback must remove only the newly-created branch"
+    );
+    fixture.shutdown().await;
+}
 
 #[tokio::test]
 async fn stream_delivers_initial_and_latest_snapshots_refreshes_and_cancels() {
@@ -829,6 +1077,263 @@ async fn interrupted_policy_handoff_retains_project_serialization_until_terminal
 }
 
 #[tokio::test]
+async fn adoption_interrupt_after_engine_handoff_retains_catalog_lifecycle_until_terminal_receipt()
+{
+    let hooks = TestHooks::default();
+    let mut fixture = CatalogRpcFixture::new_with_removal_services_and_options(
+        true,
+        Arc::new(TestNoopQuiescer),
+        None,
+        EngineOptions {
+            queue_capacity: 16,
+            test_hooks: hooks.clone(),
+        },
+    )
+    .await;
+    request(
+        fixture.socket(),
+        "43",
+        "vcs.refreshWorktreeCatalog",
+        json!({"projectId":"project-1"}),
+    )
+    .await;
+    let snapshot = success_value(fixture.socket(), "43").await;
+    let candidate = eligible_candidate(&snapshot).clone();
+    let pause = hooks.pause_before_next_command_persist();
+    request(
+        fixture.socket(),
+        "44",
+        "worktree.adopt",
+        adoption_payload("interrupted-adoption-handoff", &candidate, &snapshot),
+    )
+    .await;
+    timeout(Duration::from_secs(5), pause.wait_until_entered())
+        .await
+        .expect("adoption envelope reaches the engine boundary");
+    send_json(
+        fixture.socket(),
+        json!({"_tag":"Interrupt","requestId":"44"}),
+    )
+    .await;
+    assert!(matches!(
+        next_server_message(fixture.socket()).await,
+        ServerMessage::Exit {
+            exit: RpcExit::Failure { cause },
+            ..
+        } if cause.iter().any(|item| matches!(item, CauseItem::Interrupt { .. }))
+    ));
+
+    let catalog = fixture.catalog.clone();
+    let probe = tokio::spawn(async move {
+        catalog
+            .with_project_mutation_lock("project-1", || async {})
+            .await;
+    });
+    assert!(
+        timeout(Duration::from_millis(200), probe).await.is_err(),
+        "the server-owned adoption operation must retain project/repository locks after the RPC waiter is interrupted"
+    );
+
+    pause.release();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if fixture
+                .repositories
+                .get_command_receipt("interrupted-adoption-handoff".to_owned())
+                .await
+                .expect("receipt read")
+                .is_some_and(|receipt| receipt.status == "accepted")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("adoption reaches a terminal durable receipt");
+    let owners = fixture
+        .repositories
+        .list_threads_by_project("project-1".to_owned())
+        .await
+        .expect("project threads");
+    assert!(owners.iter().any(|thread| {
+        thread.kind == "workspace"
+            && thread.deleted_at.is_none()
+            && thread.worktree_path.as_deref() == candidate["path"].as_str()
+    }));
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn detach_interrupt_after_engine_handoff_retains_removal_lifecycle_until_terminal_receipt() {
+    let hooks = TestHooks::default();
+    let quiescer = Arc::new(RecordingPendingQuiescer::default());
+    let mut fixture = CatalogRpcFixture::new_with_removal_services_and_options(
+        true,
+        quiescer.clone(),
+        None,
+        EngineOptions {
+            queue_capacity: 16,
+            test_hooks: hooks.clone(),
+        },
+    )
+    .await;
+    let thread_id = adopt_external_for_removal(&mut fixture, "detach-handoff-adopt").await;
+    let pause = hooks.pause_before_next_command_persist();
+    request(
+        fixture.socket(),
+        "45",
+        "worktree.removeFromBibCode",
+        json!({
+            "commandId":"interrupted-detach-handoff",
+            "projectId":"project-1",
+            "threadId":thread_id
+        }),
+    )
+    .await;
+    timeout(Duration::from_secs(5), pause.wait_until_entered())
+        .await
+        .expect("detach envelope reaches the engine boundary");
+    send_json(
+        fixture.socket(),
+        json!({"_tag":"Interrupt","requestId":"45"}),
+    )
+    .await;
+    assert!(matches!(
+        next_server_message(fixture.socket()).await,
+        ServerMessage::Exit {
+            exit: RpcExit::Failure { cause },
+            ..
+        } if cause.iter().any(|item| matches!(item, CauseItem::Interrupt { .. }))
+    ));
+    assert_eq!(quiescer.call_count(), 1);
+    assert!(!quiescer.last_cancellation().is_cancelled());
+    assert_eq!(
+        fixture
+            .availability
+            .guard_thread(&thread_id)
+            .await
+            .expect_err("detach remains guarded while persistence is paused")
+            .state,
+        bibcode_server::worktree_catalog::WorkspaceGuardState::Removing
+    );
+    let catalog = fixture.catalog.clone();
+    let probe = tokio::spawn(async move {
+        catalog
+            .with_project_mutation_lock("project-1", || async {})
+            .await;
+    });
+    assert!(timeout(Duration::from_millis(200), probe).await.is_err());
+
+    pause.release();
+    wait_for_accepted_receipt(&fixture.repositories, "interrupted-detach-handoff").await;
+    fixture.operations.shutdown().await;
+    assert!(
+        fixture
+            .repositories
+            .get_thread(thread_id.clone())
+            .await
+            .expect("thread read")
+            .expect("thread remains projected")
+            .deleted_at
+            .is_some()
+    );
+    assert!(!quiescer.last_cancellation().is_cancelled());
+    fixture
+        .availability
+        .guard_thread(&thread_id)
+        .await
+        .expect("terminal detach clears the guard");
+    assert!(
+        fixture.external.exists(),
+        "detach does not delete Git files"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn destructive_remove_socket_close_after_engine_handoff_retains_lifecycle_until_terminal_receipt()
+ {
+    let hooks = TestHooks::default();
+    let quiescer = Arc::new(RecordingPendingQuiescer::default());
+    let mut fixture = CatalogRpcFixture::new_with_removal_services_and_options(
+        true,
+        quiescer.clone(),
+        None,
+        EngineOptions {
+            queue_capacity: 16,
+            test_hooks: hooks.clone(),
+        },
+    )
+    .await;
+    let thread_id = adopt_external_for_removal(&mut fixture, "remove-handoff-adopt").await;
+    let plan = removal_plan(&mut fixture, "project-1", &thread_id, "46").await;
+    let pause = hooks.pause_before_next_command_persist();
+    request(
+        fixture.socket(),
+        "47",
+        "worktree.remove",
+        removal_payload(
+            "closed-socket-removal-handoff",
+            "project-1",
+            &thread_id,
+            &plan,
+        ),
+    )
+    .await;
+    timeout(Duration::from_secs(5), pause.wait_until_entered())
+        .await
+        .expect("removal reaches the engine after Git mutation");
+    assert!(
+        !fixture.external.exists(),
+        "Git mutation completed before the pause"
+    );
+    fixture
+        .socket()
+        .close(None)
+        .await
+        .expect("close the request transport");
+    assert!(!quiescer.last_cancellation().is_cancelled());
+    assert_eq!(
+        fixture
+            .availability
+            .guard_thread(&thread_id)
+            .await
+            .expect_err("removal stays guarded while persistence is paused")
+            .state,
+        bibcode_server::worktree_catalog::WorkspaceGuardState::Removing
+    );
+    let catalog = fixture.catalog.clone();
+    let probe = tokio::spawn(async move {
+        catalog
+            .with_project_mutation_lock("project-1", || async {})
+            .await;
+    });
+    assert!(timeout(Duration::from_millis(200), probe).await.is_err());
+
+    pause.release();
+    wait_for_accepted_receipt(&fixture.repositories, "closed-socket-removal-handoff").await;
+    fixture.operations.shutdown().await;
+    assert!(
+        fixture
+            .repositories
+            .get_thread(thread_id.clone())
+            .await
+            .expect("thread read")
+            .expect("thread remains projected")
+            .deleted_at
+            .is_some()
+    );
+    assert!(!quiescer.last_cancellation().is_cancelled());
+    fixture
+        .availability
+        .guard_thread(&thread_id)
+        .await
+        .expect("terminal removal clears the guard");
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn interrupted_policy_receipt_lookup_releases_claim_without_late_mutation() {
     let mut fixture = CatalogRpcFixture::new(false).await;
     let database = fixture.repositories.database().clone();
@@ -1309,14 +1814,18 @@ async fn adopt_public_admission_replays_exactly_and_conflicts_on_changed_payload
     let first = success_value(fixture.socket(), "903").await;
     assert_eq!(first["threadId"], owner["threadId"]);
     assert_eq!(first["disposition"], "existing");
-    fixture
-        .engine
-        .dispatch(OrchestrationCommand::ThreadDelete {
-            command_id: "delete-admitted-owner".to_owned(),
-            thread_id: first["threadId"].as_str().expect("thread id").to_owned(),
-        })
-        .await
-        .expect("delete accepted owner");
+    request(
+        fixture.socket(),
+        "919",
+        "worktree.removeFromBibCode",
+        json!({
+            "commandId":"delete-admitted-owner",
+            "projectId":"project-1",
+            "threadId":first["threadId"]
+        }),
+    )
+    .await;
+    success_value(fixture.socket(), "919").await;
     let event_count = fixture
         .repositories
         .read_events_from_sequence(0, 512)
@@ -1693,7 +2202,7 @@ async fn adopted_branch_reconciliation_is_deterministic_and_healthy_only() {
 }
 
 #[tokio::test]
-async fn successful_legacy_git_mutations_suppress_and_invalidate_the_live_catalog() {
+async fn successful_managed_creation_suppresses_and_invalidates_the_live_catalog() {
     let mut fixture = CatalogRpcFixture::new(false).await;
     request(
         fixture.socket(),
@@ -1723,16 +2232,6 @@ async fn successful_legacy_git_mutations_suppress_and_invalidate_the_live_catalo
         .expect("managed worktree");
     assert_eq!(managed["eligibleForAdoption"], false);
 
-    let remove_payload = json!({ "cwd": fixture.main, "path": created_path, "force": true });
-    request(fixture.socket(), "42", "vcs.removeWorktree", remove_payload).await;
-    let removed = wait_for_mutation_and_catalog_count(fixture.socket(), "42", "40", 1).await;
-    assert_eq!(
-        removed["worktrees"]
-            .as_array()
-            .expect("removed worktrees")
-            .len(),
-        1
-    );
     fixture.shutdown().await;
 }
 
@@ -1810,7 +2309,7 @@ async fn git_mutation_observation_updates_every_project_view_of_the_verified_rep
 }
 
 #[tokio::test]
-async fn remove_observation_uses_adopted_cwd_and_removed_target_for_unpinned_association() {
+async fn raw_vcs_remove_rejects_an_adopted_target_without_mutating_git_or_ownership() {
     let mut fixture = CatalogRpcFixture::new(false).await;
     let adopted_cwd = fixture.create_named_external_worktree("adopted-cwd", "feature/adopted-cwd");
     let removed_target =
@@ -1832,16 +2331,6 @@ async fn remove_observation_uses_adopted_cwd_and_removed_target_for_unpinned_ass
         projection.threads[0].worktree_path.as_deref(),
         Some(removed_target.to_string_lossy().as_ref())
     );
-    request(
-        fixture.socket(),
-        "70",
-        "subscribeWorktreeCatalog",
-        json!({ "projectId": "project-target" }),
-    )
-    .await;
-    let initial = next_chunk(fixture.socket(), "70").await;
-    assert_eq!(initial["worktrees"].as_array().expect("worktrees").len(), 3);
-    ack(fixture.socket(), "70").await;
     fixture
         .create_project(
             "project-target",
@@ -1868,27 +2357,31 @@ async fn remove_observation_uses_adopted_cwd_and_removed_target_for_unpinned_ass
         json!({ "cwd": adopted_cwd, "path": removed_target, "force": true }),
     )
     .await;
-    let mut mutation_succeeded = false;
-    let mut invalidated = false;
-    while !mutation_succeeded || !invalidated {
-        match next_server_message(fixture.socket()).await {
-            ServerMessage::Exit {
-                request_id,
-                exit: RpcExit::Success { .. },
-            } if request_id.as_str() == "71" => mutation_succeeded = true,
-            ServerMessage::Chunk { request_id, values } if request_id.as_str() == "70" => {
-                let value = values.into_iter().next().expect("catalog value");
-                ack(fixture.socket(), "70").await;
-                if value["scanStatus"]["_tag"] == "degraded" {
-                    invalidated = true;
-                }
-            }
-            other => panic!("unexpected remove association message: {other:?}"),
-        }
-    }
+    let message = next_server_message(fixture.socket()).await;
     assert!(
-        !removed_target.exists(),
-        "the association must still use the remove target after Git deletes its directory"
+        matches!(
+            message,
+            ServerMessage::Defect { ref defect }
+                if defect.as_str().is_some_and(|detail| {
+                    detail.contains("Unknown request tag") && detail.contains("vcs.removeWorktree")
+                })
+        ),
+        "the retired raw method must be unavailable: {message:?}"
+    );
+    assert!(
+        removed_target.exists(),
+        "a public raw target cannot delete an adopted worktree"
+    );
+    assert!(
+        fixture
+            .repositories
+            .get_thread(projection.threads[0].thread_id.clone())
+            .await
+            .expect("owner read")
+            .expect("owner remains")
+            .deleted_at
+            .is_none(),
+        "a rejected raw removal cannot retire or corrupt its owner"
     );
     fixture.shutdown().await;
 }
@@ -2984,6 +3477,162 @@ async fn removal_dirty_requires_confirmation_and_detach_only_ignores_quiesce_out
 }
 
 #[tokio::test]
+async fn removal_plan_and_execute_use_catalog_trusted_fallback_when_primary_is_missing() {
+    let anchors = Arc::new(StdMutex::new(Vec::new()));
+    let removal_git = Arc::new(RecordingAnchorRemovalGit {
+        inner: GitRepository::default(),
+        anchors: anchors.clone(),
+    });
+    let mut fixture = CatalogRpcFixture::new_with_removal_git(true, removal_git).await;
+    let thread_id = adopt_external_for_removal(&mut fixture, "fallback-anchor-adopt").await;
+    let mut project = fixture
+        .repositories
+        .get_project("project-1".to_owned())
+        .await
+        .expect("project read")
+        .expect("project exists");
+    project.workspace_root = fixture
+        .root
+        .path()
+        .join("missing-primary")
+        .to_string_lossy()
+        .into_owned();
+    fixture
+        .repositories
+        .upsert_project(project)
+        .await
+        .expect("move durable project root away from the pinned repository");
+
+    let plan = removal_plan(&mut fixture, "project-1", &thread_id, "1210").await;
+    request(
+        fixture.socket(),
+        "1211",
+        "worktree.remove",
+        removal_payload("fallback-anchor-remove", "project-1", &thread_id, &plan),
+    )
+    .await;
+    assert_eq!(
+        success_value(fixture.socket(), "1211").await["gitOutcome"],
+        "removed"
+    );
+    let calls = anchors.lock().expect("anchor recording").clone();
+    assert!(!calls.is_empty());
+    let expected_anchor =
+        fs::canonicalize(fixture.main.join(".git")).expect("canonical common dir");
+    assert!(
+        calls.iter().all(|(_, anchor)| anchor == &expected_anchor),
+        "recorded anchors {calls:?}, expected {expected_anchor:?}"
+    );
+    assert!(calls.iter().any(|(operation, _)| *operation == "inventory"));
+    assert!(calls.iter().any(|(operation, _)| *operation == "inspect"));
+    assert!(calls.iter().any(|(operation, _)| *operation == "remove"));
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn removal_reselects_a_same_repository_trusted_anchor_after_quiesce() {
+    let anchors = Arc::new(StdMutex::new(Vec::new()));
+    let switch_paths = Arc::new(StdMutex::new(None));
+    let removal_git = Arc::new(RecordingAnchorRemovalGit {
+        inner: GitRepository::default(),
+        anchors: anchors.clone(),
+    });
+    let quiescer = Arc::new(SwitchingAnchorQuiescer {
+        paths: switch_paths.clone(),
+    });
+    let mut fixture =
+        CatalogRpcFixture::new_with_removal_services(true, quiescer, Some(removal_git)).await;
+    let target_thread = adopt_external_for_removal(&mut fixture, "reselect-target-adopt").await;
+    let sibling = fixture.create_named_external_worktree(
+        "reselect-trusted-sibling",
+        "feature/reselect-trusted-sibling",
+    );
+    request(
+        fixture.socket(),
+        "1212",
+        "vcs.refreshWorktreeCatalog",
+        json!({"projectId":"project-1"}),
+    )
+    .await;
+    let snapshot = success_value(fixture.socket(), "1212").await;
+    let sibling_path = canonical_string(&sibling);
+    let sibling_descriptor = snapshot["worktrees"]
+        .as_array()
+        .expect("worktrees")
+        .iter()
+        .find(|descriptor| descriptor["path"] == sibling_path)
+        .expect("trusted sibling descriptor")
+        .clone();
+    request(
+        fixture.socket(),
+        "1213",
+        "worktree.adopt",
+        adoption_payload("reselect-sibling-adopt", &sibling_descriptor, &snapshot),
+    )
+    .await;
+    success_value(fixture.socket(), "1213").await;
+
+    let mut project = fixture
+        .repositories
+        .get_project("project-1".to_owned())
+        .await
+        .expect("project read")
+        .expect("project exists");
+    project.workspace_root = fixture
+        .root
+        .path()
+        .join("reselect-missing-primary")
+        .to_string_lossy()
+        .into_owned();
+    fixture
+        .repositories
+        .upsert_project(project)
+        .await
+        .expect("move durable project root away from the pinned repository");
+    let hidden_sibling = fixture.root.path().join("reselect-hidden-sibling");
+    *switch_paths.lock().expect("switch paths") = Some((sibling.clone(), hidden_sibling));
+
+    let plan = removal_plan(&mut fixture, "project-1", &target_thread, "1214").await;
+    let plan_call_count = anchors.lock().expect("plan anchors").len();
+    assert!(
+        anchors
+            .lock()
+            .expect("plan anchors")
+            .iter()
+            .all(|(_, anchor)| anchor == &PathBuf::from(&sibling_path)),
+        "planning must use the present same-repository sibling"
+    );
+    request(
+        fixture.socket(),
+        "1215",
+        "worktree.remove",
+        removal_payload("reselect-anchor-remove", "project-1", &target_thread, &plan),
+    )
+    .await;
+    assert_eq!(
+        success_value(fixture.socket(), "1215").await["gitOutcome"],
+        "removed"
+    );
+    let common_dir = fs::canonicalize(fixture.main.join(".git")).expect("canonical common dir");
+    let calls = anchors.lock().expect("mutation anchors").clone();
+    assert!(calls.len() > plan_call_count);
+    assert!(
+        calls
+            .iter()
+            .skip(plan_call_count)
+            .any(|(operation, anchor)| *operation == "remove" && anchor == &common_dir),
+        "the Git mutation must use the anchor reselected after quiesce: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|(operation, anchor)| *operation != "remove" || anchor == &common_dir),
+        "no destructive Git call may use the now-missing pre-quiesce anchor: {calls:?}"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn removal_after_git_succeeded_before_detach_is_safe_missing_unregistered_cleanup() {
     let mut fixture = CatalogRpcFixture::new(true).await;
     let thread_id = adopt_external_for_removal(&mut fixture, "remove-adopt-crash").await;
@@ -3494,6 +4143,8 @@ struct CatalogRpcFixture {
     external: PathBuf,
     repositories: Repositories,
     catalog: WorktreeCatalogService,
+    availability: WorkspaceAvailabilityRegistry,
+    operations: WorktreeCatalogOperationRuntime,
     engine: OrchestrationEngine,
     handle: Option<bibcode_server::ServerHandle>,
     socket: Option<TestSocket>,
@@ -3599,14 +4250,19 @@ impl CatalogRpcFixture {
             .expect("project created");
         let repositories = engine.repositories();
         let git_repository = Arc::new(GitRepository::default());
-        let catalog =
-            WorktreeCatalogService::new(Arc::new(repositories.clone()), git_repository.clone());
+        let availability = WorkspaceAvailabilityRegistry::new();
+        let catalog = WorktreeCatalogService::new_with_availability_registry(
+            Arc::new(repositories.clone()),
+            git_repository.clone(),
+            availability.clone(),
+        );
         let mut registry = RpcRegistry::empty();
         let removal_services = WorktreeCatalogRpcServices::new(catalog.clone(), engine.clone())
             .with_removal_quiescer(quiescer);
         let removal_services = removal_git.map_or(removal_services.clone(), |git| {
             removal_services.with_removal_git(git)
         });
+        let operations = removal_services.operation_runtime();
         register_worktree_catalog_rpc(&mut registry, removal_services);
         register_orchestration_rpc(&mut registry, engine.clone());
         register_git_vcs_rpc(
@@ -3635,6 +4291,8 @@ impl CatalogRpcFixture {
             external,
             repositories,
             catalog,
+            availability,
+            operations,
             engine,
             handle: Some(handle),
             socket: Some(socket),
@@ -3717,6 +4375,7 @@ impl CatalogRpcFixture {
             handle.shutdown();
             handle.join().await.expect("server shutdown");
         }
+        self.operations.shutdown().await;
         self.engine.shutdown().await;
     }
 }
@@ -3730,6 +4389,101 @@ impl WorktreeRemovalQuiescer for TestNoopQuiescer {
         _request: WorktreeRemovalQuiesceRequest,
     ) -> WorktreeRemovalQuiesceFuture {
         Box::pin(async { WorktreeRemovalQuiesceLease::complete() })
+    }
+}
+
+struct SwitchingAnchorQuiescer {
+    paths: Arc<StdMutex<Option<(PathBuf, PathBuf)>>>,
+}
+
+impl WorktreeRemovalQuiescer for SwitchingAnchorQuiescer {
+    fn quiesce(
+        &self,
+        _admission: WorktreeRemovalCleanupAdmission,
+        _request: WorktreeRemovalQuiesceRequest,
+    ) -> WorktreeRemovalQuiesceFuture {
+        let paths = self.paths.clone();
+        Box::pin(async move {
+            let (visible, hidden) = paths
+                .lock()
+                .expect("switch paths")
+                .take()
+                .expect("configured anchor switch");
+            fs::rename(&visible, &hidden).expect("make the pre-quiesce anchor unavailable");
+            WorktreeRemovalQuiesceLease::complete()
+        })
+    }
+}
+
+struct RecordingAnchorRemovalGit {
+    inner: GitRepository,
+    anchors: Arc<StdMutex<Vec<(&'static str, PathBuf)>>>,
+}
+
+impl RecordingAnchorRemovalGit {
+    fn record(&self, operation: &'static str, anchor: &Path) {
+        self.anchors
+            .lock()
+            .expect("anchor recording")
+            .push((operation, anchor.to_path_buf()));
+    }
+}
+
+impl WorktreeRemovalGit for RecordingAnchorRemovalGit {
+    fn inventory(
+        &self,
+        anchor: PathBuf,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<GitWorktreeInventory> {
+        self.record("inventory", &anchor);
+        WorktreeRemovalGit::inventory(&self.inner, anchor, cancellation)
+    }
+
+    fn inspect(
+        &self,
+        anchor: PathBuf,
+        record: GitWorktreeRecord,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<GitWorktreeRemovalInspection> {
+        self.record("inspect", &anchor);
+        WorktreeRemovalGit::inspect(&self.inner, anchor, record, cancellation)
+    }
+
+    fn preview_prune(
+        &self,
+        anchor: PathBuf,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<Vec<GitPrunableWorktree>> {
+        self.record("preview-prune", &anchor);
+        WorktreeRemovalGit::preview_prune(&self.inner, anchor, cancellation)
+    }
+
+    fn remove(
+        &self,
+        anchor: PathBuf,
+        record: GitWorktreeRecord,
+        force_dirty: bool,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<()> {
+        self.record("remove", &anchor);
+        WorktreeRemovalGit::remove(&self.inner, anchor, record, force_dirty, cancellation)
+    }
+
+    fn prune(
+        &self,
+        anchor: PathBuf,
+        record: GitWorktreeRecord,
+        expected_impact_digest: String,
+        cancellation: CancellationToken,
+    ) -> WorktreeRemovalGitFuture<()> {
+        self.record("prune", &anchor);
+        WorktreeRemovalGit::prune(
+            &self.inner,
+            anchor,
+            record,
+            expected_impact_digest,
+            cancellation,
+        )
     }
 }
 
@@ -4048,6 +4802,24 @@ async fn success_value(socket: &mut TestSocket, request_id: &str) -> Value {
     };
     assert_eq!(actual.as_str(), request_id);
     value
+}
+
+async fn wait_for_accepted_receipt(repositories: &Repositories, command_id: &str) {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if repositories
+                .get_command_receipt(command_id.to_owned())
+                .await
+                .expect("receipt read")
+                .is_some_and(|receipt| receipt.status == "accepted")
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("command reaches a terminal durable receipt");
 }
 
 async fn assert_typed_removal_failure(
