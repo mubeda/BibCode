@@ -67,6 +67,9 @@ The catalog protocol is server-resolved and capability gated:
 | `subscribeWorktreeCatalog`       | `orchestration:read`    | Stream the latest project snapshot; the request contains only `projectId`.                  |
 | `vcs.refreshWorktreeCatalog`     | `orchestration:read`    | Request one bounded observation and return its snapshot.                                    |
 | `worktree.updateDiscoveryPolicy` | `orchestration:operate` | Persist a complete policy derived from an exact authoritative generation.                   |
+| `worktree.createManaged`         | `orchestration:operate` | Resolve the project root and checkout path, create Git state, then persist one owner.       |
+| `worktree.createPanel`           | `orchestration:operate` | Derive panel project, kind, branch, and path from a persisted host thread.                  |
+| `worktree.retarget`              | `orchestration:operate` | Resolve an opaque catalog key/generation before changing a workspace owner path.            |
 | `worktree.adopt`                 | `orchestration:operate` | Resolve an opaque catalog candidate and create, restore, or return its canonical workspace. |
 | `worktree.getRemovalPlan`        | `orchestration:read`    | Bind current removal facts into an opaque plan token.                                       |
 | `worktree.removeFromBibCode`     | `orchestration:operate` | Detach ownership without a Git mutation.                                                    |
@@ -77,6 +80,17 @@ path normalization, catalog joins, availability, plan validation, and Git
 effects remain server-owned. See [Worktree catalog](./worktree-catalog.md) for
 the full lifecycle and resource bounds.
 
+This dedicated surface is exclusive for worktree authority. Generic
+`orchestration.dispatchCommand`, over either WebSocket or HTTP, rejects
+client-supplied discovery policy, thread kind/worktree path, bootstrap
+worktree root, metadata path retargeting, adopted-owner deletion, and project
+deletion while an adopted owner exists. Ordinary non-worktree orchestration
+continues through the generic surface; the server derives the permitted
+default/workspace kind and project working directory. Internal resolved
+commands remain unavailable to public dispatch. The orchestration engine
+repeats ownership/deletion validation so another in-process caller cannot
+bypass the public decoder.
+
 `subscribeWorktreeCatalog` publishes the server-owned latest catalog snapshot
 for one persisted project through a watch-backed RPC stream: the atomic initial
 read is marked seen, and acknowledgement lag replaces pending state instead of
@@ -85,6 +99,13 @@ it can retain a catalog view. `vcs.refreshWorktreeCatalog` requests an explicit
 bounded observation and returns the resulting snapshot. Both require
 `orchestration:read`; clients submit only `projectId`, never baseline or
 checkout paths.
+
+Catalog entry lifetime is shared by subscriptions and unary users. Refresh,
+adoption, retarget, removal, trusted-anchor resolution, and current-snapshot
+reads acquire scoped unary ownership alongside subscriber ownership. When the
+combined subscriber/unary-user count reaches zero, the view schedules
+pointer-checked eviction after 60 seconds; reuse cancels the old timer, and
+cancellation cannot evict a newly installed entry or repository observation.
 
 `worktree.updateDiscoveryPolicy` requires `orchestration:operate`. An
 acknowledgement must name the exact latest authoritative generation. The
@@ -112,6 +133,25 @@ adoption, and removal receipts fail closed as `command-conflict`.
 Digest-less `reserved` or `prepared` policy receipts still follow the engine's
 aggregate-checked restart-resume path; only accepted legacy replay requires the
 terminal-event proof.
+
+`worktree.createManaged` accepts project/ref intent, an idempotency command
+identity, a thread identity/title, and ordinary thread defaults. It does not
+accept `cwd` or a target path. Under the project/repository mutation locks the
+server resolves the persisted project root, lets the Git owner select the
+managed checkout path, and then hands an internal workspace-thread creation to
+orchestration. If owner persistence fails after Git creation, a private
+rollback verifies and removes only that exact just-created registered
+nonprimary checkout and any branch created by this request; the rollback is not
+registered as a public RPC.
+
+`worktree.createPanel` accepts only a persisted host thread plus new panel
+identity/title/defaults. The server re-reads the host under its mutation lock
+and derives project, `panel` kind, branch, and worktree path. Similarly,
+`worktree.retarget` accepts project/thread IDs, an opaque worktree key, and an
+expected catalog generation. It refreshes and revalidates present
+nonprimary/nonbare membership and exclusive ownership before dispatching the
+resolved metadata change. Neither operation accepts generic path or kind
+authority.
 
 `worktree.adopt` also requires `orchestration:operate`. Its public payload
 contains an opaque catalog key, expected generation, project ID, command ID,
@@ -143,11 +183,14 @@ transaction's immutable thread event, fails closed as an internal error. A
 legacy receipt with no result metadata may recover `created` or `restored`
 only from its matching immutable `thread.created` or `thread.unarchived`
 event; a project-only legacy receipt cannot reconstruct `existing` from
-current ownership and also fails closed. Canonical ownership compares the
-catalog-owned lexical host-path identity stored in the command model for
-create, metadata retarget, and restart/replay; it remains defined for missing
-paths and does not perform a second filesystem probe. Resolved adoption and branch
-reconciliation command variants are rejected by
+current ownership and also fails closed. Canonical ownership compares one
+server physical identity for create, metadata retarget, adoption, restart, and
+replay. Present paths use filesystem canonicalization; a missing leaf uses its
+canonical nearest existing ancestor plus normalized suffix. POSIX comparison
+remains case-sensitive, while Windows drive and UNC keys normalize separators
+and use Unicode-aware lowercase comparison. Symlink, macOS alias, lexical, and
+missing-leaf spellings therefore cannot create a second owner. Resolved
+adoption and branch reconciliation command variants are rejected by
 `orchestration.dispatchCommand` even though trusted server services may admit
 them directly.
 
@@ -168,13 +211,22 @@ closed, while an attempted cleanup that fails may detach with a bounded
 `failed` outcome. `worktree.removeFromBibCode` performs the same atomic detach
 without requesting a Git mutation.
 
+Planning and execution resolve the catalog's trusted repository anchor rather
+than assuming the primary checkout is reachable. A pinned project may use the
+primary, a present adopted sibling, or the lifetime common directory only when
+the chosen anchor is not the target and resolves to the durable repository key.
+After quiesce and while mutation locks are still owned, execution resolves the
+anchor again and rechecks the pin immediately before Git. Missing primary,
+anchor substitution, pin drift, or repository mismatch therefore cannot
+transfer destructive authority.
+
 After any successful Git decision, internal `worktree.detach-resolved` deletes
 same-path panels, the canonical workspace thread, and its discovery baseline
 entry in one orchestration transaction. Accepted-command result metadata makes
 identical retries exact even after the thread projection is deleted; changed
 payload reuse conflicts. A present Git mutation or absence verification
 failure does not detach. The `worktreeCatalog` capability is advertised only
-with all three registered handlers, scopes, and wire fixtures.
+with the complete catalog handler set, scopes, and wire fixtures.
 
 The durable detach transaction emits the same-path panel `thread.deleted`
 events in stable order, the canonical `thread.deleted`, and one
@@ -196,6 +248,18 @@ reservation cleanup. Command claims are acquired before project/catalog and
 workspace-admission locks. They are intentionally process-local: a restarted
 engine has a fresh registry and may resume durable `reserved` or `prepared`
 receipts.
+
+Catalog mutations execute in a runtime-owned operation task. Client
+`Interrupt`, socket closure, or request cancellation may win while command
+admission, catalog refresh, or mutation-lock acquisition is still before the
+engine-envelope handoff. Once the envelope is handed off, caller cancellation
+only ends the wait: the server owner retains the command claim,
+project/repository/physical-owner locks, removal reservation and cleanup slot,
+`Removing` guard, quiesce lease, and any rollback responsibility until a
+durable accepted/rejected terminal result exists. Runtime shutdown first stops
+accepting these operations and drains their tasks, then shuts down catalog and
+process owners. This is the lifecycle boundary tested by post-enqueue
+WebSocket-interrupt and socket-close races.
 
 With that claim held, an already-accepted retry is replayed first. Every new
 removal must then acquire one finite runtime-cleanup lifetime slot before receipt
@@ -234,20 +298,20 @@ outbox commit atomically; startup scavenges a final file left by a process crash
 after reservation and publication but before that transaction.
 
 Canonical workspace ownership is protected by a server-owned global fence keyed
-by filesystem-resolved host identity, including nearest-existing-ancestor
-resolution for missing leaves. Owner create, delete, retarget, adopt, detach,
-and project-root mutations acquire deterministically ordered keys before worker
-enqueue. An omitted `thread.create.kind` has the contract's persisted
-`workspace` default for fence discovery, and an absent-thread
-`thread.turn.start` bootstrap with a workspace path acquires the same canonical
-owner key, including lexical aliases. Removal discovers a server-owned
-candidate key, acquires it, then
-re-runs the authoritative unique-owner preflight and retains the lease through
-verified Git and detach publication. A mutation that waited behind a committed
-ordinary owner change re-resolves the current old/new ownership keys before it
-reacquires the fence. A committed removal invalidates the stale waiter instead
-of allowing it to publish ownership, and detach retains the transaction-time
-ownership check as a defense.
+by physical host identity. Present paths canonicalize through the filesystem;
+missing leaves resolve the nearest existing ancestor and append their normalized
+suffix. The same key strategy covers Git/catalog joins, owner create/delete/
+retarget/adopt/detach, availability, project-root mutations, removal, and
+cross-project cleanup. Windows drive and UNC keys use Unicode-aware lowercase
+comparison; POSIX keys remain case-sensitive. Mutations acquire deterministically
+ordered keys before worker enqueue. Generic public creation cannot nominate a
+kind or path; trusted resolved commands still acquire every affected physical
+owner key. Removal discovers a server-owned candidate key, acquires it, reruns
+the authoritative unique-owner preflight, and retains the lease through verified
+Git and detach publication. A mutation that waited behind a committed owner
+change re-resolves the current old/new keys before reacquiring the fence. A
+committed removal invalidates the stale waiter instead of allowing it to publish
+ownership, and detach retains the transaction-time ownership check as a defense.
 
 Every healthy authoritative catalog publication also compares active adopted
 worktrees with durable thread branch metadata. A change dispatches one
@@ -258,17 +322,19 @@ reconcile branch state.
 
 The production runtime owns one catalog service built from the same Git
 repository and orchestration repositories used by Git/VCS and project state.
-Successful legacy create/remove worktree RPCs verify Git common-directory
-identity after the mutation, canonicalize primary/canonical-thread and target
-paths, and notify every matching project view with a matching durable pin (or
-verified unpinned path), never an arbitrary first match. Pin mismatches and
-unverifiable identities fail observation closed. Observation failure never
-changes a successful Git response into a failure. Server-owned destructive Git
-primitives also re-read repository inventory before and after mutation and
-never accept a client path as authority. Repository-wide stale-registration
-cleanup binds confirmation to a versioned digest of every sorted normalized
-registration path and its exact dry-run prune reason; either kind of drift
-fails closed before mutation. Runtime shutdown permanently
+Successful dedicated managed creation records the exact server-created physical
+path for bounded suppression and invalidates its project catalog; dedicated
+verified removal invalidates every matching live view of the durably pinned
+repository. The public raw-path `vcs.removeWorktree` method is not registered,
+typed, scoped, or bridged. The only rollback removal is a private server call
+for the exact just-created registered checkout when managed owner persistence
+fails. Pin mismatches and unverifiable identities fail observation closed.
+Observation failure never changes a successful Git response into a failure.
+Server-owned destructive Git primitives re-read repository inventory before
+and after mutation and never accept a client path as authority. Repository-wide
+stale-registration cleanup binds confirmation to a versioned digest of every
+sorted normalized registration path and its exact dry-run prune reason; either
+kind of drift fails closed before mutation. Runtime shutdown permanently
 closes the service under one lifecycle-registration mutex before draining
 pollers, queued mutation refreshes, repository-observation leaders, scans, and
 eviction work. Every spawned task registers an abort handle under that mutex
@@ -290,11 +356,13 @@ The production runtime owns one `WorkspaceAvailabilityRegistry` and injects
 that same instance into the catalog, orchestration, terminal, Git/VCS, and
 workspace/file/search/review RPC owners. The registry is the server-side source
 of truth for whether an adopted workspace may begin new path-dependent work.
-It indexes both the durable thread ID and the host-platform-normalized workspace
-path. Path guards cover the workspace root and its descendants; canonical
-aliases are checked when the requested path still exists. The public failure is
-the structured `WorkspaceUnavailableError`, including the thread ID, last-known
-path, and catalog availability.
+It indexes both the durable thread ID and the workspace's physical identity.
+Present paths canonicalize through the filesystem; missing paths resolve their
+nearest existing ancestor and retain a normalized missing suffix. Path guards
+therefore cover the workspace root and descendants across present and missing
+symlink/macOS/lexical aliases. The public failure is the structured
+`WorkspaceUnavailableError`, including the thread ID, last-known path, and
+catalog availability.
 
 Only a healthy authoritative catalog snapshot may change this state. Catalog
 reconciliation synchronously closes every superseded terminal-signal gate, then
@@ -306,20 +374,25 @@ runtime-loss callback can run. Bootstrap follows the same close, unlocked
 drain, and commit-before-publication order. Degraded scans retain the prior
 state and perform no teardown. Loss work is admitted once per `(threadId,
 generation, availability)` transition. Exact recovery clears the guard only
-when the same normalized path is present again in the same physical repository;
+when the same physical path is present again in the same physical repository;
 an active removal guard takes precedence over catalog loss and recovery.
 
 Missing-path identity also collapses duplicate separators plus lexical `.` and
 `..` components without escaping POSIX roots, Windows drive roots, or UNC share
-roots. Public work admission takes a short-lived, path-scoped lease after
-resolving the durable thread projection. This includes panel threads that do
-not appear in the workspace catalog: their persisted worktree path, or their
-project root when they have no override, is authoritative. The lease is held
-through durable command admission or external-process publication. Guard
-installation and lease admission are serialized, so loss either observes and
-quiesces work published by an earlier lease or rejects a later lease. Lease
-drop, including cancellation and error unwinding, releases every thread/path
-scope. Every lease also carries the exact loss error and a cancellation token.
+roots; Windows comparison lowercases Unicode components rather than ASCII only.
+Public work admission takes a path-scoped lease after resolving the durable
+thread projection. This includes panel threads that do not appear in the
+workspace catalog: their persisted worktree path, or their project root when
+they have no override, is authoritative. File, browse, search, asset, review,
+and filesystem-mutation handlers retain that lease for the entire operation,
+not just an entry-point check. Mutations acquire its finalization permit before
+the filesystem/durable commit boundary. Turn and process handlers retain the
+lease through durable command admission or external-process publication. Guard
+installation and lease admission are serialized, so loss either waits for work
+owned by an earlier lease and finalization permit or rejects a later lease.
+Lease drop, including cancellation and error unwinding, releases every
+thread/path scope. Every lease also carries the exact loss error and a
+cancellation token.
 The turn RPC transfers its lease into the queued engine envelope, so client
 disconnect only stops the caller wait: an already-admitted command retains its
 existing durable-delivery semantics. Authoritative loss cancels that envelope
@@ -364,7 +437,7 @@ retries with preflight-known aliases so same-project panels remain cleanable
 after detach. Shutdown cancels and drops active, queued, and backoff work,
 releasing both ownership and capacity.
 Destructive removal resolution additionally spans live projects durably pinned
-to the same repository identity and exact normalized checkout path; unrelated
+to the same repository identity and exact physical checkout path; unrelated
 or unpinned repositories are excluded. A verified Git removal/cleanup
 invalidates every live catalog view sharing the repository entry, whereas
 detach-only and failed cleanup remain scoped to the initiating project.
@@ -373,11 +446,12 @@ The guard rejects a new turn before durable admission; terminal open, restart,
 write, and restart-on-attach; client Git status and mutations; and project
 file, search, mutation, editor, asset, and review operations. It intentionally
 allows catalog refresh, conversation/history reads, non-restarting terminal
-attach, terminal close, thread delete/detach, and direct internal cleanup Git
-operations. Guard checks occur before the affected owner starts durable or
-external side effects, so a path disappearing between client resolution and
-handler execution cannot fall through to a generic filesystem or process
-failure.
+attach, terminal close, dedicated detach/removal, ordinary non-worktree thread
+deletion, and direct internal cleanup Git operations. Generic deletion of an
+adopted owner, and project deletion while any adopted owner remains, fails
+closed. Guard checks occur before the affected owner starts durable or external
+side effects, so a path disappearing between client resolution and handler
+execution cannot fall through to a generic filesystem or process failure.
 
 Provider delivery and restart reconciliation repeat the persisted thread/path
 admission immediately before provider routing. This closes the gap between a
@@ -390,7 +464,7 @@ publication lock; a PTY that finishes spawning after loss is killed by its
 uncommitted-process owner and is never inserted as a live session.
 
 For each admitted loss transition, `WorktreeRuntime` resolves every live
-ordinary or panel thread in the same persisted project whose normalized path
+ordinary or panel thread in the same persisted project whose physical path
 matches the guarded physical workspace. It deduplicates those IDs, appends one
 warning activity to the catalog owner with a deterministic transition-derived
 ID, requests every affected provider session to stop, and quiesces every
@@ -515,7 +589,9 @@ manual request per environment.
   retry sockets independently.
 - Authorization is checked at each HTTP route or RPC method, not inferred from
   successful authentication alone.
-- Cancellation flows from client interrupt or socket closure into registered
-  handlers and supervised processes.
+- Cancellation flows from client interrupt or socket closure until the
+  operation's documented handoff. After a durable engine handoff, the
+  server-owned lifecycle continues to a terminal receipt while only the caller
+  wait is canceled.
 - Durable orchestration state, not a WebSocket connection, is the recovery
   boundary.

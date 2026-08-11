@@ -2,7 +2,7 @@
 
 **Date:** 2026-08-09
 
-**Status:** Approved.
+**Status:** Approved, including the 2026-08-11 reviewer-safe authority amendment.
 
 ## Summary
 
@@ -28,14 +28,16 @@ Git worktree as well.
 
 ## Context
 
-BibCode currently represents every visible workspace row as an orchestration
+BibCode represents every visible workspace row as an orchestration
 thread:
 
 - a project's `kind: "default"` thread is its primary checkout row;
 - another non-panel thread with `worktreePath` is a worktree workspace row;
-- creating a worktree performs `vcs.createWorktree` and then `thread.create`;
-- deletion currently attempts Git worktree removal before deleting the final
-  canonical thread for that path.
+- managed creation is one server-resolved `worktree.createManaged` operation
+  that chooses the checkout path and persists its canonical owner;
+- panel creation and worktree retargeting use dedicated server-resolved RPCs;
+- detach and destructive deletion use the catalog plan/removal flow, never a
+  public raw-path Git removal.
 
 This model already gives a worktree thread all downstream capabilities, but it
 has no repository worktree inventory independent of threads. Consequently,
@@ -139,6 +141,15 @@ The load-bearing findings are:
 
 Use a **server-owned Worktree Catalog with thread-backed adoption**.
 
+The final reviewer-safe authority ruling makes the catalog RPC boundary
+exclusive for worktree policy, identity, creation, panel derivation,
+retargeting, adoption, detach, and destructive removal. Generic orchestration
+may continue to mutate ordinary non-worktree state, but cannot accept discovery
+policy, worktree kind/path/bootstrap authority, adopted-owner deletion, or
+project deletion while adopted owners remain. Public `vcs.removeWorktree` is
+retired; the only raw removal-shaped primitive is private rollback of the exact
+just-created, still-unowned managed checkout after owner persistence fails.
+
 Rejected alternatives were:
 
 1. **Client-side list-and-import.** A unary list RPC plus web-side comparison
@@ -161,7 +172,7 @@ Rejected alternatives were:
 | Conversations, agents, terminals, panels, and model settings | Existing orchestration thread |
 | Hidden/shown discovery intent and acknowledgement | Project orchestration metadata |
 | Repository identity fence | Nullable durable project `WorktreeRepositoryKey` stored outside rebuildable projections and established only by a trusted authoritative primary-checkout scan |
-| Current scan health, cache, generations, and subscribers | In-memory Worktree Catalog runtime |
+| Current scan health, cache, generations, subscribers, and scoped unary users | In-memory Worktree Catalog runtime |
 
 The design does not persist a duplicate live worktree list. Catalog state is
 rebuilt from Git after server restart. The durable repository identity is a
@@ -187,18 +198,24 @@ directoryState     present | missing | unknown
 
 `worktreeKey` is scoped to the execution environment and canonical Git common
 directory. It is derived from the repository identity plus the server's
-normalized path and is opaque to clients. It is not treated as stable across
+physical path key and is opaque to clients. It is not treated as stable across
 an external move.
 
-Path comparison is server-only:
+Path comparison is server-only and uses one physical identity across catalog
+joins, canonical-owner uniqueness, availability, mutation locks, removal, and
+cross-project cleanup:
 
-- Windows drive and UNC paths are separator-normalized and compared
-  case-insensitively.
-- POSIX paths are separator-normalized and remain case-sensitive.
-- Present paths are canonicalized after registration has been established.
-- Missing paths use normalized Git output because canonicalization is
-  impossible.
-- Branch or HEAD similarity never establishes path identity.
+- present paths are canonicalized through the filesystem after registration
+  has been established;
+- missing paths canonicalize their nearest existing ancestor and append the
+  normalized missing suffix, so symlinked parents, macOS `/var` aliases, and
+  lexical `.`/`..` spellings cannot split identity;
+- Windows drive and UNC paths are separator-normalized and compared with
+  Unicode-aware lowercase semantics, including non-ASCII path components;
+- POSIX paths are separator-normalized and remain case-sensitive;
+- an authority-changing operation fails closed when physical identity cannot be
+  established instead of creating a lexical fallback owner; and
+- branch or HEAD similarity never establishes path identity.
 
 If a worktree is moved externally, the former adopted path becomes missing
 and the new path becomes a new discovered candidate. The user decides whether
@@ -279,15 +296,19 @@ pendingMutationRefreshEpoch
 lifecycleEpoch
 inFlightScan
 subscriberCount
+unaryUserCount
 pollerCancellation
 mutationRefreshWorkerCancellation
 lastMetadataSignature
 ```
 
-Unsubscribed project views stop polling and are evicted after a bounded idle
-retention window. Subscriber reservation and eviction are atomic: attachment
-validates the currently registered view while holding the registry lock, and
-an eviction cannot orphan a newly attached subscriber. Shared repository and
+Project views with no subscribers stop polling and, after the final subscriber
+or scoped unary user releases, are evicted after a 60-second idle retention
+window. Refresh, adoption, retarget, removal, trusted-anchor resolution, and
+current-snapshot reads hold unary-user ownership. Active-user reservation and
+eviction are atomic: acquisition validates the currently registered view while
+holding the registry lock, and pointer-checked eviction cannot remove a reused
+or replacement view. Shared repository and
 mutation-lock registry slots are weak references; a held or awaited physical
 repository mutation lock remains strongly owned and cannot be removed and
 recreated concurrently. A global semaphore bounds simultaneous Git catalog
@@ -295,14 +316,14 @@ scans, and each repository admits only one observation at a time.
 Poll initialization is an idempotent project-view-owned task rather than an
 individual subscriber-owned future. All attaching subscribers await the same
 readiness generation, so aborting the subscriber that initiated initialization
-cannot strand later subscribers. Transitions from zero to one subscriber
+cannot strand later subscribers. Transitions from zero to one active user
 advance project-view and shared-repository lifecycle epochs and create fresh
 cancellation ownership; completions from an older epoch cannot publish or
 populate the new epoch's coalesced result.
 Repository observations are reusable only for callers that selected the same
 anchor path; a result from another alias's anchor cannot substitute for
 resolving and validating the current caller's primary, adopted, or lifetime
-anchor. Final view and repository subscriber decrements share the same
+anchor. Final view and repository active-user decrements share the same
 entry-to-repository lock scope, so a reattachment cannot observe half-released
 ownership or skip the repository lifecycle transition.
 
@@ -321,6 +342,14 @@ selected anchor is scanned and compared with the durable pin before its result
 is accepted. If no anchor is reachable or the key mismatches, the catalog
 becomes degraded or unavailable. It does not publish an authoritative empty
 set and never treats directory existence as recovery for an unregistered path.
+
+Removal planning uses the same trusted-anchor resolver. It excludes the target,
+requires the persisted repository pin, and may select the reachable primary, a
+present adopted sibling, or the lifetime common directory only when the chosen
+anchor resolves to that pin. Destructive execution re-resolves and revalidates
+the anchor under its mutation locks after quiesce and immediately before Git.
+The primary being absent therefore does not block a valid pinned fallback, but
+neither path reuse nor anchor substitution can transfer removal authority.
 
 ### Authoritative scan algorithm
 
@@ -383,7 +412,7 @@ initial subscription.
   Invalidations captured before its refresh fence coalesce into that scan; an
   invalidation arriving during recovery leaves a newer pending epoch and causes
   at most the next serialized scan after an async yield. When mutations stop,
-  the worker clears its slot without a lost wake. Final unsubscribe atomically
+  the worker clears its slot without a lost wake. Final active-user release atomically
   clears the pending epoch, cancels the worker token, and aborts the worker
   task. Even a non-cancellation-aware dependency await therefore releases the
   project refresh lock, and a later lifecycle cannot inherit the old task or
@@ -402,7 +431,7 @@ initial subscription.
   releases both view and repository counts. Poll sleep, shallow signatures,
   Git inventory, directory probes, and the mutation-recovery worker are
   cancellation-aware; the associated pending work stops without later
-  publication when the final subscriber leaves.
+  publication when the final active user leaves.
 - Directory probes and bulk adoption use bounded concurrency.
 
 ### Failure behavior
@@ -429,18 +458,35 @@ Add typed RPC contracts equivalent to:
 ```text
 subscribeWorktreeCatalog { projectId }
 vcs.refreshWorktreeCatalog { projectId }
+worktree.updateDiscoveryPolicy { commandId, projectId, generation/presentation intent }
+worktree.createManaged { commandId, projectId, threadId, ref intent, thread defaults }
+worktree.createPanel { commandId, hostThreadId, threadId, title, thread defaults }
+worktree.retarget { commandId, projectId, threadId, worktreeKey, expectedGeneration }
 worktree.adopt { projectId, worktreeKey, generation, thread defaults }
+worktree.getRemovalPlan { projectId, threadId }
 worktree.removeFromBibCode { projectId, threadId }
-worktree.remove { projectId, threadId, mode, force, expected generation }
+worktree.remove { projectId, threadId, mode, confirmations, expected generation, plan token }
 ```
 
-The exact final names must follow the repository's method naming conventions,
-but their responsibilities remain separate: catalog observation, adoption,
-detach-only removal, and optional Git removal.
+Their responsibilities remain separate: catalog observation/policy, managed
+creation, host-derived panel creation, opaque catalog retargeting, adoption,
+detach-only removal, and optional verified Git removal.
 
-Clients send `projectId`, opaque worktree identity, and generation. The server
-resolves project roots and registered paths; the browser never supplies a
-destructive target path.
+Clients send persisted IDs, ref intent where creation requires it, opaque
+worktree identity, and generation. The server resolves project roots, host
+metadata, checkout paths, and registered paths; the browser never supplies a
+worktree root, retarget path, or destructive target path. Public
+`vcs.removeWorktree` is absent. A private managed-creation rollback may remove
+only the exact just-created registered nonprimary checkout if owner persistence
+fails.
+
+Generic HTTP and WebSocket orchestration dispatch use the same public decoder.
+They reject discovery policy, explicit worktree kind/path, bootstrap cwd/path,
+metadata worktree-path retargeting, adopted-owner deletion, and project deletion
+while adopted owners remain. Internal resolved variants are also rejected.
+Ordinary non-worktree commands remain available, with permitted kind and
+project working-directory context derived by the server. The engine repeats
+these owner and deletion constraints as defense in depth.
 
 Execution-environment capabilities gain optional `worktreeCatalog`, decoding
 to `false`. A newer client connected to an older server:
@@ -450,8 +496,15 @@ to `false`. A newer client connected to an older server:
 - omits discovery controls for that environment;
 - does not interpret the unsupported environment as an authoritative empty
   catalog;
+- offers only a confirmed legacy detach through ordinary thread deletion,
+  leaving Git and files untouched and never calling a raw destructive method;
 - may still show discovery rows from newer sibling environments in a grouped
   project.
+
+Capability selection covers subscriptions plus every direct, bulk, archived,
+creation, retarget, adoption, policy, planning, detach, and destructive-removal
+entry point. It is read from the negotiated session and the request uses that
+same session, preventing a reconnect from racing capability and transport.
 
 Catalog reads use the existing orchestration/VCS read authority. Adoption and
 removal require the corresponding orchestration write authority. Destructive
@@ -464,7 +517,7 @@ A discovered worktree is eligible for adoption when it:
 - is registered and its directory is present;
 - is not primary or bare;
 - belongs to the project's canonical common Git directory;
-- has no non-deleted canonical workspace thread with the same normalized path.
+- has no non-deleted canonical workspace thread with the same physical path.
 
 An archived canonical workspace thread still counts as adopted. A matching
 archived thread yields a restore action instead of a second thread. Panel
@@ -492,6 +545,23 @@ It does not silently persist workspace threads. Selecting one or choosing
 Grouped logical projects group candidates first by environment and then by
 parent directory. Bulk actions retain environment boundaries and report
 partial results per candidate.
+
+## Managed and Derived Owner Workflows
+
+Managed worktree creation is one idempotent server application operation. The
+request carries project/ref intent and thread defaults, not `cwd`, kind, or
+path. Under catalog mutation locks the server resolves the project root, lets
+the Git owner choose the managed checkout path, then persists the ordinary
+workspace owner. Once Git succeeds, caller cancellation cannot split Git from
+the owner transaction. If persistence fails, private rollback re-verifies the
+exact created registration and rejects primary/bare substitution before removal.
+
+A panel request identifies its persisted host, and the server derives panel
+kind, project, branch, and worktree path under the same authority boundary. A
+retarget request identifies a catalog candidate by opaque key and exact
+generation; the server refreshes/revalidates repository membership, presence,
+eligibility, and exclusive ownership before changing the thread. Raw generic
+thread creation or metadata update cannot express either operation.
 
 ## Adoption Workflow
 
@@ -556,6 +626,13 @@ authoritative catalog and derives:
 
 A failed scan never transitions a workspace into either missing state.
 
+Client-runtime exports one presentation selector used by every surface. A
+cold/no-status workspace, `present`, and retained
+`verification-unavailable` remain usable because none authoritatively proves
+absence. Only `missing-registered`, `missing-unregistered`, and `removing`
+disable workspace actions. Sidebar and chat/panel flows do not implement
+separate interpretations.
+
 ### Missing warning row
 
 A proven-missing worktree remains in the normal project location as a warning
@@ -574,6 +651,13 @@ The row displays:
 New agent turns, terminals, Git actions, scripts, and file operations fail with
 a structured `WorkspaceUnavailableError`, not a generic process or path error.
 
+Server filesystem file, browse, search, asset, review, and mutation RPCs retain
+one physical-path admission lease for the complete operation. Mutations enter a
+finalization fence before their filesystem or durable commit. Authoritative
+loss/removal either closes admission first or waits for the admitted operation
+and its finalization to finish; a paused write/delete cannot outlive guard
+publication.
+
 ### Runtime loss reconciliation
 
 When an authoritative transition proves a previously present adopted
@@ -589,7 +673,7 @@ workspace missing, the server:
 Repeated refreshes and concurrent subscribers share one teardown request per
 workspace transition. A degraded scan performs no teardown.
 
-If the same normalized path returns as a registered worktree in the same
+If the same physical path returns as a registered worktree in the same
 repository, the guard clears and the existing workspace becomes usable. No
 new adoption is required. A differently located worktree is never guessed to
 be the same workspace.
@@ -659,11 +743,16 @@ closed.
 
 Removal runs as a retry-safe application operation:
 
-1. Acquire the workspace `removing` guard and reject new activity.
-2. Quiesce sessions and terminals.
-3. Perform and verify the requested Git mutation, if any.
-4. Atomically delete the workspace thread and update the discovery baseline.
-5. Invalidate and refresh the catalog.
+1. Claim the command and acquire a finite cleanup-lifetime slot before any
+   reservation, guard, quiesce, Git, or detach effect.
+2. Reserve the exact durable request, acquire project/repository/physical-owner
+   locks, and install the workspace `removing` guard.
+3. Quiesce sessions and terminals while retaining the cleanup slot and guard.
+4. Re-resolve the physical target and trusted repository anchor, then perform
+   and verify the requested Git mutation, if any.
+5. Atomically delete the workspace thread/panels, update the discovery baseline,
+   and record immutable result metadata.
+6. Invalidate and refresh every affected catalog view.
 
 For present destructive removal, a Git failure before verification keeps the
 thread and returns it to `present` or its newly observed state. Detach-only
@@ -672,6 +761,14 @@ removal does not depend on Git.
 If the server crashes after Git removal and before thread deletion, restart
 reconciliation produces a missing warning row. The user can safely repeat
 detach or cleanup. Command IDs make retries idempotent.
+
+Client cancellation, WebSocket interrupt, or socket closure may win before the
+engine-envelope handoff. After handoff, a server-owned operation retains the
+command claim, project/repository/physical-owner locks, cleanup slot,
+reservation, `Removing` guard, quiesce ownership, and any rollback duty until a
+durable terminal result exists. Canceling the caller wait cannot expose the
+workspace or permit a stale overlapping mutation. Runtime shutdown drains these
+operation owners before catalog/provider/terminal teardown.
 
 Dependent panel threads follow the existing teardown path. An unexpected
 second canonical thread sharing the path produces an explicit conflict rather
@@ -697,6 +794,8 @@ than an arbitrary delete choice.
 - production RPC: authorization, project lookup, streams, and command routing.
 - orchestration: discovery-policy events and idempotent adoption/detach/remove
   application commands.
+- runtime-owned worktree operations: pre-handoff cancellation, post-handoff
+  resource retention, shutdown drain, and private exact managed-create rollback.
 - provider/terminal supervision: unavailable guard and bounded teardown.
 
 ### `packages/client-runtime`
@@ -709,6 +808,7 @@ Add a focused `state/worktrees` boundary owning:
 - candidate derivation;
 - joins between project policy, thread adoption, and catalog availability;
 - add-one/add-all and removal application operations;
+- negotiated-session capability policy and one shared availability selector;
 - a presentation-neutral sidebar workspace-row model.
 
 ### `apps/web`
@@ -732,10 +832,21 @@ native file-manager behavior only for local environment paths.
   nominate an arbitrary discovery root.
 - Adoption and deletion use opaque worktree keys and expected generations,
   not client-provided filesystem targets.
+- Managed creation, panel creation, and retargeting use dedicated
+  server-resolved inputs; generic orchestration cannot set worktree policy,
+  kind, path, bootstrap root, or retarget path.
+- Generic thread deletion rejects an adopted owner, and generic project
+  deletion rejects a project containing adopted owners, so availability rows
+  and physical guards cannot be orphaned outside the exact detach transaction.
+- Public raw-path worktree removal is absent; private creation rollback proves
+  the exact just-created registered nonprimary target.
 - Immediately before mutation, the server re-reads the worktree registration
   and common Git directory from authoritative state.
 - Primary and bare worktrees are never adoption or removal targets.
-- Present paths are canonicalized only after registration is proven.
+- Present paths are canonicalized only after registration is proven; missing
+  identity uses the canonical nearest existing ancestor plus normalized suffix.
+- Windows drive and UNC identities use Unicode-aware lowercase comparison, not
+  ASCII-only folding.
 - Missing/unregistered paths are never recursively deleted.
 - Path arguments are passed through the process API after `--`, without shell
   interpolation.
@@ -755,8 +866,11 @@ native file-manager behavior only for local environment paths.
 - Actual Git scans occur on signature changes, explicit requests, mutations,
   and initial subscription rather than every poll tick.
 - Stream publication is latest-value and bounded.
+- Catalog subscriptions and unary consumers share counted active-user
+  lifetimes; final release schedules pointer-checked 60-second eviction.
 - Catalog cache entries and warnings have bounded retention.
 - Add-all and missing-runtime teardown are coalesced/bounded.
+- Post-handoff worktree operations are runtime-owned and drained at shutdown.
 - Stale scan results cannot overwrite a later mutation epoch.
 - Non-authoritative results cannot remove or teardown workspaces.
 
@@ -775,7 +889,10 @@ native file-manager behavior only for local environment paths.
   authoritative scan.
 - Worktrees orphaned by an earlier create-thread failure become discovery
   candidates.
-- New clients capability-gate older remote servers.
+- New clients capability-gate every catalog subscription and command against
+  the same negotiated session used for the request. Older servers receive no
+  new-method call; their only fallback is explicit detach-only ordinary thread
+  deletion, which leaves Git and files untouched.
 - The catalog cache is rebuilt on restart; only the repository identity fence,
   not a live catalog snapshot, is persisted.
 - No vendored dependency or production Node runtime is introduced.
@@ -808,14 +925,16 @@ warnings are deduplicated and bounded.
 ### Rust unit tests
 
 - NUL-delimited and legacy porcelain parsing.
-- Whitespace, quoted paths, newline-capable records, Windows separators, and
-  POSIX case sensitivity.
+- Whitespace, quoted paths, newline-capable records, Windows separators,
+  drive/UNC non-ASCII comparison, and POSIX case sensitivity.
 - Primary, bare, detached, unborn, locked, lock reason, and prunable records.
 - Malformed and truncated scans remain non-authoritative.
 - Directory probe `NotFound`, permission, timeout, and bounded concurrency.
-- Normalized path equality and replacement conflict detection.
+- Present symlink/macOS aliases, missing nearest-ancestor aliases, physical path
+  equality, and replacement conflict detection.
 - Catalog coalescing, global limits, generation fencing, mutation epochs,
-  backpressure, cancellation, idle eviction, and degraded recovery.
+  backpressure, subscription/unary cancellation, pointer-checked idle eviction,
+  and degraded recovery.
 - Candidate validation and common-Git membership.
 - Verified targeted removal and prune dry-run handling.
 
@@ -831,6 +950,14 @@ warnings are deduplicated and bounded.
 - Require explicit force for dirty deletion.
 - Preserve the branch after worktree removal.
 - Converge simultaneous adoption commands on one thread.
+- Reject every generic raw policy/kind/path/bootstrap/retarget/delete bypass and
+  prove dedicated managed-create/panel/retarget flows.
+- Retain post-handoff lifecycle ownership across WebSocket interrupt and socket
+  closure; permit pre-handoff cancellation.
+- Hold filesystem leases/finalization through paused read/write/delete versus
+  authoritative loss or `Removing`.
+- Plan and execute removal through a pinned trusted fallback anchor when the
+  primary checkout is missing.
 - Restore a matching archived thread.
 - Complete detach-only removal when Git cleanup fails.
 - Recover from the crash boundary after Git removal but before thread deletion.
@@ -844,7 +971,10 @@ warnings are deduplicated and bounded.
 - Retain last-authoritative data through degraded refreshes.
 - Join present, verification-unavailable, both missing states, and recovery.
 - Keep grouped environments isolated.
-- Handle mixed server capabilities and disconnected environments.
+- Handle mixed server capabilities and disconnected environments without any
+  new-method call when capability is false; legacy fallback remains detach-only.
+- Apply one cold/present/degraded/missing/removing availability selector across
+  every presentation surface.
 - Report add-all partial failures without rolling back successes.
 
 ### Web tests
@@ -896,6 +1026,18 @@ broader cross-package and RPC checks, and the repository gates:
     replacement, repository-mismatched, or unconfirmed dirty worktree.
 11. Concurrent scans, mutations, adoption requests, and slow subscribers
     remain bounded and converge predictably.
+12. Dedicated server-resolved APIs are the only public path for worktree
+    policy, creation, panel derivation, retarget, adoption, detach, and
+    destructive removal; generic/raw bypasses fail closed.
+13. Pre-handoff cancellation may win, while post-handoff worktree lifecycle
+    ownership survives interrupt/socket closure through a durable terminal
+    result.
+14. Present and missing aliases share one physical identity, and every
+    filesystem operation retains admission/finalization for its complete
+    lifetime.
+15. A false/missing catalog capability makes no new-method call, and every UI
+    uses the shared availability decision for cold, degraded, missing, and
+    removing states.
 
 ## Required Living Documentation During Implementation
 
