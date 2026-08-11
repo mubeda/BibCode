@@ -61,6 +61,35 @@ supervisor. Disconnect and scope closure interrupt in-flight work.
 supervisor owns retry state, status, cancellation, and generation fencing, so a
 stale socket cannot silently become current.
 
+## Worktree catalog subscriptions
+
+The worktree catalog is capability gated. A server that does not advertise
+`worktreeCatalog` produces no discovery controls and no catalog subscription;
+clients do not synthesize an empty supported result. For a capable environment,
+`state/worktrees` owns one catalog atom per `(environmentId, projectId)` with no
+client idle grace period. The server view itself owns bounded sharing and idle
+eviction.
+
+The RPC stream is latest-value state. Client state accepts only a current
+authoritative generation as new catalog content. If a later scan is degraded,
+it retains the last authoritative candidate and adopted-workspace arrays while
+publishing the new health status. Environment and project grouping in React is
+presentation only; it does not merge the scoped catalog sources or grant the
+browser authority over paths.
+
+Subscription acquisition resolves the current supervisor session. When a
+connection is replaced after disconnect or reconnect, the session switch ends
+the old stream and subscribes again through the new session. Replacing an
+environment registration follows the same scoped switch. Window focus and
+document visibility request one single-flight refresh per distinct physical
+project, even if several rows or panels render it.
+
+Adoption and policy updates are serialized per project in the client runtime;
+**Add all** is also bounded to four concurrent candidate operations and one
+bulk lane per environment. These are responsiveness bounds, not correctness
+locks: the server's command receipts, mutation locks, generation checks, and
+repository verification remain authoritative.
+
 ## Data boundary
 
 A session becomes ready only after the socket connects and the initial
@@ -71,4 +100,5 @@ its registration, profile, credential, supervisor scope, and environment-keyed
 client state.
 
 See [Remote architecture](./remote.md) for access methods and
-[RPC and orchestration](./rpc-and-orchestration.md) for the wire boundary.
+[RPC and orchestration](./rpc-and-orchestration.md) for the wire boundary, and
+[Worktree catalog](./worktree-catalog.md) for discovery and lifecycle rules.
