@@ -146,9 +146,12 @@ exclusive for worktree policy, identity, creation, panel derivation,
 retargeting, adoption, detach, and destructive removal. Generic orchestration
 may continue to mutate ordinary non-worktree state, but cannot accept discovery
 policy, worktree kind/path/bootstrap authority, adopted-owner deletion, or
-project deletion while adopted owners remain. Public `vcs.removeWorktree` is
-retired; the only raw removal-shaped primitive is private rollback of the exact
-just-created, still-unowned managed checkout after owner persistence fails.
+project deletion while adopted owners remain. Public `vcs.removeWorktree` and
+`vcs.createWorktree` are retired; the only raw removal-shaped primitive is
+private rollback of the exact just-created, still-unowned managed checkout and
+actual newly created branch after owner persistence fails. Pull-request
+worktree mode resolves the PR branch and enters `worktree.createManaged`; the
+legacy PR preparation operation is local-checkout-only.
 
 Rejected alternatives were:
 
@@ -210,11 +213,14 @@ cross-project cleanup:
 - missing paths canonicalize their nearest existing ancestor and append the
   normalized missing suffix, so symlinked parents, macOS `/var` aliases, and
   lexical `.`/`..` spellings cannot split identity;
-- Windows drive and UNC paths are separator-normalized and compared with
-  Unicode-aware lowercase semantics, including non-ASCII path components;
+- Windows drive and UNC paths are separator-normalized and compared with the
+  native invariant uppercase mapping compatible with Windows ordinal caseless
+  identity, including non-ASCII and sigma/final-sigma components;
 - POSIX paths are separator-normalized and remain case-sensitive;
-- an authority-changing operation fails closed when physical identity cannot be
-  established instead of creating a lexical fallback owner; and
+- only genuine `NotFound` walks to the nearest existing ancestor; permission,
+  symlink-loop, and every other identity failure returns typed
+  `WorkspaceIdentityError` and aborts the authority transition instead of
+  creating a lexical fallback owner; and
 - branch or HEAD similarity never establishes path identity.
 
 If a worktree is moved externally, the former adopted path becomes missing
@@ -476,9 +482,11 @@ Clients send persisted IDs, ref intent where creation requires it, opaque
 worktree identity, and generation. The server resolves project roots, host
 metadata, checkout paths, and registered paths; the browser never supplies a
 worktree root, retarget path, or destructive target path. Public
-`vcs.removeWorktree` is absent. A private managed-creation rollback may remove
-only the exact just-created registered nonprimary checkout if owner persistence
-fails.
+`vcs.removeWorktree` and `vcs.createWorktree` are absent. A private
+managed-creation rollback carries the exact checkout path and actual branch
+reported as newly created by Git, including automatic suffixes, and may remove
+only that state if owner persistence fails. PR worktree creation uses
+`worktree.createManaged`; `git.preparePullRequestThread` accepts only local mode.
 
 Generic HTTP and WebSocket orchestration dispatch use the same public decoder.
 They reject discovery policy, explicit worktree kind/path, bootstrap cwd/path,
@@ -770,6 +778,12 @@ durable terminal result exists. Canceling the caller wait cannot expose the
 workspace or permit a stale overlapping mutation. Runtime shutdown drains these
 operation owners before catalog/provider/terminal teardown.
 
+Admission is a named global non-waiting semaphore bound of 64 server-owned
+operation lifetimes. Saturation and closed shutdown admission return structured
+`WorktreeOperationError` reasons; the accepted task owns the permit through its
+terminal result, and shutdown closes admission before draining all tasks. No
+unbounded waiter queue is created.
+
 Dependent panel threads follow the existing teardown path. An unexpected
 second canonical thread sharing the path produces an explicit conflict rather
 than an arbitrary delete choice.
@@ -838,15 +852,17 @@ native file-manager behavior only for local environment paths.
 - Generic thread deletion rejects an adopted owner, and generic project
   deletion rejects a project containing adopted owners, so availability rows
   and physical guards cannot be orphaned outside the exact detach transaction.
-- Public raw-path worktree removal is absent; private creation rollback proves
-  the exact just-created registered nonprimary target.
+- Public raw-path worktree creation and removal are absent; private creation
+  rollback proves the exact just-created registered nonprimary target and the
+  actual newly created branch, including automatic suffixes.
 - Immediately before mutation, the server re-reads the worktree registration
   and common Git directory from authoritative state.
 - Primary and bare worktrees are never adoption or removal targets.
 - Present paths are canonicalized only after registration is proven; missing
   identity uses the canonical nearest existing ancestor plus normalized suffix.
-- Windows drive and UNC identities use Unicode-aware lowercase comparison, not
-  ASCII-only folding.
+- Windows drive and UNC identities use native invariant uppercase mapping
+  compatible with Windows ordinal caseless comparison, including non-ASCII and
+  sigma/final-sigma folds.
 - Missing/unregistered paths are never recursively deleted.
 - Path arguments are passed through the process API after `--`, without shell
   interpolation.
@@ -870,7 +886,9 @@ native file-manager behavior only for local environment paths.
   lifetimes; final release schedules pointer-checked 60-second eviction.
 - Catalog cache entries and warnings have bounded retention.
 - Add-all and missing-runtime teardown are coalesced/bounded.
-- Post-handoff worktree operations are runtime-owned and drained at shutdown.
+- Post-handoff worktree operations are runtime-owned, admitted by one named
+  non-waiting global bound of 64, and drained at shutdown. Structured saturation
+  never creates an unbounded wait queue.
 - Stale scan results cannot overwrite a later mutation epoch.
 - Non-authoritative results cannot remove or teardown workspaces.
 

@@ -22,19 +22,25 @@ worktree path/kind/policy/delete authority:
   adopted-owner deletion, and project deletion while adopted owners remain.
   Ordinary non-worktree commands remain supported with permitted context
   derived by the server.
-- Public raw-path `vcs.removeWorktree` is retired from contracts, registries,
-  scopes, desktop bridges, and handlers. A private rollback may remove only the
-  exact just-created registered nonprimary checkout when managed owner
-  persistence fails.
+- Public raw-path `vcs.removeWorktree` and `vcs.createWorktree` are retired from
+  contracts, registries, scopes, desktop bridges, and handlers. A private
+  rollback owns the exact just-created registered nonprimary checkout and the
+  actual newly created branch returned by Git, including automatic suffixes.
+  Pull-request worktree mode resolves its branch and uses
+  `worktree.createManaged`; legacy PR preparation is local-checkout-only.
 - One physical identity governs present canonical paths and missing paths via
   their canonical nearest existing ancestor plus normalized suffix. It is used
   across catalog joins, owner uniqueness, availability, mutation locks,
-  removal, and cross-project cleanup. Windows drive/UNC comparison is
-  Unicode-aware, not ASCII-only.
+  removal, and cross-project cleanup. Windows drive/UNC comparison uses native
+  invariant uppercase mapping compatible with Windows ordinal caseless
+  identity, including non-ASCII special folds.
 - Worktree mutations are runtime-owned. Cancellation may win before
   engine-envelope handoff; after handoff, the command claim, locks, removal
   reservation/slot, guard, quiesce, and rollback ownership remain until a
-  durable terminal result. Runtime shutdown drains these operations first.
+  durable terminal result. One named non-waiting global semaphore admits at
+  most 64 operation lifetimes, returns structured saturation/shutdown errors,
+  and creates no waiter queue. Runtime shutdown closes admission and drains
+  these operations first.
 - Every filesystem read/search/browse/asset/review/mutation RPC retains a
   physical-path admission lease for the complete operation; mutations cross a
   finalization fence before their filesystem or durable commit.
@@ -139,7 +145,13 @@ WorktreeRemovalAvailability =
 
 `WorktreeRemovalPlan` contains an opaque `planToken`, `generation`, `availability`, `registered`, `locked`, optional `lockReason`, counts for tracked changes and untracked files, and a bounded `pruneImpact` list of `{ path, locked, lockReason? }`. `WorktreeRemovalResult` contains `threadRemoved`, `gitOutcome`, optional `detail`, and `orphanCleanupPending`.
 
-Define tagged errors `WorktreeCatalogError`, `WorktreeAdoptionError`, `WorktreeRemovalError`, and `WorkspaceUnavailableError`. Each carries a bounded message and a literal reason; adoption/removal errors optionally carry `currentGeneration`. `WorkspaceUnavailableError` carries `threadId`, `path`, and `availability`.
+Define tagged errors `WorktreeCatalogError`, `WorktreeAdoptionError`,
+`WorktreeRemovalError`, `WorktreeOperationError`, `WorkspaceUnavailableError`,
+and `WorkspaceIdentityError`. Each carries a bounded message and literal reason;
+adoption/removal errors optionally carry `currentGeneration`.
+`WorkspaceUnavailableError` carries `threadId`, `path`, and `availability`;
+`WorkspaceIdentityError` aborts authority changes when physical identity cannot
+be verified.
 
 - [ ] **Step 1: Write failing schema tests**
 
@@ -300,11 +312,28 @@ pub struct GitWorktreeInventory {
 
 The first parsed worktree record is primary. `branch refs/heads/name` becomes `name`; `detached` and unborn entries have a nullable branch. A `prunable` field preserves its optional reason. Unknown fields are ignored only when the record itself still has exactly one `worktree` field and no duplicate singleton fields. Empty, duplicate, truncated, unterminated, over-512, or pathless records are errors.
 
-`normalize_worktree_path_key(path, platform)` normalizes separators and trailing separators, uses Unicode-aware lowercase comparison for Windows drive/UNC keys, and preserves POSIX case. Authority-bearing identity then applies `canonical_worktree_path_key`: present paths canonicalize through the filesystem, while missing paths canonicalize the nearest existing ancestor and append the normalized missing suffix. Catalog joins, owner uniqueness, availability, mutation locks, removal, and cross-project cleanup all use that physical key. `WorktreeRepositoryKey` and `WorktreeKey` are lowercase SHA-256 hex over a version prefix, normalized common-directory key, a NUL separator, and the physical worktree key.
+`normalize_worktree_path_key(path, platform)` normalizes separators and trailing
+separators, uses native invariant uppercase mapping compatible with Windows
+ordinal caseless identity for drive/UNC keys, and preserves POSIX case.
+Authority-bearing identity then applies `canonical_worktree_path_key`: present
+paths canonicalize through the filesystem, while genuine `NotFound` paths
+canonicalize the nearest existing ancestor and append the normalized missing
+suffix. Permission, symlink-loop, and all other failures propagate as typed
+`WorkspaceIdentityError`; no lexical authority fallback is permitted. Catalog
+joins, owner uniqueness, availability, mutation locks, removal, and
+cross-project cleanup all use that physical key. `WorktreeRepositoryKey` and
+`WorktreeKey` are lowercase SHA-256 hex over a version prefix, normalized
+common-directory key, a NUL separator, and the physical worktree key.
 
 - [ ] **Step 1: Add failing parser and identity tests**
 
-Cover NUL and legacy records with spaces, Git C-style quoted paths, embedded newline escapes, detached/unborn, bare, locked with and without reason, prunable with and without reason, duplicate fields, missing record terminator, over-limit output, Windows drive/UNC/non-ASCII equivalence, POSIX case distinction, present symlink/macOS aliases, missing nearest-ancestor aliases, and deterministic opaque keys.
+Cover NUL and legacy records with spaces, Git C-style quoted paths, embedded
+newline escapes, detached/unborn, bare, locked with and without reason, prunable
+with and without reason, duplicate fields, missing record terminator, over-limit
+output, Windows drive/UNC/non-ASCII/sigma equivalence for present and missing
+paths, POSIX case distinction, present symlink/macOS aliases, missing nearest-
+ancestor aliases, injected non-`NotFound` failures, and deterministic opaque
+keys.
 
 Run:
 
@@ -631,9 +660,12 @@ identity/title, and ordinary defaults, but no `cwd`, kind, or target path. The
 server resolves the project root, lets `GitRepository::create_worktree` choose
 the path, persists the canonical owner, then calls `note_managed_creation` and
 invalidates. If persistence fails after Git succeeds, a private exact rollback
-re-verifies and removes only that just-created registered nonprimary checkout
-and any newly created branch. Retire public `vcs.removeWorktree` from TypeScript
-contracts, Rust registry/scope/handler, desktop bridge, and fixtures; catalog
+uses internal creation metadata to re-verify and remove only that just-created
+registered nonprimary checkout and the actual newly created branch, including
+an automatic suffix. Retire public `vcs.createWorktree` and
+`vcs.removeWorktree` from TypeScript contracts, Rust registry/scope/handler,
+desktop bridge, and fixtures. PR worktree mode resolves its branch then invokes
+`worktree.createManaged`; `git.preparePullRequestThread` remains local-only; catalog
 removal is exclusively `worktree.removeFromBibCode` / `worktree.remove`. Never
 turn a failed observational refresh into a failed already-committed mutation
 response.
@@ -1292,7 +1324,11 @@ prune only with a matching confirmation, then detach even on cleanup failure.
 Preserve the checked-out branch. Run adoption, policy, detach, and removal in a
 server-owned operation runtime: cancellation wins only before engine-envelope
 handoff; after handoff retain all lifecycle resources until the durable receipt,
-and drain this runtime before catalog/provider/terminal shutdown.
+and drain this runtime before catalog/provider/terminal shutdown. Admit at most
+64 server-owned operation lifetimes with one named non-waiting global semaphore
+before spawn. Return structured capacity/shutdown failures, keep the permit
+through the terminal result, close admission during shutdown, and never create
+an unbounded waiter queue.
 
 - [ ] **Step 6: Advertise the capability only after the complete server surface exists**
 
