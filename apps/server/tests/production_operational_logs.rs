@@ -50,6 +50,40 @@ async fn activity_provider_events_without_a_lifecycle_suffix_are_marked_observed
 }
 
 #[tokio::test]
+async fn provider_logs_reject_malformed_item_ids() {
+    let temp = TempDir::new().expect("temporary log directory");
+    let path = temp.path().join("events.log");
+    let log = ProviderOperationalLog::start(path.clone(), OperationalLogOptions::default())
+        .await
+        .expect("provider log starts");
+
+    for item_id in [
+        format!("SENSITIVE_OVERSIZED_ITEM_ID{}", "x".repeat(5_000)),
+        "SENSITIVE_CONTROL_ITEM_ID\u{0007}".to_owned(),
+    ] {
+        assert!(log.record(&ProviderEvent {
+            native_event_id: None,
+            event_type: "assistant.message.delta".to_owned(),
+            thread_id: "thread-1".to_owned(),
+            turn_id: Some("turn-1".to_owned()),
+            item_id: Some(item_id),
+            request_id: None,
+            payload: json!({}),
+            activity: Vec::new(),
+        }));
+    }
+    log.shutdown().await.expect("provider log shuts down");
+
+    let contents = std::fs::read_to_string(path).expect("read provider log");
+    assert!(!contents.contains("SENSITIVE_OVERSIZED_ITEM_ID"));
+    assert!(!contents.contains("SENSITIVE_CONTROL_ITEM_ID"));
+    for line in contents.lines() {
+        let record: serde_json::Value = serde_json::from_str(line).expect("provider record");
+        assert!(record.get("itemId").is_none());
+    }
+}
+
+#[tokio::test]
 async fn terminal_output_is_persisted_as_metadata_without_data() {
     let temp = TempDir::new().expect("temporary log directory");
     let path = temp.path().join("terminal-events.log");

@@ -129,7 +129,9 @@ impl ProviderOperationalLog {
             event_type: &event.event_type,
             thread_id: &event.thread_id,
             turn_id: event.turn_id.as_deref(),
-            item_id: event.item_id.as_deref(),
+            item_id: crate::production::provider_runtime::valid_provider_item_id(
+                event.item_id.as_deref(),
+            ),
             request_id: event.request_id.as_deref(),
             activity_mutation_count: event.activity.len(),
             status: provider_status(&event.event_type),
