@@ -50,7 +50,7 @@ const DEFAULT_BACKEND_READINESS_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_BACKEND_READINESS_INTERVAL: Duration = Duration::from_millis(250);
 const DEFAULT_BACKEND_READINESS_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 const DEFAULT_BACKEND_SOFT_SHUTDOWN_REQUEST_TIMEOUT: Duration = Duration::from_millis(500);
-const DEFAULT_BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(1500);
+const DEFAULT_BACKEND_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 const DEFAULT_BACKEND_RESTART_INITIAL_DELAY: Duration = Duration::from_millis(250);
 const DEFAULT_BACKEND_RESTART_MAX_DELAY: Duration = Duration::from_secs(5);
 const DEFAULT_BACKEND_MONITOR_INTERVAL: Duration = Duration::from_millis(250);
@@ -3296,7 +3296,7 @@ mod tests {
         assert_eq!(
             BackendShutdownConfig::default(),
             BackendShutdownConfig {
-                timeout: Duration::from_millis(1_500),
+                timeout: Duration::from_secs(5),
             }
         );
         assert_eq!(
