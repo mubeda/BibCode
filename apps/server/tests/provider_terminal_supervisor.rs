@@ -8395,7 +8395,10 @@ async fn agent_activity_hung_factory_does_not_block_terminal_disable_or_later_se
         .await
         .expect("provider factory entered")
         .forget();
-    tokio::time::timeout(std::time::Duration::from_secs(2), opening)
+    // The manager enforces the production 500 ms callback budget. Keep this
+    // outer integration watchdog wide enough for a concurrently loaded release
+    // test graph while still proving that the original PTY launches.
+    tokio::time::timeout(std::time::Duration::from_secs(10), opening)
         .await
         .expect("manager preparation timeout")
         .expect("open task")
