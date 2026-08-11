@@ -98,6 +98,7 @@ export const ActivityCapabilities = Schema.Struct({
   backgroundWork: Schema.Boolean,
   historyRecovery: Schema.Literals(["full", "bounded", "none"]),
   terminalObservation: Schema.Boolean,
+  targetedActorCancellation: Schema.Boolean,
 });
 export type ActivityCapabilities = typeof ActivityCapabilities.Type;
 
@@ -107,6 +108,7 @@ export const NO_ACTIVITY_CAPABILITIES = {
   backgroundWork: false,
   historyRecovery: "none",
   terminalObservation: false,
+  targetedActorCancellation: false,
 } as const satisfies ActivityCapabilities;
 
 const ActivityRecordBase = {
@@ -166,8 +168,35 @@ export const ActivitySummaryCounts = Schema.Struct({
 });
 export type ActivitySummaryCounts = typeof ActivitySummaryCounts.Type;
 
+export const ActivityActorControl = Schema.Struct({
+  actorId: ActivityRecordId,
+  state: Schema.Literals(["unsupported", "available", "requested"]),
+  controlRevision: NonNegativeInt,
+  activeDescendantCount: NonNegativeInt,
+});
+export type ActivityActorControl = typeof ActivityActorControl.Type;
+
+export const ActivityCancellationOperationSummary = Schema.Struct({
+  rootActorId: ActivityRecordId,
+  state: Schema.Literals(["requested", "partial"]),
+  residualCount: NonNegativeInt,
+  message: Schema.NullOr(ActivitySummaryText),
+  operationRevision: NonNegativeInt,
+});
+export type ActivityCancellationOperationSummary = typeof ActivityCancellationOperationSummary.Type;
+
+export const ActivityControlSnapshot = Schema.Struct({
+  scopeId: ActivityScopeId,
+  revision: NonNegativeInt,
+  actors: Schema.Array(ActivityActorControl).check(Schema.isMaxLength(ACTIVITY_PAGE_MAX_LENGTH)),
+  operations: Schema.Array(ActivityCancellationOperationSummary).check(
+    Schema.isMaxLength(ACTIVITY_PAGE_MAX_LENGTH),
+  ),
+});
+export type ActivityControlSnapshot = typeof ActivityControlSnapshot.Type;
+
 export const ActivitySnapshot = Schema.Struct({
-  protocolVersion: Schema.Literal(1),
+  protocolVersion: Schema.Literal(2),
   scopeId: ActivityScopeId,
   scope: ActivityScopeRef,
   revision: NonNegativeInt,
@@ -183,6 +212,7 @@ export const ActivitySnapshot = Schema.Struct({
   ),
   actorsHasMore: Schema.Boolean,
   workItemsHasMore: Schema.Boolean,
+  control: ActivityControlSnapshot,
   updatedAt: ActivityTimestamp,
 });
 export type ActivitySnapshot = typeof ActivitySnapshot.Type;
@@ -223,9 +253,33 @@ export const ActivityDelta = Schema.Struct({
 });
 export type ActivityDelta = typeof ActivityDelta.Type;
 
+export const ActivityControlChange = Schema.Union([
+  Schema.Struct({ kind: Schema.Literal("actor-upserted"), actor: ActivityActorControl }),
+  Schema.Struct({ kind: Schema.Literal("actor-removed"), actorId: ActivityRecordId }),
+  Schema.Struct({
+    kind: Schema.Literal("operation-upserted"),
+    operation: ActivityCancellationOperationSummary,
+  }),
+  Schema.Struct({ kind: Schema.Literal("operation-removed"), rootActorId: ActivityRecordId }),
+]);
+export type ActivityControlChange = typeof ActivityControlChange.Type;
+
+export const ActivityControlDelta = Schema.Struct({
+  scopeId: ActivityScopeId,
+  previousRevision: NonNegativeInt,
+  revision: PositiveInt,
+  changes: Schema.Array(ActivityControlChange).check(
+    Schema.isMinLength(1),
+    Schema.isMaxLength(256),
+  ),
+});
+export type ActivityControlDelta = typeof ActivityControlDelta.Type;
+
 export const ActivityStreamItem = Schema.Union([
   Schema.Struct({ kind: Schema.Literal("snapshot"), snapshot: ActivitySnapshot }),
   Schema.Struct({ kind: Schema.Literal("delta"), delta: ActivityDelta }),
+  Schema.Struct({ kind: Schema.Literal("control-snapshot"), control: ActivityControlSnapshot }),
+  Schema.Struct({ kind: Schema.Literal("control-delta"), delta: ActivityControlDelta }),
 ]);
 export type ActivityStreamItem = typeof ActivityStreamItem.Type;
 
@@ -246,6 +300,9 @@ export const ActivityListRosterInput = Schema.Struct({
 });
 export const ActivityRosterPage = Schema.Struct({
   records: Schema.Array(ActivityRecordSummary).check(Schema.isMaxLength(ACTIVITY_PAGE_MAX_LENGTH)),
+  actorControls: Schema.Array(ActivityActorControl).check(
+    Schema.isMaxLength(ACTIVITY_PAGE_MAX_LENGTH),
+  ),
   nextCursor: Schema.NullOr(ActivityPageCursor),
 });
 export const ActivityListDetailInput = Schema.Struct({
@@ -258,9 +315,36 @@ export const ActivityListDetailInput = Schema.Struct({
 });
 export const ActivityDetailPage = Schema.Struct({
   record: ActivityRecordSummary,
+  actorControl: Schema.NullOr(ActivityActorControl),
   entries: Schema.Array(ActivityEntry).check(Schema.isMaxLength(ACTIVITY_PAGE_MAX_LENGTH)),
   nextCursor: Schema.NullOr(ActivityPageCursor),
 });
+export type ActivityDetailPage = typeof ActivityDetailPage.Type;
+
+export const ActivityCancelSubtreeInput = Schema.Struct({
+  scope: Schema.TaggedStruct("thread", { threadId: ActivityThreadId }),
+  scopeId: ActivityScopeId,
+  actorId: ActivityRecordId,
+  expectedControlRevision: NonNegativeInt,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ActivityCancelSubtreeInput = typeof ActivityCancelSubtreeInput.Type;
+
+export const ActivityRetrySubtreeCancellationInput = Schema.Struct({
+  scope: Schema.TaggedStruct("thread", { threadId: ActivityThreadId }),
+  scopeId: ActivityScopeId,
+  rootActorId: ActivityRecordId,
+  expectedOperationRevision: NonNegativeInt,
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
+export type ActivityRetrySubtreeCancellationInput =
+  typeof ActivityRetrySubtreeCancellationInput.Type;
+
+export const ActivitySubtreeCancellationResult = Schema.Struct({
+  disposition: Schema.Literals(["accepted", "inProgress", "alreadyTerminal"]),
+  rootActorId: ActivityRecordId,
+  operationRevision: Schema.NullOr(NonNegativeInt),
+});
+export type ActivitySubtreeCancellationResult = typeof ActivitySubtreeCancellationResult.Type;
+
 export class ActivityError extends Schema.TaggedErrorClass<ActivityError>()("ActivityError", {
   message: ActivitySummaryText,
   reason: Schema.Literals([
@@ -268,6 +352,14 @@ export class ActivityError extends Schema.TaggedErrorClass<ActivityError>()("Act
     "invalidScope",
     "invalidCursor",
     "featureDisabled",
+    "cancellationUnsupported",
+    "staleScope",
+    "staleActor",
+    "staleOperation",
+    "providerUnavailable",
+    "targetUnavailable",
+    "partialCancellation",
+    "dispatchTimeout",
     "internal",
   ]),
 }) {}

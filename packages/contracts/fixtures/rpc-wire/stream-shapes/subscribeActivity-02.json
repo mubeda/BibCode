@@ -1,0 +1,50 @@
+{
+  "_tag": "Chunk",
+  "requestId": "900719925474099312345",
+  "values": [
+    {
+      "kind": "control-snapshot",
+      "control": {
+        "scopeId": "o",
+        "revision": 2147483625,
+        "actors": [
+          {
+            "actorId": "=G`N",
+            "state": "available",
+            "controlRevision": 1547579521,
+            "activeDescendantCount": 1920673118
+          },
+          {
+            "actorId": "T+",
+            "state": "requested",
+            "controlRevision": 9,
+            "activeDescendantCount": 1047202342
+          }
+        ],
+        "operations": [
+          {
+            "rootActorId": "~U\"1L$dR",
+            "state": "requested",
+            "residualCount": 1952647743,
+            "message": null,
+            "operationRevision": 10
+          },
+          {
+            "rootActorId": "^Nk%vA|.rBO",
+            "state": "requested",
+            "residualCount": 2147483622,
+            "message": "|",
+            "operationRevision": 881477832
+          },
+          {
+            "rootActorId": "H,!yzNWQc",
+            "state": "partial",
+            "residualCount": 786202572,
+            "message": null,
+            "operationRevision": 113535764
+          }
+        ]
+      }
+    }
+  ]
+}
