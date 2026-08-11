@@ -105,6 +105,8 @@ pub struct RuntimeEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     pub payload: Value,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -122,6 +124,8 @@ pub struct RuntimeEventStableView {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     pub payload: Value,
 }
@@ -133,6 +137,7 @@ impl RuntimeEvent {
             event_type: self.event_type.clone(),
             thread_id: self.thread_id.clone(),
             turn_id: self.turn_id.clone(),
+            item_id: self.item_id.clone(),
             request_id: self.request_id.clone(),
             payload: self.payload.clone(),
         }
@@ -2327,6 +2332,7 @@ impl CodexSessionRuntime {
             event_type: event_type.to_owned(),
             thread_id: self.inner.options.thread_id.clone(),
             turn_id,
+            item_id: None,
             request_id,
             payload,
             native_event_id: None,
@@ -2354,6 +2360,7 @@ impl CodexSessionRuntime {
             event_type: "activity.native".to_owned(),
             thread_id: self.inner.options.thread_id.clone(),
             turn_id: None,
+            item_id: None,
             request_id: None,
             payload: json!({}),
             native_event_id: Some(format!("codex:activity:{receive_sequence}")),
@@ -2402,6 +2409,7 @@ impl CodexSessionRuntime {
                     event_type: "runtime.warning".to_owned(),
                     thread_id: self.inner.options.thread_id.clone(),
                     turn_id: None,
+                    item_id: None,
                     request_id: None,
                     payload: json!({
                         "message": "Codex activity reconciliation cannot safely order staged topology"
@@ -2437,6 +2445,7 @@ impl CodexSessionRuntime {
                     event_type: "activity.native".to_owned(),
                     thread_id: self.inner.options.thread_id.clone(),
                     turn_id: None,
+                    item_id: None,
                     request_id: None,
                     payload: json!({}),
                     native_event_id: Some(format!("codex:reconciliation:{sequence}")),
@@ -2486,6 +2495,7 @@ impl CodexSessionRuntime {
             event_type: event_type.to_owned(),
             thread_id: self.inner.options.thread_id.clone(),
             turn_id: None,
+            item_id: None,
             request_id: None,
             payload,
             native_event_id,

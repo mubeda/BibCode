@@ -3087,6 +3087,7 @@ async fn activity_runtime_routes_live_children_without_changing_root_events() {
                 event_type: "turn.started".to_owned(),
                 thread_id: "fixture-thread".to_owned(),
                 turn_id: Some("fixture-turn".to_owned()),
+                item_id: None,
                 request_id: None,
                 payload: json!({}),
             },
@@ -3094,6 +3095,7 @@ async fn activity_runtime_routes_live_children_without_changing_root_events() {
                 event_type: "content.delta".to_owned(),
                 thread_id: "fixture-thread".to_owned(),
                 turn_id: Some("fixture-turn".to_owned()),
+                item_id: None,
                 request_id: None,
                 payload: json!({
                     "streamKind": "assistant_text",
@@ -3104,6 +3106,7 @@ async fn activity_runtime_routes_live_children_without_changing_root_events() {
                 event_type: "item.started".to_owned(),
                 thread_id: "fixture-thread".to_owned(),
                 turn_id: Some("fixture-turn".to_owned()),
+                item_id: None,
                 request_id: None,
                 payload: json!({
                     "itemType": "command_execution",
@@ -3115,6 +3118,7 @@ async fn activity_runtime_routes_live_children_without_changing_root_events() {
                 event_type: "item.completed".to_owned(),
                 thread_id: "fixture-thread".to_owned(),
                 turn_id: Some("fixture-turn".to_owned()),
+                item_id: None,
                 request_id: None,
                 payload: json!({
                     "itemType": "command_execution",

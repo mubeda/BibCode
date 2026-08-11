@@ -3979,6 +3979,7 @@ async fn activity_only_provider_events_project_graph_mutations_without_root_payl
         event_type: "activity.native".to_owned(),
         thread_id: "t1".to_owned(),
         turn_id: None,
+        item_id: None,
         request_id: None,
         payload: json!({}),
         activity: vec![
@@ -4007,6 +4008,7 @@ async fn activity_only_provider_events_project_graph_mutations_without_root_payl
             event_type: "pump.barrier".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: None,
+            item_id: None,
             request_id: None,
             payload: json!({"visible":true}),
             activity: vec![
@@ -4092,6 +4094,7 @@ async fn mcp_complete_snapshots_project_in_order_for_the_selected_provider_insta
             event_type: "provider.note".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: None,
+            item_id: None,
             request_id: None,
             payload: json!({ "providerInstanceId": "source-owned" }),
             activity: Vec::new(),
@@ -4101,6 +4104,7 @@ async fn mcp_complete_snapshots_project_in_order_for_the_selected_provider_insta
             event_type: "mcp.status.updated".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: None,
+            item_id: None,
             request_id: None,
             payload: json!({
                 "servers": [{ "name": "old-only", "state": "connected" }]
@@ -4112,6 +4116,7 @@ async fn mcp_complete_snapshots_project_in_order_for_the_selected_provider_insta
             event_type: "mcp.status.updated".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: None,
+            item_id: None,
             request_id: None,
             payload: json!({
                 "servers": [
@@ -4281,6 +4286,7 @@ async fn agent_activity_toggle_keeps_session_ready_and_fences_native_event_gener
             event_type: "activity.native".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: None,
+            item_id: None,
             request_id: None,
             payload: json!({}),
             activity: vec![
@@ -4325,6 +4331,7 @@ async fn agent_activity_toggle_keeps_session_ready_and_fences_native_event_gener
             event_type: "activity.native".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: None,
+            item_id: None,
             request_id: None,
             payload: json!({}),
             activity: vec![
@@ -4345,6 +4352,7 @@ async fn agent_activity_toggle_keeps_session_ready_and_fences_native_event_gener
             event_type: "pump.barrier".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: None,
+            item_id: None,
             request_id: None,
             payload: json!({"visible":true}),
             activity: Vec::new(),
@@ -4404,6 +4412,7 @@ async fn agent_activity_toggle_keeps_session_ready_and_fences_native_event_gener
             event_type: "activity.native".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: None,
+            item_id: None,
             request_id: None,
             payload: json!({}),
             activity: vec![
@@ -4595,6 +4604,7 @@ async fn claude_transcript_recovery_event_persists_and_reloads_activity() {
             event_type: "activity.native".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: None,
+            item_id: None,
             request_id: None,
             payload: json!({}),
             activity: vec![
@@ -4615,6 +4625,7 @@ async fn claude_transcript_recovery_event_persists_and_reloads_activity() {
             event_type: "activity.native".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: None,
+            item_id: None,
             request_id: None,
             payload: json!({}),
             activity: vec![
@@ -4771,6 +4782,7 @@ async fn runtime_observed_capability_upgrade_survives_stream_end() {
             event_type: "activity.native".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: None,
+            item_id: None,
             request_id: None,
             payload: json!({}),
             activity: vec![ProviderActivityMutation::SetScope {
@@ -4984,6 +4996,7 @@ fn runtime_capability_upgrade_event(native_id: &str) -> ProviderEvent {
         event_type: "activity.native".to_owned(),
         thread_id: "t1".to_owned(),
         turn_id: None,
+        item_id: None,
         request_id: None,
         payload: json!({}),
         activity: vec![
@@ -5156,6 +5169,7 @@ async fn capable_relaunch_revives_stale_scope_before_accepting_activity() {
             event_type: "activity.native".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: None,
+            item_id: None,
             request_id: None,
             payload: json!({}),
             activity: vec![
@@ -5283,6 +5297,7 @@ async fn assert_capability_downgrade_preserves_history(history: RetainedActivity
             event_type: "activity.native".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: None,
+            item_id: None,
             request_id: None,
             payload: json!({}),
             activity: vec![mutation],
@@ -5474,6 +5489,7 @@ async fn invalid_native_ids_drop_only_activity_without_leaking_sensitive_text() 
                 event_type: "activity.invalid-native-id".to_owned(),
                 thread_id: "t1".to_owned(),
                 turn_id: None,
+                item_id: None,
                 request_id: None,
                 payload: json!({"index":index}),
                 activity: vec![
@@ -5564,6 +5580,7 @@ async fn mismatched_event_thread_cannot_contaminate_launch_activity_scope() {
             event_type: "activity.cross-thread".to_owned(),
             thread_id: "t2".to_owned(),
             turn_id: None,
+            item_id: None,
             request_id: None,
             payload: json!({}),
             activity: vec![
@@ -5654,6 +5671,7 @@ async fn activity_scope_ensure_failure_is_diagnostic_only() {
             event_type: "provider.scope-unavailable".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: None,
+            item_id: None,
             request_id: None,
             payload: json!({}),
             activity: vec![
@@ -5732,6 +5750,7 @@ async fn activity_apply_failure_is_diagnostic_only() {
             event_type: "provider.activity-apply-failed".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: None,
+            item_id: None,
             request_id: None,
             payload: json!({}),
             activity: vec![
@@ -5923,6 +5942,7 @@ async fn late_provider_events_after_thread_deletion_do_not_warn() {
             event_type: "session.ready".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: None,
+            item_id: None,
             request_id: None,
             payload: json!({}),
             activity: Vec::new(),
@@ -7787,6 +7807,7 @@ async fn projects_event_aliases_user_input_and_proposed_plans_with_request_conte
             event_type: "assistant.message.delta".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: Some("turn-1".to_owned()),
+            item_id: None,
             request_id: None,
             payload: json!({"messageId":"assistant-explicit","text":"Plan incoming"}),
             activity: Vec::new(),
@@ -7796,6 +7817,7 @@ async fn projects_event_aliases_user_input_and_proposed_plans_with_request_conte
             event_type: "assistant.message.completed".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: Some("turn-1".to_owned()),
+            item_id: None,
             request_id: None,
             payload: json!({"messageId":"assistant-explicit"}),
             activity: Vec::new(),
@@ -7805,6 +7827,7 @@ async fn projects_event_aliases_user_input_and_proposed_plans_with_request_conte
             event_type: "request.opened".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: Some("turn-1".to_owned()),
+            item_id: None,
             request_id: Some("approval-1".to_owned()),
             payload: json!({"requestType":"command_execution_approval","command":"cargo check"}),
             activity: Vec::new(),
@@ -7814,6 +7837,7 @@ async fn projects_event_aliases_user_input_and_proposed_plans_with_request_conte
             event_type: "request.resolved".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: Some("turn-1".to_owned()),
+            item_id: None,
             request_id: Some("approval-1".to_owned()),
             payload: json!("accepted"),
             activity: Vec::new(),
@@ -7823,6 +7847,7 @@ async fn projects_event_aliases_user_input_and_proposed_plans_with_request_conte
             event_type: "user-input.requested".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: Some("turn-1".to_owned()),
+            item_id: None,
             request_id: Some("input-1".to_owned()),
             payload: json!({
                 "questions":[{
@@ -7842,6 +7867,7 @@ async fn projects_event_aliases_user_input_and_proposed_plans_with_request_conte
             event_type: "user-input.resolved".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: Some("turn-1".to_owned()),
+            item_id: None,
             request_id: Some("input-1".to_owned()),
             payload: json!("workspace chosen"),
             activity: Vec::new(),
@@ -7851,6 +7877,7 @@ async fn projects_event_aliases_user_input_and_proposed_plans_with_request_conte
             event_type: "turn.proposed.completed".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: Some("turn-1".to_owned()),
+            item_id: None,
             request_id: None,
             payload: json!({"planMarkdown":"1. Inspect\n2. Fix\n3. Verify"}),
             activity: Vec::new(),
@@ -8760,6 +8787,7 @@ async fn normalizes_provider_approval_events_into_orchestration_projection() {
             event_type: "request.opened".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: Some("turn-1".to_owned()),
+            item_id: None,
             request_id: Some("approval-1".to_owned()),
             payload: json!({"requestType":"command_execution_approval","detail":"cargo test"}),
             activity: Vec::new(),
@@ -8827,6 +8855,7 @@ async fn projects_content_and_completion_into_a_settled_assistant_turn() {
             event_type: "content.delta".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: Some("provider-turn-1".to_owned()),
+            item_id: None,
             request_id: None,
             payload: json!({"streamKind":"assistant_text","delta":"CODEX_OK"}),
             activity: Vec::new(),
@@ -8836,6 +8865,7 @@ async fn projects_content_and_completion_into_a_settled_assistant_turn() {
             event_type: "turn.completed".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: Some("provider-turn-1".to_owned()),
+            item_id: None,
             request_id: None,
             payload: json!({"state":"completed"}),
             activity: Vec::new(),
@@ -8921,6 +8951,7 @@ async fn failed_provider_completion_clears_running_state_and_preserves_the_error
             event_type: "turn.completed".to_owned(),
             thread_id: "t1".to_owned(),
             turn_id: Some("provider-turn-1".to_owned()),
+            item_id: None,
             request_id: None,
             payload: json!({"state":"failed","error":{"message":"model unavailable"}}),
             activity: Vec::new(),

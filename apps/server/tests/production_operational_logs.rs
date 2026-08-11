@@ -23,6 +23,7 @@ async fn activity_provider_events_without_a_lifecycle_suffix_are_marked_observed
         event_type: "assistant.message.delta".to_owned(),
         thread_id: "thread-1".to_owned(),
         turn_id: Some("turn-1".to_owned()),
+        item_id: None,
         request_id: None,
         payload: json!({
             "text": "Bearer PRIVATE_BEARER_TOKEN",
@@ -94,6 +95,7 @@ async fn startup_removes_provider_log_files_that_exceed_the_configured_bound() {
         event_type: "turn.completed".to_owned(),
         thread_id: "thread-1".to_owned(),
         turn_id: None,
+        item_id: None,
         request_id: None,
         payload: json!({ "text": "must not be persisted" }),
         activity: Vec::new(),

@@ -203,6 +203,7 @@ pub struct ProviderEvent {
     pub event_type: String,
     pub thread_id: String,
     pub turn_id: Option<String>,
+    pub item_id: Option<String>,
     pub request_id: Option<String>,
     pub payload: Value,
     pub activity: Vec<ProviderActivityMutation>,
@@ -3583,17 +3584,33 @@ fn context_window_activity_payload(payload: &Value) -> Option<Value> {
     Some(sanitized)
 }
 
+const PROVIDER_ITEM_ID_MAX_CHARS: usize = 512;
+
+fn valid_provider_item_id(item_id: Option<&str>) -> Option<&str> {
+    let item_id = item_id?.trim();
+    (!item_id.is_empty()
+        && item_id.chars().count() <= PROVIDER_ITEM_ID_MAX_CHARS
+        && !item_id.chars().any(char::is_control))
+    .then_some(item_id)
+}
+
 fn assistant_message_id(event: &ProviderEvent) -> String {
-    event
-        .payload
-        .get("messageId")
-        .and_then(Value::as_str)
-        .map(str::to_owned)
+    valid_provider_item_id(event.item_id.as_deref())
+        .map(|item_id| format!("assistant:{}:item:{item_id}", event.thread_id))
+        .or_else(|| {
+            event
+                .payload
+                .get("messageId")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|message_id| !message_id.is_empty())
+                .map(str::to_owned)
+        })
         .or_else(|| {
             event
                 .turn_id
                 .as_ref()
-                .map(|turn_id| format!("assistant:{turn_id}"))
+                .map(|turn_id| format!("assistant:{}:turn:{turn_id}", event.thread_id))
         })
         .unwrap_or_else(|| format!("assistant:{}", event.thread_id))
 }
@@ -4499,6 +4516,7 @@ impl ProviderDriver for CodexDriver {
                 event_type: event.event_type,
                 thread_id: event.thread_id,
                 turn_id: event.turn_id,
+                item_id: event.item_id,
                 request_id: event.request_id,
                 payload: event.payload,
                 activity: event.activity,
@@ -4750,6 +4768,7 @@ impl ProviderDriver for CursorDriver {
                 event_type: event.event_type,
                 thread_id: event.thread_id,
                 turn_id: event.turn_id,
+                item_id: event.item_id,
                 request_id: event.request_id,
                 payload: event.payload,
                 activity: Vec::new(),
@@ -4949,6 +4968,7 @@ impl ProviderDriver for GrokDriver {
                 event_type: event.event_type,
                 thread_id: event.thread_id,
                 turn_id: event.turn_id,
+                item_id: event.item_id,
                 request_id: event.request_id,
                 payload: event.payload,
                 activity: Vec::new(),
@@ -5256,6 +5276,7 @@ impl ProviderDriver for OpenCodeDriver {
                 event_type: event.event_type,
                 thread_id: event.thread_id,
                 turn_id: event.turn_id,
+                item_id: event.item_id,
                 request_id: event.request_id,
                 payload: event.payload,
                 activity: event.activity,
@@ -5897,6 +5918,7 @@ mod claude_context_query_tests {
                 event_type: "turn.completed".to_owned(),
                 thread_id: "thread-1".to_owned(),
                 turn_id: Some("turn-1".to_owned()),
+                item_id: None,
                 request_id: None,
                 payload: json!({ "state": state }),
                 activity: Vec::new(),
@@ -7034,6 +7056,7 @@ fn spawn_claude_recovery_worker(
                     event_type: ACTIVITY_ONLY_PROVIDER_EVENT_TYPE.to_owned(),
                     thread_id: thread_id.clone(),
                     turn_id: None,
+                    item_id: None,
                     request_id: None,
                     payload: json!({}),
                     activity: output.activity,
@@ -7165,6 +7188,7 @@ fn spawn_claude_output(
                     event_type: "session.stderr".to_owned(),
                     thread_id: thread_id.clone(),
                     turn_id: None,
+                    item_id: None,
                     request_id: None,
                     payload: json!({"message":line}),
                     activity: Vec::new(),
@@ -7542,6 +7566,7 @@ fn claude_provider_event(
         event_type: event.event_type,
         thread_id: event.thread_id,
         turn_id: event.turn_id,
+        item_id: event.item_id,
         request_id: event.request_id,
         payload: event.payload,
         activity,
@@ -7589,6 +7614,7 @@ async fn emit_claude_value(
                 event_type: ACTIVITY_ONLY_PROVIDER_EVENT_TYPE.to_owned(),
                 thread_id: thread_id.to_owned(),
                 turn_id: None,
+                item_id: None,
                 request_id: None,
                 payload: json!({}),
                 activity: output.activity,
@@ -7883,7 +7909,7 @@ async fn wait_for_endpoint(
 
 #[cfg(test)]
 mod tests {
-    use super::{ProviderDriver, ProviderDriverFactory};
+    use super::{ProviderDriver, ProviderDriverFactory, ProviderEvent};
     use crate::{
         diagnostics::{
             AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
@@ -9651,6 +9677,7 @@ done
                     event_type: event_type.to_owned(),
                     thread_id: "t1".to_owned(),
                     turn_id: Some("unit-turn".to_owned()),
+                    item_id: None,
                     request_id: None,
                     payload,
                     activity: Vec::new(),
@@ -9705,6 +9732,7 @@ done
                     event_type: event_type.to_owned(),
                     thread_id: "t1".to_owned(),
                     turn_id: Some("unit-turn-follow-up".to_owned()),
+                    item_id: None,
                     request_id: None,
                     payload,
                     activity: Vec::new(),
@@ -10940,12 +10968,84 @@ done
     }
 
     #[test]
+    fn assistant_message_ids_are_thread_namespaced_and_replay_stable() {
+        let identified = ProviderEvent {
+            native_event_id: None,
+            event_type: "content.delta".to_owned(),
+            thread_id: "thread-1".to_owned(),
+            turn_id: Some("turn-1".to_owned()),
+            item_id: Some("message-1".to_owned()),
+            request_id: None,
+            payload: json!({"streamKind":"assistant_text","delta":"First."}),
+            activity: Vec::new(),
+        };
+        assert_eq!(
+            super::assistant_message_id(&identified),
+            "assistant:thread-1:item:message-1"
+        );
+        let other_thread = ProviderEvent {
+            thread_id: "thread-2".to_owned(),
+            ..identified.clone()
+        };
+        assert_eq!(
+            super::assistant_message_id(&other_thread),
+            "assistant:thread-2:item:message-1"
+        );
+
+        let unidentified = ProviderEvent {
+            item_id: None,
+            payload: json!({}),
+            ..identified.clone()
+        };
+        assert_eq!(
+            super::assistant_message_id(&unidentified),
+            "assistant:thread-1:turn:turn-1"
+        );
+    }
+
+    #[test]
+    fn malformed_provider_item_ids_use_the_turn_fallback() {
+        for item_id in ["", "contains\ncontrol"] {
+            let event = ProviderEvent {
+                native_event_id: None,
+                event_type: "content.delta".to_owned(),
+                thread_id: "thread-1".to_owned(),
+                turn_id: Some("turn-1".to_owned()),
+                item_id: Some(item_id.to_owned()),
+                request_id: None,
+                payload: json!({}),
+                activity: Vec::new(),
+            };
+            assert_eq!(
+                super::assistant_message_id(&event),
+                "assistant:thread-1:turn:turn-1"
+            );
+        }
+
+        let event = ProviderEvent {
+            item_id: Some("x".repeat(513)),
+            native_event_id: None,
+            event_type: "content.delta".to_owned(),
+            thread_id: "thread-1".to_owned(),
+            turn_id: Some("turn-1".to_owned()),
+            request_id: None,
+            payload: json!({}),
+            activity: Vec::new(),
+        };
+        assert_eq!(
+            super::assistant_message_id(&event),
+            "assistant:thread-1:turn:turn-1"
+        );
+    }
+
+    #[test]
     fn provider_projection_helpers_preserve_contract_fallbacks() {
         let event = |payload, turn_id: Option<&str>| super::ProviderEvent {
             native_event_id: None,
             event_type: "provider.event".to_owned(),
             thread_id: "thread-1".to_owned(),
             turn_id: turn_id.map(str::to_owned),
+            item_id: None,
             request_id: None,
             payload,
             activity: Vec::new(),
@@ -10956,7 +11056,7 @@ done
         );
         assert_eq!(
             super::assistant_message_id(&event(json!({}), Some("turn-1"))),
-            "assistant:turn-1"
+            "assistant:thread-1:turn:turn-1"
         );
         assert_eq!(
             super::assistant_message_id(&event(json!({}), None)),
@@ -11012,6 +11112,7 @@ done
                 event_type: "thread.token-usage.updated".to_owned(),
                 thread_id: "t1".to_owned(),
                 turn_id: Some("turn-1".to_owned()),
+                item_id: None,
                 request_id: None,
                 payload: json!({
                     "usage": {
@@ -11078,6 +11179,7 @@ done
                 event_type: "thread.token-usage.updated".to_owned(),
                 thread_id: "t1".to_owned(),
                 turn_id: Some("turn-1".to_owned()),
+                item_id: None,
                 request_id: None,
                 payload: json!({ "usage": {} }),
                 activity: Vec::new(),
@@ -11112,6 +11214,7 @@ done
                 event_type: "mcp.status.updated".to_owned(),
                 thread_id: "t1".to_owned(),
                 turn_id: None,
+                item_id: None,
                 request_id: None,
                 payload: json!({
                     "servers": [{ "name": "context7", "state": "connected" }]

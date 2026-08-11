@@ -1048,6 +1048,7 @@ impl ClaudeProviderRuntime {
             event_type: event_type.to_owned(),
             thread_id: self.thread_id.clone(),
             turn_id,
+            item_id: None,
             request_id,
             provider_refs,
             payload,
