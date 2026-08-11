@@ -142,9 +142,22 @@ payload reuse conflicts. A present Git mutation or absence verification
 failure does not detach. The `worktreeCatalog` capability is advertised only
 with all three registered handlers, scopes, and wire fixtures.
 
-An already-accepted retry is replayed first. Every new removal must then acquire
-one finite runtime-cleanup lifetime slot before receipt reservation, `Removing`,
-quiesce, Git, or detach; saturation returns the retryable
+Every command-ID reservation path first acquires the orchestration engine's
+process-local command-admission claim. The engine keeps a weak, bounded registry
+of per-ID gates, so exactly one live claimant may inspect or change that ID's
+durable receipt or perform external preparation. Same-ID callers wait without
+provider, attachment, Git, quiesce, or detach effects; after acquiring the claim
+they re-read the receipt and replay, conflict, or resume it. Handing admitted
+work to the engine worker transfers a shared claim that remains live after RPC
+cancellation and is released only after terminal persistence or exact owned
+reservation cleanup. Command claims are acquired before project/catalog and
+workspace-admission locks. They are intentionally process-local: a restarted
+engine has a fresh registry and may resume durable `reserved` or `prepared`
+receipts.
+
+With that claim held, an already-accepted retry is replayed first. Every new
+removal must then acquire one finite runtime-cleanup lifetime slot before receipt
+reservation, `Removing`, quiesce, Git, or detach; saturation returns the retryable
 `cleanup-capacity` failure with no removal mutation. The slot follows the request
 through foreground cleanup, queued retry, retry backoff, cancellation, or
 shutdown. Once admitted, removal atomically inserts an immutable generic command
@@ -155,19 +168,21 @@ removal reservation/preparation cannot be overwritten, and project creation
 reserves its identity before directory or Git initialization. After the fresh
 plan token and mode-specific preflight pass, the receipt advances to `prepared`
 and is re-proved immediately before Git; successful detach upgrades it to
-`accepted` in the same transaction as the events. Matching `reserved` work is
-safely re-preflighted, while matching `prepared` work may infer a prior verified
-Git success only when the exact target is now missing and unregistered. This
-makes a crash between Git and detach resumable without allowing an unvalidated
-request to claim success.
+`accepted` in the same transaction as the events. After a live predecessor has
+released its claim, matching `reserved` work is safely re-preflighted, while
+matching `prepared` work may infer a prior verified Git success only when the
+exact target is now missing and unregistered. This makes a crash between Git and
+detach resumable without allowing an unvalidated request to claim success.
 
 RPC preparation that can change an external provider or publish attachment
 files follows the same durable arbitration rule. A model-changing
 `thread.meta.update` reserves the exact command aggregate and canonical payload
 digest before calling the provider. A turn start reserves that identity before
 attachment publication, provider identity lookup, or delivery-route freezing.
-An accepted replay performs none of those effects; a matching reserved receipt
-is restart-resumable, while a changed payload conflicts before external work.
+An accepted replay performs none of those effects; a concurrent matching caller
+waits for the live claim and then replays without repeating preparation. A
+matching reserved receipt is restart-resumable, while a changed payload conflicts
+before external work.
 Provider failure leaves the matching metadata reservation resumable. Turn
 failures before worker enqueue release only the exact matching reserved receipt,
 and a failed or canceled worker command performs the same conditional release,

@@ -38,9 +38,20 @@ pub(crate) struct AttachmentMaterializer {
 
 #[cfg(test)]
 #[derive(Debug, Default)]
-struct AttachmentPrepareTestPause {
+pub(crate) struct AttachmentPrepareTestPause {
     reached: tokio::sync::Notify,
     resume: tokio::sync::Notify,
+}
+
+#[cfg(test)]
+impl AttachmentPrepareTestPause {
+    pub(crate) async fn wait_until_reached(&self) {
+        self.reached.notified().await;
+    }
+
+    pub(crate) fn release(&self) {
+        self.resume.notify_one();
+    }
 }
 
 #[derive(Debug)]
@@ -179,7 +190,7 @@ impl AttachmentMaterializer {
     }
 
     #[cfg(test)]
-    fn with_pause_after_final_publication(
+    pub(crate) fn with_pause_after_final_publication(
         mut self,
         pause: Arc<AttachmentPrepareTestPause>,
     ) -> Self {

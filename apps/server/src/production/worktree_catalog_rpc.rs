@@ -22,7 +22,7 @@ use crate::{
     orchestration::{
         CommandAdmission, OrchestrationCommand, OrchestrationEngine, OrchestrationError,
         canonical_command_digest,
-        engine::{OptionalNullable, WorkspaceOwnershipLease},
+        engine::{CommandAdmissionClaim, OptionalNullable, WorkspaceOwnershipLease},
     },
     persistence::Repositories,
     rpc::{RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk},
@@ -665,9 +665,14 @@ async fn adopt_worktree(services: &WorktreeCatalogRpcServices, request: RpcReque
             None,
         ))
     })?;
+    let command_claim = services
+        .orchestration
+        .acquire_command_admission(&input.command_id)
+        .await
+        .map_err(|error| encode(adoption_orchestration_error(error, None)))?;
     if let Some(result) = services
         .orchestration
-        .replay_admitted_worktree_adoption(&input.command_id, &payload_digest)
+        .replay_admitted_worktree_adoption(&command_claim, &input.command_id, &payload_digest)
         .await
         .map_err(|error| encode(adoption_orchestration_error(error, None)))?
     {
@@ -677,7 +682,7 @@ async fn adopt_worktree(services: &WorktreeCatalogRpcServices, request: RpcReque
     services
         .catalog
         .with_project_mutation_lock(&project_id, || async {
-            adopt_worktree_locked(services, input, payload_digest).await
+            adopt_worktree_locked(services, input, payload_digest, command_claim).await
         })
         .await
 }
@@ -686,6 +691,7 @@ async fn adopt_worktree_locked(
     services: &WorktreeCatalogRpcServices,
     input: WorktreeAdoptInput,
     payload_digest: String,
+    command_claim: CommandAdmissionClaim,
 ) -> RpcResult {
     let (mut snapshot, refreshed) = match services.catalog.latest(&input.project_id).await {
         Some(snapshot) => (snapshot, false),
@@ -744,7 +750,7 @@ async fn adopt_worktree_locked(
         .map_err(|error| encode(adoption_validation_error(error)))?;
     let result = services
         .orchestration
-        .dispatch_with_admission(
+        .dispatch_with_admission_and_command_claim(
             OrchestrationCommand::WorktreeAdoptResolved {
                 command_id: input.command_id,
                 project_id: input.project_id.clone(),
@@ -761,6 +767,7 @@ async fn adopt_worktree_locked(
                 attachment_refs: Vec::new(),
                 provider_turn: None,
             },
+            command_claim,
             || {},
         )
         .await
@@ -917,11 +924,18 @@ async fn remove_from_bibcode(
 ) -> RpcResult {
     let input = decode::<WorktreeRemoveFromBibCodeInput>(request)?;
     let payload_digest = removal_payload_digest(&input)?;
-    if let Some(result) = replay_removal(services, &input.command_id, &payload_digest).await? {
+    let command_claim = services
+        .orchestration
+        .acquire_command_admission(&input.command_id)
+        .await
+        .map_err(|error| encode(removal_orchestration_error(error)))?;
+    if let Some(result) =
+        replay_removal(services, &command_claim, &input.command_id, &payload_digest).await?
+    {
         return Ok(encode(result));
     }
     let cleanup_admission = admit_removal_cleanup(services).await?;
-    let reservation = reserve_removal(services, &input, &payload_digest).await?;
+    let reservation = reserve_removal(services, &command_claim, &input, &payload_digest).await?;
     if let Some(result) = reservation.result {
         return Ok(encode(result));
     }
@@ -930,7 +944,7 @@ async fn remove_from_bibcode(
         .catalog
         .with_project_mutation_lock(&project_id, || async {
             if let Some(result) =
-                replay_removal(services, &input.command_id, &payload_digest).await?
+                replay_removal(services, &command_claim, &input.command_id, &payload_digest).await?
             {
                 return Ok(encode(result));
             }
@@ -966,6 +980,7 @@ async fn remove_from_bibcode(
                 "not-requested",
                 None,
                 orphan_cleanup_pending,
+                command_claim.clone(),
                 ownership.clone(),
             )
             .await?;
@@ -990,11 +1005,18 @@ async fn remove_worktree(
 ) -> RpcResult {
     let input = decode::<WorktreeRemoveInput>(request)?;
     let payload_digest = removal_payload_digest(&input)?;
-    if let Some(result) = replay_removal(services, &input.command_id, &payload_digest).await? {
+    let command_claim = services
+        .orchestration
+        .acquire_command_admission(&input.command_id)
+        .await
+        .map_err(|error| encode(removal_orchestration_error(error)))?;
+    if let Some(result) =
+        replay_removal(services, &command_claim, &input.command_id, &payload_digest).await?
+    {
         return Ok(encode(result));
     }
     let cleanup_admission = admit_removal_cleanup(services).await?;
-    let reservation = reserve_removal(services, &input, &payload_digest).await?;
+    let reservation = reserve_removal(services, &command_claim, &input, &payload_digest).await?;
     if let Some(result) = reservation.result {
         return Ok(encode(result));
     }
@@ -1003,7 +1025,7 @@ async fn remove_worktree(
         .catalog
         .with_project_mutation_lock(&project_id, || async {
             if let Some(result) =
-                replay_removal(services, &input.command_id, &payload_digest).await?
+                replay_removal(services, &command_claim, &input.command_id, &payload_digest).await?
             {
                 return Ok(encode(result));
             }
@@ -1040,6 +1062,7 @@ async fn remove_worktree(
             services
                 .orchestration
                 .prepare_worktree_removal_admission(
+                    &command_claim,
                     &input.command_id,
                     &input.project_id,
                     &payload_digest,
@@ -1062,6 +1085,7 @@ async fn remove_worktree(
             services
                 .orchestration
                 .verify_prepared_worktree_removal_admission(
+                    &command_claim,
                     &input.command_id,
                     &input.project_id,
                     &payload_digest,
@@ -1093,6 +1117,7 @@ async fn remove_worktree(
                 git_outcome,
                 detail,
                 orphan_cleanup_pending,
+                command_claim.clone(),
                 ownership.clone(),
             )
             .await?;
@@ -1548,11 +1573,12 @@ async fn persist_detach(
     git_outcome: &str,
     detail: Option<String>,
     orphan_cleanup_pending: bool,
+    command_claim: CommandAdmissionClaim,
     ownership: WorkspaceOwnershipLease,
 ) -> Result<WorktreeRemovalResult, Value> {
     services
         .orchestration
-        .dispatch_with_admission_and_ownership(
+        .dispatch_with_admission_ownership_and_command_claim(
             OrchestrationCommand::WorktreeDetachResolved {
                 command_id,
                 project_id,
@@ -1567,6 +1593,7 @@ async fn persist_detach(
                 attachment_refs: Vec::new(),
                 provider_turn: None,
             },
+            command_claim,
             ownership,
             || {},
         )
@@ -1582,12 +1609,13 @@ async fn persist_detach(
 
 async fn replay_removal(
     services: &WorktreeCatalogRpcServices,
+    command_claim: &CommandAdmissionClaim,
     command_id: &str,
     payload_digest: &str,
 ) -> Result<Option<WorktreeRemovalResult>, Value> {
     services
         .orchestration
-        .replay_admitted_worktree_removal(command_id, payload_digest)
+        .replay_admitted_worktree_removal(command_claim, command_id, payload_digest)
         .await
         .map(|result| {
             result.map(|result| WorktreeRemovalResult {
@@ -1618,12 +1646,18 @@ async fn admit_removal_cleanup(
 
 async fn reserve_removal(
     services: &WorktreeCatalogRpcServices,
+    command_claim: &CommandAdmissionClaim,
     input: &impl RemovalAdmissionInput,
     payload_digest: &str,
 ) -> Result<RemovalAdmissionReservation, Value> {
     services
         .orchestration
-        .reserve_worktree_removal_admission(input.command_id(), input.project_id(), payload_digest)
+        .reserve_worktree_removal_admission(
+            command_claim,
+            input.command_id(),
+            input.project_id(),
+            payload_digest,
+        )
         .await
         .map(|(result, prepared_retry)| RemovalAdmissionReservation {
             result: result.map(|result| WorktreeRemovalResult {

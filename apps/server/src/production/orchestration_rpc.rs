@@ -126,6 +126,10 @@ fn register_orchestration_rpc_inner(
                     "server-internal orchestration commands cannot be dispatched by clients",
                 ));
             }
+            let command_claim = dispatch
+                .acquire_command_admission(command.command_id())
+                .await
+                .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
             if let OrchestrationCommand::ThreadTurnStart { thread_id, .. } = &command {
                 let workspace_admission = if let Some(availability) = &availability {
                     Some(
@@ -150,11 +154,19 @@ fn register_orchestration_rpc_inner(
                     payload_digest,
                     request.tag,
                     workspace_admission,
+                    command_claim,
                 )
                 .await;
             }
-            dispatch_prepared_command(dispatch, provider, command, payload_digest, request.tag)
-                .await
+            dispatch_prepared_command(
+                dispatch,
+                provider,
+                command,
+                payload_digest,
+                request.tag,
+                command_claim,
+            )
+            .await
         }
     });
 
@@ -200,6 +212,7 @@ async fn dispatch_prepared_command(
     command: OrchestrationCommand,
     payload_digest: String,
     request_tag: String,
+    command_claim: crate::orchestration::engine::CommandAdmissionClaim,
 ) -> RpcResult {
     let delivery_cancellation = match &command {
         OrchestrationCommand::ThreadTurnDeliveryResolve {
@@ -220,11 +233,6 @@ async fn dispatch_prepared_command(
         .get_command_receipt(command.command_id().to_owned())
         .await
         .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
-    #[cfg(test)]
-    dispatch
-        .test_hooks()
-        .maybe_pause_after_command_receipt_preflight()
-        .await;
     let legacy_replay = existing_receipt
         .as_ref()
         .is_some_and(|receipt| receipt.payload_digest.is_none());
@@ -237,13 +245,17 @@ async fn dispatch_prepared_command(
             }
         ) {
         dispatch
-            .reserve_generic_command_admission(&command, &payload_digest)
+            .reserve_generic_command_admission(&command_claim, &command, &payload_digest)
             .await
             .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?
     } else {
         false
     };
     if route_before_admission && let Some(provider) = provider.as_ref() {
+        #[cfg(test)]
+        dispatch
+            .test_hooks()
+            .note_generic_external_preparation_attempt();
         route_orchestration_command(
             &provider.provider,
             &dispatch,
@@ -255,7 +267,9 @@ async fn dispatch_prepared_command(
     }
     let accepted_new = Arc::new(AtomicBool::new(false));
     let result = if legacy_replay {
-        dispatch.dispatch(command.clone()).await
+        dispatch
+            .dispatch_with_command_claim(command.clone(), command_claim)
+            .await
     } else {
         let turn_delivery = is_delivery_resolution
             .then(|| {
@@ -266,13 +280,14 @@ async fn dispatch_prepared_command(
             .flatten();
         let committed = accepted_new.clone();
         dispatch
-            .dispatch_with_admission(
+            .dispatch_with_admission_and_command_claim(
                 command.clone(),
                 CommandAdmission {
                     payload_digest,
                     attachment_refs: Vec::new(),
                     provider_turn: None,
                 },
+                command_claim,
                 move || {
                     committed.store(true, Ordering::Release);
                     if let Some(turn_delivery) = turn_delivery {
@@ -332,31 +347,39 @@ async fn dispatch_turn_command(
     payload_digest: String,
     request_tag: String,
     workspace_admission: Option<crate::worktree_catalog::WorkspaceAdmissionLease>,
+    command_claim: crate::orchestration::engine::CommandAdmissionClaim,
 ) -> RpcResult {
-    if let Some(replay) = preflight_turn_replay(
-        &dispatch,
-        command.clone(),
-        payload_digest.clone(),
-        &request_tag,
-    )
-    .await?
+    let existing_receipt = dispatch
+        .repositories()
+        .get_command_receipt(command.command_id().to_owned())
+        .await
+        .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+    if existing_receipt
+        .as_ref()
+        .is_some_and(|receipt| receipt.payload_digest.is_none())
     {
-        return replay;
+        let result = dispatch
+            .dispatch_with_command_claim(command, command_claim)
+            .await
+            .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+        return serde_json::to_value(result)
+            .map_err(|error| invalid_request(&request_tag, error.to_string()));
     }
 
     let prepare_external = dispatch
-        .reserve_generic_command_admission(&command, &payload_digest)
+        .reserve_generic_command_admission(&command_claim, &command, &payload_digest)
         .await
         .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
     if !prepare_external {
         let result = dispatch
-            .dispatch_with_admission(
+            .dispatch_with_admission_and_command_claim(
                 command,
                 CommandAdmission {
                     payload_digest,
                     attachment_refs: Vec::new(),
                     provider_turn: None,
                 },
+                command_claim,
                 || {},
             )
             .await
@@ -374,11 +397,12 @@ async fn dispatch_turn_command(
         payload_digest,
         request_tag.clone(),
         workspace_admission,
+        command_claim.clone(),
     )
     .await;
     if result.is_err() {
         dispatch
-            .release_generic_command_admission(&reserved_command, &reserved_digest)
+            .release_generic_command_admission(&command_claim, &reserved_command, &reserved_digest)
             .await
             .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
     }
@@ -392,6 +416,7 @@ async fn dispatch_reserved_turn_command(
     payload_digest: String,
     request_tag: String,
     workspace_admission: Option<crate::worktree_catalog::WorkspaceAdmissionLease>,
+    command_claim: crate::orchestration::engine::CommandAdmissionClaim,
 ) -> RpcResult {
     let (command, prepared_batch) = prepare_attachments(&provider.attachments, command)
         .await
@@ -441,8 +466,13 @@ async fn dispatch_reserved_turn_command(
         let commit_fence = workspace_admission.commit_fence();
         let lifetime =
             CommandLifetimeGuard::new(workspace_admission, loss.cancellation_token(), commit_fence);
-        let dispatch =
-            dispatch.dispatch_with_admission_and_lifetime(command, admission, lifetime, on_commit);
+        let dispatch = dispatch.dispatch_with_admission_lifetime_and_command_claim(
+            command,
+            admission,
+            lifetime,
+            command_claim,
+            on_commit,
+        );
         tokio::pin!(dispatch);
         tokio::select! {
             biased;
@@ -467,60 +497,11 @@ async fn dispatch_reserved_turn_command(
         }
     } else {
         dispatch
-            .dispatch_with_admission(command, admission, on_commit)
+            .dispatch_with_admission_and_command_claim(command, admission, command_claim, on_commit)
             .await
     }
     .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
     serde_json::to_value(result).map_err(|error| invalid_request(&request_tag, error.to_string()))
-}
-
-async fn preflight_turn_replay(
-    dispatch: &OrchestrationEngine,
-    command: OrchestrationCommand,
-    payload_digest: String,
-    request_tag: &str,
-) -> Result<Option<RpcResult>, Value> {
-    let receipt = dispatch
-        .repositories()
-        .get_command_receipt(command.command_id().to_owned())
-        .await
-        .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
-    #[cfg(test)]
-    dispatch
-        .test_hooks()
-        .maybe_pause_after_command_receipt_preflight()
-        .await;
-    if let Some(receipt) = receipt {
-        let aggregate = command.aggregate_ref();
-        if receipt.status == "reserved"
-            && receipt.payload_digest.as_deref() == Some(payload_digest.as_str())
-            && receipt.aggregate_kind == aggregate.0
-            && receipt.aggregate_id == aggregate.1
-        {
-            return Ok(None);
-        }
-        let result = if receipt.payload_digest.is_none() {
-            dispatch.dispatch(command).await
-        } else {
-            dispatch
-                .dispatch_with_admission(
-                    command,
-                    CommandAdmission {
-                        payload_digest,
-                        attachment_refs: Vec::new(),
-                        provider_turn: None,
-                    },
-                    || {},
-                )
-                .await
-        }
-        .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
-        return Ok(Some(
-            serde_json::to_value(result)
-                .map_err(|error| invalid_request(request_tag, error.to_string())),
-        ));
-    }
-    Ok(None)
 }
 
 async fn turn_identity(
@@ -1052,6 +1033,7 @@ mod tests {
             },
             turn_delivery::DeliveryRouter,
         },
+        provider::attachments::AttachmentPrepareTestPause,
         worktree_catalog::{
             AdoptedWorktreeAvailability, WorkspaceAvailabilityRegistry, WorkspaceLossTransition,
         },
@@ -1081,6 +1063,24 @@ mod tests {
     struct ModelMutationProbe {
         set_model_calls: AtomicUsize,
         fail_set_model_calls: AtomicUsize,
+        pause_next_set_model: std::sync::Mutex<Option<Arc<ModelMutationPause>>>,
+    }
+
+    #[derive(Default)]
+    struct ModelMutationPause {
+        entered: tokio::sync::Notify,
+        release: tokio::sync::Notify,
+    }
+
+    impl ModelMutationProbe {
+        fn pause_next_set_model(&self) -> Arc<ModelMutationPause> {
+            let pause = Arc::new(ModelMutationPause::default());
+            *self
+                .pause_next_set_model
+                .lock()
+                .expect("model mutation pause mutex") = Some(pause.clone());
+            pause
+        }
     }
 
     impl ProviderDriver for ModelMutationProbe {
@@ -1132,6 +1132,11 @@ mod tests {
             _model: String,
         ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
             self.set_model_calls.fetch_add(1, Ordering::SeqCst);
+            let pause = self
+                .pause_next_set_model
+                .lock()
+                .expect("model mutation pause mutex")
+                .take();
             let fail = self
                 .fail_set_model_calls
                 .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
@@ -1139,6 +1144,10 @@ mod tests {
                 })
                 .is_ok();
             Box::pin(async move {
+                if let Some(pause) = pause {
+                    pause.entered.notify_one();
+                    pause.release.notified().await;
+                }
                 if fail {
                     Err(ProviderRuntimeError::Provider {
                         provider: "probe".to_owned(),
@@ -1325,12 +1334,41 @@ mod tests {
         command: OrchestrationCommand,
     ) -> RpcResult {
         let payload_digest = canonical_command_digest(&command).expect("command digest");
+        let command_claim = engine
+            .acquire_command_admission(command.command_id())
+            .await
+            .expect("test command claim");
         dispatch_prepared_command(
             engine.clone(),
             provider,
             command,
             payload_digest,
             "orchestration.dispatchCommand".to_owned(),
+            command_claim,
+        )
+        .await
+    }
+
+    async fn dispatch_turn_for_test(
+        engine: OrchestrationEngine,
+        provider: ProviderRegistration,
+        command: OrchestrationCommand,
+        payload_digest: String,
+        request_tag: String,
+        workspace_admission: Option<crate::worktree_catalog::WorkspaceAdmissionLease>,
+    ) -> RpcResult {
+        let command_claim = engine
+            .acquire_command_admission(command.command_id())
+            .await
+            .map_err(|error| orchestration_error("OrchestrationDispatchCommandError", error))?;
+        dispatch_turn_command(
+            engine,
+            provider,
+            command,
+            payload_digest,
+            request_tag,
+            workspace_admission,
+            command_claim,
         )
         .await
     }
@@ -1651,7 +1689,7 @@ mod tests {
             .expect("events before replay")
             .len();
 
-        let replay = dispatch_turn_command(
+        let replay = dispatch_turn_for_test(
             engine.clone(),
             registration.clone(),
             accepted,
@@ -1665,7 +1703,7 @@ mod tests {
             replay,
             serde_json::to_value(original).expect("original result")
         );
-        let rejection = dispatch_turn_command(
+        let rejection = dispatch_turn_for_test(
             engine.clone(),
             registration,
             rejected,
@@ -1742,10 +1780,22 @@ mod tests {
             "createdAt":CREATED_AT
         }));
         let payload_digest = canonical_command_digest(&command).expect("turn digest");
-        let pause = hooks.pause_after_next_command_receipt_preflight();
+        let removal_claim = engine
+            .acquire_command_admission("attachment-admission-race")
+            .await
+            .expect("removal owns absent turn identity");
+        engine
+            .reserve_worktree_removal_admission(
+                &removal_claim,
+                "attachment-admission-race",
+                "removal-project",
+                "removal-payload",
+            )
+            .await
+            .expect("removal reserves the absent turn identity");
         let dispatch_engine = engine.clone();
-        let dispatch = tokio::spawn(async move {
-            dispatch_turn_command(
+        let mut dispatch = tokio::spawn(async move {
+            dispatch_turn_for_test(
                 dispatch_engine,
                 registration,
                 command,
@@ -1755,16 +1805,13 @@ mod tests {
             )
             .await
         });
-        pause.wait_until_entered().await;
-        engine
-            .reserve_worktree_removal_admission(
-                "attachment-admission-race",
-                "removal-project",
-                "removal-payload",
-            )
-            .await
-            .expect("removal reserves the absent turn identity");
-        pause.release();
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut dispatch)
+                .await
+                .is_err(),
+            "turn must wait while removal owns the command ID"
+        );
+        drop(removal_claim);
 
         let error = dispatch
             .await
@@ -1779,6 +1826,108 @@ mod tests {
             !state.path().join("attachments").exists(),
             "losing admission must not initialize or publish the attachment store"
         );
+
+        delivery.shutdown().await;
+        provider.shutdown().await.expect("provider shutdown");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn concurrent_matching_turn_replays_without_repreparing_attachments() {
+        let (database, engine, thread_id) = delivery_engine(TestHooks::default()).await;
+        let state = tempfile::tempdir().expect("provider state");
+        let delivery = Arc::new(TurnDeliveryService::start_with_router(
+            engine.clone(),
+            1,
+            Arc::new(|_| Box::pin(async { Ok(()) })),
+        ));
+        let (mut registration, provider) = provider_registration(
+            database,
+            &engine,
+            state.path().to_path_buf(),
+            delivery.clone(),
+        );
+        let publication = Arc::new(AttachmentPrepareTestPause::default());
+        registration.attachments = AttachmentMaterializer::new(state.path().join("attachments"))
+            .with_pause_after_final_publication(publication.clone());
+        let command = decode_command(json!({
+            "type":"thread.turn.start",
+            "commandId":"concurrent-attachment-command",
+            "threadId":thread_id,
+            "message":{
+                "messageId":"concurrent-attachment-message",
+                "role":"user",
+                "text":"review",
+                "attachments":[{
+                    "type":"file",
+                    "id":"concurrent-attachment-file",
+                    "name":"notes.txt",
+                    "mimeType":"text/plain",
+                    "sizeBytes":5,
+                    "dataUrl":"data:text/plain;base64,bm90ZXM="
+                }]
+            },
+            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "createdAt":CREATED_AT
+        }));
+        let digest = canonical_command_digest(&command).expect("turn digest");
+        let first_engine = engine.clone();
+        let first_registration = registration.clone();
+        let first_command = command.clone();
+        let first_digest = digest.clone();
+        let first = tokio::spawn(async move {
+            dispatch_turn_for_test(
+                first_engine,
+                first_registration,
+                first_command,
+                first_digest,
+                "orchestration.dispatchCommand".to_owned(),
+                None,
+            )
+            .await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            publication.wait_until_reached(),
+        )
+        .await
+        .expect("first claimant publishes attachment");
+        let second_engine = engine.clone();
+        let mut second = tokio::spawn(async move {
+            dispatch_turn_for_test(
+                second_engine,
+                registration,
+                command,
+                digest,
+                "orchestration.dispatchCommand".to_owned(),
+                None,
+            )
+            .await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut second)
+                .await
+                .is_err(),
+            "matching turn must wait for the live claimant"
+        );
+        std::fs::write(
+            state
+                .path()
+                .join("attachments")
+                .join("concurrent-attachment-file"),
+            b"other",
+        )
+        .expect("corrupt the published file to expose duplicate preparation");
+        publication.release();
+        let first_result = first
+            .await
+            .expect("first turn joins")
+            .expect("first turn accepts");
+        let second_result = second
+            .await
+            .expect("second turn joins")
+            .expect("matching turn replays without attachment preparation");
+        assert_eq!(second_result, first_result);
 
         delivery.shutdown().await;
         provider.shutdown().await.expect("provider shutdown");
@@ -1953,15 +2102,13 @@ mod tests {
             "threadId":"provider-race-thread",
             "modelSelection":{"instanceId":"codex","model":"gpt-5.1"}
         }));
-        let pause = hooks.pause_after_next_command_receipt_preflight();
-        let generic_engine = engine.clone();
-        let racing_registration = registration.clone();
-        let generic = tokio::spawn(async move {
-            dispatch_prepared_for_test(&generic_engine, Some(racing_registration), command).await
-        });
-        pause.wait_until_entered().await;
+        let removal_claim = engine
+            .acquire_command_admission("provider-race-command")
+            .await
+            .expect("removal owns absent provider command identity");
         let reserved = engine
             .reserve_worktree_removal_admission(
+                &removal_claim,
                 "provider-race-command",
                 "provider-race-project",
                 "removal-payload",
@@ -1969,7 +2116,18 @@ mod tests {
             .await
             .expect("removal reserves the absent command identity");
         assert!(reserved.0.is_none());
-        pause.release();
+        let generic_engine = engine.clone();
+        let racing_registration = registration.clone();
+        let mut generic = tokio::spawn(async move {
+            dispatch_prepared_for_test(&generic_engine, Some(racing_registration), command).await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut generic)
+                .await
+                .is_err(),
+            "generic provider command must wait while removal owns the command ID"
+        );
+        drop(removal_claim);
 
         let error = generic
             .await
@@ -2045,12 +2203,70 @@ mod tests {
             "threadId":"provider-race-thread",
             "modelSelection":{"instanceId":"codex","model":"gpt-5.2"}
         }));
-        dispatch_prepared_for_test(&engine, Some(registration), changed)
+        dispatch_prepared_for_test(&engine, Some(registration.clone()), changed)
             .await
             .expect_err("changed payload conflicts before provider mutation");
         assert_eq!(
             probe.set_model_calls.load(Ordering::SeqCst),
             calls_after_retry
+        );
+
+        let concurrent = decode_command(json!({
+            "type":"thread.meta.update",
+            "commandId":"provider-concurrent-command",
+            "threadId":"provider-race-thread",
+            "modelSelection":{"instanceId":"codex","model":"gpt-5.3"}
+        }));
+        let calls_before_concurrent = probe.set_model_calls.load(Ordering::SeqCst);
+        let preparations_before_concurrent = hooks.generic_external_preparation_attempts();
+        let provider_pause = probe.pause_next_set_model();
+        let first_engine = engine.clone();
+        let first_registration = registration.clone();
+        let first_command = concurrent.clone();
+        let first = tokio::spawn(async move {
+            dispatch_prepared_for_test(&first_engine, Some(first_registration), first_command).await
+        });
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            provider_pause.entered.notified(),
+        )
+        .await
+        .expect("first matching claimant reaches provider mutation");
+        let second_engine = engine.clone();
+        let second_registration = registration.clone();
+        let mut second = tokio::spawn(async move {
+            dispatch_prepared_for_test(&second_engine, Some(second_registration), concurrent).await
+        });
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), &mut second)
+                .await
+                .is_err(),
+            "the matching waiter must not complete while the live claimant owns preparation"
+        );
+        assert_eq!(
+            probe.set_model_calls.load(Ordering::SeqCst),
+            calls_before_concurrent + 1,
+            "matching live claimants must coalesce to one provider mutation"
+        );
+        assert_eq!(
+            hooks.generic_external_preparation_attempts(),
+            preparations_before_concurrent + 1,
+            "the matching waiter must replay without entering provider preparation"
+        );
+        provider_pause.release.notify_one();
+        let first_result = first
+            .await
+            .expect("first matching claimant joins")
+            .expect("first matching claimant succeeds");
+        let second_result = second
+            .await
+            .expect("second matching claimant joins")
+            .expect("second matching claimant replays");
+        assert_eq!(second_result, first_result);
+        assert_eq!(
+            probe.set_model_calls.load(Ordering::SeqCst),
+            calls_before_concurrent + 1,
+            "accepted replay must not reroute after waiting"
         );
 
         delivery.shutdown().await;
