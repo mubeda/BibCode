@@ -2309,6 +2309,66 @@ fn claude_runtime_routes_only_explicit_stable_hook_input_into_activity() {
 }
 
 #[test]
+fn claude_text_deltas_follow_message_start_identity() {
+    let mut runtime = ClaudeProviderRuntime::new("thread-1".to_owned(), "session-1".to_owned());
+    runtime.start_turn(TurnInput {
+        turn_id: "turn-1".to_owned(),
+        input: "test boundaries".to_owned(),
+    });
+
+    for (message_id, text) in [
+        ("claude-message-1", "First."),
+        ("claude-message-2", "Second."),
+    ] {
+        runtime.handle_raw_value(
+            &json!({
+                "type": "stream_event",
+                "session_id": "session-1",
+                "uuid": format!("start-{message_id}"),
+                "parent_tool_use_id": null,
+                "event": { "type": "message_start", "message": { "id": message_id } }
+            }),
+            1_000,
+        );
+        let output = runtime.handle_raw_value(
+            &json!({
+                "type": "stream_event",
+                "session_id": "session-1",
+                "uuid": format!("delta-{message_id}"),
+                "parent_tool_use_id": null,
+                "event": {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": { "type": "text_delta", "text": text }
+                }
+            }),
+            1_001,
+        );
+        assert_eq!(output.events[0].item_id.as_deref(), Some(message_id));
+    }
+
+    runtime.start_turn(TurnInput {
+        turn_id: "turn-2".to_owned(),
+        input: "new turn".to_owned(),
+    });
+    let output = runtime.handle_raw_value(
+        &json!({
+            "type": "stream_event",
+            "session_id": "session-1",
+            "uuid": "delta-without-message-start",
+            "parent_tool_use_id": null,
+            "event": {
+                "type": "content_block_delta",
+                "index": 0,
+                "delta": { "type": "text_delta", "text": "No stale identity." }
+            }
+        }),
+        1_002,
+    );
+    assert_eq!(output.events[0].item_id, None);
+}
+
+#[test]
 fn forwarded_text_is_suppressed_while_forwarded_task_lifecycle_stays_canonical() {
     let mut runtime =
         ClaudeProviderRuntime::new("thread-root".to_owned(), "session-root".to_owned());
