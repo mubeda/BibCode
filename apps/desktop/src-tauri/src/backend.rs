@@ -4470,9 +4470,12 @@ exit /b 9
 
     #[test]
     fn mock_runtime_resolves_default_backend_paths_and_launch_plan() {
+        use crate::config::IsolatedTestDataRoot;
         use tauri::test::{mock_builder, mock_context, noop_assets};
 
+        let temp = tempfile::tempdir().expect("isolated desktop data root");
         let app = mock_builder()
+            .manage(IsolatedTestDataRoot::new(temp.path().join("data-root")))
             .build(mock_context(noop_assets()))
             .expect("mock Tauri app");
         let handle = app.handle();
@@ -4492,14 +4495,26 @@ exit /b 9
 
     #[tokio::test]
     async fn mock_runtime_starts_restarts_and_stops_the_default_backend() {
+        use crate::config::IsolatedTestDataRoot;
         use tauri::test::{mock_builder, mock_context, noop_assets};
 
+        let temp = tempfile::tempdir().expect("isolated desktop data root");
+        let test_data_root = temp.path().join("data-root");
         let mut context = mock_context(noop_assets());
         context.config_mut().identifier =
             format!("com.bibcode.backend-tests-{}", std::process::id());
-        let app = mock_builder().build(context).expect("mock Tauri app");
+        let app = mock_builder()
+            .manage(IsolatedTestDataRoot::new(test_data_root.clone()))
+            .build(context)
+            .expect("mock Tauri app");
         let base_dir = desktop_base_dir(app.handle()).expect("desktop base directory");
-        let _ = fs::remove_dir_all(&base_dir);
+        assert_eq!(
+            base_dir,
+            temp.path()
+                .canonicalize()
+                .expect("temporary root should canonicalize")
+                .join("data-root")
+        );
         let supervisor = BackendSupervisor::new();
 
         let started = supervisor
@@ -4519,7 +4534,6 @@ exit /b 9
             .stop(BackendShutdownConfig::default())
             .await
             .expect("default backend should stop");
-        let _ = fs::remove_dir_all(base_dir);
     }
 
     #[test]

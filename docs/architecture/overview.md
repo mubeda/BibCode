@@ -79,6 +79,15 @@ succeeds, normal SQLite locking continues to support sequential or simultaneous
 server processes sharing that established store. Graceful server join still
 waits for the SQLite worker to close before returning.
 
+Desktop development and installed builds use the same resolved base data root
+by default, but select separate `dev` and `userdata` state kinds. Rust desktop
+unit tests are forbidden from resolving that real default root: every Tauri
+mock that reaches persistence must install an explicit per-test temporary data
+root. This boundary is enforced in the shared desktop root resolver so test
+cleanup, mock backend lifecycle, window-state fixtures, and IPC fixtures cannot
+read, replace, or recursively remove a developer's or installed application's
+store on Windows, macOS, or Linux.
+
 After store preparation succeeds, the runtime copies the marker's persistent
 UUID into runtime-only server configuration. Every current-server descriptor
 surface publishes that UUID as `storageInstanceId`: the public
