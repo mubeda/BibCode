@@ -73,36 +73,33 @@ impl VcsService {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::TestSandbox;
 
     #[tokio::test]
     async fn service_detects_repository_state_and_reads_local_status() {
-        let _guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let repository = tempfile::tempdir().expect("temporary repository");
+        let sandbox = TestSandbox::new("vcs-service");
+        let repository = sandbox.root();
         let cancellation = CancellationToken::new();
         let service = VcsService::default();
         assert_eq!(
-            service
-                .detect(repository.path(), &cancellation)
-                .await
-                .unwrap(),
+            service.detect(repository, &cancellation).await.unwrap(),
             VcsDriverKind::Unknown
         );
         let output = std::process::Command::new("git")
             .arg("init")
-            .current_dir(repository.path())
+            .current_dir(repository)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_TERMINAL_PROMPT", "0")
             .output()
             .expect("git init should start");
         assert!(output.status.success());
         assert_eq!(
-            service
-                .detect(repository.path(), &cancellation)
-                .await
-                .unwrap(),
+            service.detect(repository, &cancellation).await.unwrap(),
             VcsDriverKind::Git
         );
         assert!(
             service
-                .local_status(repository.path(), &cancellation)
+                .local_status(repository, &cancellation)
                 .await
                 .is_ok()
         );

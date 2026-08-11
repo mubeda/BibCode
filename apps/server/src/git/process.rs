@@ -216,3 +216,55 @@ fn render(output: SupervisedStreamOutput, append_marker: bool) -> String {
     }
     rendered
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::TestSandbox;
+
+    fn fixture_request(sandbox: &TestSandbox, operation: &str, command: PathBuf) -> ProcessRequest {
+        ProcessRequest {
+            operation: operation.to_owned(),
+            command,
+            args: Vec::new(),
+            cwd: sandbox.root().to_path_buf(),
+            env: sandbox
+                .environment(std::iter::empty::<(String, String)>())
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+            stdin: None,
+            timeout: Duration::from_secs(30),
+            max_output_bytes: 1024,
+            output_policy: OutputPolicy::Truncate,
+            append_truncation_marker: false,
+            allow_non_zero_exit: false,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runner_uses_command_local_environment_for_parallel_children() {
+        async fn run(label: &str) -> ProcessOutput {
+            let sandbox = TestSandbox::new(label);
+            let script = sandbox.executable_script(
+                "print-label",
+                "printf '%s' \"$FIXTURE_LABEL\"",
+                "@echo off\r\n<nul set /p =%FIXTURE_LABEL%",
+            );
+            let mut request = fixture_request(&sandbox, "fixture-label", script);
+            request.env = sandbox
+                .environment([("FIXTURE_LABEL", label)])
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect();
+            ProcessRunner
+                .run(request, &CancellationToken::new())
+                .await
+                .expect("parallel git fixture process")
+        }
+
+        let (left, right) = tokio::join!(run("left"), run("right"));
+        assert_eq!(left.stdout, "left");
+        assert_eq!(right.stdout, "right");
+    }
+}
