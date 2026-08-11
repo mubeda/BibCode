@@ -33,12 +33,12 @@ pub(crate) trait ActivityCancellationDispatcher: Send + Sync {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ActivityTargetDispatchDisposition {
+pub enum ActivityTargetDispatchDisposition {
     Delivered,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum ActivityDispatchError {
+pub enum ActivityDispatchError {
     ProviderUnavailable,
     TargetUnavailable,
 }
@@ -834,26 +834,27 @@ mod tests {
     fn actor_target(actor_id: &str) -> ProviderActivityControlUpdate {
         ProviderActivityControlUpdate::ActorTarget {
             actor_id: actor_id.to_owned(),
-            target: Some(ProviderActivityNativeTarget::ClaudeTask {
-                task_id: format!("native-{actor_id}"),
-            }),
+            target: Some(ProviderActivityNativeTarget::claude_task(format!(
+                "native-{actor_id}"
+            ))),
         }
     }
 
     fn work_target(work_item_id: &str) -> ProviderActivityControlUpdate {
         ProviderActivityControlUpdate::WorkTarget {
             work_item_id: work_item_id.to_owned(),
-            target: Some(ProviderActivityNativeTarget::ClaudeTask {
-                task_id: format!("native-{work_item_id}"),
-            }),
+            target: Some(ProviderActivityNativeTarget::claude_task(format!(
+                "native-{work_item_id}"
+            ))),
         }
     }
 
     fn target_label(target: &ProviderActivityNativeTarget) -> String {
-        match target {
-            ProviderActivityNativeTarget::CodexTurn { turn_id, .. } => turn_id.clone(),
-            ProviderActivityNativeTarget::ClaudeTask { task_id } => task_id.clone(),
-        }
+        target
+            .codex_turn_ids()
+            .map(|(_, turn_id)| turn_id.to_owned())
+            .or_else(|| target.claude_task_id().map(str::to_owned))
+            .expect("native target kind")
     }
 
     struct FakeDispatcher {
@@ -1781,9 +1782,9 @@ mod tests {
                     &[],
                     &[ProviderActivityControlUpdate::ActorTarget {
                         actor_id: "root".to_owned(),
-                        target: Some(ProviderActivityNativeTarget::ClaudeTask {
-                            task_id: format!("rotated-root-{index}"),
-                        }),
+                        target: Some(ProviderActivityNativeTarget::claude_task(format!(
+                            "rotated-root-{index}"
+                        ))),
                     }],
                 )
                 .await;
@@ -1796,9 +1797,9 @@ mod tests {
         assert!(
             operation
                 .dispatched_targets
-                .contains(&ProviderActivityNativeTarget::ClaudeTask {
-                    task_id: "rotated-root-263".to_owned(),
-                })
+                .contains(&ProviderActivityNativeTarget::claude_task(
+                    "rotated-root-263".to_owned(),
+                ))
         );
         assert!(!dispatcher.call_set().contains("native-sibling"));
     }
@@ -1852,9 +1853,9 @@ mod tests {
                 &[],
                 &[ProviderActivityControlUpdate::ActorTarget {
                     actor_id: "root".to_owned(),
-                    target: Some(ProviderActivityNativeTarget::ClaudeTask {
-                        task_id: "rotated-root-overflow".to_owned(),
-                    }),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "rotated-root-overflow".to_owned(),
+                    )),
                 }],
             )
             .await;

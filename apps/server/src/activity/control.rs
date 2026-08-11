@@ -107,9 +107,9 @@ mod tests {
                 ],
                 &[ProviderActivityControlUpdate::ActorTarget {
                     actor_id: "actor-a".to_owned(),
-                    target: Some(ProviderActivityNativeTarget::ClaudeTask {
-                        task_id: "native-task".to_owned(),
-                    }),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "native-task".to_owned(),
+                    )),
                 }],
             )
             .await;
@@ -140,10 +140,10 @@ mod tests {
                 &[],
                 &[ProviderActivityControlUpdate::ActorTarget {
                     actor_id: "actor-a".to_owned(),
-                    target: Some(ProviderActivityNativeTarget::CodexTurn {
-                        thread_id: "native-thread".to_owned(),
-                        turn_id: "native-turn".to_owned(),
-                    }),
+                    target: Some(ProviderActivityNativeTarget::codex_turn(
+                        "native-thread".to_owned(),
+                        "native-turn".to_owned(),
+                    )),
                 }],
             )
             .await;
@@ -208,10 +208,10 @@ mod tests {
                         &[],
                         &[ProviderActivityControlUpdate::ActorTarget {
                             actor_id: "actor-a".to_owned(),
-                            target: Some(ProviderActivityNativeTarget::CodexTurn {
-                                thread_id: "native-thread".to_owned(),
-                                turn_id: turn_id.to_owned(),
-                            }),
+                            target: Some(ProviderActivityNativeTarget::codex_turn(
+                                "native-thread".to_owned(),
+                                turn_id.to_owned(),
+                            )),
                         }],
                     ));
             }));
@@ -250,14 +250,14 @@ mod tests {
             .observe_provider_batch(&registration, &[running_actor("actor-a", None)], &[])
             .await;
         for target in [
-            Some(ProviderActivityNativeTarget::CodexTurn {
-                thread_id: "native-thread".to_owned(),
-                turn_id: "turn-1".to_owned(),
-            }),
-            Some(ProviderActivityNativeTarget::CodexTurn {
-                thread_id: "native-thread".to_owned(),
-                turn_id: "turn-2".to_owned(),
-            }),
+            Some(ProviderActivityNativeTarget::codex_turn(
+                "native-thread".to_owned(),
+                "turn-1".to_owned(),
+            )),
+            Some(ProviderActivityNativeTarget::codex_turn(
+                "native-thread".to_owned(),
+                "turn-2".to_owned(),
+            )),
             None,
         ] {
             registry
@@ -295,9 +295,9 @@ mod tests {
                 &[],
                 &[ProviderActivityControlUpdate::ActorTarget {
                     actor_id: "root".to_owned(),
-                    target: Some(ProviderActivityNativeTarget::ClaudeTask {
-                        task_id: "native-task".to_owned(),
-                    }),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "native-task".to_owned(),
+                    )),
                 }],
             )
             .await;
@@ -328,9 +328,9 @@ mod tests {
                 &[running_actor("actor-a", None)],
                 &[ProviderActivityControlUpdate::ActorTarget {
                     actor_id: "actor-a".to_owned(),
-                    target: Some(ProviderActivityNativeTarget::ClaudeTask {
-                        task_id: "native-task".to_owned(),
-                    }),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "native-task".to_owned(),
+                    )),
                 }],
             )
             .await;
@@ -365,9 +365,9 @@ mod tests {
                 &[running_actor("actor-a", None)],
                 &[ProviderActivityControlUpdate::ActorTarget {
                     actor_id: "actor-a".to_owned(),
-                    target: Some(ProviderActivityNativeTarget::ClaudeTask {
-                        task_id: "native-task".to_owned(),
-                    }),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "native-task".to_owned(),
+                    )),
                 }],
             )
             .await;
@@ -398,9 +398,9 @@ mod tests {
                     ActivityControlActor {
                         parent_actor_id: None,
                         status: ActivityLifecycle::Running,
-                        target: Some(ProviderActivityNativeTarget::ClaudeTask {
-                            task_id: format!("native-{index}"),
-                        }),
+                        target: Some(ProviderActivityNativeTarget::claude_task(format!(
+                            "native-{index}"
+                        ))),
                         control_revision: 1,
                     },
                 );
@@ -436,9 +436,9 @@ mod tests {
         let controls = (0..=ACTIVITY_DELTA_MAX_CHANGES)
             .map(|index| ProviderActivityControlUpdate::ActorTarget {
                 actor_id: "actor-a".to_owned(),
-                target: Some(ProviderActivityNativeTarget::ClaudeTask {
-                    task_id: format!("native-{index}"),
-                }),
+                target: Some(ProviderActivityNativeTarget::claude_task(format!(
+                    "native-{index}"
+                ))),
             })
             .collect::<Vec<_>>();
 
@@ -462,9 +462,9 @@ mod tests {
                 &[running_actor("actor-a", None)],
                 &[ProviderActivityControlUpdate::ActorTarget {
                     actor_id: "actor-a".to_owned(),
-                    target: Some(ProviderActivityNativeTarget::ClaudeTask {
-                        task_id: "native-task".to_owned(),
-                    }),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "native-task".to_owned(),
+                    )),
                 }],
             )
             .await;
@@ -591,9 +591,9 @@ mod tests {
                 &[running_actor("actor-a", None)],
                 &[ProviderActivityControlUpdate::ActorTarget {
                     actor_id: "actor-a".to_owned(),
-                    target: Some(ProviderActivityNativeTarget::ClaudeTask {
-                        task_id: "native-task".to_owned(),
-                    }),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "native-task".to_owned(),
+                    )),
                 }],
             )
             .await;
@@ -620,9 +620,9 @@ mod tests {
         let controls = (0..ACTIVITY_DELTA_MAX_CHANGES)
             .map(|index| ProviderActivityControlUpdate::ActorTarget {
                 actor_id: format!("actor-{index}"),
-                target: Some(ProviderActivityNativeTarget::ClaudeTask {
-                    task_id: format!("native-{index}"),
-                }),
+                target: Some(ProviderActivityNativeTarget::claude_task(format!(
+                    "native-{index}"
+                ))),
             })
             .collect::<Vec<_>>();
 
@@ -642,16 +642,14 @@ mod tests {
         // Mutation caught: logging a provider-native thread, turn, or task identifier.
         let codex = format!(
             "{:?}",
-            ProviderActivityNativeTarget::CodexTurn {
-                thread_id: "thread-secret".to_owned(),
-                turn_id: "turn-secret".to_owned(),
-            }
+            ProviderActivityNativeTarget::codex_turn(
+                "thread-secret".to_owned(),
+                "turn-secret".to_owned(),
+            )
         );
         let claude = format!(
             "{:?}",
-            ProviderActivityNativeTarget::ClaudeTask {
-                task_id: "task-secret".to_owned(),
-            }
+            ProviderActivityNativeTarget::claude_task("task-secret".to_owned())
         );
 
         assert_eq!(codex, "CodexTurn { .. }");
@@ -664,36 +662,14 @@ use std::{
     sync::{Arc, Mutex, Weak},
 };
 
-use tokio::sync::broadcast;
-use uuid::Uuid;
-
 use super::cancellation::CancellationOperation;
 use super::model::{
     ACTIVITY_DELTA_MAX_CHANGES, ACTIVITY_ID_MAX_LENGTH, ACTIVITY_PAGE_MAX_LENGTH,
     ActivityActorControl, ActivityActorControlState, ActivityControlChange, ActivityControlDelta,
-    ActivityControlSnapshot, ActivityLifecycle, ActivityScopeRef, ProviderActivityMutation,
-    validate_text,
+    ActivityControlSnapshot, ActivityLifecycle, ActivityRuntimeGeneration, ActivityScopeRef,
+    ProviderActivityMutation, ProviderActivityNativeTarget, validate_text,
 };
-
-/// A provider-native cancellation handle. This value stays inside the Rust server and is never
-/// encoded, persisted, or logged with its provider identifiers.
-#[derive(Clone, Eq, Hash, PartialEq)]
-pub(crate) enum ProviderActivityNativeTarget {
-    CodexTurn { thread_id: String, turn_id: String },
-    ClaudeTask { task_id: String },
-}
-
-impl fmt::Debug for ProviderActivityNativeTarget {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::CodexTurn { .. } => formatter.write_str("CodexTurn { .. }"),
-            Self::ClaudeTask { .. } => formatter.write_str("ClaudeTask { .. }"),
-        }
-    }
-}
-
-#[derive(Clone, Debug, Eq, Hash, PartialEq)]
-pub(crate) struct ActivityRuntimeGeneration(Uuid);
+use tokio::sync::broadcast;
 
 pub(crate) struct ActivityRuntimeControlRegistration {
     scope_id: String,
@@ -703,6 +679,7 @@ pub(crate) struct ActivityRuntimeControlRegistration {
     publisher: ActivityControlEventPublisher,
 }
 
+#[derive(Clone, Eq, PartialEq)]
 pub(crate) enum ProviderActivityControlUpdate {
     ActorTarget {
         actor_id: String,
@@ -829,7 +806,22 @@ impl ActivityControlRegistry {
         scope_id: String,
         provider_instance_id: Option<String>,
     ) -> ActivityRuntimeControlRegistration {
-        let generation = ActivityRuntimeGeneration(Uuid::new_v4());
+        self.register_runtime_with_generation(
+            scope,
+            scope_id,
+            provider_instance_id,
+            ActivityRuntimeGeneration::new(),
+        )
+    }
+
+    #[must_use]
+    pub(crate) fn register_runtime_with_generation(
+        &self,
+        scope: ActivityScopeRef,
+        scope_id: String,
+        provider_instance_id: Option<String>,
+        generation: ActivityRuntimeGeneration,
+    ) -> ActivityRuntimeControlRegistration {
         let mut active = true;
         {
             let mut state = self.lock();

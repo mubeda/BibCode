@@ -1,8 +1,9 @@
-use std::{cmp::Ordering, str::FromStr};
+use std::{cmp::Ordering, fmt, str::FromStr};
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use time::{OffsetDateTime, UtcOffset, format_description::well_known::Rfc3339};
+use uuid::Uuid;
 
 pub const ACTIVITY_ID_MAX_LENGTH: usize = 256;
 pub const ACTIVITY_LABEL_MAX_LENGTH: usize = 256;
@@ -29,6 +30,80 @@ pub enum ActivityModelError {
 }
 
 pub type ActivityModelResult<T> = Result<T, ActivityModelError>;
+
+/// An opaque generation fence for one live provider runtime's Activity controls.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct ActivityRuntimeGeneration(Uuid);
+
+impl ActivityRuntimeGeneration {
+    pub(crate) fn new() -> Self {
+        Self(Uuid::new_v4())
+    }
+}
+
+/// An opaque provider-native cancellation handle.
+///
+/// The provider identifiers remain inaccessible outside the Rust server and this type deliberately
+/// has no serialization implementation.
+#[derive(Clone, Eq, Hash, PartialEq)]
+pub struct ProviderActivityNativeTarget(ProviderActivityNativeTargetKind);
+
+#[derive(Clone, Eq, Hash, PartialEq)]
+enum ProviderActivityNativeTargetKind {
+    CodexTurn { thread_id: String, turn_id: String },
+    ClaudeTask { task_id: String },
+}
+
+impl ProviderActivityNativeTarget {
+    pub(crate) fn codex_turn(thread_id: String, turn_id: String) -> Self {
+        Self(ProviderActivityNativeTargetKind::CodexTurn { thread_id, turn_id })
+    }
+
+    pub(crate) fn claude_task(task_id: String) -> Self {
+        Self(ProviderActivityNativeTargetKind::ClaudeTask { task_id })
+    }
+
+    pub(crate) fn codex_turn_ids(&self) -> Option<(&str, &str)> {
+        match &self.0 {
+            ProviderActivityNativeTargetKind::CodexTurn { thread_id, turn_id } => {
+                Some((thread_id, turn_id))
+            }
+            ProviderActivityNativeTargetKind::ClaudeTask { .. } => None,
+        }
+    }
+
+    pub(crate) fn claude_task_id(&self) -> Option<&str> {
+        match &self.0 {
+            ProviderActivityNativeTargetKind::ClaudeTask { task_id } => Some(task_id),
+            ProviderActivityNativeTargetKind::CodexTurn { .. } => None,
+        }
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn codex_turn_for_integration_test(thread_id: &str, turn_id: &str) -> Self {
+        Self::codex_turn(thread_id.to_owned(), turn_id.to_owned())
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn claude_task_for_integration_test(task_id: &str) -> Self {
+        Self::claude_task(task_id.to_owned())
+    }
+}
+
+impl fmt::Debug for ProviderActivityNativeTarget {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match &self.0 {
+            ProviderActivityNativeTargetKind::CodexTurn { .. } => {
+                formatter.write_str("CodexTurn { .. }")
+            }
+            ProviderActivityNativeTargetKind::ClaudeTask { .. } => {
+                formatter.write_str("ClaudeTask { .. }")
+            }
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "camelCase")]

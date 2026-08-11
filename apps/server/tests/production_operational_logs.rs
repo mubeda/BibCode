@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use bibcode_server::production::{
     operational_logs::{OperationalLogOptions, ProviderOperationalLog},
-    provider_runtime::ProviderEvent,
+    provider_runtime::{ProviderActivityControls, ProviderEvent},
 };
 use bibcode_server::{
     production::operational_logs::TerminalOperationalLog, terminal::TerminalEvent,
@@ -31,6 +31,7 @@ async fn activity_provider_events_without_a_lifecycle_suffix_are_marked_observed
             "raw": "https://hooks.example/activity?token=PRIVATE_HOOK_TOKEN"
         }),
         activity: Vec::new(),
+        activity_controls: Default::default(),
     }));
     log.shutdown().await.expect("provider log shuts down");
 
@@ -45,6 +46,41 @@ async fn activity_provider_events_without_a_lifecycle_suffix_are_marked_observed
         "PRIVATE_HOOK_TOKEN",
     ] {
         assert!(!contents.contains(private_value));
+    }
+}
+
+#[tokio::test]
+async fn targeted_activity_native_targets_never_enter_provider_logs_or_debug_output() {
+    // Mutation caught: deriving diagnostics from the private control payload instead of bounded
+    // event metadata.
+    let temp = TempDir::new().expect("temporary log directory");
+    let path = temp.path().join("events.log");
+    let log = ProviderOperationalLog::start(path.clone(), OperationalLogOptions::default())
+        .await
+        .expect("provider log starts");
+    let event = ProviderEvent {
+        native_event_id: None,
+        event_type: "activity.native".to_owned(),
+        thread_id: "thread-1".to_owned(),
+        turn_id: None,
+        request_id: None,
+        payload: json!({}),
+        activity: Vec::new(),
+        activity_controls: ProviderActivityControls::codex_actor_for_integration_test(
+            "actor-1",
+            "PRIVATE_NATIVE_THREAD",
+            "PRIVATE_NATIVE_TURN",
+        ),
+    };
+
+    assert!(log.record(&event));
+    let debug = format!("{event:?}");
+    log.shutdown().await.expect("provider log shuts down");
+    let contents = std::fs::read_to_string(path).expect("read provider log");
+
+    for native_value in ["PRIVATE_NATIVE_THREAD", "PRIVATE_NATIVE_TURN"] {
+        assert!(!debug.contains(native_value));
+        assert!(!contents.contains(native_value));
     }
 }
 
@@ -97,6 +133,7 @@ async fn startup_removes_provider_log_files_that_exceed_the_configured_bound() {
         request_id: None,
         payload: json!({ "text": "must not be persisted" }),
         activity: Vec::new(),
+        activity_controls: Default::default(),
     }));
     log.shutdown().await.expect("provider log shuts down");
 

@@ -48,10 +48,13 @@ registers their RPC adapters in `RpcRegistry`:
 - `ProviderRuntimeSupervisor` owns provider session processes and native
   protocol adapters;
 - `ActivityCancellationService` owns bounded, generation-fenced targeted
-  cancellation admission and dispatches only server-held provider targets.
-  Until the exact provider-native cancellation bridges are installed, the
-  production dispatcher fails closed with `targetUnavailable` for every target
-  and never translates an activity request into a root turn interrupt;
+  cancellation admission and dispatches only server-held provider targets. The
+  provider supervisor accepts those targets only for the matching current live
+  session, runtime generation, and control registration, then invokes the
+  driver's targeted-cancellation seam outside the ordered root turn-delivery
+  lane. Drivers without an exact provider-native adapter fail closed with
+  `targetUnavailable`; this path never translates an activity request into a
+  root turn interrupt;
 - `TurnDeliveryService` routes admitted turns to provider runtimes while
   preserving delivery and recovery invariants;
 - activity, preview, Git/VCS, terminal, settings, diagnostics, authentication,

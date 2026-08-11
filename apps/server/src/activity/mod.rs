@@ -11,6 +11,7 @@ mod rpc;
 
 #[allow(unused_imports)]
 pub(crate) use cancellation::*;
+pub use cancellation::{ActivityDispatchError, ActivityTargetDispatchDisposition};
 #[allow(unused_imports)]
 pub(crate) use control::*;
 pub use controller::*;

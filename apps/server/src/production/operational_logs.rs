@@ -761,6 +761,7 @@ mod tests {
                 )
                 .expect("valid activity mutation"),
             ],
+            activity_controls: Default::default(),
         }));
         log.shutdown().await.expect("provider log shuts down");
 
@@ -849,6 +850,7 @@ mod tests {
             request_id: None,
             payload: json!({}),
             activity: Vec::new(),
+            activity_controls: Default::default(),
         }));
         log.shutdown().await.expect("provider log shuts down");
 
