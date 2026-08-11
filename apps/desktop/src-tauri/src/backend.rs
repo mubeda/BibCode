@@ -4243,6 +4243,10 @@ if "%4"=="hostname" (
   if not "%2"=="Invalid" echo not-an-address 172.20.0.2
   exit /b 0
 )
+if "%4"=="env" (
+  echo HOME=/home/bibcode-test
+  exit /b 0
+)
 exit /b 9
 "#,
         )

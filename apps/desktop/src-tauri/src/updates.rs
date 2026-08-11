@@ -1294,7 +1294,10 @@ mod tests {
             .await;
         assert_eq!(blocked["completed"], false);
         assert_eq!(blocked["state"]["phase"], "failed");
-        assert_eq!(blocked["state"]["protection"][0]["status"], "protected");
+        assert_eq!(
+            blocked["state"]["protection"][0]["status"], "protected",
+            "primary protection should succeed: {blocked}"
+        );
         assert_eq!(blocked["state"]["protection"][1]["status"], "failed");
         assert!(
             supervisor
