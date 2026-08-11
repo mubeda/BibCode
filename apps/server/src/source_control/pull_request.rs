@@ -84,6 +84,8 @@ pub struct PullRequestService {
     runner: ProcessRunner,
     client: Client,
     bitbucket: BitbucketConfiguration,
+    git_command: PathBuf,
+    git_environment: Vec<(OsString, OsString)>,
     github_command: String,
     gitlab_command: String,
     azure_command: String,
@@ -95,6 +97,8 @@ impl Default for PullRequestService {
             runner: ProcessRunner,
             client: Client::new(),
             bitbucket: BitbucketConfiguration::default(),
+            git_command: PathBuf::from("git"),
+            git_environment: Vec::new(),
             github_command: "gh".to_owned(),
             gitlab_command: "glab".to_owned(),
             azure_command: "az".to_owned(),
@@ -115,6 +119,17 @@ impl PullRequestService {
             azure_command: azure_command.into(),
             ..Self::default()
         }
+    }
+
+    #[cfg(test)]
+    fn with_git_command_for_test(
+        mut self,
+        git_command: PathBuf,
+        git_environment: Vec<(OsString, OsString)>,
+    ) -> Self {
+        self.git_command = git_command;
+        self.git_environment = git_environment;
+        self
     }
 
     pub async fn resolve_current(
@@ -563,13 +578,13 @@ impl PullRequestService {
             .run(
                 ProcessRequest {
                     operation: "source-control.bitbucketRemote".into(),
-                    command: "git".into(),
+                    command: self.git_command.clone(),
                     args: ["remote", "get-url", "origin"]
                         .into_iter()
                         .map(OsString::from)
                         .collect(),
                     cwd: cwd.to_path_buf(),
-                    env: vec![],
+                    env: self.git_environment.clone(),
                     stdin: None,
                     timeout: Duration::from_secs(10),
                     max_output_bytes: 16_000,
@@ -585,7 +600,7 @@ impl PullRequestService {
                     ProviderKind::Bitbucket,
                     cwd,
                     "resolveRepository",
-                    Some("git"),
+                    Some(self.git_command.to_string_lossy().as_ref()),
                     None,
                     &error.to_string(),
                 )
@@ -595,7 +610,7 @@ impl PullRequestService {
                 ProviderKind::Bitbucket,
                 cwd,
                 "resolveRepository",
-                Some("git"),
+                Some(self.git_command.to_string_lossy().as_ref()),
                 None,
                 "The origin remote is not a recognizable Bitbucket repository URL.",
             )
@@ -1300,16 +1315,31 @@ mod tests {
         credentials: Option<BitbucketCredentials>,
     ) -> PullRequestService {
         PullRequestService {
-            runner: ProcessRunner,
-            client: Client::new(),
             bitbucket: BitbucketConfiguration {
                 api_base_url: api_base_url.into(),
                 credentials,
             },
-            github_command: "gh".to_owned(),
-            gitlab_command: "glab".to_owned(),
-            azure_command: "az".to_owned(),
+            ..PullRequestService::default()
         }
+    }
+
+    fn bitbucket_service_for_repository(
+        api_base_url: &str,
+        credentials: Option<BitbucketCredentials>,
+        repository: &TestSandbox,
+    ) -> PullRequestService {
+        bitbucket_service(api_base_url, credentials).with_git_command_for_test(
+            repository.executable_on_path("git"),
+            captured_git_environment(repository),
+        )
+    }
+
+    fn captured_git_environment(sandbox: &TestSandbox) -> Vec<(OsString, OsString)> {
+        sandbox
+            .environment([("GIT_CONFIG_NOSYSTEM", "1")])
+            .into_iter()
+            .map(|(key, value)| (key.into(), value.into()))
+            .collect()
     }
 
     #[cfg(unix)]
@@ -1528,6 +1558,33 @@ esac
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bitbucket_locator_uses_its_owned_git_command_and_environment() {
+        let sandbox = TestSandbox::new("bitbucket-owned-git");
+        let git_command = sandbox.executable_script(
+            "git",
+            "test \"$1:$2:$3:$FIXTURE_LABEL\" = \"remote:get-url:origin:owned\" || exit 64\nprintf '%s\\n' 'https://bitbucket.org/example/owned.git'",
+            "",
+        );
+        let service = PullRequestService::default().with_git_command_for_test(
+            git_command,
+            sandbox
+                .environment([("FIXTURE_LABEL", "owned")])
+                .into_iter()
+                .map(|(key, value)| (key.into(), value.into()))
+                .collect(),
+        );
+
+        let locator = service
+            .bitbucket_locator(sandbox.root(), &CancellationToken::new())
+            .await
+            .expect("owned Git fixture resolves Bitbucket repository");
+
+        assert_eq!(locator.workspace, "example");
+        assert_eq!(locator.repository, "owned");
+    }
+
     fn provider_failure_fixture(
         directory: &Path,
         name: &str,
@@ -1554,6 +1611,8 @@ esac
 
     async fn bitbucket_repository() -> TestSandbox {
         let sandbox = TestSandbox::new("bitbucket-repository");
+        let git_command = sandbox.executable_on_path("git");
+        let git_environment = captured_git_environment(&sandbox);
         for args in [
             vec!["init"],
             vec![
@@ -1567,14 +1626,10 @@ esac
                 .run(
                     ProcessRequest {
                         operation: "test.bitbucketRepository.git".to_owned(),
-                        command: PathBuf::from("git"),
+                        command: git_command.clone(),
                         args: args.into_iter().map(OsString::from).collect(),
                         cwd: sandbox.root().to_path_buf(),
-                        env: sandbox
-                            .environment([("GIT_CONFIG_NOSYSTEM", "1")])
-                            .into_iter()
-                            .map(|(key, value)| (key.into(), value.into()))
-                            .collect(),
+                        env: git_environment.clone(),
                         stdin: None,
                         timeout: Duration::from_secs(30),
                         max_output_bytes: 8_000,
@@ -1666,9 +1721,10 @@ esac
             ),
         ])
         .await;
-        let service = bitbucket_service(
+        let service = bitbucket_service_for_repository(
             &server.base_url,
             Some(BitbucketCredentials::Bearer("test-token".into())),
+            &repository,
         );
 
         let pull_request = service
@@ -1713,9 +1769,10 @@ esac
             ),
         )])
         .await;
-        let service = bitbucket_service(
+        let service = bitbucket_service_for_repository(
             &first_server.base_url,
             Some(BitbucketCredentials::Bearer("must-not-leak".into())),
+            &repository,
         );
 
         let error = service
@@ -1750,9 +1807,10 @@ esac
             r#"{"values":[],"next":"not a URL"}"#.to_owned(),
         )])
         .await;
-        let service = bitbucket_service(
+        let service = bitbucket_service_for_repository(
             &server.base_url,
             Some(BitbucketCredentials::Bearer("test-token".into())),
+            &repository,
         );
 
         let error = service
@@ -1805,9 +1863,10 @@ esac
             (200, response),
         ])
         .await;
-        let service = bitbucket_service(
+        let service = bitbucket_service_for_repository(
             &server.base_url,
             Some(BitbucketCredentials::Bearer("bearer-secret".into())),
+            &repository,
         );
 
         for reference in [
@@ -1852,9 +1911,10 @@ esac
             ),
         ])
         .await;
-        let service = bitbucket_service(
+        let service = bitbucket_service_for_repository(
             &server.base_url,
             Some(BitbucketCredentials::Bearer("test-token".into())),
+            &repository,
         );
 
         for (branch, number) in [("feature/123", 61), ("release/2026", 62)] {
@@ -1901,12 +1961,13 @@ esac
             r#"{"id":51,"title":"Create native flow","state":"OPEN","links":{"html":{"href":"https://bitbucket.org/example/native-source-control/pull-requests/51"}},"source":{"branch":{"name":"feature/create"}},"destination":{"branch":{"name":"release"}}}"#.to_owned(),
         )])
         .await;
-        let service = bitbucket_service(
+        let service = bitbucket_service_for_repository(
             &server.base_url,
             Some(BitbucketCredentials::Basic {
                 email: "user@example.test".into(),
                 token: "api-token".into(),
             }),
+            &repository,
         );
 
         let pull_request = service
@@ -1952,9 +2013,10 @@ esac
     async fn bitbucket_cancellation_stops_an_in_flight_request() {
         let repository = bitbucket_repository().await;
         let mut server = spawn_stalled_http_server().await;
-        let service = bitbucket_service(
+        let service = bitbucket_service_for_repository(
             &server.base_url,
             Some(BitbucketCredentials::Bearer("test-token".into())),
+            &repository,
         );
         let cancellation = CancellationToken::new();
         let request_cancellation = cancellation.clone();
@@ -2039,7 +2101,7 @@ esac
     async fn bitbucket_errors_map_credentials_http_status_and_invalid_json() {
         let repository = bitbucket_repository().await;
         let cancellation = CancellationToken::new();
-        let error = bitbucket_service("http://127.0.0.1:1/2.0", None)
+        let error = bitbucket_service_for_repository("http://127.0.0.1:1/2.0", None, &repository)
             .resolve(
                 ResolvePullRequestInput {
                     cwd: repository.root().to_path_buf(),
@@ -2054,9 +2116,10 @@ esac
 
         let oversized_detail = "x".repeat(2_100);
         let status_server = spawn_http_server(vec![(503, oversized_detail)]).await;
-        let error = bitbucket_service(
+        let error = bitbucket_service_for_repository(
             &status_server.base_url,
             Some(BitbucketCredentials::Bearer("test-token".into())),
+            &repository,
         )
         .resolve(
             ResolvePullRequestInput {
@@ -2073,9 +2136,10 @@ esac
         status_server.task.await.expect("status server task");
 
         let invalid_json_server = spawn_http_server(vec![(200, "not-json".into())]).await;
-        let error = bitbucket_service(
+        let error = bitbucket_service_for_repository(
             &invalid_json_server.base_url,
             Some(BitbucketCredentials::Bearer("test-token".into())),
+            &repository,
         )
         .resolve(
             ResolvePullRequestInput {

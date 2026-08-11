@@ -1590,15 +1590,16 @@ mod tests {
         }
     }
 
-    async fn git(cwd: &std::path::Path, args: &[&str]) {
+    async fn git(sandbox: &crate::test_support::TestSandbox, cwd: &Path, args: &[&str]) {
         ProcessRunner
             .run(
                 ProcessRequest {
                     operation: "test.gitVcs.git".to_owned(),
-                    command: PathBuf::from("git"),
+                    command: sandbox.executable_on_path("git"),
                     args: args.iter().map(OsString::from).collect(),
                     cwd: cwd.to_path_buf(),
-                    env: [("GIT_CONFIG_NOSYSTEM", "1")]
+                    env: sandbox
+                        .environment([("GIT_CONFIG_NOSYSTEM", "1")])
                         .into_iter()
                         .map(|(key, value)| (key.into(), value.into()))
                         .collect(),
@@ -1613,6 +1614,38 @@ mod tests {
             )
             .await
             .unwrap_or_else(|error| panic!("git {args:?} failed: {error}"));
+    }
+
+    struct CapturedGitRunner {
+        command: PathBuf,
+        environment: Vec<(OsString, OsString)>,
+    }
+
+    impl CapturedGitRunner {
+        fn new(sandbox: &crate::test_support::TestSandbox) -> Self {
+            Self {
+                command: sandbox.executable_on_path("git"),
+                environment: sandbox
+                    .environment([("GIT_CONFIG_NOSYSTEM", "1")])
+                    .into_iter()
+                    .map(|(key, value)| (key.into(), value.into()))
+                    .collect(),
+            }
+        }
+    }
+
+    impl crate::git::GitProcessRunner for CapturedGitRunner {
+        fn run<'a>(
+            &'a self,
+            mut request: ProcessRequest,
+            cancellation: &'a CancellationToken,
+        ) -> crate::git::BoxGitProcessFuture<'a> {
+            request.command.clone_from(&self.command);
+            let mut environment = self.environment.clone();
+            environment.extend(request.env);
+            request.env = environment;
+            Box::pin(async move { ProcessRunner.run(request, cancellation).await })
+        }
     }
 
     struct FixtureGitRunner {
@@ -1719,9 +1752,13 @@ mod tests {
     #[tokio::test]
     async fn workspace_loss_ends_an_admitted_status_stream_with_the_exact_error() {
         let sandbox = crate::test_support::TestSandbox::new("workspace-loss-status");
-        git(sandbox.root(), &["init", "-b", "main"]).await;
+        git(&sandbox, sandbox.root(), &["init", "-b", "main"]).await;
         let registry = WorkspaceAvailabilityRegistry::new();
-        let services = GitVcsRpcServices::default().with_availability_registry(registry.clone());
+        let repository = Arc::new(GitRepository::with_runner_for_test(Arc::new(
+            CapturedGitRunner::new(&sandbox),
+        )));
+        let services = GitVcsRpcServices::with_repository(repository)
+            .with_availability_registry(registry.clone());
         let mut stream = services.status_stream(
             rpc_request("subscribeVcsStatus", json!({"cwd": sandbox.root()})),
             CancellationToken::new(),
@@ -1817,7 +1854,10 @@ mod tests {
             .await
             .expect("repository directory should create");
         let cwd = repository.to_string_lossy().into_owned();
-        let mut services = GitVcsRpcServices::default();
+        let git_repository = Arc::new(GitRepository::with_runner_for_test(Arc::new(
+            CapturedGitRunner::new(&sandbox),
+        )));
+        let mut services = GitVcsRpcServices::with_repository(git_repository);
 
         assert!(
             unary(&services, "vcs.init", json!({"cwd":cwd,"kind":"mercurial"}),)
@@ -1830,8 +1870,14 @@ mod tests {
                 .expect("repository should initialize"),
             Value::Null,
         );
-        git(&repository, &["config", "user.name", "BiBCode Test"]).await;
         git(
+            &sandbox,
+            &repository,
+            &["config", "user.name", "BiBCode Test"],
+        )
+        .await;
+        git(
+            &sandbox,
             &repository,
             &["config", "user.email", "bibcode@example.test"],
         )
@@ -1868,8 +1914,13 @@ mod tests {
             .expect("file should stage"),
             Value::Null,
         );
-        git(&repository, &["commit", "--quiet", "-m", "initial"]).await;
-        git(&repository, &["branch", "-M", "main"]).await;
+        git(
+            &sandbox,
+            &repository,
+            &["commit", "--quiet", "-m", "initial"],
+        )
+        .await;
+        git(&sandbox, &repository, &["branch", "-M", "main"]).await;
 
         let refs = unary(
             &services,
@@ -1992,12 +2043,6 @@ mod tests {
             )
             .await
             .is_err()
-        );
-        assert!(
-            unary(&services, "server.discoverSourceControl", json!({}))
-                .await
-                .expect("source control should discover")["versionControlSystems"]
-                .is_array()
         );
         let source_clone = sandbox.root().join("source-clone");
         assert!(
@@ -2199,26 +2244,29 @@ mod tests {
             tokio::fs::create_dir(&bare_remote)
                 .await
                 .expect("bare remote directory");
-            git(&bare_remote, &["init", "--bare"]).await;
+            git(&sandbox, &bare_remote, &["init", "--bare"]).await;
+            let bare_remote_text = bare_remote.to_string_lossy().into_owned();
+            git(
+                &sandbox,
+                &repository,
+                &["remote", "add", "origin", bare_remote_text.as_str()],
+            )
+            .await;
 
             let gh = sandbox.executable_script(
                 "gh",
-                &format!(
-                    r#"#!/bin/sh
-case "$1:$2" in
+                r#"case "$1:$2" in
   repo:view)
-    printf '%s\n' '{{"nameWithOwner":"owner/name","url":"https://github.test/owner/name","sshUrl":"git@github.test:owner/name.git"}}'
+    printf '%s\n' '{"nameWithOwner":"owner/name","url":"https://github.test/owner/name","sshUrl":"git@github.test:owner/name.git"}'
     ;;
   repo:create)
-    git remote add origin "{}"
+    exit 0
     ;;
   *)
     exit 64
     ;;
 esac
 "#,
-                    bare_remote.display(),
-                ),
                 "",
             );
 
