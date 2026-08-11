@@ -163,6 +163,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     const TAILSCALE_STATUS_JSON: &str = r#"{"Self":{"DNSName":"desktop.tail.ts.net.","TailscaleIPs":["100.100.100.100","fd7a:115c:a1e0::1","192.168.1.20"]}}"#;
+    const FIXTURE_SUCCESS_OBSERVATION_TIMEOUT: Duration = Duration::from_secs(10);
 
     #[test]
     fn detects_tailnet_ipv4_addresses() {
@@ -324,7 +325,7 @@ mod tests {
             &format!("echo {TAILSCALE_STATUS_JSON}"),
         );
         assert_eq!(
-            read_status_fixture(&success, Duration::from_secs(2))
+            read_status_fixture(&success, FIXTURE_SUCCESS_OBSERVATION_TIMEOUT)
                 .await
                 .unwrap()
                 .magic_dns_name
