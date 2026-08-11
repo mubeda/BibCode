@@ -9,6 +9,8 @@ import {
   type WorktreeAdoptInput,
   type WorktreeAdoptResult,
   type WorktreeKey,
+  type WorktreeRemovalPlan,
+  type WorktreeRemovalResult,
   WS_METHODS,
 } from "@bibcode/contracts";
 import * as Cause from "effect/Cause";
@@ -60,6 +62,16 @@ export type WorktreeAddAllItemResult =
 export interface WorktreeAddAllResult {
   readonly results: ReadonlyArray<WorktreeAddAllItemResult>;
 }
+
+export type WorktreeRemoveCommandResult =
+  | {
+      readonly _tag: "Removed";
+      readonly result: WorktreeRemovalResult;
+    }
+  | {
+      readonly _tag: "PlanChanged";
+      readonly plan: WorktreeRemovalPlan;
+    };
 
 export function deriveWorktreeDiscoveryState(
   input: WorktreeDiscoveryStateInput,
@@ -219,6 +231,14 @@ export function createWorktreeEnvironmentAtoms<R, E>(
         ).pipe(Effect.map((results): WorktreeAddAllResult => ({ results }))),
       ),
   });
+  const getRemovalPlanEffect = (target: {
+    readonly environmentId: EnvironmentId;
+    readonly input: EnvironmentRpcInput<typeof WS_METHODS.worktreeGetRemovalPlan>;
+  }) =>
+    runInEnvironment(
+      target.environmentId,
+      request(WS_METHODS.worktreeGetRemovalPlan, target.input),
+    );
 
   return {
     catalog: createEnvironmentSubscriptionAtomFamily(runtime, {
@@ -249,5 +269,54 @@ export function createWorktreeEnvironmentAtoms<R, E>(
     }),
     addOne,
     addAll,
+    getRemovalPlan: createRuntimeCommand(runtime, {
+      label: "environment-data:worktrees:get-removal-plan",
+      execute: getRemovalPlanEffect,
+    }),
+    removeFromBibCode: createRuntimeCommand(runtime, {
+      label: "environment-data:worktrees:remove-from-bibcode",
+      execute: (target: {
+        readonly environmentId: EnvironmentId;
+        readonly input: EnvironmentRpcInput<typeof WS_METHODS.worktreeRemoveFromBibCode>;
+      }) =>
+        withProjectMutationLane(
+          projectKey(target),
+          runInEnvironment(
+            target.environmentId,
+            request(WS_METHODS.worktreeRemoveFromBibCode, target.input),
+          ),
+        ),
+    }),
+    remove: createRuntimeCommand(runtime, {
+      label: "environment-data:worktrees:remove",
+      execute: (target: {
+        readonly environmentId: EnvironmentId;
+        readonly input: EnvironmentRpcInput<typeof WS_METHODS.worktreeRemove>;
+      }) =>
+        withProjectMutationLane(
+          projectKey(target),
+          runInEnvironment(
+            target.environmentId,
+            request(WS_METHODS.worktreeRemove, target.input),
+          ).pipe(
+            Effect.map((result): WorktreeRemoveCommandResult => ({ _tag: "Removed", result })),
+            Effect.catchTag("WorktreeRemovalError", (error) =>
+              error.reason === "stale-plan"
+                ? getRemovalPlanEffect({
+                    environmentId: target.environmentId,
+                    input: {
+                      projectId: target.input.projectId,
+                      threadId: target.input.threadId,
+                    },
+                  }).pipe(
+                    Effect.map(
+                      (plan): WorktreeRemoveCommandResult => ({ _tag: "PlanChanged", plan }),
+                    ),
+                  )
+                : Effect.fail(error),
+            ),
+          ),
+        ),
+    }),
   };
 }

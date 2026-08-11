@@ -63,6 +63,9 @@ const h = vi.hoisted(() => {
     projects: [] as unknown[],
     unarchiveThread: vi.fn(),
     confirmAndDeleteThread: vi.fn(),
+    requestWorktreeRemoval: vi.fn(),
+    closeWorktreeRemovalDialog: vi.fn(),
+    completeWorktreeRemoval: vi.fn(),
     archive: {
       snapshots: [] as unknown[],
       error: null as string | null,
@@ -170,7 +173,18 @@ vi.mock("../../hooks/useThreadActions", () => ({
   useThreadActions: () => ({
     unarchiveThread: h.unarchiveThread,
     confirmAndDeleteThread: h.confirmAndDeleteThread,
+    worktreeRemovalTarget: null,
+    requestWorktreeRemoval: h.requestWorktreeRemoval,
+    closeWorktreeRemovalDialog: h.closeWorktreeRemovalDialog,
+    completeWorktreeRemoval: h.completeWorktreeRemoval,
   }),
+}));
+
+vi.mock("../WorktreeRemovalDialog", () => ({
+  WorktreeRemovalDialog: (props: AnyProps) => {
+    h.controls.push({ kind: "dialog", label: "worktree-removal", props });
+    return null;
+  },
 }));
 
 vi.mock("../../lib/archivedThreadsState", () => ({
@@ -595,6 +609,10 @@ beforeEach(() => {
   h.unarchiveThread.mockResolvedValue({ _tag: "Success", value: undefined });
   h.confirmAndDeleteThread.mockReset();
   h.confirmAndDeleteThread.mockResolvedValue({ _tag: "Success", value: undefined });
+  h.requestWorktreeRemoval.mockReset();
+  h.closeWorktreeRemovalDialog.mockReset();
+  h.completeWorktreeRemoval.mockReset();
+  h.completeWorktreeRemoval.mockResolvedValue({ _tag: "Success", value: undefined });
   h.archive.snapshots = [];
   h.archive.error = null;
   h.archive.isLoading = false;
@@ -2222,6 +2240,67 @@ describe("ArchivedThreadsPanel", () => {
         description: "menu exploded",
       }),
     );
+  });
+
+  it("opens the reusable removal dialog for an archived worktree without deleting by path", async () => {
+    const snapshots = archivedSnapshots() as any[];
+    const archivedThread = snapshots[0].snapshot.threads[1];
+    archivedThread.worktreePath = "/work/alpha-worktrees/feature";
+    archivedThread.branch = "feature/archived";
+    h.archive.snapshots = snapshots;
+    const showSpy = vi.fn().mockResolvedValue("delete");
+    h.localApi = { contextMenu: { show: showSpy } };
+    render(<ArchivedThreadsPanel />);
+
+    const row = h.rows.find(
+      (entry) => entry.title === "Newer thread" && typeof entry.onContextMenu === "function",
+    );
+    expect(row).toBeDefined();
+    (row!.onContextMenu as (event: unknown) => void)({
+      preventDefault: () => {},
+      clientX: 3,
+      clientY: 4,
+    });
+    await flush();
+
+    expect(h.requestWorktreeRemoval).toHaveBeenCalledWith({
+      environmentId: env1,
+      projectId: "project-a",
+      threadId: "thread-new",
+      title: "Newer thread",
+      path: "/work/alpha-worktrees/feature",
+      branch: "feature/archived",
+      availability: "verification-unavailable",
+      registrationState: null,
+      locked: false,
+    });
+    expect(h.confirmAndDeleteThread).not.toHaveBeenCalled();
+  });
+
+  it("keeps archived panel-thread deletion on the ordinary thread path", async () => {
+    const snapshots = archivedSnapshots() as any[];
+    const archivedThread = snapshots[0].snapshot.threads[1];
+    archivedThread.kind = "panel";
+    archivedThread.worktreePath = "/work/alpha-worktrees/feature";
+    h.archive.snapshots = snapshots;
+    h.localApi = { contextMenu: { show: vi.fn().mockResolvedValue("delete") } };
+    render(<ArchivedThreadsPanel />);
+
+    const row = h.rows.find(
+      (entry) => entry.title === "Newer thread" && typeof entry.onContextMenu === "function",
+    );
+    (row!.onContextMenu as (event: unknown) => void)({
+      preventDefault: () => {},
+      clientX: 3,
+      clientY: 4,
+    });
+    await flush();
+
+    expect(h.confirmAndDeleteThread).toHaveBeenCalledWith({
+      environmentId: env1,
+      threadId: "thread-new",
+    });
+    expect(h.requestWorktreeRemoval).not.toHaveBeenCalled();
   });
 
   it("ignores context menus when no local API is present", async () => {

@@ -6,6 +6,8 @@ import {
   ThreadId,
   WorktreeAdoptionError,
   WorktreeKey,
+  WorktreeRemovalError,
+  WorktreeRemovalPlanToken,
   WS_METHODS,
   type VcsAdoptedWorktreeStatus,
   type VcsWorktreeCatalogSnapshot,
@@ -903,6 +905,197 @@ describe("worktree adoption commands", () => {
         expect(result.value.results).toHaveLength(2);
         expect("navigateTo" in result.value).toBe(false);
       }
+      harness.atomRegistry.dispose();
+    }),
+  );
+});
+
+describe("worktree removal commands", () => {
+  it.effect("serializes detach and destructive removal for one physical project", () =>
+    Effect.gen(function* () {
+      const detachEntered = yield* Deferred.make<void>();
+      const detachGate = yield* Deferred.make<void>();
+      const events: string[] = [];
+      const client = {
+        [WS_METHODS.worktreeRemoveFromBibCode]: () =>
+          Effect.sync(() => events.push("detach:start")).pipe(
+            Effect.tap(() => Deferred.succeed(detachEntered, undefined)),
+            Effect.andThen(Deferred.await(detachGate)),
+            Effect.as({
+              threadRemoved: true,
+              gitOutcome: "not-requested" as const,
+              orphanCleanupPending: false,
+            }),
+          ),
+        [WS_METHODS.worktreeRemove]: () =>
+          Effect.sync(() => events.push("remove:start")).pipe(
+            Effect.as({
+              threadRemoved: true,
+              gitOutcome: "removed" as const,
+              orphanCleanupPending: false,
+            }),
+          ),
+      } as unknown as WsRpcProtocolClient;
+      const harness = yield* makeCommandHarness(new Map([[ENVIRONMENT_ONE, client]]));
+      const detach = harness.worktrees.removeFromBibCode.run(harness.atomRegistry, {
+        environmentId: ENVIRONMENT_ONE,
+        input: {
+          commandId: CommandId.make("command-detach"),
+          projectId: PROJECT_ID,
+          threadId: ThreadId.make("thread-one"),
+        },
+      });
+      const remove = harness.worktrees.remove.run(harness.atomRegistry, {
+        environmentId: ENVIRONMENT_ONE,
+        input: {
+          commandId: CommandId.make("command-remove"),
+          projectId: PROJECT_ID,
+          threadId: ThreadId.make("thread-two"),
+          mode: "delete-git-worktree",
+          expectedGeneration: 9,
+          planToken: WorktreeRemovalPlanToken.make("plan-one"),
+          forceDirty: false,
+          confirmRepositoryWidePrune: false,
+        },
+      });
+
+      yield* Deferred.await(detachEntered);
+      expect(events).toEqual(["detach:start"]);
+      yield* Deferred.succeed(detachGate, undefined);
+      expect((yield* Effect.promise(() => detach))._tag).toBe("Success");
+      expect((yield* Effect.promise(() => remove))._tag).toBe("Success");
+      expect(events).toEqual(["detach:start", "remove:start"]);
+      harness.atomRegistry.dispose();
+    }),
+  );
+
+  it.effect("detaches without requiring a catalog snapshot", () =>
+    Effect.gen(function* () {
+      const client = {
+        [WS_METHODS.worktreeRemoveFromBibCode]: () =>
+          Effect.succeed({
+            threadRemoved: true,
+            gitOutcome: "not-requested" as const,
+            orphanCleanupPending: false,
+          }),
+      } as unknown as WsRpcProtocolClient;
+      const harness = yield* makeCommandHarness(new Map([[ENVIRONMENT_ONE, client]]));
+
+      const result = yield* Effect.promise(() =>
+        harness.worktrees.removeFromBibCode.run(harness.atomRegistry, {
+          environmentId: ENVIRONMENT_ONE,
+          input: {
+            commandId: CommandId.make("command-detach-missing"),
+            projectId: PROJECT_ID,
+            threadId: ThreadId.make("thread-missing"),
+          },
+        }),
+      );
+
+      expect(result).toMatchObject({
+        _tag: "Success",
+        value: { threadRemoved: true, gitOutcome: "not-requested" },
+      });
+      harness.atomRegistry.dispose();
+    }),
+  );
+
+  it.effect("returns a fresh plan after a stale plan without retrying removal", () =>
+    Effect.gen(function* () {
+      let removalCalls = 0;
+      let planCalls = 0;
+      const client = {
+        [WS_METHODS.worktreeRemove]: () => {
+          removalCalls += 1;
+          return Effect.fail(
+            new WorktreeRemovalError({ reason: "stale-plan", message: "plan changed" }),
+          );
+        },
+        [WS_METHODS.worktreeGetRemovalPlan]: () => {
+          planCalls += 1;
+          return Effect.succeed({
+            planToken: WorktreeRemovalPlanToken.make("plan-fresh"),
+            generation: 10,
+            availability: "missing-registered" as const,
+            registered: true,
+            locked: false,
+            trackedChangeCount: 0,
+            untrackedFileCount: 0,
+            pruneImpact: [],
+          });
+        },
+      } as unknown as WsRpcProtocolClient;
+      const harness = yield* makeCommandHarness(new Map([[ENVIRONMENT_ONE, client]]));
+
+      const result = yield* Effect.promise(() =>
+        harness.worktrees.remove.run(harness.atomRegistry, {
+          environmentId: ENVIRONMENT_ONE,
+          input: {
+            commandId: CommandId.make("command-stale-plan"),
+            projectId: PROJECT_ID,
+            threadId: ThreadId.make("thread-one"),
+            mode: "cleanup-stale-registration",
+            expectedGeneration: 9,
+            planToken: WorktreeRemovalPlanToken.make("plan-stale"),
+            forceDirty: false,
+            confirmRepositoryWidePrune: false,
+          },
+        }),
+      );
+
+      expect(result).toMatchObject({
+        _tag: "Success",
+        value: {
+          _tag: "PlanChanged",
+          plan: { planToken: "plan-fresh", generation: 10 },
+        },
+      });
+      expect({ removalCalls, planCalls }).toEqual({ removalCalls: 1, planCalls: 1 });
+      harness.atomRegistry.dispose();
+    }),
+  );
+
+  it.effect("exposes partial stale-registration cleanup without restoring the row", () =>
+    Effect.gen(function* () {
+      const client = {
+        [WS_METHODS.worktreeRemove]: () =>
+          Effect.succeed({
+            threadRemoved: true,
+            gitOutcome: "failed" as const,
+            detail: "Remove the stale registration manually with Git.",
+            orphanCleanupPending: true,
+          }),
+      } as unknown as WsRpcProtocolClient;
+      const harness = yield* makeCommandHarness(new Map([[ENVIRONMENT_ONE, client]]));
+
+      const result = yield* Effect.promise(() =>
+        harness.worktrees.remove.run(harness.atomRegistry, {
+          environmentId: ENVIRONMENT_ONE,
+          input: {
+            commandId: CommandId.make("command-partial"),
+            projectId: PROJECT_ID,
+            threadId: ThreadId.make("thread-one"),
+            mode: "cleanup-stale-registration",
+            expectedGeneration: 9,
+            planToken: WorktreeRemovalPlanToken.make("plan-one"),
+            forceDirty: false,
+            confirmRepositoryWidePrune: false,
+          },
+        }),
+      );
+
+      expect(result).toMatchObject({
+        _tag: "Success",
+        value: {
+          _tag: "Removed",
+          result: {
+            threadRemoved: true,
+            gitOutcome: "failed",
+            orphanCleanupPending: true,
+            detail: "Remove the stale registration manually with Git.",
+          },
+        },
+      });
       harness.atomRegistry.dispose();
     }),
   );

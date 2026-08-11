@@ -167,6 +167,9 @@ const h = vi.hoisted(() => {
     updateSettings: vi.fn(),
     archiveThread: vi.fn(),
     deleteThread: vi.fn(),
+    requestWorktreeRemoval: vi.fn(),
+    closeWorktreeRemovalDialog: vi.fn(),
+    completeWorktreeRemoval: vi.fn(),
     contextMenuShow: vi.fn(),
     dialogConfirm: vi.fn(),
     toastAdd: vi.fn(),
@@ -459,7 +462,36 @@ vi.mock("../hooks/useThreadActions", () => ({
   useThreadActions: () => ({
     archiveThread: h.spies.archiveThread,
     deleteThread: h.spies.deleteThread,
+    worktreeRemovalTarget: null,
+    requestWorktreeRemoval: h.spies.requestWorktreeRemoval,
+    closeWorktreeRemovalDialog: h.spies.closeWorktreeRemovalDialog,
+    completeWorktreeRemoval: h.spies.completeWorktreeRemoval,
   }),
+}));
+
+vi.mock("./WorktreeAvailabilityWarning", () => ({
+  WorktreeAvailabilityWarning: ({ status, onRetry, onRemove }: any) => {
+    h.capture("WorktreeAvailabilityWarning", { status, onRetry, onRemove });
+    return (
+      <div data-testid={`availability-warning-${status.threadId}`}>
+        <span>{status.availability}</span>
+        <span>{status.path}</span>
+        <button type="button" onClick={onRetry}>
+          Retry detection
+        </button>
+        <button type="button" onClick={onRemove}>
+          Remove from BiBCode
+        </button>
+      </div>
+    );
+  },
+}));
+
+vi.mock("./WorktreeRemovalDialog", () => ({
+  WorktreeRemovalDialog: (props: Record<string, unknown>) => {
+    h.capture("WorktreeRemovalDialog", props);
+    return null;
+  },
 }));
 
 vi.mock("../hooks/useHandleNewThread", () => ({
@@ -1976,6 +2008,7 @@ staticDescribe("worktree discovery integration", () => {
     expect(primaryIndex).toBeGreaterThan(discoveryIndex);
     expect(h.state.discoveryCatalogSubscriptions).toEqual([
       { environmentId: ENV_MAIN, input: { projectId: projectA.id } },
+      { environmentId: ENV_MAIN, input: { projectId: projectA.id } },
     ]);
     expect(h.state.discoveryFocusRefreshCalls).toEqual([
       [{ environmentId: ENV_MAIN, projectId: projectA.id }],
@@ -2024,6 +2057,70 @@ staticDescribe("worktree discovery integration", () => {
     expect(h.state.discoveryFocusRefreshCalls).toEqual([
       [{ environmentId: ENV_MAIN, projectId: projectA.id }],
     ]);
+  });
+
+  it("keeps a missing adopted row selectable while disabling workspace actions and exposing recovery", async () => {
+    baseScenario();
+    h.state.serverConfigs = new Map([
+      [ENV_MAIN, { environment: { capabilities: { worktreeCatalog: true } } }],
+    ]);
+    h.state.worktreeCatalogs.set(`${ENV_MAIN}:${projectA.id}`, {
+      repositoryKey: WorktreeRepositoryKey.make("repository:repo-a"),
+      generation: 43,
+      authoritative: true,
+      observedAt: "2026-08-09T12:01:00.000Z",
+      scanStatus: { _tag: "ready" },
+      worktrees: [],
+      adoptedWorkspaces: [
+        {
+          threadId: threadActive.id,
+          worktreeKey: WorktreeKey.make("worktree:missing"),
+          path: "C:/wt/x",
+          branch: "feature/x",
+          availability: "missing-registered",
+          registrationState: "prunable",
+          locked: false,
+        },
+      ],
+    });
+
+    const markup = render(<Sidebar />);
+    expect(markup).toContain("availability-warning-thread-active");
+    expect(markup).toContain("C:/wt/x");
+    const row = mustFindProps(byTestId("thread-row-thread-active"), "missing row");
+    invoke(row, "onClick", mouseEvent());
+    expect(h.spies.routerNavigate).toHaveBeenCalledWith(
+      expect.objectContaining({ to: "/$environmentId/$threadId" }),
+    );
+
+    fakeLocalApi();
+    let menuItems: Array<{ id: string; disabled?: boolean; children?: unknown[] }> = [];
+    h.spies.contextMenuShow.mockImplementation(async (items) => {
+      menuItems = items;
+      return null;
+    });
+    invoke(row, "onContextMenu", mouseEvent());
+    await flush();
+    expect(menuItems.find((item) => item.id === "update")?.disabled).toBe(true);
+    expect(menuItems.find((item) => item.id === "open-in")?.disabled).toBe(true);
+
+    const warning = captured("WorktreeAvailabilityWarning").find(
+      (entry) => (entry.props.status as { threadId: string }).threadId === threadActive.id,
+    );
+    expect(warning).toBeDefined();
+    invoke(warning!.props, "onRetry", undefined);
+    expect(h.state.commandCalls).toContainEqual({
+      label: "worktree.refresh",
+      input: { environmentId: ENV_MAIN, input: { projectId: projectA.id } },
+    });
+    invoke(warning!.props, "onRemove", undefined);
+    expect(h.spies.requestWorktreeRemoval).toHaveBeenCalledWith(
+      expect.objectContaining({
+        threadId: threadActive.id,
+        availability: "missing-registered",
+        path: "C:/wt/x",
+      }),
+    );
   });
 });
 
@@ -2394,6 +2491,27 @@ staticDescribe("thread context menu", () => {
     expect(h.spies.deleteThread).not.toHaveBeenCalled();
   });
 
+  it("opens the typed removal dialog for a worktree instead of native delete confirmation", async () => {
+    baseScenario();
+    render(<Sidebar />);
+    fakeLocalApi();
+    h.spies.contextMenuShow.mockResolvedValue("delete");
+    const row = mustFindProps(byTestId("thread-row-thread-active"), "worktree row");
+
+    invoke(row, "onContextMenu", mouseEvent());
+    await flush();
+
+    expect(h.spies.requestWorktreeRemoval).toHaveBeenCalledWith(
+      expect.objectContaining({
+        projectId: projectA.id,
+        threadId: threadActive.id,
+        path: "C:/wt/x",
+      }),
+    );
+    expect(h.spies.dialogConfirm).not.toHaveBeenCalled();
+    expect(h.spies.deleteThread).not.toHaveBeenCalled();
+  });
+
   it("shows the multi-select menu when the row is part of a selection", async () => {
     baseScenario();
     // The row's isSelected flag is read at render time, so select first.
@@ -2415,6 +2533,11 @@ staticDescribe("thread context menu", () => {
     h.spies.contextMenuShow.mockResolvedValue("delete");
     invoke(row, "onContextMenu", mouseEvent());
     await flush();
+    expect(h.spies.dialogConfirm).toHaveBeenCalledWith(
+      expect.stringContaining(
+        "1 worktree-backed thread will be removed from BiBCode only. Git worktrees and files are left untouched.",
+      ),
+    );
     expect(h.spies.deleteThread).toHaveBeenCalledTimes(2);
     expect(h.spies.removeFromSelection).toHaveBeenCalled();
   });
