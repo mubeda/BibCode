@@ -3156,10 +3156,10 @@ mod tests {
 
         let pid = tokio::time::timeout(Duration::from_secs(10), async {
             loop {
-                if let Ok(pid) = std::fs::read_to_string(&pid_path) {
-                    if let Ok(pid) = pid.trim().parse::<i32>() {
-                        break pid;
-                    }
+                if let Ok(pid) = std::fs::read_to_string(&pid_path)
+                    && let Ok(pid) = pid.trim().parse::<i32>()
+                {
+                    break pid;
                 }
                 tokio::task::yield_now().await;
             }
