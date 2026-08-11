@@ -219,12 +219,26 @@ retrying an already-running target is inert. Opening a store path and exporting
 redacted diagnostics also resolve the path inside Rust rather than accepting
 renderer-controlled paths.
 
+If a desktop-owned backend fails after its launch plan has been resolved, the
+supervisor retains that exact plan as a stopped recovery target while
+withholding its connection bootstrap. The host emits only a
+`desktop:project-data-status-changed` invalidation containing the environment
+identifier. On mount and after each invalidation, the renderer re-reads the
+Rust-owned status classification through `getProjectDataStatuses`; it never
+infers recovery from an HTTP error or trusts the event as a classification,
+path, storage identifier, or diagnostic source. This closes both startup races:
+a failure recorded before the WebView mounts and one recorded immediately
+after it subscribes.
+
 The recovery dialog opens automatically only for a recovery-required local
 desktop environment and remains available manually for a storage-identity
 change. Restore requires an explicit backup selection and confirmation.
 Start-empty has a separate confirmation which states that the prior store is
 preserved rather than deleted; after commit, adopting the replacement storage
-identity remains a distinct explicit action before connection retry. Remote
+identity remains a distinct explicit action before connection retry. Desktop
+storage adoption uses the native dialog boundary and performs no transition
+when confirmation is cancelled or unavailable; browser mode retains its
+browser-dialog fallback through the same local API. Remote
 environments cannot invoke this local privileged recovery surface. Existing
 T4Code files are neither scanned nor migrated: if they overlap a current root,
 the same current-store classifier and recovery rules apply without a

@@ -64,7 +64,12 @@ root or alias diagnostics.
    owns the selected root. Do not stop a process by deleting its files.
 2. Open **Project data recovery** from the affected local environment. The
    dialog is available only for desktop-owned native and WSL backends; remote
-   bearer/relay/SSH stores must be recovered on their owning machine.
+   bearer/relay/SSH stores must be recovered on their owning machine. When a
+   desktop backend cannot start because Rust classifies its store as
+   recovery-required, the host retains the stopped launch target and the
+   dialog opens automatically even if the failure happened before the WebView
+   mounted. The renderer re-inspects the host status; it does not infer this
+   state from a generic connection error.
 3. Compare requested root, effective root, and Storage ID with the environment
    you intended to open, and confirm whether you launched an installed
    (`userdata`) or development (`dev`) build. Use **Open data folder** only
@@ -77,6 +82,9 @@ root or alias diagnostics.
 5. Use **Start empty** only when you deliberately want a new store. The current
    database, sidecars, and marker are preserved first; they are not deleted.
    The new UUID still requires explicit client adoption before normal retry.
+   **Use this data location** is a separate adoption action and always presents
+   the desktop-native confirmation that the two locations are not merged.
+   Cancelling that confirmation leaves the accepted identity unchanged.
 
 The project list is intentionally conservative during this process. Cached
 projects remain visible through reconnect, degradation, unavailability,
