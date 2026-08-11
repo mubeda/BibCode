@@ -749,6 +749,7 @@ type ChatViewRouteProps =
 type ChatViewPanelProps = {
   variant: "panel";
   panelThreadRef: ScopedThreadRef;
+  workspaceUnavailable: string | null;
   environmentId?: never;
   threadId?: never;
   routeKind?: never;
@@ -1084,6 +1085,7 @@ const LiveCenterPanelWorkspace = memo(function LiveCenterPanelWorkspace({
             <ChatView
               variant="panel"
               panelThreadRef={scopeThreadRef(hostThreadRef.environmentId, surface.threadId)}
+              workspaceUnavailable={workspaceUnavailable}
             />
           );
         case "terminal":
@@ -1739,7 +1741,10 @@ function ChatViewContent(props: ChatViewProps) {
     environmentById.get(activeThread.environmentId)?.serverConfig?.environment.capabilities
       ?.worktreeCatalog === true;
   const activeWorktreeCatalog = useEnvironmentQuery(
-    activeThread?.worktreePath && activeProject && activeEnvironmentSupportsWorktreeCatalog
+    !isPanel &&
+      activeThread?.worktreePath &&
+      activeProject &&
+      activeEnvironmentSupportsWorktreeCatalog
       ? worktreeEnvironment.catalog({
           environmentId: activeThread.environmentId,
           input: { projectId: activeProject.id },
@@ -1752,12 +1757,18 @@ function ChatViewContent(props: ChatViewProps) {
       : (activeWorktreeCatalog.data?.adoptedWorkspaces.find(
           (workspace) => workspace.threadId === activeThread.id,
         ) ?? null);
-  const workspaceUnavailable =
-    activeAdoptedWorkspace?.availability === "missing-registered" ||
-    activeAdoptedWorkspace?.availability === "missing-unregistered" ||
-    activeAdoptedWorkspace?.availability === "removing"
+  const workspaceUnavailable = isPanel
+    ? props.workspaceUnavailable
+    : activeAdoptedWorkspace?.availability === "missing-registered" ||
+        activeAdoptedWorkspace?.availability === "missing-unregistered" ||
+        activeAdoptedWorkspace?.availability === "removing"
       ? WORKSPACE_UNAVAILABLE_REASON
       : null;
+  const workspaceUnavailableRef = useRef(workspaceUnavailable);
+  useLayoutEffect(() => {
+    workspaceUnavailableRef.current = workspaceUnavailable;
+  }, [workspaceUnavailable]);
+  const readWorkspaceUnavailable = useCallback(() => workspaceUnavailableRef.current, []);
   const consumeActivityDockEscapeClose = useCallback(() => {
     if (!activeThread) {
       return false;
@@ -3985,7 +3996,7 @@ function ChatViewContent(props: ChatViewProps) {
         !activeThreadRef ||
         !activeProject ||
         !activeThread ||
-        workspaceUnavailable
+        readWorkspaceUnavailable()
       )
         return;
       if (options?.rememberAsLastInvoked !== false) {
@@ -4039,6 +4050,7 @@ function ChatViewContent(props: ChatViewProps) {
           }
           return;
         }
+        if (readWorkspaceUnavailable()) return;
         centerPanelActions.activateSurface(activeThreadRef, focusedGroup.id, reusableTerminal.id);
         setTerminalFocusRequestId((value) => value + 1);
         targetTerminalId = reusableTerminal.terminalId;
@@ -4061,9 +4073,11 @@ function ChatViewContent(props: ChatViewProps) {
           }
           return;
         }
+        if (readWorkspaceUnavailable()) return;
         targetTerminalId = creationResult.terminalId;
       }
 
+      if (readWorkspaceUnavailable()) return;
       enqueueTerminalInput({
         environmentId,
         threadId: activeThreadId,
@@ -4093,11 +4107,11 @@ function ChatViewContent(props: ChatViewProps) {
       gitCwd,
       openCenterTerminal,
       openTerminal,
+      readWorkspaceUnavailable,
       runningTerminalIds,
       setLastInvokedScriptByProjectId,
       setThreadError,
       writeTerminal,
-      workspaceUnavailable,
     ],
   );
   const activeThreadBranch =

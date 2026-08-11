@@ -47,12 +47,15 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
         .with_unsafe_no_auth();
     fs::create_dir_all(config.state_dir()).expect("server state directory");
     let provider_cwd_fifo = state.path().join("provider-cwd.fifo");
+    let provider_shutdowns = state.path().join("provider-shutdowns.log");
+    let setup_sentinel = state.path().join("adoption-must-not-run-setup");
     let fifo = Command::new("mkfifo")
         .arg(&provider_cwd_fifo)
         .output()
         .expect("create provider cwd FIFO");
     assert!(fifo.status.success(), "mkfifo failed");
-    let provider_fixture = write_cwd_recording_codex_fixture(state.path(), &provider_cwd_fifo);
+    let provider_fixture =
+        write_cwd_recording_codex_fixture(state.path(), &provider_cwd_fifo, &provider_shutdowns);
     fs::write(
         config.state_dir().join("settings.json"),
         serde_json::to_vec(&json!({
@@ -95,6 +98,24 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
     )
     .await;
     success(&mut socket, "1").await;
+    request(
+        &mut socket,
+        "19",
+        "orchestration.dispatchCommand",
+        json!({
+            "type":"project.meta.update",
+            "commandId":"configure-observable-setup-script",
+            "projectId":"project-1",
+            "scripts":[{
+                "id":"must-not-run-on-adoption",
+                "name":"Must not run on adoption",
+                "command":format!("printf setup-ran > '{}'", setup_sentinel.to_string_lossy()),
+                "runOnWorktreeCreate":true
+            }]
+        }),
+    )
+    .await;
+    success(&mut socket, "19").await;
 
     request(
         &mut socket,
@@ -112,42 +133,20 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
         &["worktree", "add", "-b", "feature/external"],
         Some(&external),
     );
-    request(
-        &mut socket,
-        "20",
-        "vcs.refreshWorktreeCatalog",
-        json!({"projectId":"project-1"}),
-    )
-    .await;
     let discovered = timeout(Duration::from_secs(5), async {
-        let mut streamed = None;
-        let mut refreshed = None;
         loop {
-            match next(&mut socket).await {
-                ServerMessage::Chunk { request_id, values } if request_id.as_str() == "2" => {
-                    ack(&mut socket, "2").await;
-                    let snapshot = values.into_iter().next().expect("catalog stream value");
-                    if snapshot["worktrees"]
-                        .as_array()
-                        .is_some_and(|worktrees| worktrees.len() == 2)
-                    {
-                        streamed = Some(snapshot);
-                    }
-                }
-                ServerMessage::Exit {
-                    request_id,
-                    exit: RpcExit::Success { value: Some(value) },
-                } if request_id.as_str() == "20" => refreshed = Some(value),
-                other => panic!("unexpected discovery message: {other:?}"),
-            }
-            if let (Some(streamed), Some(refreshed)) = (&streamed, &refreshed) {
-                assert_eq!(streamed, refreshed);
-                break streamed.clone();
+            let snapshot = chunk(&mut socket, "2").await;
+            ack(&mut socket, "2").await;
+            if snapshot["worktrees"]
+                .as_array()
+                .is_some_and(|worktrees| worktrees.len() == 2)
+            {
+                break snapshot;
             }
         }
     })
     .await
-    .expect("subscribed discovery completes within five seconds");
+    .expect("the subscribed catalog autonomously discovers the worktree within five seconds");
     let candidate = discovered["worktrees"]
         .as_array()
         .expect("worktrees")
@@ -261,6 +260,10 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
         adopted_path.to_string_lossy(),
         "the production provider launch uses the adopted worktree cwd"
     );
+    assert!(
+        !setup_sentinel.exists(),
+        "adoption must not execute a runOnWorktreeCreate project script"
+    );
 
     request(
         &mut socket,
@@ -298,6 +301,55 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
     )
     .await;
     success(&mut socket, "6").await;
+    let mut terminal_output_socket = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("terminal output WebSocket connects")
+        .0;
+    request(
+        &mut terminal_output_socket,
+        "27",
+        "terminal.attach",
+        json!({"threadId":thread_id,"terminalId":"lifecycle-terminal"}),
+    )
+    .await;
+    let initial_terminal = chunk(&mut terminal_output_socket, "27").await;
+    ack(&mut terminal_output_socket, "27").await;
+    assert_eq!(initial_terminal["snapshot"]["status"], "running");
+    request(
+        &mut socket,
+        "30",
+        "terminal.write",
+        json!({
+            "threadId":thread_id,
+            "terminalId":"lifecycle-terminal",
+            "data":"printf 'BIBCODE_ACTUAL_CWD=%s\\n' \"$PWD\"\r"
+        }),
+    )
+    .await;
+    success(&mut socket, "30").await;
+    let terminal_cwd = timeout(Duration::from_secs(15), async {
+        loop {
+            let output = chunk(&mut terminal_output_socket, "27").await;
+            ack(&mut terminal_output_socket, "27").await;
+            if output["type"] == "output"
+                && output["data"].as_str().is_some_and(|data| {
+                    data.contains(&format!(
+                        "BIBCODE_ACTUAL_CWD={}",
+                        adopted_path.to_string_lossy()
+                    ))
+                })
+            {
+                break output;
+            }
+        }
+    })
+    .await
+    .expect("terminal process reports its actual cwd within fifteen seconds");
+    assert_eq!(terminal_cwd["type"], "output");
+    terminal_output_socket
+        .close(None)
+        .await
+        .expect("close terminal output WebSocket");
     let mut terminal_metadata_socket = connect_async(format!("ws://{}/ws", handle.local_addr()))
         .await
         .expect("terminal metadata WebSocket connects")
@@ -320,6 +372,24 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
                 && terminal["terminalId"] == "lifecycle-terminal"
                 && terminal["status"] == "running")
     );
+    assert!(
+        terminal_metadata["terminals"]
+            .as_array()
+            .expect("terminal snapshot")
+            .iter()
+            .all(|terminal| !terminal["terminalId"]
+                .as_str()
+                .is_some_and(|terminal_id| terminal_id.starts_with("setup-"))),
+        "adoption must not launch an observable setup terminal"
+    );
+    request(
+        &mut socket,
+        "7",
+        "vcs.refreshWorktreeCatalog",
+        json!({"projectId":"project-1"}),
+    )
+    .await;
+    let present_before_degraded = success(&mut socket, "7").await;
     let git_dir = main.join(".git");
     let hidden_git_dir = main.join(".git-observation-unavailable");
     fs::rename(&git_dir, &hidden_git_dir).expect("hide common Git metadata");
@@ -332,6 +402,18 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
     .await;
     let degraded = success(&mut socket, "8").await;
     assert_eq!(degraded["authoritative"], false);
+    assert_eq!(
+        degraded["worktrees"], present_before_degraded["worktrees"],
+        "degraded observation retains every authoritative descriptor exactly"
+    );
+    assert_eq!(
+        degraded["adoptedWorkspaces"], present_before_degraded["adoptedWorkspaces"],
+        "degraded observation retains every authoritative availability exactly"
+    );
+    assert!(
+        !provider_shutdowns.exists(),
+        "degraded observation must not invoke provider quiesce"
+    );
     assert!(
         repositories
             .list_activities_by_thread(thread_id.clone())
@@ -360,6 +442,38 @@ async fn adopted_external_worktree_uses_normal_rpc_paths_and_survives_the_full_l
     )
     .await;
     let missing = success(&mut socket, "9").await;
+    assert_eq!(
+        fs::read_to_string(&provider_shutdowns)
+            .expect("provider shutdown audit")
+            .lines()
+            .count(),
+        1,
+        "one authoritative loss invokes provider quiesce exactly once"
+    );
+    request(
+        &mut socket,
+        "31",
+        "vcs.refreshWorktreeCatalog",
+        json!({"projectId":"project-1"}),
+    )
+    .await;
+    let repeated_missing = success(&mut socket, "31").await;
+    assert!(
+        repeated_missing["adoptedWorkspaces"]
+            .as_array()
+            .expect("repeated missing workspaces")
+            .iter()
+            .any(|workspace| workspace["threadId"] == thread_id
+                && workspace["availability"] == "missing-registered")
+    );
+    assert_eq!(
+        fs::read_to_string(&provider_shutdowns)
+            .expect("provider shutdown audit after repeated missing observation")
+            .lines()
+            .count(),
+        1,
+        "repeated missing observations must not invoke provider quiesce again"
+    );
     let terminal_quiesced = timeout(Duration::from_secs(15), async {
         loop {
             let metadata = chunk(&mut terminal_metadata_socket, "28").await;
@@ -762,7 +876,11 @@ fn init_repository(main: &Path) {
 }
 
 #[cfg(unix)]
-fn write_cwd_recording_codex_fixture(directory: &Path, cwd_fifo: &Path) -> PathBuf {
+fn write_cwd_recording_codex_fixture(
+    directory: &Path,
+    cwd_fifo: &Path,
+    shutdown_log: &Path,
+) -> PathBuf {
     use std::os::unix::fs::PermissionsExt;
 
     let executable = directory.join("codex-cwd-fixture.sh");
@@ -772,21 +890,24 @@ if [ "$1" = "--version" ]; then
   exit 0
 fi
 cwd=$(pwd)
-printf '%s\n' "$cwd" > "__BIBCODE_CWD_FIFO__"
 while IFS= read -r line; do
   id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
   case "$line" in
     *'"method":"initialize"'*) printf '{"id":%s,"result":{"userAgent":"fixture"}}\n' "$id" ;;
-    *'"method":"thread/start"'*) printf '{"id":%s,"result":{"cwd":"%s","model":"gpt-5","thread":{"id":"%s"}}}\n' "$id" "$cwd" "$cwd" ;;
+    *'"method":"thread/start"'*) printf '%s\n' "$cwd" > "__BIBCODE_CWD_FIFO__"; printf '{"id":%s,"result":{"cwd":"%s","model":"gpt-5","thread":{"id":"%s"}}}\n' "$id" "$cwd" "$cwd" ;;
     *'"method":"mcpServerStatus/list"'*) printf '{"id":%s,"result":{"data":[],"nextCursor":null}}\n' "$id" ;;
     *'"method":"thread/goal/set"'*) printf '{"id":%s,"result":{"goal":{"status":"active"}}}\n' "$id" ;;
     *'"method":"turn/start"'*) printf '{"id":%s,"result":{"turn":{"id":"fixture-turn"}}}\n{"method":"item/started","emittedAtMs":1001,"params":{"threadId":"%s","turnId":"fixture-turn","item":{"id":"cwd-observer","type":"collabAgentToolCall","tool":"spawnAgent","status":"inProgress","senderThreadId":"%s","receiverThreadIds":["cwd-observer"],"agentsStates":{"cwd-observer":{"status":"running","message":null}}},"startedAtMs":1001}}\n' "$id" "$cwd" "$cwd" ;;
     *'"method":"turn/interrupt"'*) printf '{"id":%s,"result":{}}\n' "$id" ;;
-    *'"method":"shutdown"'*) printf '{"id":%s,"result":null}\n' "$id" ;;
+    *'"method":"shutdown"'*) printf 'shutdown\n' >> "__BIBCODE_SHUTDOWN_LOG__"; printf '{"id":%s,"result":null}\n' "$id" ;;
   esac
 done
 "#
-    .replace("__BIBCODE_CWD_FIFO__", &cwd_fifo.to_string_lossy());
+    .replace("__BIBCODE_CWD_FIFO__", &cwd_fifo.to_string_lossy())
+    .replace(
+        "__BIBCODE_SHUTDOWN_LOG__",
+        &shutdown_log.to_string_lossy(),
+    );
     fs::write(&executable, script).expect("write provider fixture");
     let mut permissions = fs::metadata(&executable)
         .expect("provider fixture metadata")

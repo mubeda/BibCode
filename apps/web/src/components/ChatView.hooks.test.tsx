@@ -877,7 +877,11 @@ function renderDraftRoute(draftId: ReturnType<typeof newDraftId>): string {
 function renderPanelRoute(): string {
   resetRenderCaptures();
   return renderToStaticMarkup(
-    <ChatView variant="panel" panelThreadRef={scopeThreadRef(environmentId, threadId)} />,
+    <ChatView
+      variant="panel"
+      panelThreadRef={scopeThreadRef(environmentId, threadId)}
+      workspaceUnavailable={null}
+    />,
   );
 }
 

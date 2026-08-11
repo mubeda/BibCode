@@ -26,7 +26,10 @@ import React, {
   type ReactNode,
   type SetStateAction,
   useCallback,
+  useEffect,
+  useLayoutEffect,
   useMemo,
+  useRef,
   useState,
 } from "react";
 
@@ -187,6 +190,25 @@ export function useProjectScriptsController({
   const [autoOpenPreview, setAutoOpenPreview] = useState(false);
   const [validationError, setValidationError] = useState<string | null>(null);
   const [deleteConfirmOpen, setDeleteConfirmOpen] = useState(false);
+  const availabilityRef = useRef({ enabled, disabledReason });
+  useLayoutEffect(() => {
+    availabilityRef.current = { enabled, disabledReason };
+  }, [disabledReason, enabled]);
+  const currentDisabledReason = useCallback(() => {
+    const availability = availabilityRef.current;
+    return availability.enabled
+      ? null
+      : (availability.disabledReason ?? "Project actions are unavailable.");
+  }, []);
+
+  useEffect(() => {
+    const reason = currentDisabledReason();
+    if (reason === null) return;
+    setDialogOpen(false);
+    setIconPickerOpen(false);
+    setDeleteConfirmOpen(false);
+    setValidationError(reason);
+  }, [currentDisabledReason, disabledReason, enabled]);
 
   const primaryScript = useMemo(() => {
     if (preferredScriptId) {
@@ -210,6 +232,11 @@ export function useProjectScriptsController({
   const submitScript = useCallback(
     async (event: FormEvent) => {
       event.preventDefault();
+      const unavailableReason = currentDisabledReason();
+      if (unavailableReason !== null) {
+        setValidationError(unavailableReason);
+        return;
+      }
       const trimmedName = name.trim();
       const trimmedCommand = command.trim();
       if (trimmedName.length === 0) {
@@ -252,6 +279,11 @@ export function useProjectScriptsController({
       const result = editingScriptId
         ? await onUpdateScript(editingScriptId, payload)
         : await onAddScript(payload);
+      const lateUnavailableReason = currentDisabledReason();
+      if (lateUnavailableReason !== null) {
+        setValidationError(lateUnavailableReason);
+        return;
+      }
       if (result._tag === "Failure") {
         if (!isAtomCommandInterrupted(result)) {
           const error = squashAtomCommandFailure(result);
@@ -265,6 +297,7 @@ export function useProjectScriptsController({
     [
       autoOpenPreview,
       command,
+      currentDisabledReason,
       editingScriptId,
       icon,
       keybinding,
@@ -278,7 +311,7 @@ export function useProjectScriptsController({
   );
 
   const openAddDialog = useCallback(() => {
-    if (!enabled) return;
+    if (currentDisabledReason() !== null) return;
     setEditingScriptId(null);
     setName("");
     setCommand("");
@@ -290,11 +323,11 @@ export function useProjectScriptsController({
     setAutoOpenPreview(false);
     setValidationError(null);
     setDialogOpen(true);
-  }, [enabled]);
+  }, [currentDisabledReason]);
 
   const openEditDialog = useCallback(
     (script: ProjectScript) => {
-      if (!enabled) return;
+      if (currentDisabledReason() !== null) return;
       setEditingScriptId(script.id);
       setName(script.name);
       setCommand(script.command);
@@ -309,22 +342,27 @@ export function useProjectScriptsController({
       setValidationError(null);
       setDialogOpen(true);
     },
-    [enabled, keybindings],
+    [currentDisabledReason, keybindings],
   );
 
   const runScript = useCallback(
     (script: ProjectScript) => {
-      if (enabled) onRunScript(script);
+      if (currentDisabledReason() === null) onRunScript(script);
     },
-    [enabled, onRunScript],
+    [currentDisabledReason, onRunScript],
   );
 
   const confirmDeleteScript = useCallback(() => {
     if (!editingScriptId) return;
     setDeleteConfirmOpen(false);
     setDialogOpen(false);
+    const unavailableReason = currentDisabledReason();
+    if (unavailableReason !== null) {
+      setValidationError(unavailableReason);
+      return;
+    }
     void onDeleteScript(editingScriptId);
-  }, [editingScriptId, onDeleteScript]);
+  }, [currentDisabledReason, editingScriptId, onDeleteScript]);
 
   const controller: ProjectScriptsControllerState = {
     scripts,
