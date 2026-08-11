@@ -1090,6 +1090,9 @@ fn workspace_admission_error(error: WorkspaceAdmissionError) -> Value {
         WorkspaceAdmissionError::Unavailable(error) => {
             serde_json::to_value(error).expect("workspace unavailable error serializes")
         }
+        WorkspaceAdmissionError::Identity(error) => {
+            serde_json::to_value(error).expect("workspace identity error serializes")
+        }
         WorkspaceAdmissionError::Resolution(error) => {
             orchestration_error("OrchestrationDispatchCommandError", error)
         }
@@ -2747,7 +2750,12 @@ mod tests {
             path: state.path().to_path_buf(),
             availability: AdoptedWorktreeAvailability::MissingRegistered,
         };
-        assert!(availability.mark_unavailable(loss.clone()).await);
+        assert!(
+            availability
+                .mark_unavailable(loss.clone())
+                .await
+                .expect("physical identity resolves")
+        );
         pause.release();
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -2799,7 +2807,8 @@ mod tests {
 
         availability
             .clear_recovered_in_repository(&thread_id, state.path(), "loss-repository")
-            .await;
+            .await
+            .expect("physical identity resolves");
         for (suffix, generation, source_plan) in [
             ("accepted", 2_u64, None),
             ("rejected", 3_u64, Some("missing-forced-order-plan")),
@@ -2866,6 +2875,7 @@ mod tests {
                     .await
                     .expect("forced-order loss completes")
                     .expect("forced-order loss joins")
+                    .expect("physical identity resolves")
             );
             assert_eq!(
                 error[0]["error"]["_tag"], "WorkspaceUnavailableError",
@@ -2888,7 +2898,8 @@ mod tests {
             );
             availability
                 .clear_recovered_in_repository(&thread_id, state.path(), "loss-repository")
-                .await;
+                .await
+                .expect("physical identity resolves");
         }
         let commit_wins_pause = hooks.pause_after_next_command_finalization();
         socket
@@ -2950,6 +2961,7 @@ mod tests {
                 .await
                 .expect("loss completes after commit")
                 .expect("loss task joins")
+                .expect("physical identity resolves")
         );
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -2978,7 +2990,8 @@ mod tests {
 
         availability
             .clear_recovered_in_repository(&thread_id, state.path(), "loss-repository")
-            .await;
+            .await
+            .expect("physical identity resolves");
         let rejected_loss_wins_pause = hooks.pause_before_next_command_finalization();
         socket
             .send(Message::Text(
@@ -3023,7 +3036,12 @@ mod tests {
             path: state.path().to_path_buf(),
             availability: AdoptedWorktreeAvailability::MissingRegistered,
         };
-        assert!(availability.mark_unavailable(rejected_loss.clone()).await);
+        assert!(
+            availability
+                .mark_unavailable(rejected_loss.clone())
+                .await
+                .expect("physical identity resolves")
+        );
         rejected_loss_wins_pause.release();
         tokio::time::timeout(
             std::time::Duration::from_secs(5),
@@ -3043,7 +3061,8 @@ mod tests {
 
         availability
             .clear_recovered_in_repository(&thread_id, state.path(), "loss-repository")
-            .await;
+            .await
+            .expect("physical identity resolves");
         let rejected_commit_wins_pause = hooks.pause_after_next_command_finalization();
         socket
             .send(Message::Text(
@@ -3112,6 +3131,7 @@ mod tests {
                 .await
                 .expect("rejected loss completes after commit")
                 .expect("rejected loss task joins")
+                .expect("physical identity resolves")
         );
         tokio::time::timeout(
             std::time::Duration::from_secs(5),

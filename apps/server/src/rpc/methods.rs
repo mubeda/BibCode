@@ -102,7 +102,6 @@ pub const ACTIVE_RPC_METHODS: &[RpcMethodSpec] = &[
     unary("terminal.write"),
     unary("vcs.clone"),
     unary("vcs.createRef"),
-    unary("vcs.createWorktree"),
     unary("vcs.discardFiles"),
     unary("vcs.generateCommitMessage"),
     unary("vcs.init"),

@@ -7,9 +7,10 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "EnvironmentAuthorizationError",
-          "message": "\" J",
-          "requiredScope": "relay:write"
+          "_tag": "WorkspaceIdentityError",
+          "reason": "workspace-identity-unavailable",
+          "message": "\" J$",
+          "path": "(yf`._N_|:c4"
         }
       }
     ]

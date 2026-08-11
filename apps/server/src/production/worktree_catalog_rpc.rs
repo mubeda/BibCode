@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
-    sync::{Mutex, oneshot, watch},
+    sync::{Mutex, Semaphore, TryAcquireError, oneshot, watch},
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
@@ -28,7 +28,7 @@ use crate::{
         canonical_command_digest,
         engine::{CommandAdmissionClaim, OptionalNullable, WorkspaceOwnershipLease},
     },
-    persistence::{CommandReceipt, Repositories},
+    persistence::CommandReceipt,
     rpc::{RpcRegistry, RpcRequest, RpcResult, RpcStreamChunk},
     worktree_catalog::{
         AdoptionValidationError, AdoptionValidationErrorReason, CatalogError, CatalogErrorReason,
@@ -38,9 +38,8 @@ use crate::{
     },
 };
 
-use super::git_vcs::{CatalogMutationFuture, CatalogMutationObserver};
-
 const MAX_BASELINE_PATHS: usize = 512;
+const PRODUCTION_MAX_IN_FLIGHT_WORKTREE_OPERATIONS: usize = 64;
 
 pub type WorktreeRemovalQuiesceFuture =
     Pin<Box<dyn Future<Output = WorktreeRemovalQuiesceLease> + Send + 'static>>;
@@ -324,6 +323,7 @@ pub struct WorktreeCatalogRpcServices {
 #[derive(Clone)]
 pub struct WorktreeCatalogOperationRuntime {
     state: Arc<Mutex<WorktreeCatalogOperationState>>,
+    admission: Arc<Semaphore>,
 }
 
 struct WorktreeCatalogOperationState {
@@ -338,21 +338,29 @@ impl WorktreeCatalogOperationRuntime {
                 accepting: true,
                 tasks: Vec::new(),
             })),
+            admission: Arc::new(Semaphore::new(PRODUCTION_MAX_IN_FLIGHT_WORKTREE_OPERATIONS)),
         }
     }
 
     async fn run(&self, operation: impl Future<Output = RpcResult> + Send + 'static) -> RpcResult {
+        let operation_permit = match self.admission.clone().try_acquire_owned() {
+            Ok(permit) => permit,
+            Err(TryAcquireError::NoPermits) => {
+                return Err(encode(WorktreeOperationError::capacity()));
+            }
+            Err(TryAcquireError::Closed) => {
+                return Err(encode(WorktreeOperationError::shutting_down()));
+            }
+        };
         let (result_sender, result_receiver) = oneshot::channel();
         {
             let mut state = self.state.lock().await;
             if !state.accepting {
-                return Err(encode(CatalogError::new(
-                    CatalogErrorReason::Internal,
-                    "The worktree operation runtime is shutting down.",
-                )));
+                return Err(encode(WorktreeOperationError::shutting_down()));
             }
             state.tasks.retain(|task| !task.is_finished());
             state.tasks.push(tokio::spawn(async move {
+                let _operation_permit = operation_permit;
                 let _ = result_sender.send(operation.await);
             }));
         }
@@ -368,10 +376,46 @@ impl WorktreeCatalogOperationRuntime {
         let tasks = {
             let mut state = self.state.lock().await;
             state.accepting = false;
+            self.admission.close();
             std::mem::take(&mut state.tasks)
         };
         for task in tasks {
             let _ = task.await;
+        }
+    }
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct WorktreeOperationError {
+    #[serde(rename = "_tag")]
+    tag: &'static str,
+    reason: WorktreeOperationErrorReason,
+    message: String,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "kebab-case")]
+enum WorktreeOperationErrorReason {
+    OperationCapacity,
+    OperationShuttingDown,
+}
+
+impl WorktreeOperationError {
+    fn capacity() -> Self {
+        Self {
+            tag: "WorktreeOperationError",
+            reason: WorktreeOperationErrorReason::OperationCapacity,
+            message: "The server is already processing the maximum number of worktree operations."
+                .to_owned(),
+        }
+    }
+
+    fn shutting_down() -> Self {
+        Self {
+            tag: "WorktreeOperationError",
+            reason: WorktreeOperationErrorReason::OperationShuttingDown,
+            message: "The worktree operation runtime is shutting down.".to_owned(),
         }
     }
 }
@@ -516,139 +560,6 @@ fn branch_reconciliation_command_id(
         "worktree-branch-reconcile:{thread_id}:{}",
         sha256_hex(identity)
     )
-}
-
-#[derive(Clone)]
-pub struct WorktreeCatalogMutationObserver {
-    catalog: WorktreeCatalogService,
-    repositories: Repositories,
-    repository: Arc<GitRepository>,
-}
-
-impl WorktreeCatalogMutationObserver {
-    #[must_use]
-    pub fn new(
-        catalog: WorktreeCatalogService,
-        repositories: Repositories,
-        repository: Arc<GitRepository>,
-    ) -> Self {
-        Self {
-            catalog,
-            repositories,
-            repository,
-        }
-    }
-
-    async fn project_ids_for_mutation(
-        &self,
-        cwd: &Path,
-        target: &Path,
-    ) -> Result<Vec<String>, String> {
-        let cancellation = CancellationToken::new();
-        let inventory = self
-            .repository
-            .worktree_inventory(cwd, &cancellation)
-            .await
-            .map_err(|error| error.to_string())?;
-        let common_dir = tokio::fs::canonicalize(&inventory.common_dir)
-            .await
-            .map_err(|error| {
-                format!(
-                    "failed to canonicalize verified Git common directory {}: {error}",
-                    inventory.common_dir.display()
-                )
-            })?;
-        let repository_key = worktree_repository_key(&common_dir, host_path_platform())
-            .as_str()
-            .to_owned();
-        let mut verified_paths = HashSet::new();
-        for record in inventory.records {
-            verified_paths.insert(normalized_existing_path(&record.path).await);
-        }
-        let mutation_paths = HashSet::from([
-            normalized_existing_path(cwd).await,
-            normalized_existing_path(target).await,
-        ]);
-        let projects = self
-            .repositories
-            .list_projects()
-            .await
-            .map_err(|error| error.to_string())?;
-        let mut project_ids = Vec::new();
-        for project in projects {
-            if project.deleted_at.is_some() {
-                continue;
-            }
-            match project.worktree_repository_key.as_deref() {
-                Some(pinned) if pinned == repository_key => {
-                    project_ids.push(project.project_id);
-                    continue;
-                }
-                Some(_) => continue,
-                None => {}
-            }
-            let Some(projection) = self
-                .repositories
-                .load_worktree_catalog_projection(project.project_id.clone(), 512)
-                .await
-                .map_err(|error| error.to_string())?
-            else {
-                continue;
-            };
-            if projection.truncated {
-                return Err(format!(
-                    "project '{}' has too many canonical worktree paths to associate safely",
-                    project.project_id
-                ));
-            }
-            let persisted_paths = std::iter::once(PathBuf::from(project.workspace_root))
-                .chain(
-                    projection
-                        .threads
-                        .into_iter()
-                        .filter(|thread| thread.kind != "panel" && thread.deleted_at.is_none())
-                        .filter_map(|thread| thread.worktree_path.map(PathBuf::from)),
-                )
-                .collect::<Vec<_>>();
-            let mut associated = false;
-            for path in persisted_paths {
-                let path = normalized_existing_path(&path).await;
-                if verified_paths.contains(&path) || mutation_paths.contains(&path) {
-                    associated = true;
-                    break;
-                }
-            }
-            if associated {
-                project_ids.push(project.project_id);
-            }
-        }
-        project_ids.sort();
-        project_ids.dedup();
-        Ok(project_ids)
-    }
-}
-
-impl CatalogMutationObserver for WorktreeCatalogMutationObserver {
-    fn note_managed_creation<'a>(
-        &'a self,
-        cwd: &'a Path,
-        path: &'a Path,
-    ) -> CatalogMutationFuture<'a> {
-        Box::pin(async move {
-            for project_id in self.project_ids_for_mutation(cwd, path).await? {
-                self.catalog.note_managed_creation(&project_id, path).await;
-                self.catalog.invalidate_after_mutation(&project_id).await;
-            }
-            Ok(())
-        })
-    }
-}
-
-async fn normalized_existing_path(path: &Path) -> String {
-    let canonical = tokio::fs::canonicalize(path)
-        .await
-        .unwrap_or_else(|_| path.to_path_buf());
-    normalize_worktree_path_key(&canonical, host_path_platform())
 }
 
 async fn acquire_worktree_command_claim(
@@ -1055,7 +966,6 @@ async fn create_managed_worktree_locked(
             None,
         ))
     })?;
-    let created_branch = input.new_ref_name.clone();
     let created = repository
         .create_worktree(
             CreateWorktreeInput {
@@ -1069,7 +979,13 @@ async fn create_managed_worktree_locked(
         )
         .await
         .map_err(encode)?;
-    let created_path = PathBuf::from(&created.worktree.path);
+    let rollback = created.rollback.clone().ok_or_else(|| {
+        encode(adoption_error(
+            WorktreeAdoptionErrorReason::Internal,
+            "Managed worktree creation completed without exact rollback ownership.",
+            None,
+        ))
+    })?;
     let terminal_cancellation = CancellationToken::new();
     let dispatch = services
         .orchestration
@@ -1098,11 +1014,7 @@ async fn create_managed_worktree_locked(
         .await;
     if let Err(error) = dispatch {
         let rollback = repository
-            .rollback_managed_worktree_creation(
-                Path::new(&project.workspace_root),
-                &created_path,
-                created_branch.as_deref(),
-            )
+            .rollback_managed_worktree_creation(Path::new(&project.workspace_root), &rollback)
             .await;
         let detail = match rollback {
             Ok(()) => error.to_string(),
@@ -1119,7 +1031,7 @@ async fn create_managed_worktree_locked(
     }
     services
         .catalog
-        .note_managed_creation(&input.project_id, &created_path)
+        .note_managed_creation(&input.project_id, &rollback.created_path)
         .await;
     services
         .catalog
@@ -1605,7 +1517,8 @@ async fn remove_from_bibcode_owned(
             let registry = services.catalog.availability_registry();
             let guard = registry
                 .mark_removing(&input.thread_id, &resolved.path)
-                .await;
+                .await
+                .map_err(encode)?;
             let quiesce = services
                 .removal_quiescer
                 .quiesce(
@@ -1636,7 +1549,8 @@ async fn remove_from_bibcode_owned(
             quiesce.commit_detached();
             registry
                 .clear_recovered(&input.thread_id, &resolved.path)
-                .await;
+                .await
+                .map_err(encode)?;
             drop(guard);
             services
                 .catalog
@@ -1716,7 +1630,8 @@ async fn remove_worktree_owned(
             let registry = services.catalog.availability_registry();
             let guard = registry
                 .mark_removing(&input.thread_id, &resolved.path)
-                .await;
+                .await
+                .map_err(encode)?;
             let mut plan = build_removal_plan(
                 services,
                 &input.project_id,
@@ -1830,7 +1745,8 @@ async fn remove_worktree_owned(
             quiesce.commit_detached();
             registry
                 .clear_recovered(&input.thread_id, &resolved.path)
-                .await;
+                .await
+                .map_err(encode)?;
             drop(guard);
             if matches!(git_outcome, "removed" | "cleaned") {
                 services
@@ -3071,4 +2987,121 @@ fn now_iso() -> String {
     OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .unwrap_or_else(|_| OffsetDateTime::now_utc().unix_timestamp().to_string())
+}
+
+#[cfg(test)]
+mod operation_runtime_tests {
+    use std::sync::Arc;
+
+    use serde_json::json;
+    use tokio::sync::{Notify, Semaphore};
+
+    use super::WorktreeCatalogOperationRuntime;
+
+    const EXPECTED_MAX_IN_FLIGHT_WORKTREE_OPERATIONS: usize = 64;
+
+    #[tokio::test]
+    async fn post_handoff_operations_retain_finite_admission_after_waiters_disconnect() {
+        let runtime = WorktreeCatalogOperationRuntime::new();
+        let entered = Arc::new(Semaphore::new(0));
+        let completed = Arc::new(Semaphore::new(0));
+        let release = Arc::new(Semaphore::new(0));
+        let mut callers = Vec::new();
+
+        for _ in 0..EXPECTED_MAX_IN_FLIGHT_WORKTREE_OPERATIONS {
+            let runtime = runtime.clone();
+            let entered = entered.clone();
+            let completed = completed.clone();
+            let release = release.clone();
+            callers.push(tokio::spawn(async move {
+                runtime
+                    .run(async move {
+                        entered.add_permits(1);
+                        let _permit = release.acquire().await.expect("release remains open");
+                        completed.add_permits(1);
+                        Ok(json!({ "completed": true }))
+                    })
+                    .await
+            }));
+        }
+
+        entered
+            .acquire_many(EXPECTED_MAX_IN_FLIGHT_WORKTREE_OPERATIONS as u32)
+            .await
+            .expect("every admitted operation enters")
+            .forget();
+        for caller in callers {
+            caller.abort();
+        }
+
+        let saturated = runtime
+            .run(async { Ok(json!({ "mustNotRun": true })) })
+            .await
+            .expect_err("a full runtime rejects without adding an unbounded waiter");
+        assert_eq!(saturated["_tag"], "WorktreeOperationError");
+        assert_eq!(saturated["reason"], "operation-capacity");
+
+        release.add_permits(EXPECTED_MAX_IN_FLIGHT_WORKTREE_OPERATIONS);
+        completed
+            .acquire_many(EXPECTED_MAX_IN_FLIGHT_WORKTREE_OPERATIONS as u32)
+            .await
+            .expect("every admitted operation completes")
+            .forget();
+        assert_eq!(
+            runtime
+                .run(async { Ok(json!({ "admittedAfterCompletion": true })) })
+                .await
+                .expect("completion releases the owned operation permit"),
+            json!({ "admittedAfterCompletion": true })
+        );
+        runtime.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn shutdown_closes_admission_and_drains_the_owned_operation_permit() {
+        let runtime = WorktreeCatalogOperationRuntime::new();
+        let entered = Arc::new(Notify::new());
+        let release = Arc::new(Semaphore::new(0));
+        let operation_runtime = runtime.clone();
+        let operation_entered = entered.clone();
+        let operation_release = release.clone();
+        let waiter = tokio::spawn(async move {
+            operation_runtime
+                .run(async move {
+                    operation_entered.notify_one();
+                    let _permit = operation_release
+                        .acquire()
+                        .await
+                        .expect("release remains open");
+                    Ok(json!({ "completed": true }))
+                })
+                .await
+        });
+        entered.notified().await;
+
+        let shutdown_runtime = runtime.clone();
+        let shutdown = tokio::spawn(async move { shutdown_runtime.shutdown().await });
+        tokio::task::yield_now().await;
+        assert!(
+            !shutdown.is_finished(),
+            "shutdown drains admitted operation owners"
+        );
+
+        release.add_permits(1);
+        assert_eq!(
+            waiter
+                .await
+                .expect("waiter joins")
+                .expect("operation succeeds"),
+            json!({ "completed": true })
+        );
+        shutdown.await.expect("shutdown joins");
+
+        let closed = runtime
+            .run(async { Ok(json!({ "mustNotRun": true })) })
+            .await
+            .expect_err("shutdown rejects new operation ownership");
+        assert_eq!(closed["_tag"], "WorktreeOperationError");
+        assert_eq!(closed["reason"], "operation-shutting-down");
+    }
 }

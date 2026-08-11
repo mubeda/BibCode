@@ -168,6 +168,7 @@ vi.mock("../state/vcs", () => ({
 vi.mock("../state/worktrees", () => ({
   worktreeEnvironment: {
     catalog: () => ({ key: "worktree.catalog" }),
+    createManaged: { key: "worktree.createManaged" },
     createPanel: { key: "worktree.createPanel" },
   },
 }));

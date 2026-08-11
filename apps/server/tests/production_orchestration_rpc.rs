@@ -167,6 +167,7 @@ async fn workspace_unavailable_rejects_turn_and_generic_owner_delete_without_ret
                 availability: AdoptedWorktreeAvailability::MissingRegistered,
             })
             .await
+            .expect("physical identity resolves")
     );
     let mut registry = RpcRegistry::empty();
     register_orchestration_rpc_with_availability(
@@ -324,6 +325,7 @@ async fn workspace_unavailable_resolves_a_persisted_panel_path_before_turn_admis
                 availability: AdoptedWorktreeAvailability::MissingRegistered,
             })
             .await
+            .expect("physical identity resolves")
     );
     let mut registry = RpcRegistry::empty();
     register_orchestration_rpc_with_availability(&mut registry, engine.clone(), availability);

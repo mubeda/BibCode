@@ -153,6 +153,7 @@ async fn workspace_unavailable_rejects_terminal_starts_and_write_but_allows_clos
                 availability: AdoptedWorktreeAvailability::MissingRegistered,
             })
             .await
+            .expect("physical identity resolves")
     );
     let services = fixture_services().with_availability_registry(registry);
     let mut rpc = RpcRegistry::empty();
@@ -286,6 +287,7 @@ async fn workspace_unavailable_quiesce_retains_transcript_for_read_only_attach()
                 availability: AdoptedWorktreeAvailability::MissingRegistered,
             })
             .await
+            .expect("physical identity resolves")
     );
     quiescer
         .quiesce_thread_terminals_for_workspace_loss("thread-history")
@@ -373,7 +375,12 @@ async fn workspace_loss_fences_inflight_terminal_spawn_before_publication() {
         path: temp.path().to_path_buf(),
         availability: AdoptedWorktreeAvailability::MissingRegistered,
     };
-    assert!(availability.mark_unavailable(loss.clone()).await);
+    assert!(
+        availability
+            .mark_unavailable(loss.clone())
+            .await
+            .expect("physical identity resolves")
+    );
     let cleanup_services = quiescer.clone();
     let cleanup = tokio::spawn(async move {
         cleanup_services

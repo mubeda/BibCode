@@ -57,8 +57,8 @@ use crate::{
         turn_delivery::TurnDeliveryService,
         workspace_preview::{WorkspacePreviewRpcServices, register_workspace_preview_rpc},
         worktree_catalog_rpc::{
-            WorktreeCatalogMutationObserver, WorktreeCatalogOperationRuntime,
-            WorktreeCatalogRpcServices, register_worktree_catalog_rpc,
+            WorktreeCatalogOperationRuntime, WorktreeCatalogRpcServices,
+            register_worktree_catalog_rpc,
         },
         worktree_runtime::WorktreeRuntime,
     },
@@ -240,11 +240,6 @@ impl ProductionRuntime {
             git_repository.clone(),
             control.automatic_git_fetch_interval_signal(),
         )
-        .with_catalog_mutation_observer(Arc::new(WorktreeCatalogMutationObserver::new(
-            worktree_catalog.clone(),
-            repositories.clone(),
-            git_repository.clone(),
-        )))
         .with_availability_registry(workspace_availability.clone());
         let workspace = WorkspaceRpc::with_dependencies(
             WorkspaceService::default(),

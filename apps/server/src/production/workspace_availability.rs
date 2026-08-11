@@ -3,7 +3,8 @@ use std::path::{Path, PathBuf};
 use crate::{
     persistence::Repositories,
     worktree_catalog::{
-        WorkspaceAdmissionLease, WorkspaceAvailabilityRegistry, WorkspaceUnavailable,
+        WorkspaceAdmissionError as RegistryWorkspaceAdmissionError, WorkspaceAdmissionLease,
+        WorkspaceAvailabilityRegistry, WorkspaceIdentityError, WorkspaceUnavailable,
     },
 };
 
@@ -15,7 +16,17 @@ pub(crate) struct WorkspaceAdmissionController {
 
 pub(crate) enum WorkspaceAdmissionError {
     Unavailable(WorkspaceUnavailable),
+    Identity(WorkspaceIdentityError),
     Resolution(String),
+}
+
+impl From<RegistryWorkspaceAdmissionError> for WorkspaceAdmissionError {
+    fn from(error: RegistryWorkspaceAdmissionError) -> Self {
+        match error {
+            RegistryWorkspaceAdmissionError::Unavailable(error) => Self::Unavailable(error),
+            RegistryWorkspaceAdmissionError::Identity(error) => Self::Identity(error),
+        }
+    }
 }
 
 impl WorkspaceAdmissionController {
@@ -50,7 +61,7 @@ impl WorkspaceAdmissionController {
         self.registry
             .acquire_admission(thread_id, paths.iter().map(PathBuf::as_path))
             .await
-            .map_err(WorkspaceAdmissionError::Unavailable)
+            .map_err(WorkspaceAdmissionError::from)
     }
 }
 

@@ -19,10 +19,10 @@ use super::worktree::{WorktreePruneDryRunRecord, parse_worktree_prune_dry_run};
 use super::{
     ChangeRequest, CreateWorktreeInput, GitCommandDiagnostics, GitCommandError,
     GitPrunableWorktree, GitWorktreeInventory, GitWorktreeRecord, GitWorktreeRemovalInspection,
-    OutputPolicy, ProcessError, ProcessOutput, ProcessRequest, ProcessRunner, ProviderKind,
-    PullStatus, SourceControlProviderInfo, VcsCommit, VcsCreateWorktreeResult,
-    VcsListCommitsResult, VcsListRefsResult, VcsPullResult, VcsRef, VcsStagingArea,
-    VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusResult, VcsWorkingTree,
+    ManagedWorktreeRollback, OutputPolicy, ProcessError, ProcessOutput, ProcessRequest,
+    ProcessRunner, ProviderKind, PullStatus, SourceControlProviderInfo, VcsCommit,
+    VcsCreateWorktreeResult, VcsListCommitsResult, VcsListRefsResult, VcsPullResult, VcsRef,
+    VcsStagingArea, VcsStatusLocalResult, VcsStatusRemoteResult, VcsStatusResult, VcsWorkingTree,
     VcsWorkingTreeFile, VcsWorkingTreeFileStatus, VcsWorktree, canonical_worktree_path_key,
     git_worktree_prune_impact_digest, host_path_platform, normalize_worktree_path_key,
     parse_numstat, parse_porcelain_v2_line, parse_worktree_porcelain,
@@ -1441,6 +1441,10 @@ impl GitRepository {
                 path: path_string,
                 ref_name: target_ref.to_owned(),
             },
+            rollback: Some(ManagedWorktreeRollback {
+                created_path: canonical_path,
+                created_branch: input.new_ref_name.filter(|_| !new_ref_existed),
+            }),
         })
     }
 
@@ -1463,6 +1467,7 @@ impl GitRepository {
                     path: path.clone(),
                     ref_name: target_ref.to_owned(),
                 },
+                rollback: None,
             });
         }
         self.create_worktree(input, cancellation).await
@@ -1525,8 +1530,12 @@ impl GitRepository {
                     return Ok(VcsCreateWorktreeResult {
                         worktree: VcsWorktree {
                             path: display_path(&canonical_path),
-                            ref_name: candidate,
+                            ref_name: candidate.clone(),
                         },
+                        rollback: Some(ManagedWorktreeRollback {
+                            created_path: canonical_path,
+                            created_branch: Some(candidate),
+                        }),
                     });
                 }
                 Err(error) => {
@@ -1686,11 +1695,10 @@ impl GitRepository {
     pub(crate) async fn rollback_managed_worktree_creation(
         &self,
         cwd: &Path,
-        created_path: &Path,
-        created_branch: Option<&str>,
+        rollback: &ManagedWorktreeRollback,
     ) -> Result<(), GitCommandError> {
         let cancellation = CancellationToken::new();
-        let created_key = canonical_worktree_path_key(created_path)
+        let created_key = canonical_worktree_path_key(&rollback.created_path)
             .await
             .map_err(|error| {
                 simple_error(
@@ -1732,7 +1740,7 @@ impl GitRepository {
         }
         self.remove_worktree_verified(cwd, &record, true, &cancellation)
             .await?;
-        if let Some(branch) = created_branch {
+        if let Some(branch) = rollback.created_branch.as_deref() {
             self.rollback_created_branch(cwd, branch).await?;
         }
         Ok(())

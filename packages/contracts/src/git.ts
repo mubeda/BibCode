@@ -1,5 +1,5 @@
 import * as Schema from "effect/Schema";
-import { NonNegativeInt, PositiveInt, ThreadId, TrimmedNonEmptyString } from "./baseSchemas.ts";
+import { NonNegativeInt, PositiveInt, TrimmedNonEmptyString } from "./baseSchemas.ts";
 import { SourceControlProviderError, SourceControlProviderInfo } from "./sourceControl.ts";
 import { VcsDriverKind } from "./vcs.ts";
 
@@ -56,7 +56,7 @@ export const VcsWorkingTreeFileStatus = Schema.Literals([
 export type VcsWorkingTreeFileStatus = typeof VcsWorkingTreeFileStatus.Type;
 export const VcsStagingArea = Schema.Literals(["staged", "unstaged", "untracked"]);
 export type VcsStagingArea = typeof VcsStagingArea.Type;
-const GitPreparePullRequestThreadMode = Schema.Literals(["local", "worktree"]);
+const GitPreparePullRequestThreadMode = Schema.Literal("local");
 export const GitRunStackedActionToastRunAction = Schema.Struct({
   kind: GitStackedAction,
 });
@@ -94,10 +94,6 @@ export const VcsRef = Schema.Struct({
 });
 export type VcsRef = typeof VcsRef.Type;
 
-const VcsWorktree = Schema.Struct({
-  path: TrimmedNonEmptyStringSchema,
-  refName: TrimmedNonEmptyStringSchema,
-});
 const GitResolvedPullRequest = Schema.Struct({
   number: PositiveInt,
   title: TrimmedNonEmptyStringSchema,
@@ -157,15 +153,6 @@ export const VcsListRefsInput = Schema.Struct({
 });
 export type VcsListRefsInput = typeof VcsListRefsInput.Type;
 
-export const VcsCreateWorktreeInput = Schema.Struct({
-  cwd: TrimmedNonEmptyStringSchema,
-  refName: TrimmedNonEmptyStringSchema,
-  newRefName: Schema.optional(Schema.NullOr(TrimmedNonEmptyStringSchema)),
-  baseRefName: Schema.optional(Schema.NullOr(TrimmedNonEmptyStringSchema)),
-  path: Schema.NullOr(TrimmedNonEmptyStringSchema),
-});
-export type VcsCreateWorktreeInput = typeof VcsCreateWorktreeInput.Type;
-
 export const GitCloneInput = Schema.Struct({
   url: TrimmedNonEmptyStringSchema,
   parentDir: TrimmedNonEmptyStringSchema,
@@ -183,8 +170,7 @@ export const GitPreparePullRequestThreadInput = Schema.Struct({
   cwd: TrimmedNonEmptyStringSchema,
   reference: GitPullRequestReference,
   mode: GitPreparePullRequestThreadMode,
-  threadId: Schema.optional(ThreadId),
-});
+}).annotate({ parseOptions: { onExcessProperty: "error" } });
 export type GitPreparePullRequestThreadInput = typeof GitPreparePullRequestThreadInput.Type;
 
 export const VcsCreateRefInput = Schema.Struct({
@@ -297,11 +283,6 @@ export const VcsListRefsResult = Schema.Struct({
 });
 export type VcsListRefsResult = typeof VcsListRefsResult.Type;
 
-export const VcsCreateWorktreeResult = Schema.Struct({
-  worktree: VcsWorktree,
-});
-export type VcsCreateWorktreeResult = typeof VcsCreateWorktreeResult.Type;
-
 export const GitCloneResult = Schema.Struct({
   path: TrimmedNonEmptyStringSchema,
 });
@@ -315,7 +296,6 @@ export type GitResolvePullRequestResult = typeof GitResolvePullRequestResult.Typ
 export const GitPreparePullRequestThreadResult = Schema.Struct({
   pullRequest: GitResolvedPullRequest,
   branch: TrimmedNonEmptyStringSchema,
-  worktreePath: TrimmedNonEmptyStringSchema.pipe(Schema.NullOr),
 });
 export type GitPreparePullRequestThreadResult = typeof GitPreparePullRequestThreadResult.Type;
 

@@ -81,7 +81,6 @@ pub(crate) fn required_scope(method: &str) -> Option<&'static str> {
         | "sourceControl.publishRepository"
         | "vcs.clone"
         | "vcs.createRef"
-        | "vcs.createWorktree"
         | "vcs.discardFiles"
         | "vcs.generateCommitMessage"
         | "vcs.init"

@@ -234,6 +234,20 @@ export class WorktreeCatalogError extends Schema.TaggedErrorClass<WorktreeCatalo
   },
 ) {}
 
+export const WorktreeOperationErrorReason = Schema.Literals([
+  "operation-capacity",
+  "operation-shutting-down",
+]);
+export type WorktreeOperationErrorReason = typeof WorktreeOperationErrorReason.Type;
+
+export class WorktreeOperationError extends Schema.TaggedErrorClass<WorktreeOperationError>()(
+  "WorktreeOperationError",
+  {
+    reason: WorktreeOperationErrorReason,
+    message: WorktreeMessage,
+  },
+) {}
+
 export const WorktreeAdoptionErrorReason = Schema.Literals([
   "project-not-found",
   "environment-unsupported",
@@ -298,5 +312,17 @@ export class WorkspaceUnavailableError extends Schema.TaggedErrorClass<Workspace
     threadId: ThreadId,
     path: NormalizedWorktreePath,
     availability: AdoptedWorktreeAvailability,
+  },
+) {}
+
+export const WorkspaceIdentityErrorReason = Schema.Literal("workspace-identity-unavailable");
+export type WorkspaceIdentityErrorReason = typeof WorkspaceIdentityErrorReason.Type;
+
+export class WorkspaceIdentityError extends Schema.TaggedErrorClass<WorkspaceIdentityError>()(
+  "WorkspaceIdentityError",
+  {
+    reason: WorkspaceIdentityErrorReason,
+    message: WorktreeMessage,
+    path: NormalizedWorktreePath,
   },
 ) {}

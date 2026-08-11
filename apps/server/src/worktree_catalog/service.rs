@@ -998,7 +998,10 @@ impl WorktreeCatalogService {
             .inner
             .availability_registry
             .prepare_snapshot_reconciliation(&snapshot)
-            .await;
+            .await
+            .map_err(|error| {
+                CatalogError::new(CatalogErrorReason::RepositoryUnavailable, error.message)
+            })?;
         reconciliation.wait_for_drains().await;
         let transitions = {
             let mut state = lock(&entry.state);
@@ -1621,7 +1624,10 @@ impl WorktreeCatalogService {
                 .inner
                 .availability_registry
                 .prepare_snapshot_reconciliation(&scan.snapshot)
-                .await;
+                .await
+                .map_err(|error| {
+                    CatalogError::new(CatalogErrorReason::RepositoryUnavailable, error.message)
+                })?;
             reconciliation.wait_for_drains().await;
             let mut registry = lock(&self.inner.registry);
             if self.inner.shutdown.is_cancelled() {

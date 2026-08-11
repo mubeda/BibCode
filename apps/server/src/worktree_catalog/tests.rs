@@ -280,7 +280,12 @@ async fn bootstrap_recovery_drains_terminal_signal_without_holding_the_catalog_r
         path: PathBuf::from("/repo/adopted"),
         availability: super::AdoptedWorktreeAvailability::MissingRegistered,
     };
-    assert!(registry.mark_unavailable(loss.clone()).await);
+    assert!(
+        registry
+            .mark_unavailable(loss.clone())
+            .await
+            .expect("physical identity resolves")
+    );
     let permit = registry
         .begin_terminal_signal(&loss)
         .await

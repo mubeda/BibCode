@@ -7,9 +7,9 @@
       {
         "_tag": "Fail",
         "error": {
-          "_tag": "EnvironmentAuthorizationError",
-          "message": "k;_f\"eyyE",
-          "requiredScope": "relay:read"
+          "_tag": "WorktreeOperationError",
+          "reason": "operation-shutting-down",
+          "message": ";_f\"eyyE}H"
         }
       }
     ]

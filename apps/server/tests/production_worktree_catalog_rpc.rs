@@ -23,15 +23,14 @@ use bibcode_server::{
         CommandReceipt, Database, OrchestrationEvent, ProjectionProject, ProjectionThread,
         Repositories, run_migrations,
     },
-    production::git_vcs::{CatalogMutationObserver, GitVcsRpcServices, register_git_vcs_rpc},
+    production::git_vcs::{GitVcsRpcServices, register_git_vcs_rpc},
     production::orchestration_rpc::register_orchestration_rpc,
     production::worktree_catalog_rpc::{
-        WorktreeCatalogMutationObserver, WorktreeCatalogOperationRuntime,
-        WorktreeCatalogRpcServices, WorktreeRemovalCleanupAdmission,
-        WorktreeRemovalCleanupAdmissionError, WorktreeRemovalCleanupAdmissionFuture,
-        WorktreeRemovalGit, WorktreeRemovalGitFuture, WorktreeRemovalQuiesceFuture,
-        WorktreeRemovalQuiesceLease, WorktreeRemovalQuiesceRequest, WorktreeRemovalQuiescer,
-        compact_eligible_baseline, register_worktree_catalog_rpc,
+        WorktreeCatalogOperationRuntime, WorktreeCatalogRpcServices,
+        WorktreeRemovalCleanupAdmission, WorktreeRemovalCleanupAdmissionError,
+        WorktreeRemovalCleanupAdmissionFuture, WorktreeRemovalGit, WorktreeRemovalGitFuture,
+        WorktreeRemovalQuiesceFuture, WorktreeRemovalQuiesceLease, WorktreeRemovalQuiesceRequest,
+        WorktreeRemovalQuiescer, compact_eligible_baseline, register_worktree_catalog_rpc,
     },
     worktree_catalog::{
         CatalogScanStatus, WorkspaceAvailabilityRegistry, WorktreeAdoptionState,
@@ -295,6 +294,110 @@ async fn managed_creation_rolls_back_exact_server_owned_worktree_when_projection
         .is_empty(),
         "rollback must remove only the newly-created branch"
     );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn managed_creation_rolls_back_the_exact_automatically_suffixed_branch() {
+    let mut fixture = CatalogRpcFixture::new(false).await;
+    let existing_thread_id = fixture
+        .repositories
+        .list_threads_by_project("project-1".to_owned())
+        .await
+        .expect("project threads")
+        .into_iter()
+        .find(|thread| thread.deleted_at.is_none())
+        .expect("project default thread")
+        .thread_id;
+    let before = git_output(&fixture.main, &["worktree", "list", "--porcelain"]);
+
+    request(
+        fixture.socket(),
+        "9906",
+        "worktree.createManaged",
+        json!({
+            "commandId":"managed-suffixed-rollback-command",
+            "projectId":"project-1",
+            "threadId":existing_thread_id,
+            "title":"Rejected duplicate suffix",
+            "refName":"main",
+            "threadDefaults":{
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access",
+                "interactionMode":"default"
+            }
+        }),
+    )
+    .await;
+    let message = next_server_message(fixture.socket()).await;
+    let ServerMessage::Exit {
+        request_id,
+        exit: RpcExit::Failure { cause },
+    } = message
+    else {
+        panic!("expected duplicate owner projection to fail: {message:?}");
+    };
+    assert_eq!(request_id.as_str(), "9906");
+    assert!(cause.iter().any(|item| matches!(
+        item,
+        CauseItem::Fail { error }
+            if error["_tag"] == "WorktreeAdoptionError"
+                && error["reason"] == "orchestration-failed"
+    )));
+    assert_eq!(
+        git_output(&fixture.main, &["worktree", "list", "--porcelain"]),
+        before,
+        "rollback must leave exactly the pre-existing registrations"
+    );
+    assert!(
+        git_output(&fixture.main, &["branch", "--list", "main-2"])
+            .trim()
+            .is_empty(),
+        "rollback must delete the exact automatically-created suffix branch"
+    );
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
+async fn pull_request_branch_creation_persists_the_exact_worktree_owner_atomically() {
+    let mut fixture = CatalogRpcFixture::new(false).await;
+    git(&fixture.main, &["branch", "feature/pull-request"], None);
+
+    request(
+        fixture.socket(),
+        "9907",
+        "worktree.createManaged",
+        json!({
+            "commandId":"pull-request-managed-owner-command",
+            "projectId":"project-1",
+            "threadId":"pull-request-managed-thread",
+            "title":"feature/pull-request",
+            "refName":"feature/pull-request",
+            "newRefName":null,
+            "baseRefName":null,
+            "threadDefaults":{
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access",
+                "interactionMode":"default"
+            }
+        }),
+    )
+    .await;
+    let created = success_value(fixture.socket(), "9907").await;
+    assert_eq!(created["threadId"], "pull-request-managed-thread");
+    assert_eq!(created["refName"], "feature/pull-request");
+    let created_path = created["path"].as_str().expect("managed path");
+    assert!(Path::new(created_path).is_dir());
+
+    let owner = fixture
+        .repositories
+        .get_thread("pull-request-managed-thread".to_owned())
+        .await
+        .expect("owner read")
+        .expect("owner exists");
+    assert_eq!(owner.kind, "workspace");
+    assert_eq!(owner.branch.as_deref(), Some("feature/pull-request"));
+    assert_eq!(owner.worktree_path.as_deref(), Some(created_path));
     fixture.shutdown().await;
 }
 
@@ -2214,97 +2317,36 @@ async fn successful_managed_creation_suppresses_and_invalidates_the_live_catalog
     let _initial = next_chunk(fixture.socket(), "40").await;
     ack(fixture.socket(), "40").await;
 
-    let created_path = fixture.external.clone();
     let create_payload = json!({
-        "cwd": fixture.main,
+        "commandId":"catalog-managed-create",
+        "projectId":"project-1",
+        "threadId":"catalog-managed-thread",
+        "title":"feature/managed",
         "refName": "main",
         "newRefName": "feature/managed",
         "baseRefName": "main",
-        "path": created_path
+        "threadDefaults":{
+            "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+            "runtimeMode":"full-access",
+            "interactionMode":"default"
+        }
     });
-    request(fixture.socket(), "41", "vcs.createWorktree", create_payload).await;
+    request(
+        fixture.socket(),
+        "41",
+        "worktree.createManaged",
+        create_payload,
+    )
+    .await;
     let created = wait_for_mutation_and_catalog_count(fixture.socket(), "41", "40", 2).await;
     let managed = created["worktrees"]
         .as_array()
         .expect("created worktrees")
         .iter()
-        .find(|worktree| worktree["path"] == canonical_string(&created_path))
+        .find(|worktree| worktree["branch"] == "feature/managed")
         .expect("managed worktree");
     assert_eq!(managed["eligibleForAdoption"], false);
 
-    fixture.shutdown().await;
-}
-
-#[tokio::test]
-async fn git_mutation_observation_updates_every_project_view_of_the_verified_repository() {
-    let mut fixture = CatalogRpcFixture::new(false).await;
-    #[cfg(unix)]
-    let alias_root = {
-        let alias_root = fixture.root.path().join("primary-symlink");
-        std::os::unix::fs::symlink(&fixture.main, &alias_root).expect("primary symlink");
-        alias_root
-    };
-    #[cfg(not(unix))]
-    let alias_root = fixture.main.join(".");
-    fixture
-        .create_project("project-alias", alias_root.clone())
-        .await;
-    for (request_id, project_id) in [("60", "project-1"), ("61", "project-alias")] {
-        request(
-            fixture.socket(),
-            request_id,
-            "subscribeWorktreeCatalog",
-            json!({ "projectId": project_id }),
-        )
-        .await;
-        let _initial = next_chunk(fixture.socket(), request_id).await;
-        ack(fixture.socket(), request_id).await;
-    }
-
-    let created_path = fixture.root.path().join("shared-managed");
-    let create_payload = json!({
-        "cwd": alias_root,
-        "refName": "main",
-        "newRefName": "feature/shared-managed",
-        "baseRefName": "main",
-        "path": created_path
-    });
-    request(fixture.socket(), "62", "vcs.createWorktree", create_payload).await;
-    let mut mutation_succeeded = false;
-    let mut updated = std::collections::HashMap::<String, usize>::new();
-    while !mutation_succeeded || updated.len() != 2 {
-        match next_server_message(fixture.socket()).await {
-            ServerMessage::Exit {
-                request_id,
-                exit: RpcExit::Success { .. },
-            } if request_id.as_str() == "62" => mutation_succeeded = true,
-            ServerMessage::Chunk { request_id, values }
-                if request_id.as_str() == "60" || request_id.as_str() == "61" =>
-            {
-                let value = values.into_iter().next().expect("catalog value");
-                ack(fixture.socket(), request_id.as_str()).await;
-                if value["authoritative"] == true
-                    && value["worktrees"]
-                        .as_array()
-                        .is_some_and(|worktrees| worktrees.len() == 2)
-                {
-                    let managed = value["worktrees"]
-                        .as_array()
-                        .expect("worktrees")
-                        .iter()
-                        .find(|worktree| worktree["path"] == canonical_string(&created_path))
-                        .expect("managed worktree");
-                    assert_eq!(managed["eligibleForAdoption"], false);
-                    *updated.entry(request_id.as_str().to_owned()).or_default() += 1;
-                }
-            }
-            other => panic!("unexpected alias observation message: {other:?}"),
-        }
-    }
-    assert_eq!(
-        updated,
-        std::collections::HashMap::from([("60".to_owned(), 1), ("61".to_owned(), 1),])
-    );
     fixture.shutdown().await;
 }
 
@@ -2383,75 +2425,6 @@ async fn raw_vcs_remove_rejects_an_adopted_target_without_mutating_git_or_owners
             .is_none(),
         "a rejected raw removal cannot retire or corrupt its owner"
     );
-    fixture.shutdown().await;
-}
-
-#[tokio::test]
-async fn git_mutation_observation_excludes_a_pinned_unrelated_repository() {
-    let mut fixture = CatalogRpcFixture::new(false).await;
-    let unrelated = fixture.root.path().join("unrelated-main");
-    fs::create_dir(&unrelated).expect("unrelated directory");
-    git(&unrelated, &["init", "--initial-branch", "main"], None);
-    git(
-        &unrelated,
-        &["config", "user.email", "rpc@example.invalid"],
-        None,
-    );
-    git(&unrelated, &["config", "user.name", "RPC Test"], None);
-    fs::write(unrelated.join("README.md"), "unrelated\n").expect("unrelated file");
-    git(&unrelated, &["add", "README.md"], None);
-    git(&unrelated, &["commit", "-m", "initial"], None);
-    fixture
-        .create_project("project-unrelated", unrelated.clone())
-        .await;
-    for (request_id, project_id) in [("80", "project-1"), ("81", "project-unrelated")] {
-        request(
-            fixture.socket(),
-            request_id,
-            "subscribeWorktreeCatalog",
-            json!({ "projectId": project_id }),
-        )
-        .await;
-        let _initial = next_chunk(fixture.socket(), request_id).await;
-        ack(fixture.socket(), request_id).await;
-    }
-    let created_path = fixture.root.path().join("main-only-managed");
-    let payload = json!({
-        "cwd": fixture.main,
-        "refName": "main",
-        "newRefName": "feature/main-only",
-        "baseRefName": "main",
-        "path": created_path
-    });
-    request(fixture.socket(), "82", "vcs.createWorktree", payload).await;
-    let _updated = wait_for_mutation_and_catalog_count(fixture.socket(), "82", "80", 2).await;
-    assert!(
-        tokio::time::timeout(Duration::from_millis(150), fixture.socket().next())
-            .await
-            .is_err(),
-        "the unrelated pinned project must not be invalidated"
-    );
-    fixture.shutdown().await;
-}
-
-#[tokio::test]
-async fn unverifiable_git_identity_fails_observation_closed_without_notifying_a_project() {
-    let fixture = CatalogRpcFixture::new(false).await;
-    let observer = WorktreeCatalogMutationObserver::new(
-        fixture.catalog.clone(),
-        fixture.repositories.clone(),
-        Arc::new(GitRepository::default()),
-    );
-    let unrelated = fixture.root.path().join("not-a-repository");
-    fs::create_dir(&unrelated).expect("unrelated directory");
-
-    let error = observer
-        .note_managed_creation(&unrelated, &unrelated.join("target"))
-        .await
-        .expect_err("unverifiable identity must fail closed");
-
-    assert!(error.contains("Git"));
-    assert!(fixture.catalog.latest("project-1").await.is_none());
     fixture.shutdown().await;
 }
 
@@ -4267,12 +4240,7 @@ impl CatalogRpcFixture {
         register_orchestration_rpc(&mut registry, engine.clone());
         register_git_vcs_rpc(
             &mut registry,
-            GitVcsRpcServices::with_repository(git_repository.clone())
-                .with_catalog_mutation_observer(Arc::new(WorktreeCatalogMutationObserver::new(
-                    catalog.clone(),
-                    repositories.clone(),
-                    git_repository.clone(),
-                ))),
+            GitVcsRpcServices::with_repository(git_repository.clone()),
         );
         let server_state = root.path().join("server");
         let config = ServerConfig::new(server_state)
