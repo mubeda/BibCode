@@ -96,6 +96,14 @@ The current runtime registration owns its overlay generation: its lifecycle
 cleanup removes that generation with one bounded removal delta, while a
 superseded registration cannot remove its replacement.
 
+Structured provider batches install and reconcile their private control handles
+after validating the native event identity and before projecting display
+mutations. Any cancellation jobs discovered for late descendants start only
+after control observation and display projection have released their locks.
+Terminal display mutations reconcile the overlay even when the provider sends
+no control updates, so completed descendants cannot remain as cancellation
+residuals.
+
 Each snapshot negotiates provider capabilities separately: actors, attributed
 entries, background work, history recovery (`full`, `bounded`, or `none`), and
 terminal observation. Per-section health (`unsupported`, `live`, `stale`, or

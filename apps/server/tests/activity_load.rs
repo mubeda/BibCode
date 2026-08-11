@@ -15,9 +15,10 @@ use bibcode_server::{
     activity::{
         ActivityCapabilities, ActivityEntry, ActivityEntryKind, ActivityEntryTone,
         ActivityLifecycle, ActivityProjection, ActivityProjections, ActivityRecordKind,
-        ActivityRepository, ActivityRosterBucket, ActivityScopeSeed, ActivitySection,
-        ActivityWorkItemSummary, AgentActivityController, AgentActivitySource,
-        ProviderActivityMutation, register_activity_rpc_for_integration_test,
+        ActivityRepository, ActivityRosterBucket, ActivityScopeRef, ActivityScopeSeed,
+        ActivitySection, ActivityTargetDispatchDisposition, ActivityWorkItemSummary,
+        AgentActivityController, AgentActivitySource, ProviderActivityMutation,
+        ProviderActivityNativeTarget, register_activity_rpc_for_integration_test,
     },
     diagnostics::{ProcessAttributionRegistry, TraceDiagnosticsStore},
     orchestration::engine::{EngineOptions, OrchestrationEngine},
@@ -25,8 +26,9 @@ use bibcode_server::{
     production::{
         agent_activity::ProductionAgentActivity,
         provider_runtime::{
-            BoxRuntimeFuture, ProviderDriver, ProviderDriverFactory, ProviderLaunchRequest,
-            ProviderRuntimeError, ProviderRuntimeSupervisor, SupervisorOptions,
+            BoxRuntimeFuture, ProviderActivityControls, ProviderDriver, ProviderDriverFactory,
+            ProviderEvent, ProviderLaunchRequest, ProviderNativeEventId, ProviderRuntimeError,
+            ProviderRuntimeSupervisor, StartedSession, SupervisorOptions,
         },
     },
     provider_terminal::{
@@ -107,6 +109,346 @@ impl ProviderDriverFactory for RejectingProviderDriverFactory {
             })
         })
     }
+}
+
+struct CancellationDispatchLoadDriver {
+    events: tokio::sync::Mutex<tokio::sync::mpsc::Receiver<ProviderEvent>>,
+    targeted_cancellations: Arc<AtomicUsize>,
+}
+
+impl ProviderDriver for CancellationDispatchLoadDriver {
+    fn start(&self) -> BoxRuntimeFuture<'_, Result<StartedSession, ProviderRuntimeError>> {
+        Box::pin(async {
+            Ok(StartedSession {
+                resume_cursor: Some(json!({"threadId":"activity-cancellation-load"})),
+                runtime_payload: None,
+                activity_capabilities: ActivityCapabilities::structured_full(false),
+            })
+        })
+    }
+
+    fn send(
+        &self,
+        _text: String,
+        _attachments: Vec<Value>,
+        _interaction_mode: String,
+    ) -> BoxRuntimeFuture<'_, Result<Option<String>, ProviderRuntimeError>> {
+        Box::pin(async { Ok(None) })
+    }
+
+    fn interrupt(
+        &self,
+        _turn_id: Option<String>,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn approve(
+        &self,
+        _request_id: String,
+        _decision: String,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn answer(
+        &self,
+        _request_id: String,
+        _answers: Value,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn set_mode(&self, _mode: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn cancel_activity_target(
+        &self,
+        _target: ProviderActivityNativeTarget,
+    ) -> BoxRuntimeFuture<'_, Result<ActivityTargetDispatchDisposition, ProviderRuntimeError>> {
+        Box::pin(async move {
+            self.targeted_cancellations.fetch_add(1, Ordering::AcqRel);
+            Ok(ActivityTargetDispatchDisposition::Delivered)
+        })
+    }
+
+    fn set_model(&self, _model: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn set_options(
+        &self,
+        _options: Vec<Value>,
+    ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn rollback(&self, _turn_count: i64) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn next_event(&self) -> BoxRuntimeFuture<'_, Option<ProviderEvent>> {
+        Box::pin(async move { self.events.lock().await.recv().await })
+    }
+
+    fn shutdown(&self) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct CancellationDispatchLoadFactory {
+    events: StdMutex<Option<tokio::sync::mpsc::Receiver<ProviderEvent>>>,
+    targeted_cancellations: Arc<AtomicUsize>,
+}
+
+impl ProviderDriverFactory for CancellationDispatchLoadFactory {
+    fn create(
+        &self,
+        _request: ProviderLaunchRequest,
+    ) -> BoxRuntimeFuture<'_, Result<Arc<dyn ProviderDriver>, ProviderRuntimeError>> {
+        Box::pin(async move {
+            Ok(Arc::new(CancellationDispatchLoadDriver {
+                events: tokio::sync::Mutex::new(
+                    self.events
+                        .lock()
+                        .expect("event receiver")
+                        .take()
+                        .expect("one launch"),
+                ),
+                targeted_cancellations: self.targeted_cancellations.clone(),
+            }) as Arc<dyn ProviderDriver>)
+        })
+    }
+}
+
+#[tokio::test]
+async fn cancellation_dispatch_tracks_late_descendants_and_empty_control_terminal_batches() {
+    // Mutation caught: projecting a provider batch before the control overlay sees it, dropping
+    // late-descendant dispatch jobs, or requiring a control update to retire terminal residuals.
+    const LATE_DESCENDANTS: usize = 16;
+    let database = Database::open_in_memory().await.expect("database");
+    database
+        .call(|connection| {
+            run_migrations(connection, None)?;
+            Ok(())
+        })
+        .await
+        .expect("migrations");
+    let engine = OrchestrationEngine::start(database, EngineOptions::default())
+        .await
+        .expect("orchestration engine");
+    engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"project.create",
+                "commandId":"create-activity-cancellation-project",
+                "projectId":"p1",
+                "title":"Activity cancellation project",
+                "workspaceRoot":"C:/repo",
+                "createdAt":"2026-08-11T00:00:00Z"
+            }))
+            .expect("project create command"),
+        )
+        .await
+        .expect("project create");
+    engine
+        .dispatch(
+            serde_json::from_value(json!({
+                "type":"thread.create",
+                "commandId":"create-activity-cancellation-load",
+                "threadId":"activity-cancellation-load",
+                "projectId":"p1",
+                "title":"Activity cancellation load",
+                "modelSelection":{"instanceId":"codex","model":"gpt-5"},
+                "runtimeMode":"full-access",
+                "branch":null,
+                "worktreePath":null,
+                "createdAt":"2026-08-11T00:00:00Z"
+            }))
+            .expect("thread create command"),
+        )
+        .await
+        .expect("thread create");
+    let activity = ActivityProjection::new(ActivityRepository::new(
+        engine.repositories().database().clone(),
+    ));
+    let (events_tx, events_rx) = tokio::sync::mpsc::channel(32);
+    let targeted_cancellations = Arc::new(AtomicUsize::new(0));
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        Arc::new(CancellationDispatchLoadFactory {
+            events: StdMutex::new(Some(events_rx)),
+            targeted_cancellations: targeted_cancellations.clone(),
+        }),
+        activity.clone(),
+        SupervisorOptions::default(),
+    );
+    supervisor
+        .attach_activity_cancellation_for_integration_test(&activity)
+        .await;
+    supervisor
+        .launch(ProviderLaunchRequest {
+            thread_id: "activity-cancellation-load".to_owned(),
+            activity_causal_revision: 0,
+            provider: "codex".to_owned(),
+            provider_label: "codex".to_owned(),
+            provider_instance_id: Some("codex".to_owned()),
+            binary_path: "codex".to_owned(),
+            cwd: std::env::current_dir().expect("current directory"),
+            runtime_mode: "full-access".to_owned(),
+            interaction_mode: "default".to_owned(),
+            model: Some("gpt-5".to_owned()),
+            options: Vec::new(),
+            service_tier: None,
+            effort: None,
+            agent: None,
+            resume_cursor: None,
+            environment: Default::default(),
+            endpoint: None,
+            server_password: None,
+            mcp: None,
+            codex_home: None,
+        })
+        .await
+        .expect("provider launch");
+    let scope = ActivityScopeRef::Thread {
+        thread_id: "activity-cancellation-load".to_owned(),
+    };
+    events_tx
+        .send(ProviderEvent {
+            native_event_id: Some(
+                ProviderNativeEventId::new("activity-cancellation-root".to_owned())
+                    .expect("native event id"),
+            ),
+            event_type: "activity.native".to_owned(),
+            thread_id: "activity-cancellation-load".to_owned(),
+            turn_id: None,
+            request_id: None,
+            payload: json!({}),
+            activity: vec![
+                ProviderActivityMutation::upsert_actor("actor:root", None, "Root", "running")
+                    .expect("root mutation"),
+            ],
+            activity_controls: ProviderActivityControls::codex_actor_for_integration_test(
+                "actor:root",
+                "native-root-thread",
+                "native-root-turn",
+            ),
+        })
+        .await
+        .expect("root event");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = activity.snapshot(&scope).await.expect("activity snapshot");
+            if snapshot.control.revision == 1 && snapshot.actors.len() == 1 {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("root control installed before projection");
+
+    supervisor
+        .cancel_activity_subtree_for_integration_test(
+            scope.clone(),
+            "thread:activity-cancellation-load",
+            "actor:root",
+            1,
+        )
+        .await
+        .expect("root cancellation");
+    assert_eq!(targeted_cancellations.load(Ordering::Acquire), 1);
+
+    for index in 0..LATE_DESCENDANTS {
+        let actor_id = format!("actor:late:{index}");
+        events_tx
+            .send(ProviderEvent {
+                native_event_id: Some(
+                    ProviderNativeEventId::new(format!("activity-cancellation-late-{index}"))
+                        .expect("native event id"),
+                ),
+                event_type: "activity.native".to_owned(),
+                thread_id: "activity-cancellation-load".to_owned(),
+                turn_id: None,
+                request_id: None,
+                payload: json!({}),
+                activity: vec![
+                    ProviderActivityMutation::upsert_actor(
+                        actor_id.clone(),
+                        Some("actor:root"),
+                        format!("Late {index}"),
+                        "running",
+                    )
+                    .expect("late actor mutation"),
+                ],
+                activity_controls: ProviderActivityControls::codex_actor_for_integration_test(
+                    &actor_id,
+                    &format!("native-late-thread-{index}"),
+                    &format!("native-late-turn-{index}"),
+                ),
+            })
+            .await
+            .expect("late descendant event");
+    }
+    timeout(Duration::from_secs(2), async {
+        while targeted_cancellations.load(Ordering::Acquire) != LATE_DESCENDANTS + 1 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late descendants dispatched");
+    let requested = activity.snapshot(&scope).await.expect("requested snapshot");
+    assert_eq!(requested.control.operations.len(), 1);
+    assert_eq!(
+        requested.control.operations[0].residual_count,
+        (LATE_DESCENDANTS + 1) as u64
+    );
+
+    let mut terminal = vec![
+        ProviderActivityMutation::set_actor_status("actor:root", "completed")
+            .expect("terminal root"),
+    ];
+    terminal.extend((0..LATE_DESCENDANTS).map(|index| {
+        ProviderActivityMutation::set_actor_status(format!("actor:late:{index}"), "completed")
+            .expect("terminal descendant")
+    }));
+    events_tx
+        .send(ProviderEvent {
+            native_event_id: Some(
+                ProviderNativeEventId::new("activity-cancellation-terminal".to_owned())
+                    .expect("native event id"),
+            ),
+            event_type: "activity.native".to_owned(),
+            thread_id: "activity-cancellation-load".to_owned(),
+            turn_id: None,
+            request_id: None,
+            payload: json!({}),
+            activity: terminal,
+            activity_controls: ProviderActivityControls::default(),
+        })
+        .await
+        .expect("terminal provider batch");
+    timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = activity.snapshot(&scope).await.expect("terminal snapshot");
+            if snapshot.control.operations.is_empty()
+                && snapshot
+                    .actors
+                    .iter()
+                    .all(|actor| actor.status.is_terminal())
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("empty-control terminal batch retired residuals");
+
+    supervisor.shutdown().await.expect("supervisor shutdown");
+    engine.shutdown().await;
 }
 
 #[derive(Debug, Default)]

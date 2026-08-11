@@ -17,9 +17,10 @@ use crate::{
         ACTIVITY_ID_MAX_LENGTH, ActivityCancellationDispatcher, ActivityCancellationService,
         ActivityCapabilities, ActivityDispatchError, ActivityHistoryRecovery,
         ActivityObservationState, ActivityProjection, ActivityRepositoryError,
-        ActivityRuntimeGeneration, ActivityScopeRef, ActivityScopeSeed, ActivitySection,
-        ActivitySectionHealth, ActivitySummaryCounts, ActivityTargetDispatchDisposition,
-        AgentActivityController, ProviderActivityMutation, ProviderActivityNativeTarget,
+        ActivityRuntimeControlRegistration, ActivityRuntimeGeneration, ActivityScopeRef,
+        ActivityScopeSeed, ActivitySection, ActivitySectionHealth, ActivitySummaryCounts,
+        ActivityTargetDispatchDisposition, AgentActivityController, ProviderActivityControlUpdate,
+        ProviderActivityMutation, ProviderActivityNativeTarget,
     },
     diagnostics::{
         AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
@@ -208,6 +209,45 @@ pub struct ProviderEvent {
     pub request_id: Option<String>,
     pub payload: Value,
     pub activity: Vec<ProviderActivityMutation>,
+    pub activity_controls: ProviderActivityControls,
+}
+
+#[derive(Clone, Default, Eq, PartialEq)]
+pub struct ProviderActivityControls(Vec<ProviderActivityControlUpdate>);
+
+impl ProviderActivityControls {
+    fn take(&mut self) -> Vec<ProviderActivityControlUpdate> {
+        std::mem::take(&mut self.0)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    #[doc(hidden)]
+    #[must_use]
+    pub fn codex_actor_for_integration_test(
+        actor_id: &str,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Self {
+        Self(vec![ProviderActivityControlUpdate::ActorTarget {
+            actor_id: actor_id.to_owned(),
+            target: Some(ProviderActivityNativeTarget::codex_turn(
+                thread_id.to_owned(),
+                turn_id.to_owned(),
+            )),
+        }])
+    }
+}
+
+impl std::fmt::Debug for ProviderActivityControls {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ProviderActivityControls")
+            .field("update_count", &self.0.len())
+            .finish()
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -299,6 +339,21 @@ pub trait ProviderDriver: Send + Sync {
         _enabled: bool,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async { Ok(()) })
+    }
+    fn cancel_activity_target(
+        &self,
+        target: ProviderActivityNativeTarget,
+    ) -> BoxRuntimeFuture<'_, Result<ActivityTargetDispatchDisposition, ProviderRuntimeError>> {
+        debug_assert!(
+            target.codex_turn_ids().is_some() || target.claude_task_id().is_some(),
+            "provider-native activity targets have a recognized private shape"
+        );
+        Box::pin(async {
+            Err(ProviderRuntimeError::UnsupportedCapability {
+                provider: "activity".to_owned(),
+                capability: "targeted activity cancellation",
+            })
+        })
     }
     fn set_model(&self, model: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>>;
     fn reapply_options_on_model_change(&self) -> bool {
@@ -400,6 +455,16 @@ enum SupervisorMessage {
         enabled: bool,
         response: oneshot::Sender<Result<usize, ProviderRuntimeError>>,
     },
+    CancelActivityTarget {
+        scope: ActivityScopeRef,
+        generation: ActivityRuntimeGeneration,
+        target: ProviderActivityNativeTarget,
+        response: oneshot::Sender<Result<ActivityTargetDispatchDisposition, ProviderRuntimeError>>,
+    },
+    InspectActivityRuntimeGeneration {
+        thread_id: String,
+        response: oneshot::Sender<Option<ActivityRuntimeGeneration>>,
+    },
     Shutdown {
         response: oneshot::Sender<Result<(), ProviderRuntimeError>>,
     },
@@ -426,6 +491,11 @@ struct SessionEntry {
     resume_cursor: Option<Value>,
     runtime_payload: Option<Value>,
     activity_capable: bool,
+    activity_runtime_generation: ActivityRuntimeGeneration,
+    activity_dispatch_cancellation: CancellationToken,
+    activity_dispatch_tasks: Vec<JoinHandle<()>>,
+    activity_control: Arc<RwLock<Option<Arc<ActivityRuntimeControlRegistration>>>>,
+    activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
     activity_lifecycle: SharedActivityLifecycle,
     activity_compensation_key: String,
     event_task: JoinHandle<()>,
@@ -595,6 +665,8 @@ impl ProviderRuntimeSupervisor {
         let stopped = CancellationToken::new();
         let worker_stopped = stopped.clone();
         let worker_sender = sender.clone();
+        let activity_cancellation = Arc::new(RwLock::new(None));
+        let worker_activity_cancellation = activity_cancellation.clone();
         let worker = tokio::spawn(async move {
             run_supervisor(
                 engine,
@@ -608,6 +680,7 @@ impl ProviderRuntimeSupervisor {
                 session_idle_timeout,
                 worker_stopped,
                 operational_log,
+                worker_activity_cancellation,
             )
             .await;
         });
@@ -616,7 +689,7 @@ impl ProviderRuntimeSupervisor {
             stopped,
             worker: Arc::new(Mutex::new(Some(worker))),
             connect_mcp: Arc::new(RwLock::new(None)),
-            activity_cancellation: Arc::new(RwLock::new(None)),
+            activity_cancellation,
         }
     }
 
@@ -786,19 +859,109 @@ impl ProviderRuntimeSupervisor {
             .await
             .map_err(|_| ProviderRuntimeError::ResponseDropped)?
     }
+
+    #[doc(hidden)]
+    pub async fn activity_runtime_generation_for_integration_test(
+        &self,
+        thread_id: &str,
+    ) -> Option<ActivityRuntimeGeneration> {
+        if self.stopped.is_cancelled() {
+            return None;
+        }
+        let (response_tx, response_rx) = oneshot::channel();
+        self.sender
+            .send(SupervisorMessage::InspectActivityRuntimeGeneration {
+                thread_id: thread_id.to_owned(),
+                response: response_tx,
+            })
+            .await
+            .ok()?;
+        response_rx.await.ok().flatten()
+    }
+
+    #[doc(hidden)]
+    pub async fn cancel_activity_target_for_integration_test(
+        &self,
+        scope: ActivityScopeRef,
+        generation: ActivityRuntimeGeneration,
+        target: ProviderActivityNativeTarget,
+    ) -> Result<ActivityTargetDispatchDisposition, ActivityDispatchError> {
+        <Self as ActivityCancellationDispatcher>::cancel_target(self, scope, generation, target)
+            .await
+    }
+
+    #[doc(hidden)]
+    pub async fn attach_activity_cancellation_for_integration_test(
+        &self,
+        activity: &ActivityProjection,
+    ) {
+        self.attach_activity_cancellation(ActivityCancellationService::new(
+            activity.activity_control_registry(),
+            Arc::new(self.clone()),
+        ))
+        .await;
+    }
+
+    #[doc(hidden)]
+    pub async fn cancel_activity_subtree_for_integration_test(
+        &self,
+        scope: ActivityScopeRef,
+        scope_id: &str,
+        actor_id: &str,
+        expected_control_revision: u64,
+    ) -> Result<(), &'static str> {
+        let service = self
+            .activity_cancellation
+            .read()
+            .await
+            .clone()
+            .ok_or("activity cancellation service is not attached")?;
+        service
+            .cancel_subtree(scope, scope_id, actor_id, expected_control_revision)
+            .await
+            .map(|_| ())
+            .map_err(|_| "activity cancellation was rejected")
+    }
 }
 
 impl ActivityCancellationDispatcher for ProviderRuntimeSupervisor {
     fn cancel_target(
         &self,
-        _scope: ActivityScopeRef,
-        _generation: ActivityRuntimeGeneration,
-        _target: ProviderActivityNativeTarget,
+        scope: ActivityScopeRef,
+        generation: ActivityRuntimeGeneration,
+        target: ProviderActivityNativeTarget,
     ) -> futures_util::future::BoxFuture<
         'static,
         Result<ActivityTargetDispatchDisposition, ActivityDispatchError>,
     > {
-        Box::pin(async { Err(ActivityDispatchError::TargetUnavailable) })
+        let supervisor = self.clone();
+        Box::pin(async move {
+            if supervisor.stopped.is_cancelled() {
+                return Err(ActivityDispatchError::ProviderUnavailable);
+            }
+            let (response_tx, response_rx) = oneshot::channel();
+            supervisor
+                .sender
+                .send(SupervisorMessage::CancelActivityTarget {
+                    scope,
+                    generation,
+                    target,
+                    response: response_tx,
+                })
+                .await
+                .map_err(|_| ActivityDispatchError::ProviderUnavailable)?;
+            response_rx
+                .await
+                .map_err(|_| ActivityDispatchError::ProviderUnavailable)?
+                .map_err(|error| match error {
+                    ProviderRuntimeError::SessionNotFound { .. }
+                    | ProviderRuntimeError::StaleSession { .. }
+                    | ProviderRuntimeError::UnsupportedCapability { .. } => {
+                        ActivityDispatchError::TargetUnavailable
+                    }
+                    _ => ActivityDispatchError::ProviderUnavailable,
+                })
+        })
     }
 }
 
@@ -1804,6 +1967,7 @@ async fn run_supervisor(
     session_idle_timeout: Duration,
     stopped: CancellationToken,
     operational_log: Option<ProviderOperationalLog>,
+    activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
 ) {
     let mut sessions = HashMap::<String, SessionEntry>::new();
     let mut delivery_sequences = HashMap::<String, ThreadDeliverySequence>::new();
@@ -1832,6 +1996,7 @@ async fn run_supervisor(
                     None,
                     terminal_sender.clone(),
                     session_idle_timeout,
+                    activity_cancellation.clone(),
                 )
                 .await;
                 let _ = response.send(result);
@@ -1965,8 +2130,100 @@ async fn run_supervisor(
                 }
             }
             SupervisorMessage::SetAgentActivityEnabled { enabled, response } => {
-                let result = set_live_agent_activity_enabled(&activity, &sessions, enabled).await;
+                let result =
+                    set_live_agent_activity_enabled(&activity, &mut sessions, enabled).await;
                 let _ = response.send(result);
+            }
+            SupervisorMessage::CancelActivityTarget {
+                scope,
+                generation,
+                target,
+                response,
+            } => {
+                let activity_enabled = activity.agent_activity_controller().snapshot().enabled;
+                let result = match scope {
+                    ActivityScopeRef::Thread { thread_id } => {
+                        if let Some(entry) = sessions.get_mut(&thread_id) {
+                            entry
+                                .activity_dispatch_tasks
+                                .retain(|task| !task.is_finished());
+                            let control_current = entry.activity_control.read().await.is_some();
+                            if !activity_enabled
+                                || !control_current
+                                || entry.activity_runtime_generation != generation
+                                || !entry.configuration_healthy
+                            {
+                                Err(ProviderRuntimeError::StaleSession {
+                                    thread_id,
+                                    action: "targeted activity cancellation".to_owned(),
+                                })
+                            } else {
+                                Ok((
+                                    entry.driver.clone(),
+                                    entry.activity_dispatch_cancellation.clone(),
+                                    entry.launch.thread_id.clone(),
+                                ))
+                            }
+                        } else {
+                            Err(ProviderRuntimeError::SessionNotFound { thread_id })
+                        }
+                    }
+                    ActivityScopeRef::Terminal { thread_id, .. } => {
+                        Err(ProviderRuntimeError::StaleSession {
+                            thread_id,
+                            action: "targeted activity cancellation".to_owned(),
+                        })
+                    }
+                };
+                match result {
+                    Ok((driver, dispatch_cancellation, thread_id)) => {
+                        let task_thread_id = thread_id.clone();
+                        let task = tokio::spawn(async move {
+                            let mut response = response;
+                            tokio::select! {
+                                biased;
+                                () = response.closed() => {}
+                                () = dispatch_cancellation.cancelled() => {
+                                    let _ = response.send(Err(ProviderRuntimeError::StaleSession {
+                                        thread_id: task_thread_id,
+                                        action: "targeted activity cancellation".to_owned(),
+                                    }));
+                                }
+                                result = driver.cancel_activity_target(target) => {
+                                    let _ = response.send(result);
+                                }
+                            }
+                        });
+                        if let Some(entry) = sessions.get_mut(&thread_id) {
+                            entry.activity_dispatch_tasks.push(task);
+                        } else {
+                            task.abort();
+                            tracing::debug!(
+                                thread_id = %thread_id,
+                                "discarded targeted cancellation after session removal"
+                            );
+                        }
+                    }
+                    Err(error) => {
+                        let _ = response.send(Err(error));
+                    }
+                }
+            }
+            SupervisorMessage::InspectActivityRuntimeGeneration {
+                thread_id,
+                response,
+            } => {
+                let generation = if let Some(entry) = sessions.get(&thread_id) {
+                    entry
+                        .activity_control
+                        .read()
+                        .await
+                        .as_ref()
+                        .map(|_| entry.activity_runtime_generation.clone())
+                } else {
+                    None
+                };
+                let _ = response.send(generation);
             }
             SupervisorMessage::DeliveryComplete {
                 thread_id,
@@ -2393,20 +2650,45 @@ async fn ensure_live_activity_scope(
 
 async fn set_live_agent_activity_enabled(
     activity: &ActivityProjection,
-    sessions: &HashMap<String, SessionEntry>,
+    sessions: &mut HashMap<String, SessionEntry>,
     enabled: bool,
 ) -> Result<usize, ProviderRuntimeError> {
     let mut successful_sessions = 0;
     let mut first_error = None;
     let controller_state = activity.agent_activity_controller().snapshot();
-    let mut thread_ids = sessions.keys().collect::<Vec<_>>();
+    let mut thread_ids = sessions.keys().cloned().collect::<Vec<_>>();
     thread_ids.sort();
     for thread_id in thread_ids {
-        let entry = &sessions[thread_id];
+        let entry = sessions
+            .get_mut(&thread_id)
+            .expect("sorted session key remains present");
+        if !enabled {
+            entry.activity_dispatch_cancellation.cancel();
+            entry.activity_control.write().await.take();
+            for task in std::mem::take(&mut entry.activity_dispatch_tasks) {
+                let _ = task.await;
+            }
+        }
         match entry.driver.set_agent_activity_enabled(enabled).await {
             Ok(()) => {
                 successful_sessions += 1;
                 if enabled && entry.activity_capable && controller_state.enabled {
+                    let generation = ActivityRuntimeGeneration::new();
+                    let registration = Arc::new(
+                        activity
+                            .activity_control_registry()
+                            .register_runtime_with_generation(
+                                ActivityScopeRef::Thread {
+                                    thread_id: entry.launch.thread_id.clone(),
+                                },
+                                format!("thread:{}", entry.launch.thread_id),
+                                entry.launch.provider_instance_id.clone(),
+                                generation.clone(),
+                            ),
+                    );
+                    entry.activity_runtime_generation = generation;
+                    entry.activity_dispatch_cancellation = CancellationToken::new();
+                    *entry.activity_control.write().await = Some(registration);
                     let capabilities = entry
                         .activity_lifecycle
                         .lock()
@@ -2471,6 +2753,7 @@ async fn launch_session(
     inherited_activity_lifecycle: Option<SharedActivityLifecycle>,
     terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
     idle_timeout: Duration,
+    activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
 ) -> Result<(), ProviderRuntimeError> {
     let option_application_method = if inherited_activity_lifecycle.is_some() {
         "restart"
@@ -2487,6 +2770,7 @@ async fn launch_session(
             thread_id: request.thread_id,
         });
     }
+    let activity_runtime_generation = ActivityRuntimeGeneration::new();
     let activity_controller = activity.agent_activity_controller();
     if activity_controller.snapshot().enabled {
         request.activity_causal_revision = match activity
@@ -2504,6 +2788,18 @@ async fn launch_session(
             }
         };
     }
+    let activity_control = Arc::new(RwLock::new(Some(Arc::new(
+        activity
+            .activity_control_registry()
+            .register_runtime_with_generation(
+                ActivityScopeRef::Thread {
+                    thread_id: request.thread_id.clone(),
+                },
+                format!("thread:{}", request.thread_id),
+                request.provider_instance_id.clone(),
+                activity_runtime_generation.clone(),
+            ),
+    ))));
     let driver = factory.create(request.clone()).await?;
     persist_runtime(
         &engine.repositories(),
@@ -2589,7 +2885,12 @@ async fn launch_session(
     .await?;
     dispatch_session_state(engine, &request, "ready", None, None).await?;
 
+    if !activity_controller.snapshot().enabled {
+        activity_control.write().await.take();
+    }
+
     let cancellation = CancellationToken::new();
+    let activity_dispatch_cancellation = CancellationToken::new();
     let idle_generation = Arc::new(AtomicU64::new(0));
     let event_task = spawn_event_pump(
         engine.clone(),
@@ -2600,6 +2901,8 @@ async fn launch_session(
         activity.clone(),
         activity_lifecycle.clone(),
         activity_capable,
+        activity_control.clone(),
+        activity_cancellation.clone(),
         format!("supervisor:stream-ended:{activity_lifecycle_id}"),
         cancellation.clone(),
         operational_log.cloned(),
@@ -2616,6 +2919,11 @@ async fn launch_session(
             resume_cursor: started.resume_cursor,
             runtime_payload: started.runtime_payload,
             activity_capable,
+            activity_runtime_generation,
+            activity_dispatch_cancellation,
+            activity_dispatch_tasks: Vec::new(),
+            activity_control,
+            activity_cancellation,
             activity_lifecycle,
             activity_compensation_key: format!("supervisor:cancelled-live:{activity_lifecycle_id}"),
             event_task,
@@ -3034,11 +3342,18 @@ async fn restart_session(
     let mut inherited_activity_lifecycle = None;
     let mut terminal_sender = None;
     let mut idle_timeout = None;
-    if let Some(entry) = sessions.get(thread_id) {
+    let mut activity_cancellation = None;
+    if let Some(entry) = sessions.get_mut(thread_id) {
         launch.resume_cursor = entry.resume_cursor.clone();
         inherited_activity_lifecycle = Some(entry.activity_lifecycle.clone());
         terminal_sender = Some(entry.terminal_sender.clone());
         idle_timeout = Some(entry.idle_timeout);
+        activity_cancellation = Some(entry.activity_cancellation.clone());
+        entry.activity_dispatch_cancellation.cancel();
+        entry.activity_control.write().await.take();
+        for task in std::mem::take(&mut entry.activity_dispatch_tasks) {
+            let _ = task.await;
+        }
         entry.driver.shutdown().await?;
     }
     if let Some(entry) = sessions.remove(thread_id) {
@@ -3077,6 +3392,9 @@ async fn restart_session(
             thread_id: thread_id.to_owned(),
         })?,
         idle_timeout.ok_or_else(|| ProviderRuntimeError::SessionNotFound {
+            thread_id: thread_id.to_owned(),
+        })?,
+        activity_cancellation.ok_or_else(|| ProviderRuntimeError::SessionNotFound {
             thread_id: thread_id.to_owned(),
         })?,
     )
@@ -3209,6 +3527,8 @@ fn spawn_event_pump(
     activity: ActivityProjection,
     activity_lifecycle: SharedActivityLifecycle,
     activity_capable: bool,
+    activity_control: Arc<RwLock<Option<Arc<ActivityRuntimeControlRegistration>>>>,
+    activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
     stream_ended_event_key: String,
     cancellation: CancellationToken,
     operational_log: Option<ProviderOperationalLog>,
@@ -3275,15 +3595,18 @@ fn spawn_event_pump(
                     let activity_state = activity_controller.snapshot();
                     if activity_capable
                         && activity_state.enabled
-                        && !event.activity.is_empty()
+                        && (!event.activity.is_empty() || !event.activity_controls.is_empty())
                     {
                         let activity_batch = std::mem::take(&mut event.activity);
+                        let control_batch = event.activity_controls.take();
                         let native_event_id = event.native_event_id.take();
                         let activity_mutation_count = activity_batch.len();
+                        let activity_control_count = control_batch.len();
                         if event.thread_id != launch.thread_id {
                             tracing::warn!(
                                 provider = %launch.provider,
                                 activity_mutation_count,
+                                activity_control_count,
                                 "dropped provider activity batch for mismatched event thread"
                             );
                         } else if let Some(native_event_id) = native_event_id {
@@ -3293,12 +3616,34 @@ fn spawn_event_pump(
                                 activity_state.generation,
                                 native_event_id.as_str(),
                             );
-                            match activity.apply(
-                                &format!("thread:{}", launch.thread_id),
-                                native_event_key,
-                                activity_batch,
-                                now(),
-                            ).await {
+                            let registration = activity_control.read().await.clone();
+                            let jobs = if let Some(registration) = registration {
+                                Some(
+                                    activity
+                                        .activity_control_registry()
+                                        .observe_provider_batch(
+                                            &registration,
+                                            &activity_batch,
+                                            &control_batch,
+                                        )
+                                        .await,
+                                )
+                            } else {
+                                None
+                            };
+                            let projection_result = if activity_batch.is_empty() {
+                                Ok(Vec::new())
+                            } else {
+                                activity
+                                    .apply(
+                                        &format!("thread:{}", launch.thread_id),
+                                        native_event_key,
+                                        activity_batch,
+                                        now(),
+                                    )
+                                    .await
+                            };
+                            match projection_result {
                                     Err(error) => tracing::warn!(
                                         %error,
                                         activity_mutation_count,
@@ -3310,18 +3655,32 @@ fn spawn_event_pump(
                                             .unwrap_or_else(std::sync::PoisonError::into_inner)
                                             .observe_projected_batch(&lifecycle_mutations);
                                     }
-                                    Ok(_) => {}
+                                Ok(_) => {}
+                            }
+                            if let Some(jobs) = jobs
+                                && !jobs.is_empty()
+                            {
+                                let service = {
+                                    activity_cancellation.read().await.clone()
+                                };
+                                if let Some(service) = service {
+                                    tokio::spawn(async move {
+                                        service.dispatch_observed_jobs(jobs).await;
+                                    });
+                                }
                             }
                         } else {
                             tracing::warn!(
                                 provider = %launch.provider,
                                 thread_id = %launch.thread_id,
                                 activity_mutation_count,
+                                activity_control_count,
                                 "dropped activity batch without a stable native event key"
                             );
                         }
                     }
                     event.activity.clear();
+                    event.activity_controls = ProviderActivityControls::default();
                     if event.event_type == ACTIVITY_ONLY_PROVIDER_EVENT_TYPE {
                         continue;
                     }
@@ -3768,7 +4127,7 @@ async fn detach_session(
     sessions: &mut HashMap<String, SessionEntry>,
     thread_id: &str,
 ) -> Result<DetachedSession, ProviderRuntimeError> {
-    let Some(entry) = sessions.remove(thread_id) else {
+    let Some(mut entry) = sessions.remove(thread_id) else {
         return Err(ProviderRuntimeError::SessionNotFound {
             thread_id: thread_id.to_owned(),
         });
@@ -3779,6 +4138,11 @@ async fn detach_session(
         resume_cursor: entry.resume_cursor.clone(),
         runtime_payload: entry.runtime_payload.clone(),
     };
+    entry.activity_dispatch_cancellation.cancel();
+    entry.activity_control.write().await.take();
+    for task in std::mem::take(&mut entry.activity_dispatch_tasks) {
+        let _ = task.await;
+    }
     entry.event_cancellation.cancel();
     entry.event_task.abort();
     let _ = entry.event_task.await;
@@ -4526,6 +4890,7 @@ impl ProviderDriver for CodexDriver {
                 request_id: event.request_id,
                 payload: event.payload,
                 activity: event.activity,
+                activity_controls: Default::default(),
             })
         })
     }
@@ -4777,6 +5142,7 @@ impl ProviderDriver for CursorDriver {
                 request_id: event.request_id,
                 payload: event.payload,
                 activity: Vec::new(),
+                activity_controls: Default::default(),
             })
         })
     }
@@ -4976,6 +5342,7 @@ impl ProviderDriver for GrokDriver {
                 request_id: event.request_id,
                 payload: event.payload,
                 activity: Vec::new(),
+                activity_controls: Default::default(),
             })
         })
     }
@@ -5283,6 +5650,7 @@ impl ProviderDriver for OpenCodeDriver {
                 request_id: event.request_id,
                 payload: event.payload,
                 activity: event.activity,
+                activity_controls: Default::default(),
             })
         })
     }
@@ -5924,6 +6292,7 @@ mod claude_context_query_tests {
                 request_id: None,
                 payload: json!({ "state": state }),
                 activity: Vec::new(),
+                activity_controls: Default::default(),
             }
         }
 
@@ -7062,6 +7431,7 @@ fn spawn_claude_recovery_worker(
                     request_id: None,
                     payload: json!({}),
                     activity: output.activity,
+                    activity_controls: Default::default(),
                 },
             )
             .await
@@ -7193,6 +7563,7 @@ fn spawn_claude_output(
                     request_id: None,
                     payload: json!({"message":line}),
                     activity: Vec::new(),
+                    activity_controls: Default::default(),
                 },
             )
             .await
@@ -7570,6 +7941,7 @@ fn claude_provider_event(
         request_id: event.request_id,
         payload: event.payload,
         activity,
+        activity_controls: ProviderActivityControls::default(),
     }
 }
 
@@ -7617,6 +7989,7 @@ async fn emit_claude_value(
                 request_id: None,
                 payload: json!({}),
                 activity: output.activity,
+                activity_controls: Default::default(),
             },
         )
         .await;
@@ -7911,10 +8284,8 @@ mod tests {
     use super::{ProviderDriver, ProviderDriverFactory};
     use crate::{
         activity::{
-            ActivityCancellationDispatcher, ActivityCancellationService, ActivityControlRegistry,
-            ActivityDispatchError, ActivityRuntimeGeneration, ActivityScopeRef,
-            ActivityTargetDispatchDisposition, ProviderActivityControlUpdate,
-            ProviderActivityMutation, ProviderActivityNativeTarget,
+            ActivityCancellationDispatcher, ActivityDispatchError, ActivityRuntimeGeneration,
+            ActivityScopeRef, ProviderActivityNativeTarget,
         },
         diagnostics::{
             AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
@@ -7931,7 +8302,6 @@ mod tests {
         Json, Router,
         routing::{get, post},
     };
-    use futures_util::future::BoxFuture;
     use serde_json::{Value, json};
     use std::{
         io,
@@ -7982,22 +8352,6 @@ mod tests {
         send_gate: Option<Arc<tokio::sync::Notify>>,
         reconcile_gate: Option<Arc<tokio::sync::Notify>>,
         reconcile_started: Option<Arc<tokio::sync::Notify>>,
-    }
-
-    #[derive(Clone, Default)]
-    struct GenerationCapture(Arc<StdMutex<Option<ActivityRuntimeGeneration>>>);
-
-    impl ActivityCancellationDispatcher for GenerationCapture {
-        fn cancel_target(
-            &self,
-            _scope: ActivityScopeRef,
-            generation: ActivityRuntimeGeneration,
-            _target: ProviderActivityNativeTarget,
-        ) -> BoxFuture<'static, Result<ActivityTargetDispatchDisposition, ActivityDispatchError>>
-        {
-            *self.0.lock().expect("generation capture") = Some(generation);
-            Box::pin(async { Ok(ActivityTargetDispatchDisposition::Delivered) })
-        }
     }
 
     struct SupervisorDriver {
@@ -9540,45 +9894,13 @@ done
     }
 
     #[tokio::test]
-    async fn activity_cancellation_dispatch_fails_closed_without_queueing_provider_io() {
-        let controls = ActivityControlRegistry::new();
+    async fn activity_cancellation_queue_and_response_drop_map_to_safe_categories() {
         let scope = ActivityScopeRef::Thread {
             thread_id: "thread-activity-cancel".to_owned(),
         };
-        let scope_id = "thread:activity-cancel".to_owned();
-        let registration = controls.register_runtime(scope.clone(), scope_id.clone(), None);
-        controls
-            .observe_provider_batch(
-                &registration,
-                &[ProviderActivityMutation::upsert_actor(
-                    "actor:activity-cancel",
-                    None,
-                    "Activity cancel",
-                    "running",
-                )
-                .expect("actor mutation")],
-                &[ProviderActivityControlUpdate::ActorTarget {
-                    actor_id: "actor:activity-cancel".to_owned(),
-                    target: Some(ProviderActivityNativeTarget::ClaudeTask {
-                        task_id: "native-task".to_owned(),
-                    }),
-                }],
-            )
-            .await;
-        let capture = GenerationCapture::default();
-        let cancellation = ActivityCancellationService::new(controls, Arc::new(capture.clone()));
-        cancellation
-            .cancel_subtree(scope.clone(), &scope_id, "actor:activity-cancel", 1)
-            .await
-            .expect("capture runtime generation");
-        let generation = capture
-            .0
-            .lock()
-            .expect("generation capture")
-            .clone()
-            .expect("captured runtime generation");
-
-        let (sender, mut queued_messages) = mpsc::channel(4);
+        let generation = ActivityRuntimeGeneration::new();
+        let (sender, receiver) = mpsc::channel(1);
+        drop(receiver);
         let supervisor = super::ProviderRuntimeSupervisor {
             sender,
             stopped: tokio_util::sync::CancellationToken::new(),
@@ -9586,46 +9908,59 @@ done
             connect_mcp: Arc::new(tokio::sync::RwLock::new(None)),
             activity_cancellation: Arc::new(tokio::sync::RwLock::new(None)),
         };
-
-        for target in [
-            ProviderActivityNativeTarget::CodexTurn {
-                thread_id: "native-thread".to_owned(),
-                turn_id: "native-turn".to_owned(),
-            },
-            ProviderActivityNativeTarget::ClaudeTask {
-                task_id: "native-task".to_owned(),
-            },
-        ] {
-            let result = timeout(
-                std::time::Duration::from_millis(20),
-                supervisor.cancel_target(scope.clone(), generation.clone(), target),
-            )
-            .await;
-            let queued = queued_messages.try_recv().is_ok();
-            assert!(
-                !queued,
-                "polling and dropping native activity cancellation queued provider I/O"
-            );
-            assert_eq!(
-                result,
-                Ok(Err(ActivityDispatchError::TargetUnavailable)),
-                "native activity cancellation must fail closed immediately"
-            );
-        }
-
-        let dropped = supervisor.cancel_target(
-            scope,
-            generation,
-            ProviderActivityNativeTarget::CodexTurn {
-                thread_id: "native-thread-dropped".to_owned(),
-                turn_id: "native-turn-dropped".to_owned(),
-            },
+        assert_eq!(
+            supervisor
+                .cancel_target(
+                    scope.clone(),
+                    generation.clone(),
+                    ProviderActivityNativeTarget::claude_task("native-task".to_owned()),
+                )
+                .await,
+            Err(ActivityDispatchError::ProviderUnavailable)
         );
-        drop(dropped);
-        assert!(
-            queued_messages.try_recv().is_err(),
-            "dropping an unpolled cancellation future queued provider I/O"
+
+        let (sender, mut receiver) = mpsc::channel(1);
+        let supervisor = super::ProviderRuntimeSupervisor {
+            sender,
+            stopped: tokio_util::sync::CancellationToken::new(),
+            worker: Arc::new(tokio::sync::Mutex::new(None)),
+            connect_mcp: Arc::new(tokio::sync::RwLock::new(None)),
+            activity_cancellation: Arc::new(tokio::sync::RwLock::new(None)),
+        };
+        let drop_response = tokio::spawn(async move {
+            let Some(super::SupervisorMessage::CancelActivityTarget { response, .. }) =
+                receiver.recv().await
+            else {
+                panic!("targeted cancellation message");
+            };
+            drop(response);
+        });
+        assert_eq!(
+            supervisor
+                .cancel_target(
+                    scope,
+                    generation,
+                    ProviderActivityNativeTarget::codex_turn(
+                        "native-thread".to_owned(),
+                        "native-turn".to_owned(),
+                    ),
+                )
+                .await,
+            Err(ActivityDispatchError::ProviderUnavailable)
         );
+        drop_response.await.expect("drop response worker");
+
+        let unpolled = supervisor.cancel_target(
+            ActivityScopeRef::Thread {
+                thread_id: "never-polled".to_owned(),
+            },
+            ActivityRuntimeGeneration::new(),
+            ProviderActivityNativeTarget::codex_turn(
+                "native-thread-dropped".to_owned(),
+                "native-turn-dropped".to_owned(),
+            ),
+        );
+        drop(unpolled);
     }
 
     #[tokio::test]
@@ -9791,6 +10126,7 @@ done
                     request_id: None,
                     payload,
                     activity: Vec::new(),
+                    activity_controls: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -9845,6 +10181,7 @@ done
                     request_id: None,
                     payload,
                     activity: Vec::new(),
+                    activity_controls: Default::default(),
                 })
                 .await
                 .unwrap();
@@ -11086,6 +11423,7 @@ done
             request_id: None,
             payload,
             activity: Vec::new(),
+            activity_controls: Default::default(),
         };
         assert_eq!(
             super::assistant_message_id(&event(json!({"messageId":"message-1"}), Some("turn-1"))),
@@ -11171,6 +11509,7 @@ done
                     }
                 }),
                 activity: Vec::new(),
+                activity_controls: Default::default(),
             },
         )
         .await
@@ -11218,6 +11557,7 @@ done
                 request_id: None,
                 payload: json!({ "usage": {} }),
                 activity: Vec::new(),
+                activity_controls: Default::default(),
             },
         )
         .await
@@ -11254,6 +11594,7 @@ done
                     "servers": [{ "name": "context7", "state": "connected" }]
                 }),
                 activity: Vec::new(),
+                activity_controls: Default::default(),
             },
         )
         .await

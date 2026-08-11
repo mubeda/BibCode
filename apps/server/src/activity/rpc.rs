@@ -999,16 +999,16 @@ mod tests {
                 &[
                     ProviderActivityControlUpdate::ActorTarget {
                         actor_id: "actor:available".to_owned(),
-                        target: Some(ProviderActivityNativeTarget::CodexTurn {
-                            thread_id: "native-thread-secret".to_owned(),
-                            turn_id: "native-turn-secret".to_owned(),
-                        }),
+                        target: Some(ProviderActivityNativeTarget::codex_turn(
+                            "native-thread-secret".to_owned(),
+                            "native-turn-secret".to_owned(),
+                        )),
                     },
                     ProviderActivityControlUpdate::ActorTarget {
                         actor_id: "actor:terminal".to_owned(),
-                        target: Some(ProviderActivityNativeTarget::ClaudeTask {
-                            task_id: "native-task-secret".to_owned(),
-                        }),
+                        target: Some(ProviderActivityNativeTarget::claude_task(
+                            "native-task-secret".to_owned(),
+                        )),
                     },
                 ],
             )
@@ -1312,10 +1312,10 @@ mod tests {
                 &[actor],
                 &[ProviderActivityControlUpdate::ActorTarget {
                     actor_id: "actor:child".to_owned(),
-                    target: Some(ProviderActivityNativeTarget::CodexTurn {
-                        thread_id: "native-thread-secret".to_owned(),
-                        turn_id: "native-turn-secret".to_owned(),
-                    }),
+                    target: Some(ProviderActivityNativeTarget::codex_turn(
+                        "native-thread-secret".to_owned(),
+                        "native-turn-secret".to_owned(),
+                    )),
                 }],
             )
             .await;
