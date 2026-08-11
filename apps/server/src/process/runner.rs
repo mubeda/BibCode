@@ -432,7 +432,7 @@ mod tests {
                     .read_exact(&mut ready)
                     .await
                     .map_err(|error| error.to_string())?;
-                (ready == [b'R'])
+                (ready == *b"R")
                     .then_some(())
                     .ok_or_else(|| "unexpected fixture readiness payload".to_owned())
             })
