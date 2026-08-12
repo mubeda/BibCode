@@ -14,6 +14,10 @@ use bibcode_server::diagnostics::{
 
 fn read_process_executable(pid: u32) -> Result<PathBuf, ()> {
     let executable = std::fs::read_link(format!("/proc/{pid}/exe")).map_err(|_| ())?;
+    validate_process_executable_path(executable)
+}
+
+fn validate_process_executable_path(executable: PathBuf) -> Result<PathBuf, ()> {
     let metadata = std::fs::metadata(&executable).map_err(|_| ())?;
     metadata.is_file().then_some(executable).ok_or(())
 }
@@ -299,6 +303,7 @@ mod tests {
 
     use super::{
         LinuxObservationIssue, build_observation_with, coverage_for, read_process_executable,
+        validate_process_executable_path,
     };
 
     const SERVER_PID: u32 = 410;
@@ -363,6 +368,17 @@ mod tests {
         assert_ne!(record.identity.started_at, 0);
         assert!(executable.is_absolute());
         assert!(executable.is_file());
+    }
+
+    #[test]
+    fn linux_ui_rejects_exact_role_directory_as_executable() {
+        // Mutation caught: omitting the regular-file check accepts a non-executable directory
+        // whose basename exactly matches an allowed WebKitGTK process role.
+        let temporary = tempfile::tempdir().expect("temporary executable fixture");
+        let directory = temporary.path().join("WebKitWebProcess");
+        std::fs::create_dir(&directory).expect("exact-role directory fixture");
+
+        assert_eq!(validate_process_executable_path(directory), Err(()));
     }
 
     #[test]
@@ -934,21 +950,19 @@ usage is included, but local UI/WebView usage could not be associated reliably."
     }
 
     #[test]
-    fn linux_ui_rejects_process_record_and_executable_failures() {
+    fn linux_ui_rejects_process_record_and_executable_read_failures() {
         // Mutation caught: treating any failed validation boundary as success leaks a stale PID;
         // retaining injected detail can disclose process or filesystem information.
         enum Failure {
             ProcessExit,
             MalformedStat,
             PermissionDenial,
-            NonFileExecutable,
         }
 
         for (label, failure) in [
             ("process-exit", Failure::ProcessExit),
             ("malformed-stat", Failure::MalformedStat),
             ("permission-denial", Failure::PermissionDenial),
-            ("non-file-executable", Failure::NonFileExecutable),
         ] {
             let rows: Arc<[ProcessRow]> = Arc::from([
                 row(SERVER_PID, 1, 100, "/app/bin/bibcode-desktop"),
@@ -958,9 +972,7 @@ usage is included, but local UI/WebView usage could not be associated reliably."
             let mut records = match failure {
                 Failure::ProcessExit => VecDeque::from([Err(())]),
                 Failure::MalformedStat => VecDeque::from([Ok(expected), Err(())]),
-                Failure::PermissionDenial | Failure::NonFileExecutable => {
-                    VecDeque::from([Ok(expected), Ok(expected)])
-                }
+                Failure::PermissionDenial => VecDeque::from([Ok(expected), Ok(expected)]),
             };
 
             let observation = build_observation_with(
@@ -969,7 +981,6 @@ usage is included, but local UI/WebView usage could not be associated reliably."
                 |_| records.pop_front().expect("bounded record query"),
                 |_| match failure {
                     Failure::PermissionDenial => Err(()),
-                    Failure::NonFileExecutable => Ok(PathBuf::from("/")),
                     Failure::ProcessExit | Failure::MalformedStat => {
                         Ok(PathBuf::from("/usr/lib/WebKitWebProcess"))
                     }
