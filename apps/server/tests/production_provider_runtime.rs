@@ -4868,6 +4868,266 @@ async fn unexpected_provider_stream_end_settles_partial_turn_as_failed() {
 }
 
 #[tokio::test]
+async fn restart_recovers_eof_partial_after_terminal_settlement_retry_exhaustion() {
+    const STREAM_END_ERROR: &str = "Provider event stream ended unexpectedly.";
+    const MESSAGE_ID: &str = "assistant:t1:item:eof-retry-partial";
+    const TURN_ID: &str = "provider-turn-1";
+
+    let state_directory = TempDir::new().expect("state directory");
+    let database_path = state_directory.path().join("provider-eof-retry.sqlite3");
+    {
+        let database = Database::create_new(&database_path)
+            .await
+            .expect("persistent database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let hooks = TestHooks::default();
+        let engine = OrchestrationEngine::start(
+            database.clone(),
+            EngineOptions {
+                test_hooks: hooks.clone(),
+                ..EngineOptions::default()
+            },
+        )
+        .await
+        .expect("first engine");
+        for command in [
+            json!({"type":"project.create","commandId":"eof-retry-project","projectId":"p1","title":"Project","workspaceRoot":"C:/repo","createdAt":NOW}),
+            json!({"type":"thread.create","commandId":"eof-retry-thread","threadId":"t1","projectId":"p1","title":"Thread","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","createdAt":NOW}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(command).expect("fixture command"))
+                .await
+                .expect("fixture dispatch");
+        }
+
+        let state = Arc::new(StdMutex::new(DriverState::default()));
+        let (events_tx, events_rx) = mpsc::channel(4);
+        let factory = Arc::new(FakeFactory {
+            state,
+            events: StdMutex::new(VecDeque::from([events_rx])),
+        });
+        let supervisor = ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            factory,
+            activity_projection(&engine),
+            SupervisorOptions::default(),
+        );
+        supervisor.launch(launch()).await.unwrap();
+        let start = OrchestrationCommand::ThreadTurnStart {
+            command_id: "eof-retry-turn".to_owned(),
+            thread_id: "t1".to_owned(),
+            message: ThreadMessageInput {
+                message_id: "eof-retry-user".to_owned(),
+                role: "user".to_owned(),
+                text: "hello".to_owned(),
+                attachments: vec![],
+            },
+            model_selection: None,
+            title_seed: None,
+            runtime_mode: "full-access".to_owned(),
+            interaction_mode: "default".to_owned(),
+            bootstrap: None,
+            source_proposed_plan: None,
+            created_at: NOW.to_owned(),
+        };
+        engine.dispatch(start.clone()).await.unwrap();
+        supervisor.handle_orchestration(start).await.unwrap();
+        events_tx
+            .send(ProviderEvent {
+                native_event_id: None,
+                event_type: "content.delta".to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: Some(TURN_ID.to_owned()),
+                item_id: Some("eof-retry-partial".to_owned()),
+                request_id: None,
+                payload: json!({"streamKind":"assistant_text","delta":"Exact partial response"}),
+                activity: Vec::new(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let streaming = engine
+                    .repositories()
+                    .get_message(MESSAGE_ID.to_owned())
+                    .await
+                    .unwrap()
+                    .is_some_and(|message| message.is_streaming);
+                if streaming {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("partial assistant row is durable before EOF");
+
+        hooks.fail_next_projectors("projection.thread-messages", Some("thread.message-sent"), 2);
+        drop(events_tx);
+
+        let snapshot = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
+                let session_failed = snapshot.sessions.iter().any(|session| {
+                    session.thread_id == "t1"
+                        && session.status == "error"
+                        && session.active_turn_id.is_none()
+                        && session.last_error.as_deref() == Some(STREAM_END_ERROR)
+                });
+                let provider_error = snapshot.activities.iter().any(|activity| {
+                    activity.thread_id == "t1"
+                        && activity.kind == "provider.error"
+                        && activity.payload["error"]["message"] == STREAM_END_ERROR
+                });
+                let runtime_failed = engine
+                    .repositories()
+                    .get_provider_session_runtime("t1".to_owned())
+                    .await
+                    .unwrap()
+                    .is_some_and(|runtime| runtime.status == "error");
+                let remains_streaming = snapshot.messages.iter().any(|message| {
+                    message.message_id == MESSAGE_ID
+                        && message.turn_id.as_deref() == Some(TURN_ID)
+                        && message.text == "Exact partial response"
+                        && message.is_streaming
+                });
+                if session_failed && provider_error && runtime_failed && remains_streaming {
+                    break snapshot;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("EOF lifecycle persists after both settlement attempts fail");
+        assert_eq!(
+            snapshot
+                .messages
+                .iter()
+                .filter(|message| message.role == "assistant")
+                .map(|message| {
+                    (
+                        message.message_id.as_str(),
+                        message.turn_id.as_deref(),
+                        message.text.as_str(),
+                        message.is_streaming,
+                    )
+                })
+                .collect::<Vec<_>>(),
+            vec![(MESSAGE_ID, Some(TURN_ID), "Exact partial response", true,)]
+        );
+
+        let failed_runtime = engine
+            .repositories()
+            .get_provider_session_runtime("t1".to_owned())
+            .await
+            .unwrap()
+            .expect("EOF runtime is durable before process restart");
+        assert_eq!(failed_runtime.status, "error");
+
+        supervisor.shutdown().await.unwrap();
+        // Graceful supervisor shutdown removes its runtime row. Reinsert the
+        // already-observed durable EOF state to model an abrupt process exit
+        // while still joining the test worker cleanly.
+        engine
+            .repositories()
+            .upsert_provider_session_runtime(failed_runtime)
+            .await
+            .expect("preserve crash-time EOF runtime state");
+        engine.shutdown().await;
+        database
+            .checkpoint_wal()
+            .await
+            .expect("checkpoint before restart");
+    }
+
+    let database = Database::open_existing(&database_path)
+        .await
+        .expect("reopened database");
+    let engine = OrchestrationEngine::start(database, EngineOptions::default())
+        .await
+        .expect("restarted engine");
+    let event_count_before_recovery = engine.read_events(0).await.unwrap().len();
+    reconcile_abandoned_provider_sessions(&engine)
+        .await
+        .expect("startup reconciliation");
+
+    let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
+    assert_eq!(
+        snapshot
+            .messages
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .map(|message| {
+                (
+                    message.message_id.as_str(),
+                    message.turn_id.as_deref(),
+                    message.text.as_str(),
+                    message.is_streaming,
+                )
+            })
+            .collect::<Vec<_>>(),
+        vec![(MESSAGE_ID, Some(TURN_ID), "Exact partial response", false,)]
+    );
+    let session = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.thread_id == "t1")
+        .expect("EOF session remains projected");
+    assert_eq!(
+        (
+            session.status.as_str(),
+            session.active_turn_id.as_deref(),
+            session.last_error.as_deref(),
+        ),
+        ("error", None, Some(STREAM_END_ERROR))
+    );
+    assert_eq!(
+        snapshot
+            .activities
+            .iter()
+            .filter(|activity| {
+                activity.thread_id == "t1"
+                    && activity.kind == "provider.error"
+                    && activity.payload["error"]["message"] == STREAM_END_ERROR
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        engine
+            .repositories()
+            .get_provider_session_runtime("t1".to_owned())
+            .await
+            .unwrap()
+            .expect("EOF runtime remains durable")
+            .status,
+        "error"
+    );
+    let event_count_after_recovery = engine.read_events(0).await.unwrap().len();
+    assert_eq!(
+        event_count_after_recovery,
+        event_count_before_recovery + 1,
+        "recovery appends only the exact assistant completion"
+    );
+
+    reconcile_abandoned_provider_sessions(&engine)
+        .await
+        .expect("duplicate startup reconciliation");
+    assert_eq!(
+        engine.read_events(0).await.unwrap().len(),
+        event_count_after_recovery,
+        "completed error-runtime recovery is idempotent"
+    );
+    engine.shutdown().await;
+}
+
+#[tokio::test]
 async fn runtime_observed_capability_upgrade_survives_stream_end() {
     let (engine, database) = engine_and_database().await;
     let activity = ActivityProjection::new(ActivityRepository::new(database));

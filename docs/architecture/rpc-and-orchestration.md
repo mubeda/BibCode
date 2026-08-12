@@ -108,7 +108,10 @@ events share a timestamp. Startup reconciliation and an unexpected provider
 event-stream end settle the exact abandoned turn's existing assistant rows;
 they retain provider failure and session error state without inserting fallback
 text. This terminal settlement performs one thread-scoped read and no per-delta
-database work.
+database work. If both live settlement attempts fail after an unexpected stream
+end, the durable error runtime retains thread-scoped recovery ownership: the
+next startup settles the exact stored message and turn identities without
+rewriting the original provider or session error.
 
 ### Context-window usage flow
 
