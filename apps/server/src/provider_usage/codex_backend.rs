@@ -115,9 +115,59 @@ struct SharedAuthRead {
     receiver: tokio::sync::watch::Receiver<Option<AuthReadOutcome>>,
 }
 
-static AUTH_READS: OnceLock<Mutex<HashMap<PathBuf, SharedAuthRead>>> = OnceLock::new();
-static NEXT_AUTH_READ_ID: AtomicU64 = AtomicU64::new(1);
 static PRODUCTION_AUTH_READER: OnceLock<AuthReader> = OnceLock::new();
+
+struct AuthReadRegistry {
+    reads: Mutex<HashMap<PathBuf, SharedAuthRead>>,
+    next_id: AtomicU64,
+}
+
+impl Default for AuthReadRegistry {
+    fn default() -> Self {
+        Self {
+            reads: Mutex::new(HashMap::new()),
+            next_id: AtomicU64::new(1),
+        }
+    }
+}
+
+struct AuthReadOwner {
+    registry: Arc<AuthReadRegistry>,
+    path: PathBuf,
+    id: u64,
+    sender: Option<tokio::sync::watch::Sender<Option<AuthReadOutcome>>>,
+}
+
+impl AuthReadOwner {
+    fn publish(mut self, outcome: AuthReadOutcome) {
+        self.remove_registration();
+        if let Some(sender) = self.sender.take() {
+            sender.send_replace(Some(outcome));
+        }
+    }
+
+    fn remove_registration(&mut self) {
+        let mut reads = self
+            .registry
+            .reads
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if reads
+            .get(&self.path)
+            .is_some_and(|current| current.id == self.id)
+        {
+            reads.remove(&self.path);
+        }
+    }
+}
+
+impl Drop for AuthReadOwner {
+    fn drop(&mut self) {
+        self.remove_registration();
+    }
+}
+
+static AUTH_READ_REGISTRY: OnceLock<Arc<AuthReadRegistry>> = OnceLock::new();
 
 #[derive(Deserialize)]
 struct BackendUsageResponse {
@@ -371,7 +421,23 @@ async fn read_auth_with_reader(
     codex_home: &Path,
     auth_reader: AuthReader,
 ) -> Option<CodexBackendAuth> {
-    let mut read = shared_auth_read(codex_home.join("auth.json"), auth_reader);
+    read_auth_with_reader_in_registry(
+        codex_home,
+        auth_reader,
+        AUTH_READ_REGISTRY
+            .get_or_init(|| Arc::new(AuthReadRegistry::default()))
+            .clone(),
+    )
+    .await
+}
+
+async fn read_auth_with_reader_in_registry(
+    codex_home: &Path,
+    auth_reader: AuthReader,
+    registry: Arc<AuthReadRegistry>,
+) -> Option<CodexBackendAuth> {
+    let mut read =
+        shared_auth_read_with_registry(codex_home.join("auth.json"), auth_reader, registry);
     let bytes = loop {
         match read.receiver.borrow().clone() {
             Some(AuthReadOutcome::Bytes(bytes)) => break bytes,
@@ -392,34 +458,38 @@ async fn read_auth_with_reader(
     })
 }
 
-fn shared_auth_read(path: PathBuf, auth_reader: AuthReader) -> SharedAuthRead {
-    let reads = AUTH_READS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut reads = reads
+fn shared_auth_read_with_registry(
+    path: PathBuf,
+    auth_reader: AuthReader,
+    registry: Arc<AuthReadRegistry>,
+) -> SharedAuthRead {
+    let mut reads = registry
+        .reads
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     if let Some(existing) = reads.get(&path) {
         return existing.clone();
     }
 
-    let id = NEXT_AUTH_READ_ID.fetch_add(1, Ordering::Relaxed);
+    let id = registry.next_id.fetch_add(1, Ordering::Relaxed);
     let (sender, receiver) = tokio::sync::watch::channel(None);
     let shared = SharedAuthRead { id, receiver };
     reads.insert(path.clone(), shared.clone());
     drop(reads);
+
+    let owner = AuthReadOwner {
+        registry,
+        path: path.clone(),
+        id,
+        sender: Some(sender),
+    };
 
     tokio::spawn(async move {
         let outcome = match auth_reader(path.clone()).await {
             Ok(bytes) => AuthReadOutcome::Bytes(Arc::new(bytes)),
             Err(()) => AuthReadOutcome::Failed,
         };
-        sender.send_replace(Some(outcome));
-        let reads = AUTH_READS.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut reads = reads
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if reads.get(&path).is_some_and(|current| current.id == id) {
-            reads.remove(&path);
-        }
+        owner.publish(outcome);
     });
 
     shared
@@ -1158,6 +1228,101 @@ mod tests {
             };
             assert_eq!(fallback.kind, CodexBackendFallbackKind::Unavailable);
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn auth_read_generation_slot_is_reusable_after_owner_abort() {
+        let temporary = tempfile::tempdir().expect("temporary Codex home");
+        let auth_path = temporary.path().join("auth.json");
+        let registry = Arc::new(AuthReadRegistry::default());
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let stalled_reader: AuthReader = Arc::new({
+            let started = started.clone();
+            move |_| {
+                let started = started.clone();
+                Box::pin(async move {
+                    started.add_permits(1);
+                    std::future::pending::<Result<Vec<u8>, ()>>().await
+                })
+            }
+        });
+        let (drop_runtime, drop_runtime_receiver) = tokio::sync::oneshot::channel();
+        let owner = std::thread::spawn({
+            let auth_path = auth_path.clone();
+            let registry = registry.clone();
+            move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("auth-read owner runtime");
+                runtime.block_on(async move {
+                    let _read = shared_auth_read_with_registry(auth_path, stalled_reader, registry);
+                    drop_runtime_receiver
+                        .await
+                        .expect("runtime drop release event");
+                });
+            }
+        });
+        started
+            .acquire()
+            .await
+            .expect("auth read start event")
+            .forget();
+
+        drop_runtime.send(()).expect("drop auth-read owner runtime");
+        owner.join().expect("auth-read owner thread");
+
+        let replacement_calls = Arc::new(AtomicUsize::new(0));
+        let replacement_reader: AuthReader = Arc::new({
+            let replacement_calls = replacement_calls.clone();
+            move |_| {
+                replacement_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Ok(br#"{"tokens":{"access_token":"replacement-token"}}"#.to_vec())
+                })
+            }
+        });
+        let replacement =
+            read_auth_with_reader_in_registry(temporary.path(), replacement_reader, registry)
+                .await
+                .expect("replacement auth read");
+
+        assert_eq!(replacement.access_token, "replacement-token");
+        assert_eq!(replacement_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn auth_read_generation_slot_is_reusable_after_reader_panic() {
+        let temporary = tempfile::tempdir().expect("temporary Codex home");
+        let registry = Arc::new(AuthReadRegistry::default());
+        let panicked_reader: AuthReader = Arc::new(|_| {
+            Box::pin(async {
+                panic!("injected Codex auth reader panic");
+            })
+        });
+        assert!(
+            read_auth_with_reader_in_registry(temporary.path(), panicked_reader, registry.clone(),)
+                .await
+                .is_none()
+        );
+
+        let replacement_calls = Arc::new(AtomicUsize::new(0));
+        let replacement_reader: AuthReader = Arc::new({
+            let replacement_calls = replacement_calls.clone();
+            move |_| {
+                replacement_calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async {
+                    Ok(br#"{"tokens":{"access_token":"replacement-token"}}"#.to_vec())
+                })
+            }
+        });
+        let replacement =
+            read_auth_with_reader_in_registry(temporary.path(), replacement_reader, registry)
+                .await
+                .expect("replacement auth read after panic");
+
+        assert_eq!(replacement.access_token, "replacement-token");
+        assert_eq!(replacement_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

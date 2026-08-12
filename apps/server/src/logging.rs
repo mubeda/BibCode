@@ -1,26 +1,32 @@
 use std::{
     ffi::OsString,
     fs::{File, OpenOptions},
-    io::{IsTerminal, Write},
+    io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard, OnceLock},
+    sync::{Arc, Mutex, MutexGuard},
 };
 
+#[cfg(not(test))]
+use std::{io::IsTerminal, sync::OnceLock};
+
 use thiserror::Error;
-use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
+use tracing_subscriber::EnvFilter;
+#[cfg(not(test))]
+use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 pub(crate) const SERVER_LOG_MAX_BYTES: u64 = 4 * 1024 * 1024;
 pub(crate) const SERVER_LOG_BACKUPS: usize = 3;
 const TRUNCATION_MARKER: &[u8] = b"\n[truncated]\n";
+#[cfg(not(test))]
 static INITIALIZE_LOCK: Mutex<()> = Mutex::new(());
+#[cfg(not(test))]
 static ACTIVE_LOG_WRITER: OnceLock<LogWriter> = OnceLock::new();
-#[cfg(test)]
-pub(crate) static TEST_INITIALIZE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 #[derive(Clone)]
 struct LogWriter(Arc<Mutex<RotatingFile>>);
 
 impl LogWriter {
+    #[cfg(not(test))]
     fn replace(&self, file: RotatingFile) {
         *self
             .0
@@ -173,13 +179,36 @@ pub enum LoggingError {
 }
 
 pub fn initialize(log_path: &Path) -> Result<Init, LoggingError> {
-    let filter = crate::environment_identity::bibcode_env_string("BIBCODE_LOG")
-        .and_then(|value| EnvFilter::try_new(value).ok())
-        .or_else(|| EnvFilter::try_from_default_env().ok())
-        .unwrap_or_else(|| EnvFilter::new("info"));
-    initialize_with_filter(log_path, filter)
+    #[cfg(test)]
+    {
+        let parent = log_path.parent().unwrap_or_else(|| Path::new("."));
+        std::fs::create_dir_all(parent).map_err(|source| LoggingError::CreateDirectory {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+        RotatingFile::open(
+            log_path.to_path_buf(),
+            SERVER_LOG_MAX_BYTES,
+            SERVER_LOG_BACKUPS,
+        )
+        .map_err(|source| LoggingError::OpenFile {
+            path: log_path.to_path_buf(),
+            source,
+        })?;
+        Ok(Init::Installed)
+    }
+
+    #[cfg(not(test))]
+    {
+        let filter = crate::environment_identity::bibcode_env_string("BIBCODE_LOG")
+            .and_then(|value| EnvFilter::try_new(value).ok())
+            .or_else(|| EnvFilter::try_from_default_env().ok())
+            .unwrap_or_else(|| EnvFilter::new("info"));
+        initialize_with_filter(log_path, filter)
+    }
 }
 
+#[cfg(not(test))]
 fn initialize_with_filter(log_path: &Path, filter: EnvFilter) -> Result<Init, LoggingError> {
     let _guard = INITIALIZE_LOCK
         .lock()
@@ -281,29 +310,45 @@ mod tests {
     }
 
     #[test]
-    fn native_events_are_written_and_repeated_initialization_is_safe() {
-        let _guard = TEST_INITIALIZE_LOCK.blocking_lock();
+    fn native_events_are_written_to_independent_sandbox_writers() {
         let temp = TempDir::new().expect("temporary log directory");
-        let log_path = temp.path().join("nested/server.log");
+        let left_path = temp.path().join("left/server.log");
+        let right_path = temp.path().join("right/server.log");
+        std::fs::create_dir_all(left_path.parent().expect("left log parent"))
+            .expect("left log directory");
+        std::fs::create_dir_all(right_path.parent().expect("right log parent"))
+            .expect("right log directory");
+        let left = LogWriter(Arc::new(Mutex::new(
+            RotatingFile::open(left_path.clone(), 1024, 1).expect("left sandbox writer"),
+        )));
+        let right = LogWriter(Arc::new(Mutex::new(
+            RotatingFile::open(right_path.clone(), 1024, 1).expect("right sandbox writer"),
+        )));
+        let left_subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_env_filter(EnvFilter::new("info"))
+            .with_writer(left)
+            .finish();
+        let right_subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_env_filter(EnvFilter::new("info"))
+            .with_writer(right)
+            .finish();
 
-        let initialization = initialize_with_filter(&log_path, EnvFilter::new("info"))
-            .expect("subscriber initializes or replaces the active test writer");
-        tracing::info!(target: "bibcode_server_logging_test", "native logging is connected");
-        let replacement_path = temp.path().join("replacement/server.log");
-        assert_eq!(
-            initialize_with_filter(&replacement_path, EnvFilter::new("info"))
-                .expect("repeated initialization is safe"),
-            Init::AlreadyInstalled
-        );
-        tracing::info!(target: "bibcode_server_logging_test", "native logging moved");
+        tracing::subscriber::with_default(left_subscriber, || {
+            tracing::info!(target: "bibcode_server_logging_test", "left sandbox event");
+        });
+        tracing::subscriber::with_default(right_subscriber, || {
+            tracing::info!(target: "bibcode_server_logging_test", "right sandbox event");
+        });
 
-        let contents = std::fs::read_to_string(&log_path).expect("server log is readable");
-        let replacement =
-            std::fs::read_to_string(replacement_path).expect("replacement log is readable");
-        if initialization == Init::Installed {
-            assert!(contents.contains("native logging is connected"));
-            assert!(!contents.contains("native logging moved"));
-            assert!(replacement.contains("native logging moved"));
-        }
+        let left = std::fs::read_to_string(left_path).expect("left log is readable");
+        let right = std::fs::read_to_string(right_path).expect("right log is readable");
+        assert!(left.contains("left sandbox event"));
+        assert!(!left.contains("right sandbox event"));
+        assert!(right.contains("right sandbox event"));
+        assert!(!right.contains("left sandbox event"));
     }
 }

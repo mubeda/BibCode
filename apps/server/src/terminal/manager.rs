@@ -445,12 +445,24 @@ impl PreparedObserverHandle {
 #[derive(Clone, Debug)]
 struct ObserverCallbackIsolation {
     slots: Arc<tokio::sync::Semaphore>,
+    global_slots: Arc<tokio::sync::Semaphore>,
 }
 
 impl Default for ObserverCallbackIsolation {
     fn default() -> Self {
         Self {
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_ISOLATED_OBSERVER_CALLBACKS)),
+            global_slots: GLOBAL_OBSERVER_CALLBACK_SLOTS.clone(),
+        }
+    }
+}
+
+#[cfg(test)]
+impl ObserverCallbackIsolation {
+    fn with_global_slots(global_slots: Arc<tokio::sync::Semaphore>) -> Self {
+        Self {
+            slots: Arc::new(tokio::sync::Semaphore::new(MAX_ISOLATED_OBSERVER_CALLBACKS)),
+            global_slots,
         }
     }
 }
@@ -551,7 +563,7 @@ where
     };
     let global_permit = match tokio::time::timeout(
         OBSERVER_CALLBACK_TIMEOUT,
-        GLOBAL_OBSERVER_CALLBACK_SLOTS.clone().acquire_owned(),
+        isolation.global_slots.acquire_owned(),
     )
     .await
     {
@@ -2803,6 +2815,101 @@ mod tests {
         fn diagnostic_label(&self) -> &str {
             "registry-observer"
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn observer_callback_slot_is_reusable_after_aborted_owner() {
+        let global_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let isolation = ObserverCallbackIsolation::with_global_slots(global_slots.clone());
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let owner = tokio::spawn({
+            let isolation = isolation.clone();
+            let started = started.clone();
+            let release = release.clone();
+            async move {
+                run_observer_callback(
+                    isolation,
+                    "aborted_owner",
+                    Duration::from_secs(5),
+                    async move {
+                        started.add_permits(1);
+                        release
+                            .acquire()
+                            .await
+                            .expect("callback release event")
+                            .forget();
+                    },
+                )
+                .await
+            }
+        });
+        started
+            .acquire()
+            .await
+            .expect("callback start event")
+            .forget();
+
+        owner.abort();
+        assert!(
+            owner
+                .await
+                .expect_err("aborted callback owner")
+                .is_cancelled()
+        );
+        release.add_permits(1);
+        let returned =
+            tokio::time::timeout(Duration::from_secs(1), global_slots.clone().acquire_owned())
+                .await
+                .expect("aborted callback owner released its process slot after thread exit")
+                .expect("callback capacity remains open");
+        drop(returned);
+
+        assert_eq!(
+            run_observer_callback(
+                isolation,
+                "replacement_after_abort",
+                Duration::from_secs(1),
+                async { "replacement" },
+            )
+            .await,
+            Some("replacement")
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn observer_callback_slot_is_reusable_after_callback_panic() {
+        let global_slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let isolation = ObserverCallbackIsolation::with_global_slots(global_slots.clone());
+        assert_eq!(
+            run_observer_callback(
+                isolation.clone(),
+                "panicked_callback",
+                Duration::from_secs(1),
+                async {
+                    panic!("injected observer callback panic");
+                },
+            )
+            .await,
+            None
+        );
+        let returned =
+            tokio::time::timeout(Duration::from_secs(1), global_slots.clone().acquire_owned())
+                .await
+                .expect("panicked callback released its process slot")
+                .expect("callback capacity remains open");
+        drop(returned);
+
+        assert_eq!(
+            run_observer_callback(
+                isolation,
+                "replacement_after_panic",
+                Duration::from_secs(1),
+                async { 7_u8 },
+            )
+            .await,
+            Some(7)
+        );
     }
 
     #[tokio::test]
