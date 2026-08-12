@@ -116,6 +116,10 @@ function snapshotCanReplace(
   return current.value.scopeId !== incoming.scopeId || incoming.revision >= current.value.revision;
 }
 
+function hasConsistentActivityScope(snapshot: ActivitySnapshot): boolean {
+  return snapshot.scopeId === snapshot.control.scopeId;
+}
+
 function stateWithSnapshot(
   current: EnvironmentActivityState,
   incoming: ActivitySnapshot,
@@ -209,19 +213,6 @@ export const makeEnvironmentActivityState = Effect.fn("EnvironmentActivityState.
   });
   const featureDisabled = yield* Deferred.make<void>();
 
-  const transitionFeatureDisabled = Effect.fn("EnvironmentActivityState.transitionFeatureDisabled")(
-    function* () {
-      yield* stateLock.withPermits(1)(
-        Effect.gen(function* () {
-          yield* Ref.set(activeRecoveries, { observation: null, control: null });
-          yield* Ref.set(negotiatedCapability, "unsupported");
-          yield* SubscriptionRef.set(state, stateUnsupported());
-        }),
-      );
-      yield* Deferred.succeed(featureDisabled, undefined);
-    },
-  );
-
   const retireRecovery = Effect.fn("EnvironmentActivityState.retireRecovery")(function* (
     domain: RecoveryDomain,
     epoch: number,
@@ -237,13 +228,19 @@ export const makeEnvironmentActivityState = Effect.fn("EnvironmentActivityState.
   )(function* () {
     const recoveries = yield* Ref.get(activeRecoveries);
     if (recoveries.observation !== null || recoveries.control !== null) {
-      yield* SubscriptionRef.update(state, (current) => ({ ...current, status: "stale" }));
+      yield* SubscriptionRef.update(
+        state,
+        (current): EnvironmentActivityState => ({
+          ...current,
+          status: "stale",
+        }),
+      );
     }
   });
 
   const replaceSnapshotLocked = Effect.fn("EnvironmentActivityState.replaceSnapshotLocked")(
     function* (incoming: ActivitySnapshot) {
-      if (!scopeRefEqual(scope, incoming.scope)) {
+      if (!scopeRefEqual(scope, incoming.scope) || !hasConsistentActivityScope(incoming)) {
         return;
       }
       yield* Ref.set(acceptedScopeId, incoming.scopeId);
@@ -271,7 +268,8 @@ export const makeEnvironmentActivityState = Effect.fn("EnvironmentActivityState.
           currentRecovery.sessionEpoch !== token.sessionEpoch ||
           currentRecovery.baseRevision !== token.baseRevision ||
           currentEpoch !== token.sessionEpoch ||
-          !scopeRefEqual(scope, incoming.scope)
+          !scopeRefEqual(scope, incoming.scope) ||
+          !hasConsistentActivityScope(incoming)
         ) {
           return;
         }
@@ -346,6 +344,60 @@ export const makeEnvironmentActivityState = Effect.fn("EnvironmentActivityState.
     );
   });
 
+  const transitionFeatureDisabledForRecovery = Effect.fn(
+    "EnvironmentActivityState.transitionFeatureDisabledForRecovery",
+  )(function* (token: RecoveryToken) {
+    const transitioned = yield* stateLock.withPermits(1)(
+      Effect.gen(function* () {
+        const recoveries = yield* Ref.get(activeRecoveries);
+        const currentRecovery = recoveries[token.domain];
+        const currentEpoch = yield* Ref.get(sessionEpoch);
+        const currentSnapshot = Option.getOrNull((yield* SubscriptionRef.get(state)).snapshot);
+        const currentRevision =
+          currentSnapshot === null
+            ? null
+            : token.domain === "observation"
+              ? currentSnapshot.revision
+              : currentSnapshot.control.revision;
+        if (
+          currentRecovery?.id !== token.id ||
+          currentRecovery.sessionEpoch !== token.sessionEpoch ||
+          currentRecovery.baseRevision !== token.baseRevision ||
+          currentEpoch !== token.sessionEpoch ||
+          currentRevision !== token.baseRevision
+        ) {
+          return false;
+        }
+        yield* Ref.set(activeRecoveries, { observation: null, control: null });
+        yield* Ref.set(negotiatedCapability, "unsupported");
+        yield* SubscriptionRef.set(state, stateUnsupported());
+        return true;
+      }),
+    );
+    if (transitioned) {
+      yield* Deferred.succeed(featureDisabled, undefined);
+    }
+  });
+
+  const transitionFeatureDisabledForStream = Effect.fn(
+    "EnvironmentActivityState.transitionFeatureDisabledForStream",
+  )(function* (epoch: number) {
+    const transitioned = yield* stateLock.withPermits(1)(
+      Effect.gen(function* () {
+        if ((yield* Ref.get(sessionEpoch)) !== epoch) {
+          return false;
+        }
+        yield* Ref.set(activeRecoveries, { observation: null, control: null });
+        yield* Ref.set(negotiatedCapability, "unsupported");
+        yield* SubscriptionRef.set(state, stateUnsupported());
+        return true;
+      }),
+    );
+    if (transitioned) {
+      yield* Deferred.succeed(featureDisabled, undefined);
+    }
+  });
+
   const clearRecovery = Effect.fn("EnvironmentActivityState.clearRecovery")(function* (
     token: RecoveryToken,
   ) {
@@ -364,7 +416,7 @@ export const makeEnvironmentActivityState = Effect.fn("EnvironmentActivityState.
       Effect.flatMap((incoming) => completeRecovery(token, incoming)),
       Effect.catchCause((cause) =>
         hasFeatureDisabledActivityFailure(cause)
-          ? transitionFeatureDisabled()
+          ? transitionFeatureDisabledForRecovery(token)
           : failRecovery(token),
       ),
       Effect.ensuring(clearRecovery(token)),
@@ -584,7 +636,7 @@ export const makeEnvironmentActivityState = Effect.fn("EnvironmentActivityState.
                     {
                       onExpectedFailure: (cause) =>
                         hasFeatureDisabledActivityFailure(cause)
-                          ? transitionFeatureDisabled()
+                          ? transitionFeatureDisabledForStream(epoch)
                           : SubscriptionRef.update(state, (current) =>
                               stateWithError(current, ACTIVITY_STREAM_ERROR_MESSAGE),
                             ),

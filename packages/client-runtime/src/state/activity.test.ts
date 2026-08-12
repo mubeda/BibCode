@@ -384,6 +384,180 @@ describe("environment activity stream state", () => {
     }),
   );
 
+  it.effect("rejects combined snapshots whose control scope does not match observation", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeHarness();
+      yield* Queue.offer(harness.inputs, {
+        kind: "snapshot",
+        snapshot: snapshot(3, "Rejected initial", {
+          control: {
+            ...snapshot().control,
+            scopeId: REPLACEMENT_SCOPE_ID,
+          },
+        }),
+      });
+      for (let attempt = 0; attempt < 20; attempt += 1) yield* Effect.yieldNow;
+      expect(Option.isNone((yield* SubscriptionRef.get(harness.state)).snapshot)).toBe(true);
+
+      yield* Queue.offer(harness.inputs, { kind: "snapshot", snapshot: snapshot() });
+      yield* awaitState(harness.state, (state) => state.status === "live");
+      yield* Queue.offer(harness.inputs, {
+        kind: "snapshot",
+        snapshot: snapshot(4, "Rejected replacement", {
+          control: {
+            ...snapshot().control,
+            scopeId: REPLACEMENT_SCOPE_ID,
+            revision: 8,
+          },
+        }),
+      });
+      for (let attempt = 0; attempt < 20; attempt += 1) yield* Effect.yieldNow;
+      const retained = yield* SubscriptionRef.get(harness.state);
+      expect(Option.getOrThrow(retained.snapshot).actors[0]?.name).toBe("Explore provider events");
+      expect(Option.getOrThrow(retained.snapshot).revision).toBe(3);
+      expect(Option.getOrThrow(retained.snapshot).control.revision).toBe(5);
+    }),
+  );
+
+  it.effect("rejects a cross-scope control snapshot returned by recovery", () =>
+    Effect.gen(function* () {
+      const recovery = yield* Deferred.make<ActivitySnapshot, Error>();
+      const harness = yield* makeHarness({ getSnapshot: () => Deferred.await(recovery) });
+      yield* Queue.offer(harness.inputs, { kind: "snapshot", snapshot: snapshot() });
+      yield* awaitState(harness.state, (state) => state.status === "live");
+      yield* Queue.offer(harness.inputs, { kind: "delta", delta: gapDelta() });
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(harness.snapshotRequestCount)) === 1) break;
+        yield* Effect.yieldNow;
+      }
+      yield* Deferred.succeed(
+        recovery,
+        snapshot(6, "Rejected recovery", {
+          control: { ...snapshot().control, scopeId: REPLACEMENT_SCOPE_ID, revision: 8 },
+        }),
+      );
+      for (let attempt = 0; attempt < 20; attempt += 1) yield* Effect.yieldNow;
+      const retained = yield* SubscriptionRef.get(harness.state);
+      expect(Option.getOrThrow(retained.snapshot).revision).toBe(3);
+      expect(Option.getOrThrow(retained.snapshot).control.revision).toBe(5);
+      expect(Option.getOrThrow(retained.snapshot).actors[0]?.name).toBe("Explore provider events");
+    }),
+  );
+
+  it.effect("ignores feature-disabled from a recovery superseded by stream progress", () =>
+    Effect.gen(function* () {
+      const recovery = yield* Deferred.make<ActivitySnapshot, Error>();
+      const harness = yield* makeHarness({ getSnapshot: () => Deferred.await(recovery) });
+      yield* Queue.offer(harness.inputs, { kind: "snapshot", snapshot: snapshot() });
+      yield* awaitState(harness.state, (state) => state.status === "live");
+      yield* Queue.offer(harness.inputs, { kind: "delta", delta: gapDelta() });
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(harness.snapshotRequestCount)) === 1) break;
+        yield* Effect.yieldNow;
+      }
+      yield* Queue.offer(harness.inputs, {
+        kind: "delta",
+        delta: {
+          ...gapDelta(3, 4),
+          changes: [
+            {
+              kind: "actor-upserted",
+              actor: { ...snapshot().actors[0]!, name: "Newer progress" },
+            },
+          ],
+        },
+      });
+      yield* awaitState(
+        harness.state,
+        (state) => Option.isSome(state.snapshot) && state.snapshot.value.revision === 4,
+      );
+      yield* Deferred.fail(
+        recovery,
+        new ActivityError({ reason: "featureDisabled", message: "Late disabled result." }),
+      );
+      for (let attempt = 0; attempt < 20; attempt += 1) yield* Effect.yieldNow;
+      const retained = yield* SubscriptionRef.get(harness.state);
+      expect(retained.status).toBe("live");
+      expect(Option.getOrThrow(retained.snapshot).actors[0]?.name).toBe("Newer progress");
+      expect(yield* Ref.get(harness.streamFinalizerCount)).toBe(0);
+    }),
+  );
+
+  it.effect("ignores feature-disabled from a recovery owned by a replaced session", () =>
+    Effect.gen(function* () {
+      const recovery = yield* Deferred.make<ActivitySnapshot, Error>();
+      const harness = yield* makeHarness({ getSnapshot: () => Deferred.await(recovery) });
+      yield* Queue.offer(harness.inputs, { kind: "snapshot", snapshot: snapshot() });
+      yield* awaitState(harness.state, (state) => state.status === "live");
+      yield* Queue.offer(harness.inputs, { kind: "delta", delta: gapDelta() });
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(harness.snapshotRequestCount)) === 1) break;
+        yield* Effect.yieldNow;
+      }
+      yield* SubscriptionRef.set(harness.supervisorSession, Option.none());
+      yield* harness.reconnect;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(harness.subscriptionCount)) === 2) break;
+        yield* Effect.yieldNow;
+      }
+      yield* Queue.offer(harness.inputs, {
+        kind: "snapshot",
+        snapshot: snapshot(7, "New session"),
+      });
+      yield* awaitState(
+        harness.state,
+        (state) => Option.isSome(state.snapshot) && state.snapshot.value.revision === 7,
+      );
+      yield* Deferred.fail(
+        recovery,
+        new ActivityError({ reason: "featureDisabled", message: "Old session disabled." }),
+      );
+      for (let attempt = 0; attempt < 20; attempt += 1) yield* Effect.yieldNow;
+      const retained = yield* SubscriptionRef.get(harness.state);
+      expect(retained.status).toBe("live");
+      expect(Option.getOrThrow(retained.snapshot).actors[0]?.name).toBe("New session");
+    }),
+  );
+
+  it.effect("ignores a feature-disabled failure from a replaced subscription", () =>
+    Effect.gen(function* () {
+      const oldFailure = yield* Deferred.make<ActivityStreamItem, ActivityError>();
+      const harness = yield* makeHarness({
+        streamForSubscription: (subscription) =>
+          subscription === 1
+            ? Stream.fromEffect(Deferred.await(oldFailure))
+            : Stream.concat(
+                Stream.fromIterable([
+                  { kind: "snapshot" as const, snapshot: snapshot(8, "Replacement stream") },
+                ]),
+                Stream.never,
+              ),
+      });
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(harness.subscriptionCount)) === 1) break;
+        yield* Effect.yieldNow;
+      }
+      yield* SubscriptionRef.set(harness.supervisorSession, Option.none());
+      yield* harness.reconnect;
+      for (let attempt = 0; attempt < 100; attempt += 1) {
+        if ((yield* Ref.get(harness.subscriptionCount)) === 2) break;
+        yield* Effect.yieldNow;
+      }
+      yield* awaitState(
+        harness.state,
+        (state) => Option.isSome(state.snapshot) && state.snapshot.value.revision === 8,
+      );
+      yield* Deferred.fail(
+        oldFailure,
+        new ActivityError({ reason: "featureDisabled", message: "Old stream disabled." }),
+      );
+      for (let attempt = 0; attempt < 20; attempt += 1) yield* Effect.yieldNow;
+      const retained = yield* SubscriptionRef.get(harness.state);
+      expect(retained.status).toBe("live");
+      expect(Option.getOrThrow(retained.snapshot).actors[0]?.name).toBe("Replacement stream");
+    }),
+  );
+
   it.effect("applies control stream items independently from observation", () =>
     Effect.gen(function* () {
       const harness = yield* makeHarness();
