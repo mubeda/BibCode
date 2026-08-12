@@ -10843,7 +10843,21 @@ done
         let projected = timeout(std::time::Duration::from_secs(2), async {
             loop {
                 match activity.snapshot(&scope).await {
-                    Ok(snapshot) if snapshot.actors.len() >= orders.len() + 2 => break snapshot,
+                    Ok(snapshot)
+                        if snapshot.actors.len() >= orders.len() + 2
+                            && snapshot
+                                .control
+                                .actors
+                                .iter()
+                                .filter(|actor| {
+                                    actor.state
+                                        == crate::activity::ActivityActorControlState::Available
+                                })
+                                .count()
+                                >= orders.len() + 2 =>
+                    {
+                        break snapshot;
+                    }
                     Ok(_) | Err(crate::activity::ActivityRepositoryError::NotFound) => {}
                     Err(error) => panic!("pump snapshot: {error}"),
                 }
@@ -10859,7 +10873,7 @@ done
                 .await
                 .expect("final pump snapshot"),
         );
-        let snapshot = activity.snapshot(&scope).await.expect("control snapshot");
+        let snapshot = projected.expect("all actors and controls projected");
         let available = snapshot
             .control
             .actors
