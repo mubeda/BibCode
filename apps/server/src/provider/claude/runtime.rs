@@ -4014,9 +4014,16 @@ mod targeted_task_correlation_tests {
         assert!(
             !runtime
                 .task_control_correlator
+                .correlations_by_tool_use
+                .contains_key("tool-child-rejected")
+        );
+        assert!(
+            !runtime
+                .task_control_correlator
                 .actor_target_by_agent
                 .contains_key("agent-child-rejected")
         );
+        assert!(runtime.task_control_correlator.state_is_bounded());
         let close_pending = handle_fact(
             &mut runtime,
             &json!({
@@ -4033,6 +4040,12 @@ mod targeted_task_correlation_tests {
             .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 40_000 + index as u64))
             .collect::<Vec<_>>();
         assert!(mapped_targets(&rejected_replay).is_empty());
+        assert!(
+            !runtime
+                .task_control_correlator
+                .correlations_by_tool_use
+                .contains_key("tool-child-rejected")
+        );
         assert!(
             !runtime
                 .task_control_correlator
