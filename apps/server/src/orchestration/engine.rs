@@ -2092,7 +2092,7 @@ async fn plan_command(
             thread_id,
             created_at,
             metadata,
-            json!({"threadId":thread_id,"messageId":message_id,"role":"assistant","text":"","turnId":turn_id,"streaming":false,"createdAt":created_at,"updatedAt":created_at}),
+            json!({"threadId":thread_id,"messageId":message_id,"role":"assistant","text":"","turnId":turn_id,"streaming":false,"existingMessageOnly":true,"createdAt":created_at,"updatedAt":created_at}),
         ),
         OrchestrationCommand::ThreadProposedPlanUpsert {
             command_id,
@@ -3021,6 +3021,24 @@ fn apply_messages_projector_tx(
         return Ok(());
     }
     let payload = &event.event.payload;
+    if payload
+        .get("existingMessageOnly")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        transaction.execute(
+            "UPDATE projection_thread_messages SET is_streaming = 0, updated_at = ? \
+             WHERE message_id = ? AND thread_id = ? AND turn_id IS ? \
+               AND role = 'assistant' AND is_streaming = 1",
+            params![
+                required_str(payload, "updatedAt")?,
+                required_str(payload, "messageId")?,
+                required_str(payload, "threadId")?,
+                optional_string(payload.get("turnId")),
+            ],
+        )?;
+        return Ok(());
+    }
     transaction.execute(
         "INSERT INTO projection_thread_messages (message_id, thread_id, turn_id, role, text, attachments_json, is_streaming, created_at, updated_at) \
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
@@ -3270,6 +3288,29 @@ fn apply_turns_projector_tx(
                 return Ok(());
             };
             let thread_id = required_str(payload, "threadId")?;
+            if payload
+                .get("existingMessageOnly")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+                && !transaction
+                    .query_row(
+                        "SELECT 1 FROM projection_thread_messages \
+                         WHERE message_id = ? AND thread_id = ? AND turn_id IS ? \
+                           AND role = 'assistant' AND is_streaming = 0 AND updated_at = ? \
+                         LIMIT 1",
+                        params![
+                            required_str(payload, "messageId")?,
+                            thread_id,
+                            turn_id,
+                            required_str(payload, "updatedAt")?,
+                        ],
+                        |_| Ok(()),
+                    )
+                    .optional()?
+                    .is_some()
+            {
+                return Ok(());
+            }
             let running = transaction.query_row("SELECT 1 FROM projection_thread_sessions WHERE thread_id = ? AND status = 'running' AND active_turn_id = ?", params![thread_id, turn_id], |_| Ok(())).optional()?.is_some();
             let streaming = payload
                 .get("streaming")
