@@ -224,6 +224,89 @@ async fn activity_unary_rpc_pages_rosters_and_detail_and_bounds_scope_errors() {
 }
 
 #[tokio::test]
+async fn cancellation_rpc_fails_closed_without_an_exact_runtime_target_or_thread_scope() {
+    // Mutation caught: accepting a terminal scope or falling back to a root interruption when the
+    // current provider runtime has not registered an exact private actor target.
+    let fixture = Fixture::start(16).await;
+    let scope = thread_scope("thread:cancellation-rpc", "cancellation-rpc");
+    fixture
+        .chat_projection
+        .ensure_scope(scope.clone())
+        .await
+        .expect("scope");
+    fixture
+        .chat_projection
+        .apply(
+            &scope.scope_id,
+            "event:cancellation-rpc".to_owned(),
+            vec![ProviderActivityMutation::UpsertActor(
+                actor(
+                    "actor:cancellation-rpc",
+                    ActivityLifecycle::Running,
+                    "2026-08-11T20:01:00Z",
+                    None,
+                )
+                .expect("actor"),
+            )],
+            "2026-08-11T20:01:00Z".to_owned(),
+        )
+        .await
+        .expect("actor projection");
+    let mut socket = fixture.connect().await;
+
+    let unavailable = unary(
+        &mut socket,
+        "90",
+        "activity.cancelSubtree",
+        json!({
+            "scope":{"_tag":"thread","threadId":"cancellation-rpc"},
+            "scopeId":"thread:cancellation-rpc",
+            "actorId":"actor:cancellation-rpc",
+            "expectedControlRevision":0
+        }),
+    )
+    .await
+    .expect_err("actor without an exact native target remains read-only");
+    assert_eq!(
+        unavailable,
+        json!({
+            "_tag":"ActivityError",
+            "message":"The activity scope has changed. Refresh and try again.",
+            "reason":"staleScope"
+        })
+    );
+
+    let terminal = unary(
+        &mut socket,
+        "91",
+        "activity.cancelSubtree",
+        json!({
+            "scope":{
+                "_tag":"terminal",
+                "threadId":"cancellation-rpc",
+                "terminalId":"terminal-1"
+            },
+            "scopeId":"terminal:cancellation-rpc",
+            "actorId":"actor:cancellation-rpc",
+            "expectedControlRevision":0
+        }),
+    )
+    .await
+    .expect_err("terminal Activity cancellation must fail at the typed RPC boundary");
+    assert_eq!(
+        terminal,
+        json!({
+            "_tag":"ActivityError",
+            "message":"The requested activity scope is invalid.",
+            "reason":"invalidScope"
+        })
+    );
+
+    socket.close(None).await.expect("close socket");
+    fixture.shutdown().await;
+}
+
+#[tokio::test]
 async fn activity_stream_starts_with_snapshot_and_filters_deltas_to_exact_scope() {
     let fixture = Fixture::start(16).await;
     let first = thread_scope("thread:first", "first");

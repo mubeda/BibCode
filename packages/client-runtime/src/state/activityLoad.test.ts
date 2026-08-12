@@ -5,6 +5,7 @@ import {
   ProviderDriverKind,
   ThreadId,
   type ActivityActorSummary,
+  type ActivityControlDelta,
   type ActivityDelta,
   type ActivitySnapshot,
   type ActivityWorkItemSummary,
@@ -14,6 +15,7 @@ import * as Option from "effect/Option";
 
 import {
   applyActivityDelta,
+  applyEnvironmentActivityControlDelta,
   applyEnvironmentActivityDelta,
   type EnvironmentActivityState,
 } from "./activityReducer.ts";
@@ -235,5 +237,81 @@ describe("activity load reducer", () => {
     expect(Option.getOrThrow(gap.state.snapshot).revision).toBe(5_000);
     expect(Option.getOrThrow(gap.state.snapshot).actors).toHaveLength(ACTIVITY_PAGE_MAX_LENGTH);
     expect(Option.getOrThrow(gap.state.snapshot).workItems).toHaveLength(ACTIVITY_PAGE_MAX_LENGTH);
+  });
+
+  it("keeps requested control state across duplicate, reordered, and gapped load revisions", () => {
+    const actorId = ActivityRecordId.make("actor:control-load");
+    let current: EnvironmentActivityState = {
+      ...state(),
+      snapshot: Option.some(
+        snapshot({
+          actors: [actor(0, { id: actorId, name: "Control load" })],
+          control: {
+            scopeId: SCOPE_ID,
+            revision: 0,
+            actors: [],
+            operations: [],
+          },
+        }),
+      ),
+    };
+
+    const controls = Array.from(
+      { length: 5_000 },
+      (_, index): ActivityControlDelta => ({
+        scopeId: SCOPE_ID,
+        previousRevision: index,
+        revision: index + 1,
+        changes: [
+          {
+            kind: "actor-upserted",
+            actor: {
+              actorId,
+              state: index === 4_999 ? "requested" : "available",
+              controlRevision: index + 1,
+              activeDescendantCount: 1,
+            },
+          },
+        ],
+      }),
+    );
+    for (const next of controls) {
+      const result = applyEnvironmentActivityControlDelta(current, next);
+      if (result.kind !== "applied") {
+        throw new Error(`control load revision ${next.revision} was not applied`);
+      }
+      current = result.state;
+    }
+
+    const loaded = Option.getOrThrow(current.snapshot);
+    expect(loaded.revision).toBe(0);
+    expect(loaded.control.revision).toBe(5_000);
+    expect(loaded.control.actors).toEqual([
+      {
+        actorId,
+        state: "requested",
+        controlRevision: 5_000,
+        activeDescendantCount: 1,
+      },
+    ]);
+
+    const duplicate = applyEnvironmentActivityControlDelta(current, controls[4_999]!);
+    expect(duplicate.kind).toBe("duplicate");
+    expect(duplicate.state).toBe(current);
+
+    const reordered = applyEnvironmentActivityControlDelta(current, controls[4_998]!);
+    expect(reordered.kind).toBe("duplicate");
+    expect(reordered.state).toBe(current);
+
+    const gap = applyEnvironmentActivityControlDelta(current, {
+      scopeId: SCOPE_ID,
+      previousRevision: 5_001,
+      revision: 5_002,
+      changes: [],
+    });
+    expect(gap.kind).toBe("gap");
+    expect(gap.state.status).toBe("stale");
+    expect(Option.getOrThrow(gap.state.snapshot).control).toBe(loaded.control);
+    expect(Option.getOrThrow(gap.state.snapshot).control.actors[0]?.state).toBe("requested");
   });
 });
