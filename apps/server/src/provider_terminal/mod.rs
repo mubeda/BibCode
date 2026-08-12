@@ -24,7 +24,8 @@ pub use model::{
     PreparedTerminalLaunch, PreparedTerminalObserver, TerminalAgentActivityProviderEpochs,
     TerminalAgentActivityTransition, TerminalGenerationActivityPublisher,
     TerminalLaunchPreparation, TerminalLaunchPreparationInput, TerminalLaunchPreparer,
-    TerminalObserverCancellationReason, TerminalObserverGeneration, TerminalObserverWorkerContext,
+    TerminalObserverCancellationReason, TerminalObserverGeneration,
+    TerminalObserverGenerationLease, TerminalObserverWorkerContext,
     TerminalObserverWorkerSpawnError,
 };
 pub use opencode::{

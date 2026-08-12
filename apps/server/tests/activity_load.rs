@@ -33,7 +33,8 @@ use bibcode_server::{
         PreparedTerminalLaunch, PreparedTerminalObserver, ProviderTerminalActivitySupervisor,
         ProviderTerminalInventory, ProviderTerminalObserverFactories,
         ProviderTerminalObserverFactory, ProviderTerminalObserverFactoryInput,
-        TerminalAgentActivityTransition, TerminalObserverGeneration, TerminalObserverWorkerContext,
+        TerminalAgentActivityTransition, TerminalObserverGenerationLease,
+        TerminalObserverWorkerContext,
     },
     server_settings::ProviderSettingsState,
     terminal::{
@@ -121,7 +122,7 @@ impl PreparedTerminalObserver for LoadTerminalObserver {
     fn on_spawned(
         &self,
         _pid: u32,
-        _generation: TerminalObserverGeneration,
+        _generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) {
     }
@@ -129,7 +130,7 @@ impl PreparedTerminalObserver for LoadTerminalObserver {
     fn set_agent_activity_enabled(
         &self,
         enabled: bool,
-        _generation: TerminalObserverGeneration,
+        _generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) -> Pin<Box<dyn Future<Output = TerminalAgentActivityTransition> + Send + '_>> {
         Box::pin(async move {

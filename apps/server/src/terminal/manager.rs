@@ -28,7 +28,7 @@ use crate::{
     provider_terminal::{
         PreparedTerminalObserver, TerminalAgentActivityTransition, TerminalLaunchPreparation,
         TerminalLaunchPreparationInput, TerminalLaunchPreparer, TerminalObserverCancellationReason,
-        TerminalObserverGeneration,
+        TerminalObserverGeneration, TerminalObserverGenerationLease,
     },
 };
 
@@ -359,7 +359,7 @@ impl PreparedObserverHandle {
         }
     }
 
-    async fn on_spawned(&self, pid: u32, generation: TerminalObserverGeneration) -> bool {
+    async fn on_spawned(&self, pid: u32, generation: TerminalObserverGenerationLease) -> bool {
         if self.inner.generation.cancellation_reason().is_some() {
             return false;
         }
@@ -428,7 +428,7 @@ impl PreparedObserverHandle {
                     .observer
                     .set_agent_activity_enabled(
                         enabled,
-                        state.generation.clone(),
+                        state.generation.observation(),
                         state.generation.worker_context(),
                     )
                     .await
@@ -1545,7 +1545,7 @@ impl TerminalManager {
         let process = uncommitted_process.process();
         if let Some(observer) = generation.observer() {
             let completed = observer
-                .on_spawned(process.pid(), generation.observation.clone())
+                .on_spawned(process.pid(), generation.observation.observation())
                 .await;
             if !completed {
                 generation
@@ -2807,7 +2807,7 @@ mod tests {
         fn on_spawned(
             &self,
             _pid: u32,
-            _generation: TerminalObserverGeneration,
+            _generation: TerminalObserverGenerationLease,
             _workers: TerminalObserverWorkerContext,
         ) {
         }

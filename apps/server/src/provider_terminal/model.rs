@@ -33,6 +33,8 @@ const TERMINAL_SCOPE_PREFIX: &str = "terminal:";
 const MAX_OBSERVER_WORKERS_PER_GENERATION: usize = 16;
 const MAX_GLOBAL_OBSERVER_WORKERS: usize = 16;
 const MAX_BLOCKING_THREADS_PER_OBSERVER_WORKER: usize = 1;
+const DROPPED_GENERATION_WORKER_SHUTDOWN_TIMEOUT: Duration = Duration::from_millis(250);
+const DROPPED_GENERATION_WORKER_ABORT_TIMEOUT: Duration = Duration::from_millis(50);
 
 static GLOBAL_OBSERVER_WORKER_SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(MAX_GLOBAL_OBSERVER_WORKERS)));
@@ -446,8 +448,21 @@ impl Drop for TerminalObserverWorkerRegistry {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.accepting = false;
-        for worker in &state.workers {
-            worker.abort.cancel();
+        let workers = std::mem::take(&mut state.workers);
+        drop(state);
+        if workers.is_empty() {
+            return;
+        }
+        if let Some(runtime) = &self.runtime {
+            runtime.spawn(reap_observer_workers(
+                workers,
+                DROPPED_GENERATION_WORKER_SHUTDOWN_TIMEOUT,
+                DROPPED_GENERATION_WORKER_ABORT_TIMEOUT,
+            ));
+        } else {
+            for worker in &workers {
+                worker.abort.cancel();
+            }
         }
     }
 }
@@ -550,15 +565,22 @@ struct TerminalObserverGenerationInner {
     cancellation_reason: StdMutex<Option<TerminalObserverCancellationReason>>,
     cancellation_requested_while_current: AtomicBool,
     cancellation: CancellationToken,
-    workers: TerminalObserverWorkerContext,
 }
 
-/// Generation identity shared with a prepared observer.
+/// Lightweight generation identity shared with provider observer workers.
 ///
-/// Observer output is only publishable while this handle remains current.
+/// Observer output is only publishable while this lease remains current. The
+/// lease intentionally cannot retain the manager-owned worker registry.
+#[derive(Clone, Debug)]
+pub struct TerminalObserverGenerationLease {
+    inner: Arc<TerminalObserverGenerationInner>,
+}
+
+/// Manager-owned terminal observation generation and worker registry.
 #[derive(Clone, Debug)]
 pub struct TerminalObserverGeneration {
-    inner: Arc<TerminalObserverGenerationInner>,
+    observation: TerminalObserverGenerationLease,
+    workers: TerminalObserverWorkerContext,
 }
 
 impl TerminalObserverGeneration {
@@ -588,27 +610,108 @@ impl TerminalObserverGeneration {
         let id = Uuid::new_v4();
         let cancellation = CancellationToken::new();
         Self {
-            inner: Arc::new(TerminalObserverGenerationInner {
-                id,
-                scope_id: format!("{TERMINAL_SCOPE_PREFIX}{id}"),
-                thread_id,
-                terminal_id,
-                current: AtomicBool::new(true),
-                activity_publication: StdMutex::new(None),
-                cancellation_reason: StdMutex::new(None),
-                cancellation_requested_while_current: AtomicBool::new(false),
-                cancellation: cancellation.clone(),
-                workers: TerminalObserverWorkerContext {
-                    inner: Arc::new(TerminalObserverWorkerRegistry::new_with_worker_slots(
-                        runtime,
-                        cancellation,
-                        worker_slots,
-                    )),
-                },
-            }),
+            observation: TerminalObserverGenerationLease {
+                inner: Arc::new(TerminalObserverGenerationInner {
+                    id,
+                    scope_id: format!("{TERMINAL_SCOPE_PREFIX}{id}"),
+                    thread_id,
+                    terminal_id,
+                    current: AtomicBool::new(true),
+                    activity_publication: StdMutex::new(None),
+                    cancellation_reason: StdMutex::new(None),
+                    cancellation_requested_while_current: AtomicBool::new(false),
+                    cancellation: cancellation.clone(),
+                }),
+            },
+            workers: TerminalObserverWorkerContext {
+                inner: Arc::new(TerminalObserverWorkerRegistry::new_with_worker_slots(
+                    runtime,
+                    cancellation,
+                    worker_slots,
+                )),
+            },
         }
     }
 
+    /// Lightweight observation and publication lease for provider workers.
+    #[must_use]
+    pub fn observation(&self) -> TerminalObserverGenerationLease {
+        self.observation.clone()
+    }
+
+    /// Fresh UUID assigned to this terminal process generation.
+    pub fn id(&self) -> Uuid {
+        self.observation.id()
+    }
+
+    pub fn thread_id(&self) -> &str {
+        self.observation.thread_id()
+    }
+
+    pub fn terminal_id(&self) -> &str {
+        self.observation.terminal_id()
+    }
+
+    /// Whether output and capability publication still belongs to the current generation.
+    pub fn is_current(&self) -> bool {
+        self.observation.is_current()
+    }
+
+    /// Returns the first lifecycle reason that requested observer cancellation.
+    #[must_use]
+    pub fn cancellation_reason(&self) -> Option<TerminalObserverCancellationReason> {
+        self.observation.cancellation_reason()
+    }
+
+    /// Whether the one-shot cancellation request preceded publication invalidation.
+    #[must_use]
+    pub fn cancellation_was_requested_while_current(&self) -> bool {
+        self.observation.cancellation_was_requested_while_current()
+    }
+
+    /// Durable generation-scoped worker context for provider observers.
+    #[must_use]
+    pub fn worker_context(&self) -> TerminalObserverWorkerContext {
+        self.workers.clone()
+    }
+
+    pub(crate) fn request_cancellation(&self, reason: TerminalObserverCancellationReason) -> bool {
+        let mut current = self
+            .observation
+            .inner
+            .cancellation_reason
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if current.is_some() {
+            return false;
+        }
+        self.observation
+            .inner
+            .cancellation_requested_while_current
+            .store(self.is_current(), Ordering::Release);
+        *current = Some(reason);
+        self.workers.inner.stop_accepting();
+        self.observation.inner.cancellation.cancel();
+        true
+    }
+
+    pub(crate) async fn shutdown_workers(
+        &self,
+        graceful_timeout: Duration,
+        abort_timeout: Duration,
+    ) {
+        self.workers
+            .inner
+            .shutdown(graceful_timeout, abort_timeout)
+            .await;
+    }
+
+    pub(crate) async fn invalidate(&self) {
+        self.observation.invalidate().await;
+    }
+}
+
+impl TerminalObserverGenerationLease {
     /// Fresh UUID assigned to this terminal process generation.
     pub fn id(&self) -> Uuid {
         self.inner.id
@@ -666,6 +769,11 @@ impl TerminalObserverGeneration {
                 return reason;
             }
             notified.await;
+            if self.inner.cancellation.is_cancelled() {
+                return self
+                    .cancellation_reason()
+                    .unwrap_or(TerminalObserverCancellationReason::GenerationInvalidated);
+            }
         }
     }
 
@@ -675,42 +783,6 @@ impl TerminalObserverGeneration {
         self.inner
             .cancellation_requested_while_current
             .load(Ordering::Acquire)
-    }
-
-    /// Durable generation-scoped worker context for provider observers.
-    #[must_use]
-    pub fn worker_context(&self) -> TerminalObserverWorkerContext {
-        self.inner.workers.clone()
-    }
-
-    pub(crate) fn request_cancellation(&self, reason: TerminalObserverCancellationReason) -> bool {
-        let mut current = self
-            .inner
-            .cancellation_reason
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if current.is_some() {
-            return false;
-        }
-        self.inner
-            .cancellation_requested_while_current
-            .store(self.is_current(), Ordering::Release);
-        *current = Some(reason);
-        self.inner.workers.inner.stop_accepting();
-        self.inner.cancellation.cancel();
-        true
-    }
-
-    pub(crate) async fn shutdown_workers(
-        &self,
-        graceful_timeout: Duration,
-        abort_timeout: Duration,
-    ) {
-        self.inner
-            .workers
-            .inner
-            .shutdown(graceful_timeout, abort_timeout)
-            .await;
     }
 
     pub(crate) fn attach_activity_publication(
@@ -746,7 +818,7 @@ impl TerminalObserverGeneration {
 /// handshake has identified the session and negotiated real capabilities.
 #[derive(Clone)]
 pub struct TerminalGenerationActivityPublisher {
-    generation: TerminalObserverGeneration,
+    generation: TerminalObserverGenerationLease,
     projection: ActivityProjection,
     publication: Arc<AsyncMutex<()>>,
 }
@@ -767,6 +839,7 @@ impl TerminalGenerationActivityPublisher {
         projection: ActivityProjection,
         publication: Arc<AsyncMutex<()>>,
     ) -> Self {
+        let generation = generation.observation();
         let publication = generation.attach_activity_publication(publication);
         Self {
             generation,
@@ -1475,7 +1548,7 @@ pub trait PreparedTerminalObserver: Send + Sync {
     fn on_spawned(
         &self,
         pid: u32,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         workers: TerminalObserverWorkerContext,
     );
 
@@ -1489,7 +1562,7 @@ pub trait PreparedTerminalObserver: Send + Sync {
     fn set_agent_activity_enabled(
         &self,
         _enabled: bool,
-        _generation: TerminalObserverGeneration,
+        _generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) -> Pin<Box<dyn Future<Output = TerminalAgentActivityTransition> + Send + '_>> {
         Box::pin(async { TerminalAgentActivityTransition::default() })
@@ -1518,6 +1591,7 @@ mod tests {
         },
         persistence::{Database, run_migrations},
     };
+    use tokio::{runtime::Handle, sync::oneshot};
 
     use super::{
         MAX_GLOBAL_OBSERVER_WORKERS, TerminalAgentActivityAdmission, TerminalAgentActivityControl,
@@ -1803,6 +1877,94 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn dropping_generation_owner_cancels_a_worker_that_holds_observation_lease() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let generation = TerminalObserverGeneration::new_with_runtime_and_worker_slots(
+            "thread".into(),
+            "terminal".into(),
+            Handle::try_current().ok(),
+            slots.clone(),
+        );
+        let observation = generation.observation();
+        let (started_tx, started_rx) = oneshot::channel();
+        let (exited_tx, exited_rx) = oneshot::channel();
+        generation
+            .worker_context()
+            .spawn(async move {
+                let _ = started_tx.send(());
+                observation.cancelled().await;
+                let _ = exited_tx.send(());
+            })
+            .expect("first worker");
+        started_rx.await.expect("worker started");
+
+        drop(generation);
+        exited_rx.await.expect("worker exited after owner drop");
+        let returned = slots
+            .clone()
+            .acquire_owned()
+            .await
+            .expect("worker slot returned after owner drop");
+        drop(returned);
+        assert_eq!(slots.available_permits(), 1);
+
+        let replacement = TerminalObserverGeneration::new_with_runtime_and_worker_slots(
+            "thread-2".into(),
+            "terminal-2".into(),
+            Handle::try_current().ok(),
+            slots,
+        );
+        replacement
+            .worker_context()
+            .spawn(async {})
+            .expect("replacement worker");
+    }
+
+    #[tokio::test]
+    async fn dropping_generation_owner_transfers_stuck_worker_to_async_cleanup() {
+        struct WorkerDropSignal(Option<oneshot::Sender<()>>);
+
+        impl Drop for WorkerDropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let generation = TerminalObserverGeneration::new_with_runtime_and_worker_slots(
+            "thread-stuck".into(),
+            "terminal-stuck".into(),
+            Handle::try_current().ok(),
+            Arc::new(tokio::sync::Semaphore::new(1)),
+        );
+        let (started_tx, started_rx) = oneshot::channel();
+        let (worker_dropped_tx, worker_dropped_rx) = oneshot::channel();
+        generation
+            .worker_context()
+            .spawn(async move {
+                let _worker_drop = WorkerDropSignal(Some(worker_dropped_tx));
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+            })
+            .expect("stuck worker");
+        started_rx.await.expect("worker started");
+        let (owner_dropped_tx, owner_dropped_rx) = oneshot::channel();
+
+        tokio::spawn(async move {
+            drop(generation);
+            let _ = owner_dropped_tx.send(());
+        });
+
+        owner_dropped_rx
+            .await
+            .expect("generation owner drop remained nonblocking");
+        worker_dropped_rx
+            .await
+            .expect("retained cleanup eventually aborted the stuck worker");
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn observer_worker_slot_is_reusable_after_aborted_owner() {
         let slots = Arc::new(tokio::sync::Semaphore::new(1));
@@ -1937,7 +2099,6 @@ mod tests {
             join_release: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
         });
         *generation
-            .inner
             .workers
             .inner
             .thread_exit_hook

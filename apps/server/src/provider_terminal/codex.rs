@@ -22,6 +22,7 @@ use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::process::Child;
 
+use super::model::TerminalObserverGenerationLease;
 #[cfg(unix)]
 use super::supervisor::create_owned_generation_directory;
 use super::{
@@ -29,7 +30,7 @@ use super::{
     ProviderTerminalObserverFactoryInput, TerminalAgentActivityControl,
     TerminalAgentActivityObservation, TerminalAgentActivityObservationKind,
     TerminalAgentActivityState, TerminalAgentActivityTransition,
-    TerminalGenerationActivityPublisher, TerminalObserverGeneration, TerminalObserverWorkerContext,
+    TerminalGenerationActivityPublisher, TerminalObserverWorkerContext,
     supervisor::cleanup_owned_generation_directory,
 };
 #[cfg(unix)]
@@ -609,7 +610,7 @@ impl PreparedTerminalObserver for CodexPreparedTerminalObserver {
     fn on_spawned(
         &self,
         _pid: u32,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         workers: TerminalObserverWorkerContext,
     ) {
         if self.inner.spawned.swap(true, Ordering::AcqRel) {
@@ -629,7 +630,7 @@ impl PreparedTerminalObserver for CodexPreparedTerminalObserver {
     fn set_agent_activity_enabled(
         &self,
         enabled: bool,
-        _generation: TerminalObserverGeneration,
+        _generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) -> Pin<Box<dyn Future<Output = TerminalAgentActivityTransition> + Send + '_>> {
         Box::pin(async move {
@@ -758,7 +759,7 @@ enum CodexObserverWait<T> {
 
 async fn run_codex_observer(
     inner: Arc<CodexObserverInner>,
-    generation: TerminalObserverGeneration,
+    generation: TerminalObserverGenerationLease,
 ) {
     run_codex_observer_inner(&inner, &generation).await;
     inner.cleanup();
@@ -766,7 +767,7 @@ async fn run_codex_observer(
 
 async fn run_codex_observer_inner(
     inner: &CodexObserverInner,
-    generation: &TerminalObserverGeneration,
+    generation: &TerminalObserverGenerationLease,
 ) {
     let mut activity = inner.activity.subscribe();
     let Ok(mut client) = connect_initialized_codex_client(inner).await else {
@@ -1325,7 +1326,7 @@ async fn publish_codex_live_scope(inner: &CodexObserverInner, epoch: u64, receiv
 
 async fn cross_codex_enable_barrier(
     client: &mut dyn CodexRemoteClient,
-    generation: &TerminalObserverGeneration,
+    generation: &TerminalObserverGenerationLease,
     deadline: tokio::time::Instant,
 ) -> bool {
     let response = tokio::select! {
@@ -1345,7 +1346,7 @@ async fn cross_codex_enable_barrier(
 
 async fn reconnect_attached_codex_client(
     inner: &CodexObserverInner,
-    generation: &TerminalObserverGeneration,
+    generation: &TerminalObserverGenerationLease,
     root: &str,
     deadline: tokio::time::Instant,
 ) -> Option<Box<dyn CodexRemoteClient>> {
@@ -1363,7 +1364,7 @@ async fn reconnect_attached_codex_client(
 
 async fn reconnect_codex_root_discovery_client(
     inner: &CodexObserverInner,
-    generation: &TerminalObserverGeneration,
+    generation: &TerminalObserverGenerationLease,
     activity: &mut tokio::sync::watch::Receiver<TerminalAgentActivityState>,
     epoch: &mut u64,
 ) -> Option<Box<dyn CodexRemoteClient>> {
@@ -1405,7 +1406,7 @@ async fn reconnect_codex_root_discovery_client(
 
 async fn park_codex_observer_unavailable(
     inner: &CodexObserverInner,
-    generation: &TerminalObserverGeneration,
+    generation: &TerminalObserverGenerationLease,
     activity: &mut tokio::sync::watch::Receiver<TerminalAgentActivityState>,
     epoch: u64,
 ) {
@@ -1444,7 +1445,7 @@ async fn connect_initialized_codex_client(
 
 async fn reconnect_initialized_codex_client(
     inner: &CodexObserverInner,
-    generation: &TerminalObserverGeneration,
+    generation: &TerminalObserverGenerationLease,
     deadline: tokio::time::Instant,
 ) -> Option<Box<dyn CodexRemoteClient>> {
     loop {

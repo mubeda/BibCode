@@ -23,13 +23,16 @@ use tokio::{
     task::JoinHandle,
 };
 
+#[cfg(test)]
+use super::TerminalObserverGeneration;
+use super::model::TerminalObserverGenerationLease;
 use super::{
     PreparedTerminalLaunch, PreparedTerminalObserver, ProviderTerminalObserverFactory,
     ProviderTerminalObserverFactoryInput, TerminalAgentActivityAdmission,
     TerminalAgentActivityControl, TerminalAgentActivityObservation,
     TerminalAgentActivityObservationKind, TerminalAgentActivityState,
     TerminalAgentActivityTransition, TerminalGenerationActivityPublisher,
-    TerminalObserverGeneration, TerminalObserverWorkerContext,
+    TerminalObserverWorkerContext,
 };
 #[cfg(test)]
 use crate::provider::opencode::sse::OPENCODE_SSE_EVENT_LIMIT;
@@ -526,7 +529,8 @@ impl OpenCodeTerminalObserverFactory {
             cwd: input.launch.cwd.clone(),
             env: helper_env,
         };
-        let cleanup_generation = input.launch.generation.clone();
+        let cleanup_generation = input.launch.generation.observation();
+        let cleanup_workers = input.launch.generation.worker_context();
         let helper = async {
             let ready = self.helper.start(helper_launch).await?;
             let resources = Arc::new(OpenCodeObserverResources {
@@ -538,8 +542,7 @@ impl OpenCodeTerminalObserverFactory {
             });
             let cleanup_resources = resources.clone();
             let worker_generation = cleanup_generation.clone();
-            if cleanup_generation
-                .worker_context()
+            if cleanup_workers
                 .spawn(async move {
                     monitor_opencode_pre_spawn(cleanup_resources, worker_generation).await;
                 })
@@ -705,7 +708,7 @@ impl PreparedTerminalObserver for OpenCodePreparedTerminalObserver {
     fn on_spawned(
         &self,
         _pid: u32,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         workers: TerminalObserverWorkerContext,
     ) {
         if self.inner.spawned.swap(true, Ordering::AcqRel) {
@@ -725,7 +728,7 @@ impl PreparedTerminalObserver for OpenCodePreparedTerminalObserver {
     fn set_agent_activity_enabled(
         &self,
         enabled: bool,
-        _generation: TerminalObserverGeneration,
+        _generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) -> Pin<Box<dyn Future<Output = TerminalAgentActivityTransition> + Send + '_>> {
         Box::pin(async move {
@@ -865,7 +868,7 @@ impl Drop for OpenCodeCleanupClaim<'_> {
 
 async fn monitor_opencode_pre_spawn(
     resources: Arc<OpenCodeObserverResources>,
-    generation: TerminalObserverGeneration,
+    generation: TerminalObserverGenerationLease,
 ) {
     if resources.launched.load(Ordering::Acquire) {
         return;
@@ -942,7 +945,7 @@ enum OpenCodeLiveData {
 #[derive(Clone, Copy)]
 struct OpenCodeLiveFence<'a> {
     activity: &'a TerminalAgentActivityControl,
-    generation: &'a TerminalObserverGeneration,
+    generation: &'a TerminalObserverGenerationLease,
     state: TerminalAgentActivityState,
 }
 
@@ -968,7 +971,7 @@ impl OpenCodeLivePublication<'_> {
 
 async fn wait_for_opencode_live_work<T>(
     activity: &mut tokio::sync::watch::Receiver<TerminalAgentActivityState>,
-    generation: &TerminalObserverGeneration,
+    generation: &TerminalObserverGenerationLease,
     work: impl Future<Output = T>,
 ) -> OpenCodeLiveWork<T> {
     tokio::pin!(work);
@@ -1021,7 +1024,7 @@ fn decode_and_track_opencode_live_data(
 
 async fn run_opencode_observer(
     inner: Arc<OpenCodeObserverInner>,
-    generation: TerminalObserverGeneration,
+    generation: TerminalObserverGenerationLease,
 ) {
     let mut activity = inner.activity.subscribe();
     let owned_root = inner
@@ -1423,7 +1426,7 @@ async fn stop_opencode_observer(
 
 async fn establish_opencode_event_stream(
     remote: &mut dyn OpenCodeRemoteClient,
-    generation: &TerminalObserverGeneration,
+    generation: &TerminalObserverGenerationLease,
     timeout: Duration,
 ) -> Option<Box<dyn OpenCodeEventStream>> {
     let deadline = tokio::time::Instant::now() + timeout;
@@ -1455,7 +1458,7 @@ async fn establish_opencode_event_stream(
 
 async fn wait_for_opencode_connected(
     stream: &mut dyn OpenCodeEventStream,
-    generation: &TerminalObserverGeneration,
+    generation: &TerminalObserverGenerationLease,
     deadline: tokio::time::Instant,
 ) -> bool {
     loop {
@@ -1481,7 +1484,7 @@ async fn prepare_opencode_replacement(
     dormant_stream: &mut dyn OpenCodeEventStream,
     activity: &mut tokio::sync::watch::Receiver<TerminalAgentActivityState>,
     expected_state: TerminalAgentActivityState,
-    generation: &TerminalObserverGeneration,
+    generation: &TerminalObserverGenerationLease,
     deadline: tokio::time::Instant,
 ) -> OpenCodeReplacementOutcome {
     let mut dormant_stream_healthy = true;
@@ -1575,7 +1578,7 @@ async fn prepare_opencode_replacement(
 
 async fn keep_attach_until_cancellation(
     resources: &OpenCodeObserverResources,
-    generation: &TerminalObserverGeneration,
+    generation: &TerminalObserverGenerationLease,
     remote: &mut dyn OpenCodeRemoteClient,
     root_session_id: &str,
 ) {
@@ -1587,7 +1590,7 @@ async fn keep_attach_until_cancellation(
 async fn wait_for_owned_root(
     remote: &mut dyn OpenCodeRemoteClient,
     root_session_id: &str,
-    generation: &TerminalObserverGeneration,
+    generation: &TerminalObserverGenerationLease,
 ) -> Option<bool> {
     loop {
         if !generation.is_current() {
@@ -4338,7 +4341,8 @@ mod tests {
                 std::future::pending::<()>().await;
             }
         };
-        let waiting = wait_for_opencode_live_work(&mut changes, &generation, reconciliation);
+        let observation = generation.observation();
+        let waiting = wait_for_opencode_live_work(&mut changes, &observation, reconciliation);
         tokio::pin!(waiting);
         let first_poll =
             std::future::poll_fn(|context| std::task::Poll::Ready(waiting.as_mut().poll(context)))
@@ -4384,7 +4388,7 @@ mod tests {
         let outcome = decode_and_track_opencode_live_data(
             OpenCodeLiveFence {
                 activity: &activity,
-                generation: &generation,
+                generation: &generation.observation(),
                 state: selected_state,
             },
             &mut tracker,
@@ -4650,7 +4654,7 @@ mod tests {
         generation.request_cancellation(
             super::super::TerminalObserverCancellationReason::PreparationRejected,
         );
-        monitor_opencode_pre_spawn(resources.clone(), generation).await;
+        monitor_opencode_pre_spawn(resources.clone(), generation.observation()).await;
 
         assert!(
             !helper.terminated.load(Ordering::Acquire),
