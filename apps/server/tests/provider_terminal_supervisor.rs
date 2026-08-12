@@ -43,7 +43,7 @@ use bibcode_server::{
         ProviderTerminalObserverFactoryInput, TerminalAgentActivityTransition,
         TerminalGenerationActivityPublisher, TerminalLaunchPreparation,
         TerminalLaunchPreparationInput, TerminalLaunchPreparer, TerminalObserverCancellationReason,
-        TerminalObserverGeneration, TerminalObserverWorkerContext,
+        TerminalObserverGeneration, TerminalObserverGenerationLease, TerminalObserverWorkerContext,
         TerminalObserverWorkerSpawnError,
     },
     server_settings::{ProviderInstanceState, ProviderSettingsState, ProviderSettingsStore},
@@ -354,7 +354,7 @@ impl ProviderTerminalObserverFactory for DelayedProviderFactory {
 #[derive(Clone, Debug)]
 struct SpawnObservation {
     pid: u32,
-    generation: TerminalObserverGeneration,
+    generation: TerminalObserverGenerationLease,
 }
 
 #[derive(Clone, Debug)]
@@ -365,7 +365,7 @@ struct CancelObservation {
 
 #[derive(Debug, Default)]
 struct ObserverState {
-    generation: Mutex<Option<TerminalObserverGeneration>>,
+    generation: Mutex<Option<TerminalObserverGenerationLease>>,
     spawned: Mutex<Vec<SpawnObservation>>,
     cancelled: Mutex<Vec<CancelObservation>>,
     cancellation: tokio::sync::Notify,
@@ -410,7 +410,7 @@ impl PreparedTerminalObserver for RecordingObserver {
     fn on_spawned(
         &self,
         pid: u32,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) {
         *self.state.generation.lock().expect("generation lock") = Some(generation.clone());
@@ -437,7 +437,7 @@ impl PreparedTerminalObserver for CountingActivityObserver {
     fn on_spawned(
         &self,
         _pid: u32,
-        _generation: TerminalObserverGeneration,
+        _generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) {
     }
@@ -445,7 +445,7 @@ impl PreparedTerminalObserver for CountingActivityObserver {
     fn set_agent_activity_enabled(
         &self,
         enabled: bool,
-        _generation: TerminalObserverGeneration,
+        _generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) -> Pin<Box<dyn Future<Output = TerminalAgentActivityTransition> + Send + '_>> {
         Box::pin(async move {
@@ -544,7 +544,7 @@ impl PreparedTerminalObserver for CountingActivityObserverProxy {
     fn on_spawned(
         &self,
         pid: u32,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         workers: TerminalObserverWorkerContext,
     ) {
         self.observer.on_spawned(pid, generation, workers);
@@ -553,7 +553,7 @@ impl PreparedTerminalObserver for CountingActivityObserverProxy {
     fn set_agent_activity_enabled(
         &self,
         enabled: bool,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         workers: TerminalObserverWorkerContext,
     ) -> Pin<Box<dyn Future<Output = TerminalAgentActivityTransition> + Send + '_>> {
         self.observer
@@ -668,7 +668,7 @@ impl PreparedTerminalObserver for RacingPreparedObserver {
     fn on_spawned(
         &self,
         _pid: u32,
-        _generation: TerminalObserverGeneration,
+        _generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) {
     }
@@ -734,7 +734,7 @@ impl PreparedTerminalObserver for HungPreparedObserver {
     fn on_spawned(
         &self,
         _pid: u32,
-        _generation: TerminalObserverGeneration,
+        _generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) {
     }
@@ -835,7 +835,7 @@ struct FaultingPreparer {
     observer_on_spawned_fault: Fault,
     prepare_started: Arc<tokio::sync::Semaphore>,
     observer_started: Arc<tokio::sync::Semaphore>,
-    generation: Arc<Mutex<Option<TerminalObserverGeneration>>>,
+    generation: Arc<Mutex<Option<TerminalObserverGenerationLease>>>,
 }
 
 impl FaultingPreparer {
@@ -858,7 +858,7 @@ impl FaultingPreparer {
 struct FaultingObserver {
     on_spawned_fault: Fault,
     observer_started: Arc<tokio::sync::Semaphore>,
-    generation: Arc<Mutex<Option<TerminalObserverGeneration>>>,
+    generation: Arc<Mutex<Option<TerminalObserverGenerationLease>>>,
 }
 
 #[derive(Debug)]
@@ -905,7 +905,7 @@ struct SerializedCallbackState {
     maximum: std::sync::atomic::AtomicUsize,
     spawned: tokio::sync::Semaphore,
     release_spawned: (std::sync::Mutex<bool>, std::sync::Condvar),
-    spawned_generation: Mutex<Option<TerminalObserverGeneration>>,
+    spawned_generation: Mutex<Option<TerminalObserverGenerationLease>>,
 }
 
 impl Default for SerializedCallbackState {
@@ -954,7 +954,7 @@ impl PreparedTerminalObserver for SerializedCallbackObserver {
     fn on_spawned(
         &self,
         _pid: u32,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) {
         let _active = self.state.enter();
@@ -1014,7 +1014,7 @@ struct NonCooperativeCallbackState {
     maximum: AtomicUsize,
     started: AtomicUsize,
     release: (std::sync::Mutex<bool>, std::sync::Condvar),
-    generation: Mutex<Option<TerminalObserverGeneration>>,
+    generation: Mutex<Option<TerminalObserverGenerationLease>>,
 }
 
 impl Default for NonCooperativeCallbackState {
@@ -1045,7 +1045,7 @@ impl PreparedTerminalObserver for NonCooperativeCallbackObserver {
     fn on_spawned(
         &self,
         _pid: u32,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) {
         *self.state.generation.lock().expect("generation lock") = Some(generation);
@@ -1125,7 +1125,7 @@ impl PreparedTerminalObserver for CallbackBlockingPoolObserver {
     fn on_spawned(
         &self,
         _pid: u32,
-        _generation: TerminalObserverGeneration,
+        _generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) {
     }
@@ -1208,7 +1208,7 @@ impl PreparedTerminalObserver for DurableObserverWorker {
     fn on_spawned(
         &self,
         _pid: u32,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         workers: TerminalObserverWorkerContext,
     ) {
         let mut ping_receiver = self
@@ -1305,7 +1305,7 @@ impl PreparedTerminalObserver for ObserverSetupBoundary {
     fn on_spawned(
         &self,
         _pid: u32,
-        _generation: TerminalObserverGeneration,
+        _generation: TerminalObserverGenerationLease,
         workers: TerminalObserverWorkerContext,
     ) {
         self.state.callback_ran.store(true, Ordering::Release);
@@ -1361,7 +1361,7 @@ impl PreparedTerminalObserver for WorkerContextCaptureObserver {
     fn on_spawned(
         &self,
         _pid: u32,
-        _generation: TerminalObserverGeneration,
+        _generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) {
     }
@@ -1459,7 +1459,7 @@ impl PreparedTerminalObserver for FaultingObserver {
     fn on_spawned(
         &self,
         _pid: u32,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) {
         *self.generation.lock().expect("generation lock") = Some(generation);
@@ -1536,7 +1536,8 @@ impl TerminalLaunchPreparer for PlannedPreparer {
             {
                 PreparationPlan::PassThrough => TerminalLaunchPreparation::PassThrough,
                 PreparationPlan::Prepared(plan) => {
-                    *plan.observer.generation.lock().expect("generation lock") = Some(generation);
+                    *plan.observer.generation.lock().expect("generation lock") =
+                        Some(generation.observation());
                     plan.observer.cancellation.notify_waiters();
                     TerminalLaunchPreparation::Prepared(PreparedTerminalLaunch {
                         executable: plan.executable,
@@ -1573,7 +1574,7 @@ impl ProviderTerminalObserverFactory for RecordingFactory {
             self.scopes
                 .lock()
                 .expect("scopes lock")
-                .push(input.launch.generation.scope_id().to_owned());
+                .push(input.launch.generation.observation().scope_id().to_owned());
             self.runtime_dirs
                 .lock()
                 .expect("runtime dirs lock")
@@ -4092,7 +4093,7 @@ async fn hardening_generation_scope_is_published_only_after_factory_correlation(
         .snapshot(&logical_scope)
         .await
         .expect("published terminal scope");
-    assert_eq!(snapshot.scope_id, generation.scope_id());
+    assert_eq!(snapshot.scope_id, generation.observation().scope_id());
     assert_eq!(
         snapshot.capabilities,
         ActivityCapabilities::structured_full(false)
@@ -4166,12 +4167,19 @@ fn hardening_generation_scope_native_ids_are_generation_namespaced_and_bounded()
     let generation =
         TerminalObserverGeneration::new("thread-native".to_owned(), "terminal-native".to_owned());
     assert_eq!(
-        generation.namespace_native_id("actor:42"),
-        format!("{}:actor:42", generation.generation_id())
+        generation.observation().namespace_native_id("actor:42"),
+        format!("{}:actor:42", generation.observation().generation_id())
     );
-    let long = generation.namespace_native_id(&"native".repeat(100));
+    let long = generation
+        .observation()
+        .namespace_native_id(&"native".repeat(100));
     assert!(long.len() <= 256, "namespaced native id is unbounded");
-    assert_ne!(long, generation.namespace_native_id(&"other".repeat(100)));
+    assert_ne!(
+        long,
+        generation
+            .observation()
+            .namespace_native_id(&"other".repeat(100))
+    );
 }
 
 #[derive(Debug, Default)]
@@ -10439,7 +10447,7 @@ impl PreparedTerminalObserver for ProbedOpenCodeObserver {
     fn on_spawned(
         &self,
         pid: u32,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         workers: TerminalObserverWorkerContext,
     ) {
         self.inner.on_spawned(pid, generation, workers);
@@ -10452,7 +10460,7 @@ impl PreparedTerminalObserver for ProbedOpenCodeObserver {
     fn set_agent_activity_enabled(
         &self,
         enabled: bool,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         workers: TerminalObserverWorkerContext,
     ) -> Pin<Box<dyn Future<Output = TerminalAgentActivityTransition> + Send + '_>> {
         let activity_transition = self.activity_transition.clone();

@@ -99,6 +99,18 @@ provider terminal launched by BiBCode. It requires explicit enablement before
 that terminal is launched (or reopened), and it does not scrape arbitrary PTY
 text.
 
+The terminal manager is the sole owner of each observer generation's worker
+registry. Provider observer workers receive only a lightweight observation
+lease containing generation identity, publication fencing, and cancellation;
+that lease cannot retain the registry that owns the worker future. Explicit
+teardown cancels and drains the registry before invalidating publication. If
+the final manager generation owner is instead dropped, registry drop publishes
+cancellation without blocking and transfers its workers to a retained runtime
+cleanup task for the same bounded graceful-then-abort policy. The process-wide
+join reaper continues to own each worker thread and permit until joining proves
+the OS thread exited, so a worker that retains its observation lease cannot
+form an ownership cycle or permanently consume observer capacity.
+
 OpenCode helper cleanup is owned by the system helper launcher. Before a
 foreground cleanup waiter can block, the launcher transfers the exact child,
 reserved process-group identity, and one of sixteen cleanup permits into its

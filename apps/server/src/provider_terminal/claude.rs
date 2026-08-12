@@ -38,6 +38,9 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{Semaphore, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
+#[cfg(test)]
+use super::TerminalObserverGeneration;
+use super::model::TerminalObserverGenerationLease;
 #[cfg(unix)]
 use super::supervisor::create_owned_generation_directory;
 use super::{
@@ -45,7 +48,7 @@ use super::{
     ProviderTerminalObserverFactoryInput, TerminalAgentActivityAdmission,
     TerminalAgentActivityControl, TerminalAgentActivityObservation,
     TerminalAgentActivityObservationKind, TerminalAgentActivityTransition,
-    TerminalGenerationActivityPublisher, TerminalObserverGeneration, TerminalObserverWorkerContext,
+    TerminalGenerationActivityPublisher, TerminalObserverWorkerContext,
     supervisor::cleanup_owned_generation_directory,
 };
 use crate::{
@@ -628,7 +631,7 @@ impl PreparedTerminalObserver for ClaudePreparedTerminalObserver {
     fn on_spawned(
         &self,
         _pid: u32,
-        generation: TerminalObserverGeneration,
+        generation: TerminalObserverGenerationLease,
         workers: TerminalObserverWorkerContext,
     ) {
         if self.inner.spawned.swap(true, Ordering::AcqRel) {
@@ -661,7 +664,7 @@ impl PreparedTerminalObserver for ClaudePreparedTerminalObserver {
     fn set_agent_activity_enabled(
         &self,
         enabled: bool,
-        _generation: TerminalObserverGeneration,
+        _generation: TerminalObserverGenerationLease,
         _workers: TerminalObserverWorkerContext,
     ) -> Pin<Box<dyn Future<Output = TerminalAgentActivityTransition> + Send + '_>> {
         Box::pin(async move {
@@ -888,7 +891,7 @@ struct ClaudeHookState {
 
 async fn run_claude_observer(
     inner: Arc<ClaudeObserverInner>,
-    generation: TerminalObserverGeneration,
+    generation: TerminalObserverGenerationLease,
     listener: StdTcpListener,
     _listener_lease: ClaudeListenerLease,
 ) {
@@ -925,7 +928,7 @@ async fn run_claude_observer(
 
 async fn drive_claude_observer(
     inner: Arc<ClaudeObserverInner>,
-    generation: TerminalObserverGeneration,
+    generation: TerminalObserverGenerationLease,
     mut request_receiver: mpsc::Receiver<ClaudeHookRequest>,
     mut server: Pin<Box<dyn Future<Output = ()> + Send>>,
 ) {
@@ -985,7 +988,7 @@ fn publish_claude_listener_unavailable(inner: &ClaudeObserverInner) {
 #[allow(clippy::too_many_arguments)]
 async fn process_claude_hook(
     inner: &ClaudeObserverInner,
-    generation: &TerminalObserverGeneration,
+    generation: &TerminalObserverGenerationLease,
     root_session_id: &mut Option<String>,
     tracker: &mut Option<ClaudeActivityTracker>,
     event_sequence: &mut u64,
@@ -1151,7 +1154,7 @@ async fn process_claude_hook(
 
 async fn await_claude_recovery_while_current<T>(
     activity: &TerminalAgentActivityControl,
-    generation: &TerminalObserverGeneration,
+    generation: &TerminalObserverGenerationLease,
     cancellation: CancellationToken,
     recovery: impl Future<Output = T>,
 ) -> Result<T, StatusCode> {
@@ -2252,7 +2255,7 @@ mod tests {
         let recovery = tokio::spawn(async move {
             await_claude_recovery_while_current(
                 &recovery_activity,
-                &recovery_generation,
+                &recovery_generation.observation(),
                 cancellation,
                 async move {
                     let _ = started.send(());
@@ -2326,7 +2329,7 @@ mod tests {
         let admission = inner.activity.admit().expect("root hook admission");
         let observer = tokio::spawn(drive_claude_observer(
             inner,
-            generation,
+            generation.observation(),
             receiver,
             Box::pin(async move {
                 let _ = server_stopped.await;
