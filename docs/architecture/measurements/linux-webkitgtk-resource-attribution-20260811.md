@@ -82,9 +82,12 @@ appeared once. Closing Preview retained all four helpers with unchanged parent,
 start identity, and role; permitted shared-helper retention remained attributable
 and produced neither duplication nor an unrelated-parent claim.
 
-The accepted Resource Manager visual showed `core/server` and four exact
-`core/ui` rows (two Web, two Network), UI coverage available, and no WebKit row
-labeled `external`, `unknown`, or `fallback`. With a terminal open, the visual
+The accepted Resource Manager visual showed `core/server`, four exact `core/ui`
+rows (two Web, two Network), no WebKit row labeled `external`, `unknown`, or
+`fallback`, and no coverage warning. The visual did not display an explicit
+`Available` label. Because the presentation contract renders a warning for
+`Partial` or `Unavailable` coverage and every hinted child validated, the
+observed state is inferred to be `Available`. With a terminal open, the visual
 and two semantic samples showed 6 Combined processes = 5 Core + 1 External;
 the terminal shell remained External. The corresponding totals reconciled, with
 External at 5.9 MB and 0.0% CPU in both samples. No `WebKitGPUProcess` appeared
@@ -106,18 +109,57 @@ No acceptance-owned process remained.
 
 Commands used for the bounded checks were:
 
-```text
+```bash
 vp run dist:desktop:linux
 NO_STRIP=1 vp run dist:desktop:linux
 find release/desktop/linux-x64 -maxdepth 1 -type f -name '*.AppImage' -print
-rpm -qa
-ps -p <host-pid> -o pid=,ppid=,lstart=,comm=,args=
-ps --ppid <host-pid> -o pid=,ppid=,lstart=,comm=,args=
-sed -E 's/^[0-9]+ \(.*\) //' /proc/<pid>/stat
-readlink /proc/<pid>/exe
+
+acceptance_appimage="$(find release/desktop/linux-x64 -maxdepth 1 -type f -name '*.AppImage' -print -quit)"
+acceptance_root="<isolated-temp-root>"
+mkdir -p "$acceptance_root/config" "$acceptance_root/data" "$acceptance_root/cache"
+NO_AT_BRIDGE=0 \
+  BIBCODE_HOME="$acceptance_root" \
+  XDG_CONFIG_HOME="$acceptance_root/config" \
+  XDG_DATA_HOME="$acceptance_root/data" \
+  XDG_CACHE_HOME="$acceptance_root/cache" \
+  "$acceptance_appimage" &
+acceptance_pid=$!
+
+rpm -qa | rg -i '^(webkit2gtk4\.1|webkit2gtk|libwebkit2gtk)' | sort
+
+ps -p "$acceptance_pid" -o pid=,ppid=,lstart=,comm=,args=
+ps --ppid "$acceptance_pid" -o pid=,ppid=,lstart=,comm=,args=
+for acceptance_child in $(ps --ppid "$acceptance_pid" -o pid=); do
+  ps -p "$acceptance_child" -o pid=,ppid=,comm=,args=
+  sed -E 's/^[0-9]+ \(.*\) //' "/proc/$acceptance_child/stat" |
+    awk '{ print "ppid=" $2, "start_ticks=" $20 }'
+  readlink "/proc/$acceptance_child/exe"
+done
+
 cargo test -p bibcode-desktop linux_ui_rejects -- --nocapture
+
+for acceptance_window in $(xdotool search --pid "$acceptance_pid" --name '^BiBCode$'); do
+  geometry="$(xdotool getwindowgeometry --shell "$acceptance_window")"
+  width="$(printf '%s\n' "$geometry" | sed -n 's/^WIDTH=//p')"
+  if [ "$width" -gt 100 ]; then xdotool windowclose "$acceptance_window"; fi
+done
+
+ps -p "$acceptance_pid" -o pid=,ppid=,comm=,args=
+for acceptance_child in $(ps --ppid "$acceptance_pid" -o pid=); do
+  ps -p "$acceptance_child" -o pid=,ppid=,comm=,args=
+done
+acceptance_recorded_pids="<main-network-pid>,<main-web-pid>,<preview-network-pid>,<preview-web-pid>,<terminal-pid>"
+ps -p "$acceptance_recorded_pids" -o pid=,ppid=,comm=,args=
 ```
 
-AT-SPI was used only for semantic UI interaction and bounded Resource Manager
-text capture. Linux `ps` and `/proc` remained the process-identity source of
-truth. The supplemental visual was not added to source control.
+The direct-child process list was repeated after Preview open, navigation, and
+close; the full `stat`/`readlink` validation ran for the main helpers and all
+four helpers after navigation. One-off `python3` scripts using `pyatspi`
+selected only the `bibcode-desktop` application and exact accessible names: the
+Resource Manager trigger and dialog, Add Project, Browser/Preview, the local
+CUPS endpoint, Close Preview, Open Terminal, and Close Window. The same bounded
+scripts read only showing dialog text for the recorded samples; they did not
+enumerate unrelated windows or export unrestricted accessibility state. Linux
+`ps` and `/proc` remained the process-identity source of truth.
+Angle-bracketed values above replace task-specific paths and PIDs. The
+supplemental visual was not added to source control.
