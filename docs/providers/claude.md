@@ -176,17 +176,27 @@ invocation, its authenticated asynchronous PostToolUse result carrying the
 same `tool_use_id` and `agentId`, a local-agent `task_started` record carrying
 that `tool_use_id` and `task_id`, and the matching `SubagentStart` `agent_id`.
 Root invocations require both the stream invocation and authenticated hook to
-identify the root as their source. A nested invocation additionally requires
-its stream `parent_tool_use_id` to resolve to an active exact parent correlation
-whose launched `agentId` equals the nested authenticated PostToolUse hook's
-top-level source `agent_id`. Missing or mismatched source ownership never
-enables control.
-Arrival order is irrelevant. Names, roles, descriptions, prompts, timestamps,
-output paths, and event proximity are never correlation keys; incomplete,
-conflicting, stale, malformed, or saturated chains remain observable but
-uncontrollable. Live identity maps and unmatched terminal statuses are each
-bounded at the Activity page limit. Terminal retirement atomically removes the
-live tool/agent/task join and records generation-scoped identities in three
+identify the root as their source and `SubagentStart` to report no parent. A
+nested invocation additionally requires its stream `parent_tool_use_id` to
+resolve to an active exact parent correlation whose launched `agentId` equals
+the nested authenticated PostToolUse hook's top-level source `agent_id`; the
+Activity-verified `parent_agent_id` must equal that same parent actor.
+Root/nested mismatch, sibling cross-wiring, missing lineage, or mismatched
+source ownership never enables control. A bounded dependency fixpoint settles
+already-present parent, child, and deeper chains in one observation regardless
+of lexical identity order.
+
+Arrival order is irrelevant. Every accepted fact that installs, retires, or
+terminalizes a target carries a deterministic domain-separated SHA-256 event
+key through the production event pump. The key is duplicate-stable, bounded,
+status-separated, and contains no provider-native identity. Present invalid
+hook source or parent fields are rejected at the authenticated boundary rather
+than being coerced to the absent/root form. Names, roles, descriptions, prompts,
+timestamps, output paths, and event proximity are never correlation keys;
+incomplete, conflicting, stale, malformed, or saturated chains remain
+observable but uncontrollable. Live identity maps and unmatched terminal
+statuses are each bounded at the Activity page limit. Terminal retirement
+atomically removes the live tool/agent/task join and records generation-scoped identities in three
 fixed 256-word tombstone filters (2 KiB each; 6 KiB total). Tombstones are never
 evicted within a generation: a filter false positive can only disable a private
 target, never create one or invent lifecycle. At exact terminal-status-map

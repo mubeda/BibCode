@@ -471,8 +471,24 @@ correlator extracts only bounded status and identity fields.
 Nested correlation additionally requires exact source ownership: the nested
 stream `parent_tool_use_id` must resolve to an active parent correlation whose
 launched agent equals the authenticated nested PostToolUse source `agent_id`.
-Root and nested source forms cannot be mixed. Missing or mismatched ownership
-fails closed.
+The Activity-verified `SubagentStart.parent_agent_id` must equal that same
+source actor; a root launch instead requires an absent parent. Root and nested
+source forms cannot be mixed, and sibling cross-wiring, missing lineage, or
+mismatched ownership fails closed. Present invalid hook source/parent fields
+are rejected at the authenticated boundary instead of being interpreted as an
+absent root source.
+
+Reconciliation uses a bounded dependency fixpoint capped by the correlation
+page limit. Each newly installed parent wakes already-present descendants, so
+parent, child, and deeper chains settle in the same observation independent of
+lexical ID order without an unbounded loop.
+
+Every accepted fact that produces a target install, retirement, or terminal
+transition receives a deterministic `claude:control:<sha256>` native event key
+before the production event pump. The digest uses length-framed,
+domain-separated bounded identity/status fields. It is stable across duplicate
+delivery, separates lifecycle statuses, and never exposes raw native IDs;
+malformed or rejected facts emit no control key or control effect.
 
 Terminal retirement atomically removes live tool, agent, and task maps and adds
 each identity to generation-scoped fixed tombstone filters. The three filters
