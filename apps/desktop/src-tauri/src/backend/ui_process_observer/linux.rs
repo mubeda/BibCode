@@ -1,21 +1,48 @@
-#![cfg_attr(
-    not(test),
-    allow(
-        dead_code,
-        reason = "the pure Linux validation core is wired to the production observer in Task 5"
-    )
-)]
-
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     ffi::OsStr,
+    future::Future,
     path::{Path, PathBuf},
+    pin::Pin,
+    sync::Arc,
 };
 
 use bibcode_server::diagnostics::{
-    DesktopUiObservation, NativeProcessRecord, ProcessIdentity, ProcessRow, UiCoverage,
-    UiCoverageStatus,
+    DesktopUiObservation, DesktopUiProcessObserver, NativeProcessRecord, NativeProcessSampler,
+    ProcessIdentity, ProcessRow, UiCoverage, UiCoverageStatus,
 };
+
+fn read_process_executable(pid: u32) -> Result<PathBuf, ()> {
+    let executable = std::fs::read_link(format!("/proc/{pid}/exe")).map_err(|_| ())?;
+    let metadata = std::fs::metadata(&executable).map_err(|_| ())?;
+    metadata.is_file().then_some(executable).ok_or(())
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct LinuxDesktopUiProcessObserver;
+
+impl LinuxDesktopUiProcessObserver {
+    pub(super) fn new() -> Self {
+        Self
+    }
+}
+
+impl DesktopUiProcessObserver for LinuxDesktopUiProcessObserver {
+    fn observe(
+        &self,
+        rows: Arc<[ProcessRow]>,
+        server_identity: ProcessIdentity,
+    ) -> Pin<Box<dyn Future<Output = DesktopUiObservation> + Send + '_>> {
+        Box::pin(async move {
+            build_observation_with(
+                &rows,
+                server_identity,
+                |pid| NativeProcessSampler::process_record(pid).map_err(|_| ()),
+                read_process_executable,
+            )
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum WebKitGtkProcessRole {
@@ -267,10 +294,12 @@ mod tests {
     };
 
     use bibcode_server::diagnostics::{
-        NativeProcessRecord, ProcessIdentity, ProcessRow, UiCoverageStatus,
+        NativeProcessRecord, NativeProcessSampler, ProcessIdentity, ProcessRow, UiCoverageStatus,
     };
 
-    use super::{LinuxObservationIssue, build_observation_with, coverage_for};
+    use super::{
+        LinuxObservationIssue, build_observation_with, coverage_for, read_process_executable,
+    };
 
     const SERVER_PID: u32 = 410;
     const SERVER_STARTED_AT: u64 = 100;
@@ -321,6 +350,19 @@ mod tests {
             |pid| records.get(&pid).copied().ok_or(()),
             |pid| executables.get(&pid).cloned().ok_or(()),
         )
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_ui_native_record_and_executable_reader_validate_the_current_process() {
+        let record = NativeProcessSampler::process_record(std::process::id())
+            .expect("current process record");
+        let executable = read_process_executable(std::process::id()).expect("current executable");
+
+        assert_eq!(record.identity.pid, std::process::id());
+        assert_ne!(record.identity.started_at, 0);
+        assert!(executable.is_absolute());
+        assert!(executable.is_file());
     }
 
     #[test]
