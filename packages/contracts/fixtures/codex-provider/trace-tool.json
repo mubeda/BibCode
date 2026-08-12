@@ -30,6 +30,7 @@
     "type": "content.delta",
     "threadId": "fixture-thread",
     "turnId": "fixture-turn",
+    "itemId": "item-2",
     "payload": {
       "streamKind": "assistant_text",
       "delta": "Applied the requested edit.\n"

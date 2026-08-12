@@ -280,6 +280,20 @@ async fn cursor_runtime_matches_approval_and_cancel_traces() {
         .await
         .expect("approval response");
     approval_events.extend(runtime.collect_events(5).await);
+    let (assistant_chunk_index, assistant_chunk) = approval_events
+        .iter()
+        .enumerate()
+        .find(|(_, event)| event.event_type == "content.delta")
+        .expect("Cursor assistant chunk");
+    assert_eq!(assistant_chunk.item_id, None);
+    assert_eq!(assistant_chunk.payload["delta"], json!("hello from mock"));
+    assert!(
+        approval_events[assistant_chunk_index + 1..]
+            .iter()
+            .any(|event| {
+                event.event_type == "turn.completed" && event.turn_id == assistant_chunk.turn_id
+            })
+    );
     normalize_turn_ids(&mut approval_events, &approval_turn, "turn-3");
     assert_eq!(approval_events, stable_fixture("trace-approval.json"));
 

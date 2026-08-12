@@ -238,6 +238,7 @@ pub struct ClaudeProviderRuntime {
     session_id: String,
     runtime_mode: Option<RuntimeMode>,
     current_turn_id: Option<String>,
+    active_assistant_item_id: Option<String>,
     pending_approvals: BTreeMap<String, PendingApproval>,
     pending_user_inputs: BTreeMap<String, PendingUserInput>,
     in_flight_tools: BTreeMap<String, InFlightTool>,
@@ -266,6 +267,7 @@ impl ClaudeProviderRuntime {
             session_id,
             runtime_mode: None,
             current_turn_id: None,
+            active_assistant_item_id: None,
             pending_approvals: BTreeMap::new(),
             pending_user_inputs: BTreeMap::new(),
             in_flight_tools: BTreeMap::new(),
@@ -345,6 +347,7 @@ impl ClaudeProviderRuntime {
 
     pub fn start_turn(&mut self, input: TurnInput) -> Vec<CanonicalEvent> {
         self.token_usage.start_turn();
+        self.active_assistant_item_id = None;
         self.current_turn_id = Some(input.turn_id.clone());
         vec![self.event(
             "turn.started",
@@ -779,13 +782,16 @@ impl ClaudeProviderRuntime {
 
     fn handle_stream_event(&mut self, event: StreamEvent) -> Vec<CanonicalEvent> {
         match event {
-            StreamEvent::MessageStart { message } => vec![self.event(
-                "thread.started",
-                self.current_turn_id.clone(),
-                None,
-                None,
-                json!({ "providerThreadId": message.id }),
-            )],
+            StreamEvent::MessageStart { message } => {
+                self.active_assistant_item_id = Some(message.id.clone());
+                vec![self.event(
+                    "thread.started",
+                    self.current_turn_id.clone(),
+                    None,
+                    None,
+                    json!({ "providerThreadId": message.id }),
+                )]
+            }
             StreamEvent::ContentBlockStart {
                 index,
                 content_block: ContentBlock::ToolUse { id, name, input },
@@ -833,7 +839,7 @@ impl ClaudeProviderRuntime {
             StreamEvent::ContentBlockDelta {
                 index: _,
                 delta: ContentBlockDelta::TextDelta { text },
-            } => vec![self.event(
+            } => vec![self.item_event(
                 "content.delta",
                 self.current_turn_id.clone(),
                 None,
@@ -842,6 +848,7 @@ impl ClaudeProviderRuntime {
                     "streamKind": "assistant_text",
                     "delta": text,
                 }),
+                self.active_assistant_item_id.clone(),
             )],
             StreamEvent::ContentBlockDelta {
                 index,
@@ -1048,10 +1055,25 @@ impl ClaudeProviderRuntime {
             event_type: event_type.to_owned(),
             thread_id: self.thread_id.clone(),
             turn_id,
+            item_id: None,
             request_id,
             provider_refs,
             payload,
         }
+    }
+
+    fn item_event(
+        &self,
+        event_type: &str,
+        turn_id: Option<String>,
+        request_id: Option<String>,
+        provider_refs: Option<Value>,
+        payload: Value,
+        item_id: Option<String>,
+    ) -> CanonicalEvent {
+        let mut event = self.event(event_type, turn_id, request_id, provider_refs, payload);
+        event.item_id = item_id;
+        event
     }
 
     fn token_usage_event(

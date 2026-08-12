@@ -84,6 +84,35 @@ subsequent durable orchestration events. Streaming subscriptions can be
 re-established after reconnect from snapshots or replay methods rather than
 depending on connection-local push caches.
 
+### Assistant message identity
+
+Provider assistant text preserves a native runtime `itemId` when the provider
+exposes one. The server converts it to a thread-namespaced orchestration
+message ID before persistence. Providers whose protocol does not expose a
+message identity use one deterministic assistant message per thread turn.
+
+Terminal turn projection completes every existing streaming assistant message
+for that thread and turn and never creates an empty assistant message. The
+client therefore receives the same message boundaries from live events and
+reloaded SQLite projections; Markdown rendering does not infer or repair
+provider message boundaries. A live completion that no longer owns a matching
+streaming assistant row is accepted idempotently without appending an event, so
+a projector rewind cannot reinterpret that no-op with historical upsert
+semantics. Genuine historical message events retain their established replay
+behavior.
+
+The turn's final assistant pointer follows durable message chronology, ordered
+by message creation time and then message ID. A delayed completion for an older
+assistant item therefore cannot replace a later answer, including when provider
+events share a timestamp. Startup reconciliation and an unexpected provider
+event-stream end settle the exact abandoned turn's existing assistant rows;
+they retain provider failure and session error state without inserting fallback
+text. This terminal settlement performs one thread-scoped read and no per-delta
+database work. If both live settlement attempts fail after an unexpected stream
+end, the durable error runtime retains thread-scoped recovery ownership: the
+next startup settles the exact stored message and turn identities without
+rewriting the original provider or session error.
+
 ### Context-window usage flow
 
 Provider-native usage data is normalized in the server runtime as canonical
