@@ -146,8 +146,14 @@ yields `partial` or `unavailable` coverage. This requires neither elevated
 privileges nor a new entitlement, but it uses private WebKit and process SPI,
 so it is incompatible with a strict Mac App Store public-API-only policy.
 
-Linux and other unsupported desktop targets report `unavailable`; the observer
-never claims generic browser or renderer executable-name matches.
+On Linux, the desktop observer considers only immediate children of the current
+combined Tauri host/server. A strict WebKitGTK Web, Network, or GPU role is
+accepted only when `/proc` reports the same parent PID and start identity before
+and after resolving an exact role-matched executable. Registered provider and
+terminal ownership wins over a conflicting UI observation. Unknown roles,
+changed identities, permission failures, and unsupported process topologies
+remain unclaimed and produce bounded partial or unavailable coverage. The
+observer never claims a generic WebKit process by machine-wide name matching.
 
 Production provider and terminal launchers register their root PID, scope,
 kind, and bounded label. The schema reserves the `helper` kind, but no

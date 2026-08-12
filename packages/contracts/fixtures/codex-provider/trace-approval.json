@@ -29,6 +29,7 @@
     "type": "content.delta",
     "threadId": "fixture-thread",
     "turnId": "fixture-turn",
+    "itemId": "item-3",
     "payload": {
       "streamKind": "assistant_text",
       "delta": "Approval received and command executed.\n"

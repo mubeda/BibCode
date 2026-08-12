@@ -2220,6 +2220,68 @@ async fn opencode_runtime_matches_session_and_rollback_traces() {
 }
 
 #[tokio::test]
+async fn root_assistant_text_preserves_message_identity_and_completion() {
+    let state = Arc::new(TestServerState::default());
+    let app = Router::new()
+        .route("/session", post(create_session))
+        .route("/event", get(subscribe_root_assistant_identity_events))
+        .route("/session/{session_id}/prompt_async", post(prompt_async))
+        .with_state(state);
+    let listener = TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let address: SocketAddr = listener.local_addr().expect("addr");
+    let server = tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("serve");
+    });
+    let runtime = OpenCodeSessionRuntime::new(
+        &format!("http://{address}"),
+        "opencode-identity-thread",
+        "/tmp/project",
+        None,
+    );
+
+    runtime.start().await.expect("start");
+    let send_runtime = runtime.clone();
+    let send_turn = tokio::spawn(async move {
+        send_runtime
+            .send_turn(Some("preserve identity"), Vec::new(), None)
+            .await
+    });
+    let events = timeout(Duration::from_secs(2), async {
+        let mut events = Vec::new();
+        loop {
+            let event = runtime.next_event().await.expect("root assistant event");
+            let turn_completed = event.event_type == "turn.completed";
+            events.push(event);
+            if turn_completed {
+                return events;
+            }
+        }
+    })
+    .await
+    .expect("root assistant events");
+    send_turn.await.expect("turn join").expect("turn");
+
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| {
+                event.event_type == "content.delta"
+                    || event.event_type == "message.assistant.completed"
+            })
+            .map(|event| (event.event_type.as_str(), event.item_id.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("content.delta", Some("opencode-message-1")),
+            ("message.assistant.completed", Some("opencode-message-1")),
+            ("content.delta", Some("opencode-message-2")),
+        ]
+    );
+
+    runtime.stop().await.expect("stop");
+    server.abort();
+}
+
+#[tokio::test]
 async fn opencode_runtime_dispatches_native_commands_with_agent_and_model() {
     let state = Arc::new(TestServerState::default());
     let app = Router::new()
@@ -6768,6 +6830,90 @@ async fn subscribe_events(
         )
     });
     let stream = initial.chain(tail);
+    Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+async fn subscribe_root_assistant_identity_events(
+    State(state): State<Arc<TestServerState>>,
+    Query(_query): Query<std::collections::HashMap<String, String>>,
+) -> Sse<impl Stream<Item = Result<Event, std::convert::Infallible>>> {
+    let events = [
+        json!({
+            "type": "message.updated",
+            "properties": {
+                "info": {
+                    "id": "opencode-message-1",
+                    "sessionID": "session-1",
+                    "role": "assistant"
+                }
+            }
+        }),
+        json!({
+            "type": "message.part.updated",
+            "properties": {
+                "part": {
+                    "id": "opencode-part-1",
+                    "messageID": "opencode-message-1",
+                    "sessionID": "session-1",
+                    "type": "text",
+                    "text": "First."
+                }
+            }
+        }),
+        json!({
+            "type": "message.updated",
+            "properties": {
+                "sessionID": "session-1",
+                "info": {
+                    "id": "opencode-message-1",
+                    "sessionID": "session-1",
+                    "role": "assistant",
+                    "time": { "completed": 20 },
+                    "finish": "stop"
+                }
+            }
+        }),
+        json!({
+            "type": "message.updated",
+            "properties": {
+                "info": {
+                    "id": "opencode-message-2",
+                    "sessionID": "session-1",
+                    "role": "assistant"
+                }
+            }
+        }),
+        json!({
+            "type": "message.part.updated",
+            "properties": {
+                "part": {
+                    "id": "opencode-part-2",
+                    "messageID": "opencode-message-2",
+                    "sessionID": "session-1",
+                    "type": "text",
+                    "text": "Second."
+                }
+            }
+        }),
+        json!({
+            "type": "session.status",
+            "properties": {
+                "sessionID": "session-1",
+                "status": { "type": "idle" }
+            }
+        }),
+    ];
+    let stream = stream::once(async move {
+        state.prompt_received.notified().await;
+        events
+    })
+    .flat_map(|events| {
+        stream::iter(
+            events
+                .into_iter()
+                .map(|event| Ok(Event::default().data(event.to_string()))),
+        )
+    });
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
