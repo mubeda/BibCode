@@ -102,14 +102,18 @@ text.
 The terminal manager is the sole owner of each observer generation's worker
 registry. Provider observer workers receive only a lightweight observation
 lease containing generation identity, publication fencing, and cancellation;
-that lease cannot retain the registry that owns the worker future. Explicit
-teardown cancels and drains the registry before invalidating publication. If
-the final manager generation owner is instead dropped, registry drop publishes
-cancellation without blocking and transfers its workers to a retained runtime
-cleanup task for the same bounded graceful-then-abort policy. The process-wide
-join reaper continues to own each worker thread and permit until joining proves
-the OS thread exited, so a worker that retains its observation lease cannot
-form an ownership cycle or permanently consume observer capacity.
+that lease cannot retain the registry that owns the worker future or invalidate
+the generation. Only the manager-owned generation exposes lifecycle mutation.
+Explicit teardown cancels and drains the registry before invalidating
+publication. If the final manager generation owner is instead dropped,
+registry drop publishes cancellation without blocking and transfers its workers
+to a retained runtime cleanup task for the same bounded graceful-then-abort
+policy. Each transferred worker record also synchronously requests abort when
+dropped, so discarding that cleanup task during runtime shutdown cannot strand
+a noncooperative worker. The process-wide join reaper continues to own each
+worker thread and permit until joining proves the OS thread exited, so a worker
+that retains its observation lease cannot form an ownership cycle or
+permanently consume observer capacity.
 
 OpenCode helper cleanup is owned by the system helper launcher. Before a
 foreground cleanup waiter can block, the launcher transfers the exact child,
