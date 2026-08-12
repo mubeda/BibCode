@@ -1263,11 +1263,8 @@ impl CodexSessionRuntime {
                 message: "the targeted child turn is not the current active turn".to_owned(),
             });
         }
-        self.inner
-            .connection
-            .lock()
-            .await
-            .clone()
+        let connection = self.inner.connection.lock().await.clone();
+        connection
             .request(
                 "turn/interrupt",
                 json!({
@@ -6687,6 +6684,108 @@ mod tests {
     #[tokio::test]
     async fn live_start_before_stale_root_hint_preserves_tracker_overlay_and_exact_interrupt() {
         assert_live_target_survives_stale_hint_history(false).await;
+    }
+
+    #[tokio::test]
+    async fn targeted_interrupts_do_not_wait_for_an_unrelated_provider_response() {
+        let (connection, incoming, peer_stdout, peer_stdin, _peer_stderr) =
+            runtime_test_connection();
+        let runtime = CodexSessionRuntime::new(reconciliation_test_options(), connection, incoming);
+        configure_reconciliation_test_runtime(&runtime).await;
+        let descendants = [
+            decode_thread_read_response(json!({
+                "thread": {
+                    "id": "child-a",
+                    "parentThreadId": "provider-root",
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": {"type": "active", "activeFlags": []},
+                    "turns": []
+                }
+            }))
+            .expect("child a")
+            .thread,
+            decode_thread_read_response(json!({
+                "thread": {
+                    "id": "child-b",
+                    "parentThreadId": "provider-root",
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": {"type": "active", "activeFlags": []},
+                    "turns": []
+                }
+            }))
+            .expect("child b")
+            .thread,
+        ];
+        runtime
+            .inner
+            .activity
+            .lock()
+            .await
+            .tracker
+            .reconcile_descendants(&descendants);
+        for (thread_id, turn_id) in [("child-a", "turn-a"), ("child-b", "turn-b")] {
+            runtime
+                .handle_notification(
+                    "turn/started".to_owned(),
+                    json!({
+                        "threadId": thread_id,
+                        "turn": {"id": turn_id, "status": "inProgress", "startedAt": 3}
+                    }),
+                    3_000,
+                )
+                .await;
+        }
+
+        let first_runtime = runtime.clone();
+        let first = tokio::spawn(async move {
+            first_runtime
+                .interrupt_targeted_turn("child-a", "turn-a")
+                .await
+        });
+        let mut reader = BufReader::new(peer_stdin);
+        let mut writer = peer_stdout;
+        let first_request = read_runtime_test_json(&mut reader).await;
+        assert_eq!(first_request["method"], "turn/interrupt");
+        assert_eq!(
+            first_request["params"],
+            json!({"threadId": "child-a", "turnId": "turn-a"})
+        );
+
+        let second_runtime = runtime.clone();
+        let second = tokio::spawn(async move {
+            second_runtime
+                .interrupt_targeted_turn("child-b", "turn-b")
+                .await
+        });
+        let second_request = timeout(Duration::from_secs(1), read_runtime_test_json(&mut reader))
+            .await
+            .expect("a second exact interrupt must not wait for the first provider response");
+        assert_eq!(second_request["method"], "turn/interrupt");
+        assert_eq!(
+            second_request["params"],
+            json!({"threadId": "child-b", "turnId": "turn-b"})
+        );
+
+        write_runtime_test_json(
+            &mut writer,
+            json!({"id": second_request["id"].clone(), "result": {}}),
+        )
+        .await;
+        write_runtime_test_json(
+            &mut writer,
+            json!({"id": first_request["id"].clone(), "result": {}}),
+        )
+        .await;
+        second
+            .await
+            .expect("second interrupt task")
+            .expect("second interrupt succeeds");
+        first
+            .await
+            .expect("first interrupt task")
+            .expect("first interrupt succeeds");
     }
 
     #[tokio::test]

@@ -329,6 +329,89 @@ fn targeted_task_correlation_fixture_keeps_stopped_authoritative_after_subagent_
     }
 }
 
+#[test]
+fn targeted_task_subtree_keeps_siblings_live_and_unmapped_agents_observable() {
+    // Mutation caught: joining siblings by semantic fields or hiding an observable actor merely
+    // because it lacks the exact Agent-tool/task identity chain required for control.
+    let fixture: ClaudeTargetedCancellationFixture =
+        load_fixture("trace-targeted-task-cancellation.json");
+    let mut runtime =
+        ClaudeProviderRuntime::new("thread-targeted".to_owned(), fixture.session_id.clone());
+    let mut outputs = Vec::new();
+    for (index, fact) in fixture.orders[0].facts.iter().enumerate() {
+        outputs.push(apply_targeted_correlation_fact(
+            &mut runtime,
+            fact,
+            1_000 + index as u64,
+        ));
+    }
+    for (index, fact) in fixture.semantic_collision_facts.iter().enumerate() {
+        outputs.push(apply_targeted_correlation_fact(
+            &mut runtime,
+            fact,
+            2_000 + index as u64,
+        ));
+    }
+    for (index, fact) in fixture.nested_facts[..4].iter().enumerate() {
+        outputs.push(apply_targeted_correlation_fact(
+            &mut runtime,
+            fact,
+            3_000 + index as u64,
+        ));
+    }
+    outputs.push(runtime.handle_authenticated_hook_value(
+        &json!({
+            "hook_event_name":"SubagentStart",
+            "session_id":fixture.session_id,
+            "agent_id":"agent-unmapped",
+            "agent_type":"same-role",
+            "description":"same description",
+            "prompt":"same prompt"
+        }),
+        4_000,
+    ));
+
+    let actors = outputs
+        .iter()
+        .flat_map(|output| &output.activity)
+        .filter_map(|mutation| match mutation {
+            ProviderActivityMutation::UpsertActor(actor) => Some(actor.clone()),
+            _ => None,
+        })
+        .fold(std::collections::BTreeMap::new(), |mut latest, actor| {
+            latest.insert(actor.id.clone(), actor);
+            latest
+        });
+    assert_eq!(
+        actors["claude:agent:agent-child"]
+            .parent_actor_id
+            .as_deref(),
+        Some("claude:agent:agent-a")
+    );
+    assert!(actors["claude:agent:agent-a"].parent_actor_id.is_none());
+    assert!(actors["claude:agent:agent-b"].parent_actor_id.is_none());
+    assert!(
+        actors["claude:agent:agent-unmapped"]
+            .parent_actor_id
+            .is_none()
+    );
+    assert!(actors.values().all(|actor| !actor.status.is_terminal()));
+
+    let stopped = apply_targeted_correlation_fact(&mut runtime, &fixture.terminal_facts[0], 5_000);
+    assert!(stopped.activity.iter().any(|mutation| matches!(
+        mutation,
+        ProviderActivityMutation::UpsertActor(actor)
+            if actor.id == "claude:agent:agent-a"
+                && actor.status == ActivityLifecycle::Cancelled
+    )));
+    assert!(stopped.activity.iter().all(|mutation| !matches!(
+        mutation,
+        ProviderActivityMutation::UpsertActor(actor)
+            if actor.id == "claude:agent:agent-b"
+                || actor.id == "claude:agent:agent-unmapped"
+    )));
+}
+
 #[derive(Debug, serde::Deserialize)]
 #[serde(
     tag = "type",

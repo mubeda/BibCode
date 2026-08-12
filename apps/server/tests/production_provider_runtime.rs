@@ -1336,6 +1336,32 @@ where
     }
 }
 
+async fn tagged_rpc_request<S>(
+    socket: &mut WebSocketStream<S>,
+    id: &str,
+    tag: &str,
+    payload: Value,
+) -> Result<Value, Value>
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    socket
+        .send(Message::Text(
+            json!({
+                "_tag":"Request",
+                "id":id,
+                "tag":tag,
+                "payload":payload,
+                "headers":[]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send tagged RPC request");
+    rpc_response(socket, id).await
+}
+
 async fn assert_codex_restart_reconciliation(
     mode: &'static str,
     expected: ProviderReconciliationOutcome,
@@ -10990,6 +11016,428 @@ done
         Err(ProviderRuntimeError::Provider { provider, .. }) if provider == "codex"
     ));
     driver.shutdown().await.unwrap();
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn targeted_activity_rpc_interrupts_only_the_selected_codex_subtree_and_catches_a_late_child()
+{
+    // Mutation caught: routing an Activity-row stop through the root interrupt, a sibling target,
+    // or a client-supplied native ID instead of the server-owned canonical subtree fence.
+    let state = TempDir::new().expect("state");
+    let capture = state.path().join("codex-targeted-requests.ndjson");
+    let late_observed = state.path().join("codex-late-emitted");
+    let release_selected = state.path().join("codex-release-selected");
+    let script = format!(
+        r#"#!/bin/sh
+capture='{}'
+late_observed='{}'
+release_selected='{}'
+alpha_child_attempts=0
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$capture"
+  id=$(printf '%s\n' "$line" | sed -n 's/.*"id":\([0-9][0-9]*\).*/\1/p')
+  case "$line" in
+    *'"method":"initialize"'*) printf '{{"id":%s,"result":{{"userAgent":"fixture"}}}}\n' "$id" ;;
+    *'"method":"thread/start"'*) printf '{{"id":%s,"result":{{"cwd":"/tmp","model":"gpt-5","thread":{{"id":"provider-root"}}}}}}\n' "$id" ;;
+    *'"method":"thread/resume"'*)
+      printf '{{"id":%s,"result":{{"cwd":"/tmp","model":"gpt-5","thread":{{"id":"provider-root"}}}}}}\n' "$id"
+      ;;
+    *'"method":"thread/read"'*) printf '{{"id":%s,"result":{{"thread":{{"id":"provider-root","createdAt":1,"updatedAt":1,"status":{{"type":"idle"}},"turns":[]}}}}}}\n' "$id" ;;
+    *'"method":"thread/list"'*) printf '{{"id":%s,"result":{{"data":[],"nextCursor":null,"backwardsCursor":null}}}}\n' "$id" ;;
+    *'"method":"thread/backgroundTerminals/list"'*) printf '{{"id":%s,"result":{{"data":[],"nextCursor":null}}}}\n' "$id" ;;
+    *'"method":"mcpServerStatus/list"'*) printf '{{"id":%s,"result":{{"data":[],"nextCursor":null}}}}\n' "$id" ;;
+    *'"method":"turn/start"'*)
+      printf '{{"id":%s,"result":{{"turn":{{"id":"root-turn"}}}}}}\n' "$id"
+      printf '%s\n' '{{"method":"item/started","emittedAtMs":1001,"params":{{"threadId":"provider-root","turnId":"root-turn","item":{{"id":"spawn-root","type":"collabAgentToolCall","tool":"spawnAgent","status":"inProgress","senderThreadId":"provider-root","receiverThreadIds":["alpha","beta"],"agentsStates":{{"alpha":{{"status":"running","message":null}},"beta":{{"status":"running","message":null}}}}}},"startedAtMs":1001}}}}'
+      printf '%s\n' '{{"method":"turn/started","emittedAtMs":1002,"params":{{"threadId":"alpha","turn":{{"id":"alpha-turn","status":"inProgress","startedAt":1}}}}}}'
+      printf '%s\n' '{{"method":"turn/started","emittedAtMs":1003,"params":{{"threadId":"beta","turn":{{"id":"beta-turn","status":"inProgress","startedAt":1}}}}}}'
+      printf '%s\n' '{{"method":"item/started","emittedAtMs":1004,"params":{{"threadId":"alpha","turnId":"alpha-turn","item":{{"id":"spawn-alpha","type":"collabAgentToolCall","tool":"spawnAgent","status":"inProgress","senderThreadId":"alpha","receiverThreadIds":["alpha-child"],"agentsStates":{{"alpha-child":{{"status":"running","message":null}}}}}},"startedAtMs":1004}}}}'
+      printf '%s\n' '{{"method":"turn/started","emittedAtMs":1005,"params":{{"threadId":"alpha-child","turn":{{"id":"alpha-child-turn","status":"inProgress","startedAt":1}}}}}}'
+      ;;
+    *'"method":"turn/interrupt"'*'"threadId":"alpha"'*)
+      printf '%s\n' '{{"method":"item/started","emittedAtMs":1010,"params":{{"threadId":"alpha","turnId":"alpha-turn","item":{{"id":"spawn-alpha-late","type":"collabAgentToolCall","tool":"spawnAgent","status":"inProgress","senderThreadId":"alpha","receiverThreadIds":["alpha-late"],"agentsStates":{{"alpha-late":{{"status":"running","message":null}}}}}},"startedAtMs":1010}}}}'
+      printf '%s\n' '{{"method":"turn/started","emittedAtMs":1011,"params":{{"threadId":"alpha-late","turn":{{"id":"alpha-late-turn","status":"inProgress","startedAt":1}}}}}}'
+      : > "$late_observed"
+      while [ ! -f "$release_selected" ]; do sleep 0.01; done
+      printf '{{"id":%s,"result":{{}}}}\n' "$id"
+      ;;
+    *'"method":"turn/interrupt"'*'"threadId":"alpha-child"'*)
+      alpha_child_attempts=$((alpha_child_attempts + 1))
+      if [ "$alpha_child_attempts" -gt 1 ]; then
+        printf '{{"id":%s,"result":{{}}}}\n' "$id"
+        printf '%s\n' '{{"method":"turn/completed","emittedAtMs":1021,"params":{{"threadId":"alpha-child","turn":{{"id":"alpha-child-turn","status":"completed","completedAt":3}}}}}}'
+      fi
+      ;;
+    *'"method":"turn/interrupt"'*'"threadId":"alpha-late"'*)
+      printf '{{"id":%s,"result":{{}}}}\n' "$id"
+      printf '%s\n' '{{"method":"turn/completed","emittedAtMs":1020,"params":{{"threadId":"alpha-late","turn":{{"id":"alpha-late-turn","status":"completed","completedAt":3}}}}}}'
+      printf '%s\n' '{{"method":"turn/completed","emittedAtMs":1022,"params":{{"threadId":"alpha","turn":{{"id":"alpha-turn","status":"completed","completedAt":3}}}}}}'
+      ;;
+    *'"method":"turn/interrupt"'*) printf '{{"id":%s,"result":{{}}}}\n' "$id" ;;
+    *'"method":"shutdown"'*) printf '{{"id":%s,"result":null}}\n' "$id" ;;
+  esac
+done
+"#,
+        capture.display(),
+        late_observed.display(),
+        release_selected.display()
+    );
+    let executable = executable_fixture(&state, "codex-targeted-rpc", &script, "");
+    let config = test_config(&state);
+    std::fs::create_dir_all(config.state_dir()).expect("state directory");
+    std::fs::write(
+        config.state_dir().join("settings.json"),
+        serde_json::to_vec(&json!({
+            "providerInstances": {
+                "codex-targeted": {
+                    "driver": "codex",
+                    "enabled": true,
+                    "config": { "binaryPath": executable }
+                }
+            }
+        }))
+        .expect("settings json"),
+    )
+    .expect("provider settings");
+    let workspace = state.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let handle = ServerRuntime::start(config.clone())
+        .await
+        .expect("production RPC server");
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("WebSocket");
+    tagged_rpc_request(
+        &mut socket,
+        "1001",
+        "orchestration.dispatchCommand",
+        json!({
+            "type":"project.create","commandId":"targeted-project",
+            "projectId":"targeted-project","title":"Targeted",
+            "workspaceRoot":workspace,"defaultModelSelection":null,"createdAt":NOW
+        }),
+    )
+    .await
+    .expect("project created through public RPC");
+    tagged_rpc_request(
+        &mut socket,
+        "1002",
+        "orchestration.dispatchCommand",
+        json!({
+            "type":"thread.create","commandId":"targeted-thread","threadId":"targeted-thread",
+            "projectId":"targeted-project","title":"Targeted thread","kind":"workspace",
+            "modelSelection":{"instanceId":"codex-targeted","model":"gpt-5"},
+            "runtimeMode":"full-access","interactionMode":"default","branch":null,
+            "worktreePath":null,"createdAt":NOW
+        }),
+    )
+    .await
+    .expect("thread created through public RPC");
+    tagged_rpc_request(
+        &mut socket,
+        "1003",
+        "orchestration.dispatchCommand",
+        json!({
+            "type":"thread.turn.start","commandId":"targeted-turn","threadId":"targeted-thread",
+            "message":{"messageId":"targeted-message","role":"user","text":"start","attachments":[]},
+            "modelSelection":{"instanceId":"codex-targeted","model":"gpt-5"},
+            "runtimeMode":"full-access","interactionMode":"default","createdAt":NOW
+        }),
+    )
+    .await
+    .expect("turn admitted");
+
+    let alpha_control = timeout(Duration::from_secs(10), async {
+        let mut request_id = 0_u64;
+        loop {
+            request_id += 1;
+            let Ok(snapshot) = tagged_rpc_request(
+                &mut socket,
+                &format!("2{request_id:03}"),
+                "activity.getSnapshot",
+                json!({"_tag":"thread","threadId":"targeted-thread"}),
+            )
+            .await
+            else {
+                tokio::task::yield_now().await;
+                continue;
+            };
+            if let Some(control) = snapshot["control"]["actors"]
+                .as_array()
+                .and_then(|controls| {
+                    controls.iter().find(|control| {
+                        control["actorId"] == "codex:thread:alpha"
+                            && control["state"] == "available"
+                            && control["activeDescendantCount"] == 1
+                    })
+                })
+                .cloned()
+            {
+                break (snapshot, control);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("alpha control becomes available");
+    let (snapshot, alpha_control) = alpha_control;
+    assert!(
+        snapshot["control"]["actors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|control| {
+                control["actorId"] == "codex:thread:beta" && control["state"] == "available"
+            })
+    );
+    let cancellation_address = handle.local_addr();
+    let alpha_revision = alpha_control["controlRevision"].clone();
+    let cancellation_task = tokio::spawn(async move {
+        let (mut cancellation_socket, _) = connect_async(format!("ws://{cancellation_address}/ws"))
+            .await
+            .expect("cancellation WebSocket");
+        let result = tagged_rpc_request(
+            &mut cancellation_socket,
+            "3001",
+            "activity.cancelSubtree",
+            json!({
+                "scope": {"_tag":"thread","threadId":"targeted-thread"},
+                "scopeId":"thread:targeted-thread",
+                "actorId":"codex:thread:alpha",
+                "expectedControlRevision":alpha_revision
+            }),
+        )
+        .await;
+        cancellation_socket
+            .close(None)
+            .await
+            .expect("close cancellation socket");
+        result
+    });
+    timeout(Duration::from_secs(10), async {
+        while !late_observed.exists() {
+            tokio::task::yield_now().await;
+        }
+        let mut request_id = 3_100_u64;
+        loop {
+            request_id += 1;
+            if let Ok(snapshot) = tagged_rpc_request(
+                &mut socket,
+                &request_id.to_string(),
+                "activity.getSnapshot",
+                json!({"_tag":"thread","threadId":"targeted-thread"}),
+            )
+            .await
+                && snapshot["control"]["actors"]
+                    .as_array()
+                    .is_some_and(|actors| {
+                        actors.iter().any(|actor| {
+                            actor["actorId"] == "codex:thread:alpha-late"
+                                && actor["state"] == "requested"
+                        })
+                    })
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("late child joins the original fence before selected dispatch returns");
+    std::fs::write(&release_selected, b"release").expect("release selected dispatch");
+    cancellation_task
+        .await
+        .expect("cancellation task")
+        .expect("selected subtree cancellation accepted");
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let captured = std::fs::read_to_string(&capture).unwrap_or_default();
+            let interrupted = captured
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|request| request["method"] == "turn/interrupt")
+                .collect::<Vec<_>>();
+            if interrupted.len() == 3 {
+                break interrupted;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map(|interrupted| {
+        assert_eq!(
+            interrupted[0]["params"],
+            json!({"threadId":"alpha","turnId":"alpha-turn"}),
+            "the selected actor must dispatch first"
+        );
+        let targets = interrupted
+            .iter()
+            .map(|request| request["params"].clone())
+            .collect::<Vec<_>>();
+        assert!(targets.contains(&json!({"threadId":"alpha-child","turnId":"alpha-child-turn"})));
+        assert!(targets.contains(&json!({"threadId":"alpha-late","turnId":"alpha-late-turn"})));
+        assert!(
+            !targets
+                .iter()
+                .any(|target| target["threadId"] == "provider-root")
+        );
+        assert!(!targets.iter().any(|target| target["threadId"] == "beta"));
+    })
+    .unwrap_or_else(|_| {
+        panic!(
+            "selected and late descendants are the only provider interrupts; capture={}",
+            std::fs::read_to_string(&capture).unwrap_or_default()
+        )
+    });
+
+    let (mut reconnect, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("reconnected WebSocket");
+    let (reconnected_snapshot, operation) = timeout(Duration::from_secs(10), async {
+        let mut request_id = 7_001_u64;
+        loop {
+            request_id += 1;
+            let partial = tagged_rpc_request(
+                &mut reconnect,
+                &request_id.to_string(),
+                "activity.getSnapshot",
+                json!({"_tag":"thread","threadId":"targeted-thread"}),
+            )
+            .await
+            .expect("reconnected Activity snapshot");
+            if let Some(operation) = partial["control"]["operations"]
+                .as_array()
+                .and_then(|operations| {
+                    operations.iter().find(|operation| {
+                        operation["rootActorId"] == "codex:thread:alpha"
+                            && operation["state"] == "partial"
+                            && operation["residualCount"] == 1
+                    })
+                })
+                .cloned()
+            {
+                break (partial, operation);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("partial cancellation operation");
+    assert!(
+        reconnected_snapshot["actors"]
+            .as_array()
+            .is_some_and(|actors| actors.iter().any(|actor| {
+                actor["id"] == "codex:thread:beta" && actor["status"] == "running"
+            }))
+    );
+    assert_eq!(operation["state"], "partial");
+    assert_eq!(operation["residualCount"], 1);
+    assert_eq!(operation["message"], "Some agents are still running.");
+    tagged_rpc_request(
+        &mut reconnect,
+        "7002",
+        "activity.retrySubtreeCancellation",
+        json!({
+            "scope":{"_tag":"thread","threadId":"targeted-thread"},
+            "scopeId":"thread:targeted-thread",
+            "rootActorId":"codex:thread:alpha",
+            "expectedOperationRevision":operation["operationRevision"]
+        }),
+    )
+    .await
+    .expect("residual retry accepted");
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let captured = std::fs::read_to_string(&capture).unwrap_or_default();
+            let interrupted = captured
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|request| request["method"] == "turn/interrupt")
+                .collect::<Vec<_>>();
+            if interrupted.len() == 4 {
+                break interrupted;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .map(|interrupted| {
+        assert_eq!(
+            interrupted[3]["params"],
+            json!({"threadId":"alpha-child","turnId":"alpha-child-turn"}),
+            "retry must target only the original residual"
+        );
+    })
+    .expect("residual retry provider request");
+
+    let old_operation_revision = operation["operationRevision"].clone();
+    tagged_rpc_request(
+        &mut reconnect,
+        "8001",
+        "orchestration.dispatchCommand",
+        json!({
+            "type":"thread.runtime-mode.set","commandId":"targeted-replace-runtime",
+            "threadId":"targeted-thread","runtimeMode":"approval-required","createdAt":NOW
+        }),
+    )
+    .await
+    .expect("unsupported live mode change replaces the runtime");
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let replacement_started = std::fs::read_to_string(&capture)
+                .unwrap_or_default()
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .any(|request| request["method"] == "thread/resume");
+            if replacement_started {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "replacement runtime generation starts; capture={}",
+            std::fs::read_to_string(&capture).unwrap_or_default()
+        )
+    });
+    let before_stale_retry = std::fs::read_to_string(&capture)
+        .expect("captured requests")
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|request| request["method"] == "turn/interrupt")
+        .count();
+    assert!(
+        tagged_rpc_request(
+            &mut reconnect,
+            "8201",
+            "activity.retrySubtreeCancellation",
+            json!({
+                "scope":{"_tag":"thread","threadId":"targeted-thread"},
+                "scopeId":"thread:targeted-thread",
+                "rootActorId":"codex:thread:alpha",
+                "expectedOperationRevision":old_operation_revision
+            }),
+        )
+        .await
+        .is_err(),
+        "the replacement generation must reject the old operation fence"
+    );
+    let after_stale_retry = std::fs::read_to_string(&capture)
+        .expect("captured requests")
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|request| request["method"] == "turn/interrupt")
+        .count();
+    assert_eq!(after_stale_retry, before_stale_retry);
+
+    reconnect.close(None).await.expect("close reconnect");
+    socket.close(None).await.expect("close WebSocket");
+    handle.shutdown();
+    handle.join().await.expect("RPC server joins");
 }
 
 #[tokio::test]
