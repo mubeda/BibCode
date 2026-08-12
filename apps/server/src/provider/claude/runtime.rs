@@ -275,10 +275,20 @@ struct PendingUserInput {
 struct ClaudeTaskCorrelation {
     invocation_is_agent: Option<bool>,
     invocation_source: Option<ClaudeInvocationSource>,
+    pre_tool_source: Option<ClaudeHookSource>,
     hook_source: Option<ClaudeHookSource>,
     launched_agent_id: Option<String>,
+    fallback_agent_id: Option<String>,
     task_id: Option<String>,
     conflicted: bool,
+}
+
+impl ClaudeTaskCorrelation {
+    fn effective_agent_id(&self) -> Option<&str> {
+        self.launched_agent_id
+            .as_deref()
+            .or(self.fallback_agent_id.as_deref())
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -510,18 +520,19 @@ impl ClaudeTaskControlCorrelator {
             let Some(record) = self.correlation_mut(fact.tool_use_id) else {
                 return Vec::new();
             };
-            let launch_conflict = if !valid {
-                true
-            } else {
-                match record.launched_agent_id.as_deref() {
-                    Some(existing) if existing != fact.agent_id => true,
-                    Some(_) => false,
-                    None => {
-                        record.launched_agent_id = Some(fact.agent_id.to_owned());
-                        false
-                    }
-                }
-            };
+            let launch_conflict = !valid
+                || record
+                    .launched_agent_id
+                    .as_deref()
+                    .is_some_and(|existing| existing != fact.agent_id)
+                || record
+                    .fallback_agent_id
+                    .as_deref()
+                    .is_some_and(|existing| existing != fact.agent_id);
+            let pre_source_conflict = record
+                .pre_tool_source
+                .as_ref()
+                .is_some_and(|existing| existing != &hook_source);
             let source_conflict = match record.hook_source.as_ref() {
                 Some(existing) if existing != &hook_source => true,
                 Some(_) => false,
@@ -530,12 +541,90 @@ impl ClaudeTaskControlCorrelator {
                     false
                 }
             };
-            launch_conflict || source_conflict
+            let conflict = launch_conflict || pre_source_conflict || source_conflict;
+            if !conflict && record.launched_agent_id.is_none() {
+                record.launched_agent_id = Some(fact.agent_id.to_owned());
+                record.fallback_agent_id = None;
+            }
+            conflict
         };
         if conflict {
             return self.poison(fact.tool_use_id);
         }
         self.reconcile_all()
+    }
+
+    fn observe_pre_tool_use(
+        &mut self,
+        session_id: &str,
+        generation: u64,
+        tool_use_id: &str,
+        tool_name: &str,
+        source_agent_id: Option<&str>,
+    ) -> Vec<ClaudeTaskControlEffect> {
+        if !self.accepts(session_id, generation)
+            || !usable_control_identity(tool_use_id)
+            || !usable_control_label(tool_name)
+            || source_agent_id.is_some_and(|value| !usable_control_identity(value))
+        {
+            return Vec::new();
+        }
+        let Some(source_agent_id) = source_agent_id else {
+            return Vec::new();
+        };
+        let source = ClaudeHookSource::Agent(source_agent_id.to_owned());
+        let conflict = {
+            let Some(record) = self.correlation_mut(tool_use_id) else {
+                return Vec::new();
+            };
+            let tool_conflict = !matches!(tool_name, "Agent" | "Task")
+                || matches!(record.invocation_is_agent, Some(false));
+            let source_conflict = match record.pre_tool_source.as_ref() {
+                Some(existing) if existing != &source => true,
+                Some(_) => false,
+                None => {
+                    record.pre_tool_source = Some(source);
+                    false
+                }
+            };
+            tool_conflict || source_conflict
+        };
+        if conflict {
+            return self.poison(tool_use_id);
+        }
+        self.reconcile_all()
+    }
+
+    fn observe_post_tool_failure(
+        &mut self,
+        session_id: &str,
+        generation: u64,
+        tool_use_id: &str,
+        tool_name: &str,
+        source_agent_id: Option<&str>,
+    ) -> Vec<ClaudeTaskControlEffect> {
+        if !self.accepts(session_id, generation)
+            || !usable_control_identity(tool_use_id)
+            || !usable_control_label(tool_name)
+            || source_agent_id.is_some_and(|value| !usable_control_identity(value))
+        {
+            return Vec::new();
+        }
+        let Some(record) = self.correlations_by_tool_use.get(tool_use_id) else {
+            return Vec::new();
+        };
+        let source = source_agent_id.map(|value| ClaudeHookSource::Agent(value.to_owned()));
+        let source_conflict = source.is_some_and(|source| {
+            record
+                .pre_tool_source
+                .as_ref()
+                .or(record.hook_source.as_ref())
+                .is_some_and(|existing| existing != &source)
+        });
+        if !matches!(tool_name, "Agent" | "Task") || source_conflict {
+            return self.poison(tool_use_id);
+        }
+        self.poison(tool_use_id)
     }
 
     fn observe_task_started(
@@ -635,12 +724,10 @@ impl ClaudeTaskControlCorrelator {
         let Some(agent_id) = mapped_agent else {
             return Vec::new();
         };
-        let retired_target = self.retire_identity_chain(Some(&message.task_id), Some(&agent_id));
-        let mut effects = retired_target
-            .then(|| ClaudeTaskControlEffect::Retire {
-                agent_id: agent_id.clone(),
-            })
+        let retired_targets = self.retire_identity_chain(Some(&message.task_id), Some(&agent_id));
+        let mut effects = retired_targets
             .into_iter()
+            .map(|agent_id| ClaudeTaskControlEffect::Retire { agent_id })
             .collect::<Vec<_>>();
         effects.push(ClaudeTaskControlEffect::Terminal {
             agent_id,
@@ -683,18 +770,16 @@ impl ClaudeTaskControlCorrelator {
                 (mapped_agent == agent_id).then_some(task_id.clone())
             })
             .collect::<Vec<_>>();
-        let retired_target = self.retire_identity_chain(None, Some(agent_id));
+        let retired_targets = self.retire_identity_chain(None, Some(agent_id));
         for task_id in retired_tasks {
             if self.retired_agent_by_task.len() < ACTIVITY_PAGE_MAX_LENGTH {
                 self.retired_agent_by_task
                     .insert(task_id, agent_id.to_owned());
             }
         }
-        retired_target
-            .then(|| ClaudeTaskControlEffect::Retire {
-                agent_id: agent_id.to_owned(),
-            })
+        retired_targets
             .into_iter()
+            .map(|agent_id| ClaudeTaskControlEffect::Retire { agent_id })
             .collect()
     }
 
@@ -702,17 +787,19 @@ impl ClaudeTaskControlCorrelator {
         let identities = self
             .correlations_by_tool_use
             .get(tool_use_id)
-            .map(|record| (record.launched_agent_id.clone(), record.task_id.clone()));
+            .map(|record| {
+                (
+                    record.effective_agent_id().map(str::to_owned),
+                    record.task_id.clone(),
+                )
+            });
         self.tombstoned_tools.insert(tool_use_id);
         let Some((agent_id, task_id)) = identities else {
             return Vec::new();
         };
-        let retired = self.retire_identity_chain(task_id.as_deref(), agent_id.as_deref());
-        retired
-            .then(|| ClaudeTaskControlEffect::Retire {
-                agent_id: agent_id.expect("retired target has an agent identity"),
-            })
+        self.retire_identity_chain(task_id.as_deref(), agent_id.as_deref())
             .into_iter()
+            .map(|agent_id| ClaudeTaskControlEffect::Retire { agent_id })
             .collect()
     }
 
@@ -725,6 +812,7 @@ impl ClaudeTaskControlCorrelator {
         let mut effects = Vec::new();
         for _ in 0..tool_use_ids.len().max(1) {
             let before = effects.len();
+            effects.extend(self.reconcile_parent_local_fallbacks());
             for tool_use_id in &tool_use_ids {
                 effects.extend(self.reconcile(tool_use_id));
             }
@@ -741,7 +829,10 @@ impl ClaudeTaskControlCorrelator {
                 .get(tool_use_id)
                 .and_then(|record| {
                     (!record.conflicted && record.invocation_is_agent == Some(true)).then(|| {
-                        Some((record.launched_agent_id.clone()?, record.task_id.clone()?))
+                        Some((
+                            record.effective_agent_id().map(str::to_owned)?,
+                            record.task_id.clone()?,
+                        ))
                     })?
                 })
         else {
@@ -789,7 +880,7 @@ impl ClaudeTaskControlCorrelator {
         }
         self.agent_by_task.insert(task_id.clone(), agent_id.clone());
         if let Some(lifecycle) = self.pending_terminal_by_task.get(&task_id).copied() {
-            self.retire_identity_chain(Some(&task_id), Some(&agent_id));
+            let _ = self.retire_identity_chain(Some(&task_id), Some(&agent_id));
             effects.push(ClaudeTaskControlEffect::Terminal {
                 agent_id,
                 lifecycle,
@@ -807,8 +898,7 @@ impl ClaudeTaskControlCorrelator {
             return false;
         };
         let lineage = record
-            .launched_agent_id
-            .as_deref()
+            .effective_agent_id()
             .and_then(|agent_id| self.verified_agents.get(agent_id));
         match (&record.invocation_source, &record.hook_source, lineage) {
             (
@@ -825,7 +915,26 @@ impl ClaudeTaskControlCorrelator {
                 .get(parent_tool_use_id)
                 .is_some_and(|parent| {
                     !parent.conflicted
-                        && parent.launched_agent_id.as_deref() == Some(source_agent_id)
+                        && parent.effective_agent_id() == Some(source_agent_id)
+                        && lineage_parent == source_agent_id
+                        && self.verified_agents.contains_key(source_agent_id)
+                        && self.actor_target_by_agent.contains_key(source_agent_id)
+                }),
+            (
+                Some(ClaudeInvocationSource::ParentTool(parent_tool_use_id)),
+                None,
+                Some(ClaudeVerifiedLineage::Parent(lineage_parent)),
+            ) => self
+                .correlations_by_tool_use
+                .get(parent_tool_use_id)
+                .is_some_and(|parent| {
+                    let Some(ClaudeHookSource::Agent(source_agent_id)) =
+                        record.pre_tool_source.as_ref()
+                    else {
+                        return false;
+                    };
+                    !parent.conflicted
+                        && parent.effective_agent_id() == Some(source_agent_id)
                         && lineage_parent == source_agent_id
                         && self.verified_agents.contains_key(source_agent_id)
                         && self.actor_target_by_agent.contains_key(source_agent_id)
@@ -834,8 +943,85 @@ impl ClaudeTaskControlCorrelator {
         }
     }
 
-    fn retire_identity_chain(&mut self, task_id: Option<&str>, agent_id: Option<&str>) -> bool {
-        let mut tools = Vec::new();
+    fn reconcile_parent_local_fallbacks(&mut self) -> Vec<ClaudeTaskControlEffect> {
+        let mut candidates_by_parent = BTreeMap::<String, Vec<String>>::new();
+        for (tool_use_id, record) in &self.correlations_by_tool_use {
+            let Some(ClaudeInvocationSource::ParentTool(parent_tool_use_id)) =
+                record.invocation_source.as_ref()
+            else {
+                continue;
+            };
+            let Some(ClaudeHookSource::Agent(parent_agent_id)) = record.pre_tool_source.as_ref()
+            else {
+                continue;
+            };
+            let parent_is_active = self
+                .correlations_by_tool_use
+                .get(parent_tool_use_id)
+                .is_some_and(|parent| {
+                    !parent.conflicted
+                        && parent.effective_agent_id() == Some(parent_agent_id)
+                        && self.actor_target_by_agent.contains_key(parent_agent_id)
+                });
+            if parent_is_active
+                && record.invocation_is_agent == Some(true)
+                && record.launched_agent_id.is_none()
+                && record.fallback_agent_id.is_none()
+                && record.task_id.is_some()
+                && !record.conflicted
+            {
+                candidates_by_parent
+                    .entry(parent_agent_id.clone())
+                    .or_default()
+                    .push(tool_use_id.clone());
+            }
+        }
+
+        let assigned_agents = self
+            .correlations_by_tool_use
+            .values()
+            .filter_map(ClaudeTaskCorrelation::effective_agent_id)
+            .collect::<BTreeSet<_>>();
+        let mut children_by_parent = BTreeMap::<String, Vec<String>>::new();
+        for (agent_id, lineage) in &self.verified_agents {
+            let ClaudeVerifiedLineage::Parent(parent_agent_id) = lineage else {
+                continue;
+            };
+            if !self.actor_target_by_agent.contains_key(agent_id)
+                && !self
+                    .agent_by_task
+                    .values()
+                    .any(|assigned| assigned == agent_id)
+                && !assigned_agents.contains(agent_id.as_str())
+                && !self.tombstoned_agents.contains(agent_id)
+            {
+                children_by_parent
+                    .entry(parent_agent_id.clone())
+                    .or_default()
+                    .push(agent_id.clone());
+            }
+        }
+
+        for (parent_agent_id, tool_use_ids) in candidates_by_parent {
+            let Some(child_agent_ids) = children_by_parent.get(&parent_agent_id) else {
+                continue;
+            };
+            if tool_use_ids.len() != 1 || child_agent_ids.len() != 1 {
+                continue;
+            }
+            if let Some(record) = self.correlation_mut(&tool_use_ids[0]) {
+                record.fallback_agent_id = Some(child_agent_ids[0].clone());
+            }
+        }
+        Vec::new()
+    }
+
+    fn retire_identity_chain(
+        &mut self,
+        task_id: Option<&str>,
+        agent_id: Option<&str>,
+    ) -> BTreeSet<String> {
+        let mut tools = BTreeSet::new();
         let mut tasks = BTreeSet::new();
         let mut agents = BTreeSet::new();
         if let Some(task_id) = task_id {
@@ -844,22 +1030,46 @@ impl ClaudeTaskControlCorrelator {
         if let Some(agent_id) = agent_id {
             agents.insert(agent_id.to_owned());
         }
-        for (tool_use_id, record) in &self.correlations_by_tool_use {
-            if task_id.is_some_and(|value| record.task_id.as_deref() == Some(value))
-                || agent_id.is_some_and(|value| record.launched_agent_id.as_deref() == Some(value))
-            {
-                tools.push(tool_use_id.clone());
-                if let Some(task_id) = &record.task_id {
-                    tasks.insert(task_id.clone());
-                }
-                if let Some(agent_id) = &record.launched_agent_id {
-                    agents.insert(agent_id.clone());
+        loop {
+            let mut changed = false;
+            for (tool_use_id, record) in &self.correlations_by_tool_use {
+                let source_agent_id = record
+                    .pre_tool_source
+                    .as_ref()
+                    .or(record.hook_source.as_ref())
+                    .and_then(|source| match source {
+                        ClaudeHookSource::Root => None,
+                        ClaudeHookSource::Agent(agent_id) => Some(agent_id.as_str()),
+                    });
+                let parent_tool_use_id = match record.invocation_source.as_ref() {
+                    Some(ClaudeInvocationSource::ParentTool(parent_tool_use_id)) => {
+                        Some(parent_tool_use_id.as_str())
+                    }
+                    Some(ClaudeInvocationSource::Root) | None => None,
+                };
+                if tasks.contains(record.task_id.as_deref().unwrap_or_default())
+                    || agents.contains(record.effective_agent_id().unwrap_or_default())
+                    || source_agent_id.is_some_and(|value| agents.contains(value))
+                    || parent_tool_use_id.is_some_and(|value| tools.contains(value))
+                {
+                    changed |= tools.insert(tool_use_id.clone());
+                    if let Some(task_id) = &record.task_id {
+                        changed |= tasks.insert(task_id.clone());
+                    }
+                    if let Some(agent_id) = record.effective_agent_id() {
+                        changed |= agents.insert(agent_id.to_owned());
+                    }
                 }
             }
+            if !changed {
+                break;
+            }
         }
-        let retired_target = agents
+        let retired_targets = agents
             .iter()
-            .any(|agent_id| self.actor_target_by_agent.contains_key(agent_id));
+            .filter(|agent_id| self.actor_target_by_agent.contains_key(*agent_id))
+            .cloned()
+            .collect::<BTreeSet<_>>();
         for tool_use_id in tools {
             self.correlations_by_tool_use.remove(&tool_use_id);
             self.tombstoned_tools.insert(&tool_use_id);
@@ -875,16 +1085,13 @@ impl ClaudeTaskControlCorrelator {
             self.verified_agents.remove(&agent_id);
             self.tombstoned_agents.insert(&agent_id);
         }
-        retired_target
+        retired_targets
     }
 
     fn poison_agent(&mut self, agent_id: &str) -> Vec<ClaudeTaskControlEffect> {
-        let retired = self.retire_identity_chain(None, Some(agent_id));
-        retired
-            .then(|| ClaudeTaskControlEffect::Retire {
-                agent_id: agent_id.to_owned(),
-            })
+        self.retire_identity_chain(None, Some(agent_id))
             .into_iter()
+            .map(|agent_id| ClaudeTaskControlEffect::Retire { agent_id })
             .collect()
     }
 
@@ -892,16 +1099,13 @@ impl ClaudeTaskControlCorrelator {
         let agent_id = self.agent_by_task.get(task_id).cloned().or_else(|| {
             self.correlations_by_tool_use.values().find_map(|record| {
                 (record.task_id.as_deref() == Some(task_id))
-                    .then(|| record.launched_agent_id.clone())
+                    .then(|| record.effective_agent_id().map(str::to_owned))
                     .flatten()
             })
         });
-        let retired = self.retire_identity_chain(Some(task_id), agent_id.as_deref());
-        retired
-            .then(|| ClaudeTaskControlEffect::Retire {
-                agent_id: agent_id.expect("retired target has an agent identity"),
-            })
+        self.retire_identity_chain(Some(task_id), agent_id.as_deref())
             .into_iter()
+            .map(|agent_id| ClaudeTaskControlEffect::Retire { agent_id })
             .collect()
     }
 
@@ -1311,6 +1515,21 @@ impl ClaudeProviderRuntime {
             return Vec::new();
         };
         match value.get("hook_event_name").and_then(Value::as_str) {
+            Some("PreToolUse") => {
+                let Some(tool_use_id) = value.get("tool_use_id").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                let Some(tool_name) = value.get("tool_name").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                self.task_control_correlator.observe_pre_tool_use(
+                    session_id,
+                    self.activity_generation,
+                    tool_use_id,
+                    tool_name,
+                    value.get("agent_id").and_then(Value::as_str),
+                )
+            }
             Some("PostToolUse") => {
                 let Some(tool_use_id) = value.get("tool_use_id").and_then(Value::as_str) else {
                     return Vec::new();
@@ -1342,17 +1561,26 @@ impl ClaudeProviderRuntime {
                     },
                 )
             }
+            Some("PostToolUseFailure") => {
+                let Some(tool_use_id) = value.get("tool_use_id").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                let Some(tool_name) = value.get("tool_name").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
+                self.task_control_correlator.observe_post_tool_failure(
+                    session_id,
+                    self.activity_generation,
+                    tool_use_id,
+                    tool_name,
+                    value.get("agent_id").and_then(Value::as_str),
+                )
+            }
             Some("SubagentStart") => {
                 value
                     .get("agent_id")
                     .and_then(Value::as_str)
                     .map_or_else(Vec::new, |agent_id| {
-                        if !self
-                            .activity_tracker
-                            .is_correlated_actor(session_id, agent_id)
-                        {
-                            return Vec::new();
-                        }
                         self.task_control_correlator.observe_verified_agent(
                             session_id,
                             self.activity_generation,
@@ -2270,6 +2498,27 @@ fn claude_control_fact_native_event_id(value: &Value) -> Option<String> {
         let event = value.get("hook_event_name")?.as_str()?;
         let session_id = value.get("session_id")?.as_str()?;
         match event {
+            "PreToolUse" | "PostToolUseFailure" => {
+                let tool_use_id = value.get("tool_use_id")?.as_str()?;
+                let tool_name = value.get("tool_name")?.as_str()?;
+                if !usable_control_identity(tool_use_id) || !usable_control_label(tool_name) {
+                    return None;
+                }
+                fields.extend([
+                    if event == "PreToolUse" {
+                        "hook/pre-tool-use"
+                    } else {
+                        "hook/post-tool-use-failure"
+                    },
+                    session_id,
+                    "source",
+                ]);
+                push_optional_control_identity(
+                    &mut fields,
+                    value.get("agent_id").and_then(Value::as_str),
+                )?;
+                fields.extend([tool_use_id, classify_agent_tool(tool_name)]);
+            }
             "PostToolUse" => {
                 let tool_use_id = value.get("tool_use_id")?.as_str()?;
                 let tool_name = value.get("tool_name")?.as_str()?;
@@ -2604,6 +2853,38 @@ mod targeted_task_correlation_tests {
                 "agent_type": "identical",
                 "description": "identical",
                 "prompt": "identical"
+            }),
+        ]
+    }
+
+    fn nested_fallback_facts(
+        session_id: &str,
+        parent_tool_use_id: &str,
+        parent_agent_id: &str,
+        child_tool_use_id: &str,
+        child_agent_id: &str,
+        child_task_id: &str,
+    ) -> [Value; 4] {
+        [
+            json!({
+                "type":"stream_event", "session_id":session_id,
+                "parent_tool_use_id":parent_tool_use_id,
+                "event":{"type":"content_block_start","index":0,
+                    "content_block":{"type":"tool_use","id":child_tool_use_id,"name":"Agent","input":{}}}
+            }),
+            json!({
+                "hook_event_name":"PreToolUse", "session_id":session_id,
+                "agent_id":parent_agent_id, "tool_use_id":child_tool_use_id,
+                "tool_name":"Agent"
+            }),
+            json!({
+                "type":"system", "subtype":"task_started", "session_id":session_id,
+                "task_id":child_task_id, "tool_use_id":child_tool_use_id,
+                "task_type":"local_agent"
+            }),
+            json!({
+                "hook_event_name":"SubagentStart", "session_id":session_id,
+                "agent_id":child_agent_id, "parent_agent_id":parent_agent_id
             }),
         ]
     }
@@ -2963,6 +3244,270 @@ mod targeted_task_correlation_tests {
             );
             assert_effects_are_keyed(&outputs, &format!("root install order {order:?}"));
         }
+    }
+
+    #[test]
+    fn targeted_task_correlation_installs_unambiguous_nested_parent_local_fallback_once() {
+        // Mutation caught: ignoring authenticated PreToolUse requires missing PostToolUse evidence.
+        let parent = facts("session", "tool-parent", "agent-parent", "task-parent");
+        let child = nested_fallback_facts(
+            "session",
+            "tool-parent",
+            "agent-parent",
+            "tool-child",
+            "agent-child",
+            "task-child",
+        );
+        for order in permutations([0, 1, 2, 3]) {
+            let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+            for (index, fact) in parent.iter().enumerate() {
+                let _ = handle_fact(&mut runtime, fact, true, index as u64);
+            }
+            let outputs = order
+                .into_iter()
+                .enumerate()
+                .map(|(index, fact)| {
+                    handle_fact(&mut runtime, &child[fact], true, 10 + index as u64)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                mapped_targets(&outputs),
+                [(
+                    "claude:agent:agent-child".to_owned(),
+                    "task-child".to_owned()
+                )],
+                "failed fallback fact order {order:?}"
+            );
+            assert_effects_are_keyed(&outputs, &format!("fallback install order {order:?}"));
+            for output in &outputs {
+                if !output.activity_controls.is_empty() {
+                    let key = output
+                        .native_event_id
+                        .as_deref()
+                        .expect("install-producing output has a native key");
+                    assert!(key.starts_with("claude:control:"));
+                    assert!(!key.contains("tool-child"));
+                    assert!(!key.contains("task-child"));
+                    assert!(!key.contains("agent-child"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn targeted_task_correlation_fallback_accepts_task_variants_and_replays_idempotently() {
+        // Mutation caught: treating fallback task types differently from exact PostToolUse chains.
+        for task_type in [None, Some("local_agent"), Some("remote_agent")] {
+            let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+            for (index, fact) in facts("session", "tool-parent", "agent-parent", "task-parent")
+                .iter()
+                .enumerate()
+            {
+                let _ = handle_fact(&mut runtime, fact, true, index as u64);
+            }
+            let mut child = nested_fallback_facts(
+                "session",
+                "tool-parent",
+                "agent-parent",
+                "tool-child",
+                "agent-child",
+                "task-child",
+            );
+            match task_type {
+                Some(task_type) => child[2]["task_type"] = json!(task_type),
+                None => {
+                    child[2]
+                        .as_object_mut()
+                        .expect("fallback task_started object")
+                        .remove("task_type");
+                }
+            }
+            let outputs = child
+                .iter()
+                .chain(&child)
+                .enumerate()
+                .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 10 + index as u64))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                mapped_targets(&outputs),
+                [(
+                    "claude:agent:agent-child".to_owned(),
+                    "task-child".to_owned()
+                )],
+                "fallback task type {task_type:?}"
+            );
+            assert!(runtime.task_control_correlator.state_is_bounded());
+        }
+    }
+
+    #[test]
+    fn targeted_task_correlation_fallback_requires_cardinality_one_and_exact_evidence_resolves() {
+        // Mutation caught: choosing an arbitrary nested tool or child when the parent-local join is ambiguous.
+        let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+        for (index, fact) in facts("session", "tool-parent", "agent-parent", "task-parent")
+            .iter()
+            .enumerate()
+        {
+            let _ = handle_fact(&mut runtime, fact, true, index as u64);
+        }
+        let child_a = nested_fallback_facts(
+            "session",
+            "tool-parent",
+            "agent-parent",
+            "tool-child-a",
+            "agent-child-a",
+            "task-child-a",
+        );
+        let child_b = nested_fallback_facts(
+            "session",
+            "tool-parent",
+            "agent-parent",
+            "tool-child-b",
+            "agent-child-b",
+            "task-child-b",
+        );
+        let ambiguous = child_a[..3]
+            .iter()
+            .chain(child_b[..3].iter())
+            .chain(child_a[3..].iter())
+            .chain(child_b[3..].iter())
+            .enumerate()
+            .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 10 + index as u64))
+            .collect::<Vec<_>>();
+        assert!(mapped_targets(&ambiguous).is_empty());
+        assert!(
+            !runtime
+                .task_control_correlator
+                .actor_target_by_agent
+                .contains_key("agent-child-a")
+        );
+        assert!(runtime.task_control_correlator.state_is_bounded());
+
+        let exact = handle_fact(
+            &mut runtime,
+            &json!({
+                "hook_event_name":"PostToolUse", "session_id":"session",
+                "agent_id":"agent-parent", "tool_use_id":"tool-child-a", "tool_name":"Agent",
+                "tool_response":{"status":"async_launched","agentId":"agent-child-a"}
+            }),
+            true,
+            30,
+        );
+        assert!(mapped_targets(&[exact]).contains(&(
+            "claude:agent:agent-child-a".to_owned(),
+            "task-child-a".to_owned()
+        )));
+        assert!(runtime.task_control_correlator.state_is_bounded());
+    }
+
+    #[test]
+    fn targeted_task_correlation_fallback_retires_on_failure_conflict_and_parent_terminal() {
+        // Mutation caught: retaining a provisional child target after an authoritative close or contradiction.
+        for (event, expected_child_retirement) in [
+            (
+                json!({
+                    "hook_event_name":"PostToolUseFailure", "session_id":"session",
+                    "agent_id":"agent-parent", "tool_use_id":"tool-child", "tool_name":"Agent"
+                }),
+                true,
+            ),
+            (
+                json!({
+                    "hook_event_name":"PostToolUse", "session_id":"session",
+                    "agent_id":"agent-parent", "tool_use_id":"tool-child", "tool_name":"Agent",
+                    "tool_response":{"status":"async_launched","agentId":"agent-other"}
+                }),
+                true,
+            ),
+            (
+                json!({
+                    "type":"system", "subtype":"task_notification", "session_id":"session",
+                    "task_id":"task-parent", "status":"stopped"
+                }),
+                true,
+            ),
+        ] {
+            let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+            for (index, fact) in facts("session", "tool-parent", "agent-parent", "task-parent")
+                .iter()
+                .chain(
+                    nested_fallback_facts(
+                        "session",
+                        "tool-parent",
+                        "agent-parent",
+                        "tool-child",
+                        "agent-child",
+                        "task-child",
+                    )
+                    .iter(),
+                )
+                .enumerate()
+            {
+                let _ = handle_fact(&mut runtime, fact, true, index as u64);
+            }
+            let output = handle_fact(&mut runtime, &event, true, 20);
+            assert!(
+                output.native_event_id.is_some(),
+                "retirement is keyed: {event}"
+            );
+            assert_eq!(
+                output.activity_controls.iter().any(|update| matches!(
+                    update,
+                    ProviderActivityControlUpdate::ActorTarget { actor_id, target: None }
+                        if actor_id == "claude:agent:agent-child"
+                )),
+                expected_child_retirement,
+                "child fallback retirement: {event}"
+            );
+            assert!(
+                !runtime
+                    .task_control_correlator
+                    .actor_target_by_agent
+                    .contains_key("agent-child")
+            );
+            assert!(runtime.task_control_correlator.state_is_bounded());
+        }
+    }
+
+    #[test]
+    fn targeted_task_correlation_promotes_matching_exact_evidence_without_reinstalling() {
+        // Mutation caught: emitting a second Install when PostToolUse confirms a fallback child.
+        let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+        for (index, fact) in facts("session", "tool-parent", "agent-parent", "task-parent")
+            .iter()
+            .chain(
+                nested_fallback_facts(
+                    "session",
+                    "tool-parent",
+                    "agent-parent",
+                    "tool-child",
+                    "agent-child",
+                    "task-child",
+                )
+                .iter(),
+            )
+            .enumerate()
+        {
+            let _ = handle_fact(&mut runtime, fact, true, index as u64);
+        }
+        let confirmed = handle_fact(
+            &mut runtime,
+            &json!({
+                "hook_event_name":"PostToolUse", "session_id":"session",
+                "agent_id":"agent-parent", "tool_use_id":"tool-child", "tool_name":"Agent",
+                "tool_response":{"status":"async_launched","agentId":"agent-child"}
+            }),
+            true,
+            20,
+        );
+        assert!(mapped_targets(&[confirmed]).is_empty());
+        let child = runtime
+            .task_control_correlator
+            .correlations_by_tool_use
+            .get("tool-child")
+            .expect("promoted correlation retained");
+        assert_eq!(child.launched_agent_id.as_deref(), Some("agent-child"));
+        assert!(child.fallback_agent_id.is_none());
     }
 
     #[test]
