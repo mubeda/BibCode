@@ -1,4 +1,9 @@
-use std::{io::ErrorKind, net::SocketAddr, path::PathBuf, time::Duration};
+use std::{
+    io::ErrorKind,
+    net::SocketAddr,
+    path::{Path, PathBuf},
+    time::Duration,
+};
 
 use bibcode_server::{
     ConfigError, DESKTOP_SHUTDOWN_PATH, DESKTOP_SHUTDOWN_TOKEN_HEADER, ROUTE_INVENTORY,
@@ -21,6 +26,17 @@ const PROVIDER_DRIVERS: [&str; 5] = ["codex", "claudeAgent", "cursor", "grok", "
 
 fn test_config(temp: &TempDir) -> ServerConfig {
     ServerConfig::new(temp.path()).with_bind("127.0.0.1", 0)
+}
+
+async fn assert_log_contains(path: &Path, marker: &str) {
+    let contents = tokio::fs::read_to_string(path)
+        .await
+        .unwrap_or_else(|error| panic!("read {}: {error}", path.display()));
+    assert!(
+        contents.contains(marker),
+        "{} does not contain {marker:?}: {contents}",
+        path.display()
+    );
 }
 
 fn endpoint(address: SocketAddr, path: &str) -> String {
@@ -260,6 +276,40 @@ async fn binds_an_ephemeral_port_and_serves_the_environment_descriptor() {
         .await
         .expect("shutdown timeout")
         .expect("server joins");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_runtimes_retain_owned_log_sinks_without_retargeting() {
+    let left_root = TempDir::new().expect("left runtime root");
+    let right_root = TempDir::new().expect("right runtime root");
+    let left_log = left_root.path().join("userdata/logs/server.log");
+    let right_log = right_root.path().join("userdata/logs/server.log");
+    let (left, right) = tokio::join!(
+        ServerRuntime::start_with_registry(test_config(&left_root), RpcRegistry::empty()),
+        ServerRuntime::start_with_registry(test_config(&right_root), RpcRegistry::empty()),
+    );
+    let left = left.expect("left runtime");
+    let right = right.expect("right runtime");
+
+    let marker_a = format!("runtime-log-sink-a-{}", Uuid::new_v4());
+    tracing::warn!(target: "runtime_log_sink_registry_test", marker = %marker_a);
+    assert_log_contains(&left_log, &marker_a).await;
+    assert_log_contains(&right_log, &marker_a).await;
+
+    left.shutdown();
+    left.join().await.expect("left runtime joins");
+    left_root.close().expect("remove joined left runtime root");
+
+    let marker_b = format!("runtime-log-sink-b-{}", Uuid::new_v4());
+    tracing::warn!(target: "runtime_log_sink_registry_test", marker = %marker_b);
+    assert_log_contains(&right_log, &marker_b).await;
+    assert!(
+        !left_log.exists(),
+        "a dropped runtime sink must not recreate its removed root"
+    );
+
+    right.shutdown();
+    right.join().await.expect("right runtime joins");
 }
 
 #[tokio::test]

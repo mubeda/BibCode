@@ -41,6 +41,7 @@ pub struct ServerHandle {
     database: Option<Database>,
     _store_runtime_guard: StoreRuntimeGuard,
     _production_runtime: Option<Arc<ProductionRuntime>>,
+    _log_sink: Arc<logging::LogSinkLease>,
     shutdown: CancellationToken,
     task: Option<JoinHandle<Result<(), std::io::Error>>>,
 }
@@ -115,8 +116,10 @@ impl ServerRuntime {
             .ensure_directories_without_database_side_effects()
             .await
             .map_err(|error| ServerError::StateFiles(error.to_string()))?;
-        logging::initialize(&state_paths.server_log)
-            .map_err(|error| ServerError::Logging(error.to_string()))?;
+        let log_sink = Arc::new(
+            logging::initialize_owned(&state_paths.server_log)
+                .map_err(|error| ServerError::Logging(error.to_string()))?,
+        );
         let store_runtime_guard = StoreRuntimeGuard::acquire(&config.base_dir)
             .await
             .map_err(|error| ServerError::PersistenceInitialize(error.to_string()))?;
@@ -303,7 +306,9 @@ impl ServerRuntime {
         let server_shutdown = shutdown.clone();
         let completion_signal = shutdown.clone();
         let cleanup_runtime = production_runtime.clone();
+        let task_log_sink = log_sink.clone();
         let task = tokio::spawn(async move {
+            let _log_sink = task_log_sink;
             let result = axum::serve(listener, app)
                 .with_graceful_shutdown(server_shutdown.cancelled_owned())
                 .await;
@@ -321,6 +326,7 @@ impl ServerRuntime {
             database: Some(database),
             _store_runtime_guard: store_runtime_guard,
             _production_runtime: production_runtime,
+            _log_sink: log_sink,
             shutdown,
             task: Some(task),
         })
