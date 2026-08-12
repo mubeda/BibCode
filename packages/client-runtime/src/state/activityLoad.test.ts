@@ -70,7 +70,7 @@ function workItem(
 
 function snapshot(overrides: Partial<ActivitySnapshot> = {}): ActivitySnapshot {
   return {
-    protocolVersion: 1,
+    protocolVersion: 2,
     scopeId: SCOPE_ID,
     scope: { _tag: "thread", threadId: THREAD_ID },
     revision: 0,
@@ -82,6 +82,7 @@ function snapshot(overrides: Partial<ActivitySnapshot> = {}): ActivitySnapshot {
       backgroundWork: true,
       historyRecovery: "full",
       terminalObservation: false,
+      targetedActorCancellation: true,
     },
     observationState: "live",
     sections: {
@@ -96,6 +97,12 @@ function snapshot(overrides: Partial<ActivitySnapshot> = {}): ActivitySnapshot {
     workItems: [],
     actorsHasMore: false,
     workItemsHasMore: false,
+    control: {
+      scopeId: SCOPE_ID,
+      revision: 0,
+      actors: [],
+      operations: [],
+    },
     updatedAt: BASE_TIMESTAMP,
     ...overrides,
   };

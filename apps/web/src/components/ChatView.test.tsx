@@ -740,7 +740,7 @@ interface TestEnvironmentPresentation {
     readonly environment: {
       readonly label: string;
       readonly serverVersion?: string;
-      readonly capabilities?: { readonly activityProtocolVersion: 1 | null };
+      readonly capabilities?: { readonly activityProtocolVersion: 2 | null };
     };
   } | null;
 }
@@ -948,7 +948,7 @@ describe("ChatView", () => {
       overrides: Partial<ActivitySnapshot> = {},
     ): ActivitySnapshot =>
       ({
-        protocolVersion: 1,
+        protocolVersion: 2,
         scopeId: `scope-${scope.threadId}`,
         scope,
         revision: 1,
@@ -960,6 +960,7 @@ describe("ChatView", () => {
           backgroundWork: true,
           historyRecovery: "full",
           terminalObservation: false,
+          targetedActorCancellation: false,
         },
         observationState: "live",
         sections: {
@@ -974,6 +975,12 @@ describe("ChatView", () => {
         workItems: [],
         actorsHasMore: false,
         workItemsHasMore: false,
+        control: {
+          scopeId: `scope-${scope.threadId}`,
+          revision: 0,
+          actors: [],
+          operations: [],
+        },
         updatedAt: "2026-07-22T20:10:00.000Z",
         ...overrides,
       }) as unknown as ActivitySnapshot;
@@ -1021,7 +1028,7 @@ describe("ChatView", () => {
             limit: 200,
           },
         }),
-        { records, nextCursor } satisfies ActivityRosterPageData,
+        { records, actorControls: [], nextCursor } satisfies ActivityRosterPageData,
       );
     };
 
@@ -1422,6 +1429,7 @@ describe("ChatView", () => {
           backgroundWork: false,
           historyRecovery: "none",
           terminalObservation: false,
+          targetedActorCancellation: false,
         },
         sections: {
           subagents: {
@@ -1470,6 +1478,7 @@ describe("ChatView", () => {
           backgroundWork: false,
           historyRecovery: "full",
           terminalObservation: false,
+          targetedActorCancellation: false,
         },
         sections: {
           subagents: { state: "live", message: null, retryable: false },
@@ -1485,6 +1494,7 @@ describe("ChatView", () => {
             backgroundWork: false,
             historyRecovery: "none",
             terminalObservation: false,
+            targetedActorCancellation: false,
           },
           sections: {
             subagents: { state: "unsupported", message: null, retryable: false },
@@ -1501,7 +1511,7 @@ describe("ChatView", () => {
             providers: [codexProvider],
             environment: {
               label: "Local",
-              capabilities: { activityProtocolVersion: 1 },
+              capabilities: { activityProtocolVersion: 2 },
             },
           },
         }),

@@ -50,7 +50,7 @@ function workItem(id: string, name = id): ActivityWorkItemSummary {
 
 function snapshot(overrides: Partial<ActivitySnapshot> = {}): ActivitySnapshot {
   return {
-    protocolVersion: 1,
+    protocolVersion: 2,
     scopeId: "scope-1",
     scope: { _tag: "thread", threadId: "thread-1" },
     revision: 1,
@@ -62,6 +62,7 @@ function snapshot(overrides: Partial<ActivitySnapshot> = {}): ActivitySnapshot {
       backgroundWork: true,
       historyRecovery: "full",
       terminalObservation: false,
+      targetedActorCancellation: false,
     },
     observationState: "live",
     sections: {
@@ -76,6 +77,7 @@ function snapshot(overrides: Partial<ActivitySnapshot> = {}): ActivitySnapshot {
     workItems: [],
     actorsHasMore: false,
     workItemsHasMore: false,
+    control: { scopeId: "scope-1", revision: 0, actors: [], operations: [] },
     updatedAt: "2026-07-22T20:09:00.000Z",
     ...overrides,
   } as unknown as ActivitySnapshot;
@@ -248,6 +250,7 @@ describe("ActivityDock", () => {
         backgroundWork: false,
         historyRecovery: "none",
         terminalObservation: false,
+        targetedActorCancellation: false,
       },
       sections: {
         subagents: { state: "unsupported", message: null, retryable: false },
@@ -350,6 +353,7 @@ describe("ActivityDock", () => {
               backgroundWork: true,
               historyRecovery: "bounded",
               terminalObservation: false,
+              targetedActorCancellation: false,
             },
             observationState: "reconnecting",
             sections: {
@@ -725,6 +729,7 @@ describe("ActivityDock", () => {
         backgroundWork: true,
         historyRecovery: "bounded",
         terminalObservation: false,
+        targetedActorCancellation: false,
       },
       sections: {
         subagents: { state: "unsupported", message: null, retryable: false },
