@@ -168,9 +168,11 @@ Every accepted terminal actor transition revokes any retained native turn
 target in the same tracker update; a later status-only actor reopen cannot
 restore that completed handle. Reconciliation passes capture the live-control
 revision at pass start, coalesce staged updates by canonical actor/work subject,
-and discard a staged subject when newer live evidence has published or arrived
-before late staging. This keeps delayed recovery output from revoking a newer
-turn or re-exposing a completed one while retaining bounded unrelated work.
+and discard a staged subject when newer live evidence has published. Child
+recovery results for a superseded subject are fenced under the same activity
+state lock before any tracker mutation, retained for a bounded fresh-pass
+retry, and never allowed to erase a newer live turn or reinstall a completed
+one. Unrelated subjects in that pass continue to reconcile normally.
 
 Epoch and cancellation fences cancel recovery when activity is disabled, the
 root is replaced, or the runtime disconnects or shuts down; late results and
