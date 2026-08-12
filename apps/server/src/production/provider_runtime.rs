@@ -30,7 +30,7 @@ use crate::{
             SessionInput,
         },
     },
-    persistence::{ProviderSessionRuntime, Repositories},
+    persistence::{ProjectionThreadMessage, ProviderSessionRuntime, Repositories},
     process::{
         Platform, PreparedLaunch, configure_supervised_background_command_wrap,
         launch_executable_extensions, locate_executable,
@@ -1246,23 +1246,60 @@ pub async fn reconcile_abandoned_provider_sessions(
         .list_provider_session_runtimes()
         .await
         .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
-    for runtime in runtimes
-        .into_iter()
-        .filter(|runtime| matches!(runtime.status.as_str(), "connecting" | "ready" | "running"))
-    {
+    for runtime in runtimes {
         let thread_id = runtime.thread_id.clone();
-        if let Err(error) =
-            reconcile_abandoned_provider_session(engine, &repositories, runtime, RESTART_ERROR)
-                .await
-        {
+        let result = match runtime.status.as_str() {
+            "connecting" | "ready" | "running" => {
+                reconcile_abandoned_provider_session(engine, &repositories, runtime, RESTART_ERROR)
+                    .await
+            }
+            "error" => {
+                reconcile_failed_provider_session_messages(engine, &repositories, &runtime).await
+            }
+            _ => continue,
+        };
+        if let Err(error) = result {
             tracing::warn!(
                 thread_id,
                 %error,
-                "abandoned provider session remains eligible for startup reconciliation retry"
+                "provider session remains eligible for startup reconciliation retry"
             );
         }
     }
     Ok(())
+}
+
+async fn reconcile_failed_provider_session_messages(
+    engine: &OrchestrationEngine,
+    repositories: &Repositories,
+    runtime: &ProviderSessionRuntime,
+) -> Result<(), ProviderRuntimeError> {
+    let Some(session) = repositories
+        .get_thread_session(runtime.thread_id.clone())
+        .await
+        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
+    else {
+        return Ok(());
+    };
+    if session.status != "error"
+        || session.active_turn_id.is_some()
+        || session.provider_name.as_deref() != Some(runtime.provider_name.as_str())
+        || session.provider_instance_id != runtime.provider_instance_id
+        || session.runtime_mode != runtime.runtime_mode
+    {
+        return Ok(());
+    }
+    let messages = repositories
+        .list_messages_by_thread(runtime.thread_id.clone())
+        .await
+        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
+    settle_streaming_assistant_message_rows(
+        engine,
+        messages,
+        &format!("provider-error-reconcile:{}", Uuid::new_v4()),
+        &session.updated_at,
+    )
+    .await
 }
 
 async fn reconcile_abandoned_provider_session(
@@ -3621,8 +3658,7 @@ async fn settle_streaming_assistant_messages(
         .list_messages_by_thread(thread_id.to_owned())
         .await
         .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
-    let mut first_persistent_error = None;
-    for (index, message) in messages
+    let messages = messages
         .into_iter()
         .filter(|message| {
             message.thread_id == thread_id
@@ -3630,11 +3666,27 @@ async fn settle_streaming_assistant_messages(
                 && message.role == "assistant"
                 && message.is_streaming
         })
+        .collect();
+    settle_streaming_assistant_message_rows(engine, messages, command_id, created_at).await
+}
+
+async fn settle_streaming_assistant_message_rows(
+    engine: &OrchestrationEngine,
+    messages: Vec<ProjectionThreadMessage>,
+    command_id: &str,
+    created_at: &str,
+) -> Result<(), ProviderRuntimeError> {
+    let mut first_persistent_error = None;
+    for (index, message) in messages
+        .into_iter()
+        .filter(|message| message.role == "assistant" && message.is_streaming)
         .enumerate()
     {
+        let thread_id = message.thread_id;
+        let turn_id = message.turn_id;
         let completion = OrchestrationCommand::ThreadMessageAssistantComplete {
             command_id: format!("{command_id}:assistant-complete:{index}"),
-            thread_id: thread_id.to_owned(),
+            thread_id: thread_id.clone(),
             message_id: message.message_id,
             turn_id: turn_id.clone(),
             created_at: created_at.to_owned(),
@@ -3642,14 +3694,14 @@ async fn settle_streaming_assistant_messages(
         if let Err(error) = engine.dispatch(completion.clone()).await {
             tracing::warn!(
                 %error,
-                thread_id,
+                %thread_id,
                 turn_id = ?turn_id,
                 "assistant terminal settlement failed; retrying once"
             );
             if let Err(error) = engine.dispatch(completion).await {
                 tracing::warn!(
                     %error,
-                    thread_id,
+                    %thread_id,
                     turn_id = ?turn_id,
                     "assistant terminal settlement failed after retry"
                 );
