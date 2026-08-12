@@ -29,11 +29,13 @@ native tracing event is mirrored to every active runtime-owned sink; those log
 files are not runtime-isolated. Public initialization and runtime-owned
 initialization that resolve to the same physical log path share one writer,
 rotation state, and reference-counted registry entry, so a process event is
-written only once to that file. Dropping one exact lease removes only that
-reference; the last lease removes the sink, so one runtime cannot retarget or
-tear down another runtime's logging and completed entries do not accumulate.
-`BIBCODE_LOG` controls the filter and falls back to the standard `RUST_LOG`
-behavior, then `info`.
+written only once to that file. The registry reserves the canonical-parent and
+filename target before opening it; concurrent same-target initialization waits
+for that reservation and reuses the resulting writer, including across log
+rotation. Dropping one exact lease removes only that reference; the last lease
+removes the sink, so one runtime cannot retarget or tear down another runtime's
+logging and completed entries do not accumulate. `BIBCODE_LOG` controls the
+filter and falls back to the standard `RUST_LOG` behavior, then `info`.
 
 In headless mode, run the native server from a terminal or service manager to
 retain an additional stderr stream:

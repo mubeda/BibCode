@@ -4,7 +4,7 @@ use std::{
     fs::{File, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
-    sync::{Arc, Mutex, MutexGuard},
+    sync::{Arc, Condvar, Mutex, MutexGuard},
 };
 
 #[cfg(not(test))]
@@ -186,28 +186,44 @@ struct LogSinkRegistryState {
     sink_ids_by_path: BTreeMap<PathBuf, u64>,
 }
 
-struct RegisteredLogSink {
-    identity: PathBuf,
-    writer: LogWriter,
-    lease_count: usize,
+enum RegisteredLogSink {
+    Pending {
+        waiters: usize,
+    },
+    Ready {
+        identity: PathBuf,
+        writer: LogWriter,
+        lease_count: usize,
+    },
 }
 
 #[derive(Clone)]
-struct PreparedLogSink {
-    identity: PathBuf,
-    writer: LogWriter,
+struct LogSinkTarget {
+    path: PathBuf,
 }
 
 #[derive(Default)]
 struct LogSinkRegistry {
     state: Mutex<LogSinkRegistryState>,
+    state_changed: Condvar,
 }
 
 impl LogSinkRegistry {
-    fn register(self: &Arc<Self>, prepared: PreparedLogSink) -> LogSinkLease {
-        let PreparedLogSink { identity, writer } = prepared;
-        let mut unused_writer = Some(writer);
-        let id = {
+    fn register(self: &Arc<Self>, target: LogSinkTarget) -> Result<LogSinkLease, LoggingError> {
+        self.register_with(target, open_log_writer)
+    }
+
+    fn register_with<F>(
+        self: &Arc<Self>,
+        target: LogSinkTarget,
+        open: F,
+    ) -> Result<LogSinkLease, LoggingError>
+    where
+        F: FnOnce(&Path) -> Result<LogWriter, LoggingError>,
+    {
+        let identity = target.path.clone();
+        let mut open = Some(open);
+        loop {
             let mut state = self
                 .state
                 .lock()
@@ -217,38 +233,100 @@ impl LogSinkRegistry {
                     .sinks
                     .get_mut(&id)
                     .expect("physical log sink index references a live sink");
-                sink.lease_count = sink
-                    .lease_count
-                    .checked_add(1)
-                    .expect("native log sink lease count exhausted");
-                id
-            } else {
-                let id = state.next_id;
-                state.next_id = state
-                    .next_id
-                    .checked_add(1)
-                    .expect("native log sink identity space exhausted");
-                let writer = unused_writer
-                    .take()
-                    .expect("new physical log sink retains its prepared writer");
-                let replaced = state.sinks.insert(
-                    id,
-                    RegisteredLogSink {
-                        identity: identity.clone(),
+                match sink {
+                    RegisteredLogSink::Ready { lease_count, .. } => {
+                        *lease_count = lease_count
+                            .checked_add(1)
+                            .expect("native log sink lease count exhausted");
+                        return Ok(LogSinkLease {
+                            registry: self.clone(),
+                            id,
+                        });
+                    }
+                    RegisteredLogSink::Pending { waiters, .. } => {
+                        *waiters = waiters
+                            .checked_add(1)
+                            .expect("native log sink waiter count exhausted");
+                        self.state_changed.notify_all();
+                        state = self
+                            .state_changed
+                            .wait_while(state, |state| {
+                                state
+                                    .sink_ids_by_path
+                                    .get(&identity)
+                                    .and_then(|id| state.sinks.get(id))
+                                    .is_some_and(|sink| {
+                                        matches!(sink, RegisteredLogSink::Pending { .. })
+                                    })
+                            })
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        drop(state);
+                        continue;
+                    }
+                }
+            }
+
+            let id = state.next_id;
+            state.next_id = state
+                .next_id
+                .checked_add(1)
+                .expect("native log sink identity space exhausted");
+            let replaced = state
+                .sinks
+                .insert(id, RegisteredLogSink::Pending { waiters: 0 });
+            debug_assert!(replaced.is_none());
+            let replaced = state.sink_ids_by_path.insert(identity.clone(), id);
+            debug_assert!(replaced.is_none());
+            drop(state);
+
+            let result = open
+                .take()
+                .expect("one registration owns at most one pending reservation")(
+                &target.path
+            );
+            match result {
+                Ok(writer) => {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let sink = state
+                        .sinks
+                        .get_mut(&id)
+                        .expect("pending log sink remains reserved during file opening");
+                    assert!(
+                        matches!(sink, RegisteredLogSink::Pending { .. }),
+                        "pending log sink token cannot be finalized twice"
+                    );
+                    *sink = RegisteredLogSink::Ready {
+                        identity,
                         writer,
                         lease_count: 1,
-                    },
-                );
-                debug_assert!(replaced.is_none());
-                let replaced = state.sink_ids_by_path.insert(identity, id);
-                debug_assert!(replaced.is_none());
-                id
+                    };
+                    drop(state);
+                    self.state_changed.notify_all();
+                    return Ok(LogSinkLease {
+                        registry: self.clone(),
+                        id,
+                    });
+                }
+                Err(error) => {
+                    let mut state = self
+                        .state
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let removed = state.sinks.remove(&id);
+                    assert!(
+                        matches!(removed, Some(RegisteredLogSink::Pending { .. })),
+                        "failed log sink open rolls back its exact pending token"
+                    );
+                    let indexed_id = state.sink_ids_by_path.remove(&identity);
+                    debug_assert_eq!(indexed_id, Some(id));
+                    drop(state);
+                    self.state_changed.notify_all();
+                    return Err(error);
+                }
             }
-        };
-        drop(unused_writer);
-        LogSinkLease {
-            registry: self.clone(),
-            id,
         }
     }
 
@@ -258,12 +336,13 @@ impl LogSinkRegistry {
                 .state
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            let remove_sink = if let Some(sink) = state.sinks.get_mut(&id) {
-                sink.lease_count = sink
-                    .lease_count
+            let remove_sink = if let Some(RegisteredLogSink::Ready { lease_count, .. }) =
+                state.sinks.get_mut(&id)
+            {
+                *lease_count = lease_count
                     .checked_sub(1)
                     .expect("native log sink lease count remains positive");
-                sink.lease_count == 0
+                *lease_count == 0
             } else {
                 false
             };
@@ -272,9 +351,15 @@ impl LogSinkRegistry {
                     .sinks
                     .remove(&id)
                     .expect("last lease references a live physical log sink");
-                let indexed_id = state.sink_ids_by_path.remove(&sink.identity);
+                let RegisteredLogSink::Ready {
+                    identity, writer, ..
+                } = sink
+                else {
+                    unreachable!("only a ready log sink can own a lease")
+                };
+                let indexed_id = state.sink_ids_by_path.remove(&identity);
                 debug_assert_eq!(indexed_id, Some(id));
-                Some(sink.writer)
+                Some(writer)
             } else {
                 None
             }
@@ -288,7 +373,10 @@ impl LogSinkRegistry {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .sinks
             .values()
-            .map(|sink| sink.writer.clone())
+            .filter_map(|sink| match sink {
+                RegisteredLogSink::Ready { writer, .. } => Some(writer.clone()),
+                RegisteredLogSink::Pending { .. } => None,
+            })
             .collect()
     }
 }
@@ -402,16 +490,15 @@ pub fn initialize(log_path: &Path) -> Result<Init, LoggingError> {
         if PROCESS_LOG_SINK.get().is_some() {
             return Ok(Init::AlreadyInstalled);
         }
-        let prepared = open_log_sink(log_path)?;
-        let filter = log_filter();
-        let stderr_ansi = std::io::stderr().is_terminal();
+        let lease = initialize_owned(log_path)?;
         let _guard = INITIALIZE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         if PROCESS_LOG_SINK.get().is_some() {
+            drop(_guard);
+            drop(lease);
             return Ok(Init::AlreadyInstalled);
         }
-        let lease = initialize_owned_locked(prepared, filter, stderr_ansi)?;
         PROCESS_LOG_SINK.set(lease).map_err(|_| {
             LoggingError::InstallSubscriber(
                 "process log sink was installed concurrently".to_owned(),
@@ -437,22 +524,63 @@ pub(crate) fn initialize_owned(log_path: &Path) -> Result<LogSinkLease, LoggingE
 
     #[cfg(not(test))]
     {
-        let prepared = open_log_sink(log_path)?;
+        let target = resolve_log_sink_target(log_path)?;
+        if let Some(registry) = LOG_SINK_REGISTRY.get() {
+            return registry.register(target);
+        }
+
+        let candidate_registry = Arc::new(LogSinkRegistry::default());
+        let candidate_lease = candidate_registry.register(target.clone())?;
         let filter = log_filter();
         let stderr_ansi = std::io::stderr().is_terminal();
-        let _guard = INITIALIZE_LOCK
+        let guard = INITIALIZE_LOCK
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        initialize_owned_locked(prepared, filter, stderr_ansi)
+        if let Some(registry) = LOG_SINK_REGISTRY.get() {
+            let registry = registry.clone();
+            drop(guard);
+            drop(candidate_lease);
+            drop(candidate_registry);
+            return registry.register(target);
+        }
+
+        install_subscriber(candidate_registry.clone(), filter, stderr_ansi)
+            .map_err(LoggingError::InstallSubscriber)?;
+        assert!(
+            LOG_SINK_REGISTRY.set(candidate_registry).is_ok(),
+            "native log sink registry installation is serialized"
+        );
+        Ok(candidate_lease)
     }
 }
 
-fn open_log_sink(log_path: &Path) -> Result<PreparedLogSink, LoggingError> {
-    let parent = log_path.parent().unwrap_or_else(|| Path::new("."));
+fn resolve_log_sink_target(log_path: &Path) -> Result<LogSinkTarget, LoggingError> {
+    let parent = log_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent).map_err(|source| LoggingError::CreateDirectory {
         path: parent.to_path_buf(),
         source,
     })?;
+    let canonical_parent =
+        std::fs::canonicalize(parent).map_err(|source| LoggingError::CreateDirectory {
+            path: parent.to_path_buf(),
+            source,
+        })?;
+    let file_name = log_path.file_name().ok_or_else(|| LoggingError::OpenFile {
+        path: log_path.to_path_buf(),
+        source: std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "native log path must name a file",
+        ),
+    })?;
+    Ok(LogSinkTarget {
+        path: canonical_parent.join(file_name),
+    })
+}
+
+fn open_log_writer(log_path: &Path) -> Result<LogWriter, LoggingError> {
     let file = RotatingFile::open(
         log_path.to_path_buf(),
         SERVER_LOG_MAX_BYTES,
@@ -462,53 +590,26 @@ fn open_log_sink(log_path: &Path) -> Result<PreparedLogSink, LoggingError> {
         path: log_path.to_path_buf(),
         source,
     })?;
-    let identity = std::fs::canonicalize(log_path).map_err(|source| LoggingError::OpenFile {
-        path: log_path.to_path_buf(),
-        source,
-    })?;
-    Ok(PreparedLogSink {
-        identity,
-        writer: LogWriter::new(file),
-    })
+    Ok(LogWriter::new(file))
 }
 
 #[cfg(test)]
 fn initialize_test_sink(log_path: &Path) -> Result<LogSinkLease, LoggingError> {
     let registry = Arc::new(LogSinkRegistry::default());
-    Ok(registry.register(open_log_sink(log_path)?))
+    registry.register(resolve_log_sink_target(log_path)?)
 }
 
+#[cfg(test)]
 fn register_and_install_subscriber<F>(
     registry: &Arc<LogSinkRegistry>,
-    prepared: PreparedLogSink,
+    target: LogSinkTarget,
     install: F,
 ) -> Result<LogSinkLease, LoggingError>
 where
     F: FnOnce(Arc<LogSinkRegistry>) -> Result<(), String>,
 {
-    let lease = registry.register(prepared);
+    let lease = registry.register(target)?;
     install(registry.clone()).map_err(LoggingError::InstallSubscriber)?;
-    Ok(lease)
-}
-
-#[cfg(not(test))]
-fn initialize_owned_locked(
-    prepared: PreparedLogSink,
-    filter: EnvFilter,
-    stderr_ansi: bool,
-) -> Result<LogSinkLease, LoggingError> {
-    if let Some(registry) = LOG_SINK_REGISTRY.get() {
-        return Ok(registry.register(prepared));
-    }
-
-    let registry = Arc::new(LogSinkRegistry::default());
-    let lease = register_and_install_subscriber(&registry, prepared, |registry| {
-        install_subscriber(registry, filter, stderr_ansi)
-    })?;
-    assert!(
-        LOG_SINK_REGISTRY.set(registry).is_ok(),
-        "native log sink registry installation is serialized"
-    );
     Ok(lease)
 }
 
@@ -537,7 +638,10 @@ fn install_subscriber(
 mod tests {
     use std::{
         io::Write as _,
-        sync::{Arc, Barrier},
+        sync::{
+            Arc, Barrier,
+            atomic::{AtomicUsize, Ordering},
+        },
         thread,
     };
 
@@ -546,12 +650,13 @@ mod tests {
 
     use super::*;
 
-    fn test_sink(path: PathBuf) -> PreparedLogSink {
-        open_log_sink(&path).expect("open test log sink")
+    fn test_target(path: PathBuf) -> LogSinkTarget {
+        resolve_log_sink_target(&path).expect("resolve test log target")
     }
 
     fn test_writer(path: PathBuf) -> LogWriter {
-        test_sink(path).writer
+        let target = test_target(path);
+        open_log_writer(&target.path).expect("open test log writer")
     }
 
     fn unavailable_writer(path: PathBuf) -> LogWriter {
@@ -580,7 +685,10 @@ mod tests {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .sinks
             .values()
-            .map(|sink| sink.lease_count)
+            .filter_map(|sink| match sink {
+                RegisteredLogSink::Ready { lease_count, .. } => Some(*lease_count),
+                RegisteredLogSink::Pending { .. } => None,
+            })
             .sum()
     }
 
@@ -590,8 +698,12 @@ mod tests {
         let log_path = temp.path().join("logs/server.log");
         let equivalent_path = temp.path().join("logs/../logs/server.log");
         let registry = Arc::new(LogSinkRegistry::default());
-        let first = registry.register(open_log_sink(&log_path).expect("first log writer"));
-        let second = registry.register(open_log_sink(&equivalent_path).expect("second log writer"));
+        let first = registry
+            .register(test_target(log_path.clone()))
+            .expect("first log writer");
+        let second = registry
+            .register(test_target(equivalent_path))
+            .expect("second log writer");
 
         registry
             .make_writer()
@@ -611,13 +723,172 @@ mod tests {
     }
 
     #[test]
+    fn prepared_registration_cannot_publish_a_writer_displaced_by_rotation() {
+        let temp = TempDir::new().expect("temporary log directory");
+        let log_path = temp.path().join("logs/server.log");
+        let registry = Arc::new(LogSinkRegistry::default());
+        let original = registry
+            .register(resolve_log_sink_target(&log_path).expect("original log target"))
+            .expect("register original log writer");
+        let staged = resolve_log_sink_target(&log_path).expect("staged replacement target");
+        let staged_writer =
+            open_log_writer(&staged.path).expect("open replacement before original rotation");
+        let original_writer = {
+            let state = registry
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            match state
+                .sinks
+                .values()
+                .next()
+                .expect("original registered sink")
+            {
+                RegisteredLogSink::Ready { writer, .. } => writer.clone(),
+                RegisteredLogSink::Pending { .. } => panic!("original sink must be ready"),
+            }
+        };
+
+        original_writer
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .rotate()
+            .expect("rotate original writer after replacement preparation");
+        drop(original_writer);
+        drop(original);
+        let replacement = registry
+            .register(staged)
+            .expect("register replacement writer");
+
+        registry
+            .make_writer()
+            .write_all(b"post-rotation-marker\n")
+            .expect("write through replacement registration");
+        assert_eq!(
+            std::fs::read_to_string(&log_path).expect("current server log"),
+            "post-rotation-marker\n",
+            "replacement registration must own the current logical log target"
+        );
+        drop(replacement);
+        drop(staged_writer);
+    }
+
+    #[test]
+    fn concurrent_pending_registrants_share_one_open_writer_and_two_exact_leases() {
+        let temp = TempDir::new().expect("temporary log directory");
+        let log_path = temp.path().join("logs/server.log");
+        let target = resolve_log_sink_target(&log_path).expect("shared log target");
+        let registry = Arc::new(LogSinkRegistry::default());
+        let open_count = Arc::new(AtomicUsize::new(0));
+        let opener_entered = Arc::new(Barrier::new(2));
+        let release_opener = Arc::new(Barrier::new(2));
+
+        thread::scope(|scope| {
+            let first = {
+                let registry = registry.clone();
+                let target = target.clone();
+                let open_count = open_count.clone();
+                let opener_entered = opener_entered.clone();
+                let release_opener = release_opener.clone();
+                scope.spawn(move || {
+                    registry.register_with(target, |path| {
+                        open_count.fetch_add(1, Ordering::SeqCst);
+                        opener_entered.wait();
+                        release_opener.wait();
+                        open_log_writer(path)
+                    })
+                })
+            };
+
+            opener_entered.wait();
+            let second = {
+                let registry = registry.clone();
+                let target = target.clone();
+                let open_count = open_count.clone();
+                scope.spawn(move || {
+                    registry.register_with(target, |path| {
+                        open_count.fetch_add(1, Ordering::SeqCst);
+                        open_log_writer(path)
+                    })
+                })
+            };
+
+            let state = registry
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let state = registry
+                .state_changed
+                .wait_while(state, |state| {
+                    state.sinks.values().all(|sink| {
+                        !matches!(sink, RegisteredLogSink::Pending { waiters, .. } if *waiters > 0)
+                    })
+                })
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            drop(state);
+            release_opener.wait();
+
+            let first = first
+                .join()
+                .expect("first registration thread")
+                .expect("first lease");
+            let second = second
+                .join()
+                .expect("second registration thread")
+                .expect("second lease");
+            assert_eq!(open_count.load(Ordering::SeqCst), 1);
+            assert_eq!(active_sink_count(&registry), 1);
+            assert_eq!(active_lease_count(&registry), 2);
+            drop(first);
+            assert_eq!(active_sink_count(&registry), 1);
+            drop(second);
+        });
+
+        assert_eq!(active_sink_count(&registry), 0);
+        assert_eq!(active_lease_count(&registry), 0);
+    }
+
+    #[test]
+    fn failed_pending_open_rolls_back_before_a_later_registration() {
+        let temp = TempDir::new().expect("temporary log directory");
+        let log_path = temp.path().join("logs/server.log");
+        let target = resolve_log_sink_target(&log_path).expect("shared log target");
+        let registry = Arc::new(LogSinkRegistry::default());
+
+        let error = match registry.register_with(target.clone(), |path| {
+            Err(LoggingError::OpenFile {
+                path: path.to_path_buf(),
+                source: std::io::Error::other("injected open failure"),
+            })
+        }) {
+            Ok(_) => panic!("injected open must fail"),
+            Err(error) => error,
+        };
+        assert!(matches!(error, LoggingError::OpenFile { .. }));
+        assert_eq!(active_sink_count(&registry), 0);
+
+        let lease = registry
+            .register(target)
+            .expect("later registration can reserve and open the same target");
+        assert_eq!(active_sink_count(&registry), 1);
+        assert_eq!(active_lease_count(&registry), 1);
+        drop(lease);
+        assert_eq!(active_sink_count(&registry), 0);
+    }
+
+    #[test]
     fn dropping_a_lease_removes_only_its_exact_sink() {
         let temp = TempDir::new().expect("temporary log directory");
         let left_path = temp.path().join("left/server.log");
         let right_path = temp.path().join("right/server.log");
         let registry = Arc::new(LogSinkRegistry::default());
-        let left = registry.register(test_sink(left_path.clone()));
-        let right = registry.register(test_sink(right_path.clone()));
+        let left = registry
+            .register(test_target(left_path.clone()))
+            .expect("register left sink");
+        let right = registry
+            .register(test_target(right_path.clone()))
+            .expect("register right sink");
 
         registry
             .make_writer()
@@ -648,18 +919,18 @@ mod tests {
 
         let temp = TempDir::new().expect("temporary log directory");
         let registry = Arc::new(LogSinkRegistry::default());
-        let sink = test_sink(temp.path().join("server.log"));
+        let target = test_target(temp.path().join("server.log"));
         let registered = Arc::new(Barrier::new(WORKERS + 1));
         let release = Arc::new(Barrier::new(WORKERS + 1));
 
         thread::scope(|scope| {
             for _ in 0..WORKERS {
                 let registry = registry.clone();
-                let sink = sink.clone();
+                let target = target.clone();
                 let registered = registered.clone();
                 let release = release.clone();
                 scope.spawn(move || {
-                    let lease = registry.register(sink);
+                    let lease = registry.register(target).expect("register shared sink");
                     registered.wait();
                     release.wait();
                     drop(lease);
@@ -680,10 +951,12 @@ mod tests {
     fn repeated_terminal_leases_leave_no_registry_entries() {
         let temp = TempDir::new().expect("temporary log directory");
         let registry = Arc::new(LogSinkRegistry::default());
-        let sink = test_sink(temp.path().join("server.log"));
+        let target = test_target(temp.path().join("server.log"));
 
         for _ in 0..256 {
-            let lease = registry.register(sink.clone());
+            let lease = registry
+                .register(target.clone())
+                .expect("register terminal sink");
             assert_eq!(active_sink_count(&registry), 1);
             drop(lease);
             assert_eq!(active_sink_count(&registry), 0);
@@ -754,7 +1027,7 @@ mod tests {
 
         let result = register_and_install_subscriber(
             &registry,
-            test_sink(temp.path().join("server.log")),
+            test_target(temp.path().join("server.log")),
             |_registry| Err("injected subscriber conflict".to_owned()),
         );
 
