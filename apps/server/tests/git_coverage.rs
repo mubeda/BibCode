@@ -1014,31 +1014,22 @@ async fn worktree_removal_finishes_after_windows_releases_a_file_handle() {
             &worktree_path.to_string_lossy(),
         ],
     );
-    let locked_path = worktree_path.join("locked.txt");
+    let long_directory = (0..6).fold(worktree_path.clone(), |path, index| {
+        path.join(format!("segment-{index}-{}", "x".repeat(40)))
+    });
+    fs::create_dir_all(&long_directory).expect("long worktree descendant");
+    let locked_path = long_directory.join("locked.txt");
+    assert!(
+        locked_path.to_string_lossy().len() > 260,
+        "fixture must cross the legacy Windows path limit"
+    );
     fs::write(&locked_path, "locked\n").expect("locked fixture");
     let locked_file = fs::OpenOptions::new()
         .read(true)
         .share_mode(0)
         .open(&locked_path)
         .expect("exclusive worktree file handle");
-    let release_repo = repo.path().to_path_buf();
-    let release_path = worktree_path.to_string_lossy().replace('\\', "/");
     let release_handle = std::thread::spawn(move || {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let registered = git(&release_repo, &["worktree", "list", "--porcelain"])
-                .lines()
-                .filter_map(|line| line.strip_prefix("worktree "))
-                .any(|path| path.replace('\\', "/").eq_ignore_ascii_case(&release_path));
-            if !registered {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "worktree registration was not removed"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
         std::thread::sleep(Duration::from_millis(100));
         drop(locked_file);
     });
@@ -1049,6 +1040,77 @@ async fn worktree_removal_finishes_after_windows_releases_a_file_handle() {
     release_handle.join().expect("release locked file handle");
 
     result.expect("remove worktree after the file handle is released");
+    assert!(!worktree_path.exists());
+}
+
+#[cfg(windows)]
+#[tokio::test]
+async fn worktree_removal_remains_retryable_after_cleanup_outlives_the_retry_window() {
+    use std::os::windows::fs::OpenOptionsExt;
+
+    if relaunch_with_isolated_git_config(
+        "worktree_removal_remains_retryable_after_cleanup_outlives_the_retry_window",
+    ) {
+        return;
+    }
+    let repo = init_repo();
+    commit_file(repo.path(), "README.md", "base\n", "initial");
+    let worktree_root = tempfile::tempdir().expect("worktree parent");
+    let worktree_path = worktree_root.path().join("retryable");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/retryable",
+            &worktree_path.to_string_lossy(),
+        ],
+    );
+    let long_directory = (0..6).fold(worktree_path.clone(), |path, index| {
+        path.join(format!("segment-{index}-{}", "x".repeat(40)))
+    });
+    fs::create_dir_all(&long_directory).expect("long worktree descendant");
+    let locked_path = long_directory.join("locked.txt");
+    assert!(
+        locked_path.to_string_lossy().len() > 260,
+        "fixture must cross the legacy Windows path limit"
+    );
+    fs::write(&locked_path, "locked\n").expect("locked fixture");
+    let locked_file = fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .open(&locked_path)
+        .expect("exclusive worktree file handle");
+    let repository = GitRepository::default();
+
+    let first_error = repository
+        .remove_worktree(repo.path(), &worktree_path, true, &cancellation())
+        .await
+        .expect_err("a locked file must outlive the bounded cleanup retries");
+    assert!(first_error.diagnostics.is_none());
+    assert!(
+        first_error
+            .detail
+            .contains("could not be cleaned before Git removal")
+    );
+    assert!(worktree_path.exists());
+    let registered_path = worktree_path.to_string_lossy().replace('\\', "/");
+    assert!(
+        git(repo.path(), &["worktree", "list", "--porcelain"])
+            .lines()
+            .filter_map(|line| line.strip_prefix("worktree "))
+            .any(|path| path
+                .replace('\\', "/")
+                .eq_ignore_ascii_case(&registered_path)),
+        "failed cleanup must retain Git registration for a safe retry"
+    );
+    drop(locked_file);
+
+    repository
+        .remove_worktree(repo.path(), &worktree_path, true, &cancellation())
+        .await
+        .expect("removal remains retryable after the file handle is released");
     assert!(!worktree_path.exists());
 }
 
