@@ -37,7 +37,7 @@
         "backgroundWork": false,
         "historyRecovery": "none",
         "terminalObservation": false,
-        "targetedActorCancellation": false
+        "targetedActorCancellation": true
       },
       "observationState": "live"
     }

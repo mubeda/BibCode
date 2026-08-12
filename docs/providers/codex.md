@@ -147,5 +147,14 @@ Provider-terminal reconciliation remains list-based: `subAgentActivity` can
 trigger a bounded list pass but cannot create a provisional terminal-scope actor
 or opt that observer into structured-chat direct-read recovery.
 
+In structured chats, BiBCode exposes targeted Stop capability only for a
+canonical verified child thread with one currently active turn. The private
+child `threadId` and `turnId` can be recovered from validated live or
+reconciliation lifecycle data and are removed on matching completion. Root,
+provisional, stale, conflicting, terminal, malformed, and oversized targets are
+rejected without falling back to the root composer interrupt, terminal cleanup,
+or operating-system process termination. Provider-terminal Activity remains
+read-only.
+
 See [Activity observation](../architecture/activity-observation.md) for the
 shared protocol and provider matrix.

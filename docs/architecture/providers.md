@@ -201,8 +201,13 @@ disables that fallback. Equal, ambiguous, or missing comparisons remain
 ## Activity support
 
 Activity is a separate capability from provider execution. The server
-advertises activity protocol v1 only after its RPC surface is registered, and
+advertises activity protocol v2 only after its RPC surface is registered, and
 each adapter reports only the activity it can prove.
+
+Codex structured chat also reports targeted actor cancellation when its adapter
+can publish exact verified child-thread/active-turn handles. Those handles stay
+inside the server and dispatch through the child-specific App Server
+`turn/interrupt` request; provider terminals remain observation-only.
 
 | Provider | Structured chat | Structured activity                                                                            | Provider-terminal observation                                                                                      | Downgrade behavior                                                                                       |
 | -------- | --------------- | ---------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------------- |

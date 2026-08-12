@@ -685,7 +685,7 @@ impl ActivityRuntimeControlRegistration {
     }
 }
 
-#[derive(Clone, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) enum ProviderActivityControlUpdate {
     ActorTarget {
         actor_id: String,

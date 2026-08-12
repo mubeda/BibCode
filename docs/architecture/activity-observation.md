@@ -1,6 +1,6 @@
 # Activity observation
 
-Activity observation is the bounded, read-only view of provider work shown in
+Activity is the bounded observation and capability-gated control view of provider work shown in
 the **Subagents** and **Background Tasks** surfaces. It is separate from chat
 rendering and terminal output: provider adapters emit only activity they can
 attribute, while the server owns projection, persistence, authorization, and
@@ -152,6 +152,17 @@ parent is the root or an already verified actor. Bounded root, live, list, and
 nested recovery repairs reconnect topology. An empty successful list neither
 erases known actors nor suppresses hinted actors and their direct reads.
 Malformed, out-of-scope, self-referential, or cyclic hints are ignored.
+
+For structured chat only, a verified descendant becomes cancellable while the
+tracker can prove one current active turn for that native child thread. Live
+`turn/started` and bounded child-history reconciliation install the same private
+thread/turn handle; matching completion removes it. Conflicting turns,
+provisional hints, malformed or oversized IDs, terminal turns, and stale
+completion for an older turn fail closed. Dispatch revalidates that exact
+handle against the current tracker state and sends `turn/interrupt` with the
+child `threadId` and `turnId`. Equality with the root provider thread is rejected
+before provider I/O; the composer interrupt and background-terminal or process
+cleanup paths are never used as targeted fallbacks.
 
 Epoch and cancellation fences cancel recovery when activity is disabled, the
 root is replaced, or the runtime disconnects or shuts down; late results and

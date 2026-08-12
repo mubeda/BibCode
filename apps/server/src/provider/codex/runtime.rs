@@ -21,7 +21,7 @@ use crate::activity::{
 use super::{
     activity::{
         BackgroundSnapshotAuthority, CodexActivityTracker, MAX_TRACKED_ACTORS,
-        MAX_TRACKED_WORK_ITEMS,
+        MAX_TRACKED_WORK_ITEMS, usable_native_id,
     },
     mcp_status::{
         McpOpenCompletion, McpOpenReservation, McpStatusEffect, McpStatusHandle,
@@ -111,6 +111,8 @@ pub struct RuntimeEvent {
     pub native_event_id: Option<String>,
     #[serde(skip)]
     pub activity: Vec<crate::activity::ProviderActivityMutation>,
+    #[serde(skip)]
+    pub(crate) activity_controls: Vec<crate::activity::ProviderActivityControlUpdate>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -206,6 +208,7 @@ struct RuntimeActivityState {
     resolved_hinted_descendant_ids: HashSet<String>,
     hint_source_versions: HashMap<String, Option<u64>>,
     pending_reconciliation_mutations: Vec<ProviderActivityMutation>,
+    pending_reconciliation_controls: Vec<crate::activity::ProviderActivityControlUpdate>,
     pending_reconciliation_topology_valid: bool,
 }
 
@@ -329,11 +332,22 @@ impl RuntimeActivityState {
         self.pending_reconciliation_topology_valid = pending.topology_valid;
     }
 
+    fn stage_reconciliation_controls(
+        &mut self,
+        controls: impl IntoIterator<Item = crate::activity::ProviderActivityControlUpdate>,
+    ) {
+        let remaining = RECONCILIATION_MUTATION_LIMIT
+            .saturating_sub(self.pending_reconciliation_controls.len());
+        self.pending_reconciliation_controls
+            .extend(controls.into_iter().take(remaining));
+    }
+
     fn install_root_thread_id(&mut self, native_thread_id: &str) {
         if !self.tracker.is_root_thread(native_thread_id) {
             self.clear_pending_hinted_descendants();
             self.clear_hint_freshness();
             self.pending_reconciliation_mutations.clear();
+            self.pending_reconciliation_controls.clear();
             self.pending_reconciliation_topology_valid = true;
         }
         self.tracker.set_root_thread_id(native_thread_id);
@@ -616,7 +630,7 @@ impl CodexSessionRuntime {
                     background_work: false,
                     history_recovery: ActivityHistoryRecovery::Bounded,
                     terminal_observation: false,
-                    targeted_actor_cancellation: false,
+                    targeted_actor_cancellation: true,
                 },
                 reconciliation_epoch: 0,
                 reconciliation_pass_cancellation: CancellationToken::new(),
@@ -625,6 +639,7 @@ impl CodexSessionRuntime {
                 resolved_hinted_descendant_ids: HashSet::new(),
                 hint_source_versions: HashMap::new(),
                 pending_reconciliation_mutations: Vec::new(),
+                pending_reconciliation_controls: Vec::new(),
                 pending_reconciliation_topology_valid: true,
             }),
         });
@@ -667,6 +682,7 @@ impl CodexSessionRuntime {
             activity.clear_pending_hinted_descendants();
             activity.clear_hint_freshness();
             activity.pending_reconciliation_mutations.clear();
+            activity.pending_reconciliation_controls.clear();
             activity.pending_reconciliation_topology_valid = true;
             if enabled {
                 activity.tracker.begin_detail_baseline();
@@ -1082,6 +1098,52 @@ impl CodexSessionRuntime {
         Ok(())
     }
 
+    pub async fn interrupt_targeted_turn(
+        &self,
+        thread_id: &str,
+        turn_id: &str,
+    ) -> Result<(), RuntimeError> {
+        if !usable_native_id(thread_id) || !usable_native_id(turn_id) {
+            return Err(RuntimeError::InvalidPayload {
+                message:
+                    "targeted native IDs must satisfy the non-empty 256-byte whitespace-free bound"
+                        .to_owned(),
+            });
+        }
+        let provider_thread_id = self.provider_thread_id().await?;
+        if thread_id == provider_thread_id {
+            return Err(RuntimeError::InvalidPayload {
+                message: "the root provider thread cannot be targeted as a child".to_owned(),
+            });
+        }
+        let is_current_target = self
+            .inner
+            .activity
+            .lock()
+            .await
+            .tracker
+            .is_current_target(thread_id, turn_id);
+        if !is_current_target {
+            return Err(RuntimeError::InvalidPayload {
+                message: "the targeted child turn is not the current active turn".to_owned(),
+            });
+        }
+        self.inner
+            .connection
+            .lock()
+            .await
+            .clone()
+            .request(
+                "turn/interrupt",
+                json!({
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                }),
+            )
+            .await?;
+        Ok(())
+    }
+
     pub async fn rollback_thread(
         &self,
         num_turns: u64,
@@ -1487,6 +1549,7 @@ impl CodexSessionRuntime {
                         );
                         activity.enqueue_hinted_descendants(&hinted_descendant_ids);
                         activity.stage_reconciliation_mutations(hints.mutations);
+                        activity.stage_reconciliation_controls(hints.controls);
                         drop(activity);
                         for thread_id in hinted_descendant_ids {
                             if !thread_id.is_empty()
@@ -1627,6 +1690,8 @@ impl CodexSessionRuntime {
                 );
             activity
                 .stage_reconciliation_mutations(std::mem::take(&mut descendants.output.mutations));
+            activity
+                .stage_reconciliation_controls(std::mem::take(&mut descendants.output.controls));
             descendants
         };
         let read_enabled = !read_incompatible
@@ -1691,6 +1756,7 @@ impl CodexSessionRuntime {
                         .iter()
                         .any(|accepted| accepted == &thread_id);
                     activity.stage_reconciliation_mutations(descendants.output.mutations);
+                    activity.stage_reconciliation_controls(descendants.output.controls);
                     if !accepted {
                         activity.remove_pending_hinted_descendant(&thread_id);
                         activity.mark_hinted_descendant_resolved(&thread_id);
@@ -1716,8 +1782,10 @@ impl CodexSessionRuntime {
                     );
                     activity.enqueue_hinted_descendants(&nested_hinted_descendants);
                     activity.stage_reconciliation_mutations(hints.mutations);
+                    activity.stage_reconciliation_controls(hints.controls);
                     let history = activity.tracker.reconcile_thread_history(&response.thread);
                     activity.stage_reconciliation_mutations(history.mutations);
+                    activity.stage_reconciliation_controls(history.controls);
                     nested_hinted_descendants
                 };
                 read_succeeded = true;
@@ -1895,7 +1963,7 @@ impl CodexSessionRuntime {
             background_work: background_support == ReconciliationMethodSupport::Supported,
             history_recovery: history_recovery_for_support(list_support, read_support),
             terminal_observation: false,
-            targeted_actor_cancellation: false,
+            targeted_actor_cancellation: true,
         };
         let background_health = match background_support {
             ReconciliationMethodSupport::Supported => ActivitySectionHealth::live(),
@@ -2033,6 +2101,7 @@ impl CodexSessionRuntime {
             receive_sequence,
             activity_epoch,
             activity,
+            activity_controls,
             request_reconciliation,
             is_root,
             is_verified_child,
@@ -2044,6 +2113,7 @@ impl CodexSessionRuntime {
                 (
                     0,
                     state.reconciliation_epoch,
+                    Vec::new(),
                     Vec::new(),
                     false,
                     is_root,
@@ -2070,15 +2140,21 @@ impl CodexSessionRuntime {
                     receive_sequence,
                     state.reconciliation_epoch,
                     output.mutations,
+                    output.controls,
                     output.request_reconciliation,
                     is_root,
                     is_verified_child,
                 )
             }
         };
-        if !activity.is_empty() {
-            self.emit_activity(receive_sequence, activity_epoch, activity)
-                .await;
+        if !activity.is_empty() || !activity_controls.is_empty() {
+            self.emit_activity(
+                receive_sequence,
+                activity_epoch,
+                activity,
+                activity_controls,
+            )
+            .await;
         }
         if request_reconciliation {
             self.request_reconciliation(false).await;
@@ -2333,6 +2409,7 @@ impl CodexSessionRuntime {
             payload,
             native_event_id: None,
             activity: Vec::new(),
+            activity_controls: Vec::new(),
         };
         let _ = self.inner.events_tx.send(event);
     }
@@ -2342,6 +2419,7 @@ impl CodexSessionRuntime {
         receive_sequence: u128,
         activity_epoch: u64,
         activity: Vec<crate::activity::ProviderActivityMutation>,
+        activity_controls: Vec<crate::activity::ProviderActivityControlUpdate>,
     ) {
         let mut counter = self.inner.event_counter.lock().await;
         let state = self.inner.activity.lock().await;
@@ -2360,6 +2438,7 @@ impl CodexSessionRuntime {
             payload: json!({}),
             native_event_id: Some(format!("codex:activity:{receive_sequence}")),
             activity,
+            activity_controls,
         };
         let _ = self.inner.events_tx.send(event);
     }
@@ -2410,6 +2489,7 @@ impl CodexSessionRuntime {
                     }),
                     native_event_id: None,
                     activity: Vec::new(),
+                    activity_controls: Vec::new(),
                 });
                 return;
             }
@@ -2419,6 +2499,8 @@ impl CodexSessionRuntime {
                 let record_capacity = RECONCILIATION_MUTATION_LIMIT - prefix.len();
                 let record_count =
                     record_capacity.min(activity_state.pending_reconciliation_mutations.len());
+                let final_batch =
+                    record_count == activity_state.pending_reconciliation_mutations.len();
                 let mut activity = prefix;
                 activity.extend(
                     activity_state.pending_reconciliation_mutations[..record_count]
@@ -2443,6 +2525,11 @@ impl CodexSessionRuntime {
                     payload: json!({}),
                     native_event_id: Some(format!("codex:reconciliation:{sequence}")),
                     activity,
+                    activity_controls: if final_batch {
+                        activity_state.pending_reconciliation_controls.clone()
+                    } else {
+                        Vec::new()
+                    },
                 };
                 if self.inner.events_tx.send(event).is_err() {
                     return;
@@ -2450,6 +2537,9 @@ impl CodexSessionRuntime {
                 activity_state
                     .pending_reconciliation_mutations
                     .drain(..record_count);
+                if final_batch {
+                    activity_state.pending_reconciliation_controls.clear();
+                }
                 if activity_state.pending_reconciliation_mutations.is_empty() {
                     return;
                 }
@@ -2492,6 +2582,7 @@ impl CodexSessionRuntime {
             payload,
             native_event_id,
             activity,
+            activity_controls: Vec::new(),
         };
         let _ = self.inner.events_tx.send(event);
     }
