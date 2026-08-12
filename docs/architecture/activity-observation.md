@@ -102,21 +102,35 @@ text.
 OpenCode helper cleanup is owned by the system helper launcher. Before a
 foreground cleanup waiter can block, the launcher transfers the exact child,
 reserved process-group identity, and one of sixteen cleanup permits into its
-retained reaper registry. The foreground TERM/grace/KILL/wait budget remains
-bounded; a timed-out child stays registry-owned until `Child::wait` completes.
-An `Interrupted` wait is retried immediately. Any other wait failure keeps the
-same child, process-group guard, stdout ownership, and permit in that task and
-retries after a fixed 100 ms delay. The first shutdown drain for a non-empty
-registry phase also wakes one immediate retry. Concurrent drains, repeated
-drains, and a new drain after an earlier caller is cancelled all share that one
-nudge until the registry becomes empty; they cannot repeatedly bypass the
-delay. A repeated failure cannot publish reap completion, disarm the guard, or
-release capacity, and after the shared shutdown nudge it attempts at most once
-per delay. Shutdown therefore recovers from a transient wait error without a
-missing-signal deadlock, while a persistent platform wait error keeps shutdown
-pending at a finite retry cadence rather than discarding the exact owner or
-hot-looping. Once the task registry is empty, repeated shutdown is inert and
-the nudge state resets.
+retained reaper registry. The cleanup permit is acquired before the helper
+process is spawned. Retained submission synchronously inserts a pending
+registration before it spawns the Tokio reaper task, then promotes that exact
+entry to running without an await or other cancellation point. Pending and
+running entries and the active drain epoch share one registry mutex, so
+shutdown treats an in-flight submission as live work.
+
+The foreground TERM/grace/KILL/wait budget remains bounded; a timed-out child
+stays registry-owned until `Child::wait` completes. An `Interrupted` wait is
+retried immediately. Any other wait failure keeps the same child,
+process-group guard, stdout ownership, and permit in that task and retries
+after a fixed 100 ms delay. The first shutdown of a non-empty registry phase
+publishes a snapshot drain epoch that permits one immediate retry per retained
+task. A task promoted after that publication reads the current snapshot and
+cannot miss the epoch. Concurrent and repeated shutdown callers, including
+replacements after an earlier caller is cancelled, reuse the active epoch and
+cannot repeatedly bypass the delay. A repeated failure cannot publish reap
+completion, disarm the guard, or release capacity.
+
+Shutdown removes completed running entries, creates or reuses the phase epoch,
+and decides whether it may return while holding the same registry mutex. When
+the last entry is removed, epoch reset and the empty-state shutdown return
+linearize under that lock; a later submission belongs to a distinct phase.
+Process waits, stdout joins, task joins, timers, logging, and notification
+waits all run after the mutex is released. A persistent platform wait error
+therefore keeps shutdown pending at a finite retry cadence rather than
+discarding the exact owner or hot-looping, while repeated shutdown after an
+empty-state linearization is inert.
+
 Terminal-manager shutdown first cancels and drains observer generations and
 sessions, then calls the launch-preparer/factory shutdown hook to drain this
 registry while the production Tokio runtime is still live. Other provider
