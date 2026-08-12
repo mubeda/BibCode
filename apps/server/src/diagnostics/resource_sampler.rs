@@ -921,9 +921,9 @@ mod tests {
                 row(target_pid, server_pid, target_identity.started_at),
             ],
             FakeObservation::Return(DesktopUiObservation {
-                identities: Vec::new(),
+                identities: vec![target_identity],
                 coverage: UiCoverage {
-                    status: UiCoverageStatus::NotApplicable,
+                    status: UiCoverageStatus::Available,
                     message: None,
                 },
             }),
