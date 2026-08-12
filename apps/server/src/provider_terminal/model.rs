@@ -52,6 +52,16 @@ struct TerminalObserverWorker {
     completion: watch::Receiver<bool>,
 }
 
+impl Drop for TerminalObserverWorker {
+    fn drop(&mut self) {
+        // The runtime-owned graceful cleanup future can itself be discarded
+        // during runtime shutdown. Dropping its worker records must still make
+        // abort positively visible to private-runtime workers; the join reaper
+        // retains their threads and permits until actual OS-thread exit.
+        self.abort.cancel();
+    }
+}
+
 struct TerminalObserverWorkerJoin {
     thread: std::thread::JoinHandle<()>,
     global_permit: OwnedSemaphorePermit,
@@ -83,6 +93,21 @@ struct WorkerThreadExitTestHook {
     exit_release: Arc<(StdMutex<bool>, std::sync::Condvar)>,
     before_join_reached: Arc<tokio::sync::Semaphore>,
     join_release: Arc<(StdMutex<bool>, std::sync::Condvar)>,
+}
+
+#[cfg(test)]
+#[derive(Debug)]
+struct WorkerCleanupGraceTestHook {
+    reached: Arc<tokio::sync::Semaphore>,
+    release: CancellationToken,
+}
+
+#[cfg(test)]
+impl WorkerCleanupGraceTestHook {
+    async fn block(&self) {
+        self.reached.add_permits(1);
+        self.release.cancelled().await;
+    }
 }
 
 #[cfg(test)]
@@ -258,6 +283,8 @@ struct TerminalObserverWorkerRegistry {
     state: StdMutex<TerminalObserverWorkerRegistryState>,
     #[cfg(test)]
     thread_exit_hook: StdMutex<Option<Arc<WorkerThreadExitTestHook>>>,
+    #[cfg(test)]
+    cleanup_grace_hook: StdMutex<Option<Arc<WorkerCleanupGraceTestHook>>>,
 }
 
 impl fmt::Debug for TerminalObserverWorkerRegistry {
@@ -293,6 +320,8 @@ impl TerminalObserverWorkerRegistry {
             }),
             #[cfg(test)]
             thread_exit_hook: StdMutex::new(None),
+            #[cfg(test)]
+            cleanup_grace_hook: StdMutex::new(None),
         }
     }
 
@@ -424,8 +453,21 @@ impl TerminalObserverWorkerRegistry {
             if workers.is_empty() {
                 completion.send_replace(true);
             } else if let Some(runtime) = runtime {
+                #[cfg(test)]
+                let cleanup_grace_hook = self
+                    .cleanup_grace_hook
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .clone();
                 runtime.spawn(async move {
-                    reap_observer_workers(workers, graceful_timeout, abort_timeout).await;
+                    reap_observer_workers(
+                        workers,
+                        graceful_timeout,
+                        abort_timeout,
+                        #[cfg(test)]
+                        cleanup_grace_hook,
+                    )
+                    .await;
                     completion.send_replace(true);
                 });
             } else {
@@ -454,11 +496,22 @@ impl Drop for TerminalObserverWorkerRegistry {
             return;
         }
         if let Some(runtime) = &self.runtime {
-            runtime.spawn(reap_observer_workers(
-                workers,
-                DROPPED_GENERATION_WORKER_SHUTDOWN_TIMEOUT,
-                DROPPED_GENERATION_WORKER_ABORT_TIMEOUT,
-            ));
+            #[cfg(test)]
+            let cleanup_grace_hook = self
+                .cleanup_grace_hook
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            runtime.spawn(async move {
+                reap_observer_workers(
+                    workers,
+                    DROPPED_GENERATION_WORKER_SHUTDOWN_TIMEOUT,
+                    DROPPED_GENERATION_WORKER_ABORT_TIMEOUT,
+                    #[cfg(test)]
+                    cleanup_grace_hook,
+                )
+                .await;
+            });
         } else {
             for worker in &workers {
                 worker.abort.cancel();
@@ -471,7 +524,12 @@ async fn reap_observer_workers(
     workers: Vec<TerminalObserverWorker>,
     graceful_timeout: Duration,
     abort_timeout: Duration,
+    #[cfg(test)] cleanup_grace_hook: Option<Arc<WorkerCleanupGraceTestHook>>,
 ) {
+    #[cfg(test)]
+    if let Some(cleanup_grace_hook) = cleanup_grace_hook {
+        cleanup_grace_hook.block().await;
+    }
     let graceful_deadline = Instant::now() + graceful_timeout;
     let mut pending = Vec::new();
     let mut workers = workers.into_iter();
@@ -797,7 +855,7 @@ impl TerminalObserverGenerationLease {
         publication.get_or_insert(lock).clone()
     }
 
-    pub(crate) async fn invalidate(&self) {
+    async fn invalidate(&self) {
         let publication = self
             .inner
             .activity_publication
@@ -1598,7 +1656,8 @@ mod tests {
         TerminalAgentActivityObservation, TerminalAgentActivityObservationKind,
         TerminalAgentActivityPublicationTestHook, TerminalAgentActivityTransition,
         TerminalGenerationActivityPublisher, TerminalObserverCancellationReason,
-        TerminalObserverGeneration, TerminalObserverWorkerSpawnError, WorkerThreadExitTestHook,
+        TerminalObserverGeneration, TerminalObserverWorkerSpawnError, WorkerCleanupGraceTestHook,
+        WorkerThreadExitTestHook,
     };
 
     #[derive(Debug)]
@@ -1963,6 +2022,84 @@ mod tests {
         worker_dropped_rx
             .await
             .expect("retained cleanup eventually aborted the stuck worker");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn destroying_cleanup_runtime_during_grace_aborts_worker_and_returns_exact_slot() {
+        struct WorkerDropSignal(Option<oneshot::Sender<()>>);
+
+        impl Drop for WorkerDropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self.0.take() {
+                    let _ = sender.send(());
+                }
+            }
+        }
+
+        let cleanup_runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()
+            .expect("cleanup runtime");
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let generation = TerminalObserverGeneration::new_with_runtime_and_worker_slots(
+            "thread-runtime-drop".into(),
+            "terminal-runtime-drop".into(),
+            Some(cleanup_runtime.handle().clone()),
+            slots.clone(),
+        );
+        let cleanup_grace_reached = Arc::new(tokio::sync::Semaphore::new(0));
+        let cleanup_grace_hook = Arc::new(WorkerCleanupGraceTestHook {
+            reached: cleanup_grace_reached.clone(),
+            release: tokio_util::sync::CancellationToken::new(),
+        });
+        *generation
+            .workers
+            .inner
+            .cleanup_grace_hook
+            .lock()
+            .expect("cleanup hook lock") = Some(cleanup_grace_hook);
+        let (started_tx, started_rx) = oneshot::channel();
+        let (worker_dropped_tx, worker_dropped_rx) = oneshot::channel();
+        generation
+            .worker_context()
+            .spawn(async move {
+                let _worker_drop = WorkerDropSignal(Some(worker_dropped_tx));
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+            })
+            .expect("stuck worker");
+        started_rx.await.expect("worker started");
+
+        drop(generation);
+        cleanup_grace_reached
+            .acquire()
+            .await
+            .expect("cleanup entered grace")
+            .forget();
+        cleanup_runtime.shutdown_background();
+
+        tokio::time::timeout(Duration::from_secs(1), worker_dropped_rx)
+            .await
+            .expect("runtime destruction aborted worker")
+            .expect("worker drop signal");
+        let returned = tokio::time::timeout(Duration::from_secs(1), slots.clone().acquire_owned())
+            .await
+            .expect("worker thread joined after runtime destruction")
+            .expect("worker slot remains open");
+        drop(returned);
+        assert_eq!(slots.available_permits(), 1);
+
+        let replacement = TerminalObserverGeneration::new_with_runtime_and_worker_slots(
+            "thread-runtime-drop-2".into(),
+            "terminal-runtime-drop-2".into(),
+            Handle::try_current().ok(),
+            slots,
+        );
+        replacement
+            .worker_context()
+            .spawn(async {})
+            .expect("replacement worker");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
