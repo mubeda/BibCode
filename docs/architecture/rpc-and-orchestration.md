@@ -84,6 +84,19 @@ subsequent durable orchestration events. Streaming subscriptions can be
 re-established after reconnect from snapshots or replay methods rather than
 depending on connection-local push caches.
 
+### Assistant message identity
+
+Provider assistant text preserves a native runtime `itemId` when the provider
+exposes one. The server converts it to a thread-namespaced orchestration
+message ID before persistence. Providers whose protocol does not expose a
+message identity use one deterministic assistant message per thread turn.
+
+Terminal turn projection completes every existing streaming assistant message
+for that thread and turn and never creates an empty assistant message. The
+client therefore receives the same message boundaries from live events and
+reloaded SQLite projections; Markdown rendering does not infer or repair
+provider message boundaries.
+
 ### Context-window usage flow
 
 Provider-native usage data is normalized in the server runtime as canonical
