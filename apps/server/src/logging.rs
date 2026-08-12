@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     ffi::OsString,
     fs::{File, OpenOptions},
     io::Write,
@@ -20,18 +21,34 @@ const TRUNCATION_MARKER: &[u8] = b"\n[truncated]\n";
 #[cfg(not(test))]
 static INITIALIZE_LOCK: Mutex<()> = Mutex::new(());
 #[cfg(not(test))]
-static ACTIVE_LOG_WRITER: OnceLock<LogWriter> = OnceLock::new();
+static LOG_SINK_REGISTRY: OnceLock<Arc<LogSinkRegistry>> = OnceLock::new();
+#[cfg(not(test))]
+static PROCESS_LOG_SINK: OnceLock<LogSinkLease> = OnceLock::new();
 
 #[derive(Clone)]
 struct LogWriter(Arc<Mutex<RotatingFile>>);
 
 impl LogWriter {
-    #[cfg(not(test))]
-    fn replace(&self, file: RotatingFile) {
-        *self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = file;
+    fn new(file: RotatingFile) -> Self {
+        Self(Arc::new(Mutex::new(file)))
+    }
+
+    fn write_record(&self, buffer: &[u8]) -> std::io::Result<()> {
+        let mut writer = self.make_writer_guard();
+        writer.write_all(buffer)?;
+        writer.flush()
+    }
+
+    fn flush_record(&self) -> std::io::Result<()> {
+        self.make_writer_guard().flush()
+    }
+
+    fn make_writer_guard(&self) -> LogWriterGuard<'_> {
+        LogWriterGuard(
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        )
     }
 }
 
@@ -112,11 +129,7 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogWriter {
     type Writer = LogWriterGuard<'a>;
 
     fn make_writer(&'a self) -> Self::Writer {
-        LogWriterGuard(
-            self.0
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        )
+        self.make_writer_guard()
     }
 }
 
@@ -136,21 +149,161 @@ impl Write for LogWriterGuard<'_> {
         if self.0.bytes > 0 && self.0.bytes.saturating_add(buffer.len() as u64) > self.0.max_bytes {
             self.0.rotate()?;
         }
+        if self.0.file.is_none() {
+            return Err(std::io::Error::other(format!(
+                "rotating log file {} is unavailable",
+                self.0.path.display()
+            )));
+        }
         self.0
             .file
             .as_mut()
-            .expect("rotating log file is always open")
+            .expect("rotating log file availability was checked")
             .write_all(buffer)?;
         self.0.bytes = self.0.bytes.saturating_add(buffer.len() as u64);
         Ok(original_len)
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
+        if self.0.file.is_none() {
+            return Err(std::io::Error::other(format!(
+                "rotating log file {} is unavailable",
+                self.0.path.display()
+            )));
+        }
         self.0
             .file
             .as_mut()
-            .expect("rotating log file is always open")
+            .expect("rotating log file availability was checked")
             .flush()
+    }
+}
+
+#[derive(Default)]
+struct LogSinkRegistryState {
+    next_id: u64,
+    sinks: BTreeMap<u64, LogWriter>,
+}
+
+#[derive(Default)]
+struct LogSinkRegistry {
+    state: Mutex<LogSinkRegistryState>,
+}
+
+impl LogSinkRegistry {
+    fn register(self: &Arc<Self>, writer: LogWriter) -> LogSinkLease {
+        let id = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let id = state.next_id;
+            state.next_id = state
+                .next_id
+                .checked_add(1)
+                .expect("native log sink identity space exhausted");
+            let replaced = state.sinks.insert(id, writer);
+            debug_assert!(replaced.is_none());
+            id
+        };
+        LogSinkLease {
+            registry: self.clone(),
+            id,
+        }
+    }
+
+    fn remove_exact(&self, id: u64) {
+        let removed = {
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            state.sinks.remove(&id)
+        };
+        drop(removed);
+    }
+
+    fn snapshot(&self) -> Vec<LogWriter> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sinks
+            .values()
+            .cloned()
+            .collect()
+    }
+}
+
+pub(crate) struct LogSinkLease {
+    registry: Arc<LogSinkRegistry>,
+    id: u64,
+}
+
+impl Drop for LogSinkLease {
+    fn drop(&mut self) {
+        self.registry.remove_exact(self.id);
+    }
+}
+
+struct MultiLogWriter {
+    writers: Vec<LogWriter>,
+}
+
+impl Write for MultiLogWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        let mut accepted = false;
+        let mut last_error = None;
+        for writer in &self.writers {
+            match writer.write_record(buffer) {
+                Ok(()) => accepted = true,
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if accepted || self.writers.is_empty() {
+            Ok(buffer.len())
+        } else {
+            Err(last_error.expect("every non-empty sink write failed"))
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut accepted = false;
+        let mut last_error = None;
+        for writer in &self.writers {
+            match writer.flush_record() {
+                Ok(()) => accepted = true,
+                Err(error) => last_error = Some(error),
+            }
+        }
+        if accepted || self.writers.is_empty() {
+            Ok(())
+        } else {
+            Err(last_error.expect("every non-empty sink flush failed"))
+        }
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogSinkRegistry {
+    type Writer = MultiLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        MultiLogWriter {
+            writers: self.snapshot(),
+        }
+    }
+}
+
+#[cfg(not(test))]
+struct SharedLogSinkRegistry(Arc<LogSinkRegistry>);
+
+#[cfg(not(test))]
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for SharedLogSinkRegistry {
+    type Writer = MultiLogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        MultiLogWriter {
+            writers: self.0.snapshot(),
+        }
     }
 }
 
@@ -181,44 +334,67 @@ pub enum LoggingError {
 pub fn initialize(log_path: &Path) -> Result<Init, LoggingError> {
     #[cfg(test)]
     {
-        let parent = log_path.parent().unwrap_or_else(|| Path::new("."));
-        std::fs::create_dir_all(parent).map_err(|source| LoggingError::CreateDirectory {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-        RotatingFile::open(
-            log_path.to_path_buf(),
-            SERVER_LOG_MAX_BYTES,
-            SERVER_LOG_BACKUPS,
-        )
-        .map_err(|source| LoggingError::OpenFile {
-            path: log_path.to_path_buf(),
-            source,
-        })?;
+        drop(initialize_test_sink(log_path)?);
         Ok(Init::Installed)
     }
 
     #[cfg(not(test))]
     {
-        let filter = crate::environment_identity::bibcode_env_string("BIBCODE_LOG")
-            .and_then(|value| EnvFilter::try_new(value).ok())
-            .or_else(|| EnvFilter::try_from_default_env().ok())
-            .unwrap_or_else(|| EnvFilter::new("info"));
-        initialize_with_filter(log_path, filter)
+        if PROCESS_LOG_SINK.get().is_some() {
+            return Ok(Init::AlreadyInstalled);
+        }
+        let writer = open_log_writer(log_path)?;
+        let filter = log_filter();
+        let stderr_ansi = std::io::stderr().is_terminal();
+        let _guard = INITIALIZE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if PROCESS_LOG_SINK.get().is_some() {
+            return Ok(Init::AlreadyInstalled);
+        }
+        let lease = initialize_owned_locked(writer, filter, stderr_ansi)?;
+        PROCESS_LOG_SINK.set(lease).map_err(|_| {
+            LoggingError::InstallSubscriber(
+                "process log sink was installed concurrently".to_owned(),
+            )
+        })?;
+        Ok(Init::Installed)
     }
 }
 
 #[cfg(not(test))]
-fn initialize_with_filter(log_path: &Path, filter: EnvFilter) -> Result<Init, LoggingError> {
-    let _guard = INITIALIZE_LOCK
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
+fn log_filter() -> EnvFilter {
+    crate::environment_identity::bibcode_env_string("BIBCODE_LOG")
+        .and_then(|value| EnvFilter::try_new(value).ok())
+        .or_else(|| EnvFilter::try_from_default_env().ok())
+        .unwrap_or_else(|| EnvFilter::new("info"))
+}
+
+pub(crate) fn initialize_owned(log_path: &Path) -> Result<LogSinkLease, LoggingError> {
+    #[cfg(test)]
+    {
+        initialize_test_sink(log_path)
+    }
+
+    #[cfg(not(test))]
+    {
+        let writer = open_log_writer(log_path)?;
+        let filter = log_filter();
+        let stderr_ansi = std::io::stderr().is_terminal();
+        let _guard = INITIALIZE_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        initialize_owned_locked(writer, filter, stderr_ansi)
+    }
+}
+
+fn open_log_writer(log_path: &Path) -> Result<LogWriter, LoggingError> {
     let parent = log_path.parent().unwrap_or_else(|| Path::new("."));
     std::fs::create_dir_all(parent).map_err(|source| LoggingError::CreateDirectory {
         path: parent.to_path_buf(),
         source,
     })?;
-    let file = RotatingFile::open(
+    RotatingFile::open(
         log_path.to_path_buf(),
         SERVER_LOG_MAX_BYTES,
         SERVER_LOG_BACKUPS,
@@ -226,37 +402,257 @@ fn initialize_with_filter(log_path: &Path, filter: EnvFilter) -> Result<Init, Lo
     .map_err(|source| LoggingError::OpenFile {
         path: log_path.to_path_buf(),
         source,
-    })?;
-    if let Some(file_writer) = ACTIVE_LOG_WRITER.get() {
-        file_writer.replace(file);
-        return Ok(Init::AlreadyInstalled);
+    })
+    .map(LogWriter::new)
+}
+
+#[cfg(test)]
+fn initialize_test_sink(log_path: &Path) -> Result<LogSinkLease, LoggingError> {
+    let registry = Arc::new(LogSinkRegistry::default());
+    Ok(registry.register(open_log_writer(log_path)?))
+}
+
+fn register_and_install_subscriber<F>(
+    registry: &Arc<LogSinkRegistry>,
+    writer: LogWriter,
+    install: F,
+) -> Result<LogSinkLease, LoggingError>
+where
+    F: FnOnce(Arc<LogSinkRegistry>) -> Result<(), String>,
+{
+    let lease = registry.register(writer);
+    install(registry.clone()).map_err(LoggingError::InstallSubscriber)?;
+    Ok(lease)
+}
+
+#[cfg(not(test))]
+fn initialize_owned_locked(
+    writer: LogWriter,
+    filter: EnvFilter,
+    stderr_ansi: bool,
+) -> Result<LogSinkLease, LoggingError> {
+    if let Some(registry) = LOG_SINK_REGISTRY.get() {
+        return Ok(registry.register(writer));
     }
-    let file_writer = LogWriter(Arc::new(Mutex::new(file)));
+
+    let registry = Arc::new(LogSinkRegistry::default());
+    let lease = register_and_install_subscriber(&registry, writer, |registry| {
+        install_subscriber(registry, filter, stderr_ansi)
+    })?;
+    assert!(
+        LOG_SINK_REGISTRY.set(registry).is_ok(),
+        "native log sink registry installation is serialized"
+    );
+    Ok(lease)
+}
+
+#[cfg(not(test))]
+fn install_subscriber(
+    registry: Arc<LogSinkRegistry>,
+    filter: EnvFilter,
+    stderr_ansi: bool,
+) -> Result<(), String> {
     let stderr = tracing_subscriber::fmt::layer()
-        .with_ansi(std::io::stderr().is_terminal())
+        .with_ansi(stderr_ansi)
         .with_writer(std::io::stderr);
     let file = tracing_subscriber::fmt::layer()
         .with_ansi(false)
-        .with_writer(file_writer.clone());
+        .with_writer(SharedLogSinkRegistry(registry));
 
     tracing_subscriber::registry()
         .with(filter)
         .with(stderr)
         .with(file)
         .try_init()
-        .map_err(|error| LoggingError::InstallSubscriber(error.to_string()))?;
-    let _ = ACTIVE_LOG_WRITER.set(file_writer);
-    Ok(Init::Installed)
+        .map_err(|error| error.to_string())
 }
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write as _;
+    use std::{
+        io::Write as _,
+        sync::{Arc, Barrier},
+        thread,
+    };
 
     use tempfile::TempDir;
     use tracing_subscriber::fmt::MakeWriter as _;
 
     use super::*;
+
+    fn test_writer(path: PathBuf) -> LogWriter {
+        std::fs::create_dir_all(path.parent().expect("test log parent"))
+            .expect("create test log directory");
+        LogWriter::new(RotatingFile::open(path, 1024, 1).expect("open test rotating log writer"))
+    }
+
+    fn unavailable_writer(path: PathBuf) -> LogWriter {
+        LogWriter::new(RotatingFile {
+            path,
+            file: None,
+            bytes: 0,
+            max_bytes: 1024,
+            backups: 1,
+        })
+    }
+
+    fn active_sink_count(registry: &LogSinkRegistry) -> usize {
+        registry
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sinks
+            .len()
+    }
+
+    #[test]
+    fn dropping_a_lease_removes_only_its_exact_sink() {
+        let temp = TempDir::new().expect("temporary log directory");
+        let left_path = temp.path().join("left/server.log");
+        let right_path = temp.path().join("right/server.log");
+        let registry = Arc::new(LogSinkRegistry::default());
+        let left = registry.register(test_writer(left_path.clone()));
+        let right = registry.register(test_writer(right_path.clone()));
+
+        registry
+            .make_writer()
+            .write_all(b"before-drop\n")
+            .expect("write both registered sinks");
+        drop(left);
+        registry
+            .make_writer()
+            .write_all(b"after-drop\n")
+            .expect("write remaining registered sink");
+
+        assert_eq!(active_sink_count(&registry), 1);
+        assert_eq!(
+            std::fs::read_to_string(left_path).expect("left log"),
+            "before-drop\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(right_path).expect("right log"),
+            "before-drop\nafter-drop\n"
+        );
+        drop(right);
+        assert_eq!(active_sink_count(&registry), 0);
+    }
+
+    #[test]
+    fn concurrent_registration_and_drop_preserve_every_exact_lease() {
+        const WORKERS: usize = 16;
+
+        let temp = TempDir::new().expect("temporary log directory");
+        let registry = Arc::new(LogSinkRegistry::default());
+        let writer = test_writer(temp.path().join("server.log"));
+        let registered = Arc::new(Barrier::new(WORKERS + 1));
+        let release = Arc::new(Barrier::new(WORKERS + 1));
+
+        thread::scope(|scope| {
+            for _ in 0..WORKERS {
+                let registry = registry.clone();
+                let writer = writer.clone();
+                let registered = registered.clone();
+                let release = release.clone();
+                scope.spawn(move || {
+                    let lease = registry.register(writer);
+                    registered.wait();
+                    release.wait();
+                    drop(lease);
+                });
+            }
+
+            registered.wait();
+            assert_eq!(active_sink_count(&registry), WORKERS);
+            release.wait();
+        });
+
+        assert_eq!(active_sink_count(&registry), 0);
+    }
+
+    #[test]
+    fn repeated_terminal_leases_leave_no_registry_entries() {
+        let temp = TempDir::new().expect("temporary log directory");
+        let registry = Arc::new(LogSinkRegistry::default());
+        let writer = test_writer(temp.path().join("server.log"));
+
+        for _ in 0..256 {
+            let lease = registry.register(writer.clone());
+            assert_eq!(active_sink_count(&registry), 1);
+            drop(lease);
+            assert_eq!(active_sink_count(&registry), 0);
+        }
+
+        let state = registry
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        assert_eq!(state.next_id, 256);
+        assert!(state.sinks.is_empty());
+    }
+
+    #[test]
+    fn a_failing_sink_does_not_starve_healthy_writes_or_flushes() {
+        let temp = TempDir::new().expect("temporary log directory");
+        let healthy_path = temp.path().join("healthy/server.log");
+        let mut writer = MultiLogWriter {
+            writers: vec![
+                unavailable_writer(temp.path().join("missing/server.log")),
+                test_writer(healthy_path.clone()),
+            ],
+        };
+
+        writer
+            .write_all(b"healthy-after-failure\n")
+            .expect("one healthy sink accepts the record");
+        writer.flush().expect("one healthy sink accepts the flush");
+
+        assert_eq!(
+            std::fs::read_to_string(healthy_path).expect("healthy log"),
+            "healthy-after-failure\n"
+        );
+    }
+
+    #[test]
+    fn a_composite_reports_the_last_error_when_every_sink_fails() {
+        let temp = TempDir::new().expect("temporary log directory");
+        let last_path = temp.path().join("last/server.log");
+        let mut writer = MultiLogWriter {
+            writers: vec![
+                unavailable_writer(temp.path().join("first/server.log")),
+                unavailable_writer(last_path.clone()),
+            ],
+        };
+
+        let write_error = writer
+            .write_all(b"unwritten\n")
+            .expect_err("every sink write fails");
+        assert!(
+            write_error
+                .to_string()
+                .contains(&last_path.display().to_string())
+        );
+        let flush_error = writer.flush().expect_err("every sink flush fails");
+        assert!(
+            flush_error
+                .to_string()
+                .contains(&last_path.display().to_string())
+        );
+    }
+
+    #[test]
+    fn failed_first_subscriber_install_rolls_back_its_provisional_lease() {
+        let temp = TempDir::new().expect("temporary log directory");
+        let registry = Arc::new(LogSinkRegistry::default());
+
+        let result = register_and_install_subscriber(
+            &registry,
+            test_writer(temp.path().join("server.log")),
+            |_registry| Err("injected subscriber conflict".to_owned()),
+        );
+
+        assert!(matches!(result, Err(LoggingError::InstallSubscriber(_))));
+        assert_eq!(active_sink_count(&registry), 0);
+    }
 
     #[test]
     fn native_log_files_rotate_with_a_bounded_backup_count() {

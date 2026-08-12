@@ -19,11 +19,17 @@ Native diagnostics remain local to each BiBCode installation.
 ## Logs
 
 Rust diagnostics are emitted with `tracing::debug!`, `tracing::warn!`, and
-`tracing::error!` at operational boundaries. Every server mode initializes the
-same native subscriber and appends to `userdata/logs/server.log` (or
-`dev/logs/server.log` for a source development environment) while retaining
-human-readable stderr output. `BIBCODE_LOG` controls the filter and falls back to
-the standard `RUST_LOG` behavior, then `info`.
+`tracing::error!` at operational boundaries. Native tracing is one
+process-wide stream with one subscriber. Each active server runtime owns an
+exact sink lease for `userdata/logs/server.log` (or `dev/logs/server.log` for a
+source development environment), while the subscriber also retains
+human-readable stderr output. Production normally has one active runtime and
+one file sink. When several embedded runtimes coexist in one process, every
+native tracing event is mirrored to every active runtime-owned sink; those log
+files are not runtime-isolated. Dropping one exact lease removes only that
+runtime's sink, so it cannot retarget or tear down another runtime's logging,
+and completed runtime entries do not accumulate. `BIBCODE_LOG` controls the
+filter and falls back to the standard `RUST_LOG` behavior, then `info`.
 
 In headless mode, run the native server from a terminal or service manager to
 retain an additional stderr stream:
