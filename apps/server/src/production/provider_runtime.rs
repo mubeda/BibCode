@@ -480,8 +480,12 @@ enum SupervisorMessage {
     ActivityDispatchTaskComplete {
         thread_id: String,
         generation: ActivityRuntimeGeneration,
+        task_id: ActivityDispatchTaskId,
     },
 }
+
+#[derive(Clone, Copy, Eq, Hash, PartialEq)]
+struct ActivityDispatchTaskId(u64);
 
 struct ActivityDispatchEnvelope {
     thread_id: String,
@@ -492,6 +496,15 @@ struct ActivityDispatchEnvelope {
 enum SupervisorInput {
     Control(SupervisorMessage),
     Activity(ActivityDispatchEnvelope),
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+struct ActivityDispatchCompletionTestHook {
+    hold_before_return: Arc<AtomicBool>,
+    sent: Arc<tokio::sync::Notify>,
+    received: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
 }
 
 struct SessionEntry {
@@ -505,7 +518,8 @@ struct SessionEntry {
     activity_dispatch_cancellation: CancellationToken,
     activity_dispatch_tasks: Vec<JoinHandle<()>>,
     activity_late_dispatch_cancellation: CancellationToken,
-    activity_late_dispatch_tasks: Vec<JoinHandle<()>>,
+    activity_late_dispatch_tasks: HashMap<ActivityDispatchTaskId, JoinHandle<()>>,
+    next_activity_late_dispatch_task_id: u64,
     activity_control: Arc<RwLock<Option<Arc<ActivityRuntimeControlRegistration>>>>,
     activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
     activity_lifecycle: SharedActivityLifecycle,
@@ -651,7 +665,15 @@ impl ProviderRuntimeSupervisor {
         activity: ActivityProjection,
         options: SupervisorOptions,
     ) -> Self {
-        Self::start_inner(engine, factory, activity, options, None)
+        Self::start_inner(
+            engine,
+            factory,
+            activity,
+            options,
+            None,
+            #[cfg(test)]
+            None,
+        )
     }
 
     #[must_use]
@@ -662,7 +684,15 @@ impl ProviderRuntimeSupervisor {
         options: SupervisorOptions,
         operational_log: ProviderOperationalLog,
     ) -> Self {
-        Self::start_inner(engine, factory, activity, options, Some(operational_log))
+        Self::start_inner(
+            engine,
+            factory,
+            activity,
+            options,
+            Some(operational_log),
+            #[cfg(test)]
+            None,
+        )
     }
 
     fn start_inner(
@@ -671,6 +701,7 @@ impl ProviderRuntimeSupervisor {
         activity: ActivityProjection,
         options: SupervisorOptions,
         operational_log: Option<ProviderOperationalLog>,
+        #[cfg(test)] activity_dispatch_completion_hook: Option<ActivityDispatchCompletionTestHook>,
     ) -> Self {
         let queue_capacity = options.queue_capacity.max(1);
         let session_idle_timeout = options.session_idle_timeout;
@@ -698,6 +729,8 @@ impl ProviderRuntimeSupervisor {
                 worker_stopped,
                 operational_log,
                 worker_activity_cancellation,
+                #[cfg(test)]
+                activity_dispatch_completion_hook,
             )
             .await;
         });
@@ -1943,15 +1976,13 @@ async fn run_supervisor(
     stopped: CancellationToken,
     operational_log: Option<ProviderOperationalLog>,
     activity_cancellation: Arc<RwLock<Option<ActivityCancellationService>>>,
+    #[cfg(test)] activity_dispatch_completion_hook: Option<ActivityDispatchCompletionTestHook>,
 ) {
     let mut sessions = HashMap::<String, SessionEntry>::new();
     let mut delivery_sequences = HashMap::<String, ThreadDeliverySequence>::new();
     let mut next_delivery_generation = 0_u64;
     let mut deferred_configuration = DeferredConfigurations::new();
     loop {
-        for entry in sessions.values_mut() {
-            reap_completed_activity_tasks(&mut entry.activity_late_dispatch_tasks).await;
-        }
         let activity_task_count = sessions
             .values()
             .map(|entry| entry.activity_late_dispatch_tasks.len())
@@ -1980,6 +2011,8 @@ async fn run_supervisor(
                     &mut sessions,
                     envelope,
                     terminal_sender.clone(),
+                    #[cfg(test)]
+                    activity_dispatch_completion_hook.clone(),
                 )
                 .await;
                 continue;
@@ -2226,11 +2259,20 @@ async fn run_supervisor(
             SupervisorMessage::ActivityDispatchTaskComplete {
                 thread_id,
                 generation,
+                task_id,
             } => {
-                if let Some(entry) = sessions.get_mut(&thread_id)
-                    && entry.activity_runtime_generation == generation
-                {
-                    reap_completed_activity_tasks(&mut entry.activity_late_dispatch_tasks).await;
+                #[cfg(test)]
+                if let Some(hook) = &activity_dispatch_completion_hook {
+                    hook.received.notify_one();
+                }
+                if let Some(entry) = sessions.get_mut(&thread_id) {
+                    reap_activity_dispatch_task(
+                        &entry.activity_runtime_generation,
+                        &mut entry.activity_late_dispatch_tasks,
+                        &generation,
+                        task_id,
+                    )
+                    .await;
                 }
             }
             #[cfg(test)]
@@ -2632,6 +2674,7 @@ async fn dispatch_activity_envelope(
     sessions: &mut HashMap<String, SessionEntry>,
     envelope: ActivityDispatchEnvelope,
     terminal_sender: mpsc::UnboundedSender<SupervisorMessage>,
+    #[cfg(test)] activity_dispatch_completion_hook: Option<ActivityDispatchCompletionTestHook>,
 ) {
     if envelope.jobs.is_empty()
         || envelope.jobs.len() > ACTIVITY_DELTA_MAX_CHANGES
@@ -2663,23 +2706,63 @@ async fn dispatch_activity_envelope(
         return;
     };
     let dispatch_cancellation = entry.activity_late_dispatch_cancellation.clone();
+    let task_id = allocate_activity_dispatch_task_id(entry);
     let thread_id = envelope.thread_id;
     let generation = envelope.generation;
     let completion_thread_id = thread_id.clone();
     let completion_generation = generation.clone();
-    entry
-        .activity_late_dispatch_tasks
-        .push(tokio::spawn(async move {
-            tokio::select! {
-                biased;
-                () = dispatch_cancellation.cancelled() => {}
-                () = service.dispatch_observed_jobs(envelope.jobs) => {}
-            }
-            let _ = terminal_sender.send(SupervisorMessage::ActivityDispatchTaskComplete {
+    let task = tokio::spawn(async move {
+        tokio::select! {
+            biased;
+            () = dispatch_cancellation.cancelled() => {}
+            () = service.dispatch_observed_jobs(envelope.jobs) => {}
+        }
+        let _completion_sent = terminal_sender
+            .send(SupervisorMessage::ActivityDispatchTaskComplete {
                 thread_id: completion_thread_id,
                 generation: completion_generation,
-            });
-        }));
+                task_id,
+            })
+            .is_ok();
+        #[cfg(test)]
+        if _completion_sent
+            && let Some(hook) = activity_dispatch_completion_hook
+            && hook.hold_before_return.swap(false, Ordering::AcqRel)
+        {
+            hook.sent.notify_one();
+            hook.release.notified().await;
+        }
+    });
+    let replaced = entry.activity_late_dispatch_tasks.insert(task_id, task);
+    debug_assert!(replaced.is_none());
+}
+
+fn allocate_activity_dispatch_task_id(entry: &mut SessionEntry) -> ActivityDispatchTaskId {
+    for _ in 0..=entry.activity_late_dispatch_tasks.len() {
+        let task_id = ActivityDispatchTaskId(entry.next_activity_late_dispatch_task_id);
+        entry.next_activity_late_dispatch_task_id =
+            entry.next_activity_late_dispatch_task_id.wrapping_add(1);
+        if !entry.activity_late_dispatch_tasks.contains_key(&task_id) {
+            return task_id;
+        }
+    }
+    unreachable!("bounded activity dispatch task IDs always have a free slot")
+}
+
+async fn reap_activity_dispatch_task(
+    current_generation: &ActivityRuntimeGeneration,
+    tasks: &mut HashMap<ActivityDispatchTaskId, JoinHandle<()>>,
+    completion_generation: &ActivityRuntimeGeneration,
+    task_id: ActivityDispatchTaskId,
+) -> bool {
+    if current_generation != completion_generation {
+        return false;
+    }
+    let Some(task) = tasks.remove(&task_id) else {
+        return false;
+    };
+    let _ = task.await;
+    true
 }
 
 async fn send_activity_dispatch_envelope(
@@ -2826,7 +2909,7 @@ async fn reap_completed_activity_tasks(tasks: &mut Vec<JoinHandle<()>>) {
 async fn cancel_and_reap_activity_tasks(entry: &mut SessionEntry) {
     entry.activity_late_dispatch_cancellation.cancel();
     entry.activity_dispatch_cancellation.cancel();
-    for task in std::mem::take(&mut entry.activity_late_dispatch_tasks) {
+    for (_, task) in std::mem::take(&mut entry.activity_late_dispatch_tasks) {
         let _ = task.await;
     }
     for task in std::mem::take(&mut entry.activity_dispatch_tasks) {
@@ -3039,7 +3122,8 @@ async fn launch_session(
             activity_dispatch_cancellation,
             activity_dispatch_tasks: Vec::new(),
             activity_late_dispatch_cancellation,
-            activity_late_dispatch_tasks: Vec::new(),
+            activity_late_dispatch_tasks: HashMap::new(),
+            next_activity_late_dispatch_task_id: 0,
             activity_control,
             activity_cancellation,
             activity_lifecycle,
@@ -10638,6 +10722,257 @@ done
             .await,
             "closed handoff must fail without blocking"
         );
+    }
+
+    #[tokio::test]
+    async fn stale_activity_completion_id_cannot_remove_current_generation_handle() {
+        let current_generation = ActivityRuntimeGeneration::new();
+        let stale_generation = ActivityRuntimeGeneration::new();
+        let task_id = super::ActivityDispatchTaskId(7);
+        let release = Arc::new(tokio::sync::Notify::new());
+        let task_release = release.clone();
+        let mut tasks = std::collections::HashMap::from([(
+            task_id,
+            tokio::spawn(async move {
+                task_release.notified().await;
+            }),
+        )]);
+
+        assert!(
+            !super::reap_activity_dispatch_task(
+                &current_generation,
+                &mut tasks,
+                &stale_generation,
+                task_id,
+            )
+            .await
+        );
+        assert_eq!(tasks.len(), 1);
+        assert!(!tasks[&task_id].is_finished());
+
+        release.notify_one();
+        assert!(
+            super::reap_activity_dispatch_task(
+                &current_generation,
+                &mut tasks,
+                &current_generation,
+                task_id,
+            )
+            .await
+        );
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn duplicate_activity_completion_id_is_idempotent() {
+        let generation = ActivityRuntimeGeneration::new();
+        let task_id = super::ActivityDispatchTaskId(11);
+        let mut tasks = std::collections::HashMap::from([(task_id, tokio::spawn(async {}))]);
+
+        assert!(
+            super::reap_activity_dispatch_task(&generation, &mut tasks, &generation, task_id,)
+                .await
+        );
+        assert!(
+            !super::reap_activity_dispatch_task(&generation, &mut tasks, &generation, task_id,)
+                .await
+        );
+        assert!(tasks.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn completion_received_before_task_return_reaps_exact_handle_and_wakes_capacity() {
+        const LATE_BATCH_COUNT: usize = 5;
+        let engine = supervisor_engine().await;
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            activity_capabilities: crate::activity::ActivityCapabilities::structured_full(false),
+            ..SupervisorDriverState::default()
+        }));
+        let (events_tx, events_rx) = mpsc::channel(1);
+        let completion_hook = super::ActivityDispatchCompletionTestHook {
+            hold_before_return: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            sent: Arc::new(tokio::sync::Notify::new()),
+            received: Arc::new(tokio::sync::Notify::new()),
+            release: Arc::new(tokio::sync::Notify::new()),
+        };
+        let supervisor = super::ProviderRuntimeSupervisor::start_inner(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state: state.clone(),
+                events: StdMutex::new(Some(events_rx)),
+            }),
+            activity.clone(),
+            super::SupervisorOptions {
+                queue_capacity: 1,
+                ..super::SupervisorOptions::default()
+            },
+            None,
+            Some(completion_hook.clone()),
+        );
+        let cancellation = ActivityCancellationService::new(
+            activity.activity_control_registry(),
+            Arc::new(supervisor.clone()),
+        );
+        supervisor
+            .attach_activity_cancellation(cancellation.clone())
+            .await;
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "codex");
+        launch.thread_id = "t1".to_owned();
+        supervisor.launch(launch).await.expect("launch runtime");
+        let scope = ActivityScopeRef::Thread {
+            thread_id: "t1".to_owned(),
+        };
+        events_tx
+            .send(super::ProviderEvent {
+                native_event_id: Some(
+                    super::ProviderNativeEventId::new("completion-race-root".to_owned())
+                        .expect("native event id"),
+                ),
+                event_type: super::ACTIVITY_ONLY_PROVIDER_EVENT_TYPE.to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: None,
+                request_id: None,
+                payload: json!({}),
+                activity: vec![
+                    ProviderActivityMutation::upsert_actor("actor:root", None, "Root", "running")
+                        .expect("root mutation"),
+                ],
+                activity_controls: super::ProviderActivityControls::from_updates(vec![
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id: "actor:root".to_owned(),
+                        target: Some(ProviderActivityNativeTarget::codex_turn(
+                            "native-root-thread".to_owned(),
+                            "native-root-turn".to_owned(),
+                        )),
+                    },
+                ]),
+            })
+            .await
+            .expect("root batch");
+        timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if activity
+                    .snapshot(&scope)
+                    .await
+                    .expect("root snapshot")
+                    .control
+                    .actors
+                    .len()
+                    == 1
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("root control");
+        cancellation
+            .cancel_subtree(scope, "thread:t1", "actor:root", 1)
+            .await
+            .expect("root cancellation");
+
+        let late_event = |index: usize| {
+            let actor_id = format!("actor:completion-race:{index}");
+            super::ProviderEvent {
+                native_event_id: Some(
+                    super::ProviderNativeEventId::new(format!("completion-race-{index}"))
+                        .expect("native event id"),
+                ),
+                event_type: super::ACTIVITY_ONLY_PROVIDER_EVENT_TYPE.to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: None,
+                request_id: None,
+                payload: json!({}),
+                activity: vec![
+                    ProviderActivityMutation::upsert_actor(
+                        actor_id.clone(),
+                        Some("actor:root"),
+                        format!("Late {index}"),
+                        "running",
+                    )
+                    .expect("late mutation"),
+                ],
+                activity_controls: super::ProviderActivityControls::from_updates(vec![
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id,
+                        target: Some(ProviderActivityNativeTarget::codex_turn(
+                            format!("native-completion-thread-{index}"),
+                            format!("native-completion-turn-{index}"),
+                        )),
+                    },
+                ]),
+            }
+        };
+        events_tx
+            .send(late_event(0))
+            .await
+            .expect("first late batch");
+        timeout(
+            std::time::Duration::from_secs(2),
+            completion_hook.sent.notified(),
+        )
+        .await
+        .expect("completion sent before aggregate task return");
+        timeout(
+            std::time::Duration::from_secs(2),
+            completion_hook.received.notified(),
+        )
+        .await
+        .expect("supervisor received early completion");
+
+        let producer = tokio::spawn(async move {
+            for index in 1..LATE_BATCH_COUNT {
+                events_tx
+                    .send(late_event(index))
+                    .await
+                    .expect("queued late batch");
+            }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        assert!(
+            !producer.is_finished(),
+            "capacity-one handoff must backpressure while the first handle is owned"
+        );
+
+        completion_hook.release.notify_one();
+        timeout(std::time::Duration::from_secs(2), producer)
+            .await
+            .expect("exact completion wakes bounded capacity")
+            .expect("late producer");
+        timeout(std::time::Duration::from_secs(2), async {
+            while state.lock().unwrap().targeted_calls.len() != LATE_BATCH_COUNT + 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("every exact target dispatched once");
+        {
+            let state = state.lock().unwrap();
+            assert_eq!(state.interrupts, 0);
+            for index in 0..LATE_BATCH_COUNT {
+                assert_eq!(
+                    state
+                        .targeted_calls
+                        .iter()
+                        .filter(|target| {
+                            target.as_str()
+                                == format!(
+                                    "codex:native-completion-thread-{index}:native-completion-turn-{index}"
+                                )
+                        })
+                        .count(),
+                    1
+                );
+            }
+        }
+
+        supervisor.shutdown().await.expect("shutdown supervisor");
+        engine.shutdown().await;
     }
 
     #[tokio::test]
