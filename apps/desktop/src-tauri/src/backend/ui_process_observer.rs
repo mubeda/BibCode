@@ -7,6 +7,8 @@ use bibcode_server::diagnostics::UnavailableDesktopUiProcessObserver;
 use bibcode_server::diagnostics::WebView2DesktopUiProcessObserver;
 use tauri::{AppHandle, Runtime};
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]
