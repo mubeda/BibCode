@@ -13,6 +13,7 @@ use std::{
 };
 
 use base64::Engine as _;
+use futures_util::FutureExt as _;
 use serde_json::{Value, json};
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
@@ -2360,11 +2361,71 @@ async fn wait_opencode_child(
     }
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct OpenCodeRetainedReaperTask {
-    join: JoinHandle<()>,
+    join: Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>,
+    join_succeeded: Arc<AtomicBool>,
     completed: Arc<AtomicBool>,
     failure: Arc<Mutex<Option<String>>>,
+}
+
+impl OpenCodeRetainedReaperTask {
+    fn try_join_finished(&self) -> bool {
+        if self.join_succeeded.load(Ordering::Acquire) {
+            return true;
+        }
+        let Ok(mut join) = self.join.try_lock() else {
+            return false;
+        };
+        if self.join_succeeded.load(Ordering::Acquire) {
+            return true;
+        }
+        let Some(handle) = join.as_mut() else {
+            return false;
+        };
+        if !handle.is_finished() {
+            return false;
+        }
+        let result = (&mut *handle)
+            .now_or_never()
+            .expect("a finished OpenCode retained reaper join is ready");
+        join.take();
+        self.record_join_result(result)
+    }
+
+    async fn join_completed(&self) -> bool {
+        if self.join_succeeded.load(Ordering::Acquire) {
+            return true;
+        }
+        let mut join = self.join.lock().await;
+        if self.join_succeeded.load(Ordering::Acquire) {
+            return true;
+        }
+        let Some(handle) = join.as_mut() else {
+            return false;
+        };
+        let result = (&mut *handle).await;
+        join.take();
+        self.record_join_result(result)
+    }
+
+    fn record_join_result(&self, result: Result<(), tokio::task::JoinError>) -> bool {
+        match result {
+            Ok(()) => {
+                self.join_succeeded.store(true, Ordering::Release);
+                true
+            }
+            Err(error) => {
+                *self
+                    .failure
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(format!(
+                    "OpenCode helper retained reaper task join failed: {error}"
+                ));
+                false
+            }
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2422,11 +2483,51 @@ impl OpenCodeRetainedReaper {
     }
 
     fn reserve_pending(self: &Arc<Self>) -> OpenCodePendingReaperRegistration {
+        let terminal_tasks = {
+            let registry = self
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            registry
+                .entries
+                .iter()
+                .filter_map(|(task_id, entry)| match entry {
+                    OpenCodeRetainedReaperEntry::Running(task)
+                        if task.completed.load(Ordering::Acquire) =>
+                    {
+                        Some((*task_id, task.clone()))
+                    }
+                    OpenCodeRetainedReaperEntry::Pending
+                    | OpenCodeRetainedReaperEntry::Running(_) => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let joined = terminal_tasks
+            .into_iter()
+            .filter_map(|(task_id, task)| {
+                task.try_join_finished()
+                    .then(|| (task_id, task.join.clone()))
+            })
+            .collect::<Vec<_>>();
         let task_id = {
             let mut registry = self
                 .registry
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
+            for (task_id, join) in joined {
+                let remove = matches!(
+                    registry.entries.get(&task_id),
+                    Some(OpenCodeRetainedReaperEntry::Running(task))
+                        if task.join_succeeded.load(Ordering::Acquire)
+                            && Arc::ptr_eq(&task.join, &join)
+                );
+                if remove {
+                    registry.entries.remove(&task_id);
+                }
+            }
+            if registry.entries.is_empty() && registry.active_drain_epoch.take().is_some() {
+                self.drain_epoch.send_replace(None);
+            }
             let task_id = loop {
                 let task_id = registry.next_task_id;
                 registry.next_task_id = registry.next_task_id.wrapping_add(1);
@@ -2655,7 +2756,8 @@ impl OpenCodeRetainedReaper {
             changed.notify_waiters();
         });
         let mut retained_task = Some(OpenCodeRetainedReaperTask {
-            join,
+            join: Arc::new(tokio::sync::Mutex::new(Some(join))),
+            join_succeeded: Arc::new(AtomicBool::new(false)),
             completed,
             failure,
         });
@@ -2683,10 +2785,15 @@ impl OpenCodeRetainedReaper {
             }
         };
         if let Some(message) = promotion_error {
-            retained_task
+            let retained_task = retained_task
                 .take()
-                .expect("failed retained reaper promotion keeps the spawned task")
+                .expect("failed retained reaper promotion keeps the spawned task");
+            let mut join = retained_task
                 .join
+                .try_lock()
+                .expect("unpublished retained reaper join owner is uncontended");
+            join.take()
+                .expect("failed retained reaper promotion keeps its join handle")
                 .abort();
             panic!("{message}");
         }
@@ -2703,32 +2810,46 @@ impl OpenCodeRetainedReaper {
             let notified = self.changed.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
-            let (completed, failure, linearized_empty) = {
-                let mut registry = self
+            let completed = {
+                let registry = self
                     .registry
                     .lock()
                     .unwrap_or_else(std::sync::PoisonError::into_inner);
-                let completed_task_ids = registry
+                registry
                     .entries
                     .iter()
                     .filter_map(|(task_id, entry)| match entry {
                         OpenCodeRetainedReaperEntry::Running(task)
                             if task.completed.load(Ordering::Acquire) =>
                         {
-                            Some(*task_id)
+                            Some((*task_id, task.clone()))
                         }
                         OpenCodeRetainedReaperEntry::Pending
                         | OpenCodeRetainedReaperEntry::Running(_) => None,
                     })
-                    .collect::<Vec<_>>();
-                let mut completed = Vec::with_capacity(completed_task_ids.len());
-                for task_id in completed_task_ids {
-                    let Some(OpenCodeRetainedReaperEntry::Running(task)) =
-                        registry.entries.remove(&task_id)
-                    else {
-                        unreachable!("completed retained reaper entry remains running");
-                    };
-                    completed.push(task.join);
+                    .collect::<Vec<_>>()
+            };
+            let mut joined = Vec::with_capacity(completed.len());
+            for (task_id, task) in completed {
+                if task.join_completed().await {
+                    joined.push((task_id, task.join));
+                }
+            }
+            let (failure, linearized_empty) = {
+                let mut registry = self
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                for (task_id, join) in joined {
+                    let remove = matches!(
+                        registry.entries.get(&task_id),
+                        Some(OpenCodeRetainedReaperEntry::Running(task))
+                            if task.join_succeeded.load(Ordering::Acquire)
+                                && Arc::ptr_eq(&task.join, &join)
+                    );
+                    if remove {
+                        registry.entries.remove(&task_id);
+                    }
                 }
                 let failure = registry.entries.values().find_map(|entry| match entry {
                     OpenCodeRetainedReaperEntry::Pending => None,
@@ -2752,11 +2873,8 @@ impl OpenCodeRetainedReaper {
                     registry.active_drain_epoch = Some(drain_epoch);
                     self.drain_epoch.send_replace(Some(drain_epoch));
                 }
-                (completed, failure, linearized_empty)
+                (failure, linearized_empty)
             };
-            for task in completed {
-                let _ = task.await;
-            }
             if linearized_empty {
                 return;
             }
@@ -3342,6 +3460,27 @@ mod tests {
                 .reaper
                 .reserve()
                 .expect("retained submission permit");
+            self.spawn_prepared_retained_submission(permit)
+        }
+
+        async fn prepare_retained_submission_waiting_for_permit(
+            &self,
+        ) -> PreparedRetainedSubmission {
+            let permit = self
+                .launcher
+                .reaper
+                .permits
+                .clone()
+                .acquire_owned()
+                .await
+                .expect("retained submission semaphore remains open");
+            self.spawn_prepared_retained_submission(permit)
+        }
+
+        fn spawn_prepared_retained_submission(
+            &self,
+            permit: OwnedSemaphorePermit,
+        ) -> PreparedRetainedSubmission {
             let mut command = tokio::process::Command::new("/bin/sleep");
             command
                 .arg("3600")
@@ -3458,6 +3597,161 @@ mod tests {
                 .await
                 .expect("drain epoch sender remains live");
         }
+    }
+
+    #[cfg(unix)]
+    async fn next_completed_join_owner(
+        reaper: &Arc<OpenCodeRetainedReaper>,
+    ) -> (u64, Arc<tokio::sync::Mutex<Option<JoinHandle<()>>>>) {
+        loop {
+            let notified = reaper.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let completed = {
+                let registry = reaper
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                registry.entries.iter().find_map(|(task_id, entry)| {
+                    let OpenCodeRetainedReaperEntry::Running(task) = entry else {
+                        return None;
+                    };
+                    task.completed
+                        .load(Ordering::Acquire)
+                        .then(|| (*task_id, task.join.clone()))
+                })
+            };
+            if let Some(completed) = completed {
+                return completed;
+            }
+            notified.await;
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn completed_submissions_are_pruned_without_shutdown() {
+        let fixture =
+            retained_reap_fixture("opencode-completed-submission-pruning").without_reap_timeout();
+        let submission_count = OPENCODE_HELPER_REAPER_CAPACITY * 2;
+        let mut process_ids = Vec::with_capacity(submission_count);
+        let mut reaped_checkpoint = fixture.events.reaped.checkpoint();
+
+        for _ in 0..submission_count {
+            let prepared = fixture
+                .prepare_retained_submission_waiting_for_permit()
+                .await;
+            process_ids.push(prepared.pid);
+            let registration = fixture.launcher.reaper.reserve_pending();
+            assert!(
+                fixture
+                    .launcher
+                    .reaper
+                    .registry
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .entries
+                    .len()
+                    <= OPENCODE_HELPER_REAPER_CAPACITY,
+                "each normal reservation keeps retained records within live capacity"
+            );
+            let mut foreground_done = fixture.submit_reserved_real_child(registration, prepared);
+            fixture.events.reaped.wait_after(reaped_checkpoint).await;
+            reaped_checkpoint = fixture.events.reaped.checkpoint();
+            while !*foreground_done.borrow_and_update() {
+                foreground_done
+                    .changed()
+                    .await
+                    .expect("retained foreground completion sender remains live");
+            }
+        }
+        let mut returned_permits = Vec::with_capacity(OPENCODE_HELPER_REAPER_CAPACITY);
+        for _ in 0..OPENCODE_HELPER_REAPER_CAPACITY {
+            returned_permits.push(
+                fixture
+                    .launcher
+                    .reaper
+                    .permits
+                    .clone()
+                    .acquire_owned()
+                    .await
+                    .expect("all retained cleanup permits return"),
+            );
+        }
+
+        let registry = fixture
+            .launcher
+            .reaper
+            .registry
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert!(
+            registry.entries.len() <= OPENCODE_HELPER_REAPER_CAPACITY,
+            "terminal retained records must remain bounded by live cleanup capacity"
+        );
+        drop(registry);
+        for pid in process_ids {
+            assert!(matches!(
+                waitid_child_once(pid),
+                Err(error) if error.raw_os_error() == Some(libc::ECHILD)
+            ));
+        }
+        drop(returned_permits);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cancelled_completed_join_keeps_shared_registry_owner() {
+        let fixture =
+            retained_reap_fixture("opencode-cancelled-completed-join").without_reap_timeout();
+        let prepared = fixture.prepare_retained_submission().await;
+        let pid = prepared.pid;
+        let registration = fixture.launcher.reaper.reserve_pending();
+        let _foreground_done = fixture.submit_reserved_real_child(registration, prepared);
+        let (task_id, join_owner) = next_completed_join_owner(&fixture.launcher.reaper).await;
+        let join_guard = join_owner.lock().await;
+        assert!(join_guard.is_some(), "registry owns the terminal task join");
+
+        let mut cancelled_shutdown = Box::pin(fixture.launcher.reaper.shutdown());
+        let first_poll = std::future::poll_fn(|context| {
+            std::task::Poll::Ready(cancelled_shutdown.as_mut().poll(context))
+        })
+        .await;
+        assert!(
+            first_poll.is_pending(),
+            "shutdown waits at the completed-entry join boundary"
+        );
+        {
+            let registry = fixture
+                .launcher
+                .reaper
+                .registry
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            assert!(
+                registry.entries.contains_key(&task_id),
+                "the registry remains the shared join owner while shutdown waits"
+            );
+        }
+        drop(cancelled_shutdown);
+        assert!(
+            join_guard.is_some(),
+            "cancelling shutdown leaves the join handle in its shared owner"
+        );
+        drop(join_guard);
+
+        let shutdowns = (0..8)
+            .map(|_| {
+                let launcher = fixture.launcher.clone();
+                tokio::spawn(async move { launcher.shutdown().await })
+            })
+            .collect::<Vec<_>>();
+        for shutdown in shutdowns {
+            shutdown
+                .await
+                .expect("concurrent replacement shutdown task");
+        }
+        fixture.assert_reaped(pid).await;
     }
 
     #[cfg(unix)]
