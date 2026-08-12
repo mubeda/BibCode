@@ -556,8 +556,6 @@ mod tests {
 
     #[tokio::test]
     async fn server_runtime_covers_production_fallback_startup_access_and_shutdown_paths() {
-        let _logging_guard = crate::logging::TEST_INITIALIZE_LOCK.lock().await;
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let production_state = tempfile::tempdir().expect("production state directory");
         let production_config =
             ServerConfig::new(production_state.path()).with_bind("127.0.0.1", 0);

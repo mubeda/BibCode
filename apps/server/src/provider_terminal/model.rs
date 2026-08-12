@@ -252,6 +252,7 @@ impl TerminalObserverWorkerJoinReaper {
 struct TerminalObserverWorkerRegistry {
     runtime: Option<Handle>,
     cancellation: CancellationToken,
+    global_slots: Arc<tokio::sync::Semaphore>,
     state: StdMutex<TerminalObserverWorkerRegistryState>,
     #[cfg(test)]
     thread_exit_hook: StdMutex<Option<Arc<WorkerThreadExitTestHook>>>,
@@ -274,10 +275,15 @@ impl fmt::Debug for TerminalObserverWorkerRegistry {
 }
 
 impl TerminalObserverWorkerRegistry {
-    fn new(runtime: Option<Handle>, cancellation: CancellationToken) -> Self {
+    fn new_with_worker_slots(
+        runtime: Option<Handle>,
+        cancellation: CancellationToken,
+        global_slots: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
         Self {
             runtime,
             cancellation,
+            global_slots,
             state: StdMutex::new(TerminalObserverWorkerRegistryState {
                 accepting: true,
                 workers: Vec::new(),
@@ -323,7 +329,8 @@ impl TerminalObserverWorkerRegistry {
         let Some(join_reaper) = GLOBAL_OBSERVER_WORKER_JOIN_REAPER.as_ref() else {
             return Err(TerminalObserverWorkerSpawnError::WorkerStartFailed);
         };
-        let global_permit = GLOBAL_OBSERVER_WORKER_SLOTS
+        let global_permit = self
+            .global_slots
             .clone()
             .try_acquire_owned()
             .map_err(|_| TerminalObserverWorkerSpawnError::CapacityExceeded)?;
@@ -427,6 +434,20 @@ impl TerminalObserverWorkerRegistry {
             if completion.changed().await.is_err() {
                 break;
             }
+        }
+    }
+}
+
+impl Drop for TerminalObserverWorkerRegistry {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.accepting = false;
+        for worker in &state.workers {
+            worker.abort.cancel();
         }
     }
 }
@@ -550,6 +571,20 @@ impl TerminalObserverGeneration {
         terminal_id: String,
         runtime: Option<Handle>,
     ) -> Self {
+        Self::new_with_runtime_and_worker_slots(
+            thread_id,
+            terminal_id,
+            runtime,
+            GLOBAL_OBSERVER_WORKER_SLOTS.clone(),
+        )
+    }
+
+    fn new_with_runtime_and_worker_slots(
+        thread_id: String,
+        terminal_id: String,
+        runtime: Option<Handle>,
+        worker_slots: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
         let id = Uuid::new_v4();
         let cancellation = CancellationToken::new();
         Self {
@@ -564,7 +599,11 @@ impl TerminalObserverGeneration {
                 cancellation_requested_while_current: AtomicBool::new(false),
                 cancellation: cancellation.clone(),
                 workers: TerminalObserverWorkerContext {
-                    inner: Arc::new(TerminalObserverWorkerRegistry::new(runtime, cancellation)),
+                    inner: Arc::new(TerminalObserverWorkerRegistry::new_with_worker_slots(
+                        runtime,
+                        cancellation,
+                        worker_slots,
+                    )),
                 },
             }),
         }
@@ -1465,7 +1504,7 @@ mod tests {
     use std::{
         future::poll_fn,
         sync::{
-            Arc, LazyLock,
+            Arc,
             atomic::{AtomicUsize, Ordering},
         },
         task::Poll,
@@ -1487,9 +1526,6 @@ mod tests {
         TerminalGenerationActivityPublisher, TerminalObserverCancellationReason,
         TerminalObserverGeneration, TerminalObserverWorkerSpawnError, WorkerThreadExitTestHook,
     };
-
-    static GLOBAL_OBSERVER_WORKER_TEST_LOCK: LazyLock<tokio::sync::Mutex<()>> =
-        LazyLock::new(|| tokio::sync::Mutex::new(()));
 
     #[derive(Debug)]
     struct DropCount(Arc<AtomicUsize>);
@@ -1653,9 +1689,12 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn hardening_worker_shutdown_is_single_flight_and_cancellation_safe() {
-        let _test_guard = GLOBAL_OBSERVER_WORKER_TEST_LOCK.lock().await;
-        let generation =
-            TerminalObserverGeneration::new("thread".to_owned(), "terminal".to_owned());
+        let generation = TerminalObserverGeneration::new_with_runtime_and_worker_slots(
+            "thread".to_owned(),
+            "terminal".to_owned(),
+            tokio::runtime::Handle::try_current().ok(),
+            Arc::new(tokio::sync::Semaphore::new(2)),
+        );
         let workers = generation.worker_context();
         let started = Arc::new(tokio::sync::Semaphore::new(0));
         let release = Arc::new(tokio::sync::Semaphore::new(0));
@@ -1765,10 +1804,130 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn observer_worker_slot_is_reusable_after_aborted_owner() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let owner = tokio::spawn({
+            let slots = slots.clone();
+            let started = started.clone();
+            async move {
+                let generation = TerminalObserverGeneration::new_with_runtime_and_worker_slots(
+                    "thread-aborted-owner".to_owned(),
+                    "terminal-aborted-owner".to_owned(),
+                    tokio::runtime::Handle::try_current().ok(),
+                    slots,
+                );
+                generation
+                    .worker_context()
+                    .spawn(async move {
+                        started.add_permits(1);
+                        std::future::pending::<()>().await;
+                    })
+                    .expect("worker admission");
+                std::future::pending::<()>().await;
+                drop(generation);
+            }
+        });
+        started
+            .acquire()
+            .await
+            .expect("worker start event")
+            .forget();
+
+        owner.abort();
+        assert!(
+            owner
+                .await
+                .expect_err("aborted generation owner")
+                .is_cancelled()
+        );
+        let returned = tokio::time::timeout(Duration::from_secs(1), slots.clone().acquire_owned())
+            .await
+            .expect("aborted owner reaped its worker thread")
+            .expect("worker capacity remains open");
+        drop(returned);
+
+        let replacement_finished = Arc::new(tokio::sync::Semaphore::new(0));
+        let replacement = TerminalObserverGeneration::new_with_runtime_and_worker_slots(
+            "thread-replacement".to_owned(),
+            "terminal-replacement".to_owned(),
+            tokio::runtime::Handle::try_current().ok(),
+            slots,
+        );
+        replacement
+            .worker_context()
+            .spawn({
+                let replacement_finished = replacement_finished.clone();
+                async move {
+                    replacement_finished.add_permits(1);
+                }
+            })
+            .expect("replacement worker admission");
+        replacement_finished
+            .acquire()
+            .await
+            .expect("replacement worker completion event")
+            .forget();
+        replacement
+            .shutdown_workers(Duration::from_secs(1), Duration::from_millis(20))
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn observer_worker_slot_is_reusable_after_worker_panic() {
+        let slots = Arc::new(tokio::sync::Semaphore::new(1));
+        let started = Arc::new(tokio::sync::Semaphore::new(0));
+        let generation = TerminalObserverGeneration::new_with_runtime_and_worker_slots(
+            "thread-panicked-worker".to_owned(),
+            "terminal-panicked-worker".to_owned(),
+            tokio::runtime::Handle::try_current().ok(),
+            slots.clone(),
+        );
+        generation
+            .worker_context()
+            .spawn({
+                let started = started.clone();
+                async move {
+                    started.add_permits(1);
+                    panic!("injected observer worker panic");
+                }
+            })
+            .expect("worker admission");
+        started
+            .acquire()
+            .await
+            .expect("worker start event")
+            .forget();
+        let returned = tokio::time::timeout(Duration::from_secs(1), slots.clone().acquire_owned())
+            .await
+            .expect("panicked worker thread was joined")
+            .expect("worker capacity remains open");
+        drop(returned);
+
+        let replacement = TerminalObserverGeneration::new_with_runtime_and_worker_slots(
+            "thread-after-panic".to_owned(),
+            "terminal-after-panic".to_owned(),
+            tokio::runtime::Handle::try_current().ok(),
+            slots,
+        );
+        replacement
+            .worker_context()
+            .spawn(async {})
+            .expect("replacement worker admission");
+        replacement
+            .shutdown_workers(Duration::from_secs(1), Duration::from_millis(20))
+            .await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn hardening_worker_slot_is_retained_until_the_os_thread_exits() {
-        let _test_guard = GLOBAL_OBSERVER_WORKER_TEST_LOCK.lock().await;
-        let generation =
-            TerminalObserverGeneration::new("thread".to_owned(), "terminal".to_owned());
+        let slots = Arc::new(tokio::sync::Semaphore::new(MAX_GLOBAL_OBSERVER_WORKERS));
+        let generation = TerminalObserverGeneration::new_with_runtime_and_worker_slots(
+            "thread".to_owned(),
+            "terminal".to_owned(),
+            tokio::runtime::Handle::try_current().ok(),
+            slots.clone(),
+        );
         let hook = Arc::new(WorkerThreadExitTestHook {
             before_completion_reached: Arc::new(tokio::sync::Semaphore::new(0)),
             completion_release: Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new())),
@@ -1810,8 +1969,12 @@ mod tests {
             .expect("join-owner barrier")
             .forget();
 
-        let challenger =
-            TerminalObserverGeneration::new("thread-2".to_owned(), "terminal-2".to_owned());
+        let challenger = TerminalObserverGeneration::new_with_runtime_and_worker_slots(
+            "thread-2".to_owned(),
+            "terminal-2".to_owned(),
+            tokio::runtime::Handle::try_current().ok(),
+            slots.clone(),
+        );
         let challenger_admission = challenger.worker_context().spawn(async {});
         let mut shutdown = tokio::spawn({
             let generation = generation.clone();
@@ -1838,28 +2001,26 @@ mod tests {
             .await;
 
         let capacity_reused = Arc::new(tokio::sync::Semaphore::new(0));
-        let follow_up =
-            TerminalObserverGeneration::new("thread-3".to_owned(), "terminal-3".to_owned());
+        let returned = tokio::time::timeout(Duration::from_secs(1), slots.clone().acquire_owned())
+            .await
+            .expect("capacity returns after the join owner releases the OS thread")
+            .expect("worker capacity remains open");
+        drop(returned);
+        let follow_up = TerminalObserverGeneration::new_with_runtime_and_worker_slots(
+            "thread-3".to_owned(),
+            "terminal-3".to_owned(),
+            tokio::runtime::Handle::try_current().ok(),
+            slots,
+        );
         let follow_up_workers = follow_up.worker_context();
-        tokio::time::timeout(Duration::from_secs(1), async {
-            loop {
-                let admission = follow_up_workers.spawn({
-                    let capacity_reused = capacity_reused.clone();
-                    async move {
-                        capacity_reused.add_permits(1);
-                    }
-                });
-                match admission {
-                    Ok(()) => break,
-                    Err(TerminalObserverWorkerSpawnError::CapacityExceeded) => {
-                        tokio::task::yield_now().await;
-                    }
-                    Err(error) => panic!("unexpected follow-up admission failure: {error}"),
+        follow_up_workers
+            .spawn({
+                let capacity_reused = capacity_reused.clone();
+                async move {
+                    capacity_reused.add_permits(1);
                 }
-            }
-        })
-        .await
-        .expect("capacity reusable after actual thread exit");
+            })
+            .expect("capacity reusable after actual thread exit");
         capacity_reused
             .acquire()
             .await

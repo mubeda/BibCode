@@ -2362,7 +2362,6 @@ mod tests {
 
     #[tokio::test]
     async fn compiled_cursor_update_fixture_reports_and_advances_its_version() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("Cursor fixture directory");
         let executable =
             compile_cursor_update_fixture(directory.path(), "2026.06.19-653a7fb").await;
@@ -2528,7 +2527,6 @@ mod tests {
 
     #[tokio::test]
     async fn provider_update_invalidates_latest_version_only_after_zero_exit() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("state directory");
         let executable =
             compile_cursor_update_fixture(directory.path(), "2026.06.19-653a7fb").await;
@@ -2647,7 +2645,6 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_advisory_does_not_treat_stale_published_version_as_update_progress() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("state directory");
         let executable =
             compile_cursor_update_fixture(directory.path(), "2026.08.04-aaa8809").await;
@@ -2685,7 +2682,6 @@ mod tests {
 
     #[tokio::test]
     async fn failed_exact_target_probe_disables_unknown_advisory_advancement() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("state directory");
         let executable =
             compile_cursor_update_fixture(directory.path(), "2026.08.04-aaa8809").await;
@@ -2961,7 +2957,6 @@ mod tests {
 
     #[tokio::test]
     async fn removed_provider_update_state_is_not_retained_or_reused() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("state directory");
         let executable = write_cursor_update_fixture(directory.path()).await;
         let control = control_with_cursor_update_fixture(executable.clone()).await;
@@ -3058,7 +3053,6 @@ mod tests {
 
     #[tokio::test]
     async fn unrelated_settings_commit_after_capability_resolution_uses_current_generation() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("Cursor fixture root");
         let executable = compile_cursor_update_fixture(directory.path(), "2026.01.01-old").await;
         let release_directory = executable
@@ -3111,7 +3105,6 @@ mod tests {
 
     #[tokio::test]
     async fn environment_change_after_capability_resolution_fails_reservation_closed() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("Cursor fixture root");
         let executable = compile_cursor_update_fixture(directory.path(), "2026.01.01-old").await;
         let release_directory = executable.parent().expect("Cursor release directory");
@@ -3159,7 +3152,6 @@ mod tests {
 
     #[tokio::test]
     async fn queued_update_revalidates_binary_and_environment_before_execution() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let old_root = tempfile::tempdir().expect("old Cursor fixture root");
         let new_root = tempfile::tempdir().expect("new Cursor fixture root");
         let old_executable = compile_cursor_update_fixture(old_root.path(), "2026.01.01-old").await;
@@ -3261,7 +3253,6 @@ mod tests {
 
     #[tokio::test]
     async fn settings_change_during_fresh_preprobe_prevents_stale_command_execution() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let old_root = tempfile::tempdir().expect("old Cursor fixture root");
         let new_root = tempfile::tempdir().expect("new Cursor fixture root");
         let old_executable = compile_cursor_update_fixture(old_root.path(), "2026.01.01-old").await;
@@ -3328,7 +3319,6 @@ mod tests {
 
     #[tokio::test]
     async fn absent_target_verification_removes_update_state_while_settings_refresh_is_paused() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("state directory");
         let control = control_with_cursor_update_fixture(
             write_slow_cursor_update_fixture(directory.path()).await,
@@ -3407,7 +3397,6 @@ mod tests {
 
     #[tokio::test]
     async fn cancelled_provider_update_publishes_failed_state() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let directory = tempfile::tempdir().expect("state directory");
         let control = control_with_cursor_update_fixture(
             write_slow_cursor_update_fixture(directory.path()).await,
@@ -4340,7 +4329,6 @@ mod tests {
 
     #[tokio::test]
     async fn server_settings_expose_terminal_webgl_default_and_patch() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
         let mut config = ServerConfig::new(temp.path());
         config.environment_id = "environment-webgl".to_owned();
@@ -4362,7 +4350,6 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_settings_updates_preserve_every_committed_patch() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
         let mut config = ServerConfig::new(temp.path());
         config.environment_id = "environment-concurrent-settings".to_owned();
@@ -4424,7 +4411,6 @@ mod tests {
 
     #[tokio::test]
     async fn older_probe_completion_cannot_overwrite_newer_same_generation_snapshot() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
         let mut config = ServerConfig::new(temp.path());
         config.environment_id = "environment-provider-probe-order".to_owned();
@@ -4525,7 +4511,6 @@ mod tests {
 
     #[tokio::test]
     async fn concurrent_settings_stream_discards_stale_provider_probes_in_commit_order() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
         let mut config = running_test_config(temp.path());
         config.environment_id = "environment-concurrent-stream".to_owned();
@@ -4673,7 +4658,6 @@ mod tests {
 
     #[tokio::test]
     async fn malformed_settings_surface_structured_errors_and_refuse_mutation() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
@@ -4724,7 +4708,6 @@ mod tests {
 
     #[tokio::test]
     async fn schema_invalid_settings_surface_structured_errors_and_preserve_original_bytes() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let cases = [
             ("top-level array", br#"[]"#.as_slice()),
             (
@@ -4824,7 +4807,6 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_settings_patch_is_transactional_and_publishes_no_events() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
@@ -4883,7 +4865,6 @@ mod tests {
 
     #[tokio::test]
     async fn settings_validation_accepts_fractional_fetch_intervals() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
@@ -4905,7 +4886,6 @@ mod tests {
 
     #[tokio::test]
     async fn settings_validation_preserves_open_unknown_keys_and_legacy_options() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
         let config = ServerConfig::new(temp.path());
         let settings_path = config.state_dir().join("settings.json");
@@ -5003,7 +4983,6 @@ mod tests {
 
     #[tokio::test]
     async fn unit_build_covers_server_control_settings_keybindings_and_streams() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("state directory");
         let mut config = running_test_config(temp.path());
         config.environment_id = "environment-1".to_owned();

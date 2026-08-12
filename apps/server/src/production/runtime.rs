@@ -962,7 +962,6 @@ mod tests {
     #[tokio::test]
     async fn production_activity_rpc_stream_receives_producer_projection_deltas() {
         // Mutation caught: registering RPC with fresh projections that do not share producer buses.
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path())
             .with_bind("127.0.0.1", 0)
@@ -1257,7 +1256,6 @@ mod tests {
 
     #[tokio::test]
     async fn startup_interrupts_only_unresolved_terminal_activity() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
         std::fs::create_dir_all(config.state_dir()).expect("state directory");
@@ -1402,7 +1400,6 @@ mod tests {
 
     #[tokio::test]
     async fn agent_activity_startup_migrates_legacy_true_to_chat_enabled_and_terminal_disabled() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
         std::fs::create_dir_all(config.state_dir()).expect("state directory");
@@ -1470,7 +1467,6 @@ mod tests {
 
     #[tokio::test]
     async fn agent_activity_runtime_settings_updates_change_only_the_selected_source_controller() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path())
             .with_bind("127.0.0.1", 0)
@@ -1544,7 +1540,6 @@ mod tests {
 
     #[tokio::test]
     async fn hardening_bootstrap_provider_observation_failure_does_not_abort_production_runtime() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
         std::fs::create_dir_all(config.state_dir()).expect("state directory");
@@ -1578,7 +1573,6 @@ mod tests {
 
     #[tokio::test]
     async fn production_runtime_covers_core_routes_assets_diagnostics_and_shutdown() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let state = TempDir::new().expect("temporary state directory");
         let config = ServerConfig::new(state.path()).with_bind("127.0.0.1", 0);
         let database = Database::open_in_memory()
@@ -1918,7 +1912,6 @@ mod tests {
 
     #[tokio::test]
     async fn production_runtime_shutdown_cancels_owned_worktree_catalog_pollers() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let state = TempDir::new().expect("temporary state directory");
         let repository = state.path().join("catalog-runtime-project");
         std::fs::create_dir(&repository).expect("repository directory");
@@ -1995,7 +1988,6 @@ mod tests {
 
     #[tokio::test]
     async fn git_review_backend_includes_untracked_files() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let repository = TempDir::new().expect("temporary repository");
         assert!(
             std::process::Command::new("git")
@@ -2029,7 +2021,6 @@ mod tests {
 
     #[tokio::test]
     async fn git_review_backend_includes_staged_changes_and_branch_range() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let repository = TempDir::new().expect("temporary repository");
         let git = |args: &[&str]| {
             let output = std::process::Command::new("git")
@@ -2138,7 +2129,6 @@ mod tests {
 
     #[tokio::test]
     async fn untracked_review_diff_marks_binary_and_oversized_files() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let repository = TempDir::new().expect("temporary repository");
         assert!(
             std::process::Command::new("git")
@@ -2169,7 +2159,6 @@ mod tests {
         #[cfg(unix)]
         use std::os::unix::fs::PermissionsExt;
 
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         assert!(
             run_review_diff("\0", review_diff_args(false, Some("HEAD"), false))
                 .await

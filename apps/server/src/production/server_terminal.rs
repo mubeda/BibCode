@@ -2209,7 +2209,6 @@ mod tests {
 
     #[tokio::test]
     async fn unit_build_covers_server_terminal_callbacks_payloads_and_wire_adapters() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = tempfile::tempdir().expect("terminal workspace");
         let terminal = TerminalManager::new(
             Arc::new(PortablePtyBackend),
