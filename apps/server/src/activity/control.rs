@@ -3,15 +3,19 @@ mod tests {
     use std::{
         sync::{
             Arc, Barrier, Mutex,
-            atomic::{AtomicBool, Ordering},
+            atomic::{AtomicBool, AtomicUsize, Ordering},
             mpsc,
         },
         thread,
         time::Duration,
     };
 
+    use futures_util::future::BoxFuture;
+
     use crate::activity::{
-        ActivityCapabilities, ActivityHistoryRecovery, ActivityObservationState,
+        ActivityCancellationDispatcher, ActivityCancellationError, ActivityCancellationService,
+        ActivityCapabilities, ActivityDispatchError, ActivityHistoryRecovery,
+        ActivityObservationState, ActivityTargetDispatchDisposition,
     };
 
     use super::*;
@@ -39,6 +43,22 @@ mod tests {
             .iter()
             .find(|actor| actor.actor_id == id)
             .expect("actor control")
+    }
+
+    #[derive(Default)]
+    struct CountingDispatcher(AtomicUsize);
+
+    impl ActivityCancellationDispatcher for CountingDispatcher {
+        fn cancel_target(
+            &self,
+            _scope: ActivityScopeRef,
+            _generation: ActivityRuntimeGeneration,
+            _target: ProviderActivityNativeTarget,
+        ) -> BoxFuture<'static, Result<ActivityTargetDispatchDisposition, ActivityDispatchError>>
+        {
+            self.0.fetch_add(1, Ordering::AcqRel);
+            Box::pin(async { Ok(ActivityTargetDispatchDisposition::Delivered) })
+        }
     }
 
     #[tokio::test]
@@ -702,6 +722,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exhausted_operation_revision_clock_fails_closed_before_provider_io() {
+        // Mutation caught: wrapping the registry-lifetime operation fence to a replayable value.
+        let registry = ActivityControlRegistry::new();
+        let registration = registry.register_runtime(
+            thread_scope(),
+            "scope-control".to_owned(),
+            Some("claude".to_owned()),
+        );
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[running_actor("actor-a", None)],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor-a".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "native-task".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+        registry
+            .operation_revision_clock
+            .store(u64::MAX, Ordering::Release);
+        let dispatcher = Arc::new(CountingDispatcher::default());
+        let service = ActivityCancellationService::new(registry.clone(), dispatcher.clone());
+        let snapshot = registry.snapshot("scope-control").await;
+
+        assert_eq!(
+            service
+                .cancel_subtree(
+                    thread_scope(),
+                    "scope-control",
+                    "actor-a",
+                    actor(&snapshot, "actor-a").control_revision,
+                )
+                .await,
+            Err(ActivityCancellationError::CapacityExceeded)
+        );
+        assert_eq!(dispatcher.0.load(Ordering::Acquire), 0);
+        assert!(
+            registry
+                .snapshot("scope-control")
+                .await
+                .operations
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
     async fn bounded_four_level_tree_emits_one_delta_and_cleans_up_replaced_generations() {
         // Mutation caught: keeping the 201st actor, splitting one batch, or letting stale teardown
         // erase its replacement.
@@ -988,6 +1057,7 @@ pub(crate) struct ActivityControlRegistry {
     pub(super) publisher: ActivityControlEventPublisher,
     scope_revision_clock: Arc<AtomicU64>,
     actor_revision_clock: Arc<AtomicU64>,
+    operation_revision_clock: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Default)]
@@ -1004,6 +1074,7 @@ pub(super) struct ActivityControlScope {
     revision: u64,
     scope_revision_clock: Arc<AtomicU64>,
     actor_revision_clock: Arc<AtomicU64>,
+    operation_revision_clock: Arc<AtomicU64>,
     actor_revision_floor: u64,
     actor_revision_tombstones: BTreeMap<String, u64>,
     targeted_control_supported: bool,
@@ -1040,6 +1111,7 @@ impl ActivityControlRegistry {
             },
             scope_revision_clock: Arc::new(AtomicU64::new(0)),
             actor_revision_clock: Arc::new(AtomicU64::new(0)),
+            operation_revision_clock: Arc::new(AtomicU64::new(1)),
         }
     }
 
@@ -1132,6 +1204,7 @@ impl ActivityControlRegistry {
                         revision,
                         scope_revision_clock: self.scope_revision_clock.clone(),
                         actor_revision_clock: self.actor_revision_clock.clone(),
+                        operation_revision_clock: self.operation_revision_clock.clone(),
                         actor_revision_floor,
                         actor_revision_tombstones: BTreeMap::new(),
                         targeted_control_supported: true,
@@ -1381,6 +1454,14 @@ impl Default for ActivityControlRegistry {
 }
 
 impl ActivityControlScope {
+    pub(super) fn next_operation_revision(&self) -> Option<u64> {
+        self.operation_revision_clock
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |revision| {
+                revision.checked_add(1)
+            })
+            .ok()
+    }
+
     fn advance_actor_revision(actor_revision_clock: &AtomicU64, actor: &mut ActivityControlActor) {
         actor.control_revision = actor.control_revision.saturating_add(1);
         actor_revision_clock.fetch_max(actor.control_revision.saturating_add(1), Ordering::AcqRel);
@@ -1806,7 +1887,10 @@ impl ActivityControlScope {
                 || before_residual_actors != operation.residual_actor_ids
                 || before_residual_work != operation.residual_work_item_ids;
             if changed {
-                operation.operation_revision = operation.operation_revision.saturating_add(1);
+                let Some(operation_revision) = self.next_operation_revision() else {
+                    continue;
+                };
+                operation.operation_revision = operation_revision;
             }
             if operation.residual_actor_ids.is_empty()
                 && operation.residual_work_item_ids.is_empty()

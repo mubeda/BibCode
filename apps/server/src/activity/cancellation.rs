@@ -98,6 +98,7 @@ pub(super) struct CancellationOperation {
 }
 
 struct ActivityOperationDeadline {
+    id: Uuid,
     cancellation: CancellationToken,
     task: Mutex<Option<JoinHandle<()>>>,
 }
@@ -238,10 +239,11 @@ impl ActivityCancellationService {
         scope_id: &str,
         generation: &ActivityRuntimeGeneration,
         root_actor_id: &str,
-        operation_revision: u64,
     ) -> Arc<ActivityOperationDeadline> {
+        let deadline_id = Uuid::new_v4();
         let cancellation = CancellationToken::new();
         let deadline = Arc::new(ActivityOperationDeadline {
+            id: deadline_id,
             cancellation: cancellation.clone(),
             task: Mutex::new(None),
         });
@@ -268,20 +270,33 @@ impl ActivityCancellationService {
             if scope.generation != generation {
                 return;
             }
-            let before = scope.clone();
-            let Some(operation) = scope.operations.get_mut(&root_actor_id) else {
+            let Some(operation) = scope.operations.get(&root_actor_id) else {
                 return;
             };
             if operation.generation != generation
-                || operation.operation_revision != operation_revision
+                || operation.deadline.id != deadline_id
                 || operation.state != ActivityCancellationOperationState::Requested
                 || (operation.residual_actor_ids.is_empty()
                     && operation.residual_work_item_ids.is_empty())
             {
                 return;
             }
+            let before = scope.clone();
+            let Some(operation_revision) = scope.next_operation_revision() else {
+                scope.operations.remove(&root_actor_id);
+                let Ok(changes) = scope.pending_changes(&before) else {
+                    return;
+                };
+                if let Some(event) = scope.publish_changes(changes) {
+                    publisher.send_delta(event);
+                }
+                return;
+            };
+            let Some(operation) = scope.operations.get_mut(&root_actor_id) else {
+                return;
+            };
             operation.state = ActivityCancellationOperationState::Partial;
-            operation.operation_revision = operation.operation_revision.saturating_add(1);
+            operation.operation_revision = operation_revision;
             let Ok(changes) = scope.pending_changes(&before) else {
                 return;
             };
@@ -515,7 +530,9 @@ impl ActivityCancellationService {
                 .map(|(root, _)| root.clone())
                 .collect::<Vec<_>>();
             let attempt_id = ActivityDispatchAttemptId(Uuid::new_v4());
-            let operation_revision = 1;
+            let operation_revision = scope
+                .next_operation_revision()
+                .ok_or(ActivityCancellationError::CapacityExceeded)?;
             let mut operation = CancellationOperation {
                 root_actor_id: actor_id.to_owned(),
                 generation: scope.generation.clone(),
@@ -529,12 +546,7 @@ impl ActivityCancellationService {
                 residual_work_item_ids,
                 state: ActivityCancellationOperationState::Requested,
                 operation_revision,
-                deadline: self.operation_deadline(
-                    scope_id,
-                    &scope.generation,
-                    actor_id,
-                    operation_revision,
-                ),
+                deadline: self.operation_deadline(scope_id, &scope.generation, actor_id),
             };
             for absorbed_root in absorbed_roots {
                 if let Some(absorbed) = scope.operations.remove(&absorbed_root) {
@@ -658,21 +670,20 @@ impl ActivityCancellationService {
                 return Err(ActivityCancellationError::CapacityExceeded);
             }
             let before = scope.clone();
+            let operation_revision = scope
+                .next_operation_revision()
+                .ok_or(ActivityCancellationError::CapacityExceeded)?;
+            let deadline = self.operation_deadline(scope_id, &scope.generation, root_actor_id);
             let operation = scope
                 .operations
                 .get_mut(root_actor_id)
                 .ok_or(ActivityCancellationError::StaleOperation)?;
             operation.state = ActivityCancellationOperationState::Requested;
-            operation.operation_revision = operation.operation_revision.saturating_add(1);
+            operation.operation_revision = operation_revision;
             for target in operation.retryable_targets.drain() {
                 operation.dispatched_targets.remove(&target);
             }
-            operation.deadline = self.operation_deadline(
-                scope_id,
-                &scope.generation,
-                root_actor_id,
-                operation.operation_revision,
-            );
+            operation.deadline = deadline;
             let attempt_id = ActivityDispatchAttemptId(Uuid::new_v4());
             operation.active_attempt_ids.insert(attempt_id.clone());
             operation
@@ -892,12 +903,19 @@ impl ActivityControlRegistry {
             };
             operation.active_attempt_ids.remove(attempt_id);
             operation.active_attempt_targets.remove(attempt_id);
+            let mut revision_exhausted = false;
             if failed && operation.state != ActivityCancellationOperationState::Partial {
-                operation.state = ActivityCancellationOperationState::Partial;
-                operation.operation_revision = operation.operation_revision.saturating_add(1);
+                if let Some(operation_revision) = scope.next_operation_revision() {
+                    operation.state = ActivityCancellationOperationState::Partial;
+                    operation.operation_revision = operation_revision;
+                } else {
+                    revision_exhausted = true;
+                }
             }
-            scope.prune_operation_targets(&mut operation);
-            scope.operations.insert(owner_root, operation);
+            if !revision_exhausted {
+                scope.prune_operation_targets(&mut operation);
+                scope.operations.insert(owner_root, operation);
+            }
             let Ok(changes) = scope.pending_changes(&before) else {
                 *scope = before;
                 return;
@@ -2164,6 +2182,102 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn operation_deadline_survives_residual_reconciliation_revision_changes() {
+        // Mutation caught: fencing the admission deadline to the public operation revision, so
+        // completing one residual silently disables the finalizer for the remaining residual.
+        let registry = ActivityControlRegistry::new();
+        let registration =
+            registry.register_runtime(thread_scope("thread-a"), SCOPE_ID.to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[
+                    running_actor("root", None),
+                    running_actor("child", Some("root")),
+                ],
+                &[actor_target("root"), actor_target("child")],
+            )
+            .await;
+        let service =
+            ActivityCancellationService::new(registry.clone(), Arc::new(FakeDispatcher::default()));
+        service
+            .cancel_subtree(
+                thread_scope("thread-a"),
+                SCOPE_ID,
+                "root",
+                actor_revision(&registry.snapshot(SCOPE_ID).await, "root"),
+            )
+            .await
+            .expect("delivered cancellation");
+        let admitted_revision = registry.snapshot(SCOPE_ID).await.operations[0].operation_revision;
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        registry
+            .observe_provider_batch(&registration, &[actor_status("child", "completed")], &[])
+            .await;
+        let reconciled = registry.snapshot(SCOPE_ID).await.operations[0].clone();
+        assert!(reconciled.operation_revision > admitted_revision);
+        assert_eq!(reconciled.residual_count, 1);
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        let operation = registry.snapshot(SCOPE_ID).await.operations[0].clone();
+        assert_eq!(operation.state, ActivityCancellationOperationState::Partial);
+        assert_eq!(operation.residual_count, 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn operation_deadline_survives_late_descendant_revision_changes() {
+        // Mutation caught: moving or invalidating the original admission deadline when a late
+        // descendant expands the covered subtree and advances the public operation revision.
+        let registry = ActivityControlRegistry::new();
+        let registration =
+            registry.register_runtime(thread_scope("thread-a"), SCOPE_ID.to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[running_actor("root", None)],
+                &[actor_target("root")],
+            )
+            .await;
+        let service =
+            ActivityCancellationService::new(registry.clone(), Arc::new(FakeDispatcher::default()));
+        service
+            .cancel_subtree(
+                thread_scope("thread-a"),
+                SCOPE_ID,
+                "root",
+                actor_revision(&registry.snapshot(SCOPE_ID).await, "root"),
+            )
+            .await
+            .expect("delivered cancellation");
+        let admitted_revision = registry.snapshot(SCOPE_ID).await.operations[0].operation_revision;
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        let late_jobs = registry
+            .observe_provider_batch(
+                &registration,
+                &[running_actor("late-child", Some("root"))],
+                &[actor_target("late-child")],
+            )
+            .await;
+        assert_eq!(late_jobs.len(), 1);
+        let reconciled = registry.snapshot(SCOPE_ID).await.operations[0].clone();
+        assert!(reconciled.operation_revision > admitted_revision);
+        assert_eq!(reconciled.residual_count, 2);
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+
+        let operation = registry.snapshot(SCOPE_ID).await.operations[0].clone();
+        assert_eq!(operation.state, ActivityCancellationOperationState::Partial);
+        assert_eq!(operation.residual_count, 2);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn terminal_before_operation_deadline_removes_operation_without_revival() {
         // Mutation caught: a stale finalizer reviving an operation removed by authoritative lifecycle.
         let registry = ActivityControlRegistry::new();
@@ -2508,6 +2622,134 @@ mod tests {
             .await
             .expect("replacement generation cancellation");
         assert_eq!(dispatcher.calls().last().unwrap(), "replacement-root");
+    }
+
+    #[tokio::test]
+    async fn replacement_operation_revision_cannot_replay_a_stale_retry_fence() {
+        // Mutation caught: restarting every same-root operation at revision one, allowing an old
+        // retry fence to collide with replacement work after both operations become partial.
+        let registry = ActivityControlRegistry::new();
+        let first = registry.register_runtime(thread_scope("thread-a"), SCOPE_ID.to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &first,
+                &[running_actor("root", None)],
+                &[actor_target("root")],
+            )
+            .await;
+        let dispatcher = Arc::new(FakeDispatcher::default());
+        dispatcher.fail("native-root");
+        let service = ActivityCancellationService::new(registry.clone(), dispatcher.clone());
+        service
+            .cancel_subtree(
+                thread_scope("thread-a"),
+                SCOPE_ID,
+                "root",
+                actor_revision(&registry.snapshot(SCOPE_ID).await, "root"),
+            )
+            .await
+            .expect("old cancellation");
+        let stale_revision = registry.snapshot(SCOPE_ID).await.operations[0].operation_revision;
+        assert_eq!(
+            registry.snapshot(SCOPE_ID).await.operations[0].state,
+            ActivityCancellationOperationState::Partial
+        );
+
+        drop(first);
+        let replacement =
+            registry.register_runtime(thread_scope("thread-a"), SCOPE_ID.to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &replacement,
+                &[running_actor("root", None)],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "root".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "replacement-root".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+        dispatcher.fail("replacement-root");
+        service
+            .cancel_subtree(
+                thread_scope("thread-a"),
+                SCOPE_ID,
+                "root",
+                actor_revision(&registry.snapshot(SCOPE_ID).await, "root"),
+            )
+            .await
+            .expect("replacement cancellation");
+        let replacement_revision =
+            registry.snapshot(SCOPE_ID).await.operations[0].operation_revision;
+        let calls_before_stale_retry = dispatcher.calls();
+
+        dispatcher.clear_failures();
+        assert_eq!(
+            service
+                .retry_subtree_cancellation(
+                    thread_scope("thread-a"),
+                    SCOPE_ID,
+                    "root",
+                    stale_revision,
+                )
+                .await,
+            Err(ActivityCancellationError::StaleOperation)
+        );
+        assert_eq!(dispatcher.calls(), calls_before_stale_retry);
+        assert!(replacement_revision > stale_revision);
+
+        service
+            .retry_subtree_cancellation(
+                thread_scope("thread-a"),
+                SCOPE_ID,
+                "root",
+                replacement_revision,
+            )
+            .await
+            .expect("current replacement retry");
+        assert_eq!(dispatcher.calls().last().unwrap(), "replacement-root");
+    }
+
+    #[tokio::test]
+    async fn operation_revisions_remain_monotonic_across_scope_tombstone_eviction() {
+        // Mutation caught: retaining per-operation revision-one initialization even after the
+        // bounded inactive-scope window evicts earlier stable public scopes.
+        let registry = ActivityControlRegistry::new();
+        let service =
+            ActivityCancellationService::new(registry.clone(), Arc::new(FakeDispatcher::default()));
+        let mut revisions = Vec::new();
+        for index in 0..=ACTIVITY_PAGE_MAX_LENGTH {
+            let scope_id = format!("scope-{index:03}");
+            let actor_id = format!("root-{index:03}");
+            let registration =
+                registry.register_runtime(thread_scope("thread-a"), scope_id.clone(), None);
+            registry
+                .observe_provider_batch(
+                    &registration,
+                    &[running_actor(&actor_id, None)],
+                    &[actor_target(&actor_id)],
+                )
+                .await;
+            let result = service
+                .cancel_subtree(
+                    thread_scope("thread-a"),
+                    &scope_id,
+                    &actor_id,
+                    actor_revision(&registry.snapshot(&scope_id).await, &actor_id),
+                )
+                .await
+                .expect("bounded operation admission");
+            revisions.push(result.operation_revision.expect("operation revision"));
+            drop(registration);
+        }
+
+        assert!(
+            revisions.windows(2).all(|pair| pair[0] < pair[1]),
+            "every public operation fence is unique and monotonic within the registry"
+        );
+        assert!(registry.lock().scopes.len() <= ACTIVITY_PAGE_MAX_LENGTH);
+        assert_eq!(registry.bounded_counts().1, 0);
     }
 
     #[tokio::test]

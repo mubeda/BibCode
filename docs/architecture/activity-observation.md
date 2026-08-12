@@ -117,7 +117,12 @@ observation history. The client recovers a gap in either domain from a fresh
 server snapshot while retaining the other domain's last accepted data as
 stale. Cancellation operations and their residual sets are therefore
 reconnect-visible during one live server runtime, but they are intentionally
-not restart-resumable.
+not restart-resumable. Every public operation revision comes from one checked,
+registry-lifetime monotonic allocator rather than a scope- or operation-local
+counter. Replacing or evicting a stable scope therefore cannot make an old
+same-root retry fence valid for replacement work. Exhaustion fails closed
+before provider I/O, and the allocator is runtime-only rather than SQLite
+state.
 
 `requested` control records and the UI label **Stopping** express
 server-authoritative cancellation intent. They never manufacture a terminal
@@ -129,11 +134,15 @@ late descendants already admitted beneath the original cancellation fence.
 Every admitted operation also owns one non-polling ten-second finalizer. If
 active residuals remain after that deadline—even when the exact target was
 unavailable or provider delivery produced no terminal event—the generation- and
-operation-revision-fenced finalizer publishes `partial` without inventing a
-provider lifecycle. Terminal observation, absorption, retry, runtime
-replacement, and teardown cancel the superseded timer. Retry re-dispatches only
-targets whose prior provider attempt failed plus newly targetable residuals;
-successfully delivered targets remain fenced until provider lifecycle changes.
+deadline-identity-fenced finalizer publishes `partial` without inventing a
+provider lifecycle. Its private deadline identity remains stable when ordinary
+provider reconciliation changes coverage, residuals, or the public operation
+revision, so those updates do not postpone or disable the original ten-second
+window. Absorption creates a new owner and deadline; retry starts a fresh full
+window and identity. Terminal observation, replacement, and teardown remove the
+operation and cancel its timer. Retry re-dispatches only targets whose prior
+provider attempt failed plus newly targetable residuals; successfully delivered
+targets remain fenced until provider lifecycle changes.
 
 Claude targeted dispatch is provisional for a runtime generation only when its
 bounded compatibility probe proves both required hook switches and the private
