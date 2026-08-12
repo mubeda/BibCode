@@ -171,18 +171,34 @@ its normal stream-JSON mode without structured hook activity.
 
 Structured chat control correlation is stricter than display observation.
 BiBCode exposes a private task target only after one session and Activity
-generation proves the complete identity chain: a root Agent/legacy Task tool
+generation proves the complete identity chain: an Agent/legacy Task tool
 invocation, its authenticated asynchronous PostToolUse result carrying the
 same `tool_use_id` and `agentId`, a local-agent `task_started` record carrying
 that `tool_use_id` and `task_id`, and the matching `SubagentStart` `agent_id`.
+Root invocations require both the stream invocation and authenticated hook to
+identify the root as their source. A nested invocation additionally requires
+its stream `parent_tool_use_id` to resolve to an active exact parent correlation
+whose launched `agentId` equals the nested authenticated PostToolUse hook's
+top-level source `agent_id`. Missing or mismatched source ownership never
+enables control.
 Arrival order is irrelevant. Names, roles, descriptions, prompts, timestamps,
 output paths, and event proximity are never correlation keys; incomplete,
 conflicting, stale, malformed, or saturated chains remain observable but
-uncontrollable. Only bounded identities and terminal status are retained, and
-provider-native IDs do not cross persistence, contracts, or logs.
+uncontrollable. Live identity maps and unmatched terminal statuses are each
+bounded at the Activity page limit. Terminal retirement atomically removes the
+live tool/agent/task join and records generation-scoped identities in three
+fixed 256-word tombstone filters (2 KiB each; 6 KiB total). Tombstones are never
+evicted within a generation: a filter false positive can only disable a private
+target, never create one or invent lifecycle. At exact terminal-status-map
+saturation new ambiguous task facts fail closed rather than displacing earlier
+terminal authority. Only bounded identities and terminal status are retained,
+and provider-native IDs do not cross persistence, contracts, or logs.
 
-A `task_notification` with status `stopped` is authoritative cancellation for
-an exactly mapped actor and retires its private target. A later
+A `task_notification` with status `stopped`/`cancelled`, `failed`, or
+`interrupted` is authoritative Cancelled, Failed, or Interrupted lifecycle for
+an exactly mapped actor and retires its private target. The runtime retains a
+bounded exact terminal task-to-agent link after an ordinary SubagentStop so a
+reordered authoritative task notification can still replace Completed. A later
 `SubagentStop` cannot rewrite cancelled, interrupted, or failed lifecycle to
 completed. The provider-specific `stop_task` request and capability downgrade
 are described separately when dispatch support is enabled.

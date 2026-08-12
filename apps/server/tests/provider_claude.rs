@@ -221,7 +221,41 @@ struct ClaudeTargetedCancellationFixture {
     session_id: String,
     orders: Vec<ClaudeTargetedCancellationOrder>,
     semantic_collision_facts: Vec<Value>,
+    nested_facts: Vec<Value>,
     terminal_facts: Vec<Value>,
+}
+
+#[test]
+fn targeted_task_correlation_fixture_requires_exact_nested_source_owner() {
+    // Mutation caught: accepting nested Agent correlation without its exact parent tool owner.
+    let fixture: ClaudeTargetedCancellationFixture =
+        load_fixture("trace-targeted-task-cancellation.json");
+    let mut runtime =
+        ClaudeProviderRuntime::new("thread-targeted".to_owned(), fixture.session_id.clone());
+    for (index, fact) in fixture.orders[0].facts.iter().enumerate() {
+        let _ = apply_targeted_correlation_fact(&mut runtime, fact, index as u64);
+    }
+    let outputs = fixture
+        .nested_facts
+        .iter()
+        .enumerate()
+        .map(|(index, fact)| {
+            apply_targeted_correlation_fact(&mut runtime, fact, 100 + index as u64)
+        })
+        .collect::<Vec<_>>();
+    let statuses = outputs
+        .iter()
+        .flat_map(|output| &output.activity)
+        .filter_map(|mutation| match mutation {
+            ProviderActivityMutation::UpsertActor(actor)
+                if actor.id == "claude:agent:agent-child" && actor.status.is_terminal() =>
+            {
+                Some(actor.status)
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(statuses, [ActivityLifecycle::Failed]);
 }
 
 #[derive(Debug, serde::Deserialize)]

@@ -157,6 +157,63 @@
       "prompt": "same prompt"
     }
   ],
+  "nestedFacts": [
+    {
+      "type": "stream_event",
+      "session_id": "session-targeted",
+      "uuid": "tool-child",
+      "parent_tool_use_id": "tool-agent-a",
+      "event": {
+        "type": "content_block_start",
+        "index": 0,
+        "content_block": {
+          "type": "tool_use",
+          "id": "tool-agent-child",
+          "name": "Agent",
+          "input": { "description": "same description", "prompt": "same prompt" }
+        }
+      }
+    },
+    {
+      "hook_event_name": "PostToolUse",
+      "session_id": "session-targeted",
+      "agent_id": "agent-a",
+      "tool_name": "Agent",
+      "tool_use_id": "tool-agent-child",
+      "tool_response": { "status": "async_launched", "agentId": "agent-child" }
+    },
+    {
+      "type": "system",
+      "subtype": "task_started",
+      "session_id": "session-targeted",
+      "uuid": "task-child-start",
+      "task_id": "task-child",
+      "tool_use_id": "tool-agent-child",
+      "task_type": "local_agent"
+    },
+    {
+      "hook_event_name": "SubagentStart",
+      "session_id": "session-targeted",
+      "agent_id": "agent-child",
+      "parent_agent_id": "agent-a",
+      "agent_type": "same-role"
+    },
+    {
+      "type": "system",
+      "subtype": "task_notification",
+      "session_id": "session-targeted",
+      "uuid": "task-child-failed",
+      "task_id": "task-child",
+      "status": "failed"
+    },
+    {
+      "hook_event_name": "SubagentStop",
+      "session_id": "session-targeted",
+      "agent_id": "agent-child",
+      "parent_agent_id": "agent-a",
+      "agent_type": "same-role"
+    }
+  ],
   "terminalFacts": [
     {
       "type": "system",

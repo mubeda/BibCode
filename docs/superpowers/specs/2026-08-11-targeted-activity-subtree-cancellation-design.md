@@ -468,6 +468,20 @@ control correlation even though root tool activity is not emitted as a child
 Activity entry. Secrets and arbitrary tool output remain excluded; the
 correlator extracts only bounded status and identity fields.
 
+Nested correlation additionally requires exact source ownership: the nested
+stream `parent_tool_use_id` must resolve to an active parent correlation whose
+launched agent equals the authenticated nested PostToolUse source `agent_id`.
+Root and nested source forms cannot be mixed. Missing or mismatched ownership
+fails closed.
+
+Terminal retirement atomically removes live tool, agent, and task maps and adds
+each identity to generation-scoped fixed tombstone filters. The three filters
+each contain 256 `u64` words (2 KiB each; 6 KiB total), reset only with the
+Activity generation, and never evict. False positives can only disable
+control. Unmatched exact terminal statuses remain bounded at the Activity page
+limit without eviction; at saturation, later task identities are tombstoned so
+delayed joins cannot displace or bypass retained terminal authority.
+
 Names, descriptions, prompts, timestamps, output paths, and event adjacency are
 never correlation keys. If the installed Claude version does not expose the
 complete chain, the actor remains `unsupported`.
@@ -479,10 +493,13 @@ Extend Claude's streaming control request model with the provider's
 task is stopped first, then every exactly mapped descendant task and
 attributable background task under the concurrency bound.
 
-`TaskNotificationMessage(status: "stopped")` is authoritative cancellation
-completion for a background task. `SubagentStop` must not blindly rewrite a
-previously stopped/cancelled actor to `completed`; the tracker reconciles the
-task terminal state and hook terminal event monotonically.
+`TaskNotificationMessage(status: "stopped" | "cancelled" | "failed" |
+"interrupted")` is authoritative Cancelled, Failed, or Interrupted completion
+for a background task. `SubagentStop` must not blindly rewrite a previously
+cancelled, interrupted, or failed actor to `completed`; the tracker reconciles
+the task terminal state and hook terminal event monotonically. Reordered
+notification after an ordinary SubagentStop uses a bounded exact terminal
+task-to-agent link to replace Completed with the authoritative lifecycle.
 
 Foreground subagents without a background `task_id` remain observable but do
 not advertise Stop. Calling the root Claude `interrupt` request would violate

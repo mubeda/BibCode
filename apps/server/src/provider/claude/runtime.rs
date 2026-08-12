@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, BTreeSet, HashSet, VecDeque},
+    collections::{BTreeMap, BTreeSet, HashSet},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -20,7 +20,7 @@ use super::transcript::{
 };
 use super::usage::{ClaudeTokenUsageSnapshot, ClaudeTokenUsageState};
 use crate::activity::{
-    ACTIVITY_PAGE_MAX_LENGTH, ActivityCapabilities, ActivityHistoryRecovery,
+    ACTIVITY_PAGE_MAX_LENGTH, ActivityCapabilities, ActivityHistoryRecovery, ActivityLifecycle,
     ActivityObservationState, ProviderActivityControlUpdate, ProviderActivityMutation,
     ProviderActivityNativeTarget,
 };
@@ -221,16 +221,85 @@ struct PendingUserInput {
 #[derive(Debug, Default)]
 struct ClaudeTaskCorrelation {
     invocation_is_agent: Option<bool>,
+    invocation_source: Option<ClaudeInvocationSource>,
+    hook_source: Option<ClaudeHookSource>,
     launched_agent_id: Option<String>,
     task_id: Option<String>,
     conflicted: bool,
 }
 
 #[derive(Debug, Eq, PartialEq)]
+enum ClaudeInvocationSource {
+    Root,
+    ParentTool(String),
+}
+
+#[derive(Debug, Eq, PartialEq)]
+enum ClaudeHookSource {
+    Root,
+    Agent(String),
+}
+
+struct ClaudeAsyncLaunchFact<'a> {
+    session_id: &'a str,
+    tool_use_id: &'a str,
+    tool_name: &'a str,
+    status: &'a str,
+    agent_id: &'a str,
+    source_agent_id: Option<&'a str>,
+}
+
+#[derive(Debug, Eq, PartialEq)]
 enum ClaudeTaskControlEffect {
-    Install { agent_id: String, task_id: String },
-    Retire { agent_id: String },
-    Stopped { agent_id: String },
+    Install {
+        agent_id: String,
+        task_id: String,
+    },
+    Retire {
+        agent_id: String,
+    },
+    Terminal {
+        agent_id: String,
+        lifecycle: ActivityLifecycle,
+    },
+}
+
+const CLAUDE_TOMBSTONE_WORDS: usize = 256;
+
+#[derive(Clone)]
+struct ClaudeIdentityTombstones {
+    words: [u64; CLAUDE_TOMBSTONE_WORDS],
+}
+
+impl Default for ClaudeIdentityTombstones {
+    fn default() -> Self {
+        Self {
+            words: [0; CLAUDE_TOMBSTONE_WORDS],
+        }
+    }
+}
+
+impl ClaudeIdentityTombstones {
+    fn insert(&mut self, identity: &str) {
+        for bit in tombstone_bits(identity) {
+            self.words[bit / u64::BITS as usize] |= 1_u64 << (bit % u64::BITS as usize);
+        }
+    }
+
+    fn contains(&self, identity: &str) -> bool {
+        tombstone_bits(identity).into_iter().all(|bit| {
+            self.words[bit / u64::BITS as usize] & (1_u64 << (bit % u64::BITS as usize)) != 0
+        })
+    }
+}
+
+fn tombstone_bits(identity: &str) -> [usize; 4] {
+    let digest = Sha256::digest(identity.as_bytes());
+    let bit_count = CLAUDE_TOMBSTONE_WORDS * u64::BITS as usize;
+    std::array::from_fn(|index| {
+        let offset = index * 2;
+        usize::from(u16::from_be_bytes([digest[offset], digest[offset + 1]])) % bit_count
+    })
 }
 
 struct ClaudeTaskControlCorrelator {
@@ -240,9 +309,12 @@ struct ClaudeTaskControlCorrelator {
     verified_agents: BTreeSet<String>,
     actor_target_by_agent: BTreeMap<String, String>,
     agent_by_task: BTreeMap<String, String>,
-    terminal_status_by_task: BTreeSet<String>,
-    terminal_status_order: VecDeque<String>,
-    saturated: bool,
+    retired_agent_by_task: BTreeMap<String, String>,
+    pending_terminal_by_task: BTreeMap<String, ActivityLifecycle>,
+    terminal_overflowed: bool,
+    tombstoned_tools: ClaudeIdentityTombstones,
+    tombstoned_agents: ClaudeIdentityTombstones,
+    tombstoned_tasks: ClaudeIdentityTombstones,
 }
 
 impl std::fmt::Debug for ClaudeTaskControlCorrelator {
@@ -254,8 +326,12 @@ impl std::fmt::Debug for ClaudeTaskControlCorrelator {
             .field("verified_agent_count", &self.verified_agents.len())
             .field("active_target_count", &self.actor_target_by_agent.len())
             .field("task_count", &self.agent_by_task.len())
-            .field("terminal_count", &self.terminal_status_by_task.len())
-            .field("saturated", &self.saturated)
+            .field("retired_task_count", &self.retired_agent_by_task.len())
+            .field(
+                "pending_terminal_count",
+                &self.pending_terminal_by_task.len(),
+            )
+            .field("terminal_overflowed", &self.terminal_overflowed)
             .finish()
     }
 }
@@ -269,9 +345,12 @@ impl ClaudeTaskControlCorrelator {
             verified_agents: BTreeSet::new(),
             actor_target_by_agent: BTreeMap::new(),
             agent_by_task: BTreeMap::new(),
-            terminal_status_by_task: BTreeSet::new(),
-            terminal_status_order: VecDeque::new(),
-            saturated: false,
+            retired_agent_by_task: BTreeMap::new(),
+            pending_terminal_by_task: BTreeMap::new(),
+            terminal_overflowed: false,
+            tombstoned_tools: ClaudeIdentityTombstones::default(),
+            tombstoned_agents: ClaudeIdentityTombstones::default(),
+            tombstoned_tasks: ClaudeIdentityTombstones::default(),
         }
     }
 
@@ -286,11 +365,14 @@ impl ClaudeTaskControlCorrelator {
     }
 
     fn correlation_mut(&mut self, tool_use_id: &str) -> Option<&mut ClaudeTaskCorrelation> {
+        if self.tombstoned_tools.contains(tool_use_id) {
+            return None;
+        }
         if self.correlations_by_tool_use.contains_key(tool_use_id) {
             return self.correlations_by_tool_use.get_mut(tool_use_id);
         }
-        if self.saturated || self.correlations_by_tool_use.len() >= ACTIVITY_PAGE_MAX_LENGTH {
-            self.saturated = true;
+        if self.correlations_by_tool_use.len() >= ACTIVITY_PAGE_MAX_LENGTH {
+            self.tombstoned_tools.insert(tool_use_id);
             return None;
         }
         self.correlations_by_tool_use
@@ -304,70 +386,97 @@ impl ClaudeTaskControlCorrelator {
         generation: u64,
         tool_use_id: &str,
         tool_name: &str,
+        parent_tool_use_id: Option<&str>,
     ) -> Vec<ClaudeTaskControlEffect> {
         if !self.accepts(session_id, generation)
             || !usable_control_identity(tool_use_id)
             || !usable_control_label(tool_name)
+            || parent_tool_use_id.is_some_and(|value| !usable_control_identity(value))
         {
             return Vec::new();
         }
         let is_agent = matches!(tool_name, "Agent" | "Task");
+        let invocation_source = parent_tool_use_id.map_or(ClaudeInvocationSource::Root, |value| {
+            ClaudeInvocationSource::ParentTool(value.to_owned())
+        });
         let conflict = {
             let Some(record) = self.correlation_mut(tool_use_id) else {
                 return Vec::new();
             };
-            match record.invocation_is_agent {
+            let identity_conflict = match record.invocation_is_agent {
                 Some(existing) if existing != is_agent => true,
                 Some(_) => false,
                 None => {
                     record.invocation_is_agent = Some(is_agent);
                     false
                 }
-            }
+            };
+            let source_conflict = match record.invocation_source.as_ref() {
+                Some(existing) if existing != &invocation_source => true,
+                Some(_) => false,
+                None => {
+                    record.invocation_source = Some(invocation_source);
+                    false
+                }
+            };
+            identity_conflict || source_conflict
         };
         if conflict {
             return self.poison(tool_use_id);
         }
-        self.reconcile(tool_use_id)
+        self.reconcile_all()
     }
 
     fn observe_async_launch(
         &mut self,
-        session_id: &str,
         generation: u64,
-        tool_use_id: &str,
-        tool_name: &str,
-        status: &str,
-        agent_id: &str,
+        fact: ClaudeAsyncLaunchFact<'_>,
     ) -> Vec<ClaudeTaskControlEffect> {
-        if !self.accepts(session_id, generation)
-            || !usable_control_identity(tool_use_id)
-            || !usable_control_identity(agent_id)
+        if !self.accepts(fact.session_id, generation)
+            || !usable_control_identity(fact.tool_use_id)
+            || !usable_control_identity(fact.agent_id)
+            || fact
+                .source_agent_id
+                .is_some_and(|value| !usable_control_identity(value))
         {
             return Vec::new();
         }
-        let valid = matches!(tool_name, "Agent" | "Task") && status == "async_launched";
+        let valid = matches!(fact.tool_name, "Agent" | "Task") && fact.status == "async_launched";
+        let hook_source = fact
+            .source_agent_id
+            .map_or(ClaudeHookSource::Root, |value| {
+                ClaudeHookSource::Agent(value.to_owned())
+            });
         let conflict = {
-            let Some(record) = self.correlation_mut(tool_use_id) else {
+            let Some(record) = self.correlation_mut(fact.tool_use_id) else {
                 return Vec::new();
             };
-            if !valid {
+            let launch_conflict = if !valid {
                 true
             } else {
                 match record.launched_agent_id.as_deref() {
-                    Some(existing) if existing != agent_id => true,
+                    Some(existing) if existing != fact.agent_id => true,
                     Some(_) => false,
                     None => {
-                        record.launched_agent_id = Some(agent_id.to_owned());
+                        record.launched_agent_id = Some(fact.agent_id.to_owned());
                         false
                     }
                 }
-            }
+            };
+            let source_conflict = match record.hook_source.as_ref() {
+                Some(existing) if existing != &hook_source => true,
+                Some(_) => false,
+                None => {
+                    record.hook_source = Some(hook_source);
+                    false
+                }
+            };
+            launch_conflict || source_conflict
         };
         if conflict {
-            return self.poison(tool_use_id);
+            return self.poison(fact.tool_use_id);
         }
-        self.reconcile(tool_use_id)
+        self.reconcile_all()
     }
 
     fn observe_task_started(
@@ -378,6 +487,8 @@ impl ClaudeTaskControlCorrelator {
         if !self.accepts(&message.session_id, generation)
             || !usable_control_identity(&message.tool_use_id)
             || !usable_control_identity(&message.task_id)
+            || (self.tombstoned_tasks.contains(&message.task_id)
+                && !self.pending_terminal_by_task.contains_key(&message.task_id))
         {
             return Vec::new();
         }
@@ -401,7 +512,7 @@ impl ClaudeTaskControlCorrelator {
         if conflict {
             return self.poison(&message.tool_use_id);
         }
-        self.reconcile(&message.tool_use_id)
+        self.reconcile_all()
     }
 
     fn observe_verified_agent(
@@ -410,33 +521,20 @@ impl ClaudeTaskControlCorrelator {
         generation: u64,
         agent_id: &str,
     ) -> Vec<ClaudeTaskControlEffect> {
-        if !self.accepts(session_id, generation) || !usable_control_identity(agent_id) {
+        if !self.accepts(session_id, generation)
+            || !usable_control_identity(agent_id)
+            || self.tombstoned_agents.contains(agent_id)
+        {
             return Vec::new();
         }
         if !self.verified_agents.contains(agent_id) {
-            let known = self
-                .correlations_by_tool_use
-                .values()
-                .any(|record| record.launched_agent_id.as_deref() == Some(agent_id));
-            if (self.saturated && !known) || self.verified_agents.len() >= ACTIVITY_PAGE_MAX_LENGTH
-            {
-                self.saturated = true;
-                return Vec::new();
+            if self.verified_agents.len() >= ACTIVITY_PAGE_MAX_LENGTH {
+                self.tombstoned_agents.insert(agent_id);
+                return self.poison_agent(agent_id);
             }
             self.verified_agents.insert(agent_id.to_owned());
         }
-        let tool_use_ids = self
-            .correlations_by_tool_use
-            .iter()
-            .filter_map(|(tool_use_id, record)| {
-                (record.launched_agent_id.as_deref() == Some(agent_id))
-                    .then_some(tool_use_id.clone())
-            })
-            .collect::<Vec<_>>();
-        tool_use_ids
-            .into_iter()
-            .flat_map(|tool_use_id| self.reconcile(&tool_use_id))
-            .collect()
+        self.reconcile_all()
     }
 
     fn observe_task_notification(
@@ -444,37 +542,59 @@ impl ClaudeTaskControlCorrelator {
         generation: u64,
         message: &ClaudeTaskNotificationMessage,
     ) -> Vec<ClaudeTaskControlEffect> {
-        if message.status != "stopped"
-            || !self.accepts(&message.session_id, generation)
+        let Some(lifecycle) = task_notification_lifecycle(&message.status) else {
+            return Vec::new();
+        };
+        if !self.accepts(&message.session_id, generation)
             || !usable_control_identity(&message.task_id)
         {
             return Vec::new();
         }
-        let mapped_agent = self.agent_by_task.get(&message.task_id).cloned();
-        self.remember_terminal_task(&message.task_id);
+        let mapped_agent = self
+            .agent_by_task
+            .get(&message.task_id)
+            .or_else(|| self.retired_agent_by_task.get(&message.task_id))
+            .cloned();
+        if mapped_agent.is_none()
+            && self.tombstoned_tasks.contains(&message.task_id)
+            && !self.pending_terminal_by_task.contains_key(&message.task_id)
+        {
+            return Vec::new();
+        }
+        let lifecycle = self.remember_terminal_task(&message.task_id, lifecycle);
         let Some(agent_id) = mapped_agent else {
             return Vec::new();
         };
-        self.retire_terminal_mapping(&message.task_id, &agent_id);
-        vec![
-            ClaudeTaskControlEffect::Retire {
+        let retired_target = self.retire_identity_chain(Some(&message.task_id), Some(&agent_id));
+        let mut effects = retired_target
+            .then(|| ClaudeTaskControlEffect::Retire {
                 agent_id: agent_id.clone(),
-            },
-            ClaudeTaskControlEffect::Stopped { agent_id },
-        ]
+            })
+            .into_iter()
+            .collect::<Vec<_>>();
+        effects.push(ClaudeTaskControlEffect::Terminal {
+            agent_id,
+            lifecycle,
+        });
+        effects
     }
 
-    fn remember_terminal_task(&mut self, task_id: &str) {
-        if self.terminal_status_by_task.contains(task_id) {
-            return;
+    fn remember_terminal_task(
+        &mut self,
+        task_id: &str,
+        lifecycle: ActivityLifecycle,
+    ) -> ActivityLifecycle {
+        self.tombstoned_tasks.insert(task_id);
+        if let Some(existing) = self.pending_terminal_by_task.get(task_id) {
+            return *existing;
         }
-        while self.terminal_status_order.len() >= ACTIVITY_PAGE_MAX_LENGTH {
-            if let Some(evicted) = self.terminal_status_order.pop_front() {
-                self.terminal_status_by_task.remove(&evicted);
-            }
+        if self.pending_terminal_by_task.len() >= ACTIVITY_PAGE_MAX_LENGTH {
+            self.terminal_overflowed = true;
+            return lifecycle;
         }
-        self.terminal_status_by_task.insert(task_id.to_owned());
-        self.terminal_status_order.push_back(task_id.to_owned());
+        self.pending_terminal_by_task
+            .insert(task_id.to_owned(), lifecycle);
+        lifecycle
     }
 
     fn observe_agent_stop(
@@ -486,9 +606,22 @@ impl ClaudeTaskControlCorrelator {
         if !self.accepts(session_id, generation) || !usable_control_identity(agent_id) {
             return Vec::new();
         }
-        self.actor_target_by_agent
-            .remove(agent_id)
-            .map(|_| ClaudeTaskControlEffect::Retire {
+        let retired_tasks = self
+            .agent_by_task
+            .iter()
+            .filter_map(|(task_id, mapped_agent)| {
+                (mapped_agent == agent_id).then_some(task_id.clone())
+            })
+            .collect::<Vec<_>>();
+        let retired_target = self.retire_identity_chain(None, Some(agent_id));
+        for task_id in retired_tasks {
+            if self.retired_agent_by_task.len() < ACTIVITY_PAGE_MAX_LENGTH {
+                self.retired_agent_by_task
+                    .insert(task_id, agent_id.to_owned());
+            }
+        }
+        retired_target
+            .then(|| ClaudeTaskControlEffect::Retire {
                 agent_id: agent_id.to_owned(),
             })
             .into_iter()
@@ -496,16 +629,33 @@ impl ClaudeTaskControlCorrelator {
     }
 
     fn poison(&mut self, tool_use_id: &str) -> Vec<ClaudeTaskControlEffect> {
-        let agent_id = self
+        let identities = self
             .correlations_by_tool_use
-            .get_mut(tool_use_id)
-            .and_then(|record| {
-                record.conflicted = true;
-                record.launched_agent_id.clone()
-            });
-        agent_id
-            .map(|agent_id| self.poison_agent(&agent_id))
-            .unwrap_or_default()
+            .get(tool_use_id)
+            .map(|record| (record.launched_agent_id.clone(), record.task_id.clone()));
+        self.tombstoned_tools.insert(tool_use_id);
+        let Some((agent_id, task_id)) = identities else {
+            return Vec::new();
+        };
+        let retired = self.retire_identity_chain(task_id.as_deref(), agent_id.as_deref());
+        retired
+            .then(|| ClaudeTaskControlEffect::Retire {
+                agent_id: agent_id.expect("retired target has an agent identity"),
+            })
+            .into_iter()
+            .collect()
+    }
+
+    fn reconcile_all(&mut self) -> Vec<ClaudeTaskControlEffect> {
+        let tool_use_ids = self
+            .correlations_by_tool_use
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        tool_use_ids
+            .into_iter()
+            .flat_map(|tool_use_id| self.reconcile(&tool_use_id))
+            .collect()
     }
 
     fn reconcile(&mut self, tool_use_id: &str) -> Vec<ClaudeTaskControlEffect> {
@@ -521,6 +671,9 @@ impl ClaudeTaskControlCorrelator {
             return Vec::new();
         };
         if !self.verified_agents.contains(&agent_id) {
+            return Vec::new();
+        }
+        if !self.source_owner_agrees(tool_use_id) {
             return Vec::new();
         }
 
@@ -550,13 +703,20 @@ impl ClaudeTaskControlCorrelator {
             || (self.agent_by_task.len() >= ACTIVITY_PAGE_MAX_LENGTH
                 && !self.agent_by_task.contains_key(&task_id))
         {
-            self.saturated = true;
+            self.tombstoned_tools.insert(tool_use_id);
+            self.tombstoned_agents.insert(&agent_id);
+            self.tombstoned_tasks.insert(&task_id);
+            self.correlations_by_tool_use.remove(tool_use_id);
+            self.verified_agents.remove(&agent_id);
             return effects;
         }
         self.agent_by_task.insert(task_id.clone(), agent_id.clone());
-        if self.terminal_status_by_task.contains(&task_id) {
-            self.retire_terminal_mapping(&task_id, &agent_id);
-            effects.push(ClaudeTaskControlEffect::Stopped { agent_id });
+        if let Some(lifecycle) = self.pending_terminal_by_task.get(&task_id).copied() {
+            self.retire_identity_chain(Some(&task_id), Some(&agent_id));
+            effects.push(ClaudeTaskControlEffect::Terminal {
+                agent_id,
+                lifecycle,
+            });
         } else {
             self.actor_target_by_agent
                 .insert(agent_id.clone(), task_id.clone());
@@ -565,33 +725,76 @@ impl ClaudeTaskControlCorrelator {
         effects
     }
 
-    fn retire_terminal_mapping(&mut self, task_id: &str, agent_id: &str) {
-        self.actor_target_by_agent.remove(agent_id);
-        self.agent_by_task.remove(task_id);
-        self.verified_agents.remove(agent_id);
-        self.terminal_status_by_task.remove(task_id);
-        self.terminal_status_order
-            .retain(|retained| retained != task_id);
-        self.correlations_by_tool_use.retain(|_, record| {
-            record.task_id.as_deref() != Some(task_id)
-                && record.launched_agent_id.as_deref() != Some(agent_id)
-        });
+    fn source_owner_agrees(&self, tool_use_id: &str) -> bool {
+        let Some(record) = self.correlations_by_tool_use.get(tool_use_id) else {
+            return false;
+        };
+        match (&record.invocation_source, &record.hook_source) {
+            (Some(ClaudeInvocationSource::Root), Some(ClaudeHookSource::Root)) => true,
+            (
+                Some(ClaudeInvocationSource::ParentTool(parent_tool_use_id)),
+                Some(ClaudeHookSource::Agent(source_agent_id)),
+            ) => self
+                .correlations_by_tool_use
+                .get(parent_tool_use_id)
+                .is_some_and(|parent| {
+                    !parent.conflicted
+                        && parent.launched_agent_id.as_deref() == Some(source_agent_id)
+                        && self.verified_agents.contains(source_agent_id)
+                        && self.actor_target_by_agent.contains_key(source_agent_id)
+                }),
+            _ => false,
+        }
+    }
+
+    fn retire_identity_chain(&mut self, task_id: Option<&str>, agent_id: Option<&str>) -> bool {
+        let mut tools = Vec::new();
+        let mut tasks = BTreeSet::new();
+        let mut agents = BTreeSet::new();
+        if let Some(task_id) = task_id {
+            tasks.insert(task_id.to_owned());
+        }
+        if let Some(agent_id) = agent_id {
+            agents.insert(agent_id.to_owned());
+        }
+        for (tool_use_id, record) in &self.correlations_by_tool_use {
+            if task_id.is_some_and(|value| record.task_id.as_deref() == Some(value))
+                || agent_id.is_some_and(|value| record.launched_agent_id.as_deref() == Some(value))
+            {
+                tools.push(tool_use_id.clone());
+                if let Some(task_id) = &record.task_id {
+                    tasks.insert(task_id.clone());
+                }
+                if let Some(agent_id) = &record.launched_agent_id {
+                    agents.insert(agent_id.clone());
+                }
+            }
+        }
+        let retired_target = agents
+            .iter()
+            .any(|agent_id| self.actor_target_by_agent.contains_key(agent_id));
+        for tool_use_id in tools {
+            self.correlations_by_tool_use.remove(&tool_use_id);
+            self.tombstoned_tools.insert(&tool_use_id);
+        }
+        for task_id in tasks {
+            self.agent_by_task.remove(&task_id);
+            self.pending_terminal_by_task.remove(&task_id);
+            self.retired_agent_by_task.remove(&task_id);
+            self.tombstoned_tasks.insert(&task_id);
+        }
+        for agent_id in agents {
+            self.actor_target_by_agent.remove(&agent_id);
+            self.verified_agents.remove(&agent_id);
+            self.tombstoned_agents.insert(&agent_id);
+        }
+        retired_target
     }
 
     fn poison_agent(&mut self, agent_id: &str) -> Vec<ClaudeTaskControlEffect> {
-        for record in self.correlations_by_tool_use.values_mut() {
-            if record.launched_agent_id.as_deref() == Some(agent_id) {
-                record.conflicted = true;
-            }
-        }
-        let task_id = self.actor_target_by_agent.remove(agent_id);
-        if let Some(task_id) = task_id.as_ref()
-            && self.agent_by_task.get(task_id).map(String::as_str) == Some(agent_id)
-        {
-            self.agent_by_task.remove(task_id);
-        }
-        task_id
-            .map(|_| ClaudeTaskControlEffect::Retire {
+        let retired = self.retire_identity_chain(None, Some(agent_id));
+        retired
+            .then(|| ClaudeTaskControlEffect::Retire {
                 agent_id: agent_id.to_owned(),
             })
             .into_iter()
@@ -599,16 +802,17 @@ impl ClaudeTaskControlCorrelator {
     }
 
     fn poison_task(&mut self, task_id: &str) -> Vec<ClaudeTaskControlEffect> {
-        for record in self.correlations_by_tool_use.values_mut() {
-            if record.task_id.as_deref() == Some(task_id) {
-                record.conflicted = true;
-            }
-        }
-        let agent_id = self.agent_by_task.remove(task_id);
-        agent_id
-            .and_then(|agent_id| {
-                self.actor_target_by_agent.remove(&agent_id)?;
-                Some(ClaudeTaskControlEffect::Retire { agent_id })
+        let agent_id = self.agent_by_task.get(task_id).cloned().or_else(|| {
+            self.correlations_by_tool_use.values().find_map(|record| {
+                (record.task_id.as_deref() == Some(task_id))
+                    .then(|| record.launched_agent_id.clone())
+                    .flatten()
+            })
+        });
+        let retired = self.retire_identity_chain(Some(task_id), agent_id.as_deref());
+        retired
+            .then(|| ClaudeTaskControlEffect::Retire {
+                agent_id: agent_id.expect("retired target has an agent identity"),
             })
             .into_iter()
             .collect()
@@ -620,8 +824,25 @@ impl ClaudeTaskControlCorrelator {
             && self.verified_agents.len() <= ACTIVITY_PAGE_MAX_LENGTH
             && self.actor_target_by_agent.len() <= ACTIVITY_PAGE_MAX_LENGTH
             && self.agent_by_task.len() <= ACTIVITY_PAGE_MAX_LENGTH
-            && self.terminal_status_by_task.len() <= ACTIVITY_PAGE_MAX_LENGTH
-            && self.terminal_status_order.len() <= ACTIVITY_PAGE_MAX_LENGTH
+            && self.retired_agent_by_task.len() <= ACTIVITY_PAGE_MAX_LENGTH
+            && self.pending_terminal_by_task.len() <= ACTIVITY_PAGE_MAX_LENGTH
+    }
+
+    #[cfg(test)]
+    fn active_identity_maps_are_empty(&self) -> bool {
+        self.correlations_by_tool_use.is_empty()
+            && self.verified_agents.is_empty()
+            && self.actor_target_by_agent.is_empty()
+            && self.agent_by_task.is_empty()
+    }
+}
+
+fn task_notification_lifecycle(status: &str) -> Option<ActivityLifecycle> {
+    match status {
+        "stopped" | "cancelled" => Some(ActivityLifecycle::Cancelled),
+        "failed" => Some(ActivityLifecycle::Failed),
+        "interrupted" => Some(ActivityLifecycle::Interrupted),
+        _ => None,
     }
 }
 
@@ -784,7 +1005,6 @@ impl ClaudeProviderRuntime {
     pub fn handle_message(&mut self, message: ClaudeMessage) -> Vec<CanonicalEvent> {
         match message {
             ClaudeMessage::StreamEvent(message) => self.handle_stream_event(message.event),
-            ClaudeMessage::System(_) => Vec::new(),
             ClaudeMessage::User(message) => self.handle_user_message(message.message.content),
             ClaudeMessage::Assistant(message) => self.handle_assistant_message(message),
             ClaudeMessage::Result(message) => self.handle_result_message(message),
@@ -938,13 +1158,14 @@ impl ClaudeProviderRuntime {
                 ..ClaudeRuntimeOutput::default()
             };
         }
-        let control_effects = root_agent_tool_identity(value)
-            .map(|(session_id, tool_use_id, tool_name)| {
+        let control_effects = agent_tool_identity(value)
+            .map(|(session_id, tool_use_id, tool_name, parent_tool_use_id)| {
                 self.task_control_correlator.observe_tool_invocation(
                     session_id,
                     self.activity_generation,
                     tool_use_id,
                     tool_name,
+                    parent_tool_use_id,
                 )
             })
             .unwrap_or_default();
@@ -1000,25 +1221,35 @@ impl ClaudeProviderRuntime {
                     return Vec::new();
                 };
                 self.task_control_correlator.observe_async_launch(
-                    session_id,
                     self.activity_generation,
-                    tool_use_id,
-                    tool_name,
-                    status,
-                    agent_id,
+                    ClaudeAsyncLaunchFact {
+                        session_id,
+                        tool_use_id,
+                        tool_name,
+                        status,
+                        agent_id,
+                        source_agent_id: value.get("agent_id").and_then(Value::as_str),
+                    },
                 )
             }
-            Some("SubagentStart") => value
-                .get("agent_id")
-                .and_then(Value::as_str)
-                .map(|agent_id| {
-                    self.task_control_correlator.observe_verified_agent(
-                        session_id,
-                        self.activity_generation,
-                        agent_id,
-                    )
-                })
-                .unwrap_or_default(),
+            Some("SubagentStart") => {
+                value
+                    .get("agent_id")
+                    .and_then(Value::as_str)
+                    .map_or_else(Vec::new, |agent_id| {
+                        if !self
+                            .activity_tracker
+                            .is_correlated_actor(session_id, agent_id)
+                        {
+                            return Vec::new();
+                        }
+                        self.task_control_correlator.observe_verified_agent(
+                            session_id,
+                            self.activity_generation,
+                            agent_id,
+                        )
+                    })
+            }
             Some("SubagentStop") => value
                 .get("agent_id")
                 .and_then(Value::as_str)
@@ -1064,10 +1295,13 @@ impl ClaudeProviderRuntime {
                         target: None,
                     });
                 }
-                ClaudeTaskControlEffect::Stopped { agent_id } => {
+                ClaudeTaskControlEffect::Terminal {
+                    agent_id,
+                    lifecycle,
+                } => {
                     activity.extend(
                         self.activity_tracker
-                            .handle_task_stopped(&agent_id, emitted_at_ms)
+                            .handle_task_terminal(&agent_id, lifecycle, emitted_at_ms)
                             .mutations,
                     );
                 }
@@ -1723,11 +1957,8 @@ enum ClaudeMessageRoute {
     SuppressedChildText,
 }
 
-fn root_agent_tool_identity(value: &Value) -> Option<(&str, &str, &str)> {
+fn agent_tool_identity(value: &Value) -> Option<(&str, &str, &str, Option<&str>)> {
     if value.get("type").and_then(Value::as_str) != Some("stream_event")
-        || value
-            .get("parent_tool_use_id")
-            .is_some_and(|parent| !parent.is_null())
         || value.pointer("/event/type").and_then(Value::as_str) != Some("content_block_start")
         || value
             .pointer("/event/content_block/type")
@@ -1736,10 +1967,17 @@ fn root_agent_tool_identity(value: &Value) -> Option<(&str, &str, &str)> {
     {
         return None;
     }
+    let parent = value.get("parent_tool_use_id")?;
+    let parent_tool_use_id = if parent.is_null() {
+        None
+    } else {
+        Some(parent.as_str()?)
+    };
     Some((
         value.get("session_id")?.as_str()?,
         value.pointer("/event/content_block/id")?.as_str()?,
         value.pointer("/event/content_block/name")?.as_str()?,
+        parent_tool_use_id,
     ))
 }
 
@@ -1783,7 +2021,6 @@ fn claude_message_route(message: &ClaudeMessage) -> ClaudeMessageRoute {
         ClaudeMessage::Assistant(_) | ClaudeMessage::Result(_) | ClaudeMessage::StreamEvent(_) => {
             ClaudeMessageRoute::Root
         }
-        ClaudeMessage::System(_) => ClaudeMessageRoute::Root,
     }
 }
 
@@ -1977,6 +2214,7 @@ fn is_interrupted_error(error: &str) -> bool {
 #[cfg(test)]
 mod targeted_task_correlation_tests {
     use super::*;
+    use crate::activity::ActivityLifecycle;
 
     fn facts(session_id: &str, tool_use_id: &str, agent_id: &str, task_id: &str) -> [Value; 4] {
         [
@@ -2291,5 +2529,350 @@ mod targeted_task_correlation_tests {
             .collect::<Vec<_>>();
         assert!(mapped_targets(&outputs).is_empty());
         assert!(runtime.task_control_correlator.state_is_bounded());
+    }
+
+    #[test]
+    fn targeted_task_tombstone_membership_only_disables_control() {
+        // Mutation caught: treating probabilistic tombstone membership as positive correlation.
+        let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+        runtime
+            .task_control_correlator
+            .tombstoned_tools
+            .insert("tool-filtered");
+        let outputs = facts(
+            "session",
+            "tool-filtered",
+            "agent-filtered",
+            "task-filtered",
+        )
+        .iter()
+        .enumerate()
+        .map(|(index, fact)| handle_fact(&mut runtime, fact, true, index as u64))
+        .collect::<Vec<_>>();
+        assert!(mapped_targets(&outputs).is_empty());
+        assert!(
+            outputs
+                .iter()
+                .flat_map(|output| &output.activity)
+                .all(|mutation| !matches!(
+                    mutation,
+                    ProviderActivityMutation::UpsertActor(actor) if actor.status.is_terminal()
+                ))
+        );
+        assert!(runtime.task_control_correlator.state_is_bounded());
+    }
+
+    #[test]
+    fn targeted_task_correlation_prunes_normal_completions_without_reopening_tombstones() {
+        // Mutation caught: retaining terminal joins until the 200-entry pending map blocks a long session.
+        let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+        for index in 0..=ACTIVITY_PAGE_MAX_LENGTH {
+            let chain = facts(
+                "session",
+                &format!("tool-{index}"),
+                &format!("agent-{index}"),
+                &format!("task-{index}"),
+            );
+            let outputs = chain
+                .iter()
+                .enumerate()
+                .map(|(offset, fact)| {
+                    handle_fact(&mut runtime, fact, true, index as u64 * 10 + offset as u64)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                mapped_targets(&outputs).len(),
+                1,
+                "sequential chain {index}"
+            );
+            let stopped = handle_fact(
+                &mut runtime,
+                &json!({
+                    "hook_event_name":"SubagentStop",
+                    "session_id":"session",
+                    "agent_id":format!("agent-{index}"),
+                    "agent_type":"identical"
+                }),
+                true,
+                index as u64 * 10 + 5,
+            );
+            assert!(stopped.activity_controls.iter().any(|update| matches!(
+                update,
+                ProviderActivityControlUpdate::ActorTarget { target: None, .. }
+            )));
+            assert!(
+                runtime
+                    .task_control_correlator
+                    .active_identity_maps_are_empty()
+            );
+        }
+        assert!(runtime.task_control_correlator.state_is_bounded());
+
+        let replay = facts("session", "tool-0", "agent-0", "task-0")
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 10_000 + index as u64))
+            .collect::<Vec<_>>();
+        assert!(
+            mapped_targets(&replay).is_empty(),
+            "terminal identities must not reopen"
+        );
+    }
+
+    #[test]
+    fn targeted_task_correlation_never_evicts_pending_terminal_authority() {
+        // Mutation caught: FIFO eviction of an early stopped notification followed by a delayed join.
+        let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+        let first_terminal = json!({
+            "type":"system",
+            "subtype":"task_notification",
+            "session_id":"session",
+            "task_id":"task-delayed",
+            "status":"stopped"
+        });
+        let _ = handle_fact(&mut runtime, &first_terminal, true, 0);
+        for index in 0..=ACTIVITY_PAGE_MAX_LENGTH {
+            let _ = handle_fact(
+                &mut runtime,
+                &json!({
+                    "type":"system",
+                    "subtype":"task_notification",
+                    "session_id":"session",
+                    "task_id":format!("unmatched-{index}"),
+                    "status":"stopped"
+                }),
+                true,
+                index as u64 + 1,
+            );
+        }
+        let outputs = facts("session", "tool-delayed", "agent-delayed", "task-delayed")
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 1_000 + index as u64))
+            .collect::<Vec<_>>();
+        assert!(mapped_targets(&outputs).is_empty());
+        assert!(
+            outputs
+                .iter()
+                .flat_map(|output| &output.activity)
+                .any(|mutation| matches!(
+                    mutation,
+                    ProviderActivityMutation::UpsertActor(actor)
+                        if actor.id == "claude:agent:agent-delayed"
+                            && actor.status == ActivityLifecycle::Cancelled
+                ))
+        );
+        assert!(runtime.task_control_correlator.state_is_bounded());
+    }
+
+    #[test]
+    fn targeted_task_correlation_nested_source_owner_must_match_exact_parent_chain() {
+        // Mutation caught: rejecting all nested Agent invocations or trusting a mismatched child hook source.
+        let parent = facts("session", "tool-parent", "agent-parent", "task-parent");
+        let nested = [
+            json!({
+                "type":"stream_event",
+                "session_id":"session",
+                "uuid":"nested-tool",
+                "parent_tool_use_id":"tool-parent",
+                "event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-child","name":"Agent","input":{"description":"identical","prompt":"identical"}}}
+            }),
+            json!({
+                "hook_event_name":"PostToolUse",
+                "session_id":"session",
+                "agent_id":"agent-parent",
+                "tool_name":"Agent",
+                "tool_use_id":"tool-child",
+                "tool_response":{"status":"async_launched","agentId":"agent-child"}
+            }),
+            json!({
+                "type":"system","subtype":"task_started","session_id":"session",
+                "task_id":"task-child","tool_use_id":"tool-child","task_type":"local_agent"
+            }),
+            json!({
+                "hook_event_name":"SubagentStart","session_id":"session",
+                "agent_id":"agent-child","parent_agent_id":"agent-parent","agent_type":"identical"
+            }),
+        ];
+        for order in permutations([0, 1, 2, 3]) {
+            let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+            for (index, fact) in parent.iter().enumerate() {
+                let _ = handle_fact(&mut runtime, fact, true, index as u64);
+            }
+            let outputs = order
+                .into_iter()
+                .enumerate()
+                .map(|(index, fact)| {
+                    handle_fact(&mut runtime, &nested[fact], true, 10 + index as u64)
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                mapped_targets(&outputs),
+                [(
+                    "claude:agent:agent-child".to_owned(),
+                    "task-child".to_owned()
+                )],
+                "failed exact nested fact order {order:?}"
+            );
+        }
+
+        for (name, mutate) in [
+            ("mismatched root and child source", 0_u8),
+            ("mismatched hook owner", 1),
+            ("cross-parent invocation", 2),
+            ("missing hook source", 3),
+        ] {
+            let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+            for (index, fact) in parent.iter().enumerate() {
+                let _ = handle_fact(&mut runtime, fact, true, index as u64);
+            }
+            let mut invalid = nested.clone();
+            match mutate {
+                0 => invalid[0]["parent_tool_use_id"] = Value::Null,
+                1 => invalid[1]["agent_id"] = json!("agent-other"),
+                2 => invalid[0]["parent_tool_use_id"] = json!("tool-other"),
+                3 => {
+                    invalid[1]
+                        .as_object_mut()
+                        .expect("hook object")
+                        .remove("agent_id");
+                }
+                _ => unreachable!(),
+            }
+            let outputs = invalid
+                .iter()
+                .enumerate()
+                .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 20 + index as u64))
+                .collect::<Vec<_>>();
+            assert!(mapped_targets(&outputs).is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn targeted_task_terminal_notifications_are_monotonic_before_and_after_join() {
+        // Mutation caught: treating failed/interrupted tasks as ordinary SubagentStop completion.
+        for (provider_status, expected) in [
+            ("stopped", ActivityLifecycle::Cancelled),
+            ("failed", ActivityLifecycle::Failed),
+            ("interrupted", ActivityLifecycle::Interrupted),
+        ] {
+            for notification_first in [false, true] {
+                let mut runtime =
+                    ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+                let chain = facts("session", "tool-a", "agent-a", "task-a");
+                let notification = json!({
+                    "type":"system","subtype":"task_notification","session_id":"session",
+                    "task_id":"task-a","status":provider_status
+                });
+                let mut outputs = Vec::new();
+                if notification_first {
+                    outputs.push(handle_fact(&mut runtime, &notification, true, 0));
+                }
+                outputs.extend(
+                    chain.iter().enumerate().map(|(index, fact)| {
+                        handle_fact(&mut runtime, fact, true, index as u64 + 1)
+                    }),
+                );
+                if !notification_first {
+                    outputs.push(handle_fact(&mut runtime, &notification, true, 10));
+                }
+                outputs.push(handle_fact(
+                    &mut runtime,
+                    &json!({
+                        "hook_event_name":"SubagentStop","session_id":"session",
+                        "agent_id":"agent-a","agent_type":"identical",
+                        "last_assistant_message":"must not complete"
+                    }),
+                    true,
+                    20,
+                ));
+                let terminal = outputs
+                    .iter()
+                    .flat_map(|output| &output.activity)
+                    .filter_map(|mutation| match mutation {
+                        ProviderActivityMutation::UpsertActor(actor)
+                            if actor.id == "claude:agent:agent-a" && actor.status.is_terminal() =>
+                        {
+                            Some(actor.status)
+                        }
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    terminal,
+                    [expected],
+                    "{provider_status}/{notification_first}"
+                );
+                assert!(
+                    outputs
+                        .iter()
+                        .rev()
+                        .take(2)
+                        .flat_map(|output| &output.activity_controls)
+                        .any(|update| matches!(
+                            update,
+                            ProviderActivityControlUpdate::ActorTarget { target: None, .. }
+                        ))
+                        || notification_first
+                );
+                let replay = chain
+                    .iter()
+                    .enumerate()
+                    .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 30 + index as u64))
+                    .collect::<Vec<_>>();
+                assert!(mapped_targets(&replay).is_empty());
+                assert!(
+                    runtime
+                        .task_control_correlator
+                        .active_identity_maps_are_empty()
+                );
+                let duplicate = handle_fact(&mut runtime, &notification, true, 40);
+                assert!(duplicate.activity.is_empty());
+                assert!(
+                    runtime
+                        .task_control_correlator
+                        .pending_terminal_by_task
+                        .is_empty()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn targeted_task_terminal_notification_after_subagent_stop_overrides_completion() {
+        // Mutation caught: discarding the exact terminal task-to-agent link during normal retirement.
+        let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+        let chain = facts("session", "tool-a", "agent-a", "task-a");
+        for (index, fact) in chain.iter().enumerate() {
+            let _ = handle_fact(&mut runtime, fact, true, index as u64);
+        }
+        let stop = json!({
+            "hook_event_name":"SubagentStop","session_id":"session",
+            "agent_id":"agent-a","agent_type":"identical"
+        });
+        let notification = json!({
+            "type":"system","subtype":"task_notification","session_id":"session",
+            "task_id":"task-a","status":"failed"
+        });
+        let completed = handle_fact(&mut runtime, &stop, true, 10);
+        let failed = handle_fact(&mut runtime, &notification, true, 11);
+        let duplicate_stop = handle_fact(&mut runtime, &stop, true, 12);
+        assert!(completed.activity.iter().any(|mutation| matches!(
+            mutation,
+            ProviderActivityMutation::UpsertActor(actor)
+                if actor.status == ActivityLifecycle::Completed
+        )));
+        assert!(failed.activity.iter().any(|mutation| matches!(
+            mutation,
+            ProviderActivityMutation::UpsertActor(actor)
+                if actor.status == ActivityLifecycle::Failed
+        )));
+        assert!(duplicate_stop.activity.is_empty());
+        assert!(
+            runtime
+                .task_control_correlator
+                .retired_agent_by_task
+                .is_empty()
+        );
     }
 }
