@@ -208,8 +208,36 @@ struct RuntimeActivityState {
     resolved_hinted_descendant_ids: HashSet<String>,
     hint_source_versions: HashMap<String, Option<u64>>,
     pending_reconciliation_mutations: Vec<ProviderActivityMutation>,
-    pending_reconciliation_controls: Vec<crate::activity::ProviderActivityControlUpdate>,
+    pending_reconciliation_controls: Vec<StagedReconciliationControl>,
+    control_revision: u64,
+    control_revision_exhausted: bool,
+    live_control_revisions: HashMap<ActivityControlSubject, u64>,
     pending_reconciliation_topology_valid: bool,
+}
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+enum ActivityControlSubject {
+    Actor(String),
+    Work(String),
+}
+
+#[derive(Clone, Debug)]
+struct StagedReconciliationControl {
+    update: crate::activity::ProviderActivityControlUpdate,
+    observed_control_revision: u64,
+}
+
+fn activity_control_subject(
+    update: &crate::activity::ProviderActivityControlUpdate,
+) -> ActivityControlSubject {
+    match update {
+        crate::activity::ProviderActivityControlUpdate::ActorTarget { actor_id, .. } => {
+            ActivityControlSubject::Actor(actor_id.clone())
+        }
+        crate::activity::ProviderActivityControlUpdate::WorkTarget { work_item_id, .. } => {
+            ActivityControlSubject::Work(work_item_id.clone())
+        }
+    }
 }
 
 impl RuntimeActivityState {
@@ -334,12 +362,71 @@ impl RuntimeActivityState {
 
     fn stage_reconciliation_controls(
         &mut self,
+        observed_control_revision: u64,
         controls: impl IntoIterator<Item = crate::activity::ProviderActivityControlUpdate>,
     ) {
-        let remaining = RECONCILIATION_MUTATION_LIMIT
-            .saturating_sub(self.pending_reconciliation_controls.len());
+        if self.control_revision_exhausted {
+            return;
+        }
+        for update in controls {
+            let subject = activity_control_subject(&update);
+            if self
+                .live_control_revisions
+                .get(&subject)
+                .is_some_and(|revision| *revision > observed_control_revision)
+            {
+                continue;
+            }
+            self.pending_reconciliation_controls
+                .retain(|pending| activity_control_subject(&pending.update) != subject);
+            if self.pending_reconciliation_controls.len() < RECONCILIATION_MUTATION_LIMIT {
+                self.pending_reconciliation_controls
+                    .push(StagedReconciliationControl {
+                        update,
+                        observed_control_revision,
+                    });
+            }
+        }
+    }
+
+    fn record_live_controls(
+        &mut self,
+        controls: &[crate::activity::ProviderActivityControlUpdate],
+    ) {
+        if controls.is_empty() {
+            return;
+        }
+        let Some(revision) = self.control_revision.checked_add(1) else {
+            self.control_revision_exhausted = true;
+            self.pending_reconciliation_controls.clear();
+            return;
+        };
+        self.control_revision = revision;
+        for update in controls {
+            let subject = activity_control_subject(update);
+            self.live_control_revisions
+                .insert(subject.clone(), revision);
+            self.pending_reconciliation_controls
+                .retain(|pending| activity_control_subject(&pending.update) != subject);
+        }
+    }
+
+    fn current_reconciliation_controls(
+        &self,
+    ) -> Vec<crate::activity::ProviderActivityControlUpdate> {
+        if self.control_revision_exhausted {
+            return Vec::new();
+        }
         self.pending_reconciliation_controls
-            .extend(controls.into_iter().take(remaining));
+            .iter()
+            .filter(|pending| {
+                let subject = activity_control_subject(&pending.update);
+                self.live_control_revisions
+                    .get(&subject)
+                    .is_none_or(|revision| *revision <= pending.observed_control_revision)
+            })
+            .map(|pending| pending.update.clone())
+            .collect()
     }
 
     fn install_root_thread_id(&mut self, native_thread_id: &str) {
@@ -348,6 +435,9 @@ impl RuntimeActivityState {
             self.clear_hint_freshness();
             self.pending_reconciliation_mutations.clear();
             self.pending_reconciliation_controls.clear();
+            self.control_revision = 0;
+            self.control_revision_exhausted = false;
+            self.live_control_revisions.clear();
             self.pending_reconciliation_topology_valid = true;
         }
         self.tracker.set_root_thread_id(native_thread_id);
@@ -387,6 +477,7 @@ struct ReconciliationPass {
     epoch: u64,
     root_thread_id: String,
     cancellation: CancellationToken,
+    observed_control_revision: u64,
 }
 
 enum ReconciliationEmission {
@@ -640,6 +731,9 @@ impl CodexSessionRuntime {
                 hint_source_versions: HashMap::new(),
                 pending_reconciliation_mutations: Vec::new(),
                 pending_reconciliation_controls: Vec::new(),
+                control_revision: 0,
+                control_revision_exhausted: false,
+                live_control_revisions: HashMap::new(),
                 pending_reconciliation_topology_valid: true,
             }),
         });
@@ -683,6 +777,9 @@ impl CodexSessionRuntime {
             activity.clear_hint_freshness();
             activity.pending_reconciliation_mutations.clear();
             activity.pending_reconciliation_controls.clear();
+            activity.control_revision = 0;
+            activity.control_revision_exhausted = false;
+            activity.live_control_revisions.clear();
             activity.pending_reconciliation_topology_valid = true;
             if enabled {
                 activity.tracker.begin_detail_baseline();
@@ -1461,7 +1558,7 @@ impl CodexSessionRuntime {
             Ok(root_thread_id) => root_thread_id,
             Err(_) => return,
         };
-        let (epoch, cancellation) = {
+        let (epoch, cancellation, observed_control_revision) = {
             let activity = self.inner.activity.lock().await;
             if !activity.agent_activity_enabled || !activity.tracker.is_root_thread(&root_thread_id)
             {
@@ -1470,12 +1567,14 @@ impl CodexSessionRuntime {
             (
                 activity.reconciliation_epoch,
                 activity.reconciliation_pass_cancellation.clone(),
+                activity.control_revision,
             )
         };
         let pass = ReconciliationPass {
             epoch,
             root_thread_id: root_thread_id.clone(),
             cancellation,
+            observed_control_revision,
         };
         let connection = self.inner.connection.lock().await.clone();
         let pending_hinted_descendants = self
@@ -1549,7 +1648,10 @@ impl CodexSessionRuntime {
                         );
                         activity.enqueue_hinted_descendants(&hinted_descendant_ids);
                         activity.stage_reconciliation_mutations(hints.mutations);
-                        activity.stage_reconciliation_controls(hints.controls);
+                        activity.stage_reconciliation_controls(
+                            pass.observed_control_revision,
+                            hints.controls,
+                        );
                         drop(activity);
                         for thread_id in hinted_descendant_ids {
                             if !thread_id.is_empty()
@@ -1690,8 +1792,10 @@ impl CodexSessionRuntime {
                 );
             activity
                 .stage_reconciliation_mutations(std::mem::take(&mut descendants.output.mutations));
-            activity
-                .stage_reconciliation_controls(std::mem::take(&mut descendants.output.controls));
+            activity.stage_reconciliation_controls(
+                pass.observed_control_revision,
+                std::mem::take(&mut descendants.output.controls),
+            );
             descendants
         };
         let read_enabled = !read_incompatible
@@ -1756,7 +1860,10 @@ impl CodexSessionRuntime {
                         .iter()
                         .any(|accepted| accepted == &thread_id);
                     activity.stage_reconciliation_mutations(descendants.output.mutations);
-                    activity.stage_reconciliation_controls(descendants.output.controls);
+                    activity.stage_reconciliation_controls(
+                        pass.observed_control_revision,
+                        descendants.output.controls,
+                    );
                     if !accepted {
                         activity.remove_pending_hinted_descendant(&thread_id);
                         activity.mark_hinted_descendant_resolved(&thread_id);
@@ -1782,10 +1889,16 @@ impl CodexSessionRuntime {
                     );
                     activity.enqueue_hinted_descendants(&nested_hinted_descendants);
                     activity.stage_reconciliation_mutations(hints.mutations);
-                    activity.stage_reconciliation_controls(hints.controls);
+                    activity.stage_reconciliation_controls(
+                        pass.observed_control_revision,
+                        hints.controls,
+                    );
                     let history = activity.tracker.reconcile_thread_history(&response.thread);
                     activity.stage_reconciliation_mutations(history.mutations);
-                    activity.stage_reconciliation_controls(history.controls);
+                    activity.stage_reconciliation_controls(
+                        pass.observed_control_revision,
+                        history.controls,
+                    );
                     nested_hinted_descendants
                 };
                 read_succeeded = true;
@@ -2132,6 +2245,7 @@ impl CodexSessionRuntime {
                     receive_sequence,
                 );
                 state.enqueue_hinted_descendants(&output.hinted_descendant_ids);
+                state.record_live_controls(&output.controls);
                 let is_root = notification_thread_id
                     .is_some_and(|thread_id| state.tracker.is_root_thread(thread_id));
                 let is_verified_child = notification_thread_id
@@ -2526,7 +2640,7 @@ impl CodexSessionRuntime {
                     native_event_id: Some(format!("codex:reconciliation:{sequence}")),
                     activity,
                     activity_controls: if final_batch {
-                        activity_state.pending_reconciliation_controls.clone()
+                        activity_state.current_reconciliation_controls()
                     } else {
                         Vec::new()
                     },
@@ -3186,6 +3300,7 @@ mod tests {
                 MCP_STATUS_PAGE_LIMIT, MCP_STATUS_PAGE_SIZE, MCP_STATUS_REQUEST_TIMEOUT,
                 McpServerState, McpServerStatus,
             },
+            model::ReconciliationThread,
             protocol::ConnectionConfig,
         },
     };
@@ -5900,6 +6015,170 @@ mod tests {
         activity.tracker.begin_detail_baseline();
     }
 
+    fn verified_reconciliation_child() -> ReconciliationThread {
+        decode_thread_read_response(json!({
+            "thread": {
+                "id": "durable-child",
+                "parentThreadId": "provider-root",
+                "createdAt": 1,
+                "updatedAt": 2,
+                "status": {"type": "active", "activeFlags": []},
+                "turns": []
+            }
+        }))
+        .expect("verified child")
+        .thread
+    }
+
+    async fn emit_successful_reconciliation(runtime: &CodexSessionRuntime) {
+        let (pass, capabilities) = {
+            let activity = runtime.inner.activity.lock().await;
+            (
+                ReconciliationPass {
+                    epoch: activity.reconciliation_epoch,
+                    root_thread_id: "provider-root".to_owned(),
+                    cancellation: activity.reconciliation_pass_cancellation.clone(),
+                    observed_control_revision: activity.control_revision,
+                },
+                activity.capabilities.clone(),
+            )
+        };
+        runtime
+            .emit_reconciliation(
+                &pass,
+                ReconciliationEmission::Successful {
+                    capabilities,
+                    mutations: Vec::new(),
+                },
+            )
+            .await;
+    }
+
+    #[tokio::test]
+    async fn newer_live_start_supersedes_staged_reconciliation_revocation() {
+        // Mutation caught: publishing an old reconciled None after a newer live target.
+        let (connection, incoming, _stdout, _stdin, _stderr) = runtime_test_connection();
+        let runtime = CodexSessionRuntime::new(reconciliation_test_options(), connection, incoming);
+        configure_reconciliation_test_runtime(&runtime).await;
+        {
+            let mut activity = runtime.inner.activity.lock().await;
+            activity
+                .tracker
+                .reconcile_descendants(&[verified_reconciliation_child()]);
+            activity.tracker.handle_notification(
+                "turn/started",
+                &json!({
+                    "threadId": "durable-child",
+                    "turn": {"id": "turn-1", "status": "inProgress", "startedAt": 3}
+                }),
+                3_000,
+                0,
+            );
+            let terminal = activity.tracker.handle_notification(
+                "turn/completed",
+                &json!({
+                    "threadId": "durable-child",
+                    "turn": {"id": "turn-1", "status": "completed", "completedAt": 4}
+                }),
+                4_000,
+                1,
+            );
+            let observed_control_revision = activity.control_revision;
+            activity.stage_reconciliation_controls(observed_control_revision, terminal.controls);
+        }
+
+        runtime
+            .handle_notification(
+                "turn/started".to_owned(),
+                json!({
+                    "threadId": "durable-child",
+                    "turn": {"id": "turn-2", "status": "inProgress", "startedAt": 5}
+                }),
+                5_000,
+            )
+            .await;
+        emit_successful_reconciliation(&runtime).await;
+
+        let events = drain_runtime_events(&runtime).await;
+        let reconciliation = events
+            .iter()
+            .find(|event| {
+                event
+                    .native_event_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("codex:reconciliation:"))
+            })
+            .expect("reconciliation event");
+        assert!(reconciliation.activity_controls.is_empty());
+        assert!(
+            runtime
+                .inner
+                .activity
+                .lock()
+                .await
+                .tracker
+                .is_current_target("durable-child", "turn-2")
+        );
+    }
+
+    #[tokio::test]
+    async fn newer_live_completion_supersedes_staged_reconciliation_target() {
+        // Mutation caught: publishing an old reconciled Some after live completion.
+        let (connection, incoming, _stdout, _stdin, _stderr) = runtime_test_connection();
+        let runtime = CodexSessionRuntime::new(reconciliation_test_options(), connection, incoming);
+        configure_reconciliation_test_runtime(&runtime).await;
+        {
+            let mut activity = runtime.inner.activity.lock().await;
+            activity
+                .tracker
+                .reconcile_descendants(&[verified_reconciliation_child()]);
+            let active = activity.tracker.handle_notification(
+                "turn/started",
+                &json!({
+                    "threadId": "durable-child",
+                    "turn": {"id": "turn-1", "status": "inProgress", "startedAt": 3}
+                }),
+                3_000,
+                0,
+            );
+            let observed_control_revision = activity.control_revision;
+            activity.stage_reconciliation_controls(observed_control_revision, active.controls);
+        }
+
+        runtime
+            .handle_notification(
+                "turn/completed".to_owned(),
+                json!({
+                    "threadId": "durable-child",
+                    "turn": {"id": "turn-1", "status": "completed", "completedAt": 4}
+                }),
+                4_000,
+            )
+            .await;
+        emit_successful_reconciliation(&runtime).await;
+
+        let events = drain_runtime_events(&runtime).await;
+        let reconciliation = events
+            .iter()
+            .find(|event| {
+                event
+                    .native_event_id
+                    .as_deref()
+                    .is_some_and(|id| id.starts_with("codex:reconciliation:"))
+            })
+            .expect("reconciliation event");
+        assert!(reconciliation.activity_controls.is_empty());
+        assert!(
+            !runtime
+                .inner
+                .activity
+                .lock()
+                .await
+                .tracker
+                .is_current_target("durable-child", "turn-1")
+        );
+    }
+
     fn root_reconciliation_response(request: &Value) -> Value {
         json!({
             "id": request["id"].clone(),
@@ -6199,6 +6478,7 @@ mod tests {
                 epoch: activity.reconciliation_epoch,
                 root_thread_id: "provider-root".to_owned(),
                 cancellation: activity.reconciliation_pass_cancellation.clone(),
+                observed_control_revision: activity.control_revision,
             }
         };
         let capabilities = ActivityCapabilities::structured_full(false);
@@ -6280,6 +6560,7 @@ mod tests {
                 epoch: activity.reconciliation_epoch,
                 root_thread_id: "provider-root".to_owned(),
                 cancellation: activity.reconciliation_pass_cancellation.clone(),
+                observed_control_revision: activity.control_revision,
             }
         };
         let capabilities = ActivityCapabilities::structured_full(false);
@@ -6445,6 +6726,7 @@ mod tests {
                 epoch: activity.reconciliation_epoch,
                 root_thread_id: "provider-root".to_owned(),
                 cancellation: activity.reconciliation_pass_cancellation.clone(),
+                observed_control_revision: activity.control_revision,
             }
         };
         let capabilities = ActivityCapabilities::structured_full(false);
@@ -6619,6 +6901,7 @@ mod tests {
                 epoch: activity.reconciliation_epoch,
                 root_thread_id: "provider-root".to_owned(),
                 cancellation: activity.reconciliation_pass_cancellation.clone(),
+                observed_control_revision: activity.control_revision,
             }
         };
         runtime
