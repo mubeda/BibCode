@@ -58,6 +58,7 @@ const h = vi.hoisted(() => {
     captured: {} as Record<string, unknown>,
     atomValuesByKey: new Map<string, unknown>(),
     commandCalls: [] as Array<{ key: string; input: unknown }>,
+    commandOptions: [] as Array<{ key: string; options: unknown }>,
     commandResults: {} as Record<string, (input: unknown) => unknown>,
     defaultCommandResult: (() => undefined) as (input?: unknown) => unknown,
     environments: [] as unknown[],
@@ -108,8 +109,9 @@ const h = vi.hoisted(() => {
 // ── Heavy state/atom modules ─────────────────────────────────────────
 
 vi.mock("../state/use-atom-command", () => ({
-  useAtomCommand: (command: { key?: string } | null | undefined, _options?: unknown) => {
+  useAtomCommand: (command: { key?: string } | null | undefined, options?: unknown) => {
     const key = command && typeof command.key === "string" ? command.key : "unknown-command";
+    h.commandOptions.push({ key, options });
     return (input: unknown) => {
       h.commandCalls.push({ key, input });
       const respond = h.commandResults[key] ?? h.defaultCommandResult;
@@ -233,6 +235,8 @@ vi.mock("../state/activity", () => {
       stateAtom: (target: unknown) => atom("activity-state-source", target),
       roster: (target: unknown) => atom("activity-roster", target),
       detail: (target: unknown) => atom("activity-detail", target),
+      cancelSubtree: { key: "activity.cancelSubtree" },
+      retrySubtreeCancellation: { key: "activity.retrySubtreeCancellation" },
     },
   };
 });
@@ -857,6 +861,7 @@ beforeEach(() => {
   h.atomValuesByKey.set("atom:keybindings", []);
   h.atomValuesByKey.set("atom:editors", []);
   h.commandCalls.length = 0;
+  h.commandOptions.length = 0;
   h.commandResults = {};
   h.defaultCommandResult = () => AsyncResult.success(undefined);
   h.environments = [];
@@ -1015,6 +1020,7 @@ describe("ChatView", () => {
       records: ActivityRosterPageData["records"],
       nextCursor: string | null = null,
       cursor?: string,
+      actorControls: ActivityRosterPageData["actorControls"] = [],
     ): void => {
       h.queryDataByKey.set(
         activityKey("activity-roster", {
@@ -1028,7 +1034,7 @@ describe("ChatView", () => {
             limit: 200,
           },
         }),
-        { records, actorControls: [], nextCursor } satisfies ActivityRosterPageData,
+        { records, actorControls, nextCursor } satisfies ActivityRosterPageData,
       );
     };
 
@@ -1174,6 +1180,177 @@ describe("ChatView", () => {
       expect(props).toBeDefined();
       return props as ActivityPanelProps;
     };
+
+    it("binds server-fenced cancel and residual retry commands without reporting raw failures", async () => {
+      const child = actor("actor-cancellable", "Cancellable reviewer");
+      const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child], {
+        capabilities: {
+          actors: true,
+          attributedActivity: true,
+          backgroundWork: true,
+          historyRecovery: "full",
+          terminalObservation: false,
+          targetedActorCancellation: true,
+        },
+        control: {
+          scopeId: `scope-${threadId}` as ActivitySnapshot["scopeId"],
+          revision: 19,
+          actors: [
+            {
+              actorId: child.id,
+              state: "available",
+              controlRevision: 11,
+              activeDescendantCount: 2,
+            },
+          ],
+          operations: [
+            {
+              rootActorId: child.id,
+              state: "partial",
+              residualCount: 2,
+              message: "Some agents are still running.",
+              operationRevision: 17,
+            },
+          ],
+        },
+      });
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      seedActivityState(environmentId, snapshot.scope, snapshot);
+      seedRoster(environmentId, snapshot, "subagents", "active", [child], null, undefined, [
+        snapshot.control.actors[0]!,
+      ]);
+      seedRoster(environmentId, snapshot, "subagents", "done", []);
+
+      const { container, root } = await mountActivityRoute();
+      try {
+        await openSubagents(container);
+        const panel = latestActivityPanelProps();
+        await act(async () => panel.onCancelActor?.(child.id, 11));
+        await act(async () => panel.onRetryCancellation?.(child.id, 17));
+
+        expect(h.commandCalls.filter((call) => call.key.startsWith("activity."))).toEqual([
+          {
+            key: "activity.cancelSubtree",
+            input: {
+              environmentId,
+              input: {
+                scope: snapshot.scope,
+                scopeId: snapshot.scopeId,
+                actorId: child.id,
+                expectedControlRevision: 11,
+              },
+            },
+          },
+          {
+            key: "activity.retrySubtreeCancellation",
+            input: {
+              environmentId,
+              input: {
+                scope: snapshot.scope,
+                scopeId: snapshot.scopeId,
+                rootActorId: child.id,
+                expectedOperationRevision: 17,
+              },
+            },
+          },
+        ]);
+        expect(h.commandOptions.filter((entry) => entry.key.startsWith("activity."))).toEqual(
+          expect.arrayContaining([
+            { key: "activity.cancelSubtree", options: { reportFailure: false } },
+            {
+              key: "activity.retrySubtreeCancellation",
+              options: { reportFailure: false },
+            },
+          ]),
+        );
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it("maps typed cancellation failures to bounded copy without leaking native payloads", async () => {
+      const child = actor("actor-provider-down", "Provider-down reviewer");
+      const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child], {
+        capabilities: {
+          actors: true,
+          attributedActivity: true,
+          backgroundWork: true,
+          historyRecovery: "full",
+          terminalObservation: false,
+          targetedActorCancellation: true,
+        },
+      });
+      const nativePayload = "claude-task-id=secret-native-42 provider socket exploded";
+      h.commandResults["activity.cancelSubtree"] = () =>
+        AsyncResult.failure(
+          Cause.fail(new ActivityError({ reason: "providerUnavailable", message: nativePayload })),
+        );
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      seedActivityState(environmentId, snapshot.scope, snapshot);
+      seedActivityQueries(environmentId, snapshot, [child]);
+
+      const { container, root } = await mountActivityRoute();
+      try {
+        await openSubagents(container);
+        await act(async () => latestActivityPanelProps().onCancelActor?.(child.id, 5));
+        await vi.waitFor(() => {
+          expect(latestActivityPanelProps().cancellationError).toBe(
+            "The provider is unavailable. Try again when it reconnects.",
+          );
+        });
+        expect(container.textContent).not.toContain(nativePayload);
+        expect(container.textContent).not.toContain("secret-native-42");
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it("keeps provider-terminal Activity bindings read-only", async () => {
+      const terminalScope: ActivityScopeRef = {
+        _tag: "terminal",
+        threadId,
+        terminalId: "terminal-activity-1",
+      };
+      const child = actor("terminal-actor", "Terminal observer");
+      const snapshot = activitySnapshot(terminalScope, [child], {
+        capabilities: {
+          actors: true,
+          attributedActivity: true,
+          backgroundWork: true,
+          historyRecovery: "bounded",
+          terminalObservation: true,
+          targetedActorCancellation: true,
+        },
+      });
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      h.settings = { ...h.settings, enableTerminalAgentActivity: true };
+      seedActivityState(environmentId, terminalScope, snapshot);
+      seedActivityQueries(environmentId, snapshot, [child]);
+      useRightPanelStore.getState().openActivity(threadRef, "subagents", terminalScope);
+
+      const { container, root } = await mountActivityRoute();
+      try {
+        await vi.waitFor(() =>
+          expect(container.querySelector("[data-activity-panel]")).not.toBeNull(),
+        );
+        expect(latestActivityPanelProps().onCancelActor).toBeUndefined();
+        expect(latestActivityPanelProps().onRetryCancellation).toBeUndefined();
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
 
     it("removes activity UI and its persisted surface on settingsUpdated, then restores the dock", async () => {
       const child = actor("actor-settings-toggle", "Settings toggle reviewer");

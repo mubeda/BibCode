@@ -1,5 +1,7 @@
 import {
   ACTIVITY_PAGE_MAX_LENGTH,
+  type ActivityActorControl,
+  type ActivityRecordId,
   type ActivityRecordSummary,
   type ActivitySection,
   type ActivitySnapshot,
@@ -11,6 +13,7 @@ import { PROVIDER_ICON_BY_PROVIDER } from "~/components/chat/providerIconUtils";
 import { Alert, AlertAction, AlertDescription } from "~/components/ui/alert";
 import { Button } from "~/components/ui/button";
 import { Spinner } from "~/components/ui/spinner";
+import { Tooltip, TooltipPopup, TooltipTrigger } from "~/components/ui/tooltip";
 import {
   activityElapsedLabel,
   activityStatusLabel,
@@ -175,67 +178,111 @@ function recordTime(record: ActivityRecordSummary, now: string): string {
 
 interface ActivityRecordRowProps {
   readonly record: ActivityRecordSummary;
+  readonly control: ActivityActorControl | null;
   readonly provider: string;
   readonly now: string;
   readonly onSelect: (record: ActivityRecordSummary) => void;
+  readonly onCancelActor?: (actorId: ActivityRecordId, controlRevision: number) => void;
   readonly registerRow: (recordId: string, element: HTMLButtonElement | null) => void;
 }
 
 function ActivityRecordRow({
   record,
+  control,
   provider,
   now,
   onSelect,
+  onCancelActor,
   registerRow,
 }: ActivityRecordRowProps) {
   const recordProvider = providerForRecord(record, provider);
   const ProviderIcon = providerIcon(recordProvider);
   const RecordIcon = record._tag === "actor" ? BotIcon : ListTodoIcon;
   const typeLabel = record._tag === "actor" ? (record.role ?? "Actor") : record.workKind;
+  const stopping = control?.state === "requested";
+  const stopLabel =
+    control === null || record._tag !== "actor"
+      ? null
+      : control.activeDescendantCount === 0
+        ? `Stop ${record.name}`
+        : `Stop ${record.name} and ${control.activeDescendantCount} child ${control.activeDescendantCount === 1 ? "agent" : "agents"}`;
 
   return (
-    <Button
-      className="w-full items-start justify-start gap-3 whitespace-normal px-3 py-2 text-left"
-      data-activity-row={record.id}
-      onClick={() => onSelect(record)}
-      ref={(element) => registerRow(record.id, element)}
-      size="content"
-      variant="ghost"
-    >
-      <span className="mt-0.5 flex shrink-0 items-center -space-x-1">
-        <span
-          className="flex size-6 items-center justify-center rounded-full border border-border bg-muted"
-          data-activity-provider-glyph={recordProvider}
-          title={recordProvider}
-        >
-          <ProviderIcon aria-hidden="true" className="size-3.5" />
-        </span>
-        <span
-          className="flex size-6 items-center justify-center rounded-full border border-border bg-background"
-          data-activity-record-glyph={record._tag}
-          title={typeLabel}
-        >
-          <RecordIcon aria-hidden="true" className="size-3.5" />
-        </span>
-      </span>
-      <span className="min-w-0 flex-1">
-        <span className="flex min-w-0 items-center gap-2">
-          <span className="min-w-0 flex-1 truncate font-medium">{record.name}</span>
-          <span className="shrink-0 text-xs text-muted-foreground">
-            {activityStatusLabel(record.status)}
+    <div className="flex min-w-0 w-full items-start gap-1" data-activity-row-layout={record.id}>
+      <Button
+        className="min-w-0 flex-1 items-start justify-start gap-3 whitespace-normal px-3 py-2 text-left"
+        data-activity-row={record.id}
+        onClick={() => onSelect(record)}
+        ref={(element) => registerRow(record.id, element)}
+        size="content"
+        variant="ghost"
+      >
+        <span className="mt-0.5 flex shrink-0 items-center -space-x-1">
+          <span
+            className="flex size-6 items-center justify-center rounded-full border border-border bg-muted"
+            data-activity-provider-glyph={recordProvider}
+            title={recordProvider}
+          >
+            <ProviderIcon aria-hidden="true" className="size-3.5" />
+          </span>
+          <span
+            className="flex size-6 items-center justify-center rounded-full border border-border bg-background"
+            data-activity-record-glyph={record._tag}
+            title={typeLabel}
+          >
+            <RecordIcon aria-hidden="true" className="size-3.5" />
           </span>
         </span>
-        {record.summary !== null ? (
-          <span className="line-clamp-2 text-xs font-normal text-muted-foreground">
-            {record.summary}
+        <span className="min-w-0 flex-1">
+          <span className="flex min-w-0 items-center gap-2">
+            <span className="min-w-0 flex-1 truncate font-medium">{record.name}</span>
+            <span className="shrink-0 text-xs text-muted-foreground">
+              {stopping ? "Stopping" : activityStatusLabel(record.status)}
+            </span>
           </span>
-        ) : null}
-        <span className="mt-1 flex gap-2 text-[11px] font-normal text-muted-foreground">
-          <span>{typeLabel}</span>
-          <span>{recordTime(record, now)}</span>
+          {record.summary !== null ? (
+            <span className="line-clamp-2 text-xs font-normal text-muted-foreground">
+              {record.summary}
+            </span>
+          ) : null}
+          <span className="mt-1 flex gap-2 text-[11px] font-normal text-muted-foreground">
+            <span>{typeLabel}</span>
+            <span>{recordTime(record, now)}</span>
+          </span>
         </span>
-      </span>
-    </Button>
+      </Button>
+      {stopLabel === null || control === null || onCancelActor === undefined ? null : (
+        <Tooltip>
+          <TooltipTrigger
+            render={
+              <Button
+                aria-label={stopLabel}
+                className="mt-1 shrink-0 text-muted-foreground hover:text-foreground"
+                disabled={control.state === "requested"}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onCancelActor(record.id, control.controlRevision);
+                }}
+                onPointerDown={(event) => event.stopPropagation()}
+                size="icon-xs"
+                variant="ghost"
+              >
+                <svg
+                  aria-hidden="true"
+                  fill="currentColor"
+                  height="12"
+                  viewBox="0 0 12 12"
+                  width="12"
+                >
+                  <rect height="8" rx="1.5" width="8" x="2" y="2" />
+                </svg>
+              </Button>
+            }
+          />
+          <TooltipPopup>{stopLabel}</TooltipPopup>
+        </Tooltip>
+      )}
+    </div>
   );
 }
 
@@ -251,6 +298,7 @@ export interface ActivityRosterProps {
   readonly onFocusRestored: () => void;
   readonly onSelect: (record: ActivityRecordSummary) => void;
   readonly onLoadMore: (bucket: "active" | "done") => void;
+  readonly onCancelActor?: (actorId: ActivityRecordId, controlRevision: number) => void;
 }
 
 export function ActivityRoster({
@@ -265,6 +313,7 @@ export function ActivityRoster({
   onFocusRestored,
   onSelect,
   onLoadMore,
+  onCancelActor,
 }: ActivityRosterProps) {
   const rowRefs = useRef(new Map<string, HTMLButtonElement>());
   const activeRecords = reconciled.active;
@@ -283,6 +332,29 @@ export function ActivityRoster({
     (active.loading || done.loading) &&
     snapshot.sections[section].state !== "unsupported";
   const hasRosterError = active.error !== null || done.error !== null;
+  const actorControls = new Map<string, ActivityActorControl>(
+    snapshot.control.actors.map((control) => [control.actorId, control]),
+  );
+  for (const query of [active, done]) {
+    for (const page of query.pages) {
+      for (const control of page.actorControls) {
+        actorControls.set(control.actorId, control);
+      }
+    }
+  }
+  const controlForRecord = (record: ActivityRecordSummary): ActivityActorControl | null => {
+    if (
+      section !== "subagents" ||
+      snapshot.scope._tag !== "thread" ||
+      !snapshot.capabilities.targetedActorCancellation ||
+      record._tag !== "actor" ||
+      !isActivityLifecycleActive(record.status)
+    ) {
+      return null;
+    }
+    const control = actorControls.get(record.id);
+    return control?.state === "available" || control?.state === "requested" ? control : null;
+  };
 
   useEffect(() => {
     if (focusRecordId === null) {
@@ -349,9 +421,11 @@ export function ActivityRoster({
                   <div data-activity-window-group={`active-${groupIndex}`} key={group[0]?.id}>
                     {group.map((record) => (
                       <ActivityRecordRow
+                        control={controlForRecord(record)}
                         key={record.id}
                         now={now}
                         onSelect={onSelect}
+                        {...(onCancelActor === undefined ? {} : { onCancelActor })}
                         provider={snapshot.provider}
                         record={record}
                         registerRow={registerRow}
@@ -373,9 +447,11 @@ export function ActivityRoster({
                   <div data-activity-window-group={`done-${groupIndex}`} key={group[0]?.id}>
                     {group.map((record) => (
                       <ActivityRecordRow
+                        control={controlForRecord(record)}
                         key={record.id}
                         now={now}
                         onSelect={onSelect}
+                        {...(onCancelActor === undefined ? {} : { onCancelActor })}
                         provider={snapshot.provider}
                         record={record}
                         registerRow={registerRow}

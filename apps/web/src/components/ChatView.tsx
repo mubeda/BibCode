@@ -513,6 +513,30 @@ function isRemovedActivityFailure(failure: unknown): failure is ActivityError {
   return isActivityError(failure) && failure.reason === "notFound";
 }
 
+function activityCancellationFailureMessage(failure: unknown): string {
+  if (!isActivityError(failure)) {
+    return "Unable to stop agents. Try again.";
+  }
+  switch (failure.reason) {
+    case "cancellationUnsupported":
+      return "Stopping this agent is not supported.";
+    case "staleScope":
+    case "staleActor":
+    case "staleOperation":
+      return "Activity changed before the request could be applied. Refresh and try again.";
+    case "providerUnavailable":
+      return "The provider is unavailable. Try again when it reconnects.";
+    case "targetUnavailable":
+      return "This agent can no longer be stopped.";
+    case "partialCancellation":
+      return "Some agents are still running.";
+    case "dispatchTimeout":
+      return "Stopping agents timed out. Some agents may still be running.";
+    default:
+      return "Unable to stop agents. Try again.";
+  }
+}
+
 const ActivityPanelBinding = memo(function ActivityPanelBinding({
   target,
   threadRef,
@@ -527,6 +551,17 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
   const activityState =
     useAtomValue(stateValueAtom) ?? (EMPTY_ENVIRONMENT_ACTIVITY_STATE as EnvironmentActivityState);
   const refreshSnapshot = useAtomRefresh(stateSourceAtom);
+  const cancelSubtree = useAtomCommand(environmentActivity.cancelSubtree, {
+    reportFailure: false,
+  });
+  const retrySubtreeCancellation = useAtomCommand(environmentActivity.retrySubtreeCancellation, {
+    reportFailure: false,
+  });
+  const [cancellationFailure, setCancellationFailure] = useState<{
+    readonly message: string;
+    readonly scopeId: string;
+    readonly controlRevision: number;
+  } | null>(null);
   const snapshot = useMemo(() => activitySnapshotForState(activityState), [activityState]);
   const section = surface.section;
   const queryBaseKey =
@@ -660,6 +695,77 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
       bucket === "active" ? activeRoster.loadMore() : doneRoster.loadMore(),
     [activeRoster.loadMore, doneRoster.loadMore],
   );
+  const cancellationTarget = useMemo(
+    () =>
+      snapshot !== null &&
+      snapshot.scope._tag === "thread" &&
+      snapshot.capabilities.targetedActorCancellation
+        ? {
+            environmentId: threadRef.environmentId,
+            scope: snapshot.scope,
+            scopeId: snapshot.scopeId,
+            controlRevision: snapshot.control.revision,
+          }
+        : null,
+    [snapshot, threadRef.environmentId],
+  );
+  const cancellationError =
+    cancellationFailure !== null &&
+    snapshot !== null &&
+    cancellationFailure.scopeId === snapshot.scopeId &&
+    cancellationFailure.controlRevision === snapshot.control.revision
+      ? cancellationFailure.message
+      : null;
+  const onCancelActor = useCallback(
+    async (actorId: ActivityRecordId, expectedControlRevision: number) => {
+      if (cancellationTarget === null) {
+        return;
+      }
+      setCancellationFailure(null);
+      const result = await cancelSubtree({
+        environmentId: cancellationTarget.environmentId,
+        input: {
+          scope: cancellationTarget.scope,
+          scopeId: cancellationTarget.scopeId,
+          actorId,
+          expectedControlRevision,
+        },
+      });
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        setCancellationFailure({
+          message: activityCancellationFailureMessage(squashAtomCommandFailure(result)),
+          scopeId: cancellationTarget.scopeId,
+          controlRevision: cancellationTarget.controlRevision,
+        });
+      }
+    },
+    [cancelSubtree, cancellationTarget],
+  );
+  const onRetryCancellation = useCallback(
+    async (rootActorId: ActivityRecordId, expectedOperationRevision: number) => {
+      if (cancellationTarget === null) {
+        return;
+      }
+      setCancellationFailure(null);
+      const result = await retrySubtreeCancellation({
+        environmentId: cancellationTarget.environmentId,
+        input: {
+          scope: cancellationTarget.scope,
+          scopeId: cancellationTarget.scopeId,
+          rootActorId,
+          expectedOperationRevision,
+        },
+      });
+      if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
+        setCancellationFailure({
+          message: activityCancellationFailureMessage(squashAtomCommandFailure(result)),
+          scopeId: cancellationTarget.scopeId,
+          controlRevision: cancellationTarget.controlRevision,
+        });
+      }
+    },
+    [cancellationTarget, retrySubtreeCancellation],
+  );
 
   if (snapshot === null) {
     return null;
@@ -674,6 +780,8 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
       onLoadMoreRoster={onLoadMoreRoster}
       onLoadMoreDetail={detailQuery.loadMore}
       onRefreshSnapshot={refreshSnapshot}
+      cancellationError={cancellationError}
+      {...(cancellationTarget === null ? {} : { onCancelActor, onRetryCancellation })}
     />
   );
 });
