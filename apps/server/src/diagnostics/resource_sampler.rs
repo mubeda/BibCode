@@ -386,11 +386,16 @@ fn append_ui_claims(
             started_at: row.started_at,
         })
         .collect::<HashSet<_>>();
+    let mut claimed_identities = claims
+        .iter()
+        .map(|claim| claim.identity)
+        .collect::<HashSet<_>>();
     claims.extend(
         identities
             .iter()
             .copied()
             .filter(|identity| sampled_identities.contains(identity))
+            .filter(|identity| claimed_identities.insert(*identity))
             .map(|identity| ProcessClaim {
                 identity,
                 scope: AttributionScope::Core,
@@ -689,6 +694,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exact_external_claim_wins_over_a_conflicting_ui_observation() {
+        let server_pid = std::process::id();
+        let candidate = identity(server_pid + 1, 200);
+        let registry = ProcessAttributionRegistry::new();
+        let _registration = registry
+            .register_identity(
+                candidate,
+                ProcessRegistrationMetadata {
+                    scope: AttributionScope::External,
+                    kind: AttributionKind::Provider,
+                    label: "external/provider/codex".to_owned(),
+                    source: RegistrationSource::Provider,
+                },
+            )
+            .expect("registration should fit");
+        let (sampler, _) = sampler_with_registry(
+            vec![
+                row(server_pid, 1, 100),
+                row(candidate.pid, server_pid, candidate.started_at),
+            ],
+            FakeObservation::Return(DesktopUiObservation {
+                identities: vec![candidate, candidate],
+                coverage: UiCoverage {
+                    status: UiCoverageStatus::Available,
+                    message: None,
+                },
+            }),
+            registry,
+        );
+
+        let snapshot = sampler.sample().await.expect("sample should succeed");
+        let process = snapshot
+            .processes
+            .iter()
+            .find(|process| process.identity == candidate)
+            .expect("registered candidate");
+
+        assert_eq!(process.scope, AttributionScope::External);
+        assert_eq!(process.kind, AttributionKind::Provider);
+        assert_eq!(process.label, "external/provider/codex");
+        assert_eq!(process.confidence, AttributionConfidence::Exact);
+    }
+
+    #[tokio::test]
     async fn every_ui_coverage_status_survives_the_sample() {
         for status in [
             UiCoverageStatus::Available,
@@ -872,9 +921,9 @@ mod tests {
                 row(target_pid, server_pid, target_identity.started_at),
             ],
             FakeObservation::Return(DesktopUiObservation {
-                identities: Vec::new(),
+                identities: vec![target_identity],
                 coverage: UiCoverage {
-                    status: UiCoverageStatus::NotApplicable,
+                    status: UiCoverageStatus::Available,
                     message: None,
                 },
             }),

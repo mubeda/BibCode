@@ -23,7 +23,7 @@ pub use model::{
     process_tree_metadata,
 };
 pub use monitor::{CurrentProcessDiagnostics, DiagnosticsMonitor, ProcessSampler, SamplingError};
-pub use native::{NativeProcessSampler, ProcessSignal, SignalError};
+pub use native::{NativeProcessRecord, NativeProcessSampler, ProcessSignal, SignalError};
 pub use registry::{
     ProcessAttributionRegistry, ProcessRegistration, ProcessRegistrationMetadata,
     RegistrationSource,
