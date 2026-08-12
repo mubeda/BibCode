@@ -48,21 +48,19 @@ export function activityActorControl(
   snapshot: ActivitySnapshot,
   actorId: ActivityRecordId,
 ): ActivityActorControl | null {
-  return Option.getOrNull(
-    Arr.findFirst(snapshot.control.actors, (control) => control.actorId === actorId),
-  );
+  const matches = Arr.filter(snapshot.control.actors, (control) => control.actorId === actorId);
+  return matches.length === 1 ? (matches[0] ?? null) : null;
 }
 
 export function activityCancellationOperation(
   snapshot: ActivitySnapshot,
   rootActorId: ActivityRecordId,
 ): ActivityCancellationOperationSummary | null {
-  return Option.getOrNull(
-    Arr.findFirst(
-      snapshot.control.operations,
-      (operation) => operation.rootActorId === rootActorId,
-    ),
+  const matches = Arr.filter(
+    snapshot.control.operations,
+    (operation) => operation.rootActorId === rootActorId,
   );
+  return matches.length === 1 ? (matches[0] ?? null) : null;
 }
 
 function absurd(value: never): never {
@@ -451,6 +449,12 @@ export function applyActivityControlDelta(
   }
 
   const nextControl = Arr.reduce(delta.changes, snapshot.control, applyControlChange);
+  if (
+    nextControl.actors.length > ACTIVITY_PAGE_MAX_LENGTH ||
+    nextControl.operations.length > ACTIVITY_PAGE_MAX_LENGTH
+  ) {
+    return { kind: "gap" };
+  }
   return {
     kind: "applied",
     snapshot: {
