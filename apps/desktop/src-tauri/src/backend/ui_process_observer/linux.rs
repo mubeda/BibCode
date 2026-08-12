@@ -7,7 +7,7 @@
 )]
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     ffi::OsStr,
     path::{Path, PathBuf},
 };
@@ -32,6 +32,23 @@ enum LinuxObservationIssue {
     Executable,
     RoleMismatch,
     UnsupportedRole,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WebKitGtkCandidateHint {
+    Supported(WebKitGtkProcessRole),
+    Unsupported,
+    Conflicting,
+}
+
+impl WebKitGtkCandidateHint {
+    fn merge(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Supported(left), Self::Supported(right)) if left == right => self,
+            (Self::Unsupported, Self::Unsupported) => self,
+            _ => Self::Conflicting,
+        }
+    }
 }
 
 impl WebKitGtkProcessRole {
@@ -63,6 +80,21 @@ fn is_webkit_like_process_name(name: &str) -> bool {
     name.starts_with("WebKit") && name.ends_with("Process")
 }
 
+fn candidate_hint(command: &str) -> Option<WebKitGtkCandidateHint> {
+    let executable_name = command_executable_name(command)?;
+    if !is_webkit_like_process_name(executable_name) {
+        return None;
+    }
+    Some(
+        WebKitGtkProcessRole::from_executable_name(executable_name).map_or(
+            WebKitGtkCandidateHint::Unsupported,
+            WebKitGtkCandidateHint::Supported,
+        ),
+    )
+}
+
+const LINUX_UI_CANDIDATE_LIMIT: usize = 64;
+
 fn build_observation_with(
     rows: &[ProcessRow],
     server_identity: ProcessIdentity,
@@ -81,32 +113,43 @@ fn build_observation_with(
         };
     }
 
-    let mut candidates = rows
-        .iter()
-        .filter(|row| row.ppid == server_identity.pid)
-        .collect::<Vec<_>>();
-    candidates.sort_by_key(|row| row.pid);
+    let mut candidates = BTreeMap::<(u32, u64), (&ProcessRow, WebKitGtkCandidateHint)>::new();
+    for row in rows.iter().filter(|row| row.ppid == server_identity.pid) {
+        let Some(hint) = candidate_hint(&row.command) else {
+            continue;
+        };
+        let key = (row.pid, row.started_at);
+        if let Some((_, existing_hint)) = candidates.get_mut(&key) {
+            *existing_hint = existing_hint.merge(hint);
+            continue;
+        }
 
-    let mut seen_candidates = HashSet::new();
+        if candidates.len() == LINUX_UI_CANDIDATE_LIMIT {
+            let largest_key = *candidates
+                .last_key_value()
+                .expect("a full candidate map has a largest key")
+                .0;
+            issues.insert(LinuxObservationIssue::ProcessRecord);
+            if key >= largest_key {
+                continue;
+            }
+            candidates.pop_last();
+        }
+        candidates.insert(key, (row, hint));
+    }
+
     let mut accepted = HashSet::new();
-    for row in candidates {
-        let snapshot_identity = ProcessIdentity {
-            pid: row.pid,
-            started_at: row.started_at,
-        };
-        if !seen_candidates.insert(snapshot_identity) {
-            continue;
-        }
-
-        let Some(executable_name) = command_executable_name(&row.command) else {
-            continue;
-        };
-        if !is_webkit_like_process_name(executable_name) {
-            continue;
-        }
-        let Some(role) = WebKitGtkProcessRole::from_executable_name(executable_name) else {
-            issues.insert(LinuxObservationIssue::UnsupportedRole);
-            continue;
+    for (_, (row, hint)) in candidates {
+        let role = match hint {
+            WebKitGtkCandidateHint::Supported(role) => role,
+            WebKitGtkCandidateHint::Unsupported => {
+                issues.insert(LinuxObservationIssue::UnsupportedRole);
+                continue;
+            }
+            WebKitGtkCandidateHint::Conflicting => {
+                issues.insert(LinuxObservationIssue::RoleMismatch);
+                continue;
+            }
         };
 
         match validate_candidate(
@@ -126,7 +169,7 @@ fn build_observation_with(
     }
 
     let mut identities = accepted.into_iter().collect::<Vec<_>>();
-    identities.sort_unstable_by_key(|identity| identity.pid);
+    identities.sort_unstable_by_key(|identity| (identity.pid, identity.started_at));
     DesktopUiObservation {
         coverage: coverage_for(!identities.is_empty(), &issues),
         identities,
@@ -374,6 +417,246 @@ mod tests {
         assert_eq!(&*record_queries.borrow(), &[501, 501, 503, 503]);
         assert_eq!(&*executable_queries.borrow(), &[501, 503]);
         assert_eq!(observation.coverage.status, UiCoverageStatus::Available);
+    }
+
+    #[test]
+    fn linux_ui_bounds_candidate_validation_before_native_reads() {
+        // Mutation caught: applying the 64-identity limit only after validation performs native
+        // work for every hinted child and can incorrectly report complete coverage.
+        let mut rows = vec![row(
+            SERVER_PID,
+            1,
+            SERVER_STARTED_AT,
+            "/app/bin/bibcode-desktop",
+        )];
+        for pid in (500..=565).rev() {
+            rows.push(row(
+                pid,
+                SERVER_PID,
+                1_000 + u64::from(pid),
+                "/usr/lib/WebKitWebProcess",
+            ));
+        }
+        let rows: Arc<[ProcessRow]> = Arc::from(rows.into_boxed_slice());
+        let records = stable_records(&rows);
+        let record_queries = RefCell::new(Vec::new());
+        let executable_queries = RefCell::new(Vec::new());
+
+        let observation = build_observation_with(
+            &rows,
+            server_identity(),
+            |pid| {
+                record_queries.borrow_mut().push(pid);
+                records.get(&pid).copied().ok_or(())
+            },
+            |pid| {
+                executable_queries.borrow_mut().push(pid);
+                Ok(PathBuf::from("/usr/lib/WebKitWebProcess"))
+            },
+        );
+
+        let expected_record_queries = (500..=563).flat_map(|pid| [pid, pid]).collect::<Vec<_>>();
+        let expected_executable_queries = (500..=563).collect::<Vec<_>>();
+        assert_eq!(&*record_queries.borrow(), &expected_record_queries);
+        assert_eq!(&*executable_queries.borrow(), &expected_executable_queries);
+        assert_eq!(
+            observation
+                .identities
+                .iter()
+                .map(|identity| identity.pid)
+                .collect::<Vec<_>>(),
+            expected_executable_queries
+        );
+        assert_eq!(observation.identities.len(), 64);
+        assert_eq!(observation.coverage.status, UiCoverageStatus::Partial);
+        assert_eq!(
+            observation.coverage.message.as_deref(),
+            Some("A WebKitGTK process identity could not be validated.")
+        );
+    }
+
+    #[test]
+    fn linux_ui_orders_reused_pid_candidates_by_start_identity() {
+        // Mutation caught: sorting accepted identities only by PID leaves equal-PID rows in
+        // hash-iteration order rather than the deterministic candidate identity order.
+        let mut rows = vec![row(
+            SERVER_PID,
+            1,
+            SERVER_STARTED_AT,
+            "/app/bin/bibcode-desktop",
+        )];
+        for started_at in (200..=207).rev() {
+            rows.push(row(
+                501,
+                SERVER_PID,
+                started_at,
+                "/usr/lib/WebKitWebProcess",
+            ));
+        }
+        let rows: Arc<[ProcessRow]> = Arc::from(rows.into_boxed_slice());
+        let mut records = (200..=207)
+            .flat_map(|started_at| {
+                let current = Ok(record(501, SERVER_PID, started_at));
+                [current, current]
+            })
+            .collect::<VecDeque<_>>();
+
+        let observation = build_observation_with(
+            &rows,
+            server_identity(),
+            |_| records.pop_front().expect("bounded record query"),
+            |_| Ok(PathBuf::from("/usr/lib/WebKitWebProcess")),
+        );
+
+        assert_eq!(
+            observation
+                .identities
+                .iter()
+                .map(|identity| identity.started_at)
+                .collect::<Vec<_>>(),
+            vec![200, 201, 202, 203, 204, 205, 206, 207]
+        );
+        assert!(records.is_empty());
+        assert_eq!(observation.coverage.status, UiCoverageStatus::Available);
+    }
+
+    #[test]
+    fn linux_ui_classifies_duplicate_hints_independently_of_row_order() {
+        // Mutation caught: deduplicating before hint classification lets an ordinary duplicate
+        // suppress a later valid WebKit hint for the same snapshot identity.
+        let server = row(SERVER_PID, 1, SERVER_STARTED_AT, "/app/bin/bibcode-desktop");
+        let ordinary = row(501, SERVER_PID, 200, "/usr/bin/ordinary-helper");
+        let web = row(501, SERVER_PID, 200, "/usr/lib/WebKitWebProcess");
+
+        for duplicate_rows in [
+            [ordinary.clone(), web.clone()],
+            [web.clone(), ordinary.clone()],
+        ] {
+            let rows: Arc<[ProcessRow]> = Arc::from([
+                server.clone(),
+                duplicate_rows[0].clone(),
+                duplicate_rows[1].clone(),
+            ]);
+            let expected = record(501, SERVER_PID, 200);
+            let record_queries = RefCell::new(Vec::new());
+            let executable_queries = RefCell::new(Vec::new());
+
+            let observation = build_observation_with(
+                &rows,
+                server_identity(),
+                |pid| {
+                    record_queries.borrow_mut().push(pid);
+                    Ok(expected)
+                },
+                |pid| {
+                    executable_queries.borrow_mut().push(pid);
+                    Ok(PathBuf::from("/usr/lib/WebKitWebProcess"))
+                },
+            );
+
+            assert_eq!(
+                observation.identities,
+                vec![ProcessIdentity {
+                    pid: 501,
+                    started_at: 200,
+                }]
+            );
+            assert_eq!(&*record_queries.borrow(), &[501, 501]);
+            assert_eq!(&*executable_queries.borrow(), &[501]);
+            assert_eq!(observation.coverage.status, UiCoverageStatus::Available);
+        }
+    }
+
+    #[test]
+    fn linux_ui_rejects_conflicting_duplicate_hints_in_either_order() {
+        // Mutation caught: first-row-wins deduplication validates one of two conflicting role
+        // hints, making coverage depend on equal-identity snapshot row order.
+        let server = row(SERVER_PID, 1, SERVER_STARTED_AT, "/app/bin/bibcode-desktop");
+        let web = row(501, SERVER_PID, 200, "/usr/lib/WebKitWebProcess");
+        let gpu = row(501, SERVER_PID, 200, "/usr/lib/WebKitGPUProcess");
+
+        for duplicate_rows in [[web.clone(), gpu.clone()], [gpu.clone(), web.clone()]] {
+            let rows: Arc<[ProcessRow]> = Arc::from([
+                server.clone(),
+                duplicate_rows[0].clone(),
+                duplicate_rows[1].clone(),
+            ]);
+            let record_queries = RefCell::new(Vec::new());
+            let executable_queries = RefCell::new(Vec::new());
+
+            let observation = build_observation_with(
+                &rows,
+                server_identity(),
+                |pid| {
+                    record_queries.borrow_mut().push(pid);
+                    Ok(record(501, SERVER_PID, 200))
+                },
+                |pid| {
+                    executable_queries.borrow_mut().push(pid);
+                    Ok(PathBuf::from("/usr/lib/WebKitWebProcess"))
+                },
+            );
+
+            assert!(observation.identities.is_empty());
+            assert!(record_queries.borrow().is_empty());
+            assert!(executable_queries.borrow().is_empty());
+            assert_eq!(observation.coverage.status, UiCoverageStatus::Unavailable);
+            assert!(
+                observation
+                    .coverage
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.starts_with(
+                        "A WebKitGTK process executable did not match its reported role."
+                    ))
+            );
+        }
+    }
+
+    #[test]
+    fn linux_ui_rejects_supported_and_unsupported_duplicate_hints_in_either_order() {
+        // Mutation caught: merging a supported and unsupported WebKit-like hint by first-row
+        // precedence can validate an ambiguous identity or vary with snapshot order.
+        let server = row(SERVER_PID, 1, SERVER_STARTED_AT, "/app/bin/bibcode-desktop");
+        let web = row(501, SERVER_PID, 200, "/usr/lib/WebKitWebProcess");
+        let model = row(501, SERVER_PID, 200, "/usr/lib/WebKitModelProcess");
+
+        for duplicate_rows in [[web.clone(), model.clone()], [model.clone(), web.clone()]] {
+            let rows: Arc<[ProcessRow]> = Arc::from([
+                server.clone(),
+                duplicate_rows[0].clone(),
+                duplicate_rows[1].clone(),
+            ]);
+            let record_queries = RefCell::new(Vec::new());
+            let executable_queries = RefCell::new(Vec::new());
+
+            let observation = build_observation_with(
+                &rows,
+                server_identity(),
+                |pid| {
+                    record_queries.borrow_mut().push(pid);
+                    Ok(record(501, SERVER_PID, 200))
+                },
+                |pid| {
+                    executable_queries.borrow_mut().push(pid);
+                    Ok(PathBuf::from("/usr/lib/WebKitWebProcess"))
+                },
+            );
+
+            assert!(observation.identities.is_empty());
+            assert!(record_queries.borrow().is_empty());
+            assert!(executable_queries.borrow().is_empty());
+            assert_eq!(observation.coverage.status, UiCoverageStatus::Unavailable);
+            assert!(
+                observation
+                    .coverage
+                    .message
+                    .as_deref()
+                    .is_some_and(|message| message.starts_with(
+                        "A WebKitGTK process executable did not match its reported role."
+                    ))
+            );
+        }
     }
 
     #[test]
