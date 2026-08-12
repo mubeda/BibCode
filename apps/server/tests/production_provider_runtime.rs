@@ -9367,8 +9367,9 @@ async fn failed_and_interrupted_turns_settle_existing_assistant_messages() {
     );
 }
 
-#[tokio::test]
-async fn terminal_completion_failure_retries_and_preserves_the_lifecycle_projection() {
+async fn project_terminal_with_completion_failures(
+    failure_count: usize,
+) -> (Vec<(String, String, bool)>, bool, Option<String>) {
     let hooks = TestHooks::default();
     let (engine, _) = engine_and_database_with_options(EngineOptions {
         test_hooks: hooks.clone(),
@@ -9444,7 +9445,11 @@ async fn terminal_completion_failure_retries_and_preserves_the_lifecycle_project
     .await
     .expect("both assistant item rows must exist before terminal failure injection");
 
-    hooks.fail_next_projector("projection.thread-messages", Some("thread.message-sent"));
+    hooks.fail_next_projectors(
+        "projection.thread-messages",
+        Some("thread.message-sent"),
+        failure_count,
+    );
     for event in [
         ProviderEvent {
             native_event_id: None,
@@ -9503,9 +9508,15 @@ async fn terminal_completion_failure_retries_and_preserves_the_lifecycle_project
         .sessions
         .iter()
         .find(|session| session.thread_id == "t1")
-        .and_then(|session| session.last_error.as_deref());
+        .and_then(|session| session.last_error.clone());
+    supervisor.shutdown().await.unwrap();
+    (messages, provider_error, session_error)
+}
+
+#[tokio::test]
+async fn terminal_completion_failure_retries_and_preserves_the_lifecycle_projection() {
     assert_eq!(
-        (messages, provider_error, session_error),
+        project_terminal_with_completion_failures(1).await,
         (
             vec![
                 (
@@ -9520,10 +9531,32 @@ async fn terminal_completion_failure_retries_and_preserves_the_lifecycle_project
                 ),
             ],
             true,
-            Some("model unavailable"),
+            Some("model unavailable".to_owned()),
         )
     );
-    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn terminal_completion_retry_exhaustion_isolates_the_failed_message() {
+    assert_eq!(
+        project_terminal_with_completion_failures(2).await,
+        (
+            vec![
+                (
+                    "assistant:t1:item:partial-1".to_owned(),
+                    "partial-1".to_owned(),
+                    true,
+                ),
+                (
+                    "assistant:t1:item:partial-2".to_owned(),
+                    "partial-2".to_owned(),
+                    false,
+                ),
+            ],
+            true,
+            Some("model unavailable".to_owned()),
+        )
+    );
 }
 
 #[tokio::test]

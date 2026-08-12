@@ -43,6 +43,28 @@ const PROJECTOR_NAMES: [&str; 9] = [
 ];
 const HISTORICAL_PROJECT_ROOT_INSPECTION_TIMEOUT: Duration = Duration::from_millis(250);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ProjectionMode {
+    #[default]
+    Legacy,
+    UpdateExistingAssistantMessage,
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+struct ProjectionContext {
+    mode: ProjectionMode,
+    existing_assistant_message_updated: bool,
+}
+
+impl ProjectionContext {
+    fn new(mode: ProjectionMode) -> Self {
+        Self {
+            mode,
+            existing_assistant_message_updated: false,
+        }
+    }
+}
+
 #[derive(Clone, Debug, Default)]
 pub enum OptionalNullable<T> {
     #[default]
@@ -617,7 +639,7 @@ pub struct EngineOptions {
 
 #[derive(Clone, Debug, Default)]
 pub struct TestHooks {
-    fail_next_projector: Arc<StdMutex<Option<FailProjectorOnce>>>,
+    fail_next_projector: Arc<StdMutex<Option<FailProjector>>>,
     pause_after_admission_commit: Arc<StdMutex<Option<AdmissionCommitPause>>>,
     fail_delivery_transitions: Arc<AtomicUsize>,
     delivery_transition_attempts: Arc<AtomicUsize>,
@@ -640,16 +662,28 @@ impl AdmissionCommitPause {
 }
 
 #[derive(Clone, Debug)]
-struct FailProjectorOnce {
+struct FailProjector {
     projector: String,
     event_type: Option<String>,
+    remaining: usize,
 }
 
 impl TestHooks {
     pub fn fail_next_projector(&self, projector: impl Into<String>, event_type: Option<&str>) {
-        *self.fail_next_projector.lock().expect("failpoint mutex") = Some(FailProjectorOnce {
+        self.fail_next_projectors(projector, event_type, 1);
+    }
+
+    pub fn fail_next_projectors(
+        &self,
+        projector: impl Into<String>,
+        event_type: Option<&str>,
+        count: usize,
+    ) {
+        let mut guard = self.fail_next_projector.lock().expect("failpoint mutex");
+        *guard = (count > 0).then(|| FailProjector {
             projector: projector.into(),
             event_type: event_type.map(str::to_owned),
+            remaining: count,
         });
     }
 
@@ -721,7 +755,12 @@ impl TestHooks {
             })
             .unwrap_or(false);
         if should_fail {
-            *guard = None;
+            if let Some(failpoint) = guard.as_mut() {
+                failpoint.remaining = failpoint.remaining.saturating_sub(1);
+                if failpoint.remaining == 0 {
+                    *guard = None;
+                }
+            }
             return Err(OrchestrationError::InjectedProjectorFailure {
                 projector: projector.to_owned(),
                 event_type: event_type.to_owned(),
@@ -1299,6 +1338,14 @@ async fn process_envelope(
         }
     }
 
+    let projection_mode = if matches!(
+        command,
+        OrchestrationCommand::ThreadMessageAssistantComplete { .. }
+    ) {
+        ProjectionMode::UpdateExistingAssistantMessage
+    } else {
+        ProjectionMode::Legacy
+    };
     let mut planned = match plan_command(repositories, model, &command, &occurred_at).await {
         Ok(planned) => planned,
         Err(error) => {
@@ -1354,6 +1401,7 @@ async fn process_envelope(
         aggregate.0,
         aggregate.1,
         admission,
+        projection_mode,
     )
     .await?;
     apply_to_model(model, &committed);
@@ -2092,7 +2140,7 @@ async fn plan_command(
             thread_id,
             created_at,
             metadata,
-            json!({"threadId":thread_id,"messageId":message_id,"role":"assistant","text":"","turnId":turn_id,"streaming":false,"existingMessageOnly":true,"createdAt":created_at,"updatedAt":created_at}),
+            json!({"threadId":thread_id,"messageId":message_id,"role":"assistant","text":"","turnId":turn_id,"streaming":false,"createdAt":created_at,"updatedAt":created_at}),
         ),
         OrchestrationCommand::ThreadProposedPlanUpsert {
             command_id,
@@ -2290,6 +2338,7 @@ fn required_command_string(
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn persist_command(
     repositories: &Repositories,
     hooks: &TestHooks,
@@ -2298,6 +2347,7 @@ async fn persist_command(
     aggregate_kind: &str,
     aggregate_id: &str,
     admission: Option<CommandAdmission>,
+    projection_mode: ProjectionMode,
 ) -> Result<VecDeque<OrchestrationEvent>, OrchestrationError> {
     let repositories = repositories.clone();
     let hooks = hooks.clone();
@@ -2312,11 +2362,17 @@ async fn persist_command(
             let mut committed = VecDeque::new();
             for planned in &event_list {
                 let saved = append_event_tx(&transaction, planned.clone())?;
+                let mut projection_context = ProjectionContext::new(projection_mode);
                 for projector in PROJECTOR_NAMES {
                     hooks
                         .maybe_fail(projector, &saved.event.event_type)
                         .map_err(projector_failure_to_persistence)?;
-                    apply_projector_tx(&transaction, projector, &saved)?;
+                    apply_projector_tx(
+                        &transaction,
+                        projector,
+                        &saved,
+                        &mut projection_context,
+                    )?;
                     upsert_projection_state_tx(
                         &transaction,
                         projector,
@@ -2426,7 +2482,12 @@ async fn persist_turn_delivery_transition(
                 hooks
                     .maybe_fail(projector, &saved.event.event_type)
                     .map_err(projector_failure_to_persistence)?;
-                apply_projector_tx(&transaction, projector, &saved)?;
+                apply_projector_tx(
+                    &transaction,
+                    projector,
+                    &saved,
+                    &mut ProjectionContext::default(),
+                )?;
                 upsert_projection_state_tx(
                     &transaction,
                     projector,
@@ -2535,7 +2596,12 @@ async fn persist_turn_delivery_resolution(
                 hooks
                     .maybe_fail(projector, &saved.event.event_type)
                     .map_err(projector_failure_to_persistence)?;
-                apply_projector_tx(&transaction, projector, &saved)?;
+                apply_projector_tx(
+                    &transaction,
+                    projector,
+                    &saved,
+                    &mut ProjectionContext::default(),
+                )?;
                 upsert_projection_state_tx(
                     &transaction,
                     projector,
@@ -2716,7 +2782,12 @@ async fn bootstrap_projectors(
                     hooks
                         .maybe_fail(&projector, &event.event.event_type)
                         .map_err(projector_failure_to_persistence)?;
-                    apply_projector_tx(&transaction, &projector, &event)?;
+                    apply_projector_tx(
+                        &transaction,
+                        &projector,
+                        &event,
+                        &mut ProjectionContext::default(),
+                    )?;
                     upsert_projection_state_tx(
                         &transaction,
                         &projector,
@@ -2845,14 +2916,15 @@ fn apply_projector_tx(
     transaction: &Transaction<'_>,
     projector: &str,
     event: &OrchestrationEvent,
+    context: &mut ProjectionContext,
 ) -> Result<(), PersistenceError> {
     match projector {
         "projection.projects" => apply_projects_projector_tx(transaction, event),
-        "projection.thread-messages" => apply_messages_projector_tx(transaction, event),
+        "projection.thread-messages" => apply_messages_projector_tx(transaction, event, context),
         "projection.thread-proposed-plans" => apply_plans_projector_tx(transaction, event),
         "projection.thread-activities" => apply_activities_projector_tx(transaction, event),
         "projection.thread-sessions" => apply_sessions_projector_tx(transaction, event),
-        "projection.thread-turns" => apply_turns_projector_tx(transaction, event),
+        "projection.thread-turns" => apply_turns_projector_tx(transaction, event, context),
         "projection.checkpoints" => apply_checkpoints_projector_tx(transaction, event),
         "projection.pending-approvals" => apply_pending_approvals_projector_tx(transaction, event),
         "projection.threads" => apply_threads_projector_tx(transaction, event),
@@ -2994,6 +3066,7 @@ fn apply_threads_projector_tx(
 fn apply_messages_projector_tx(
     transaction: &Transaction<'_>,
     event: &OrchestrationEvent,
+    context: &mut ProjectionContext,
 ) -> Result<(), PersistenceError> {
     if event.event.event_type == "thread.reverted" {
         transaction.execute(
@@ -3021,12 +3094,8 @@ fn apply_messages_projector_tx(
         return Ok(());
     }
     let payload = &event.event.payload;
-    if payload
-        .get("existingMessageOnly")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
-    {
-        transaction.execute(
+    if context.mode == ProjectionMode::UpdateExistingAssistantMessage {
+        context.existing_assistant_message_updated = transaction.execute(
             "UPDATE projection_thread_messages SET is_streaming = 0, updated_at = ? \
              WHERE message_id = ? AND thread_id = ? AND turn_id IS ? \
                AND role = 'assistant' AND is_streaming = 1",
@@ -3036,7 +3105,7 @@ fn apply_messages_projector_tx(
                 required_str(payload, "threadId")?,
                 optional_string(payload.get("turnId")),
             ],
-        )?;
+        )? == 1;
         return Ok(());
     }
     transaction.execute(
@@ -3208,6 +3277,7 @@ fn apply_sessions_projector_tx(
 fn apply_turns_projector_tx(
     transaction: &Transaction<'_>,
     event: &OrchestrationEvent,
+    context: &mut ProjectionContext,
 ) -> Result<(), PersistenceError> {
     let payload = &event.event.payload;
     match event.event.event_type.as_str() {
@@ -3288,26 +3358,8 @@ fn apply_turns_projector_tx(
                 return Ok(());
             };
             let thread_id = required_str(payload, "threadId")?;
-            if payload
-                .get("existingMessageOnly")
-                .and_then(Value::as_bool)
-                .unwrap_or(false)
-                && !transaction
-                    .query_row(
-                        "SELECT 1 FROM projection_thread_messages \
-                         WHERE message_id = ? AND thread_id = ? AND turn_id IS ? \
-                           AND role = 'assistant' AND is_streaming = 0 AND updated_at = ? \
-                         LIMIT 1",
-                        params![
-                            required_str(payload, "messageId")?,
-                            thread_id,
-                            turn_id,
-                            required_str(payload, "updatedAt")?,
-                        ],
-                        |_| Ok(()),
-                    )
-                    .optional()?
-                    .is_some()
+            if context.mode == ProjectionMode::UpdateExistingAssistantMessage
+                && !context.existing_assistant_message_updated
             {
                 return Ok(());
             }
@@ -5508,6 +5560,7 @@ mod tests {
                             json!({"threadId":"projector-thread"}),
                             json!({}),
                         ),
+                        &mut ProjectionContext::default(),
                     ),
                     apply_pending_approvals_projector_tx(
                         &transaction,
