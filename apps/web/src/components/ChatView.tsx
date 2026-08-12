@@ -559,8 +559,9 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
   });
   const [cancellationFailure, setCancellationFailure] = useState<{
     readonly message: string;
-    readonly scopeId: string;
+    readonly targetKey: string;
     readonly controlRevision: number;
+    readonly invocation: number;
   } | null>(null);
   const snapshot = useMemo(() => activitySnapshotForState(activityState), [activityState]);
   const section = surface.section;
@@ -705,15 +706,43 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
             scope: snapshot.scope,
             scopeId: snapshot.scopeId,
             controlRevision: snapshot.control.revision,
+            key: JSON.stringify([
+              threadRef.environmentId,
+              snapshot.scope._tag,
+              snapshot.scope.threadId,
+              snapshot.scopeId,
+            ]),
           }
         : null,
     [snapshot, threadRef.environmentId],
   );
+  // The panel has one scoped mutation banner, so the newest cancel or retry invocation owns it.
+  const cancellationOwnershipRef = useRef<{
+    targetKey: string | null;
+    controlRevision: number;
+    invocation: number;
+  }>({ targetKey: null, controlRevision: -1, invocation: 0 });
+  const currentCancellationTargetKey = cancellationTarget?.key ?? null;
+  const currentCancellationControlRevision = snapshot?.control.revision ?? -1;
+  useLayoutEffect(() => {
+    const ownership = cancellationOwnershipRef.current;
+    ownership.targetKey = currentCancellationTargetKey;
+    ownership.controlRevision = currentCancellationControlRevision;
+    ownership.invocation += 1;
+    return () => {
+      if (
+        ownership.targetKey === currentCancellationTargetKey &&
+        ownership.controlRevision === currentCancellationControlRevision
+      ) {
+        ownership.targetKey = null;
+        ownership.invocation += 1;
+      }
+    };
+  }, [currentCancellationControlRevision, currentCancellationTargetKey]);
   const cancellationError =
     cancellationFailure !== null &&
-    snapshot !== null &&
-    cancellationFailure.scopeId === snapshot.scopeId &&
-    cancellationFailure.controlRevision === snapshot.control.revision
+    cancellationFailure.targetKey === currentCancellationTargetKey &&
+    cancellationFailure.controlRevision === currentCancellationControlRevision
       ? cancellationFailure.message
       : null;
   const onCancelActor = useCallback(
@@ -721,6 +750,11 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
       if (cancellationTarget === null) {
         return;
       }
+      const ownership = cancellationOwnershipRef.current;
+      const invocation = ownership.invocation + 1;
+      ownership.invocation = invocation;
+      const targetKey = cancellationTarget.key;
+      const controlRevision = cancellationTarget.controlRevision;
       setCancellationFailure(null);
       const result = await cancelSubtree({
         environmentId: cancellationTarget.environmentId,
@@ -731,11 +765,19 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
           expectedControlRevision,
         },
       });
+      if (
+        ownership.targetKey !== targetKey ||
+        ownership.controlRevision !== controlRevision ||
+        ownership.invocation !== invocation
+      ) {
+        return;
+      }
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
         setCancellationFailure({
           message: activityCancellationFailureMessage(squashAtomCommandFailure(result)),
-          scopeId: cancellationTarget.scopeId,
-          controlRevision: cancellationTarget.controlRevision,
+          targetKey,
+          controlRevision,
+          invocation,
         });
       }
     },
@@ -746,6 +788,11 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
       if (cancellationTarget === null) {
         return;
       }
+      const ownership = cancellationOwnershipRef.current;
+      const invocation = ownership.invocation + 1;
+      ownership.invocation = invocation;
+      const targetKey = cancellationTarget.key;
+      const controlRevision = cancellationTarget.controlRevision;
       setCancellationFailure(null);
       const result = await retrySubtreeCancellation({
         environmentId: cancellationTarget.environmentId,
@@ -756,11 +803,19 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
           expectedOperationRevision,
         },
       });
+      if (
+        ownership.targetKey !== targetKey ||
+        ownership.controlRevision !== controlRevision ||
+        ownership.invocation !== invocation
+      ) {
+        return;
+      }
       if (result._tag === "Failure" && !isAtomCommandInterrupted(result)) {
         setCancellationFailure({
           message: activityCancellationFailureMessage(squashAtomCommandFailure(result)),
-          scopeId: cancellationTarget.scopeId,
-          controlRevision: cancellationTarget.controlRevision,
+          targetKey,
+          controlRevision,
+          invocation,
         });
       }
     },
