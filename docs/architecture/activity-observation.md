@@ -98,9 +98,18 @@ actor and operation records, and a delta contains at most 256 changes. It is
 never written to SQLite: after a server restart, historical actors remain
 `unsupported` until the current runtime proves an exact native target. Provider
 native target IDs never cross contracts, persistence, or diagnostic logs.
-The current runtime registration owns its overlay generation: its lifecycle
-cleanup removes that generation with one bounded removal delta, while a
-superseded registration cannot remove its replacement.
+The current runtime registration owns its overlay generation. Lifecycle cleanup
+publishes one bounded removal delta and leaves a bounded, target-free in-memory
+tombstone for the stable public scope. The tombstone retains only monotonic
+scope and actor-fence counters; it contains no provider target, operation, or
+SQLite state. At most 200 inactive scope tombstones are retained. Within each
+scope, at most 200 inactive actor counters are retained in addition to the
+existing 200-active-actor bound. A scope or actor recreated after bounded
+tombstone eviction is seeded above a registry-local high-water mark.
+Replacement targets therefore cannot reuse pre-restart control revisions, an
+already-open stream can consume the replacement delta or recover its
+intentional revision gap, and a superseded registration still cannot remove
+its replacement.
 
 Observation and control revisions are independent monotonic domains. An
 observation delta cannot fill a control gap, and a control delta cannot advance
@@ -117,6 +126,14 @@ actor lifecycle. Only provider observation can move an actor to `cancelled`,
 actor from any residual set. A partial operation may be retried only with its
 current operation revision, and the server dispatches only active residuals and
 late descendants already admitted beneath the original cancellation fence.
+Every admitted operation also owns one non-polling ten-second finalizer. If
+active residuals remain after that deadline—even when the exact target was
+unavailable or provider delivery produced no terminal event—the generation- and
+operation-revision-fenced finalizer publishes `partial` without inventing a
+provider lifecycle. Terminal observation, absorption, retry, runtime
+replacement, and teardown cancel the superseded timer. Retry re-dispatches only
+targets whose prior provider attempt failed plus newly targetable residuals;
+successfully delivered targets remain fenced until provider lifecycle changes.
 
 Claude targeted dispatch is provisional for a runtime generation only when its
 bounded compatibility probe proves both required hook switches and the private
@@ -236,8 +253,10 @@ These recovery downgrades do not disable ordinary Codex chat.
 
 Claude structured control joins native task identity only through the complete
 same-session, same-generation Agent/Task `tool_use_id` chain: root tool
-invocation, authenticated asynchronous PostToolUse `agentId`, local-agent
-`task_started` `task_id`, and verified `SubagentStart` `agent_id`. The bounded
+invocation, authenticated asynchronous PostToolUse `agentId`, an exact
+`task_started` `task_id` whose optional `task_type` is absent, `local_agent`, or
+`remote_agent`, and verified `SubagentStart` `agent_id`. Other task types fail
+closed. The bounded
 correlator never uses semantic text, timing, order, or proximity and fails
 closed on conflicts, malformed identity, duplicate assignment, stale
 generation, or saturation. Its target updates share the provider event batch

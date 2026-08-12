@@ -125,8 +125,11 @@ revisions; it never supplies descendants or provider-native thread, turn, task,
 process, or agent identifiers. Admission installs the cancellation fence before
 provider dispatch. The selected actor is sent first, descendants use bounded
 parallelism, each native attempt has a two-second timeout, and one operation has
-a ten-second deadline. Duplicate and overlapping requests join or absorb the
-existing operation without broadening the canonical boundary.
+a lifecycle-owned ten-second deadline. The deadline finalizes any still-active
+residual as `partial` even after dispatch draining has ended; it is fenced by
+runtime generation, operation identity, and operation revision and cannot
+terminalize provider observation. Duplicate and overlapping requests join or
+absorb the existing operation without broadening the canonical boundary.
 
 Observation history and its revision persist in SQLite. Exact handles,
 cancellation fences, operation summaries, residuals, and the independently
@@ -135,7 +138,9 @@ the current server's control snapshot; restart or provider-generation
 replacement invalidates it. `Stopping` is server-authoritative intent, while
 provider events remain the sole authority for terminal lifecycle. A partial
 retry is fenced by its operation revision and cannot recompute parents,
-siblings, or unrelated work.
+siblings, or unrelated work. Runtime cleanup retains only bounded target-free
+scope/actor revision tombstones so a stable public scope cannot reuse a stale
+pre-restart control fence; no operation or provider-native identity survives.
 
 ### Context-window usage flow
 

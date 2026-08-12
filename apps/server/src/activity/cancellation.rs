@@ -1,15 +1,17 @@
 use std::{
     collections::{HashMap, HashSet},
     fmt,
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
 use futures_util::{StreamExt, future::BoxFuture, stream::FuturesUnordered};
 use tokio::{
     sync::Semaphore,
+    task::JoinHandle,
     time::{Instant, timeout, timeout_at},
 };
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
 use super::{
@@ -84,6 +86,7 @@ pub(super) struct CancellationOperation {
     pub(super) covered_actor_ids: HashSet<String>,
     pub(super) covered_work_item_ids: HashSet<String>,
     pub(super) dispatched_targets: HashSet<ProviderActivityNativeTarget>,
+    pub(super) retryable_targets: HashSet<ProviderActivityNativeTarget>,
     pub(super) active_attempt_ids: HashSet<ActivityDispatchAttemptId>,
     pub(super) active_attempt_targets:
         HashMap<ActivityDispatchAttemptId, HashSet<ProviderActivityNativeTarget>>,
@@ -91,6 +94,34 @@ pub(super) struct CancellationOperation {
     pub(super) residual_work_item_ids: HashSet<String>,
     pub(super) state: ActivityCancellationOperationState,
     pub(super) operation_revision: u64,
+    deadline: Arc<ActivityOperationDeadline>,
+}
+
+struct ActivityOperationDeadline {
+    cancellation: CancellationToken,
+    task: Mutex<Option<JoinHandle<()>>>,
+}
+
+impl fmt::Debug for ActivityOperationDeadline {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ActivityOperationDeadline")
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for ActivityOperationDeadline {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        if let Some(task) = self
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            task.abort();
+        }
+    }
 }
 
 impl fmt::Debug for CancellationOperation {
@@ -102,6 +133,7 @@ impl fmt::Debug for CancellationOperation {
             .field("covered_actor_count", &self.covered_actor_ids.len())
             .field("covered_work_item_count", &self.covered_work_item_ids.len())
             .field("dispatched_target_count", &self.dispatched_targets.len())
+            .field("retryable_target_count", &self.retryable_targets.len())
             .field("active_attempt_count", &self.active_attempt_ids.len())
             .field(
                 "active_attempt_target_count",
@@ -199,6 +231,69 @@ impl ActivityCancellationService {
             registry,
             dispatcher,
         }
+    }
+
+    fn operation_deadline(
+        &self,
+        scope_id: &str,
+        generation: &ActivityRuntimeGeneration,
+        root_actor_id: &str,
+        operation_revision: u64,
+    ) -> Arc<ActivityOperationDeadline> {
+        let cancellation = CancellationToken::new();
+        let deadline = Arc::new(ActivityOperationDeadline {
+            cancellation: cancellation.clone(),
+            task: Mutex::new(None),
+        });
+        let inner = Arc::downgrade(&self.registry.inner);
+        let publisher = self.registry.publisher.clone();
+        let scope_id = scope_id.to_owned();
+        let generation = generation.clone();
+        let root_actor_id = root_actor_id.to_owned();
+        let task = tokio::spawn(async move {
+            tokio::select! {
+                biased;
+                () = cancellation.cancelled() => return,
+                () = tokio::time::sleep(OPERATION_DEADLINE) => {}
+            }
+            let Some(inner) = inner.upgrade() else {
+                return;
+            };
+            let mut state = inner
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let Some(scope) = state.scopes.get_mut(&scope_id) else {
+                return;
+            };
+            if scope.generation != generation {
+                return;
+            }
+            let before = scope.clone();
+            let Some(operation) = scope.operations.get_mut(&root_actor_id) else {
+                return;
+            };
+            if operation.generation != generation
+                || operation.operation_revision != operation_revision
+                || operation.state != ActivityCancellationOperationState::Requested
+                || (operation.residual_actor_ids.is_empty()
+                    && operation.residual_work_item_ids.is_empty())
+            {
+                return;
+            }
+            operation.state = ActivityCancellationOperationState::Partial;
+            operation.operation_revision = operation.operation_revision.saturating_add(1);
+            let Ok(changes) = scope.pending_changes(&before) else {
+                return;
+            };
+            if let Some(event) = scope.publish_changes(changes) {
+                publisher.send_delta(event);
+            }
+        });
+        *deadline
+            .task
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(task);
+        deadline
     }
 
     pub(crate) async fn cancel_subtree(
@@ -420,18 +515,26 @@ impl ActivityCancellationService {
                 .map(|(root, _)| root.clone())
                 .collect::<Vec<_>>();
             let attempt_id = ActivityDispatchAttemptId(Uuid::new_v4());
+            let operation_revision = 1;
             let mut operation = CancellationOperation {
                 root_actor_id: actor_id.to_owned(),
                 generation: scope.generation.clone(),
                 covered_actor_ids,
                 covered_work_item_ids,
                 dispatched_targets: HashSet::new(),
+                retryable_targets: HashSet::new(),
                 active_attempt_ids: HashSet::from([attempt_id.clone()]),
                 active_attempt_targets: HashMap::from([(attempt_id.clone(), HashSet::new())]),
                 residual_actor_ids,
                 residual_work_item_ids,
                 state: ActivityCancellationOperationState::Requested,
-                operation_revision: 1,
+                operation_revision,
+                deadline: self.operation_deadline(
+                    scope_id,
+                    &scope.generation,
+                    actor_id,
+                    operation_revision,
+                ),
             };
             for absorbed_root in absorbed_roots {
                 if let Some(absorbed) = scope.operations.remove(&absorbed_root) {
@@ -450,6 +553,9 @@ impl ActivityCancellationService {
                     operation
                         .dispatched_targets
                         .extend(absorbed.dispatched_targets);
+                    operation
+                        .retryable_targets
+                        .extend(absorbed.retryable_targets);
                     operation
                         .active_attempt_ids
                         .extend(absorbed.active_attempt_ids);
@@ -558,7 +664,15 @@ impl ActivityCancellationService {
                 .ok_or(ActivityCancellationError::StaleOperation)?;
             operation.state = ActivityCancellationOperationState::Requested;
             operation.operation_revision = operation.operation_revision.saturating_add(1);
-            operation.dispatched_targets.clear();
+            for target in operation.retryable_targets.drain() {
+                operation.dispatched_targets.remove(&target);
+            }
+            operation.deadline = self.operation_deadline(
+                scope_id,
+                &scope.generation,
+                root_actor_id,
+                operation.operation_revision,
+            );
             let attempt_id = ActivityDispatchAttemptId(Uuid::new_v4());
             operation.active_attempt_ids.insert(attempt_id.clone());
             operation
@@ -643,7 +757,9 @@ impl ActivityCancellationService {
         if !self.prepare_dispatch(&job, attempt_id) {
             return false;
         }
-        !matches!(
+        let scope_id = job.scope_id.clone();
+        let target = job.target.clone();
+        let failed = !matches!(
             timeout(
                 TARGET_DISPATCH_TIMEOUT,
                 self.dispatcher
@@ -651,7 +767,31 @@ impl ActivityCancellationService {
             )
             .await,
             Ok(Ok(ActivityTargetDispatchDisposition::Delivered))
-        )
+        );
+        if failed {
+            self.release_failed_target(&scope_id, attempt_id, &target);
+        }
+        failed
+    }
+
+    fn release_failed_target(
+        &self,
+        scope_id: &str,
+        attempt_id: &ActivityDispatchAttemptId,
+        target: &ProviderActivityNativeTarget,
+    ) {
+        let mut state = self.registry.lock();
+        let Some(scope) = state.scopes.get_mut(scope_id) else {
+            return;
+        };
+        let Some(operation) = scope
+            .operations
+            .values_mut()
+            .find(|operation| operation.active_attempt_ids.contains(attempt_id))
+        else {
+            return;
+        };
+        operation.retryable_targets.insert(target.clone());
     }
 
     fn prepare_dispatch(
@@ -1682,7 +1822,17 @@ mod tests {
                 .iter()
                 .filter(|call| call.as_str() == "native-late-held")
                 .count(),
-            2
+            1,
+            "a successfully delivered target is not a retry residual"
+        );
+        assert_eq!(
+            dispatcher
+                .calls()
+                .iter()
+                .filter(|call| call.as_str() == "native-late-failed")
+                .count(),
+            2,
+            "the failed target remains retryable"
         );
     }
 
@@ -1933,6 +2083,234 @@ mod tests {
         assert_eq!(operation.residual_count, 1);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn operation_deadline_marks_targetless_active_descendant_partial() {
+        // Mutation caught: bounding only provider futures while a targetless residual stays Requested forever.
+        let registry = ActivityControlRegistry::new();
+        let registration =
+            registry.register_runtime(thread_scope("thread-a"), SCOPE_ID.to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[
+                    running_actor("root", None),
+                    running_actor("child", Some("root")),
+                ],
+                &[actor_target("root")],
+            )
+            .await;
+        let dispatcher = Arc::new(FakeDispatcher::default());
+        let service = ActivityCancellationService::new(registry.clone(), dispatcher.clone());
+        service
+            .cancel_subtree(
+                thread_scope("thread-a"),
+                SCOPE_ID,
+                "root",
+                actor_revision(&registry.snapshot(SCOPE_ID).await, "root"),
+            )
+            .await
+            .expect("admitted cancellation");
+        assert_eq!(
+            registry.snapshot(SCOPE_ID).await.operations[0].state,
+            ActivityCancellationOperationState::Requested
+        );
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(OPERATION_DEADLINE).await;
+        tokio::task::yield_now().await;
+
+        let operation = registry.snapshot(SCOPE_ID).await.operations[0].clone();
+        assert_eq!(operation.state, ActivityCancellationOperationState::Partial);
+        assert_eq!(operation.residual_count, 2);
+        assert_eq!(dispatcher.calls(), vec!["native-root"]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn operation_deadline_marks_delivered_target_without_terminal_event_partial() {
+        // Mutation caught: treating provider delivery acknowledgement as terminal lifecycle.
+        let registry = ActivityControlRegistry::new();
+        let registration =
+            registry.register_runtime(thread_scope("thread-a"), SCOPE_ID.to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[running_actor("root", None)],
+                &[actor_target("root")],
+            )
+            .await;
+        let dispatcher = Arc::new(FakeDispatcher::default());
+        let service = ActivityCancellationService::new(registry.clone(), dispatcher);
+        service
+            .cancel_subtree(
+                thread_scope("thread-a"),
+                SCOPE_ID,
+                "root",
+                actor_revision(&registry.snapshot(SCOPE_ID).await, "root"),
+            )
+            .await
+            .expect("delivered cancellation");
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(OPERATION_DEADLINE).await;
+        tokio::task::yield_now().await;
+
+        let operation = registry.snapshot(SCOPE_ID).await.operations[0].clone();
+        assert_eq!(operation.state, ActivityCancellationOperationState::Partial);
+        assert_eq!(operation.residual_count, 1);
+        assert_eq!(
+            registry.lock().scopes[SCOPE_ID].actors["root"].status,
+            ActivityLifecycle::Running
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn terminal_before_operation_deadline_removes_operation_without_revival() {
+        // Mutation caught: a stale finalizer reviving an operation removed by authoritative lifecycle.
+        let registry = ActivityControlRegistry::new();
+        let registration =
+            registry.register_runtime(thread_scope("thread-a"), SCOPE_ID.to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[running_actor("root", None)],
+                &[actor_target("root")],
+            )
+            .await;
+        let service =
+            ActivityCancellationService::new(registry.clone(), Arc::new(FakeDispatcher::default()));
+        service
+            .cancel_subtree(
+                thread_scope("thread-a"),
+                SCOPE_ID,
+                "root",
+                actor_revision(&registry.snapshot(SCOPE_ID).await, "root"),
+            )
+            .await
+            .expect("delivered cancellation");
+        registry
+            .observe_provider_batch(&registration, &[actor_status("root", "completed")], &[])
+            .await;
+        assert!(registry.snapshot(SCOPE_ID).await.operations.is_empty());
+
+        tokio::task::yield_now().await;
+        tokio::time::advance(OPERATION_DEADLINE).await;
+        tokio::task::yield_now().await;
+
+        assert!(registry.snapshot(SCOPE_ID).await.operations.is_empty());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn deadline_partial_retry_dispatches_only_residual_and_replaces_stale_timer() {
+        // Mutation caught: retrying already delivered targets or letting the first timer finalize the retry.
+        let registry = ActivityControlRegistry::new();
+        let registration =
+            registry.register_runtime(thread_scope("thread-a"), SCOPE_ID.to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[
+                    running_actor("root", None),
+                    running_actor("targetless", Some("root")),
+                ],
+                &[actor_target("root")],
+            )
+            .await;
+        let dispatcher = Arc::new(FakeDispatcher::default());
+        let service = ActivityCancellationService::new(registry.clone(), dispatcher.clone());
+        service
+            .cancel_subtree(
+                thread_scope("thread-a"),
+                SCOPE_ID,
+                "root",
+                actor_revision(&registry.snapshot(SCOPE_ID).await, "root"),
+            )
+            .await
+            .expect("initial cancellation");
+        tokio::task::yield_now().await;
+        tokio::time::advance(OPERATION_DEADLINE).await;
+        tokio::task::yield_now().await;
+        let partial = registry.snapshot(SCOPE_ID).await.operations[0].clone();
+        assert_eq!(partial.state, ActivityCancellationOperationState::Partial);
+
+        let late_jobs = registry
+            .observe_provider_batch(&registration, &[], &[actor_target("targetless")])
+            .await;
+        assert_eq!(late_jobs.len(), 1);
+        service
+            .retry_subtree_cancellation(
+                thread_scope("thread-a"),
+                SCOPE_ID,
+                "root",
+                registry.snapshot(SCOPE_ID).await.operations[0].operation_revision,
+            )
+            .await
+            .expect("residual retry");
+        assert_eq!(
+            dispatcher.calls(),
+            vec!["native-root", "native-targetless"],
+            "retry must dispatch only the residual target"
+        );
+        assert_eq!(
+            registry.snapshot(SCOPE_ID).await.operations[0].state,
+            ActivityCancellationOperationState::Requested
+        );
+
+        tokio::time::advance(Duration::from_millis(1)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            registry.snapshot(SCOPE_ID).await.operations[0].state,
+            ActivityCancellationOperationState::Requested,
+            "the replaced first deadline must be a no-op"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn absorbed_operation_deadline_cannot_finalize_its_new_owner_early() {
+        // Mutation caught: retaining an absorbed descendant operation's deadline ownership.
+        let registry = ActivityControlRegistry::new();
+        let registration = install_tree(&registry, SCOPE_ID, "thread-a").await;
+        let dispatcher = Arc::new(FakeDispatcher::default());
+        let service = ActivityCancellationService::new(registry.clone(), dispatcher);
+        service
+            .cancel_subtree(
+                thread_scope("thread-a"),
+                SCOPE_ID,
+                "alpha-two",
+                actor_revision(&registry.snapshot(SCOPE_ID).await, "alpha-two"),
+            )
+            .await
+            .expect("descendant operation");
+        tokio::task::yield_now().await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+        service
+            .cancel_subtree(
+                thread_scope("thread-a"),
+                SCOPE_ID,
+                "alpha",
+                actor_revision(&registry.snapshot(SCOPE_ID).await, "alpha"),
+            )
+            .await
+            .expect("absorbing operation");
+        tokio::task::yield_now().await;
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        let operation = registry.snapshot(SCOPE_ID).await.operations[0].clone();
+        assert_eq!(operation.root_actor_id, "alpha");
+        assert_eq!(
+            operation.state,
+            ActivityCancellationOperationState::Requested
+        );
+
+        tokio::time::advance(Duration::from_secs(5)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            registry.snapshot(SCOPE_ID).await.operations[0].state,
+            ActivityCancellationOperationState::Partial
+        );
+        drop(registration);
+    }
+
     #[tokio::test]
     async fn aborting_after_admission_before_selected_await_marks_partial_and_allows_retry() {
         // Mutation caught: dropping an admitted request without disarming its Requested fence.
@@ -2048,6 +2426,88 @@ mod tests {
         assert_eq!(registry.snapshot(SCOPE_ID).await.scope_id, SCOPE_ID);
         drop(replacement);
         assert!(registry.snapshot(SCOPE_ID).await.operations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn runtime_restart_rejects_old_actor_and_operation_fences_before_provider_io() {
+        // Mutation caught: reusing a pre-restart actor/operation revision for replacement work.
+        let registry = ActivityControlRegistry::new();
+        let first = registry.register_runtime(thread_scope("thread-a"), SCOPE_ID.to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &first,
+                &[running_actor("root", None)],
+                &[actor_target("root")],
+            )
+            .await;
+        let dispatcher = Arc::new(FakeDispatcher::default());
+        let service = ActivityCancellationService::new(registry.clone(), dispatcher.clone());
+        let old_actor_revision = actor_revision(&registry.snapshot(SCOPE_ID).await, "root");
+        let accepted = service
+            .cancel_subtree(
+                thread_scope("thread-a"),
+                SCOPE_ID,
+                "root",
+                old_actor_revision,
+            )
+            .await
+            .expect("old generation cancellation");
+        let old_operation_revision = accepted.operation_revision.expect("operation revision");
+        assert_eq!(dispatcher.calls(), vec!["native-root"]);
+
+        drop(first);
+        let replacement =
+            registry.register_runtime(thread_scope("thread-a"), SCOPE_ID.to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &replacement,
+                &[running_actor("root", None)],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "root".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "replacement-root".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+        let current_actor_revision = actor_revision(&registry.snapshot(SCOPE_ID).await, "root");
+        assert!(current_actor_revision > old_actor_revision);
+        let calls_before_stale = dispatcher.calls();
+
+        assert_eq!(
+            service
+                .cancel_subtree(
+                    thread_scope("thread-a"),
+                    SCOPE_ID,
+                    "root",
+                    old_actor_revision,
+                )
+                .await,
+            Err(ActivityCancellationError::StaleActor)
+        );
+        assert_eq!(
+            service
+                .retry_subtree_cancellation(
+                    thread_scope("thread-a"),
+                    SCOPE_ID,
+                    "root",
+                    old_operation_revision,
+                )
+                .await,
+            Err(ActivityCancellationError::StaleOperation)
+        );
+        assert_eq!(dispatcher.calls(), calls_before_stale);
+
+        service
+            .cancel_subtree(
+                thread_scope("thread-a"),
+                SCOPE_ID,
+                "root",
+                current_actor_revision,
+            )
+            .await
+            .expect("replacement generation cancellation");
+        assert_eq!(dispatcher.calls().last().unwrap(), "replacement-root");
     }
 
     #[tokio::test]

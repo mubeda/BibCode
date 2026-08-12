@@ -29,13 +29,13 @@ emit() {
 }
 
 emit '{"type":"stream_event","session_id":"__SESSION__","uuid":"tool-a","parent_tool_use_id":null,"event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-agent-a","name":"Agent","input":{"description":"same description","prompt":"same prompt","subagent_type":"same-role"}}}}'
-emit '{"type":"system","subtype":"task_started","session_id":"__SESSION__","uuid":"task-a-start","task_id":"task-a","tool_use_id":"tool-agent-a","task_type":"local_agent","description":"same description"}'
+emit '{"type":"system","subtype":"task_started","session_id":"__SESSION__","uuid":"task-a-start","task_id":"task-a","tool_use_id":"tool-agent-a","task_type":"remote_agent","description":"same description"}'
 
 emit '{"type":"stream_event","session_id":"__SESSION__","uuid":"tool-b","parent_tool_use_id":null,"event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-agent-b","name":"Agent","input":{"description":"same description","prompt":"same prompt","subagent_type":"same-role"}}}}'
 emit '{"type":"system","subtype":"task_started","session_id":"__SESSION__","uuid":"task-b-start","task_id":"task-b","tool_use_id":"tool-agent-b","task_type":"local_agent","description":"same description"}'
 
 emit '{"type":"stream_event","session_id":"__SESSION__","uuid":"tool-child","parent_tool_use_id":"tool-agent-a","event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-agent-child","name":"Agent","input":{"description":"same description","prompt":"same prompt"}}}}'
-emit '{"type":"system","subtype":"task_started","session_id":"__SESSION__","uuid":"task-child-start","task_id":"task-child","tool_use_id":"tool-agent-child","task_type":"local_agent"}'
+emit '{"type":"system","subtype":"task_started","session_id":"__SESSION__","uuid":"task-child-start","task_id":"task-child","tool_use_id":"tool-agent-child"}'
 
 stop_count=0
 while IFS= read -r line; do

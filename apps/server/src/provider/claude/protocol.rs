@@ -152,7 +152,7 @@ pub(crate) struct ClaudeTaskStartedMessage {
     pub(crate) session_id: String,
     pub(crate) task_id: String,
     pub(crate) tool_use_id: String,
-    pub(crate) task_type: String,
+    pub(crate) task_type: Option<String>,
 }
 
 impl std::fmt::Debug for ClaudeTaskStartedMessage {

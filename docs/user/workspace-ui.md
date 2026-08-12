@@ -175,6 +175,9 @@ terminal state. If dispatch finishes with active residuals, the panel reports
 the bounded remaining count and offers **Retry remaining**. Retry is constrained
 by the server to residuals and late descendants under the original cancellation
 fence; it cannot expand to a parent, sibling, or replacement provider runtime.
+An operation that still has active residuals ten seconds after admission becomes
+partial even if provider delivery returned without a terminal lifecycle event,
+so the UI cannot remain on **Stopping** indefinitely.
 Reconnect restores the current server's control state, while a server restart
 requires the new runtime to prove exact targets again.
 

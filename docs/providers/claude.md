@@ -173,8 +173,10 @@ Structured chat control correlation is stricter than display observation.
 BiBCode exposes a private task target only after one session and Activity
 generation proves the complete identity chain: an Agent/legacy Task tool
 invocation, its authenticated asynchronous PostToolUse result carrying the
-same `tool_use_id` and `agentId`, a local-agent `task_started` record carrying
-that `tool_use_id` and `task_id`, and the matching `SubagentStart` `agent_id`.
+same `tool_use_id` and `agentId`, a `task_started` record carrying that
+`tool_use_id` and `task_id`, and the matching `SubagentStart` `agent_id`.
+`task_type` may be absent or exactly `local_agent` or `remote_agent`; every
+other value fails closed.
 Root invocations require both the stream invocation and authenticated hook to
 identify the root as their source and `SubagentStart` to report no parent. A
 nested invocation additionally requires its stream `parent_tool_use_id` to

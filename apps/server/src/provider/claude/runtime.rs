@@ -555,7 +555,10 @@ impl ClaudeTaskControlCorrelator {
             let Some(record) = self.correlation_mut(&message.tool_use_id) else {
                 return Vec::new();
             };
-            if message.task_type != "local_agent" {
+            if !matches!(
+                message.task_type.as_deref(),
+                None | Some("local_agent" | "remote_agent")
+            ) {
                 true
             } else {
                 match record.task_id.as_deref() {
@@ -2201,7 +2204,10 @@ fn claude_control_fact_native_event_id(value: &Value) -> Option<String> {
                     session_id,
                     tool_use_id,
                     task_id,
-                    classify_task_type(value.get("task_type")?.as_str()?),
+                    classify_task_type(match value.get("task_type") {
+                        Some(task_type) => Some(task_type.as_str()?),
+                        None => None,
+                    }),
                 ]);
             }
             "task_notification" => {
@@ -2334,11 +2340,12 @@ fn classify_async_launch_status(status: &str) -> &'static str {
     }
 }
 
-fn classify_task_type(task_type: &str) -> &'static str {
-    if task_type == "local_agent" {
-        "local-agent"
-    } else {
-        "other"
+fn classify_task_type(task_type: Option<&str>) -> &'static str {
+    match task_type {
+        None => "absent",
+        Some("local_agent") => "local-agent",
+        Some("remote_agent") => "remote-agent",
+        Some(_) => "other",
     }
 }
 
@@ -2933,6 +2940,74 @@ mod targeted_task_correlation_tests {
                 "failed exact fact order {order:?}"
             );
             assert_effects_are_keyed(&outputs, &format!("root install order {order:?}"));
+        }
+    }
+
+    #[test]
+    fn targeted_task_correlation_accepts_optional_local_and_remote_agent_task_types() {
+        // Mutation caught: requiring task_type or treating remote_agent as a non-agent task.
+        for task_type in [None, Some("local_agent"), Some("remote_agent")] {
+            let mut chain = facts("session", "tool-a", "agent-a", "task-a");
+            match task_type {
+                Some(task_type) => chain[2]["task_type"] = json!(task_type),
+                None => {
+                    chain[2]
+                        .as_object_mut()
+                        .expect("task_started object")
+                        .remove("task_type");
+                }
+            }
+            let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+            let outputs = chain
+                .iter()
+                .enumerate()
+                .map(|(index, fact)| handle_fact(&mut runtime, fact, true, index as u64))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                mapped_targets(&outputs),
+                [("claude:agent:agent-a".to_owned(), "task-a".to_owned())],
+                "task type {task_type:?}"
+            );
+            assert_effects_are_keyed(&outputs, &format!("task type {task_type:?}"));
+        }
+    }
+
+    #[test]
+    fn targeted_nested_task_correlation_accepts_remote_and_omitted_task_types() {
+        // Mutation caught: accepting the optional task types only for root correlations.
+        for task_type in [None, Some("remote_agent")] {
+            let parent = facts("session", "tool-parent", "agent-parent", "task-parent");
+            let mut child = facts("session", "tool-child", "agent-child", "task-child");
+            child[0]["parent_tool_use_id"] = json!("tool-parent");
+            child[1]["agent_id"] = json!("agent-parent");
+            child[3]["parent_agent_id"] = json!("agent-parent");
+            match task_type {
+                Some(task_type) => child[2]["task_type"] = json!(task_type),
+                None => {
+                    child[2]
+                        .as_object_mut()
+                        .expect("nested task_started object")
+                        .remove("task_type");
+                }
+            }
+
+            let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+            for (index, fact) in parent.iter().enumerate() {
+                let _ = handle_fact(&mut runtime, fact, true, index as u64);
+            }
+            let outputs = child
+                .iter()
+                .enumerate()
+                .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 10 + index as u64))
+                .collect::<Vec<_>>();
+            assert_eq!(
+                mapped_targets(&outputs),
+                [(
+                    "claude:agent:agent-child".to_owned(),
+                    "task-child".to_owned()
+                )],
+                "nested task type {task_type:?}"
+            );
         }
     }
 
