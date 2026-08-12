@@ -3483,6 +3483,110 @@ mod targeted_task_correlation_tests {
     }
 
     #[test]
+    fn targeted_task_correlation_pending_fallback_failure_tombstones_later_join() {
+        // Mutation caught: accepting a child start after authenticated PostToolUseFailure closed its pending candidate.
+        let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+        for (index, fact) in facts("session", "tool-parent", "agent-parent", "task-parent")
+            .iter()
+            .enumerate()
+        {
+            let _ = handle_fact(&mut runtime, fact, true, index as u64);
+        }
+        let child = nested_fallback_facts(
+            "session",
+            "tool-parent",
+            "agent-parent",
+            "tool-child",
+            "agent-child",
+            "task-child",
+        );
+        for (index, fact) in child[..3].iter().enumerate() {
+            let _ = handle_fact(&mut runtime, fact, true, 10 + index as u64);
+        }
+        let failure = handle_fact(
+            &mut runtime,
+            &json!({
+                "hook_event_name":"PostToolUseFailure", "session_id":"session",
+                "agent_id":"agent-parent", "tool_use_id":"tool-child", "tool_name":"Agent"
+            }),
+            true,
+            20,
+        );
+        assert!(mapped_targets(&[failure]).is_empty());
+        let later = child
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 30 + index as u64))
+            .collect::<Vec<_>>();
+        assert!(mapped_targets(&later).is_empty());
+        assert!(
+            !runtime
+                .task_control_correlator
+                .actor_target_by_agent
+                .contains_key("agent-child")
+        );
+        assert!(runtime.task_control_correlator.state_is_bounded());
+    }
+
+    #[test]
+    fn targeted_task_correlation_contradictory_fallback_replay_never_remaps() {
+        // Mutation caught: replaying matching facts after a contradictory PostToolUse recreates a retired fallback target.
+        let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+        let parent = facts("session", "tool-parent", "agent-parent", "task-parent");
+        let child = nested_fallback_facts(
+            "session",
+            "tool-parent",
+            "agent-parent",
+            "tool-child",
+            "agent-child",
+            "task-child",
+        );
+        for (index, fact) in parent.iter().chain(child.iter()).enumerate() {
+            let _ = handle_fact(&mut runtime, fact, true, index as u64);
+        }
+        let contradiction = handle_fact(
+            &mut runtime,
+            &json!({
+                "hook_event_name":"PostToolUse", "session_id":"session",
+                "agent_id":"agent-parent", "tool_use_id":"tool-child", "tool_name":"Agent",
+                "tool_response":{"status":"async_launched","agentId":"agent-other"}
+            }),
+            true,
+            20,
+        );
+        assert!(
+            contradiction
+                .activity_controls
+                .iter()
+                .any(|update| matches!(
+                    update,
+                    ProviderActivityControlUpdate::ActorTarget { actor_id, target: None }
+                        if actor_id == "claude:agent:agent-child"
+                ))
+        );
+        let matching = json!({
+            "hook_event_name":"PostToolUse", "session_id":"session",
+            "agent_id":"agent-parent", "tool_use_id":"tool-child", "tool_name":"Agent",
+            "tool_response":{"status":"async_launched","agentId":"agent-child"}
+        });
+        let replay = parent
+            .iter()
+            .chain(child.iter())
+            .chain(std::iter::once(&matching))
+            .enumerate()
+            .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 30 + index as u64))
+            .collect::<Vec<_>>();
+        assert!(mapped_targets(&replay).is_empty());
+        assert!(
+            !runtime
+                .task_control_correlator
+                .actor_target_by_agent
+                .contains_key("agent-child")
+        );
+        assert!(runtime.task_control_correlator.state_is_bounded());
+    }
+
+    #[test]
     fn targeted_task_correlation_promotes_matching_exact_evidence_without_reinstalling() {
         // Mutation caught: emitting a second Install when PostToolUse confirms a fallback child.
         let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
@@ -3671,14 +3775,17 @@ mod targeted_task_correlation_tests {
                 "task-child-b",
             );
             if extra_child {
-                runtime.task_control_correlator.verified_agents.insert(
-                    "agent-child-a".to_owned(),
-                    ClaudeVerifiedLineage::Parent("agent-parent".to_owned()),
-                );
-                runtime.task_control_correlator.verified_agents.insert(
-                    "agent-child-b".to_owned(),
-                    ClaudeVerifiedLineage::Parent("agent-parent".to_owned()),
-                );
+                for agent_id in ["agent-child-a", "agent-child-b"] {
+                    let _ = handle_fact(
+                        &mut runtime,
+                        &json!({
+                            "hook_event_name":"SubagentStart", "session_id":"session",
+                            "agent_id":agent_id, "parent_agent_id":"agent-parent"
+                        }),
+                        true,
+                        9,
+                    );
+                }
             }
             let facts = if extra_child {
                 child_a[..3].iter().collect::<Vec<_>>()
@@ -3844,7 +3951,8 @@ mod targeted_task_correlation_tests {
         {
             let _ = handle_fact(&mut runtime, fact, true, index as u64);
         }
-        for index in 0..=ACTIVITY_PAGE_MAX_LENGTH {
+        let maximum_pending_children = ACTIVITY_PAGE_MAX_LENGTH - 1;
+        for index in 0..maximum_pending_children {
             let facts = nested_fallback_facts(
                 "session",
                 "tool-parent",
@@ -3870,12 +3978,68 @@ mod targeted_task_correlation_tests {
                 .len(),
             ACTIVITY_PAGE_MAX_LENGTH
         );
+        for index in 0..=ACTIVITY_PAGE_MAX_LENGTH {
+            let _ = handle_fact(
+                &mut runtime,
+                &json!({
+                    "type":"system", "subtype":"task_notification", "session_id":"session",
+                    "task_id":format!("terminal-pending-{index}"), "status":"stopped"
+                }),
+                false,
+                10_000 + index as u64,
+            );
+        }
+        assert_eq!(
+            runtime
+                .task_control_correlator
+                .pending_terminal_by_task
+                .len(),
+            ACTIVITY_PAGE_MAX_LENGTH
+        );
+        assert!(runtime.task_control_correlator.terminal_overflowed);
+        let rejected = nested_fallback_facts(
+            "session",
+            "tool-parent",
+            "agent-parent",
+            "tool-child-rejected",
+            "agent-child-rejected",
+            "task-child-rejected",
+        );
+        let rejected_outputs = rejected
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 20_000 + index as u64))
+            .collect::<Vec<_>>();
+        assert!(mapped_targets(&rejected_outputs).is_empty());
         assert!(
             !runtime
                 .task_control_correlator
-                .correlations_by_tool_use
-                .contains_key("tool-child-200")
+                .actor_target_by_agent
+                .contains_key("agent-child-rejected")
         );
+        let close_pending = handle_fact(
+            &mut runtime,
+            &json!({
+                "hook_event_name":"PostToolUseFailure", "session_id":"session",
+                "agent_id":"agent-parent", "tool_use_id":"tool-child-0", "tool_name":"Agent"
+            }),
+            true,
+            30_000,
+        );
+        assert!(mapped_targets(&[close_pending]).is_empty());
+        let rejected_replay = rejected
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 40_000 + index as u64))
+            .collect::<Vec<_>>();
+        assert!(mapped_targets(&rejected_replay).is_empty());
+        assert!(
+            !runtime
+                .task_control_correlator
+                .actor_target_by_agent
+                .contains_key("agent-child-rejected")
+        );
+        assert!(runtime.task_control_correlator.state_is_bounded());
     }
 
     #[test]
