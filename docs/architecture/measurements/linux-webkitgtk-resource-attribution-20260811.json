@@ -1,0 +1,41 @@
+{
+  "label": "linux-webkitgtk-resource-attribution",
+  "rootPid": 69860,
+  "sampledAt": "2026-08-12T13:57:51.725Z",
+  "startupMs": 0.017430000000004497,
+  "windowReadyMs": null,
+  "readyUrl": null,
+  "windowTitle": null,
+  "idleMs": 30000,
+  "processIds": [69860, 69945, 69970],
+  "processCount": 3,
+  "totalPrivateBytes": 749260800,
+  "privateBytesMetric": "rss-approximation",
+  "totalWorkingSetBytes": 749260800,
+  "topProcesses": [
+    {
+      "pid": 69970,
+      "processName": "WebKitWebProces",
+      "command": "././/libexec/webkit2gtk-4.1/WebKitWebProcess 4 21",
+      "privateBytes": 479653888,
+      "workingSetBytes": 479653888,
+      "mainWindowTitle": ""
+    },
+    {
+      "pid": 69860,
+      "processName": "bibcode-desktop",
+      "command": "bibcode-desktop",
+      "privateBytes": 206327808,
+      "workingSetBytes": 206327808,
+      "mainWindowTitle": ""
+    },
+    {
+      "pid": 69945,
+      "processName": "WebKitNetworkPr",
+      "command": "././/libexec/webkit2gtk-4.1/WebKitNetworkProcess 1 16",
+      "privateBytes": 63279104,
+      "workingSetBytes": 63279104,
+      "mainWindowTitle": ""
+    }
+  ]
+}
