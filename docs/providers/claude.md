@@ -237,6 +237,14 @@ restarted or re-enabled runtime starts a fresh generation and may prove support
 and exact mappings again. Private task IDs and raw control errors are redacted
 from Activity errors, logs, and Debug output.
 
+The Activity panel shows `Stopping` from the server's ephemeral control overlay;
+the `stop_task` response itself does not terminalize the actor. Authenticated
+hook and task lifecycle events remain authoritative. If only part of a selected
+subtree is delivered, **Retry remaining** sends only the current exact residual
+task mappings and late descendants already captured by the original
+generation-scoped fence. It never performs a new semantic lookup or falls back
+to Claude's conversation-wide interrupt.
+
 Provider-terminal observation has a separate capability and safety gate. The
 executable must support the required settings switches and BiBCode's additive
 hook preparation. If preparation cannot be established before spawn, the

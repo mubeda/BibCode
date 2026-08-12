@@ -33,7 +33,7 @@ protocol:
 | -------- | ---------------------------------------------- | ------------------------------------------------------------------------------------------ |
 | Codex    | Codex App Server JSON-RPC                      | Structured chat and managed-terminal observation.                                          |
 | Claude   | Claude stream-JSON CLI and authenticated hooks | Structured chat and managed-terminal observation when required capabilities are available. |
-| Cursor   | Agent Client Protocol                          | Normal chat only in activity protocol v1.                                                  |
+| Cursor   | Agent Client Protocol                          | Normal chat only in activity protocol v2.                                                  |
 | OpenCode | OpenCode server/events API                     | Structured chat and managed-terminal observation.                                          |
 
 Provider-specific events are normalized into shared orchestration contracts;
@@ -222,7 +222,7 @@ never falls back to the root interrupt path.
 | Codex    | Supported       | Actors, attributed entries, and version-gated background tasks.                                                                                               | Supported when the executable advertises the required App Server listener and remote-TUI features.                 | Incompatible recovery or background methods reduce capabilities without disabling ordinary provider use.                         |
 | Claude   | Supported       | Actors and attributed entries when both hook-event switches are detected; exact correlated actors support generation-scoped `stop_task`; no background tasks. | Supported after safe settings composition, authenticated hooks, merge attestation, and private executable pinning. | Failed probes preserve ordinary use; exact unsupported `stop_task` revokes every target for only the current runtime generation. |
 | OpenCode | Supported       | Actors and attributed entries after child-session correlation; no background tasks.                                                                           | Supported after authenticated serve/attach preparation and owned-root correlation.                                 | Reconciliation can report none, bounded, full, or stale without restarting the original command.                                 |
-| Cursor   | Supported       | Unsupported in protocol v1.                                                                                                                                   | Unsupported in protocol v1.                                                                                        | Cursor remains usable for ordinary chat without an activity dock.                                                                |
+| Cursor   | Supported       | Unsupported in protocol v2.                                                                                                                                   | Unsupported in protocol v2.                                                                                        | Cursor remains usable for ordinary chat without an activity dock.                                                                |
 
 For every terminal observer, failed or timed-out preparation passes through the
 original command. Once a prepared command is running, later observer failure
