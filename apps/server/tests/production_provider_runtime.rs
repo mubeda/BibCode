@@ -1103,6 +1103,46 @@ async fn captured_json_request(path: &Path, predicate: impl Fn(&Value) -> bool) 
     .expect("captured provider request")
 }
 
+async fn captured_complete_ndjson(path: &Path) -> Vec<Value> {
+    timeout(Duration::from_secs(5), async {
+        loop {
+            let content = std::fs::read_to_string(path).unwrap_or_default();
+            if (content.is_empty() || content.ends_with('\n'))
+                && let Some(values) = content
+                    .lines()
+                    .map(|line| serde_json::from_str::<Value>(line).ok())
+                    .collect::<Option<Vec<_>>>()
+            {
+                break values;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "provider capture never reached a complete NDJSON boundary: path={}, capture={:?}",
+            path.display(),
+            std::fs::read_to_string(path)
+        )
+    })
+}
+
+fn claude_stop_task_targets(requests: &[Value]) -> Vec<String> {
+    requests
+        .iter()
+        .filter(|request| request["request"]["subtype"] == "stop_task")
+        .filter_map(|request| request["request"]["task_id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn claude_root_interrupt_count(requests: &[Value]) -> usize {
+    requests
+        .iter()
+        .filter(|request| request["request"]["subtype"] == "interrupt")
+        .count()
+}
+
 fn image_attachment(temp: &TempDir) -> Value {
     let directory = temp.path().join("attachments");
     std::fs::create_dir_all(&directory).expect("attachment directory");
@@ -11120,9 +11160,10 @@ while IFS= read -r line; do
       printf '{{"id":%s,"result":{{}}}}\n' "$id"
       printf '%s\n' '{{"method":"turn/completed","emittedAtMs":1020,"params":{{"threadId":"alpha-late","turn":{{"id":"alpha-late-turn","status":"completed","completedAt":3}}}}}}'
       printf '%s\n' '{{"method":"turn/completed","emittedAtMs":1022,"params":{{"threadId":"alpha","turn":{{"id":"alpha-turn","status":"completed","completedAt":3}}}}}}'
-      printf '%s\n' '{{"method":"turn/started","emittedAtMs":1030,"params":{{"threadId":"beta","turn":{{"id":"beta-followup-turn","status":"inProgress","startedAt":4}}}}}}'
-      printf '%s\n' '{{"method":"item/started","emittedAtMs":1031,"params":{{"threadId":"provider-root","turnId":"root-turn","item":{{"id":"spawn-root-followup","type":"collabAgentToolCall","tool":"spawnAgent","status":"inProgress","senderThreadId":"provider-root","receiverThreadIds":["root-followup"],"agentsStates":{{"root-followup":{{"status":"running","message":null}}}}}},"startedAtMs":1031}}}}'
-      printf '%s\n' '{{"method":"turn/started","emittedAtMs":1032,"params":{{"threadId":"root-followup","turn":{{"id":"root-followup-turn","status":"inProgress","startedAt":4}}}}}}'
+      printf '%s\n' '{{"method":"item/started","emittedAtMs":1030,"params":{{"threadId":"beta","turnId":"beta-turn","item":{{"id":"spawn-beta-followup","type":"collabAgentToolCall","tool":"spawnAgent","status":"inProgress","senderThreadId":"beta","receiverThreadIds":["beta-followup"],"agentsStates":{{"beta-followup":{{"status":"running","message":null}}}}}},"startedAtMs":1030}}}}'
+      printf '%s\n' '{{"method":"turn/started","emittedAtMs":1031,"params":{{"threadId":"beta-followup","turn":{{"id":"beta-followup-turn","status":"inProgress","startedAt":4}}}}}}'
+      printf '%s\n' '{{"method":"item/started","emittedAtMs":1032,"params":{{"threadId":"provider-root","turnId":"root-turn","item":{{"id":"spawn-root-followup","type":"collabAgentToolCall","tool":"spawnAgent","status":"inProgress","senderThreadId":"provider-root","receiverThreadIds":["root-followup"],"agentsStates":{{"root-followup":{{"status":"running","message":null}}}}}},"startedAtMs":1032}}}}'
+      printf '%s\n' '{{"method":"turn/started","emittedAtMs":1033,"params":{{"threadId":"root-followup","turn":{{"id":"root-followup-turn","status":"inProgress","startedAt":4}}}}}}'
       ;;
     *'"method":"turn/interrupt"'*) printf '{{"id":%s,"result":{{}}}}\n' "$id" ;;
     *'"method":"shutdown"'*) printf '{{"id":%s,"result":null}}\n' "$id" ;;
@@ -11461,6 +11502,16 @@ done
         reconnected_snapshot["actors"]
             .as_array()
             .is_some_and(|actors| actors.iter().any(|actor| {
+                actor["id"] == "codex:thread:beta-followup"
+                    && actor["parentActorId"] == "codex:thread:beta"
+                    && actor["status"] == "running"
+            })),
+        "a unique post-cancellation beta descendant proves the sibling provider event was applied"
+    );
+    assert!(
+        reconnected_snapshot["actors"]
+            .as_array()
+            .is_some_and(|actors| actors.iter().any(|actor| {
                 actor["id"] == "codex:thread:root-followup" && actor["status"] == "running"
             })),
         "a post-cancellation root provider event remains observable after reconnect"
@@ -11583,11 +11634,13 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
     let settings_capture = state.path().join("claude-targeted-settings.json");
     let token_capture = state.path().join("claude-targeted-token");
     let session_capture = state.path().join("claude-targeted-session");
+    let ready_capture = state.path().join("claude-targeted-ready");
     let script = include_str!("fixtures/claude-provider/targeted-rpc.sh")
         .replace("__CAPTURE__", &capture.to_string_lossy())
         .replace("__SETTINGS__", &settings_capture.to_string_lossy())
         .replace("__TOKEN__", &token_capture.to_string_lossy())
-        .replace("__SESSION_PATH__", &session_capture.to_string_lossy());
+        .replace("__SESSION_PATH__", &session_capture.to_string_lossy())
+        .replace("__READY__", &ready_capture.to_string_lossy());
     let executable = executable_fixture(&state, "claude-targeted-rpc", &script, "");
     let config = test_config(&state);
     std::fs::create_dir_all(config.state_dir()).expect("state directory");
@@ -11656,21 +11709,20 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
     .expect("turn admitted");
 
     timeout(Duration::from_secs(10), async {
-        while !(std::fs::read_to_string(&settings_capture)
-            .ok()
-            .is_some_and(|settings| serde_json::from_str::<Value>(&settings).is_ok())
-            && std::fs::read_to_string(&token_capture)
-                .ok()
-                .is_some_and(|token| !token.is_empty())
-            && std::fs::read_to_string(&session_capture)
-                .ok()
-                .is_some_and(|session| !session.is_empty()))
-        {
+        while !ready_capture.exists() {
             tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("Claude fixture captures authenticated hook settings");
+    .unwrap_or_else(|_| {
+        panic!(
+            "Claude fixture did not reach launch-ready marker: ready={}, settings={:?}, token_bytes={}, session={:?}",
+            ready_capture.exists(),
+            std::fs::read_to_string(&settings_capture),
+            std::fs::read(&token_capture).map_or(0, |token| token.len()),
+            std::fs::read_to_string(&session_capture)
+        )
+    });
     let settings: Value = serde_json::from_str(
         &std::fs::read_to_string(&settings_capture).expect("Claude hook settings"),
     )
@@ -11833,7 +11885,11 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
     ));
     ack_stream_rpc(&mut thread_stream, "9501").await;
 
-    let before_unmapped = std::fs::read_to_string(&capture).unwrap_or_default();
+    let before_unmapped = captured_complete_ndjson(&capture).await;
+    let before_unmapped_stop_tasks = claude_stop_task_targets(&before_unmapped);
+    let before_unmapped_root_interrupts = claude_root_interrupt_count(&before_unmapped);
+    assert!(before_unmapped_stop_tasks.is_empty());
+    assert_eq!(before_unmapped_root_interrupts, 0);
     assert!(
         tagged_rpc_request(
             &mut socket,
@@ -11849,9 +11905,16 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
         .await
         .is_err()
     );
+    let after_unmapped = captured_complete_ndjson(&capture).await;
     assert_eq!(
-        std::fs::read_to_string(&capture).unwrap_or_default(),
-        before_unmapped
+        claude_stop_task_targets(&after_unmapped),
+        before_unmapped_stop_tasks,
+        "an unsupported actor must not write a targeted stop request"
+    );
+    assert_eq!(
+        claude_root_interrupt_count(&after_unmapped),
+        0,
+        "an unsupported actor must not fall back to interrupting the root"
     );
 
     tagged_rpc_request(
@@ -11870,25 +11933,23 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
 
     let stop_tasks = timeout(Duration::from_secs(10), async {
         loop {
-            let requests = std::fs::read_to_string(&capture).unwrap_or_default();
-            let stops = requests
-                .lines()
-                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                .filter(|request| request["request"]["subtype"] == "stop_task")
-                .collect::<Vec<_>>();
-            if stops.len() == 2 {
-                break stops;
+            let requests = captured_complete_ndjson(&capture).await;
+            let stop_tasks = claude_stop_task_targets(&requests);
+            if stop_tasks.len() == 2 {
+                break (requests, stop_tasks);
             }
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("exact selected Claude stop_task requests");
-    assert_eq!(stop_tasks[0]["request"]["task_id"], "task-a");
-    assert_eq!(stop_tasks[1]["request"]["task_id"], "task-child");
-    assert!(stop_tasks.iter().all(|request| {
-        request["request"]["subtype"] == "stop_task" && request["request"]["task_id"] != "task-b"
-    }));
+    let (requests, stop_tasks) = stop_tasks;
+    assert_eq!(stop_tasks, ["task-a", "task-child"]);
+    assert_eq!(
+        claude_root_interrupt_count(&requests),
+        0,
+        "selected cancellation must never fall back to a root interrupt"
+    );
 
     let post_cancel = timeout(Duration::from_secs(10), async {
         let mut request_id = 9_400_u64;
