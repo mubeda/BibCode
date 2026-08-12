@@ -20,6 +20,9 @@ while [ "$#" -gt 0 ]; do
 done
 printf '%s' "$BIBCODE_CLAUDE_HOOK_TOKEN" > '__TOKEN__'
 printf '%s' "$session_id" > '__SESSION_PATH__'
+if [ -s '__SETTINGS__' ] && [ -s '__TOKEN__' ] && [ -s '__SESSION_PATH__' ]; then
+  : > '__READY__'
+fi
 
 emit() {
   printf '%s\n' "$1" | sed "s/__SESSION__/$session_id/g"
