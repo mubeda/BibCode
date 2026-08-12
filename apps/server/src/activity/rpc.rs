@@ -1176,7 +1176,11 @@ mod tests {
         .expect("retry cancellation");
         assert_eq!(retry["disposition"], "accepted");
         assert_eq!(retry["operationRevision"], 2);
-        assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            dispatcher.calls.load(Ordering::SeqCst),
+            1,
+            "retry does not redispatch an already delivered target"
+        );
 
         let wire = serde_json::to_string(&(terminal_result, accepted, duplicate, retry))
             .expect("serialize wire results");
@@ -1258,7 +1262,7 @@ mod tests {
             .await
             .expect("scope persistence");
         let control_registry = projection.activity_control_registry();
-        let _registration = control_registry.register_runtime(
+        let registration = control_registry.register_runtime(
             scope.scope.clone(),
             scope.scope_id.clone(),
             Some("codex".to_owned()),
@@ -1308,7 +1312,7 @@ mod tests {
 
         control_registry
             .observe_provider_batch(
-                &_registration,
+                &registration,
                 &[actor],
                 &[ProviderActivityControlUpdate::ActorTarget {
                     actor_id: "actor:child".to_owned(),
@@ -1335,10 +1339,60 @@ mod tests {
         assert!(!serialized.contains("native-thread-secret"));
         assert!(!serialized.contains("native-turn-secret"));
 
+        drop(registration);
+        let removed = stream
+            .recv()
+            .await
+            .expect("runtime removal chunk")
+            .expect("runtime removal delta");
+        assert_eq!(removed[0]["kind"], "control-delta");
+        assert_eq!(removed[0]["delta"]["previousRevision"], 1);
+        assert_eq!(removed[0]["delta"]["revision"], 2);
+        assert_eq!(removed[0]["delta"]["changes"][0]["kind"], "actor-removed");
+
+        let replacement_registration = control_registry.register_runtime(
+            scope.scope.clone(),
+            scope.scope_id.clone(),
+            Some("codex".to_owned()),
+        );
+        control_registry
+            .observe_provider_batch(
+                &replacement_registration,
+                &[
+                    ProviderActivityMutation::upsert_actor("actor:child", None, "Child", "running")
+                        .expect("replacement actor"),
+                ],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor:child".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::codex_turn(
+                        "replacement-native-thread-secret".to_owned(),
+                        "replacement-native-turn-secret".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+        let replaced = stream
+            .recv()
+            .await
+            .expect("replacement control chunk")
+            .expect("replacement control delta");
+        assert_eq!(replaced[0]["kind"], "control-delta");
+        assert_eq!(replaced[0]["delta"]["previousRevision"], 2);
+        assert_eq!(replaced[0]["delta"]["revision"], 3);
+        assert_eq!(
+            replaced[0]["delta"]["changes"][0]["actor"]["state"],
+            "available"
+        );
+        assert!(
+            replaced[0]["delta"]["changes"][0]["actor"]["controlRevision"]
+                .as_u64()
+                .is_some_and(|revision| revision > 1)
+        );
+
         control_registry.publish_delta(ActivityControlDelta {
             scope_id: scope.scope_id.clone(),
-            previous_revision: 2,
-            revision: 3,
+            previous_revision: 4,
+            revision: 5,
             changes: vec![ActivityControlChange::ActorRemoved {
                 actor_id: "actor:other".to_owned(),
             }],
@@ -1349,7 +1403,7 @@ mod tests {
             .expect("control replacement chunk")
             .expect("control replacement");
         assert_eq!(replacement[0]["kind"], "control-snapshot");
-        assert_eq!(replacement[0]["control"]["revision"], 1);
+        assert_eq!(replacement[0]["control"]["revision"], 3);
         assert_eq!(
             replacement[0]["control"]["actors"][0]["actorId"],
             "actor:child"

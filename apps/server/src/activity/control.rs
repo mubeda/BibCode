@@ -534,10 +534,67 @@ mod tests {
         let ActivityControlEvent::Delta(delta) = events.recv().await.expect("removal delta");
         assert!(delta.changes.len() <= ACTIVITY_DELTA_MAX_CHANGES);
         assert_eq!(delta.changes.len(), 1);
-        assert_eq!(
-            registry.snapshot("scope-control").await,
-            ActivityControlSnapshot::empty("scope-control")
+        let tombstone = registry.snapshot("scope-control").await;
+        assert_eq!(tombstone.scope_id, "scope-control");
+        assert_eq!(tombstone.revision, delta.revision);
+        assert!(tombstone.actors.is_empty());
+        assert!(tombstone.operations.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dropped_scope_tombstone_keeps_stream_and_actor_fences_monotonic_on_restart() {
+        // Mutation caught: deleting the public scope and reusing revision zero for replacement work.
+        let registry = ActivityControlRegistry::new();
+        let mut events = registry.subscribe();
+        let first =
+            registry.register_runtime(thread_scope(), "thread:stable-thread".to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &first,
+                &[running_actor("actor-a", None)],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor-a".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "old-native-task".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+        let available = registry.snapshot("thread:stable-thread").await;
+        let old_actor_revision = actor(&available, "actor-a").control_revision;
+        let _ = events.recv().await.expect("available delta");
+
+        drop(first);
+        let ActivityControlEvent::Delta(removal) = events.recv().await.expect("removal delta");
+        let removed = registry.snapshot("thread:stable-thread").await;
+        assert_eq!(removed.revision, removal.revision);
+        assert!(removed.revision > available.revision);
+        assert!(removed.actors.is_empty());
+
+        let replacement =
+            registry.register_runtime(thread_scope(), "thread:stable-thread".to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &replacement,
+                &[running_actor("actor-a", None)],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor-a".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "replacement-native-task".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+        let replacement_snapshot = registry.snapshot("thread:stable-thread").await;
+        assert!(replacement_snapshot.revision > removed.revision);
+        assert!(
+            actor(&replacement_snapshot, "actor-a").control_revision > old_actor_revision,
+            "replacement actor fence must not repeat"
         );
+        let ActivityControlEvent::Delta(replacement_delta) =
+            events.recv().await.expect("replacement delta");
+        assert_eq!(replacement_delta.previous_revision, removed.revision);
+        assert_eq!(replacement_delta.revision, replacement_snapshot.revision);
     }
 
     #[tokio::test]
@@ -555,15 +612,15 @@ mod tests {
 
         assert_eq!(registry.snapshot("scope-control").await.actors.len(), 1);
         drop(replacement);
-        assert_eq!(
-            registry.snapshot("scope-control").await,
-            ActivityControlSnapshot::empty("scope-control")
-        );
+        let tombstone = registry.snapshot("scope-control").await;
+        assert!(tombstone.revision > 0);
+        assert!(tombstone.actors.is_empty());
+        assert!(tombstone.operations.is_empty());
     }
 
     #[test]
-    fn repeated_registration_churn_releases_every_scope() {
-        // Mutation caught: growing the registry's scope map for every completed runtime.
+    fn repeated_registration_churn_retains_only_the_bounded_tombstone_window() {
+        // Mutation caught: growing the registry's generation-safe scope tombstones without bound.
         let registry = ActivityControlRegistry::new();
         for index in 0..ACTIVITY_DELTA_MAX_CHANGES * 2 {
             let registration =
@@ -571,7 +628,77 @@ mod tests {
             drop(registration);
         }
 
-        assert!(registry.lock().scopes.is_empty());
+        assert!(registry.lock().scopes.len() <= ACTIVITY_PAGE_MAX_LENGTH);
+    }
+
+    #[tokio::test]
+    async fn repeated_actor_churn_retains_a_bounded_fence_window_and_advances_evictions() {
+        // Mutation caught: retaining one fence counter per completed native actor without bound,
+        // or letting an actor whose exact counter was evicted reuse its stale fence.
+        let registry = ActivityControlRegistry::new();
+        let registration =
+            registry.register_runtime(thread_scope(), "scope-control".to_owned(), None);
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[running_actor("actor-000", None)],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor-000".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "old-native-task".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+        let old_revision =
+            actor(&registry.snapshot("scope-control").await, "actor-000").control_revision;
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[ProviderActivityMutation::RemoveActor {
+                    actor_id: "actor-000".to_owned(),
+                }],
+                &[],
+            )
+            .await;
+
+        for index in 1..=ACTIVITY_PAGE_MAX_LENGTH {
+            let actor_id = format!("actor-{index:03}");
+            registry
+                .observe_provider_batch(
+                    &registration,
+                    &[
+                        running_actor(&actor_id, None),
+                        ProviderActivityMutation::RemoveActor { actor_id },
+                    ],
+                    &[],
+                )
+                .await;
+        }
+
+        assert!(
+            registry.lock().scopes["scope-control"]
+                .actor_revision_tombstones
+                .len()
+                <= ACTIVITY_PAGE_MAX_LENGTH
+        );
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[running_actor("actor-000", None)],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor-000".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "replacement-native-task".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+
+        assert!(
+            actor(&registry.snapshot("scope-control").await, "actor-000").control_revision
+                > old_revision
+        );
     }
 
     #[tokio::test]
@@ -632,10 +759,10 @@ mod tests {
         drop(replacement);
         let ActivityControlEvent::Delta(removal) = events.recv().await.expect("removal delta");
         assert!(removal.changes.len() <= ACTIVITY_DELTA_MAX_CHANGES);
-        assert_eq!(
-            registry.snapshot("scope-control").await,
-            ActivityControlSnapshot::empty("scope-control")
-        );
+        let tombstone = registry.snapshot("scope-control").await;
+        assert_eq!(tombstone.revision, removal.revision);
+        assert!(tombstone.actors.is_empty());
+        assert!(tombstone.operations.is_empty());
     }
 
     #[tokio::test]
@@ -718,7 +845,10 @@ mod tests {
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
     fmt,
-    sync::{Arc, Mutex, Weak},
+    sync::{
+        Arc, Mutex, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 
 use super::cancellation::CancellationOperation;
@@ -760,9 +890,10 @@ impl ActivityRuntimeControlRegistration {
         let mut changed = staged.targeted_control_supported || !staged.operations.is_empty();
         staged.targeted_control_supported = false;
         staged.operations.clear();
+        let actor_revision_clock = staged.actor_revision_clock.clone();
         for actor in staged.actors.values_mut() {
             if actor.target.take().is_some() {
-                actor.control_revision = actor.control_revision.saturating_add(1);
+                ActivityControlScope::advance_actor_revision(&actor_revision_clock, actor);
                 changed = true;
             }
         }
@@ -822,7 +953,7 @@ pub(crate) enum ActivityControlEvent {
 type BeforePublishHook = Arc<dyn Fn(u64) + Send + Sync>;
 
 #[derive(Clone)]
-struct ActivityControlEventPublisher {
+pub(super) struct ActivityControlEventPublisher {
     events: broadcast::Sender<ActivityControlEvent>,
     #[cfg(test)]
     before_publish: Arc<Mutex<Option<BeforePublishHook>>>,
@@ -837,7 +968,7 @@ impl fmt::Debug for ActivityControlEventPublisher {
 }
 
 impl ActivityControlEventPublisher {
-    fn send_delta(&self, delta: ActivityControlDelta) {
+    pub(super) fn send_delta(&self, delta: ActivityControlDelta) {
         #[cfg(test)]
         if let Some(hook) = self
             .before_publish
@@ -853,8 +984,10 @@ impl ActivityControlEventPublisher {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ActivityControlRegistry {
-    inner: Arc<Mutex<ActivityControlRegistryState>>,
-    publisher: ActivityControlEventPublisher,
+    pub(super) inner: Arc<Mutex<ActivityControlRegistryState>>,
+    pub(super) publisher: ActivityControlEventPublisher,
+    scope_revision_clock: Arc<AtomicU64>,
+    actor_revision_clock: Arc<AtomicU64>,
 }
 
 #[derive(Debug, Default)]
@@ -869,6 +1002,10 @@ pub(super) struct ActivityControlScope {
     pub(super) generation: ActivityRuntimeGeneration,
     _provider_instance_id: Option<String>,
     revision: u64,
+    scope_revision_clock: Arc<AtomicU64>,
+    actor_revision_clock: Arc<AtomicU64>,
+    actor_revision_floor: u64,
+    actor_revision_tombstones: BTreeMap<String, u64>,
     targeted_control_supported: bool,
     pub(super) actors: BTreeMap<String, ActivityControlActor>,
     pub(super) work_items: BTreeMap<String, ActivityControlWorkItem>,
@@ -901,6 +1038,8 @@ impl ActivityControlRegistry {
                 #[cfg(test)]
                 before_publish: Arc::new(Mutex::new(None)),
             },
+            scope_revision_clock: Arc::new(AtomicU64::new(0)),
+            actor_revision_clock: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -936,9 +1075,10 @@ impl ActivityControlRegistry {
                 staged.scope = scope;
                 staged._provider_instance_id = provider_instance_id;
                 staged.targeted_control_supported = true;
+                let actor_revision_clock = staged.actor_revision_clock.clone();
                 for actor in staged.actors.values_mut() {
                     if actor.target.take().is_some() {
-                        actor.control_revision = actor.control_revision.saturating_add(1);
+                        ActivityControlScope::advance_actor_revision(&actor_revision_clock, actor);
                     }
                 }
                 for work_item in staged.work_items.values_mut() {
@@ -959,6 +1099,29 @@ impl ActivityControlRegistry {
                 *existing = staged;
                 existing.publish_changes(changes)
             } else {
+                if state.scopes.len() >= ACTIVITY_PAGE_MAX_LENGTH {
+                    let tombstone = state.scopes.iter().find_map(|(scope_id, scope)| {
+                        (!scope.targeted_control_supported
+                            && scope.actors.is_empty()
+                            && scope.work_items.is_empty()
+                            && scope.operations.is_empty())
+                        .then(|| scope_id.clone())
+                    });
+                    if let Some(tombstone) = tombstone {
+                        state.scopes.remove(&tombstone);
+                    } else {
+                        active = false;
+                        return ActivityRuntimeControlRegistration {
+                            scope_id,
+                            generation,
+                            active,
+                            inner: Arc::downgrade(&self.inner),
+                            publisher: self.publisher.clone(),
+                        };
+                    }
+                }
+                let revision = self.scope_revision_clock.fetch_add(1, Ordering::AcqRel);
+                let actor_revision_floor = self.actor_revision_clock.fetch_add(1, Ordering::AcqRel);
                 state.scopes.insert(
                     scope_id.clone(),
                     ActivityControlScope {
@@ -966,7 +1129,11 @@ impl ActivityControlRegistry {
                         scope,
                         generation: generation.clone(),
                         _provider_instance_id: provider_instance_id,
-                        revision: 0,
+                        revision,
+                        scope_revision_clock: self.scope_revision_clock.clone(),
+                        actor_revision_clock: self.actor_revision_clock.clone(),
+                        actor_revision_floor,
+                        actor_revision_tombstones: BTreeMap::new(),
                         targeted_control_supported: true,
                         actors: BTreeMap::new(),
                         work_items: BTreeMap::new(),
@@ -1059,6 +1226,44 @@ impl ActivityControlRegistry {
             .collect()
     }
 
+    pub(crate) async fn snapshot_for_actors(
+        &self,
+        scope_id: &str,
+        actors: &[super::model::ActivityActorSummary],
+    ) -> ActivityControlSnapshot {
+        let state = self.lock();
+        let Some(scope) = state.scopes.get(scope_id) else {
+            return ActivityControlSnapshot {
+                scope_id: scope_id.to_owned(),
+                revision: 0,
+                actors: actors
+                    .iter()
+                    .map(|actor| ActivityActorControl::unsupported(actor.id.clone()))
+                    .collect(),
+                operations: Vec::new(),
+            };
+        };
+        let by_id = scope.actor_controls();
+        ActivityControlSnapshot {
+            scope_id: scope.scope_id(),
+            revision: scope.revision,
+            actors: actors
+                .iter()
+                .map(|actor| {
+                    by_id
+                        .get(&actor.id)
+                        .cloned()
+                        .unwrap_or_else(|| ActivityActorControl::unsupported(actor.id.clone()))
+                })
+                .collect(),
+            operations: scope
+                .operations
+                .values()
+                .map(CancellationOperation::summary)
+                .collect(),
+        }
+    }
+
     pub(crate) async fn actor_control_for(
         &self,
         scope_id: &str,
@@ -1142,10 +1347,27 @@ impl Drop for ActivityRuntimeControlRegistration {
             if !is_current {
                 return;
             }
-            let Some(mut scope) = state.scopes.remove(&self.scope_id) else {
+            let Some(scope) = state.scopes.get_mut(&self.scope_id) else {
                 return;
             };
-            if let Some(event) = scope.removal_delta() {
+            let before = scope.clone();
+            scope.targeted_control_supported = false;
+            scope.operations.clear();
+            let actors = std::mem::take(&mut scope.actors);
+            for (actor_id, mut actor) in actors {
+                if actor.target.take().is_some() {
+                    ActivityControlScope::advance_actor_revision(
+                        &scope.actor_revision_clock,
+                        &mut actor,
+                    );
+                }
+                scope.remember_actor_revision(actor_id, actor.control_revision);
+            }
+            scope.work_items.clear();
+            let Ok(changes) = scope.pending_changes(&before) else {
+                return;
+            };
+            if let Some(event) = scope.publish_changes(changes) {
                 self.publisher.send_delta(event);
             }
         }
@@ -1159,6 +1381,26 @@ impl Default for ActivityControlRegistry {
 }
 
 impl ActivityControlScope {
+    fn advance_actor_revision(actor_revision_clock: &AtomicU64, actor: &mut ActivityControlActor) {
+        actor.control_revision = actor.control_revision.saturating_add(1);
+        actor_revision_clock.fetch_max(actor.control_revision.saturating_add(1), Ordering::AcqRel);
+    }
+
+    fn remember_actor_revision(&mut self, actor_id: String, revision: u64) {
+        if self.actor_revision_tombstones.len() >= ACTIVITY_PAGE_MAX_LENGTH
+            && !self.actor_revision_tombstones.contains_key(&actor_id)
+        {
+            if let Some(evicted) = self.actor_revision_tombstones.keys().next().cloned() {
+                self.actor_revision_tombstones.remove(&evicted);
+            }
+            self.actor_revision_floor = self
+                .actor_revision_clock
+                .fetch_add(1, Ordering::AcqRel)
+                .saturating_add(1);
+        }
+        self.actor_revision_tombstones.insert(actor_id, revision);
+    }
+
     fn apply_activity(&mut self, activity: &[ProviderActivityMutation]) -> bool {
         if !activity.iter().all(validate_canonical_mutation) {
             return false;
@@ -1180,13 +1422,21 @@ impl ActivityControlScope {
                                 parent_actor_id: actor.parent_actor_id.clone(),
                                 status: actor.status,
                                 target: None,
-                                control_revision: 0,
+                                control_revision: self
+                                    .actor_revision_tombstones
+                                    .remove(&actor.id)
+                                    .unwrap_or(self.actor_revision_floor),
                             },
                         );
                     }
                 }
                 ProviderActivityMutation::RemoveActor { actor_id } => {
-                    self.actors.remove(actor_id);
+                    if let Some(mut actor) = self.actors.remove(actor_id) {
+                        if actor.target.take().is_some() {
+                            Self::advance_actor_revision(&self.actor_revision_clock, &mut actor);
+                        }
+                        self.remember_actor_revision(actor_id.clone(), actor.control_revision);
+                    }
                 }
                 ProviderActivityMutation::UpsertWorkItem(work_item) => {
                     if let Some(existing) = self.work_items.get_mut(&work_item.id) {
@@ -1229,7 +1479,7 @@ impl ActivityControlScope {
                     };
                     if actor.target != target {
                         actor.target = target;
-                        actor.control_revision = actor.control_revision.saturating_add(1);
+                        Self::advance_actor_revision(&self.actor_revision_clock, actor);
                     }
                 }
                 ProviderActivityControlUpdate::WorkTarget {
@@ -1253,7 +1503,7 @@ impl ActivityControlScope {
         }
         for actor in self.actors.values_mut() {
             if actor.status.is_terminal() && actor.target.take().is_some() {
-                actor.control_revision = actor.control_revision.saturating_add(1);
+                Self::advance_actor_revision(&self.actor_revision_clock, actor);
             }
         }
         for work_item in self.work_items.values_mut() {
@@ -1308,6 +1558,11 @@ impl ActivityControlScope {
                 operation.covered_actor_ids.len() <= ACTIVITY_PAGE_MAX_LENGTH
                     && operation.covered_work_item_ids.len() <= ACTIVITY_PAGE_MAX_LENGTH
                     && operation.dispatched_targets.len() <= ACTIVITY_DELTA_MAX_CHANGES
+                    && operation.retryable_targets.len() <= ACTIVITY_DELTA_MAX_CHANGES
+                    && operation
+                        .retryable_targets
+                        .iter()
+                        .all(|target| operation.dispatched_targets.contains(target))
                     && operation.active_attempt_ids.len() <= ACTIVITY_DELTA_MAX_CHANGES
                     && operation.active_attempt_targets.len() == operation.active_attempt_ids.len()
                     && operation
@@ -1608,6 +1863,9 @@ impl ActivityControlScope {
         operation
             .dispatched_targets
             .retain(|target| retained.contains(target));
+        operation
+            .retryable_targets
+            .retain(|target| retained.contains(target));
     }
 
     pub(super) fn pending_changes(
@@ -1673,28 +1931,14 @@ impl ActivityControlScope {
         }
         let previous_revision = self.revision;
         self.revision = self.revision.saturating_add(1);
+        self.scope_revision_clock
+            .fetch_max(self.revision.saturating_add(1), Ordering::AcqRel);
         Some(ActivityControlDelta {
             scope_id: self.scope_id(),
             previous_revision,
             revision: self.revision,
             changes,
         })
-    }
-
-    fn removal_delta(&mut self) -> Option<ActivityControlDelta> {
-        let empty = ActivityControlScope {
-            scope_id: self.scope_id.clone(),
-            scope: self.scope.clone(),
-            generation: self.generation.clone(),
-            _provider_instance_id: None,
-            revision: self.revision,
-            targeted_control_supported: false,
-            actors: BTreeMap::new(),
-            work_items: BTreeMap::new(),
-            operations: BTreeMap::new(),
-        };
-        let changes = empty.pending_changes(self).ok()?;
-        self.publish_changes(changes)
     }
 
     fn snapshot(&self) -> ActivityControlSnapshot {

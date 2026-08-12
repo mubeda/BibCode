@@ -579,12 +579,9 @@ impl ActivityProjection {
         scope_id: &str,
         actors: &[super::ActivityActorSummary],
     ) -> ActivityControlSnapshot {
-        let mut control = self.control_registry.snapshot(scope_id).await;
-        control.actors = self
-            .control_registry
-            .actor_controls_for(scope_id, actors)
-            .await;
-        control
+        self.control_registry
+            .snapshot_for_actors(scope_id, actors)
+            .await
     }
 
     async fn admit_read<T>(

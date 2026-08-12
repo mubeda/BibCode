@@ -13049,7 +13049,7 @@ done
                     1,
                 )
                 .await,
-            Err(ActivityCancellationError::StaleScope)
+            Err(ActivityCancellationError::StaleOperation)
         );
         runtime
             .supervisor
@@ -13434,7 +13434,7 @@ done
             cancellation
                 .retry_subtree_cancellation(scope, "thread:t1", "actor:root", 1)
                 .await,
-            Err(ActivityCancellationError::StaleScope)
+            Err(ActivityCancellationError::StaleOperation)
         );
 
         supervisor.shutdown().await.expect("shutdown supervisor");
