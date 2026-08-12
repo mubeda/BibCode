@@ -762,22 +762,41 @@ mod tests {
     struct RelayValidationFixture {
         _sandbox: TestSandbox,
         executable: PathBuf,
+        curl: PathBuf,
         pid_path: PathBuf,
+        listener: TcpListener,
+        endpoint: String,
+        pair_started: Arc<tokio::sync::Barrier>,
         reaped: Arc<FixtureEvent>,
     }
 
     #[cfg(unix)]
-    fn relay_validation_fixture(sandbox: TestSandbox) -> RelayValidationFixture {
+    async fn relay_validation_fixture(
+        sandbox: TestSandbox,
+        pair_started: Arc<tokio::sync::Barrier>,
+    ) -> RelayValidationFixture {
         let pid_path = sandbox.path("validation.pid");
         let executable = sandbox.executable_script(
             "relay-validation",
-            "pid_tmp=\"${1}.tmp\"\nprintf '%s' \"$$\" > \"$pid_tmp\"\nmv \"$pid_tmp\" \"$1\"\nprintf 'cloudflared fixture\\n'",
+            "pid_tmp=\"${1}.tmp\"\nprintf '%s' \"$$\" > \"$pid_tmp\"\nmv \"$pid_tmp\" \"$1\"\n\"$2\" --silent --show-error --fail \"$3\"\nprintf 'cloudflared fixture\\n'",
             "",
+        );
+        let curl = sandbox.executable_on_path("curl");
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind relay validation fixture");
+        let endpoint = format!(
+            "http://{}/started",
+            listener.local_addr().expect("relay fixture address")
         );
         RelayValidationFixture {
             _sandbox: sandbox,
             executable,
+            curl,
             pid_path,
+            listener,
+            endpoint,
+            pair_started,
             reaped: Arc::new(FixtureEvent::default()),
         }
     }
@@ -785,17 +804,38 @@ mod tests {
     #[cfg(unix)]
     impl RelayValidationFixture {
         async fn run(&self) -> (Result<(), RelayInstallError>, i32) {
-            let result = run_checked(
+            let validation = run_checked(
                 &self.executable,
-                [self.pid_path.as_os_str().to_owned()],
+                [
+                    self.pid_path.as_os_str().to_owned(),
+                    self.curl.as_os_str().to_owned(),
+                    OsString::from(&self.endpoint),
+                ],
                 "validation_failed",
                 "relay validation fixture failed",
-            )
-            .await;
+            );
+            tokio::pin!(validation);
+            let (mut connection, _) = tokio::select! {
+                accepted = self.listener.accept() => accepted.expect("accept relay fixture child"),
+                result = &mut validation => panic!("relay child exited before start rendezvous: {result:?}"),
+            };
+            let mut request = [0_u8; 2_048];
+            let request_bytes = connection
+                .read(&mut request)
+                .await
+                .expect("read relay fixture request");
+            assert!(request_bytes > 0, "relay fixture sent an HTTP request");
             let pid = std::fs::read_to_string(&self.pid_path)
                 .expect("relay validation PID")
                 .parse::<i32>()
                 .expect("numeric relay validation PID");
+            self.pair_started.wait().await;
+            connection
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("release relay fixture child");
+            drop(connection);
+            let result = validation.await;
             self.reaped.publish();
             (result, pid)
         }
@@ -850,8 +890,15 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn two_relay_validation_children_publish_distinct_pids_and_reap_in_parallel() {
-        let left = relay_validation_fixture(TestSandbox::new("relay-validation-left"));
-        let right = relay_validation_fixture(TestSandbox::new("relay-validation-right"));
+        let pair_started = Arc::new(tokio::sync::Barrier::new(2));
+        let left = relay_validation_fixture(
+            TestSandbox::new("relay-validation-left"),
+            pair_started.clone(),
+        )
+        .await;
+        let right =
+            relay_validation_fixture(TestSandbox::new("relay-validation-right"), pair_started)
+                .await;
 
         let ((left_result, left_pid), (right_result, right_pid)) =
             tokio::join!(left.run(), right.run());
