@@ -215,8 +215,27 @@ an exactly mapped actor and retires its private target. The runtime retains a
 bounded exact terminal task-to-agent link after an ordinary SubagentStop so a
 reordered authoritative task notification can still replace Completed. A later
 `SubagentStop` cannot rewrite cancelled, interrupted, or failed lifecycle to
-completed. The provider-specific `stop_task` request and capability downgrade
-are described separately when dispatch support is enabled.
+completed.
+
+When the compatibility probe proves both hook switches and the authenticated
+hook sink starts, targeted cancellation is provisionally enabled for that
+structured-chat runtime generation. Clicking an actor with a complete exact
+mapping sends one stream-JSON control request with subtype `stop_task` and that
+private `task_id`. Any non-Claude target, root/foreground actor, or actor without
+an exact current mapping is rejected before provider I/O; BiBCode never falls
+back to the conversation-wide interrupt request.
+
+The control response must carry the matching request ID. Only Claude's exact
+unsupported-control protocol error authoritatively disables targeted
+cancellation for the current generation. Before the caller receives that
+result, BiBCode removes every current Claude task handle and operation,
+publishes targeted cancellation as unsupported, and cancels and reaps queued or
+in-flight targeted work. Future clicks then fail without another provider
+write. Generic provider errors, timeouts, malformed responses, and connection
+closure remain safe operation failures and do not disable the capability. A
+restarted or re-enabled runtime starts a fresh generation and may prove support
+and exact mappings again. Private task IDs and raw control errors are redacted
+from Activity errors, logs, and Debug output.
 
 Provider-terminal observation has a separate capability and safety gate. The
 executable must support the required settings switches and BiBCode's additive

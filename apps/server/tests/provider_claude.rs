@@ -1919,6 +1919,28 @@ fn control_requests_encode_official_correlated_frames() {
 }
 
 #[test]
+fn stop_task_control_request_encodes_the_exact_private_task_target() {
+    // Mutation caught: using the root interrupt subtype or the wrong native task-id field.
+    assert_eq!(
+        serde_json::to_value(ClaudeControlRequest::stop_task(41, "task-a"))
+            .expect("stop task json"),
+        json!({
+            "type": "control_request",
+            "request_id": "bibcode-41",
+            "request": { "subtype": "stop_task", "task_id": "task-a" }
+        })
+    );
+}
+
+#[test]
+fn stop_task_control_request_debug_redacts_the_private_target() {
+    let debug = format!("{:?}", ClaudeControlRequest::stop_task(41, "task-private"));
+
+    assert_eq!(debug, "ClaudeControlRequest { .. }");
+    assert!(!debug.contains("task-private"));
+}
+
+#[test]
 fn claude_system_init_and_status_query_normalize_mcp_servers() {
     let mut runtime = ClaudeProviderRuntime::new("thread-1".to_owned(), "session-1".to_owned());
     let initial = runtime.handle_raw_value(

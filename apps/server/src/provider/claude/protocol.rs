@@ -121,18 +121,30 @@ pub struct ResultMessage {
     pub uuid: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Clone, PartialEq, Deserialize)]
 pub(crate) struct ClaudeControlResponseFrame {
     pub response: ClaudeControlResponse,
 }
 
-#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[derive(Clone, PartialEq, Deserialize)]
 pub(crate) struct ClaudeControlResponse {
     pub subtype: String,
     pub request_id: String,
     #[serde(default)]
     pub response: Value,
     pub error: Option<String>,
+}
+
+impl std::fmt::Debug for ClaudeControlResponseFrame {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ClaudeControlResponseFrame { .. }")
+    }
+}
+
+impl std::fmt::Debug for ClaudeControlResponse {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ClaudeControlResponse { .. }")
+    }
 }
 
 #[derive(Deserialize)]
