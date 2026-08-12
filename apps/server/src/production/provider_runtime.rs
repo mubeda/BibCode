@@ -3401,16 +3401,29 @@ async fn project_provider_event(
             })
             .enumerate()
         {
-            engine
-                .dispatch(OrchestrationCommand::ThreadMessageAssistantComplete {
-                    command_id: format!("{command_id}:assistant-complete:{index}"),
-                    thread_id: event.thread_id.clone(),
-                    message_id: message.message_id,
-                    turn_id: event.turn_id.clone(),
-                    created_at: created_at.clone(),
-                })
-                .await
-                .map_err(|error| ProviderRuntimeError::Orchestration(error.to_string()))?;
+            let completion = OrchestrationCommand::ThreadMessageAssistantComplete {
+                command_id: format!("{command_id}:assistant-complete:{index}"),
+                thread_id: event.thread_id.clone(),
+                message_id: message.message_id,
+                turn_id: event.turn_id.clone(),
+                created_at: created_at.clone(),
+            };
+            if let Err(error) = engine.dispatch(completion.clone()).await {
+                tracing::warn!(
+                    %error,
+                    thread_id = %event.thread_id,
+                    turn_id = ?event.turn_id,
+                    "assistant terminal settlement failed; retrying once"
+                );
+                if let Err(error) = engine.dispatch(completion).await {
+                    tracing::warn!(
+                        %error,
+                        thread_id = %event.thread_id,
+                        turn_id = ?event.turn_id,
+                        "assistant terminal settlement failed after retry"
+                    );
+                }
+            }
         }
     }
     if matches!(

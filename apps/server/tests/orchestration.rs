@@ -444,3 +444,117 @@ async fn projector_failure_rolls_back_event_projection_and_receipt() {
     assert_eq!(engine.read_events(0).await.unwrap().len(), 4);
     engine.shutdown().await;
 }
+
+#[tokio::test]
+async fn assistant_completion_updates_only_matching_streaming_assistant_rows() {
+    let repositories = migrated_repositories().await;
+    let engine =
+        OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
+            .await
+            .expect("engine starts");
+    for command in [
+        json!({"type":"project.create","commandId":"completion-project","projectId":"p1","title":"Project","workspaceRoot":"C:/repo","createdAt":CREATED_AT}),
+        json!({"type":"thread.create","commandId":"completion-thread-1","threadId":"t1","projectId":"p1","title":"Thread 1","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","createdAt":CREATED_AT}),
+        json!({"type":"thread.create","commandId":"completion-thread-2","threadId":"t2","projectId":"p1","title":"Thread 2","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","createdAt":CREATED_AT}),
+        json!({"type":"thread.message.assistant.delta","commandId":"removed-delta","threadId":"t1","messageId":"assistant-removed","delta":"removed","turnId":"turn-1","createdAt":CREATED_AT}),
+    ] {
+        engine
+            .dispatch(decode(command))
+            .await
+            .expect("setup command");
+    }
+    repositories
+        .delete_messages_by_thread("t1".to_owned())
+        .await
+        .expect("simulate checkpoint message removal");
+    engine
+        .dispatch(decode(json!({
+            "type":"thread.message.assistant.complete",
+            "commandId":"removed-complete",
+            "threadId":"t1",
+            "messageId":"assistant-removed",
+            "turnId":"turn-1",
+            "createdAt":CREATED_AT
+        })))
+        .await
+        .expect("completion of a removed row is an accepted no-op");
+    for command in [
+        json!({"type":"thread.message.assistant.delta","commandId":"wrong-turn-delta","threadId":"t1","messageId":"assistant-wrong-turn","delta":"wrong turn","turnId":"turn-other","createdAt":CREATED_AT}),
+        json!({"type":"thread.message.assistant.delta","commandId":"wrong-thread-delta","threadId":"t2","messageId":"assistant-wrong-thread","delta":"wrong thread","turnId":"turn-2","createdAt":CREATED_AT}),
+        json!({"type":"thread.turn.start","commandId":"user-start","threadId":"t1","message":{"messageId":"user-message","role":"user","text":"keep user","attachments":[]},"createdAt":CREATED_AT}),
+        json!({"type":"thread.message.assistant.delta","commandId":"settled-delta","threadId":"t1","messageId":"assistant-settled","delta":"settled","turnId":"turn-1","createdAt":CREATED_AT}),
+        json!({"type":"thread.message.assistant.complete","commandId":"settled-complete","threadId":"t1","messageId":"assistant-settled","turnId":"turn-1","createdAt":CREATED_AT}),
+    ] {
+        engine
+            .dispatch(decode(command))
+            .await
+            .expect("setup command");
+    }
+    for command in [
+        json!({"type":"thread.message.assistant.complete","commandId":"wrong-turn-complete","threadId":"t1","messageId":"assistant-wrong-turn","turnId":"turn-1","createdAt":"2026-07-10T10:01:00.000Z"}),
+        json!({"type":"thread.message.assistant.complete","commandId":"wrong-thread-complete","threadId":"t1","messageId":"assistant-wrong-thread","turnId":"turn-2","createdAt":"2026-07-10T10:01:00.000Z"}),
+        json!({"type":"thread.message.assistant.complete","commandId":"wrong-role-complete","threadId":"t1","messageId":"user-message","turnId":null,"createdAt":"2026-07-10T10:01:00.000Z"}),
+        json!({"type":"thread.message.assistant.complete","commandId":"already-settled-complete","threadId":"t1","messageId":"assistant-settled","turnId":"turn-1","createdAt":"2026-07-10T10:01:00.000Z"}),
+    ] {
+        engine
+            .dispatch(decode(command))
+            .await
+            .expect("mismatched completion is an accepted no-op");
+    }
+
+    let wrong_turn = repositories
+        .get_message("assistant-wrong-turn".to_owned())
+        .await
+        .unwrap()
+        .unwrap();
+    let wrong_thread = repositories
+        .get_message("assistant-wrong-thread".to_owned())
+        .await
+        .unwrap()
+        .unwrap();
+    let user = repositories
+        .get_message("user-message".to_owned())
+        .await
+        .unwrap()
+        .unwrap();
+    let settled = repositories
+        .get_message("assistant-settled".to_owned())
+        .await
+        .unwrap()
+        .unwrap();
+    let removed_missing = repositories
+        .get_message("assistant-removed".to_owned())
+        .await
+        .expect("removed message query")
+        .is_none();
+    assert_eq!(
+        (
+            removed_missing,
+            (
+                wrong_turn.turn_id.as_deref(),
+                wrong_turn.text.as_str(),
+                wrong_turn.is_streaming,
+            ),
+            (
+                wrong_thread.thread_id.as_str(),
+                wrong_thread.text.as_str(),
+                wrong_thread.is_streaming,
+            ),
+            (user.role.as_str(), user.text.as_str()),
+            (
+                settled.text.as_str(),
+                settled.is_streaming,
+                settled.updated_at.as_str(),
+            ),
+        ),
+        (
+            true,
+            (Some("turn-other"), "wrong turn", true),
+            ("t2", "wrong thread", true),
+            ("user", "keep user"),
+            ("settled", false, CREATED_AT),
+        )
+    );
+
+    engine.shutdown().await;
+}
