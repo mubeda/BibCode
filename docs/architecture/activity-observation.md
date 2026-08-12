@@ -1,18 +1,24 @@
 # Activity observation
 
-Activity is the bounded observation and capability-gated control view of provider work shown in
-the **Subagents** and **Background Tasks** surfaces. It is separate from chat
-rendering and terminal output: provider adapters emit only activity they can
-attribute, while the server owns projection, persistence, authorization, and
-stream recovery.
+Activity is the bounded observation and capability-gated targeted control view
+of provider work shown in the **Subagents** and **Background Tasks** surfaces.
+It is not globally read-only. Observation is separate from chat rendering and
+terminal output: provider adapters emit only activity they can attribute, while
+the server owns projection, persistence, authorization, stream recovery, and
+targeted cancellation policy.
 
 ```mermaid
 flowchart LR
   Source["Structured provider protocol<br/>or managed provider terminal"] --> Adapter["Provider activity adapter"]
-  Adapter --> Projection["Server projection"]
-  Projection --> Store["Bounded SQLite repository"]
-  Projection --> RPC["Authorized activity RPC"]
-  RPC --> Client["Client reducer and activity UI"]
+  Adapter --> Projection["Observation projection"]
+  Projection --> Store["Bounded SQLite history"]
+  Projection --> RPC["Authorized Activity RPC"]
+  Adapter --> Controls["Ephemeral exact-target registry"]
+  Controls --> RPC
+  Client["Client reducer and Activity UI"] -->|"operate-scoped canonical target"| RPC
+  RPC --> Client
+  RPC -->|"exact private target"| Provider["Current provider runtime"]
+  Provider --> Source
 ```
 
 ## Canonical model and invariants
@@ -69,11 +75,11 @@ independent of provider CLI probing. See
 and [`packages/client-runtime/src/state/activity.ts`](../../packages/client-runtime/src/state/activity.ts).
 
 Every subscription starts with a full `ActivitySnapshot` whose
-`protocolVersion` is `2`. Effective observation changes are journaled as contiguous deltas:
-`previousRevision` must equal the accepted snapshot revision and `revision` is
-the next value. A large mutation batch may be split into multiple deltas of at
-most 256 changes. Duplicate and net-no-op provider events do not consume a
-revision.
+`protocolVersion` is `2`. Effective observation changes are journaled as
+contiguous deltas: `previousRevision` must equal the accepted observation
+snapshot revision and `revision` is the next value. A large mutation batch may
+be split into multiple deltas of at most 256 changes. Duplicate and net-no-op
+provider events do not consume an observation revision.
 
 The server replaces the stream with a fresh snapshot when the current scope
 generation changes, a non-contiguous delta is observed, or the broadcast
@@ -95,6 +101,22 @@ native target IDs never cross contracts, persistence, or diagnostic logs.
 The current runtime registration owns its overlay generation: its lifecycle
 cleanup removes that generation with one bounded removal delta, while a
 superseded registration cannot remove its replacement.
+
+Observation and control revisions are independent monotonic domains. An
+observation delta cannot fill a control gap, and a control delta cannot advance
+observation history. The client recovers a gap in either domain from a fresh
+server snapshot while retaining the other domain's last accepted data as
+stale. Cancellation operations and their residual sets are therefore
+reconnect-visible during one live server runtime, but they are intentionally
+not restart-resumable.
+
+`requested` control records and the UI label **Stopping** express
+server-authoritative cancellation intent. They never manufacture a terminal
+actor lifecycle. Only provider observation can move an actor to `cancelled`,
+`interrupted`, `completed`, or `failed`; terminal observation also removes the
+actor from any residual set. A partial operation may be retried only with its
+current operation revision, and the server dispatches only active residuals and
+late descendants already admitted beneath the original cancellation fence.
 
 Claude targeted dispatch is provisional for a runtime generation only when its
 bounded compatibility probe proves both required hook switches and the private
@@ -232,7 +254,7 @@ ordinary Claude chat or observation.
 | Codex    | Supported: actors and attributed entries; background work is enabled only when its reconciliation method is accepted. | Supported when capability probes prove a Unix App Server listener and remote TUI.                                                          | Structured recovery combines bounded validated hints, list discovery, and direct reads; the exact `full`/`bounded`/`none` guarantees are above. The terminal path publishes only after root resume and keeps known data when an optional bounded reconciliation request has no usable response.                                                                                                                                                                                                |
 | Claude   | Supported when the launch probe proves both hook-event switches; actors and attributed entries only.                  | Supported when settings composition, authenticated HTTP hooks, additive merge semantics, and a safe private executable pin are all proven. | No background-work capability. Recovery moves from `none` to `bounded` only after correlated transcript recovery; unproven hook support leaves activity unsupported.                                                                                                                                                                                                                                                                                                                           |
 | OpenCode | Supported after the child-session endpoint and root correlation are proven; actors and attributed entries only.       | Supported after authenticated serve/attach preparation and owned-root correlation.                                                         | Structured chat reports no activity when the child endpoint is unsupported, `bounded` recovery when child discovery works without both status and history, and `full` when all three work; transient fetch failure marks the scope stale while retrying. The terminal path instead publishes `full` after owned-root correlation and currently skips later child/status/message request failures without downgrading that capability. Failed correlation publishes no terminal activity scope. |
-| Cursor   | Unsupported in activity protocol v1; ordinary Cursor provider chat still works.                                       | Unsupported in v1.                                                                                                                         | No structured activity or activity dock is claimed.                                                                                                                                                                                                                                                                                                                                                                                                                                            |
+| Cursor   | Unsupported in activity protocol v2; ordinary Cursor provider chat still works.                                       | Unsupported in v2.                                                                                                                         | No structured activity or activity dock is claimed.                                                                                                                                                                                                                                                                                                                                                                                                                                            |
 
 Codex provider-terminal observation remains list-based. A terminal-scope
 `subAgentActivity` item can wake the bounded reconciliation pass, but it does
@@ -260,8 +282,8 @@ After publication there is no universal observer-failure state transition:
 Claude explicitly interrupts tracked active records when its observer ends;
 Codex does not directly terminalize them; and OpenCode retries its event stream
 but skips failed reconciliation requests without changing its advertised
-terminal history capability. The terminal remains independent of the read-only
-activity surface.
+terminal history capability. The terminal remains independent of its read-only
+terminal Activity surface.
 
 See the ownership and fallback paths in
 [`apps/server/src/provider_terminal/supervisor.rs`](../../apps/server/src/provider_terminal/supervisor.rs)
@@ -273,7 +295,7 @@ and [`apps/server/tests/provider_terminal_supervisor.rs`](../../apps/server/test
 
 ## Bounds, retention, authorization, and data policy
 
-The v1 contract limits IDs and labels to 256 UTF-16 units, summaries to 2,048,
+The v2 contract limits IDs and labels to 256 UTF-16 units, summaries to 2,048,
 details to 16,384, cursors to 512, snapshot/page results to 200 records, and a
 delta to 256 changes. Provider payload decoders, probe output, hook bodies,
 queues, reconciliation passes, and observer workers have additional local
@@ -316,6 +338,6 @@ and [`apps/server/tests/provider_opencode.rs`](../../apps/server/tests/provider_
 | **Error**        | A scope's bare `observationState` is `error`, or a section health object is `error`. Only section health has `message` and `retryable` fields.                                    | For a section, inspect its message and retryability. For a scope, use operational logs plus reconnect, resubscribe, and snapshot-resync evidence. |
 | **Interrupted**  | A record—not the scope—reached the terminal `interrupted` lifecycle through a provider-specific transition or repository cleanup.                                                 | Treat that work as ended; start a new provider operation if needed.                                                                               |
 
-An absent dock is also meaningful: protocol v1 may be unavailable, the provider
+An absent dock is also meaningful: protocol v2 may be unavailable, the provider
 may be unsupported, or a terminal handshake may not have established correlated
 activity. None of those states changes whether the provider itself can run.

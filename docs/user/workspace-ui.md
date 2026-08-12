@@ -152,6 +152,32 @@ Plan surfaces can also appear when the active provider/session supplies them.
 - **Activity** shows structured provider activity when available.
 - **Plan** displays the active agent plan when available.
 
+### Activity and targeted Stop
+
+Activity combines provider-attributed observation with capability-gated
+control. In a structured-chat **Subagents** roster, an active actor shows a
+persistent trailing Stop button only while the current provider runtime has
+proved an exact target for that actor. The row and Stop button are separate
+keyboard-focusable controls: the row opens detail, while Stop acts immediately
+and does not open detail. Its accessible label and tooltip name the actor and
+the number of currently active child agents included in the subtree.
+
+Stop targets the selected actor and every attributable descendant in its
+canonical subtree. It does not target the actor's parent, siblings, root chat,
+unrelated work, or an Activity-enabled terminal. Unsupported and completed
+actors have no Stop button. The composer Stop remains the separate root-turn
+action.
+
+After admission, every currently covered active actor shows **Stopping** and
+its Stop button is disabled. This label is server-authoritative intent, not a
+completed lifecycle: the row moves to Done only after provider events report a
+terminal state. If dispatch finishes with active residuals, the panel reports
+the bounded remaining count and offers **Retry remaining**. Retry is constrained
+by the server to residuals and late descendants under the original cancellation
+fence; it cannot expand to a parent, sibling, or replacement provider runtime.
+Reconnect restores the current server's control state, while a server restart
+requires the new runtime to prove exact targets again.
+
 Right-panel terminals retain their internal terminal grouping and splitting.
 When a right-panel terminal owns focus, the terminal new, split right, split
 down, and close shortcuts operate within that right-panel terminal surface;

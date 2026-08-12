@@ -156,5 +156,14 @@ rejected without falling back to the root composer interrupt, terminal cleanup,
 or operating-system process termination. Provider-terminal Activity remains
 read-only.
 
+After revalidating the private handle against the current session and Activity
+generation, BiBCode sends App Server `turn/interrupt` with that exact child
+`threadId` and active child `turnId`. It never substitutes the root thread or
+routes the request through the composer Stop path. Interrupt acknowledgement
+records delivery only: subsequent App Server lifecycle events decide whether
+the actor is interrupted, cancelled, completed, or failed. Subtree retries stay
+inside the original server-owned fence and send only active residual or late
+descendant handles that are still exact.
+
 See [Activity observation](../architecture/activity-observation.md) for the
 shared protocol and provider matrix.
