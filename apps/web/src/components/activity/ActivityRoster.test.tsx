@@ -3,14 +3,20 @@
 import type {
   ActivityActorControl,
   ActivityActorSummary,
+  ActivityRecordSummary,
   ActivitySnapshot,
+  ActivityWorkItemSummary,
 } from "@bibcode/contracts";
 import { act, type ReactElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
 import { TooltipProvider } from "~/components/ui/tooltip";
-import { ActivityRoster, type ActivityRosterProps } from "./ActivityRoster";
+import {
+  ActivityRoster,
+  type ActivityRosterProps,
+  projectActivityRosterHierarchy,
+} from "./ActivityRoster";
 import type { ActivityRosterPageData } from "./ActivityPanel";
 
 const mounted: Array<{ readonly root: Root; readonly container: HTMLDivElement }> = [];
@@ -18,7 +24,9 @@ const mounted: Array<{ readonly root: Root; readonly container: HTMLDivElement }
 function actor(
   id: string,
   name: string,
-  overrides: Partial<ActivityActorSummary> = {},
+  overrides: Partial<Omit<ActivityActorSummary, "parentActorId">> & {
+    readonly parentActorId?: string | null;
+  } = {},
 ): ActivityActorSummary {
   return {
     _tag: "actor",
@@ -43,6 +51,36 @@ function control(
   controlRevision = 3,
 ): ActivityActorControl {
   return { actorId, state, activeDescendantCount, controlRevision } as ActivityActorControl;
+}
+
+function workItem(
+  id: string,
+  overrides: Partial<Omit<ActivityWorkItemSummary, "ownerActorId">> & {
+    readonly ownerActorId?: string | null;
+  } = {},
+): ActivityWorkItemSummary {
+  return {
+    _tag: "workItem",
+    id,
+    name: id,
+    status: "running",
+    summary: null,
+    startedAt: "2026-08-11T20:00:00.000Z",
+    updatedAt: "2026-08-11T20:01:00.000Z",
+    terminalAt: null,
+    ownerActorId: null,
+    workKind: "process",
+    command: null,
+    cwd: null,
+    ...overrides,
+  } as ActivityWorkItemSummary;
+}
+
+function projectHierarchy(
+  records: ReadonlyArray<ActivityRecordSummary>,
+  section: "subagents" | "backgroundTasks",
+): ReturnType<typeof projectActivityRosterHierarchy> {
+  return projectActivityRosterHierarchy(records, section);
 }
 
 function snapshot(overrides: Partial<ActivitySnapshot> = {}): ActivitySnapshot {
@@ -99,7 +137,7 @@ function props(overrides: Partial<ActivityRosterProps> = {}): ActivityRosterProp
     [available, requested, unsupported],
     [
       control(available.id, "available", 2),
-      control(requested.id, "requested"),
+      control(requested.id, "requested", 1),
       control(unsupported.id, "unsupported"),
     ],
   );
@@ -170,10 +208,12 @@ describe("ActivityRoster targeted cancellation controls", () => {
       'button[aria-label="Stop Lovelace and 2 child agents"]',
     );
     const requestedStop = container.querySelector<HTMLButtonElement>(
-      'button[aria-label="Stop Turing"]',
+      'button[aria-label="Stop Turing and 1 child agent"]',
     );
     expect(availableStop).not.toBeNull();
+    expect(availableStop?.textContent).toBe("Stop subtree");
     expect(requestedStop?.disabled).toBe(true);
+    expect(requestedStop?.textContent).toBe("Stopping");
     expect(container.textContent).toContain("Stopping");
     expect(container.querySelector('button[aria-label^="Stop Hopper"]')).toBeNull();
     expect(container.querySelector('button[aria-label^="Stop Hamilton"]')).toBeNull();
@@ -189,6 +229,12 @@ describe("ActivityRoster targeted cancellation controls", () => {
     expect(detailButton?.className).toContain("min-w-0");
     expect(detailButton?.className).toContain("flex-1");
     expect(detailButton?.parentElement?.className).toContain("min-w-0");
+    const providerGlyph = detailButton?.querySelector<HTMLElement>(
+      "[data-activity-provider-glyph]",
+    );
+    expect(detailButton?.querySelectorAll("[data-activity-provider-glyph]")).toHaveLength(1);
+    expect(providerGlyph?.className).toContain("shrink-0");
+    expect(detailButton?.querySelector("[data-activity-record-glyph='actor']")).toBeNull();
 
     availableStop?.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
     await act(async () => availableStop?.click());
@@ -216,6 +262,54 @@ describe("ActivityRoster targeted cancellation controls", () => {
         (popup) => popup.textContent === "Stop Lovelace and 2 child agents",
       ),
     ).toBe(true);
+  });
+
+  it("renders parent, leaf, and requested text actions with exact server-authoritative impact", async () => {
+    const parent = actor("parent-action", "Alpha");
+    const leaf = actor("leaf-action", "Beta", { parentActorId: parent.id });
+    const requested = actor("requested-action", "Gamma");
+    const activePage = page(
+      [leaf, requested, parent],
+      [
+        control(parent.id, "available", 1, 4),
+        control(leaf.id, "available", 0, 5),
+        control(requested.id, "requested", 1, 6),
+      ],
+    );
+    const container = await mount(
+      <ActivityRoster
+        {...props({
+          active: { pages: [activePage], loading: false, error: null },
+          done: { pages: [page([])], loading: false, error: null },
+          reconciled: { active: [leaf, requested, parent], done: [] },
+        })}
+      />,
+    );
+
+    const parentStop = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Stop Alpha and 1 child agent"]',
+    );
+    const leafStop = container.querySelector<HTMLButtonElement>('button[aria-label="Stop Beta"]');
+    const requestedStop = container.querySelector<HTMLButtonElement>(
+      'button[aria-label="Stop Gamma and 1 child agent"]',
+    );
+    expect(parentStop?.textContent).toBe("Stop subtree");
+    expect(leafStop?.textContent).toBe("Stop");
+    expect(requestedStop?.textContent).toBe("Stopping");
+    expect(requestedStop?.disabled).toBe(true);
+
+    const rows = Array.from(container.querySelectorAll<HTMLElement>("[data-activity-row-layout]"));
+    expect(rows.map((row) => row.dataset.activityRowLayout)).toEqual([
+      "requested-action",
+      "parent-action",
+      "leaf-action",
+    ]);
+    expect(rows.map((row) => row.dataset.activityHierarchyDepth)).toEqual(["0", "0", "1"]);
+    expect(
+      rows[2]?.querySelector('[data-activity-hierarchy-connector="leaf-action"]'),
+    ).not.toBeNull();
+    expect(rows[2]?.textContent).toContain("reviewer");
+    expect(rows[2]?.textContent).toContain("Child agent");
   });
 
   it("uses roster-page controls only as fallback and gives streamed snapshot controls precedence", async () => {
@@ -341,7 +435,140 @@ describe("ActivityRoster targeted cancellation controls", () => {
     );
     expect(terminal.querySelector('button[aria-label^="Stop "]')).toBeNull();
 
-    const background = await mount(<ActivityRoster {...props({ section: "backgroundTasks" })} />);
+    const work = workItem("work-1");
+    const background = await mount(
+      <ActivityRoster
+        {...props({
+          section: "backgroundTasks",
+          active: { pages: [page([work])], loading: false, error: null },
+          done: { pages: [page([])], loading: false, error: null },
+          reconciled: { active: [work], done: [] },
+        })}
+      />,
+    );
     expect(background.querySelector('button[aria-label^="Stop "]')).toBeNull();
+    const row = background.querySelector('button[data-activity-row="work-1"]');
+    expect(row?.querySelectorAll('[data-activity-record-glyph="workItem"]')).toHaveLength(1);
+    expect(
+      row?.querySelector<HTMLElement>('[data-activity-record-glyph="workItem"]')?.className,
+    ).toContain("shrink-0");
+    expect(row?.querySelector("[data-activity-provider-glyph]")).toBeNull();
+  });
+});
+
+describe("ActivityRoster hierarchy projection", () => {
+  it("renders each child subtree before the next stable sibling", () => {
+    const grandchild = actor("grandchild", "Grandchild", { parentActorId: "child" });
+    const parent = actor("parent", "Parent");
+    const child = actor("child", "Child", { parentActorId: "parent" });
+    const sibling = actor("sibling", "Sibling", { parentActorId: "parent" });
+
+    const projected = projectHierarchy([grandchild, parent, child, sibling], "subagents");
+
+    expect(projected.map(({ record }) => record.id)).toEqual([
+      "parent",
+      "child",
+      "grandchild",
+      "sibling",
+    ]);
+  });
+
+  it("uses stable canonical sibling order for a parent-first preorder", () => {
+    const sibling = actor("sibling", "Sibling", { parentActorId: "parent" });
+    const grandchild = actor("grandchild", "Grandchild", { parentActorId: "child" });
+    const parent = actor("parent", "Parent");
+    const child = actor("child", "Child", { parentActorId: "parent" });
+
+    const projected = projectHierarchy([sibling, grandchild, parent, child], "subagents");
+
+    expect(projected.map(({ record }) => record.id)).toEqual([
+      "parent",
+      "sibling",
+      "child",
+      "grandchild",
+    ]);
+    expect(projected.map(({ depth }) => depth)).toEqual([0, 1, 1, 2]);
+    expect(projected.map(({ connectedToVisibleParent }) => connectedToVisibleParent)).toEqual([
+      false,
+      true,
+      true,
+      true,
+    ]);
+  });
+
+  it("keeps missing and cross-kind parents at the stable root fallback", () => {
+    const missing = actor("missing", "Missing", { parentActorId: "not-loaded" });
+    const crossKind = actor("cross-kind", "Cross kind", { parentActorId: "work-parent" });
+    const workParent = workItem("work-parent");
+
+    const projected = projectHierarchy([missing, crossKind, workParent], "subagents");
+
+    expect(projected.map(({ record }) => record.id)).toEqual([
+      "missing",
+      "cross-kind",
+      "work-parent",
+    ]);
+    expect(projected.map(({ depth }) => depth)).toEqual([0, 0, 0]);
+    expect(projected.every(({ connectedToVisibleParent }) => !connectedToVisibleParent)).toBe(true);
+  });
+
+  it("keeps self-parent and every cycle member as stable roots", () => {
+    const cycleB = actor("cycle-b", "Cycle B", { parentActorId: "cycle-a" });
+    const self = actor("self", "Self", { parentActorId: "self" });
+    const cycleA = actor("cycle-a", "Cycle A", { parentActorId: "cycle-b" });
+
+    const projected = projectHierarchy([cycleB, self, cycleA], "subagents");
+
+    expect(projected.map(({ record }) => record.id)).toEqual(["cycle-b", "self", "cycle-a"]);
+    expect(projected.map(({ depth }) => depth)).toEqual([0, 0, 0]);
+    expect(projected.every(({ connectedToVisibleParent }) => !connectedToVisibleParent)).toBe(true);
+  });
+
+  it("caps visual depth without changing eight-level preorder", () => {
+    const chain = Array.from({ length: 8 }, (_, index) =>
+      actor(`level-${index}`, `Level ${index}`, {
+        parentActorId: index === 0 ? null : `level-${index - 1}`,
+      }),
+    ).toReversed();
+
+    const projected = projectHierarchy(chain, "subagents");
+
+    expect(projected.map(({ record }) => record.id)).toEqual([
+      "level-0",
+      "level-1",
+      "level-2",
+      "level-3",
+      "level-4",
+      "level-5",
+      "level-6",
+      "level-7",
+    ]);
+    expect(projected.map(({ depth }) => depth)).toEqual([0, 1, 2, 3, 4, 4, 4, 4]);
+  });
+
+  it("leaves background work flat and stable", () => {
+    const second = workItem("second", { ownerActorId: "first" });
+    const first = workItem("first");
+
+    const projected = projectHierarchy([second, first], "backgroundTasks");
+
+    expect(projected.map(({ record }) => record.id)).toEqual(["second", "first"]);
+    expect(projected.map(({ depth }) => depth)).toEqual([0, 0]);
+    expect(projected.every(({ connectedToVisibleParent }) => !connectedToVisibleParent)).toBe(true);
+  });
+
+  it("projects active and done buckets independently", () => {
+    const activeChild = actor("active-child", "Active child", { parentActorId: "done-parent" });
+    const doneParent = actor("done-parent", "Done parent", {
+      status: "completed",
+      terminalAt: "2026-08-11T20:02:00.000Z",
+    });
+
+    expect(projectHierarchy([activeChild], "subagents")).toEqual([
+      { record: activeChild, depth: 0, connectedToVisibleParent: false },
+    ]);
+    expect(projectHierarchy([doneParent], "subagents")).toEqual([
+      { record: doneParent, depth: 0, connectedToVisibleParent: false },
+    ]);
   });
 });

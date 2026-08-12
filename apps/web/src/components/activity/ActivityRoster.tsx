@@ -23,6 +23,7 @@ import {
 import type { ActivityQueryResult, ActivityRosterPageData } from "./ActivityPanel";
 
 const WINDOW_GROUP_SIZE = 50;
+const MAX_ROSTER_INDENT_DEPTH = 4;
 
 function compareText(left: string, right: string): number {
   return left < right ? -1 : left > right ? 1 : 0;
@@ -31,6 +32,120 @@ function compareText(left: string, right: string): number {
 export interface ReconciledActivityRoster {
   readonly active: ReadonlyArray<ActivityRecordSummary>;
   readonly done: ReadonlyArray<ActivityRecordSummary>;
+}
+
+export interface ActivityRosterPresentationRecord {
+  readonly record: ActivityRecordSummary;
+  readonly depth: number;
+  readonly connectedToVisibleParent: boolean;
+}
+
+function invalidParentIds(records: ReadonlyArray<ActivityRecordSummary>): ReadonlySet<string> {
+  const actorsById = new Map<string, Extract<ActivityRecordSummary, { readonly _tag: "actor" }>>();
+  for (const record of records) {
+    if (record._tag === "actor") {
+      actorsById.set(record.id, record);
+    }
+  }
+
+  const invalid = new Set<string>();
+  for (const record of records) {
+    if (record._tag !== "actor") {
+      continue;
+    }
+    const path: string[] = [];
+    const pathIndex = new Map<string, number>();
+    let current: Extract<ActivityRecordSummary, { readonly _tag: "actor" }> | undefined = record;
+    for (let hops = 0; current !== undefined && hops <= records.length; hops += 1) {
+      const cycleStart = pathIndex.get(current.id);
+      if (cycleStart !== undefined) {
+        for (let index = cycleStart; index < path.length; index += 1) {
+          invalid.add(path[index]!);
+        }
+        break;
+      }
+      pathIndex.set(current.id, path.length);
+      path.push(current.id);
+      current = current.parentActorId === null ? undefined : actorsById.get(current.parentActorId);
+    }
+  }
+  return invalid;
+}
+
+export function projectActivityRosterHierarchy(
+  records: ReadonlyArray<ActivityRecordSummary>,
+  section: ActivitySection,
+): ReadonlyArray<ActivityRosterPresentationRecord> {
+  if (section !== "subagents") {
+    return records.map((record) => ({
+      record,
+      depth: 0,
+      connectedToVisibleParent: false,
+    }));
+  }
+
+  const byId = new Map<string, ActivityRecordSummary>();
+  for (const record of records) {
+    byId.set(record.id, record);
+  }
+  const invalid = invalidParentIds(records);
+  const childrenByParentId = new Map<string, ActivityRecordSummary[]>();
+  const roots: ActivityRecordSummary[] = [];
+  for (const record of records) {
+    if (record._tag !== "actor" || record.parentActorId === null || invalid.has(record.id)) {
+      roots.push(record);
+      continue;
+    }
+    const parent = byId.get(record.parentActorId);
+    if (parent?._tag !== "actor") {
+      roots.push(record);
+      continue;
+    }
+    const children = childrenByParentId.get(parent.id);
+    if (children === undefined) {
+      childrenByParentId.set(parent.id, [record]);
+    } else {
+      children.push(record);
+    }
+  }
+
+  const projected: ActivityRosterPresentationRecord[] = [];
+  const visited = new Set<string>();
+  const appendTree = (root: ActivityRecordSummary) => {
+    const stack: Array<{
+      readonly record: ActivityRecordSummary;
+      readonly traversalDepth: number;
+      readonly connectedToVisibleParent: boolean;
+    }> = [{ record: root, traversalDepth: 0, connectedToVisibleParent: false }];
+    while (stack.length > 0) {
+      const item = stack.pop()!;
+      if (visited.has(item.record.id)) {
+        continue;
+      }
+      visited.add(item.record.id);
+      projected.push({
+        record: item.record,
+        depth: Math.min(item.traversalDepth, MAX_ROSTER_INDENT_DEPTH),
+        connectedToVisibleParent: item.connectedToVisibleParent,
+      });
+      const children = childrenByParentId.get(item.record.id) ?? [];
+      for (let index = children.length - 1; index >= 0; index -= 1) {
+        stack.push({
+          record: children[index]!,
+          traversalDepth: item.traversalDepth + 1,
+          connectedToVisibleParent: true,
+        });
+      }
+    }
+  };
+
+  for (const root of roots) {
+    appendTree(root);
+  }
+  for (const record of records) {
+    appendTree(record);
+  }
+  return projected;
 }
 
 export function reconcileActivityRosterRecords(
@@ -144,9 +259,9 @@ function RosterError({
 }
 
 function recordGroups(
-  records: ReadonlyArray<ActivityRecordSummary>,
-): ReadonlyArray<ReadonlyArray<ActivityRecordSummary>> {
-  const groups: ActivityRecordSummary[][] = [];
+  records: ReadonlyArray<ActivityRosterPresentationRecord>,
+): ReadonlyArray<ReadonlyArray<ActivityRosterPresentationRecord>> {
+  const groups: ActivityRosterPresentationRecord[][] = [];
   for (let index = 0; index < records.length; index += WINDOW_GROUP_SIZE) {
     groups.push(records.slice(index, index + WINDOW_GROUP_SIZE));
   }
@@ -178,6 +293,8 @@ function recordTime(record: ActivityRecordSummary, now: string): string {
 
 interface ActivityRecordRowProps {
   readonly record: ActivityRecordSummary;
+  readonly depth: number;
+  readonly connectedToVisibleParent: boolean;
   readonly control: ActivityActorControl | null;
   readonly provider: string;
   readonly now: string;
@@ -188,6 +305,8 @@ interface ActivityRecordRowProps {
 
 function ActivityRecordRow({
   record,
+  depth,
+  connectedToVisibleParent,
   control,
   provider,
   now,
@@ -197,18 +316,32 @@ function ActivityRecordRow({
 }: ActivityRecordRowProps) {
   const recordProvider = providerForRecord(record, provider);
   const ProviderIcon = providerIcon(recordProvider);
-  const RecordIcon = record._tag === "actor" ? BotIcon : ListTodoIcon;
   const typeLabel = record._tag === "actor" ? (record.role ?? "Actor") : record.workKind;
   const stopping = control?.state === "requested";
-  const stopLabel =
+  const activeDescendants = control?.activeDescendantCount ?? 0;
+  const stopImpactLabel =
     control === null || record._tag !== "actor"
       ? null
-      : control.activeDescendantCount === 0
+      : activeDescendants === 0
         ? `Stop ${record.name}`
-        : `Stop ${record.name} and ${control.activeDescendantCount} child ${control.activeDescendantCount === 1 ? "agent" : "agents"}`;
+        : `Stop ${record.name} and ${activeDescendants} child ${activeDescendants === 1 ? "agent" : "agents"}`;
+  const actionText = stopping ? "Stopping" : activeDescendants > 0 ? "Stop subtree" : "Stop";
 
   return (
-    <div className="flex min-w-0 w-full items-start gap-1" data-activity-row-layout={record.id}>
+    <div
+      className="relative flex min-w-0 w-full items-start gap-2"
+      data-activity-hierarchy-depth={depth}
+      data-activity-row-layout={record.id}
+      style={{ paddingInlineStart: `${Math.min(depth, MAX_ROSTER_INDENT_DEPTH) * 12}px` }}
+    >
+      {connectedToVisibleParent ? (
+        <span
+          aria-hidden="true"
+          className="pointer-events-none absolute bottom-1 top-0 w-px bg-border"
+          data-activity-hierarchy-connector={record.id}
+          style={{ insetInlineStart: `${Math.max(0, depth - 1) * 12 + 6}px` }}
+        />
+      ) : null}
       <Button
         className="min-w-0 flex-1 items-start justify-start gap-3 whitespace-normal px-3 py-2 text-left"
         data-activity-row={record.id}
@@ -217,22 +350,23 @@ function ActivityRecordRow({
         size="content"
         variant="ghost"
       >
-        <span className="mt-0.5 flex shrink-0 items-center -space-x-1">
+        {record._tag === "actor" ? (
           <span
-            className="flex size-6 items-center justify-center rounded-full border border-border bg-muted"
+            className="flex size-6 shrink-0 items-center justify-center rounded-full border border-border bg-muted"
             data-activity-provider-glyph={recordProvider}
             title={recordProvider}
           >
             <ProviderIcon aria-hidden="true" className="size-3.5" />
           </span>
+        ) : (
           <span
-            className="flex size-6 items-center justify-center rounded-full border border-border bg-background"
-            data-activity-record-glyph={record._tag}
+            className="flex size-6 shrink-0 items-center justify-center rounded-full border border-border bg-background"
+            data-activity-record-glyph="workItem"
             title={typeLabel}
           >
-            <RecordIcon aria-hidden="true" className="size-3.5" />
+            <ListTodoIcon aria-hidden="true" className="size-3.5" />
           </span>
-        </span>
+        )}
         <span className="min-w-0 flex-1">
           <span className="flex min-w-0 items-center gap-2">
             <span className="min-w-0 flex-1 truncate font-medium">{record.name}</span>
@@ -247,39 +381,34 @@ function ActivityRecordRow({
           ) : null}
           <span className="mt-1 flex gap-2 text-[11px] font-normal text-muted-foreground">
             <span>{typeLabel}</span>
+            {record._tag === "actor" && record.parentActorId !== null ? (
+              <span>Child agent</span>
+            ) : null}
             <span>{recordTime(record, now)}</span>
           </span>
         </span>
       </Button>
-      {stopLabel === null || control === null || onCancelActor === undefined ? null : (
+      {stopImpactLabel === null || control === null || onCancelActor === undefined ? null : (
         <Tooltip>
           <TooltipTrigger
             render={
               <Button
-                aria-label={stopLabel}
-                className="mt-1 shrink-0 text-muted-foreground hover:text-foreground"
+                aria-label={stopImpactLabel}
+                className="mt-1 min-h-8 min-w-14 shrink-0"
                 disabled={control.state === "requested"}
                 onClick={(event) => {
                   event.stopPropagation();
                   onCancelActor(record.id, control.controlRevision);
                 }}
                 onPointerDown={(event) => event.stopPropagation()}
-                size="icon-xs"
-                variant="ghost"
+                size="sm"
+                variant="outline"
               >
-                <svg
-                  aria-hidden="true"
-                  fill="currentColor"
-                  height="12"
-                  viewBox="0 0 12 12"
-                  width="12"
-                >
-                  <rect height="8" rx="1.5" width="8" x="2" y="2" />
-                </svg>
+                {actionText}
               </Button>
             }
           />
-          <TooltipPopup>{stopLabel}</TooltipPopup>
+          <TooltipPopup>{stopImpactLabel}</TooltipPopup>
         </Tooltip>
       )}
     </div>
@@ -375,8 +504,8 @@ export function ActivityRoster({
       rowRefs.current.set(recordId, element);
     }
   };
-  const activeGroups = recordGroups(activeRecords);
-  const doneGroups = recordGroups(doneRecords);
+  const activeGroups = recordGroups(projectActivityRosterHierarchy(activeRecords, section));
+  const doneGroups = recordGroups(projectActivityRosterHierarchy(doneRecords, section));
 
   return (
     <section aria-label={sectionName} className="flex min-h-0 flex-1 flex-col">
@@ -419,10 +548,15 @@ export function ActivityRoster({
               </h3>
               <div>
                 {activeGroups.map((group, groupIndex) => (
-                  <div data-activity-window-group={`active-${groupIndex}`} key={group[0]?.id}>
-                    {group.map((record) => (
+                  <div
+                    data-activity-window-group={`active-${groupIndex}`}
+                    key={group[0]?.record.id}
+                  >
+                    {group.map(({ record, depth, connectedToVisibleParent }) => (
                       <ActivityRecordRow
+                        connectedToVisibleParent={connectedToVisibleParent}
                         control={controlForRecord(record)}
+                        depth={depth}
                         key={record.id}
                         now={now}
                         onSelect={onSelect}
@@ -445,10 +579,12 @@ export function ActivityRoster({
               </h3>
               <div>
                 {doneGroups.map((group, groupIndex) => (
-                  <div data-activity-window-group={`done-${groupIndex}`} key={group[0]?.id}>
-                    {group.map((record) => (
+                  <div data-activity-window-group={`done-${groupIndex}`} key={group[0]?.record.id}>
+                    {group.map(({ record, depth, connectedToVisibleParent }) => (
                       <ActivityRecordRow
+                        connectedToVisibleParent={connectedToVisibleParent}
                         control={controlForRecord(record)}
+                        depth={depth}
                         key={record.id}
                         now={now}
                         onSelect={onSelect}

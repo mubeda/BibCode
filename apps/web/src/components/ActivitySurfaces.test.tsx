@@ -22,12 +22,16 @@ const mounted: Array<{ readonly root: Root; readonly container: HTMLDivElement }
 const scopeId = ActivityScopeId.make("scope:surface");
 const threadId = ThreadId.make("thread-1");
 
-function actor(): ActivityActorSummary {
+function actor(
+  id: string,
+  name: string,
+  parentActorId: ActivityActorSummary["parentActorId"] = null,
+): ActivityActorSummary {
   return {
     _tag: "actor",
-    id: "actor:surface",
-    parentActorId: null,
-    name: "Surface agent",
+    id,
+    parentActorId,
+    name,
     role: "reviewer",
     providerType: "codex",
     status: "running",
@@ -38,17 +42,22 @@ function actor(): ActivityActorSummary {
   } as ActivityActorSummary;
 }
 
-function control(): ActivityActorControl {
+function control(
+  actorId: ActivityActorSummary["id"],
+  activeDescendantCount: number,
+  controlRevision: number,
+): ActivityActorControl {
   return {
-    actorId: actor().id,
+    actorId,
     state: "available",
-    controlRevision: 7,
-    activeDescendantCount: 1,
+    controlRevision,
+    activeDescendantCount,
   } as ActivityActorControl;
 }
 
 function snapshot(scope: ActivitySnapshot["scope"]): ActivitySnapshot {
-  const current = actor();
+  const parent = actor("actor:parent", "Surface parent");
+  const child = actor("actor:child", "Surface child", parent.id);
   return {
     protocolVersion: 2,
     scopeId,
@@ -70,17 +79,17 @@ function snapshot(scope: ActivitySnapshot["scope"]): ActivitySnapshot {
       backgroundTasks: { state: "unsupported", message: null, retryable: false },
     },
     counts: {
-      subagents: { active: 1, done: 0 },
+      subagents: { active: 2, done: 0 },
       backgroundTasks: { active: 0, done: 0 },
     },
-    actors: [current],
+    actors: [child, parent],
     workItems: [],
     actorsHasMore: false,
     workItemsHasMore: false,
     control: {
       scopeId,
       revision: 9,
-      actors: [control()],
+      actors: [control(parent.id, 1, 7), control(child.id, 0, 8)],
       operations: [],
     },
     updatedAt: "2026-08-11T20:01:00.000Z",
@@ -92,10 +101,11 @@ function panelProps(
   onCancelActor: NonNullable<ActivityPanelProps["onCancelActor"]>,
   onNavigate: ActivityPanelProps["onNavigate"],
 ): ActivityPanelProps {
-  const current = actor();
+  const parent = actor("actor:parent", "Surface parent");
+  const child = actor("actor:child", "Surface child", parent.id);
   const page = {
-    records: [current],
-    actorControls: [control()],
+    records: [child, parent],
+    actorControls: [control(parent.id, 1, 7), control(child.id, 0, 8)],
     nextCursor: null,
   } as ActivityRosterPageData;
   return {
@@ -182,6 +192,10 @@ describe("Activity cancellation surfaces", () => {
   ] as const)(
     "keeps the trailing Stop action keyboard-reachable in the %s",
     async (_name, sheet, key) => {
+      if (sheet) {
+        window.innerWidth = 640;
+        window.dispatchEvent(new Event("resize"));
+      }
       const onCancelActor = vi.fn();
       const onNavigate = vi.fn();
       const roster = (
@@ -197,24 +211,41 @@ describe("Activity cancellation surfaces", () => {
         ),
       );
       const searchRoot = sheet ? document.body : container;
-      const detail = searchRoot.querySelector<HTMLButtonElement>(
-        'button[data-activity-row="actor:surface"]',
+      const parentDetail = searchRoot.querySelector<HTMLButtonElement>(
+        'button[data-activity-row="actor:parent"]',
       );
       const stop = searchRoot.querySelector<HTMLButtonElement>(
-        'button[aria-label="Stop Surface agent and 1 child agent"]',
+        'button[aria-label="Stop Surface parent and 1 child agent"]',
       );
 
-      expect(detail).not.toBeNull();
+      const rows = Array.from(
+        searchRoot.querySelectorAll<HTMLElement>("[data-activity-row-layout]"),
+      );
+      expect(rows.map((row) => row.dataset.activityRowLayout)).toEqual([
+        "actor:parent",
+        "actor:child",
+      ]);
+      expect(rows.map((row) => row.dataset.activityHierarchyDepth)).toEqual(["0", "1"]);
+      expect(
+        rows[1]?.querySelector('[data-activity-hierarchy-connector="actor:child"]'),
+      ).not.toBeNull();
+      for (const row of rows) {
+        expect(row.querySelectorAll("[data-activity-provider-glyph]")).toHaveLength(1);
+        expect(row.querySelector("[data-activity-record-glyph='actor']")).toBeNull();
+      }
+      expect(parentDetail).not.toBeNull();
       expect(stop?.tabIndex).toBe(0);
-      expect(detail?.contains(stop!)).toBe(false);
+      expect(stop?.textContent).toBe("Stop subtree");
+      expect(parentDetail?.contains(stop!)).toBe(false);
+      expect(parentDetail?.parentElement).toBe(stop?.parentElement);
       expect(stop?.querySelector("button")).toBeNull();
-      detail?.focus();
-      const tab = await pressTab(detail!, stop!);
+      parentDetail?.focus();
+      const tab = await pressTab(parentDetail!, stop!);
       expect(tab.defaultPrevented).toBe(false);
       expect(document.activeElement).toBe(stop);
       await activate(stop!, key);
       expect(onCancelActor).toHaveBeenCalledTimes(1);
-      expect(onCancelActor).toHaveBeenCalledWith("actor:surface", 7);
+      expect(onCancelActor).toHaveBeenCalledWith("actor:parent", 7);
       expect(onNavigate).not.toHaveBeenCalled();
       expect(document.activeElement).toBe(stop);
     },
@@ -233,7 +264,8 @@ describe("Activity cancellation surfaces", () => {
       />,
     );
 
-    expect(container.querySelector('button[data-activity-row="actor:surface"]')).not.toBeNull();
+    expect(container.querySelector('button[data-activity-row="actor:parent"]')).not.toBeNull();
+    expect(container.querySelector('button[data-activity-row="actor:child"]')).not.toBeNull();
     expect(container.querySelector('button[aria-label^="Stop "]')).toBeNull();
     expect(onCancelActor).not.toHaveBeenCalled();
     expect(onNavigate).not.toHaveBeenCalled();
