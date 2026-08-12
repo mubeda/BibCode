@@ -104,6 +104,15 @@ foreground cleanup waiter can block, the launcher transfers the exact child,
 reserved process-group identity, and one of sixteen cleanup permits into its
 retained reaper registry. The foreground TERM/grace/KILL/wait budget remains
 bounded; a timed-out child stays registry-owned until `Child::wait` completes.
+An `Interrupted` wait is retried immediately. Any other wait failure keeps the
+same child, process-group guard, stdout ownership, and permit in that task and
+retries after a fixed 100 ms delay; entering registry shutdown also wakes one
+immediate retry. A repeated failure cannot publish reap completion, disarm the
+guard, or release capacity, and absent a new shutdown request it attempts at
+most once per delay. Shutdown therefore recovers from a transient wait error
+without a missing-signal deadlock, while a persistent platform wait error keeps
+shutdown pending at a finite retry cadence rather than discarding the exact
+owner or hot-looping.
 Terminal-manager shutdown first cancels and drains observer generations and
 sessions, then calls the launch-preparer/factory shutdown hook to drain this
 registry while the production Tokio runtime is still live. Other provider
