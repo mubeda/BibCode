@@ -267,40 +267,37 @@ describe("ActivityDock", () => {
     expect(container.childElementCount).toBe(0);
   });
 
-  it("shows a bounded deterministic actor glyph roster and exact total active/done counts", async () => {
-    const container = await mount(
-      <ActivityDock
-        {...props({
-          snapshot: snapshot({
-            counts: {
-              subagents: { active: 3, done: 3 },
-              backgroundTasks: { active: 1, done: 1 },
-            },
-            actors: [
-              actor("actor-f"),
-              actor("actor-b"),
-              actor("actor-d"),
-              actor("actor-a"),
-              actor("actor-e"),
-              actor("actor-c"),
-            ],
-          }),
-        })}
-      />,
-    );
+  it.each([
+    ["no loaded actors", [], false],
+    ["one loaded actor", [actor("actor-a")], false],
+    ["three loaded actors", [actor("actor-a"), actor("actor-b"), actor("actor-c")], false],
+    ["truncated actors", [actor("actor-a"), actor("actor-b"), actor("actor-c")], true],
+    ["count-only actors", [], true],
+  ])(
+    "renders one scope provider glyph regardless of %s",
+    async (_caseName, actors, actorsHasMore) => {
+      const container = await mount(
+        <ActivityDock
+          {...props({
+            snapshot: snapshot({
+              counts: {
+                subagents: { active: 1, done: 2 },
+                backgroundTasks: { active: 0, done: 0 },
+              },
+              actors,
+              actorsHasMore,
+            }),
+          })}
+        />,
+      );
 
-    const glyphs = Array.from(container.querySelectorAll<HTMLElement>("[data-activity-glyph]"));
-    expect(glyphs).toHaveLength(4);
-    expect(glyphs.map((glyph) => glyph.dataset.activityGlyph)).toEqual([
-      "actor-a",
-      "actor-b",
-      "actor-c",
-      "actor-d",
-    ]);
-    expect(container.textContent).toContain("+2");
-    expect(container.textContent).toContain("Active 4");
-    expect(container.textContent).toContain("Done 4");
-  });
+      expect(container.querySelectorAll("[data-activity-provider-glyph]")).toHaveLength(1);
+      expect(container.querySelectorAll("[data-activity-glyph]")).toHaveLength(0);
+      expect(container.textContent).not.toContain("+2");
+      expect(container.textContent).toContain("Active 1");
+      expect(container.textContent).toContain("Done 2");
+    },
+  );
 
   it("renders independent visible section buttons with exact counts and collapses before opening", async () => {
     const calls: string[] = [];
@@ -339,6 +336,46 @@ describe("ActivityDock", () => {
     calls.length = 0;
     await act(async () => backgroundTasks?.click());
     expect(calls).toEqual(["expanded:false", "open:backgroundTasks"]);
+  });
+
+  it("separates expanded section counts from elapsed metadata", async () => {
+    const container = await mount(
+      <ActivityDock
+        {...props({
+          expanded: true,
+          snapshot: snapshot({
+            actors: [actor("actor-a")],
+            workItems: [workItem("work-a")],
+          }),
+        })}
+      />,
+    );
+
+    const subagentsPrimary = container.querySelector<HTMLElement>(
+      '[data-activity-section-primary="subagents"]',
+    );
+    const subagentsMetadata = container.querySelector<HTMLElement>(
+      '[data-activity-section-metadata="subagents"]',
+    );
+    const backgroundTasksPrimary = container.querySelector<HTMLElement>(
+      '[data-activity-section-primary="backgroundTasks"]',
+    );
+    const backgroundTasksMetadata = container.querySelector<HTMLElement>(
+      '[data-activity-section-metadata="backgroundTasks"]',
+    );
+
+    expect(container.querySelectorAll("[data-activity-provider-glyph]")).toHaveLength(1);
+    expect(container.querySelectorAll("[data-activity-glyph]")).toHaveLength(0);
+    expect(subagentsPrimary?.textContent).toContain("Subagents");
+    expect(subagentsPrimary?.textContent).toContain("Active 2");
+    expect(subagentsPrimary?.textContent).toContain("Done 1");
+    expect(subagentsMetadata?.textContent).toBe("10m");
+    expect(subagentsPrimary?.contains(subagentsMetadata!)).toBe(false);
+    expect(backgroundTasksPrimary?.textContent).toContain("Background tasks");
+    expect(backgroundTasksPrimary?.textContent).toContain("Active 1");
+    expect(backgroundTasksPrimary?.textContent).toContain("Done 1");
+    expect(backgroundTasksMetadata?.textContent).toBe("5m");
+    expect(backgroundTasksPrimary?.contains(backgroundTasksMetadata!)).toBe(false);
   });
 
   it("retains stale/reconnecting counts and labels the card as stale", async () => {
@@ -436,9 +473,9 @@ describe("ActivityDock", () => {
     expect(container.textContent).toContain("Done 3");
     expect(container.textContent).not.toContain("NaN");
     expect(container.textContent).not.toContain("Infinity");
-    expect(container.querySelector('[data-activity-elapsed="backgroundTasks"]')?.textContent).toBe(
-      "0s",
-    );
+    expect(
+      container.querySelector('[data-activity-section-metadata="backgroundTasks"]')?.textContent,
+    ).toBe("0s");
 
     await rerender(container, <ActivityDock {...propsWithoutNow({ snapshot: malformed })} />);
     expect(container.querySelector('[data-activity-provider-glyph="unknown"]')).not.toBeNull();
@@ -614,13 +651,17 @@ describe("ActivityDock", () => {
       "Activity update: 2 active subagents, 1 done subagent, 1 active background task, 1 done background task",
     );
     const initialAnnouncement = liveRegion?.textContent;
-    expect(container.querySelector('[data-activity-elapsed="subagents"]')?.textContent).toBe("10m");
+    expect(
+      container.querySelector('[data-activity-section-metadata="subagents"]')?.textContent,
+    ).toBe("10m");
 
     await rerender(container, <ActivityDock {...initialProps} now="2026-07-22T20:11:00.000Z" />);
     const afterTick = container.querySelector<HTMLElement>('[aria-live="polite"]');
     expect(afterTick).toBe(liveRegion);
     expect(afterTick?.textContent).toBe(initialAnnouncement);
-    expect(container.querySelector('[data-activity-elapsed="subagents"]')?.textContent).toBe("11m");
+    expect(
+      container.querySelector('[data-activity-section-metadata="subagents"]')?.textContent,
+    ).toBe("11m");
 
     const changedSnapshot = snapshot({
       ...initialSnapshot,
@@ -688,6 +729,7 @@ describe("ActivityDock", () => {
     expect(sectionButtons[0]?.textContent).not.toContain("Done");
     expect(sectionButtons[0]?.querySelectorAll("[data-activity-count]")).toHaveLength(2);
     expect(sectionButtons[1]?.textContent).not.toContain("Background tasks");
+    expect(container.querySelectorAll("[data-activity-section-metadata]")).toHaveLength(0);
     expect(addEventListener.mock.calls.some(([type]) => type === "resize")).toBe(false);
 
     await rerender(container, <ActivityDock {...compactProps} compact={false} />);
@@ -784,7 +826,7 @@ describe("ActivityDock", () => {
     },
   );
 
-  it("uses exact totals for overflow when actor summaries are truncated", async () => {
+  it("keeps exact counts when actor summaries are truncated without a glyph overflow badge", async () => {
     const truncatedSnapshot = snapshot({
       counts: {
         subagents: { active: 8, done: 3 },
@@ -803,24 +845,19 @@ describe("ActivityDock", () => {
     const dockProps = props({ snapshot: truncatedSnapshot });
     const container = await mount(<ActivityDock {...dockProps} />);
 
-    const glyphs = Array.from(container.querySelectorAll<HTMLElement>("[data-activity-glyph]"));
-    expect(glyphs).toHaveLength(4);
-    expect(glyphs.map((glyph) => glyph.dataset.activityGlyph)).toEqual([
-      "actor-a",
-      "actor-b",
-      "actor-c",
-      "actor-d",
-    ]);
-    expect(container.textContent).toContain("+7");
-    expect(container.querySelector("[data-activity-provider-glyph]")).toBeNull();
+    expect(container.querySelectorAll("[data-activity-provider-glyph]")).toHaveLength(1);
+    expect(container.querySelectorAll("[data-activity-glyph]")).toHaveLength(0);
+    expect(container.textContent).not.toContain("+7");
+    expect(container.textContent).toContain("Active 8");
+    expect(container.textContent).toContain("Done 3");
 
     await rerender(
       container,
       <ActivityDock {...dockProps} snapshot={snapshot({ ...truncatedSnapshot, actors: [] })} />,
     );
-    expect(container.querySelector("[data-activity-glyph]")).toBeNull();
-    expect(container.querySelector('[data-activity-provider-glyph="codex"]')).not.toBeNull();
-    expect(container.textContent).toContain("+11");
+    expect(container.querySelectorAll("[data-activity-provider-glyph]")).toHaveLength(1);
+    expect(container.querySelectorAll("[data-activity-glyph]")).toHaveLength(0);
+    expect(container.textContent).not.toContain("+11");
   });
 
   it("uses bounded tokenized placement, focus, truncation, and reduced-motion classes", async () => {
