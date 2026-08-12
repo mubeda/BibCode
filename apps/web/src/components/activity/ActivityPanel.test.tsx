@@ -92,7 +92,7 @@ function entry(
 
 function snapshot(overrides: Partial<ActivitySnapshot> = {}): ActivitySnapshot {
   return {
-    protocolVersion: 1,
+    protocolVersion: 2,
     scopeId: "scope-1",
     scope: { _tag: "thread", threadId: "thread-1" },
     revision: 1,
@@ -104,6 +104,7 @@ function snapshot(overrides: Partial<ActivitySnapshot> = {}): ActivitySnapshot {
       backgroundWork: true,
       historyRecovery: "full",
       terminalObservation: false,
+      targetedActorCancellation: false,
     },
     observationState: "live",
     sections: {
@@ -118,6 +119,7 @@ function snapshot(overrides: Partial<ActivitySnapshot> = {}): ActivitySnapshot {
     workItems: [],
     actorsHasMore: false,
     workItemsHasMore: false,
+    control: { scopeId: "scope-1", revision: 0, actors: [], operations: [] },
     updatedAt: "2026-07-22T20:10:00.000Z",
     ...overrides,
   } as unknown as ActivitySnapshot;
@@ -139,7 +141,7 @@ function rosterPage(
   records: ActivityRosterPageData["records"],
   nextCursor: string | null = null,
 ): ActivityRosterPageData {
-  return { records, nextCursor } as ActivityRosterPageData;
+  return { records, actorControls: [], nextCursor } as ActivityRosterPageData;
 }
 
 function detailPage(
@@ -671,6 +673,7 @@ describe("ActivityPanel roster", () => {
               backgroundWork: true,
               historyRecovery: "none",
               terminalObservation: false,
+              targetedActorCancellation: false,
             },
             sections: {
               subagents: { state: "unsupported", message: null, retryable: false },
