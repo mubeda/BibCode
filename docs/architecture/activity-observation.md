@@ -126,10 +126,17 @@ and decides whether it may return while holding the same registry mutex. When
 the last entry is removed, epoch reset and the empty-state shutdown return
 linearize under that lock; a later submission belongs to a distinct phase.
 Process waits, stdout joins, task joins, timers, logging, and notification
-waits all run after the mutex is released. A persistent platform wait error
-therefore keeps shutdown pending at a finite retry cadence rather than
-discarding the exact owner or hot-looping, while repeated shutdown after an
-empty-state linearization is inert.
+waits all run after the mutex is released. Each completed task keeps its join
+handle in a shared async owner reachable from the registry. Shutdown callers
+serialize on that owner and await the handle by mutable reference, so
+cancelling one caller cannot detach the handle or make a replacement drain see
+an empty registry. Only a successful join permits removal. Normal reservation
+also prunes finished, successfully joined terminal records synchronously, so a
+long-running server cannot accumulate records beyond the live cleanup
+capacity; it never detaches a running task epilogue to do so. A persistent
+platform wait error therefore keeps shutdown pending at a finite retry cadence
+rather than discarding the exact owner or hot-looping, while repeated shutdown
+after an empty-state linearization is inert.
 
 Terminal-manager shutdown first cancels and drains observer generations and
 sessions, then calls the launch-preparer/factory shutdown hook to drain this
