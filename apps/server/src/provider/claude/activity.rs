@@ -534,11 +534,20 @@ impl ClaudeActivityTracker {
         output
     }
 
-    pub(crate) fn handle_task_stopped(
+    pub(crate) fn handle_task_terminal(
         &mut self,
         agent_id: &str,
+        lifecycle: ActivityLifecycle,
         emitted_at_ms: u64,
     ) -> ClaudeActivityOutput {
+        if !matches!(
+            lifecycle,
+            ActivityLifecycle::Cancelled
+                | ActivityLifecycle::Interrupted
+                | ActivityLifecycle::Failed
+        ) {
+            return ClaudeActivityOutput::default();
+        }
         let agent_key = retained_key("agent", agent_id);
         let actor = self
             .actors
@@ -557,7 +566,7 @@ impl ClaudeActivityTracker {
         }
         let timestamp = unix_millis_to_timestamp(emitted_at_ms);
         let mut candidate = actor.clone();
-        candidate.status = ActivityLifecycle::Cancelled;
+        candidate.status = lifecycle;
         candidate.updated_at.clone_from(&timestamp);
         candidate.terminal_at = Some(timestamp);
         let Some(summary) = candidate.to_summary() else {

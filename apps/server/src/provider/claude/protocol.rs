@@ -5,17 +5,9 @@ use serde_json::Value;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClaudeMessage {
     StreamEvent(StreamEventMessage),
-    System(SystemMessage),
     User(UserMessage),
     Assistant(AssistantMessage),
     Result(ResultMessage),
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(tag = "subtype", rename_all = "snake_case")]
-pub enum SystemMessage {
-    TaskStarted(ClaudeTaskStartedMessage),
-    TaskNotification(ClaudeTaskNotificationMessage),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -143,17 +135,54 @@ pub(crate) struct ClaudeControlResponse {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClaudeTaskStartedMessage {
-    pub session_id: String,
-    pub task_id: String,
-    pub tool_use_id: String,
-    pub task_type: String,
+#[derive(Deserialize)]
+pub(crate) struct ClaudeTaskStartedMessage {
+    pub(crate) session_id: String,
+    pub(crate) task_id: String,
+    pub(crate) tool_use_id: String,
+    pub(crate) task_type: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClaudeTaskNotificationMessage {
-    pub session_id: String,
-    pub task_id: String,
-    pub status: String,
+impl std::fmt::Debug for ClaudeTaskStartedMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ClaudeTaskStartedMessage { .. }")
+    }
+}
+
+#[derive(Deserialize)]
+pub(crate) struct ClaudeTaskNotificationMessage {
+    pub(crate) session_id: String,
+    pub(crate) task_id: String,
+    pub(crate) status: String,
+}
+
+impl std::fmt::Debug for ClaudeTaskNotificationMessage {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ClaudeTaskNotificationMessage { .. }")
+    }
+}
+
+#[cfg(test)]
+mod task_lifecycle_privacy_tests {
+    use super::*;
+
+    #[test]
+    fn internal_task_lifecycle_debug_never_exposes_native_identifiers() {
+        let started: ClaudeTaskStartedMessage = serde_json::from_value(serde_json::json!({
+            "session_id":"session-secret","task_id":"task-secret",
+            "tool_use_id":"tool-secret","task_type":"local_agent"
+        }))
+        .expect("typed task-started message");
+        let notification: ClaudeTaskNotificationMessage =
+            serde_json::from_value(serde_json::json!({
+                "session_id":"session-secret","task_id":"task-secret","status":"failed"
+            }))
+            .expect("typed task notification");
+        let debug = format!("{started:?} {notification:?}");
+        assert!(!debug.contains("secret"));
+        assert_eq!(
+            debug,
+            "ClaudeTaskStartedMessage { .. } ClaudeTaskNotificationMessage { .. }"
+        );
+    }
 }
