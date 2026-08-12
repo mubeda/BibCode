@@ -2610,8 +2610,16 @@ async fn session_runtime_matches_text_tool_and_approval_traces() {
             "params": {
                 "threadId": "provider-thread-1",
                 "turnId": "fixture-turn",
-                "itemId": "item-1",
-                "delta": "I will make a small update.\n"
+                "itemId": "commentary-1",
+                "delta": "First."
+            }
+        }))
+        .emit_notification(json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "provider-thread-1",
+                "turnId": "fixture-turn",
+                "item": { "id": "commentary-1", "type": "agentMessage" }
             }
         }))
         .emit_notification(json!({
@@ -2619,8 +2627,8 @@ async fn session_runtime_matches_text_tool_and_approval_traces() {
             "params": {
                 "threadId": "provider-thread-1",
                 "turnId": "fixture-turn",
-                "itemId": "item-1",
-                "delta": "Done.\n"
+                "itemId": "final-1",
+                "delta": "Second."
             }
         }))
         .emit_notification(json!({
@@ -2730,6 +2738,7 @@ async fn session_runtime_matches_text_tool_and_approval_traces() {
     assert_eq!(startup_events[0].event_type, "session.connecting");
     assert_eq!(startup_events[1].event_type, "mcp.status.updated");
     assert_eq!(startup_events[2].event_type, "session.ready");
+    runtime.set_agent_activity_enabled(false).await;
 
     runtime
         .set_goal("Finish the provider parity work")
@@ -2740,8 +2749,21 @@ async fn session_runtime_matches_text_tool_and_approval_traces() {
         .send_turn(Some("Small text turn".to_owned()), vec![], None, None)
         .await
         .expect("text turn");
-    let text_events = runtime.collect_events(4).await;
+    let text_events = runtime.collect_events(5).await;
     assert_eq!(text_events, stable_fixture("trace-text.json"));
+    assert_eq!(
+        text_events
+            .iter()
+            .map(|event| (event.event_type.as_str(), event.item_id.as_deref()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("turn.started", None),
+            ("content.delta", Some("commentary-1")),
+            ("message.assistant.completed", Some("commentary-1")),
+            ("content.delta", Some("final-1")),
+            ("turn.completed", None),
+        ]
+    );
 
     runtime
         .send_turn(Some("Run a tool".to_owned()), vec![], None, None)
@@ -3087,6 +3109,7 @@ async fn activity_runtime_routes_live_children_without_changing_root_events() {
                 event_type: "turn.started".to_owned(),
                 thread_id: "fixture-thread".to_owned(),
                 turn_id: Some("fixture-turn".to_owned()),
+                item_id: None,
                 request_id: None,
                 payload: json!({}),
             },
@@ -3094,6 +3117,7 @@ async fn activity_runtime_routes_live_children_without_changing_root_events() {
                 event_type: "content.delta".to_owned(),
                 thread_id: "fixture-thread".to_owned(),
                 turn_id: Some("fixture-turn".to_owned()),
+                item_id: Some("root-message-1".to_owned()),
                 request_id: None,
                 payload: json!({
                     "streamKind": "assistant_text",
@@ -3104,6 +3128,7 @@ async fn activity_runtime_routes_live_children_without_changing_root_events() {
                 event_type: "item.started".to_owned(),
                 thread_id: "fixture-thread".to_owned(),
                 turn_id: Some("fixture-turn".to_owned()),
+                item_id: None,
                 request_id: None,
                 payload: json!({
                     "itemType": "command_execution",
@@ -3115,6 +3140,7 @@ async fn activity_runtime_routes_live_children_without_changing_root_events() {
                 event_type: "item.completed".to_owned(),
                 thread_id: "fixture-thread".to_owned(),
                 turn_id: Some("fixture-turn".to_owned()),
+                item_id: None,
                 request_id: None,
                 payload: json!({
                     "itemType": "command_execution",

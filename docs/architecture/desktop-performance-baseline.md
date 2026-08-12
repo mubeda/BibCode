@@ -30,6 +30,11 @@ The raw, immutable measurement reports are:
 - [Tauri Windows x64, 30 seconds](measurements/tauri-win-x64-release-default-30s-20260709-214307.md)
 - [Electron Windows x64, 30 seconds](measurements/electron-win-x64-dir-default-30s-20260709-221951.md)
 
+Supplemental platform-specific evidence, not part of the matched Windows
+performance comparison above:
+
+- [Linux WebKitGTK resource attribution, 2026-08-11](measurements/linux-webkitgtk-resource-attribution-20260811.md)
+
 ## Results
 
 | Metric                 | Historical Electron | Transitional Tauri 2 | Final Rust cold | Final Rust warm |

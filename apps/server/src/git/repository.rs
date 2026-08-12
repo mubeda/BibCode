@@ -1228,14 +1228,22 @@ impl GitRepository {
         force: bool,
         cancellation: &CancellationToken,
     ) -> Result<(), GitCommandError> {
-        let was_registered = self
-            .worktree_paths(cwd, cancellation)
-            .await
-            .is_ok_and(|paths| {
-                paths
-                    .iter()
-                    .any(|registered| same_worktree_path(registered, path))
-            });
+        let registered_paths = self.worktree_paths(cwd, cancellation).await?;
+        let registered_index = registered_paths
+            .iter()
+            .position(|registered| same_worktree_path(registered, path));
+        let was_registered = registered_index.is_some();
+        if force && registered_index.is_some_and(|index| index > 0) {
+            if !self
+                .is_registered_linked_worktree_path(cwd, path, cancellation)
+                .await
+            {
+                return Err(registered_worktree_identity_error(cwd, path));
+            }
+            remove_worktree_contents(path, cancellation)
+                .await
+                .map_err(|error| worktree_cleanup_error(cwd, path, &error))?;
+        }
         let mut args = strings(&["worktree", "remove"]);
         if force {
             args.push("--force".into());
@@ -1261,24 +1269,103 @@ impl GitRepository {
             return Ok(());
         }
         if !was_registered {
+            if force && self.is_managed_orphaned_worktree_path(cwd, path).await {
+                return remove_directory_with_retries(path, cancellation)
+                    .await
+                    .map_err(|error| orphaned_worktree_cleanup_error(cwd, path, &error));
+            }
             return Err(error);
         }
-        for attempt in 0..WORKTREE_REMOVE_RETRY_ATTEMPTS {
-            match tokio::fs::remove_dir_all(path).await {
-                Ok(()) => return Ok(()),
-                Err(filesystem_error) if filesystem_error.kind() == io::ErrorKind::NotFound => {
-                    return Ok(());
-                }
-                Err(_) if attempt + 1 < WORKTREE_REMOVE_RETRY_ATTEMPTS => {
-                    tokio::select! {
-                        () = cancellation.cancelled() => return Err(error),
-                        () = tokio::time::sleep(WORKTREE_REMOVE_RETRY_DELAY) => {}
-                    }
-                }
-                Err(_) => return Err(error),
-            }
+        if let Err(filesystem_error) = remove_directory_with_retries(path, cancellation).await {
+            return Err(with_filesystem_cleanup_error(error, &filesystem_error));
         }
-        Err(error)
+        Ok(())
+    }
+
+    async fn is_managed_orphaned_worktree_path(&self, cwd: &Path, path: &Path) -> bool {
+        let Ok(metadata) = tokio::fs::symlink_metadata(path).await else {
+            return false;
+        };
+        if !metadata.is_dir()
+            || metadata.file_type().is_symlink()
+            || tokio::fs::symlink_metadata(path.join(".git")).await.is_ok()
+        {
+            return false;
+        }
+        let Ok(path_policy) = self.worktree_path_policy(cwd).await else {
+            return false;
+        };
+        let expected_path = path_policy.path_for(cwd, "managed-orphan-candidate");
+        let Some(expected_parent) = expected_path.parent() else {
+            return false;
+        };
+        let (Ok(canonical_expected_parent), Ok(canonical_path)) = (
+            tokio::fs::canonicalize(expected_parent).await,
+            tokio::fs::canonicalize(path).await,
+        ) else {
+            return false;
+        };
+        canonical_path.parent() == Some(canonical_expected_parent.as_path())
+    }
+
+    async fn is_registered_linked_worktree_path(
+        &self,
+        cwd: &Path,
+        path: &Path,
+        cancellation: &CancellationToken,
+    ) -> bool {
+        let git_file = path.join(".git");
+        let Ok(metadata) = tokio::fs::symlink_metadata(&git_file).await else {
+            return false;
+        };
+        if !metadata.is_file() || metadata.file_type().is_symlink() {
+            return false;
+        }
+        let Ok(contents) = tokio::fs::read_to_string(&git_file).await else {
+            return false;
+        };
+        let Some(raw_admin_path) = contents.trim().strip_prefix("gitdir: ") else {
+            return false;
+        };
+        let admin_path = resolve_git_metadata_path(path, raw_admin_path);
+        let Ok(canonical_admin_path) = tokio::fs::canonicalize(&admin_path).await else {
+            return false;
+        };
+        let Ok(common_dir_output) = self
+            .run(
+                "GitVcsDriver.removeWorktree.commonDir",
+                cwd,
+                &strings(&["rev-parse", "--git-common-dir"]),
+                cancellation,
+            )
+            .await
+        else {
+            return false;
+        };
+        let common_dir = resolve_git_metadata_path(cwd, common_dir_output.stdout.trim());
+        let Ok(canonical_worktrees_dir) =
+            tokio::fs::canonicalize(common_dir.join("worktrees")).await
+        else {
+            return false;
+        };
+        if !canonical_admin_path
+            .parent()
+            .is_some_and(|parent| same_path(parent, &canonical_worktrees_dir))
+        {
+            return false;
+        }
+        let Ok(backlink) = tokio::fs::read_to_string(canonical_admin_path.join("gitdir")).await
+        else {
+            return false;
+        };
+        let backlink_path = resolve_git_metadata_path(&canonical_admin_path, backlink.trim());
+        let (Ok(canonical_backlink), Ok(canonical_git_file)) = (
+            tokio::fs::canonicalize(backlink_path).await,
+            tokio::fs::canonicalize(git_file).await,
+        ) else {
+            return false;
+        };
+        same_path(&canonical_backlink, &canonical_git_file)
     }
 
     pub async fn create_ref(
@@ -1779,7 +1866,7 @@ impl GitRepository {
         &self,
         cwd: &Path,
         cancellation: &CancellationToken,
-    ) -> Result<HashSet<String>, GitCommandError> {
+    ) -> Result<Vec<String>, GitCommandError> {
         let output = self
             .run(
                 "GitVcsDriver.worktreePaths",
@@ -1795,6 +1882,75 @@ impl GitRepository {
             .map(|path| display_path(Path::new(path)))
             .collect())
     }
+}
+
+async fn remove_worktree_contents(
+    path: &Path,
+    cancellation: &CancellationToken,
+) -> Result<(), io::Error> {
+    remove_worktree_path_with_retries(path, true, cancellation).await
+}
+
+async fn remove_directory_with_retries(
+    path: &Path,
+    cancellation: &CancellationToken,
+) -> Result<(), io::Error> {
+    remove_worktree_path_with_retries(path, false, cancellation).await
+}
+
+async fn remove_worktree_path_with_retries(
+    path: &Path,
+    preserve_git_link: bool,
+    cancellation: &CancellationToken,
+) -> Result<(), io::Error> {
+    let mut last_error = None;
+    for attempt in 0..WORKTREE_REMOVE_RETRY_ATTEMPTS {
+        if cancellation.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "worktree removal was cancelled",
+            ));
+        }
+        let result = if preserve_git_link {
+            remove_worktree_contents_once(path).await
+        } else {
+            tokio::fs::remove_dir_all(path).await
+        };
+        match result {
+            Ok(()) => return Ok(()),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => last_error = Some(error),
+        }
+        if attempt + 1 < WORKTREE_REMOVE_RETRY_ATTEMPTS {
+            tokio::select! {
+                () = cancellation.cancelled() => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::Interrupted,
+                        "worktree removal was cancelled",
+                    ));
+                }
+                () = tokio::time::sleep(WORKTREE_REMOVE_RETRY_DELAY) => {}
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| io::Error::other("worktree cleanup failed")))
+}
+
+async fn remove_worktree_contents_once(path: &Path) -> Result<(), io::Error> {
+    let mut entries = tokio::fs::read_dir(path).await?;
+    while let Some(entry) = entries.next_entry().await? {
+        if entry.file_name() == ".git" {
+            continue;
+        }
+        let entry_path = entry.path();
+        let file_type = entry.file_type().await?;
+        if file_type.is_dir() {
+            tokio::fs::remove_dir_all(entry_path).await?;
+        } else {
+            tokio::fs::remove_file(entry_path).await?;
+        }
+    }
+    Ok(())
 }
 
 fn git_environment() -> Vec<(OsString, OsString)> {
@@ -1859,6 +2015,25 @@ fn same_worktree_path(registered: &str, path: &Path) -> bool {
         registered.eq_ignore_ascii_case(&candidate)
     } else {
         registered == candidate
+    }
+}
+
+fn same_path(left: &Path, right: &Path) -> bool {
+    let left = display_path(left);
+    let right = display_path(right);
+    if cfg!(windows) {
+        left.eq_ignore_ascii_case(&right)
+    } else {
+        left == right
+    }
+}
+
+fn resolve_git_metadata_path(base: &Path, value: &str) -> PathBuf {
+    let path = Path::new(value);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
     }
 }
 
@@ -2060,6 +2235,51 @@ fn simple_error(operation: &str, cwd: &Path, detail: &str) -> GitCommandError {
         diagnostics: None,
         detail: detail.into(),
     }
+}
+
+fn worktree_cleanup_error(cwd: &Path, path: &Path, error: &io::Error) -> GitCommandError {
+    simple_error(
+        "GitVcsDriver.removeWorktree",
+        cwd,
+        &format!(
+            "The registered worktree path '{}' could not be cleaned before Git removal: {error}",
+            display_path(path)
+        ),
+    )
+}
+
+fn registered_worktree_identity_error(cwd: &Path, path: &Path) -> GitCommandError {
+    simple_error(
+        "GitVcsDriver.removeWorktree",
+        cwd,
+        &format!(
+            "The registered worktree path '{}' no longer has a verifiable linked-worktree identity, so it was not deleted.",
+            display_path(path)
+        ),
+    )
+}
+
+fn orphaned_worktree_cleanup_error(cwd: &Path, path: &Path, error: &io::Error) -> GitCommandError {
+    simple_error(
+        "GitVcsDriver.removeWorktree",
+        cwd,
+        &format!(
+            "The managed orphaned worktree path '{}' could not be removed: {error}",
+            display_path(path)
+        ),
+    )
+}
+
+fn with_filesystem_cleanup_error(
+    mut error: GitCommandError,
+    filesystem_error: &io::Error,
+) -> GitCommandError {
+    error.detail = format!(
+        "{}\nFilesystem cleanup also failed: {filesystem_error}",
+        error.detail
+    )
+    .into();
+    error
 }
 
 fn reserve_implicit_worktree_path(
