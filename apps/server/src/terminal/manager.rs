@@ -459,9 +459,12 @@ impl Default for ObserverCallbackIsolation {
 
 #[cfg(test)]
 impl ObserverCallbackIsolation {
-    fn with_global_slots(global_slots: Arc<tokio::sync::Semaphore>) -> Self {
+    fn with_slots(
+        slots: Arc<tokio::sync::Semaphore>,
+        global_slots: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
         Self {
-            slots: Arc::new(tokio::sync::Semaphore::new(MAX_ISOLATED_OBSERVER_CALLBACKS)),
+            slots,
             global_slots,
         }
     }
@@ -2819,51 +2822,52 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn observer_callback_slot_is_reusable_after_aborted_owner() {
+        let local_slots = Arc::new(tokio::sync::Semaphore::new(1));
         let global_slots = Arc::new(tokio::sync::Semaphore::new(1));
-        let isolation = ObserverCallbackIsolation::with_global_slots(global_slots.clone());
-        let started = Arc::new(tokio::sync::Semaphore::new(0));
-        let release = Arc::new(tokio::sync::Semaphore::new(0));
-        let owner = tokio::spawn({
+        let isolation =
+            ObserverCallbackIsolation::with_slots(local_slots.clone(), global_slots.clone());
+        let (started_sender, started) = tokio::sync::oneshot::channel();
+        let (release, release_receiver) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn({
             let isolation = isolation.clone();
-            let started = started.clone();
-            let release = release.clone();
             async move {
                 run_observer_callback(
                     isolation,
                     "aborted_owner",
                     Duration::from_secs(5),
                     async move {
-                        started.add_permits(1);
-                        release
-                            .acquire()
-                            .await
-                            .expect("callback release event")
-                            .forget();
+                        started_sender.send(()).expect("callback thread started");
+                        release_receiver.await.expect("release callback thread");
                     },
                 )
                 .await
             }
         });
-        started
-            .acquire()
-            .await
-            .expect("callback start event")
-            .forget();
+        started.await.expect("callback thread started");
 
-        owner.abort();
+        caller.abort();
         assert!(
-            owner
+            caller
                 .await
                 .expect_err("aborted callback owner")
                 .is_cancelled()
         );
-        release.add_permits(1);
-        let returned =
-            tokio::time::timeout(Duration::from_secs(1), global_slots.clone().acquire_owned())
-                .await
-                .expect("aborted callback owner released its process slot after thread exit")
-                .expect("callback capacity remains open");
-        drop(returned);
+        assert!(local_slots.clone().try_acquire_owned().is_err());
+        assert!(global_slots.clone().try_acquire_owned().is_err());
+        let exited = tokio::spawn({
+            let local_slots = local_slots.clone();
+            async move {
+                let permit = local_slots
+                    .acquire_owned()
+                    .await
+                    .expect("callback capacity remains open");
+                drop(permit);
+            }
+        });
+        release.send(()).expect("release callback thread");
+        exited.await.expect("callback thread exited");
+        assert!(local_slots.try_acquire_owned().is_ok());
+        assert!(global_slots.try_acquire_owned().is_ok());
 
         assert_eq!(
             run_observer_callback(
@@ -2879,26 +2883,46 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn observer_callback_slot_is_reusable_after_callback_panic() {
+        let local_slots = Arc::new(tokio::sync::Semaphore::new(1));
         let global_slots = Arc::new(tokio::sync::Semaphore::new(1));
-        let isolation = ObserverCallbackIsolation::with_global_slots(global_slots.clone());
-        assert_eq!(
-            run_observer_callback(
-                isolation.clone(),
-                "panicked_callback",
-                Duration::from_secs(1),
-                async {
-                    panic!("injected observer callback panic");
-                },
-            )
-            .await,
-            None
-        );
-        let returned =
-            tokio::time::timeout(Duration::from_secs(1), global_slots.clone().acquire_owned())
+        let isolation =
+            ObserverCallbackIsolation::with_slots(local_slots.clone(), global_slots.clone());
+        let (started_sender, started) = tokio::sync::oneshot::channel();
+        let (release, release_receiver) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn({
+            let isolation = isolation.clone();
+            async move {
+                run_observer_callback(
+                    isolation,
+                    "panicked_callback",
+                    Duration::from_secs(1),
+                    async move {
+                        started_sender.send(()).expect("callback thread started");
+                        release_receiver.await.expect("release callback thread");
+                        panic!("injected observer callback panic");
+                    },
+                )
                 .await
-                .expect("panicked callback released its process slot")
-                .expect("callback capacity remains open");
-        drop(returned);
+            }
+        });
+        started.await.expect("callback thread started");
+        assert!(local_slots.clone().try_acquire_owned().is_err());
+        assert!(global_slots.clone().try_acquire_owned().is_err());
+        let exited = tokio::spawn({
+            let local_slots = local_slots.clone();
+            async move {
+                let permit = local_slots
+                    .acquire_owned()
+                    .await
+                    .expect("callback capacity remains open");
+                drop(permit);
+            }
+        });
+        release.send(()).expect("release callback thread");
+        assert_eq!(caller.await.expect("panicked callback owner"), None);
+        exited.await.expect("callback thread exited");
+        assert!(local_slots.try_acquire_owned().is_ok());
+        assert!(global_slots.try_acquire_owned().is_ok());
 
         assert_eq!(
             run_observer_callback(
