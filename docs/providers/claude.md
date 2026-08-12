@@ -169,6 +169,24 @@ only when help advertises both exact switches:
 If either switch is unavailable or the bounded probe fails, Claude still runs in
 its normal stream-JSON mode without structured hook activity.
 
+Structured chat control correlation is stricter than display observation.
+BiBCode exposes a private task target only after one session and Activity
+generation proves the complete identity chain: a root Agent/legacy Task tool
+invocation, its authenticated asynchronous PostToolUse result carrying the
+same `tool_use_id` and `agentId`, a local-agent `task_started` record carrying
+that `tool_use_id` and `task_id`, and the matching `SubagentStart` `agent_id`.
+Arrival order is irrelevant. Names, roles, descriptions, prompts, timestamps,
+output paths, and event proximity are never correlation keys; incomplete,
+conflicting, stale, malformed, or saturated chains remain observable but
+uncontrollable. Only bounded identities and terminal status are retained, and
+provider-native IDs do not cross persistence, contracts, or logs.
+
+A `task_notification` with status `stopped` is authoritative cancellation for
+an exactly mapped actor and retires its private target. A later
+`SubagentStop` cannot rewrite cancelled, interrupted, or failed lifecycle to
+completed. The provider-specific `stop_task` request and capability downgrade
+are described separately when dispatch support is enabled.
+
 Provider-terminal observation has a separate capability and safety gate. The
 executable must support the required settings switches and BiBCode's additive
 hook preparation. If preparation cannot be established before spawn, the

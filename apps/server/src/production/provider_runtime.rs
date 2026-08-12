@@ -230,7 +230,6 @@ impl ProviderActivityControls {
         self.0.len()
     }
 
-    #[cfg(test)]
     pub(crate) fn from_updates(updates: Vec<ProviderActivityControlUpdate>) -> Self {
         Self(updates)
     }
@@ -8268,7 +8267,9 @@ async fn emit_claude_value(
     let native_event_id = output
         .native_event_id
         .and_then(|value| ProviderNativeEventId::new(value).ok());
-    if output.events.is_empty() && !output.activity.is_empty() {
+    if output.events.is_empty()
+        && (!output.activity.is_empty() || !output.activity_controls.is_empty())
+    {
         let sent = send_claude_output(
             sender,
             cancellation,
@@ -8280,7 +8281,7 @@ async fn emit_claude_value(
                 request_id: None,
                 payload: json!({}),
                 activity: output.activity,
-                activity_controls: Default::default(),
+                activity_controls: ProviderActivityControls::from_updates(output.activity_controls),
             },
         )
         .await;
@@ -8290,17 +8291,20 @@ async fn emit_claude_value(
         return sent;
     }
     let mut activity = Some(output.activity);
+    let mut activity_controls = Some(output.activity_controls);
     let mut native_event_id = native_event_id;
     for event in output.events {
-        if !send_claude_output(
-            sender,
-            cancellation,
-            claude_provider_event(
+        if !send_claude_output(sender, cancellation, {
+            let mut provider_event = claude_provider_event(
                 event,
                 native_event_id.take(),
                 activity.take().unwrap_or_default(),
-            ),
-        )
+            );
+            provider_event.activity_controls = ProviderActivityControls::from_updates(
+                activity_controls.take().unwrap_or_default(),
+            );
+            provider_event
+        })
         .await
         {
             return false;
@@ -9740,6 +9744,99 @@ done
             acknowledgement_receiver.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
+    }
+
+    #[tokio::test]
+    async fn claude_exact_task_correlation_crosses_the_provider_control_bridge() {
+        // Mutation caught: dropping ClaudeRuntimeOutput activity controls before projection.
+        let runtime = Arc::new(tokio::sync::Mutex::new(
+            crate::provider::claude::ClaudeProviderRuntime::new(
+                "claude-control-thread".to_owned(),
+                "claude-control-session".to_owned(),
+            ),
+        ));
+        let (event_sender, mut event_receiver) = tokio::sync::mpsc::channel(8);
+        let (recovery_sender, _recovery_receiver) = tokio::sync::mpsc::channel(1);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let slot = super::ClaudeAcknowledgementSlot::default();
+        let facts = [
+            (
+                false,
+                json!({
+                    "type": "stream_event",
+                    "session_id": "claude-control-session",
+                    "uuid": "tool-event",
+                    "parent_tool_use_id": null,
+                    "event": {"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-a","name":"Agent","input":{}}}
+                }),
+            ),
+            (
+                true,
+                json!({
+                    "hook_event_name":"PostToolUse",
+                    "session_id":"claude-control-session",
+                    "tool_name":"Agent",
+                    "tool_use_id":"tool-a",
+                    "tool_response":{"status":"async_launched","agentId":"agent-a"}
+                }),
+            ),
+            (
+                false,
+                json!({
+                    "type":"system",
+                    "subtype":"task_started",
+                    "session_id":"claude-control-session",
+                    "task_id":"task-a",
+                    "tool_use_id":"tool-a",
+                    "task_type":"local_agent"
+                }),
+            ),
+            (
+                true,
+                json!({
+                    "hook_event_name":"SubagentStart",
+                    "session_id":"claude-control-session",
+                    "agent_id":"agent-a",
+                    "agent_type":"Explore"
+                }),
+            ),
+        ];
+        for (authenticated, value) in facts {
+            assert!(
+                super::emit_claude_value(
+                    &runtime,
+                    "claude-control-thread",
+                    value,
+                    &event_sender,
+                    authenticated,
+                    &recovery_sender,
+                    &cancellation,
+                    &slot,
+                )
+                .await
+            );
+        }
+        let mut events = Vec::new();
+        while let Ok(event) = event_receiver.try_recv() {
+            events.push(event);
+        }
+        assert_eq!(
+            events
+                .iter()
+                .flat_map(|event| event.activity_controls.0.iter())
+                .filter_map(|update| match update {
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id,
+                        target: Some(target),
+                    } => target
+                        .claude_task_id()
+                        .map(|task_id| (actor_id.as_str(), task_id)),
+                    ProviderActivityControlUpdate::ActorTarget { .. }
+                    | ProviderActivityControlUpdate::WorkTarget { .. } => None,
+                })
+                .collect::<Vec<_>>(),
+            [("claude:agent:agent-a", "task-a")]
+        );
     }
 
     #[cfg(unix)]

@@ -216,6 +216,86 @@ struct ClaudeActivityLaunchExpectation {
 }
 
 #[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClaudeTargetedCancellationFixture {
+    session_id: String,
+    orders: Vec<ClaudeTargetedCancellationOrder>,
+    semantic_collision_facts: Vec<Value>,
+    terminal_facts: Vec<Value>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ClaudeTargetedCancellationOrder {
+    name: String,
+    facts: Vec<Value>,
+}
+
+fn apply_targeted_correlation_fact(
+    runtime: &mut ClaudeProviderRuntime,
+    fact: &Value,
+    emitted_at_ms: u64,
+) -> claude::runtime::ClaudeRuntimeOutput {
+    if fact.get("hook_event_name").is_some() {
+        runtime.handle_authenticated_hook_value(fact, emitted_at_ms)
+    } else {
+        runtime.handle_raw_value(fact, emitted_at_ms)
+    }
+}
+
+#[test]
+fn targeted_task_correlation_fixture_keeps_stopped_authoritative_after_subagent_stop() {
+    // Mutation caught: ignoring a stopped task or allowing the later hook to rewrite it completed.
+    let fixture: ClaudeTargetedCancellationFixture =
+        load_fixture("trace-targeted-task-cancellation.json");
+    assert_eq!(fixture.orders.len(), 2);
+    assert!(fixture.orders.iter().all(|order| !order.name.is_empty()));
+
+    for order in &fixture.orders {
+        let mut runtime =
+            ClaudeProviderRuntime::new("thread-targeted".to_owned(), fixture.session_id.clone());
+        for (index, fact) in order.facts.iter().enumerate() {
+            let _ = apply_targeted_correlation_fact(&mut runtime, fact, 1_000 + index as u64);
+        }
+        for (index, fact) in fixture.semantic_collision_facts.iter().enumerate() {
+            let _ = apply_targeted_correlation_fact(&mut runtime, fact, 2_000 + index as u64);
+        }
+
+        let stopped =
+            apply_targeted_correlation_fact(&mut runtime, &fixture.terminal_facts[0], 3_000);
+        let after_stop =
+            apply_targeted_correlation_fact(&mut runtime, &fixture.terminal_facts[1], 4_000);
+        let stopped_statuses = stopped
+            .activity
+            .iter()
+            .chain(&after_stop.activity)
+            .filter_map(|mutation| match mutation {
+                ProviderActivityMutation::UpsertActor(actor)
+                    if actor.id == "claude:agent:agent-a" =>
+                {
+                    Some(actor.status)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            stopped_statuses,
+            [ActivityLifecycle::Cancelled],
+            "{} must preserve stopped as the sole terminal lifecycle",
+            order.name
+        );
+        assert!(
+            stopped
+                .activity
+                .iter()
+                .all(|mutation| !format!("{mutation:?}").contains("must not be retained")),
+            "task output paths and summaries are not activity data"
+        );
+    }
+}
+
+#[derive(Debug, serde::Deserialize)]
 #[serde(
     tag = "type",
     rename_all = "camelCase",
