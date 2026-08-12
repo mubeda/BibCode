@@ -892,6 +892,11 @@ pub trait TerminalLaunchPreparer: Send + Sync {
         &self,
         input: TerminalLaunchPreparationInput,
     ) -> Pin<Box<dyn Future<Output = TerminalLaunchPreparation> + Send + '_>>;
+
+    #[doc(hidden)]
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::ready(()))
+    }
 }
 
 pub enum TerminalLaunchPreparation {

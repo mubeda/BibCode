@@ -18,6 +18,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::{
     io::{AsyncBufReadExt, AsyncReadExt, BufReader},
     process::Child,
+    sync::{OwnedSemaphorePermit, Semaphore, watch},
     task::JoinHandle,
 };
 
@@ -50,6 +51,7 @@ const OPENCODE_HTTP_BODY_LIMIT: usize = 1024 * 1024;
 const OPENCODE_HELPER_READY_TIMEOUT: Duration = Duration::from_secs(3);
 const OPENCODE_HELPER_TERM_GRACE: Duration = Duration::from_millis(100);
 const OPENCODE_HELPER_REAP_TIMEOUT: Duration = Duration::from_millis(100);
+const OPENCODE_HELPER_REAPER_CAPACITY: usize = 16;
 #[cfg(unix)]
 const OPENCODE_WAITID_EINTR_RETRY_LIMIT: usize = 8;
 const OPENCODE_PRE_SPAWN_DELETE_TIMEOUT: Duration = Duration::from_millis(100);
@@ -360,6 +362,11 @@ pub trait OpenCodeHelperLauncher: Send + Sync + fmt::Debug {
         &self,
         launch: OpenCodeHelperLaunch,
     ) -> Pin<Box<dyn Future<Output = Result<OpenCodeHelperReady, String>> + Send + '_>>;
+
+    #[doc(hidden)]
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(std::future::ready(()))
+    }
 }
 
 pub trait OpenCodeEventStream: Send {
@@ -620,6 +627,10 @@ impl ProviderTerminalObserverFactory for OpenCodeTerminalObserverFactory {
         input: ProviderTerminalObserverFactoryInput,
     ) -> Pin<Box<dyn Future<Output = Option<PreparedTerminalLaunch>> + Send + '_>> {
         Box::pin(self.prepare_inner(input))
+    }
+
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        self.helper.shutdown()
     }
 }
 
@@ -1781,6 +1792,7 @@ impl OpenCodeCapabilityProbeRunner for SystemOpenCodeCapabilityProbeRunner {
 #[derive(Debug)]
 struct SystemOpenCodeHelperLauncher {
     readiness_timeout: Duration,
+    reaper: Arc<OpenCodeRetainedReaper>,
     #[cfg(test)]
     fixture_events: Option<OpenCodeHelperFixtureEvents>,
 }
@@ -1799,6 +1811,7 @@ struct OpenCodeHelperFixtureEvents {
 #[derive(Clone, Debug)]
 struct OpenCodeHelperReapTimeoutEvents {
     foreground_wait_started: Arc<crate::test_support::FixtureEvent>,
+    foreground_return_release: Arc<crate::test_support::FixtureEvent>,
     background_wait_started: Arc<crate::test_support::FixtureEvent>,
     background_wait_release: Arc<crate::test_support::FixtureEvent>,
 }
@@ -1824,6 +1837,7 @@ impl Default for SystemOpenCodeHelperLauncher {
     fn default() -> Self {
         Self {
             readiness_timeout: OPENCODE_HELPER_READY_TIMEOUT,
+            reaper: Arc::new(OpenCodeRetainedReaper::default()),
             #[cfg(test)]
             fixture_events: None,
         }
@@ -1832,12 +1846,13 @@ impl Default for SystemOpenCodeHelperLauncher {
 
 impl SystemOpenCodeHelperLauncher {
     #[cfg(test)]
-    const fn with_fixture_events(
+    fn with_fixture_events(
         readiness_timeout: Duration,
         fixture_events: OpenCodeHelperFixtureEvents,
     ) -> Self {
         Self {
             readiness_timeout,
+            reaper: Arc::new(OpenCodeRetainedReaper::default()),
             fixture_events: Some(fixture_events),
         }
     }
@@ -1850,6 +1865,7 @@ impl OpenCodeHelperLauncher for SystemOpenCodeHelperLauncher {
     ) -> Pin<Box<dyn Future<Output = Result<OpenCodeHelperReady, String>> + Send + '_>> {
         Box::pin(async move {
             let mut command = tokio::process::Command::new(&launch.executable);
+            let reaper_permit = self.reaper.reserve()?;
             configure_background_command(&mut command);
             command
                 .args(&launch.args)
@@ -1874,6 +1890,8 @@ impl OpenCodeHelperLauncher for SystemOpenCodeHelperLauncher {
                 process_group_identity_reserved: AtomicBool::new(child.id().is_some()),
                 child: Mutex::new(Some(child)),
                 stdout_task: Mutex::new(None),
+                reaper: self.reaper.clone(),
+                reaper_permit: Mutex::new(Some(reaper_permit)),
                 #[cfg(test)]
                 fixture_events: self.fixture_events.clone(),
             });
@@ -1914,6 +1932,10 @@ impl OpenCodeHelperLauncher for SystemOpenCodeHelperLauncher {
                 .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(stdout_task);
             Ok(OpenCodeHelperReady { endpoint, process })
         })
+    }
+
+    fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(self.reaper.shutdown())
     }
 }
 
@@ -1960,6 +1982,8 @@ struct SystemOpenCodeHelperProcess {
     process_group_identity_reserved: AtomicBool,
     child: Mutex<Option<Child>>,
     stdout_task: Mutex<Option<JoinHandle<()>>>,
+    reaper: Arc<OpenCodeRetainedReaper>,
+    reaper_permit: Mutex<Option<OwnedSemaphorePermit>>,
     #[cfg(test)]
     fixture_events: Option<OpenCodeHelperFixtureEvents>,
 }
@@ -2002,7 +2026,7 @@ impl OpenCodeHelperProcess for SystemOpenCodeHelperProcess {
     }
 
     fn terminate(&self) {
-        let mut child = self
+        let child = self
             .child
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -2015,11 +2039,23 @@ impl OpenCodeHelperProcess for SystemOpenCodeHelperProcess {
         if let Some(stdout_task) = stdout_task {
             stdout_task.abort();
         }
-        let Some(child) = child.as_mut() else {
+        let permit = self
+            .reaper_permit
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take();
+        let Some(mut child) = child else {
+            return;
+        };
+        let Some(permit) = permit else {
             return;
         };
         #[cfg(unix)]
-        if let Some(process_group_id) = self.reserved_process_group_id() {
+        let process_group_id = self.reserved_process_group_id();
+        #[cfg(not(unix))]
+        let process_group_id = self.process_group_id;
+        #[cfg(unix)]
+        if let Some(process_group_id) = process_group_id {
             // SAFETY: the process-group ID was captured from this owned helper
             // and non-reaping observation still proves its leader identity is
             // reserved.
@@ -2028,6 +2064,13 @@ impl OpenCodeHelperProcess for SystemOpenCodeHelperProcess {
             }
         }
         let _ = child.start_kill();
+        self.reaper.submit(
+            child,
+            process_group_id,
+            permit,
+            #[cfg(test)]
+            self.fixture_events.clone(),
+        );
     }
 
     fn terminate_and_reap(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
@@ -2041,13 +2084,13 @@ impl OpenCodeHelperProcess for SystemOpenCodeHelperProcess {
             let process_group_id = self.reserved_process_group_id();
             #[cfg(not(unix))]
             let process_group_id = self.process_group_id;
-            let mut cleanup = child.map(|child| SystemOpenCodeReapGuard {
-                child: Some(child),
-                #[cfg(unix)]
-                process_group_id,
-            });
             let stdout_task = self
                 .stdout_task
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .take();
+            let permit = self
+                .reaper_permit
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .take();
@@ -2055,7 +2098,10 @@ impl OpenCodeHelperProcess for SystemOpenCodeHelperProcess {
                 stdout_task.abort();
                 let _ = stdout_task.await;
             }
-            let Some(cleanup) = cleanup.as_mut() else {
+            let Some(child) = child else {
+                return;
+            };
+            let Some(permit) = permit else {
                 return;
             };
             #[cfg(unix)]
@@ -2068,26 +2114,17 @@ impl OpenCodeHelperProcess for SystemOpenCodeHelperProcess {
             }
             #[cfg(test)]
             let fixture_events = self.fixture_events.clone();
-            if reap_opencode_helper(
-                cleanup,
+            let mut foreground_done = self.reaper.submit(
+                child,
                 process_group_id,
+                permit,
                 #[cfg(test)]
-                fixture_events.as_ref(),
-            )
-            .await
-            {
-                #[cfg(test)]
-                if let Some(events) = fixture_events.as_ref() {
-                    events.reaped.publish();
+                fixture_events,
+            );
+            while !*foreground_done.borrow() {
+                if foreground_done.changed().await.is_err() {
+                    break;
                 }
-            } else {
-                let child = cleanup.take_child();
-                spawn_opencode_background_reaper(
-                    child,
-                    process_group_id,
-                    #[cfg(test)]
-                    fixture_events,
-                );
             }
         })
     }
@@ -2104,10 +2141,6 @@ impl SystemOpenCodeReapGuard {
         self.child
             .as_mut()
             .expect("OpenCode reap guard owns a child")
-    }
-
-    fn take_child(&mut self) -> Child {
-        self.child.take().expect("OpenCode reap guard owns a child")
     }
 
     fn disarm(&mut self) {
@@ -2241,32 +2274,144 @@ async fn reap_opencode_helper(
     }
 }
 
-fn spawn_opencode_background_reaper(
-    child: Child,
-    process_group_id: Option<i32>,
-    #[cfg(test)] fixture_events: Option<OpenCodeHelperFixtureEvents>,
-) {
-    tokio::spawn(async move {
-        let mut cleanup = SystemOpenCodeReapGuard {
-            child: Some(child),
-            #[cfg(unix)]
-            process_group_id,
-        };
-        #[cfg(test)]
-        if let Some(reap_timeout) = fixture_events
-            .as_ref()
-            .and_then(|events| events.reap_timeout.as_ref())
-        {
-            reap_timeout.background_wait_started.publish();
-            reap_timeout.background_wait_release.wait_after(0).await;
+#[derive(Debug)]
+struct OpenCodeRetainedReaperTask {
+    join: JoinHandle<()>,
+    completed: Arc<AtomicBool>,
+}
+
+#[derive(Debug)]
+struct OpenCodeRetainedReaper {
+    permits: Arc<Semaphore>,
+    tasks: Mutex<Vec<OpenCodeRetainedReaperTask>>,
+    changed: Arc<tokio::sync::Notify>,
+}
+
+impl Default for OpenCodeRetainedReaper {
+    fn default() -> Self {
+        Self {
+            permits: Arc::new(Semaphore::new(OPENCODE_HELPER_REAPER_CAPACITY)),
+            tasks: Mutex::new(Vec::with_capacity(OPENCODE_HELPER_REAPER_CAPACITY)),
+            changed: Arc::new(tokio::sync::Notify::new()),
         }
-        let _ = cleanup.child_mut().wait().await;
-        #[cfg(test)]
-        if let Some(events) = fixture_events.as_ref() {
-            events.reaped.publish();
+    }
+}
+
+impl OpenCodeRetainedReaper {
+    fn reserve(&self) -> Result<OwnedSemaphorePermit, String> {
+        self.permits
+            .clone()
+            .try_acquire_owned()
+            .map_err(|_| "OpenCode helper cleanup capacity is exhausted".to_owned())
+    }
+
+    fn submit(
+        &self,
+        child: Child,
+        process_group_id: Option<i32>,
+        permit: OwnedSemaphorePermit,
+        #[cfg(test)] fixture_events: Option<OpenCodeHelperFixtureEvents>,
+    ) -> watch::Receiver<bool> {
+        let (foreground_done, foreground_wait) = watch::channel(false);
+        let completed = Arc::new(AtomicBool::new(false));
+        let task_completed = completed.clone();
+        let changed = self.changed.clone();
+        let join = tokio::spawn(async move {
+            let _permit = permit;
+            let mut cleanup = SystemOpenCodeReapGuard {
+                child: Some(child),
+                #[cfg(unix)]
+                process_group_id,
+            };
+            let foreground_reaped = reap_opencode_helper(
+                &mut cleanup,
+                process_group_id,
+                #[cfg(test)]
+                fixture_events.as_ref(),
+            )
+            .await;
+            if foreground_reaped {
+                #[cfg(test)]
+                if let Some(events) = fixture_events.as_ref() {
+                    events.reaped.publish();
+                }
+                foreground_done.send_replace(true);
+                task_completed.store(true, Ordering::Release);
+                changed.notify_waiters();
+                return;
+            }
+            #[cfg(test)]
+            if let Some(reap_timeout) = fixture_events
+                .as_ref()
+                .and_then(|events| events.reap_timeout.as_ref())
+            {
+                reap_timeout.background_wait_started.publish();
+                reap_timeout.foreground_return_release.wait_after(0).await;
+            }
+            foreground_done.send_replace(true);
+            #[cfg(test)]
+            if let Some(reap_timeout) = fixture_events
+                .as_ref()
+                .and_then(|events| events.reap_timeout.as_ref())
+            {
+                reap_timeout.background_wait_release.wait_after(0).await;
+            }
+            let _ = cleanup.child_mut().wait().await;
+            #[cfg(test)]
+            if let Some(events) = fixture_events.as_ref() {
+                events.reaped.publish();
+            }
+            cleanup.disarm();
+            task_completed.store(true, Ordering::Release);
+            changed.notify_waiters();
+        });
+        let mut tasks = self
+            .tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        tasks.retain(|task| !task.completed.load(Ordering::Acquire));
+        tasks.push(OpenCodeRetainedReaperTask { join, completed });
+        foreground_wait
+    }
+
+    async fn shutdown(&self) {
+        loop {
+            let notified = self.changed.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            let completed = {
+                let mut tasks = self
+                    .tasks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let mut completed = Vec::new();
+                let mut index = 0;
+                while index < tasks.len() {
+                    if tasks[index].completed.load(Ordering::Acquire) {
+                        completed.push(tasks.swap_remove(index).join);
+                    } else {
+                        index += 1;
+                    }
+                }
+                if tasks.is_empty() && completed.is_empty() {
+                    return;
+                }
+                completed
+            };
+            for task in completed {
+                let _ = task.await;
+            }
+            let has_pending = !self
+                .tasks
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .is_empty();
+            if !has_pending {
+                return;
+            }
+            notified.await;
         }
-        cleanup.disarm();
-    });
+    }
 }
 
 impl Drop for SystemOpenCodeHelperProcess {
@@ -2712,17 +2857,27 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn readiness_error_returns_after_foreground_reap_timeout_and_background_reaps() {
-        let sandbox = TestSandbox::new("opencode-background-reap");
+    struct RetainedReapFixture {
+        _sandbox: TestSandbox,
+        pid_path: PathBuf,
+        events: OpenCodeHelperFixtureEvents,
+        timeout_events: OpenCodeHelperReapTimeoutEvents,
+        launcher: Arc<SystemOpenCodeHelperLauncher>,
+        launch: OpenCodeHelperLaunch,
+    }
+
+    #[cfg(unix)]
+    fn retained_reap_fixture(name: &str) -> RetainedReapFixture {
+        let sandbox = TestSandbox::new(name);
         let pid_path = sandbox.path("helper.pid");
         let executable = sandbox.executable_script(
             "invalid-opencode-helper",
             "printf 'opencode server listening on http://0.0.0.0:43127\\n'\nexec sleep 3600",
             "",
         );
-        let reap_timeout = OpenCodeHelperReapTimeoutEvents {
+        let timeout_events = OpenCodeHelperReapTimeoutEvents {
             foreground_wait_started: Arc::new(FixtureEvent::default()),
+            foreground_return_release: Arc::new(FixtureEvent::default()),
             background_wait_started: Arc::new(FixtureEvent::default()),
             background_wait_release: Arc::new(FixtureEvent::default()),
         };
@@ -2731,34 +2886,80 @@ mod tests {
             release: Arc::new(FixtureEvent::default()),
             reaped: Arc::new(FixtureEvent::default()),
             pid_path: pid_path.clone(),
-            reap_timeout: Some(reap_timeout.clone()),
+            reap_timeout: Some(timeout_events.clone()),
         };
-        let launcher = SystemOpenCodeHelperLauncher::with_fixture_events(
+        let launcher = Arc::new(SystemOpenCodeHelperLauncher::with_fixture_events(
             OPENCODE_HELPER_READY_TIMEOUT,
             events.clone(),
-        );
+        ));
         let launch = OpenCodeHelperLaunch {
             executable: executable.to_string_lossy().into_owned(),
             args: Vec::new(),
             cwd: sandbox.root().to_path_buf(),
             env: sandbox.environment(std::iter::empty::<(String, String)>()),
         };
+        RetainedReapFixture {
+            _sandbox: sandbox,
+            pid_path,
+            events,
+            timeout_events,
+            launcher,
+            launch,
+        }
+    }
 
-        let start = tokio::spawn(async move { launcher.start(launch).await });
-        tokio::time::timeout(Duration::from_secs(10), events.spawned.wait_after(0))
+    #[cfg(unix)]
+    impl RetainedReapFixture {
+        async fn reach_background_owner(
+            &self,
+        ) -> (
+            tokio::task::JoinHandle<Result<OpenCodeHelperReady, String>>,
+            u32,
+        ) {
+            let launcher = self.launcher.clone();
+            let launch = self.launch.clone();
+            let start = tokio::spawn(async move { launcher.start(launch).await });
+            tokio::time::timeout(Duration::from_secs(10), self.events.spawned.wait_after(0))
+                .await
+                .expect("OpenCode PID publication outer watchdog");
+            let pid = std::fs::read_to_string(&self.pid_path)
+                .expect("OpenCode helper PID")
+                .parse::<u32>()
+                .expect("numeric OpenCode helper PID");
+            self.events.release.publish();
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                self.timeout_events.foreground_wait_started.wait_after(0),
+            )
             .await
-            .expect("OpenCode PID publication outer watchdog");
-        let pid = std::fs::read_to_string(&pid_path)
-            .expect("OpenCode helper PID")
-            .parse::<u32>()
-            .expect("numeric OpenCode helper PID");
-        events.release.publish();
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            reap_timeout.foreground_wait_started.wait_after(0),
-        )
-        .await
-        .expect("foreground reap attempt outer watchdog");
+            .expect("foreground reap attempt outer watchdog");
+            tokio::time::timeout(
+                Duration::from_secs(10),
+                self.timeout_events.background_wait_started.wait_after(0),
+            )
+            .await
+            .expect("retained reaper ownership outer watchdog");
+            (start, pid)
+        }
+
+        async fn assert_reaped(&self, pid: u32) {
+            tokio::time::timeout(Duration::from_secs(10), self.events.reaped.wait_after(0))
+                .await
+                .expect("retained reap completion outer watchdog");
+            assert!(matches!(
+                waitid_child_once(pid),
+                Err(error) if error.raw_os_error() == Some(libc::ECHILD)
+            ));
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn foreground_timeout_transfers_exact_child_before_error_return() {
+        let fixture = retained_reap_fixture("opencode-background-transfer");
+        let (start, pid) = fixture.reach_background_owner().await;
+        assert_eq!(fixture.events.reaped.checkpoint(), 0);
+        fixture.timeout_events.foreground_return_release.publish();
 
         let error = tokio::time::timeout(Duration::from_secs(10), start)
             .await
@@ -2769,22 +2970,56 @@ mod tests {
             error == "OpenCode helper advertised an invalid endpoint"
                 || error == "OpenCode helper readiness timed out"
         );
-        tokio::time::timeout(
-            Duration::from_secs(10),
-            reap_timeout.background_wait_started.wait_after(0),
-        )
-        .await
-        .expect("background reaper ownership outer watchdog");
-        assert_eq!(events.reaped.checkpoint(), 0);
-
-        reap_timeout.background_wait_release.publish();
-        tokio::time::timeout(Duration::from_secs(10), events.reaped.wait_after(0))
+        fixture.timeout_events.background_wait_release.publish();
+        tokio::time::timeout(Duration::from_secs(10), fixture.launcher.shutdown())
             .await
-            .expect("background reap completion outer watchdog");
-        assert!(matches!(
-            waitid_child_once(pid),
-            Err(error) if error.raw_os_error() == Some(libc::ECHILD)
-        ));
+            .expect("retained reaper shutdown outer watchdog");
+        fixture.assert_reaped(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn aborting_foreground_waiter_does_not_lose_reaper_ownership() {
+        let fixture = retained_reap_fixture("opencode-aborted-waiter");
+        let (start, pid) = fixture.reach_background_owner().await;
+        start.abort();
+        assert!(
+            start
+                .await
+                .expect_err("foreground waiter is aborted")
+                .is_cancelled()
+        );
+
+        fixture.timeout_events.foreground_return_release.publish();
+        fixture.timeout_events.background_wait_release.publish();
+        tokio::time::timeout(Duration::from_secs(10), fixture.launcher.shutdown())
+            .await
+            .expect("retained reaper drain after waiter abort");
+        fixture.assert_reaped(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn launcher_shutdown_waits_for_retained_child_true_reap() {
+        let fixture = retained_reap_fixture("opencode-shutdown-drain");
+        let (start, pid) = fixture.reach_background_owner().await;
+        fixture.timeout_events.foreground_return_release.publish();
+        let _ = start.await.expect("OpenCode start task");
+
+        let shutdown = fixture.launcher.shutdown();
+        tokio::pin!(shutdown);
+        let first_poll =
+            std::future::poll_fn(|context| std::task::Poll::Ready(shutdown.as_mut().poll(context)))
+                .await;
+        assert!(
+            first_poll.is_pending(),
+            "shutdown must retain the pending reap"
+        );
+        fixture.timeout_events.background_wait_release.publish();
+        tokio::time::timeout(Duration::from_secs(10), shutdown)
+            .await
+            .expect("launcher shutdown drains retained child");
+        fixture.assert_reaped(pid).await;
     }
 
     #[derive(Debug, Default)]
@@ -2959,11 +3194,14 @@ mod tests {
         command.process_group(0);
         let child = command.spawn().expect("actual exited helper");
         let process_id = child.id().expect("actual helper process ID");
+        let reaper = Arc::new(OpenCodeRetainedReaper::default());
         let helper = SystemOpenCodeHelperProcess {
             process_group_id: i32::try_from(process_id).ok(),
             process_group_identity_reserved: AtomicBool::new(true),
             child: Mutex::new(Some(child)),
             stdout_task: Mutex::new(None),
+            reaper_permit: Mutex::new(Some(reaper.reserve().expect("helper reap permit"))),
+            reaper,
             fixture_events: None,
         };
 
@@ -3037,11 +3275,14 @@ mod tests {
             );
         }
 
+        let reaper = Arc::new(OpenCodeRetainedReaper::default());
         let helper = SystemOpenCodeHelperProcess {
             process_group_id: i32::try_from(sentinel_process_group).ok(),
             process_group_identity_reserved: AtomicBool::new(true),
             child: Mutex::new(Some(exited_child)),
             stdout_task: Mutex::new(None),
+            reaper_permit: Mutex::new(Some(reaper.reserve().expect("helper reap permit"))),
+            reaper,
             fixture_events: None,
         };
         let observed_exited = helper.has_exited();
@@ -3070,6 +3311,7 @@ mod tests {
             let _ = sentinel.start_kill();
             let _ = sentinel.wait().await;
         }
+        helper.reaper.shutdown().await;
 
         assert!(
             observed_exited,

@@ -99,6 +99,18 @@ provider terminal launched by BiBCode. It requires explicit enablement before
 that terminal is launched (or reopened), and it does not scrape arbitrary PTY
 text.
 
+OpenCode helper cleanup is owned by the system helper launcher. Before a
+foreground cleanup waiter can block, the launcher transfers the exact child,
+reserved process-group identity, and one of sixteen cleanup permits into its
+retained reaper registry. The foreground TERM/grace/KILL/wait budget remains
+bounded; a timed-out child stays registry-owned until `Child::wait` completes.
+Terminal-manager shutdown first cancels and drains observer generations and
+sessions, then calls the launch-preparer/factory shutdown hook to drain this
+registry while the production Tokio runtime is still live. Other provider
+factories use the hook's no-op default. This makes waiter cancellation safe,
+bounds live helper/reaper ownership, and prevents runtime teardown from
+discarding an unreaped OpenCode child.
+
 ## Independent activity controls
 
 Each environment has separate Chat and AI Terminal activity gates. Chat defaults

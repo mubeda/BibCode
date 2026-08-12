@@ -2518,6 +2518,9 @@ impl TerminalManager {
             self.publish_closed_sessions(&closed.notifications);
             report.merge(closed.report);
         }
+        if let Some(preparer) = self.inner.options.launch_preparer.as_ref() {
+            preparer.shutdown().await;
+        }
         report
     }
 
@@ -2766,6 +2769,25 @@ mod tests {
     };
     use std::time::Instant;
 
+    #[derive(Debug, Default)]
+    struct ShutdownRecordingPreparer {
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl TerminalLaunchPreparer for ShutdownRecordingPreparer {
+        fn prepare(
+            &self,
+            _input: TerminalLaunchPreparationInput,
+        ) -> Pin<Box<dyn Future<Output = TerminalLaunchPreparation> + Send + '_>> {
+            Box::pin(std::future::ready(TerminalLaunchPreparation::PassThrough))
+        }
+
+        fn shutdown(&self) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(std::future::ready(()))
+        }
+    }
+
     #[derive(Debug)]
     struct RegistryObserver;
 
@@ -2812,6 +2834,23 @@ mod tests {
         );
         assert!(!displaced.observation.is_current());
         assert!(replacement.observation.is_current());
+    }
+
+    #[tokio::test]
+    async fn shutdown_drains_the_owned_launch_preparer_after_terminal_generations() {
+        let preparer = Arc::new(ShutdownRecordingPreparer::default());
+        let manager = TerminalManager::new(
+            Arc::new(HistoryTestBackend::default()),
+            TerminalManagerOptions {
+                launch_preparer: Some(preparer.clone()),
+                ..TerminalManagerOptions::default()
+            },
+        );
+
+        manager.shutdown().await;
+        manager.shutdown().await;
+
+        assert_eq!(preparer.calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
