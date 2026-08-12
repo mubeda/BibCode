@@ -1737,6 +1737,46 @@ impl CodexActivityTracker {
         )
     }
 
+    pub(crate) fn validated_reconciliation_hint_receiver_ids(
+        &self,
+        thread: &ReconciliationThread,
+    ) -> HashSet<String> {
+        let Some(owning_thread_id) = thread.id.as_deref().filter(|id| usable_native_id(id)) else {
+            return HashSet::new();
+        };
+        if !self.is_root_thread(owning_thread_id) && !self.is_verified_child(owning_thread_id) {
+            return HashSet::new();
+        }
+        let mut receiver_ids = HashSet::new();
+        let mut normalized_hint_count = 0;
+        'turns: for turn in thread.turns.iter().rev().take(MAX_RECONCILED_TURNS).rev() {
+            for item in &turn.items {
+                let ReconciliationThreadItem::SubAgentActivity {
+                    agent_thread_id,
+                    agent_path,
+                    kind,
+                    ..
+                } = item
+                else {
+                    continue;
+                };
+                if normalized_hint_count == MAX_RECONCILED_ENTRIES {
+                    break 'turns;
+                }
+                normalized_hint_count += 1;
+                if let Some(hint) = self.validate_sub_agent_hint(
+                    owning_thread_id,
+                    agent_thread_id.as_deref(),
+                    agent_path.as_deref(),
+                    kind.as_deref(),
+                ) {
+                    receiver_ids.insert(hint.native_thread_id.to_owned());
+                }
+            }
+        }
+        receiver_ids
+    }
+
     pub(crate) fn reconcile_sub_agent_hints_with_projection_limit_excluding(
         &mut self,
         thread: &ReconciliationThread,

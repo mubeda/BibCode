@@ -29,8 +29,8 @@ use super::{
     },
     model::{
         BuildTurnStartInput, CodexProviderSnapshot, CodexRuntimeMode, CodexThreadSnapshot,
-        ThreadBackgroundTerminalsListParams, ThreadListParams, ThreadReadParams,
-        build_initialize_params, build_turn_start_params,
+        ReconciliationThread, ThreadBackgroundTerminalsListParams, ThreadListParams,
+        ThreadReadParams, build_initialize_params, build_turn_start_params,
         decode_background_terminals_list_response, decode_thread_list_response,
         decode_thread_read_response, delivery_key_exists, is_recoverable_thread_resume_error,
         parse_model_list_response, parse_skills_list_response, parse_thread_snapshot,
@@ -443,6 +443,28 @@ impl RuntimeActivityState {
         self.live_control_revisions
             .get(&ActivityControlSubject::Actor(actor_id.to_owned()))
             .is_some_and(|revision| *revision > observed_control_revision)
+    }
+
+    fn exclude_superseded_reconciliation_hint_receivers(
+        &mut self,
+        observed_control_revision: u64,
+        thread: &ReconciliationThread,
+        excluded_native_thread_ids: &mut HashSet<String>,
+    ) -> bool {
+        let receiver_ids = self
+            .tracker
+            .validated_reconciliation_hint_receiver_ids(thread);
+        let mut excluded_any = false;
+        for native_thread_id in receiver_ids {
+            if self
+                .reconciliation_actor_was_superseded(observed_control_revision, &native_thread_id)
+            {
+                excluded_native_thread_ids.insert(native_thread_id.clone());
+                self.retain_retry_source(&native_thread_id);
+                excluded_any = true;
+            }
+        }
+        excluded_any
     }
 
     fn install_root_thread_id(&mut self, native_thread_id: &str) {
@@ -1646,8 +1668,15 @@ impl CodexSessionRuntime {
                             return;
                         }
                         let source_version = response.thread.updated_at;
-                        let excluded_hints =
+                        let mut excluded_hints =
                             activity.resolved_hints_for_source(&root_thread_id, source_version);
+                        if activity.exclude_superseded_reconciliation_hint_receivers(
+                            pass.observed_control_revision,
+                            &response.thread,
+                            &mut excluded_hints,
+                        ) {
+                            deferred_read_candidates = true;
+                        }
                         let hints = activity
                             .tracker
                             .reconcile_sub_agent_hints_with_projection_limit_excluding(
@@ -1910,8 +1939,15 @@ impl CodexSessionRuntime {
                         continue;
                     }
                     let source_version = response.thread.updated_at;
-                    let excluded_hints =
+                    let mut excluded_hints =
                         activity.resolved_hints_for_source(&thread_id, source_version);
+                    if activity.exclude_superseded_reconciliation_hint_receivers(
+                        pass.observed_control_revision,
+                        &response.thread,
+                        &mut excluded_hints,
+                    ) {
+                        deferred_read_candidates = true;
+                    }
                     let hints = activity
                         .tracker
                         .reconcile_sub_agent_hints_with_projection_limit_excluding(
@@ -6351,6 +6387,401 @@ mod tests {
             (true, Err(_)) => panic!("expected exact child interrupt"),
             (false, Ok(request)) => Some(request),
         }
+    }
+
+    fn hint_race_history_response(
+        request: &Value,
+        owner_thread_id: &str,
+        durable_hint_kind: &str,
+    ) -> Value {
+        let mut thread = json!({
+            "id": owner_thread_id,
+            "createdAt": 1,
+            "updatedAt": 5,
+            "status": {"type": "active", "activeFlags": []},
+            "turns": [{
+                "id": "hint-turn",
+                "startedAt": 5,
+                "completedAt": 5,
+                "items": [
+                    {
+                        "id": "stale-interrupt",
+                        "type": "subAgentActivity",
+                        "agentThreadId": "durable-child",
+                        "agentPath": "/root/durable-child",
+                        "kind": durable_hint_kind
+                    },
+                    {
+                        "id": "unrelated-start",
+                        "type": "subAgentActivity",
+                        "agentThreadId": "unrelated-child",
+                        "agentPath": "/root/unrelated-child",
+                        "kind": "started"
+                    }
+                ]
+            }]
+        });
+        if owner_thread_id != "provider-root" {
+            thread["parentThreadId"] = json!("provider-root");
+        }
+        json!({"id": request["id"].clone(), "result": {"thread": thread}})
+    }
+
+    async fn run_hint_control_race_peer(
+        peer_stdin: DuplexStream,
+        peer_stdout: DuplexStream,
+        nested_owner: bool,
+        durable_hint_kind: &'static str,
+        hint_read_seen: oneshot::Sender<()>,
+        release_hint_read: oneshot::Receiver<()>,
+        expect_interrupt: bool,
+    ) -> Option<Value> {
+        let mut reader = BufReader::new(peer_stdin);
+        let mut writer = peer_stdout;
+        let mut hint_read_seen = Some(hint_read_seen);
+        let mut release_hint_read = Some(release_hint_read);
+
+        let root_read = read_runtime_test_json(&mut reader).await;
+        assert_eq!(root_read["method"], "thread/read");
+        if nested_owner {
+            write_runtime_test_json(&mut writer, root_reconciliation_response(&root_read)).await;
+        } else {
+            hint_read_seen
+                .take()
+                .expect("root hint signal")
+                .send(())
+                .expect("signal pending root history");
+            release_hint_read
+                .take()
+                .expect("root hint release")
+                .await
+                .expect("release root history");
+            write_runtime_test_json(
+                &mut writer,
+                hint_race_history_response(&root_read, "provider-root", durable_hint_kind),
+            )
+            .await;
+        }
+
+        let list = read_runtime_test_json(&mut reader).await;
+        assert_eq!(list["method"], "thread/list");
+        write_runtime_test_json(
+            &mut writer,
+            json!({
+                "id": list["id"].clone(),
+                "result": {"data": [], "nextCursor": null, "backwardsCursor": null}
+            }),
+        )
+        .await;
+
+        if nested_owner {
+            let parent_read = read_runtime_test_json(&mut reader).await;
+            assert_eq!(parent_read["method"], "thread/read");
+            assert_eq!(parent_read["params"]["threadId"], "nested-parent");
+            hint_read_seen
+                .take()
+                .expect("nested hint signal")
+                .send(())
+                .expect("signal pending nested history");
+            release_hint_read
+                .take()
+                .expect("nested hint release")
+                .await
+                .expect("release nested history");
+            write_runtime_test_json(
+                &mut writer,
+                hint_race_history_response(&parent_read, "nested-parent", durable_hint_kind),
+            )
+            .await;
+        }
+
+        loop {
+            let request = read_runtime_test_json(&mut reader).await;
+            if request["method"] == "thread/backgroundTerminals/list" {
+                write_runtime_test_json(
+                    &mut writer,
+                    json!({"id": request["id"].clone(), "result": {"data": [], "nextCursor": null}}),
+                )
+                .await;
+                break;
+            }
+            assert_eq!(request["method"], "thread/read");
+            let child_thread_id = request["params"]["threadId"]
+                .as_str()
+                .expect("child thread ID");
+            assert!(matches!(
+                child_thread_id,
+                "durable-child" | "unrelated-child"
+            ));
+            let turns = if child_thread_id == "unrelated-child" {
+                json!([{
+                    "id": "unrelated-turn",
+                    "status": "inProgress",
+                    "startedAt": 6,
+                    "items": []
+                }])
+            } else {
+                json!([])
+            };
+            let parent_thread_id = if nested_owner {
+                "nested-parent"
+            } else {
+                "provider-root"
+            };
+            write_runtime_test_json(
+                &mut writer,
+                json!({
+                    "id": request["id"].clone(),
+                    "result": {
+                        "thread": {
+                            "id": child_thread_id,
+                            "parentThreadId": parent_thread_id,
+                            "createdAt": 1,
+                            "updatedAt": 6,
+                            "status": {"type": "active", "activeFlags": []},
+                            "turns": turns
+                        }
+                    }
+                }),
+            )
+            .await;
+        }
+
+        let request = timeout(
+            Duration::from_millis(500),
+            read_runtime_test_json(&mut reader),
+        )
+        .await;
+        let Ok(request) = request else {
+            assert!(!expect_interrupt, "expected exact interrupt request");
+            return None;
+        };
+        if request["method"] == "turn/interrupt" {
+            write_runtime_test_json(
+                &mut writer,
+                json!({"id": request["id"].clone(), "result": {}}),
+            )
+            .await;
+        }
+        Some(request)
+    }
+
+    async fn assert_live_target_survives_stale_hint_history(nested_owner: bool) {
+        let (connection, incoming, peer_stdout, peer_stdin, _peer_stderr) =
+            runtime_test_connection();
+        let runtime = CodexSessionRuntime::new(reconciliation_test_options(), connection, incoming);
+        configure_reconciliation_test_runtime(&runtime).await;
+        let durable_parent_id = if nested_owner {
+            "nested-parent"
+        } else {
+            "provider-root"
+        };
+        let descendants = [
+            decode_thread_read_response(json!({
+                "thread": {
+                    "id": "nested-parent",
+                    "parentThreadId": "provider-root",
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": {"type": "active", "activeFlags": []},
+                    "turns": []
+                }
+            }))
+            .expect("nested parent")
+            .thread,
+            decode_thread_read_response(json!({
+                "thread": {
+                    "id": "durable-child",
+                    "parentThreadId": durable_parent_id,
+                    "createdAt": 1,
+                    "updatedAt": 2,
+                    "status": {"type": "active", "activeFlags": []},
+                    "turns": []
+                }
+            }))
+            .expect("durable child")
+            .thread,
+        ];
+        {
+            let mut activity = runtime.inner.activity.lock().await;
+            activity.tracker.reconcile_descendants(&descendants);
+            if nested_owner {
+                activity.enqueue_hinted_descendants(&["nested-parent".to_owned()]);
+            }
+        }
+        let (read_seen_tx, read_seen_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let peer = tokio::spawn(run_hint_control_race_peer(
+            peer_stdin,
+            peer_stdout,
+            nested_owner,
+            "interrupted",
+            read_seen_tx,
+            release_rx,
+            true,
+        ));
+        let reconcile_runtime = runtime.clone();
+        let reconciliation = tokio::spawn(async move {
+            reconcile_runtime.reconcile_once().await;
+        });
+        read_seen_rx.await.expect("hint history read is pending");
+
+        runtime
+            .handle_notification(
+                "turn/started".to_owned(),
+                json!({
+                    "threadId": "durable-child",
+                    "turn": {"id": "live-turn", "status": "inProgress", "startedAt": 5}
+                }),
+                5_000,
+            )
+            .await;
+        release_tx.send(()).expect("release stale hint history");
+        reconciliation.await.expect("reconciliation task");
+
+        let activity = runtime.inner.activity.lock().await;
+        assert!(
+            activity
+                .tracker
+                .is_current_target("durable-child", "live-turn"),
+            "a stale hinted receiver must not mutate the newer live tracker target"
+        );
+        assert!(
+            activity
+                .tracker
+                .is_current_target("unrelated-child", "unrelated-turn"),
+            "unrelated hinted receivers must still reconcile"
+        );
+        assert!(
+            activity
+                .pending_hinted_descendants_snapshot()
+                .iter()
+                .any(|thread_id| thread_id == "durable-child"),
+            "the superseded receiver must remain queued for a bounded fresh retry"
+        );
+        drop(activity);
+        let events = drain_runtime_events(&runtime).await;
+        assert_eq!(
+            actor_control_targets(&events, "codex:thread:durable-child").last(),
+            Some(&Some(("durable-child".to_owned(), "live-turn".to_owned())))
+        );
+        assert_eq!(
+            actor_control_targets(&events, "codex:thread:unrelated-child").last(),
+            Some(&Some((
+                "unrelated-child".to_owned(),
+                "unrelated-turn".to_owned()
+            )))
+        );
+        runtime
+            .interrupt_targeted_turn("durable-child", "live-turn")
+            .await
+            .expect("newer live target remains cancellable");
+        let request = peer.await.expect("peer").expect("interrupt request");
+        assert_eq!(request["method"], "turn/interrupt");
+        assert_eq!(
+            request["params"],
+            json!({"threadId": "durable-child", "turnId": "live-turn"})
+        );
+    }
+
+    #[tokio::test]
+    async fn live_start_before_stale_root_hint_preserves_tracker_overlay_and_exact_interrupt() {
+        assert_live_target_survives_stale_hint_history(false).await;
+    }
+
+    #[tokio::test]
+    async fn live_start_before_stale_nested_hint_preserves_receiver_target_and_exact_interrupt() {
+        assert_live_target_survives_stale_hint_history(true).await;
+    }
+
+    #[tokio::test]
+    async fn live_completion_before_stale_active_root_hint_preserves_terminal_target_without_io() {
+        let (connection, incoming, peer_stdout, peer_stdin, _peer_stderr) =
+            runtime_test_connection();
+        let runtime = CodexSessionRuntime::new(reconciliation_test_options(), connection, incoming);
+        configure_reconciliation_test_runtime(&runtime).await;
+        runtime
+            .inner
+            .activity
+            .lock()
+            .await
+            .tracker
+            .reconcile_descendants(&[verified_reconciliation_child()]);
+        runtime
+            .handle_notification(
+                "turn/started".to_owned(),
+                json!({
+                    "threadId": "durable-child",
+                    "turn": {"id": "live-turn", "status": "inProgress", "startedAt": 3}
+                }),
+                3_000,
+            )
+            .await;
+        let (read_seen_tx, read_seen_rx) = oneshot::channel();
+        let (release_tx, release_rx) = oneshot::channel();
+        let peer = tokio::spawn(run_hint_control_race_peer(
+            peer_stdin,
+            peer_stdout,
+            false,
+            "started",
+            read_seen_tx,
+            release_rx,
+            false,
+        ));
+        let reconcile_runtime = runtime.clone();
+        let reconciliation = tokio::spawn(async move {
+            reconcile_runtime.reconcile_once().await;
+        });
+        read_seen_rx.await.expect("root hint history is pending");
+
+        runtime
+            .handle_notification(
+                "turn/completed".to_owned(),
+                json!({
+                    "threadId": "durable-child",
+                    "turn": {"id": "live-turn", "status": "completed", "completedAt": 5}
+                }),
+                5_000,
+            )
+            .await;
+        release_tx.send(()).expect("release stale active hint");
+        reconciliation.await.expect("reconciliation task");
+
+        let activity = runtime.inner.activity.lock().await;
+        assert!(
+            !activity
+                .tracker
+                .is_current_target("durable-child", "live-turn")
+        );
+        assert!(
+            activity
+                .tracker
+                .is_current_target("unrelated-child", "unrelated-turn")
+        );
+        assert!(
+            activity
+                .pending_hinted_descendants_snapshot()
+                .iter()
+                .any(|thread_id| thread_id == "durable-child")
+        );
+        drop(activity);
+        let events = drain_runtime_events(&runtime).await;
+        assert_eq!(
+            actor_control_targets(&events, "codex:thread:durable-child").last(),
+            Some(&None)
+        );
+        let error = runtime
+            .interrupt_targeted_turn("durable-child", "live-turn")
+            .await
+            .expect_err("completed target must fail before provider I/O");
+        assert!(error.to_string().contains("active"));
+        let follow_up = peer.await.expect("peer");
+        assert!(
+            follow_up
+                .as_ref()
+                .is_none_or(|request| request["method"] != "turn/interrupt"),
+            "a fresh bounded reconciliation retry is allowed, but targeted provider I/O is not"
+        );
     }
 
     #[tokio::test]

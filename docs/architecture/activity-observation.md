@@ -172,7 +172,10 @@ and discard a staged subject when newer live evidence has published. Child
 recovery results for a superseded subject are fenced under the same activity
 state lock before any tracker mutation, retained for a bounded fresh-pass
 retry, and never allowed to erase a newer live turn or reinstall a completed
-one. Unrelated subjects in that pass continue to reconcile normally.
+one. Root and nested history hints apply the same pre-mutation fence to every
+validated receiver rather than only to the history owner; superseded receivers
+remain queued for bounded recovery while unrelated hinted receivers in that
+pass continue to reconcile normally.
 
 Epoch and cancellation fences cancel recovery when activity is disabled, the
 root is replaced, or the runtime disconnects or shuts down; late results and
