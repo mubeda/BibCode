@@ -165,11 +165,11 @@ Subagents follow the canonical actor hierarchy, using indentation and a
 connector for a visible parent. Missing, invalid, cyclic, or otherwise unusable
 parentage safely renders the actor as a root rather than inventing a hierarchy.
 In a structured-chat **Subagents** roster, an active actor shows a persistent
-trailing action only while the current provider runtime has proved an exact
-target for that actor. The row and action are separate keyboard-focusable
-controls: the row opens detail, while the action acts immediately and does not
-open detail. Its accessible label and tooltip name the actor and the number of
-currently active child agents included in the subtree.
+trailing action only while the current provider runtime has proved a current
+admitted control target for that actor. The row and action are separate
+keyboard-focusable controls: the row opens detail, while the action acts
+immediately and does not open detail. Its accessible label and tooltip name the
+actor and the number of currently active child agents included in the subtree.
 
 **Stop subtree** targets the selected actor and every attributable descendant
 in its canonical subtree; **Stop** targets an actor with no active descendants.

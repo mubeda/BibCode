@@ -195,9 +195,10 @@ interval. The nested-only parent-local fallback admits control only when the
 stream parent tool, the accepted nested `task_started` candidate, and the
 Activity-verified child lineage agree on that parent, with exactly one candidate
 on each side. A later exact PostToolUse result promotes that pending state to an
-exact target or contradicts it and retires it. Ambiguous candidates remain
-observable but unsupported and cause zero provider I/O; BiBCode does not infer
-identity from text, timing, order, proximity, or transcript contents.
+exact target or contradicts it, retires it, and tombstones its identity chain
+so replay cannot recreate the target. Ambiguous candidates remain observable
+but unsupported and cause zero provider I/O; BiBCode does not infer identity
+from text, timing, order, proximity, or transcript contents.
 
 Arrival order is irrelevant. Every accepted fact that installs, retires, or
 terminalizes a target carries a deterministic domain-separated SHA-256 event

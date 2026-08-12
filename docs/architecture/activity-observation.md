@@ -266,8 +266,8 @@ tool invocation, authenticated asynchronous PostToolUse `agentId`, an exact
 `task_started` `task_id` whose optional `task_type` is absent, `local_agent`, or
 `remote_agent`, and verified `SubagentStart` `agent_id`. Other task types fail
 closed. This exact PostToolUse path remains authoritative: it can promote a
-pending nested fallback to an exact target or contradict it and retire the
-candidate.
+pending nested fallback to an exact target or contradict it, retire it, and
+tombstone its identity chain so replay cannot recreate the target.
 
 For nested invocations only, an authenticated `PreToolUse` from the already
 verified parent opens a parent-owned pending interval when a matching
