@@ -754,6 +754,59 @@ mod tests {
 
     use super::*;
 
+    #[cfg(unix)]
+    use crate::test_support::{FixtureEvent, TestSandbox};
+
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct RelayValidationFixture {
+        _sandbox: TestSandbox,
+        executable: PathBuf,
+        pid_path: PathBuf,
+        reaped: Arc<FixtureEvent>,
+    }
+
+    #[cfg(unix)]
+    fn relay_validation_fixture(sandbox: TestSandbox) -> RelayValidationFixture {
+        let pid_path = sandbox.path("validation.pid");
+        let executable = sandbox.executable_script(
+            "relay-validation",
+            "pid_tmp=\"${1}.tmp\"\nprintf '%s' \"$$\" > \"$pid_tmp\"\nmv \"$pid_tmp\" \"$1\"\nprintf 'cloudflared fixture\\n'",
+            "",
+        );
+        RelayValidationFixture {
+            _sandbox: sandbox,
+            executable,
+            pid_path,
+            reaped: Arc::new(FixtureEvent::default()),
+        }
+    }
+
+    #[cfg(unix)]
+    impl RelayValidationFixture {
+        async fn run(&self) -> (Result<(), RelayInstallError>, i32) {
+            let result = run_checked(
+                &self.executable,
+                [self.pid_path.as_os_str().to_owned()],
+                "validation_failed",
+                "relay validation fixture failed",
+            )
+            .await;
+            let pid = std::fs::read_to_string(&self.pid_path)
+                .expect("relay validation PID")
+                .parse::<i32>()
+                .expect("numeric relay validation PID");
+            self.reaped.publish();
+            (result, pid)
+        }
+
+        async fn wait_reaped(&self) {
+            tokio::time::timeout(Duration::from_secs(10), self.reaped.wait_after(0))
+                .await
+                .expect("relay validation reap outer watchdog");
+        }
+    }
+
     fn successful_reporter() -> InstallReporter {
         Arc::new(|_| Box::pin(async { Ok(()) }))
     }
@@ -794,9 +847,23 @@ mod tests {
         spawn_raw_response(response).await
     }
 
+    #[cfg(unix)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_relay_validation_children_publish_distinct_pids_and_reap_in_parallel() {
+        let left = relay_validation_fixture(TestSandbox::new("relay-validation-left"));
+        let right = relay_validation_fixture(TestSandbox::new("relay-validation-right"));
+
+        let ((left_result, left_pid), (right_result, right_pid)) =
+            tokio::join!(left.run(), right.run());
+
+        left_result.expect("left relay validation");
+        right_result.expect("right relay validation");
+        assert_ne!(left_pid, right_pid);
+        tokio::join!(left.wait_reaped(), right.wait_reaped());
+    }
+
     #[tokio::test]
     async fn native_relay_client_covers_resolution_installation_and_private_helpers() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("temp dir");
         let fixture = native_success_executable();
         let executable = temp.path().join("cloudflared");
@@ -1061,7 +1128,6 @@ mod tests {
 
     #[tokio::test]
     async fn relay_installer_maps_lock_directory_download_and_activation_failures() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("temp dir");
         let reporter = successful_reporter();
 
@@ -1215,7 +1281,6 @@ mod tests {
 
     #[tokio::test]
     async fn windows_named_relay_binary_installs_from_native_fixture() {
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
         let temp = TempDir::new().expect("temp dir");
         let fixture = fs::read(native_success_executable())
             .await

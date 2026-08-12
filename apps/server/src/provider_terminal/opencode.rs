@@ -1781,20 +1781,56 @@ impl OpenCodeCapabilityProbeRunner for SystemOpenCodeCapabilityProbeRunner {
 #[derive(Debug)]
 struct SystemOpenCodeHelperLauncher {
     readiness_timeout: Duration,
+    #[cfg(test)]
+    fixture_events: Option<OpenCodeHelperFixtureEvents>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+struct OpenCodeHelperFixtureEvents {
+    spawned: Arc<crate::test_support::FixtureEvent>,
+    release: Arc<crate::test_support::FixtureEvent>,
+    reaped: Arc<crate::test_support::FixtureEvent>,
+    pid_path: PathBuf,
+}
+
+#[cfg(test)]
+impl OpenCodeHelperFixtureEvents {
+    fn publish_spawned(&self, process_id: Option<u32>) -> Result<(), String> {
+        let process_id =
+            process_id.ok_or_else(|| "OpenCode helper PID is unavailable".to_owned())?;
+        let mut temporary_name = self.pid_path.as_os_str().to_owned();
+        temporary_name.push(".tmp");
+        let temporary_path = PathBuf::from(temporary_name);
+        std::fs::write(&temporary_path, process_id.to_string())
+            .map_err(|error| format!("failed staging OpenCode helper PID: {error}"))?;
+        std::fs::rename(&temporary_path, &self.pid_path)
+            .map_err(|error| format!("failed publishing OpenCode helper PID: {error}"))?;
+        self.spawned.publish();
+        Ok(())
+    }
 }
 
 impl Default for SystemOpenCodeHelperLauncher {
     fn default() -> Self {
         Self {
             readiness_timeout: OPENCODE_HELPER_READY_TIMEOUT,
+            #[cfg(test)]
+            fixture_events: None,
         }
     }
 }
 
 impl SystemOpenCodeHelperLauncher {
     #[cfg(test)]
-    const fn with_readiness_timeout(readiness_timeout: Duration) -> Self {
-        Self { readiness_timeout }
+    const fn with_fixture_events(
+        readiness_timeout: Duration,
+        fixture_events: OpenCodeHelperFixtureEvents,
+    ) -> Self {
+        Self {
+            readiness_timeout,
+            fixture_events: Some(fixture_events),
+        }
     }
 }
 
@@ -1830,6 +1866,15 @@ impl OpenCodeHelperLauncher for SystemOpenCodeHelperLauncher {
                 child: Mutex::new(Some(child)),
                 stdout_task: Mutex::new(None),
             });
+            #[cfg(test)]
+            if let Some(events) = self.fixture_events.as_ref() {
+                events.publish_spawned(
+                    process
+                        .process_group_id
+                        .and_then(|pid| u32::try_from(pid).ok()),
+                )?;
+                events.release.wait_after(0).await;
+            }
             let mut stdout = BufReader::new(stdout);
             let endpoint = match tokio::time::timeout(
                 self.readiness_timeout,
@@ -1839,16 +1884,28 @@ impl OpenCodeHelperLauncher for SystemOpenCodeHelperLauncher {
             {
                 Ok(Ok(endpoint)) => endpoint,
                 Ok(Err(error)) => {
-                    process.terminate();
+                    process.terminate_and_reap().await;
+                    #[cfg(test)]
+                    if let Some(events) = self.fixture_events.as_ref() {
+                        events.reaped.publish();
+                    }
                     return Err(error);
                 }
                 Err(_) => {
-                    process.terminate();
+                    process.terminate_and_reap().await;
+                    #[cfg(test)]
+                    if let Some(events) = self.fixture_events.as_ref() {
+                        events.reaped.publish();
+                    }
                     return Err("OpenCode helper readiness timed out".to_owned());
                 }
             };
             if !valid_loopback_endpoint(&endpoint) {
-                process.terminate();
+                process.terminate_and_reap().await;
+                #[cfg(test)]
+                if let Some(events) = self.fixture_events.as_ref() {
+                    events.reaped.publish();
+                }
                 return Err("OpenCode helper advertised an invalid endpoint".to_owned());
             }
             let stdout_task = tokio::spawn(drain_opencode_stdout(stdout));
@@ -2511,6 +2568,82 @@ mod tests {
     use futures_util::{StreamExt, stream};
 
     use super::*;
+    use crate::test_support::{FixtureEvent, TestSandbox};
+
+    #[cfg(unix)]
+    #[derive(Debug)]
+    struct InvalidReadinessFixture {
+        sandbox: TestSandbox,
+        executable: PathBuf,
+        pid_path: PathBuf,
+        events: OpenCodeHelperFixtureEvents,
+        pair_started: Arc<tokio::sync::Barrier>,
+    }
+
+    #[cfg(unix)]
+    fn invalid_readiness_fixture(
+        sandbox: TestSandbox,
+        pair_started: Arc<tokio::sync::Barrier>,
+    ) -> InvalidReadinessFixture {
+        let pid_path = sandbox.path("helper.pid");
+        let executable = sandbox.executable_script(
+            "invalid-opencode-helper",
+            "printf 'opencode server listening on http://0.0.0.0:43127\\n'\nexec sleep 3600",
+            "",
+        );
+        InvalidReadinessFixture {
+            sandbox,
+            executable,
+            pid_path: pid_path.clone(),
+            events: OpenCodeHelperFixtureEvents {
+                spawned: Arc::new(FixtureEvent::default()),
+                release: Arc::new(FixtureEvent::default()),
+                reaped: Arc::new(FixtureEvent::default()),
+                pid_path,
+            },
+            pair_started,
+        }
+    }
+
+    #[cfg(unix)]
+    impl InvalidReadinessFixture {
+        async fn start_and_release(&self) -> (String, i32) {
+            let launcher = SystemOpenCodeHelperLauncher::with_fixture_events(
+                OPENCODE_HELPER_READY_TIMEOUT,
+                self.events.clone(),
+            );
+            let launch = OpenCodeHelperLaunch {
+                executable: self.executable.to_string_lossy().into_owned(),
+                args: Vec::new(),
+                cwd: self.sandbox.root().to_path_buf(),
+                env: self
+                    .sandbox
+                    .environment(std::iter::empty::<(String, String)>()),
+            };
+            let start = tokio::spawn(async move { launcher.start(launch).await });
+            tokio::time::timeout(Duration::from_secs(10), self.events.spawned.wait_after(0))
+                .await
+                .expect("OpenCode PID publication outer watchdog");
+            let pid = std::fs::read_to_string(&self.pid_path)
+                .expect("OpenCode helper PID")
+                .parse::<i32>()
+                .expect("numeric OpenCode helper PID");
+            self.pair_started.wait().await;
+            self.events.release.publish();
+            let error = tokio::time::timeout(Duration::from_secs(10), start)
+                .await
+                .expect("OpenCode invalid readiness outer watchdog")
+                .expect("OpenCode helper start task")
+                .expect_err("invalid OpenCode readiness must fail");
+            (error, pid)
+        }
+
+        async fn wait_reaped(&self) {
+            tokio::time::timeout(Duration::from_secs(10), self.events.reaped.wait_after(0))
+                .await
+                .expect("OpenCode helper reap outer watchdog");
+        }
+    }
 
     #[derive(Debug, Default)]
     struct RecordingOpenCodeHelper {
@@ -3114,73 +3247,22 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test]
-    async fn invalid_helper_readiness_is_killed_and_reaped_before_error_returns() {
-        use std::os::unix::fs::PermissionsExt;
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_invalid_helper_readiness_children_reap_in_parallel() {
+        let pair_started = Arc::new(tokio::sync::Barrier::new(2));
+        let left = invalid_readiness_fixture(
+            TestSandbox::new("opencode-invalid-left"),
+            pair_started.clone(),
+        );
+        let right =
+            invalid_readiness_fixture(TestSandbox::new("opencode-invalid-right"), pair_started);
 
-        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
-        let root = tempfile::tempdir().expect("OpenCode helper process root");
-        let executable = root.path().join("invalid-opencode-helper");
-        let pid_path = root.path().join("helper.pid");
-        let release_path = root.path().join("release-readiness");
-        std::fs::write(
-            &executable,
-            "#!/bin/sh\nprintf '%s' \"$$\" > \"$OPENCODE_TEST_PID_PATH\"\nwhile [ ! -f \"$OPENCODE_TEST_RELEASE_PATH\" ]; do sleep 0.01; done\nprintf 'opencode server listening on http://0.0.0.0:43127\\n'\nsleep 60\n",
-        )
-        .expect("OpenCode helper script");
-        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o700))
-            .expect("OpenCode helper script permissions");
-        let launcher =
-            SystemOpenCodeHelperLauncher::with_readiness_timeout(Duration::from_secs(10));
-        let launch_pid_path = pid_path.clone();
-        let launch_release_path = release_path.clone();
-        let start = tokio::spawn(async move {
-            launcher
-                .start(OpenCodeHelperLaunch {
-                    executable: executable.to_string_lossy().into_owned(),
-                    args: Vec::new(),
-                    cwd: root.path().to_path_buf(),
-                    env: BTreeMap::from([
-                        (
-                            "OPENCODE_TEST_PID_PATH".to_owned(),
-                            launch_pid_path.to_string_lossy().into_owned(),
-                        ),
-                        (
-                            "OPENCODE_TEST_RELEASE_PATH".to_owned(),
-                            launch_release_path.to_string_lossy().into_owned(),
-                        ),
-                    ]),
-                })
-                .await
-        });
+        let ((left_error, left_pid), (right_error, right_pid)) =
+            tokio::join!(left.start_and_release(), right.start_and_release());
 
-        let pid = tokio::time::timeout(Duration::from_secs(10), async {
-            loop {
-                if let Ok(pid) = std::fs::read_to_string(&pid_path)
-                    && let Ok(pid) = pid.trim().parse::<i32>()
-                {
-                    break pid;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("OpenCode helper PID should be observed before readiness release");
-        std::fs::write(&release_path, b"release").expect("release OpenCode readiness");
-        let result = start.await.expect("OpenCode helper start task should join");
-
-        assert!(result.is_err());
-        tokio::time::timeout(Duration::from_millis(500), async {
-            loop {
-                // SAFETY: signal zero only checks the exact test-child PID and
-                // does not change process state.
-                if unsafe { libc::kill(pid, 0) } == -1 {
-                    break;
-                }
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("failed OpenCode helper must be reaped before returning");
+        assert!(left_error.contains("invalid endpoint"));
+        assert!(right_error.contains("invalid endpoint"));
+        assert_ne!(left_pid, right_pid);
+        tokio::join!(left.wait_reaped(), right.wait_reaped());
     }
 }

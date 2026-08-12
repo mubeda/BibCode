@@ -1774,12 +1774,13 @@ impl ClaudeCapabilityProbeRunner for SystemClaudeCapabilityProbeRunner {
 
 #[cfg(all(test, unix))]
 mod tests {
-    use std::{os::unix::fs::PermissionsExt, sync::atomic::AtomicUsize};
+    use std::sync::atomic::AtomicUsize;
 
     use super::*;
     use crate::{
         activity::{ActivityProjection, ActivityRepository, ActivityScopeRef},
         persistence::{Database, run_migrations},
+        test_support::TestSandbox,
     };
 
     #[test]
@@ -1928,12 +1929,34 @@ mod tests {
         }
     }
 
-    fn executable_script(root: &Path, name: &str, body: &str) -> PathBuf {
-        let path = root.join(name);
-        std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write probe script");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))
-            .expect("make probe script executable");
-        path
+    #[derive(Debug)]
+    struct ClaudeBoundedProbeFixture {
+        _sandbox: TestSandbox,
+        executable: PathBuf,
+    }
+
+    fn bounded_probe_fixture(sandbox: TestSandbox) -> ClaudeBoundedProbeFixture {
+        let bytes = CLAUDE_PROBE_OUTPUT_LIMIT + 8 * 1024;
+        let executable = sandbox.executable_script(
+            "large-claude-probe",
+            &format!(
+                "dd if=/dev/zero bs={bytes} count=1 2>/dev/null\n\
+                 dd if=/dev/zero bs={bytes} count=1 1>&2 2>/dev/null"
+            ),
+            "",
+        );
+        ClaudeBoundedProbeFixture {
+            _sandbox: sandbox,
+            executable,
+        }
+    }
+
+    impl ClaudeBoundedProbeFixture {
+        async fn run(&self) -> Result<ClaudeProbeOutput, String> {
+            SystemClaudeCapabilityProbeRunner::default()
+                .run(&self.executable, Vec::new())
+                .await
+        }
     }
 
     fn restore_modified_time(source: &Path, target: &Path) {
@@ -1946,30 +1969,19 @@ mod tests {
         assert!(status.success(), "restore fixture modified time");
     }
 
-    #[tokio::test]
-    async fn system_probe_streams_large_output_into_fixed_bounds() {
-        let root = tempfile::tempdir().expect("probe directory");
-        let executable = executable_script(
-            root.path(),
-            "large-claude-probe",
-            "dd if=/dev/zero bs=262144 count=1 2>/dev/null\n\
-             dd if=/dev/zero bs=262144 count=1 1>&2 2>/dev/null",
-        );
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn two_claude_probes_bound_both_output_streams_in_parallel() {
+        let left = bounded_probe_fixture(TestSandbox::new("claude-probe-left"));
+        let right = bounded_probe_fixture(TestSandbox::new("claude-probe-right"));
 
-        let output = SystemClaudeCapabilityProbeRunner::with_timeout(Duration::from_secs(10))
-            .run(&executable, Vec::new())
-            .await
-            .expect("large probe");
+        let (left, right) = tokio::join!(left.run(), right.run());
 
-        assert!(output.success);
-        assert!(
-            output.stdout.len() <= CLAUDE_PROBE_OUTPUT_LIMIT,
-            "stdout allocation exceeded the Claude probe bound"
-        );
-        assert!(
-            output.stderr.len() <= CLAUDE_PROBE_OUTPUT_LIMIT,
-            "stderr allocation exceeded the Claude probe bound"
-        );
+        for output in [left, right] {
+            let output = output.expect("large Claude probe");
+            assert!(output.success);
+            assert_eq!(output.stdout.len(), CLAUDE_PROBE_OUTPUT_LIMIT);
+            assert_eq!(output.stderr.len(), CLAUDE_PROBE_OUTPUT_LIMIT);
+        }
     }
 
     #[tokio::test]
