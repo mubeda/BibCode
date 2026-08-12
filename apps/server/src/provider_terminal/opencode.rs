@@ -51,6 +51,7 @@ const OPENCODE_HTTP_BODY_LIMIT: usize = 1024 * 1024;
 const OPENCODE_HELPER_READY_TIMEOUT: Duration = Duration::from_secs(3);
 const OPENCODE_HELPER_TERM_GRACE: Duration = Duration::from_millis(100);
 const OPENCODE_HELPER_REAP_TIMEOUT: Duration = Duration::from_millis(100);
+const OPENCODE_HELPER_WAIT_RETRY_DELAY: Duration = Duration::from_millis(100);
 const OPENCODE_HELPER_REAPER_CAPACITY: usize = 16;
 #[cfg(unix)]
 const OPENCODE_WAITID_EINTR_RETRY_LIMIT: usize = 8;
@@ -1829,10 +1830,24 @@ struct OpenCodeHelperStdoutJoinEvents {
 #[cfg(test)]
 #[derive(Clone, Debug)]
 struct OpenCodeHelperWaitErrorEvents {
-    inject_once: Arc<AtomicBool>,
-    observed: Arc<crate::test_support::FixtureEvent>,
+    failures_remaining: Arc<std::sync::atomic::AtomicUsize>,
+    fail_persistently: Arc<AtomicBool>,
+    injected: Arc<crate::test_support::FixtureEvent>,
     recorded: Arc<crate::test_support::FixtureEvent>,
-    cleared: Arc<crate::test_support::FixtureEvent>,
+    retry_started: Arc<crate::test_support::FixtureEvent>,
+}
+
+#[cfg(test)]
+impl OpenCodeHelperWaitErrorEvents {
+    fn should_inject(&self) -> bool {
+        self.fail_persistently.load(Ordering::Acquire)
+            || self
+                .failures_remaining
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok()
+    }
 }
 
 #[cfg(test)]
@@ -2331,9 +2346,9 @@ async fn wait_opencode_child(
     loop {
         #[cfg(test)]
         if let Some(wait_error) = fixture_events.and_then(|events| events.wait_error.as_ref())
-            && wait_error.inject_once.swap(false, Ordering::AcqRel)
+            && wait_error.should_inject()
         {
-            wait_error.observed.publish();
+            wait_error.injected.publish();
             return Err(std::io::Error::other(
                 "injected OpenCode helper wait failure",
             ));
@@ -2439,10 +2454,17 @@ impl OpenCodeRetainedReaper {
                     return;
                 }
                 OpenCodeForegroundReap::WaitFailed(error) => {
-                    *task_failure
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(error);
-                    changed.notify_waiters();
+                    let first_failure = {
+                        let mut failure = task_failure
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
+                        let first_failure = failure.is_none();
+                        *failure = Some(error);
+                        first_failure
+                    };
+                    if first_failure {
+                        changed.notify_waiters();
+                    }
                 }
                 OpenCodeForegroundReap::TimedOut => {}
             }
@@ -2471,12 +2493,21 @@ impl OpenCodeRetainedReaper {
                 )
                 .await
                 {
-                    Ok(_) => break,
-                    Err(error) => {
+                    Ok(_) => {
                         *task_failure
                             .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                            Some(format!("OpenCode helper wait failed: {error}"));
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                        break;
+                    }
+                    Err(error) => {
+                        let first_failure = {
+                            let mut failure = task_failure
+                                .lock()
+                                .unwrap_or_else(std::sync::PoisonError::into_inner);
+                            let first_failure = failure.is_none();
+                            *failure = Some(format!("OpenCode helper wait failed: {error}"));
+                            first_failure
+                        };
                         #[cfg(test)]
                         if let Some(wait_error) = fixture_events
                             .as_ref()
@@ -2484,21 +2515,29 @@ impl OpenCodeRetainedReaper {
                         {
                             wait_error.recorded.publish();
                         }
-                        changed.notify_waiters();
-                        while *retry.borrow() == retry_checkpoint {
-                            if retry.changed().await.is_err() {
-                                return;
-                            }
+                        if first_failure {
+                            changed.notify_waiters();
                         }
-                        *task_failure
-                            .lock()
-                            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+                        let retry_requested = async {
+                            loop {
+                                if *retry.borrow() != retry_checkpoint {
+                                    return;
+                                }
+                                if retry.changed().await.is_err() {
+                                    std::future::pending::<()>().await;
+                                }
+                            }
+                        };
+                        tokio::select! {
+                            _ = tokio::time::sleep(OPENCODE_HELPER_WAIT_RETRY_DELAY) => {}
+                            _ = retry_requested => {}
+                        }
                         #[cfg(test)]
                         if let Some(wait_error) = fixture_events
                             .as_ref()
                             .and_then(|events| events.wait_error.as_ref())
                         {
-                            wait_error.cleared.publish();
+                            wait_error.retry_started.publish();
                         }
                     }
                 }
@@ -2529,6 +2568,7 @@ impl OpenCodeRetainedReaper {
     }
 
     async fn shutdown(&self) {
+        self.request_retry();
         loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
@@ -2576,9 +2616,8 @@ impl OpenCodeRetainedReaper {
         }
     }
 
-    #[cfg(test)]
-    fn retry_failed(&self) {
-        let next_retry = self.retry.borrow().saturating_add(1);
+    fn request_retry(&self) {
+        let next_retry = self.retry.borrow().wrapping_add(1);
         self.retry.send_replace(next_retry);
     }
 }
@@ -3265,40 +3304,118 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn non_interrupted_wait_error_remains_owned_and_is_not_false_completion() {
+    #[tokio::test(start_paused = true)]
+    async fn transient_wait_error_recovers_automatically_at_retry_boundary() {
         let wait_error = OpenCodeHelperWaitErrorEvents {
-            inject_once: Arc::new(AtomicBool::new(true)),
-            observed: Arc::new(FixtureEvent::default()),
+            failures_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(1)),
+            fail_persistently: Arc::new(AtomicBool::new(false)),
+            injected: Arc::new(FixtureEvent::default()),
             recorded: Arc::new(FixtureEvent::default()),
-            cleared: Arc::new(FixtureEvent::default()),
+            retry_started: Arc::new(FixtureEvent::default()),
         };
-        let fixture =
-            retained_reap_fixture("opencode-wait-error").with_wait_error(wait_error.clone());
+        let fixture = retained_reap_fixture("opencode-transient-wait-error")
+            .with_wait_error(wait_error.clone());
         let (start, pid) = fixture.reach_background_owner().await;
         fixture.timeout_events.foreground_return_release.publish();
         let _ = start.await.expect("OpenCode launch task");
         fixture.timeout_events.background_wait_release.publish();
-        tokio::time::timeout(Duration::from_secs(10), wait_error.observed.wait_after(0))
-            .await
-            .expect("injected wait error observed");
-        tokio::time::timeout(Duration::from_secs(10), wait_error.recorded.wait_after(0))
-            .await
-            .expect("injected wait error retained");
+        wait_error.injected.wait_after(0).await;
+        wait_error.recorded.wait_after(0).await;
 
-        let shutdown = fixture.launcher.reaper.shutdown();
-        tokio::pin!(shutdown);
-        let first_poll =
-            std::future::poll_fn(|context| std::task::Poll::Ready(shutdown.as_mut().poll(context)))
-                .await;
-        assert!(first_poll.is_pending(), "wait error keeps shutdown pending");
         assert_eq!(fixture.events.reaped.checkpoint(), 0);
-        fixture.launcher.reaper.retry_failed();
-        tokio::time::timeout(Duration::from_secs(10), wait_error.cleared.wait_after(0))
-            .await
-            .expect("retained wait retry begins");
-        shutdown.await;
+        tokio::time::advance(Duration::from_millis(99)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(
+            wait_error.retry_started.checkpoint(),
+            0,
+            "retry must not hot-loop before its backoff expires"
+        );
+        tokio::time::advance(Duration::from_millis(1)).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        let retried_automatically = wait_error.retry_started.checkpoint() == 1;
+        if !retried_automatically {
+            fixture.launcher.reaper.request_retry();
+            wait_error.retry_started.wait_after(0).await;
+        }
+        fixture.launcher.shutdown().await;
         fixture.assert_reaped(pid).await;
+        assert!(
+            retried_automatically,
+            "a retained transient wait failure must retry automatically"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn persistent_wait_error_retries_at_finite_cadence_during_shutdown() {
+        let wait_error = OpenCodeHelperWaitErrorEvents {
+            failures_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail_persistently: Arc::new(AtomicBool::new(true)),
+            injected: Arc::new(FixtureEvent::default()),
+            recorded: Arc::new(FixtureEvent::default()),
+            retry_started: Arc::new(FixtureEvent::default()),
+        };
+        let fixture = retained_reap_fixture("opencode-persistent-wait-error")
+            .with_wait_error(wait_error.clone());
+        let (start, pid) = fixture.reach_background_owner().await;
+        fixture.timeout_events.foreground_return_release.publish();
+        let _ = start.await.expect("OpenCode launch task");
+        fixture.timeout_events.background_wait_release.publish();
+        wait_error.injected.wait_after(0).await;
+        wait_error.recorded.wait_after(0).await;
+
+        let launcher = fixture.launcher.clone();
+        let shutdown = tokio::spawn(async move { launcher.shutdown().await });
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        let shutdown_drove_retry = wait_error.retry_started.checkpoint() == 1;
+        if !shutdown_drove_retry {
+            fixture.launcher.reaper.request_retry();
+            wait_error.retry_started.wait_after(0).await;
+        }
+        wait_error.injected.wait_after(1).await;
+        assert_eq!(
+            wait_error.injected.checkpoint(),
+            2,
+            "shutdown may drive one immediate retry but not a hot loop"
+        );
+
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(
+            wait_error.injected.checkpoint(),
+            2,
+            "persistent failure must stay parked without time or a new signal"
+        );
+        tokio::time::advance(Duration::from_millis(99)).await;
+        tokio::task::yield_now().await;
+        assert_eq!(wait_error.injected.checkpoint(), 2);
+        tokio::time::advance(Duration::from_millis(1)).await;
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        let cadence_retried = wait_error.injected.checkpoint() == 3;
+
+        wait_error.fail_persistently.store(false, Ordering::Release);
+        if cadence_retried {
+            tokio::time::advance(Duration::from_millis(100)).await;
+        } else {
+            fixture.launcher.reaper.request_retry();
+        }
+        shutdown.await.expect("retained reaper shutdown task");
+        fixture.assert_reaped(pid).await;
+        assert!(
+            shutdown_drove_retry,
+            "shutdown must wake a retained wait failure without a missing signal deadlock"
+        );
+        assert!(
+            cadence_retried,
+            "persistent wait failure must retry once per finite cadence"
+        );
     }
 
     #[derive(Debug, Default)]
