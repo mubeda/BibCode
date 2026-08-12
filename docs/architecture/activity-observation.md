@@ -260,22 +260,37 @@ recovery is `full` only for
 `bounded` for every other list/read pair, including unknown or unproven pairs.
 These recovery downgrades do not disable ordinary Codex chat.
 
-Claude structured control joins native task identity only through the complete
-same-session, same-generation Agent/Task `tool_use_id` chain: root tool
-invocation, authenticated asynchronous PostToolUse `agentId`, an exact
+Claude structured control normally joins native task identity only through the
+complete same-session, same-generation Agent/Task `tool_use_id` chain: root
+tool invocation, authenticated asynchronous PostToolUse `agentId`, an exact
 `task_started` `task_id` whose optional `task_type` is absent, `local_agent`, or
 `remote_agent`, and verified `SubagentStart` `agent_id`. Other task types fail
-closed. The bounded
-correlator never uses semantic text, timing, order, or proximity and fails
-closed on conflicts, malformed identity, duplicate assignment, stale
-generation, or saturation. Its target updates share the provider event batch
-with the canonical actor mutation; native identities remain private and
-redacted. `task_notification(stopped)` monotonically cancels the mapped actor
-and retires its handle, so later hook completion cannot rewrite cancellation.
-When targeted dispatch is provisionally supported, the exact handle maps to the
-Claude stream-JSON `stop_task` control subtype. Authoritative unsupported
-responses revoke all such handles for that runtime generation without changing
-ordinary Claude chat or observation.
+closed. This exact PostToolUse path remains authoritative: it can promote a
+pending nested fallback to an exact target or contradict it and retire the
+candidate.
+
+For nested invocations only, an authenticated `PreToolUse` from the already
+verified parent opens a parent-owned pending interval when a matching
+PostToolUse result is not available. The fallback admits a target only when the
+stream parent tool, one accepted nested `task_started` candidate, and one
+verified unassigned child lineage all agree on that active parent. Both
+parent-local candidate sets must have cardinality one. Ambiguity is observable
+but unsupported and performs zero provider I/O; semantic text, timing, order,
+proximity, transcript reads, polling, and timers are never correlation inputs.
+Pending state is generation-owned and bounded to 200 correlations. Terminal
+events, runtime replacement, and Activity disablement retire or clear pending
+and installed fallback state.
+
+The bounded correlator fails closed on conflicts, malformed identity, duplicate
+assignment, stale generation, or saturation. Accepted effect facts always carry
+opaque event keys; target updates share the provider event batch with the
+canonical actor mutation, and native identities remain private and redacted.
+`task_notification(stopped)` monotonically cancels the mapped actor and retires
+its handle, so later hook completion cannot rewrite cancellation. When targeted
+dispatch is provisionally supported, an admitted handle maps to the Claude
+stream-JSON `stop_task` control subtype. Authoritative unsupported responses
+revoke all such handles for that runtime generation without changing ordinary
+Claude chat or observation.
 
 | Provider | Structured chat activity                                                                                              | Provider-terminal observation                                                                                                              | Recovery and truthful downgrade                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | -------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
