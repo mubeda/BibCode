@@ -579,7 +579,7 @@ impl ClaudeTaskControlCorrelator {
             };
             let tool_conflict = !matches!(tool_name, "Agent" | "Task")
                 || matches!(record.invocation_is_agent, Some(false));
-            let source_conflict = match record.pre_tool_source.as_ref() {
+            let pre_source_conflict = match record.pre_tool_source.as_ref() {
                 Some(existing) if existing != &source => true,
                 Some(_) => false,
                 None => {
@@ -587,7 +587,10 @@ impl ClaudeTaskControlCorrelator {
                     false
                 }
             };
-            tool_conflict || source_conflict
+            let hook_source_conflict = record.hook_source.as_ref().is_some_and(|existing| {
+                existing != record.pre_tool_source.as_ref().expect("set above")
+            });
+            tool_conflict || pre_source_conflict || hook_source_conflict
         };
         if conflict {
             return self.poison(tool_use_id);
@@ -1235,7 +1238,15 @@ impl ClaudeProviderRuntime {
     }
 
     pub(crate) fn set_targeted_activity_control_supported(&mut self, supported: bool) {
+        if self.targeted_activity_control_supported == supported {
+            return;
+        }
         self.targeted_activity_control_supported = supported;
+        if !supported {
+            self.activity_generation = self.activity_generation.wrapping_add(1);
+            self.task_control_correlator
+                .reset(&self.session_id, self.activity_generation);
+        }
     }
 
     pub fn build_launch_request(input: LaunchRequestInput) -> LaunchRequest {
@@ -3370,7 +3381,6 @@ mod targeted_task_correlation_tests {
             .iter()
             .chain(child_b[..3].iter())
             .chain(child_a[3..].iter())
-            .chain(child_b[3..].iter())
             .enumerate()
             .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 10 + index as u64))
             .collect::<Vec<_>>();
@@ -3393,10 +3403,13 @@ mod targeted_task_correlation_tests {
             true,
             30,
         );
-        assert!(mapped_targets(&[exact]).contains(&(
-            "claude:agent:agent-child-a".to_owned(),
-            "task-child-a".to_owned()
-        )));
+        assert_eq!(
+            mapped_targets(&[exact]),
+            [(
+                "claude:agent:agent-child-a".to_owned(),
+                "task-child-a".to_owned()
+            )]
+        );
         assert!(runtime.task_control_correlator.state_is_bounded());
     }
 
@@ -3508,6 +3521,361 @@ mod targeted_task_correlation_tests {
             .expect("promoted correlation retained");
         assert_eq!(child.launched_agent_id.as_deref(), Some("agent-child"));
         assert!(child.fallback_agent_id.is_none());
+    }
+
+    #[test]
+    fn targeted_task_correlation_poisoned_source_conflicts_are_symmetric() {
+        // Mutation caught: accepting conflicting authenticated launch sources when PostToolUse arrives first.
+        for post_tool_first in [false, true] {
+            let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+            for (index, fact) in facts("session", "tool-parent", "agent-parent", "task-parent")
+                .iter()
+                .enumerate()
+            {
+                let _ = handle_fact(&mut runtime, fact, true, index as u64);
+            }
+            let child = nested_fallback_facts(
+                "session",
+                "tool-parent",
+                "agent-parent",
+                "tool-child",
+                "agent-child",
+                "task-child",
+            );
+            for (index, fact) in child.iter().enumerate() {
+                if index != 1 {
+                    let _ = handle_fact(&mut runtime, fact, true, 10 + index as u64);
+                }
+            }
+            let post_parent = json!({
+                "hook_event_name":"PostToolUse", "session_id":"session",
+                "agent_id":"agent-parent",
+                "tool_use_id":"tool-child", "tool_name":"Agent",
+                "tool_response":{"status":"async_launched","agentId":"agent-child"}
+            });
+            let post_other = json!({
+                "hook_event_name":"PostToolUse", "session_id":"session",
+                "agent_id":"agent-other",
+                "tool_use_id":"tool-child", "tool_name":"Agent",
+                "tool_response":{"status":"async_launched","agentId":"agent-child"}
+            });
+            let pre_parent = json!({
+                "hook_event_name":"PreToolUse", "session_id":"session",
+                "agent_id":"agent-parent",
+                "tool_use_id":"tool-child", "tool_name":"Agent"
+            });
+            let pre_other = json!({
+                "hook_event_name":"PreToolUse", "session_id":"session",
+                "agent_id":"agent-other",
+                "tool_use_id":"tool-child", "tool_name":"Agent"
+            });
+            let (installed, conflicting) = if post_tool_first {
+                (
+                    handle_fact(&mut runtime, &post_parent, true, 20),
+                    handle_fact(&mut runtime, &pre_other, true, 21),
+                )
+            } else {
+                (
+                    handle_fact(&mut runtime, &pre_parent, true, 20),
+                    handle_fact(&mut runtime, &post_other, true, 21),
+                )
+            };
+            assert_eq!(
+                mapped_targets(&[installed]),
+                [(
+                    "claude:agent:agent-child".to_owned(),
+                    "task-child".to_owned()
+                )]
+            );
+            assert!(conflicting.activity_controls.iter().any(|update| matches!(
+                update,
+                ProviderActivityControlUpdate::ActorTarget { actor_id, target: None }
+                    if actor_id == "claude:agent:agent-child"
+            )));
+            assert!(
+                !runtime
+                    .task_control_correlator
+                    .actor_target_by_agent
+                    .contains_key("agent-child")
+            );
+            assert!(runtime.task_control_correlator.state_is_bounded());
+        }
+    }
+
+    #[test]
+    fn targeted_task_correlation_capability_disable_fences_pending_and_installed_fallbacks() {
+        // Mutation caught: re-enabling targeted cancellation lets a prior capability generation install stale fallback state.
+        for installed in [false, true] {
+            let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+            for (index, fact) in facts("session", "tool-parent", "agent-parent", "task-parent")
+                .iter()
+                .enumerate()
+            {
+                let _ = handle_fact(&mut runtime, fact, true, index as u64);
+            }
+            let child = nested_fallback_facts(
+                "session",
+                "tool-parent",
+                "agent-parent",
+                "tool-child",
+                "agent-child",
+                "task-child",
+            );
+            for (index, fact) in child.iter().enumerate() {
+                if installed || index != 3 {
+                    let _ = handle_fact(&mut runtime, fact, true, 10 + index as u64);
+                }
+            }
+            runtime.set_targeted_activity_control_supported(false);
+            runtime.set_targeted_activity_control_supported(true);
+            let after_reenable = handle_fact(&mut runtime, &child[3], true, 30);
+            assert!(
+                mapped_targets(&[after_reenable]).is_empty(),
+                "installed {installed}"
+            );
+            assert!(
+                runtime
+                    .task_control_correlator
+                    .actor_target_by_agent
+                    .is_empty()
+            );
+            assert!(runtime.task_control_correlator.state_is_bounded());
+        }
+    }
+
+    #[test]
+    fn targeted_task_correlation_fallback_rejects_each_cardinality_many_case() {
+        // Mutation caught: selecting a child by insertion order when only the candidate or child side is ambiguous.
+        for extra_child in [false, true] {
+            let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+            for (index, fact) in facts("session", "tool-parent", "agent-parent", "task-parent")
+                .iter()
+                .enumerate()
+            {
+                let _ = handle_fact(&mut runtime, fact, true, index as u64);
+            }
+            let child_a = nested_fallback_facts(
+                "session",
+                "tool-parent",
+                "agent-parent",
+                "tool-child-a",
+                "agent-child-a",
+                "task-child-a",
+            );
+            let child_b = nested_fallback_facts(
+                "session",
+                "tool-parent",
+                "agent-parent",
+                "tool-child-b",
+                "agent-child-b",
+                "task-child-b",
+            );
+            if extra_child {
+                runtime.task_control_correlator.verified_agents.insert(
+                    "agent-child-a".to_owned(),
+                    ClaudeVerifiedLineage::Parent("agent-parent".to_owned()),
+                );
+                runtime.task_control_correlator.verified_agents.insert(
+                    "agent-child-b".to_owned(),
+                    ClaudeVerifiedLineage::Parent("agent-parent".to_owned()),
+                );
+            }
+            let facts = if extra_child {
+                child_a[..3].iter().collect::<Vec<_>>()
+            } else {
+                child_a[..3]
+                    .iter()
+                    .chain(child_b[..3].iter())
+                    .chain(child_a[3..].iter())
+                    .collect::<Vec<_>>()
+            };
+            let outputs = facts
+                .iter()
+                .enumerate()
+                .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 10 + index as u64))
+                .collect::<Vec<_>>();
+            assert!(
+                mapped_targets(&outputs).is_empty(),
+                "extra child {extra_child}"
+            );
+            assert!(
+                !runtime
+                    .task_control_correlator
+                    .actor_target_by_agent
+                    .contains_key("agent-child-a")
+            );
+            assert!(
+                !runtime
+                    .task_control_correlator
+                    .actor_target_by_agent
+                    .contains_key("agent-child-b")
+            );
+            assert!(runtime.task_control_correlator.state_is_bounded());
+        }
+    }
+
+    #[test]
+    fn targeted_task_correlation_fallback_terminal_and_generation_fences_do_not_reopen() {
+        // Mutation caught: retaining fallback joins through terminal or activity-generation replacement.
+        for replacement in [false, true] {
+            let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+            for (index, fact) in facts("session", "tool-parent", "agent-parent", "task-parent")
+                .iter()
+                .chain(
+                    nested_fallback_facts(
+                        "session",
+                        "tool-parent",
+                        "agent-parent",
+                        "tool-child",
+                        "agent-child",
+                        "task-child",
+                    )
+                    .iter(),
+                )
+                .enumerate()
+            {
+                let _ = handle_fact(&mut runtime, fact, true, index as u64);
+            }
+            if replacement {
+                runtime.set_agent_activity_enabled(false);
+                runtime.set_agent_activity_enabled(true);
+            } else {
+                let terminal = handle_fact(
+                    &mut runtime,
+                    &json!({
+                        "type":"system", "subtype":"task_notification", "session_id":"session",
+                        "task_id":"task-child", "status":"stopped"
+                    }),
+                    false,
+                    20,
+                );
+                assert!(terminal.activity_controls.iter().any(|update| matches!(
+                    update,
+                    ProviderActivityControlUpdate::ActorTarget { actor_id, target: None }
+                        if actor_id == "claude:agent:agent-child"
+                )));
+            }
+            let replay = nested_fallback_facts(
+                "session",
+                "tool-parent",
+                "agent-parent",
+                "tool-child",
+                "agent-child",
+                "task-child",
+            )
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 30 + index as u64))
+            .collect::<Vec<_>>();
+            assert!(
+                mapped_targets(&replay).is_empty(),
+                "replacement {replacement}"
+            );
+            assert!(
+                !runtime
+                    .task_control_correlator
+                    .actor_target_by_agent
+                    .contains_key("agent-child")
+            );
+            assert!(runtime.task_control_correlator.state_is_bounded());
+        }
+    }
+
+    #[test]
+    fn targeted_task_correlation_fallback_keys_frame_absence_and_debug_redacts_identities() {
+        // Mutation caught: aliasing absent sources to a literal identity or retaining fallback IDs in Debug output.
+        for event in ["PreToolUse", "PostToolUseFailure"] {
+            let absent = json!({
+                "hook_event_name":event, "session_id":"session", "tool_use_id":"tool-secret", "tool_name":"Agent"
+            });
+            let literal = json!({
+                "hook_event_name":event, "session_id":"session", "agent_id":"<root>",
+                "tool_use_id":"tool-secret", "tool_name":"Agent"
+            });
+            assert_ne!(
+                claude_control_fact_native_event_id(&absent),
+                claude_control_fact_native_event_id(&literal),
+                "{event} presence framing"
+            );
+        }
+        let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+        for (index, fact) in facts(
+            "session",
+            "tool-parent-secret",
+            "agent-parent-secret",
+            "task-parent-secret",
+        )
+        .iter()
+        .chain(
+            nested_fallback_facts(
+                "session",
+                "tool-parent-secret",
+                "agent-parent-secret",
+                "tool-child-secret",
+                "agent-child-secret",
+                "task-child-secret",
+            )
+            .iter(),
+        )
+        .enumerate()
+        {
+            let _ = handle_fact(&mut runtime, fact, true, index as u64);
+        }
+        let debug = format!("{:?}", runtime.task_control_correlator);
+        for secret in [
+            "tool-parent-secret",
+            "agent-parent-secret",
+            "task-parent-secret",
+            "tool-child-secret",
+            "agent-child-secret",
+            "task-child-secret",
+        ] {
+            assert!(!debug.contains(secret), "debug leaked {secret}");
+        }
+    }
+
+    #[test]
+    fn targeted_task_correlation_fallback_pending_capacity_rejects_overflow_without_joining() {
+        // Mutation caught: retaining a 201st pending fallback candidate after the bounded correlator is full.
+        let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+        for (index, fact) in facts("session", "tool-parent", "agent-parent", "task-parent")
+            .iter()
+            .enumerate()
+        {
+            let _ = handle_fact(&mut runtime, fact, true, index as u64);
+        }
+        for index in 0..=ACTIVITY_PAGE_MAX_LENGTH {
+            let facts = nested_fallback_facts(
+                "session",
+                "tool-parent",
+                "agent-parent",
+                &format!("tool-child-{index}"),
+                &format!("agent-child-{index}"),
+                &format!("task-child-{index}"),
+            );
+            let outputs = facts[..3]
+                .iter()
+                .enumerate()
+                .map(|(offset, fact)| {
+                    handle_fact(&mut runtime, fact, true, index as u64 * 10 + offset as u64)
+                })
+                .collect::<Vec<_>>();
+            assert!(mapped_targets(&outputs).is_empty());
+            assert!(runtime.task_control_correlator.state_is_bounded());
+        }
+        assert_eq!(
+            runtime
+                .task_control_correlator
+                .correlations_by_tool_use
+                .len(),
+            ACTIVITY_PAGE_MAX_LENGTH
+        );
+        assert!(
+            !runtime
+                .task_control_correlator
+                .correlations_by_tool_use
+                .contains_key("tool-child-200")
+        );
     }
 
     #[test]
