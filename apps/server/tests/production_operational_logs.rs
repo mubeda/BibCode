@@ -60,6 +60,9 @@ async fn provider_logs_reject_malformed_item_ids() {
     for item_id in [
         format!("SENSITIVE_OVERSIZED_ITEM_ID{}", "x".repeat(5_000)),
         "SENSITIVE_CONTROL_ITEM_ID\u{0007}".to_owned(),
+        " SENSITIVE_LEADING_SPACE_ITEM_ID".to_owned(),
+        "SENSITIVE_TRAILING_SPACE_ITEM_ID ".to_owned(),
+        "SENSITIVE_TRAILING_NEWLINE_ITEM_ID\n".to_owned(),
     ] {
         assert!(log.record(&ProviderEvent {
             native_event_id: None,
@@ -77,6 +80,9 @@ async fn provider_logs_reject_malformed_item_ids() {
     let contents = std::fs::read_to_string(path).expect("read provider log");
     assert!(!contents.contains("SENSITIVE_OVERSIZED_ITEM_ID"));
     assert!(!contents.contains("SENSITIVE_CONTROL_ITEM_ID"));
+    assert!(!contents.contains("SENSITIVE_LEADING_SPACE_ITEM_ID"));
+    assert!(!contents.contains("SENSITIVE_TRAILING_SPACE_ITEM_ID"));
+    assert!(!contents.contains("SENSITIVE_TRAILING_NEWLINE_ITEM_ID"));
     for line in contents.lines() {
         let record: serde_json::Value = serde_json::from_str(line).expect("provider record");
         assert!(record.get("itemId").is_none());

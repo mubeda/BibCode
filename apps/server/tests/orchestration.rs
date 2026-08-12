@@ -610,6 +610,113 @@ async fn zero_row_completion_does_not_rewind_the_turn_assistant_message() {
 }
 
 #[tokio::test]
+async fn assistant_pointer_uses_message_id_to_break_equal_timestamp_ties() {
+    let repositories = migrated_repositories().await;
+    let engine =
+        OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
+            .await
+            .expect("engine starts");
+    for command in [
+        json!({"type":"project.create","commandId":"tie-project","projectId":"p1","title":"Project","workspaceRoot":"C:/repo","createdAt":CREATED_AT}),
+        json!({"type":"thread.create","commandId":"tie-thread","threadId":"t1","projectId":"p1","title":"Thread","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","createdAt":CREATED_AT}),
+        json!({"type":"thread.message.assistant.delta","commandId":"tie-a-delta","threadId":"t1","messageId":"assistant-a","delta":"A","turnId":"turn-1","createdAt":CREATED_AT}),
+        json!({"type":"thread.message.assistant.delta","commandId":"tie-z-delta","threadId":"t1","messageId":"assistant-z","delta":"Z","turnId":"turn-1","createdAt":CREATED_AT}),
+        json!({"type":"thread.message.assistant.complete","commandId":"tie-z-complete","threadId":"t1","messageId":"assistant-z","turnId":"turn-1","createdAt":CREATED_AT}),
+        json!({"type":"thread.message.assistant.complete","commandId":"tie-a-late-complete","threadId":"t1","messageId":"assistant-a","turnId":"turn-1","createdAt":CREATED_AT}),
+    ] {
+        engine
+            .dispatch(decode(command))
+            .await
+            .expect("command dispatches");
+    }
+
+    let turns = repositories
+        .list_turns_by_thread("t1".to_owned())
+        .await
+        .expect("turns query");
+    assert_eq!(turns.len(), 1);
+    assert_eq!(
+        turns[0].assistant_message_id.as_deref(),
+        Some("assistant-z")
+    );
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn live_noop_assistant_completion_is_not_replayed_after_projector_rewind() {
+    let repositories = migrated_repositories().await;
+    let engine =
+        OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
+            .await
+            .expect("engine starts");
+    for command in [
+        json!({"type":"project.create","commandId":"noop-replay-project","projectId":"p1","title":"Project","workspaceRoot":"C:/repo","createdAt":CREATED_AT}),
+        json!({"type":"thread.create","commandId":"noop-replay-thread","threadId":"t1","projectId":"p1","title":"Thread","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","createdAt":CREATED_AT}),
+        json!({"type":"thread.message.assistant.delta","commandId":"noop-replay-delta","threadId":"t1","messageId":"assistant-removed","delta":"removed","turnId":"turn-1","createdAt":CREATED_AT}),
+    ] {
+        engine
+            .dispatch(decode(command))
+            .await
+            .expect("setup command");
+    }
+    repositories
+        .delete_messages_by_thread("t1".to_owned())
+        .await
+        .expect("simulate checkpoint message removal");
+    let sequence_before_completion = engine
+        .read_events(0)
+        .await
+        .expect("durable setup event read")
+        .last()
+        .expect("setup event")
+        .sequence;
+    engine
+        .dispatch(decode(json!({
+            "type":"thread.message.assistant.complete",
+            "commandId":"noop-replay-complete",
+            "threadId":"t1",
+            "messageId":"assistant-removed",
+            "turnId":"turn-1",
+            "createdAt":"2026-07-10T10:01:00.000Z"
+        })))
+        .await
+        .expect("completion of a removed row is an accepted no-op");
+    engine.shutdown().await;
+
+    repositories
+        .database()
+        .call(move |connection| {
+            connection.execute(
+                "UPDATE projection_state SET last_applied_sequence = ? WHERE projector = 'projection.thread-messages'",
+                [sequence_before_completion],
+            )?;
+            Ok(())
+        })
+        .await
+        .expect("rewind the message projector to before the no-op completion");
+
+    let restarted =
+        OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
+            .await
+            .expect("projector restart");
+    let message = repositories
+        .get_message("assistant-removed".to_owned())
+        .await
+        .expect("replayed message query");
+    let completion_events = restarted
+        .read_events(0)
+        .await
+        .expect("durable event read")
+        .into_iter()
+        .filter(|event| event.event.command_id.as_deref() == Some("noop-replay-complete"))
+        .count();
+    assert_eq!((message.is_none(), completion_events), (true, 0));
+
+    restarted.shutdown().await;
+}
+
+#[tokio::test]
 async fn bootstrap_preserves_legacy_unmarked_message_sent_projection() {
     let repositories = migrated_repositories().await;
     let engine =

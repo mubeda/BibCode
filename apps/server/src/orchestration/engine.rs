@@ -1393,7 +1393,7 @@ async fn process_envelope(
 
     prepare_project_create(&command, project_command_effects).await?;
     let aggregate = command.aggregate_ref();
-    let committed = persist_command(
+    let persisted = persist_command(
         repositories,
         hooks,
         &planned,
@@ -1404,21 +1404,14 @@ async fn process_envelope(
         projection_mode,
     )
     .await?;
-    apply_to_model(model, &committed);
-    for event in &committed {
+    apply_to_model(model, &persisted.committed);
+    for event in &persisted.committed {
         let _ = events.send(event.clone());
     }
-    let last_sequence = committed
-        .back()
-        .map(|event| event.sequence)
-        .ok_or_else(|| OrchestrationError::Invariant {
-            command_type: command.command_type().to_owned(),
-            detail: "Command produced no events.".to_owned(),
-        })?;
     let project_id = project_create_identity.map(|(project_id, _)| project_id);
     Ok(ProcessEnvelopeOutcome {
         result: DispatchResult {
-            sequence: last_sequence,
+            sequence: persisted.result_sequence,
             thread_id: project_id
                 .as_deref()
                 .and_then(|project_id| canonical_default_thread_id(model, project_id)),
@@ -2338,6 +2331,11 @@ fn required_command_string(
         })
 }
 
+struct PersistCommandOutcome {
+    committed: VecDeque<OrchestrationEvent>,
+    result_sequence: i64,
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn persist_command(
     repositories: &Repositories,
@@ -2348,7 +2346,7 @@ async fn persist_command(
     aggregate_id: &str,
     admission: Option<CommandAdmission>,
     projection_mode: ProjectionMode,
-) -> Result<VecDeque<OrchestrationEvent>, OrchestrationError> {
+) -> Result<PersistCommandOutcome, OrchestrationError> {
     let repositories = repositories.clone();
     let hooks = hooks.clone();
     let event_list = events.to_vec();
@@ -2361,6 +2359,11 @@ async fn persist_command(
             let transaction = connection.transaction()?;
             let mut committed = VecDeque::new();
             for planned in &event_list {
+                if projection_mode == ProjectionMode::UpdateExistingAssistantMessage
+                    && !streaming_assistant_message_exists_tx(&transaction, &planned.payload)?
+                {
+                    continue;
+                }
                 let saved = append_event_tx(&transaction, planned.clone())?;
                 let mut projection_context = ProjectionContext::new(projection_mode);
                 for projector in PROJECTOR_NAMES {
@@ -2385,17 +2388,28 @@ async fn persist_command(
                 }
                 committed.push_back(saved);
             }
-            let last_saved = committed.back().cloned().ok_or_else(|| {
-                PersistenceError::Corrupt("planned command emitted no events".to_owned())
-            })?;
+            let accepted_at = event_list
+                .last()
+                .map(|event| event.occurred_at.clone())
+                .ok_or_else(|| {
+                    PersistenceError::Corrupt("planned command emitted no events".to_owned())
+                })?;
+            let result_sequence = match committed.back() {
+                Some(event) => event.sequence,
+                None => transaction.query_row(
+                    "SELECT COALESCE(MAX(sequence), 0) FROM orchestration_events",
+                    [],
+                    |row| row.get(0),
+                )?,
+            };
             upsert_command_receipt_tx(
                 &transaction,
                 CommandReceipt {
                     command_id: command_id.clone(),
                     aggregate_kind,
                     aggregate_id,
-                    accepted_at: last_saved.event.occurred_at.clone(),
-                    result_sequence: last_saved.sequence,
+                    accepted_at,
+                    result_sequence,
                     status: "accepted".to_owned(),
                     error: None,
                     payload_digest: admission.as_ref().map(|value| value.payload_digest.clone()),
@@ -2416,7 +2430,10 @@ async fn persist_command(
                 }
             }
             transaction.commit()?;
-            Ok(committed)
+            Ok(PersistCommandOutcome {
+                committed,
+                result_sequence,
+            })
         })
         .await
         .map_err(wrap_persistence)?;
@@ -3131,6 +3148,43 @@ fn apply_messages_projector_tx(
     Ok(())
 }
 
+fn streaming_assistant_message_exists_tx(
+    transaction: &Transaction<'_>,
+    payload: &Value,
+) -> Result<bool, PersistenceError> {
+    Ok(transaction
+        .query_row(
+            "SELECT 1 FROM projection_thread_messages \
+             WHERE message_id = ? AND thread_id = ? AND turn_id IS ? \
+               AND role = 'assistant' AND is_streaming = 1",
+            params![
+                required_str(payload, "messageId")?,
+                required_str(payload, "threadId")?,
+                optional_string(payload.get("turnId")),
+            ],
+            |_| Ok(()),
+        )
+        .optional()?
+        .is_some())
+}
+
+fn latest_assistant_message_id_tx(
+    transaction: &Transaction<'_>,
+    thread_id: &str,
+    turn_id: &str,
+) -> Result<Option<String>, PersistenceError> {
+    transaction
+        .query_row(
+            "SELECT message_id FROM projection_thread_messages \
+             WHERE thread_id = ? AND turn_id = ? AND role = 'assistant' \
+             ORDER BY created_at DESC, message_id DESC LIMIT 1",
+            params![thread_id, turn_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
 fn apply_plans_projector_tx(
     transaction: &Transaction<'_>,
     event: &OrchestrationEvent,
@@ -3371,7 +3425,10 @@ fn apply_turns_projector_tx(
             let settles = !streaming && !running;
             let updated_at = required_str(payload, "updatedAt")?;
             let created_at = required_str(payload, "createdAt")?;
-            let updated = transaction.execute("UPDATE projection_turns SET assistant_message_id = ?, state = CASE WHEN ? THEN CASE WHEN state IN ('interrupted', 'error') THEN state ELSE 'completed' END ELSE state END, started_at = COALESCE(started_at, ?), completed_at = CASE WHEN ? THEN COALESCE(completed_at, ?) ELSE completed_at END WHERE thread_id = ? AND turn_id = ?", params![required_str(payload,"messageId")?, settles, created_at.clone(), settles, updated_at.clone(), thread_id.clone(), turn_id.clone()])?;
+            let assistant_message_id =
+                latest_assistant_message_id_tx(transaction, &thread_id, &turn_id)?
+                    .unwrap_or(required_str(payload, "messageId")?);
+            let updated = transaction.execute("UPDATE projection_turns SET assistant_message_id = ?, state = CASE WHEN ? THEN CASE WHEN state IN ('interrupted', 'error') THEN state ELSE 'completed' END ELSE state END, started_at = COALESCE(started_at, ?), completed_at = CASE WHEN ? THEN COALESCE(completed_at, ?) ELSE completed_at END WHERE thread_id = ? AND turn_id = ?", params![assistant_message_id.clone(), settles, created_at.clone(), settles, updated_at.clone(), thread_id.clone(), turn_id.clone()])?;
             if updated == 0 {
                 transaction.execute(
                     TURN_UPSERT_SQL,
@@ -3381,7 +3438,7 @@ fn apply_turns_projector_tx(
                         Option::<String>::None,
                         Option::<String>::None,
                         Option::<String>::None,
-                        Some(required_str(payload, "messageId")?),
+                        Some(assistant_message_id),
                         if settles { "completed" } else { "running" },
                         created_at,
                         Some(created_at.clone()),
