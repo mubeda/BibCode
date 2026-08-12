@@ -189,9 +189,14 @@ of lexical identity order.
 Arrival order is irrelevant. Every accepted fact that installs, retires, or
 terminalizes a target carries a deterministic domain-separated SHA-256 event
 key through the production event pump. The key is duplicate-stable, bounded,
-status-separated, and contains no provider-native identity. Present invalid
-hook source or parent fields are rejected at the authenticated boundary rather
-than being coerced to the absent/root form. Names, roles, descriptions, prompts,
+status-separated, and contains no provider-native identity. Effect-producing
+conflicts use bounded canonical classes such as asynchronous/other and
+local-agent/other, so arbitrary status or type labels cannot suppress a target
+retirement. Optional source and parent identities are framed as explicit
+`none` or `some` plus the bounded value; the valid literal native identity
+`<root>` is therefore never confused with absence. Present invalid hook source
+or parent fields are rejected at the authenticated boundary rather than being
+coerced to the absent/root form. Names, roles, descriptions, prompts,
 timestamps, output paths, and event proximity are never correlation keys;
 incomplete, conflicting, stale, malformed, or saturated chains remain
 observable but uncontrollable. Live identity maps and unmatched terminal
