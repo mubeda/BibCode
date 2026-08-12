@@ -409,6 +409,14 @@ impl CodexActivityTracker {
             && !self.provisional_actor_keys.contains(&native_key)
     }
 
+    pub(crate) fn actor_control_id(&self, native_thread_id: &str) -> Option<&str> {
+        let native_key = thread_key(native_thread_id);
+        (!self.provisional_actor_keys.contains(&native_key))
+            .then(|| self.actors_by_thread.get(&native_key))
+            .flatten()
+            .map(|actor| actor.canonical_id.as_str())
+    }
+
     #[must_use]
     pub(crate) fn is_current_target(&self, native_thread_id: &str, turn_id: &str) -> bool {
         usable_native_id(native_thread_id)
