@@ -1272,19 +1272,32 @@ async fn reconcile_abandoned_provider_session(
     restart_error: &str,
 ) -> Result<(), ProviderRuntimeError> {
     let projected_at = runtime.last_seen_at.clone();
-    let projection_is_complete = repositories
+    let projected_session = repositories
         .get_thread_session(runtime.thread_id.clone())
         .await
-        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?
-        .is_some_and(|session| {
-            session.status == "error"
-                && session.provider_name.as_deref() == Some(runtime.provider_name.as_str())
-                && session.provider_instance_id == runtime.provider_instance_id
-                && session.runtime_mode == runtime.runtime_mode
-                && session.active_turn_id.is_none()
-                && session.last_error.as_deref() == Some(restart_error)
-                && session.updated_at == projected_at
-        });
+        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
+    let abandoned_turn_id = projected_session
+        .as_ref()
+        .and_then(|session| session.active_turn_id.clone());
+    let projection_is_complete = projected_session.is_some_and(|session| {
+        session.status == "error"
+            && session.provider_name.as_deref() == Some(runtime.provider_name.as_str())
+            && session.provider_instance_id == runtime.provider_instance_id
+            && session.runtime_mode == runtime.runtime_mode
+            && session.active_turn_id.is_none()
+            && session.last_error.as_deref() == Some(restart_error)
+            && session.updated_at == projected_at
+    });
+    if let Some(turn_id) = abandoned_turn_id {
+        settle_streaming_assistant_messages(
+            engine,
+            &runtime.thread_id,
+            Some(turn_id),
+            &format!("provider-restart-reconcile:{}", Uuid::new_v4()),
+            &projected_at,
+        )
+        .await?;
+    }
     if !projection_is_complete {
         engine
             .dispatch(OrchestrationCommand::ThreadSessionSet {
@@ -3235,6 +3248,55 @@ fn spawn_event_pump(
                                 }
                             }
                         }
+                        if !cancellation.is_cancelled() {
+                            const STREAM_END_ERROR: &str =
+                                "Provider event stream ended unexpectedly.";
+                            let active_turn_id = match engine
+                                .repositories()
+                                .get_thread_session(launch.thread_id.clone())
+                                .await
+                            {
+                                Ok(session) => session.and_then(|session| session.active_turn_id),
+                                Err(error) => {
+                                    tracing::warn!(
+                                        %error,
+                                        provider = %launch.provider,
+                                        thread_id = %launch.thread_id,
+                                        "failed to read provider session after its event stream ended"
+                                    );
+                                    None
+                                }
+                            };
+                            let failure = ProviderEvent {
+                                native_event_id: None,
+                                event_type: "turn.completed".to_owned(),
+                                thread_id: launch.thread_id.clone(),
+                                turn_id: active_turn_id,
+                                item_id: None,
+                                request_id: None,
+                                payload: json!({
+                                    "state": "failed",
+                                    "error": { "message": STREAM_END_ERROR },
+                                }),
+                                activity: Vec::new(),
+                            };
+                            if let Err(error) = project_provider_event(
+                                &engine,
+                                &launch,
+                                resume_cursor.clone(),
+                                runtime_payload.clone(),
+                                failure,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    %error,
+                                    provider = %launch.provider,
+                                    thread_id = %launch.thread_id,
+                                    "failed to project provider stream-end failure"
+                                );
+                            }
+                        }
                         if let Err(error) = driver.shutdown().await {
                             tracing::debug!(
                                 %error,
@@ -3386,44 +3448,21 @@ async fn project_provider_event(
         )
         .await?;
         dispatch_session_state(engine, launch, status, None, last_error).await?;
-        let messages = engine
-            .repositories()
-            .list_messages_by_thread(event.thread_id.clone())
-            .await
-            .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
-        for (index, message) in messages
-            .into_iter()
-            .filter(|message| {
-                message.thread_id == event.thread_id
-                    && message.turn_id.as_ref() == event.turn_id.as_ref()
-                    && message.role == "assistant"
-                    && message.is_streaming
-            })
-            .enumerate()
+        if let Err(error) = settle_streaming_assistant_messages(
+            engine,
+            &event.thread_id,
+            event.turn_id.clone(),
+            &command_id,
+            &created_at,
+        )
+        .await
         {
-            let completion = OrchestrationCommand::ThreadMessageAssistantComplete {
-                command_id: format!("{command_id}:assistant-complete:{index}"),
-                thread_id: event.thread_id.clone(),
-                message_id: message.message_id,
-                turn_id: event.turn_id.clone(),
-                created_at: created_at.clone(),
-            };
-            if let Err(error) = engine.dispatch(completion.clone()).await {
-                tracing::warn!(
-                    %error,
-                    thread_id = %event.thread_id,
-                    turn_id = ?event.turn_id,
-                    "assistant terminal settlement failed; retrying once"
-                );
-                if let Err(error) = engine.dispatch(completion).await {
-                    tracing::warn!(
-                        %error,
-                        thread_id = %event.thread_id,
-                        turn_id = ?event.turn_id,
-                        "assistant terminal settlement failed after retry"
-                    );
-                }
-            }
+            tracing::warn!(
+                %error,
+                thread_id = %event.thread_id,
+                turn_id = ?event.turn_id,
+                "one or more assistant messages remained unsettled after terminal projection"
+            );
         }
     }
     if matches!(
@@ -3570,6 +3609,62 @@ async fn project_provider_event(
         .map_err(|error| ProviderRuntimeError::Orchestration(error.to_string()))
 }
 
+async fn settle_streaming_assistant_messages(
+    engine: &OrchestrationEngine,
+    thread_id: &str,
+    turn_id: Option<String>,
+    command_id: &str,
+    created_at: &str,
+) -> Result<(), ProviderRuntimeError> {
+    let messages = engine
+        .repositories()
+        .list_messages_by_thread(thread_id.to_owned())
+        .await
+        .map_err(|error| ProviderRuntimeError::Persistence(error.to_string()))?;
+    let mut first_persistent_error = None;
+    for (index, message) in messages
+        .into_iter()
+        .filter(|message| {
+            message.thread_id == thread_id
+                && message.turn_id.as_ref() == turn_id.as_ref()
+                && message.role == "assistant"
+                && message.is_streaming
+        })
+        .enumerate()
+    {
+        let completion = OrchestrationCommand::ThreadMessageAssistantComplete {
+            command_id: format!("{command_id}:assistant-complete:{index}"),
+            thread_id: thread_id.to_owned(),
+            message_id: message.message_id,
+            turn_id: turn_id.clone(),
+            created_at: created_at.to_owned(),
+        };
+        if let Err(error) = engine.dispatch(completion.clone()).await {
+            tracing::warn!(
+                %error,
+                thread_id,
+                turn_id = ?turn_id,
+                "assistant terminal settlement failed; retrying once"
+            );
+            if let Err(error) = engine.dispatch(completion).await {
+                tracing::warn!(
+                    %error,
+                    thread_id,
+                    turn_id = ?turn_id,
+                    "assistant terminal settlement failed after retry"
+                );
+                if first_persistent_error.is_none() {
+                    first_persistent_error = Some(error.to_string());
+                }
+            }
+        }
+    }
+    match first_persistent_error {
+        Some(detail) => Err(ProviderRuntimeError::Orchestration(detail)),
+        None => Ok(()),
+    }
+}
+
 fn context_window_activity_payload(payload: &Value) -> Option<Value> {
     let usage = payload.get("usage")?.as_object()?;
     let used_tokens = usage.get("usedTokens")?.as_u64()?;
@@ -3616,8 +3711,9 @@ fn context_window_activity_payload(payload: &Value) -> Option<Value> {
 const PROVIDER_ITEM_ID_MAX_CHARS: usize = 512;
 
 pub(crate) fn valid_provider_item_id(item_id: Option<&str>) -> Option<&str> {
-    let item_id = item_id?.trim();
+    let item_id = item_id?;
     (!item_id.is_empty()
+        && item_id.trim() == item_id
         && item_id.chars().count() <= PROVIDER_ITEM_ID_MAX_CHARS
         && !item_id.chars().any(char::is_control))
     .then_some(item_id)
@@ -11065,6 +11161,38 @@ done
             super::assistant_message_id(&event),
             "assistant:thread-1:turn:turn-1"
         );
+    }
+
+    #[test]
+    fn provider_item_ids_are_opaque_and_reject_raw_whitespace_or_controls() {
+        let message_id = |item_id: &str| {
+            super::assistant_message_id(&ProviderEvent {
+                native_event_id: None,
+                event_type: "content.delta".to_owned(),
+                thread_id: "thread-1".to_owned(),
+                turn_id: Some("turn-1".to_owned()),
+                item_id: Some(item_id.to_owned()),
+                request_id: None,
+                payload: json!({}),
+                activity: Vec::new(),
+            })
+        };
+
+        assert_eq!(message_id("message-1"), "assistant:thread-1:item:message-1");
+        for malformed in [
+            " message-1",
+            "message-1 ",
+            "message-1\t",
+            "message-1\n",
+            "message-1\r",
+            "message-\u{0007}1",
+        ] {
+            assert_eq!(
+                message_id(malformed),
+                "assistant:thread-1:turn:turn-1",
+                "malformed raw provider ID {malformed:?} must not alias the canonical ID"
+            );
+        }
     }
 
     #[test]

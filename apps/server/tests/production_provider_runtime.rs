@@ -4748,6 +4748,126 @@ async fn unexpected_provider_stream_end_marks_activity_scope_stale() {
 }
 
 #[tokio::test]
+async fn unexpected_provider_stream_end_settles_partial_turn_as_failed() {
+    let engine = engine().await;
+    let state = Arc::new(StdMutex::new(DriverState::default()));
+    let (events_tx, events_rx) = mpsc::channel(4);
+    let factory = Arc::new(FakeFactory {
+        state,
+        events: StdMutex::new(VecDeque::from([events_rx])),
+    });
+    let supervisor = ProviderRuntimeSupervisor::start(
+        engine.clone(),
+        factory,
+        activity_projection(&engine),
+        SupervisorOptions::default(),
+    );
+    supervisor.launch(launch()).await.unwrap();
+    let start = OrchestrationCommand::ThreadTurnStart {
+        command_id: "unexpected-eof-turn".to_owned(),
+        thread_id: "t1".to_owned(),
+        message: ThreadMessageInput {
+            message_id: "unexpected-eof-user".to_owned(),
+            role: "user".to_owned(),
+            text: "hello".to_owned(),
+            attachments: vec![],
+        },
+        model_selection: None,
+        title_seed: None,
+        runtime_mode: "full-access".to_owned(),
+        interaction_mode: "default".to_owned(),
+        bootstrap: None,
+        source_proposed_plan: None,
+        created_at: NOW.to_owned(),
+    };
+    engine.dispatch(start.clone()).await.unwrap();
+    supervisor.handle_orchestration(start).await.unwrap();
+    events_tx
+        .send(ProviderEvent {
+            native_event_id: None,
+            event_type: "content.delta".to_owned(),
+            thread_id: "t1".to_owned(),
+            turn_id: Some("provider-turn-1".to_owned()),
+            item_id: Some("unexpected-eof-partial".to_owned()),
+            request_id: None,
+            payload: json!({"streamKind":"assistant_text","delta":"Partial response"}),
+            activity: Vec::new(),
+        })
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let streaming = engine
+                .repositories()
+                .get_message("assistant:t1:item:unexpected-eof-partial".to_owned())
+                .await
+                .unwrap()
+                .is_some_and(|message| message.is_streaming);
+            if streaming {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("partial assistant row is persisted before EOF");
+
+    drop(events_tx);
+
+    let snapshot = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
+            let settled = snapshot.messages.iter().any(|message| {
+                message.message_id == "assistant:t1:item:unexpected-eof-partial"
+                    && message.text == "Partial response"
+                    && !message.is_streaming
+            });
+            let failed_session = snapshot.sessions.iter().any(|session| {
+                session.thread_id == "t1"
+                    && session.status == "error"
+                    && session.active_turn_id.is_none()
+                    && session
+                        .last_error
+                        .as_deref()
+                        .is_some_and(|error| error.contains("event stream ended unexpectedly"))
+            });
+            let provider_error = snapshot.activities.iter().any(|activity| {
+                activity.thread_id == "t1"
+                    && activity.kind == "provider.error"
+                    && activity.payload["error"]["message"]
+                        == "Provider event stream ended unexpectedly."
+            });
+            let failed_runtime = engine
+                .repositories()
+                .get_provider_session_runtime("t1".to_owned())
+                .await
+                .unwrap()
+                .is_some_and(|runtime| runtime.status == "error");
+            if settled && failed_session && provider_error && failed_runtime {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("unexpected EOF fails and settles the active partial turn");
+    assert_eq!(
+        snapshot
+            .messages
+            .iter()
+            .filter(|message| message.role == "assistant")
+            .map(|message| (message.message_id.as_str(), message.text.as_str()))
+            .collect::<Vec<_>>(),
+        vec![(
+            "assistant:t1:item:unexpected-eof-partial",
+            "Partial response"
+        )]
+    );
+
+    supervisor.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn runtime_observed_capability_upgrade_survives_stream_end() {
     let (engine, database) = engine_and_database().await;
     let activity = ActivityProjection::new(ActivityRepository::new(database));
@@ -8219,6 +8339,128 @@ async fn checkpoint_rpc_reports_effect_failure_without_a_direct_or_second_rollba
 }
 
 #[tokio::test]
+async fn restart_reconciliation_settles_a_persisted_partial_assistant_message() {
+    let state = TempDir::new().expect("state directory");
+    let database_path = state.path().join("provider-restart.sqlite3");
+    {
+        let database = Database::create_new(&database_path)
+            .await
+            .expect("persistent database");
+        database
+            .call(|connection| {
+                run_migrations(connection, None)?;
+                Ok(())
+            })
+            .await
+            .expect("migrations");
+        let engine = OrchestrationEngine::start(database.clone(), EngineOptions::default())
+            .await
+            .expect("first engine");
+        for command in [
+            json!({"type":"project.create","commandId":"restart-partial-project","projectId":"p1","title":"Project","workspaceRoot":"C:/repo","createdAt":NOW}),
+            json!({"type":"thread.create","commandId":"restart-partial-thread","threadId":"t1","projectId":"p1","title":"Thread","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","createdAt":NOW}),
+            json!({"type":"thread.session.set","commandId":"restart-partial-session","threadId":"t1","session":{"threadId":"t1","status":"running","providerName":"codex","providerInstanceId":"codex","runtimeMode":"full-access","activeTurnId":"provider-turn-1","lastError":null,"updatedAt":NOW},"createdAt":NOW}),
+            json!({"type":"thread.message.assistant.delta","commandId":"restart-partial-delta","threadId":"t1","messageId":"assistant:t1:item:restart-partial","delta":"Partial response","turnId":"provider-turn-1","createdAt":NOW}),
+        ] {
+            engine
+                .dispatch(serde_json::from_value(command).expect("fixture command"))
+                .await
+                .expect("fixture dispatch");
+        }
+        engine
+            .repositories()
+            .upsert_provider_session_runtime(ProviderSessionRuntime {
+                thread_id: "t1".to_owned(),
+                provider_name: "codex".to_owned(),
+                provider_instance_id: Some("codex".to_owned()),
+                adapter_key: "codex-app-server".to_owned(),
+                runtime_mode: "full-access".to_owned(),
+                status: "running".to_owned(),
+                last_seen_at: NOW.to_owned(),
+                resume_cursor: Some(json!({"threadId":"provider-thread-1"})),
+                runtime_payload: None,
+            })
+            .await
+            .expect("persisted runtime");
+        assert!(
+            engine
+                .repositories()
+                .get_message("assistant:t1:item:restart-partial".to_owned())
+                .await
+                .unwrap()
+                .is_some_and(|message| message.is_streaming)
+        );
+        engine.shutdown().await;
+        database
+            .checkpoint_wal()
+            .await
+            .expect("checkpoint before restart");
+    }
+
+    let database = Database::open_existing(&database_path)
+        .await
+        .expect("reopened database");
+    let engine = OrchestrationEngine::start(database, EngineOptions::default())
+        .await
+        .expect("restarted engine");
+    reconcile_abandoned_provider_sessions(&engine)
+        .await
+        .expect("startup reconciliation");
+
+    let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
+    let assistant_messages = snapshot
+        .messages
+        .iter()
+        .filter(|message| message.role == "assistant")
+        .map(|message| {
+            (
+                message.message_id.as_str(),
+                message.text.as_str(),
+                message.is_streaming,
+            )
+        })
+        .collect::<Vec<_>>();
+    let session = snapshot
+        .sessions
+        .iter()
+        .find(|session| session.thread_id == "t1")
+        .expect("reconciled session");
+    assert_eq!(
+        (
+            assistant_messages,
+            session.status.as_str(),
+            session.active_turn_id.as_deref(),
+            snapshot
+                .turns
+                .iter()
+                .find(|turn| turn.turn_id.as_deref() == Some("provider-turn-1"))
+                .map(|turn| turn.state.as_str()),
+        ),
+        (
+            vec![(
+                "assistant:t1:item:restart-partial",
+                "Partial response",
+                false,
+            )],
+            "error",
+            None,
+            Some("error"),
+        )
+    );
+
+    let event_count = engine.read_events(0).await.unwrap().len();
+    reconcile_abandoned_provider_sessions(&engine)
+        .await
+        .expect("duplicate startup reconciliation");
+    assert_eq!(
+        engine.read_events(0).await.unwrap().len(),
+        event_count,
+        "completed reconciliation is idempotent"
+    );
+    engine.shutdown().await;
+}
+
+#[tokio::test]
 async fn restart_reconciles_abandoned_running_provider_sessions() {
     let engine = engine().await;
     engine
@@ -9369,7 +9611,13 @@ async fn failed_and_interrupted_turns_settle_existing_assistant_messages() {
 
 async fn project_terminal_with_completion_failures(
     failure_count: usize,
-) -> (Vec<(String, String, bool)>, bool, Option<String>) {
+    recover_failed_message_late: bool,
+) -> (
+    Vec<(String, String, bool)>,
+    Option<String>,
+    bool,
+    Option<String>,
+) {
     let hooks = TestHooks::default();
     let (engine, _) = engine_and_database_with_options(EngineOptions {
         test_hooks: hooks.clone(),
@@ -9475,7 +9723,7 @@ async fn project_terminal_with_completion_failures(
         events_tx.send(event).await.unwrap();
     }
 
-    let snapshot = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+    tokio::time::timeout(std::time::Duration::from_secs(2), async {
         loop {
             let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
             if snapshot.activities.iter().any(|activity| {
@@ -9483,13 +9731,45 @@ async fn project_terminal_with_completion_failures(
                     && activity.summary == "session.updated"
                     && activity.payload["sentinel"] == true
             }) {
-                break snapshot;
+                break;
             }
             tokio::task::yield_now().await;
         }
     })
     .await
     .expect("sentinel event proves the terminal event left the provider event pump");
+    if recover_failed_message_late {
+        events_tx
+            .send(ProviderEvent {
+                native_event_id: None,
+                event_type: "turn.completed".to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: Some("provider-turn-1".to_owned()),
+                item_id: None,
+                request_id: None,
+                payload: json!({"state":"failed","error":{"message":"model unavailable"}}),
+                activity: Vec::new(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let recovered = engine
+                    .repositories()
+                    .get_message("assistant:t1:item:partial-1".to_owned())
+                    .await
+                    .unwrap()
+                    .is_some_and(|message| !message.is_streaming);
+                if recovered {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("duplicate terminal event settles the previously failed message");
+    }
+    let snapshot = load_snapshot(&engine.repositories()).await.unwrap();
     let messages = engine
         .repositories()
         .list_messages_by_thread("t1".to_owned())
@@ -9509,14 +9789,24 @@ async fn project_terminal_with_completion_failures(
         .iter()
         .find(|session| session.thread_id == "t1")
         .and_then(|session| session.last_error.clone());
+    let assistant_message_id = snapshot
+        .turns
+        .iter()
+        .find(|turn| turn.thread_id == "t1" && turn.turn_id.as_deref() == Some("provider-turn-1"))
+        .and_then(|turn| turn.assistant_message_id.clone());
     supervisor.shutdown().await.unwrap();
-    (messages, provider_error, session_error)
+    (
+        messages,
+        assistant_message_id,
+        provider_error,
+        session_error,
+    )
 }
 
 #[tokio::test]
 async fn terminal_completion_failure_retries_and_preserves_the_lifecycle_projection() {
     assert_eq!(
-        project_terminal_with_completion_failures(1).await,
+        project_terminal_with_completion_failures(1, false).await,
         (
             vec![
                 (
@@ -9530,6 +9820,7 @@ async fn terminal_completion_failure_retries_and_preserves_the_lifecycle_project
                     false,
                 ),
             ],
+            Some("assistant:t1:item:partial-2".to_owned()),
             true,
             Some("model unavailable".to_owned()),
         )
@@ -9539,7 +9830,7 @@ async fn terminal_completion_failure_retries_and_preserves_the_lifecycle_project
 #[tokio::test]
 async fn terminal_completion_retry_exhaustion_isolates_the_failed_message() {
     assert_eq!(
-        project_terminal_with_completion_failures(2).await,
+        project_terminal_with_completion_failures(2, false).await,
         (
             vec![
                 (
@@ -9553,6 +9844,31 @@ async fn terminal_completion_retry_exhaustion_isolates_the_failed_message() {
                     false,
                 ),
             ],
+            Some("assistant:t1:item:partial-2".to_owned()),
+            true,
+            Some("model unavailable".to_owned()),
+        )
+    );
+}
+
+#[tokio::test]
+async fn late_duplicate_terminal_keeps_the_later_assistant_message_final() {
+    assert_eq!(
+        project_terminal_with_completion_failures(2, true).await,
+        (
+            vec![
+                (
+                    "assistant:t1:item:partial-1".to_owned(),
+                    "partial-1".to_owned(),
+                    false,
+                ),
+                (
+                    "assistant:t1:item:partial-2".to_owned(),
+                    "partial-2".to_owned(),
+                    false,
+                ),
+            ],
+            Some("assistant:t1:item:partial-2".to_owned()),
             true,
             Some("model unavailable".to_owned()),
         )
