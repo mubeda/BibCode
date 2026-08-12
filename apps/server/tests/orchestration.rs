@@ -2,7 +2,7 @@ use bibcode_server::orchestration::engine::{
     EngineOptions, OrchestrationCommand, OrchestrationEngine, OrchestrationError, TestHooks,
     load_snapshot,
 };
-use bibcode_server::persistence::{Database, Repositories, run_migrations};
+use bibcode_server::persistence::{Database, NewOrchestrationEvent, Repositories, run_migrations};
 use serde_json::{Value, json};
 
 const CREATED_AT: &str = "2026-07-10T10:00:00.000Z";
@@ -557,4 +557,119 @@ async fn assistant_completion_updates_only_matching_streaming_assistant_rows() {
     );
 
     engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn zero_row_completion_does_not_rewind_the_turn_assistant_message() {
+    let repositories = migrated_repositories().await;
+    let engine =
+        OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
+            .await
+            .expect("engine starts");
+    for command in [
+        json!({"type":"project.create","commandId":"rewind-project","projectId":"p1","title":"Project","workspaceRoot":"C:/repo","createdAt":CREATED_AT}),
+        json!({"type":"thread.create","commandId":"rewind-thread","threadId":"t1","projectId":"p1","title":"Thread","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","createdAt":CREATED_AT}),
+        json!({"type":"thread.message.assistant.delta","commandId":"rewind-a-delta","threadId":"t1","messageId":"assistant-a","delta":"A","turnId":"turn-1","createdAt":CREATED_AT}),
+        json!({"type":"thread.message.assistant.complete","commandId":"rewind-a-complete","threadId":"t1","messageId":"assistant-a","turnId":"turn-1","createdAt":CREATED_AT}),
+        json!({"type":"thread.message.assistant.delta","commandId":"rewind-b-delta","threadId":"t1","messageId":"assistant-b","delta":"B","turnId":"turn-1","createdAt":CREATED_AT}),
+        json!({"type":"thread.message.assistant.complete","commandId":"rewind-a-duplicate","threadId":"t1","messageId":"assistant-a","turnId":"turn-1","createdAt":CREATED_AT}),
+    ] {
+        engine
+            .dispatch(decode(command))
+            .await
+            .expect("command dispatches");
+    }
+
+    let turns = repositories
+        .list_turns_by_thread("t1".to_owned())
+        .await
+        .expect("turns query");
+    let messages = repositories
+        .list_messages_by_thread("t1".to_owned())
+        .await
+        .expect("messages query");
+    assert_eq!(turns.len(), 1);
+    assert_eq!(
+        (
+            turns[0].assistant_message_id.as_deref(),
+            messages
+                .iter()
+                .find(|message| message.message_id == "assistant-a")
+                .expect("assistant A")
+                .is_streaming,
+            messages
+                .iter()
+                .find(|message| message.message_id == "assistant-b")
+                .expect("assistant B")
+                .is_streaming,
+        ),
+        (Some("assistant-b"), false, true)
+    );
+
+    engine.shutdown().await;
+}
+
+#[tokio::test]
+async fn bootstrap_preserves_legacy_unmarked_message_sent_projection() {
+    let repositories = migrated_repositories().await;
+    let engine =
+        OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
+            .await
+            .expect("engine starts");
+    for command in [
+        json!({"type":"project.create","commandId":"legacy-project","projectId":"p1","title":"Project","workspaceRoot":"C:/repo","createdAt":CREATED_AT}),
+        json!({"type":"thread.create","commandId":"legacy-thread","threadId":"t1","projectId":"p1","title":"Thread","modelSelection":{"instanceId":"codex","model":"gpt-5"},"runtimeMode":"full-access","createdAt":CREATED_AT}),
+    ] {
+        engine
+            .dispatch(decode(command))
+            .await
+            .expect("setup command");
+    }
+    engine.shutdown().await;
+
+    repositories
+        .append_event(NewOrchestrationEvent {
+            event_id: "legacy-unmarked-message-event".to_owned(),
+            event_type: "thread.message-sent".to_owned(),
+            aggregate_kind: "thread".to_owned(),
+            aggregate_id: "t1".to_owned(),
+            occurred_at: CREATED_AT.to_owned(),
+            command_id: Some("legacy-unmarked-message-command".to_owned()),
+            causation_event_id: None,
+            correlation_id: Some("legacy-unmarked-message-command".to_owned()),
+            payload: json!({
+                "threadId": "t1",
+                "messageId": "legacy-assistant",
+                "role": "assistant",
+                "text": "legacy text",
+                "turnId": "turn-legacy",
+                "streaming": false,
+                "createdAt": CREATED_AT,
+                "updatedAt": CREATED_AT,
+            }),
+            metadata: json!({}),
+        })
+        .await
+        .expect("legacy event append");
+
+    let restarted =
+        OrchestrationEngine::start(repositories.database().clone(), EngineOptions::default())
+            .await
+            .expect("legacy projector restart");
+    let message = repositories
+        .get_message("legacy-assistant".to_owned())
+        .await
+        .expect("legacy message query")
+        .expect("legacy message projected");
+    assert_eq!(
+        (
+            message.thread_id.as_str(),
+            message.turn_id.as_deref(),
+            message.role.as_str(),
+            message.text.as_str(),
+            message.is_streaming,
+        ),
+        ("t1", Some("turn-legacy"), "assistant", "legacy text", false,)
+    );
+    restarted.shutdown().await;
 }

@@ -220,6 +220,77 @@ async fn orchestration_rpc_registration_has_the_contract_modes() {
 }
 
 #[tokio::test]
+async fn assistant_completion_replay_preserves_the_declared_message_payload_shape() {
+    let harness = harness().await;
+    let outcome = AssertUnwindSafe(async {
+        let workspace_root = harness.workspace_root("assistant-completion-replay");
+        for command in [
+            create_project("completion-replay-project", &workspace_root),
+            create_thread(
+                "completion-replay-thread",
+                "completion-replay-project",
+                "Completion replay",
+            ),
+            json!({
+                "type": "thread.message.assistant.delta",
+                "commandId": "completion-replay-delta",
+                "threadId": "completion-replay-thread",
+                "messageId": "completion-replay-message",
+                "delta": "response",
+                "turnId": "completion-replay-turn",
+                "createdAt": CREATED_AT,
+            }),
+            json!({
+                "type": "thread.message.assistant.complete",
+                "commandId": "completion-replay-complete",
+                "threadId": "completion-replay-thread",
+                "messageId": "completion-replay-message",
+                "turnId": "completion-replay-turn",
+                "createdAt": CREATED_AT,
+            }),
+        ] {
+            harness
+                .engine
+                .dispatch(serde_json::from_value(command).expect("command decodes"))
+                .await
+                .expect("command dispatches");
+        }
+
+        let mut socket = harness.connect().await;
+        let replay = unary_success(
+            &mut socket,
+            "1",
+            "orchestration.replayEvents",
+            json!({ "fromSequenceExclusive": 0 }),
+        )
+        .await;
+        let completion = replay
+            .as_array()
+            .expect("replayed events")
+            .iter()
+            .find(|event| event["commandId"] == "completion-replay-complete")
+            .expect("assistant completion event");
+        assert_eq!(
+            completion["payload"],
+            json!({
+                "threadId": "completion-replay-thread",
+                "messageId": "completion-replay-message",
+                "role": "assistant",
+                "text": "",
+                "turnId": "completion-replay-turn",
+                "streaming": false,
+                "createdAt": CREATED_AT,
+                "updatedAt": CREATED_AT,
+            })
+        );
+        socket.close(None).await.expect("close WebSocket");
+    })
+    .catch_unwind()
+    .await;
+    finish_test(harness, outcome).await;
+}
+
+#[tokio::test]
 async fn project_create_can_initialize_git_before_registration() {
     let harness = harness().await;
     let outcome = AssertUnwindSafe(async {
