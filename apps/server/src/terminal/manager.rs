@@ -7,6 +7,9 @@ use std::{
     time::Duration,
 };
 
+#[cfg(test)]
+use std::sync::Mutex as StdMutex;
+
 use thiserror::Error;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tokio::sync::{Mutex, RwLock, broadcast};
@@ -446,6 +449,8 @@ impl PreparedObserverHandle {
 struct ObserverCallbackIsolation {
     slots: Arc<tokio::sync::Semaphore>,
     global_slots: Arc<tokio::sync::Semaphore>,
+    #[cfg(test)]
+    joined_callback_thread: Arc<StdMutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 }
 
 impl Default for ObserverCallbackIsolation {
@@ -453,6 +458,8 @@ impl Default for ObserverCallbackIsolation {
         Self {
             slots: Arc::new(tokio::sync::Semaphore::new(MAX_ISOLATED_OBSERVER_CALLBACKS)),
             global_slots: GLOBAL_OBSERVER_CALLBACK_SLOTS.clone(),
+            #[cfg(test)]
+            joined_callback_thread: Arc::new(StdMutex::new(None)),
         }
     }
 }
@@ -466,7 +473,28 @@ impl ObserverCallbackIsolation {
         Self {
             slots,
             global_slots,
+            joined_callback_thread: Arc::new(StdMutex::new(None)),
         }
+    }
+
+    fn callback_thread_joined(&self) -> tokio::sync::oneshot::Receiver<()> {
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        assert!(
+            self.joined_callback_thread
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .replace(sender)
+                .is_none(),
+            "only one callback thread join can be observed at a time"
+        );
+        receiver
+    }
+
+    fn take_callback_thread_joined(&self) -> Option<tokio::sync::oneshot::Sender<()>> {
+        self.joined_callback_thread
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
     }
 }
 
@@ -545,7 +573,7 @@ where
 {
     let manager_permit = match tokio::time::timeout(
         OBSERVER_CALLBACK_TIMEOUT,
-        isolation.slots.acquire_owned(),
+        isolation.slots.clone().acquire_owned(),
     )
     .await
     {
@@ -566,7 +594,7 @@ where
     };
     let global_permit = match tokio::time::timeout(
         OBSERVER_CALLBACK_TIMEOUT,
-        isolation.global_slots.acquire_owned(),
+        isolation.global_slots.clone().acquire_owned(),
     )
     .await
     {
@@ -600,6 +628,29 @@ where
         tracing::warn!(callback, %error, "failed to start provider terminal observer isolation");
         return None;
     }
+    let thread = thread.expect("checked observer callback thread spawn result");
+    #[cfg(test)]
+    match isolation.take_callback_thread_joined() {
+        Some(joined_callback_thread) => {
+            if let Err(error) = std::thread::Builder::new()
+                .name(format!("terminal-observer-join-{callback}"))
+                .spawn(move || {
+                    if thread.join().is_err() {
+                        tracing::warn!(
+                            callback,
+                            "provider terminal observer callback thread panicked"
+                        );
+                    }
+                    let _ = joined_callback_thread.send(());
+                })
+            {
+                tracing::warn!(callback, %error, "failed to start provider terminal observer callback joiner");
+            }
+        }
+        None => drop(thread),
+    }
+    #[cfg(not(test))]
+    drop(thread);
     match tokio::time::timeout(execution_budget, result_receiver).await {
         Ok(Ok(IsolatedCallbackResult::Completed(value))) => Some(value),
         Ok(Ok(IsolatedCallbackResult::Panicked)) => {
@@ -2826,6 +2877,7 @@ mod tests {
         let global_slots = Arc::new(tokio::sync::Semaphore::new(1));
         let isolation =
             ObserverCallbackIsolation::with_slots(local_slots.clone(), global_slots.clone());
+        let exited = isolation.callback_thread_joined();
         let (started_sender, started) = tokio::sync::oneshot::channel();
         let (release, release_receiver) = tokio::sync::oneshot::channel();
         let caller = tokio::spawn({
@@ -2854,18 +2906,8 @@ mod tests {
         );
         assert!(local_slots.clone().try_acquire_owned().is_err());
         assert!(global_slots.clone().try_acquire_owned().is_err());
-        let exited = tokio::spawn({
-            let local_slots = local_slots.clone();
-            async move {
-                let permit = local_slots
-                    .acquire_owned()
-                    .await
-                    .expect("callback capacity remains open");
-                drop(permit);
-            }
-        });
         release.send(()).expect("release callback thread");
-        exited.await.expect("callback thread exited");
+        exited.await.expect("callback thread joined");
         assert!(local_slots.try_acquire_owned().is_ok());
         assert!(global_slots.try_acquire_owned().is_ok());
 
@@ -2887,6 +2929,7 @@ mod tests {
         let global_slots = Arc::new(tokio::sync::Semaphore::new(1));
         let isolation =
             ObserverCallbackIsolation::with_slots(local_slots.clone(), global_slots.clone());
+        let exited = isolation.callback_thread_joined();
         let (started_sender, started) = tokio::sync::oneshot::channel();
         let (release, release_receiver) = tokio::sync::oneshot::channel();
         let caller = tokio::spawn({
@@ -2908,19 +2951,9 @@ mod tests {
         started.await.expect("callback thread started");
         assert!(local_slots.clone().try_acquire_owned().is_err());
         assert!(global_slots.clone().try_acquire_owned().is_err());
-        let exited = tokio::spawn({
-            let local_slots = local_slots.clone();
-            async move {
-                let permit = local_slots
-                    .acquire_owned()
-                    .await
-                    .expect("callback capacity remains open");
-                drop(permit);
-            }
-        });
         release.send(()).expect("release callback thread");
         assert_eq!(caller.await.expect("panicked callback owner"), None);
-        exited.await.expect("callback thread exited");
+        exited.await.expect("callback thread joined");
         assert!(local_slots.try_acquire_owned().is_ok());
         assert!(global_slots.try_acquire_owned().is_ok());
 
