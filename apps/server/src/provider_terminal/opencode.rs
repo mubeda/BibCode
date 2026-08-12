@@ -2373,6 +2373,7 @@ struct OpenCodeRetainedReaper {
     tasks: Mutex<Vec<OpenCodeRetainedReaperTask>>,
     changed: Arc<tokio::sync::Notify>,
     retry: watch::Sender<u64>,
+    shutdown_retry_requested: AtomicBool,
 }
 
 impl Default for OpenCodeRetainedReaper {
@@ -2383,6 +2384,7 @@ impl Default for OpenCodeRetainedReaper {
             tasks: Mutex::new(Vec::with_capacity(OPENCODE_HELPER_REAPER_CAPACITY)),
             changed: Arc::new(tokio::sync::Notify::new()),
             retry,
+            shutdown_retry_requested: AtomicBool::new(false),
         }
     }
 }
@@ -2568,7 +2570,7 @@ impl OpenCodeRetainedReaper {
     }
 
     async fn shutdown(&self) {
-        self.request_retry();
+        self.request_shutdown_retry();
         loop {
             let notified = self.changed.notified();
             tokio::pin!(notified);
@@ -2588,6 +2590,8 @@ impl OpenCodeRetainedReaper {
                     }
                 }
                 if tasks.is_empty() && completed.is_empty() {
+                    self.shutdown_retry_requested
+                        .store(false, Ordering::Release);
                     return;
                 }
                 let failure = tasks.iter().find_map(|task| {
@@ -2604,11 +2608,18 @@ impl OpenCodeRetainedReaper {
             if let Some(error) = completed.1 {
                 tracing::warn!(%error, "OpenCode helper retained reaper drain is waiting for a successful kernel wait");
             }
-            let has_pending = !self
-                .tasks
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner)
-                .is_empty();
+            let has_pending = {
+                let tasks = self
+                    .tasks
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                let has_pending = !tasks.is_empty();
+                if !has_pending {
+                    self.shutdown_retry_requested
+                        .store(false, Ordering::Release);
+                }
+                has_pending
+            };
             if !has_pending {
                 return;
             }
@@ -2616,7 +2627,14 @@ impl OpenCodeRetainedReaper {
         }
     }
 
-    fn request_retry(&self) {
+    fn request_shutdown_retry(&self) {
+        if self
+            .shutdown_retry_requested
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return;
+        }
         let next_retry = self.retry.borrow().wrapping_add(1);
         self.retry.send_replace(next_retry);
     }
@@ -3336,7 +3354,7 @@ mod tests {
         }
         let retried_automatically = wait_error.retry_started.checkpoint() == 1;
         if !retried_automatically {
-            fixture.launcher.reaper.request_retry();
+            fixture.launcher.reaper.request_shutdown_retry();
             wait_error.retry_started.wait_after(0).await;
         }
         fixture.launcher.shutdown().await;
@@ -3373,7 +3391,7 @@ mod tests {
         }
         let shutdown_drove_retry = wait_error.retry_started.checkpoint() == 1;
         if !shutdown_drove_retry {
-            fixture.launcher.reaper.request_retry();
+            fixture.launcher.reaper.request_shutdown_retry();
             wait_error.retry_started.wait_after(0).await;
         }
         wait_error.injected.wait_after(1).await;
@@ -3404,7 +3422,7 @@ mod tests {
         if cadence_retried {
             tokio::time::advance(Duration::from_millis(100)).await;
         } else {
-            fixture.launcher.reaper.request_retry();
+            fixture.launcher.reaper.request_shutdown_retry();
         }
         shutdown.await.expect("retained reaper shutdown task");
         fixture.assert_reaped(pid).await;
@@ -3415,6 +3433,94 @@ mod tests {
         assert!(
             cadence_retried,
             "persistent wait failure must retry once per finite cadence"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_and_repeated_shutdowns_coalesce_one_immediate_wait_retry() {
+        let wait_error = OpenCodeHelperWaitErrorEvents {
+            failures_remaining: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            fail_persistently: Arc::new(AtomicBool::new(true)),
+            injected: Arc::new(FixtureEvent::default()),
+            recorded: Arc::new(FixtureEvent::default()),
+            retry_started: Arc::new(FixtureEvent::default()),
+        };
+        let fixture = retained_reap_fixture("opencode-coalesced-shutdown-retry")
+            .with_wait_error(wait_error.clone());
+        let (start, pid) = fixture.reach_background_owner().await;
+        fixture.timeout_events.foreground_return_release.publish();
+        let _ = start.await.expect("OpenCode launch task");
+        fixture.timeout_events.background_wait_release.publish();
+        wait_error.injected.wait_after(0).await;
+        wait_error.recorded.wait_after(0).await;
+
+        let mut initial_shutdowns = Vec::new();
+        for _ in 0..8 {
+            let mut shutdown = Box::pin(fixture.launcher.reaper.shutdown());
+            let first_poll = std::future::poll_fn(|context| {
+                std::task::Poll::Ready(shutdown.as_mut().poll(context))
+            })
+            .await;
+            assert!(first_poll.is_pending(), "persistent wait keeps drain live");
+            initial_shutdowns.push(shutdown);
+        }
+        wait_error.retry_started.wait_after(0).await;
+        wait_error.injected.wait_after(1).await;
+        wait_error.recorded.wait_after(1).await;
+        let initial_shutdowns_coalesced = wait_error.injected.checkpoint() == 2;
+
+        drop(initial_shutdowns);
+        let mut repeated_shutdowns = Vec::new();
+        for _ in 0..8 {
+            let mut shutdown = Box::pin(fixture.launcher.reaper.shutdown());
+            let first_poll = std::future::poll_fn(|context| {
+                std::task::Poll::Ready(shutdown.as_mut().poll(context))
+            })
+            .await;
+            assert!(first_poll.is_pending(), "repeated drain remains live");
+            repeated_shutdowns.push(shutdown);
+        }
+        for _ in 0..32 {
+            tokio::task::yield_now().await;
+        }
+        let repeated_shutdowns_coalesced = wait_error.injected.checkpoint() == 2;
+
+        tokio::time::advance(Duration::from_millis(99)).await;
+        tokio::task::yield_now().await;
+        let no_retry_before_cadence = wait_error.injected.checkpoint() == 2;
+        let retry_checkpoint = wait_error.retry_started.checkpoint();
+        let injected_checkpoint = wait_error.injected.checkpoint();
+        let recorded_checkpoint = wait_error.recorded.checkpoint();
+        tokio::time::advance(Duration::from_millis(1)).await;
+        wait_error.retry_started.wait_after(retry_checkpoint).await;
+        wait_error.injected.wait_after(injected_checkpoint).await;
+        wait_error.recorded.wait_after(recorded_checkpoint).await;
+        let one_cadence_retry = wait_error.injected.checkpoint() == 3;
+
+        wait_error.fail_persistently.store(false, Ordering::Release);
+        tokio::time::advance(Duration::from_millis(100)).await;
+        fixture.events.reaped.wait_after(0).await;
+        for shutdown in repeated_shutdowns {
+            shutdown.await;
+        }
+        fixture.assert_reaped(pid).await;
+
+        assert!(
+            initial_shutdowns_coalesced,
+            "concurrent shutdown callers must share one immediate retry"
+        );
+        assert!(
+            repeated_shutdowns_coalesced,
+            "repeated shutdown callers in one drain phase must not bypass backoff"
+        );
+        assert!(
+            no_retry_before_cadence,
+            "persistent wait failure must remain parked through 99 ms"
+        );
+        assert!(
+            one_cadence_retry,
+            "persistent wait failure must attempt exactly once at 100 ms"
         );
     }
 
