@@ -1022,6 +1022,134 @@ async fn worktree_creation_accepts_windows_extended_length_repository_paths() {
 }
 
 #[tokio::test]
+async fn managed_orphaned_worktree_directory_can_be_removed_after_git_registration_is_lost() {
+    let repo = init_repo();
+    commit_file(repo.path(), "README.md", "hello\n", "initial");
+    let workspace = tempfile::tempdir().expect("managed worktree workspace");
+    let repository = repository_with_workspace(Some(workspace.path().to_path_buf()));
+    let created = repository
+        .create_worktree(
+            CreateWorktreeInput {
+                cwd: repo.path().to_path_buf(),
+                ref_name: "main".into(),
+                new_ref_name: Some("feature/orphaned".into()),
+                base_ref_name: Some("main".into()),
+                path: None,
+            },
+            &cancellation(),
+        )
+        .await
+        .expect("managed worktree creation");
+    let worktree_path = PathBuf::from(created.worktree.path);
+    let git_link = worktree_path.join(".git");
+    let git_link_contents = fs::read_to_string(&git_link).expect("linked worktree Git file");
+    let admin_path = PathBuf::from(
+        git_link_contents
+            .trim()
+            .strip_prefix("gitdir: ")
+            .expect("linked worktree Git directory"),
+    );
+    fs::remove_dir_all(admin_path).expect("simulate lost Git worktree registration");
+    fs::remove_file(git_link).expect("simulate the partially removed Git link");
+    assert!(!has_registered_worktree(repo.path(), &worktree_path));
+    assert!(worktree_path.is_dir());
+
+    repository
+        .remove_worktree(repo.path(), &worktree_path, true, &cancellation())
+        .await
+        .expect("managed orphan cleanup");
+    assert!(!worktree_path.exists());
+}
+
+#[tokio::test]
+async fn unregistered_directories_without_managed_orphan_proof_are_preserved() {
+    let repo = init_repo();
+    commit_file(repo.path(), "README.md", "hello\n", "initial");
+    let workspace = tempfile::tempdir().expect("managed worktree workspace");
+    let repository = repository_with_workspace(Some(workspace.path().to_path_buf()));
+    let unrelated_root = tempfile::tempdir().expect("unrelated parent");
+    let outside_workspace = unrelated_root.path().join("unrelated");
+    fs::create_dir(&outside_workspace).expect("unrelated directory");
+    fs::write(outside_workspace.join("keep.txt"), "keep\n").expect("unrelated fixture");
+    let repo_name = repo.path().file_name().expect("repository name");
+    let repository_directory = workspace.path().join(repo_name);
+    fs::create_dir(&repository_directory).expect("managed repository directory");
+    let managed_repository = repository_directory.join("existing-repository");
+    fs::create_dir(&managed_repository).expect("managed candidate");
+    fs::create_dir(managed_repository.join(".git")).expect("repository marker");
+    fs::write(managed_repository.join("keep.txt"), "keep\n").expect("managed fixture");
+
+    for path in [&outside_workspace, &managed_repository] {
+        repository
+            .remove_worktree(repo.path(), path, true, &cancellation())
+            .await
+            .expect_err("unregistered directory is not a proven managed orphan");
+        assert_eq!(
+            fs::read_to_string(path.join("keep.txt")).expect("directory must remain"),
+            "keep\n"
+        );
+    }
+}
+
+#[tokio::test]
+async fn forced_worktree_removal_never_precleans_the_primary_checkout() {
+    let repo = init_repo();
+    commit_file(repo.path(), "README.md", "hello\n", "initial");
+
+    GitRepository::default()
+        .remove_worktree(repo.path(), repo.path(), true, &cancellation())
+        .await
+        .expect_err("Git must reject removing the primary checkout");
+    assert_eq!(
+        fs::read_to_string(repo.path().join("README.md")).expect("primary checkout remains"),
+        "hello\n"
+    );
+}
+
+#[tokio::test]
+async fn stale_registered_path_replaced_without_a_git_link_is_not_precleaned() {
+    let repo = init_repo();
+    commit_file(repo.path(), "README.md", "hello\n", "initial");
+    let worktree_parent = tempfile::tempdir().expect("worktree parent");
+    let worktree_path = worktree_parent.path().join("replaced");
+    git(
+        repo.path(),
+        &[
+            "worktree",
+            "add",
+            "-b",
+            "feature/replaced",
+            &worktree_path.to_string_lossy(),
+        ],
+    );
+    fs::remove_dir_all(&worktree_path).expect("remove the original linked worktree");
+    fs::create_dir(&worktree_path).expect("replacement directory");
+    fs::write(worktree_path.join("keep.txt"), "keep\n").expect("replacement fixture");
+
+    GitRepository::default()
+        .remove_worktree(repo.path(), &worktree_path, true, &cancellation())
+        .await
+        .expect_err("a replacement directory is not the registered linked worktree");
+    assert_eq!(
+        fs::read_to_string(worktree_path.join("keep.txt")).expect("replacement remains"),
+        "keep\n"
+    );
+    fs::write(
+        worktree_path.join(".git"),
+        "gitdir: C:/missing-bibcode-worktree-admin\n",
+    )
+    .expect("malformed linked-worktree marker");
+    GitRepository::default()
+        .remove_worktree(repo.path(), &worktree_path, true, &cancellation())
+        .await
+        .expect_err("an unverified Git file does not prove linked-worktree ownership");
+    assert_eq!(
+        fs::read_to_string(worktree_path.join("keep.txt")).expect("replacement still remains"),
+        "keep\n"
+    );
+}
+
+#[tokio::test]
 async fn failed_worktree_creation_removes_only_the_branch_created_by_the_attempt() {
     let repo = init_repo();
     commit_file(repo.path(), "README.md", "hello\n", "initial");

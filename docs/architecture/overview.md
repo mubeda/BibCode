@@ -393,6 +393,15 @@ See [RPC and orchestration](./rpc-and-orchestration.md) and
 - WSL-only desktop startup never falls back to a native Windows backend.
   Planning and primary-start failures remain tagged through the desktop bridge;
   only an explicit settings action switches the primary runtime to Windows.
+- Forced linked-worktree deletion cleans the registered worktree contents before
+  asking Git to deregister it, but only after the candidate's administrative
+  `.git` file and backlink verify against the repository's common worktree
+  metadata. The link remains until filesystem cleanup succeeds, so a blocked
+  cleanup is safely retryable across client and server restarts. Compatibility cleanup of a
+  previously deregistered directory is limited to a normal directory without a
+  `.git` entry whose canonical parent is exactly BiBCode's computed
+  per-repository worktree namespace; primary checkouts and arbitrary paths are
+  never pre-cleaned.
 - Configured secondary WSL planning/start failures remain desired, unavailable
   topology with stable identity and no endpoint/session. They do not remove
   cached project/thread state; explicit disable or distro replacement does.
