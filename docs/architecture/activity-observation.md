@@ -106,7 +106,11 @@ disablement and re-enablement. Late-job batches then cross a dedicated bounded
 handoff whose capacity matches the provider supervisor queue, with at most 256
 jobs per batch and no more active aggregate dispatch tasks than that configured
 capacity. A full handoff backpressures the event pump and session or shutdown
-cancellation abandons the pending send without orphaning provider I/O.
+cancellation abandons the pending send without orphaning provider I/O. Each
+aggregate task has a stable session-owned ID. Its bounded priority completion
+removes and awaits that exact handle, so capacity is released even when the
+completion message is observed before Tokio marks the handle finished; stale
+generation and duplicate completion IDs cannot remove current work.
 Terminal display mutations reconcile the overlay even when the provider sends
 no control updates, so completed descendants cannot remain as cancellation
 residuals. If durable display projection rejects a batch after control
