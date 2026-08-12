@@ -188,6 +188,17 @@ source ownership never enables control. A bounded dependency fixpoint settles
 already-present parent, child, and deeper chains in one observation regardless
 of lexical identity order.
 
+The complete PostToolUse chain is the authoritative path. When a nested Claude
+version provides no usable PostToolUse launch result, an authenticated
+`PreToolUse` from an already exact parent instead opens a parent-owned pending
+interval. The nested-only parent-local fallback admits control only when the
+stream parent tool, the accepted nested `task_started` candidate, and the
+Activity-verified child lineage agree on that parent, with exactly one candidate
+on each side. A later exact PostToolUse result promotes that pending state to an
+exact target or contradicts it and retires it. Ambiguous candidates remain
+observable but unsupported and cause zero provider I/O; BiBCode does not infer
+identity from text, timing, order, proximity, or transcript contents.
+
 Arrival order is irrelevant. Every accepted fact that installs, retires, or
 terminalizes a target carries a deterministic domain-separated SHA-256 event
 key through the production event pump. The key is duplicate-stable, bounded,
@@ -202,7 +213,11 @@ coerced to the absent/root form. Names, roles, descriptions, prompts,
 timestamps, output paths, and event proximity are never correlation keys;
 incomplete, conflicting, stale, malformed, or saturated chains remain
 observable but uncontrollable. Live identity maps and unmatched terminal
-statuses are each bounded at the Activity page limit. Terminal retirement
+statuses are each bounded at the Activity page limit, including the
+generation-owned parent-local pending set (200 correlations). The fallback uses
+no timers, polling, or transcript reads. Terminal retirement, Activity
+disablement, and runtime replacement clear or retire its pending and installed
+state. Terminal retirement
 atomically removes the live tool/agent/task join and records generation-scoped identities in three
 fixed 256-word tombstone filters (2 KiB each; 6 KiB total). Tombstones are never
 evicted within a generation: a filter false positive can only disable a private
@@ -222,10 +237,11 @@ completed.
 When the compatibility probe proves both hook switches and the authenticated
 hook sink starts, targeted cancellation is provisionally enabled for that
 structured-chat runtime generation. Clicking an actor with a complete exact
-mapping sends one stream-JSON control request with subtype `stop_task` and that
-private `task_id`. Any non-Claude target, root/foreground actor, or actor without
-an exact current mapping is rejected before provider I/O; BiBCode never falls
-back to the conversation-wide interrupt request.
+mapping or admitted nested-only parent-local fallback sends one stream-JSON
+control request with subtype `stop_task` and that private `task_id`. Any
+non-Claude target, root/foreground actor, ambiguous nested actor, or actor
+without a current admitted mapping is rejected before provider I/O; BiBCode
+never falls back to the conversation-wide interrupt request.
 
 The control response must carry the matching request ID. Only Claude's exact
 unsupported-control protocol error authoritatively disables targeted
