@@ -742,7 +742,8 @@ const ActivityPanelBinding = memo(function ActivityPanelBinding({
   const cancellationError =
     cancellationFailure !== null &&
     cancellationFailure.targetKey === currentCancellationTargetKey &&
-    cancellationFailure.controlRevision === currentCancellationControlRevision
+    cancellationFailure.controlRevision === currentCancellationControlRevision &&
+    cancellationFailure.invocation === cancellationOwnershipRef.current.invocation
       ? cancellationFailure.message
       : null;
   const onCancelActor = useCallback(

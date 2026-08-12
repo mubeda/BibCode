@@ -1391,6 +1391,117 @@ describe("ChatView", () => {
       }
     });
 
+    it("does not resurrect a rendered cancellation failure after leaving and returning to its target", async () => {
+      const child = actor("actor-return-target", "Returning reviewer");
+      const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child], {
+        scopeId: "reused-scope" as ActivitySnapshot["scopeId"],
+        capabilities: {
+          actors: true,
+          attributedActivity: true,
+          backgroundWork: true,
+          historyRecovery: "full",
+          terminalObservation: false,
+          targetedActorCancellation: true,
+        },
+      });
+      h.commandResults["activity.cancelSubtree"] = () =>
+        AsyncResult.failure(
+          Cause.fail(
+            new ActivityError({
+              reason: "providerUnavailable",
+              message: "secret returning-target payload",
+            }),
+          ),
+        );
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      seedActivityState(environmentId, snapshot.scope, snapshot);
+      seedActivityQueries(environmentId, snapshot, [child]);
+
+      const { container, root } = await mountActivityRoute();
+      try {
+        await openSubagents(container);
+        await act(async () => latestActivityPanelProps().onCancelActor?.(child.id, 5));
+        await vi.waitFor(() =>
+          expect(latestActivityPanelProps().cancellationError).toBe(
+            "The provider is unavailable. Try again when it reconnects.",
+          ),
+        );
+        expect(container.textContent).not.toContain("secret returning-target payload");
+
+        const nextEnvironmentId = EnvironmentId.make("environment-away");
+        const nextThreadRef = scopeThreadRef(nextEnvironmentId, threadId);
+        const nextChild = actor("actor-away-target", "Away reviewer");
+        const nextSnapshot = activitySnapshot({ _tag: "thread", threadId }, [nextChild], {
+          scopeId: snapshot.scopeId,
+          capabilities: snapshot.capabilities,
+          control: {
+            ...snapshot.control,
+            actors: [
+              {
+                actorId: nextChild.id,
+                state: "available",
+                controlRevision: 5,
+                activeDescendantCount: 0,
+              },
+            ],
+          },
+        });
+        seedEnvironment(makeEnvironmentPresentation({ environmentId: nextEnvironmentId }));
+        seedProject(makeProject({ environmentId: nextEnvironmentId }));
+        seedServerThread(makeThread({ environmentId: nextEnvironmentId }));
+        seedActivityState(nextEnvironmentId, nextSnapshot.scope, nextSnapshot);
+        seedActivityQueries(nextEnvironmentId, nextSnapshot, [nextChild]);
+        useRightPanelStore.getState().openActivity(nextThreadRef, "subagents", nextSnapshot.scope);
+        await act(async () => {
+          root.render(
+            <ChatView
+              environmentId={nextEnvironmentId}
+              threadId={threadId}
+              routeKind="server"
+              reserveTitleBarControlInset
+            />,
+          );
+          await Promise.resolve();
+        });
+        await vi.waitFor(() =>
+          expect((latestActivityPanelProps().snapshot as ActivitySnapshot).actors[0]?.id).toBe(
+            nextChild.id,
+          ),
+        );
+        expect(latestActivityPanelProps().cancellationError).toBeNull();
+
+        useRightPanelStore.getState().openActivity(threadRef, "subagents", snapshot.scope);
+        await act(async () => {
+          root.render(
+            <ChatView
+              environmentId={environmentId}
+              threadId={threadId}
+              routeKind="server"
+              reserveTitleBarControlInset
+            />,
+          );
+          await Promise.resolve();
+        });
+        await vi.waitFor(() =>
+          expect((latestActivityPanelProps().snapshot as ActivitySnapshot).actors[0]?.id).toBe(
+            child.id,
+          ),
+        );
+
+        expect(latestActivityPanelProps().snapshot.control.revision).toBe(
+          snapshot.control.revision,
+        );
+        expect(latestActivityPanelProps().cancellationError).toBeNull();
+        expect(container.textContent).not.toContain("secret returning-target payload");
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
     it("lets the latest cancel or retry success or failure exclusively own the single banner", async () => {
       const child = actor("actor-command-order", "Ordered reviewer");
       const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child], {
