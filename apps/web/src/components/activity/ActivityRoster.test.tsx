@@ -132,6 +132,16 @@ async function mount(element: ReactElement): Promise<HTMLDivElement> {
   return container;
 }
 
+async function rerender(container: HTMLDivElement, element: ReactElement): Promise<void> {
+  const tree = mounted.find((candidate) => candidate.container === container);
+  if (tree === undefined) {
+    throw new Error("Cannot rerender an unmounted ActivityRoster test tree.");
+  }
+  await act(async () => {
+    tree.root.render(<TooltipProvider delay={0}>{element}</TooltipProvider>);
+  });
+}
+
 beforeEach(() => {
   (globalThis as { IS_REACT_ACT_ENVIRONMENT?: boolean }).IS_REACT_ACT_ENVIRONMENT = true;
   Object.defineProperty(Element.prototype, "getAnimations", {
@@ -208,7 +218,7 @@ describe("ActivityRoster targeted cancellation controls", () => {
     ).toBe(true);
   });
 
-  it("uses snapshot controls as initial fallback and lets roster-page controls override them", async () => {
+  it("uses roster-page controls only as fallback and gives streamed snapshot controls precedence", async () => {
     const fallbackActor = actor("fallback", "Ada");
     const overriddenActor = actor("overridden", "Grace");
     const activePage = page(
@@ -244,7 +254,60 @@ describe("ActivityRoster targeted cancellation controls", () => {
     expect(container.querySelector('button[aria-label="Stop Ada"]')).not.toBeNull();
     expect(
       container.querySelector<HTMLButtonElement>('button[aria-label="Stop Grace"]')?.disabled,
+    ).toBe(false);
+    expect(
+      container.querySelector('button[data-activity-row="overridden"]')?.textContent,
+    ).toContain("Running");
+  });
+
+  it("applies a control-only streamed update over a stale available roster-page fallback", async () => {
+    const currentActor = actor("control-only", "Curie");
+    const staleRosterPage = page([currentActor], [control(currentActor.id, "available", 1, 4)]);
+    const baseProps = props({
+      snapshot: snapshot({
+        revision: 12,
+        control: {
+          scopeId: "scope-1" as ActivitySnapshot["scopeId"],
+          revision: 4,
+          actors: [],
+          operations: [],
+        },
+      }),
+      active: { pages: [staleRosterPage], loading: false, error: null },
+      done: { pages: [page([])], loading: false, error: null },
+      reconciled: { active: [currentActor], done: [] },
+    });
+    const container = await mount(<ActivityRoster {...baseProps} />);
+    expect(
+      container.querySelector<HTMLButtonElement>(
+        'button[aria-label="Stop Curie and 1 child agent"]',
+      )?.disabled,
+    ).toBe(false);
+
+    await rerender(
+      container,
+      <ActivityRoster
+        {...baseProps}
+        snapshot={snapshot({
+          revision: 12,
+          control: {
+            scopeId: "scope-1" as ActivitySnapshot["scopeId"],
+            revision: 5,
+            actors: [control(currentActor.id, "requested", 1, 5)],
+            operations: [],
+          },
+        })}
+      />,
+    );
+
+    expect(
+      container.querySelector<HTMLButtonElement>(
+        'button[aria-label="Stop Curie and 1 child agent"]',
+      )?.disabled,
     ).toBe(true);
+    expect(
+      container.querySelector('button[data-activity-row="control-only"]')?.textContent,
+    ).toContain("Stopping");
   });
 
   it("restores focus to the main detail action instead of the trailing Stop control", async () => {

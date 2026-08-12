@@ -1313,6 +1313,275 @@ describe("ChatView", () => {
       }
     });
 
+    it("ignores a late cancellation failure after the Activity target changes environments", async () => {
+      const child = actor("actor-old-target", "Old target reviewer");
+      const oldSnapshot = activitySnapshot({ _tag: "thread", threadId }, [child], {
+        scopeId: "colliding-scope" as ActivitySnapshot["scopeId"],
+        capabilities: {
+          actors: true,
+          attributedActivity: true,
+          backgroundWork: true,
+          historyRecovery: "full",
+          terminalObservation: false,
+          targetedActorCancellation: true,
+        },
+      });
+      const oldFailure = deferredResult<ReturnType<typeof AsyncResult.failure>>();
+      h.commandResults["activity.cancelSubtree"] = () => oldFailure.promise;
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      seedActivityState(environmentId, oldSnapshot.scope, oldSnapshot);
+      seedActivityQueries(environmentId, oldSnapshot, [child]);
+
+      const { container, root } = await mountActivityRoute();
+      try {
+        await openSubagents(container);
+        void latestActivityPanelProps().onCancelActor?.(child.id, 5);
+
+        const nextEnvironmentId = EnvironmentId.make("environment-remote");
+        const nextThreadRef = scopeThreadRef(nextEnvironmentId, threadId);
+        const nextChild = actor("actor-new-target", "New target reviewer");
+        const nextSnapshot = activitySnapshot({ _tag: "thread", threadId }, [nextChild], {
+          scopeId: "colliding-scope" as ActivitySnapshot["scopeId"],
+          capabilities: oldSnapshot.capabilities,
+        });
+        seedEnvironment(makeEnvironmentPresentation({ environmentId: nextEnvironmentId }));
+        seedProject(makeProject({ environmentId: nextEnvironmentId }));
+        seedServerThread(makeThread({ environmentId: nextEnvironmentId }));
+        seedActivityState(nextEnvironmentId, nextSnapshot.scope, nextSnapshot);
+        seedActivityQueries(nextEnvironmentId, nextSnapshot, [nextChild]);
+        useRightPanelStore.getState().openActivity(nextThreadRef, "subagents", nextSnapshot.scope);
+        await act(async () => {
+          root.render(
+            <ChatView
+              environmentId={nextEnvironmentId}
+              threadId={threadId}
+              routeKind="server"
+              reserveTitleBarControlInset
+            />,
+          );
+          await Promise.resolve();
+        });
+        await vi.waitFor(() =>
+          expect((latestActivityPanelProps().snapshot as ActivitySnapshot).scopeId).toBe(
+            nextSnapshot.scopeId,
+          ),
+        );
+
+        await act(async () => {
+          oldFailure.resolve(
+            AsyncResult.failure(
+              Cause.fail(
+                new ActivityError({
+                  reason: "providerUnavailable",
+                  message: "secret old environment payload",
+                }),
+              ),
+            ),
+          );
+          await Promise.resolve();
+        });
+        expect(latestActivityPanelProps().cancellationError).toBeNull();
+        expect(container.textContent).not.toContain("secret old environment payload");
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it("lets the latest cancel or retry success or failure exclusively own the single banner", async () => {
+      const child = actor("actor-command-order", "Ordered reviewer");
+      const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child], {
+        capabilities: {
+          actors: true,
+          attributedActivity: true,
+          backgroundWork: true,
+          historyRecovery: "full",
+          terminalObservation: false,
+          targetedActorCancellation: true,
+        },
+      });
+      const olderCancel = deferredResult<ReturnType<typeof AsyncResult.failure>>();
+      const newerRetry = deferredResult<ReturnType<typeof AsyncResult.failure>>();
+      h.commandResults["activity.cancelSubtree"] = () => olderCancel.promise;
+      h.commandResults["activity.retrySubtreeCancellation"] = () => newerRetry.promise;
+      seedEnvironment(makeEnvironmentPresentation());
+      seedProject(makeProject());
+      seedServerThread(makeThread());
+      seedGitStatus(true);
+      seedActivityState(environmentId, snapshot.scope, snapshot);
+      seedActivityQueries(environmentId, snapshot, [child]);
+
+      const { container, root } = await mountActivityRoute();
+      try {
+        await openSubagents(container);
+        void latestActivityPanelProps().onCancelActor?.(child.id, 5);
+        void latestActivityPanelProps().onRetryCancellation?.(child.id, 7);
+
+        await act(async () => {
+          newerRetry.resolve(
+            AsyncResult.failure(
+              Cause.fail(
+                new ActivityError({
+                  reason: "providerUnavailable",
+                  message: "new secret payload",
+                }),
+              ),
+            ),
+          );
+          await Promise.resolve();
+        });
+        await vi.waitFor(() =>
+          expect(latestActivityPanelProps().cancellationError).toBe(
+            "The provider is unavailable. Try again when it reconnects.",
+          ),
+        );
+
+        await act(async () => {
+          olderCancel.resolve(
+            AsyncResult.failure(
+              Cause.fail(
+                new ActivityError({ reason: "dispatchTimeout", message: "old secret payload" }),
+              ),
+            ),
+          );
+          await Promise.resolve();
+        });
+        expect(latestActivityPanelProps().cancellationError).toBe(
+          "The provider is unavailable. Try again when it reconnects.",
+        );
+        expect(container.textContent).not.toContain("new secret payload");
+        expect(container.textContent).not.toContain("old secret payload");
+
+        const secondOlderCancel = deferredResult<ReturnType<typeof AsyncResult.failure>>();
+        const latestRetrySuccess = deferredResult<ReturnType<typeof AsyncResult.success>>();
+        h.commandResults["activity.cancelSubtree"] = () => secondOlderCancel.promise;
+        h.commandResults["activity.retrySubtreeCancellation"] = () => latestRetrySuccess.promise;
+        void latestActivityPanelProps().onCancelActor?.(child.id, 5);
+        void latestActivityPanelProps().onRetryCancellation?.(child.id, 7);
+        await act(async () => {
+          latestRetrySuccess.resolve(AsyncResult.success(undefined));
+          await Promise.resolve();
+        });
+        await act(async () => {
+          secondOlderCancel.resolve(
+            AsyncResult.failure(
+              Cause.fail(
+                new ActivityError({
+                  reason: "dispatchTimeout",
+                  message: "superseded failure payload",
+                }),
+              ),
+            ),
+          );
+          await Promise.resolve();
+        });
+        expect(latestActivityPanelProps().cancellationError).toBeNull();
+        expect(container.textContent).not.toContain("superseded failure payload");
+      } finally {
+        await act(async () => root.unmount());
+        container.remove();
+      }
+    });
+
+    it.each(["requested", "partial"] as const)(
+      "invalidates a pending failure when authoritative control state advances to %s",
+      async (operationState) => {
+        const child = actor("actor-authoritative", "Authoritative reviewer");
+        const snapshot = activitySnapshot({ _tag: "thread", threadId }, [child], {
+          capabilities: {
+            actors: true,
+            attributedActivity: true,
+            backgroundWork: true,
+            historyRecovery: "full",
+            terminalObservation: false,
+            targetedActorCancellation: true,
+          },
+          control: {
+            scopeId: `scope-${threadId}` as ActivitySnapshot["scopeId"],
+            revision: 3,
+            actors: [
+              {
+                actorId: child.id,
+                state: "available",
+                controlRevision: 3,
+                activeDescendantCount: 0,
+              },
+            ],
+            operations: [],
+          },
+        });
+        const pending = deferredResult<ReturnType<typeof AsyncResult.failure>>();
+        h.commandResults["activity.cancelSubtree"] = () => pending.promise;
+        seedEnvironment(makeEnvironmentPresentation());
+        seedProject(makeProject());
+        seedServerThread(makeThread());
+        seedGitStatus(true);
+        seedActivityState(environmentId, snapshot.scope, snapshot);
+        seedActivityQueries(environmentId, snapshot, [child]);
+
+        const { container, root } = await mountActivityRoute();
+        try {
+          await openSubagents(container);
+          void latestActivityPanelProps().onCancelActor?.(child.id, 3);
+          const authoritative = activitySnapshot(snapshot.scope, [child], {
+            scopeId: snapshot.scopeId,
+            revision: snapshot.revision,
+            capabilities: snapshot.capabilities,
+            control: {
+              scopeId: snapshot.scopeId,
+              revision: 4,
+              actors: [
+                {
+                  actorId: child.id,
+                  state: operationState === "requested" ? "requested" : "available",
+                  controlRevision: 4,
+                  activeDescendantCount: 0,
+                },
+              ],
+              operations: [
+                {
+                  rootActorId: child.id,
+                  state: operationState,
+                  residualCount: 1,
+                  message: null,
+                  operationRevision: 4,
+                },
+              ],
+            },
+          });
+          seedActivityState(environmentId, authoritative.scope, authoritative);
+          await act(async () => {
+            useRightPanelStore.getState().navigateActivity(threadRef, {
+              section: "subagents",
+              selectedRecordKind: "actor",
+              selectedRecordId: child.id,
+            });
+            await Promise.resolve();
+          });
+
+          await act(async () => {
+            pending.resolve(
+              AsyncResult.failure(
+                Cause.fail(
+                  new ActivityError({ reason: "dispatchTimeout", message: "late secret payload" }),
+                ),
+              ),
+            );
+            await Promise.resolve();
+          });
+          expect(latestActivityPanelProps().snapshot.control.revision).toBe(4);
+          expect(latestActivityPanelProps().cancellationError).toBeNull();
+          expect(container.textContent).not.toContain("late secret payload");
+        } finally {
+          await act(async () => root.unmount());
+          container.remove();
+        }
+      },
+    );
+
     it("keeps provider-terminal Activity bindings read-only", async () => {
       const terminalScope: ActivityScopeRef = {
         _tag: "terminal",

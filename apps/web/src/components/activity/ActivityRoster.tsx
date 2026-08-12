@@ -332,15 +332,16 @@ export function ActivityRoster({
     (active.loading || done.loading) &&
     snapshot.sections[section].state !== "unsupported";
   const hasRosterError = active.error !== null || done.error !== null;
-  const actorControls = new Map<string, ActivityActorControl>(
-    snapshot.control.actors.map((control) => [control.actorId, control]),
-  );
+  const actorControls = new Map<string, ActivityActorControl>();
   for (const query of [active, done]) {
     for (const page of query.pages) {
       for (const control of page.actorControls) {
         actorControls.set(control.actorId, control);
       }
     }
+  }
+  for (const control of snapshot.control.actors) {
+    actorControls.set(control.actorId, control);
   }
   const controlForRecord = (record: ActivityRecordSummary): ActivityActorControl | null => {
     if (
