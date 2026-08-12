@@ -489,6 +489,12 @@ before the production event pump. The digest uses length-framed,
 domain-separated bounded identity/status fields. It is stable across duplicate
 delivery, separates lifecycle statuses, and never exposes raw native IDs;
 malformed or rejected facts emit no control key or control effect.
+Effect-producing conflicts encode bounded canonical classifications rather
+than arbitrary raw status, tool, or task-type labels, making key derivation
+total for every install, retirement, and terminal branch. Optional parent and
+source identities use explicit `none`/`some` discriminants before the bounded
+value. Absence therefore cannot alias a valid provider identity such as the
+literal `<root>`.
 
 Terminal retirement atomically removes live tool, agent, and task maps and adds
 each identity to generation-scoped fixed tombstone filters. The three filters

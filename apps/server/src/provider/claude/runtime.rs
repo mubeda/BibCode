@@ -2120,7 +2120,7 @@ fn claude_hook_native_event_id(value: &Value) -> Option<String> {
 }
 
 fn claude_control_fact_native_event_id(value: &Value) -> Option<String> {
-    let mut fields = Vec::with_capacity(8);
+    let mut fields = Vec::with_capacity(12);
     if value.get("type").and_then(Value::as_str) == Some("system") {
         let subtype = value.get("subtype").and_then(Value::as_str)?;
         let session_id = value.get("session_id").and_then(Value::as_str)?;
@@ -2129,20 +2129,29 @@ fn claude_control_fact_native_event_id(value: &Value) -> Option<String> {
         }
         match subtype {
             "task_started" => {
+                let tool_use_id = value.get("tool_use_id")?.as_str()?;
+                let task_id = value.get("task_id")?.as_str()?;
+                if !usable_control_identity(tool_use_id) || !usable_control_identity(task_id) {
+                    return None;
+                }
                 fields.extend([
                     "system/task_started",
                     session_id,
-                    value.get("tool_use_id")?.as_str()?,
-                    value.get("task_id")?.as_str()?,
-                    value.get("task_type")?.as_str()?,
+                    tool_use_id,
+                    task_id,
+                    classify_task_type(value.get("task_type")?.as_str()?),
                 ]);
             }
             "task_notification" => {
+                let task_id = value.get("task_id")?.as_str()?;
+                if !usable_control_identity(task_id) {
+                    return None;
+                }
                 fields.extend([
                     "system/task_notification",
                     session_id,
-                    value.get("task_id")?.as_str()?,
-                    value.get("status")?.as_str()?,
+                    task_id,
+                    classify_task_notification_status(value.get("status")?.as_str()?),
                 ]);
             }
             _ => return None,
@@ -2150,13 +2159,20 @@ fn claude_control_fact_native_event_id(value: &Value) -> Option<String> {
     } else if let Some((session_id, tool_use_id, tool_name, parent_tool_use_id)) =
         agent_tool_identity(value)
     {
+        if !usable_control_identity(session_id)
+            || !usable_control_identity(tool_use_id)
+            || !usable_control_label(tool_name)
+        {
+            return None;
+        }
         fields.extend([
             "stream/agent-tool",
             session_id,
             tool_use_id,
-            tool_name,
-            parent_tool_use_id.unwrap_or("<root>"),
+            classify_agent_tool(tool_name),
+            "parent",
         ]);
+        push_optional_control_identity(&mut fields, parent_tool_use_id)?;
     } else {
         if !claude_hook_identity_fields_are_safe(value) {
             return None;
@@ -2164,38 +2180,50 @@ fn claude_control_fact_native_event_id(value: &Value) -> Option<String> {
         let event = value.get("hook_event_name")?.as_str()?;
         let session_id = value.get("session_id")?.as_str()?;
         match event {
-            "PostToolUse" => fields.extend([
-                "hook/post-tool-use",
-                session_id,
-                value
-                    .get("agent_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<root>"),
-                value.get("tool_use_id")?.as_str()?,
-                value.get("tool_name")?.as_str()?,
-                value.pointer("/tool_response/status")?.as_str()?,
-                value.pointer("/tool_response/agentId")?.as_str()?,
-            ]),
-            "SubagentStart" | "SubagentStop" => fields.extend([
-                if event == "SubagentStart" {
-                    "hook/subagent-start"
-                } else {
-                    "hook/subagent-stop"
-                },
-                session_id,
-                value.get("agent_id")?.as_str()?,
-                value
-                    .get("parent_agent_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or("<root>"),
-            ]),
+            "PostToolUse" => {
+                let tool_use_id = value.get("tool_use_id")?.as_str()?;
+                let tool_name = value.get("tool_name")?.as_str()?;
+                let agent_id = value.pointer("/tool_response/agentId")?.as_str()?;
+                if !usable_control_identity(tool_use_id)
+                    || !usable_control_label(tool_name)
+                    || !usable_control_identity(agent_id)
+                {
+                    return None;
+                }
+                fields.extend(["hook/post-tool-use", session_id, "source"]);
+                push_optional_control_identity(
+                    &mut fields,
+                    value.get("agent_id").and_then(Value::as_str),
+                )?;
+                fields.extend([
+                    tool_use_id,
+                    classify_agent_tool(tool_name),
+                    classify_async_launch_status(value.pointer("/tool_response/status")?.as_str()?),
+                    agent_id,
+                ]);
+            }
+            "SubagentStart" | "SubagentStop" => {
+                let agent_id = value.get("agent_id")?.as_str()?;
+                if !usable_control_identity(agent_id) {
+                    return None;
+                }
+                fields.extend([
+                    if event == "SubagentStart" {
+                        "hook/subagent-start"
+                    } else {
+                        "hook/subagent-stop"
+                    },
+                    session_id,
+                    agent_id,
+                    "parent",
+                ]);
+                push_optional_control_identity(
+                    &mut fields,
+                    value.get("parent_agent_id").and_then(Value::as_str),
+                )?;
+            }
             _ => return None,
         }
-    }
-    if fields.iter().any(|field| {
-        !usable_control_label(field) || field.len() > 256 || field.chars().any(char::is_whitespace)
-    }) {
-        return None;
     }
     let mut hasher = Sha256::new();
     hasher.update(b"bibcode:claude-control-event:v1");
@@ -2209,6 +2237,56 @@ fn claude_control_fact_native_event_id(value: &Value) -> Option<String> {
         .map(|byte| format!("{byte:02x}"))
         .collect::<String>();
     Some(format!("claude:control:{encoded}"))
+}
+
+fn push_optional_control_identity<'a>(
+    fields: &mut Vec<&'a str>,
+    identity: Option<&'a str>,
+) -> Option<()> {
+    match identity {
+        Some(identity) if usable_control_identity(identity) => {
+            fields.extend(["some", identity]);
+            Some(())
+        }
+        Some(_) => None,
+        None => {
+            fields.push("none");
+            Some(())
+        }
+    }
+}
+
+fn classify_agent_tool(tool_name: &str) -> &'static str {
+    match tool_name {
+        "Agent" => "agent",
+        "Task" => "task",
+        _ => "other",
+    }
+}
+
+fn classify_async_launch_status(status: &str) -> &'static str {
+    if status == "async_launched" {
+        "async-launched"
+    } else {
+        "other"
+    }
+}
+
+fn classify_task_type(task_type: &str) -> &'static str {
+    if task_type == "local_agent" {
+        "local-agent"
+    } else {
+        "other"
+    }
+}
+
+fn classify_task_notification_status(status: &str) -> &'static str {
+    match status {
+        "stopped" | "cancelled" => "cancelled",
+        "failed" => "failed",
+        "interrupted" => "interrupted",
+        _ => "other",
+    }
 }
 
 fn claude_hook_identity_fields_are_safe(value: &Value) -> bool {
@@ -2469,6 +2547,22 @@ mod targeted_task_correlation_tests {
             .collect()
     }
 
+    fn assert_effects_are_keyed(outputs: &[ClaudeRuntimeOutput], case: &str) {
+        for output in outputs {
+            if !output.activity.is_empty() || !output.activity_controls.is_empty() {
+                let key = output
+                    .native_event_id
+                    .as_deref()
+                    .unwrap_or_else(|| panic!("effect-producing output is unkeyed: {case}"));
+                assert!(key.len() <= 256, "oversized effect key: {case}");
+                assert!(
+                    key.starts_with("claude:control:") || key.starts_with("claude:hook:"),
+                    "unexpected effect key domain: {case}"
+                );
+            }
+        }
+    }
+
     fn permutations(values: [usize; 4]) -> Vec<[usize; 4]> {
         let mut result = Vec::new();
         for a in values {
@@ -2551,6 +2645,195 @@ mod targeted_task_correlation_tests {
     }
 
     #[test]
+    fn targeted_task_control_native_key_is_total_for_every_retirement_branch() {
+        // Mutation caught: whitespace in an accepted conflict made key derivation drop retirement.
+        let conflicts = [
+            (
+                false,
+                json!({
+                    "type":"stream_event","session_id":"session","parent_tool_use_id":null,
+                    "event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-a","name":"Bash","input":{}}}
+                }),
+            ),
+            (
+                false,
+                json!({
+                    "type":"stream_event","session_id":"session","parent_tool_use_id":"other-parent",
+                    "event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-a","name":"Agent","input":{}}}
+                }),
+            ),
+            (
+                true,
+                json!({
+                    "hook_event_name":"PostToolUse",
+                    "session_id":"session",
+                    "tool_name":"not Agent",
+                    "tool_use_id":"tool-a",
+                    "tool_response":{"status":"async_launched","agentId":"agent-a"},
+                }),
+            ),
+            (
+                true,
+                json!({
+                    "hook_event_name":"PostToolUse",
+                    "session_id":"session",
+                    "tool_name":"Agent",
+                    "tool_use_id":"tool-a",
+                    "tool_response":{"status":"not async","agentId":"agent-a"},
+                }),
+            ),
+            (
+                true,
+                json!({
+                    "hook_event_name":"PostToolUse",
+                    "session_id":"session",
+                    "tool_name":"Agent",
+                    "tool_use_id":"tool-a",
+                    "tool_response":{"status":"async_launched","agentId":"other-agent"},
+                }),
+            ),
+            (
+                true,
+                json!({
+                    "hook_event_name":"PostToolUse",
+                    "session_id":"session",
+                    "agent_id":"other-source",
+                    "tool_name":"Agent",
+                    "tool_use_id":"tool-a",
+                    "tool_response":{"status":"async_launched","agentId":"agent-a"},
+                }),
+            ),
+            (
+                false,
+                json!({
+                    "type":"system",
+                    "subtype":"task_started",
+                    "session_id":"session",
+                    "task_id":"task-a",
+                    "tool_use_id":"tool-a",
+                    "task_type":"not local agent",
+                }),
+            ),
+            (
+                false,
+                json!({
+                    "type":"system",
+                    "subtype":"task_started",
+                    "session_id":"session",
+                    "task_id":"other-task",
+                    "tool_use_id":"tool-a",
+                    "task_type":"local_agent",
+                }),
+            ),
+            (
+                true,
+                json!({
+                    "hook_event_name":"SubagentStart",
+                    "session_id":"session",
+                    "agent_id":"agent-a",
+                    "parent_agent_id":"other-parent",
+                }),
+            ),
+            (
+                true,
+                json!({
+                    "hook_event_name":"SubagentStop",
+                    "session_id":"session",
+                    "agent_id":"agent-a",
+                }),
+            ),
+        ];
+        for (authenticated, conflict) in conflicts {
+            let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+            for (index, fact) in facts("session", "tool-a", "agent-a", "task-a")
+                .iter()
+                .enumerate()
+            {
+                let _ = handle_fact(&mut runtime, fact, true, index as u64);
+            }
+            let output = handle_fact(&mut runtime, &conflict, authenticated, 10);
+            assert!(
+                output.activity_controls.iter().any(|update| matches!(
+                    update,
+                    ProviderActivityControlUpdate::ActorTarget { target: None, .. }
+                )),
+                "conflict must retire the installed target: {conflict}"
+            );
+            assert!(
+                output.native_event_id.is_some(),
+                "every effect-producing accepted conflict needs a production event key: {conflict}"
+            );
+            let key = output.native_event_id.expect("effect key checked above");
+            assert!(key.starts_with("claude:control:") || key.starts_with("claude:hook:"));
+            assert!(key.len() <= 256);
+            assert!(!key.contains("tool-a"));
+            assert!(!key.contains("agent-a"));
+            assert!(!key.contains("task-a"));
+        }
+
+        for status in ["stopped", "cancelled", "failed", "interrupted"] {
+            let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+            for (index, fact) in facts("session", "tool-a", "agent-a", "task-a")
+                .iter()
+                .enumerate()
+            {
+                let _ = handle_fact(&mut runtime, fact, true, index as u64);
+            }
+            let output = handle_fact(
+                &mut runtime,
+                &json!({
+                    "type":"system","subtype":"task_notification","session_id":"session",
+                    "task_id":"task-a","status":status,
+                }),
+                false,
+                10,
+            );
+            assert!(!output.activity_controls.is_empty());
+            assert!(output.native_event_id.is_some(), "terminal status {status}");
+        }
+    }
+
+    #[test]
+    fn targeted_task_control_native_key_presence_framing_cannot_alias_literal_root_identity() {
+        // Mutation caught: using the valid native ID `<root>` as the absence sentinel.
+        let stream_root = json!({
+            "type":"stream_event","session_id":"session","parent_tool_use_id":null,
+            "event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-a","name":"Agent","input":{}}}
+        });
+        let stream_literal = json!({
+            "type":"stream_event","session_id":"session","parent_tool_use_id":"<root>",
+            "event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"tool-a","name":"Agent","input":{}}}
+        });
+        let hook_root = json!({
+            "hook_event_name":"PostToolUse","session_id":"session","tool_name":"Agent",
+            "tool_use_id":"tool-a","tool_response":{"status":"async_launched","agentId":"agent-a"}
+        });
+        let hook_literal = json!({
+            "hook_event_name":"PostToolUse","session_id":"session","agent_id":"<root>",
+            "tool_name":"Agent","tool_use_id":"tool-a",
+            "tool_response":{"status":"async_launched","agentId":"agent-a"}
+        });
+        let start_root = json!({
+            "hook_event_name":"SubagentStart","session_id":"session","agent_id":"agent-a"
+        });
+        let start_literal = json!({
+            "hook_event_name":"SubagentStart","session_id":"session","agent_id":"agent-a",
+            "parent_agent_id":"<root>"
+        });
+        for (absent, literal) in [
+            (stream_root, stream_literal),
+            (hook_root, hook_literal),
+            (start_root, start_literal),
+        ] {
+            let absent_key = claude_control_fact_native_event_id(&absent)
+                .expect("absent/root identity is keyable");
+            let literal_key = claude_control_fact_native_event_id(&literal)
+                .expect("literal <root> remains an intentionally valid bounded native identity");
+            assert_ne!(absent_key, literal_key);
+        }
+    }
+
+    #[test]
     fn targeted_task_correlation_accepts_all_exact_identity_fact_orders_once() {
         // Mutation caught: making correlation depend on event adjacency or arrival order.
         let facts = facts("session", "tool-a", "agent-a", "task-a");
@@ -2566,6 +2849,7 @@ mod targeted_task_correlation_tests {
                 [("claude:agent:agent-a".to_owned(), "task-a".to_owned())],
                 "failed exact fact order {order:?}"
             );
+            assert_effects_are_keyed(&outputs, &format!("root install order {order:?}"));
         }
     }
 
@@ -2714,6 +2998,7 @@ mod targeted_task_correlation_tests {
                     )
                 })
         );
+        assert_effects_are_keyed(&outputs, "duplicate task assignment");
 
         let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
         let base = facts("session", "tool-a", "agent-a", "task-a");
@@ -2738,6 +3023,33 @@ mod targeted_task_correlation_tests {
                     )
                 }))
         );
+        assert_effects_are_keyed(&outputs, "conflicting launched agent");
+
+        let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+        for (index, fact) in facts("session", "tool-a", "agent-a", "task-a")
+            .iter()
+            .enumerate()
+        {
+            let _ = handle_fact(&mut runtime, fact, true, index as u64);
+        }
+        let outputs = facts("session", "tool-b", "agent-a", "task-b")
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| handle_fact(&mut runtime, fact, true, 20 + index as u64))
+            .collect::<Vec<_>>();
+        assert!(
+            outputs
+                .iter()
+                .flat_map(|output| &output.activity_controls)
+                .any(|update| matches!(
+                    update,
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id,
+                        target: None,
+                    } if actor_id == "claude:agent:agent-a"
+                ))
+        );
+        assert_effects_are_keyed(&outputs, "one actor assigned a conflicting task");
     }
 
     #[test]
@@ -2951,6 +3263,7 @@ mod targeted_task_correlation_tests {
                 )],
                 "failed exact nested fact order {order:?}"
             );
+            assert_effects_are_keyed(&outputs, &format!("nested install order {order:?}"));
         }
 
         for (name, mutate) in [
@@ -3194,6 +3507,10 @@ mod targeted_task_correlation_tests {
                     [expected],
                     "{provider_status}/{notification_first}"
                 );
+                assert_effects_are_keyed(
+                    &outputs,
+                    &format!("terminal {provider_status}/{notification_first}"),
+                );
                 assert!(
                     outputs
                         .iter()
@@ -3259,6 +3576,10 @@ mod targeted_task_correlation_tests {
                 if actor.status == ActivityLifecycle::Failed
         )));
         assert!(duplicate_stop.activity.is_empty());
+        assert_effects_are_keyed(
+            &[completed, failed, duplicate_stop],
+            "notification after ordinary stop",
+        );
         assert!(
             runtime
                 .task_control_correlator

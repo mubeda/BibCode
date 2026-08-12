@@ -10092,6 +10092,198 @@ done
     }
 
     #[tokio::test]
+    async fn claude_poison_retirements_survive_the_real_event_pump() {
+        // Mutation caught: an accepted conflicting status/type retired in memory but had no pump key.
+        let engine = supervisor_engine().await;
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let capabilities = crate::activity::ActivityCapabilities {
+            actors: true,
+            attributed_activity: true,
+            background_work: false,
+            history_recovery: crate::activity::ActivityHistoryRecovery::None,
+            terminal_observation: false,
+            targeted_actor_cancellation: false,
+        };
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            activity_capabilities: capabilities.clone(),
+            ..SupervisorDriverState::default()
+        }));
+        let (event_sender, event_receiver) = mpsc::channel(64);
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "claude");
+        launch.thread_id = "t1".to_owned();
+        let registration = Arc::new(
+            activity
+                .activity_control_registry()
+                .register_runtime_with_generation(
+                    ActivityScopeRef::Thread {
+                        thread_id: launch.thread_id.clone(),
+                    },
+                    format!("thread:{}", launch.thread_id),
+                    launch.provider_instance_id.clone(),
+                    ActivityRuntimeGeneration::new(),
+                ),
+        );
+        let activity_control = Arc::new(RwLock::new(Some(registration)));
+        let activity_lifecycle = Arc::new(StdMutex::new(
+            super::ProviderActivityLifecycleState::new(capabilities.clone()),
+        ));
+        super::ensure_live_activity_scope(
+            &activity,
+            &launch,
+            &activity_lifecycle,
+            &capabilities,
+            "claude-poison-live".to_owned(),
+        )
+        .await
+        .expect("live activity scope");
+        let driver: Arc<dyn ProviderDriver> = Arc::new(SupervisorDriver {
+            state,
+            events: tokio::sync::Mutex::new(event_receiver),
+        });
+        let (activity_dispatch_sender, _activity_dispatch_receiver) = mpsc::channel(64);
+        let (terminal_sender, _terminal_receiver) = mpsc::unbounded_channel();
+        let pump_cancellation = tokio_util::sync::CancellationToken::new();
+        let pump = super::spawn_event_pump(
+            engine.clone(),
+            driver,
+            launch,
+            None,
+            None,
+            activity.clone(),
+            activity_lifecycle,
+            true,
+            activity_control,
+            activity_dispatch_sender,
+            "claude-poison-stream-ended".to_owned(),
+            pump_cancellation.clone(),
+            None,
+            Arc::new(AtomicU64::new(0)),
+            terminal_sender,
+            Duration::from_secs(3_600),
+        );
+        let (recovery_sender, _recovery_receiver) = mpsc::channel(1);
+        let cancellation = tokio_util::sync::CancellationToken::new();
+        let slot = super::ClaudeAcknowledgementSlot::default();
+        let mut runtimes = Vec::new();
+        for index in 0..2 {
+            let session = format!("claude-poison-session-{index}");
+            let tool = format!("poison-tool-{index}");
+            let agent = format!("poison-agent-{index}");
+            let task = format!("poison-task-{index}");
+            let runtime = Arc::new(tokio::sync::Mutex::new(
+                crate::provider::claude::ClaudeProviderRuntime::new(
+                    "t1".to_owned(),
+                    session.clone(),
+                ),
+            ));
+            for (authenticated, value) in [
+                (
+                    false,
+                    json!({"type":"stream_event","session_id":session,"parent_tool_use_id":null,"event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":tool,"name":"Agent","input":{}}}}),
+                ),
+                (
+                    true,
+                    json!({"hook_event_name":"PostToolUse","session_id":session,"tool_name":"Agent","tool_use_id":tool,"tool_response":{"status":"async_launched","agentId":agent}}),
+                ),
+                (
+                    false,
+                    json!({"type":"system","subtype":"task_started","session_id":session,"task_id":task,"tool_use_id":tool,"task_type":"local_agent"}),
+                ),
+                (
+                    true,
+                    json!({"hook_event_name":"SubagentStart","session_id":session,"agent_id":agent,"agent_type":"Explore"}),
+                ),
+            ] {
+                assert!(
+                    super::emit_claude_value(
+                        &runtime,
+                        "t1",
+                        value,
+                        &event_sender,
+                        authenticated,
+                        &recovery_sender,
+                        &cancellation,
+                        &slot,
+                    )
+                    .await
+                );
+            }
+            runtimes.push((runtime, session, tool, agent, task));
+        }
+        let scope = ActivityScopeRef::Thread {
+            thread_id: "t1".to_owned(),
+        };
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = activity.snapshot(&scope).await.expect("installed snapshot");
+                if snapshot
+                    .control
+                    .actors
+                    .iter()
+                    .filter(|actor| {
+                        actor.state == crate::activity::ActivityActorControlState::Available
+                    })
+                    .count()
+                    == 2
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both targets installed");
+        for (index, (runtime, session, tool, agent, task)) in runtimes.iter().enumerate() {
+            let conflict = if index == 0 {
+                json!({"hook_event_name":"PostToolUse","session_id":session,"tool_name":"Agent","tool_use_id":tool,"tool_response":{"status":"not async","agentId":agent}})
+            } else {
+                json!({"type":"system","subtype":"task_started","session_id":session,"task_id":task,"tool_use_id":tool,"task_type":"not local agent"})
+            };
+            assert!(
+                super::emit_claude_value(
+                    runtime,
+                    "t1",
+                    conflict,
+                    &event_sender,
+                    index == 0,
+                    &recovery_sender,
+                    &cancellation,
+                    &slot,
+                )
+                .await
+            );
+        }
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = activity.snapshot(&scope).await.expect("retired snapshot");
+                if snapshot.control.actors.iter().all(|actor| {
+                    actor.state != crate::activity::ActivityActorControlState::Available
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both poison retirements survive the production pump");
+        let snapshot = activity
+            .snapshot(&scope)
+            .await
+            .expect("final poison snapshot");
+        assert_eq!(
+            snapshot.actors.len(),
+            2,
+            "conflict must not widen the graph"
+        );
+        pump_cancellation.cancel();
+        pump.await.expect("event pump shutdown");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn claude_terminal_control_keys_survive_the_real_event_pump() {
         // Mutation caught: unkeyed task notifications are dropped before lifecycle/target projection.
         let engine = supervisor_engine().await;
