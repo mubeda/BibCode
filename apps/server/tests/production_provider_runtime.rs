@@ -10124,7 +10124,7 @@ async fn claude_activity_probe_deadline_covers_resolution_and_reaps_process_tree
 
 #[cfg(unix)]
 #[tokio::test]
-async fn native_claude_startup_capabilities_follow_hook_sink_availability() {
+async fn claude_targeted_activity_startup_capabilities_follow_hook_sink_availability() {
     let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
     reset_claude_activity_probe_cache_for_test().await;
     let temp = TempDir::new().unwrap();
@@ -10165,7 +10165,7 @@ cat >/dev/null
             background_work: false,
             history_recovery: ActivityHistoryRecovery::None,
             terminal_observation: false,
-            targeted_actor_cancellation: false,
+            targeted_actor_cancellation: true,
         }
     );
     supported_driver.shutdown().await.unwrap();
@@ -10220,7 +10220,7 @@ cat >/dev/null
             background_work: false,
             history_recovery: ActivityHistoryRecovery::None,
             terminal_observation: false,
-            targeted_actor_cancellation: false,
+            targeted_actor_cancellation: true,
         }
     );
     let event = timeout(Duration::from_secs(2), driver.next_event())
@@ -10309,7 +10309,7 @@ cat >/dev/null
             background_work: false,
             history_recovery: ActivityHistoryRecovery::None,
             terminal_observation: false,
-            targeted_actor_cancellation: false,
+            targeted_actor_cancellation: true,
         }
     );
     timeout(Duration::from_secs(2), async {

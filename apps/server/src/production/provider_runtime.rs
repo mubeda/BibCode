@@ -100,6 +100,7 @@ pub type BoxRuntimeFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 const DEFAULT_QUEUE_CAPACITY: usize = 32;
 const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 128;
+const CLAUDE_CONTROL_RESPONSE_CAPACITY: usize = 128;
 const DEFAULT_SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
 const ACTIVITY_ONLY_PROVIDER_EVENT_TYPE: &str = "activity.native";
 const DELIVERY_ROUTE_FINGERPRINT_FIELD: &str = "_bibcodeProviderRouteFingerprint";
@@ -407,6 +408,8 @@ pub enum ProviderRuntimeError {
         provider: String,
         capability: &'static str,
     },
+    #[error("provider {provider} does not support targeted activity cancellation in this runtime")]
+    ActivityTargetUnsupported { provider: String },
     #[error("failed to spawn {provider} provider process: {detail}")]
     Spawn { provider: String, detail: String },
     #[error("{provider} provider operation failed: {detail}")]
@@ -486,6 +489,12 @@ enum SupervisorMessage {
         thread_id: String,
         generation: ActivityRuntimeGeneration,
         task_id: ActivityDispatchTaskId,
+    },
+    ActivityTargetUnsupported {
+        thread_id: String,
+        generation: ActivityRuntimeGeneration,
+        response: oneshot::Sender<Result<ActivityTargetDispatchDisposition, ProviderRuntimeError>>,
+        provider: String,
     },
 }
 
@@ -659,6 +668,12 @@ impl ProviderActivityLifecycleState {
             self.capabilities = capabilities;
             self.runtime_observed_capabilities = true;
         }
+    }
+
+    fn downgrade_targeted_actor_cancellation(&mut self) -> ActivityCapabilities {
+        self.capabilities.targeted_actor_cancellation = false;
+        self.runtime_observed_capabilities = true;
+        self.capabilities.clone()
     }
 }
 
@@ -967,7 +982,8 @@ impl ActivityCancellationDispatcher for ProviderRuntimeSupervisor {
                 .map_err(|error| match error {
                     ProviderRuntimeError::SessionNotFound { .. }
                     | ProviderRuntimeError::StaleSession { .. }
-                    | ProviderRuntimeError::UnsupportedCapability { .. } => {
+                    | ProviderRuntimeError::UnsupportedCapability { .. }
+                    | ProviderRuntimeError::ActivityTargetUnsupported { .. } => {
                         ActivityDispatchError::TargetUnavailable
                     }
                     _ => ActivityDispatchError::ProviderUnavailable,
@@ -2201,6 +2217,8 @@ async fn run_supervisor(
                                     entry.driver.clone(),
                                     entry.activity_dispatch_cancellation.clone(),
                                     entry.launch.thread_id.clone(),
+                                    entry.terminal_sender.clone(),
+                                    entry.activity_runtime_generation.clone(),
                                 ))
                             }
                         } else {
@@ -2215,7 +2233,7 @@ async fn run_supervisor(
                     }
                 };
                 match result {
-                    Ok((driver, dispatch_cancellation, thread_id)) => {
+                    Ok((driver, dispatch_cancellation, thread_id, terminal_sender, generation)) => {
                         let task_thread_id = thread_id.clone();
                         let task = tokio::spawn(async move {
                             let mut response = response;
@@ -2229,7 +2247,21 @@ async fn run_supervisor(
                                     }));
                                 }
                                 result = driver.cancel_activity_target(target) => {
-                                    let _ = response.send(result);
+                                    match result {
+                                        Err(ProviderRuntimeError::ActivityTargetUnsupported { provider }) => {
+                                            let _ = terminal_sender.send(
+                                                SupervisorMessage::ActivityTargetUnsupported {
+                                                    thread_id: task_thread_id,
+                                                    generation,
+                                                    response,
+                                                    provider,
+                                                },
+                                            );
+                                        }
+                                        result => {
+                                            let _ = response.send(result);
+                                        }
+                                    }
                                 }
                             }
                         });
@@ -2279,6 +2311,45 @@ async fn run_supervisor(
                     )
                     .await;
                 }
+            }
+            SupervisorMessage::ActivityTargetUnsupported {
+                thread_id,
+                generation,
+                response,
+                provider,
+            } => {
+                if let Some(entry) = sessions.get_mut(&thread_id)
+                    && entry.activity_runtime_generation == generation
+                {
+                    let registration = entry.activity_control.read().await.clone();
+                    if let Some(registration) = registration {
+                        registration.downgrade_targeted_control();
+                    }
+                    let capabilities = entry
+                        .activity_lifecycle
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .downgrade_targeted_actor_cancellation();
+                    if let Err(error) = ensure_live_activity_scope(
+                        &activity,
+                        &entry.launch,
+                        &entry.activity_lifecycle,
+                        &capabilities,
+                        format!("supervisor:targeted-unsupported:{}", Uuid::new_v4()),
+                    )
+                    .await
+                    {
+                        tracing::warn!(
+                            thread_id,
+                            %error,
+                            "targeted activity downgrade scope publication failed"
+                        );
+                    }
+                    cancel_and_reap_activity_tasks(entry).await;
+                }
+                let _ = response.send(Err(ProviderRuntimeError::ActivityTargetUnsupported {
+                    provider,
+                }));
             }
             #[cfg(test)]
             SupervisorMessage::InspectActivityRuntimeGeneration {
@@ -2932,6 +3003,7 @@ fn normalize_agent_activity_transition_error(error: ProviderRuntimeError) -> Pro
         ProviderRuntimeError::SessionAlreadyExists { .. } => "session conflict",
         ProviderRuntimeError::UnsupportedProvider { .. } => "unsupported provider",
         ProviderRuntimeError::UnsupportedCapability { .. } => "unsupported capability",
+        ProviderRuntimeError::ActivityTargetUnsupported { .. } => "targeted activity unsupported",
         ProviderRuntimeError::Spawn { .. } => "provider spawn failure",
         ProviderRuntimeError::Provider { .. } => "provider operation failure",
         ProviderRuntimeError::Persistence(_) => "persistence failure",
@@ -4852,6 +4924,28 @@ fn codex_activity_target_ids(
         })
 }
 
+fn claude_activity_target_id(
+    target: &ProviderActivityNativeTarget,
+) -> Result<&str, ProviderRuntimeError> {
+    let task_id =
+        target
+            .claude_task_id()
+            .ok_or_else(|| ProviderRuntimeError::UnsupportedCapability {
+                provider: "claude".to_owned(),
+                capability: "targeted activity cancellation",
+            })?;
+    if task_id.is_empty()
+        || task_id.chars().count() > ACTIVITY_ID_MAX_LENGTH
+        || task_id.chars().any(char::is_control)
+    {
+        return Err(ProviderRuntimeError::Provider {
+            provider: "claude".to_owned(),
+            detail: "targeted activity handle is invalid".to_owned(),
+        });
+    }
+    Ok(task_id)
+}
+
 impl CodexDriver {
     async fn spawn(
         mut request: ProviderLaunchRequest,
@@ -6012,14 +6106,43 @@ impl Drop for ClaudeAcknowledgementRegistration {
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ClaudeControlQueryError {
-    Remote,
+#[derive(Clone, PartialEq)]
+enum ClaudeControlQueryOutcome {
+    Success(Value),
+    Unsupported,
+    Timeout,
     Closed,
+    Failed,
+}
+
+impl std::fmt::Debug for ClaudeControlQueryOutcome {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Success(_) => formatter.write_str("Success(..)"),
+            Self::Unsupported => formatter.write_str("Unsupported"),
+            Self::Timeout => formatter.write_str("Timeout"),
+            Self::Closed => formatter.write_str("Closed"),
+            Self::Failed => formatter.write_str("Failed"),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClaudeControlResponseRoute {
+    NotControl,
+    Matched,
+    Mismatched,
+    Invalid,
+}
+
+impl ClaudeControlResponseRoute {
+    fn consumed(self) -> bool {
+        self != Self::NotControl
+    }
 }
 
 type ClaudeControlResponseWaiters =
-    Arc<StdMutex<HashMap<String, oneshot::Sender<Result<Value, ClaudeControlQueryError>>>>>;
+    Arc<StdMutex<HashMap<String, oneshot::Sender<ClaudeControlQueryOutcome>>>>;
 
 #[derive(Clone)]
 struct ClaudeControlResponseRouter {
@@ -6043,7 +6166,10 @@ impl ClaudeControlResponseRouter {
         }
         let (sender, receiver) = oneshot::channel();
         let mut pending = self.pending.lock().expect("Claude control response lock");
-        if self.closed.load(Ordering::Acquire) || pending.contains_key(&request_id) {
+        if self.closed.load(Ordering::Acquire)
+            || pending.len() >= CLAUDE_CONTROL_RESPONSE_CAPACITY
+            || pending.contains_key(&request_id)
+        {
             return None;
         }
         pending.insert(request_id.clone(), sender);
@@ -6054,31 +6180,38 @@ impl ClaudeControlResponseRouter {
         })
     }
 
-    fn route(&self, value: &Value) -> bool {
+    fn route(&self, value: &Value) -> ClaudeControlResponseRoute {
         if value.get("type").and_then(Value::as_str) != Some("control_response") {
-            return false;
+            return ClaudeControlResponseRoute::NotControl;
         }
         let Ok(frame) = serde_json::from_value::<ClaudeControlResponseFrame>(value.clone()) else {
-            return false;
+            return ClaudeControlResponseRoute::Invalid;
         };
         let response = frame.response;
         let result = if response.subtype == "success" && response.error.is_none() {
-            Ok(response.response)
+            ClaudeControlQueryOutcome::Success(response.response)
+        } else if response.subtype == "error"
+            && response.error.as_deref().map(str::trim)
+                == Some("Unsupported control request subtype: stop_task")
+        {
+            ClaudeControlQueryOutcome::Unsupported
         } else {
-            Err(ClaudeControlQueryError::Remote)
+            ClaudeControlQueryOutcome::Failed
         };
         let mut pending = self.pending.lock().expect("Claude control response lock");
         if let Some(sender) = pending.remove(&response.request_id) {
             let _ = sender.send(result);
+            ClaudeControlResponseRoute::Matched
+        } else {
+            ClaudeControlResponseRoute::Mismatched
         }
-        true
     }
 
     fn close(&self) {
         self.closed.store(true, Ordering::Release);
         let mut pending = self.pending.lock().expect("Claude control response lock");
         for (_, sender) in pending.drain() {
-            let _ = sender.send(Err(ClaudeControlQueryError::Closed));
+            let _ = sender.send(ClaudeControlQueryOutcome::Closed);
         }
     }
 
@@ -6094,17 +6227,17 @@ impl ClaudeControlResponseRouter {
 struct ClaudeControlResponseRegistration {
     request_id: String,
     pending: ClaudeControlResponseWaiters,
-    receiver: Option<oneshot::Receiver<Result<Value, ClaudeControlQueryError>>>,
+    receiver: Option<oneshot::Receiver<ClaudeControlQueryOutcome>>,
 }
 
 impl ClaudeControlResponseRegistration {
-    async fn receive(mut self) -> Result<Value, ClaudeControlQueryError> {
+    async fn receive(mut self) -> ClaudeControlQueryOutcome {
         let result = self
             .receiver
             .as_mut()
             .expect("Claude control response receiver")
             .await
-            .unwrap_or(Err(ClaudeControlQueryError::Closed));
+            .unwrap_or(ClaudeControlQueryOutcome::Closed);
         self.receiver = None;
         result
     }
@@ -6133,7 +6266,7 @@ async fn query_claude_context_usage(
     sequence: u64,
     timeout: Duration,
 ) -> Option<Value> {
-    query_claude_control(
+    match query_claude_control(
         provider,
         writer,
         responses,
@@ -6142,6 +6275,13 @@ async fn query_claude_context_usage(
         timeout,
     )
     .await
+    {
+        ClaudeControlQueryOutcome::Success(value) => Some(value),
+        ClaudeControlQueryOutcome::Unsupported
+        | ClaudeControlQueryOutcome::Timeout
+        | ClaudeControlQueryOutcome::Closed
+        | ClaudeControlQueryOutcome::Failed => None,
+    }
 }
 
 async fn query_claude_mcp_status(
@@ -6152,12 +6292,39 @@ async fn query_claude_mcp_status(
     sequence: u64,
     timeout: Duration,
 ) -> Option<Value> {
-    query_claude_control(
+    match query_claude_control(
         provider,
         writer,
         responses,
         cancellation,
         ClaudeControlRequest::mcp_status(sequence),
+        timeout,
+    )
+    .await
+    {
+        ClaudeControlQueryOutcome::Success(value) => Some(value),
+        ClaudeControlQueryOutcome::Unsupported
+        | ClaudeControlQueryOutcome::Timeout
+        | ClaudeControlQueryOutcome::Closed
+        | ClaudeControlQueryOutcome::Failed => None,
+    }
+}
+
+async fn query_claude_stop_task(
+    provider: &str,
+    writer: &Mutex<Box<dyn AsyncWrite + Send + Unpin>>,
+    responses: &ClaudeControlResponseRouter,
+    cancellation: &CancellationToken,
+    sequence: u64,
+    task_id: &str,
+    timeout: Duration,
+) -> ClaudeControlQueryOutcome {
+    query_claude_control(
+        provider,
+        writer,
+        responses,
+        cancellation,
+        ClaudeControlRequest::stop_task(sequence, task_id),
         timeout,
     )
     .await
@@ -6170,33 +6337,34 @@ async fn query_claude_control(
     cancellation: &CancellationToken,
     request: ClaudeControlRequest,
     timeout: Duration,
-) -> Option<Value> {
+) -> ClaudeControlQueryOutcome {
     let query = async {
-        let registration = responses.register(request.request_id().to_owned())?;
-        let mut bytes = serde_json::to_vec(&request)
-            .map_err(provider_error(provider))
-            .ok()?;
+        let Some(registration) = responses.register(request.request_id().to_owned()) else {
+            return if responses.closed.load(Ordering::Acquire) {
+                ClaudeControlQueryOutcome::Closed
+            } else {
+                ClaudeControlQueryOutcome::Failed
+            };
+        };
+        let Ok(mut bytes) = serde_json::to_vec(&request).map_err(provider_error(provider)) else {
+            return ClaudeControlQueryOutcome::Failed;
+        };
         bytes.push(b'\n');
         {
             let mut writer = writer.lock().await;
-            writer
-                .write_all(&bytes)
-                .await
-                .map_err(provider_error(provider))
-                .ok()?;
-            writer
-                .flush()
-                .await
-                .map_err(provider_error(provider))
-                .ok()?;
+            if writer.write_all(&bytes).await.is_err() || writer.flush().await.is_err() {
+                return ClaudeControlQueryOutcome::Failed;
+            }
         }
-        registration.receive().await.ok()
+        registration.receive().await
     };
 
     tokio::select! {
         biased;
-        () = cancellation.cancelled() => None,
-        result = tokio::time::timeout(timeout, query) => result.ok().flatten(),
+        () = cancellation.cancelled() => ClaudeControlQueryOutcome::Closed,
+        result = tokio::time::timeout(timeout, query) => {
+            result.unwrap_or(ClaudeControlQueryOutcome::Timeout)
+        },
     }
 }
 
@@ -6212,7 +6380,10 @@ fn claude_completion_query_turn_id(event: &ProviderEvent) -> Option<&str> {
 
 #[cfg(test)]
 mod claude_control_response_tests {
-    use super::{ClaudeControlQueryError, ClaudeControlResponseRouter};
+    use super::{
+        CLAUDE_CONTROL_RESPONSE_CAPACITY, ClaudeControlQueryOutcome, ClaudeControlResponseRoute,
+        ClaudeControlResponseRouter,
+    };
     use serde_json::json;
 
     #[tokio::test]
@@ -6222,27 +6393,37 @@ mod claude_control_response_tests {
             .register("bibcode-20".to_owned())
             .expect("registration");
 
-        assert!(router.route(&json!({
-            "type": "control_response",
-            "response": { "subtype": "success", "request_id": "other", "response": {} }
-        })));
+        assert_eq!(
+            router.route(&json!({
+                "type": "control_response",
+                "response": { "subtype": "success", "request_id": "other", "response": {} }
+            })),
+            ClaudeControlResponseRoute::Mismatched
+        );
         assert_eq!(router.pending_count(), 1);
-        assert!(router.route(&json!({
-            "type": "control_response",
-            "response": {
-                "subtype": "success",
-                "request_id": "bibcode-20",
+        assert_eq!(
+            router.route(&json!({
+                "type": "control_response",
                 "response": {
-                    "totalTokens": 31251,
-                    "maxTokens": 200000,
-                    "isAutoCompactEnabled": true
+                    "subtype": "success",
+                    "request_id": "bibcode-20",
+                    "response": {
+                        "totalTokens": 31251,
+                        "maxTokens": 200000,
+                        "isAutoCompactEnabled": true
+                    }
                 }
-            }
-        })));
+            })),
+            ClaudeControlResponseRoute::Matched
+        );
 
         assert_eq!(
-            registration.receive().await.expect("response")["totalTokens"],
-            31_251
+            registration.receive().await,
+            ClaudeControlQueryOutcome::Success(json!({
+                "totalTokens": 31251,
+                "maxTokens": 200000,
+                "isAutoCompactEnabled": true
+            }))
         );
         assert_eq!(router.pending_count(), 0);
     }
@@ -6254,20 +6435,155 @@ mod claude_control_response_tests {
             .register("bibcode-21".to_owned())
             .expect("registration");
 
-        assert!(router.route(&json!({
-            "type": "control_response",
-            "response": {
-                "subtype": "error",
-                "request_id": "bibcode-21",
-                "error": "get_context_usage is unsupported"
-            }
-        })));
+        assert_eq!(
+            router.route(&json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "error",
+                    "request_id": "bibcode-21",
+                    "error": "get_context_usage is unsupported"
+                }
+            })),
+            ClaudeControlResponseRoute::Matched
+        );
 
         assert_eq!(
             registration.receive().await,
-            Err(ClaudeControlQueryError::Remote)
+            ClaudeControlQueryOutcome::Failed
         );
         assert_eq!(router.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn classifies_only_the_protocols_exact_unsupported_control_error() {
+        // Mutation caught: downgrading targeted control after any generic Claude task failure.
+        let router = ClaudeControlResponseRouter::default();
+        let unsupported = router
+            .register("bibcode-31".to_owned())
+            .expect("unsupported registration");
+        assert_eq!(
+            router.route(&json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "error",
+                    "request_id": "bibcode-31",
+                    "error": "Unsupported control request subtype: stop_task"
+                }
+            })),
+            ClaudeControlResponseRoute::Matched
+        );
+        assert_eq!(
+            unsupported.receive().await,
+            ClaudeControlQueryOutcome::Unsupported
+        );
+
+        let failed = router
+            .register("bibcode-32".to_owned())
+            .expect("failed registration");
+        assert_eq!(
+            router.route(&json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "error",
+                    "request_id": "bibcode-32",
+                    "error": "task task-private failed"
+                }
+            })),
+            ClaudeControlResponseRoute::Matched
+        );
+        let outcome = failed.receive().await;
+        assert_eq!(outcome, ClaudeControlQueryOutcome::Failed);
+        assert_eq!(format!("{outcome:?}"), "Failed");
+    }
+
+    #[test]
+    fn mismatched_request_ids_are_consumed_without_settling_another_waiter() {
+        // Mutation caught: delivering a control response to whichever request happens to be pending.
+        let router = ClaudeControlResponseRouter::default();
+        let registration = router
+            .register("bibcode-33".to_owned())
+            .expect("registration");
+
+        assert_eq!(
+            router.route(&json!({
+                "type": "control_response",
+                "response": {
+                    "subtype": "success",
+                    "request_id": "bibcode-other",
+                    "response": {}
+                }
+            })),
+            ClaudeControlResponseRoute::Mismatched
+        );
+        assert_eq!(router.pending_count(), 1);
+        drop(registration);
+        assert_eq!(router.pending_count(), 0);
+    }
+
+    #[test]
+    fn duplicate_and_malformed_responses_are_consumed_without_leaking_or_settling_waiters() {
+        let router = ClaudeControlResponseRouter::default();
+        let registration = router
+            .register("bibcode-34".to_owned())
+            .expect("registration");
+        let response = json!({
+            "type": "control_response",
+            "response": { "subtype": "success", "request_id": "bibcode-34", "response": {} }
+        });
+        assert_eq!(router.route(&response), ClaudeControlResponseRoute::Matched);
+        assert_eq!(
+            router.route(&response),
+            ClaudeControlResponseRoute::Mismatched
+        );
+        assert_eq!(router.pending_count(), 0);
+        drop(registration);
+
+        let pending = router
+            .register("bibcode-35".to_owned())
+            .expect("pending registration");
+        assert_eq!(
+            router.route(&json!({"type": "control_response", "response": {}})),
+            ClaudeControlResponseRoute::Invalid
+        );
+        assert_eq!(router.pending_count(), 1);
+        drop(pending);
+        assert_eq!(router.pending_count(), 0);
+    }
+
+    #[test]
+    fn pending_router_is_bounded_and_releases_capacity_on_drop() {
+        let router = ClaudeControlResponseRouter::default();
+        let registrations = (0..CLAUDE_CONTROL_RESPONSE_CAPACITY)
+            .map(|index| {
+                router
+                    .register(format!("bibcode-{index}"))
+                    .expect("bounded registration")
+            })
+            .collect::<Vec<_>>();
+        assert!(router.register("bibcode-overflow".to_owned()).is_none());
+        assert_eq!(router.pending_count(), CLAUDE_CONTROL_RESPONSE_CAPACITY);
+
+        drop(registrations);
+        assert_eq!(router.pending_count(), 0);
+        assert!(router.register("bibcode-after-drop".to_owned()).is_some());
+    }
+
+    #[test]
+    fn response_debug_redacts_request_ids_and_provider_errors() {
+        let frame = serde_json::from_value::<
+            crate::provider::claude::protocol::ClaudeControlResponseFrame,
+        >(json!({
+            "response": {
+                "subtype": "error",
+                "request_id": "task-private-request",
+                "error": "raw-private-provider-error"
+            }
+        }))
+        .expect("control response");
+        let debug = format!("{frame:?}");
+        assert_eq!(debug, "ClaudeControlResponseFrame { .. }");
+        assert!(!debug.contains("task-private-request"));
+        assert!(!debug.contains("raw-private-provider-error"));
     }
 
     #[test]
@@ -6299,17 +6615,138 @@ mod claude_control_response_tests {
         router.close();
 
         assert_eq!(router.pending_count(), 0);
-        assert_eq!(first.receive().await, Err(ClaudeControlQueryError::Closed));
-        assert_eq!(second.receive().await, Err(ClaudeControlQueryError::Closed));
+        assert_eq!(first.receive().await, ClaudeControlQueryOutcome::Closed);
+        assert_eq!(second.receive().await, ClaudeControlQueryOutcome::Closed);
         assert!(router.register("bibcode-25".to_owned()).is_none());
+    }
+}
+
+#[cfg(test)]
+mod claude_stop_task_control_tests {
+    use super::{
+        ClaudeControlQueryOutcome, ClaudeControlResponseRoute, ClaudeControlResponseRouter,
+        query_claude_stop_task,
+    };
+    use serde_json::{Value, json};
+    use std::time::Duration;
+    use tokio::{
+        io::{AsyncBufReadExt, AsyncWrite, BufReader},
+        sync::Mutex,
+    };
+    use tokio_util::sync::CancellationToken;
+
+    #[tokio::test]
+    async fn stop_task_writes_the_exact_request_and_returns_typed_success() {
+        // Mutation caught: sending a root interrupt or accepting a response for another request.
+        let (writer_stream, reader_stream) = tokio::io::duplex(1_024);
+        let writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>> = Mutex::new(Box::new(writer_stream));
+        let responses = ClaudeControlResponseRouter::default();
+        let cancellation = CancellationToken::new();
+        let responder = async {
+            let mut lines = BufReader::new(reader_stream).lines();
+            let line = lines
+                .next_line()
+                .await
+                .expect("stop task read")
+                .expect("stop task line");
+            assert_eq!(
+                serde_json::from_str::<Value>(&line).expect("stop task json"),
+                json!({
+                    "type": "control_request",
+                    "request_id": "bibcode-41",
+                    "request": { "subtype": "stop_task", "task_id": "task-a" }
+                })
+            );
+            assert_eq!(
+                responses.route(&json!({
+                    "type": "control_response",
+                    "response": {
+                        "subtype": "success",
+                        "request_id": "bibcode-41",
+                        "response": {}
+                    }
+                })),
+                ClaudeControlResponseRoute::Matched
+            );
+        };
+
+        let (outcome, ()) = tokio::join!(
+            query_claude_stop_task(
+                "claude",
+                &writer,
+                &responses,
+                &cancellation,
+                41,
+                "task-a",
+                Duration::from_secs(1),
+            ),
+            responder,
+        );
+
+        assert_eq!(outcome, ClaudeControlQueryOutcome::Success(json!({})));
+        assert_eq!(responses.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stop_task_timeout_is_typed_and_releases_the_waiter() {
+        // Mutation caught: collapsing a bounded wait into an ambiguous generic failure or leak.
+        let (writer_stream, _reader_stream) = tokio::io::duplex(1_024);
+        let writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>> = Mutex::new(Box::new(writer_stream));
+        let responses = ClaudeControlResponseRouter::default();
+
+        assert_eq!(
+            query_claude_stop_task(
+                "claude",
+                &writer,
+                &responses,
+                &CancellationToken::new(),
+                42,
+                "task-a",
+                Duration::from_millis(1),
+            )
+            .await,
+            ClaudeControlQueryOutcome::Timeout
+        );
+        assert_eq!(responses.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn stop_task_closed_router_fails_before_provider_io() {
+        // Mutation caught: writing a provider request after its response router has closed.
+        let (writer_stream, reader_stream) = tokio::io::duplex(1_024);
+        let writer: Mutex<Box<dyn AsyncWrite + Send + Unpin>> = Mutex::new(Box::new(writer_stream));
+        let responses = ClaudeControlResponseRouter::default();
+        responses.close();
+
+        assert_eq!(
+            query_claude_stop_task(
+                "claude",
+                &writer,
+                &responses,
+                &CancellationToken::new(),
+                43,
+                "task-a",
+                Duration::from_secs(1),
+            )
+            .await,
+            ClaudeControlQueryOutcome::Closed
+        );
+        let mut lines = BufReader::new(reader_stream).lines();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), lines.next_line())
+                .await
+                .is_err(),
+            "closed query must not write a line"
+        );
     }
 }
 
 #[cfg(test)]
 mod claude_context_query_tests {
     use super::{
-        ClaudeControlResponseRouter, ProviderEvent, claude_completion_query_turn_id,
-        claude_provider_event, query_claude_context_usage, query_claude_mcp_status,
+        ClaudeControlResponseRoute, ClaudeControlResponseRouter, ProviderEvent,
+        claude_completion_query_turn_id, claude_provider_event, query_claude_context_usage,
+        query_claude_mcp_status,
     };
     use crate::provider::claude::{ClaudeProviderRuntime, TurnInput};
     use serde_json::{Value, json};
@@ -6342,18 +6779,21 @@ mod claude_context_query_tests {
                     "request": { "subtype": "get_context_usage" }
                 })
             );
-            assert!(responses.route(&json!({
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": "bibcode-20",
+            assert_eq!(
+                responses.route(&json!({
+                    "type": "control_response",
                     "response": {
-                        "totalTokens": 31251,
-                        "maxTokens": 200000,
-                        "isAutoCompactEnabled": true
+                        "subtype": "success",
+                        "request_id": "bibcode-20",
+                        "response": {
+                            "totalTokens": 31251,
+                            "maxTokens": 200000,
+                            "isAutoCompactEnabled": true
+                        }
                     }
-                }
-            })));
+                })),
+                ClaudeControlResponseRoute::Matched
+            );
         };
 
         let (response, ()) = tokio::join!(
@@ -6393,16 +6833,19 @@ mod claude_context_query_tests {
                     "request": { "subtype": "mcp_status" }
                 })
             );
-            assert!(responses.route(&json!({
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": "bibcode-21",
+            assert_eq!(
+                responses.route(&json!({
+                    "type": "control_response",
                     "response": {
-                        "mcpServers": [{ "name": "context7", "status": "connected" }]
+                        "subtype": "success",
+                        "request_id": "bibcode-21",
+                        "response": {
+                            "mcpServers": [{ "name": "context7", "status": "connected" }]
+                        }
                     }
-                }
-            })));
+                })),
+                ClaudeControlResponseRoute::Matched
+            );
         };
 
         let (response, ()) = tokio::join!(
@@ -6450,18 +6893,21 @@ mod claude_context_query_tests {
                 turn_id: "turn-2".to_owned(),
                 input: "second turn".to_owned(),
             });
-            assert!(responses.route(&json!({
-                "type": "control_response",
-                "response": {
-                    "subtype": "success",
-                    "request_id": "bibcode-24",
+            assert_eq!(
+                responses.route(&json!({
+                    "type": "control_response",
                     "response": {
-                        "totalTokens": 31251,
-                        "maxTokens": 200000,
-                        "isAutoCompactEnabled": true
+                        "subtype": "success",
+                        "request_id": "bibcode-24",
+                        "response": {
+                            "totalTokens": 31251,
+                            "maxTokens": 200000,
+                            "isAutoCompactEnabled": true
+                        }
                     }
-                }
-            })));
+                })),
+                ClaudeControlResponseRoute::Matched
+            );
         };
 
         let (response, ()) = tokio::join!(
@@ -6651,6 +7097,8 @@ struct ClaudeDriver {
     interaction_mode: Mutex<String>,
     options: Vec<Value>,
     supports_fast_mode: bool,
+    targeted_activity_provisionally_supported: bool,
+    targeted_activity_control_supported: AtomicBool,
     sequence: Mutex<u64>,
     attachments: AttachmentMaterializer,
     pending_acknowledgement: ClaudeAcknowledgementSlot,
@@ -7248,6 +7696,8 @@ impl ClaudeDriver {
         } else {
             None
         };
+        let targeted_activity_provisionally_supported =
+            support.include_hook_events && support.forward_subagent_text && hook_sink.is_some();
         let hook_settings = hook_sink
             .as_ref()
             .map(|sink| claude_hook_settings(&sink.endpoint));
@@ -7271,13 +7721,15 @@ impl ClaudeDriver {
             .stderr()
             .take()
             .ok_or_else(|| pipe_error(&request.provider, "stderr"))?;
-        let runtime = Arc::new(Mutex::new(
-            ClaudeProviderRuntime::new_with_agent_activity_enabled(
-                request.thread_id.clone(),
-                session_id.clone(),
-                activity_enabled,
-            ),
-        ));
+        let mut provider_runtime = ClaudeProviderRuntime::new_with_agent_activity_enabled(
+            request.thread_id.clone(),
+            session_id.clone(),
+            activity_enabled,
+        );
+        provider_runtime.set_targeted_activity_control_supported(
+            targeted_activity_provisionally_supported && activity_enabled,
+        );
+        let runtime = Arc::new(Mutex::new(provider_runtime));
         let (events_tx, events_rx) = mpsc::channel(DEFAULT_EVENT_QUEUE_CAPACITY);
         let (hook_receiver, hook_handle) = match hook_sink {
             Some(sink) => (Some(sink.receiver), Some(Arc::new(sink.handle))),
@@ -7310,6 +7762,10 @@ impl ClaudeDriver {
             interaction_mode: Mutex::new(request.interaction_mode),
             options: request.options,
             supports_fast_mode,
+            targeted_activity_provisionally_supported,
+            targeted_activity_control_supported: AtomicBool::new(
+                targeted_activity_provisionally_supported && activity_enabled,
+            ),
             sequence: Mutex::new(0),
             attachments,
             pending_acknowledgement,
@@ -7389,7 +7845,9 @@ impl ProviderDriver for ClaudeDriver {
                         background_work: false,
                         history_recovery: ActivityHistoryRecovery::None,
                         terminal_observation: false,
-                        targeted_actor_cancellation: false,
+                        targeted_actor_cancellation: self
+                            .targeted_activity_control_supported
+                            .load(Ordering::Acquire),
                     }
                 } else {
                     ActivityCapabilities::none()
@@ -7552,11 +8010,67 @@ impl ProviderDriver for ClaudeDriver {
         enabled: bool,
     ) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         Box::pin(async move {
-            self.runtime
-                .lock()
-                .await
-                .set_agent_activity_enabled(enabled);
+            let supported = enabled && self.targeted_activity_provisionally_supported;
+            self.targeted_activity_control_supported
+                .store(supported, Ordering::Release);
+            let mut runtime = self.runtime.lock().await;
+            runtime.set_agent_activity_enabled(enabled);
+            runtime.set_targeted_activity_control_supported(supported);
             Ok(())
+        })
+    }
+    fn cancel_activity_target(
+        &self,
+        target: ProviderActivityNativeTarget,
+    ) -> BoxRuntimeFuture<'_, Result<ActivityTargetDispatchDisposition, ProviderRuntimeError>> {
+        Box::pin(async move {
+            let task_id = claude_activity_target_id(&target)?.to_owned();
+            if !self
+                .targeted_activity_control_supported
+                .load(Ordering::Acquire)
+            {
+                return Err(ProviderRuntimeError::ActivityTargetUnsupported {
+                    provider: self.provider.clone(),
+                });
+            }
+            match query_claude_stop_task(
+                &self.provider,
+                &self.writer,
+                &self.control_responses,
+                &self.output.cancellation,
+                self.next_sequence().await,
+                &task_id,
+                CLAUDE_CONTEXT_QUERY_TIMEOUT,
+            )
+            .await
+            {
+                ClaudeControlQueryOutcome::Success(_) => {
+                    Ok(ActivityTargetDispatchDisposition::Delivered)
+                }
+                ClaudeControlQueryOutcome::Unsupported => {
+                    self.targeted_activity_control_supported
+                        .store(false, Ordering::Release);
+                    self.runtime
+                        .lock()
+                        .await
+                        .set_targeted_activity_control_supported(false);
+                    Err(ProviderRuntimeError::ActivityTargetUnsupported {
+                        provider: self.provider.clone(),
+                    })
+                }
+                ClaudeControlQueryOutcome::Timeout => Err(ProviderRuntimeError::Provider {
+                    provider: self.provider.clone(),
+                    detail: "targeted activity cancellation timed out".to_owned(),
+                }),
+                ClaudeControlQueryOutcome::Closed => Err(ProviderRuntimeError::Provider {
+                    provider: self.provider.clone(),
+                    detail: "targeted activity cancellation connection closed".to_owned(),
+                }),
+                ClaudeControlQueryOutcome::Failed => Err(ProviderRuntimeError::Provider {
+                    provider: self.provider.clone(),
+                    detail: "targeted activity cancellation failed".to_owned(),
+                }),
+            }
         })
     }
     fn set_interaction_mode(
@@ -7776,7 +8290,7 @@ fn spawn_claude_output(
             let Ok(value) = serde_json::from_str::<Value>(&line) else {
                 continue;
             };
-            if stdout_control_responses.route(&value) {
+            if stdout_control_responses.route(&value).consumed() {
                 continue;
             }
             if !emit_claude_value(
@@ -8579,10 +9093,10 @@ mod tests {
     use super::{ProviderDriver, ProviderDriverFactory};
     use crate::{
         activity::{
-            ActivityCancellationDispatcher, ActivityCancellationError, ActivityCancellationService,
-            ActivityDispatchError, ActivityLifecycle, ActivityRepository,
-            ActivityRuntimeGeneration, ActivityScopeRef, ProviderActivityControlUpdate,
-            ProviderActivityMutation, ProviderActivityNativeTarget,
+            ACTIVITY_ID_MAX_LENGTH, ActivityCancellationDispatcher, ActivityCancellationError,
+            ActivityCancellationService, ActivityDispatchError, ActivityLifecycle,
+            ActivityRepository, ActivityRuntimeGeneration, ActivityScopeRef,
+            ProviderActivityControlUpdate, ProviderActivityMutation, ProviderActivityNativeTarget,
         },
         diagnostics::{
             AttributionKind, AttributionScope, NativeProcessSampler, ProcessAttributionRegistry,
@@ -8618,6 +9132,20 @@ mod tests {
         sync::{RwLock, mpsc},
         time::timeout,
     };
+
+    static CLAUDE_STOP_TASK_PROBE_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    fn targeted_claude_runtime(
+        thread_id: impl Into<String>,
+        session_id: impl Into<String>,
+    ) -> crate::provider::claude::ClaudeProviderRuntime {
+        let mut runtime = crate::provider::claude::ClaudeProviderRuntime::new(
+            thread_id.into(),
+            session_id.into(),
+        );
+        runtime.set_targeted_activity_control_supported(true);
+        runtime
+    }
 
     struct CurrentDirectoryGuard {
         original: std::path::PathBuf,
@@ -8656,6 +9184,7 @@ mod tests {
         reconcile_gate: Option<Arc<tokio::sync::Notify>>,
         reconcile_started: Option<Arc<tokio::sync::Notify>>,
         targeted_calls: Vec<String>,
+        targeted_unsupported_after: Option<usize>,
         targeted_hold_after: Option<usize>,
         targeted_entered: Option<Arc<tokio::sync::Notify>>,
         targeted_release: Option<Arc<tokio::sync::Notify>>,
@@ -8788,7 +9317,7 @@ mod tests {
             Result<super::ActivityTargetDispatchDisposition, super::ProviderRuntimeError>,
         > {
             Box::pin(async move {
-                let (call_index, hold_after, entered, release, active) = {
+                let (call_index, unsupported_after, hold_after, entered, release, active) = {
                     let mut state = self.state.lock().unwrap();
                     let target_label = target
                         .codex_turn_ids()
@@ -8802,6 +9331,7 @@ mod tests {
                     state.targeted_calls.push(target_label);
                     (
                         state.targeted_calls.len(),
+                        state.targeted_unsupported_after,
                         state.targeted_hold_after,
                         state.targeted_entered.clone(),
                         state.targeted_release.clone(),
@@ -8816,6 +9346,11 @@ mod tests {
                     }
                 }
                 let _active = ActiveTarget(active);
+                if unsupported_after.is_some_and(|after| call_index >= after) {
+                    return Err(super::ProviderRuntimeError::ActivityTargetUnsupported {
+                        provider: "claudeAgent".to_owned(),
+                    });
+                }
                 if hold_after.is_some_and(|hold_after| call_index >= hold_after) {
                     if let Some(entered) = entered {
                         entered.notify_one();
@@ -9466,6 +10001,263 @@ done
         )
     }
 
+    #[cfg(unix)]
+    const CLAUDE_STOP_TASK_FIXTURE: &str = r#"#!/bin/sh
+case "$1" in
+  --version) printf '%s\n' '2.1.218'; exit 0;;
+  --help) printf '%s\n' '--include-hook-events --forward-subagent-text'; exit 0;;
+esac
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$BIBCODE_TEST_REQUEST_CAPTURE"
+  case "$line" in
+    *'"subtype":"stop_task"'*)
+      request_id=$(printf '%s\n' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+      if [ "$BIBCODE_TEST_STOP_TASK_OUTCOME" = "unsupported" ]; then
+        printf '{"type":"control_response","response":{"subtype":"error","request_id":"%s","error":"Unsupported control request subtype: stop_task"}}\n' "$request_id"
+      elif [ "$BIBCODE_TEST_STOP_TASK_OUTCOME" = "failed" ]; then
+        printf '{"type":"control_response","response":{"subtype":"error","request_id":"%s","error":"provider task-private failed with raw payload"}}\n' "$request_id"
+      elif [ "$BIBCODE_TEST_STOP_TASK_OUTCOME" = "closed" ]; then
+        exit 0
+      elif [ "$BIBCODE_TEST_STOP_TASK_OUTCOME" = "timeout" ]; then
+        :
+      else
+        printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$request_id"
+      fi
+      ;;
+  esac
+done
+"#;
+
+    #[cfg(unix)]
+    async fn claude_stop_task_driver(
+        temp: &TempDir,
+        outcome: &str,
+    ) -> (Arc<super::ClaudeDriver>, std::path::PathBuf) {
+        super::reset_claude_activity_probe_cache_for_test().await;
+        let capture = temp
+            .path()
+            .join(format!("claude-stop-task-{outcome}.jsonl"));
+        let executable = executable_fixture(
+            temp,
+            &format!("claude-stop-task-{outcome}"),
+            CLAUDE_STOP_TASK_FIXTURE,
+        );
+        let factory = super::NativeProviderDriverFactory::new(temp.path().join("attachments"));
+        let mut request = native_launch(temp, "claudeAgent");
+        request.binary_path = executable.to_string_lossy().into_owned();
+        request.environment.insert(
+            "BIBCODE_TEST_REQUEST_CAPTURE".to_owned(),
+            capture.to_string_lossy().into_owned(),
+        );
+        request.environment.insert(
+            "BIBCODE_TEST_STOP_TASK_OUTCOME".to_owned(),
+            outcome.to_owned(),
+        );
+        let driver = Arc::new(
+            super::ClaudeDriver::spawn(
+                request,
+                factory.attachments.clone(),
+                factory.attribution.clone(),
+                true,
+            )
+            .await
+            .expect("Claude stop-task driver"),
+        );
+        (driver, capture)
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_targeted_activity_writes_only_stop_task_for_the_exact_target() {
+        // Mutation caught: falling back to root interrupt or sending a foreign target variant.
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let _probe_guard = CLAUDE_STOP_TASK_PROBE_LOCK.lock().await;
+        let temp = TempDir::new().expect("Claude stop-task fixture");
+        let (driver, capture) = claude_stop_task_driver(&temp, "success").await;
+        assert!(
+            driver
+                .start()
+                .await
+                .expect("Claude start")
+                .activity_capabilities
+                .targeted_actor_cancellation
+        );
+
+        let wrong = ProviderActivityNativeTarget::codex_turn(
+            "child-thread".to_owned(),
+            "child-turn".to_owned(),
+        );
+        assert!(driver.cancel_activity_target(wrong).await.is_err());
+        assert!(
+            !capture.exists(),
+            "wrong target must fail before provider I/O"
+        );
+
+        assert_eq!(
+            driver
+                .cancel_activity_target(ProviderActivityNativeTarget::claude_task(
+                    "task-a".to_owned(),
+                ))
+                .await
+                .expect("exact stop_task"),
+            crate::activity::ActivityTargetDispatchDisposition::Delivered
+        );
+        let requests = std::fs::read_to_string(&capture).expect("captured stop_task request");
+        assert_eq!(requests.lines().count(), 1);
+        assert!(requests.contains("\"subtype\":\"stop_task\""));
+        assert!(requests.contains("\"task_id\":\"task-a\""));
+        assert!(!requests.contains("\"subtype\":\"interrupt\""));
+        driver.shutdown().await.expect("Claude shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_authoritative_unsupported_downgrades_until_a_fresh_generation() {
+        // Mutation caught: retrying provider I/O after authoritative unsupported, or persisting it forever.
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let _probe_guard = CLAUDE_STOP_TASK_PROBE_LOCK.lock().await;
+        let temp = TempDir::new().expect("Claude unsupported fixture");
+        let (driver, capture) = claude_stop_task_driver(&temp, "unsupported").await;
+        let target = || ProviderActivityNativeTarget::claude_task("task-a".to_owned());
+
+        assert!(matches!(
+            driver.cancel_activity_target(target()).await,
+            Err(super::ProviderRuntimeError::ActivityTargetUnsupported { provider })
+                if provider == "claudeAgent"
+        ));
+        assert!(matches!(
+            driver.cancel_activity_target(target()).await,
+            Err(super::ProviderRuntimeError::ActivityTargetUnsupported { provider })
+                if provider == "claudeAgent"
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&capture)
+                .expect("unsupported request")
+                .lines()
+                .count(),
+            1,
+            "the downgraded generation must fail before another provider write"
+        );
+        assert!(
+            !driver
+                .start()
+                .await
+                .expect("downgraded start state")
+                .activity_capabilities
+                .targeted_actor_cancellation
+        );
+
+        driver
+            .set_agent_activity_enabled(false)
+            .await
+            .expect("disable Activity");
+        driver
+            .set_agent_activity_enabled(true)
+            .await
+            .expect("fresh Activity generation");
+        assert!(
+            driver
+                .start()
+                .await
+                .expect("fresh generation state")
+                .activity_capabilities
+                .targeted_actor_cancellation
+        );
+        assert!(matches!(
+            driver.cancel_activity_target(target()).await,
+            Err(super::ProviderRuntimeError::ActivityTargetUnsupported { .. })
+        ));
+        assert_eq!(
+            std::fs::read_to_string(&capture)
+                .expect("fresh unsupported request")
+                .lines()
+                .count(),
+            2
+        );
+        driver.shutdown().await.expect("Claude shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_generic_stop_task_failure_does_not_downgrade_the_generation() {
+        // Mutation caught: treating every remote task failure as authoritative protocol unsupported.
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let _probe_guard = CLAUDE_STOP_TASK_PROBE_LOCK.lock().await;
+        let temp = TempDir::new().expect("Claude failure fixture");
+        let (driver, capture) = claude_stop_task_driver(&temp, "failed").await;
+        let target = || ProviderActivityNativeTarget::claude_task("task-a".to_owned());
+
+        for _ in 0..2 {
+            let error = driver
+                .cancel_activity_target(target())
+                .await
+                .expect_err("generic failure");
+            assert_eq!(
+                error.to_string(),
+                "claudeAgent provider operation failed: targeted activity cancellation failed"
+            );
+            assert!(!format!("{error:?}").contains("task-private"));
+            assert!(
+                driver
+                    .start()
+                    .await
+                    .expect("capability remains")
+                    .activity_capabilities
+                    .targeted_actor_cancellation
+            );
+        }
+        assert_eq!(
+            std::fs::read_to_string(capture)
+                .expect("failed requests")
+                .lines()
+                .count(),
+            2
+        );
+        driver.shutdown().await.expect("Claude shutdown");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn claude_timeout_and_closed_stop_task_do_not_downgrade_the_generation() {
+        // Mutation caught: permanently disabling targeted control for transient transport failures.
+        let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
+        let _probe_guard = CLAUDE_STOP_TASK_PROBE_LOCK.lock().await;
+        for (outcome, expected_detail) in [
+            ("timeout", "targeted activity cancellation timed out"),
+            ("closed", "targeted activity cancellation connection closed"),
+        ] {
+            let temp = TempDir::new().expect("Claude transport failure fixture");
+            let (driver, capture) = claude_stop_task_driver(&temp, outcome).await;
+            let error = driver
+                .cancel_activity_target(ProviderActivityNativeTarget::claude_task(
+                    "task-private".to_owned(),
+                ))
+                .await
+                .expect_err("transport failure");
+            assert_eq!(
+                error.to_string(),
+                format!("claudeAgent provider operation failed: {expected_detail}")
+            );
+            assert!(!format!("{error:?}").contains("task-private"));
+            assert!(
+                driver
+                    .start()
+                    .await
+                    .expect("capability remains provisional")
+                    .activity_capabilities
+                    .targeted_actor_cancellation
+            );
+            assert_eq!(
+                std::fs::read_to_string(capture)
+                    .expect("captured request")
+                    .lines()
+                    .count(),
+                1
+            );
+            driver.shutdown().await.expect("Claude shutdown");
+        }
+    }
+
     #[tokio::test]
     async fn claude_options_acknowledge_the_exact_launch_vector_and_restart_only_fast_changes() {
         let _process_guard = crate::process::EXTERNAL_PROCESS_TEST_LOCK.lock().await;
@@ -9751,12 +10543,10 @@ done
     #[tokio::test]
     async fn claude_exact_task_correlation_crosses_the_provider_control_bridge() {
         // Mutation caught: dropping ClaudeRuntimeOutput activity controls before projection.
-        let runtime = Arc::new(tokio::sync::Mutex::new(
-            crate::provider::claude::ClaudeProviderRuntime::new(
-                "claude-control-thread".to_owned(),
-                "claude-control-session".to_owned(),
-            ),
-        ));
+        let runtime = Arc::new(tokio::sync::Mutex::new(targeted_claude_runtime(
+            "claude-control-thread".to_owned(),
+            "claude-control-session".to_owned(),
+        )));
         let (event_sender, mut event_receiver) = tokio::sync::mpsc::channel(8);
         let (recovery_sender, _recovery_receiver) = tokio::sync::mpsc::channel(1);
         let cancellation = tokio_util::sync::CancellationToken::new();
@@ -9860,7 +10650,7 @@ done
             background_work: false,
             history_recovery: crate::activity::ActivityHistoryRecovery::None,
             terminal_observation: false,
-            targeted_actor_cancellation: false,
+            targeted_actor_cancellation: true,
         };
         let state = Arc::new(StdMutex::new(SupervisorDriverState {
             activity_capabilities: capabilities.clone(),
@@ -9942,12 +10732,10 @@ done
         }
         for (index, order) in orders.iter().enumerate() {
             let session = format!("claude-pump-session-{index}");
-            let runtime = Arc::new(tokio::sync::Mutex::new(
-                crate::provider::claude::ClaudeProviderRuntime::new(
-                    "t1".to_owned(),
-                    session.clone(),
-                ),
-            ));
+            let runtime = Arc::new(tokio::sync::Mutex::new(targeted_claude_runtime(
+                "t1".to_owned(),
+                session.clone(),
+            )));
             let tool = format!("tool-pump-{index}");
             let agent = format!("agent-pump-{index}");
             let task = format!("task-pump-{index}");
@@ -10000,12 +10788,10 @@ done
                 );
             }
         }
-        let nested_runtime = Arc::new(tokio::sync::Mutex::new(
-            crate::provider::claude::ClaudeProviderRuntime::new(
-                "t1".to_owned(),
-                "claude-pump-nested-session".to_owned(),
-            ),
-        ));
+        let nested_runtime = Arc::new(tokio::sync::Mutex::new(targeted_claude_runtime(
+            "t1".to_owned(),
+            "claude-pump-nested-session".to_owned(),
+        )));
         for (authenticated, value) in [
             (
                 false,
@@ -10104,7 +10890,7 @@ done
             background_work: false,
             history_recovery: crate::activity::ActivityHistoryRecovery::None,
             terminal_observation: false,
-            targeted_actor_cancellation: false,
+            targeted_actor_cancellation: true,
         };
         let state = Arc::new(StdMutex::new(SupervisorDriverState {
             activity_capabilities: capabilities.clone(),
@@ -10173,12 +10959,10 @@ done
             let tool = format!("poison-tool-{index}");
             let agent = format!("poison-agent-{index}");
             let task = format!("poison-task-{index}");
-            let runtime = Arc::new(tokio::sync::Mutex::new(
-                crate::provider::claude::ClaudeProviderRuntime::new(
-                    "t1".to_owned(),
-                    session.clone(),
-                ),
-            ));
+            let runtime = Arc::new(tokio::sync::Mutex::new(targeted_claude_runtime(
+                "t1".to_owned(),
+                session.clone(),
+            )));
             for (authenticated, value) in [
                 (
                     false,
@@ -11172,6 +11956,137 @@ done
         );
         assert_eq!(first.lock().unwrap().targeted_calls.len(), 1);
         assert!(second.lock().unwrap().targeted_calls.is_empty());
+
+        supervisor.shutdown().await.expect("shutdown supervisor");
+        engine.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn claude_targeted_unsupported_clears_the_current_overlay_before_returning() {
+        // Mutation caught: leaving sibling targets available or issuing another provider call after downgrade.
+        let engine = supervisor_engine().await;
+        let activity = super::ActivityProjection::new(ActivityRepository::new(
+            engine.repositories().database().clone(),
+        ));
+        let state = Arc::new(StdMutex::new(SupervisorDriverState {
+            targeted_unsupported_after: Some(1),
+            activity_capabilities: crate::activity::ActivityCapabilities {
+                actors: true,
+                attributed_activity: true,
+                background_work: false,
+                history_recovery: crate::activity::ActivityHistoryRecovery::None,
+                terminal_observation: false,
+                targeted_actor_cancellation: true,
+            },
+            ..SupervisorDriverState::default()
+        }));
+        let (events_tx, events_rx) = mpsc::channel(4);
+        let supervisor = super::ProviderRuntimeSupervisor::start(
+            engine.clone(),
+            Arc::new(SupervisorFactory {
+                state: state.clone(),
+                events: StdMutex::new(Some(events_rx)),
+            }),
+            activity.clone(),
+            super::SupervisorOptions::default(),
+        );
+        let temp = TempDir::new().expect("launch directory");
+        let mut launch = native_launch(&temp, "claudeAgent");
+        launch.thread_id = "t1".to_owned();
+        supervisor.launch(launch).await.expect("launch runtime");
+        let generation = supervisor
+            .activity_runtime_generation("t1")
+            .await
+            .expect("runtime generation");
+        events_tx
+            .send(super::ProviderEvent {
+                native_event_id: Some(
+                    super::ProviderNativeEventId::new("claude-targets".to_owned())
+                        .expect("native event id"),
+                ),
+                event_type: super::ACTIVITY_ONLY_PROVIDER_EVENT_TYPE.to_owned(),
+                thread_id: "t1".to_owned(),
+                turn_id: None,
+                request_id: None,
+                payload: json!({}),
+                activity: vec![
+                    ProviderActivityMutation::upsert_actor("actor:a", None, "A", "running")
+                        .expect("actor a"),
+                    ProviderActivityMutation::upsert_actor(
+                        "actor:b",
+                        Some("actor:a"),
+                        "B",
+                        "running",
+                    )
+                    .expect("actor b"),
+                ],
+                activity_controls: super::ProviderActivityControls::from_updates(vec![
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id: "actor:a".to_owned(),
+                        target: Some(ProviderActivityNativeTarget::claude_task(
+                            "task-a".to_owned(),
+                        )),
+                    },
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id: "actor:b".to_owned(),
+                        target: Some(ProviderActivityNativeTarget::claude_task(
+                            "task-b".to_owned(),
+                        )),
+                    },
+                ]),
+            })
+            .await
+            .expect("target batch");
+        let scope = ActivityScopeRef::Thread {
+            thread_id: "t1".to_owned(),
+        };
+        timeout(Duration::from_secs(2), async {
+            loop {
+                let snapshot = activity.snapshot(&scope).await.expect("target snapshot");
+                if snapshot.control.actors.len() == 2
+                    && snapshot.control.actors.iter().all(|actor| {
+                        actor.state == crate::activity::ActivityActorControlState::Available
+                    })
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("both Claude targets become available");
+
+        assert_eq!(
+            supervisor
+                .cancel_target(
+                    scope.clone(),
+                    generation.clone(),
+                    ProviderActivityNativeTarget::claude_task("task-a".to_owned()),
+                )
+                .await,
+            Err(ActivityDispatchError::TargetUnavailable)
+        );
+        let downgraded = activity
+            .snapshot(&scope)
+            .await
+            .expect("downgraded snapshot");
+        assert!(!downgraded.capabilities.targeted_actor_cancellation);
+        assert!(downgraded.control.actors.iter().all(|actor| {
+            actor.state == crate::activity::ActivityActorControlState::Unsupported
+        }));
+
+        assert_eq!(
+            supervisor
+                .cancel_target(
+                    scope,
+                    generation,
+                    ProviderActivityNativeTarget::claude_task("task-b".to_owned()),
+                )
+                .await,
+            Err(ActivityDispatchError::TargetUnavailable)
+        );
+        assert_eq!(state.lock().unwrap().targeted_calls.len(), 1);
+        assert_eq!(state.lock().unwrap().interrupts, 0);
 
         supervisor.shutdown().await.expect("shutdown supervisor");
         engine.shutdown().await;
@@ -14610,6 +15525,28 @@ done
                 capability: "targeted activity cancellation",
             }) if provider == "codex"
         ));
+    }
+
+    #[test]
+    fn claude_targeted_activity_accepts_only_bounded_exact_task_handles() {
+        // Mutation caught: routing a Codex turn, empty/oversized ID, or control character to Claude.
+        let claude = ProviderActivityNativeTarget::claude_task("task-1".to_owned());
+        assert_eq!(
+            super::claude_activity_target_id(&claude).expect("exact Claude target"),
+            "task-1"
+        );
+
+        for invalid in [
+            ProviderActivityNativeTarget::codex_turn(
+                "child-thread".to_owned(),
+                "child-turn".to_owned(),
+            ),
+            ProviderActivityNativeTarget::claude_task(String::new()),
+            ProviderActivityNativeTarget::claude_task("x".repeat(ACTIVITY_ID_MAX_LENGTH + 1)),
+            ProviderActivityNativeTarget::claude_task("task\nprivate".to_owned()),
+        ] {
+            assert!(super::claude_activity_target_id(&invalid).is_err());
+        }
     }
 
     #[test]

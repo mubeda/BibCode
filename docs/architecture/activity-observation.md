@@ -96,6 +96,20 @@ The current runtime registration owns its overlay generation: its lifecycle
 cleanup removes that generation with one bounded removal delta, while a
 superseded registration cannot remove its replacement.
 
+Claude targeted dispatch is provisional for a runtime generation only when its
+bounded compatibility probe proves both required hook switches and the private
+hook sink starts. An exact current `ClaudeTask` handle dispatches one correlated
+`stop_task` control request; foreign target variants, root, foreground, and
+unmapped actors fail before provider I/O, and root interrupt is never a
+fallback. The response router is bounded and request-ID correlated. Only
+Claude's exact unsupported-control protocol response authoritatively downgrades
+the current generation. That transition clears every exact target and pending
+operation, publishes targeted cancellation as unsupported, and cancels and
+reaps in-flight dispatch work before returning. Later clicks in the same
+generation fail before provider I/O; timeout, connection close, and generic
+provider failures do not downgrade. A replaced or re-enabled runtime begins a
+fresh provisional generation and must prove its targets again.
+
 Structured provider batches install and reconcile their private control handles
 after validating the native event identity and before projecting display
 mutations. Any cancellation jobs discovered for late descendants start only
@@ -208,6 +222,10 @@ generation, or saturation. Its target updates share the provider event batch
 with the canonical actor mutation; native identities remain private and
 redacted. `task_notification(stopped)` monotonically cancels the mapped actor
 and retires its handle, so later hook completion cannot rewrite cancellation.
+When targeted dispatch is provisionally supported, the exact handle maps to the
+Claude stream-JSON `stop_task` control subtype. Authoritative unsupported
+responses revoke all such handles for that runtime generation without changing
+ordinary Claude chat or observation.
 
 | Provider | Structured chat activity                                                                                              | Provider-terminal observation                                                                                                              | Recovery and truthful downgrade                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | -------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |

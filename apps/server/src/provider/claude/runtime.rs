@@ -1,5 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
+    fmt,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -77,7 +78,7 @@ pub struct LaunchRequest {
     pub executable: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClaudeControlRequest {
     #[serde(rename = "type")]
     message_type: String,
@@ -85,7 +86,7 @@ pub struct ClaudeControlRequest {
     request: ControlRequestBody,
 }
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "subtype", rename_all = "snake_case")]
 pub enum ControlRequestBody {
     Interrupt,
@@ -93,6 +94,29 @@ pub enum ControlRequestBody {
     CancelRequest { request_id: String },
     GetContextUsage,
     McpStatus,
+    StopTask { task_id: String },
+}
+
+impl fmt::Debug for ClaudeControlRequest {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ClaudeControlRequest { .. }")
+    }
+}
+
+impl fmt::Debug for ControlRequestBody {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Interrupt => formatter.write_str("Interrupt"),
+            Self::SetPermissionMode { mode } => formatter
+                .debug_struct("SetPermissionMode")
+                .field("mode", mode)
+                .finish(),
+            Self::CancelRequest { .. } => formatter.write_str("CancelRequest { .. }"),
+            Self::GetContextUsage => formatter.write_str("GetContextUsage"),
+            Self::McpStatus => formatter.write_str("McpStatus"),
+            Self::StopTask { .. } => formatter.write_str("StopTask { .. }"),
+        }
+    }
 }
 
 impl ClaudeControlRequest {
@@ -138,8 +162,37 @@ impl ClaudeControlRequest {
         }
     }
 
+    pub fn stop_task(sequence: u64, task_id: &str) -> Self {
+        Self {
+            message_type: "control_request".to_owned(),
+            request_id: format!("bibcode-{sequence}"),
+            request: ControlRequestBody::StopTask {
+                task_id: task_id.to_owned(),
+            },
+        }
+    }
+
     pub fn request_id(&self) -> &str {
         &self.request_id
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::ClaudeControlRequest;
+    use serde_json::json;
+
+    #[test]
+    fn stop_task_serializes_the_exact_private_control_shape() {
+        assert_eq!(
+            serde_json::to_value(ClaudeControlRequest::stop_task(41, "task-a"))
+                .expect("stop_task request"),
+            json!({
+                "type": "control_request",
+                "request_id": "bibcode-41",
+                "request": { "subtype": "stop_task", "task_id": "task-a" }
+            })
+        );
     }
 }
 
@@ -920,6 +973,7 @@ pub struct ClaudeProviderRuntime {
     activity_generation: u64,
     activity_not_before_unix_nanos: i128,
     correlated_activity_enabled: bool,
+    targeted_activity_control_supported: bool,
     token_usage: ClaudeTokenUsageState,
     last_mcp_status: Option<Vec<Value>>,
 }
@@ -950,6 +1004,7 @@ impl ClaudeProviderRuntime {
             activity_generation: 0,
             activity_not_before_unix_nanos: i128::MIN,
             correlated_activity_enabled: false,
+            targeted_activity_control_supported: false,
             token_usage: ClaudeTokenUsageState::default(),
             last_mcp_status: None,
         }
@@ -968,6 +1023,10 @@ impl ClaudeProviderRuntime {
             self.activity_not_before_unix_nanos = current_unix_nanos();
             self.correlated_activity_enabled = false;
         }
+    }
+
+    pub(crate) fn set_targeted_activity_control_supported(&mut self, supported: bool) {
+        self.targeted_activity_control_supported = supported;
     }
 
     pub fn build_launch_request(input: LaunchRequestInput) -> LaunchRequest {
@@ -1134,7 +1193,7 @@ impl ClaudeProviderRuntime {
                             background_work: false,
                             history_recovery: ActivityHistoryRecovery::None,
                             terminal_observation: false,
-                            targeted_actor_cancellation: false,
+                            targeted_actor_cancellation: self.targeted_activity_control_supported,
                         },
                         observation_state: ActivityObservationState::Live,
                     },
@@ -1324,6 +1383,9 @@ impl ClaudeProviderRuntime {
         for effect in effects {
             match effect {
                 ClaudeTaskControlEffect::Install { agent_id, task_id } => {
+                    if !self.targeted_activity_control_supported {
+                        continue;
+                    }
                     let Some(actor_id) = canonical_actor_id(&agent_id) else {
                         continue;
                     };
@@ -1412,7 +1474,7 @@ impl ClaudeProviderRuntime {
                 background_work: false,
                 history_recovery: ActivityHistoryRecovery::Bounded,
                 terminal_observation: false,
-                targeted_actor_cancellation: false,
+                targeted_actor_cancellation: self.targeted_activity_control_supported,
             },
             observation_state: ActivityObservationState::Live,
         });
@@ -2523,11 +2585,32 @@ mod targeted_task_correlation_tests {
         authenticated_hook: bool,
         at: u64,
     ) -> ClaudeRuntimeOutput {
+        runtime.set_targeted_activity_control_supported(true);
         if authenticated_hook && value.get("hook_event_name").is_some() {
             runtime.handle_authenticated_hook_value(value, at)
         } else {
             runtime.handle_raw_value(value, at)
         }
+    }
+
+    #[test]
+    fn targeted_task_control_does_not_reinstall_after_runtime_downgrade() {
+        // Mutation caught: allowing later provider facts to restore a target in a downgraded generation.
+        let mut runtime = ClaudeProviderRuntime::new("thread".to_owned(), "session".to_owned());
+        runtime.set_targeted_activity_control_supported(false);
+        let outputs = facts("session", "tool-a", "agent-a", "task-a")
+            .iter()
+            .enumerate()
+            .map(|(index, fact)| {
+                if fact.get("hook_event_name").is_some() {
+                    runtime.handle_authenticated_hook_value(fact, index as u64)
+                } else {
+                    runtime.handle_raw_value(fact, index as u64)
+                }
+            })
+            .collect::<Vec<_>>();
+
+        assert!(mapped_targets(&outputs).is_empty());
     }
 
     fn mapped_targets(outputs: &[ClaudeRuntimeOutput]) -> Vec<(String, String)> {

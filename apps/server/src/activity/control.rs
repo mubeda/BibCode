@@ -384,6 +384,65 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn authoritative_runtime_downgrade_clears_every_exact_target_and_operation() {
+        // Mutation caught: leaving another Claude actor clickable after this generation rejects stop_task.
+        let registry = ActivityControlRegistry::new();
+        let registration = registry.register_runtime(
+            thread_scope(),
+            "scope-control".to_owned(),
+            Some("claudeAgent".to_owned()),
+        );
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[
+                    running_actor("actor-a", None),
+                    running_actor("actor-b", Some("actor-a")),
+                ],
+                &[
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id: "actor-a".to_owned(),
+                        target: Some(ProviderActivityNativeTarget::claude_task(
+                            "task-a".to_owned(),
+                        )),
+                    },
+                    ProviderActivityControlUpdate::ActorTarget {
+                        actor_id: "actor-b".to_owned(),
+                        target: Some(ProviderActivityNativeTarget::claude_task(
+                            "task-b".to_owned(),
+                        )),
+                    },
+                ],
+            )
+            .await;
+        assert!(registration.downgrade_targeted_control());
+
+        let snapshot = registry.snapshot("scope-control").await;
+        assert!(snapshot.actors.iter().all(|actor| {
+            actor.state == ActivityActorControlState::Unsupported && actor.control_revision == 2
+        }));
+        assert!(snapshot.operations.is_empty());
+        registry
+            .observe_provider_batch(
+                &registration,
+                &[],
+                &[ProviderActivityControlUpdate::ActorTarget {
+                    actor_id: "actor-b".to_owned(),
+                    target: Some(ProviderActivityNativeTarget::claude_task(
+                        "queued-before-downgrade".to_owned(),
+                    )),
+                }],
+            )
+            .await;
+        assert_eq!(
+            actor(&registry.snapshot("scope-control").await, "actor-b").state,
+            ActivityActorControlState::Unsupported,
+            "a provider batch already queued before downgrade must not reinstall a target"
+        );
+        assert!(!registration.downgrade_targeted_control());
+    }
+
+    #[tokio::test]
     async fn oversized_runtime_replacement_is_rejected_without_mutating_state_or_revision() {
         // Mutation caught: publishing an over-256 control delta while replacing a runtime.
         let registry = ActivityControlRegistry::new();
@@ -683,6 +742,45 @@ impl ActivityRuntimeControlRegistration {
     pub(crate) fn generation(&self) -> ActivityRuntimeGeneration {
         self.generation.clone()
     }
+
+    pub(crate) fn downgrade_targeted_control(&self) -> bool {
+        let Some(inner) = self.inner.upgrade() else {
+            return false;
+        };
+        let mut state = inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let Some(scope) = state.scopes.get_mut(&self.scope_id) else {
+            return false;
+        };
+        if scope.generation != self.generation {
+            return false;
+        }
+        let mut staged = scope.clone();
+        let mut changed = staged.targeted_control_supported || !staged.operations.is_empty();
+        staged.targeted_control_supported = false;
+        staged.operations.clear();
+        for actor in staged.actors.values_mut() {
+            if actor.target.take().is_some() {
+                actor.control_revision = actor.control_revision.saturating_add(1);
+                changed = true;
+            }
+        }
+        for work_item in staged.work_items.values_mut() {
+            changed |= work_item.target.take().is_some();
+        }
+        if !changed {
+            return false;
+        }
+        let Ok(changes) = staged.pending_changes(scope) else {
+            return false;
+        };
+        *scope = staged;
+        if let Some(event) = scope.publish_changes(changes) {
+            self.publisher.send_delta(event);
+        }
+        true
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -771,6 +869,7 @@ pub(super) struct ActivityControlScope {
     pub(super) generation: ActivityRuntimeGeneration,
     _provider_instance_id: Option<String>,
     revision: u64,
+    targeted_control_supported: bool,
     pub(super) actors: BTreeMap<String, ActivityControlActor>,
     pub(super) work_items: BTreeMap<String, ActivityControlWorkItem>,
     pub(super) operations: BTreeMap<String, CancellationOperation>,
@@ -836,6 +935,7 @@ impl ActivityControlRegistry {
                 staged.generation = generation.clone();
                 staged.scope = scope;
                 staged._provider_instance_id = provider_instance_id;
+                staged.targeted_control_supported = true;
                 for actor in staged.actors.values_mut() {
                     if actor.target.take().is_some() {
                         actor.control_revision = actor.control_revision.saturating_add(1);
@@ -867,6 +967,7 @@ impl ActivityControlRegistry {
                         generation: generation.clone(),
                         _provider_instance_id: provider_instance_id,
                         revision: 0,
+                        targeted_control_supported: true,
                         actors: BTreeMap::new(),
                         work_items: BTreeMap::new(),
                         operations: BTreeMap::new(),
@@ -1119,6 +1220,7 @@ impl ActivityControlScope {
                         continue;
                     };
                     let target = if matches!(self.scope, ActivityScopeRef::Thread { .. })
+                        && self.targeted_control_supported
                         && !actor.status.is_terminal()
                     {
                         target.clone()
@@ -1138,6 +1240,7 @@ impl ActivityControlScope {
                         continue;
                     };
                     work_item.target = if matches!(self.scope, ActivityScopeRef::Thread { .. })
+                        && self.targeted_control_supported
                         && !work_item.status.is_terminal()
                         && work_item.owner_actor_id.is_some()
                     {
@@ -1585,6 +1688,7 @@ impl ActivityControlScope {
             generation: self.generation.clone(),
             _provider_instance_id: None,
             revision: self.revision,
+            targeted_control_supported: false,
             actors: BTreeMap::new(),
             work_items: BTreeMap::new(),
             operations: BTreeMap::new(),
