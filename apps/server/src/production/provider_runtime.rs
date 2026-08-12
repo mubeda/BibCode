@@ -220,8 +220,14 @@ impl ProviderActivityControls {
         std::mem::take(&mut self.0)
     }
 
-    fn is_empty(&self) -> bool {
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
         self.0.is_empty()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.0.len()
     }
 
     #[cfg(test)]
@@ -4836,6 +4842,17 @@ struct CodexDriver {
     attachments: AttachmentMaterializer,
 }
 
+fn codex_activity_target_ids(
+    target: &ProviderActivityNativeTarget,
+) -> Result<(&str, &str), ProviderRuntimeError> {
+    target
+        .codex_turn_ids()
+        .ok_or_else(|| ProviderRuntimeError::UnsupportedCapability {
+            provider: "codex".to_owned(),
+            capability: "targeted activity cancellation",
+        })
+}
+
 impl CodexDriver {
     async fn spawn(
         mut request: ProviderLaunchRequest,
@@ -4958,7 +4975,7 @@ impl ProviderDriver for CodexDriver {
                     background_work: false,
                     history_recovery: ActivityHistoryRecovery::None,
                     terminal_observation: false,
-                    targeted_actor_cancellation: false,
+                    targeted_actor_cancellation: true,
                 },
             })
         })
@@ -5079,6 +5096,19 @@ impl ProviderDriver for CodexDriver {
             Ok(())
         })
     }
+    fn cancel_activity_target(
+        &self,
+        target: ProviderActivityNativeTarget,
+    ) -> BoxRuntimeFuture<'_, Result<ActivityTargetDispatchDisposition, ProviderRuntimeError>> {
+        Box::pin(async move {
+            let (thread_id, turn_id) = codex_activity_target_ids(&target)?;
+            self.runtime
+                .interrupt_targeted_turn(thread_id, turn_id)
+                .await
+                .map_err(provider_error("codex"))?;
+            Ok(ActivityTargetDispatchDisposition::Delivered)
+        })
+    }
     fn set_model(&self, _model: String) -> BoxRuntimeFuture<'_, Result<(), ProviderRuntimeError>> {
         unsupported("codex", "post-start model changes")
     }
@@ -5151,7 +5181,7 @@ impl ProviderDriver for CodexDriver {
                 request_id: event.request_id,
                 payload: event.payload,
                 activity: event.activity,
-                activity_controls: Default::default(),
+                activity_controls: ProviderActivityControls(event.activity_controls),
             })
         })
     }
@@ -13831,6 +13861,28 @@ done
             super::event_activity_shape("turn.completed"),
             ("info", "provider.turn")
         );
+    }
+
+    #[test]
+    fn codex_targeted_activity_accepts_only_exact_codex_turn_handles() {
+        // Mutation caught: routing another provider's target into Codex or widening to root interrupt.
+        let codex = ProviderActivityNativeTarget::codex_turn(
+            "child-thread-2".to_owned(),
+            "child-turn-7".to_owned(),
+        );
+        assert_eq!(
+            super::codex_activity_target_ids(&codex).expect("exact Codex target"),
+            ("child-thread-2", "child-turn-7")
+        );
+
+        let claude = ProviderActivityNativeTarget::claude_task("task-1".to_owned());
+        assert!(matches!(
+            super::codex_activity_target_ids(&claude),
+            Err(super::ProviderRuntimeError::UnsupportedCapability {
+                provider,
+                capability: "targeted activity cancellation",
+            }) if provider == "codex"
+        ));
     }
 
     #[test]

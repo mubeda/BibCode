@@ -9046,6 +9046,234 @@ async fn codex_runtime_and_probe_reject_invalid_provider_payloads() {
     resume_task.await.expect("resume peer");
 }
 
+#[tokio::test]
+async fn targeted_cancel_interrupts_only_the_verified_active_child_turn() {
+    // Mutation caught: reusing the root composer interrupt or dispatching stale child handles.
+    let (connection, _protocol_incoming, mut peer) = scripted_peer();
+    let runtime = CodexSessionRuntime::new(
+        CodexSessionOptions {
+            version: "0.1.1".to_owned(),
+            thread_id: "fixture-thread".to_owned(),
+            cwd: "/tmp/project".to_owned(),
+            runtime_mode: CodexRuntimeMode::FullAccess,
+            model: Some("gpt-5.3-codex".to_owned()),
+            service_tier: None,
+            effort: None,
+            resume_cursor: None,
+        },
+        connection,
+        _protocol_incoming,
+    );
+    peer.expect_request("initialize", fixture("initialize-params.json"))
+        .respond(json!({}));
+    peer.expect_notification("initialized");
+    peer.expect_request(
+        "thread/start",
+        json!({
+            "cwd": "/tmp/project",
+            "approvalPolicy": "never",
+            "sandbox": "danger-full-access",
+            "model": "gpt-5.3-codex",
+            "serviceTier": null,
+        }),
+    )
+    .respond(json!({
+        "thread": {"id": "provider-root"},
+        "cwd": "/tmp/project",
+        "model": "gpt-5.3-codex"
+    }))
+    .emit_notification(json!({
+        "method": "thread/started",
+        "emittedAtMs": 1_000,
+        "params": {"thread": {"id": "provider-root"}}
+    }));
+    peer.expect_request(
+        "thread/read",
+        json!({"threadId": "provider-root", "includeTurns": true}),
+    )
+    .respond(empty_root_thread_read_result());
+    peer.expect_request(
+        "thread/list",
+        json!({"ancestorThreadId": "provider-root", "limit": 50}),
+    )
+    .respond(json!({
+        "data": [
+            {
+                "id": "child-thread-1",
+                "parentThreadId": "provider-root",
+                "createdAt": 2,
+                "updatedAt": 3,
+                "status": {"type": "active", "activeFlags": []}
+            },
+            {
+                "id": "child-thread-2",
+                "parentThreadId": "child-thread-1",
+                "createdAt": 3,
+                "updatedAt": 4,
+                "status": {"type": "active", "activeFlags": []}
+            }
+        ],
+        "nextCursor": null,
+        "backwardsCursor": null
+    }));
+    peer.expect_request(
+        "thread/read",
+        json!({"threadId": "child-thread-1", "includeTurns": true}),
+    )
+    .respond(json!({
+        "thread": {
+            "id": "child-thread-1",
+            "parentThreadId": "provider-root",
+            "createdAt": 2,
+            "updatedAt": 3,
+            "status": {"type": "active", "activeFlags": []},
+            "turns": [{"id": "child-turn-3", "status": "inProgress", "startedAt": 3, "items": []}]
+        }
+    }));
+    peer.expect_request(
+        "thread/read",
+        json!({"threadId": "child-thread-2", "includeTurns": true}),
+    )
+    .respond(json!({
+        "thread": {
+            "id": "child-thread-2",
+            "parentThreadId": "child-thread-1",
+            "createdAt": 3,
+            "updatedAt": 4,
+            "status": {"type": "active", "activeFlags": []},
+            "turns": [{"id": "child-turn-7", "status": "inProgress", "startedAt": 4, "items": []}]
+        }
+    }));
+    peer.expect_request(
+        "thread/backgroundTerminals/list",
+        json!({"threadId": "provider-root", "limit": 128}),
+    )
+    .respond(empty_background_terminal_list_result());
+    peer.expect_request(
+        "turn/interrupt",
+        json!({
+            "threadId": "child-thread-2",
+            "turnId": "child-turn-7"
+        }),
+    )
+    .respond(json!({}))
+    .emit_notification(json!({
+        "method": "turn/completed",
+        "emittedAtMs": 5_000,
+        "params": {
+            "threadId": "child-thread-2",
+            "turn": {"id": "child-turn-7", "status": "completed", "completedAt": 5}
+        }
+    }));
+    peer.expect_request(
+        "thread/read",
+        json!({"threadId": "provider-root", "includeTurns": true}),
+    )
+    .respond(empty_root_thread_read_result());
+    peer.expect_request(
+        "thread/list",
+        json!({"ancestorThreadId": "provider-root", "limit": 50}),
+    )
+    .respond(json!({
+        "data": [
+            {
+                "id": "child-thread-1",
+                "parentThreadId": "provider-root",
+                "createdAt": 2,
+                "updatedAt": 3,
+                "status": {"type": "active", "activeFlags": []}
+            },
+            {
+                "id": "child-thread-2",
+                "parentThreadId": "child-thread-1",
+                "createdAt": 3,
+                "updatedAt": 4,
+                "status": {"type": "idle"}
+            }
+        ],
+        "nextCursor": null,
+        "backwardsCursor": null
+    }));
+    peer.expect_request(
+        "thread/backgroundTerminals/list",
+        json!({"threadId": "provider-root", "limit": 128}),
+    )
+    .respond(empty_background_terminal_list_result())
+    .emit_notification(json!({
+        "method": "turn/started",
+        "emittedAtMs": 6_000,
+        "params": {
+            "threadId": "child-thread-2",
+            "turn": {"id": "child-turn-8", "status": "inProgress", "startedAt": 6}
+        }
+    }));
+    peer.expect_request(
+        "turn/interrupt",
+        json!({
+            "threadId": "child-thread-2",
+            "turnId": "child-turn-8"
+        }),
+    )
+    .respond_error(json!({
+        "code": -32000,
+        "message": "provider refused exact child interrupt",
+        "data": null
+    }));
+    peer.expect_request("shutdown", Value::Null)
+        .respond(Value::Null);
+    let peer_task = tokio::spawn(peer.run());
+
+    runtime.start().await.expect("runtime starts");
+    next_codex_event_matching(&runtime, |event| {
+        event.native_event_id.as_deref() == Some("codex:reconciliation:0")
+    })
+    .await;
+
+    let root_error = runtime
+        .interrupt_targeted_turn("provider-root", "root-turn")
+        .await
+        .expect_err("root thread must never be a targeted child");
+    assert!(root_error.to_string().contains("root"));
+    let oversized_error = runtime
+        .interrupt_targeted_turn(&"x".repeat(257), "child-turn-7")
+        .await
+        .expect_err("oversized native id must fail closed");
+    assert!(oversized_error.to_string().contains("bound"));
+
+    runtime
+        .interrupt_targeted_turn("child-thread-2", "child-turn-7")
+        .await
+        .expect("exact nested child interrupt");
+    next_codex_event_matching(&runtime, |event| {
+        event.native_event_id.as_deref() == Some("codex:reconciliation:1")
+    })
+    .await;
+
+    next_codex_event_matching(&runtime, |event| {
+        event.event_type == "activity.native"
+            && event.native_event_id.as_deref() == Some("codex:activity:2")
+    })
+    .await;
+    let stale_error = runtime
+        .interrupt_targeted_turn("child-thread-2", "child-turn-7")
+        .await
+        .expect_err("naturally completed target must be stale before provider I/O");
+    assert!(stale_error.to_string().contains("active"));
+
+    let provider_error = runtime
+        .interrupt_targeted_turn("child-thread-2", "child-turn-8")
+        .await
+        .expect_err("provider error must propagate");
+    assert!(
+        provider_error
+            .to_string()
+            .contains("provider refused exact child interrupt")
+    );
+
+    runtime.shutdown().await.expect("runtime shuts down");
+    peer_task.await.expect("peer");
+}
+
 fn codex_invalid_options(resume_cursor: Option<&str>) -> CodexSessionOptions {
     CodexSessionOptions {
         version: "0.1.1".to_owned(),
