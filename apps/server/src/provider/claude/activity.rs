@@ -139,6 +139,8 @@ pub(crate) struct ClaudeActivityTracker {
     root_session_id: String,
     root_session_key: String,
     actors: HashMap<String, ClaudeActorState>,
+    terminal_actors: HashMap<String, ClaudeActorState>,
+    terminal_actor_order: VecDeque<String>,
     tool_owner_by_use_id: HashMap<String, ToolLifecycle>,
     terminal_actor_keys: BoundedSeenSet,
     seen_events: BoundedSeenSet,
@@ -151,6 +153,8 @@ impl ClaudeActivityTracker {
             root_session_id: root_session_id.to_owned(),
             root_session_key: session_key(root_session_id),
             actors: HashMap::new(),
+            terminal_actors: HashMap::new(),
+            terminal_actor_order: VecDeque::new(),
             tool_owner_by_use_id: HashMap::new(),
             terminal_actor_keys: BoundedSeenSet::default(),
             seen_events: BoundedSeenSet::default(),
@@ -522,11 +526,63 @@ impl ClaudeActivityTracker {
         }
         self.terminal_actor_keys.insert(agent_key);
         self.actors.remove(agent_key);
+        self.insert_terminal_actor(agent_key.to_owned(), candidate);
         self.tool_owner_by_use_id
             .retain(|_, lifecycle| lifecycle.owner_key != agent_key);
         let mut output = ClaudeActivityOutput::default();
         output.push(ProviderActivityMutation::UpsertActor(summary));
         output
+    }
+
+    pub(crate) fn handle_task_stopped(
+        &mut self,
+        agent_id: &str,
+        emitted_at_ms: u64,
+    ) -> ClaudeActivityOutput {
+        let agent_key = retained_key("agent", agent_id);
+        let actor = self
+            .actors
+            .get(&agent_key)
+            .or_else(|| self.terminal_actors.get(&agent_key));
+        let Some(actor) = actor else {
+            return ClaudeActivityOutput::default();
+        };
+        if matches!(
+            actor.status,
+            ActivityLifecycle::Cancelled
+                | ActivityLifecycle::Interrupted
+                | ActivityLifecycle::Failed
+        ) {
+            return ClaudeActivityOutput::default();
+        }
+        let timestamp = unix_millis_to_timestamp(emitted_at_ms);
+        let mut candidate = actor.clone();
+        candidate.status = ActivityLifecycle::Cancelled;
+        candidate.updated_at.clone_from(&timestamp);
+        candidate.terminal_at = Some(timestamp);
+        let Some(summary) = candidate.to_summary() else {
+            return ClaudeActivityOutput::default();
+        };
+        self.terminal_actor_keys.insert(&agent_key);
+        self.actors.remove(&agent_key);
+        self.insert_terminal_actor(agent_key.clone(), candidate);
+        self.tool_owner_by_use_id
+            .retain(|_, lifecycle| lifecycle.owner_key != agent_key);
+        let mut output = ClaudeActivityOutput::default();
+        output.push(ProviderActivityMutation::UpsertActor(summary));
+        output
+    }
+
+    fn insert_terminal_actor(&mut self, agent_key: String, actor: ClaudeActorState) {
+        if !self.terminal_actors.contains_key(&agent_key) {
+            while self.terminal_actor_order.len() >= MAX_TRACKED_ACTORS {
+                if let Some(evicted) = self.terminal_actor_order.pop_front() {
+                    self.terminal_actors.remove(&evicted);
+                }
+            }
+            self.terminal_actor_order.push_back(agent_key.clone());
+        }
+        self.terminal_actors.insert(agent_key, actor);
     }
 
     fn handle_pre_tool(
@@ -812,7 +868,7 @@ fn contains_environment_assignment(value: &str) -> bool {
     })
 }
 
-fn canonical_actor_id(agent_id: &str) -> Option<String> {
+pub(crate) fn canonical_actor_id(agent_id: &str) -> Option<String> {
     canonical_native_id("claude:agent:", agent_id)
 }
 

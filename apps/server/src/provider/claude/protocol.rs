@@ -5,9 +5,17 @@ use serde_json::Value;
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ClaudeMessage {
     StreamEvent(StreamEventMessage),
+    System(SystemMessage),
     User(UserMessage),
     Assistant(AssistantMessage),
     Result(ResultMessage),
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "subtype", rename_all = "snake_case")]
+pub enum SystemMessage {
+    TaskStarted(ClaudeTaskStartedMessage),
+    TaskNotification(ClaudeTaskNotificationMessage),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -133,4 +141,19 @@ pub(crate) struct ClaudeControlResponse {
     #[serde(default)]
     pub response: Value,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeTaskStartedMessage {
+    pub session_id: String,
+    pub task_id: String,
+    pub tool_use_id: String,
+    pub task_type: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaudeTaskNotificationMessage {
+    pub session_id: String,
+    pub task_id: String,
+    pub status: String,
 }

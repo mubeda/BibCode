@@ -198,6 +198,17 @@ recovery is `full` only for
 `bounded` for every other list/read pair, including unknown or unproven pairs.
 These recovery downgrades do not disable ordinary Codex chat.
 
+Claude structured control joins native task identity only through the complete
+same-session, same-generation Agent/Task `tool_use_id` chain: root tool
+invocation, authenticated asynchronous PostToolUse `agentId`, local-agent
+`task_started` `task_id`, and verified `SubagentStart` `agent_id`. The bounded
+correlator never uses semantic text, timing, order, or proximity and fails
+closed on conflicts, malformed identity, duplicate assignment, stale
+generation, or saturation. Its target updates share the provider event batch
+with the canonical actor mutation; native identities remain private and
+redacted. `task_notification(stopped)` monotonically cancels the mapped actor
+and retires its handle, so later hook completion cannot rewrite cancellation.
+
 | Provider | Structured chat activity                                                                                              | Provider-terminal observation                                                                                                              | Recovery and truthful downgrade                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
 | -------- | --------------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Codex    | Supported: actors and attributed entries; background work is enabled only when its reconciliation method is accepted. | Supported when capability probes prove a Unix App Server listener and remote TUI.                                                          | Structured recovery combines bounded validated hints, list discovery, and direct reads; the exact `full`/`bounded`/`none` guarantees are above. The terminal path publishes only after root resume and keeps known data when an optional bounded reconciliation request has no usable response.                                                                                                                                                                                                |
