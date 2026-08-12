@@ -10,8 +10,11 @@ import { act, type ReactElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vite-plus/test";
 
-import { ActivityRoster, type ActivityRosterProps } from "./activity/ActivityRoster";
-import type { ActivityRosterPageData } from "./activity/ActivityPanel";
+import {
+  ActivityPanel,
+  type ActivityPanelProps,
+  type ActivityRosterPageData,
+} from "./activity/ActivityPanel";
 import { RightPanelSheet } from "./RightPanelSheet";
 import { TooltipProvider } from "./ui/tooltip";
 
@@ -84,10 +87,11 @@ function snapshot(scope: ActivitySnapshot["scope"]): ActivitySnapshot {
   } as unknown as ActivitySnapshot;
 }
 
-function rosterProps(
+function panelProps(
   scope: ActivitySnapshot["scope"],
-  onCancelActor: NonNullable<ActivityRosterProps["onCancelActor"]>,
-): ActivityRosterProps {
+  onCancelActor: NonNullable<ActivityPanelProps["onCancelActor"]>,
+  onNavigate: ActivityPanelProps["onNavigate"],
+): ActivityPanelProps {
   const current = actor();
   const page = {
     records: [current],
@@ -95,17 +99,22 @@ function rosterProps(
     nextCursor: null,
   } as ActivityRosterPageData;
   return {
-    section: "subagents",
+    route: {
+      section: "subagents",
+      selectedRecordKind: null,
+      selectedRecordId: null,
+    },
     snapshot: snapshot(scope),
-    active: { pages: [page], loading: false, error: null },
-    done: { pages: [], loading: false, error: null },
-    reconciled: { active: [current], done: [] },
+    roster: {
+      active: { pages: [page], loading: false, error: null },
+      done: { pages: [], loading: false, error: null },
+    },
+    detail: null,
     now: "2026-08-11T20:02:00.000Z",
-    notification: null,
-    focusRecordId: null,
-    onFocusRestored: vi.fn(),
-    onSelect: vi.fn(),
-    onLoadMore: vi.fn(),
+    onNavigate,
+    onLoadMoreRoster: vi.fn(),
+    onLoadMoreDetail: vi.fn(),
+    onRefreshSnapshot: vi.fn(),
     onCancelActor,
   };
 }
@@ -174,8 +183,9 @@ describe("Activity cancellation surfaces", () => {
     "keeps the trailing Stop action keyboard-reachable in the %s",
     async (_name, sheet, key) => {
       const onCancelActor = vi.fn();
+      const onNavigate = vi.fn();
       const roster = (
-        <ActivityRoster {...rosterProps({ _tag: "thread", threadId }, onCancelActor)} />
+        <ActivityPanel {...panelProps({ _tag: "thread", threadId }, onCancelActor, onNavigate)} />
       );
       const container = await mount(
         sheet ? (
@@ -196,6 +206,8 @@ describe("Activity cancellation surfaces", () => {
 
       expect(detail).not.toBeNull();
       expect(stop?.tabIndex).toBe(0);
+      expect(detail?.contains(stop!)).toBe(false);
+      expect(stop?.querySelector("button")).toBeNull();
       detail?.focus();
       const tab = await pressTab(detail!, stop!);
       expect(tab.defaultPrevented).toBe(false);
@@ -203,19 +215,27 @@ describe("Activity cancellation surfaces", () => {
       await activate(stop!, key);
       expect(onCancelActor).toHaveBeenCalledTimes(1);
       expect(onCancelActor).toHaveBeenCalledWith("actor:surface", 7);
+      expect(onNavigate).not.toHaveBeenCalled();
+      expect(document.activeElement).toBe(stop);
     },
   );
 
   it("keeps provider-terminal Activity observable and read-only", async () => {
     const onCancelActor = vi.fn();
+    const onNavigate = vi.fn();
     const container = await mount(
-      <ActivityRoster
-        {...rosterProps({ _tag: "terminal", threadId, terminalId: "terminal-1" }, onCancelActor)}
+      <ActivityPanel
+        {...panelProps(
+          { _tag: "terminal", threadId, terminalId: "terminal-1" },
+          onCancelActor,
+          onNavigate,
+        )}
       />,
     );
 
     expect(container.querySelector('button[data-activity-row="actor:surface"]')).not.toBeNull();
     expect(container.querySelector('button[aria-label^="Stop "]')).toBeNull();
     expect(onCancelActor).not.toHaveBeenCalled();
+    expect(onNavigate).not.toHaveBeenCalled();
   });
 });

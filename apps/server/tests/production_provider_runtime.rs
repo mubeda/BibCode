@@ -1362,6 +1362,53 @@ where
     rpc_response(socket, id).await
 }
 
+async fn stream_rpc_request<S>(socket: &mut WebSocketStream<S>, id: &str, tag: &str, payload: Value)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    socket
+        .send(Message::Text(
+            json!({
+                "_tag":"Request",
+                "id":id,
+                "tag":tag,
+                "payload":payload,
+                "headers":[]
+            })
+            .to_string()
+            .into(),
+        ))
+        .await
+        .expect("send stream RPC request");
+}
+
+async fn stream_rpc_message<S>(socket: &mut WebSocketStream<S>) -> ServerMessage
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    let frame = timeout(Duration::from_secs(10), socket.next())
+        .await
+        .expect("stream RPC response timeout")
+        .expect("stream WebSocket remains open")
+        .expect("valid stream WebSocket frame");
+    let Message::Text(text) = frame else {
+        panic!("expected text stream WebSocket message, got {frame:?}");
+    };
+    serde_json::from_str(&text).expect("valid stream RPC message")
+}
+
+async fn ack_stream_rpc<S>(socket: &mut WebSocketStream<S>, id: &str)
+where
+    S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+{
+    socket
+        .send(Message::Text(
+            json!({"_tag":"Ack","requestId":id}).to_string().into(),
+        ))
+        .await
+        .expect("ack stream RPC chunk");
+}
+
 async fn assert_codex_restart_reconciliation(
     mode: &'static str,
     expected: ProviderReconciliationOutcome,
@@ -11073,6 +11120,9 @@ while IFS= read -r line; do
       printf '{{"id":%s,"result":{{}}}}\n' "$id"
       printf '%s\n' '{{"method":"turn/completed","emittedAtMs":1020,"params":{{"threadId":"alpha-late","turn":{{"id":"alpha-late-turn","status":"completed","completedAt":3}}}}}}'
       printf '%s\n' '{{"method":"turn/completed","emittedAtMs":1022,"params":{{"threadId":"alpha","turn":{{"id":"alpha-turn","status":"completed","completedAt":3}}}}}}'
+      printf '%s\n' '{{"method":"turn/started","emittedAtMs":1030,"params":{{"threadId":"beta","turn":{{"id":"beta-followup-turn","status":"inProgress","startedAt":4}}}}}}'
+      printf '%s\n' '{{"method":"item/started","emittedAtMs":1031,"params":{{"threadId":"provider-root","turnId":"root-turn","item":{{"id":"spawn-root-followup","type":"collabAgentToolCall","tool":"spawnAgent","status":"inProgress","senderThreadId":"provider-root","receiverThreadIds":["root-followup"],"agentsStates":{{"root-followup":{{"status":"running","message":null}}}}}},"startedAtMs":1031}}}}'
+      printf '%s\n' '{{"method":"turn/started","emittedAtMs":1032,"params":{{"threadId":"root-followup","turn":{{"id":"root-followup-turn","status":"inProgress","startedAt":4}}}}}}'
       ;;
     *'"method":"turn/interrupt"'*) printf '{{"id":%s,"result":{{}}}}\n' "$id" ;;
     *'"method":"shutdown"'*) printf '{{"id":%s,"result":null}}\n' "$id" ;;
@@ -11191,6 +11241,29 @@ done
                 control["actorId"] == "codex:thread:beta" && control["state"] == "available"
             })
     );
+    let (mut activity_stream, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("initial Activity stream WebSocket");
+    stream_rpc_request(
+        &mut activity_stream,
+        "2901",
+        "subscribeActivity",
+        json!({"_tag":"thread","threadId":"targeted-thread"}),
+    )
+    .await;
+    let initial_stream_snapshot = stream_rpc_message(&mut activity_stream).await;
+    assert!(matches!(
+        initial_stream_snapshot,
+        ServerMessage::Chunk { ref values, .. }
+            if values[0]["kind"] == "snapshot"
+                && values[0]["snapshot"]["control"]["actors"]
+                    .as_array()
+                    .is_some_and(|actors| actors.iter().any(|actor| {
+                        actor["actorId"] == "codex:thread:alpha"
+                            && actor["state"] == "available"
+                    }))
+    ));
+    ack_stream_rpc(&mut activity_stream, "2901").await;
     let cancellation_address = handle.local_addr();
     let alpha_revision = alpha_control["controlRevision"].clone();
     let cancellation_task = tokio::spawn(async move {
@@ -11219,32 +11292,84 @@ done
         while !late_observed.exists() {
             tokio::task::yield_now().await;
         }
-        let mut request_id = 3_100_u64;
+        let mut actor_requested = false;
+        let mut operation_requested = false;
         loop {
-            request_id += 1;
-            if let Ok(snapshot) = tagged_rpc_request(
-                &mut socket,
-                &request_id.to_string(),
-                "activity.getSnapshot",
-                json!({"_tag":"thread","threadId":"targeted-thread"}),
-            )
-            .await
-                && snapshot["control"]["actors"]
-                    .as_array()
-                    .is_some_and(|actors| {
-                        actors.iter().any(|actor| {
-                            actor["actorId"] == "codex:thread:alpha-late"
-                                && actor["state"] == "requested"
-                        })
-                    })
-            {
+            let ServerMessage::Chunk { values, .. } =
+                stream_rpc_message(&mut activity_stream).await
+            else {
+                panic!("Activity stream must remain open while cancellation is requested");
+            };
+            ack_stream_rpc(&mut activity_stream, "2901").await;
+            for value in values {
+                if value["kind"] != "control-delta" {
+                    continue;
+                }
+                for change in value["delta"]["changes"].as_array().into_iter().flatten() {
+                    actor_requested |= change["kind"] == "actor-upserted"
+                        && change["actor"]["actorId"] == "codex:thread:alpha"
+                        && change["actor"]["state"] == "requested";
+                    operation_requested |= change["kind"] == "operation-upserted"
+                        && change["operation"]["rootActorId"] == "codex:thread:alpha"
+                        && change["operation"]["state"] == "requested";
+                }
+            }
+            if actor_requested && operation_requested {
                 break;
             }
-            tokio::task::yield_now().await;
         }
     })
     .await
-    .expect("late child joins the original fence before selected dispatch returns");
+    .expect("the original stream observes the held cancellation as requested");
+    activity_stream
+        .close(None)
+        .await
+        .expect("close original Activity stream while requested");
+
+    let (mut requested_reconnect, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("reconnected requested Activity stream");
+    stream_rpc_request(
+        &mut requested_reconnect,
+        "3901",
+        "subscribeActivity",
+        json!({"_tag":"thread","threadId":"targeted-thread"}),
+    )
+    .await;
+    let requested_initial = stream_rpc_message(&mut requested_reconnect).await;
+    let ServerMessage::Chunk { values, .. } = requested_initial else {
+        panic!("reconnected Activity stream must begin with a snapshot");
+    };
+    let restored = &values[0];
+    assert_eq!(restored["kind"], "snapshot");
+    assert!(
+        restored["snapshot"]["control"]["operations"]
+            .as_array()
+            .is_some_and(|operations| operations.iter().any(|operation| {
+                operation["rootActorId"] == "codex:thread:alpha"
+                    && operation["state"] == "requested"
+            }))
+    );
+    assert!(
+        restored["snapshot"]["control"]["actors"]
+            .as_array()
+            .is_some_and(|actors| actors.iter().any(|actor| {
+                actor["actorId"] == "codex:thread:alpha" && actor["state"] == "requested"
+            }))
+    );
+    assert!(
+        restored["snapshot"]["control"]["actors"]
+            .as_array()
+            .is_some_and(|actors| actors.iter().any(|actor| {
+                actor["actorId"] == "codex:thread:alpha-late" && actor["state"] == "requested"
+            }))
+    );
+    ack_stream_rpc(&mut requested_reconnect, "3901").await;
+    requested_reconnect
+        .close(None)
+        .await
+        .expect("close restored requested Activity stream");
+
     std::fs::write(&release_selected, b"release").expect("release selected dispatch");
     cancellation_task
         .await
@@ -11331,6 +11456,14 @@ done
             .is_some_and(|actors| actors.iter().any(|actor| {
                 actor["id"] == "codex:thread:beta" && actor["status"] == "running"
             }))
+    );
+    assert!(
+        reconnected_snapshot["actors"]
+            .as_array()
+            .is_some_and(|actors| actors.iter().any(|actor| {
+                actor["id"] == "codex:thread:root-followup" && actor["status"] == "running"
+            })),
+        "a post-cancellation root provider event remains observable after reconnect"
     );
     assert_eq!(operation["state"], "partial");
     assert_eq!(operation["residualCount"], 1);
@@ -11435,6 +11568,396 @@ done
     assert_eq!(after_stale_retry, before_stale_retry);
 
     reconnect.close(None).await.expect("close reconnect");
+    socket.close(None).await.expect("close WebSocket");
+    handle.shutdown();
+    handle.join().await.expect("RPC server joins");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree() {
+    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
+    reset_claude_activity_probe_cache_for_test().await;
+    let state = TempDir::new().expect("state");
+    let capture = state.path().join("claude-targeted-requests.ndjson");
+    let settings_capture = state.path().join("claude-targeted-settings.json");
+    let token_capture = state.path().join("claude-targeted-token");
+    let session_capture = state.path().join("claude-targeted-session");
+    let script = include_str!("fixtures/claude-provider/targeted-rpc.sh")
+        .replace("__CAPTURE__", &capture.to_string_lossy())
+        .replace("__SETTINGS__", &settings_capture.to_string_lossy())
+        .replace("__TOKEN__", &token_capture.to_string_lossy())
+        .replace("__SESSION_PATH__", &session_capture.to_string_lossy());
+    let executable = executable_fixture(&state, "claude-targeted-rpc", &script, "");
+    let config = test_config(&state);
+    std::fs::create_dir_all(config.state_dir()).expect("state directory");
+    std::fs::write(
+        config.state_dir().join("settings.json"),
+        serde_json::to_vec(&json!({
+            "providerInstances": {
+                "claude-targeted": {
+                    "driver": "claudeAgent",
+                    "enabled": true,
+                    "config": { "binaryPath": executable }
+                }
+            }
+        }))
+        .expect("settings json"),
+    )
+    .expect("provider settings");
+    let workspace = state.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let handle = ServerRuntime::start(config.clone())
+        .await
+        .expect("production RPC server");
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("WebSocket");
+    tagged_rpc_request(
+        &mut socket,
+        "9101",
+        "orchestration.dispatchCommand",
+        json!({
+            "type":"project.create","commandId":"claude-targeted-project",
+            "projectId":"claude-targeted-project","title":"Claude Targeted",
+            "workspaceRoot":workspace,"defaultModelSelection":null,"createdAt":NOW
+        }),
+    )
+    .await
+    .expect("project created through public RPC");
+    tagged_rpc_request(
+        &mut socket,
+        "9102",
+        "orchestration.dispatchCommand",
+        json!({
+            "type":"thread.create","commandId":"claude-targeted-thread",
+            "threadId":"claude-targeted-thread","projectId":"claude-targeted-project",
+            "title":"Claude targeted thread","kind":"workspace",
+            "modelSelection":{"instanceId":"claude-targeted","model":"claude-sonnet"},
+            "runtimeMode":"full-access","interactionMode":"default","branch":null,
+            "worktreePath":null,"createdAt":NOW
+        }),
+    )
+    .await
+    .expect("thread created through public RPC");
+    tagged_rpc_request(
+        &mut socket,
+        "9103",
+        "orchestration.dispatchCommand",
+        json!({
+            "type":"thread.turn.start","commandId":"claude-targeted-turn",
+            "threadId":"claude-targeted-thread",
+            "message":{"messageId":"claude-targeted-message","role":"user","text":"start","attachments":[]},
+            "modelSelection":{"instanceId":"claude-targeted","model":"claude-sonnet"},
+            "runtimeMode":"full-access","interactionMode":"default","createdAt":NOW
+        }),
+    )
+    .await
+    .expect("turn admitted");
+
+    timeout(Duration::from_secs(10), async {
+        while !(std::fs::read_to_string(&settings_capture)
+            .ok()
+            .is_some_and(|settings| serde_json::from_str::<Value>(&settings).is_ok())
+            && std::fs::read_to_string(&token_capture)
+                .ok()
+                .is_some_and(|token| !token.is_empty())
+            && std::fs::read_to_string(&session_capture)
+                .ok()
+                .is_some_and(|session| !session.is_empty()))
+        {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("Claude fixture captures authenticated hook settings");
+    let settings: Value = serde_json::from_str(
+        &std::fs::read_to_string(&settings_capture).expect("Claude hook settings"),
+    )
+    .expect("valid Claude hook settings");
+    let hook_url = settings["hooks"]["SubagentStart"][0]["hooks"][0]["url"]
+        .as_str()
+        .expect("Claude hook URL")
+        .to_owned();
+    let token = std::fs::read_to_string(&token_capture).expect("Claude hook token");
+    let session_id = std::fs::read_to_string(&session_capture).expect("Claude session ID");
+    let client = reqwest::Client::new();
+    for hook in [
+        json!({
+            "hook_event_name":"PostToolUse","session_id":session_id,
+            "tool_name":"Agent","tool_use_id":"tool-agent-a",
+            "tool_response":{"status":"async_launched","agentId":"agent-a"}
+        }),
+        json!({
+            "hook_event_name":"SubagentStart","session_id":session_id,
+            "agent_id":"agent-a","agent_type":"same-role",
+            "description":"same description","prompt":"same prompt"
+        }),
+        json!({
+            "hook_event_name":"PostToolUse","session_id":session_id,
+            "tool_name":"Agent","tool_use_id":"tool-agent-b",
+            "tool_response":{"status":"async_launched","agentId":"agent-b"}
+        }),
+        json!({
+            "hook_event_name":"SubagentStart","session_id":session_id,
+            "agent_id":"agent-b","agent_type":"same-role",
+            "description":"same description","prompt":"same prompt"
+        }),
+        json!({
+            "hook_event_name":"PostToolUse","session_id":session_id,
+            "agent_id":"agent-a","tool_name":"Agent","tool_use_id":"tool-agent-child",
+            "tool_response":{"status":"async_launched","agentId":"agent-child"}
+        }),
+        json!({
+            "hook_event_name":"SubagentStart","session_id":session_id,
+            "agent_id":"agent-child","parent_agent_id":"agent-a","agent_type":"same-role"
+        }),
+        json!({
+            "hook_event_name":"SubagentStart","session_id":session_id,
+            "agent_id":"agent-unmapped","agent_type":"same-role",
+            "description":"same description","prompt":"same prompt"
+        }),
+    ] {
+        assert_eq!(
+            client
+                .post(&hook_url)
+                .header("Authorization", format!("Bearer {token}"))
+                .json(&hook)
+                .send()
+                .await
+                .expect("authenticated Claude hook")
+                .status(),
+            reqwest::StatusCode::NO_CONTENT
+        );
+    }
+
+    let available = timeout(Duration::from_secs(10), async {
+        let mut request_id = 9_200_u64;
+        loop {
+            request_id += 1;
+            let Ok(snapshot) = tagged_rpc_request(
+                &mut socket,
+                &request_id.to_string(),
+                "activity.getSnapshot",
+                json!({"_tag":"thread","threadId":"claude-targeted-thread"}),
+            )
+            .await
+            else {
+                tokio::task::yield_now().await;
+                continue;
+            };
+            let selected = snapshot["control"]["actors"]
+                .as_array()
+                .and_then(|controls| {
+                    controls.iter().find(|control| {
+                        control["actorId"] == "claude:agent:agent-a"
+                            && control["state"] == "available"
+                            && control["activeDescendantCount"] == 1
+                    })
+                })
+                .cloned();
+            let sibling_available =
+                snapshot["control"]["actors"]
+                    .as_array()
+                    .is_some_and(|controls| {
+                        controls.iter().any(|control| {
+                            control["actorId"] == "claude:agent:agent-b"
+                                && control["state"] == "available"
+                        })
+                    });
+            let unmapped_observable = snapshot["actors"].as_array().is_some_and(|actors| {
+                actors.iter().any(|actor| {
+                    actor["id"] == "claude:agent:agent-unmapped" && actor["status"] == "running"
+                })
+            });
+            if let Some(selected) = selected.filter(|_| sibling_available && unmapped_observable) {
+                break (snapshot, selected);
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    let (snapshot, selected_control) = match available {
+        Ok(available) => available,
+        Err(_) => {
+            let diagnostic = tagged_rpc_request(
+                &mut socket,
+                "9299",
+                "activity.getSnapshot",
+                json!({"_tag":"thread","threadId":"claude-targeted-thread"}),
+            )
+            .await;
+            panic!(
+                "exact Claude controls become available; snapshot={diagnostic:?}; capture={}",
+                std::fs::read_to_string(&capture).unwrap_or_default()
+            );
+        }
+    };
+
+    assert!(
+        snapshot["control"]["actors"]
+            .as_array()
+            .is_some_and(|controls| controls.iter().any(|control| {
+                control["actorId"] == "claude:agent:agent-b" && control["state"] == "available"
+            }))
+    );
+    assert!(
+        snapshot["actors"]
+            .as_array()
+            .is_some_and(|actors| actors.iter().any(|actor| {
+                actor["id"] == "claude:agent:agent-unmapped" && actor["status"] == "running"
+            }))
+    );
+    assert!(
+        snapshot["control"]["actors"]
+            .as_array()
+            .is_some_and(|controls| controls.iter().any(|control| {
+                control["actorId"] == "claude:agent:agent-unmapped"
+                    && control["state"] == "unsupported"
+            }))
+    );
+
+    let (mut thread_stream, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("thread stream");
+    stream_rpc_request(
+        &mut thread_stream,
+        "9501",
+        "orchestration.subscribeThread",
+        json!({"threadId":"claude-targeted-thread"}),
+    )
+    .await;
+    assert!(matches!(
+        stream_rpc_message(&mut thread_stream).await,
+        ServerMessage::Chunk { ref values, .. } if values[0]["kind"] == "snapshot"
+    ));
+    ack_stream_rpc(&mut thread_stream, "9501").await;
+
+    let before_unmapped = std::fs::read_to_string(&capture).unwrap_or_default();
+    assert!(
+        tagged_rpc_request(
+            &mut socket,
+            "9301",
+            "activity.cancelSubtree",
+            json!({
+                "scope":{"_tag":"thread","threadId":"claude-targeted-thread"},
+                "scopeId":"thread:claude-targeted-thread",
+                "actorId":"claude:agent:agent-unmapped",
+                "expectedControlRevision":0
+            }),
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        std::fs::read_to_string(&capture).unwrap_or_default(),
+        before_unmapped
+    );
+
+    tagged_rpc_request(
+        &mut socket,
+        "9302",
+        "activity.cancelSubtree",
+        json!({
+            "scope":{"_tag":"thread","threadId":"claude-targeted-thread"},
+            "scopeId":"thread:claude-targeted-thread",
+            "actorId":"claude:agent:agent-a",
+            "expectedControlRevision":selected_control["controlRevision"]
+        }),
+    )
+    .await
+    .expect("selected Claude subtree cancellation accepted");
+
+    let stop_tasks = timeout(Duration::from_secs(10), async {
+        loop {
+            let requests = std::fs::read_to_string(&capture).unwrap_or_default();
+            let stops = requests
+                .lines()
+                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                .filter(|request| request["request"]["subtype"] == "stop_task")
+                .collect::<Vec<_>>();
+            if stops.len() == 2 {
+                break stops;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("exact selected Claude stop_task requests");
+    assert_eq!(stop_tasks[0]["request"]["task_id"], "task-a");
+    assert_eq!(stop_tasks[1]["request"]["task_id"], "task-child");
+    assert!(stop_tasks.iter().all(|request| {
+        request["request"]["subtype"] == "stop_task" && request["request"]["task_id"] != "task-b"
+    }));
+
+    let post_cancel = timeout(Duration::from_secs(10), async {
+        let mut request_id = 9_400_u64;
+        loop {
+            request_id += 1;
+            let snapshot = tagged_rpc_request(
+                &mut socket,
+                &request_id.to_string(),
+                "activity.getSnapshot",
+                json!({"_tag":"thread","threadId":"claude-targeted-thread"}),
+            )
+            .await
+            .expect("post-cancel Activity snapshot");
+            let actors = snapshot["actors"].as_array().cloned().unwrap_or_default();
+            if actors.iter().any(|actor| {
+                actor["id"] == "claude:agent:agent-a" && actor["status"] == "cancelled"
+            }) && actors.iter().any(|actor| {
+                actor["id"] == "claude:agent:agent-child" && actor["status"] == "cancelled"
+            }) {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("selected Claude actors become terminal");
+    assert!(post_cancel["actors"].as_array().is_some_and(|actors| {
+        actors
+            .iter()
+            .any(|actor| actor["id"] == "claude:agent:agent-b" && actor["status"] == "running")
+    }));
+    assert!(
+        post_cancel["actors"]
+            .as_array()
+            .is_some_and(|actors| actors.iter().any(|actor| {
+                actor["id"] == "claude:agent:agent-unmapped" && actor["status"] == "running"
+            }))
+    );
+    assert_eq!(post_cancel["observationState"], "live");
+
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let message = stream_rpc_message(&mut thread_stream).await;
+            let root_live = matches!(
+                message,
+                ServerMessage::Chunk { ref values, .. }
+                    if values[0]["kind"] == "snapshot"
+                        && values[0]["snapshot"]["thread"]["messages"]
+                            .as_array()
+                            .is_some_and(|messages| messages.iter().any(|message| {
+                                message["role"] == "assistant"
+                                    && message["text"].as_str().is_some_and(|text| {
+                                        text.contains("root-after-cancel")
+                                    })
+                            }))
+            );
+            ack_stream_rpc(&mut thread_stream, "9501").await;
+            if root_live {
+                break;
+            }
+        }
+    })
+    .await
+    .expect("the root thread continues streaming after selected cancellation");
+
+    thread_stream
+        .close(None)
+        .await
+        .expect("close thread stream");
     socket.close(None).await.expect("close WebSocket");
     handle.shutdown();
     handle.join().await.expect("RPC server joins");
