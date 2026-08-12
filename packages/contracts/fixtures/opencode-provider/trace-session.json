@@ -19,6 +19,7 @@
     "type": "content.delta",
     "threadId": "opencode-thread-1",
     "turnId": "turn-3",
+    "itemId": "assistant-1",
     "payload": {
       "streamKind": "assistant_text",
       "delta": "Hello"
@@ -51,6 +52,7 @@
     "type": "content.delta",
     "threadId": "opencode-thread-1",
     "turnId": "turn-3",
+    "itemId": "assistant-1",
     "payload": {
       "streamKind": "assistant_text",
       "delta": " world"

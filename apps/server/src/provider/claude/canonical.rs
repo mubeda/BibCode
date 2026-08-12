@@ -10,6 +10,8 @@ pub struct CanonicalEvent {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_refs: Option<Value>,
@@ -25,6 +27,8 @@ pub struct CanonicalEventTrace {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub item_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_refs: Option<Value>,
@@ -37,6 +41,7 @@ impl From<&CanonicalEvent> for CanonicalEventTrace {
             event_type: value.event_type.clone(),
             thread_id: value.thread_id.clone(),
             turn_id: value.turn_id.clone(),
+            item_id: value.item_id.clone(),
             request_id: value.request_id.clone(),
             provider_refs: value.provider_refs.clone(),
             payload: value.payload.clone(),

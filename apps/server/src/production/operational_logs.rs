@@ -129,6 +129,9 @@ impl ProviderOperationalLog {
             event_type: &event.event_type,
             thread_id: &event.thread_id,
             turn_id: event.turn_id.as_deref(),
+            item_id: crate::production::provider_runtime::valid_provider_item_id(
+                event.item_id.as_deref(),
+            ),
             request_id: event.request_id.as_deref(),
             activity_mutation_count: event.activity.len(),
             status: provider_status(&event.event_type),
@@ -319,6 +322,8 @@ struct ProviderEventSummary<'a> {
     thread_id: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     turn_id: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    item_id: Option<&'a str>,
     #[serde(skip_serializing_if = "Option::is_none")]
     request_id: Option<&'a str>,
     activity_mutation_count: usize,
@@ -745,6 +750,7 @@ mod tests {
             event_type: "turn.completed".to_owned(),
             thread_id: "thread-1".to_owned(),
             turn_id: Some("turn-1".to_owned()),
+            item_id: Some("item-1".to_owned()),
             request_id: Some("request-1".to_owned()),
             payload: json!({
                 "text": "PRIVATE_PROMPT",
@@ -770,11 +776,12 @@ mod tests {
         assert_eq!(record["nativeEventId"], "native:event:1");
         assert_eq!(record["threadId"], "thread-1");
         assert_eq!(record["turnId"], "turn-1");
+        assert_eq!(record["itemId"], "item-1");
         assert_eq!(record["requestId"], "request-1");
         assert_eq!(record["activityMutationCount"], 1);
         assert_eq!(record["status"], "completed");
         assert!(record["timestamp"].is_string());
-        assert_eq!(record.as_object().expect("record object").len(), 8);
+        assert_eq!(record.as_object().expect("record object").len(), 9);
         for private_value in [
             "PRIVATE_PROMPT",
             "PRIVATE_CREDENTIAL",
@@ -846,6 +853,7 @@ mod tests {
             event_type: "activity.native".to_owned(),
             thread_id: "thread-1".to_owned(),
             turn_id: None,
+            item_id: None,
             request_id: None,
             payload: json!({}),
             activity: Vec::new(),
