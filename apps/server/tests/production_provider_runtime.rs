@@ -1103,17 +1103,18 @@ async fn captured_json_request(path: &Path, predicate: impl Fn(&Value) -> bool) 
     .expect("captured provider request")
 }
 
-async fn captured_complete_ndjson(path: &Path) -> Vec<Value> {
+async fn captured_complete_ndjson_with_bytes(path: &Path) -> (Vec<u8>, Vec<Value>) {
     timeout(Duration::from_secs(5), async {
         loop {
-            let content = std::fs::read_to_string(path).unwrap_or_default();
-            if (content.is_empty() || content.ends_with('\n'))
+            let bytes = std::fs::read(path).unwrap_or_default();
+            if (bytes.is_empty() || bytes.ends_with(b"\n"))
+                && let Ok(content) = std::str::from_utf8(&bytes)
                 && let Some(values) = content
                     .lines()
                     .map(|line| serde_json::from_str::<Value>(line).ok())
                     .collect::<Option<Vec<_>>>()
             {
-                break values;
+                break (bytes, values);
             }
             tokio::task::yield_now().await;
         }
@@ -1126,6 +1127,10 @@ async fn captured_complete_ndjson(path: &Path) -> Vec<Value> {
             std::fs::read_to_string(path)
         )
     })
+}
+
+async fn captured_complete_ndjson(path: &Path) -> Vec<Value> {
+    captured_complete_ndjson_with_bytes(path).await.1
 }
 
 fn claude_stop_task_targets(requests: &[Value]) -> Vec<String> {
@@ -1141,6 +1146,28 @@ fn claude_root_interrupt_count(requests: &[Value]) -> usize {
         .iter()
         .filter(|request| request["request"]["subtype"] == "interrupt")
         .count()
+}
+
+fn assert_exact_claude_stop_task_request(request: &Value, expected_task_id: &str) {
+    let object = request
+        .as_object()
+        .expect("Claude control request must be an object");
+    assert_eq!(
+        object.len(),
+        3,
+        "Claude targeted control must not carry an unbounded native payload: {request}"
+    );
+    assert_eq!(request["type"], "control_request");
+    assert!(
+        request["request_id"]
+            .as_str()
+            .is_some_and(|request_id| request_id.starts_with("bibcode-")),
+        "Claude targeted control must carry a bounded correlated request id: {request}"
+    );
+    assert_eq!(
+        request["request"],
+        json!({"subtype":"stop_task", "task_id":expected_task_id})
+    );
 }
 
 fn image_attachment(temp: &TempDir) -> Value {
@@ -13029,9 +13056,8 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
             "description":"same description","prompt":"same prompt"
         }),
         json!({
-            "hook_event_name":"PostToolUse","session_id":session_id,
-            "agent_id":"agent-a","tool_name":"Agent","tool_use_id":"tool-agent-child",
-            "tool_response":{"status":"async_launched","agentId":"agent-child"}
+            "hook_event_name":"PreToolUse","session_id":session_id,
+            "agent_id":"agent-a","tool_name":"Agent","tool_use_id":"tool-agent-child"
         }),
         json!({
             "hook_event_name":"SubagentStart","session_id":session_id,
@@ -13090,12 +13116,32 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
                                 && control["state"] == "available"
                         })
                     });
+            let child_available =
+                snapshot["control"]["actors"]
+                    .as_array()
+                    .is_some_and(|controls| {
+                        controls.iter().any(|control| {
+                            control["actorId"] == "claude:agent:agent-child"
+                                && control["state"] == "available"
+                        })
+                    });
             let unmapped_observable = snapshot["actors"].as_array().is_some_and(|actors| {
                 actors.iter().any(|actor| {
                     actor["id"] == "claude:agent:agent-unmapped" && actor["status"] == "running"
                 })
             });
-            if let Some(selected) = selected.filter(|_| sibling_available && unmapped_observable) {
+            let unmapped_unsupported =
+                snapshot["control"]["actors"]
+                    .as_array()
+                    .is_some_and(|controls| {
+                        controls.iter().any(|control| {
+                            control["actorId"] == "claude:agent:agent-unmapped"
+                                && control["state"] == "unsupported"
+                        })
+                    });
+            if let Some(selected) = selected.filter(|_| {
+                child_available && sibling_available && unmapped_observable && unmapped_unsupported
+            }) {
                 break (snapshot, selected);
             }
             tokio::task::yield_now().await;
@@ -13119,6 +13165,13 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
         }
     };
 
+    assert!(
+        snapshot["control"]["actors"]
+            .as_array()
+            .is_some_and(|controls| controls.iter().any(|control| {
+                control["actorId"] == "claude:agent:agent-child" && control["state"] == "available"
+            }))
+    );
     assert!(
         snapshot["control"]["actors"]
             .as_array()
@@ -13158,27 +13211,47 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
     ));
     ack_stream_rpc(&mut thread_stream, "9501").await;
 
-    let before_unmapped = captured_complete_ndjson(&capture).await;
+    let _ = captured_json_request(&capture, |request| request["type"] == "user").await;
+    let _ = captured_json_request(&capture, |request| {
+        request["request_id"] == "bibcode-inventory"
+    })
+    .await;
+    let (before_unmapped_bytes, before_unmapped) =
+        captured_complete_ndjson_with_bytes(&capture).await;
     let before_unmapped_stop_tasks = claude_stop_task_targets(&before_unmapped);
     let before_unmapped_root_interrupts = claude_root_interrupt_count(&before_unmapped);
     assert!(before_unmapped_stop_tasks.is_empty());
     assert_eq!(before_unmapped_root_interrupts, 0);
-    assert!(
-        tagged_rpc_request(
-            &mut socket,
-            "9301",
-            "activity.cancelSubtree",
-            json!({
-                "scope":{"_tag":"thread","threadId":"claude-targeted-thread"},
-                "scopeId":"thread:claude-targeted-thread",
-                "actorId":"claude:agent:agent-unmapped",
-                "expectedControlRevision":0
-            }),
-        )
-        .await
-        .is_err()
+    let unmapped_error = tagged_rpc_request(
+        &mut socket,
+        "9301",
+        "activity.cancelSubtree",
+        json!({
+            "scope":{"_tag":"thread","threadId":"claude-targeted-thread"},
+            "scopeId":"thread:claude-targeted-thread",
+            "actorId":"claude:agent:agent-unmapped",
+            "expectedControlRevision":0
+        }),
+    )
+    .await
+    .expect_err("an unsupported actor must fail through the public RPC");
+    assert_eq!(
+        unmapped_error,
+        json!([{
+            "_tag":"Fail",
+            "error":{
+                "_tag":"ActivityError",
+                "message":"The provider cancellation target is no longer available.",
+                "reason":"targetUnavailable"
+            }
+        }])
     );
-    let after_unmapped = captured_complete_ndjson(&capture).await;
+    let (after_unmapped_bytes, after_unmapped) =
+        captured_complete_ndjson_with_bytes(&capture).await;
+    assert_eq!(
+        after_unmapped_bytes, before_unmapped_bytes,
+        "an unsupported actor must leave the complete-line provider capture byte-for-byte unchanged"
+    );
     assert_eq!(
         claude_stop_task_targets(&after_unmapped),
         before_unmapped_stop_tasks,
@@ -13186,7 +13259,7 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
     );
     assert_eq!(
         claude_root_interrupt_count(&after_unmapped),
-        0,
+        before_unmapped_root_interrupts,
         "an unsupported actor must not fall back to interrupting the root"
     );
 
@@ -13218,6 +13291,20 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
     .expect("exact selected Claude stop_task requests");
     let (requests, stop_tasks) = stop_tasks;
     assert_eq!(stop_tasks, ["task-a", "task-child"]);
+    let targeted_requests = requests
+        .get(after_unmapped.len()..)
+        .expect("captured requests retain the pre-cancellation prefix");
+    let stop_task_requests = targeted_requests
+        .iter()
+        .filter(|request| request["request"]["subtype"] == "stop_task")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        targeted_requests.len(),
+        2,
+        "selected cancellation must write only the exact bounded target requests: {targeted_requests:?}"
+    );
+    assert_exact_claude_stop_task_request(stop_task_requests[0], "task-a");
+    assert_exact_claude_stop_task_request(stop_task_requests[1], "task-child");
     assert_eq!(
         claude_root_interrupt_count(&requests),
         0,
@@ -13249,6 +13336,11 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
     })
     .await
     .expect("selected Claude actors become terminal");
+    assert_eq!(
+        claude_stop_task_targets(&captured_complete_ndjson(&capture).await),
+        ["task-a", "task-child"],
+        "provider notification must not trigger another targeted request"
+    );
     assert!(post_cancel["actors"].as_array().is_some_and(|actors| {
         actors
             .iter()
@@ -13292,6 +13384,263 @@ async fn targeted_activity_rpc_writes_only_the_selected_claude_stop_task_subtree
         .close(None)
         .await
         .expect("close thread stream");
+    socket.close(None).await.expect("close WebSocket");
+    handle.shutdown();
+    handle.join().await.expect("RPC server joins");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn targeted_activity_rpc_keeps_ambiguous_claude_children_unsupported_without_provider_io() {
+    let _probe_guard = CLAUDE_ACTIVITY_PROBE_TEST_LOCK.lock().await;
+    reset_claude_activity_probe_cache_for_test().await;
+    let state = TempDir::new().expect("state");
+    let capture = state
+        .path()
+        .join("claude-targeted-ambiguous-requests.ndjson");
+    let settings_capture = state.path().join("claude-targeted-ambiguous-settings.json");
+    let token_capture = state.path().join("claude-targeted-ambiguous-token");
+    let session_capture = state.path().join("claude-targeted-ambiguous-session");
+    let ready_capture = state.path().join("claude-targeted-ambiguous-ready");
+    let script = include_str!("fixtures/claude-provider/targeted-rpc-ambiguous.sh")
+        .replace("__CAPTURE__", &capture.to_string_lossy())
+        .replace("__SETTINGS__", &settings_capture.to_string_lossy())
+        .replace("__TOKEN__", &token_capture.to_string_lossy())
+        .replace("__SESSION_PATH__", &session_capture.to_string_lossy())
+        .replace("__READY__", &ready_capture.to_string_lossy());
+    let executable = executable_fixture(&state, "claude-targeted-rpc-ambiguous", &script, "");
+    let config = test_config(&state);
+    std::fs::create_dir_all(config.state_dir()).expect("state directory");
+    std::fs::write(
+        config.state_dir().join("settings.json"),
+        serde_json::to_vec(&json!({
+            "providerInstances": {
+                "claude-targeted-ambiguous": {
+                    "driver": "claudeAgent",
+                    "enabled": true,
+                    "config": { "binaryPath": executable }
+                }
+            }
+        }))
+        .expect("settings json"),
+    )
+    .expect("provider settings");
+    let workspace = state.path().join("workspace");
+    std::fs::create_dir(&workspace).expect("workspace");
+    let handle = ServerRuntime::start(config.clone())
+        .await
+        .expect("production RPC server");
+    let (mut socket, _) = connect_async(format!("ws://{}/ws", handle.local_addr()))
+        .await
+        .expect("WebSocket");
+    tagged_rpc_request(
+        &mut socket,
+        "9601",
+        "orchestration.dispatchCommand",
+        json!({
+            "type":"project.create","commandId":"claude-ambiguous-project",
+            "projectId":"claude-ambiguous-project","title":"Claude Ambiguous",
+            "workspaceRoot":workspace,"defaultModelSelection":null,"createdAt":NOW
+        }),
+    )
+    .await
+    .expect("project created through public RPC");
+    tagged_rpc_request(
+        &mut socket,
+        "9602",
+        "orchestration.dispatchCommand",
+        json!({
+            "type":"thread.create","commandId":"claude-ambiguous-thread",
+            "threadId":"claude-ambiguous-thread","projectId":"claude-ambiguous-project",
+            "title":"Claude ambiguous thread","kind":"workspace",
+            "modelSelection":{"instanceId":"claude-targeted-ambiguous","model":"claude-sonnet"},
+            "runtimeMode":"full-access","interactionMode":"default","branch":null,
+            "worktreePath":null,"createdAt":NOW
+        }),
+    )
+    .await
+    .expect("thread created through public RPC");
+    tagged_rpc_request(
+        &mut socket,
+        "9603",
+        "orchestration.dispatchCommand",
+        json!({
+            "type":"thread.turn.start","commandId":"claude-ambiguous-turn",
+            "threadId":"claude-ambiguous-thread",
+            "message":{"messageId":"claude-ambiguous-message","role":"user","text":"start","attachments":[]},
+            "modelSelection":{"instanceId":"claude-targeted-ambiguous","model":"claude-sonnet"},
+            "runtimeMode":"full-access","interactionMode":"default","createdAt":NOW
+        }),
+    )
+    .await
+    .expect("turn admitted");
+
+    timeout(Duration::from_secs(10), async {
+        while !ready_capture.exists() {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        panic!(
+            "ambiguous Claude fixture did not reach launch-ready marker: ready={}, settings={:?}, token_bytes={}, session={:?}",
+            ready_capture.exists(),
+            std::fs::read_to_string(&settings_capture),
+            std::fs::read(&token_capture).map_or(0, |token| token.len()),
+            std::fs::read_to_string(&session_capture)
+        )
+    });
+    let settings: Value = serde_json::from_str(
+        &std::fs::read_to_string(&settings_capture).expect("Claude hook settings"),
+    )
+    .expect("valid Claude hook settings");
+    let hook_url = settings["hooks"]["SubagentStart"][0]["hooks"][0]["url"]
+        .as_str()
+        .expect("Claude hook URL")
+        .to_owned();
+    let token = std::fs::read_to_string(&token_capture).expect("Claude hook token");
+    let session_id = std::fs::read_to_string(&session_capture).expect("Claude session ID");
+    let client = reqwest::Client::new();
+    for hook in [
+        json!({
+            "hook_event_name":"PostToolUse","session_id":session_id,
+            "tool_name":"Agent","tool_use_id":"tool-agent-parent",
+            "tool_response":{"status":"async_launched","agentId":"agent-parent"}
+        }),
+        json!({
+            "hook_event_name":"SubagentStart","session_id":session_id,
+            "agent_id":"agent-parent","agent_type":"same-role"
+        }),
+        json!({
+            "hook_event_name":"PreToolUse","session_id":session_id,
+            "agent_id":"agent-parent","tool_name":"Agent","tool_use_id":"tool-agent-child-one"
+        }),
+        json!({
+            "hook_event_name":"PreToolUse","session_id":session_id,
+            "agent_id":"agent-parent","tool_name":"Agent","tool_use_id":"tool-agent-child-two"
+        }),
+        json!({
+            "hook_event_name":"SubagentStart","session_id":session_id,
+            "agent_id":"agent-child-one","parent_agent_id":"agent-parent","agent_type":"same-role"
+        }),
+        json!({
+            "hook_event_name":"SubagentStart","session_id":session_id,
+            "agent_id":"agent-child-two","parent_agent_id":"agent-parent","agent_type":"same-role"
+        }),
+    ] {
+        assert_eq!(
+            client
+                .post(&hook_url)
+                .header("Authorization", format!("Bearer {token}"))
+                .json(&hook)
+                .send()
+                .await
+                .expect("authenticated Claude hook")
+                .status(),
+            reqwest::StatusCode::NO_CONTENT
+        );
+    }
+
+    let snapshot = timeout(Duration::from_secs(10), async {
+        let mut request_id = 9_700_u64;
+        loop {
+            request_id += 1;
+            let Ok(snapshot) = tagged_rpc_request(
+                &mut socket,
+                &request_id.to_string(),
+                "activity.getSnapshot",
+                json!({"_tag":"thread","threadId":"claude-ambiguous-thread"}),
+            )
+            .await
+            else {
+                tokio::task::yield_now().await;
+                continue;
+            };
+            let actors = snapshot["actors"].as_array().cloned().unwrap_or_default();
+            let controls = snapshot["control"]["actors"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let both_running = ["agent-child-one", "agent-child-two"]
+                .iter()
+                .all(|agent_id| {
+                    actors.iter().any(|actor| {
+                        actor["id"] == format!("claude:agent:{agent_id}")
+                            && actor["status"] == "running"
+                    })
+                });
+            let both_unsupported = ["agent-child-one", "agent-child-two"]
+                .iter()
+                .all(|agent_id| {
+                    controls.iter().any(|control| {
+                        control["actorId"] == format!("claude:agent:{agent_id}")
+                            && control["state"] == "unsupported"
+                    })
+                });
+            let parent_available = controls.iter().any(|control| {
+                control["actorId"] == "claude:agent:agent-parent" && control["state"] == "available"
+            });
+            if both_running && both_unsupported && parent_available {
+                break snapshot;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("ambiguous children remain observable and unsupported");
+
+    let _ = captured_json_request(&capture, |request| request["type"] == "user").await;
+    let _ = captured_json_request(&capture, |request| {
+        request["request_id"] == "bibcode-inventory"
+    })
+    .await;
+    let before = captured_complete_ndjson_with_bytes(&capture).await;
+    assert!(claude_stop_task_targets(&before.1).is_empty());
+    assert_eq!(claude_root_interrupt_count(&before.1), 0);
+    for (index, agent_id) in ["agent-child-one", "agent-child-two"].iter().enumerate() {
+        let actor_id = format!("claude:agent:{agent_id}");
+        let control = snapshot["control"]["actors"]
+            .as_array()
+            .and_then(|controls| {
+                controls
+                    .iter()
+                    .find(|control| control["actorId"] == actor_id)
+            })
+            .expect("unsupported child control");
+        let error = tagged_rpc_request(
+            &mut socket,
+            &(9_800 + index).to_string(),
+            "activity.cancelSubtree",
+            json!({
+                "scope":{"_tag":"thread","threadId":"claude-ambiguous-thread"},
+                "scopeId":"thread:claude-ambiguous-thread",
+                "actorId":actor_id,
+                "expectedControlRevision":control["controlRevision"]
+            }),
+        )
+        .await
+        .expect_err("ambiguous child cancellation must fail through public RPC");
+        assert_eq!(
+            error,
+            json!([{
+                "_tag":"Fail",
+                "error":{
+                    "_tag":"ActivityError",
+                    "message":"The provider cancellation target is no longer available.",
+                    "reason":"targetUnavailable"
+                }
+            }])
+        );
+    }
+    let after = captured_complete_ndjson_with_bytes(&capture).await;
+    assert_eq!(
+        after.0, before.0,
+        "ambiguous child cancellation must add no provider request bytes"
+    );
+    assert_eq!(after.1, before.1);
+    assert!(claude_stop_task_targets(&after.1).is_empty());
+    assert_eq!(claude_root_interrupt_count(&after.1), 0);
+
     socket.close(None).await.expect("close WebSocket");
     handle.shutdown();
     handle.join().await.expect("RPC server joins");

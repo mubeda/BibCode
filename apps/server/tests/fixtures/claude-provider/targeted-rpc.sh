@@ -43,9 +43,12 @@ while IFS= read -r line; do
   case "$line" in
     *'"subtype":"stop_task"'*)
       request_id=$(printf '%s\n' "$line" | sed -n 's/.*"request_id":"\([^"]*\)".*/\1/p')
+      task_id=$(printf '%s\n' "$line" | sed -n 's/.*"task_id":"\([^"]*\)".*/\1/p')
       printf '{"type":"control_response","response":{"subtype":"success","request_id":"%s","response":{}}}\n' "$request_id"
-      stop_count=$((stop_count + 1))
-      if [ "$stop_count" -eq 2 ]; then
+      if [ "$stop_count" -eq 0 ] && [ "$task_id" = 'task-a' ]; then
+        stop_count=1
+      elif [ "$stop_count" -eq 1 ] && [ "$task_id" = 'task-child' ]; then
+        stop_count=2
         emit '{"type":"system","subtype":"task_notification","session_id":"__SESSION__","uuid":"task-child-stopped","task_id":"task-child","status":"stopped"}'
         emit '{"type":"system","subtype":"task_notification","session_id":"__SESSION__","uuid":"task-a-stopped","task_id":"task-a","status":"stopped"}'
         emit '{"type":"stream_event","session_id":"__SESSION__","uuid":"root-after-cancel","parent_tool_use_id":null,"event":{"type":"content_block_delta","index":9,"delta":{"type":"text_delta","text":"root-after-cancel"}}}'
