@@ -86,11 +86,12 @@ flowchart TB
   missing. Public adoption receipts bind the canonical opaque payload and an
   immutable result. Only healthy authoritative catalog observations may
   reconcile durable adopted-thread branch metadata.
-  A standalone server may perform a final sweep of
-  descendants rooted at its own process after its managed owners shut down. An
-  in-process desktop server shares the Tauri host PID and therefore skips that
-  sweep: provider and terminal owners still stop their registered processes,
-  while host-owned WebView children remain under the desktop lifecycle.
+  The standalone `bibcode` binary may perform a final sweep of descendants
+  rooted at its own process after its managed owners shut down. Reusable
+  in-process runtimes—including the desktop server—share their host PID and
+  therefore skip that sweep: provider and terminal owners still stop their
+  registered processes, while host-owned children remain under the host
+  lifecycle.
 - **Contracts (`packages/contracts`)** contains Effect schemas and TypeScript
   contracts only. It defines persisted models, RPC methods, HTTP APIs, desktop
   bridge values, and provider events without application runtime logic.

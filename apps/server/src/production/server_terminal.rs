@@ -90,7 +90,7 @@ impl ServerTerminalServices {
             provider_usage,
             relay,
             control,
-            ProcessTreeCleanup::StandaloneServer,
+            ProcessTreeCleanup::EmbeddedHost,
         )
     }
 
