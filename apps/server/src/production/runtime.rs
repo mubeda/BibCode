@@ -53,7 +53,9 @@ use crate::{
             reconcile_abandoned_provider_sessions,
         },
         relay::relay_client_service,
-        server_terminal::{ServerTerminalServices, register_server_terminal_rpc},
+        server_terminal::{
+            ProcessTreeCleanup, ServerTerminalServices, register_server_terminal_rpc,
+        },
         turn_delivery::TurnDeliveryService,
         workspace_preview::{WorkspacePreviewRpcServices, register_workspace_preview_rpc},
     },
@@ -111,6 +113,25 @@ impl ProductionRuntime {
         auth: AuthService,
         asset_secret: Vec<u8>,
         ui_process_observer: Arc<dyn DesktopUiProcessObserver>,
+    ) -> Result<Self, String> {
+        Self::start_with_process_tree_cleanup(
+            config,
+            database,
+            auth,
+            asset_secret,
+            ui_process_observer,
+            ProcessTreeCleanup::StandaloneServer,
+        )
+        .await
+    }
+
+    pub(crate) async fn start_with_process_tree_cleanup(
+        config: &ServerConfig,
+        database: Database,
+        auth: AuthService,
+        asset_secret: Vec<u8>,
+        ui_process_observer: Arc<dyn DesktopUiProcessObserver>,
+        process_tree_cleanup: ProcessTreeCleanup,
     ) -> Result<Self, String> {
         let state_paths = StatePaths::from_config(config);
         let trace_diagnostics =
@@ -264,7 +285,7 @@ impl ProductionRuntime {
         ));
         agent_activity.record_startup(0).await;
         control.attach_agent_activity_handler(agent_activity).await;
-        let terminal_services = ServerTerminalServices::new(
+        let terminal_services = ServerTerminalServices::new_with_process_tree_cleanup(
             terminal_manager,
             process_sampler,
             resource_sampler.clone(),
@@ -272,6 +293,7 @@ impl ProductionRuntime {
             provider_usage,
             relay,
             control.clone(),
+            process_tree_cleanup,
         );
         let orchestration_effects = OrchestrationEffects::start(
             orchestration.clone(),
