@@ -72,6 +72,29 @@ pub(crate) async fn run_supervised(
     request: SupervisedRunRequest,
     cancellation: &CancellationToken,
 ) -> Result<SupervisedRunOutput, SupervisedRunError> {
+    run_supervised_with_observer(request, cancellation, |_| {}).await
+}
+
+#[cfg(test)]
+pub(crate) async fn run_supervised_with_spawn_observer<F>(
+    request: SupervisedRunRequest,
+    cancellation: &CancellationToken,
+    observer: F,
+) -> Result<SupervisedRunOutput, SupervisedRunError>
+where
+    F: FnOnce(Option<u32>) + Send,
+{
+    run_supervised_with_observer(request, cancellation, observer).await
+}
+
+async fn run_supervised_with_observer<F>(
+    request: SupervisedRunRequest,
+    cancellation: &CancellationToken,
+    observer: F,
+) -> Result<SupervisedRunOutput, SupervisedRunError>
+where
+    F: FnOnce(Option<u32>) + Send,
+{
     if cancellation.is_cancelled() {
         return Err(SupervisedRunError::Cancelled);
     }
@@ -92,6 +115,7 @@ pub(crate) async fn run_supervised(
     let mut command = CommandWrap::from(command);
     configure_supervised_background_command_wrap(&mut command);
     let mut child = spawn_wrapped(&mut command).map_err(SupervisedRunError::Spawn)?;
+    observer(child.id());
 
     let outcome = execute_child(&mut *child, &execution, cancellation).await;
     if outcome.is_err() {
