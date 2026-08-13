@@ -10,13 +10,16 @@ only that runtime's provider and terminal process trees, while peer runtimes in
 the same operating-system process remain live.
 
 **Architecture:** Treat the existing per-runtime `ProcessAttributionRegistry`
-as the exact root source of truth. Shutdown first closes provider and terminal
-admission, freezes that registry, and captures an identity-safe closure of its
-registered roots and currently visible descendants before either manager drops
-its registrations. Existing process-group and Windows Job owners remain the
-primary kill-and-reap mechanism; after they finish, one residual pass resamples
-surviving captured roots, includes late descendants, and signals only exact
-captured identities. The shared-PID descendant sweep is removed.
+as the exact root source of truth and as the shutdown admission fence. Shutdown
+freezes that registry and captures an identity-safe closure of its registered
+roots and currently visible descendants before either manager drops its
+registrations. A persistent provider or terminal spawn that reaches
+registration after freeze receives a typed rejection and its existing
+uncommitted owner kills and reaps it before returning. Existing process-group
+and Windows Job owners remain the primary kill-and-reap mechanism; after they
+finish, one residual pass resamples surviving captured roots, includes late
+descendants, and signals only exact captured identities. The shared-PID
+descendant sweep is removed.
 
 **Tech Stack:** Rust 2024, Tokio, `sysinfo`, Linux pidfds, Windows process
 handles and Job Objects, Unix process groups, portable-pty, Cargo tests.
@@ -36,10 +39,12 @@ handles and Job Objects, Unix process groups, portable-pty, Cargo tests.
 - Existing provider process groups and terminal process groups/Windows Jobs
   remain the primary owners and reapers. The new residual pass is idempotent
   and cannot replace or race those owners with a broad sweep.
-- A root registration created after shutdown freeze is not published as a live
-  runtime process. Provider admission is closed at the supervisor fence;
-  terminal work that was already between admission and publication remains
-  owned by `UncommittedPtyProcess` and must kill and wait before returning.
+- A root registration attempted after shutdown freeze returns a typed
+  `Shutdown` rejection; capacity exhaustion returns a distinct typed
+  `Capacity` rejection. Neither process is published as live. Provider spawn
+  retains its child wrapper until terminate-and-wait completes; terminal work
+  remains owned by `UncommittedPtyProcess`, whose process-group/Job kill and PTY
+  waiter reap before startup returns.
 - Preserve public RPC, schema, persistence, provider command, and terminal
   command behavior. Add no production Node runtime or helper sidecar.
 - Linux, macOS, and Windows remain supported. Platform-specific signaling may
@@ -68,7 +73,7 @@ PID reuse, but it does not prove runtime ownership, so the target set is wrong.
 | Spawn class | Lifetime and current owner | Task 9H treatment |
 | --- | --- | --- |
 | Native Codex, Claude, Cursor, Grok, and OpenCode sessions | `AttributedChild` retains a `ProcessRegistration`; process-wrap owns a Unix process group or Windows Job and `ProviderRuntimeSupervisor` kills and waits during session shutdown. | Freeze and capture the exact registered root before supervisor cleanup; leave kill/reap with the supervisor, then identity-clean only a surviving captured closure. |
-| Ordinary and provider terminals | `TerminalManager` retains a root registration; `PortablePtyProcess` owns the Unix process group or Windows Job; `UncommittedPtyProcess` owns every pre-publication failure. | Close admission before capture; leave kill/reap with the manager and its uncommitted guard; identity-clean only captured residuals. |
+| Ordinary and provider terminals | `TerminalManager` retains a root registration; `PortablePtyProcess` owns the Unix process group or Windows Job; `UncommittedPtyProcess` owns every pre-publication failure. | Freeze registration before capture; a racing pre-publication child is rejected and cleaned by its uncommitted owner; leave normal kill/reap with the manager and identity-clean only captured residuals. |
 | Provider-terminal observer helpers | They are launched under the prepared terminal process tree and are retained by observer worker/reaper ownership. | They inherit the captured PTY root and require no second registry. |
 | Shared process runner, Git runner, provider maintenance, and most inventory probes | Whole operations are bounded by cancellation/timeout and their local supervised process-group/Job owner waits before returning. | Do not register transient roots or duplicate their lifecycle in Task 9H. |
 | Provider usage and relay validation probes | The request future owns a kill-on-drop child and bounded completion; they are not persistent runtime sessions. | Keep request ownership. They are outside the runtime-session residual sweep and are not a reason to signal peer descendants. |
@@ -86,10 +91,11 @@ configuration is required.
 
 Add a one-way shutdown freeze that copies registered root identities under the
 short registry mutex. Sample the native table after releasing the mutex and
-capture the exact roots plus their identity-valid descendants. Close provider
-and terminal admission before the freeze so no publishable root can appear
-after it. After manager cleanup, resample and union descendants of any still
-live captured root with exact identities from the initial closure. This catches
+capture the exact roots plus their identity-valid descendants. The freeze is
+the linearization point: any racing persistent spawn after it receives a typed
+registration error and must clean its uncommitted process before returning.
+After manager cleanup, resample and union descendants of any still live
+captured root with exact identities from the initial closure. This catches
 ordinary late forks without ever walking from the shared application PID.
 
 This is the smallest design with one source of truth. It preserves the existing
@@ -119,31 +125,28 @@ than conditionally retained.
 
 1. Drain worktree operations, catalog observation, delivery, effects, and
    provider-update scheduling as today.
-2. Send a fenced shutdown message through `ProviderRuntimeSupervisor`. When the
-   actor dequeues it, it closes both command receivers and reports that
-   admission is closed while retaining every live driver and registration.
-3. Call `TerminalManager::begin_shutdown`; it cancels the manager and crosses
-   the lifecycle mutex once. A published session is now stable; an older
-   uncommitted spawn can no longer publish and remains owned by its guard.
-4. Call `ProcessAttributionRegistry::freeze_and_snapshot_identities`. This
+2. Call `ProcessAttributionRegistry::freeze_and_snapshot_identities`. This
    makes registration one-way closed and copies at most 512 exact roots without
-   awaiting under the mutex.
-5. `NativeProcessSampler::capture_runtime_process_ownership` samples after the
+   awaiting under the mutex. A provider or terminal spawn that raced across
+   this point receives a typed rejection and its existing uncommitted owner
+   kills and reaps it; no new manager lifecycle protocol is required.
+3. `NativeProcessSampler::capture_runtime_process_ownership` samples after the
    mutex is released. It accepts a root only when the sampled creation identity
    matches, walks only parent links whose exact parent identity is already in
    the owned closure, rejects creation-time inversion/cycles, deduplicates, and
    stores identities leaf-first.
-6. Release the provider fence. Provider shutdown and terminal shutdown retain
-   their current graceful/forced process-group or Job termination and wait
-   behavior. Dropping/cancelling the caller before release must release the
-   fence so the supervisor cannot remain parked.
-7. `cleanup_runtime_process_ownership` samples once more. It selects only exact
+4. Provider shutdown and terminal shutdown retain their current
+   graceful/forced process-group or Job termination and wait behavior. Provider
+   actor queue ordering and terminal lifecycle cancellation continue to reject
+   later work; the registry fence closes the narrower post-spawn publication
+   race.
+5. `cleanup_runtime_process_ownership` samples once more. It selects only exact
    initial identities still alive plus descendants of still-live captured
    roots, again with identity-valid parent links, and signals leaves before
    roots. `NotFound` and `StaleIdentity` mean the captured process is already
    gone and are successful idempotent outcomes; unsupported/rejected/read
    failures remain bounded diagnostics.
-8. A second shutdown is inert. A restarted `ProductionRuntime` owns a fresh,
+6. A second shutdown is inert. A restarted `ProductionRuntime` owns a fresh,
    unfrozen registry and cannot inherit the old runtime's roots or snapshot.
 
 No filesystem, protocol, persistence, authentication, or desktop trust
@@ -170,6 +173,12 @@ task, queue, polling loop, or allocation occurs during ordinary execution.
 ```rust
 pub(crate) fn freeze_and_snapshot_identities(&self) -> Vec<ProcessIdentity>;
 
+pub(crate) fn register_identity(
+    &self,
+    identity: ProcessIdentity,
+    metadata: ProcessRegistrationMetadata,
+) -> Result<ProcessRegistration, ProcessRegistrationError>;
+
 #[derive(Clone, Debug, Default)]
 pub(crate) struct RuntimeProcessOwnership {
     roots: Vec<ProcessIdentity>,
@@ -190,7 +199,9 @@ pub(crate) async fn cleanup_runtime_process_ownership(
 - `RuntimeProcessOwnership` remains crate-internal and contains no public
   schema or serialized state.
 - `freeze_and_snapshot_identities` is one-way and idempotent. A new runtime
-  receives a new unfrozen registry.
+  receives a new unfrozen registry. `ProcessRegistrationError` distinguishes
+  `Shutdown` from `Capacity`; persistent process callers must fail closed and
+  clean their uncommitted child for either result.
 
 - [ ] **Step 1: Write failing registry and closure tests**
 
@@ -248,7 +259,9 @@ failure.
 Add `accepting_registrations: bool` to `RegistryState`, initialized to `true`.
 `freeze_and_snapshot_identities` sets it to `false`, copies identities in
 `registration_order`, and releases the mutex. `register_identity` returns
-`None` after freeze without evicting or mutating existing entries.
+`Err(ProcessRegistrationError::Shutdown)` after freeze without evicting or
+mutating existing entries. Capacity returns
+`Err(ProcessRegistrationError::Capacity)` and also never evicts a live owner.
 
 Implement a pure helper in `native.rs` that indexes rows by exact identity and
 PID, seeds only exact matching roots, traverses children only from already
@@ -289,7 +302,7 @@ git commit -m "fix(process): capture exact runtime process ownership"
 
 ---
 
-### Task 2: Fence manager admission before capture
+### Task 2: Fail closed when a persistent spawn races registry freeze
 
 **Files:**
 
@@ -303,23 +316,18 @@ git commit -m "fix(process): capture exact runtime process ownership"
 - Produces:
 
 ```rust
-pub(crate) struct ProviderShutdownFence { /* release + completion ownership */ }
-
-pub(crate) async fn begin_shutdown(
-    &self,
-) -> Result<ProviderShutdownFence, ProviderRuntimeError>;
-
-impl ProviderShutdownFence {
-    pub(crate) async fn complete(self) -> Result<(), ProviderRuntimeError>;
+pub(crate) enum ProcessRegistrationError {
+    Shutdown,
+    Capacity,
 }
-
-pub(crate) async fn begin_shutdown(&self); // TerminalManager
 ```
 
-- `ProviderRuntimeSupervisor::shutdown` delegates to `begin_shutdown` plus
-  `ProviderShutdownFence::complete`, preserving existing callers.
-- Dropping `ProviderShutdownFence` releases the actor to finish cleanup; caller
-  cancellation cannot strand the supervisor.
+- Provider mapping: `Shutdown` becomes `ProviderRuntimeError::Shutdown` after
+  terminate-and-wait; `Capacity` becomes the existing typed spawn error with a
+  bounded detail after terminate-and-wait.
+- Terminal mapping: `Shutdown` becomes `TerminalError::Shutdown` while the
+  `UncommittedPtyProcess` still owns cleanup; `Capacity` becomes a typed spawn
+  failure and is cleaned by the same owner.
 
 - [ ] **Step 1: Write failing admission-fence tests**
 
@@ -327,55 +335,53 @@ Add tests proving:
 
 ```rust
 #[tokio::test]
-async fn provider_shutdown_fence_retains_roots_and_rejects_later_launches() {
-    // Launch a real positively gated provider fixture, enter the fence, assert
-    // its registration still exists, and assert a later launch returns
-    // Shutdown/QueueClosed. Complete the fence and assert the child is reaped.
+async fn provider_spawn_rejected_after_freeze_is_killed_and_reaped() {
+    // Freeze the factory's registry, launch a positively gated real provider,
+    // assert typed Shutdown, and prove the exact child identity disappears.
 }
 
 #[tokio::test]
-async fn dropped_provider_shutdown_fence_releases_and_joins_cleanup() {
-    // Enter with a live fixture, drop the fence, then call shutdown and prove
-    // bounded owner completion and no survivor.
+async fn provider_capacity_rejection_is_killed_and_reaped() {
+    // Fill the bounded registry, launch a positively gated real provider,
+    // assert typed spawn/capacity failure, and prove no child survives.
 }
 
 #[tokio::test]
-async fn terminal_shutdown_admission_prevents_inflight_publication() {
-    // Pause a real start at the existing publication seam, begin shutdown,
-    // release it, and prove UncommittedPtyProcess reaps it without inserting a
-    // live session or accepting restart.
+async fn terminal_spawn_rejected_after_freeze_is_killed_and_reaped() {
+    // Freeze the manager registry before a real start; assert typed Shutdown,
+    // no live session publication, and exact child reap by the uncommitted
+    // process owner.
 }
 ```
 
-The production mutations caught are sampling before admissions close and
-parking an actor forever when the capturing caller is cancelled.
+The production mutations caught are treating ownership registration as
+best-effort and returning from startup while an unregistered child remains
+live.
 
 - [ ] **Step 2: Run exact RED tests**
 
 Run each test by exact fully qualified name with `--nocapture`. Expected:
-compile failure because the fence APIs do not exist. Confirm the terminal test
-uses the existing deterministic publication barrier, not timing.
+compile/type failure because registration does not return typed errors and the
+provider path cannot await cleanup. Confirm fixtures use positive readiness and
+exact process identity, not timing.
 
-- [ ] **Step 3: Implement the provider actor fence**
+- [ ] **Step 3: Make provider registration and cleanup fail closed**
 
-Add one shutdown message carrying `entered`, `release`, and `completion`
-channels. When dequeued, close the bounded and terminal receivers before
-signaling `entered`; retain the session map and all registrations until
-`release` resolves; then execute existing `shutdown_sessions`, cancel the
-stopped token, send completion, and return. Channel closure rejects messages
-that race after the fence without processing them.
+Make the native provider `spawn_child` path async. After spawn, require an exact
+live identity and typed registry success before returning the child wrapper. On
+`Shutdown`, `Capacity`, or missing exact identity, call the existing bounded
+`terminate_and_wait`, log only bounded secondary cleanup failures, and then
+return the primary typed error. Do not detach cleanup or register transient
+probe/maintenance work.
 
-The fence drop path sends release. Completion/worker joining remains exactly
-once and bounded by the existing manager cleanup semantics.
+- [ ] **Step 4: Make terminal registration fail closed**
 
-- [ ] **Step 4: Implement the terminal admission fence**
-
-Make `TerminalManager::begin_shutdown` idempotently cancel the manager and
-cross its lifecycle mutex once. Keep the existing generation cancellation,
-session close, observer shutdown, process-tree kill, and wait in
-`shutdown_with_report`. An in-flight spawn that has not published must encounter
-the cancelled manager at its existing final lifecycle check and drop its
-`UncommittedPtyProcess` owner.
+Require an exact live identity and typed registry success before constructing
+or publishing the terminal session. On `Shutdown` return
+`TerminalError::Shutdown`; on `Capacity` return a typed spawn failure. In both
+cases the still-armed `UncommittedPtyProcess` kills the process group/Job and
+the existing PTY waiter reaps the root. Preserve the manager's existing final
+lifecycle cancellation check; do not add another manager fence.
 
 - [ ] **Step 5: Run GREEN and affected manager suites**
 
@@ -396,7 +402,7 @@ serialization.
 ```bash
 git add apps/server/src/production/provider_runtime.rs \
   apps/server/src/terminal/manager.rs
-git commit -m "fix(server): fence process owners before shutdown capture"
+git commit -m "fix(server): reject unowned persistent process spawns"
 ```
 
 ---
@@ -466,18 +472,16 @@ the application PID. Record PID, creation identity, and command for A and B;
 the test cleanup must always release/kill both fixtures after an assertion
 failure.
 
-- [ ] **Step 3: Wire the fenced capture through production shutdown**
+- [ ] **Step 3: Wire exact capture through production shutdown**
 
 In `ProductionRuntime::quiesce_for_update`, preserve upstream drain ordering,
 then:
 
-1. enter the provider shutdown fence;
-2. begin terminal shutdown admission closure;
-3. freeze the shared runtime registry and capture ownership;
-4. complete provider shutdown;
-5. run terminal manager shutdown;
-6. run residual identity cleanup with the retained snapshot;
-7. preserve the first bounded manager error while still attempting every later
+1. freeze the shared runtime registry and capture ownership;
+2. run provider shutdown;
+3. run terminal manager shutdown;
+4. run residual identity cleanup with the retained snapshot;
+5. preserve the first bounded manager error while still attempting every later
    cleanup stage.
 
 For standalone `ServerTerminalServices::shutdown`, begin terminal shutdown,
@@ -591,11 +595,11 @@ admission/capacity regression.
 Give the reviewer the Task 9 final blocker, this amendment, base
 `9c83db92`, final HEAD, the RED/GREEN evidence, and explicit questions about:
 
-- admission/capture/cleanup linearization;
+- registry-freeze/capture/cleanup linearization;
 - descendants forked between initial and residual samples;
 - PID reuse and creation-time inversion;
 - process-group/Job primary ownership and double-kill/double-wait;
-- fence-drop cancellation and idempotent shutdown;
+- typed late-spawn rejection, owned cleanup, and idempotent shutdown;
 - registry capacity, restart isolation, and lock/await behavior;
 - Linux, macOS, and Windows selection/signal semantics;
 - accidental policy, timeout, serialization, or public API drift.
@@ -617,4 +621,3 @@ git status --short
 Expected: only scoped diagnostics/manager/runtime/tests/living-doc changes are
 tracked; no `.codegraph/`, `.repos/`, dependency, lockfile, generated, debug,
 or unrelated files are included.
-
