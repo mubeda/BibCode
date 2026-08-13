@@ -1,4 +1,4 @@
-use std::{io, process::ExitStatus, time::Duration};
+use std::{future::Future, io, process::ExitStatus, time::Duration};
 
 use process_wrap::tokio::{ChildWrapper, CommandWrap};
 use tokio::{
@@ -158,7 +158,19 @@ async fn execute_child(
         tokio::select! {
             biased;
             () = cancellation.cancelled() => Outcome::Cancelled,
-            () = tokio::time::sleep(request.timeout) => Outcome::TimedOut,
+            () = tokio::time::sleep(request.timeout) => {
+                let completed = std::future::poll_fn(|context| {
+                    std::task::Poll::Ready(match execution.as_mut().poll(context) {
+                        std::task::Poll::Ready(result) => Some(result),
+                        std::task::Poll::Pending => None,
+                    })
+                })
+                .await;
+                match completed {
+                    Some(result) => Outcome::Completed(result),
+                    None => Outcome::TimedOut,
+                }
+            },
             result = &mut execution => Outcome::Completed(result),
         }
     };
@@ -471,6 +483,42 @@ mod tests {
         drop_calls: Arc<AtomicUsize>,
     }
 
+    #[derive(Debug)]
+    struct CompletionGatedChild {
+        child: Child,
+        release: watch::Receiver<bool>,
+        wait_calls: Arc<AtomicUsize>,
+    }
+
+    impl ChildWrapper for CompletionGatedChild {
+        fn inner(&self) -> &dyn ChildWrapper {
+            &self.child
+        }
+
+        fn inner_mut(&mut self) -> &mut dyn ChildWrapper {
+            &mut self.child
+        }
+
+        fn into_inner(self: Box<Self>) -> Box<dyn ChildWrapper> {
+            Box::new(self.child)
+        }
+
+        fn wait(&mut self) -> Pin<Box<dyn Future<Output = io::Result<ExitStatus>> + Send + '_>> {
+            self.wait_calls.fetch_add(1, Ordering::SeqCst);
+            let mut release = self.release.clone();
+            let child = &mut self.child;
+            Box::pin(async move {
+                while !*release.borrow() {
+                    release
+                        .changed()
+                        .await
+                        .map_err(|_| io::Error::other("completion gate sender dropped"))?;
+                }
+                child.wait().await
+            })
+        }
+    }
+
     impl Drop for DelayedReapChild {
         fn drop(&mut self) {
             self.drop_calls.fetch_add(1, Ordering::SeqCst);
@@ -581,6 +629,36 @@ mod tests {
         }
     }
 
+    async fn completion_gated_child() -> (
+        CompletionGatedChild,
+        watch::Sender<bool>,
+        Arc<AtomicUsize>,
+        ExitStatus,
+    ) {
+        let mut command = completed_command();
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("completion-boundary child");
+        let expected_status = child
+            .wait()
+            .await
+            .expect("completion-boundary child is positively reaped");
+        let (release, release_rx) = watch::channel(false);
+        let wait_calls = Arc::new(AtomicUsize::new(0));
+        (
+            CompletionGatedChild {
+                child,
+                release: release_rx,
+                wait_calls: Arc::clone(&wait_calls),
+            },
+            release,
+            wait_calls,
+            expected_status,
+        )
+    }
+
     #[tokio::test]
     async fn pre_cancelled_run_rejects_before_spawning_the_command() {
         let cancellation = CancellationToken::new();
@@ -600,6 +678,79 @@ mod tests {
         .expect_err("pre-cancelled execution must not attempt to spawn");
 
         assert!(matches!(error, SupervisedRunError::Cancelled));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn completed_and_reaped_execution_wins_the_timeout_boundary() {
+        let (mut child, release, wait_calls, expected_status) = completion_gated_child().await;
+        let cancellation = CancellationToken::new();
+        let request = execution();
+        let execution = execute_child(&mut child, &request, &cancellation);
+        tokio::pin!(execution);
+
+        std::future::poll_fn(|context| {
+            assert!(
+                execution.as_mut().poll(context).is_pending(),
+                "completion gate must retain the already-reaped child"
+            );
+            std::task::Poll::Ready(())
+        })
+        .await;
+        release
+            .send(true)
+            .expect("release completed execution at its timeout boundary");
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        let output = execution
+            .await
+            .expect("completed execution must win over the simultaneous timeout wake");
+        assert_eq!(output.status, expected_status);
+        assert_eq!(wait_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_execution_still_times_out_at_the_boundary() {
+        let (mut child, _release, wait_calls, _expected_status) = completion_gated_child().await;
+        let cancellation = CancellationToken::new();
+        let request = execution();
+        let execution = execute_child(&mut child, &request, &cancellation);
+        tokio::pin!(execution);
+
+        std::future::poll_fn(|context| {
+            assert!(execution.as_mut().poll(context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        assert!(matches!(execution.await, Err(SupervisedRunError::Timeout)));
+        assert_eq!(wait_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancellation_wins_over_simultaneous_completion_and_timeout() {
+        let (mut child, release, wait_calls, _expected_status) = completion_gated_child().await;
+        let cancellation = CancellationToken::new();
+        let request = execution();
+        let execution = execute_child(&mut child, &request, &cancellation);
+        tokio::pin!(execution);
+
+        std::future::poll_fn(|context| {
+            assert!(execution.as_mut().poll(context).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        release
+            .send(true)
+            .expect("release completion at cancellation boundary");
+        cancellation.cancel();
+        tokio::time::advance(Duration::from_secs(5)).await;
+
+        assert!(matches!(
+            execution.await,
+            Err(SupervisedRunError::Cancelled)
+        ));
+        assert_eq!(wait_calls.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]

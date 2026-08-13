@@ -40,6 +40,13 @@ Provider-specific events are normalized into shared orchestration contracts;
 provider wire payloads do not leak into React state. See
 [RPC and orchestration](./rpc-and-orchestration.md).
 
+Provider subprocess probes use the server's shared supervised execution owner,
+which collects both output streams within byte limits and retains kill-and-reap
+ownership on cancellation or timeout. Cancellation takes precedence at a
+simultaneous wake. At the timeout boundary, an execution whose process wait and
+pipe collection are already complete returns that result; only an execution
+that remains pending is terminated as timed out.
+
 The canonical `thread.token-usage.updated` event describes two distinct values:
 `usedTokens` is active context-window usage, while optional
 `totalProcessedTokens` is lifetime tokens processed by the provider. The latter

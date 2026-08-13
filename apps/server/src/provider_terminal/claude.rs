@@ -1936,28 +1936,42 @@ mod tests {
     struct ClaudeBoundedProbeFixture {
         _sandbox: TestSandbox,
         executable: PathBuf,
+        started: PathBuf,
+        completed: PathBuf,
     }
 
     fn bounded_probe_fixture(sandbox: TestSandbox) -> ClaudeBoundedProbeFixture {
         let bytes = CLAUDE_PROBE_OUTPUT_LIMIT + 8 * 1024;
+        let started = sandbox.path("probe.started");
+        let completed = sandbox.path("probe.completed");
         let executable = sandbox.executable_script(
             "large-claude-probe",
             &format!(
-                "dd if=/dev/zero bs={bytes} count=1 2>/dev/null\n\
-                 dd if=/dev/zero bs={bytes} count=1 1>&2 2>/dev/null"
+                "printf started > \"$1\"\n\
+                 dd if=/dev/zero bs={bytes} count=1 2>/dev/null\n\
+                 dd if=/dev/zero bs={bytes} count=1 1>&2 2>/dev/null\n\
+                 printf completed > \"$2\""
             ),
             "",
         );
         ClaudeBoundedProbeFixture {
             _sandbox: sandbox,
             executable,
+            started,
+            completed,
         }
     }
 
     impl ClaudeBoundedProbeFixture {
         async fn run(&self) -> Result<ClaudeProbeOutput, String> {
             SystemClaudeCapabilityProbeRunner::default()
-                .run(&self.executable, Vec::new())
+                .run(
+                    &self.executable,
+                    vec![
+                        self.started.to_string_lossy().into_owned(),
+                        self.completed.to_string_lossy().into_owned(),
+                    ],
+                )
                 .await
         }
     }
@@ -1977,9 +1991,17 @@ mod tests {
         let left = bounded_probe_fixture(TestSandbox::new("claude-probe-left"));
         let right = bounded_probe_fixture(TestSandbox::new("claude-probe-right"));
 
-        let (left, right) = tokio::join!(left.run(), right.run());
+        let (left_output, right_output) = tokio::join!(left.run(), right.run());
 
-        for output in [left, right] {
+        for (fixture, output) in [(&left, left_output), (&right, right_output)] {
+            assert!(
+                fixture.started.is_file(),
+                "Claude probe child did not start"
+            );
+            assert!(
+                fixture.completed.is_file(),
+                "Claude probe fixture body did not complete before {output:?}"
+            );
             let output = output.expect("large Claude probe");
             assert!(output.success);
             assert_eq!(output.stdout.len(), CLAUDE_PROBE_OUTPUT_LIMIT);
